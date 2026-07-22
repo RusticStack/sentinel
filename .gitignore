@@ -10,6 +10,9 @@ _fresh/
 .env.*
 !.env.example
 
+# Local session store (Deno KV / SQLite)
+data/
+
 # Deno
 .deno/
 

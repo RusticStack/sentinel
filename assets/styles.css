@@ -9,7 +9,7 @@
 @import "@fontsource/ibm-plex-mono/600.css";
 
 @theme {
-  /* Surfaces — soft luminous summer layers (glass sits on top) */
+  /* Surfaces */
   --color-surface-0: #f6f9ef;
   --color-surface-1: #fbfdf7;
   --color-surface-2: #ffffff;
@@ -24,14 +24,14 @@
   --color-fg: #1c2417;
   --color-fg-strong: #10160e;
 
-  /* Accent — Fresh lemon / citrus (bright, optimistic) */
+  /* Accent (lemon) */
   --color-accent: #ffdb1e;
   --color-accent-hover: #f0c800;
   --color-accent-muted: #c9a80a;
   --color-accent-soft: color-mix(in srgb, #ffdb1e 26%, transparent);
   --color-accent-ink: #3a3000;
 
-  /* Status palette (runner/workflow states — not shell chrome) */
+  /* Status palette (entity states, not shell chrome) */
   --color-status-online: #16a34a;
   --color-status-idle: #64748b;
   --color-status-busy: #d97706;
@@ -41,11 +41,11 @@
   --color-status-warning: #d97706;
   --color-status-info: #0284c7;
 
-  /* Typography — IBM Plex (bright modern, not Inter/Roboto/Arial) */
+  /* Typography */
   --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
 
-  /* Radii — soft system-ish corners */
+  /* Radii */
   --radius-sm: 0.5rem;
   --radius-md: 0.75rem;
   --radius-lg: 1rem;
@@ -55,7 +55,7 @@
   --spacing-18: 4.5rem;
   --spacing-22: 5.5rem;
 
-  /* Soft glass elevation (depth via translucency, not heavy shadows) */
+  /* Glass elevation */
   --shadow-glass: 0 1px 1px rgb(28 36 23 / 0.03),
     0 6px 24px rgb(28 36 23 / 0.05);
   --shadow-glass-sm: 0 1px 1px rgb(28 36 23 / 0.02),
@@ -101,7 +101,7 @@
 }
 
 @layer components {
-  /* Frosted glass panels — Apple-like translucency */
+  /* Frosted glass */
   .glass {
     background: color-mix(in srgb, var(--color-surface-2) 68%, transparent);
     backdrop-filter: blur(22px) saturate(1.5);
@@ -120,8 +120,8 @@
 
   /* App shell chrome */
   .shell-nav-link {
-    @apply rounded-md px-2.5 py-1.5 text-sm font-medium text-muted
-      transition-colors;
+    @apply inline-flex min-h-10 items-center rounded-md px-2.5 py-1.5
+      text-sm font-medium text-muted transition-colors;
   }
 
   .shell-nav-link[aria-current="page"] {
@@ -143,6 +143,153 @@
   .placeholder-bar {
     @apply h-2.5 rounded-full bg-surface-4/80;
   }
+
+  /* Native form controls on glass surfaces */
+  .filter-control {
+    @apply rounded-md border border-border bg-surface-2/80 px-3 py-2
+      font-sans text-sm text-fg outline-none;
+  }
+
+  .filter-control:focus {
+    @apply border-accent-muted ring-2 ring-accent-soft;
+  }
+
+  .filter-control[aria-invalid="true"] {
+    @apply border-status-error/60 ring-2 ring-status-error/20;
+  }
+
+  .form-label {
+    @apply text-xs font-medium tracking-wide text-muted uppercase;
+  }
+
+  .form-hint {
+    @apply text-xs leading-relaxed text-subtle;
+  }
+
+  .form-error {
+    @apply text-xs font-medium text-status-error;
+  }
+
+  .form-field {
+    @apply flex min-w-[10rem] flex-col gap-1.5;
+  }
+
+  /* Focus rings */
+  .shell-nav-link:focus-visible,
+  a:focus-visible,
+  button:focus-visible {
+    @apply outline-2 outline-offset-2 outline-accent-muted;
+  }
+
+  /* Quiet refresh flash */
+  .quiet-refresh-flash {
+    animation: quiet-refresh 1.4s ease-out;
+  }
+
+  /* Native confirm dialog on glass */
+  .sentinel-dialog {
+    border: 1px solid color-mix(in srgb, white 75%, var(--color-border));
+    background: color-mix(in srgb, var(--color-surface-2) 88%, transparent);
+    color: var(--color-fg);
+    max-width: min(24rem, calc(100vw - 2rem));
+  }
+
+  .sentinel-dialog::backdrop {
+    background: rgb(16 22 14 / 0.4);
+    backdrop-filter: blur(2px);
+  }
+
+  /* Collapse secondary columns under breakpoints */
+  .col-hide-sm {
+    @apply hidden sm:table-cell;
+  }
+
+  .col-hide-md {
+    @apply hidden md:table-cell;
+  }
+
+  .col-hide-lg {
+    @apply hidden lg:table-cell;
+  }
+
+  /* Horizontally scrollable tables stay keyboard-reachable */
+  .table-scroll {
+    @apply overflow-x-auto;
+    scrollbar-gutter: stable;
+  }
+
+  .table-scroll:focus-visible {
+    @apply outline-2 outline-offset-2 outline-accent-muted;
+  }
+
+  /* Driver.js popover (popoverClass: sentinel-driver) */
+  .sentinel-driver.driver-popover {
+    --driver-popover-font-family: var(--font-sans);
+    background: color-mix(in srgb, var(--color-surface-2) 86%, transparent);
+    backdrop-filter: blur(18px) saturate(1.4);
+    -webkit-backdrop-filter: blur(18px) saturate(1.4);
+    border: 1px solid color-mix(in srgb, white 75%, var(--color-border));
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-glass);
+    color: var(--color-fg);
+    max-width: 20rem;
+  }
+
+  .sentinel-driver .driver-popover-title {
+    font-family: var(--font-sans);
+    font-size: 0.9375rem;
+    font-weight: 600;
+    color: var(--color-fg-strong);
+  }
+
+  .sentinel-driver .driver-popover-description {
+    font-family: var(--font-sans);
+    font-size: 0.875rem;
+    line-height: 1.45;
+    color: var(--color-muted);
+  }
+
+  .sentinel-driver .driver-popover-progress-text {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--color-subtle);
+  }
+
+  .sentinel-driver .driver-popover-navigation-btns button {
+    font-family: var(--font-sans);
+    font-size: 0.8125rem;
+    font-weight: 600;
+    border-radius: var(--radius-sm);
+    text-shadow: none;
+  }
+
+  .sentinel-driver .driver-popover-next-btn,
+  .sentinel-driver .driver-popover-done-btn {
+    background: var(--color-accent) !important;
+    color: var(--color-accent-ink) !important;
+    border: 1px solid transparent !important;
+  }
+
+  .sentinel-driver .driver-popover-next-btn:hover,
+  .sentinel-driver .driver-popover-done-btn:hover {
+    background: var(--color-accent-hover) !important;
+  }
+
+  .sentinel-driver .driver-popover-prev-btn {
+    background: color-mix(in srgb, var(--color-surface-2) 70%, transparent)
+      !important;
+    color: var(--color-fg) !important;
+    border: 1px solid var(--color-border) !important;
+  }
+
+  .sentinel-driver .driver-popover-close-btn {
+    color: var(--color-muted);
+  }
+
+  .driver-active .driver-active-element {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
 }
 
 @layer utilities {
@@ -158,11 +305,57 @@
     animation: fade-rise 0.45s ease-out 0.06s both;
   }
 
-  @media (prefers-reduced-motion: reduce) {
-    .fade-rise,
-    .fade-rise-delay {
-      animation: none;
-    }
+  /* Stack metric meters on narrow viewports (side-by-side only from sm+) */
+  .meters-stack {
+    @apply flex flex-col gap-3;
+  }
+
+  .meters-stack-row {
+    @apply flex flex-col gap-3 sm:flex-row sm:items-stretch sm:gap-4;
+  }
+
+  .sparkline {
+    @apply block max-w-full;
+  }
+}
+
+/*
+ * Reduced motion: drop transforms / stage slides. Opacity and color cues may
+ * remain. ProductTour also disables Driver.js animate/smoothScroll.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .quiet-refresh-flash {
+    animation: none !important;
+    box-shadow: inset 0 0 0 1px
+      color-mix(in srgb, var(--color-accent) 35%, transparent);
+  }
+
+  .fade-rise,
+  .fade-rise-delay {
+    animation: none !important;
+    opacity: 1;
+    transform: none;
+  }
+
+  .sentinel-dialog,
+  .sentinel-dialog::backdrop {
+    transition: none !important;
+    animation: none !important;
+  }
+
+  /* Driver.js overlay / stage motion */
+  .driver-overlay,
+  .driver-overlay-animated,
+  .driver-active-element,
+  .driver-popover,
+  .driver-popover * {
+    transition: none !important;
+    animation: none !important;
+    scroll-behavior: auto !important;
+  }
+
+  html {
+    scroll-behavior: auto;
   }
 }
 
@@ -174,5 +367,20 @@
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes quiet-refresh {
+  0% {
+    box-shadow: inset 0 0 0 0
+      color-mix(in srgb, var(--color-accent) 0%, transparent);
+  }
+  25% {
+    box-shadow: inset 0 0 0 1px
+      color-mix(in srgb, var(--color-accent) 45%, transparent);
+  }
+  100% {
+    box-shadow: inset 0 0 0 0
+      color-mix(in srgb, var(--color-accent) 0%, transparent);
   }
 }

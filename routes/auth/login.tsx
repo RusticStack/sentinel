@@ -1,8 +1,18 @@
 import { Lock, Server } from "lucide-preact";
 import { Head } from "fresh/runtime";
+import { page } from "fresh";
+import {
+  appendOAuthHandshakeCookie,
+  applySecurityHeaders,
+  buildAuthorizeUrl,
+  callbackRedirectUri,
+  createOAuthState,
+  createPkcePair,
+  sealOAuthHandshake,
+} from "../../lib/auth.ts";
 import { define } from "../../utils.ts";
 
-/** Inline mark — Lucide no longer ships a GitHub icon. */
+/** Inline mark: Lucide no longer ships a GitHub icon. */
 function GitHubMark() {
   return (
     <svg
@@ -16,12 +26,41 @@ function GitHubMark() {
   );
 }
 
+export const handler = define.handlers({
+  async GET(ctx) {
+    if (ctx.state.user) {
+      return ctx.redirect("/");
+    }
+
+    // Begin OAuth: sealed state+PKCE cookie, then redirect to GitHub.
+    if (ctx.url.searchParams.get("start") === "1") {
+      const state = createOAuthState();
+      const { verifier, challenge } = await createPkcePair();
+      const redirectUri = callbackRedirectUri(ctx.url);
+      const authorizeUrl = buildAuthorizeUrl({
+        redirectUri,
+        state,
+        codeChallenge: challenge,
+      });
+      const sealed = await sealOAuthHandshake({ state, verifier });
+
+      const headers = new Headers({ Location: authorizeUrl });
+      appendOAuthHandshakeCookie(headers, ctx.url, sealed);
+      applySecurityHeaders(headers);
+      return new Response(null, { status: 302, headers });
+    }
+
+    return page();
+  },
+});
+
 /**
- * Locked auth gate — primary entry for unauthenticated users.
- * Phase 1 wires the GitHub OAuth redirect from this page / a POST handler.
+ * Locked auth gate: primary entry for unauthenticated users.
  * No dashboard chrome or peek; the app feels locked until sign-in succeeds.
  */
-export default define.page(function Login() {
+export default define.page(function Login(ctx) {
+  const error = ctx.url.searchParams.get("error");
+
   return (
     <div class="flex min-h-screen flex-col items-center justify-center px-4 py-10 sm:px-6">
       <Head>
@@ -62,22 +101,29 @@ export default define.page(function Login() {
             </div>
           </div>
 
-          {/* Phase 1: replace disabled button with OAuth authorize redirect */}
-          <button
-            type="button"
-            disabled
-            class="mt-6 inline-flex w-full cursor-not-allowed items-center justify-center gap-2 rounded-md bg-accent/70 px-4 py-2.5 font-sans text-sm font-semibold text-accent-ink opacity-80"
-            aria-describedby="oauth-phase-note"
+          {error && (
+            <p
+              class="mt-4 rounded-md border border-status-error/25 bg-status-error/10 px-3 py-2 text-sm text-status-error"
+              role="alert"
+            >
+              {error === "oauth"
+                ? "GitHub sign-in failed. Try again."
+                : error === "state"
+                ? "Sign-in could not be verified. Try again."
+                : "Sign-in was cancelled or failed. Try again."}
+            </p>
+          )}
+
+          <a
+            href="/auth/login?start=1"
+            class="mt-6 inline-flex w-full items-center justify-center gap-2 rounded-md bg-accent px-4 py-2.5 font-sans text-sm font-semibold text-accent-ink transition-colors hover:bg-accent-hover"
           >
             <GitHubMark />
             Sign in with GitHub
-          </button>
+          </a>
 
-          <p
-            id="oauth-phase-note"
-            class="mt-3 text-center font-mono text-[0.7rem] leading-relaxed text-subtle"
-          >
-            GitHub OAuth + org check — Phase 1
+          <p class="mt-3 text-center font-mono text-[0.7rem] leading-relaxed text-subtle">
+            Requires org membership · scope: read:org
           </p>
         </div>
 

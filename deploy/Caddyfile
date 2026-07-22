@@ -1,0 +1,33 @@
+# Sentinel Caddy reverse proxy (automatic HTTPS)
+#
+# Prerequisites:
+#   - DNS A/AAAA for your domain → this host
+#   - Sentinel listening on 127.0.0.1:3000 (see PORT in EnvironmentFile)
+#   - Fresh App uses trustProxy: true (main.ts) so X-Forwarded-* is honored
+#
+# Install: copy/adapt into your Caddyfile, then `caddy reload` / restart Caddy.
+# Docs: https://caddyserver.com/docs/quick-starts/reverse-proxy
+
+{
+	# Optional: ACME account email for Let's Encrypt notices
+	# email you@example.com
+}
+
+sentinel.example.com {
+	# Automatic HTTPS + HTTP→HTTPS redirect (Caddy default for named hosts)
+
+	encode gzip
+
+	# Security headers at the edge (OWASP-friendly defaults)
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+	}
+
+	# reverse_proxy forwards X-Forwarded-For / X-Forwarded-Proto by default.
+	# WebSocket upgrades (/api/ws) are supported without extra config.
+	reverse_proxy 127.0.0.1:3000
+}

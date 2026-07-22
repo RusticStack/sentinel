@@ -1,0 +1,57 @@
+# Sentinel Dashboard systemd unit
+#
+# Install (as root):
+#   1. Copy this file to /etc/systemd/system/sentinel.service
+#   2. Edit User, WorkingDirectory, ExecStart paths, and EnvironmentFile
+#   3. Ensure the EnvironmentFile exists (chmod 600) with PORT=3000 and secrets
+#   4. systemctl daemon-reload && systemctl enable --now sentinel
+#
+# See docs/DEPLOY.md for the full checklist.
+
+[Unit]
+Description=Sentinel Dashboard
+Documentation=https://github.com/RusticStack/sentinel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel
+
+# Prefer a dedicated env file outside the git tree (chmod 600, root:sentinel).
+# Do not commit real secrets. Example keys: see .env.example
+EnvironmentFile=/etc/sentinel/sentinel.env
+
+# Bound restarts: recover from crashes without an infinite crash loop.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=10min
+StartLimitBurst=5
+
+# Production listen port comes from EnvironmentFile (PORT). systemd expands ${PORT}.
+# Build first: deno task build (writes _fresh/).
+# Replace /usr/bin/deno with `which deno` on your host if needed.
+ExecStart=/usr/bin/deno serve -A --port=${PORT} /opt/sentinel/_fresh/server.js
+
+# Hardening (adjust ReadWritePaths if your SESSION_DB_PATH differs)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/sentinel/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+
+# Nice-to-have resource bounds for a small dashboard
+LimitNOFILE=65535
+TimeoutStopSec=30
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

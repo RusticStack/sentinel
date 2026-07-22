@@ -1,143 +1,264 @@
-import { Gauge, GitBranch, Server } from "lucide-preact";
+import { AlertTriangle, GitBranch, Server, Shield } from "lucide-preact";
 import { Head } from "fresh/runtime";
 import { page } from "fresh";
+import { Button } from "../components/Button.tsx";
+import { EmptyState } from "../components/EmptyState.tsx";
+import { Panel } from "../components/Panel.tsx";
+import SystemStats from "../islands/SystemStats.tsx";
+import RunnerGrid from "../islands/RunnerGrid.tsx";
+import RunsTable from "../islands/RunsTable.tsx";
+import SecurityFeed from "../islands/SecurityFeed.tsx";
+import ProductTour from "../islands/ProductTour.tsx";
+import {
+  loadRunnersWithServices,
+  loadSystemMetrics,
+  type RunnerWithService,
+} from "../lib/dashboard.ts";
+import { githubOrg } from "../lib/env.ts";
+import {
+  GitHubApiError,
+  listRecentOrgRuns,
+  type WorkflowRun,
+} from "../lib/github.ts";
+import type { SystemMetrics } from "../lib/system.ts";
+import {
+  isVigilConfigured,
+  loadSecuritySnapshot,
+  type VigilSecuritySnapshot,
+} from "../lib/vigil.ts";
 import { define } from "../utils.ts";
 
-/**
- * Dashboard lives at `/` after auth.
- * Phase 0 has no sessions yet, so everyone is redirected to the locked login gate.
- * Phase 1 middleware will also redirect unauthenticated users; this handler stays
- * as a belt-and-suspenders check once `ctx.state.user` is set on login.
- */
+type HomeData = {
+  org: string;
+  system: SystemMetrics | null;
+  systemError: string | null;
+  runners: RunnerWithService[];
+  expectedCount: number;
+  runnersError: string | null;
+  runs: WorkflowRun[];
+  runsError: string | null;
+  vigilConfigured: boolean;
+  security: VigilSecuritySnapshot | null;
+};
+
 export const handler = define.handlers({
-  GET(ctx) {
+  async GET(ctx) {
     if (!ctx.state.user) {
       return ctx.redirect("/auth/login");
     }
-    return page();
+
+    const org = githubOrg();
+    const vigilConfigured = isVigilConfigured();
+    const [systemRes, runnersRes, runsSettled, security] = await Promise.all([
+      loadSystemMetrics(),
+      loadRunnersWithServices(),
+      listRecentOrgRuns({ limit: 12 }).then(
+        (runs) => ({ runs, error: null as string | null }),
+        (err) => ({
+          runs: [] as WorkflowRun[],
+          error: err instanceof GitHubApiError
+            ? err.message
+            : err instanceof Error
+            ? err.message
+            : "Failed to list runs",
+        }),
+      ),
+      vigilConfigured ? loadSecuritySnapshot(5) : Promise.resolve(null),
+    ]);
+
+    return page(
+      {
+        org,
+        system: systemRes.data,
+        systemError: systemRes.error,
+        runners: runnersRes.data?.runners ?? [],
+        expectedCount: runnersRes.data?.expectedCount ?? 0,
+        runnersError: runnersRes.error,
+        runs: runsSettled.runs,
+        runsError: runsSettled.error,
+        vigilConfigured,
+        security,
+      } satisfies HomeData,
+    );
   },
 });
 
-export default define.page(function Home() {
+export default define.page<typeof handler>(function Home({ data }) {
+  const {
+    org,
+    system,
+    systemError,
+    runners,
+    expectedCount,
+    runnersError,
+    runs,
+    runsError,
+    vigilConfigured,
+    security,
+  } = data;
+
+  const online = runners.filter((r) => r.status === "online").length;
+  const busy = runners.filter((r) => r.busy).length;
+
   return (
-    <div class="flex min-h-screen flex-col">
+    <>
       <Head>
-        <title>Sentinel</title>
+        <title>Dashboard · Sentinel</title>
       </Head>
 
-      <header class="glass sticky top-0 z-20 border-b border-border-subtle/70">
-        <div class="mx-auto flex h-14 max-w-6xl items-center gap-6 px-4 sm:px-6">
-          <div class="flex shrink-0 items-center gap-2.5">
-            <span class="flex size-7 items-center justify-center rounded-md bg-accent text-accent-ink">
-              <Server class="size-3.5" strokeWidth={2.25} aria-hidden="true" />
-            </span>
-            <span class="font-sans text-sm font-semibold tracking-tight text-fg-strong">
-              Sentinel
-            </span>
-          </div>
+      <ProductTour showBanner />
 
-          <nav
-            class="hidden items-center gap-0.5 sm:flex"
-            aria-label="Primary"
-          >
-            <a href="/" class="shell-nav-link" aria-current="page">
-              Dashboard
-            </a>
-            <span class="shell-nav-link" aria-disabled="true">
-              Runners
-            </span>
-            <span class="shell-nav-link" aria-disabled="true">
-              Runs
-            </span>
-          </nav>
-
-          <div class="ml-auto">
-            <a
-              href="/logout"
-              class="rounded-md border border-border bg-surface-2/70 px-3.5 py-1.5 font-sans text-sm font-medium text-fg transition-colors hover:border-accent-muted hover:bg-accent-soft"
-            >
-              Sign out
-            </a>
-          </div>
-        </div>
-      </header>
-
-      <main
-        id="main"
-        class="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-5 px-4 py-6 sm:px-6 sm:py-8"
-      >
-        <div class="fade-rise flex items-end justify-between gap-4">
-          <div>
-            <h1 class="font-sans text-lg font-semibold tracking-tight text-fg-strong sm:text-xl">
-              Dashboard
-            </h1>
-            <p class="mt-0.5 text-sm text-muted">
-              Overview of runners, host resources, and recent workflow runs.
-            </p>
-          </div>
-        </div>
-
-        <div class="fade-rise-delay grid gap-3 sm:grid-cols-3">
-          <section class="glass-subtle rounded-xl p-4" aria-label="Runners">
-            <div class="flex items-center justify-between">
-              <div class="flex items-center gap-2 text-muted">
-                <Server class="size-4" aria-hidden="true" />
-                <h2 class="font-sans text-sm font-medium text-fg">Runners</h2>
-              </div>
-            </div>
-            <div class="mt-5 space-y-2.5" aria-hidden="true">
-              <div class="placeholder-bar w-1/3" />
-              <div class="placeholder-bar w-2/3 opacity-70" />
-            </div>
-          </section>
-
-          <section class="glass-subtle rounded-xl p-4" aria-label="System">
-            <div class="flex items-center gap-2 text-muted">
-              <Gauge class="size-4" aria-hidden="true" />
-              <h2 class="font-sans text-sm font-medium text-fg">System</h2>
-            </div>
-            <div class="mt-5 space-y-2.5" aria-hidden="true">
-              <div class="placeholder-bar w-2/5" />
-              <div class="placeholder-bar w-3/5 opacity-70" />
-            </div>
-          </section>
-
-          <section class="glass-subtle rounded-xl p-4" aria-label="Runs">
-            <div class="flex items-center gap-2 text-muted">
-              <GitBranch class="size-4" aria-hidden="true" />
-              <h2 class="font-sans text-sm font-medium text-fg">Runs</h2>
-            </div>
-            <div class="mt-5 space-y-2.5" aria-hidden="true">
-              <div class="placeholder-bar w-1/4" />
-              <div class="placeholder-bar w-1/2 opacity-70" />
-            </div>
-          </section>
-        </div>
-
-        <section
-          class="glass fade-rise-delay flex min-h-64 flex-1 flex-col rounded-xl p-4 sm:p-5"
-          aria-label="Recent activity"
-        >
-          <div class="flex items-center justify-between border-b border-border-subtle/80 pb-3">
-            <h2 class="font-sans text-sm font-semibold text-fg-strong">
-              Recent activity
-            </h2>
-            <span class="font-mono text-xs text-subtle">—</span>
-          </div>
-          <div
-            class="mt-4 flex flex-1 flex-col justify-center gap-3"
-            aria-hidden="true"
-          >
-            <div class="placeholder-bar w-full max-w-md opacity-60" />
-            <div class="placeholder-bar w-full max-w-sm opacity-45" />
-            <div class="placeholder-bar w-full max-w-lg opacity-35" />
-            <div class="placeholder-bar w-full max-w-xs opacity-25" />
-          </div>
-          <p class="mt-4 text-center text-sm text-subtle">
-            Runner and workflow data loads after auth (Phase 2+).
+      <div class="fade-rise flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 class="font-sans text-lg font-semibold tracking-tight text-fg-strong sm:text-xl">
+            Dashboard
+          </h1>
+          <p class="mt-0.5 text-sm text-muted">
+            {org} · runners, host resources, and recent workflow runs
           </p>
-        </section>
-      </main>
-    </div>
+        </div>
+        <p class="font-mono text-xs text-subtle">
+          {runners.length}/{expectedCount || "-"} registered
+          {busy > 0 ? ` · ${busy} busy` : ""}
+        </p>
+      </div>
+
+      <div class="fade-rise-delay grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <Panel tone="subtle" title="Runners" class="!p-4">
+          {runnersError
+            ? (
+              <EmptyState
+                tone="error"
+                title="Runners unavailable"
+                description={runnersError}
+                icon={<AlertTriangle class="size-4" aria-hidden="true" />}
+              />
+            )
+            : (
+              <div class="space-y-3">
+                <div class="flex items-center gap-2 text-muted">
+                  <Server class="size-4" aria-hidden="true" />
+                  <span class="font-mono text-2xl font-semibold tabular-nums text-fg-strong">
+                    {online}
+                  </span>
+                  <span class="text-sm text-muted">online</span>
+                </div>
+                <p class="font-mono text-xs text-subtle">
+                  {runners.length} total
+                  {expectedCount > 0 ? ` · expect ${expectedCount}` : ""}
+                  {busy > 0 ? ` · ${busy} busy` : ""}
+                </p>
+                <Button href="/runners" variant="secondary" class="!py-1.5">
+                  View runners
+                </Button>
+              </div>
+            )}
+        </Panel>
+
+        <Panel
+          tone="subtle"
+          title="System"
+          class="!p-4"
+          data-tour="system"
+        >
+          <SystemStats
+            initialSystem={system}
+            initialError={systemError}
+          />
+        </Panel>
+
+        <Panel tone="subtle" title="Runs" class="!p-4">
+          {runsError
+            ? (
+              <EmptyState
+                tone="error"
+                title="Runs unavailable"
+                description={runsError}
+                icon={<GitBranch class="size-4" aria-hidden="true" />}
+              />
+            )
+            : (
+              <div class="space-y-3">
+                <div class="flex items-center gap-2 text-muted">
+                  <GitBranch class="size-4" aria-hidden="true" />
+                  <span class="font-mono text-2xl font-semibold tabular-nums text-fg-strong">
+                    {runs.length}
+                  </span>
+                  <span class="text-sm text-muted">recent</span>
+                </div>
+                <p class="font-mono text-xs text-subtle">
+                  Across org repositories
+                </p>
+                <Button href="/runs" variant="secondary" class="!py-1.5">
+                  View runs
+                </Button>
+              </div>
+            )}
+        </Panel>
+      </div>
+
+      {vigilConfigured && (
+        <Panel
+          title="Security"
+          subtitle="Vigil SOC summary"
+          data-tour="security"
+          actions={
+            <Button
+              href="/security"
+              variant="ghost"
+              class="!px-2 !py-1 text-xs"
+            >
+              <Shield class="size-3.5" aria-hidden="true" />
+              Overview
+            </Button>
+          }
+          class="fade-rise-delay"
+        >
+          <SecurityFeed
+            variant="strip"
+            limit={5}
+            initial={security}
+          />
+        </Panel>
+      )}
+
+      <Panel
+        title="Runners"
+        subtitle="Self-hosted org runners and local service state"
+        data-tour="runners"
+        actions={
+          <Button href="/runners" variant="ghost" class="!px-2 !py-1 text-xs">
+            Details
+          </Button>
+        }
+        class="fade-rise-delay"
+      >
+        <RunnerGrid
+          org={org}
+          initialRunners={runners}
+          expectedCount={expectedCount}
+          initialError={runnersError}
+        />
+      </Panel>
+
+      <Panel
+        title="Recent runs"
+        subtitle="Newest workflow runs across the org"
+        data-tour="runs"
+        actions={
+          <Button href="/runs" variant="ghost" class="!px-2 !py-1 text-xs">
+            All runs
+          </Button>
+        }
+        class="fade-rise-delay"
+      >
+        <RunsTable
+          initialRuns={runs}
+          initialError={runsError}
+          limit={12}
+          compact
+        />
+      </Panel>
+    </>
   );
 });

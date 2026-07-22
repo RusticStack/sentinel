@@ -10,14 +10,21 @@
     "jsr:@fresh/plugin-vite@^1.1.2": "1.1.2",
     "jsr:@std/assert@^1.0.19": "1.0.19",
     "jsr:@std/bytes@^1.0.6": "1.0.6",
+    "jsr:@std/cli@^1.0.31": "1.0.32",
+    "jsr:@std/crypto@^1.1.0": "1.1.0",
     "jsr:@std/dotenv@~0.225.5": "0.225.7",
+    "jsr:@std/dotenv@~0.225.7": "0.225.7",
     "jsr:@std/encoding@^1.0.10": "1.0.11",
     "jsr:@std/encoding@^1.0.11": "1.0.11",
+    "jsr:@std/fmt@^1.0.10": "1.0.10",
     "jsr:@std/fmt@^1.0.7": "1.0.10",
     "jsr:@std/fmt@^1.0.8": "1.0.10",
     "jsr:@std/fs@^1.0.19": "1.0.24",
+    "jsr:@std/fs@^1.0.24": "1.0.24",
     "jsr:@std/html@^1.0.5": "1.0.7",
+    "jsr:@std/html@^1.0.7": "1.0.7",
     "jsr:@std/http@^1.0.21": "1.1.2",
+    "jsr:@std/http@^1.1.2": "1.1.2",
     "jsr:@std/internal@^1.0.12": "1.0.14",
     "jsr:@std/internal@^1.0.14": "1.0.14",
     "jsr:@std/json@^1.0.2": "1.1.0",
@@ -29,7 +36,9 @@
     "jsr:@std/path@^1.1.1": "1.1.6",
     "jsr:@std/path@^1.1.2": "1.1.6",
     "jsr:@std/path@^1.1.5": "1.1.6",
+    "jsr:@std/path@^1.1.6": "1.1.6",
     "jsr:@std/semver@^1.0.6": "1.0.8",
+    "jsr:@std/streams@^1.1.1": "1.1.1",
     "jsr:@std/uuid@^1.0.9": "1.1.1",
     "npm:@babel/core@^7.28.0": "7.29.7",
     "npm:@babel/preset-react@^7.27.1": "7.29.7_@babel+core@7.29.7",
@@ -43,9 +52,11 @@
     "npm:@tailwindcss/node@^4.3.3": "4.3.3",
     "npm:@tailwindcss/vite@^4.3.3": "4.3.3_vite@7.3.6",
     "npm:@types/babel__core@^7.20.5": "7.20.5",
+    "npm:driver.js@^1.8.0": "1.8.0",
     "npm:esbuild-wasm@~0.25.11": "0.25.12",
     "npm:esbuild@0.25.7": "0.25.7",
     "npm:esbuild@~0.25.5": "0.25.12",
+    "npm:jose@^6.2.3": "6.2.3",
     "npm:lucide-preact@^1.25.0": "1.25.0_preact@10.29.7__preact-render-to-string@6.7.0",
     "npm:preact-render-to-string@^6.6.3": "6.7.0_preact@10.29.7",
     "npm:preact@^10.28.2": "10.29.7_preact-render-to-string@6.7.0",
@@ -84,9 +95,9 @@
         "jsr:@fresh/build-id",
         "jsr:@std/encoding@^1.0.10",
         "jsr:@std/fmt@^1.0.8",
-        "jsr:@std/fs",
-        "jsr:@std/html",
-        "jsr:@std/http",
+        "jsr:@std/fs@^1.0.19",
+        "jsr:@std/html@^1.0.5",
+        "jsr:@std/http@^1.0.21",
         "jsr:@std/jsonc",
         "jsr:@std/media-types@^1.1.0",
         "jsr:@std/net",
@@ -108,7 +119,7 @@
         "jsr:@deno/loader@0.4",
         "jsr:@fresh/core@2",
         "jsr:@fresh/core@^2.3.3",
-        "jsr:@std/dotenv",
+        "jsr:@std/dotenv@~0.225.5",
         "jsr:@std/fmt@^1.0.7",
         "jsr:@std/media-types@1",
         "jsr:@std/path@1",
@@ -129,6 +140,12 @@
     },
     "@std/bytes@1.0.6": {
       "integrity": "f6ac6adbd8ccd99314045f5703e23af0a68d7f7e58364b47d2c7f408aeb5820a"
+    },
+    "@std/cli@1.0.32": {
+      "integrity": "188b3a100d6202d64e3f5bd3d799c7fa4f6d77f92cc65eb7f641c1fa0aa92a66"
+    },
+    "@std/crypto@1.1.0": {
+      "integrity": "b8d6d0a6377a32b213af2661ed7bf1062d94feac0c57def5526a8e74a95c3ec8"
     },
     "@std/dotenv@0.225.7": {
       "integrity": "11d8db03ca4ad5aba9eba809f2e8058b2a4f320b7b09fea4b360e162928329e3"
@@ -151,7 +168,15 @@
     "@std/http@1.1.2": {
       "integrity": "1c0473590d5e5b75b30b2be4833c08047dd799aeea35624fd34ec58d67fc9240",
       "dependencies": [
-        "jsr:@std/encoding@^1.0.11"
+        "jsr:@std/cli",
+        "jsr:@std/encoding@^1.0.11",
+        "jsr:@std/fmt@^1.0.10",
+        "jsr:@std/fs@^1.0.24",
+        "jsr:@std/html@^1.0.7",
+        "jsr:@std/media-types@^1.1.0",
+        "jsr:@std/net",
+        "jsr:@std/path@^1.1.6",
+        "jsr:@std/streams"
       ]
     },
     "@std/internal@1.0.14": {
@@ -180,6 +205,9 @@
     },
     "@std/semver@1.0.8": {
       "integrity": "dc830e8b8b6a380c895d53fbfd1258dc253704ca57bbe1629ac65fd7830179b7"
+    },
+    "@std/streams@1.1.1": {
+      "integrity": "92556d350e537e9dce527a6d08f6f15be3ff65e656079dea69d15252187c7613"
     },
     "@std/uuid@1.1.1": {
       "integrity": "7b49060282d90f72fec64952f8c7a2914cbe6fdba3eca665f8cedc90830154a7",
@@ -1124,6 +1152,9 @@
     "detect-libc@2.1.2": {
       "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ=="
     },
+    "driver.js@1.8.0": {
+      "integrity": "sha512-+8/IO7h1v14IzWh2GP60N7T3PFZweXwdn5e5POuxRSBoCYUojsBxzqawPeXh3YZIibRy7EehYNEyxe7slwwtdg=="
+    },
     "electron-to-chromium@1.5.389": {
       "integrity": "sha512-cEto7aeOqBfU1D+c5py5pE+ooscKE75JifxLBdFUZsqAxRS6y7kebtxAZvICszSl05gPjYHDTjY+lXpyGvpJbg=="
     },
@@ -1266,6 +1297,9 @@
     "jiti@2.7.0": {
       "integrity": "sha512-AC/7JofJvZGrrneWNaEnJeOLUx+JlGt7tNa0wZiRPT4MY1wmfKjt2+6O2p2uz2+skll8OZZmJMNqeke7kKbNgQ==",
       "bin": true
+    },
+    "jose@6.2.3": {
+      "integrity": "sha512-YYVDInQKFJfR/xa3ojUTl8c2KoTwiL1R5Wg9YCydwH0x0B9grbzlg5HC7mMjCtUJjbQ/YnGEZIhI5tCgfTb4Hw=="
     },
     "js-tokens@4.0.0": {
       "integrity": "sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ=="
@@ -1500,12 +1534,17 @@
       "jsr:@fresh/core@^2.3.3",
       "jsr:@fresh/plugin-vite@^1.1.2",
       "jsr:@std/assert@^1.0.19",
+      "jsr:@std/crypto@^1.1.0",
+      "jsr:@std/dotenv@~0.225.7",
+      "jsr:@std/http@^1.1.2",
       "npm:@fontsource/ibm-plex-mono@^5.3.0",
       "npm:@fontsource/ibm-plex-sans@^5.3.0",
       "npm:@preact/signals@^2.9.4",
       "npm:@tailwindcss/node@^4.3.3",
       "npm:@tailwindcss/vite@^4.3.3",
       "npm:@types/babel__core@^7.20.5",
+      "npm:driver.js@^1.8.0",
+      "npm:jose@^6.2.3",
       "npm:lucide-preact@^1.25.0",
       "npm:preact@^10.29.7",
       "npm:tailwindcss@^4.3.3",

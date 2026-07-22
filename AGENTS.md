@@ -1,248 +1,169 @@
 # AGENTS.md - Sentinel
 
-## Project
+Maintenance guide for operators and contributors. Sentinel is feature-complete; this file describes how the system works today, not a build plan.
 
-Sentinel is a dashboard for monitoring self-hosted GitHub Actions runners. It shows runner status, system resources, and recent workflow runs. Access is restricted to your GitHub org members through OAuth.
+## What it is
 
-Optionally, Sentinel can integrate with [Vigil SOC](https://vigilsoc.org/), an open-source AI security operations platform, to surface security findings alongside CI metrics.
+Sentinel monitors self-hosted GitHub Actions runners: status, host resources, and recent workflow runs. Access is limited to members of your GitHub org via OAuth.
 
-Built with Deno 2 and Fresh 2.3.
+Optional [Vigil SOC](https://vigilsoc.org/) integration surfaces security findings alongside CI metrics when `VIGIL_URL` is set.
 
-## Tech stack
+Stack: Deno 2, Fresh 2.3 (SSR by default, islands where needed), Preact, Deno KV (sessions + capped metric history), WebSockets for live updates.
 
-- **Runtime:** Deno 2
-- **Framework:** Fresh 2.3 (server-rendered by default, islands for interactivity)
-- **UI:** Preact (bundled with Fresh)
-- **Auth:** GitHub OAuth with signed JWT sessions
-- **Real-time:** Fresh 2.3 WebSocket support
-- **SOC integration:** Vigil (optional, via FastAPI backend)
-- **Reverse proxy:** Caddy or nginx (your choice, with TLS)
-
-## Prerequisites
-
-- Deno 2 installed
-- A GitHub OAuth App with:
-  - Homepage URL set to your dashboard URL
-  - Authorization callback URL set to `https://your-domain/auth/callback`
-  - At login, request scopes `read:org` and `repo` on the authorize URL (`scope=`). Scopes are not configured as OAuth App form fields.
-- A GitHub PAT (classic) with `admin:org` and `repo` for org-scoped runner/run queries (OAuth user tokens typically lack `admin:org`)
-- (Optional) A running Vigil SOC instance if you want the security tab
-
-## Development
-
-```bash
-deno task dev      # Vite dev server with HMR (default http://localhost:8000; set in vite.config.ts)
-deno task build    # Production build (writes _fresh/)
-deno task start    # Run production server via deno serve (build first)
-deno task check    # Type-check
-deno task test     # Run tests
-```
-
-Dev port is controlled by Vite (`vite.config.ts` `server.port`). Production port is controlled by `deno serve --port` in the `start` task (or `PORT` if you wire it there). Do not assume `PORT` alone changes the Vite dev server.
-
-## Environment variables
-
-Create a `.env` file (don't commit it):
-
-```env
-GITHUB_CLIENT_ID=your_oauth_app_client_id
-GITHUB_CLIENT_SECRET=your_oauth_app_client_secret
-SESSION_SECRET=random_32_char_string
-GH_ORG=your_org_name
-GITHUB_PAT=ghp_your_pat_with_admin_org_and_repo
-PORT=3000
-RUNNER_COUNT=4
-
-# Optional: Vigil SOC integration
-VIGIL_URL=http://localhost:6987
-VIGIL_USERNAME=sentinel_service_user
-VIGIL_PASSWORD=your_vigil_password
-```
-
-When `VIGIL_URL` is set, the security tab appears in the UI and Sentinel pulls findings, cases, and agent lists from the Vigil backend. Vigil's `/api/findings`, `/api/cases`, and `/api/agents/*` routes require an authenticated Vigil user JWT (not a shared API key). Use a dedicated Vigil service user and exchange credentials for a JWT via `POST /api/auth/login`.
-
-## Project structure
+## Layout
 
 ```
 sentinel/
-├── routes/              # File-based routing
-│   ├── _middleware.ts   # Auth: session check + org membership
-│   ├── _app.tsx         # HTML shell, global layout
-│   ├── index.tsx        # Dashboard home
-│   ├── runners/         # Runner detail pages
-│   ├── runs/            # Workflow runs page
-│   ├── security/        # Vigil SOC integration (optional)
-│   ├── auth/            # OAuth login + callback
-│   ├── api/             # JSON API + WebSocket
-│   └── logout.tsx       # Session cleanup
-├── islands/             # Client-side hydrated components
-├── components/          # Server-side reusable components
-├── lib/                 # Business logic (github.ts, system.ts, auth.ts, vigil.ts, cache.ts)
-├── static/              # Static assets (CSS, images)
-├── deno.json            # Deno config, Fresh dependency, tasks
-├── main.ts              # App entry point
-└── vite.config.ts       # Vite config
+├── routes/           # File-based routes, middleware, APIs
+│   ├── _middleware.ts
+│   ├── _app.tsx
+│   ├── auth/         # OAuth login, callback, denied
+│   ├── api/          # JSON + WebSocket
+│   ├── runners/, runs/, security/
+│   └── logout.tsx
+├── islands/          # Client JS only (live panels, tour, logout confirm)
+├── components/       # SSR UI primitives
+├── lib/              # Auth, GitHub, system, Vigil, cache, realtime
+├── assets/           # Tailwind theme + global CSS
+├── static/           # Favicon, OG image, static files
+├── deploy/           # systemd, Caddy, nginx templates
+├── docs/             # DEPLOY.md, VIGIL.md
+├── main.ts
+├── utils.ts          # createDefine<State>()
+└── vite.config.ts    # Dev server port 8000
 ```
 
-## Conventions
+## Tasks
 
-### Fresh 2 patterns
-- Create `define` once with `createDefine<State>()` (typically in `utils.ts`) and import it everywhere
-- Use `define.middleware()` for middleware
-- Use `define.handlers()` + `define.page()` for routes (there is no `define.route()`)
-- Use `define.layout()` for layouts
-- Context is unified: `ctx.req`, `ctx.state`, `ctx.render()`, `ctx.next()`, `ctx.redirect()`
-- WebSockets: `ctx.upgrade()` in a GET handler, or `app.ws()` in `main.ts`
-- Only files in `islands/` ship JavaScript to the browser
-- Everything else is server-rendered HTML
-- Behind a reverse proxy, construct the app with `trustProxy: true` so `ctx.url` honors `X-Forwarded-*`
-
-### Auth flow
-1. `_middleware.ts` runs on every request
-2. Checks for the session cookie, verifies the JWT signature and expiry
-3. If valid, checks org membership (cached for 5 min) and sets `ctx.state.user`
-4. If missing or invalid, redirects to `/auth/login` (except for `/auth/*` routes)
-5. `/auth/login` redirects to GitHub OAuth with `scope=read:org repo`
-6. `/auth/callback` exchanges the code, verifies membership, creates the JWT, sets the cookie
-
-### GitHub API usage
-- Use the user's OAuth token for user-scoped queries (org membership via `GET /user/memberships/orgs/{org}`)
-- Use `GITHUB_PAT` for org-scoped queries (runners, repos, runs). Listing org runners requires `admin:org`
-- Cache all API responses with TTL to stay within rate limits
-- See `plan.md` for cache TTLs per endpoint
-
-### Vigil API usage
-- Sentinel talks to the Vigil FastAPI backend (default port 6987)
-- Authenticate with a Vigil service user (`POST /api/auth/login`), then call APIs with the JWT
-- Pull findings (`GET /api/findings`), cases (`GET /api/cases`), and agents (`GET /api/agents/agents`)
-- All Vigil API responses are cached with TTL (see `plan.md`)
-- File-based `/security` routes always exist; show the security tab / return data only when `VIGIL_URL` is set
-
-### System metrics
-- Use `Deno.Command` for shell commands (not child_process, this is Deno)
-- `free -m`, `df -h /`, `/proc/loadavg`, `uptime -p`, `nproc`, `lscpu`
-- `systemctl show {service}` for per-runner service state
-
-## Vigil SOC integration
-
-[Vigil](https://github.com/Vigil-SOC/vigil) is an open-source AI SOC with 13 agents for security operations. Sentinel connects to its backend API and surfaces findings in a dedicated security tab.
-
-### Authenticating to Vigil
-Vigil protects findings/cases/agents with user JWT auth (`get_current_active_user`). There is no general-purpose `VIGIL_API_KEY` for read APIs.
-
-1. Create a dedicated Vigil user for Sentinel (least privilege)
-2. Set `VIGIL_URL`, `VIGIL_USERNAME`, and `VIGIL_PASSWORD` in Sentinel's `.env`
-3. On startup / first request, `POST {VIGIL_URL}/api/auth/login` and cache the access token
-4. Call Vigil APIs with `Authorization: Bearer <access_token>`
-5. Refresh via Vigil's refresh flow when the access token expires
-
-Local Vigil with `DEV_MODE=true` bypasses auth (dev only — never in production).
-
-### Setting up Vigil with Ollama Cloud
-Vigil uses Bifrost as its LLM gateway. Upstream `docker/bifrost/config.json` already includes an `ollama` provider wired to `env.OLLAMA_URL`. Point that at Ollama Cloud and supply an API key:
-
-1. Fork `Vigil-SOC/vigil` only if you need patches beyond upstream (for example, open issues that still hardcode Anthropic in chat streaming — see Vigil #327 / #328)
-2. Ensure Bifrost has an Ollama provider entry (upstream already does). For Ollama Cloud:
-
-```json
-{
-  "providers": {
-    "ollama": {
-      "keys": [{
-        "name": "ollama-cloud",
-        "value": "env.OLLAMA_API_KEY",
-        "models": ["*"],
-        "weight": 1.0,
-        "ollama_key_config": {
-          "url": "https://ollama.com"
-        }
-      }]
-    }
-  }
-}
-```
-
-3. Set env vars: `OLLAMA_ENABLED=true`, `OLLAMA_URL=https://ollama.com`, `DEFAULT_LLM_PROVIDER=ollama`, plus your Ollama Cloud API key for Bifrost
-4. Prefer currently available Cloud models (check [Ollama Cloud docs](https://docs.ollama.com/cloud) for retirements). As of mid-2026, `gpt-oss:120b` / `gpt-oss:20b` are the durable picks; several older free-tier models (e.g. `gemma3:27b`, `glm-4.7`, `qwen3-coder:480b`) were retired 2026-07-15
-5. Direct Cloud API is `https://ollama.com/api/chat` with `Authorization: Bearer $OLLAMA_API_KEY`
-
-### Vigil fork maintenance
-- Prefer tracking upstream. Bifrost already ships an Ollama provider section (issue #324's config gap is largely addressed in current `docker/bifrost/config.json`)
-- Keep any remaining Bifrost / provider patches on a separate branch so rebasing stays clean
-- Non-Anthropic chat may still need upstream fixes (#327 / #328) before Ollama Cloud works end-to-end in Vigil's UI agents
-
-See `plan.md` for the full integration architecture and API endpoints.
-
-## Deployment
-
-### Server setup
-- Install Deno 2 on the server
-- Clone the repo and run `deno task build`
-- Create a `.env` file with the variables listed above
-- Set up a systemd service:
-
-```ini
-[Unit]
-Description=Sentinel Dashboard
-After=network.target
-
-[Service]
-Type=simple
-User=your-user
-WorkingDirectory=/path/to/sentinel
-EnvironmentFile=/path/to/sentinel/.env
-ExecStart=/path/to/deno task start
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-- Put a reverse proxy in front with TLS. Enable Fresh `trustProxy: true` so redirects and absolute URLs see the public host. Caddy example:
-
-```
-your-domain.com {
-    reverse_proxy 127.0.0.1:3000
-}
-```
-
-### With Vigil SOC
-- Deploy Vigil (upstream or a minimal fork) on the same server or a separate one
-- Configure Bifrost for Ollama Cloud if desired (see above); verify chat works under your provider (#327)
-- Set `VIGIL_URL` plus Vigil service-user credentials in Sentinel's `.env`
-- The security tab appears in the UI when `VIGIL_URL` is set
-
-### Deploy steps
 ```bash
-cd /path/to/sentinel
+deno task dev      # Vite HMR (http://localhost:8000)
+deno task build    # Production build → _fresh/
+deno task start    # deno serve on port 3000 (build first)
+deno task check    # fmt --check, lint, type-check
+deno task test     # Unit tests
+```
+
+Dev port comes from `vite.config.ts` (`server.port`, default 8000). `deno task start` always uses `--port=3000` (Deno tasks do not expand `${PORT:-3000}`). Under systemd, use `deno serve --port=${PORT}` so `PORT` from `EnvironmentFile` is honored. See `deploy/sentinel.service` and `docs/DEPLOY.md`.
+
+## Environment
+
+Copy `.env.example` to `.env` (never commit `.env` or `data/`):
+
+```env
+GITHUB_CLIENT_ID=...
+GITHUB_CLIENT_SECRET=...
+SESSION_SECRET=...          # ≥32 random chars
+# SESSION_DB_PATH=data/sessions.db
+GH_ORG=...
+GITHUB_PAT=...              # classic: admin:org + repo
+APP_BASE_URL=https://...    # required off localhost
+PORT=3000
+RUNNER_COUNT=4
+
+# Optional Vigil
+VIGIL_URL=http://localhost:6987
+VIGIL_USERNAME=...
+VIGIL_PASSWORD=...
+```
+
+## Fresh conventions
+
+- Define once: `createDefine<State>()` in `utils.ts`, import everywhere
+- Routes: `define.handlers()` + `define.page()` (no `define.route()`)
+- Middleware: `define.middleware()`; layouts: `define.layout()`
+- Context: `ctx.req`, `ctx.state`, `ctx.render()`, `ctx.next()`, `ctx.redirect()`
+- WebSockets: `ctx.upgrade()` in a GET handler (`routes/api/ws.ts`)
+- Only `islands/` ship client JS; everything else is SSR HTML
+- `trustProxy: true` in `main.ts` so `ctx.url` honors `X-Forwarded-*` behind TLS
+
+## Auth flow
+
+1. `_middleware.ts` reads the opaque session cookie, loads the Deno KV record (hashed key), enforces absolute (~12h) and idle (~2h) expiry
+2. Valid session → re-check org membership via `GITHUB_PAT` (cached 5 min) → set `ctx.state.user`
+3. Missing/invalid session → redirect to `/auth/login` (except `/auth/*`); `/api/*` returns JSON 401/403/503
+4. Login: GitHub OAuth with `scope=read:org`, PKCE S256, sealed handshake cookie (SameSite=Lax)
+5. Callback: exchange code, `GET /user`, confirm active org membership with PAT, create KV session, set opaque cookie (GitHub user token discarded)
+6. Logout / confirmed non-member: delete KV record and clear cookie
+
+Session records hold identity only (never the GitHub access token). Membership re-checks always use `GITHUB_PAT`.
+
+## GitHub API + cache TTLs
+
+| Call | Token | TTL |
+|------|-------|-----|
+| Org membership | `GITHUB_PAT` | 5 min |
+| Org runners | `GITHUB_PAT` | 15 s |
+| Org repos | `GITHUB_PAT` | 5 min |
+| Workflow runs / jobs | `GITHUB_PAT` | 30 s |
+
+Listing org runners needs `admin:org`. Cache lives in `lib/cache.ts`; callers in `lib/github.ts`.
+
+## System metrics
+
+Linux host via `Deno.Command`: `free -m`, `df -h /`, `/proc/loadavg`, `uptime -p`, `nproc`, `lscpu`, `systemctl show` for runner services. See `lib/system.ts`.
+
+Host samples (load / memory % / disk %) are written to the same Deno KV file as sessions under `["metrics", "host"]`, capped to about 1 hour (~240 points). Growth stays tiny.
+
+## Vigil (optional)
+
+When `VIGIL_URL` is set, the Security nav appears. Sentinel logs in as a Vigil service user (`POST /api/auth/login`), caches the JWT, and reads:
+
+| Endpoint | TTL |
+|----------|-----|
+| `GET /api/findings` | 30 s |
+| `GET /api/cases` | 30 s |
+| `GET /api/findings/{id}` | 60 s |
+| `GET /api/agents/agents` | 15 s |
+
+There is no `/api/agents/status`. File routes under `/security` always exist; UI and data gate on `VIGIL_URL`. Credentials and JWTs stay server-side.
+
+Deploy notes and Ollama Cloud / Bifrost guidance: `docs/VIGIL.md`. Prefer upstream Vigil; Sentinel only needs the HTTP API.
+
+Local Vigil `DEV_MODE=true` bypasses auth (dev only, never production).
+
+## Deploy
+
+Full checklist: `docs/DEPLOY.md`.
+
+Templates (edit paths/domain before use):
+
+- `deploy/sentinel.service`: systemd + `EnvironmentFile` + restart limits
+- `deploy/Caddyfile`: reverse proxy + automatic HTTPS
+- `deploy/nginx.conf.example`: TLS + WebSocket `/api/ws`
+
+Typical update:
+
+```bash
+cd /opt/sentinel
 git pull origin main
 deno task build
 sudo systemctl restart sentinel
 ```
 
+## Security (keep these true)
+
+- Never commit `.env`, secrets, or `data/`
+- `SESSION_SECRET` seals the OAuth handshake cookie and HMACs opaque session IDs at rest
+- Cookie holds only an opaque ID; authoritative session is Deno KV (`SESSION_DB_PATH`)
+- Logout and membership denial delete the server record (immediate revocation)
+- Absolute + idle TTLs enforced server-side; cookie `maxAge` matches absolute TTL
+- Session ID rotated on login
+- `APP_BASE_URL` pins OAuth `redirect_uri` and Secure-cookie decisions (do not trust Host / `X-Forwarded-*` alone)
+- Session cookie: httpOnly, Secure on HTTPS, SameSite=Strict, `__Host-` on HTTPS
+- Handshake cookie: httpOnly, Secure on HTTPS, SameSite=Lax, integrity-sealed (state + PKCE)
+- Login scope `read:org` only; org APIs use `GITHUB_PAT` (`admin:org` + `repo`)
+- Only `state=active` membership counts; pending invites denied
+- Confirmed non-members lose the session; GitHub upstream errors return 503 without clearing it
+- Vigil credentials and JWTs never reach the browser
+
+## UI notes
+
+- Auth-first: unauthenticated users see `/auth/login`, not a dashboard peek
+- Light lemon / frosted glass theme in `assets/styles.css` (`@theme` tokens)
+- No Live/Offline shell badges; quiet refresh on successful updates
+- Product tour: Driver.js in `islands/ProductTour.tsx`; help at `/help`
+- Prefer SSR; put interactivity only in islands
+
 ## CI
 
-The repo includes a GitHub Actions workflow:
-
-```yaml
-runs-on: [self-hosted, linux, arm64]
-steps:
-  - uses: actions/checkout@v4
-  - uses: denoland/setup-deno@v2
-  - run: deno task check
-  - run: deno task test
-```
-
-If you're running Sentinel for your own self-hosted runners, this CI runs on those same runners.
-
-## Security
-
-- Never commit `.env` or secrets
-- The JWT session secret (`SESSION_SECRET`) should be a long random string
-- The OAuth client secret stays server-side, never sent to the browser
-- All cookies are httpOnly, secure, sameSite=strict
-- Org membership is checked on login and re-verified on each request (cached for 5 min)
-- If a member leaves the org, their session stops working within 5 minutes
-- `GITHUB_PAT` should have minimal scopes: `admin:org` and `repo`
-- Vigil credentials (`VIGIL_USERNAME` / `VIGIL_PASSWORD`) and any obtained JWTs stay server-side and are never exposed to the browser
+`.github/workflows/` runs `deno task check` and `deno task test` on self-hosted Linux runners (same runners Sentinel monitors when you self-host).
