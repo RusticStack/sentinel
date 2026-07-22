@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Fresh build output
+_fresh/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Deno
+.deno/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
