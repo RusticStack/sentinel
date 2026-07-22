@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+vendor/
 
 # Fresh build output
 _fresh/
@@ -21,3 +22,6 @@ _fresh/
 # OS
 .DS_Store
 Thumbs.db
+
+# IMPORTANT: Do not gitignore routes/, components/, islands/, or assets/.
+# Tailwind v4 Oxide silently excludes gitignored paths from its source scan.

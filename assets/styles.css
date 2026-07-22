@@ -1,0 +1,178 @@
+@import "tailwindcss";
+
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-sans/700.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@import "@fontsource/ibm-plex-mono/600.css";
+
+@theme {
+  /* Surfaces — soft luminous summer layers (glass sits on top) */
+  --color-surface-0: #f6f9ef;
+  --color-surface-1: #fbfdf7;
+  --color-surface-2: #ffffff;
+  --color-surface-3: #eef4e5;
+  --color-surface-4: #e5ecd8;
+
+  /* Borders & muted text */
+  --color-border: #d2dcc4;
+  --color-border-subtle: #e3ebd6;
+  --color-muted: #5c6754;
+  --color-subtle: #8a9480;
+  --color-fg: #1c2417;
+  --color-fg-strong: #10160e;
+
+  /* Accent — Fresh lemon / citrus (bright, optimistic) */
+  --color-accent: #ffdb1e;
+  --color-accent-hover: #f0c800;
+  --color-accent-muted: #c9a80a;
+  --color-accent-soft: color-mix(in srgb, #ffdb1e 26%, transparent);
+  --color-accent-ink: #3a3000;
+
+  /* Status palette (runner/workflow states — not shell chrome) */
+  --color-status-online: #16a34a;
+  --color-status-idle: #64748b;
+  --color-status-busy: #d97706;
+  --color-status-offline: #94a3b8;
+  --color-status-error: #dc2626;
+  --color-status-success: #16a34a;
+  --color-status-warning: #d97706;
+  --color-status-info: #0284c7;
+
+  /* Typography — IBM Plex (bright modern, not Inter/Roboto/Arial) */
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+
+  /* Radii — soft system-ish corners */
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-xl: 1.25rem;
+
+  /* Spacing scale extras */
+  --spacing-18: 4.5rem;
+  --spacing-22: 5.5rem;
+
+  /* Soft glass elevation (depth via translucency, not heavy shadows) */
+  --shadow-glass: 0 1px 1px rgb(28 36 23 / 0.03),
+    0 6px 24px rgb(28 36 23 / 0.05);
+  --shadow-glass-sm: 0 1px 1px rgb(28 36 23 / 0.02),
+    0 3px 12px rgb(28 36 23 / 0.04);
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+
+  body {
+    @apply m-0 min-h-screen bg-surface-0 font-sans text-fg antialiased;
+    background-image:
+      radial-gradient(
+      ellipse 85% 50% at 8% -8%,
+      color-mix(in srgb, var(--color-accent) 48%, transparent),
+      transparent 60%
+    ),
+      radial-gradient(
+      ellipse 55% 40% at 96% 4%,
+      color-mix(in srgb, #b8e0ff 32%, transparent),
+      transparent 55%
+    ),
+      radial-gradient(
+      ellipse 50% 35% at 72% 105%,
+      color-mix(in srgb, #c5f0a0 26%, transparent),
+      transparent 52%
+    ),
+      linear-gradient(
+      168deg,
+      #fcfef8 0%,
+      var(--color-surface-0) 42%,
+      #edf4e4 100%
+    );
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    background: var(--color-accent-soft);
+    color: var(--color-fg-strong);
+  }
+}
+
+@layer components {
+  /* Frosted glass panels — Apple-like translucency */
+  .glass {
+    background: color-mix(in srgb, var(--color-surface-2) 68%, transparent);
+    backdrop-filter: blur(22px) saturate(1.5);
+    -webkit-backdrop-filter: blur(22px) saturate(1.5);
+    border: 1px solid color-mix(in srgb, white 75%, var(--color-border));
+    box-shadow: var(--shadow-glass);
+  }
+
+  .glass-subtle {
+    background: color-mix(in srgb, var(--color-surface-2) 48%, transparent);
+    backdrop-filter: blur(16px) saturate(1.35);
+    -webkit-backdrop-filter: blur(16px) saturate(1.35);
+    border: 1px solid color-mix(in srgb, white 60%, var(--color-border-subtle));
+    box-shadow: var(--shadow-glass-sm);
+  }
+
+  /* App shell chrome */
+  .shell-nav-link {
+    @apply rounded-md px-2.5 py-1.5 text-sm font-medium text-muted
+      transition-colors;
+  }
+
+  .shell-nav-link[aria-current="page"] {
+    @apply bg-accent-soft text-fg-strong;
+  }
+
+  .shell-nav-link:not([aria-current="page"]):hover {
+    @apply bg-surface-2/50 text-fg;
+  }
+
+  .shell-nav-link[aria-disabled="true"] {
+    @apply cursor-default text-subtle opacity-70;
+  }
+
+  .shell-nav-link[aria-disabled="true"]:hover {
+    @apply bg-transparent text-subtle;
+  }
+
+  .placeholder-bar {
+    @apply h-2.5 rounded-full bg-surface-4/80;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .fade-rise {
+    animation: fade-rise 0.45s ease-out both;
+  }
+
+  .fade-rise-delay {
+    animation: fade-rise 0.45s ease-out 0.06s both;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .fade-rise,
+    .fade-rise-delay {
+      animation: none;
+    }
+  }
+}
+
+@keyframes fade-rise {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

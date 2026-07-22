@@ -12,7 +12,7 @@ Sentinel also has an optional integration with [Vigil SOC](https://vigilsoc.org/
 - No client-side routing library, no SPA bundle. Fast first paint, small payload.
 - Fresh 2.3 added first-class WebSocket support, which is useful for pushing runner status updates in real time instead of polling.
 - File-based routing and middleware make the auth layer straightforward.
-- No node_modules, no build step during development. Deno handles it all natively.
+- Fresh 2.x uses Vite for the dev server and production asset build (`deno task build`). Pages still ship zero client JS by default; islands opt in to hydration.
 - This is a small app. Fresh is designed for exactly this kind of thing.
 
 ## Auth: GitHub OAuth + org membership
@@ -33,8 +33,9 @@ Sentinel also has an optional integration with [Vigil SOC](https://vigilsoc.org/
 - Go to GitHub Settings -> Developer settings -> OAuth Apps -> New OAuth App
 - Homepage URL: your dashboard URL
 - Authorization callback URL: `https://your-domain/auth/callback`
-- Scopes: `read:org` (membership check) and `repo` (reading workflow runs)
+- At login, request scopes on the authorize URL: `read:org` (membership) and `repo` (workflow runs). Scopes are not OAuth App form fields.
 - Put the client ID and secret in your `.env`
+- Also create a classic PAT with `admin:org` + `repo` and set `GITHUB_PAT` for org runner/run queries (listing org self-hosted runners requires `admin:org`)
 
 ### Sessions
 - Signed JWT stored in an httpOnly, secure, sameSite=strict cookie
@@ -56,17 +57,22 @@ Sentinel also has an optional integration with [Vigil SOC](https://vigilsoc.org/
 
 ### How Sentinel connects to Vigil
 - Sentinel talks to the Vigil FastAPI backend (default port 6987)
-- Pulls recent findings, active cases, and agent activity
-- Surfaces them in a dedicated "Security" tab on the dashboard
-- Links to the Vigil web UI for deep dives
+- Vigil findings/cases/agents routes require an authenticated Vigil user JWT (`Depends(get_current_active_user)`). There is no shared `VIGIL_API_KEY` for these reads
+- Sentinel logs in as a dedicated Vigil service user (`POST /api/auth/login`), caches the access token, and calls:
+  - `GET /api/findings` — recent findings
+  - `GET /api/cases` — cases
+  - `GET /api/findings/{id}` — finding detail
+  - `GET /api/agents/agents` — available agents (there is no `/api/agents/status`)
+- Surfaces them in a dedicated "Security" tab when `VIGIL_URL` is configured (UI/nav gate; file routes still exist on disk)
+- Links to the Vigil web UI (default `:6988`) for deep dives
 
 ### Swapping the AI backend to Ollama Cloud
-Vigil uses [Bifrost](https://docs.getbifrost.ai/) as its LLM gateway. By default it routes to Anthropic Claude, but Bifrost supports Ollama as a provider. This means you can point Vigil at Ollama Cloud (which has a free tier) instead of paying for Claude API calls.
+Vigil uses [Bifrost](https://docs.getbifrost.ai/) as its LLM gateway. Upstream already ships an `ollama` provider in `docker/bifrost/config.json` wired to `env.OLLAMA_URL`. You can point that at Ollama Cloud instead of a local daemon.
 
-To do this, you fork Vigil and update the Bifrost config:
+To use Ollama Cloud:
 
-1. Fork `Vigil-SOC/vigil` to your org
-2. Edit `docker/bifrost/config.json` and add an Ollama provider entry:
+1. Prefer upstream Vigil first. Fork only if you need patches beyond upstream (notably open issues #327 / #328 where chat endpoints still hardcode `ClaudeService`, which blocks non-Anthropic streaming even when Bifrost is correct)
+2. Configure Bifrost for Ollama Cloud (API key + Cloud URL):
 
 ```json
 {
@@ -75,7 +81,7 @@ To do this, you fork Vigil and update the Bifrost config:
       "keys": [
         {
           "name": "ollama-cloud",
-          "value": "your_ollama_api_key",
+          "value": "env.OLLAMA_API_KEY",
           "models": ["*"],
           "weight": 1.0,
           "ollama_key_config": {
@@ -88,32 +94,32 @@ To do this, you fork Vigil and update the Bifrost config:
 }
 ```
 
-3. Set the env vars in your `.env`:
+3. Set the env vars in Vigil's `.env`:
 ```
 OLLAMA_ENABLED=true
 OLLAMA_URL=https://ollama.com
-OLLAMA_DEFAULT_MODEL=gpt-oss:120b-cloud
+OLLAMA_DEFAULT_MODEL=gpt-oss:120b
 DEFAULT_LLM_PROVIDER=ollama
 ```
+Plus provide the Ollama Cloud API key to Bifrost (`OLLAMA_API_KEY` / Bifrost key `value`).
 
-4. Ollama Cloud models that work on the free tier (confirmed by the community):
-   - `gpt-oss:120b-cloud` - strong reasoning, good for investigation agents
-   - `gpt-oss:20b-cloud` - lighter, faster, good for triage
-   - `gemma3:27b-cloud` - solid all-rounder
-   - `glm-4.7:cloud` - good for analysis tasks
-   - `qwen3-coder:480b-cloud` - if available on free tier, excellent for code analysis
+4. Model notes (as of 2026-07-22):
+   - Prefer `gpt-oss:120b` / `gpt-oss:20b` via Cloud API
+   - Several older Cloud models were retired 2026-07-15 (`gemma3:27b`, `glm-4.7`, `qwen3-coder:480b`, and others) — check [Ollama Cloud docs](https://docs.ollama.com/cloud)
+   - Local `ollama run …-cloud` offload uses `*-cloud` names; direct `https://ollama.com` API often uses the base name (e.g. `gpt-oss:120b`)
 
-5. The Ollama Cloud API is at `https://ollama.com/api/chat` with bearer token auth. It speaks the same protocol as local Ollama, so Bifrost routes to it the same way.
+5. Direct Cloud API: `https://ollama.com/api/chat` with bearer token auth. Bifrost routes the same way when `ollama_key_config.url` is `https://ollama.com` and `value` holds the API key.
 
 ### Considerations
-- The free tier has rate limits and some models may be gated. Check [the unofficial tracker](https://github.com/OshriFatkiev/ollama-cloud-free-tier) for which models currently work on free.
-- For production use, you may want to run a local Ollama instance with a smaller model on the same server, or upgrade to a paid Ollama Cloud plan.
-- Bifrost supports multiple providers simultaneously, so you can mix Ollama Cloud (free) with a paid provider as fallback.
+- Free / Cloud tiers have rate limits and rotating availability. Prefer official retirement notices over outdated community lists.
+- For production, you may want local Ollama, paid Ollama Cloud, or Anthropic/OpenAI via Bifrost.
+- Bifrost supports multiple providers simultaneously, so you can mix providers as fallback.
+- Until Vigil #327 / #328 land, agent chat streaming may still require Anthropic even if Bifrost can reach Ollama.
 
 ### Vigil fork notes
-- The fork should track upstream closely. Vigil is actively developed (300+ commits).
-- Keep your Bifrost config changes in a separate branch or overlay so rebasing on upstream is clean.
-- The `env.example` in Vigil already has Ollama settings, but the Bifrost config file was missing the Ollama provider entry (known issue #324). Your fork fixes this.
+- Prefer tracking upstream. Current upstream Bifrost config already includes `providers.ollama` with `env.OLLAMA_URL` (issue #324's missing-provider gap is largely addressed).
+- Keep any remaining Bifrost / provider patches on a separate branch so rebasing stays clean.
+- `env.example` already documents Ollama settings (`OLLAMA_ENABLED`, `OLLAMA_URL`, `DEFAULT_LLM_PROVIDER`).
 
 ## Architecture
 
@@ -142,10 +148,9 @@ sentinel/
 │   └── logout.tsx              # Clear session, redirect to login
 ├── islands/
 │   ├── SystemStats.tsx         # Auto-refreshing system metric cards
-│   ├── RunnerGrid.tsx          # Runner cards with live status
+│   ├── RunnerGrid.tsx          # Runner cards with status
 │   ├── RunsTable.tsx           # Runs table with auto-refresh
-│   ├── SecurityFeed.tsx        # Vigil findings feed (if enabled)
-│   └── LiveIndicator.tsx       # WebSocket-connected status dot
+│   └── SecurityFeed.tsx        # Vigil findings feed (if enabled)
 ├── components/
 │   ├── StatCard.tsx            # Reusable stat card
 │   ├── RunnerCard.tsx          # Reusable runner card
@@ -156,33 +161,36 @@ sentinel/
 │   ├── github.ts               # GitHub API client (runners, runs, jobs, repos)
 │   ├── system.ts               # System metrics via shell commands
 │   ├── auth.ts                 # OAuth flow, JWT creation/verification, org check
-│   ├── vigil.ts                # Vigil API client (findings, cases, agents)
+│   ├── vigil.ts                # Vigil API client (JWT login, findings, cases, agents)
 │   └── cache.ts                # In-memory cache with TTL
 ├── static/
-│   └── styles.css              # Global styles (dark theme)
+│   └── styles.css              # Global styles (light translucent + lemon tokens)
 ├── deno.json                   # Deno config, Fresh dependency, tasks
-├── main.ts                     # App entry point
-└── vite.config.ts              # Vite config for Fresh
+├── main.ts                     # App entry point (consider trustProxy: true behind TLS proxy)
+└── vite.config.ts              # Vite config for Fresh (dev server port lives here)
 ```
 
 ## Data sources
 
-### GitHub API (server-side, using a PAT or the user's OAuth token)
-| Endpoint | What it's for | Cache TTL |
-|----------|---------------|-----------|
-| `GET /orgs/{org}/actions/runners` | Runner list and status | 15s |
-| `GET /orgs/{org}/repos` | Repo list for fetching runs | 5min |
-| `GET /repos/{org}/{repo}/actions/runs?per_page=5` | Recent runs per repo | 30s |
-| `GET /repos/{org}/{repo}/actions/runs/{id}/jobs` | Jobs for a run (which runner) | 30s |
-| `GET /user/memberships/orgs/{org}` | Org membership check | 5min |
+### GitHub API (server-side)
+| Endpoint | Auth | What it's for | Cache TTL |
+|----------|------|---------------|-----------|
+| `GET /orgs/{org}/actions/runners` | `GITHUB_PAT` (`admin:org`) | Runner list and status | 15s |
+| `GET /orgs/{org}/repos` | `GITHUB_PAT` | Repo list for fetching runs | 5min |
+| `GET /repos/{org}/{repo}/actions/runs?per_page=5` | `GITHUB_PAT` (`repo` if private) | Recent runs per repo | 30s |
+| `GET /repos/{org}/{repo}/actions/runs/{id}/jobs` | `GITHUB_PAT` | Jobs for a run (which runner) | 30s |
+| `GET /user/memberships/orgs/{org}` | User OAuth token | Org membership check | 5min |
 
-### Vigil API (optional, if VIGIL_URL is set)
+### Vigil API (optional, if VIGIL_URL is set; requires Vigil user JWT)
 | Endpoint | What it's for | Cache TTL |
 |----------|---------------|-----------|
+| `POST /api/auth/login` | Obtain Vigil access JWT for the service user | n/a (token cache) |
 | `GET /api/findings` | Recent security findings | 30s |
-| `GET /api/cases` | Active cases | 30s |
+| `GET /api/cases` | Cases list | 30s |
 | `GET /api/findings/{id}` | Finding detail | 60s |
-| `GET /api/agents/status` | Agent activity status | 15s |
+| `GET /api/agents/agents` | Available agents list | 15s |
+
+There is no Vigil `GET /api/agents/status` endpoint. Derive any "activity" UI from findings/cases/agent list data.
 
 ### System metrics (shell commands on the host)
 | Source | Data |
@@ -196,6 +204,7 @@ sentinel/
 
 ### WebSocket (Fresh 2.3)
 - Client connects to `/api/ws` on page load
+- Implement with `define.handlers({ GET(ctx) { return ctx.upgrade({...}) } })` (or `app.ws()` in `main.ts`)
 - Server pushes updates every 15 seconds: system metrics, runner status, and (if enabled) Vigil findings
 - Client updates the DOM without a full page reload
 - Falls back to HTTP polling if the WebSocket drops
@@ -219,15 +228,15 @@ sentinel/
 - Filter by repo, status, or runner
 - Click a run to open it on GitHub
 
-### `/security` - Vigil SOC (optional, only if VIGIL_URL is set)
-- Recent findings from Vigil with severity, status, and agent that handled them
-- Active cases with MITRE ATT&CK mappings
-- Agent activity feed
+### `/security` - Vigil SOC (optional UI, when VIGIL_URL is set)
+- Recent findings from Vigil with severity, status, and related agent context when available
+- Active cases with MITRE ATT&CK mappings when present on the case/finding
+- Agent list from Vigil (not a live "status" feed — Vigil has no `/api/agents/status`)
 - Links to the Vigil web UI for full investigation
 
 ### `/auth/login` - Login
 - "Sign in with GitHub" button
-- Redirects to the GitHub OAuth authorize URL
+- Redirects to the GitHub OAuth authorize URL with `scope=read:org repo`
 
 ### `/auth/callback` - OAuth callback
 - Exchanges the code for a token
@@ -241,15 +250,16 @@ sentinel/
 2. Clone the repo
 3. Run `deno task build`
 4. Create a `.env` file with the variables listed below
-5. Set up a systemd service running `deno task start`
+5. Set up a systemd service running `deno task start` (ensure the start task sets `--port` / `PORT` as intended)
 6. Put a reverse proxy in front (Caddy, nginx, whatever you prefer) with TLS
+7. Construct the Fresh app with `trustProxy: true` so `ctx.url` reflects `X-Forwarded-Proto` / `X-Forwarded-Host`
 
 ### With Vigil SOC (optional)
-1. Fork Vigil-SOC/vigil to your org
-2. Configure Bifrost to use Ollama Cloud (see the Vigil section above)
-3. Deploy Vigil on the same server or a separate one
-4. Set `VIGIL_URL` in Sentinel's `.env` pointing to the Vigil backend
-5. The security tab appears automatically when `VIGIL_URL` is set
+1. Deploy Vigil (prefer upstream; fork only for needed patches)
+2. Configure Bifrost for Ollama Cloud if desired; confirm chat works for your provider (#327)
+3. Create a Vigil service user for Sentinel
+4. Set `VIGIL_URL`, `VIGIL_USERNAME`, and `VIGIL_PASSWORD` in Sentinel's `.env`
+5. The security tab appears in the UI when `VIGIL_URL` is set
 
 ### CI
 - The repo includes a GitHub Actions workflow that runs `deno task check` and `deno task test`
@@ -258,14 +268,14 @@ sentinel/
 ## Implementation phases
 
 ### Phase 1: Scaffold + auth
-- Scaffold a Fresh project with `deno create`
-- Set up the GitHub OAuth App
-- Write the auth middleware in `_middleware.ts`
-- Implement login, callback, and logout routes
+- Scaffold a Fresh project with `deno create @fresh/init`
+- Set up the GitHub OAuth App and `GITHUB_PAT`
+- Write the auth middleware in `_middleware.ts` using `define.middleware()`
+- Implement login, callback, and logout routes with `define.handlers()` / `define.page()`
 - Verify: you can log in with GitHub and only org members get through
 
 ### Phase 2: Data layer
-- Write `lib/github.ts` (GitHub API client with caching)
+- Write `lib/github.ts` (GitHub API client with caching; OAuth token for membership, PAT for org APIs)
 - Write `lib/system.ts` (system metrics via shell)
 - Write `lib/cache.ts` (TTL cache)
 - Add API routes: `/api/system`, `/api/runners`, `/api/runs`
@@ -280,11 +290,11 @@ sentinel/
 - `islands/SystemStats.tsx` for auto-refreshing stat cards
 - `islands/RunnerGrid.tsx` for live runner status
 - `islands/RunsTable.tsx` for the auto-refreshing runs table
-- WebSocket endpoint at `/api/ws` for real-time push
+- WebSocket endpoint at `/api/ws` via `ctx.upgrade()` for real-time push
 
 ### Phase 5: Vigil SOC integration
-- Write `lib/vigil.ts` (Vigil API client)
-- Add `/security` route with findings, cases, and agent activity
+- Write `lib/vigil.ts` (login + JWT-backed Vigil API client)
+- Add `/security` UI gated on `VIGIL_URL` with findings, cases, and agent list
 - Build `FindingCard` component
 - Add security summary to the dashboard home
 - WebSocket pushes Vigil findings alongside runner status
@@ -292,8 +302,8 @@ sentinel/
 ### Phase 6: Deploy
 - Install Deno on the server
 - Build and deploy
-- Configure the reverse proxy
-- If using Vigil: deploy the fork, configure Bifrost with Ollama Cloud, set VIGIL_URL
+- Configure the reverse proxy + `trustProxy`
+- If using Vigil: deploy Vigil, configure Bifrost/provider as needed, set Vigil env vars
 - Test end to end
 
 ## Environment variables
@@ -304,10 +314,12 @@ sentinel/
 | `GITHUB_CLIENT_SECRET` | OAuth App client secret |
 | `SESSION_SECRET` | Random string for JWT signing (32+ chars) |
 | `GH_ORG` | GitHub org name |
-| `PORT` | Server port (default: 3000) |
+| `GITHUB_PAT` | PAT with `admin:org` + `repo` for org runners/runs |
+| `PORT` | Production server port (wire via `deno serve --port`; default often 8000 unless overridden) |
 | `RUNNER_COUNT` | Number of runner instances (default: 4) |
 | `VIGIL_URL` | URL of Vigil backend (optional, enables security tab) |
-| `VIGIL_API_KEY` | API key for Vigil backend (optional) |
+| `VIGIL_USERNAME` | Vigil service-user username (optional) |
+| `VIGIL_PASSWORD` | Vigil service-user password (optional) |
 
 ## Tech stack
 

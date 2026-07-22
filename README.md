@@ -32,8 +32,9 @@ You need a GitHub OAuth App:
 
 1. Go to GitHub Settings -> Developer settings -> OAuth Apps -> New OAuth App
 2. Set the homepage URL to your dashboard URL
-3. Set the callback URL to `https://your-domain/auth/callback`
-4. Request scopes: `read:org` and `repo`
+3. Set the authorization callback URL to `https://your-domain/auth/callback`
+4. At login, request scopes `read:org` and `repo` on the authorize URL
+5. Create a classic PAT with `admin:org` and `repo` for org runner/run API calls
 
 Environment variables:
 
@@ -43,16 +44,18 @@ Environment variables:
 | `GITHUB_CLIENT_SECRET` | OAuth App client secret |
 | `SESSION_SECRET` | Random string for JWT signing (32+ chars) |
 | `GH_ORG` | GitHub org name |
-| `PORT` | Server port (default: 3000) |
+| `GITHUB_PAT` | PAT with `admin:org` + `repo` for org runners/runs |
+| `PORT` | Production server port (wire via `deno serve --port`) |
 | `RUNNER_COUNT` | Number of runner instances (default: 4) |
 | `VIGIL_URL` | URL of Vigil backend (optional, enables security tab) |
-| `VIGIL_API_KEY` | API key for Vigil backend (optional) |
+| `VIGIL_USERNAME` | Vigil service-user username (optional) |
+| `VIGIL_PASSWORD` | Vigil service-user password (optional) |
 
 ## Vigil SOC integration
 
-Sentinel can connect to a [Vigil SOC](https://github.com/Vigil-SOC/vigil) instance and surface security findings alongside your CI runner health. When `VIGIL_URL` is set, a security tab appears automatically.
+Sentinel can connect to a [Vigil SOC](https://github.com/Vigil-SOC/vigil) instance and surface security findings alongside your CI runner health. When `VIGIL_URL` is set, a security tab appears in the UI. Vigil APIs require a Vigil user JWT — use a dedicated service user (`VIGIL_USERNAME` / `VIGIL_PASSWORD`), not a fictional shared API key.
 
-Vigil uses Bifrost as its LLM gateway and supports Ollama as a provider. This means you can point it at [Ollama Cloud](https://ollama.com) (which has a free tier) instead of paying for Claude API calls. See [AGENTS.md](AGENTS.md) for the full setup guide.
+Vigil uses Bifrost as its LLM gateway and supports Ollama as a provider. You can point it at [Ollama Cloud](https://ollama.com). See [AGENTS.md](AGENTS.md) for the full setup guide (including open Vigil issues that still affect non-Anthropic chat).
 
 ## Deployment
 
