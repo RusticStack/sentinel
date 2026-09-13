@@ -86,6 +86,6 @@ The spec is persisted as one format byte plus a postcard-encoded blob in the sto
 
 ## Verification
 
-Ten unit tests cover scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override,, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Four fixture tests compile the three valid fixtures, check each of the 23 invalid fixtures against its expected message, decode every field of the full example, and prove determinism on a diamond DAG under reordering. All pass on Windows and Linux.
+Ten unit tests cover scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Four fixture tests compile the three valid fixtures, check each of the 23 invalid fixtures against its expected message, decode every field of the full example, and prove determinism on a diamond DAG under reordering. All pass on Windows and Linux.
 
 Not in this schema version: expressions and conditions (C06), named pipelines, schedules, manual inputs, matrices, service containers, extra checkouts (Part 16 and later parts). Files using them fail at `unknown key`.
