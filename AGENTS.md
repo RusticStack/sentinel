@@ -1,5 +1,7 @@
 # Working on Sentinel
 
+**Rule one: write the most optimized code possible, every time.** Sentinel exists to beat other CI engines on the same hardware, so every change is judged on its cost: no allocation, copy, syscall, lock, or database round trip that the work does not require; hot paths are branch-light and cache-friendly; data structures are chosen for the access pattern; measurements, not guesses, justify anything slower than the obvious fast path. Correctness and bounded resource usage are not traded away for speed, but slow-and-simple is not an acceptable default.
+
 Sentinel is a performance-first, self-hosted Rust CI engine. Read [README.md](README.md), then use [TODO.md](TODO.md) as the execution tracker and [plan.md](plan.md) as the design reference.
 
 ## Workflow
@@ -29,6 +31,7 @@ On Windows, run the Linux checks inside WSL2 with `export CARGO_TARGET_DIR=targe
 
 | Path | Purpose |
 |---|---|
+| `crates/sentinel-core` | Pure contracts: IDs, state machine, failure classes; see [docs/core-contracts.md](docs/core-contracts.md) |
 | `crates/sentinel` | CLI plus Linux `server`/`worker` roles behind features |
 | `crates/sentinel-bench` | Benchmark runner; see [docs/benchmarking.md](docs/benchmarking.md) |
 | `crates/sentinel-probes` | SQLite/clone probes; see [docs/feasibility-probes.md](docs/feasibility-probes.md) |

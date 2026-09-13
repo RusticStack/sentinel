@@ -427,6 +427,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-core"
+version = "0.1.0-dev"
+dependencies = [
+ "uuid",
+]
+
+[[package]]
 name = "sentinel-probes"
 version = "0.1.0-dev"
 dependencies = [
