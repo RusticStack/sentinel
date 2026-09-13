@@ -1,0 +1,17 @@
+[package]
+name = "sentinel"
+description = "Performance-first, self-hosted CI for humans and coding agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+server = []
+worker = []
+
+[lints]
+workspace = true

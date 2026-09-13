@@ -1,6 +1,6 @@
 # Sentinel — implementation plan
 
-Status: design and acceptance criteria; implementation starts from scratch.
+Status: design and acceptance criteria; from-scratch implementation has begun with the Rust workspace foundation. The CI engine is not implemented yet.
 Reviewed: 2026-09-13. Repository: `RusticStack/sentinel`.
 
 Development tracker: [TODO.md](TODO.md) splits this design into actionable parts, dependencies, first-slice work, and verification gates. Implementation progress is recorded there.

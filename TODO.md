@@ -1,6 +1,6 @@
 # Sentinel development TODO
 
-Status: ready to start implementation. Only the planning/repository tasks below are complete; no CI engine has been implemented yet.
+Status: implementation started with F01's Rust workspace and platform build foundation. Runtime commands and the CI engine are not implemented yet.
 
 **Build a purpose-built Rust CI engine for maximum performance.** Primary target: representative warm PR required-check completion **p95 < 60 seconds on the same hardware previously taking >=300 seconds**, with the declared assertions and freshness policy preserved. Support multiple organizations, personal repositories, remote workers, first-class caching, OAuth CLI/MCP, and agent-manageable secrets.
 
@@ -63,7 +63,7 @@ After that, connect one GitHub App repository through Part 05 and run the first 
 
 ## Part 01 — Rust foundation and measurement harness
 
-- [ ] **F01** Initialize a minimal Rust workspace, pin the supported toolchain, commit the lockfile, and establish Linux server/worker plus Linux/macOS/Windows CLI build targets. Record library choices and production/build-time dependency boundaries.
+- [x] **F01** Initialize a minimal Rust workspace, pin the supported toolchain, commit the lockfile, and establish Linux server/worker plus Linux/macOS/Windows CLI build targets. Record library choices and production/build-time dependency boundaries. See [Rust foundation](docs/rust-foundation.md) and the completion evidence below.
 - [ ] **F02** Add `sentinel server`, `sentinel worker`, and CLI entry points with typed configuration, version information, explicit data paths, validation, and graceful shutdown. No execution from the server process.
 - [ ] **F03** Establish developer commands for formatting, lint, tests, and release builds; document Linux runtime prerequisites and a local two-process development setup. Keep generated runtime data and credentials out of Git.
 - [ ] **F04** Add structured internal tracing, request/run/job/attempt IDs, monotonic duration measurement, bounded queues, and an explicit blocking/CPU-work boundary. Define the end-to-end timing fields before job execution exists.
@@ -280,5 +280,6 @@ Append concise entries as work lands; reference existing test reports/benchmark 
 |---|---|---|
 | P01–P02 | `4b85877`, `39d833f`, `3c92be5`; linked design/research docs | Repository/planning groundwork complete; engine not implemented |
 | P03 | This backlog and entry-point links; Markdown/ID/dependency validation | Development parts prepared |
+| F01 | Commit titled `build: initialize pinned Rust workspace and platform contract`; [foundation documentation](docs/rust-foundation.md); verification on 2026-09-13 | Rust 1.97.0, committed lockfile, one package, zero external dependencies. Format/Clippy passed; test harness passed with 0 tests; Windows x86_64 release build and stderr/exit-code smoke check passed. All six documented CLI targets passed `cargo check`; both Linux targets passed server/worker/combined checks; all four non-Linux targets rejected each Linux role feature as expected. Metadata/dependency tree verified. Cross-target checks do not establish native linking/runtime support. |
 
-**Next task:** `F01` — initialize the minimal Rust workspace and pinned toolchain. Continue into the first vertical slice; update this tracker with actual implemented behavior and measurements.
+**Next task:** `F02` — implement server, worker and CLI entry points with typed configuration, version information, explicit data paths, validation and graceful shutdown. Continue into the first vertical slice; update this tracker with actual implemented behavior and measurements.
