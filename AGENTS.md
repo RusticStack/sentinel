@@ -50,3 +50,4 @@ On Windows, run the Linux checks inside WSL2 with `export CARGO_TARGET_DIR=targe
 - Durations are monotonic `Instant` measurements in nanoseconds; wall-clock timestamps are provenance only. Unmeasured fields are absent, never zero.
 - Diagnostics must not echo configuration or parser payloads that could contain credentials.
 - Tests cover behavior and failure paths; do not add tests that merely mirror the implementation.
+- Versioned contracts (pipeline schema, run spec format, migrations, error/explain schemas, cursors, worker protocol) change only under [docs/compatibility.md](docs/compatibility.md).

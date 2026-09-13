@@ -1,0 +1,40 @@
+# Schema and API compatibility policy (C08)
+
+Sentinel carries several independently versioned contracts. Each has one owner, one version marker and one rule for what a change may do. Nothing is versioned implicitly: if a shape is not listed here it is internal and may change with any commit.
+
+| Contract | Marker | Where | Consumers |
+|---|---|---|---|
+| Pipeline schema | `schema: N` in `.sentinel.yml` (currently 1) | `sentinel-pipeline` | repositories |
+| Run spec blob | leading format byte (currently 1) | `sentinel-pipeline::run`, `run_specs.format` | store, workers |
+| Metadata database | `schema_migrations.version` (currently 3) | `sentinel-store` | controller |
+| API error | `schema: "sentinel.error/1"` | `sentinel-protocol` | CLI, MCP, UI, workers |
+| Explain output | `schema: "sentinel.explain/1"` | `sentinel-pipeline::explain` | CLI, agents |
+| Event cursor | text prefix `c1` | `sentinel-protocol::cursor` | API clients |
+| Worker protocol | `protocol_min..=protocol_max` in `Hello` (currently 1..=1) | `sentinel-protocol::negotiate` | workers |
+| Capabilities | bit positions in `Capabilities` | `sentinel-protocol` | workers, scheduler |
+
+## Rules
+
+**Pipeline schema.** A file names the schema it was written for and is accepted only by builds that implement that exact version. Within a version, changes may only widen what is accepted (new optional keys, new functions, relaxed limits). Rejecting something that was previously accepted, changing the meaning of an accepted construct, or tightening a limit requires a new schema number; the old number stays supported for at least two minor releases and its removal is announced in the changelog. Unknown keys are always errors, so a file cannot silently depend on a feature its declared schema does not have.
+
+**Run spec.** The blob is written once per run and read by every attempt. The format byte identifies the postcard layout. Adding a trailing optional field keeps the byte; any other layout change increments it, and readers reject unknown bytes rather than guess. A controller upgrade never rewrites stored specs; runs created under an old format finish under the code that can read it, which is why old readers are kept for one release after a bump.
+
+**Database.** Migrations are append-only and forward-only; there is no down migration. A release may add migrations; it must be able to open a database at any version produced by the previous release. Columns are never dropped in the same release that stops writing them. `PRAGMA user_version` is not used; `schema_migrations` is the only truth.
+
+**Error and explain shapes.** Fields may be added; existing fields keep their type and meaning; `code` values are never renamed or reused. A breaking change is a new schema string, and clients treat an unknown schema as unparseable (the marker types enforce this). HTTP status codes are derived from `code` and follow it.
+
+**Cursors.** Opaque to clients. The version byte changes when the layout does; old cursors are then rejected as `invalid_cursor` and the client restarts from the beginning of the stream, which is always safe because event sequences are dense and idempotent to re-read.
+
+**Worker protocol.** The controller serves an inclusive range. Adding an optional message field is compatible; anything else bumps the maximum and, after one release of overlap, the minimum. A worker outside the range receives a typed rejection naming which side must upgrade. Capability bits are allocated once and never reused; unknown bits from newer workers are masked, not rejected.
+
+**Limits.** Every numeric limit in `sentinel-protocol::limits` and the pipeline crate may be raised without a version change and lowered only with one, since lowering can reject previously valid input.
+
+## Verification behind this policy
+
+The C08 test suites exercise the failure modes the policy relies on:
+
+- **Malformed input** (`sentinel-pipeline/tests/robustness.rs`): every truncation of every fixture and thousands of deterministic single-byte mutations compile or fail with a structured error within 500 ms; aliasing bombs, 10,000-deep nesting, 200 KB scalars, NUL, BOM, CRLF and 20,000-key mappings are rejected at their limit.
+- **Duplicate requests** (`sentinel-store/tests/verification.rs`): the same key and body executes once and replays the same run; a different body is rejected; another tenant's identical key is unrelated; keys expire after 24 hours. Decisions are taken inside the mutation's transaction.
+- **Transaction rollback**: an idempotency record followed by a failing run creation leaves zero rows in every table.
+- **Conflicting updates**: eight threads racing to lease one job produce exactly one lease and one attempt row; the rest see a typed transition error.
+- **Crash and reopen**: a child process performs 25 acknowledged runs and transitions with `synchronous=FULL` and then aborts; the parent reopens the database, passes `integrity_check`, and finds every acknowledged row. This is the acknowledgement policy from [storage](storage.md) proven against a real process death, though not against power loss mid-fsync, which needs a fault-injecting VFS.

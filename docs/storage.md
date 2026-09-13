@@ -17,7 +17,7 @@ Both durable paths are bound by the same fsync and land within 20% of each other
 
 ## Layout and ownership
 
-Migrations are an append-only list of `(version, sql)` in `schema.rs`; each runs in its own `BEGIN IMMEDIATE` transaction and is recorded in `schema_migrations`. Version 1 creates `tenants`, `repos`, `runs`, `jobs` and `attempts` as `WITHOUT ROWID` tables keyed by 16-byte IDs. Version 2 adds `run_specs` (the immutable compiled specification per run: pipeline digest, format byte, postcard blob) and `jobs.spec_index`.
+Migrations are an append-only list of `(version, sql)` in `schema.rs`; each runs in its own `BEGIN IMMEDIATE` transaction and is recorded in `schema_migrations`. Version 1 creates `tenants`, `repos`, `runs`, `jobs` and `attempts` as `WITHOUT ROWID` tables keyed by 16-byte IDs. Version 2 adds `run_specs` (the immutable compiled specification per run: pipeline digest, format byte, postcard blob) and `jobs.spec_index`. Version 3 adds `idempotency_keys`, scoped to (tenant, principal, route): `idempotency::begin` decides execute/replay/mismatch inside the mutation's own transaction and `complete` records the created run, so a duplicate can never execute twice.
 
 Every table after `tenants` carries `tenant_id`. Inserts of runs and jobs are `INSERT … SELECT` from the parent row filtered by tenant, so a run cannot reference another tenant's repo and a job cannot reference another tenant's run; both fail as `NotFound`, the same answer a nonexistent row gets. Every read and transition predicate includes `tenant_id`. Foreign keys are enforced (`PRAGMA foreign_keys=ON`) as a second line of defence.
 

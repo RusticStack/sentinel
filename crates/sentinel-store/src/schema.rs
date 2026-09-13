@@ -77,4 +77,20 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     -- Position of the job in the compiled pipeline; dependencies are read from the spec.
     ALTER TABLE jobs ADD COLUMN spec_index INTEGER NOT NULL DEFAULT 0;",
     ),
+    (
+        3,
+        "-- Mutation idempotency, scoped to (tenant, principal, route); see sentinel-protocol.
+    CREATE TABLE idempotency_keys(
+        tenant_id BLOB NOT NULL REFERENCES tenants(id),
+        principal TEXT NOT NULL,
+        route TEXT NOT NULL,
+        key TEXT NOT NULL CHECK(length(key) BETWEEN 1 AND 64),
+        fingerprint BLOB NOT NULL CHECK(length(fingerprint) = 16),
+        created_ms INTEGER NOT NULL,
+        completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+        run_id BLOB REFERENCES runs(id),
+        PRIMARY KEY(tenant_id, principal, route, key)
+    ) WITHOUT ROWID;
+    CREATE INDEX idempotency_by_age ON idempotency_keys(created_ms);",
+    ),
 ];

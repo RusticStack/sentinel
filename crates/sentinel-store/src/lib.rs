@@ -12,6 +12,7 @@
 //! indexes, migrations and ad-hoc queries at no extra cost.
 
 pub mod codec;
+pub mod idempotency;
 pub mod jobs;
 pub mod runs;
 pub mod schema;

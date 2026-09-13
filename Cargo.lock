@@ -566,6 +566,7 @@ dependencies = [
  "rusqlite",
  "sentinel-core",
  "sentinel-pipeline",
+ "sentinel-protocol",
  "tempfile",
 ]
 
