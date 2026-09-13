@@ -6,7 +6,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::yaml::Node;
+use crate::{
+    expr::{Expr, Phase, Template},
+    yaml::Node,
+};
 
 pub const SCHEMA_VERSION: i64 = 1;
 
@@ -43,7 +46,8 @@ pub enum Trigger {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Concurrency {
-    pub group: String,
+    /// Rendered at dispatch; may not reference `needs` or `hash_files`.
+    pub group: Template,
     pub cancel_in_progress: bool,
 }
 
@@ -51,6 +55,8 @@ pub struct Concurrency {
 pub struct Job {
     pub image: String,
     pub needs: Vec<String>,
+    /// `if:` evaluated at schedule time once every dependency is terminal.
+    pub condition: Option<Expr>,
     pub runs_on: RunsOn,
     pub resources: Resources,
     pub timeout_secs: u64,
@@ -87,6 +93,8 @@ pub struct Resources {
 pub struct Step {
     pub id: String,
     pub run: String,
+    /// `if:` evaluated by the worker before the step starts.
+    pub condition: Option<Expr>,
     pub shell: Shell,
     pub env: Vec<(String, String)>,
     pub workdir: Option<String>,
@@ -106,7 +114,8 @@ pub enum Shell {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cache {
     pub name: String,
-    pub key: String,
+    /// Rendered by the worker after checkout (`hash_files` allowed).
+    pub key: Template,
     pub paths: Vec<String>,
 }
 
@@ -400,6 +409,41 @@ pub fn parse_bytes(s: &str) -> Option<u64> {
     n.checked_mul(mult)
 }
 
+fn condition(path: &str, node: &Node) -> Result<Expr> {
+    let s = expect_str(path, node, crate::expr::MAX_EXPR_BYTES)?;
+    // Accept both `if: ${{ expr }}` and bare `if: expr`.
+    let inner = s
+        .trim()
+        .strip_prefix("${{")
+        .and_then(|r| r.strip_suffix("}}"))
+        .unwrap_or(s);
+    let e = Expr::parse(inner).map_err(|e| {
+        err(
+            path,
+            SchemaErrorKind::Invalid(format!("invalid expression {e}")),
+        )
+    })?;
+    if let Expr::Lit(v) = &e
+        && v.as_condition().is_none()
+    {
+        return Err(err(
+            path,
+            SchemaErrorKind::Invalid("condition must be a boolean expression".into()),
+        ));
+    }
+    Ok(e)
+}
+
+fn template(path: &str, node: &Node, max: usize) -> Result<Template> {
+    let s = expect_str(path, node, max)?;
+    Template::parse(s).map_err(|e| {
+        err(
+            path,
+            SchemaErrorKind::Invalid(format!("invalid template {e}")),
+        )
+    })
+}
+
 fn timeout(path: &str, node: &Node) -> Result<u64> {
     let s = expect_str(path, node, 32)?;
     match parse_duration_secs(s) {
@@ -554,6 +598,10 @@ fn step(path: &str, node: &Node) -> Result<Step> {
         .ok_or_else(|| err(&format!("{path}.run"), SchemaErrorKind::Missing))
         .and_then(|n| expect_str(&map.child("run"), n, MAX_RUN_BYTES))?
         .to_owned();
+    let condition = match map.take("if") {
+        Some(n) => Some(condition(&map.child("if"), n)?),
+        None => None,
+    };
     let shell = match map.take("shell") {
         None => Shell::Sh,
         Some(n) => match expect_str(&map.child("shell"), n, 8)? {
@@ -583,6 +631,7 @@ fn step(path: &str, node: &Node) -> Result<Step> {
     Ok(Step {
         id,
         run,
+        condition,
         shell,
         env,
         workdir,
@@ -632,11 +681,11 @@ fn cache(path: &str, node: &Node) -> Result<Cache> {
         .ok_or_else(|| err(&format!("{path}.name"), SchemaErrorKind::Missing))
         .and_then(|n| expect_id(&map.child("name"), n))?
         .to_owned();
+    let key_path = map.child("key");
     let key = map
         .take("key")
-        .ok_or_else(|| err(&format!("{path}.key"), SchemaErrorKind::Missing))
-        .and_then(|n| expect_str(&map.child("key"), n, 256))?
-        .to_owned();
+        .ok_or_else(|| err(&key_path, SchemaErrorKind::Missing))
+        .and_then(|n| template(&key_path, n, 256))?;
     let paths_path = map.child("paths");
     let paths = map
         .take("paths")
@@ -784,6 +833,10 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy) -> Result<Job> {
             out
         }
     };
+    let condition = match map.take("if") {
+        Some(n) => Some(condition(&map.child("if"), n)?),
+        None => None,
+    };
     let runs_on = match map.take("runs_on") {
         None => RunsOn::default(),
         Some(n) => runs_on(&map.child("runs_on"), n)?,
@@ -836,6 +889,7 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy) -> Result<Job> {
     Ok(Job {
         image: image.to_owned(),
         needs,
+        condition,
         runs_on,
         resources,
         timeout_secs,
@@ -905,8 +959,15 @@ pub fn decode(root: &Node, policy: &ResourcePolicy) -> Result<Pipeline> {
             let group = c
                 .take("group")
                 .ok_or_else(|| err("concurrency.group", SchemaErrorKind::Missing))
-                .and_then(|n| expect_str("concurrency.group", n, 256))?
-                .to_owned();
+                .and_then(|n| template("concurrency.group", n, 256))?;
+            if group.min_phase() > Phase::Dispatch {
+                return Err(err(
+                    "concurrency.group",
+                    SchemaErrorKind::Invalid(
+                        "may only use event, repo and run context (no needs or hash_files)".into(),
+                    ),
+                ));
+            }
             let cancel_in_progress = match c.take("cancel_in_progress") {
                 None => false,
                 Some(n) => expect_bool("concurrency.cancel_in_progress", n)?,

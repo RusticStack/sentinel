@@ -1,0 +1,6 @@
+# expect: jobs.b.if: needs.<job> may only name a job listed
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}]}
+  b: {image: busybox, if: "${{ needs.a.result == 'passed' }}", steps: [{id: s, run: x}]}

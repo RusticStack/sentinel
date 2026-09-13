@@ -1,0 +1,5 @@
+# expect: jobs.a.cache[0].key: invalid template
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}], cache: [{name: c, key: "k-${{ event.sha", paths: [t]}]}

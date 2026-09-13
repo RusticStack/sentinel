@@ -1,0 +1,5 @@
+# expect: jobs.a.if: condition must be a boolean expression
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, if: "'yes'", steps: [{id: s, run: x}]}

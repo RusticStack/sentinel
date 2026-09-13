@@ -1,0 +1,5 @@
+# expect: jobs.a.if: job conditions cannot use hash_files
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, if: "hash_files('x') == 'y'", steps: [{id: s, run: x}]}

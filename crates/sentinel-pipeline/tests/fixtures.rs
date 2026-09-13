@@ -1,6 +1,10 @@
 use std::{fs, path::Path};
 
-use sentinel_pipeline::{compile_str, schema::Trigger};
+use sentinel_pipeline::{
+    compile_str,
+    expr::{Context, DependencySummary, HashFilesError, Lookup, Phase, Value},
+    schema::Trigger,
+};
 
 fn fixture_dir(sub: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -100,4 +104,94 @@ fn compilation_is_deterministic_and_order_is_canonical() {
     // Any semantic change moves the digest.
     let changed = text.replace("echo z", "echo zz");
     assert_ne!(compile_str(&changed).unwrap().digest, a.digest);
+}
+
+struct Ctx {
+    phase: Phase,
+    test_passed: bool,
+}
+
+impl Context for Ctx {
+    fn phase(&self) -> Phase {
+        self.phase
+    }
+    fn lookup(&self, path: &[String]) -> Lookup {
+        let key: Vec<&str> = path.iter().map(String::as_str).collect();
+        match key.as_slice() {
+            ["event", "ref"] => Lookup::Value(Value::Str("refs/heads/main".into())),
+            ["event", "key"] => Lookup::Value(Value::Str("pr-12".into())),
+            ["repo", "id"] => Lookup::Value(Value::Str("rep_x".into())),
+            ["needs", "test", "result"] if self.phase >= Phase::Schedule => Lookup::Value(
+                Value::Str(if self.test_passed { "passed" } else { "failed" }.into()),
+            ),
+            _ => Lookup::Unresolved,
+        }
+    }
+    fn dependency_summary(&self) -> Option<DependencySummary> {
+        (self.phase >= Phase::Schedule).then_some(DependencySummary {
+            all_succeeded: self.test_passed,
+            any_failed: !self.test_passed,
+        })
+    }
+    fn cancelled(&self) -> Option<bool> {
+        Some(false)
+    }
+    fn hash_files(&self, patterns: &[&str]) -> Result<String, HashFilesError> {
+        Ok(format!("hash({})", patterns.join("+")))
+    }
+}
+
+#[test]
+fn conditions_fixture_evaluates_by_phase() {
+    let text = fs::read_to_string(fixture_dir("valid").join("conditions.yml")).unwrap();
+    let p = compile_str(&text).unwrap();
+    let group = p.concurrency.as_ref().unwrap().group.clone();
+    let dispatch = Ctx {
+        phase: Phase::Dispatch,
+        test_passed: false,
+    };
+    assert_eq!(group.render(&dispatch, 256).unwrap(), "rep_x:pr-12");
+
+    let report = p.jobs.iter().find(|j| j.name == "report").unwrap();
+    let job_if = report.spec.condition.as_ref().unwrap();
+    assert!(
+        job_if.eval(&dispatch).is_err(),
+        "needs are unknown at dispatch"
+    );
+    let failed = Ctx {
+        phase: Phase::Schedule,
+        test_passed: false,
+    };
+    assert_eq!(
+        job_if.eval(&failed).unwrap().as_condition(),
+        Some(true),
+        "always() runs on failure"
+    );
+    let step_if = report.spec.steps[0].condition.as_ref().unwrap();
+    assert_eq!(step_if.eval(&failed).unwrap().as_condition(), Some(true));
+    let passed = Ctx {
+        phase: Phase::Schedule,
+        test_passed: true,
+    };
+    assert_eq!(step_if.eval(&passed).unwrap().as_condition(), Some(false));
+
+    let worker = Ctx {
+        phase: Phase::Worker,
+        test_passed: true,
+    };
+    let key = report.spec.cache[0].key.render(&worker, 256).unwrap();
+    assert_eq!(key, "deps-hash(Cargo.lock+crates/*/Cargo.toml)");
+    assert!(
+        report.spec.cache[0].key.render(&passed, 256).is_err(),
+        "hash_files needs the worker"
+    );
+
+    let main_only = p.jobs.iter().find(|j| j.name == "test").unwrap().spec.steps[1]
+        .condition
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        main_only.eval(&dispatch).unwrap().as_condition(),
+        Some(true)
+    );
 }

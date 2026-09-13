@@ -1,0 +1,26 @@
+schema: 1
+on: [push, pull_request]
+concurrency:
+  group: "${{ repo.id }}:${{ event.key }}"
+  cancel_in_progress: true
+jobs:
+  test:
+    image: busybox
+    steps:
+      - id: unit
+        run: echo unit
+      - id: main-only
+        if: ${{ event.ref == 'refs/heads/main' }}
+        run: echo main
+  report:
+    needs: [test]
+    if: ${{ always() && !cancelled() }}
+    image: busybox
+    cache:
+      - name: deps
+        key: "deps-${{ hash_files('Cargo.lock', 'crates/*/Cargo.toml') }}"
+        paths: [target]
+    steps:
+      - id: on-failure
+        if: failure() || needs.test.result == 'failed'
+        run: echo report

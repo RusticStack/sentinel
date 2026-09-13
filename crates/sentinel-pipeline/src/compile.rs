@@ -7,7 +7,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{Job, Pipeline, Step, Trigger};
+use crate::{
+    expr::{Phase, Template},
+    schema::{Job, Pipeline, Step, Trigger},
+};
 
 pub const MAX_STEPS_TOTAL: usize = 1024;
 
@@ -32,15 +35,44 @@ pub struct CompiledJob {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompileError {
-    UnknownDependency { job: String, needs: String },
-    SelfDependency { job: String },
-    DuplicateDependency { job: String, needs: String },
-    Cycle { jobs: Vec<String> },
-    DuplicateStepId { job: String, step: String },
-    DuplicateCacheName { job: String, name: String },
-    DuplicateArtifactName { job: String, name: String },
-    StepTimeoutExceedsJob { job: String, step: String },
-    TooManySteps { limit: usize },
+    UnknownDependency {
+        job: String,
+        needs: String,
+    },
+    SelfDependency {
+        job: String,
+    },
+    DuplicateDependency {
+        job: String,
+        needs: String,
+    },
+    Cycle {
+        jobs: Vec<String>,
+    },
+    DuplicateStepId {
+        job: String,
+        step: String,
+    },
+    DuplicateCacheName {
+        job: String,
+        name: String,
+    },
+    DuplicateArtifactName {
+        job: String,
+        name: String,
+    },
+    StepTimeoutExceedsJob {
+        job: String,
+        step: String,
+    },
+    TooManySteps {
+        limit: usize,
+    },
+    /// An `if` or template references a job outside `needs` or a phase it cannot reach.
+    Expression {
+        path: String,
+        message: &'static str,
+    },
 }
 
 impl fmt::Display for CompileError {
@@ -72,18 +104,62 @@ impl fmt::Display for CompileError {
                 )
             }
             Self::TooManySteps { limit } => write!(f, "jobs: more than {limit} steps in total"),
+            Self::Expression { path, message } => write!(f, "{path}: {message}"),
         }
     }
 }
 impl std::error::Error for CompileError {}
 
+fn check_refs(path: String, refs: &[String], needs: &[String]) -> Result<(), CompileError> {
+    match refs.iter().find(|r| !needs.contains(r)) {
+        None => Ok(()),
+        Some(_) => Err(CompileError::Expression {
+            path,
+            message: "needs.<job> may only name a job listed in this job's `needs`",
+        }),
+    }
+}
+
+fn check_template(
+    path: String,
+    t: &Template,
+    needs: &[String],
+    max: Phase,
+) -> Result<(), CompileError> {
+    if t.min_phase() > max {
+        return Err(CompileError::Expression {
+            path,
+            message: "uses context that is not available where this value is rendered",
+        });
+    }
+    let mut refs = Vec::new();
+    t.referenced_needs(&mut refs);
+    check_refs(path, &refs, needs)
+}
+
 fn check_job(name: &str, job: &Job) -> Result<(), CompileError> {
+    if let Some(cond) = &job.condition {
+        if cond.min_phase() > Phase::Schedule {
+            return Err(CompileError::Expression {
+                path: format!("jobs.{name}.if"),
+                message: "job conditions cannot use hash_files; use a step condition",
+            });
+        }
+        let mut refs = Vec::new();
+        cond.referenced_needs(&mut refs);
+        check_refs(format!("jobs.{name}.if"), &refs, &job.needs)?;
+    }
     for (i, s) in job.steps.iter().enumerate() {
         if job.steps[..i].iter().any(|o| o.id == s.id) {
             return Err(CompileError::DuplicateStepId {
                 job: name.into(),
                 step: s.id.clone(),
             });
+        }
+        if let Some(cond) = &s.condition {
+            let mut refs = Vec::new();
+            cond.referenced_needs(&mut refs);
+            check_refs(format!("jobs.{name}.steps.{}.if", s.id), &refs, &job.needs)?;
         }
         if s.timeout_secs.is_some_and(|t| t > job.timeout_secs) {
             return Err(CompileError::StepTimeoutExceedsJob {
@@ -93,6 +169,12 @@ fn check_job(name: &str, job: &Job) -> Result<(), CompileError> {
         }
     }
     for (i, c) in job.cache.iter().enumerate() {
+        check_template(
+            format!("jobs.{name}.cache.{}.key", c.name),
+            &c.key,
+            &job.needs,
+            Phase::Worker,
+        )?;
         if job.cache[..i].iter().any(|o| o.name == c.name) {
             return Err(CompileError::DuplicateCacheName {
                 job: name.into(),
@@ -243,6 +325,11 @@ impl Digest {
     fn str(&mut self, s: &str) {
         self.bytes(s.as_bytes());
     }
+    fn encoded<T: serde::Serialize>(&mut self, v: &T) {
+        // postcard is deterministic for a given type layout.
+        let bytes = postcard::to_allocvec(v).unwrap_or_default();
+        self.bytes(&bytes);
+    }
     fn opt_str(&mut self, s: Option<&str>) {
         match s {
             None => self.u64(0),
@@ -257,6 +344,7 @@ impl Digest {
 fn digest_step(d: &mut Digest, s: &Step) {
     d.str(&s.id);
     d.str(&s.run);
+    d.encoded(&s.condition);
     d.u64(s.shell as u64);
     d.u64(s.env.len() as u64);
     for (k, v) in &s.env {
@@ -282,7 +370,7 @@ fn digest_of(
         None => d.u64(0),
         Some(c) => {
             d.u64(1);
-            d.str(&c.group);
+            d.encoded(&c.group);
             d.u64(c.cancel_in_progress as u64);
         }
     }
@@ -295,6 +383,7 @@ fn digest_of(
         }
         let s = &j.spec;
         d.str(&s.image);
+        d.encoded(&s.condition);
         d.u64(s.runs_on.arch.map_or(u64::MAX, |a| a as u64));
         d.u64(s.runs_on.labels.len() as u64);
         for l in &s.runs_on.labels {
@@ -317,7 +406,7 @@ fn digest_of(
         d.u64(s.cache.len() as u64);
         for c in &s.cache {
             d.str(&c.name);
-            d.str(&c.key);
+            d.encoded(&c.key);
             d.u64(c.paths.len() as u64);
             for p in &c.paths {
                 d.str(p);

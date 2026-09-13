@@ -47,7 +47,7 @@ jobs:                           # 1–64, names [a-z0-9][a-z0-9_-]{0,63}
       - {name: release, paths: [target/release/app], when: success|failure|always, retain: 7d}
 ```
 
-Unknown keys anywhere are rejected with their path, for example `jobs.test: unknown key `imgae``. Durations are `<int>s|m|h` sums such as `1h30m`. Sizes use binary units only, `MiB` or `GiB`. CPU is whole cores or a quoted decimal such as `"0.5"`, stored as millicores. Paths are normalised relative paths with no `..`, `//`, leading `./` or trailing `/`; cache paths may also be absolute inside the container but never `/`. Expressions in `concurrency.group` and cache keys are carried as opaque strings until C06 defines their grammar.
+Unknown keys anywhere are rejected with their path, for example `jobs.test: unknown key `imgae``. Durations are `<int>s|m|h` sums such as `1h30m`. Sizes use binary units only, `MiB` or `GiB`. CPU is whole cores or a quoted decimal such as `"0.5"`, stored as millicores. Paths are normalised relative paths with no `..`, `//`, leading `./` or trailing `/`; cache paths may also be absolute inside the container but never `/`. `concurrency.group` and cache `key` are templates; job and step `if` are expressions (see below).
 
 ## Resource policy
 
@@ -80,12 +80,28 @@ The spec is persisted as one format byte plus a postcard-encoded blob in the sto
 
 `RunSpec::step_command(job, step)` derives the exact process a worker runs: argv, merged environment and working directory, plus the effective timeout (step timeout, else job timeout).
 
+## Expressions (C06)
+
+`${{ … }}` in templates and the `if:` keys use one bounded grammar, parsed once at compile time into an AST stored with the run spec:
+
+- Literals: `'single quoted'` (`''` escapes a quote), integers, `true`, `false`, `null`.
+- Context paths: `event.name|ref|base_ref|sha|key|pr_number`, `repo.id|name`, `run.id`, `job.id|name`, `needs.<job>.result`. Any other root or field is a compile error, so a typo cannot evaluate to null.
+- Operators: `==`, `!=` (same-type only, `null` compares with anything), `!`, `&&`, `||` (short-circuit, boolean operands only), parentheses. Comparisons do not chain.
+- Functions: `success()`, `failure()`, `always()`, `cancelled()`, `contains(a, b)`, `starts_with(a, b)`, `ends_with(a, b)`, `hash_files('pattern', …)`. Nothing else: no arithmetic, no string building, no user functions, no network.
+- Limits: 1,024 bytes, 256 tokens, depth 16, 8 arguments, 4 path segments.
+
+Evaluation is phased. Each path and function has a minimum phase, and an expression evaluated earlier yields an `Unresolved` error rather than a default: `event`, `repo`, `run`, `job` and `cancelled()` at **dispatch**; `needs.*`, `success()`, `failure()`, `always()` at **schedule** (once every dependency is terminal); `hash_files` at **worker** (after the pinned checkout). The compiler enforces placement: `concurrency.group` may only use dispatch context; a job `if` may not use `hash_files` and may only name jobs in its own `needs`; step `if` and cache keys may use everything but also only name jobs in `needs`. A condition must evaluate to a boolean; a literal non-boolean `if` is rejected at compile time, and a string at evaluation time is an error, never truthy. `success()` and `failure()` summarise dependency outcomes; `always()` is true unless the run is cancelled.
+
+Templates render each interpolation as string, integer or boolean; `null` is an error, and output is bounded (256 bytes for concurrency keys and cache keys).
+
+`hash_files` is resolved by the worker against the checkout root with `hash_files(root, patterns)`: segments may contain `*` or be `**`; matches are deduplicated and sorted; symlinks are never followed; the result is the BLAKE3 hex of `path \0 length content` records, so it is identical on every host. Limits: 8 patterns, 10,000 files, 256 MiB. No match is an error, not an empty key, because a missing lockfile is a misconfiguration and a silent constant would make unrelated builds share a cache.
+
 ## Shell semantics
 
 `sh` runs `/bin/sh -e -c <script>` so the first failing command fails the step. `bash` runs `bash -e -o pipefail -c <script>` and requires an image that provides bash. Failure classes are identical for both: exit 0 passes; any other exit status is `command_failed`; death by signal is `command_signaled`; exceeding the step or job timeout is `execution_timeout`; a cgroup memory kill is `out_of_memory`. Output is captured for diagnostics and never interpreted for the verdict. Environment precedence is job `env`, then step `env` overriding by name, then the worker's own `SENTINEL_*` context variables appended last so a pipeline cannot spoof them. A step `workdir` is joined under the job `workdir`; both are validated relative paths so the join cannot escape the workspace. Steps of one job run sequentially in one container and workspace; jobs share nothing implicitly.
 
 ## Verification
 
-Ten unit tests cover scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Four fixture tests compile the three valid fixtures, check each of the 23 invalid fixtures against its expected message, decode every field of the full example, and prove determinism on a diamond DAG under reordering. All pass on Windows and Linux.
+Eighteen unit tests cover the expression grammar (precedence, rejected constructs, phase gating, typing, templates), the `hash_files` resolver (globbing, ordering, sensitivity, cross-root stability), scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Five fixture tests compile the four valid fixtures, check each of the 29 invalid fixtures against its expected message, evaluate the conditions example across dispatch, schedule and worker phases, decode every field of the full example, and prove determinism on a diamond DAG under reordering. All pass on Windows and Linux.
 
-Not in this schema version: expressions and conditions (C06), named pipelines, schedules, manual inputs, matrices, service containers, extra checkouts (Part 16 and later parts). Files using them fail at `unknown key`.
+Not in this schema version: named pipelines, schedules, manual inputs, matrices, service containers, extra checkouts (Part 16 and later parts). Files using them fail at `unknown key`.

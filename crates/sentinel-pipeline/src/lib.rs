@@ -4,6 +4,8 @@
 //! not implement.
 
 pub mod compile;
+pub mod expr;
+pub mod hash_files;
 pub mod run;
 pub mod schema;
 pub mod yaml;
@@ -11,6 +13,8 @@ pub mod yaml;
 use std::fmt;
 
 pub use compile::{CompileError, CompiledJob, CompiledPipeline};
+pub use expr::{Context, Expr, Phase, Template, Value};
+pub use hash_files::hash_files;
 pub use run::{ImageRef, PinnedSource, RunSpec, StepCommand};
 pub use schema::{Pipeline, ResourcePolicy, SCHEMA_VERSION, SchemaError};
 pub use yaml::YamlError;
