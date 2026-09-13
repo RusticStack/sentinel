@@ -136,6 +136,75 @@ pub enum Expr {
     Call(Func, Vec<Expr>),
 }
 
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Null => f.write_str("null"),
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Int(i) => write!(f, "{i}"),
+            Value::Str(s) => write!(f, "'{}'", s.replace('\'', "''")),
+        }
+    }
+}
+
+impl Func {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Always => "always",
+            Self::Cancelled => "cancelled",
+            Self::Contains => "contains",
+            Self::StartsWith => "starts_with",
+            Self::EndsWith => "ends_with",
+            Self::HashFiles => "hash_files",
+        }
+    }
+}
+
+/// Canonical text: fully parenthesised binary operations, so printing and
+/// re-parsing yields the same tree and diagnostics show exactly what runs.
+impl fmt::Display for Expr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expr::Lit(v) => write!(f, "{v}"),
+            Expr::Path(p) => f.write_str(&p.join(".")),
+            Expr::Not(e) => write!(f, "!{e}"),
+            Expr::Bin(op, a, b) => {
+                let sym = match op {
+                    BinOp::Eq => "==",
+                    BinOp::Ne => "!=",
+                    BinOp::And => "&&",
+                    BinOp::Or => "||",
+                };
+                write!(f, "({a} {sym} {b})")
+            }
+            Expr::Call(func, args) => {
+                write!(f, "{}(", func.name())?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{a}")?;
+                }
+                f.write_str(")")
+            }
+        }
+    }
+}
+
+impl fmt::Display for Template {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for p in &self.parts {
+            match p {
+                Part::Lit(s) => f.write_str(s)?,
+                Part::Expr(e) => write!(f, "${{{{ {e} }}}}")?,
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseError {
     /// Byte offset into the expression text.
@@ -965,6 +1034,27 @@ mod tests {
             Expr::parse("'it''s'").unwrap(),
             Expr::Lit(Value::Str("it's".into()))
         );
+    }
+
+    #[test]
+    fn display_is_canonical_and_round_trips() {
+        for src in [
+            "event.ref == 'refs/heads/main' && (repo.id == 7 || !cancelled())",
+            "starts_with(event.ref, 'x''y') && event.pr_number == null",
+            "hash_files('Cargo.lock', 'crates/*/Cargo.toml')",
+            "!!true",
+        ] {
+            let e = Expr::parse(src).unwrap();
+            let printed = e.to_string();
+            assert_eq!(Expr::parse(&printed).unwrap(), e, "{printed}");
+        }
+        assert_eq!(
+            Expr::parse("a.b").unwrap_err().message,
+            "unknown context; expected event, repo, run, job or needs"
+        );
+        let t = Template::parse("k-${{ repo.id }}:${{ hash_files('x') }}").unwrap();
+        assert_eq!(t.to_string(), "k-${{ repo.id }}:${{ hash_files('x') }}");
+        assert_eq!(Template::parse(&t.to_string()).unwrap(), t);
     }
 
     #[test]

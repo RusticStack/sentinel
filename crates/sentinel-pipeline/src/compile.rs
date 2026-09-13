@@ -412,6 +412,10 @@ fn digest_of(
                 d.str(p);
             }
         }
+        d.u64(s.secrets.len() as u64);
+        for name in &s.secrets {
+            d.str(name);
+        }
         d.u64(s.artifacts.len() as u64);
         for a in &s.artifacts {
             d.str(&a.name);

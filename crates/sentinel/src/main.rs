@@ -4,6 +4,7 @@ compile_error!(
 );
 
 mod cli;
+mod pipeline;
 
 #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]
 mod service;
@@ -18,6 +19,7 @@ fn main() -> ExitCode {
     let (role, args) = match cli.command {
         Command::Server(args) => ("server", args),
         Command::Worker(args) => ("worker", args),
+        Command::Pipeline(args) => return pipeline::run(args),
     };
 
     #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]

@@ -21,6 +21,7 @@ pub const MAX_CACHES: usize = 8;
 pub const MAX_ARTIFACTS: usize = 8;
 pub const MAX_PATHS: usize = 32;
 pub const MAX_LABELS: usize = 8;
+pub const MAX_SECRETS: usize = 16;
 pub const MAX_RUN_BYTES: usize = 4096;
 pub const MAX_ID_BYTES: usize = 64;
 /// One day; nothing in CI legitimately runs longer without human review.
@@ -65,6 +66,10 @@ pub struct Job {
     pub steps: Vec<Step>,
     pub cache: Vec<Cache>,
     pub artifacts: Vec<Artifact>,
+    /// Names of secrets the job needs. Values never appear in YAML: the
+    /// worker injects each as an environment variable of the same name only
+    /// if the repository has been granted that secret.
+    pub secrets: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -874,6 +879,33 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy) -> Result<Job> {
                 .collect::<Result<Vec<_>>>()?
         }
     };
+    let secrets = match map.take("secrets") {
+        None => Vec::new(),
+        Some(n) => {
+            let child = map.child("secrets");
+            let items = expect_seq(&child, n, MAX_SECRETS)?;
+            let mut out: Vec<String> = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let p = format!("{child}[{i}]");
+                let s = expect_str(&p, item, MAX_ID_BYTES)?;
+                let valid = s
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                    && !s.as_bytes()[0].is_ascii_digit();
+                if !valid {
+                    return Err(err(
+                        &p,
+                        SchemaErrorKind::Invalid("secret names must match [A-Z_][A-Z0-9_]*".into()),
+                    ));
+                }
+                if out.iter().any(|o| o == s) {
+                    return Err(err(&p, SchemaErrorKind::Invalid("duplicate secret".into())));
+                }
+                out.push(s.to_owned());
+            }
+            out
+        }
+    };
     let artifacts = match map.take("artifacts") {
         None => Vec::new(),
         Some(n) => {
@@ -898,6 +930,7 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy) -> Result<Job> {
         steps,
         cache,
         artifacts,
+        secrets,
     })
 }
 

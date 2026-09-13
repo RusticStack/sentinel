@@ -16,6 +16,30 @@ pub enum Command {
     Server(ServiceArgs),
     /// Start the separate Linux worker lifecycle (job execution is not implemented yet)
     Worker(ServiceArgs),
+    /// Validate or explain a `.sentinel.yml` offline, on any platform
+    Pipeline(PipelineArgs),
+}
+
+#[derive(Args)]
+pub struct PipelineArgs {
+    #[command(subcommand)]
+    pub command: PipelineCommand,
+}
+
+#[derive(Subcommand)]
+pub enum PipelineCommand {
+    /// Load, decode and compile the file; print nothing on success
+    Validate {
+        /// Path to the pipeline file
+        file: PathBuf,
+    },
+    /// Show jobs, order, budgets, required grants and unresolved runtime inputs
+    Explain {
+        file: PathBuf,
+        /// Machine-readable output (`sentinel.explain/1`)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args)]

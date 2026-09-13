@@ -498,6 +498,7 @@ version = "0.1.0-dev"
 dependencies = [
  "clap",
  "ctrlc",
+ "sentinel-pipeline",
  "serde",
  "serde_json",
  "tempfile",
@@ -532,6 +533,7 @@ dependencies = [
  "postcard",
  "sentinel-protocol",
  "serde",
+ "serde_json",
  "tempfile",
  "yaml-rust2",
 ]

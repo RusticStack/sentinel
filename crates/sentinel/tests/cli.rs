@@ -44,6 +44,60 @@ fn missing_or_invalid_commands_are_usage_errors() {
     }
 }
 
+fn fixture(rel: &str) -> String {
+    format!(
+        "{}/../../fixtures/pipelines/{rel}",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+#[test]
+fn pipeline_validate_reports_path_and_exit_code() {
+    let ok = invoke(&["pipeline", "validate", &fixture("valid/full.yml")]);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(ok.stdout.is_empty(), "validate prints nothing on success");
+
+    let bad = invoke(&["pipeline", "validate", &fixture("invalid/cycle.yml")]);
+    assert_eq!(bad.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert!(err.contains("cycle.yml"), "{err}");
+    assert!(err.contains("dependency cycle through a -> b"), "{err}");
+    assert!(bad.stdout.is_empty());
+
+    let missing = invoke(&["pipeline", "validate", "does/not/exist.yml"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("cannot read"));
+}
+
+#[test]
+fn pipeline_explain_lists_requirements_and_unresolved_inputs() {
+    let text = invoke(&["pipeline", "explain", &fixture("valid/conditions.yml")]);
+    assert!(text.status.success());
+    let out = String::from_utf8_lossy(&text.stdout);
+    assert!(out.contains("job test"), "{out}");
+    assert!(out.contains("job report"), "{out}");
+    assert!(out.contains("needs: test"), "{out}");
+    assert!(out.contains("unpinned: resolved at first pull"), "{out}");
+    assert!(out.contains("resolved by worker"), "{out}");
+    assert!(out.contains("unresolved until runtime:"), "{out}");
+    assert!(out.contains("jobs.report.cache.deps.key"), "{out}");
+
+    let json = invoke(&["pipeline", "explain", "--json", &fixture("valid/full.yml")]);
+    assert!(json.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(v["schema"], "sentinel.explain/1");
+    assert_eq!(v["jobs"][0]["name"], "test");
+    assert_eq!(v["jobs"][1]["needs"][0], "test");
+    assert_eq!(v["jobs"][0]["caches"][0]["key_known"], false);
+    assert_eq!(v["requires"]["repository_read"], true);
+    assert_eq!(v["requires"]["artifacts"][0], "release");
+    assert!(v["digest"].as_str().unwrap().len() == 32);
+}
+
 #[test]
 fn unavailable_roles_fail_explicitly() {
     for (role, enabled) in [

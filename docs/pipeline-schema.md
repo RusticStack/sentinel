@@ -45,6 +45,7 @@ jobs:                           # 1–64, names [a-z0-9][a-z0-9_-]{0,63}
       - {name: cargo, key: "cargo-${{ hash_files('Cargo.lock') }}", paths: [/usr/local/cargo/registry, target]}
     artifacts:                  # ≤ 8, unique names
       - {name: release, paths: [target/release/app], when: success|failure|always, retain: 7d}
+    secrets: [DEPLOY_TOKEN]     # ≤ 16 names [A-Z_][A-Z0-9_]*; values never appear in YAML
 ```
 
 Unknown keys anywhere are rejected with their path, for example `jobs.test: unknown key `imgae``. Durations are `<int>s|m|h` sums such as `1h30m`. Sizes use binary units only, `MiB` or `GiB`. CPU is whole cores or a quoted decimal such as `"0.5"`, stored as millicores. Paths are normalised relative paths with no `..`, `//`, leading `./` or trailing `/`; cache paths may also be absolute inside the container but never `/`. `concurrency.group` and cache `key` are templates; job and step `if` are expressions (see below).
@@ -96,12 +97,22 @@ Templates render each interpolation as string, integer or boolean; `null` is an 
 
 `hash_files` is resolved by the worker against the checkout root with `hash_files(root, patterns)`: segments may contain `*` or be `**`; matches are deduplicated and sorted; symlinks are never followed; the result is the BLAKE3 hex of `path \0 length content` records, so it is identical on every host. Limits: 8 patterns, 10,000 files, 256 MiB. No match is an error, not an empty key, because a missing lockfile is a misconfiguration and a silent constant would make unrelated builds share a cache.
 
+## Bindings and offline validation (C07)
+
+Three kinds of binding connect a job to state outside its container, and each is declared by name so grants can be checked before anything runs:
+
+- **cache**: a name, a key template and container paths. The worker materialises the named cache scope for the rendered key; the key is unknown offline whenever it interpolates runtime context.
+- **artifacts**: named path sets published after the job under a `when` policy and a retention period; publication needs artifact storage.
+- **secrets**: names only. The worker injects each granted secret as an environment variable of that name; the file never carries a value, and a job that names a secret the repository has not been granted fails at dispatch, not silently with an empty variable.
+
+`sentinel pipeline validate <file>` runs the same loader, decoder and compiler as the server on any platform, prints nothing on success, and on failure prints `<file>: <stage>: <path>: <message>` and exits 1. `sentinel pipeline explain <file> [--json]` prints the compiled view: digest, triggers, concurrency, every job in execution order with its dependencies, image and pin status, condition, budgets, steps, caches, artifacts and secrets; a **requires** section (repository read, secret names to grant, cache scopes, artifact storage, registry access for unpinned images); and an **unresolved until runtime** list naming each expression with the phase that resolves it. Nothing unresolved is given a value: `hash_files` keys are shown as their template, secrets as names, and unpinned images as needing resolution at first pull. `--json` emits the `sentinel.explain/1` shape for tools and agents.
+
 ## Shell semantics
 
 `sh` runs `/bin/sh -e -c <script>` so the first failing command fails the step. `bash` runs `bash -e -o pipefail -c <script>` and requires an image that provides bash. Failure classes are identical for both: exit 0 passes; any other exit status is `command_failed`; death by signal is `command_signaled`; exceeding the step or job timeout is `execution_timeout`; a cgroup memory kill is `out_of_memory`. Output is captured for diagnostics and never interpreted for the verdict. Environment precedence is job `env`, then step `env` overriding by name, then the worker's own `SENTINEL_*` context variables appended last so a pipeline cannot spoof them. A step `workdir` is joined under the job `workdir`; both are validated relative paths so the join cannot escape the workspace. Steps of one job run sequentially in one container and workspace; jobs share nothing implicitly.
 
 ## Verification
 
-Eighteen unit tests cover the expression grammar (precedence, rejected constructs, phase gating, typing, templates), the `hash_files` resolver (globbing, ordering, sensitivity, cross-root stability), scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Five fixture tests compile the four valid fixtures, check each of the 29 invalid fixtures against its expected message, evaluate the conditions example across dispatch, schedule and worker phases, decode every field of the full example, and prove determinism on a diamond DAG under reordering. All pass on Windows and Linux.
+Twenty unit tests cover secret-name validation and the explanation model (requirements, unresolved inputs, no invented values), the expression grammar (precedence, rejected constructs, phase gating, typing, templates), the `hash_files` resolver (globbing, ordering, sensitivity, cross-root stability), scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Five fixture tests compile the four valid fixtures, check each of the 29 invalid fixtures against its expected message, evaluate the conditions example across dispatch, schedule and worker phases, decode every field of the full example, and prove determinism on a diamond DAG under reordering. All pass on Windows and Linux.
 
 Not in this schema version: named pipelines, schedules, manual inputs, matrices, service containers, extra checkouts (Part 16 and later parts). Files using them fail at `unknown key`.

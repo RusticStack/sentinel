@@ -4,6 +4,7 @@
 //! not implement.
 
 pub mod compile;
+pub mod explain;
 pub mod expr;
 pub mod hash_files;
 pub mod run;
@@ -13,6 +14,7 @@ pub mod yaml;
 use std::fmt;
 
 pub use compile::{CompileError, CompiledJob, CompiledPipeline};
+pub use explain::Explanation;
 pub use expr::{Context, Expr, Phase, Template, Value};
 pub use hash_files::hash_files;
 pub use run::{ImageRef, PinnedSource, RunSpec, StepCommand};

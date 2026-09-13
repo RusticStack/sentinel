@@ -54,7 +54,7 @@ cargo test-linux
 cargo release-linux
 ```
 
-`cargo bench-noop --help` runs the benchmark runner in release mode; see [Benchmarking](benchmarking.md). `cargo probe --help` runs the feasibility probes; see [feasibility probes](feasibility-probes.md).
+`cargo run -p sentinel -- pipeline validate <file>` and `pipeline explain <file> [--json]` check a `.sentinel.yml` offline on any platform (see [pipeline schema](pipeline-schema.md#bindings-and-offline-validation-c07)). `cargo bench-noop --help` runs the benchmark runner in release mode; see [Benchmarking](benchmarking.md). `cargo probe --help` runs the feasibility probes; see [feasibility probes](feasibility-probes.md).
 
 The role tests cover each feature independently and together, including unavailable-role errors in single-role builds. `test-cli` runs with default features, which currently exclude both roles. `--all-targets` in the lint aliases checks package tests/examples as well as the binary; it does not cross-compile for every operating system. Cross-target checks are documented in [Rust foundation](rust-foundation.md).
 
