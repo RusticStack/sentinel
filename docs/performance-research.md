@@ -76,6 +76,8 @@ Go's documented/tested [cache semantics][C2] distinguish build reuse from test-r
 
 ## 3. Real Lockwell timing evidence
 
+Superseded in breadth by the measured [CI baseline](ci-baseline.md) (25 runs, host topology, isolated versus concurrent probe). The single-run detail below remains valid.
+
 Source: [successful PR CI run 34757783544][L1], source SHA `0c87e0181c794fe2bbfeb15dc34e7b6aae375d8b`, inspected through GitHub run/jobs APIs. Run created `2026-09-13T12:41:34Z`, last job completed `12:50:11Z`, run updated `12:50:12Z`: about **8m38s**. This run is newer than the main-branch workflow inventory in the migration document. The runner names indicate org/VPS workers; physical topology, CPU quotas, disk behavior, and cache-hit state are not available in this metadata.
 
 | Observation | Elapsed | Implication / next measurement |
