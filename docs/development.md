@@ -29,7 +29,7 @@ podman info --debug
 podman unshare cat /proc/self/uid_map /proc/self/gid_map
 ```
 
-Record runtime/kernel/filesystem/cgroup details for F05/F07. No Podman version or host resource budget is qualified yet; those measurements are separate backlog tasks. Podman is a worker execution prerequisite, not a dependency for the controller lifecycle or portable CLI.
+The benchmark runner records runtime/kernel/filesystem/cgroup details automatically; see [Benchmarking](benchmarking.md) for the F05 baseline. No host resource budget is qualified yet. Podman is a worker execution prerequisite, not a dependency for the controller lifecycle or portable CLI.
 
 ## Daily checks
 
@@ -53,6 +53,8 @@ cargo test-worker
 cargo test-linux
 cargo release-linux
 ```
+
+`cargo bench-noop --help` runs the benchmark runner in release mode; see [Benchmarking](benchmarking.md).
 
 The role tests cover each feature independently and together, including unavailable-role errors in single-role builds. `test-cli` runs with default features, which currently exclude both roles. `--all-targets` in the lint aliases checks package tests/examples as well as the binary; it does not cross-compile for every operating system. Cross-target checks are documented in [Rust foundation](rust-foundation.md).
 
@@ -106,4 +108,4 @@ The repository ignores:
 
 Sentinel does not load dotenv files. Keep actual credentials in an OS credential store or protected files outside the checkout; `.local/` is ignored, not encrypted. Current TOML examples contain only paths. Commit sanitized examples and the lockfile, not generated state or tokens. Use `git status --short` and `git diff --cached --check` before committing; review the staged content as well.
 
-Command verification is recorded in [TODO.md](../TODO.md). See [runtime foundations](runtime-foundation.md) for F04's tracing, IDs, timing contract and bounded work lanes. Performance measurement and runtime isolation qualification remain F05–F07 and later work.
+Command verification is recorded in [TODO.md](../TODO.md). See [runtime foundations](runtime-foundation.md) for F04's tracing, IDs, timing contract and bounded work lanes. The no-op benchmark runner and its baseline are described in [Benchmarking](benchmarking.md); CI baseline capture and runtime isolation qualification remain F06–F07 and later work.

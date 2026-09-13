@@ -107,7 +107,7 @@ User-feedback measurements are overlapping views, not additive phases:
 | `first_failure` | Same trigger → first actionable failing diagnostic visible |
 | `acceptance` | Same trigger → declared long acceptance/audit lane complete |
 
-Each future benchmark record must identify observer/clock domain, source/tool/image revisions, resource allocation, warm state, sample count and relevant correlation IDs. Unmeasured fields are absent, not zero. Export numeric nanosecond durations with wall-clock provenance separately. Persisted UTC timestamps may support approximate cross-restart chronology but cannot reconstruct a precise monotonic interval after a restart. Do not sum overlapping jobs/phases into wall time, equate cache attachment with first-touch cost, or subtract clocks on different hosts. The F05 harness will implement machine-readable runs; no latency or RSS budget has been measured by F04.
+Each future benchmark record must identify observer/clock domain, source/tool/image revisions, resource allocation, warm state, sample count and relevant correlation IDs. Unmeasured fields are absent, not zero. Export numeric nanosecond durations with wall-clock provenance separately. Persisted UTC timestamps may support approximate cross-restart chronology but cannot reconstruct a precise monotonic interval after a restart. Do not sum overlapping jobs/phases into wall time, equate cache attachment with first-touch cost, or subtract clocks on different hosts. The [F05 benchmark runner](benchmarking.md) implements machine-readable runs and the no-op baseline; no Sentinel job latency or RSS budget is measured yet.
 
 ## Blocking I/O and CPU lanes
 

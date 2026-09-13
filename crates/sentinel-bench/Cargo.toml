@@ -1,0 +1,20 @@
+[package]
+name = "sentinel-bench"
+description = "Reproducible workload and machine-readable benchmark runner for Sentinel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap = { version = "4.5", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

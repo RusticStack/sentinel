@@ -15,3 +15,6 @@ release-linux = "build --locked --workspace --release --all-features"
 # Arguments appended by the caller are Sentinel arguments (the -- is included).
 dev-server = "run --locked --package sentinel --features server -- server"
 dev-worker = "run --locked --package sentinel --features worker -- worker"
+
+# Benchmark runner (release profile); append runner arguments directly.
+bench-noop = "run --locked --package sentinel-bench --release --"
