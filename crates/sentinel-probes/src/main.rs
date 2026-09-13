@@ -7,6 +7,8 @@ use std::{
     time::Instant,
 };
 
+mod redb_probe;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
@@ -21,6 +23,8 @@ struct Cli {
 enum Command {
     /// SQLite WAL commit and indexed dispatch latency with one writer
     Sqlite(SqliteArgs),
+    /// The same dispatch workload on redb (pure-Rust ACID B-tree)
+    Redb(redb_probe::RedbArgs),
     /// Generate a file tree fixture of many small files
     Generate(GenerateArgs),
     /// Clone a directory tree by reflink, explicit read/write copy, or std::fs::copy
@@ -87,7 +91,7 @@ enum CloneMode {
 }
 
 #[derive(Serialize)]
-struct Stats {
+pub struct Stats {
     count: usize,
     min_ns: u64,
     median_ns: u64,
@@ -97,7 +101,7 @@ struct Stats {
     total_ns: u64,
 }
 
-fn stats(mut v: Vec<u64>) -> Stats {
+pub fn stats(mut v: Vec<u64>) -> Stats {
     v.sort_unstable();
     let rank = |p: f64| v[((p * v.len() as f64).ceil() as usize).max(1) - 1];
     Stats {
@@ -111,7 +115,7 @@ fn stats(mut v: Vec<u64>) -> Stats {
     }
 }
 
-fn ns(start: Instant) -> u64 {
+pub fn ns(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
@@ -119,6 +123,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Sqlite(args) => sqlite(args),
+        Command::Redb(args) => redb_probe::run(args),
         Command::Generate(args) => generate(args),
         Command::Clone(args) => clone(args),
     };
