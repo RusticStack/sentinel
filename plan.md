@@ -3,6 +3,8 @@
 Status: design and acceptance criteria; implementation starts from scratch.
 Reviewed: 2026-09-13. Repository: `RusticStack/sentinel`.
 
+Development tracker: [TODO.md](TODO.md) splits this design into actionable parts, dependencies, first-slice work, and verification gates. Implementation progress is recorded there.
+
 ## 1. Product contract
 
 Build a fully open-source, self-hosted CI engine optimized for fast feedback on organization **and personal** GitHub repositories. GitHub remains the forge; Sentinel owns execution, scheduling, logs, caches, artifacts, and diagnostics. Borrow Woodpecker's independent-server/runner model and Blacksmith's emphasis on fast startup, local data, and observability.
