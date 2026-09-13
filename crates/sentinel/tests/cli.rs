@@ -124,6 +124,8 @@ mod linux {
             b"password = 'do-not-echo-this-secret'".to_vec(),
             b"data_dir = '/a'\ndata_dir = '/b'".to_vec(),
             b"data_dir = 42".to_vec(),
+            b"log_format = 'xml'".to_vec(),
+            b"log_level = 'verbose'".to_vec(),
             b"[".to_vec(),
             vec![0xff],
             vec![b' '; 65537],
@@ -188,6 +190,87 @@ mod linux {
         assert_eq!(fs::read_to_string(file).unwrap(), "existing data");
     }
 
+    #[test]
+    fn logging_options_use_typed_config_and_cli_precedence() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("config.toml");
+        fs::write(&file, "log_format = 'json'\nlog_level = 'warn'").unwrap();
+        for role in roles() {
+            let output = invoke(&[role, "--config", file.to_str().unwrap(), "--check"]);
+            assert!(output.status.success());
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(text.contains("log_format=Json"));
+            assert!(text.contains("log_level=Warn"));
+            let output = invoke(&[
+                role,
+                "--config",
+                file.to_str().unwrap(),
+                "--log-format",
+                "text",
+                "--log-level",
+                "debug",
+                "--check",
+            ]);
+            assert!(output.status.success());
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(text.contains("log_format=Text"));
+            assert!(text.contains("log_level=Debug"));
+            assert_eq!(
+                invoke(&[role, "--log-format", "xml", "--check"])
+                    .status
+                    .code(),
+                Some(2)
+            );
+            assert_eq!(
+                invoke(&[role, "--log-level", "verbose", "--check"])
+                    .status
+                    .code(),
+                Some(2)
+            );
+        }
+    }
+
+    #[test]
+    fn initialization_failure_has_json_error_and_failed_phase() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("dangling-directory");
+        std::os::unix::fs::symlink(temp.path().join("absent-target"), &data).unwrap();
+        for role in roles() {
+            let output = invoke(&[
+                role,
+                "--data-dir",
+                data.to_str().unwrap(),
+                "--log-format",
+                "json",
+            ]);
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            let records: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .map(|line| {
+                    serde_json::from_str(line)
+                        .expect("no plaintext fallback after logger initialization")
+                })
+                .collect();
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record["fields"]["event"] == "runtime_failed"
+                        && record["level"] == "ERROR")
+            );
+            let startup = records
+                .iter()
+                .find(|record| record["fields"]["phase"] == "startup")
+                .unwrap();
+            assert_eq!(startup["fields"]["outcome"], "failed");
+            assert!(
+                !records
+                    .iter()
+                    .any(|record| record["fields"]["event"] == "service_initialized")
+            );
+        }
+    }
+
     struct ChildGuard(Child);
     impl Drop for ChildGuard {
         fn drop(&mut self) {
@@ -200,11 +283,20 @@ mod linux {
     fn each_role_starts_and_shuts_down_cleanly_on_signals() {
         for role in roles() {
             for signal in ["-INT", "-TERM", "-HUP"] {
+                let format = if signal == "-INT" { "text" } else { "json" };
                 let temp = tempdir().unwrap();
                 let data_dir = temp.path().join("data");
                 let mut child = ChildGuard(
                     Command::new(env!("CARGO_BIN_EXE_sentinel"))
-                        .args([role, "--data-dir", data_dir.to_str().unwrap()])
+                        .args([
+                            role,
+                            "--data-dir",
+                            data_dir.to_str().unwrap(),
+                            "--log-format",
+                            format,
+                            "--log-level",
+                            "debug",
+                        ])
                         .stdout(Stdio::null())
                         .stderr(Stdio::piped())
                         .spawn()
@@ -219,13 +311,18 @@ mod linux {
                         }
                     }
                 });
-                let started = receiver
-                    .recv_timeout(Duration::from_secs(10))
-                    .expect("startup before deadline");
-                assert!(
-                    started.contains(&format!("{role} initialized")),
-                    "{started}"
-                );
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut lines = Vec::new();
+                loop {
+                    let line = receiver
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .expect("startup before deadline");
+                    let initialized = line.contains(&format!("{role} initialized"));
+                    lines.push(line);
+                    if initialized {
+                        break;
+                    }
+                }
                 assert!(data_dir.is_dir());
                 // Existing data must survive shutdown.
                 let marker = data_dir.join("keep");
@@ -247,10 +344,39 @@ mod linux {
                     thread::sleep(Duration::from_millis(10));
                 }
                 reader.join().unwrap();
-                let tail = receiver.try_iter().collect::<Vec<_>>().join("\n");
+                lines.extend(receiver.try_iter());
+                let tail = lines.join("\n");
                 assert!(tail.contains("shutdown requested"));
                 assert!(tail.contains(&format!("{role} stopped")));
                 assert_eq!(fs::read_to_string(marker).unwrap(), "retained");
+                if format == "json" {
+                    let records: Vec<serde_json::Value> = lines
+                        .iter()
+                        .map(|line| serde_json::from_str(line).expect("complete JSON event"))
+                        .collect();
+                    let process = records[0]["spans"][0]["process_id"].as_str().unwrap();
+                    process.parse::<sentinel::correlation::ProcessId>().unwrap();
+                    for record in &records {
+                        assert_eq!(record["spans"][0]["process_id"], process);
+                        assert_eq!(record["spans"][0]["schema_version"], 1);
+                        assert!(record["spans"][0].get("run_id").is_none());
+                        assert_eq!(record["spans"][1]["role"], role);
+                        assert!(record["timestamp"].is_string());
+                    }
+                    for phase in ["configuration", "startup", "shutdown"] {
+                        let event = records
+                            .iter()
+                            .find(|record| record["fields"]["phase"] == phase)
+                            .unwrap();
+                        assert!(event["fields"]["duration_ns"].is_u64());
+                        assert_eq!(event["fields"]["outcome"], "completed");
+                    }
+                    let initialized = records
+                        .iter()
+                        .find(|record| record["fields"]["event"] == "service_initialized")
+                        .unwrap();
+                    assert!(initialized["fields"]["service_startup_ns"].is_u64());
+                }
             }
         }
     }

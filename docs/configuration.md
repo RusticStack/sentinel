@@ -1,6 +1,6 @@
 # CLI and process configuration
 
-F02 implements the server and worker **process lifecycle**: command parsing, configuration validation, data-directory initialization, and clean signal-driven exit. Scheduling, API listeners, worker enrollment/connections, job execution, and durable writers arrive in later tasks. Startup explicitly reports this lifecycle-only status.
+F02 implements the server and worker **process lifecycle**: command parsing, configuration validation, data-directory initialization, and clean signal-driven exit. F04 adds structured diagnostics, monotonic timing and bounded execution lanes; see [runtime foundations](runtime-foundation.md). Scheduling, API listeners, worker enrollment/connections, job execution, and durable writers arrive in later tasks. Startup explicitly reports this lifecycle-only status.
 
 ## Build and inspect
 
@@ -27,16 +27,20 @@ Each role accepts:
 | `--config FILE` | Read this UTF-8 TOML file; relative file paths resolve from the working directory |
 | `--data-dir PATH` | Override the data directory; must be absolute |
 | `--check` | Validate and print the effective data directory, then exit without creating directories, installing signal handlers or starting the lifecycle |
+| `--log-format text\|json` | Internal diagnostic format; defaults to `text` |
+| `--log-level error\|warn\|info\|debug\|trace` | Diagnostic verbosity; defaults to `info` |
 
 Precedence is **built-in role defaults < explicit config file < command-line flags**. There is no implicit config discovery, environment-variable override, shell expansion, or dotenv loading. A supplied configuration file must be valid even when a flag overrides a setting.
 
-The complete F02 file schema is:
+The complete current file schema is:
 
 ```toml
 data_dir = "/srv/sentinel/controller"
+log_format = "text"
+log_level = "info"
 ```
 
-`data_dir` is optional in the file. Empty files use the role default:
+All three fields are optional in the file. Empty files use the logging defaults above and the role data path:
 
 - Server: `/var/lib/sentinel`
 - Worker: `/var/lib/sentinel-worker`
@@ -74,14 +78,14 @@ Alternatively use `--config examples/server.toml` or `--config examples/worker.t
 
 - Ctrl+C / `SIGINT`, service-manager `SIGTERM`, and `SIGHUP` request a clean exit. SIGHUP is **shutdown**, not configuration reload.
 - A handler is registered before directory initialization. A capacity-one notification channel retains a shutdown request during startup and coalesces repeated requests; the main thread blocks without polling while idle.
-- Startup and lifecycle messages go to stderr. Help, version and successful `--check` output go to stdout.
-- The main thread reports shutdown and returns success. There are currently no jobs, writers or sockets to drain. Future subsystems must add bounded cancellation/drain/flush before reporting stopped; F02 is not evidence of durable job shutdown.
+- Structured startup and lifecycle diagnostics go to stderr. Help, version and successful `--check` output go to stdout. Bootstrap CLI/configuration errors remain plaintext.
+- The main thread closes the bounded I/O/CPU lanes (one second per lane) and drains internal diagnostics (500 ms). Incomplete lane shutdown or diagnostic sink failure returns exit code 1. There are currently no jobs, durable writers or sockets to drain. Future subsystems must add bounded cancellation/drain/flush before reporting stopped; current lifecycle shutdown is not evidence of durable job shutdown.
 - Data directories and existing contents survive shutdown. Uncatchable termination such as SIGKILL cannot run cleanup.
 
 | Exit code | Meaning |
 |---|---|
 | `0` | Help/version/check succeeded, or requested lifecycle shutdown completed |
-| `1` | Runtime initialization or lifecycle failure |
+| `1` | Runtime initialization, bootstrap task deadline, lifecycle failure or incomplete diagnostic drain |
 | `2` | CLI usage error, unavailable role, or invalid/unreadable configuration |
 
 ## Verification

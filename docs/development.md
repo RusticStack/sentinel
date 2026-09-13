@@ -106,4 +106,4 @@ The repository ignores:
 
 Sentinel does not load dotenv files. Keep actual credentials in an OS credential store or protected files outside the checkout; `.local/` is ignored, not encrypted. Current TOML examples contain only paths. Commit sanitized examples and the lockfile, not generated state or tokens. Use `git status --short` and `git diff --cached --check` before committing; review the staged content as well.
 
-F03's command verification is recorded in [TODO.md](../TODO.md). Performance measurement, structured tracing, and runtime isolation qualification remain F04–F07 and later work.
+Command verification is recorded in [TODO.md](../TODO.md). See [runtime foundations](runtime-foundation.md) for F04's tracing, IDs, timing contract and bounded work lanes. Performance measurement and runtime isolation qualification remain F05–F07 and later work.

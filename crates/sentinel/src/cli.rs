@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use sentinel::{LogFormat, LogLevel};
 
 #[derive(Parser)]
 #[command(version, about, propagate_version = true)]
@@ -30,4 +31,12 @@ pub struct ServiceArgs {
     /// Validate configuration and print the resolved data path without starting
     #[arg(long)]
     pub check: bool,
+
+    /// Internal diagnostic format (text or JSON lines); overrides the config file
+    #[arg(long, value_enum)]
+    pub log_format: Option<LogFormat>,
+
+    /// Internal diagnostic verbosity; defaults to info
+    #[arg(long, value_enum)]
+    pub log_level: Option<LogLevel>,
 }

@@ -31,7 +31,9 @@ fn main() -> ExitCode {
             return match service::run(role, args) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
-                    eprintln!("error: {}", error.message);
+                    if !error.reported {
+                        eprintln!("error: {}", error.message);
+                    }
                     ExitCode::from(error.code)
                 }
             };

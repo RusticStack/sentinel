@@ -1,6 +1,6 @@
 # Rust workspace and platform contract
 
-Implemented for **F01**, updated for **F02**. The repository builds a `sentinel` executable with help/version, typed role configuration, and Linux process startup/shutdown. See [CLI and configuration](configuration.md). Job execution and GitHub integration are not implemented yet.
+Implemented for **F01**, updated through **F04**. The repository builds a `sentinel` executable with help/version, typed role configuration, Linux process startup/shutdown, and [tracing/timing/work-lane foundations](runtime-foundation.md). See [CLI and configuration](configuration.md). Job execution and GitHub integration are not implemented yet.
 
 ## Workspace
 
@@ -12,6 +12,7 @@ crates/sentinel/Cargo.toml     initial executable package and role features
 crates/sentinel/src/main.rs    platform guard and role dispatch
 crates/sentinel/src/cli.rs     portable command definitions
 crates/sentinel/src/service.rs Linux configuration and process lifecycle
+crates/sentinel/src/lib.rs     shared options and Linux foundation modules
 crates/sentinel/tests/cli.rs   executable-level contract tests
 ```
 
@@ -94,15 +95,16 @@ Also check `server` and `worker` individually on Linux, and verify each is rejec
 | Portable CLI | `clap` derive with std/help/usage/error-context; default features disabled | Parsing/help/version on all supported CLI targets; no server runtime dependencies |
 | Linux role configuration | Optional `serde` derive and `toml` with only std/parse/serde | Compiled only with server or worker on Linux; strict bounded file input |
 | Linux signal handling | Optional `ctrlc` with termination feature | SIGINT/SIGTERM/SIGHUP delivered to a bounded main-thread notification channel; no Tokio runtime needed for this lifecycle |
+| Linux diagnostics/IDs | Optional `tracing` (std only), `tracing-subscriber` (std/fmt/json/registry, defaults off), and `uuid` v4 | Structured events and explicit context propagation; bounded stderr queue; typed random correlation IDs. No network exporter or tracing environment filter |
 | Build dependencies / build scripts | None | No network/tool installers or opaque code generation during builds; add only for a concrete documented need |
-| Development dependencies | `tempfile` for isolated process-test data | Test-only, never a production runtime dependency |
+| Development dependencies | `tempfile` for isolated process-test data and `serde_json` for output assertions | Test-only direct dependencies; JSON serialization also enters Linux role builds transitively through the subscriber |
 | Development tooling | Pinned Cargo, rustfmt, Clippy | Toolchain components, not services installed in production |
 | OS/runtime prerequisites | Native linker/SDK for linking | Git and rootless Podman are future Linux worker runtime tools, not server/CLI dependencies |
 | UI toolchain | Not selected or installed | Future build-time tooling produces embedded static assets; no required Node/Deno server |
 | Networking, SQLite, TLS, crypto | Not added yet | Select maintained libraries at the implementing task; use bounded APIs and avoid unnecessary default features |
 | Optional Tailcat / S3 | No helper or SDK dependency yet | Add only with the implemented transport/storage feature; no mandatory external service |
 
-There is intentionally no empty `[workspace.dependencies]` catalog or speculative dependency stack. F01 used only the standard library; F02 adds the above libraries for implemented behavior. Exact versions, including proc-macro and platform transitive dependencies, are committed in `Cargo.lock`. Sentinel has no build script or direct build dependencies; maintained dependencies may use build scripts and proc macros. Inspect `cargo tree --locked --edges normal,build` with the selected target/features to distinguish the actual production tree from dev-only and inactive lockfile packages.
+There is intentionally no empty `[workspace.dependencies]` catalog or speculative dependency stack. F01 used only the standard library; later tasks add the above libraries for implemented behavior. Exact versions, including proc-macro and platform transitive dependencies, are committed in `Cargo.lock`. Sentinel has no build script or direct build dependencies; maintained dependencies may use build scripts and proc macros. Inspect `cargo tree --locked --edges normal,build` with the selected target/features to distinguish the actual production tree from dev-only and inactive lockfile packages. Work lanes and bounded queue plumbing use the standard library; no async runtime is introduced before a networking/control-loop requirement exists.
 
 ## Foundation verification
 
