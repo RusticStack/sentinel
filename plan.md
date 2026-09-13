@@ -10,7 +10,8 @@ Build a fully open-source, self-hosted CI engine optimized for fast feedback on 
 - Rust control plane, worker, storage modules, CLI, and MCP integration.
 - One host to start; multiple heterogeneous workers are a v1 requirement.
 - One deployment supports multiple organizations and personal namespaces, with authenticated users, deployment super admins, controlled registrations, and tenant-scoped resources from v1.
-- `RusticStack/lockwell` is the reference migration workload; full CI, acceptance, chaos, production, and release parity are release gates. See [Lockwell migration specification](docs/lockwell-migration.md).
+- `RusticStack/lockwell` is a representative performance/migration workload, not the architecture specification. Adapt its orchestration to Sentinel; requirements that fundamentally change Sentinel remain repository-side adaptations or unsupported lanes. Full Lockwell parity is not a Sentinel release gate. See [migration notes](docs/lockwell-migration.md).
+- Primary performance objective: take a representative warm PR workload from five minutes or more to **under one minute on the same hardware**, preserving the declared check contract. Optimize useful end-to-end feedback, not just queue latency. See [performance research and engineering strategy](docs/performance-research.md).
 - No Sentinel execution-minute pricing, license server, mandatory cloud account, or paid feature gates. Hardware, electricity, bandwidth, optional S3, and GitHub service limits still exist. Capacity and retention limits prevent unattended machines from filling up.
 - Near-immediate dispatch when an eligible worker has capacity; explicit explanations when it cannot start.
 - Human-readable web UI and bounded, structured, evidence-linked responses for coding agents.
@@ -48,9 +49,9 @@ Inspected `RusticStack/sentinel` at `ba6c583715c16fde498d646577c98bc60c221adb`: 
 
 ### Scope boundaries
 
-V1: Linux x86_64/arm64 server/workers; multiple org/personal GitHub App installations; authentication and super-admin registration controls; own YAML; named pipelines and job DAGs; schedules/typed inputs; trusted-code rootless containers plus isolated Docker-capable execution environments; local/remote workers; Tailcat; caches/artifacts; UI/CLI/MCP; backup/restore; quotas and operating limits. Lockwell requires multi-repository checkout, cleanup finalizers, image build/publish, and multi-architecture release support before its full cutover.
+V1: Linux x86_64/arm64 server/workers; multiple org/personal GitHub App installations; authentication and super-admin registrations; OAuth CLI/HTTP MCP; CLI-managed secrets; own YAML and job DAGs; trusted-code rootless containers; local/remote workers; Tailcat; first-class caches/artifacts; UI/CLI/MCP; backup/restore; quotas and operating limits. This is a purpose-built CI engine with specialized scheduling, storage, caching, and diagnostics, not a general automation platform. Different project toolchains run through images/commands without repository-specific scheduler rules.
 
-Later: hostile fork execution, bounded generic matrix expansion, declarative service-container syntax beyond the required isolated Compose environment, reusable pipelines, deployment environments/OIDC, Windows/macOS execution, multi-controller HA, and cloud autoscaling. Explicit amd64/arm64 release jobs do not require generic matrix expansion.
+Incremental general features: named pipelines, schedules/typed inputs, multi-repository checkout, outputs/finalizers, and conservative declared-input result reuse. Add only with a small general contract and measured value. Later/optional: hostile fork execution, microVM runtime, Docker/Compose compatibility environment, generic matrix expansion, declarative service containers, reusable pipelines, deployment environments/OIDC, Windows/macOS execution, multi-controller HA, and cloud autoscaling. Image builds and registry publishing can be repository commands on compatible authorized workers; no mandatory built-in release engine or VM fleet.
 
 No Actions YAML compatibility or marketplace/plugin runtime in v1. Inventory current workflows before migration; unsupported requirements block migration of that repository rather than being silently ignored. “Any machine” means supported Linux hardware or a suitable Linux VM; capabilities and performance depend on filesystem, kernel, architecture, and virtualization.
 
@@ -83,7 +84,7 @@ Logical modules/crates: `core`, `pipeline`, `protocol`, `scheduler`, `github`, `
 
 - Use maintained Rust libraries for async networking, TLS, serialization, hashing, compression, and embedded SQLite. Pin and justify dependencies.
 - Required worker tooling: Git and a rootless OCI runtime. **Podman first**; Docker only after runtime conformance tests. Do not implement containers, cryptography, TLS, or Git transport ourselves.
-- Lockwell's Compose/build/chaos lanes additionally require a tested Docker/Compose/BuildKit toolchain inside a job-owned VM or exclusively leased disposable worker environment. These are workload dependencies, not mandatory services on every Sentinel server. Provision a resettable VM pool for fast starts where virtualization is available; support dedicated machines through exclusive leases and verified cleanup.
+- Project tools (Go, Rust, Python, Java, Node, Bun, pnpm, Gradle, Bazel, compilers, browsers, builders) belong in project-selected versioned images/scripts. Cookbook profiles expose cache paths and diagnostics, not privileged plugins. Optional runtime capabilities must be justified across workloads; Lockwell's current Docker harness does not mandate VM lifecycle support in Sentinel.
 - No required Redis, Postgres, MinIO, Elasticsearch, Kubernetes, Deno, Node server, or message broker. UI tooling can be build-time only.
 - Build the application-specific storage layer ourselves; embed SQLite instead of inventing a database engine. Reconsider a custom engine only after profiling demonstrates a real bottleneck and a separate durability/recovery design exists.
 - Optional Tailcat helper/self-hosted DERP and optional S3 are explicit dependencies, not hidden cloud requirements.
@@ -160,7 +161,7 @@ Gate support on pinned-version tests: unattended restart, persistent identity, m
 
 `.sentinel.yml`, versioned strict schema, duplicate/unknown-key errors, bounded YAML size/depth/aliases, no custom tags, deterministic compiled DAG. **Proposed syntax** to finalize alongside schema in M1:
 
-The compact example is a single default pipeline. Before Lockwell migration the schema must also support named pipelines (`ci`, `acceptance`, `focus`, `chaos`, `production`, `release`) in this file, each with independent triggers, inputs, concurrency, and required/advisory status. Do not combine all six into one undifferentiated required check. Exact named-pipeline syntax is finalized with compiler/schema fixtures, not treated as implemented here.
+The compact example is a single default pipeline. Named pipelines can later express independent triggers/inputs/concurrency/required status without copying Actions. Finalize syntax with compiler fixtures; none of Lockwell's six workflow names is a built-in Sentinel concept. Unsupported lanes keep their existing executor until adapted.
 
 ```yaml
 schema: 1
@@ -220,7 +221,7 @@ Specify and test:
 ## 7. Execution and trust boundaries
 
 - Rootless Podman, user namespaces, seccomp, dropped capabilities, no-new-privileges, restricted mounts, and cgroup v2 from the first runnable milestone.
-- No shared worker-host Docker socket or YAML-granted privileged escape hatch. Lockwell build/Compose/fault lanes run in a job-owned VM or exclusively leased disposable worker, with its own Docker daemon, network, volumes, bounded resources, and operator-granted capabilities. The guest-local Docker socket can be available to that job. `NET_ADMIN`/fault injection/binfmt operations stay inside this isolated boundary. General rootless jobs cannot select it without a pool grant. Dedicated bare-metal leases offer operational exclusivity, not protection from hostile code; unrelated trust domains require VM isolation or separate hosts.
+- No shared host Docker socket or YAML-granted privileged escape hatch. Repositories adapt daemon/cluster tests to ordinary isolated job processes or a separately provisioned, scoped test environment reachable from the job. Docker API/Compose-specific or fault-injection lanes can wait for a general optional runtime; do not add VM orchestration just to retain an existing script verbatim. Any future powerful runtime needs operator-granted capabilities and separate trust boundaries.
 - Separate job networks from control endpoints, host services, cloud metadata, and credentials; enforce through runtime/firewall policy.
 - Checkout exact SHA with short-lived repo-scoped credentials in a worker checkout helper. Never leave tokens in URLs, job environment, Git config, or logs. Submodules/LFS need explicit support and credential scoping.
 - Optional worker-local Git mirrors with locked updates, object validation, repository/trust separation, and job workspaces unable to mutate shared objects/configuration.
@@ -268,7 +269,17 @@ Rust storage module and local worker data paths, not a mandatory storage service
 5. Concurrent writers produce distinct immutable generations; choose winners transactionally. Corrupt/incompatible/missing cache is a miss, not build failure.
 6. Scheduler prefers local copies. Cross-worker hydration uses portable manifests and checksummed compressed transfer; local snapshot mounts do not work across hosts by magic.
 7. Begin with simple versioned object transfer. Add chunk dedup only if measurements justify it. Filesystem send/receive can be an optional same-backend optimization, not the portable protocol.
-8. Report hit/miss/partial, bytes, backend, key dimensions, and miss reason. Evaluate compiler caches later; a lockfile alone does not capture all compiler inputs.
+8. Report hit/miss/partial, bytes, backend, key dimensions, and miss reason. Compiler-cache persistence is a first-class fast path; optional remote compiler protocols follow measured need. A lockfile alone does not capture all compiler inputs.
+
+### Performance-first cache contract
+
+Cache **toolchains, source objects, dependencies, compiler intermediates, extracted images, and task outputs** separately. Keep stable compiler-cache namespaces across source/lockfile edits where the tool validates entries; exact dependency materializations require complete compatibility keys. Restore prefixes never cross tenant/trust/toolchain boundaries. See [cache design](docs/performance-research.md#sentinel-cache-design).
+
+- Default job-private writable clones, source mirror leases, bounded prefetch, stampede suppression, and measured locality-aware placement. Snapshot mount time and first-touch cost are separate measurements.
+- Prefer local materialization over compress/upload/download/extract. Stop a slow optional remote restore when estimated rebuild is cheaper. Required artifacts are never optional cache misses.
+- Build-tool caches stay tool-owned; Sentinel need not understand every language's compiler. Expose generic paths, policies, metrics, and versioned evidence reports.
+- Reuse test/task outcomes only for explicitly opted-in deterministic declared-input tasks with sufficient isolation; default arbitrary shell/network/secret/time-sensitive tests always execute. Reuse is visible with producing run/input digest, never relabeled fresh execution. Lockwell's `-count=1` tests retain fresh execution until its check contract is explicitly changed.
+- Required pass publication waits for required results/artifacts and durable completion, not optional cache replication/GC. Local publication is atomic; background upload has bounded backlog and quota.
 
 ### External S3 option
 
@@ -284,7 +295,7 @@ On S3 outage retain bounded spool and expose degraded durability; enforce admiss
 - Redact before storage/index/transport/UI. Handle secrets split across reads, long lines, invalid UTF-8, ANSI, and binary output. Arbitrary transformations of secrets cannot be reliably redacted.
 - Segmented append logs with sparse step/time/line indexes; compress sealed segments and stream active ones. No per-line SQLite writes or whole-file reads to obtain tails.
 - Bounded memory queues and worker disk spool isolate execution from slow consumers. Resume by cursor. At output caps, keep draining pipes, emit explicit truncation/gap events, and mark completeness; no unbounded RAM or silent loss.
-- Initial diagnostic inputs: versioned Sentinel events, Go test JSON (package/test/subtest/panic/race), Rust compiler JSON, JUnit, and versioned Lockwell acceptance/production evidence. Bound parser size/time and treat all content as untrusted. Plain commands still expose exit/signal/OOM/timeout and selected excerpts. Keep test exit status authoritative; distinguish advisory failure, incomplete evidence, skipped scope, and full gate pass.
+- Initial diagnostic inputs: versioned Sentinel events, Go test JSON (package/test/subtest/panic/race), Rust compiler JSON, JUnit, and a generic report schema. Lockwell converts its evidence to that schema in repository scripts; no Lockwell parser in the core. Bound parser size/time and treat all content as untrusted. Plain commands still expose exit/signal/OOM/timeout and excerpts; distinguish advisory failure, incomplete evidence, skipped scope, reused result, and fresh full pass.
 
 ### Failure API contract
 
@@ -302,7 +313,11 @@ Shared versioned API/authorization, stable IDs, pagination, structured errors, r
 
 ```text
 sentinel auth login
+sentinel auth login --device
+sentinel auth status --json
 sentinel context use <tenant>
+sentinel secret set REGISTRY_TOKEN --repo owner/repo --stdin
+sentinel secret list --repo owner/repo --json
 sentinel status --repo owner/repo --sha <sha> --json
 sentinel runs list
 sentinel run <id>
@@ -324,9 +339,9 @@ sentinel doctor
 
 CLI: human default, JSON/NDJSON, documented exit codes distinguishing failed run/pending/transport error. Bounded event-driven `wait` avoids agent polling loops. `doctor` diagnoses runtime/filesystem/cgroups/connectivity/disk/GitHub without credentials. Linux/macOS/Windows CLI even though execution is Linux-first.
 
-MCP read tools: `list_runs`, `get_run`, `wait_run`, `get_failure`, `get_logs`, `explain_queue`, `get_pipeline`, `validate_pipeline`; schema/cookbook/expressions as resources. Mutations: `dispatch`, `rerun`, `cancel` with scopes, idempotency, audit, and accurate MCP tool annotations. A confirmation boolean is not authorization. No repo editing/Git push/secret administration tool.
+MCP read tools: `list_runs`, `get_run`, `wait_run`, `get_failure`, `get_logs`, `explain_queue`, `get_pipeline`, `validate_pipeline`; schema/cookbook/expressions as resources. Mutations: `dispatch`, `rerun`, `cancel` with scopes, idempotency, audit, and accurate MCP tool annotations. Secret creation/update is available to authorized agents through CLI secure input, with metadata-only MCP inspection; no need to put secret values into model tool arguments. See [OAuth and secrets contract](docs/auth-and-secrets.md).
 
-Stdio uses CLI credentials. Streamable HTTP uses supported MCP authorization and origin/session handling, verified against target clients. Both share bounded diagnostics and repository authorization.
+Stdio uses the CLI's locally provisioned credential source; it does not run an HTTP OAuth handshake over stdio. Streamable HTTP implements MCP OAuth discovery, authorization code + PKCE, resource/audience validation, and supported client registration. CLI uses browser OAuth + PKCE or device authorization for headless hosts. Sentinel issues scoped tokens after GitHub/local sign-in; GitHub tokens are not Sentinel API tokens. Both transports share the API authorization layer.
 
 ### New human UI
 
@@ -353,6 +368,7 @@ Serve lightweight build-time UI assets from Rust; choose stack after accessible 
 - GitHub identity is provider + immutable user ID. Do not auto-link accounts by email. Account linking requires authentication of both identities. Sign-in uses validated state/redirects and PKCE where supported; exact provider flow is verified at implementation.
 - Opaque server-side sessions, Secure/HttpOnly/SameSite cookies, rotation on login/role change, idle/absolute expiry, logout-all, CSRF protection, and immediate account suspension checks.
 - CLI/browser login issues scoped, expiring tokens using a browser handoff bound to the initiating client. MCP and service accounts cannot inherit ambient super-admin authority. Hash opaque token secrets at rest; allow listing metadata, revocation, and last-used audit.
+- Implement the complete [OAuth and secret management contract](docs/auth-and-secrets.md): public CLI client/PKCE, device grant, refresh rotation/revocation, MCP metadata/audience/client compatibility, OS credential storage, scoped CLI secret writes/rotation, and job-time injection. Interactive login is reusable for humans/agents; noninteractive agents use explicit bounded service grants.
 
 **Registration policy:** default `invite_only`; super admin may choose `closed` or `approval_required` per deployment. A successful GitHub login is authentication, not automatic admission. Pending accounts have no tenant data or worker access. Approvals/rejections, invitations, expiry, revocation, and suspensions are visible in the admin console/API and audited.
 
@@ -389,6 +405,8 @@ Acceptance tests: at least two orgs and a personal namespace on one deployment; 
 - GitHub outages can block intake/source fetch; explain that separately from worker capacity. Migrated execution/artifacts do not consume Actions usage, but GitHub limits and unrelated workflows still exist.
 
 ## 12. Performance targets and evidence
+
+Primary product target: **warm, representative PR required-check completion p95 < 60 seconds on the same hardware that previously took >=300 seconds**. This supersedes the earlier 25% improvement ambition. Specify exact checks, inputs, resources, freshness, and warm state before measuring. Measure first useful failure, required-check completion, and full audit/acceptance completion separately; a fast partial result does not mean all checks passed. [Research and real Lockwell timing evidence](docs/performance-research.md) define the optimization sequence and feasibility gates.
 
 Targets, **not measured results**. Reference: Linux modern 8-core host, 32 GiB RAM, NVMe, supported rootless runtime, controller/worker RTT <= 10 ms, warm image/source/cache, eligible idle capacity. Publish exact hardware/kernel/filesystem/runtime/revision.
 
@@ -441,7 +459,7 @@ Gate: real PR green/red; duplicate delivery creates no duplicate logical run; re
 
 - DAG, fairness/aging, per-repo concurrency, superseded cancel, labels/resources, drain/revoke, queue explanations, org/personal installations.
 - Direct/Tailcat sessions, owned relay documentation, fenced reconnect, bounded control/bulk paths.
-- Super-admin registration console, multiple org/personal tenant bindings, suspension/revocation, pool grants, fairness and cross-tenant tests. Named pipelines, schedules, typed inputs, multi-repo checkout, resource locks, and isolated Docker execution spike using Lockwell's real scripts.
+- Super-admin registration console, org/personal tenant bindings, suspension/revocation, pool grants/fairness and cross-tenant tests. Profile real CI workloads across toolchains, including adaptable Lockwell tests. Select incremental pipeline features by measured CI value; Docker/VM compatibility is not a gate.
 
 Gate: three workers load-balance bursts within allocations; eligible idle capacity is used promptly; stale completions cannot replace current state; relay/partition/restart tests pass.
 
@@ -449,13 +467,13 @@ Gate: three workers load-balance bursts within allocations; eligible idle capaci
 
 - Immutable caches/safe copy/optimized backend; artifacts and DAG handoff; segmented indexes; quotas/retention/GC/restore.
 - Portable remote hydration and optional S3 tested for interruption/corruption.
-- Lockwell-ready Docker/Compose/BuildKit environment, job finalizers/reaper, full-history checkout, non-secret outputs, artifact requirements, and build/runtime capability tests. Preserve fresh job state while warming tools and immutable layers.
+- Toolchain cache recipes for Go/Rust/Node/Python/Java and a custom-tool fixture; specialized image/source/compiler locality, invalidation, concurrent publication, remote-restore cost bounds, and required-result versus optional-cache finalization. No repository-specific executor.
 
 Gate: measured warm improvement; no concurrent cache corruption or lower-trust poisoning; disk-pressure/restore drills pass; log/artifact completeness is truthful.
 
 ### M4 — Agent and human experience
 
-- Bounded failure evidence, Go/Rust/JUnit and Lockwell report parsing, cursor search, JSON/wait CLI, MCP stdio/HTTP and docs.
+- Bounded Go/Rust/JUnit/generic report evidence, cursor search, JSON/wait CLI, OAuth CLI/MCP, authorized CLI secret management, and docs. Verify browser/device/refresh/revoke flows and secret handling without plaintext echo.
 - Accessible virtualized UI, worker/queue/cache pages, GitHub rerequest/stable required-check semantics.
 
 Gate: agent locates actual error in noisy 100 MiB fixture using bounded responses, retrieves evidence, and reruns without full dumps; human can find same error/queue reason; authorization/parser-limit tests pass.
@@ -463,7 +481,7 @@ Gate: agent locates actual error in noisy 100 MiB fixture using bounded response
 ### M5 — Pilot, benchmark, replace
 
 - Shadow representative repos while old CI remains authoritative; compare results, filters, secrets, artifacts, merge behavior, latency.
-- Complete [Lockwell's six-workflow migration](docs/lockwell-migration.md), including contract-test updates, full acceptance/production evidence, native amd64/arm64 publishing, registry credentials, readback, and GitHub release parity. No full Lockwell cutover while a lane remains unsupported.
+- Adapt representative [Lockwell lanes](docs/lockwell-migration.md) to Sentinel's execution/cache/report contracts and update their tests/docs. Other lanes migrate independently or stay external; full six-workflow parity is not a Sentinel release gate. Benchmark multiple toolchains and publish progress against the sub-minute target, including unmet bottlenecks.
 - Publish evidence/limitations; meet reference targets and scale/fault tests.
 - Change required checks repo by repo after parity; disable superseded Actions to stop duplicate execution. Preserve explicit rollback to old workflows/required checks.
 - Tag v0.1 with Linux packages/systemd/container examples, upgrade/backup/recovery docs, dependency/license inventory.
@@ -472,7 +490,7 @@ Gate: migrated repos run entirely under Sentinel; org/personal installs and remo
 
 ## 14. Decisions and open questions
 
-Adopted: Rust core; independent named pipelines; existing repo with preserved legacy; new UI; multi-org tenants/auth/super-admin registrations; Linux-first fleet with isolated Docker-capable environments for Lockwell; durable push scheduling; local-first caches; SQLite; owned file storage; optional S3; pinned Tailcat plus direct TLS; shared API; deterministic bounded diagnostics; MIT/no usage gate.
+Adopted: purpose-built performance-first Rust CI engine; strict pipelines; preserved legacy/new UI; multi-org auth/super-admin registrations; OAuth CLI/MCP and scoped secret management; Linux-first rootless fleet; durable push scheduling; first-class local/compiler/image caches; SQLite/owned file storage; optional S3; pinned Tailcat/direct TLS; shared API; bounded diagnostics; same-hardware sub-minute PR ambition; MIT/no usage gate. Supporting many project tools does not mean a generic automation framework. Repository adaptation must not dictate fundamental runtime changes.
 
 Resolve through hardware/workflow evidence:
 
@@ -492,6 +510,7 @@ Inspected 2026-09-13; pin versions and recheck exact behavior during implementat
 - [Legacy reviewed commit](https://github.com/RusticStack/sentinel/tree/ba6c583715c16fde498d646577c98bc60c221adb): README/tree/`lib/github.ts`/`lib/realtime.ts`/LICENSE through GitHub API.
 - [Lockwell migration evidence and source inventory](docs/lockwell-migration.md): six workflows, Makefile, CI guide, Go module, CI contract tests, acceptance/chaos scripts, and production Compose reviewed through GitHub API on 2026-09-13.
 - [Blacksmith](https://www.blacksmith.sh/): vendor emphasizes fast hardware, colocated caches, persistent NVMe layers, microVM startup, and observability. Vendor claims are not independent benchmarks.
+- [Detailed performance research](docs/performance-research.md): Blacksmith technical docs/blogs, Depot architecture/cache/boot engineering, Bazel/Go cache semantics, and actual Lockwell job timestamps. [Auth research](docs/auth-and-secrets.md): native-app OAuth, device grant, and versioned MCP authorization specification.
 - [Tailcat README/source](https://github.com/tailscale/tailcat): Go CLI/library, account-free NAT transport, owned DERP, keys/forwarding, explicit instability; read through GitHub API. Integration has not been tested yet.
 - [GitHub branch rename](https://docs.github.com/en/rest/branches/branches#rename-a-branch): consulted through Context7; appropriate permissions required and completion may be asynchronous.
 - Implementation verification references to recheck at corresponding milestones: [Checks](https://docs.github.com/en/rest/checks/runs), [webhooks](https://docs.github.com/en/webhooks/webhook-events-and-payloads), [SQLite WAL](https://www.sqlite.org/wal.html), [backup](https://www.sqlite.org/backup.html), [Woodpecker](https://woodpecker-ci.org/docs/intro), [MCP specification](https://modelcontextprotocol.io/specification/latest). This plan is not an implementation conformance report.

@@ -6,9 +6,9 @@ Repository: `RusticStack/lockwell` (the requested “lovkwell”). Reviewed main
 
 ## Objective
 
-Run all existing CI/test scopes under Sentinel, preserving their assertions and evidence requirements while reducing waiting, setup/downloads, repeated compilation, and avoidable serialization. Port orchestration and provider-specific contract tests; keep Go tests, shell harnesses, SDK conformance, and production/acceptance validators as repository-owned tests. Sentinel remains a general Rust CI engine, not a reimplementation of Lockwell's tests.
+Adapt Lockwell CI to Sentinel's purpose-built performance model, preserving the assertions/evidence of each migrated lane while reducing waiting, repeated work, and contention. Port orchestration and provider-specific contract tests; keep Go tests, SDK conformance, and acceptance validators repository-owned. Supporting Lockwell does not justify fundamentally changing Sentinel or reproducing every Actions feature.
 
-Lockwell is the first demanding compatibility workload. Docker/Compose, scheduled runs, multiple SDK repositories, and release publishing are migration requirements, not indefinite “later” features.
+**Scope correction:** the earlier demand for all six workflows, VM pools, Docker/Compose compatibility, and publishing as Sentinel v1 release gates is withdrawn. Lockwell is a demanding measurement/adaptation case. Adapt tests to existing Sentinel execution primitives; lanes needing unsupported capabilities may stay external. Complete replacement remains a repository migration goal, not a requirement to reshape the engine. The inventory below records current workload needs and possible translations, not committed core features.
 
 ## Observed workflow inventory
 
@@ -62,7 +62,7 @@ Lockwell is the first demanding compatibility workload. Docker/Compose, schedule
 | Buildx/login/metadata/build-push actions | Repository scripts invoking pinned build/registry tooling inside isolated environment |
 | GitHub error annotations | Structured diagnostics and Checks annotations with source/evidence references |
 
-Create `.sentinel.yml` with six named pipelines and small `scripts/ci/` entry points as useful. Avoid inventing a general Actions compatibility shim. Replace `LOCKWELL_GITHUB_ACTIONS_CHAOS` and provider-specific execution-scope detection with an explicit Sentinel execution contract in the harness; merely spoofing GitHub environment variables is not provenance or authorization.
+Create `.sentinel.yml` for supported lanes and small repository `scripts/ci/` entry points. Split/merge old workflow boundaries according to real dependencies and feedback needs; six named pipelines are one possible future layout, not required syntax. Replace `LOCKWELL_GITHUB_ACTIONS_CHAOS` and provider-specific execution-scope detection with accurate execution provenance in repository scripts; merely spoofing GitHub variables is not authorization. Keep unsupported integrations external rather than building an Actions shim or Lockwell-specific executor.
 
 Port `docs/runner_ci_contract_test.go` and related toolchain/release/automation/production contract tests alongside CI docs. Many currently assert exact Actions filenames, routing expressions, setup steps, and environment markers. New tests should validate Sentinel's compiled plan/declared invariant plus harness behavior, retaining coverage, isolation, toolchain, evidence, and cleanup assertions. Do not delete those assertions to obtain green tests. Search the whole repository for provider-specific assumptions during implementation, including `CI.md`, `RELEASE.md`, and scripts.
 
@@ -70,11 +70,11 @@ Port `docs/runner_ci_contract_test.go` and related toolchain/release/automation/
 
 1. **General Go/docs:** rootless job containers, warm Go/npm caches, hard resource budgets.
 2. **Integration:** reserved CPU/memory and process isolation; budget Go `-p`, `-parallel`, and `GOMAXPROCS` to assigned cores. Preserve all packages/cases.
-3. **Docker/acceptance:** job-owned resettable Linux VM, or exclusively leased disposable trusted worker, with Docker/Compose/BuildKit. Guest-local daemon only. Reserve capacity for all three cluster nodes, clients, Go/Java harnesses, volumes, and logs—not just the test driver. The observed chaos template caps each node at 2 CPUs/2 GiB; measure total peak before assigning pool size.
+3. **Cluster/acceptance:** first evaluate running the real daemons as isolated job processes or using an explicitly provisioned test target through repository scripts. Reserve resources for nodes/clients/harnesses, not only the driver. Exact Docker/Compose semantics remain an optional compatibility lane; a VM environment may be provisioned externally, but Sentinel does not acquire a VM manager for this repo. The observed chaos template caps each node at 2 CPUs/2 GiB; measure total peak. Fault scenarios that need unavailable isolation/capabilities remain unmigrated, not silently simplified.
 4. **Production-large:** separate capacity/queue profile and measured disk reservation for simultaneous copies, multipart data, container layers, logs, and cleanup headroom. A 15 GiB test needs more than 15 GiB free. Never replace streaming/durability disk tests with tmpfs to win benchmarks.
-5. **Release:** native amd64 and arm64 build workers, scoped registry access, separate publication permission. If native capacity is unavailable, provision a tested QEMU environment inside the job isolation boundary; never silently omit an architecture.
+5. **Release:** repository commands on authorized compatible amd64/arm64 workers, scoped registry access, separate publication permission. Native capacity/emulation is an explicit environment requirement for that lane; Sentinel need not implement a release service or provision QEMU. Keep the lane external if required capabilities are unavailable.
 
-The shared-host workflows use fixed port blocks 9100/9200/9300 and 19000+; acceptance/focus share a serialized block around 19010–19042. Job-owned network namespaces/VMs permit concurrent reuse. Until that is validated, explicit resource locks cover fixed-port environments. Although the chaos workflow comments say host publishing is disabled, the inspected script still publishes an owned webhook-receiver loopback port: inventory generated Compose, not comments alone.
+The shared-host workflows use fixed port blocks 9100/9200/9300 and 19000+; acceptance/focus share a serialized block around 19010–19042. Adapt scripts to job-private networking and allocated endpoints where equivalent, rather than preserve global port constraints in the core. Explicit resource leases remain necessary for genuinely shared external targets. Although chaos comments say host publishing is disabled, the inspected script still publishes a webhook-receiver loopback port: inventory generated Compose, not comments alone.
 
 Every stack/container/network/volume/temp directory has run/attempt ownership. Finalizers collect evidence and remove only owned resources; a worker reaper handles cancel/crash cases. No fleet-wide `docker prune`. `keep_stack` becomes an explicitly permitted expiring debug lease within the same tenant/isolated environment, charged to reserved capacity, with eventual forced teardown and no full-gate claim until required cleanup receipts exist.
 
@@ -83,7 +83,7 @@ Prewarming retains immutable tool/image layers, not previous test databases, clu
 ## Evidence and AI experience
 
 - Parse Go JSON into package/test/subtest results, race/panic snippets, duration, and source links. Capture logs without changing the command's exit status (including pipefail when teeing).
-- Ingest existing acceptance and production JSON/JSONL as versioned reports. Index scenario, SDK language, invariant, source SHA, dependency SHAs, environment, scope, and cleanup status.
+- Repository adapters translate acceptance/production JSON/JSONL into Sentinel's report schema. Index scenario, SDK language, invariant, source SHA, dependency SHAs, environment, scope, and cleanup status. No Lockwell-specific report parser in the core.
 - Failure view points to the failed row and nearby evidence, not thousands of passing Go tests. Attach log cursors, artifact paths/digests, and provenance.
 - Suggested focused rerun includes failing scenario prerequisites. Scenarios such as backup/restore depend on prior topology changes; do not indiscriminately parallelize or execute them out of order.
 - Acceptance's generated signing seed, TLS/private cluster config, and credentials are job-local secret material. Upload only intended redacted evidence; never recursively publish a private config tree. Preserve source-bound attestation validation and explicit missing-artifact failures.
@@ -110,16 +110,16 @@ Optimization order:
 5. Prebuild pinned sidecar dependency images: current production clients install boto3/JS dependencies at startup and some use `latest`. Record/pin versions through a reviewed Lockwell change, so speed does not hide changed client coverage.
 6. Prefer locality over transferring huge test data; generate run-owned datasets on target disk. Index small reports instead of sending full logs to agents.
 
-Provisional acceptance targets: meet Sentinel warm dispatch/start SLOs for container lanes; publish a separate VM/cluster-ready distribution and prewarm hit rate. Aim for >=25% reduction in same-hardware warm PR critical-path p95 against healthy current CI, with no required lane p95 regression >10% beyond measured noise. This is a target to benchmark, not an observed speedup. Report full production/chaos times and I/O separately; mandatory waits, fuzz duration, and 10/15 GiB processing remain real work.
+Primary ambition is now **under one minute for representative warm PR required feedback on the same hardware previously taking five minutes or more**, not the earlier 25% reduction goal. See [performance research](performance-research.md) for observed 8m38s run timings, cache strategy, a 55-second budget, and experiments needed to make this credible. Keep required-check scope explicit; no dropped assertions or silently cached `-count=1` tests. Report long production/chaos scopes separately without presenting them as completed under a minute. VM/cluster readiness is measured only when such an external/optional environment is actually used.
 
 Cutover checklist:
 
 - Per-workflow parity matrix lists all jobs/triggers/inputs/checks/permissions/artifacts/exit policies and converted command contracts.
-- Full required CI + candidate-head acceptance, scheduled lane, deterministic/transport/full chaos, production including huge scenarios, focused diagnostics, and dry-run release graph exercised on Sentinel.
+- Each migrated lane exercises its full declared checks and evidence under Sentinel. Inventory unsupported lanes explicitly; they keep their existing required checks/executor. Sentinel release does not wait for all of Lockwell's production, chaos, and publishing features.
 - Perform registry/release parity in a designated test namespace before any real publish; real release authorization remains the existing repository policy.
 - Verify cancel/restart cleanup, parallel port safety, missing SDK/artifact failure, tenant isolation, and bounded AI diagnostics on real failure fixtures.
 - Shadow old/new CI with distinct check names, same inputs, separate data/ports, and sufficient capacity to avoid contaminating timings. Publish results before changing required checks.
-- Update Lockwell contract tests/docs and native pipelines together; switch required checks by lane after parity, then disable corresponding Actions triggers. Full migration means all six workflows are supported, with rollback documented.
+- Update Lockwell contract tests/docs and native pipelines together; switch required checks per adapted lane after parity, then disable corresponding Actions triggers. Full repository migration eventually accounts for every old scope through equivalent Sentinel methods or explicitly reviewed scope changes; no silent coverage loss and no obligation to retain the old six-workflow structure.
 
 ## Reviewed sources
 
