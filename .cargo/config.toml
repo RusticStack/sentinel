@@ -1,0 +1,17 @@
+# Run from the repository root. No host-specific target, linker, or credentials.
+[alias]
+fmt-check = "fmt --all -- --check"
+lint = "clippy --locked --workspace --all-targets -- -D warnings"
+test-cli = "test --locked --workspace"
+release-cli = "build --locked --workspace --release"
+
+# Linux-only role commands; portable checks above intentionally omit role features.
+lint-linux = "clippy --locked --workspace --all-targets --all-features -- -D warnings"
+test-server = "test --locked --workspace --features server"
+test-worker = "test --locked --workspace --features worker"
+test-linux = "test --locked --workspace --all-features"
+release-linux = "build --locked --workspace --release --all-features"
+
+# Arguments appended by the caller are Sentinel arguments (the -- is included).
+dev-server = "run --locked --package sentinel --features server -- server"
+dev-worker = "run --locked --package sentinel --features worker -- worker"

@@ -4,6 +4,9 @@
 /.env.*
 !/.env.example
 /data/
+/.local/
+/.cargo/credentials
+/.cargo/credentials.toml
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

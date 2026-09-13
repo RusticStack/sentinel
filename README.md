@@ -10,6 +10,8 @@ See [Rust foundation](docs/rust-foundation.md) for the pinned toolchain, build c
 
 See [CLI and configuration](docs/configuration.md) to validate configuration, start the separate Linux processes, and shut them down.
 
+For contributor prerequisites, daily check/build commands, and a local two-process setup, see [Development](docs/development.md).
+
 The new implementation will use a Rust core and its own pipeline format. GitHub will remain the forge, with results published through Checks. The default deployment will use embedded SQLite and Sentinel-owned local storage, with optional external S3 and Tailcat-connected workers.
 
 One deployment will support multiple organizations and personal namespaces, super-admin registration controls, OAuth-authenticated CLI/MCP, CLI-managed secrets, and tenant-scoped workers/data. [Lockwell](docs/lockwell-migration.md) is a representative workload whose CI adapts to Sentinel; it does not dictate the engine's architecture.

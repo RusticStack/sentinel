@@ -4,6 +4,8 @@ F02 implements the server and worker **process lifecycle**: command parsing, con
 
 ## Build and inspect
 
+For shared Cargo shortcuts and contributor prerequisites, see [Development](development.md).
+
 ```sh
 cargo build --locked --release --features server,worker
 ./target/release/sentinel --version
