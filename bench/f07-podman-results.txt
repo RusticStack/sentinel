@@ -1,0 +1,14 @@
+podman: podman version 4.9.3 user=sentinelbench uid=1000 kernel=6.18.33.2-microsoft-standard-WSL2
+controllers: [cpu memory pids] manager=systemd runtime=runc
+PASS cpu_quota: usage_usec=5076246 nr_throttled=49 cpu.max='100000 100000' (4 spinners x 5 s capped near 5 CPU-s)
+PASS memory_limit: rc=0 67108864 0 low 0 high 0 max 20 oom 1 oom_kill 1 oom_group_kill 0 
+PASS pids_limit: forked=30 32 
+PASS network_none: 1 wget: can't connect to remote host (1.1.1.1): Network is unreachable EGRESS_BLOCKED 
+PASS read_only_rootfs: touch: /etc/x: Read-only file system WORK_OK 
+PASS caps_dropped: 0 0 1000 1 1 100000 65536 CapEff: 0000000000000000 
+host view of a container process uid (rootless mapping):
+ 0 1000 1
+ 1 100000 65536
+time="2026-09-13T22:19:43+01:00" level=warning msg="StopSignal SIGTERM failed to stop container competent_heyrovsky in 1 seconds, resorting to SIGKILL"
+PASS stop_timeout: podman stop -t 1 wall_ms=1237
+   bind mount: 0:0 WRITE_OK  host_owner=1000:1000

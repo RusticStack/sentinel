@@ -19,6 +19,7 @@ Run from the repository root; aliases live in `.cargo/config.toml`.
 | Portable checks (all OSes) | `cargo fmt-check`, `cargo lint`, `cargo test-cli`, `cargo release-cli` |
 | Linux role checks | `cargo lint-linux`, `cargo test-server`, `cargo test-worker`, `cargo test-linux`, `cargo release-linux` |
 | Benchmark runner | `cargo bench-noop --runtime direct --warm-state warm` |
+| Feasibility probes | `cargo probe sqlite --path /tmp/d.sqlite` |
 
 All aliases pass `--locked`; a dependency change must update and commit `Cargo.lock` (use `cargo update --workspace --offline` for new members). Apply formatting with `cargo fmt --all`.
 
@@ -30,6 +31,7 @@ On Windows, run the Linux checks inside WSL2 with `export CARGO_TARGET_DIR=targe
 |---|---|
 | `crates/sentinel` | CLI plus Linux `server`/`worker` roles behind features |
 | `crates/sentinel-bench` | Benchmark runner; see [docs/benchmarking.md](docs/benchmarking.md) |
+| `crates/sentinel-probes` | SQLite/clone probes; see [docs/feasibility-probes.md](docs/feasibility-probes.md) |
 | `bench/` | Committed machine-readable benchmark records |
 | `docs/` | Contracts and guides: [development](docs/development.md), [configuration](docs/configuration.md), [runtime foundations](docs/runtime-foundation.md) |
 | `examples/` | Sanitized configuration files |

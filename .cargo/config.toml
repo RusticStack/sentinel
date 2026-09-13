@@ -18,3 +18,6 @@ dev-worker = "run --locked --package sentinel --features worker -- worker"
 
 # Benchmark runner (release profile); append runner arguments directly.
 bench-noop = "run --locked --package sentinel-bench --release --"
+
+# Feasibility probes (release profile); append probe subcommand and arguments.
+probe = "run --locked --package sentinel-probes --release --"
