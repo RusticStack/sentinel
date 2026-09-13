@@ -1,6 +1,6 @@
 # Rust workspace and platform contract
 
-Implemented for **F01**. The repository now builds a minimal `sentinel` executable. Command handling, the server and worker runtime, configuration, and shutdown behavior begin in F02; this foundation does not execute jobs or contact GitHub.
+Implemented for **F01**, updated for **F02**. The repository builds a `sentinel` executable with help/version, typed role configuration, and Linux process startup/shutdown. See [CLI and configuration](configuration.md). Job execution and GitHub integration are not implemented yet.
 
 ## Workspace
 
@@ -9,10 +9,13 @@ Cargo.toml                    workspace, shared package metadata and lint policy
 Cargo.lock                    committed dependency resolution
 rust-toolchain.toml           exact compiler/tooling pin
 crates/sentinel/Cargo.toml     initial executable package and role features
-crates/sentinel/src/main.rs    platform guard and foundation executable
+crates/sentinel/src/main.rs    platform guard and role dispatch
+crates/sentinel/src/cli.rs     portable command definitions
+crates/sentinel/src/service.rs Linux configuration and process lifecycle
+crates/sentinel/tests/cli.rs   executable-level contract tests
 ```
 
-One package is sufficient for the foundation. Introduce library modules/crates when implemented boundaries justify them; avoid empty server/store/scheduler crates. The one executable can eventually include server and worker subcommands on Linux, while each role still runs as a separate process.
+One package is sufficient for the foundation. Introduce library modules/crates when implemented boundaries justify them; avoid empty server/store/scheduler crates. The executable includes feature-gated server and worker lifecycles on Linux, with each role running as a separate process.
 
 The package is `0.1.0-dev`, MIT, and not published to crates.io. This version identifies development code, not a released CI engine.
 
@@ -27,7 +30,7 @@ The package is `0.1.0-dev`, MIT, and not published to crates.io. This version id
 
 ## Platform and feature matrix
 
-Features select which **roles can be compiled**, not user authorization or paid capabilities. They currently establish platform boundaries; role commands are not implemented yet.
+Features select which **roles can be compiled**, not user authorization or paid capabilities. They enable Linux lifecycle commands and their configuration/signal dependencies.
 
 | Target triple | Build contract | Features |
 |---|---|---|
@@ -57,7 +60,7 @@ On Linux, compile the complete role distribution:
 cargo build --locked --release --features server,worker
 ```
 
-For F01, running the executable writes a development-status message to stderr and returns failure (exit code 1). It deliberately does not pretend an unimplemented command succeeded. F02 replaces this foundation behavior with actual command entry points.
+Run `sentinel --help` or `sentinel --version` to inspect the build. F02 replaced F01's status-only executable with command entry points; see [configuration](configuration.md) for startup and exit semantics.
 
 ### Target checks
 
@@ -86,22 +89,24 @@ Also check `server` and `worker` individually on Linux, and verify each is rejec
 
 ## Library and dependency boundaries
 
-| Category | F01 choice | Boundary for subsequent work |
+| Category | Current choice | Boundary for subsequent work |
 |---|---|---|
-| Production Rust dependencies | Standard library only; zero external crates | Add maintained libraries when actual behavior needs them; record purpose, feature selection and role/platform reach |
+| Portable CLI | `clap` derive with std/help/usage/error-context; default features disabled | Parsing/help/version on all supported CLI targets; no server runtime dependencies |
+| Linux role configuration | Optional `serde` derive and `toml` with only std/parse/serde | Compiled only with server or worker on Linux; strict bounded file input |
+| Linux signal handling | Optional `ctrlc` with termination feature | SIGINT/SIGTERM/SIGHUP delivered to a bounded main-thread notification channel; no Tokio runtime needed for this lifecycle |
 | Build dependencies / build scripts | None | No network/tool installers or opaque code generation during builds; add only for a concrete documented need |
-| Development dependencies | None | Prefer meaningful standard test facilities initially; introduce helpers for actual behavioral tests |
+| Development dependencies | `tempfile` for isolated process-test data | Test-only, never a production runtime dependency |
 | Development tooling | Pinned Cargo, rustfmt, Clippy | Toolchain components, not services installed in production |
 | OS/runtime prerequisites | Native linker/SDK for linking | Git and rootless Podman are future Linux worker runtime tools, not server/CLI dependencies |
 | UI toolchain | Not selected or installed | Future build-time tooling produces embedded static assets; no required Node/Deno server |
-| Networking, CLI parsing, serialization, SQLite, TLS, crypto | Not added to an empty binary | Select maintained libraries at the implementing task; use bounded APIs and avoid unnecessary default features |
+| Networking, SQLite, TLS, crypto | Not added yet | Select maintained libraries at the implementing task; use bounded APIs and avoid unnecessary default features |
 | Optional Tailcat / S3 | No helper or SDK dependency yet | Add only with the implemented transport/storage feature; no mandatory external service |
 
-There is intentionally no empty `[workspace.dependencies]` catalog or speculative dependency stack. F01's lockfile contains only Sentinel. Future dependency reviews should inspect normal/build/dev and feature-specific trees so platform tooling does not leak into portable CLI builds.
+There is intentionally no empty `[workspace.dependencies]` catalog or speculative dependency stack. F01 used only the standard library; F02 adds the above libraries for implemented behavior. Exact versions, including proc-macro and platform transitive dependencies, are committed in `Cargo.lock`. Sentinel has no build script or direct build dependencies; maintained dependencies may use build scripts and proc macros. Inspect `cargo tree --locked --edges normal,build` with the selected target/features to distinguish the actual production tree from dev-only and inactive lockfile packages.
 
 ## Foundation verification
 
-The F01 completion record in [TODO.md](../TODO.md) records executed checks and platform limits. Relevant checks are:
+The F01/F02 completion records in [TODO.md](../TODO.md) record executed checks and platform limits. Relevant portable checks are:
 
 ```sh
 cargo fmt --all -- --check
@@ -112,6 +117,6 @@ cargo metadata --locked --no-deps --format-version 1
 cargo tree --locked
 ```
 
-There are no behavioral tests to invent for this status-only entry point; F02 and later tasks introduce command/runtime behavior and corresponding tests. For F01, validate workspace metadata, target/feature compilation, non-Linux rejection and the native executable's status/exit behavior directly.
+F02 adds meaningful command/configuration and real Linux signal-lifecycle integration tests. Run the feature-specific Linux commands in [configuration](configuration.md) in addition to portable checks; non-Linux builds cannot enable role features.
 
 Cargo reference used for workspace inheritance, resolver and lint configuration: [Cargo workspaces](https://doc.rust-lang.org/cargo/reference/workspaces.html) and [feature resolver](https://doc.rust-lang.org/cargo/reference/resolver.html). Verification is against the pinned toolchain, not documentation assumptions alone.
