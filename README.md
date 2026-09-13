@@ -16,6 +16,8 @@ See [Core contracts](docs/core-contracts.md) for typed identifiers, the fenced j
 
 See [Storage](docs/storage.md) for the SQLite metadata store, the engine decision, and the durable single-writer acknowledgement policy.
 
+See [Protocol contracts](docs/protocol.md) for structured errors, idempotency, event cursors, size limits and worker capability negotiation.
+
 See [Runtime foundations](docs/runtime-foundation.md) for structured diagnostics, correlation IDs, monotonic phase timing, and bounded I/O/CPU execution lanes.
 
 See [Benchmarking](docs/benchmarking.md) for the machine-readable benchmark runner and the no-op rootless-runtime baseline, [CI baseline](docs/ci-baseline.md) for the measured Lockwell CI topology and timings Sentinel must beat, and [feasibility probes](docs/feasibility-probes.md) for the SQLite, Podman, reflink and Tailcat decisions.

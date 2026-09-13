@@ -455,6 +455,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-protocol"
+version = "0.1.0-dev"
+dependencies = [
+ "sentinel-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sentinel-store"
 version = "0.1.0-dev"
 dependencies = [

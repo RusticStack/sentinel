@@ -33,6 +33,7 @@ On Windows, run the Linux checks inside WSL2 with `export CARGO_TARGET_DIR=targe
 |---|---|
 | `crates/sentinel-core` | Pure contracts: IDs, state machine, failure classes; see [docs/core-contracts.md](docs/core-contracts.md) |
 | `crates/sentinel-store` | SQLite metadata store, single durable writer; see [docs/storage.md](docs/storage.md) |
+| `crates/sentinel-protocol` | Errors, idempotency, cursors, limits, negotiation; see [docs/protocol.md](docs/protocol.md) |
 | `crates/sentinel` | CLI plus Linux `server`/`worker` roles behind features |
 | `crates/sentinel-bench` | Benchmark runner; see [docs/benchmarking.md](docs/benchmarking.md) |
 | `crates/sentinel-probes` | SQLite/clone probes; see [docs/feasibility-probes.md](docs/feasibility-probes.md) |
