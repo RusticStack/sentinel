@@ -1,0 +1,8 @@
+# expect: duplicate key `image`
+schema: 1
+on: [push]
+jobs:
+  a:
+    image: busybox
+    image: alpine
+    steps: [{id: s, run: x}]

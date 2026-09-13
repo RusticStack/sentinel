@@ -34,10 +34,12 @@ On Windows, run the Linux checks inside WSL2 with `export CARGO_TARGET_DIR=targe
 | `crates/sentinel-core` | Pure contracts: IDs, state machine, failure classes; see [docs/core-contracts.md](docs/core-contracts.md) |
 | `crates/sentinel-store` | SQLite metadata store, single durable writer; see [docs/storage.md](docs/storage.md) |
 | `crates/sentinel-protocol` | Errors, idempotency, cursors, limits, negotiation; see [docs/protocol.md](docs/protocol.md) |
+| `crates/sentinel-pipeline` | `.sentinel.yml` loader, schema and compiler; see [docs/pipeline-schema.md](docs/pipeline-schema.md) |
 | `crates/sentinel` | CLI plus Linux `server`/`worker` roles behind features |
 | `crates/sentinel-bench` | Benchmark runner; see [docs/benchmarking.md](docs/benchmarking.md) |
 | `crates/sentinel-probes` | SQLite/clone probes; see [docs/feasibility-probes.md](docs/feasibility-probes.md) |
 | `bench/` | Committed machine-readable benchmark records |
+| `fixtures/` | Valid and invalid pipeline fixtures exercised by tests |
 | `docs/` | Contracts and guides: [development](docs/development.md), [configuration](docs/configuration.md), [runtime foundations](docs/runtime-foundation.md) |
 | `examples/` | Sanitized configuration files |
 | `.local/`, `data/`, `target/` | Ignored local state; never commit credentials or generated data |

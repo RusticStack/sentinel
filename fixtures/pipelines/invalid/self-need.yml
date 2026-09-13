@@ -1,0 +1,5 @@
+# expect: job depends on itself
+schema: 1
+on: [push]
+jobs:
+  a: {needs: [a], image: busybox, steps: [{id: s, run: x}]}

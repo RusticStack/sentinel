@@ -1,0 +1,5 @@
+# expect: jobs.a: unknown key `imgae`
+schema: 1
+on: [push]
+jobs:
+  a: {imgae: busybox, image: busybox, steps: [{id: s, run: x}]}

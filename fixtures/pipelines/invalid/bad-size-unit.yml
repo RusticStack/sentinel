@@ -1,0 +1,5 @@
+# expect: expected a size such as 8GiB
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, resources: {memory: 8GB}, steps: [{id: s, run: x}]}

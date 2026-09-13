@@ -1,0 +1,18 @@
+schema: 1
+on: [pull_request]
+jobs:
+  zeta:
+    needs: [beta, alpha]
+    image: busybox
+    steps: [{id: s, run: echo z}]
+  alpha:
+    image: busybox
+    steps: [{id: s, run: echo a}]
+  beta:
+    needs: [alpha]
+    image: busybox
+    steps: [{id: s, run: echo b}]
+  gamma:
+    needs: [alpha]
+    image: busybox
+    steps: [{id: s, run: echo g}]

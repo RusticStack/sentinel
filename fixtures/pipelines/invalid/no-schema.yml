@@ -1,0 +1,4 @@
+# expect: `schema: 1` is required
+on: [push]
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}]}

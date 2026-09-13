@@ -18,6 +18,8 @@ See [Storage](docs/storage.md) for the SQLite metadata store, the engine decisio
 
 See [Protocol contracts](docs/protocol.md) for structured errors, idempotency, event cursors, size limits and worker capability negotiation.
 
+See [Pipeline schema](docs/pipeline-schema.md) for the strict, bounded `.sentinel.yml` format and its deterministic compiler.
+
 See [Runtime foundations](docs/runtime-foundation.md) for structured diagnostics, correlation IDs, monotonic phase timing, and bounded I/O/CPU execution lanes.
 
 See [Benchmarking](docs/benchmarking.md) for the machine-readable benchmark runner and the no-op rootless-runtime baseline, [CI baseline](docs/ci-baseline.md) for the measured Lockwell CI topology and timings Sentinel must beat, and [feasibility probes](docs/feasibility-probes.md) for the SQLite, Podman, reflink and Tailcat decisions.

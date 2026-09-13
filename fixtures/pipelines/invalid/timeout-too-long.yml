@@ -1,0 +1,5 @@
+# expect: exceeds the maximum
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, timeout: 25h, steps: [{id: s, run: x}]}

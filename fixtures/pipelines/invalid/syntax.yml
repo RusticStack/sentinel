@@ -1,0 +1,4 @@
+# expect: invalid YAML
+schema: 1
+on: [push
+jobs:

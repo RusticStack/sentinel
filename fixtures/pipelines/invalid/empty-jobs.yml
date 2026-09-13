@@ -1,0 +1,4 @@
+# expect: jobs: must not be empty
+schema: 1
+on: [push]
+jobs: {}

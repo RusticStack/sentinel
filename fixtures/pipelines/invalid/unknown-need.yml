@@ -1,0 +1,6 @@
+# expect: jobs.b.needs: `c` is not a job
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}]}
+  b: {needs: [c], image: busybox, steps: [{id: s, run: x}]}

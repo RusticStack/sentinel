@@ -1,0 +1,16 @@
+[package]
+name = "sentinel-pipeline"
+description = "Bounded strict .sentinel.yml parsing and deterministic pipeline compilation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+sentinel-protocol = { path = "../sentinel-protocol" }
+yaml-rust2 = "0.13"
+
+[lints]
+workspace = true
