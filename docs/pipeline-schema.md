@@ -70,12 +70,22 @@ The compiler validates cross-job references and produces a canonical form:
 - Jobs are sorted by name, then ordered by Kahn's algorithm with a name-ordered ready set, so the execution order is a pure function of the DAG and does not change when unrelated jobs are edited. `needs` become ascending indices into that order, every one smaller than the job's own index.
 - A 128-bit digest over the canonical form identifies the compiled pipeline. Reordering job declarations or `needs` lists yields the same digest; any semantic change yields a different one. The digest is FNV-1a, for equality only, never for trust.
 
+## Run specification (C05)
+
+`RunSpec` binds one compiled pipeline to one exact source and is written once per run, never edited. It holds a `PinnedSource` (repository, full lowercase hex SHA-1 or SHA-256, optional ref name kept as provenance only), the `CompiledPipeline`, and one `ImageRef` per job. An image reference is parsed into name, tag and digest; it is *pinned* when it carries a `sha256` digest. Tag-only references are resolved by the first worker to pull them and the digest is recorded on the run, so every later attempt uses the same bytes; a pin can be set once and never changed.
+
+The spec is persisted as one format byte plus a postcard-encoded blob in the store's `run_specs` table alongside the run, in the same transaction that creates the job rows. Jobs with no dependencies are created `Queued`, the rest `Blocked`; dependency indices are read from the spec, not duplicated in rows. `get_run_spec` returns exactly what was written and rejects blobs with an unknown format byte instead of misreading them.
+
+**Rerun versus new dispatch.** A rerun is a new attempt of an existing job under the same spec: the job goes from any terminal state back to `Queued`, its attempt history and failure class are cleared, and the fence is kept so the next lease advances it and any late report from the old attempt is stale. A job with cancellation desired cannot be rerun. A different source revision or pipeline is a new run with its own spec and its own IDs.
+
+`RunSpec::step_command(job, step)` derives the exact process a worker runs: argv, merged environment and working directory, plus the effective timeout (step timeout, else job timeout).
+
 ## Shell semantics
 
-`sh` runs `/bin/sh -e -c` so the first failing command fails the step. `bash` runs `bash -eo pipefail -c` and requires an image that provides bash. Steps of one job run sequentially in one container and workspace; jobs share nothing implicitly.
+`sh` runs `/bin/sh -e -c <script>` so the first failing command fails the step. `bash` runs `bash -e -o pipefail -c <script>` and requires an image that provides bash. Failure classes are identical for both: exit 0 passes; any other exit status is `command_failed`; death by signal is `command_signaled`; exceeding the step or job timeout is `execution_timeout`; a cgroup memory kill is `out_of_memory`. Output is captured for diagnostics and never interpreted for the verdict. Environment precedence is job `env`, then step `env` overriding by name, then the worker's own `SENTINEL_*` context variables appended last so a pipeline cannot spoof them. A step `workdir` is joined under the job `workdir`; both are validated relative paths so the join cannot escape the workspace. Steps of one job run sequentially in one container and workspace; jobs share nothing implicitly.
 
 ## Verification
 
-Six unit tests cover scalar resolution, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Four fixture tests compile the three valid fixtures, check each of the 23 invalid fixtures against its expected message, decode every field of the full example, and prove determinism on a diamond DAG under reordering. All pass on Windows and Linux.
+Ten unit tests cover scalar resolution, source SHA validation, image reference parsing and single pinning, spec encode/decode round trip with format-byte rejection, step command derivation and environment override,, every rejected YAML construct, each loading limit, error positions, duration and size parsing, and identifier, path and image validation. Four fixture tests compile the three valid fixtures, check each of the 23 invalid fixtures against its expected message, decode every field of the full example, and prove determinism on a diamond DAG under reordering. All pass on Windows and Linux.
 
 Not in this schema version: expressions and conditions (C06), named pipelines, schedules, manual inputs, matrices, service containers, extra checkouts (Part 16 and later parts). Files using them fail at `unknown key`.

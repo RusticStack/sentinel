@@ -5,11 +5,13 @@
 //! can be recognised.
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::schema::{Job, Pipeline, Step, Trigger};
 
 pub const MAX_STEPS_TOTAL: usize = 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledPipeline {
     pub on: Vec<Trigger>,
     pub concurrency: Option<crate::schema::Concurrency>,
@@ -20,7 +22,7 @@ pub struct CompiledPipeline {
     pub digest: u128,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledJob {
     pub name: String,
     /// Indices into `jobs`, ascending; every index is smaller than this job's.

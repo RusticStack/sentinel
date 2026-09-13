@@ -40,8 +40,9 @@ Outcomes, in aggregation precedence from lowest to highest: `passed`, `skipped`,
 | `LeaseExpired` | controller, reconciler | leased … finalizing | infra_failed |
 | `WorkerLost` | controller, reconciler | leased … finalizing | infra_failed |
 | `Reconciled` | reconciler | leased … finalizing | infra_failed |
+| `Rerun` | controller | any terminal, cancel not requested | queued (fence unchanged) |
 
-Anything else is rejected without changing state: `Forbidden` (wrong actor), `StaleFence`, `Invalid` (no such edge), or `AlreadyTerminal` (terminal states absorb every event, which lets callers treat duplicate completions as idempotent acknowledgements). The tests enumerate every state, event and actor combination and assert the machine never panics and never mutates on error.
+Anything else is rejected without changing state: `Forbidden` (wrong actor), `StaleFence`, `Invalid` (no such edge), or `AlreadyTerminal` (terminal states absorb every event except a controller `Rerun`, which lets callers treat duplicate completions as idempotent acknowledgements). `Rerun` is the only exit from terminal: it re-queues the job under the same compiled spec without touching the fence, so the next lease advances it and a late report from the previous attempt is stale. A cancelled job cannot be rerun. The tests enumerate every state, event and actor combination and assert the machine never panics and never mutates on error.
 
 ## Failure classes
 

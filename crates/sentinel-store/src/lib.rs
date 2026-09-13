@@ -13,6 +13,7 @@
 
 pub mod codec;
 pub mod jobs;
+pub mod runs;
 pub mod schema;
 
 use std::{
@@ -39,6 +40,8 @@ pub enum Error {
     Transition(sentinel_core::TransitionError),
     /// Persisted value could not be decoded; the database is corrupt or newer.
     Corrupt(&'static str),
+    /// A run specification could not be built or encoded.
+    Spec(sentinel_pipeline::run::SpecError),
     /// Writer queue is full or the writer has stopped.
     WriterUnavailable,
     Io(std::io::Error),
@@ -52,6 +55,7 @@ impl fmt::Display for Error {
             Self::NotFound => f.write_str("not found"),
             Self::Transition(e) => write!(f, "transition rejected: {e:?}"),
             Self::Corrupt(what) => write!(f, "corrupt {what}"),
+            Self::Spec(e) => write!(f, "run spec: {e:?}"),
             Self::WriterUnavailable => f.write_str("writer unavailable"),
             Self::Io(e) => write!(f, "io: {e}"),
         }

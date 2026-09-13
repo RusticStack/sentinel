@@ -4,6 +4,8 @@
 //! strings here; their grammar is C06.
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::yaml::Node;
 
 pub const SCHEMA_VERSION: i64 = 1;
@@ -22,7 +24,7 @@ pub const MAX_ID_BYTES: usize = 64;
 pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 60 * 60;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pipeline {
     pub on: Vec<Trigger>,
     pub concurrency: Option<Concurrency>,
@@ -30,7 +32,7 @@ pub struct Pipeline {
     pub jobs: Vec<(String, Job)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Trigger {
     Push = 0,
@@ -39,13 +41,13 @@ pub enum Trigger {
     Manual = 3,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Concurrency {
     pub group: String,
     pub cancel_in_progress: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     pub image: String,
     pub needs: Vec<String>,
@@ -59,13 +61,13 @@ pub struct Job {
     pub artifacts: Vec<Artifact>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunsOn {
     pub arch: Option<Arch>,
     pub labels: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Arch {
     Amd64 = 0,
@@ -74,14 +76,14 @@ pub enum Arch {
 
 /// Explicit per-job allocation. Absent fields take the policy defaults so a
 /// compiled job always has a finite, enforceable budget.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resources {
     pub cpu_millis: u32,
     pub memory_bytes: u64,
     pub disk_bytes: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     pub id: String,
     pub run: String,
@@ -91,7 +93,7 @@ pub struct Step {
     pub timeout_secs: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Shell {
     /// `/bin/sh -e -c`: fail on the first failing command.
@@ -101,14 +103,14 @@ pub enum Shell {
     Bash = 1,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cache {
     pub name: String,
     pub key: String,
     pub paths: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
     pub name: String,
     pub paths: Vec<String>,
@@ -116,7 +118,7 @@ pub struct Artifact {
     pub retain_secs: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ArtifactWhen {
     #[default]

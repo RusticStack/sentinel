@@ -6,9 +6,10 @@
 //! Encoding: IDs are 16-byte BLOBs (the raw UUID); state is one INTEGER
 //! (`state_code`, see `codec`); timestamps are UTC milliseconds.
 
-pub const MIGRATIONS: &[(u32, &str)] = &[(
-    1,
-    "CREATE TABLE tenants(
+pub const MIGRATIONS: &[(u32, &str)] = &[
+    (
+        1,
+        "CREATE TABLE tenants(
         id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
         slug TEXT NOT NULL UNIQUE,
         created_ms INTEGER NOT NULL
@@ -61,4 +62,19 @@ pub const MIGRATIONS: &[(u32, &str)] = &[(
         UNIQUE(job_id, fence)
     ) WITHOUT ROWID;
     CREATE INDEX attempts_by_lease ON attempts(lease_until_ms);",
-)];
+    ),
+    (
+        2,
+        "-- The immutable compiled specification of a run: written once with the run,
+    -- never updated. `digest` is the pipeline content digest for dedup/diagnostics.
+    CREATE TABLE run_specs(
+        run_id BLOB PRIMARY KEY NOT NULL REFERENCES runs(id),
+        tenant_id BLOB NOT NULL REFERENCES tenants(id),
+        digest BLOB NOT NULL CHECK(length(digest) = 16),
+        format INTEGER NOT NULL,
+        spec BLOB NOT NULL
+    ) WITHOUT ROWID;
+    -- Position of the job in the compiled pipeline; dependencies are read from the spec.
+    ALTER TABLE jobs ADD COLUMN spec_index INTEGER NOT NULL DEFAULT 0;",
+    ),
+];

@@ -17,7 +17,7 @@ Both durable paths are bound by the same fsync and land within 20% of each other
 
 ## Layout and ownership
 
-Migrations are an append-only list of `(version, sql)` in `schema.rs`; each runs in its own `BEGIN IMMEDIATE` transaction and is recorded in `schema_migrations`. Version 1 creates `tenants`, `repos`, `runs`, `jobs` and `attempts` as `WITHOUT ROWID` tables keyed by 16-byte IDs.
+Migrations are an append-only list of `(version, sql)` in `schema.rs`; each runs in its own `BEGIN IMMEDIATE` transaction and is recorded in `schema_migrations`. Version 1 creates `tenants`, `repos`, `runs`, `jobs` and `attempts` as `WITHOUT ROWID` tables keyed by 16-byte IDs. Version 2 adds `run_specs` (the immutable compiled specification per run: pipeline digest, format byte, postcard blob) and `jobs.spec_index`.
 
 Every table after `tenants` carries `tenant_id`. Inserts of runs and jobs are `INSERT … SELECT` from the parent row filtered by tenant, so a run cannot reference another tenant's repo and a job cannot reference another tenant's run; both fail as `NotFound`, the same answer a nonexistent row gets. Every read and transition predicate includes `tenant_id`. Foreign keys are enforced (`PRAGMA foreign_keys=ON`) as a second line of defence.
 
@@ -31,10 +31,10 @@ A full queue returns `WriterUnavailable` immediately instead of blocking or grow
 
 ## Transitions
 
-`jobs::transition` reads the row, lets `JobControl::apply` decide (actor permission, fence, edge), then executes one static `UPDATE … WHERE id=? AND tenant_id=? AND state_code=? AND fence=?`. Zero rows changed means the row moved between read and write: `Conflict`, and the transaction rolls back. `jobs::lease` bumps the fence, transitions to `Leased` and inserts the attempt row in the same transaction. `jobs::pick_ready` is a single indexed `ORDER BY priority, created_seq LIMIT 1`; the test asserts the query plan uses `jobs_ready`. `jobs::run_state` recomputes the run outcome from job rows through the core aggregation.
+`jobs::transition` reads the row, lets `JobControl::apply` decide (actor permission, fence, edge), then executes one static `UPDATE … WHERE id=? AND tenant_id=? AND state_code=? AND fence=?`. Zero rows changed means the row moved between read and write: `Conflict`, and the transaction rolls back. `jobs::lease` bumps the fence, transitions to `Leased` and inserts the attempt row in the same transaction. `jobs::pick_ready` is a single indexed `ORDER BY priority, created_seq LIMIT 1`; the test asserts the query plan uses `jobs_ready`. `jobs::run_state` recomputes the run outcome from job rows through the core aggregation. `runs::create_run` writes the run, its spec and its job rows in one transaction (dependency-free jobs start `Queued`); `runs::rerun_job` applies the core `Rerun` edge with a compare-and-set that clears attempt history and keeps the fence.
 
 ## Verification
 
-Nine integration tests: migrations idempotent with WAL and foreign keys on; full lifecycle with fence, timestamps and run aggregation; stale fence and wrong tenant rejected; compare-and-set conflict rolls back the whole transaction; dangling and cross-tenant inserts fail; ready-queue ordering and index use; durable cancel flag; acknowledged writes survive drop-without-checkpoint and reopen; writer back-pressure rejects only overflow. Plus two codec round-trip tests. All pass on Windows and Linux.
+Thirteen integration tests. Runs: spec persisted and read back byte-for-byte, job states seeded from dependencies, cross-tenant read denied, duplicate run creation rejected with the original intact, rerun keeps the fence and stales the old attempt, rerun refused for running and cancelled jobs. Core: migrations idempotent with WAL and foreign keys on; full lifecycle with fence, timestamps and run aggregation; stale fence and wrong tenant rejected; compare-and-set conflict rolls back the whole transaction; dangling and cross-tenant inserts fail; ready-queue ordering and index use; durable cancel flag; acknowledged writes survive drop-without-checkpoint and reopen; writer back-pressure rejects only overflow. Plus two codec round-trip tests. All pass on Windows and Linux.
 
 Not yet covered: crash injection mid-fsync (requires a fault-injecting VFS), multi-process access (unsupported by design), and checkpoint scheduling under sustained load.

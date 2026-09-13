@@ -4,12 +4,14 @@
 //! not implement.
 
 pub mod compile;
+pub mod run;
 pub mod schema;
 pub mod yaml;
 
 use std::fmt;
 
 pub use compile::{CompileError, CompiledJob, CompiledPipeline};
+pub use run::{ImageRef, PinnedSource, RunSpec, StepCommand};
 pub use schema::{Pipeline, ResourcePolicy, SCHEMA_VERSION, SchemaError};
 pub use yaml::YamlError;
 

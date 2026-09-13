@@ -191,6 +191,10 @@ pub enum Event {
     WorkerLost,
     /// Reconciler: attempt found in an unknown state after restart.
     Reconciled,
+    /// Controller: operator asked for a new attempt of a finished job. The
+    /// compiled spec is unchanged; only the attempt (and fence) is new. A job
+    /// with cancellation desired cannot be rerun; dispatch a new run instead.
+    Rerun,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,7 +245,22 @@ impl JobControl {
     /// updated in place and the new state is returned; on error nothing changes.
     pub const fn apply(&mut self, actor: Actor, event: Event) -> Result<JobState, TransitionError> {
         if let JobState::Terminal(o) = self.state {
-            return Err(TransitionError::AlreadyTerminal(o));
+            // The single way out of terminal: a controller rerun of a job that
+            // is not cancelled. Everything else is absorbed.
+            return match (actor, event) {
+                (Actor::Controller, Event::Rerun) if !self.cancel_requested => {
+                    self.state = JobState::Queued;
+                    Ok(JobState::Queued)
+                }
+                (Actor::Controller, Event::Rerun) => Err(TransitionError::Invalid {
+                    from: self.state,
+                    event,
+                }),
+                (Actor::Worker(_) | Actor::Reconciler, Event::Rerun) => {
+                    Err(TransitionError::Forbidden { actor, event })
+                }
+                _ => Err(TransitionError::AlreadyTerminal(o)),
+            };
         }
         // Permission check first: a forbidden actor never learns validity details.
         match (actor, event) {
@@ -262,6 +281,7 @@ impl JobControl {
                 | Event::Failed(_),
             )
             | (Actor::Reconciler, Event::LeaseExpired | Event::WorkerLost | Event::Reconciled) => {}
+            // Rerun only applies to terminal jobs, handled above.
             _ => return Err(TransitionError::Forbidden { actor, event }),
         }
         if let Actor::Worker(presented) = actor
@@ -435,7 +455,7 @@ mod tests {
         JobState::Terminal(Outcome::Failed),
         JobState::Terminal(Outcome::InfraFailed),
     ];
-    const ALL_EVENTS: [Event; 13] = [
+    const ALL_EVENTS: [Event; 14] = [
         Event::DependenciesSatisfied,
         Event::Skip,
         Event::Leased(Fence(1)),
@@ -449,6 +469,7 @@ mod tests {
         Event::LeaseExpired,
         Event::WorkerLost,
         Event::Reconciled,
+        Event::Rerun,
     ];
 
     fn at(state: JobState, fence: Fence) -> JobControl {
@@ -493,7 +514,7 @@ mod tests {
     #[test]
     fn terminal_states_absorb_every_event_from_every_actor() {
         for state in ALL_STATES.iter().filter(|s| s.is_terminal()) {
-            for event in ALL_EVENTS {
+            for event in ALL_EVENTS.iter().copied().filter(|e| *e != Event::Rerun) {
                 for actor in [
                     Actor::Controller,
                     Actor::Worker(Fence(1)),
@@ -648,6 +669,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn rerun_is_the_only_exit_from_terminal_and_keeps_the_fence() {
+        for state in ALL_STATES.iter().filter(|s| s.is_terminal()) {
+            let mut j = at(*state, Fence(3));
+            assert_eq!(
+                j.apply(Actor::Controller, Event::Rerun),
+                Ok(JobState::Queued)
+            );
+            assert_eq!(
+                j.fence,
+                Fence(3),
+                "the next lease advances the fence, not the rerun"
+            );
+            assert!(matches!(
+                at(*state, Fence(3)).apply(Actor::Worker(Fence(3)), Event::Rerun),
+                Err(TransitionError::Forbidden { .. })
+            ));
+            let mut cancelled = at(*state, Fence(3));
+            cancelled.cancel_requested = true;
+            assert!(matches!(
+                cancelled.apply(Actor::Controller, Event::Rerun),
+                Err(TransitionError::Invalid { .. })
+            ));
+        }
+        assert!(matches!(
+            at(JobState::Running, Fence(1)).apply(Actor::Controller, Event::Rerun),
+            Err(TransitionError::Forbidden { .. })
+        ));
     }
 
     #[test]
