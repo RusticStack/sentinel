@@ -24,6 +24,7 @@ pub mod schema;
 pub mod sign_in;
 pub mod tenancy;
 pub mod tokens;
+pub mod workers;
 
 use std::{
     fmt,

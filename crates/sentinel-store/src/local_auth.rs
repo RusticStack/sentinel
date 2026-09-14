@@ -104,6 +104,10 @@ pub enum Event {
     PoolGranted = 41,
     PoolGrantRevoked = 42,
     NamespaceCreated = 43,
+    WorkerEnrollmentIssued = 44,
+    WorkerEnrollmentRefused = 45,
+    WorkerEnrolled = 46,
+    WorkerRevoked = 47,
 }
 
 impl Event {
@@ -152,6 +156,10 @@ impl Event {
             41 => Event::PoolGranted,
             42 => Event::PoolGrantRevoked,
             43 => Event::NamespaceCreated,
+            44 => Event::WorkerEnrollmentIssued,
+            45 => Event::WorkerEnrollmentRefused,
+            46 => Event::WorkerEnrolled,
+            47 => Event::WorkerRevoked,
             _ => return None,
         })
     }

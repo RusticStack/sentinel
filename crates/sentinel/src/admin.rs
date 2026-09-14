@@ -11,7 +11,7 @@
 use std::io::{IsTerminal, Read};
 
 use sentinel_core::{
-    InvitationId, RepoId, SessionId, TenantId, TokenId, UnixMillis, UserId,
+    InvitationId, RepoId, SessionId, TenantId, TokenId, UnixMillis, UserId, WorkerId,
     auth::{Permissions, Role},
 };
 use sentinel_store::{
@@ -24,13 +24,14 @@ use sentinel_store::{
     sign_in,
     tenancy::{self, PoolKind},
     tokens::{self, Grant},
+    workers,
 };
 
 use crate::cli::{
     AccountArgs, AccountCommand, AdminArgs, AdminCommand, DataDir, IdentityArgs, IdentityCommand,
     InviteArgs, InviteCommand, KeyArgs, KeyCommand, MfaArgs, MfaCommand, PolicyArgs, PolicyCommand,
     PoolArgs, PoolCommand, SessionArgs, SessionCommand, TenantArgs, TenantCommand, TokenArgs,
-    TokenCommand,
+    TokenCommand, WorkerArgs, WorkerCommand,
 };
 
 pub struct Error {
@@ -181,6 +182,7 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
         AdminCommand::Session(args) => session(args, now)?,
         AdminCommand::Tenant(args) => tenant(args, now)?,
         AdminCommand::Pool(args) => pool(args, now)?,
+        AdminCommand::Worker(args) => worker(args, now)?,
     }
     Ok(())
 }
@@ -899,6 +901,78 @@ fn pool(args: &PoolArgs, now: UnixMillis) -> Result<(), Error> {
     Ok(())
 }
 
+fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
+    match &args.command {
+        WorkerCommand::Enroll {
+            data,
+            pool,
+            expires_in,
+        } => {
+            let store = open(data, true)?;
+            let lifetime_ms = lifetime_ms(expires_in)?;
+            if lifetime_ms > workers::MAX_ENROLLMENT_MS {
+                return Err(fail("enrollment lifetime is at most 1d"));
+            }
+            let owned = pool.clone();
+            let pool = store
+                .read(move |conn| lookup::pool_by_name(conn, &owned))
+                .map_err(|_| fail("no pool with that name"))?;
+            let enrollment = store
+                .writer()
+                .write(move |tx| {
+                    workers::issue_enrollment(tx, Authority::HostLocal, pool, lifetime_ms, now)
+                })
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound => fail("that pool is not active"),
+                    other => fail(format!("cannot issue the enrollment: {other}")),
+                })?;
+            println!("{}", sentinel_auth::token::format(&enrollment.secret));
+            eprintln!(
+                "issued {} for pool {} expiring at {} (shown once)",
+                enrollment.id, enrollment.pool, enrollment.expires.0
+            );
+        }
+        WorkerCommand::List { data, pool } => {
+            let store = open(data, true)?;
+            let owned = pool.clone();
+            let pool = store
+                .read(move |conn| lookup::pool_by_name(conn, &owned))
+                .map_err(|_| fail("no pool with that name"))?;
+            let live = store
+                .read(|conn| workers::in_pool(conn, Authority::HostLocal, pool))
+                .map_err(|error| fail(format!("cannot list workers: {error}")))?;
+            for w in live {
+                println!(
+                    "{} {} {:?} protocol={} capabilities={:#x}{}",
+                    w.id,
+                    w.name,
+                    w.negotiated.arch,
+                    w.negotiated.protocol.0,
+                    w.negotiated.capabilities.0,
+                    w.last_seen
+                        .map(|at| format!(" last_seen={}", at.0))
+                        .unwrap_or_default()
+                );
+            }
+        }
+        WorkerCommand::Revoke { data, id } => {
+            let store = open(data, true)?;
+            let id: WorkerId = id
+                .parse()
+                .map_err(|_| fail("expected a wrk_ worker identifier"))?;
+            store
+                .writer()
+                .write(move |tx| workers::revoke(tx, Authority::HostLocal, id, now))
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound => fail("no live worker with that identifier"),
+                    other => fail(format!("revocation failed: {other}")),
+                })?;
+            eprintln!("revoked {id}");
+        }
+    }
+    Ok(())
+}
+
 const fn event_name(event: Event) -> &'static str {
     match event {
         Event::Bootstrap => "bootstrap",
@@ -944,5 +1018,9 @@ const fn event_name(event: Event) -> &'static str {
         Event::PoolGranted => "pool-granted",
         Event::PoolGrantRevoked => "pool-grant-revoked",
         Event::NamespaceCreated => "namespace-created",
+        Event::WorkerEnrollmentIssued => "worker-enrollment-issued",
+        Event::WorkerEnrollmentRefused => "worker-enrollment-refused",
+        Event::WorkerEnrolled => "worker-enrolled",
+        Event::WorkerRevoked => "worker-revoked",
     }
 }

@@ -82,6 +82,43 @@ pub enum AdminCommand {
     Tenant(TenantArgs),
     /// Register worker pools and grant shared ones to tenants
     Pool(PoolArgs),
+    /// Enroll, list and revoke workers
+    Worker(WorkerArgs),
+}
+
+#[derive(Args)]
+pub struct WorkerArgs {
+    #[command(subcommand)]
+    pub command: WorkerCommand,
+}
+
+#[derive(Subcommand)]
+pub enum WorkerCommand {
+    /// Issue a one-time enrollment for a pool; the secret alone goes to stdout
+    Enroll {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        pool: String,
+        /// Lifetime such as 1h or 30m; bounded by one day
+        #[arg(long, value_name = "DURATION", default_value = "1h")]
+        expires_in: String,
+    },
+    /// Live workers of a pool
+    List {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        pool: String,
+    },
+    /// Revoke a worker; its session is refused at its next authentication
+    Revoke {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `wrk_` identifier the worker generated
+        #[arg(long)]
+        id: String,
+    },
 }
 
 #[derive(Args)]
