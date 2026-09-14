@@ -434,7 +434,19 @@ fn closing_registration_refuses_everyone_new_and_locks_nobody_out() {
         .store
         .read(|conn| local_auth::authenticate(conn, &session.session, at(32)))
         .unwrap();
-    sign_in::link(&f.store, &session, "github", "4242", at(33)).unwrap();
+    let session = local_auth::Session {
+        stepped_up: Some(at(33)),
+        ..session
+    };
+    sign_in::link(
+        &f.store,
+        &session,
+        Policy::default(),
+        "github",
+        "4242",
+        at(33),
+    )
+    .unwrap();
     assert!(matches!(
         sign_in::complete(&f.store, "github", "4242", Policy::default(), at(34)).unwrap(),
         sign_in::Outcome::SignedIn(_)

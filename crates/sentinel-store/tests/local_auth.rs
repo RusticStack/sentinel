@@ -416,7 +416,7 @@ fn suspending_an_account_invalidates_its_live_cookies_at_once() {
         .writer()
         .write(move |tx| {
             provisioning::insert_human(tx, member, "Member", false, at(2_200))?;
-            local_auth::provision_credential(tx, admin, member, "member", &phc, at(2_200))
+            local_auth::provision_credential(tx, stepped(admin), member, "member", &phc, at(2_200))
         })
         .unwrap();
     let theirs = accept(
@@ -477,9 +477,9 @@ fn credentials_and_sessions_are_refused_for_non_human_principals() {
             )
         })
         .unwrap();
-    let refused = store
-        .writer()
-        .write(move |tx| local_auth::provision_credential(tx, admin, bot, "bot", &phc, at(2_300)));
+    let refused = store.writer().write(move |tx| {
+        local_auth::provision_credential(tx, stepped(admin), bot, "bot", &phc, at(2_300))
+    });
     assert!(matches!(refused, Err(Error::Sqlite(_))));
 }
 

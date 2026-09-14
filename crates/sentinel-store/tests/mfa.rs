@@ -662,3 +662,131 @@ fn step_up_freshness_cannot_be_forged_or_rewound() {
         .unwrap();
     assert!(!s.stepped_up_within(Policy::default(), earlier));
 }
+
+#[test]
+fn repeated_failed_step_ups_revoke_the_session_and_a_success_forgives_them() {
+    let f = fixture();
+    let now = at(T0 + 10);
+    let session = f.session(now);
+    for _ in 0..mfa::MAX_STEP_UP_FAILURES - 1 {
+        assert!(
+            !mfa::step_up(
+                &f.store,
+                &f.key,
+                &f.cookie,
+                &session,
+                Proof::Password(b"guess"),
+                now
+            )
+            .unwrap()
+        );
+    }
+    // Still alive, and one good proof clears the slate.
+    assert!(
+        f.store
+            .read(|c| local_auth::authenticate(c, &f.cookie, now))
+            .is_ok()
+    );
+    assert!(
+        mfa::step_up(
+            &f.store,
+            &f.key,
+            &f.cookie,
+            &session,
+            Proof::Password(PASSWORD),
+            now
+        )
+        .unwrap()
+    );
+    let (failures, revoked): (i64, Option<i64>) = f
+        .store
+        .read(|c| {
+            c.query_row(
+                "SELECT step_up_failures, revoked_ms FROM sessions WHERE id = ?1",
+                [session.id.unwrap().as_bytes()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(Error::from)
+        })
+        .unwrap();
+    assert_eq!((failures, revoked), (0, None));
+
+    // The full run of failures ends the session, whatever proof is tried.
+    let later = at(T0 + 10 + Policy::default().step_up_ms + 1);
+    let session = f.session(later);
+    for _ in 0..mfa::MAX_STEP_UP_FAILURES {
+        let _ = mfa::step_up(
+            &f.store,
+            &f.key,
+            &f.cookie,
+            &session,
+            Proof::Totp("000000"),
+            later,
+        );
+    }
+    assert!(matches!(
+        f.store
+            .read(|c| local_auth::authenticate(c, &f.cookie, later)),
+        Err(Error::NotFound)
+    ));
+    let revoked = f
+        .store
+        .read(|c| local_auth::recent_audit(c, 100))
+        .unwrap()
+        .into_iter()
+        .find(|r| r.event == Event::SessionRevoked)
+        .expect("revocation is audited");
+    assert_eq!(revoked.detail.as_deref(), Some("step-up failures"));
+}
+
+#[test]
+fn linking_an_identity_and_provisioning_a_password_are_authentication_changes() {
+    let f = fixture();
+    let now = at(T0 + 10);
+    let session = f.session(now);
+    // A plain session cannot attach a GitHub account to itself.
+    assert!(matches!(
+        sentinel_store::sign_in::link(&f.store, &session, Policy::default(), "github", "4242", now),
+        Err(Error::StepUpRequired)
+    ));
+    let target = UserId::new();
+    let phc = sentinel_auth::password::hash(PASSWORD).unwrap();
+    f.store
+        .writer()
+        .write(move |tx| provisioning::insert_human(tx, target, "Target", false, now))
+        .unwrap();
+    let refused = f.store.writer().write({
+        let authority = f.authority(now);
+        let phc = phc.clone();
+        move |tx| local_auth::provision_credential(tx, authority, target, "target", &phc, now)
+    });
+    assert!(matches!(refused, Err(Error::StepUpRequired)));
+
+    assert!(
+        mfa::step_up(
+            &f.store,
+            &f.key,
+            &f.cookie,
+            &session,
+            Proof::Password(PASSWORD),
+            now
+        )
+        .unwrap()
+    );
+    let session = f.session(now);
+    sentinel_store::sign_in::link(&f.store, &session, Policy::default(), "github", "4242", now)
+        .unwrap();
+    f.store
+        .writer()
+        .write({
+            let authority = f.authority(now);
+            move |tx| local_auth::provision_credential(tx, authority, target, "target", &phc, now)
+        })
+        .unwrap();
+    // A bearer credential never carries step-up, so it cannot make these changes.
+    let refused = f.store.writer().write({
+        let bearer = Authority::credential(session.principal());
+        move |tx| local_auth::set_super_admin(tx, bearer, target, true, now)
+    });
+    assert!(matches!(refused, Err(Error::StepUpRequired)));
+}

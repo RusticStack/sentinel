@@ -8,7 +8,7 @@ use sentinel_core::{
 };
 use sentinel_store::{
     Durability, Error, Store,
-    auth::provisioning,
+    auth::{Authority, provisioning},
     local_auth::{self, Event, Policy},
     sign_in::{self, Outcome},
 };
@@ -44,6 +44,15 @@ fn admitted(store: &Store) -> (UserId, local_auth::Session) {
         .read(|conn| local_auth::authenticate(conn, &issued.session, at(2)))
         .unwrap();
     (user, session)
+}
+
+/// The session as it looks right after proving a second factor: linking an
+/// identity is an authentication change and requires that freshness.
+fn stepped(session: &local_auth::Session) -> local_auth::Session {
+    local_auth::Session {
+        stepped_up: Some(at(0)),
+        ..*session
+    }
 }
 
 fn signed_in(outcome: Outcome) -> local_auth::Issued {
@@ -143,7 +152,15 @@ fn a_verified_identity_signs_in_only_after_it_has_been_linked() {
     assert_eq!(accounts, 1);
 
     // Linking is an authenticated act by the account that will own it.
-    sign_in::link(&store, &session, GITHUB, SUBJECT, at(20)).unwrap();
+    sign_in::link(
+        &store,
+        &stepped(&session),
+        Policy::default(),
+        GITHUB,
+        SUBJECT,
+        at(20),
+    )
+    .unwrap();
     let issued =
         signed_in(sign_in::complete(&store, GITHUB, SUBJECT, Policy::default(), at(30)).unwrap());
     assert_eq!(issued.user, user);
@@ -166,7 +183,15 @@ fn a_verified_identity_signs_in_only_after_it_has_been_linked() {
 fn identity_is_the_immutable_subject_not_the_renameable_login() {
     let (_dir, store) = store();
     let (user, session) = admitted(&store);
-    sign_in::link(&store, &session, GITHUB, SUBJECT, at(20)).unwrap();
+    sign_in::link(
+        &store,
+        &stepped(&session),
+        Policy::default(),
+        GITHUB,
+        SUBJECT,
+        at(20),
+    )
+    .unwrap();
 
     // A different subject is a different account, whatever it calls itself.
     assert!(matches!(
@@ -187,7 +212,15 @@ fn identity_is_the_immutable_subject_not_the_renameable_login() {
 fn an_identity_belongs_to_one_account_and_is_never_silently_moved() {
     let (_dir, store) = store();
     let (_root, session) = admitted(&store);
-    sign_in::link(&store, &session, GITHUB, SUBJECT, at(20)).unwrap();
+    sign_in::link(
+        &store,
+        &stepped(&session),
+        Policy::default(),
+        GITHUB,
+        SUBJECT,
+        at(20),
+    )
+    .unwrap();
 
     let other = UserId::new();
     store
@@ -204,7 +237,14 @@ fn an_identity_belongs_to_one_account_and_is_never_silently_moved() {
 
     // Claiming an identity another account already holds fails; it is not taken.
     assert!(matches!(
-        sign_in::link(&store, &other_session, GITHUB, SUBJECT, at(24)),
+        sign_in::link(
+            &store,
+            &stepped(&other_session),
+            Policy::default(),
+            GITHUB,
+            SUBJECT,
+            at(24)
+        ),
         Err(Error::Conflict)
     ));
     assert_eq!(
@@ -214,7 +254,17 @@ fn an_identity_belongs_to_one_account_and_is_never_silently_moved() {
     );
     // Relinking the same identity to its own account is refused too: the link
     // is immutable, so there is no re-verification side effect to exploit.
-    assert!(sign_in::link(&store, &session, GITHUB, SUBJECT, at(26)).is_err());
+    assert!(
+        sign_in::link(
+            &store,
+            &stepped(&session),
+            Policy::default(),
+            GITHUB,
+            SUBJECT,
+            at(26)
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -233,7 +283,15 @@ fn a_suspended_account_cannot_sign_in_through_its_provider() {
     let member_session = store
         .read(|conn| local_auth::authenticate(conn, &member_session.session, at(22)))
         .unwrap();
-    sign_in::link(&store, &member_session, GITHUB, SUBJECT, at(23)).unwrap();
+    sign_in::link(
+        &store,
+        &stepped(&member_session),
+        Policy::default(),
+        GITHUB,
+        SUBJECT,
+        at(23),
+    )
+    .unwrap();
 
     let admin = Principal::new(root, P::ALL, None, None);
     store
@@ -262,10 +320,18 @@ fn a_suspended_account_cannot_sign_in_through_its_provider() {
 fn linking_and_unlinking_are_audited_and_authorized() {
     let (_dir, store) = store();
     let (root, session) = admitted(&store);
-    sign_in::link(&store, &session, GITHUB, SUBJECT, at(20)).unwrap();
+    sign_in::link(
+        &store,
+        &stepped(&session),
+        Policy::default(),
+        GITHUB,
+        SUBJECT,
+        at(20),
+    )
+    .unwrap();
 
     let identities = store
-        .read(|conn| sign_in::identities(conn, session.principal(), root))
+        .read(|conn| sign_in::identities(conn, Authority::credential(session.principal()), root))
         .unwrap();
     assert_eq!(identities.len(), 1);
     assert_eq!(identities[0].provider, GITHUB);
@@ -279,25 +345,35 @@ fn linking_and_unlinking_are_audited_and_authorized() {
         .unwrap();
     let theirs = Principal::new(outsider, P::ALL, None, None);
     assert!(matches!(
-        store.read(|conn| sign_in::identities(conn, theirs, root)),
+        store.read(|conn| sign_in::identities(conn, Authority::credential(theirs), root)),
         Err(Error::NotFound)
     ));
     let refused = store
         .writer()
-        .write(move |tx| sign_in::unlink(tx, theirs, root, GITHUB, at(22)));
+        .write(move |tx| sign_in::unlink(tx, Authority::credential(theirs), root, GITHUB, at(22)));
     assert!(matches!(refused, Err(Error::NotFound)));
 
     let principal = session.principal();
     store
         .writer()
-        .write(move |tx| sign_in::unlink(tx, principal, root, GITHUB, at(23)))
+        .write(move |tx| {
+            sign_in::unlink(tx, Authority::credential(principal), root, GITHUB, at(23))
+        })
         .unwrap();
     assert!(matches!(
         sign_in::complete(&store, GITHUB, SUBJECT, Policy::default(), at(24)).unwrap(),
         Outcome::NoAccount
     ));
     // Unlinking makes the identity claimable again, by the same account or another.
-    sign_in::link(&store, &session, GITHUB, SUBJECT, at(25)).unwrap();
+    sign_in::link(
+        &store,
+        &stepped(&session),
+        Policy::default(),
+        GITHUB,
+        SUBJECT,
+        at(25),
+    )
+    .unwrap();
     sign_in::unlink_host_local(&store, root, GITHUB, at(26)).unwrap();
     assert!(matches!(
         sign_in::unlink_host_local(&store, root, GITHUB, at(27)),
@@ -340,7 +416,15 @@ fn a_federated_sign_in_is_recorded_whether_or_not_it_resolves() {
     let (_dir, store) = store();
     let (_root, session) = admitted(&store);
     sign_in::complete(&store, GITHUB, "1", Policy::default(), at(10)).unwrap();
-    sign_in::link(&store, &session, GITHUB, SUBJECT, at(20)).unwrap();
+    sign_in::link(
+        &store,
+        &stepped(&session),
+        Policy::default(),
+        GITHUB,
+        SUBJECT,
+        at(20),
+    )
+    .unwrap();
     sign_in::complete(&store, GITHUB, SUBJECT, Policy::default(), at(30)).unwrap();
 
     let audit = store

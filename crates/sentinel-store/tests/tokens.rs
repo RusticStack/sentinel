@@ -8,7 +8,7 @@ use sentinel_core::{
 };
 use sentinel_store::{
     Durability, Error, Store,
-    auth::{self, NamespaceKind, provisioning},
+    auth::{self, Authority, NamespaceKind, provisioning},
     local_auth,
     tokens::{self, Grant},
 };
@@ -382,7 +382,7 @@ fn revocation_is_immediate_final_and_reaches_the_whole_account() {
     let id = first.id;
     store
         .writer()
-        .write(move |tx| tokens::revoke(tx, owner, id, at(2_000)))
+        .write(move |tx| tokens::revoke(tx, Authority::credential(owner), id, at(2_000)))
         .unwrap();
     assert!(matches!(
         authenticate(&store, &first.secret, at(2_100)),
@@ -417,16 +417,21 @@ fn another_account_cannot_revoke_list_or_learn_of_a_credential() {
     let id = granted.id;
     let refused = store
         .writer()
-        .write(move |tx| tokens::revoke(tx, outsider, id, at(2_000)));
+        .write(move |tx| tokens::revoke(tx, Authority::credential(outsider), id, at(2_000)));
     assert!(matches!(refused, Err(Error::NotFound)));
     assert!(matches!(
-        store.read(|conn| tokens::list(conn, outsider, i.dev, 10)),
+        store.read(|conn| tokens::list(conn, Authority::credential(outsider), i.dev, 10)),
         Err(Error::NotFound)
     ));
     // A guessed identifier is not a discovery channel either.
-    let refused = store
-        .writer()
-        .write(move |tx| tokens::revoke(tx, admin(i), TokenId::new(), at(2_000)));
+    let refused = store.writer().write(move |tx| {
+        tokens::revoke(
+            tx,
+            Authority::credential(admin(i)),
+            TokenId::new(),
+            at(2_000),
+        )
+    });
     assert!(matches!(refused, Err(Error::NotFound)));
     assert!(authenticate(&store, &granted.secret, at(2_100)).is_ok());
 }
@@ -457,7 +462,7 @@ fn listing_returns_metadata_and_records_use_without_the_secret() {
     assert!(!authenticated.record_use_due(at(2_001)));
 
     let records = store
-        .read(|conn| tokens::list(conn, owner, i.dev, 10))
+        .read(|conn| tokens::list(conn, Authority::credential(owner), i.dev, 10))
         .unwrap();
     assert_eq!(records.len(), 1);
     let record = &records[0];
@@ -473,7 +478,7 @@ fn listing_returns_metadata_and_records_use_without_the_secret() {
     assert!(!format!("{record:?}").contains(&text));
     assert!(
         store
-            .read(|conn| tokens::list(conn, owner, i.dev, 0))
+            .read(|conn| tokens::list(conn, Authority::credential(owner), i.dev, 0))
             .is_err()
     );
 }

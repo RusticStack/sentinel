@@ -136,7 +136,19 @@ fn a_linked_github_account_signs_in_end_to_end() {
         .store
         .read(|conn| local_auth::authenticate(conn, &issued.session, at(2)))
         .unwrap();
-    sign_in::link(&f.store, &session, PROVIDER, "4242", at(3)).unwrap();
+    let session = local_auth::Session {
+        stepped_up: Some(at(2)),
+        ..session
+    };
+    sign_in::link(
+        &f.store,
+        &session,
+        Policy::default(),
+        PROVIDER,
+        "4242",
+        at(3),
+    )
+    .unwrap();
 
     // Sign-in begins: state is minted, stored as a digest and set as a cookie.
     let state = sign_in::begin(&f.store, PROVIDER, Some("/runs"), at(10), 60_000).unwrap();

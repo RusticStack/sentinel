@@ -12,10 +12,11 @@
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::secret::Secret;
-use sentinel_core::{UnixMillis, UserId, auth::Principal};
+use sentinel_core::{UnixMillis, UserId};
 
 use crate::{
     Error, Result, Store,
+    auth::Authority,
     local_auth::{Event, Issued, Policy, Session, audit},
 };
 
@@ -140,8 +141,16 @@ pub fn complete(
     let provider = provider.to_owned();
     let issued = store.writer().write(move |tx| {
         // The account could have been suspended between resolution and this
-        // transaction; session insertion checks that live, and so does this.
-        let issued = crate::local_auth::issue_session(tx, user, policy, now)?;
+        // transaction: the session insert trigger refuses it, and that refusal
+        // is the same honest answer as never having been linked.
+        let issued = match crate::local_auth::issue_session(tx, user, policy, now) {
+            Err(Error::Sqlite(rusqlite::Error::SqliteFailure(code, _)))
+                if code.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(Error::NotFound);
+            }
+            other => other?,
+        };
         audit(
             tx,
             Event::LoginAccepted,
@@ -151,22 +160,30 @@ pub fn complete(
             Some(&provider),
         )?;
         Ok(issued)
-    })?;
-    Ok(Outcome::SignedIn(issued))
+    });
+    match issued {
+        Ok(issued) => Ok(Outcome::SignedIn(issued)),
+        Err(Error::NotFound) => Ok(Outcome::NoAccount),
+        Err(other) => Err(other),
+    }
 }
 
 /// Link a verified identity to the account of an authenticated session.
 ///
-/// Linking requires being signed in already: that is the authenticated intent.
-/// A provider identity is linked to at most one account and is never silently
-/// moved — relinking an already-claimed identity fails rather than taking it.
+/// Linking changes who can authenticate as this account, so it needs the same
+/// recent proof of presence as any other change to authentication: a stolen
+/// cookie must not be able to attach an attacker's GitHub account. A provider
+/// identity is linked to at most one account and is never silently moved —
+/// relinking an already-claimed identity fails rather than taking it.
 pub fn link(
     store: &Store,
     session: &Session,
+    policy: Policy,
     provider: &str,
     subject: &str,
     now: UnixMillis,
 ) -> Result<()> {
+    session.require_step_up(policy, now)?;
     let user = session.user;
     let (provider, subject) = (provider.to_owned(), subject.to_owned());
     store.writer().write(move |tx| {
@@ -195,14 +212,16 @@ pub fn link(
 /// record survives, so an unlink before a relink is visible.
 pub fn unlink(
     tx: &Transaction<'_>,
-    principal: Principal,
+    authority: Authority,
     user: UserId,
     provider: &str,
     now: UnixMillis,
 ) -> Result<()> {
     let _ = now;
-    if principal.user != user {
-        crate::auth::require_platform_admin(tx, principal).map_err(|_| Error::NotFound)?;
+    if authority.actor() != Some(user) {
+        authority
+            .require_platform(tx)
+            .map_err(|_| Error::NotFound)?;
     }
     let removed = tx.execute(
         "DELETE FROM external_identities WHERE user_id = ?1 AND provider = ?2",
@@ -214,9 +233,9 @@ pub fn unlink(
     audit(
         tx,
         Event::IdentityUnlinked,
-        Some(principal.user),
+        authority.actor(),
         Some(user),
-        false,
+        authority.host_local(),
         Some(provider),
     )
 }
@@ -258,9 +277,11 @@ pub struct Identity {
 
 /// One account's linked identities. The account itself or a platform admin may
 /// look; a subject is not a secret, but it is not public either.
-pub fn identities(conn: &Connection, principal: Principal, user: UserId) -> Result<Vec<Identity>> {
-    if principal.user != user {
-        crate::auth::require_platform_admin(conn, principal).map_err(|_| Error::NotFound)?;
+pub fn identities(conn: &Connection, authority: Authority, user: UserId) -> Result<Vec<Identity>> {
+    if authority.actor() != Some(user) {
+        authority
+            .require_platform(conn)
+            .map_err(|_| Error::NotFound)?;
     }
     let mut stmt = conn.prepare_cached(
         "SELECT provider, subject, created_ms FROM external_identities

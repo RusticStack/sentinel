@@ -15,7 +15,9 @@ A session proves who you are. **Step-up** proves you are still there, just now, 
 
 Routine administration — approving applications, inviting, revoking credentials, binding installations — needs platform (or tenant) administration but not step-up. `Authority::HostLocal` needs no step-up either: holding the database file is already stronger than any proof a session can offer, and every host-local action is audited as such.
 
-A session that lacks a fresh stamp gets `Error::StepUpRequired`, distinct from `Forbidden`, so a client can prompt for a code rather than report a denial. The stamp lasts `Policy::step_up_ms` (10 minutes), only ever moves forward, cannot be written onto a revoked session, and is judged against the clock — a stamp in the future is not fresh.
+A session that lacks a fresh stamp gets `Error::StepUpRequired`, distinct from `Forbidden`, so a client can prompt for a code rather than report a denial. **A bearer credential can never step up**: `Authority::credential` is always unstepped, so an API token — even one carrying `platform-admin` — cannot make any of these changes. Only a session with a recent proof, or the host-local operator, can.
+
+Five consecutive failed proofs **revoke the session** (migration 10, `MAX_STEP_UP_FAILURES`): a six-digit code has three valid values per window, and a cookie holder who keeps guessing is not the person it was issued to. A successful proof resets the counter. Linking an external identity (`sign_in::link`) and provisioning a password (`provision_credential`) are authentication changes and require step-up too. The stamp lasts `Policy::step_up_ms` (10 minutes), only ever moves forward, cannot be written onto a revoked session, and is judged against the clock — a stamp in the future is not fresh.
 
 ## Proofs
 
@@ -23,7 +25,7 @@ A session that lacks a fresh stamp gets `Error::StepUpRequired`, distinct from `
 - **Recovery codes**: ten 50-bit codes in a look-alike-free alphabet, stored as BLAKE3 digests, each spent once (a trigger refuses to un-spend). Retyping without the separator or in upper case still works. Reissuing a set replaces the old one entirely.
 - **Password**, accepted **only when no second factor is enrolled**. Otherwise the weaker proof would stand in for the stronger, which is the opposite of stepping up.
 
-A wrong proof returns `false` and an audited `StepUpFailed`, not an error: the caller renders one response either way.
+A wrong proof returns `false` and an audited `StepUpFailed`, not an error: the caller renders one response either way. A GitHub-only account has no password to offer, so a GitHub-only super admin must enroll TOTP before any privileged change; enrollment itself needs only a session, so there is no lockout.
 
 ## The seed is sealed
 

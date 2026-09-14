@@ -338,12 +338,8 @@ fn token(args: &TokenArgs, now: UnixMillis) -> Result<(), Error> {
         TokenCommand::List { data, user } => {
             let store = open(data, true)?;
             let user = resolve_user(&store, user)?;
-            // Host-local listing acts as the account itself, and metadata is all
-            // that exists to read: no secret is recoverable from these rows.
-            let principal =
-                sentinel_core::auth::Principal::new(user, Permissions::NONE, None, None);
             let records = store
-                .read(|conn| tokens::list(conn, principal, user, 100))
+                .read(|conn| tokens::list(conn, Authority::HostLocal, user, 100))
                 .map_err(|error| fail(format!("cannot list credentials: {error}")))?;
             for record in records {
                 println!(
@@ -383,10 +379,8 @@ fn identity(args: &IdentityArgs, now: UnixMillis) -> Result<(), Error> {
         IdentityCommand::List { data, user } => {
             let store = open(data, true)?;
             let user = resolve_user(&store, user)?;
-            let principal =
-                sentinel_core::auth::Principal::new(user, Permissions::NONE, None, None);
             let identities = store
-                .read(|conn| sign_in::identities(conn, principal, user))
+                .read(|conn| sign_in::identities(conn, Authority::HostLocal, user))
                 .map_err(|error| fail(format!("cannot list identities: {error}")))?;
             for identity in identities {
                 println!(

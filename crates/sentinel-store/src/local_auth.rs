@@ -701,15 +701,17 @@ pub fn recover(
 
 /// Provision a local credential for an existing human account. Trusted
 /// administration, not a registration route: A05 owns invitations and approval.
+/// Giving an account a password changes how it can authenticate, so it needs
+/// the same recent step-up as any other change to authentication.
 pub fn provision_credential(
     tx: &Transaction<'_>,
-    principal: Principal,
+    authority: Authority,
     target: UserId,
     login_name: &str,
     phc: &str,
     now: UnixMillis,
 ) -> Result<()> {
-    crate::auth::require_platform_admin(tx, principal)?;
+    authority.require_privileged(tx)?;
     insert_credential(tx, target, username(login_name)?, phc, now)
 }
 

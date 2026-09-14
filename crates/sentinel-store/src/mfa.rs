@@ -26,6 +26,11 @@ use crate::{
     local_auth::{Event, Policy, Session, audit},
 };
 
+/// Failed step-ups a session may accumulate before it is revoked. Small: a
+/// six-digit code has three valid values per window, and a session that keeps
+/// guessing is not the person it was issued to.
+pub const MAX_STEP_UP_FAILURES: i64 = 5;
+
 /// Context binding a sealed seed to the account it belongs to, so a seed row
 /// copied onto another account cannot be opened.
 fn context(user: UserId) -> Vec<u8> {
@@ -194,11 +199,11 @@ pub fn step_up(
                 .map_err(Error::from)
             })?;
             let Some(sealed) = sealed else {
-                return refuse(store, user, now);
+                return refuse(store, digest.0, user, now);
             };
             let seed = open_seed(key, user, &sealed)?;
             let Some(step) = mfa::check(&seed, code, unix_seconds(now)) else {
-                return refuse(store, user, now);
+                return refuse(store, digest.0, user, now);
             };
             // RFC 6238 leaves one-use to the caller: a step already accepted is
             // refused, so a code seen over a shoulder is worthless.
@@ -212,14 +217,14 @@ pub fn step_up(
             })?
         }
         Proof::Recovery(code) => {
-            let Some(digest) = mfa::recovery_digest(code) else {
-                return refuse(store, user, now);
+            let Some(code_digest) = mfa::recovery_digest(code) else {
+                return refuse(store, digest.0, user, now);
             };
             store.writer().write(move |tx| {
                 let spent = tx.execute(
                     "UPDATE mfa_recovery_codes SET used_ms = ?3
                      WHERE code_digest = ?1 AND user_id = ?2 AND used_ms IS NULL",
-                    params![digest.0, user.as_bytes(), now.0],
+                    params![code_digest.0, user.as_bytes(), now.0],
                 )?;
                 if spent == 1 {
                     audit(
@@ -252,13 +257,13 @@ pub fn step_up(
                 }
                 _ => {
                     password::spend_equal_work(password_bytes);
-                    return refuse(store, user, now);
+                    return refuse(store, digest.0, user, now);
                 }
             }
         }
     };
     if !accepted {
-        return refuse(store, user, now);
+        return refuse(store, digest.0, user, now);
     }
     store.writer().write(move |tx| {
         stamp(tx, digest.0, now)?;
@@ -267,17 +272,43 @@ pub fn step_up(
     Ok(true)
 }
 
-fn refuse(store: &Store, user: UserId, now: UnixMillis) -> Result<bool> {
-    let _ = now;
-    store
-        .writer()
-        .write(move |tx| audit(tx, Event::StepUpFailed, Some(user), Some(user), false, None))?;
-    Ok(false)
+/// Record a failed proof against the session that presented it. Past the
+/// limit the session is revoked outright: the cookie holder has shown they
+/// cannot prove presence, so the cookie stops proving identity too.
+fn refuse(store: &Store, digest: [u8; 32], user: UserId, now: UnixMillis) -> Result<bool> {
+    store.writer().write(move |tx| {
+        let failures: Option<i64> = tx
+            .prepare_cached(
+                "UPDATE sessions SET step_up_failures = step_up_failures + 1
+                 WHERE token_digest = ?1 AND revoked_ms IS NULL RETURNING step_up_failures",
+            )?
+            .query_row([digest], |r| r.get(0))
+            .optional()?;
+        audit(tx, Event::StepUpFailed, Some(user), Some(user), false, None)?;
+        if failures.is_some_and(|count| count >= MAX_STEP_UP_FAILURES) {
+            tx.execute(
+                "UPDATE sessions SET revoked_ms = ?2 WHERE token_digest = ?1 AND revoked_ms IS NULL",
+                params![digest, now.0],
+            )?;
+            audit(
+                tx,
+                Event::SessionRevoked,
+                None,
+                Some(user),
+                false,
+                Some("step-up failures"),
+            )?;
+        }
+        Ok(false)
+    })
 }
 
+/// Stamp presence and forgive earlier failures: the proof just given is what
+/// the counter was protecting.
 fn stamp(tx: &rusqlite::Transaction<'_>, digest: [u8; 32], now: UnixMillis) -> Result<()> {
     tx.execute(
-        "UPDATE sessions SET stepped_up_ms = ?2 WHERE token_digest = ?1 AND revoked_ms IS NULL
+        "UPDATE sessions SET stepped_up_ms = ?2, step_up_failures = 0
+         WHERE token_digest = ?1 AND revoked_ms IS NULL
          AND (stepped_up_ms IS NULL OR stepped_up_ms < ?2)",
         params![digest, now.0],
     )?;

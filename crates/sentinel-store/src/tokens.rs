@@ -20,6 +20,7 @@ use sentinel_core::{
 
 use crate::{
     Error, Result, Store,
+    auth::Authority,
     local_auth::{Event, audit},
 };
 
@@ -299,7 +300,7 @@ pub fn record_use(store: &Store, token: TokenId, now: UnixMillis) -> Result<()> 
 /// checked live, inside this transaction. Revocation is immediate and final.
 pub fn revoke(
     tx: &Transaction<'_>,
-    principal: Principal,
+    authority: Authority,
     token: TokenId,
     now: UnixMillis,
 ) -> Result<()> {
@@ -309,16 +310,18 @@ pub fn revoke(
         .optional()?
         .ok_or(Error::NotFound)?;
     let owner = UserId::from_bytes(owner).map_err(|_| Error::Corrupt("user_id"))?;
-    if principal.user != owner {
-        crate::auth::require_platform_admin(tx, principal).map_err(|_| Error::NotFound)?;
+    if authority.actor() != Some(owner) {
+        authority
+            .require_platform(tx)
+            .map_err(|_| Error::NotFound)?;
     }
     revoke_row(tx, token, now)?;
     audit(
         tx,
         Event::TokenRevoked,
-        Some(principal.user),
+        authority.actor(),
         Some(owner),
-        false,
+        authority.host_local(),
         None,
     )
 }
@@ -376,15 +379,17 @@ pub struct Record {
 /// guessing its ID. At most 100 records.
 pub fn list(
     conn: &Connection,
-    principal: Principal,
+    authority: Authority,
     user: UserId,
     limit: u16,
 ) -> Result<Vec<Record>> {
     if !(1..=100).contains(&limit) {
         return Err(Error::InvalidInput("page size"));
     }
-    if principal.user != user {
-        crate::auth::require_platform_admin(conn, principal).map_err(|_| Error::NotFound)?;
+    if authority.actor() != Some(user) {
+        authority
+            .require_platform(conn)
+            .map_err(|_| Error::NotFound)?;
     }
     let mut stmt = conn.prepare_cached(
         "SELECT id, user_id, name, permissions, tenant_id, repo_id, created_ms,
