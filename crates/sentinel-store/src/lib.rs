@@ -15,6 +15,7 @@ pub mod auth;
 pub mod codec;
 pub mod dispatch;
 pub mod idempotency;
+pub mod intake;
 pub mod jobs;
 pub mod local_auth;
 pub mod logs;

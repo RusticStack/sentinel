@@ -148,6 +148,12 @@ identifier!(
     InstallationId,
     "ins"
 );
+identifier!(
+    /// One authenticated webhook/ref-update delivery (G02). Names the record so
+    /// an operator can trace it; the provider's own delivery ID is the dedup key.
+    DeliveryId,
+    "dlv"
+);
 
 /// Step position inside its job. Steps are compiled in order and referenced by
 /// index; the human name lives in the compiled spec. `u16` bounds a job to

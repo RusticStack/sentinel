@@ -11,6 +11,8 @@ publish.workspace = true
 [dependencies]
 sentinel-auth = { path = "../sentinel-auth" }
 sentinel-core = { path = "../sentinel-core" }
+sentinel-github = { path = "../sentinel-github" }
+sentinel-intake = { path = "../sentinel-intake" }
 sentinel-link = { path = "../sentinel-link", features = ["controller"] }
 sentinel-pipeline = { path = "../sentinel-pipeline" }
 sentinel-protocol = { path = "../sentinel-protocol" }
@@ -20,6 +22,7 @@ serde_json = "1.0"
 tiny_http = { version = "0.12", default-features = false }
 
 [dev-dependencies]
+ring = "0.17"
 tempfile = "3.20"
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 

@@ -232,6 +232,8 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
         logs: Arc::clone(&logs),
         controller: controller.as_ref().unwrap().handle(),
         sessions: local_auth::Policy::default(),
+        github_webhook_secret: None,
+        intake: None,
     })
     .unwrap();
     let api = Api {

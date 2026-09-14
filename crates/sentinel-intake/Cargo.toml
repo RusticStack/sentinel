@@ -1,0 +1,25 @@
+[package]
+name = "sentinel-intake"
+description = "Durable event intake: authenticated ref updates, GitHub webhooks, dedup and bounded resolution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+sentinel-core = { path = "../sentinel-core" }
+sentinel-github = { path = "../sentinel-github" }
+sentinel-protocol = { path = "../sentinel-protocol" }
+sentinel-store = { path = "../sentinel-store" }
+serde_json = "1.0"
+
+[dev-dependencies]
+ring = "0.17"
+sentinel-auth = { path = "../sentinel-auth" }
+sentinel-pipeline = { path = "../sentinel-pipeline" }
+tempfile = "3.20"
+
+[lints]
+workspace = true

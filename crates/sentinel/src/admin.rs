@@ -38,7 +38,7 @@ pub struct Error {
     pub message: String,
 }
 
-fn fail(message: impl Into<String>) -> Error {
+pub(crate) fn fail(message: impl Into<String>) -> Error {
     Error {
         message: message.into(),
     }
@@ -94,6 +94,7 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
     let now = sentinel_core::UnixMillis::now();
     match &args.command {
         AdminCommand::Source(args) => crate::source_admin::run(args)?,
+        AdminCommand::Intake(args) => crate::intake_admin::run(args)?,
         AdminCommand::Bootstrap {
             data,
             username,
@@ -242,24 +243,30 @@ const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 /// Whole units only (`30d`, `12h`, `90m`, `45s`). A lifetime is an operator
 /// decision, so it is stated plainly rather than parsed loosely.
 fn lifetime_ms(text: &str) -> Result<i64, Error> {
+    duration_ms(text, tokens::MAX_LIFETIME_MS)
+}
+
+/// Parse `<whole number><d|h|m|s>` with an explicit ceiling. No calendar
+/// arithmetic, no fractional units, no unbounded retention.
+pub(crate) fn duration_ms(text: &str, max_ms: i64) -> Result<i64, Error> {
     let (digits, unit) = text.split_at(text.len().saturating_sub(1));
     let scale = match unit {
         "d" => DAY_MS,
         "h" => 60 * 60 * 1000,
         "m" => 60 * 1000,
         "s" => 1000,
-        _ => return Err(fail("lifetime must end in d, h, m or s, as in 30d")),
+        _ => return Err(fail("duration must end in d, h, m or s, as in 30d")),
     };
     let value: i64 = digits
         .parse()
-        .map_err(|_| fail("lifetime must be a whole number of units, as in 30d"))?;
+        .map_err(|_| fail("duration must be a whole number of units, as in 30d"))?;
     value
         .checked_mul(scale)
-        .filter(|ms| (1..=tokens::MAX_LIFETIME_MS).contains(ms))
+        .filter(|ms| (1..=max_ms).contains(ms))
         .ok_or_else(|| {
             fail(format!(
-                "lifetime must be between 1s and {}d",
-                tokens::MAX_LIFETIME_MS / DAY_MS
+                "duration must be between 1s and {}d",
+                max_ms / DAY_MS
             ))
         })
 }

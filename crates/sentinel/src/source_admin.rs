@@ -13,7 +13,7 @@ use crate::{
 use sentinel_core::{InstallationId, RepoId, TenantId, UnixMillis, UserId};
 use sentinel_protocol::source::{Binding, Credential, MAX_SOURCE_BYTES};
 use sentinel_store::{
-    MASTER_KEY_FILE, auth, registration, registration::Authority, sources, sources_forge,
+    MASTER_KEY_FILE, auth, intake, registration, registration::Authority, sources, sources_forge,
 };
 use serde::Deserialize;
 use std::{io::Read, path::Path, sync::Arc};
@@ -72,6 +72,38 @@ pub fn load_app(root: &Path) -> Result<Option<Arc<sentinel_github::app::App>>, E
     Ok(Some(Arc::new(
         sentinel_github::app::App::new(config.app_id, pem).map_err(|_| fail("invalid App key"))?,
     )))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebhookConfig {
+    secret: String,
+}
+
+/// The GitHub App's webhook secret, when the deployment configured one. The
+/// route only exists with it; without the file there is nothing to verify.
+pub fn load_webhook_secret(root: &Path) -> Result<Option<Arc<[u8]>>, Error> {
+    let path = root.join("github-webhook.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let config: WebhookConfig = serde_json::from_slice(&file(&path, 4096)?)
+        .map_err(|_| fail("invalid GitHub webhook configuration"))?;
+    let secret = config.secret.as_bytes();
+    if !(16..=256).contains(&secret.len()) || secret.iter().any(|b| !(0x20..0x7f).contains(b)) {
+        return Err(fail(
+            "GitHub webhook secret must be 16-256 printable ASCII bytes",
+        ));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&path)
+        .map_err(|_| fail("cannot inspect GitHub webhook configuration"))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        return Err(fail("GitHub webhook configuration must be owner-only"));
+    }
+    Ok(Some(Arc::from(secret)))
 }
 
 pub fn load_destinations(root: &Path) -> Result<Vec<String>, Error> {
@@ -175,12 +207,17 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
         }
         SourceCommand::Show { repo: r } => {
             let repo = repo(r)?;
-            let m = store
-                .read(|c| sources::metadata_trusted(c, repo))
+            let (m, hook_token) = store
+                .read(|c| {
+                    Ok((
+                        sources::metadata_trusted(c, repo)?,
+                        intake::token_issued(c, repo)?,
+                    ))
+                })
                 .map_err(denied)?;
             println!(
                 "{}",
-                serde_json::json!({"repo":repo.to_string(),"binding":m.binding,"version":m.version,"revoked":m.revoked,"forge":m.forge.map(|(i,r)|serde_json::json!({"installation":i.to_string(),"repository_id":r}))})
+                serde_json::json!({"repo":repo.to_string(),"binding":m.binding,"version":m.version,"revoked":m.revoked,"hook_token_ms":hook_token.map(|t|t.0),"forge":m.forge.map(|(i,r)|serde_json::json!({"installation":i.to_string(),"repository_id":r}))})
             );
         }
         SourceCommand::Revoke { repo: r, expected } => {
@@ -194,6 +231,27 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                 "{}",
                 serde_json::json!({"revoked":true,"version":expected+1})
             );
+        }
+        SourceCommand::HookToken { repo: r, revoke } => {
+            let repo = repo(r)?;
+            if *revoke {
+                store
+                    .writer()
+                    .write(move |tx| intake::revoke_token(tx, host, repo, now))
+                    .map_err(denied)?;
+                println!(
+                    "{}",
+                    serde_json::json!({"repo":repo.to_string(),"revoked":true})
+                );
+            } else {
+                let secret = store
+                    .writer()
+                    .write(move |tx| intake::issue_token(tx, host, repo, now))
+                    .map_err(denied)?;
+                // The one presentation: only the secret reaches stdout, so a
+                // shell can redirect it without a parser in between.
+                println!("{}", intake::hook_token_text(&secret));
+            }
         }
         SourceCommand::RefreshInstallation {
             external_id,

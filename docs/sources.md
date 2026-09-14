@@ -122,6 +122,10 @@ printf '%s' '{"binding":{"remote":"https://git.example:8443/team/repo.git",
 sentinel admin source show   --data-dir "$DATA" --actor usr_... --repo rep_...
 sentinel admin source revoke --data-dir "$DATA" --actor usr_... --repo rep_... --expected 1
 
+# The repository's intake hook secret (shown once; rotates on the next call)
+sentinel admin source hook-token --data-dir "$DATA" --actor usr_... --repo rep_...
+sentinel admin source hook-token --data-dir "$DATA" --actor usr_... --repo rep_... --revoke
+
 # GitHub App lifecycle (platform administration)
 sentinel admin source refresh-installation --data-dir "$DATA" --actor usr_... \
   --external-id 12345678 --expected 0
@@ -130,6 +134,13 @@ sentinel admin source bind-installation   --data-dir "$DATA" --actor usr_... \
 sentinel admin source remove-installation --data-dir "$DATA" --actor usr_... \
   --installation ins_...
 ```
+
+`sentinel admin intake list --data-dir "$DATA" --repo rep_… [--state …]` shows
+the newest event deliveries and `admin intake purge --older-than 7d` retires
+settled ones ([intake](intake.md)). The `post-receive` hook and its relay live
+in `examples/hooks/`. A GitHub App installation is bound with
+`admin source bind-installation`; its webhook secret is the operator's to set
+in `<data_dir>/github-webhook.json`.
 
 `show` reports the binding, version, revocation and forge association —
 metadata only, never credential material. `bind` reads its JSON from standard
@@ -148,9 +159,12 @@ Sentinel stores and delivers them, and cannot make a write-capable token safe.
 ## Compatibility
 
 Migration 17 adds `source_bindings` and `source_audit` and extends
-`installations`; existing repositories stay unbound and unbound legacy runs
-keep working. Protocol 2 adds the `Source` message; workers negotiate
-`1..=2`. See [compatibility](compatibility.md).
+`installations`; migration 18 adds `source_intake_tokens` and
+`webhook_deliveries` ([intake](intake.md)). Existing repositories stay unbound
+and unbound legacy runs keep working. Protocol 2 adds the `Source` message;
+workers negotiate `1..=2`. The HTTP API gains `POST /api/v1/hooks/github` and
+`POST /api/v1/intake/{repo}`; both are additive under the `/api/v1` path
+policy. See [compatibility](compatibility.md).
 
 ## Verification
 
@@ -159,6 +173,8 @@ keep working. Protocol 2 adds the `Source` message; workers negotiate
   revocation with compare-and-set; ref and destination policy; installation
   lifecycle including suspension, transfer and deletion; migration from
   version 16 preserving repositories with no invented binding.
+- `crates/sentinel-store/tests/intake.rs`: hook secrets and the delivery
+  lifecycle ([intake](intake.md#verification)).
 - `crates/sentinel-worker/tests/checkout.rs`: a private HTTPS checkout against
   a loopback server with CA trust, a rotated credential and a removed CA, with
   no credential file left behind; a real `sshd` deployment-key checkout with

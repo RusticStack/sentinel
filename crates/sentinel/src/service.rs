@@ -435,6 +435,9 @@ enum Running {
         controller: sentinel_link::controller::Controller,
         api: sentinel_api::Server,
         store: Arc<sentinel_store::Store>,
+        /// Boxed: the enum is constructed once per process, and this keeps
+        /// the variant from dominating its size.
+        lane: Box<sentinel_intake::Lane>,
     },
     #[cfg(feature = "worker")]
     Worker {
@@ -491,6 +494,39 @@ fn start_server(
                 .map_err(|_| Error::runtime("cannot load source sealing key"))?,
         ));
     }
+    // The durable intake lane: accepted deliveries are resolved off the
+    // request path, bounded, and woken by the intake route. Its thread is not
+    // inside the service's scoped diagnostic dispatcher, so the dispatcher is
+    // captured here and installed around each notice, exactly as `work.rs`
+    // does for its lanes.
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let lane = sentinel_intake::Lane::start(
+        Arc::clone(&store),
+        sentinel_intake::lane::Config::default(),
+        move |batch| {
+            tracing::dispatcher::with_default(&dispatch, || {
+                if batch.failed > 0 {
+                    tracing::warn!(
+                        event = "intake_failed",
+                        failed = batch.failed,
+                        "deliveries settled with an explicit failure"
+                    );
+                }
+                for settled in &batch.settled {
+                    tracing::info!(
+                        event = "intake_settled",
+                        delivery = %settled.id,
+                        outcome = %settled.outcome
+                    );
+                }
+            });
+        },
+    );
+    let github_webhook_secret = crate::source_admin::load_webhook_secret(&config.data_dir)
+        .map_err(|_| Error::runtime("cannot load the GitHub webhook secret"))?;
+    if github_webhook_secret.is_some() {
+        tracing::info!(event = "github_webhook_enabled");
+    }
     tracing::info!(
         event = "link_listening",
         addr = %controller.local_addr(),
@@ -506,6 +542,8 @@ fn start_server(
         logs: Arc::clone(&logs),
         controller: controller.handle(),
         sessions: sentinel_store::local_auth::Policy::default(),
+        github_webhook_secret,
+        intake: Some(lane.waker()),
     })
     .map_err(|error| Error::runtime(format!("cannot listen on {api_listen}: {error}")))?;
     tracing::info!(event = "api_listening", addr = %api.local_addr());
@@ -513,6 +551,7 @@ fn start_server(
         controller,
         api,
         store,
+        lane: Box::new(lane),
     })
 }
 
@@ -776,8 +815,10 @@ fn initialize_and_wait(
             controller,
             api,
             store,
+            lane,
         } => {
             api.shutdown();
+            drop(lane);
             let sessions_drained = controller.shutdown(LINK_SHUTDOWN);
             let store_drained = matches!(
                 Arc::try_unwrap(store)

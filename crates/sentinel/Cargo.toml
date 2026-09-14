@@ -10,7 +10,7 @@ publish.workspace = true
 
 [features]
 default = []
-server = ["dep:sentinel-core", "dep:sentinel-store", "dep:sentinel-link", "sentinel-link/controller", "dep:sentinel-protocol", "dep:sentinel-api", "dep:sentinel-github", "dep:ctrlc", "dep:serde", "dep:toml", "dep:tracing", "dep:tracing-subscriber", "dep:uuid"]
+server = ["dep:sentinel-core", "dep:sentinel-store", "dep:sentinel-link", "sentinel-link/controller", "dep:sentinel-protocol", "dep:sentinel-api", "dep:sentinel-github", "dep:sentinel-intake", "dep:ctrlc", "dep:serde", "dep:toml", "dep:tracing", "dep:tracing-subscriber", "dep:uuid"]
 worker = ["dep:sentinel-core", "dep:sentinel-link", "dep:sentinel-protocol", "dep:sentinel-worker", "dep:ctrlc", "dep:serde", "dep:toml", "dep:tracing", "dep:tracing-subscriber", "dep:uuid"]
 
 [dependencies]
@@ -22,6 +22,7 @@ ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sentinel-github = { path = "../sentinel-github", optional = true }
+sentinel-intake = { path = "../sentinel-intake", optional = true }
 sentinel-api = { path = "../sentinel-api", optional = true }
 sentinel-core = { path = "../sentinel-core", optional = true }
 sentinel-store = { path = "../sentinel-store", optional = true }

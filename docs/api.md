@@ -19,7 +19,7 @@ The credential yields a `Principal`; every route then asks the store — `auth::
 
 ## Routes
 
-All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](protocol.md)); bodies bounded at 1 MiB before they are read.
+All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](protocol.md)); bodies bounded at 1 MiB before they are read, with the intake routes bounding their own bodies ([intake](intake.md)).
 
 | Route | Auth | Does |
 |---|---|---|
@@ -27,6 +27,8 @@ All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](p
 | `POST /login` `{username,password}` | none | password login → `Set-Cookie` session, body `{user, csrf}`; every non-accepted outcome is one `unauthenticated` |
 | `POST /logout` | session + CSRF | ends the session, clears the cookie |
 | `GET /me` | any | who the credential is and how |
+| `POST /hooks/github` | App webhook signature | GitHub webhooks ([intake](intake.md)): raw-body HMAC-SHA256, delivery dedup, `push` intake, `ping` probe. `not_found` until `<data_dir>/github-webhook.json` exists |
+| `POST /intake/{repo}` | repository hook secret | generic ref updates ([intake](intake.md)): bounded JSON, dedup, durable acceptance → `202` with the delivery id |
 | `GET /tenants/{slug}/repos` | member | repositories visible to the caller |
 | `GET /tenants/{slug}/repos/{name}/runs?limit` | `read` | newest runs first |
 | `POST /tenants/{slug}/repos/{name}/runs` `{pipeline, source:{repo,sha,ref}}` | `run` | compile, pin, create the run and its jobs, resolve every digest-pinned image, wake the dispatcher → `201` run status. `Idempotency-Key` replays the same run (`200`) and refuses a different body (`idempotency_mismatch`). Every image must be pinned by digest until a resolver exists |
@@ -59,7 +61,13 @@ sentinel api --token-file ~/.sentinel/token workers --tenant acme --json
 
 ## What is not here yet
 
-Webhook intake and GitHub Checks (G-tasks) are the other way runs start; the API dispatch is the manual one. MCP is the M-tasks over these same routes. TLS in the server itself is deliberately absent. Pagination cursors exist in the protocol and are not yet used by `runs` (a limit suffices for the first page). Step-up over the API (second factor for privileged mutations) arrives with the routes that need it.
+GitHub Checks (G03–G06) are the other way runs *finish* externally; webhook
+intake and the resolution lane exist ([intake](intake.md)), while the
+policy-selected pipeline resolution and run creation are G03. MCP is the
+M-tasks over these same routes. TLS in the server itself is deliberately
+absent. Pagination cursors exist in the protocol and are not yet used by
+`runs` (a limit suffices for the first page). Step-up over the API (second
+factor for privileged mutations) arrives with the routes that need it.
 
 ## Verification
 

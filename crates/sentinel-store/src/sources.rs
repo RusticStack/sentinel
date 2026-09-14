@@ -129,6 +129,11 @@ pub fn revoke(
         return Err(Error::InvalidInput("source version"));
     }
     if tx.execute("UPDATE source_bindings SET revoked=1,version=version+1,credential=x'',updated_ms=?3 WHERE repo_id=?1 AND version=?2 AND revoked=0",params![repo.as_bytes(),expected as i64,now.0])? != 1 { return Err(Error::Conflict); }
+    // A revoked binding's hook secret must not keep accepting events.
+    tx.execute(
+        "DELETE FROM source_intake_tokens WHERE repo_id = ?1",
+        [repo.as_bytes()],
+    )?;
     let recorded = actor.or_else(|| authority.actor());
     let recorded = recorded.map(|a| *a.as_bytes());
     tx.execute("INSERT INTO source_audit(tenant_id,repo_id,version,actor,action,at_ms) VALUES(?1,?2,?3,?4,'revoke',?5)",params![tenant.as_bytes(),repo.as_bytes(),(expected+1) as i64,recorded,now.0])?;

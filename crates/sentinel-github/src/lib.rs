@@ -18,6 +18,7 @@
 pub mod app;
 pub mod http;
 pub mod oauth;
+pub mod webhook;
 
 use std::fmt;
 

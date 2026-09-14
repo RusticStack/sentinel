@@ -1158,6 +1158,7 @@ dependencies = [
  "sentinel-auth",
  "sentinel-core",
  "sentinel-github",
+ "sentinel-intake",
  "sentinel-link",
  "sentinel-pipeline",
  "sentinel-protocol",
@@ -1177,8 +1178,11 @@ dependencies = [
 name = "sentinel-api"
 version = "0.1.0-dev"
 dependencies = [
+ "ring",
  "sentinel-auth",
  "sentinel-core",
+ "sentinel-github",
+ "sentinel-intake",
  "sentinel-link",
  "sentinel-pipeline",
  "sentinel-protocol",
@@ -1231,6 +1235,21 @@ dependencies = [
  "tempfile",
  "time",
  "ureq",
+]
+
+[[package]]
+name = "sentinel-intake"
+version = "0.1.0-dev"
+dependencies = [
+ "ring",
+ "sentinel-auth",
+ "sentinel-core",
+ "sentinel-github",
+ "sentinel-pipeline",
+ "sentinel-protocol",
+ "sentinel-store",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

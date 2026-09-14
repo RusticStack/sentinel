@@ -7,13 +7,15 @@ use std::io::Read;
 
 use sentinel_auth::cookie;
 use sentinel_core::{
-    AttemptId, JobId, JobState, RunId, RunState, UnixMillis,
+    AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis,
     auth::{Permissions, Principal},
 };
+use sentinel_intake::ingest;
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str, schema::Arch};
 use sentinel_protocol::{
     error::{ApiError, ErrorCode},
     idempotency::{Fingerprint, IdempotencyKey},
+    intake::{MAX_HOOK_BODY_BYTES, MAX_WEBHOOK_BODY_BYTES},
     limits::{MAX_API_BODY_BYTES, MAX_PAGE_ITEMS, page_size},
 };
 use sentinel_store::{
@@ -108,22 +110,26 @@ fn header_value<'a>(request: &'a Request, name: &'static str) -> Option<&'a str>
 
 /// Read a JSON body within the protocol limit.
 fn body(request: &mut Request) -> Result<Vec<u8>, ApiError> {
-    if request
-        .body_length()
-        .is_some_and(|n| n > MAX_API_BODY_BYTES)
-    {
-        return Err(err(ErrorCode::PayloadTooLarge, "body too large")
-            .with_detail("limit_bytes", MAX_API_BODY_BYTES));
+    body_limit(request, MAX_API_BODY_BYTES)
+}
+
+/// Read a body within a route-specific limit, before anything is buffered.
+fn body_limit(request: &mut Request, limit: usize) -> Result<Vec<u8>, ApiError> {
+    if request.body_length().is_some_and(|n| n > limit) {
+        return Err(
+            err(ErrorCode::PayloadTooLarge, "body too large").with_detail("limit_bytes", limit)
+        );
     }
     let mut bytes = Vec::new();
     request
         .as_reader()
-        .take(MAX_API_BODY_BYTES as u64 + 1)
+        .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| err(ErrorCode::InvalidRequest, "unreadable body"))?;
-    if bytes.len() > MAX_API_BODY_BYTES {
-        return Err(err(ErrorCode::PayloadTooLarge, "body too large")
-            .with_detail("limit_bytes", MAX_API_BODY_BYTES));
+    if bytes.len() > limit {
+        return Err(
+            err(ErrorCode::PayloadTooLarge, "body too large").with_detail("limit_bytes", limit)
+        );
     }
     Ok(bytes)
 }
@@ -171,6 +177,8 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match (method, parts.as_slice()) {
         ("GET", ["api", "v1", "health"]) => ok(json!({ "ok": true })),
+        ("POST", ["api", "v1", "hooks", "github"]) => github_hook(state, request),
+        ("POST", ["api", "v1", "intake", repo]) => generic_intake(state, request, repo),
         ("POST", ["api", "v1", "login"]) => login(state, request),
         ("POST", ["api", "v1", "logout"]) => logout(state, request),
         ("GET", ["api", "v1", "me"]) => {
@@ -349,6 +357,104 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
         }
         _ => Err(err(ErrorCode::NotFound, "no such route")),
     }
+}
+
+fn intake_error(error: ingest::Error) -> ApiError {
+    match error {
+        ingest::Error::Unauthenticated => err(ErrorCode::Unauthenticated, "invalid credential"),
+        ingest::Error::InvalidRequest(what) => {
+            err(ErrorCode::InvalidRequest, format!("invalid {what}"))
+        }
+        ingest::Error::NotFound => err(ErrorCode::NotFound, "not found"),
+        ingest::Error::Forbidden(what) => err(ErrorCode::Forbidden, format!("forbidden: {what}")),
+        ingest::Error::Conflict => err(
+            ErrorCode::Conflict,
+            "delivery identity reused with different content",
+        ),
+        ingest::Error::RateLimited => err(ErrorCode::RateLimited, "intake queue full; retry"),
+        ingest::Error::Internal => err(ErrorCode::Internal, "controller fault"),
+    }
+}
+
+/// A header value copied out of the request before its body is read, bounded
+/// so a hostile client cannot make the controller buffer unbounded headers.
+fn bounded_header(request: &Request, name: &'static str, max: usize) -> Option<String> {
+    header_value(request, name)
+        .filter(|value| value.len() <= max)
+        .map(str::to_owned)
+}
+
+/// The `Bearer` value of an Authorization header, scheme case-insensitive.
+fn authorization_value(header: &str) -> Option<&str> {
+    let (scheme, value) = header.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| value.trim_start())
+}
+
+fn wake_intake(state: &State, duplicate: bool) {
+    if !duplicate && let Some(waker) = &state.intake {
+        waker.wake();
+    }
+}
+
+/// GitHub App webhooks: signature over the raw body, then the shared intake.
+/// Once the signature verifies, everything GitHub may legitimately send is
+/// answered 2xx — an unbound repository is a normal state, and an error would
+/// make GitHub disable the hook and hide future real events.
+fn github_hook(state: &State, request: &mut Request) -> Reply {
+    let Some(secret) = state.github_webhook_secret.as_deref() else {
+        return Err(err(ErrorCode::NotFound, "no such route"));
+    };
+    let event =
+        bounded_header(request, sentinel_github::webhook::EVENT_HEADER, 64).unwrap_or_default();
+    let delivery = bounded_header(request, sentinel_github::webhook::DELIVERY_HEADER, 128);
+    let signature = bounded_header(request, sentinel_github::webhook::SIGNATURE_HEADER, 128);
+    let body = body_limit(request, MAX_WEBHOOK_BODY_BYTES)?;
+    let outcome = ingest::github(
+        &state.store,
+        secret,
+        &event,
+        delivery.as_deref(),
+        signature.as_deref(),
+        &body,
+        UnixMillis::now(),
+    )
+    .map_err(intake_error)?;
+    match outcome {
+        ingest::Github::Pong => ok(json!({ "pong": true })),
+        ingest::Github::Ignored(why) => ok(json!({ "ignored": why })),
+        ingest::Github::Ingested(ingested) => {
+            wake_intake(state, ingested.duplicate);
+            Ok((
+                202,
+                json!({ "delivery": ingested.id.to_string(), "duplicate": ingested.duplicate }),
+                Vec::new(),
+            ))
+        }
+    }
+}
+
+/// Generic ref-update intake: a repository hook secret over the raw body.
+fn generic_intake(state: &State, request: &mut Request, repo: &str) -> Reply {
+    let repo: RepoId = id(repo, "repository")?;
+    let presented = bounded_header(request, "authorization", 128)
+        .and_then(|header| authorization_value(&header).map(str::to_owned))
+        .ok_or_else(|| {
+            err(
+                ErrorCode::Unauthenticated,
+                "present the repository hook secret",
+            )
+        })?;
+    let body = body_limit(request, MAX_HOOK_BODY_BYTES)?;
+    let ingested = ingest::generic(&state.store, &presented, repo, &body, UnixMillis::now())
+        .map_err(intake_error)?;
+    wake_intake(state, ingested.duplicate);
+    Ok((
+        202,
+        json!({ "delivery": ingested.id.to_string(), "duplicate": ingested.duplicate }),
+        Vec::new(),
+    ))
 }
 
 fn authorize_run(

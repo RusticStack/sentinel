@@ -10,17 +10,25 @@ use sentinel_core::{
     auth::{Namespace, Permissions as P, Principal},
 };
 use sentinel_link::{controller::Controller, identity::Identity};
-use sentinel_protocol::logs::{Frame, Stream};
+use sentinel_protocol::{
+    logs::{Frame, Stream},
+    source::{Binding, Credential},
+};
 use sentinel_store::{
     Durability, Store,
     auth::{self, Authority, NamespaceKind, provisioning},
-    local_auth,
+    intake, local_auth,
     logs::LogStore,
+    registration,
+    sources::{self, Update},
+    sources_forge,
     tenancy::{self, PoolKind},
     tokens::{self, Grant},
 };
 
 const DIGEST: &str = "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
+const WEBHOOK_SECRET: &[u8] = b"a-webhook-secret-value";
+const GITHUB_REPO_ID: u64 = 91;
 
 struct Deployment {
     _dir: tempfile::TempDir,
@@ -30,8 +38,11 @@ struct Deployment {
     server: Option<sentinel_api::Server>,
     base: String,
     token: String,
+    hook_token: String,
     tenant: TenantId,
     repo: RepoId,
+    github_repo: RepoId,
+    intake_repo: RepoId,
     root: UserId,
 }
 
@@ -40,9 +51,19 @@ fn deployment() -> Deployment {
     let store =
         Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
     let logs = Arc::new(LogStore::open(dir.path().join("logs")).unwrap());
-    let (tenant, repo, pool) = (TenantId::new(), RepoId::new(), PoolId::new());
-    // A bootstrapped super admin with a password, a namespace, a repository
-    // and a pool.
+    let key_path = dir.path().join("master.key");
+    sentinel_auth::sealed::Key::create(&key_path).unwrap();
+    let key = sentinel_auth::sealed::Key::load(&key_path).unwrap();
+    let (tenant, repo, github_repo, intake_repo, pool) = (
+        TenantId::new(),
+        RepoId::new(),
+        RepoId::new(),
+        RepoId::new(),
+        PoolId::new(),
+    );
+    // A bootstrapped super admin with a password, a namespace, two bound
+    // repositories (one generic, one through a GitHub App installation) and a
+    // pool.
     let root = local_auth::bootstrap(
         &store,
         "root",
@@ -51,6 +72,7 @@ fn deployment() -> Deployment {
         UnixMillis::now(),
     )
     .unwrap();
+    let now = UnixMillis::now();
     store
         .writer()
         .write(move |tx| {
@@ -60,7 +82,7 @@ fn deployment() -> Deployment {
                 tenant,
                 Namespace::parse("acme").unwrap(),
                 NamespaceKind::Organization,
-                UnixMillis::now(),
+                now,
             )?;
             // The super admin created the namespace; membership is what
             // repository access is judged by, so root joins it explicitly.
@@ -77,7 +99,82 @@ fn deployment() -> Deployment {
                 tenant,
                 repo,
                 "app",
-                UnixMillis::now(),
+                now,
+            )?;
+            auth::create_repo(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                github_repo,
+                "widget",
+                now,
+            )?;
+            auth::create_repo(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                intake_repo,
+                "hooked",
+                now,
+            )?;
+            let generic = Binding {
+                remote: "https://git.example:8443/team/repo.git".into(),
+                allowed_refs: vec!["refs/heads/main".into()],
+                pipeline_path: ".sentinel.yml".into(),
+                trust: String::new(),
+            };
+            sources::bind(
+                tx,
+                Authority::HostLocal,
+                Some(root),
+                Update {
+                    repo: intake_repo,
+                    expected: 0,
+                    binding: &generic,
+                    credential: &Credential::Https {
+                        username: "deploy".into(),
+                        secret: "deploy-token".into(),
+                    },
+                    forge: None,
+                },
+                &["https://git.example:8443".into()],
+                &key,
+                now,
+            )?;
+            let installation = sources_forge::refresh(
+                tx,
+                sources_forge::Snapshot {
+                    external_id: 42,
+                    account_id: 73,
+                    login: "account",
+                    personal: false,
+                    suspended: false,
+                    permissions_valid: true,
+                    expected: 0,
+                },
+                now,
+            )?;
+            registration::bind_installation_trusted(tx, installation, tenant, now)?;
+            let forge = Binding {
+                remote: "https://github.com/account/widget.git".into(),
+                allowed_refs: vec!["refs/heads/main".into()],
+                pipeline_path: ".sentinel.yml".into(),
+                trust: String::new(),
+            };
+            sources::bind(
+                tx,
+                Authority::HostLocal,
+                Some(root),
+                Update {
+                    repo: github_repo,
+                    expected: 0,
+                    binding: &forge,
+                    credential: &Credential::Public,
+                    forge: Some((installation, GITHUB_REPO_ID)),
+                },
+                &["https://github.com".into()],
+                &key,
+                now,
             )?;
             tenancy::create_pool(
                 tx,
@@ -85,10 +182,17 @@ fn deployment() -> Deployment {
                 pool,
                 "builders",
                 PoolKind::Dedicated(tenant),
-                UnixMillis::now(),
+                now,
             )
         })
         .unwrap();
+    let hook_token = {
+        let secret = store
+            .writer()
+            .write(move |tx| intake::issue_token(tx, Authority::HostLocal, intake_repo, now))
+            .unwrap();
+        intake::hook_token_text(&secret)
+    };
     let granted = tokens::provision(
         &store,
         Grant {
@@ -115,6 +219,8 @@ fn deployment() -> Deployment {
         logs: Arc::clone(&logs),
         controller: controller.handle(),
         sessions: local_auth::Policy::default(),
+        github_webhook_secret: Some(Arc::from(WEBHOOK_SECRET)),
+        intake: None,
     })
     .unwrap();
     let base = format!("http://{}", server.local_addr());
@@ -127,8 +233,11 @@ fn deployment() -> Deployment {
         server: Some(server),
         base,
         token: sentinel_auth::token::format(&granted.secret),
+        hook_token,
         tenant,
         repo,
+        github_repo,
+        intake_repo,
         root,
     }
 }
@@ -286,7 +395,13 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         &[],
     );
     assert_eq!(status, 200, "{repos}");
-    assert_eq!(repos["repos"][0]["name"], "app");
+    let names: Vec<&str> = repos["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(names.contains(&"app"), "{names:?}");
     let (status, list) = call(
         &d,
         "GET",
@@ -683,4 +798,360 @@ fn a_password_session_needs_the_csrf_header_for_mutations() {
         (401, Some("unauthenticated"))
     );
     let _ = DIGEST;
+}
+
+/// A GitHub `push` payload for one immutable repository ID.
+fn push_payload(repository: u64) -> serde_json::Value {
+    serde_json::json!({
+        "ref": "refs/heads/main",
+        "before": "a".repeat(40),
+        "after": "b".repeat(40),
+        "created": false,
+        "deleted": false,
+        "forced": false,
+        "installation": {"id": 42},
+        "repository": {"id": repository, "full_name": "account/widget"},
+    })
+}
+
+/// The App webhook signature over exactly the bytes the request carries.
+fn webhook_signature(body: &[u8]) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, WEBHOOK_SECRET);
+    let tag = ring::hmac::sign(&key, body);
+    let mut out = String::from("sha256=");
+    for byte in tag.as_ref() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn hook_bearer(d: &Deployment) -> String {
+    format!("Bearer {}", d.hook_token)
+}
+
+fn delivery_state(d: &Deployment, id: &str) -> intake::State {
+    let id: sentinel_core::DeliveryId = id.parse().unwrap();
+    d.store.read(move |c| intake::get(c, id)).unwrap().state
+}
+
+#[test]
+fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
+    let d = deployment();
+
+    // Generic intake: no secret, a malformed secret, an unknown repository and
+    // another repository's secret are one indistinguishable refusal.
+    let update = |delivery: &str| {
+        serde_json::json!({
+            "delivery_id": delivery,
+            "ref": "refs/heads/main",
+            "old_sha": "a".repeat(40),
+            "new_sha": "b".repeat(40),
+        })
+    };
+    let intake_path = format!("/api/v1/intake/{}", d.intake_repo);
+    let (status, body) = call(&d, "POST", &intake_path, Some(&update("hook-1")), None, &[]);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (401, Some("unauthenticated"))
+    );
+    let (status, _) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&update("hook-1")),
+        Some("Bearer sentinel_hook_0000"),
+        &[],
+    );
+    assert_eq!(status, 401);
+    let (status, _) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/intake/{}", RepoId::new()),
+        Some(&update("hook-1")),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(status, 401, "a repository is never enumerable by intake");
+
+    // A malformed body is invalid_request; a body over the route's limit is
+    // refused before it is parsed.
+    let (status, body) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&serde_json::json!({ "delivery_id": "hook-2" })),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+    let oversize = serde_json::json!({
+        "delivery_id": "hook-3",
+        "ref": "refs/heads/main",
+        "old_sha": "a".repeat(40),
+        "new_sha": "b".repeat(40),
+        "padding": "x".repeat(70_000),
+    });
+    let (status, body) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&oversize),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (413, Some("payload_too_large"))
+    );
+
+    // A valid delivery is acknowledged with its record id, durable before the
+    // response; the redelivery is a duplicate of the same record.
+    let (status, first) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&update("hook-4")),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(
+        (status, first["duplicate"].as_bool()),
+        (202, Some(false)),
+        "{first}"
+    );
+    let id = first["delivery"].as_str().unwrap().to_owned();
+    assert_eq!(delivery_state(&d, &id), intake::State::Pending);
+    let (status, again) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&update("hook-4")),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(
+        (
+            status,
+            again["duplicate"].as_bool(),
+            again["delivery"].as_str()
+        ),
+        (202, Some(true), Some(id.as_str()))
+    );
+    // The same identity with different content is a conflict, not a replay.
+    let (status, body) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&serde_json::json!({
+            "delivery_id": "hook-4",
+            "ref": "refs/heads/other",
+            "old_sha": "a".repeat(40),
+            "new_sha": "b".repeat(40),
+        })),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (409, Some("conflict")));
+
+    // GitHub intake: the signature covers the raw body, and a ping is a probe
+    // that stores nothing.
+    let payload = push_payload(GITHUB_REPO_ID);
+    let raw = payload.to_string();
+    let signed = webhook_signature(raw.as_bytes());
+    let (status, _) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&payload),
+        None,
+        &[],
+    );
+    assert_eq!(status, 401, "no signature");
+    let (status, _) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&payload),
+        None,
+        &[
+            ("x-hub-signature-256", "sha256=00"),
+            ("x-github-event", "push"),
+            ("x-github-delivery", "gh-1"),
+        ],
+    );
+    assert_eq!(status, 401, "wrong signature length");
+    let ping = serde_json::json!({ "zen": "Keep it logically awesome." });
+    let ping_raw = ping.to_string();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&ping),
+        None,
+        &[
+            (
+                "x-hub-signature-256",
+                &webhook_signature(ping_raw.as_bytes()),
+            ),
+            ("x-github-event", "ping"),
+        ],
+    );
+    assert_eq!((status, body["pong"].as_bool()), (200, Some(true)));
+
+    // A valid push for an unbound repository is accepted and ignored: GitHub
+    // must not retry it, and no delivery is stored.
+    let unbound = push_payload(92);
+    let unbound_raw = unbound.to_string();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&unbound),
+        None,
+        &[
+            (
+                "x-hub-signature-256",
+                &webhook_signature(unbound_raw.as_bytes()),
+            ),
+            ("x-github-event", "push"),
+            ("x-github-delivery", "gh-2"),
+        ],
+    );
+    assert_eq!(
+        (status, body["ignored"].as_str()),
+        (200, Some("unbound_repository"))
+    );
+    // A delivery without its identity header is refused before the store.
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&payload),
+        None,
+        &[("x-hub-signature-256", &signed), ("x-github-event", "push")],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+    // The bound repository accepts, stores and deduplicates.
+    let (status, first) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&payload),
+        None,
+        &[
+            ("x-hub-signature-256", &signed),
+            ("x-github-event", "push"),
+            ("x-github-delivery", "gh-3"),
+        ],
+    );
+    assert_eq!(
+        (status, first["duplicate"].as_bool()),
+        (202, Some(false)),
+        "{first}"
+    );
+    let id = first["delivery"].as_str().unwrap().to_owned();
+    assert_eq!(delivery_state(&d, &id), intake::State::Pending);
+    let (status, again) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&payload),
+        None,
+        &[
+            ("x-hub-signature-256", &signed),
+            ("x-github-event", "push"),
+            ("x-github-delivery", "gh-3"),
+        ],
+    );
+    assert_eq!((status, again["duplicate"].as_bool()), (202, Some(true)));
+    assert_eq!(again["delivery"].as_str(), Some(id.as_str()));
+    // An event this deployment does not handle yet is acknowledged and
+    // ignored, not retried.
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&payload),
+        None,
+        &[
+            ("x-hub-signature-256", &signed),
+            ("x-github-event", "pull_request"),
+            ("x-github-delivery", "gh-4"),
+        ],
+    );
+    assert_eq!(
+        (status, body["ignored"].as_str()),
+        (200, Some("unsupported_event"))
+    );
+    // The repository owned by the token is what the delivery belongs to: the
+    // generic secret is scoped to its repository.
+    let (status, _) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/intake/{}", d.github_repo),
+        Some(&update("hook-5")),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(status, 401);
+
+    // The admission bound is reported as rate_limited, and a duplicate of an
+    // already-stored delivery is still acknowledged at the bound.
+    let repo = d.intake_repo;
+    let tenant = d.tenant;
+    let received = UnixMillis::now().0;
+    d.store
+        .writer()
+        .write(move |tx| {
+            for index in 0..sentinel_store::intake::MAX_PENDING_PER_REPO {
+                let id = sentinel_core::DeliveryId::new();
+                let filler = format!("filler-{index}");
+                let (old, new) = ("a".repeat(40), "b".repeat(40));
+                tx.execute(
+                    "INSERT INTO webhook_deliveries(id, tenant_id, repo_id, provider, external_id,
+                        event, ref_name, old_sha, new_sha, state, received_ms)
+                     VALUES (?1, ?2, ?3, 'generic', ?4, 'ref_update', ?5, ?6, ?7, 0, ?8)",
+                    (
+                        id.as_bytes().as_slice(),
+                        tenant.as_bytes().as_slice(),
+                        repo.as_bytes().as_slice(),
+                        filler.as_str(),
+                        "refs/heads/main",
+                        old.as_str(),
+                        new.as_str(),
+                        received,
+                    ),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let (status, body) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&update("hook-6")),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (429, Some("rate_limited")),
+        "{body}"
+    );
+    let (status, again) = call(
+        &d,
+        "POST",
+        &intake_path,
+        Some(&update("hook-4")),
+        Some(&hook_bearer(&d)),
+        &[],
+    );
+    assert_eq!((status, again["duplicate"].as_bool()), (202, Some(true)));
 }

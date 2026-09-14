@@ -130,6 +130,8 @@ pub struct DataDir {
 pub enum AdminCommand {
     /// Bind source repositories, rotate deploy credentials and manage App installations
     Source(SourceArgs),
+    /// Inspect and purge durable event intake records
+    Intake(IntakeArgs),
     /// Admit the first super admin; refused once any active super admin exists
     Bootstrap {
         #[command(flatten)]
@@ -235,6 +237,14 @@ pub enum SourceCommand {
         #[arg(long)]
         expected: u64,
     },
+    /// Issue (or rotate) the repository's intake hook secret; only the secret goes to stdout
+    HookToken {
+        #[arg(long)]
+        repo: String,
+        /// Remove the secret instead of issuing one
+        #[arg(long)]
+        revoke: bool,
+    },
     /// Fetch a fresh authenticated GitHub App installation snapshot
     RefreshInstallation {
         #[arg(long)]
@@ -251,6 +261,37 @@ pub enum SourceCommand {
     RemoveInstallation {
         #[arg(long)]
         installation: String,
+    },
+}
+
+#[derive(Args)]
+pub struct IntakeArgs {
+    #[command(flatten)]
+    pub data: DataDir,
+    #[command(subcommand)]
+    pub command: IntakeCommand,
+}
+
+#[derive(Subcommand)]
+pub enum IntakeCommand {
+    /// Newest event deliveries of one repository, optionally one state
+    List {
+        /// The `rep_` identifier
+        #[arg(long)]
+        repo: String,
+        /// pending | ready | ignored | failed
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long, default_value = "50", value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    /// Delete settled deliveries older than a retention duration
+    Purge {
+        /// Retention such as 7d or 24h; settled records older than this go
+        #[arg(long, value_name = "DURATION", default_value = "7d")]
+        older_than: String,
+        #[arg(long, default_value = "1000")]
+        limit: u32,
     },
 }
 

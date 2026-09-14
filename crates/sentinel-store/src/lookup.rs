@@ -126,6 +126,20 @@ pub fn pool_by_name(conn: &Connection, name: &str) -> Result<sentinel_core::Pool
     sentinel_core::PoolId::from_bytes(bytes).map_err(|_| Error::Corrupt("pool id"))
 }
 
+/// The tenant that owns a repository, whatever the tenant's state: an
+/// operator listing intake records must be able to name a suspended tenant.
+pub fn repo_tenant(
+    conn: &Connection,
+    repo: sentinel_core::RepoId,
+) -> Result<sentinel_core::TenantId> {
+    let tenant: [u8; 16] = conn
+        .prepare_cached("SELECT tenant_id FROM repos WHERE id = ?1")?
+        .query_row([repo.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    sentinel_core::TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))
+}
+
 /// A repository by name inside one tenant; the pair is the unique key.
 pub fn repo_by_name(conn: &Connection, tenant: TenantId, name: &str) -> Result<RepoId> {
     let bytes: [u8; 16] = conn

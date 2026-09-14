@@ -38,6 +38,11 @@ pub struct Config {
     pub controller: Handle,
     /// Session policy for password logins.
     pub sessions: sentinel_store::local_auth::Policy,
+    /// The GitHub App webhook secret, when one is configured. Without it the
+    /// GitHub intake route does not exist.
+    pub github_webhook_secret: Option<Arc<[u8]>>,
+    /// Wakes the resolution lane after an accepted delivery.
+    pub intake: Option<sentinel_intake::Waker>,
 }
 
 pub(crate) struct State {
@@ -45,6 +50,8 @@ pub(crate) struct State {
     pub logs: Arc<LogStore>,
     pub controller: Handle,
     pub sessions: sentinel_store::local_auth::Policy,
+    pub github_webhook_secret: Option<Arc<[u8]>>,
+    pub intake: Option<sentinel_intake::Waker>,
     pub stop: AtomicBool,
 }
 
@@ -70,6 +77,8 @@ impl Server {
             logs: config.logs,
             controller: config.controller,
             sessions: config.sessions,
+            github_webhook_secret: config.github_webhook_secret,
+            intake: config.intake,
             stop: AtomicBool::new(false),
         });
         let mut threads = Vec::with_capacity(WORKERS);

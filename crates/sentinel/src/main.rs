@@ -7,6 +7,8 @@ compile_error!(
 mod admin;
 mod cli;
 mod client;
+#[cfg(all(target_os = "linux", feature = "server"))]
+mod intake_admin;
 mod pipeline;
 #[cfg(all(target_os = "linux", feature = "server"))]
 mod source_admin;
