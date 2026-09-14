@@ -52,6 +52,27 @@ pub fn tenant_by_slug(conn: &Connection, slug: &str) -> Result<TenantId> {
     TenantId::from_bytes(bytes).map_err(|_| Error::Corrupt("tenant_id"))
 }
 
+/// A namespace by slug whatever its state: an operator lifting a suspension
+/// must be able to name a suspended tenant.
+pub fn tenant_by_slug_any(conn: &Connection, slug: &str) -> Result<TenantId> {
+    let bytes: [u8; 16] = conn
+        .prepare_cached("SELECT id FROM tenants WHERE slug = ?1")?
+        .query_row([slug], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    TenantId::from_bytes(bytes).map_err(|_| Error::Corrupt("tenant_id"))
+}
+
+/// A pool by its unique name.
+pub fn pool_by_name(conn: &Connection, name: &str) -> Result<sentinel_core::PoolId> {
+    let bytes: [u8; 16] = conn
+        .prepare_cached("SELECT id FROM pools WHERE name = ?1")?
+        .query_row([name], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    sentinel_core::PoolId::from_bytes(bytes).map_err(|_| Error::Corrupt("pool id"))
+}
+
 /// A repository by name inside one tenant; the pair is the unique key.
 pub fn repo_by_name(conn: &Connection, tenant: TenantId, name: &str) -> Result<RepoId> {
     let bytes: [u8; 16] = conn

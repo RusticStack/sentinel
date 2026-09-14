@@ -119,7 +119,7 @@ fn a_host_local_credential_authenticates_through_the_ordinary_authorization_laye
     // Losing the membership behind the credential ends its access at once.
     store
         .writer()
-        .write(move |tx| auth::remove_membership(tx, admin(i), i.tenant, i.dev))
+        .write(move |tx| auth::remove_membership(tx, admin(i), i.tenant, i.dev, NOW))
         .unwrap();
     assert!(matches!(
         store.read(|conn| auth::require_repo(conn, principal, i.repo, P::READ)),

@@ -95,6 +95,15 @@ pub enum Event {
     RecoveryCodeUsed = 32,
     RecoveryCodesIssued = 33,
     SessionRevoked = 34,
+    TenantSuspended = 35,
+    TenantReactivated = 36,
+    MembershipSet = 37,
+    MembershipRemoved = 38,
+    GrantChanged = 39,
+    PoolCreated = 40,
+    PoolGranted = 41,
+    PoolGrantRevoked = 42,
+    NamespaceCreated = 43,
 }
 
 impl Event {
@@ -134,6 +143,15 @@ impl Event {
             32 => Event::RecoveryCodeUsed,
             33 => Event::RecoveryCodesIssued,
             34 => Event::SessionRevoked,
+            35 => Event::TenantSuspended,
+            36 => Event::TenantReactivated,
+            37 => Event::MembershipSet,
+            38 => Event::MembershipRemoved,
+            39 => Event::GrantChanged,
+            40 => Event::PoolCreated,
+            41 => Event::PoolGranted,
+            42 => Event::PoolGrantRevoked,
+            43 => Event::NamespaceCreated,
             _ => return None,
         })
     }

@@ -335,7 +335,13 @@ fn namespace_identity_and_bounded_lists_do_not_leak_other_tenants() {
     assert!(
         store
             .writer()
-            .write(move |tx| auth::remove_membership(tx, principal(i.root), i.personal, i.alice))
+            .write(move |tx| auth::remove_membership(
+                tx,
+                principal(i.root),
+                i.personal,
+                i.alice,
+                NOW
+            ))
             .is_err()
     );
     assert!(
@@ -433,7 +439,7 @@ fn revocation_is_live_and_readding_membership_does_not_restore_old_grants() {
         .unwrap();
     store
         .writer()
-        .write(move |tx| auth::remove_membership(tx, principal(i.alice), i.a, i.bob))
+        .write(move |tx| auth::remove_membership(tx, principal(i.alice), i.a, i.bob, NOW))
         .unwrap();
     store
         .writer()
@@ -770,7 +776,7 @@ fn dispatch_and_spec_read_derive_ownership_and_recheck_revoked_permissions() {
     }
     store
         .writer()
-        .write(move |tx| auth::remove_membership(tx, principal(i.alice), i.a, i.bot))
+        .write(move |tx| auth::remove_membership(tx, principal(i.alice), i.a, i.bot, NOW))
         .unwrap();
     let input = spec();
     missing(

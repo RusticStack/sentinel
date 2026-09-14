@@ -404,6 +404,8 @@ pub fn get_namespace(
     })
 }
 
+/// Set or change a member's role. A downgrade takes effect on the next query;
+/// the tenant's authorization epoch moves so anything long-lived re-checks.
 pub fn set_membership(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -422,22 +424,89 @@ pub fn set_membership(
     if changed == 0 {
         return Err(Error::NotFound);
     }
-    Ok(())
+    crate::tenancy::bump_epoch(tx, tenant)?;
+    crate::local_auth::audit(
+        tx,
+        crate::local_auth::Event::MembershipSet,
+        Some(principal.user),
+        Some(user),
+        false,
+        Some(match role {
+            Role::Reader => "reader",
+            Role::Operator => "operator",
+            Role::TenantAdmin => "admin",
+        }),
+    )
 }
 
+/// Remove a member. Grants cascade away, so removing and re-adding membership
+/// cannot resurrect them; credentials narrowed to this tenant are revoked in
+/// the same transaction, because nothing they could reach remains.
 pub fn remove_membership(
     tx: &Transaction<'_>,
     principal: Principal,
     tenant: TenantId,
     user: UserId,
+    now: UnixMillis,
 ) -> Result<()> {
     require_tenant_admin(tx, principal, tenant)?;
-    // Grants cascade away, so removing and re-adding membership cannot resurrect them.
-    tx.execute(
+    let removed = tx.execute(
         "DELETE FROM memberships WHERE tenant_id = ?1 AND user_id = ?2",
         params![tenant.as_bytes(), user.as_bytes()],
     )?;
-    Ok(())
+    if removed == 0 {
+        return Err(Error::NotFound);
+    }
+    tx.execute(
+        "UPDATE api_tokens SET revoked_ms = ?3 WHERE user_id = ?1 AND tenant_id = ?2
+         AND revoked_ms IS NULL",
+        params![user.as_bytes(), tenant.as_bytes(), now.0],
+    )?;
+    crate::tenancy::bump_epoch(tx, tenant)?;
+    crate::local_auth::audit(
+        tx,
+        crate::local_auth::Event::MembershipRemoved,
+        Some(principal.user),
+        Some(user),
+        false,
+        None,
+    )
+}
+
+/// Resolve a namespace the principal is a member of (or, with platform scope,
+/// administers) by its identifier. Same predicate as [`get_namespace`].
+pub fn get_namespace_by_id(
+    conn: &Connection,
+    principal: Principal,
+    tenant: TenantId,
+) -> Result<TenantNamespace> {
+    if principal.repo.is_some() || principal.permissions == Permissions::NONE {
+        return Err(Error::NotFound);
+    }
+    let row = conn
+        .prepare_cached(
+            "SELECT t.id, t.slug, t.kind FROM tenants t JOIN users u ON u.id = ?1
+        LEFT JOIN memberships m ON m.tenant_id = t.id AND m.user_id = u.id
+        WHERE t.id = ?2 AND t.active = 1 AND u.active = 1
+        AND (?3 IS NULL OR t.id = ?3) AND (u.kind = 0 OR u.service_tenant_id = t.id)
+        AND (m.user_id IS NOT NULL OR (u.kind = 0 AND u.super_admin = 1 AND ?4))",
+        )?
+        .query_row(
+            params![
+                principal.user.as_bytes(),
+                tenant.as_bytes(),
+                principal.tenant.as_ref().map(TenantId::as_bytes),
+                principal.permissions.contains(Permissions::PLATFORM_ADMIN)
+            ],
+            |r| Ok((r.get::<_, [u8; 16]>(0)?, r.get(1)?, r.get::<_, i64>(2)?)),
+        )
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    Ok(TenantNamespace {
+        id: TenantId::from_bytes(row.0).map_err(|_| Error::Corrupt("tenant_id"))?,
+        slug: row.1,
+        personal: row.2 == 1,
+    })
 }
 
 pub fn create_repo(
@@ -488,7 +557,15 @@ pub fn set_repo_grant(
             ON CONFLICT(tenant_id, user_id, repo_id) DO UPDATE SET permissions = excluded.permissions",
             params![tenant.as_bytes(), user.as_bytes(), repo.as_bytes(), permissions.bits()])?;
     }
-    Ok(())
+    crate::tenancy::bump_epoch(tx, tenant)?;
+    crate::local_auth::audit(
+        tx,
+        crate::local_auth::Event::GrantChanged,
+        Some(principal.user),
+        Some(user),
+        false,
+        None,
+    )
 }
 
 pub fn create_service_account(

@@ -78,6 +78,87 @@ pub enum AdminCommand {
     Mfa(MfaArgs),
     /// List and revoke an account's sessions
     Session(SessionArgs),
+    /// Suspend or reactivate a tenant namespace
+    Tenant(TenantArgs),
+    /// Register worker pools and grant shared ones to tenants
+    Pool(PoolArgs),
+}
+
+#[derive(Args)]
+pub struct TenantArgs {
+    #[command(subcommand)]
+    pub command: TenantCommand,
+}
+
+#[derive(Subcommand)]
+pub enum TenantCommand {
+    /// Create an organization namespace and print its identifier
+    Create {
+        #[command(flatten)]
+        data: DataDir,
+        /// 1-63 lower-case letters, digits and hyphens, alphanumeric at both ends
+        #[arg(long)]
+        slug: String,
+    },
+    /// Stop intake, revoke the tenant's credentials and cancel its live jobs
+    Suspend {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long, value_name = "SLUG")]
+        tenant: String,
+    },
+    /// Lift a suspension; nothing revoked comes back on its own
+    Reactivate {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long, value_name = "SLUG")]
+        tenant: String,
+    },
+}
+
+#[derive(Args)]
+pub struct PoolArgs {
+    #[command(subcommand)]
+    pub command: PoolCommand,
+}
+
+#[derive(Subcommand)]
+pub enum PoolCommand {
+    /// Register a pool; dedicated to --tenant, or shared when omitted
+    Create {
+        #[command(flatten)]
+        data: DataDir,
+        /// Lower-case letters, digits and hyphens
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_name = "SLUG")]
+        tenant: Option<String>,
+    },
+    /// Admit a tenant to a shared pool
+    Grant {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        pool: String,
+        #[arg(long, value_name = "SLUG")]
+        tenant: String,
+    },
+    /// Withdraw a tenant from a shared pool
+    Revoke {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        pool: String,
+        #[arg(long, value_name = "SLUG")]
+        tenant: String,
+    },
+    /// The pools a tenant may use
+    List {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long, value_name = "SLUG")]
+        tenant: String,
+    },
 }
 
 #[derive(Args)]

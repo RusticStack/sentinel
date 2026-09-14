@@ -22,13 +22,15 @@ use sentinel_store::{
         self, Authority, DeploymentPolicy, InstallationBinding, Registration, TenantCreation, Terms,
     },
     sign_in,
+    tenancy::{self, PoolKind},
     tokens::{self, Grant},
 };
 
 use crate::cli::{
     AccountArgs, AccountCommand, AdminArgs, AdminCommand, DataDir, IdentityArgs, IdentityCommand,
     InviteArgs, InviteCommand, KeyArgs, KeyCommand, MfaArgs, MfaCommand, PolicyArgs, PolicyCommand,
-    SessionArgs, SessionCommand, TokenArgs, TokenCommand,
+    PoolArgs, PoolCommand, SessionArgs, SessionCommand, TenantArgs, TenantCommand, TokenArgs,
+    TokenCommand,
 };
 
 pub struct Error {
@@ -177,6 +179,8 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
         AdminCommand::Key(args) => key(args)?,
         AdminCommand::Mfa(args) => second_factor(args, now)?,
         AdminCommand::Session(args) => session(args, now)?,
+        AdminCommand::Tenant(args) => tenant(args, now)?,
+        AdminCommand::Pool(args) => pool(args, now)?,
     }
     Ok(())
 }
@@ -766,6 +770,135 @@ fn session(args: &SessionArgs, now: UnixMillis) -> Result<(), Error> {
     Ok(())
 }
 
+fn tenant(args: &TenantArgs, now: UnixMillis) -> Result<(), Error> {
+    let (data, slug, suspend) = match &args.command {
+        TenantCommand::Create { data, slug } => {
+            let store = open(data, true)?;
+            let id = TenantId::new();
+            let owned = slug.clone();
+            store
+                .writer()
+                .write(move |tx| {
+                    let slug = sentinel_core::auth::Namespace::parse(&owned)
+                        .ok_or(sentinel_store::Error::InvalidInput("namespace slug"))?;
+                    tenancy::create_organization(tx, Authority::HostLocal, id, slug, now)
+                })
+                .map_err(|error| match error {
+                    sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
+                    other => fail(format!("cannot create the namespace: {other}")),
+                })?;
+            println!("{id}");
+            return Ok(());
+        }
+        TenantCommand::Suspend { data, tenant } => (data, tenant, true),
+        TenantCommand::Reactivate { data, tenant } => (data, tenant, false),
+    };
+    let store = open(data, true)?;
+    // A suspended tenant is inactive, so resolve by slug without that filter.
+    let owned = slug.clone();
+    let id = store
+        .read(move |conn| lookup::tenant_by_slug_any(conn, &owned))
+        .map_err(|_| fail("no tenant with that slug"))?;
+    if suspend {
+        let done = store
+            .writer()
+            .write(move |tx| tenancy::suspend(tx, Authority::HostLocal, id, now))
+            .map_err(|error| match error {
+                sentinel_store::Error::NotFound => fail("that tenant is already suspended"),
+                other => fail(format!("suspension failed: {other}")),
+            })?;
+        eprintln!(
+            "suspended {id}: {} credential(s) revoked, {} invitation(s) revoked, {} job(s) canceled, {} running job(s) asked to stop",
+            done.tokens_revoked,
+            done.invitations_revoked,
+            done.jobs_canceled,
+            done.jobs_cancel_requested
+        );
+    } else {
+        store
+            .writer()
+            .write(move |tx| tenancy::reactivate(tx, Authority::HostLocal, id, now))
+            .map_err(|error| match error {
+                sentinel_store::Error::NotFound => fail("that tenant is not suspended"),
+                other => fail(format!("reactivation failed: {other}")),
+            })?;
+        eprintln!("reactivated {id}");
+    }
+    Ok(())
+}
+
+fn pool(args: &PoolArgs, now: UnixMillis) -> Result<(), Error> {
+    match &args.command {
+        PoolCommand::Create { data, name, tenant } => {
+            let store = open(data, true)?;
+            let (owner, _) = resolve_target(&store, tenant.as_ref(), None)?;
+            let kind = owner.map_or(PoolKind::Shared, PoolKind::Dedicated);
+            let id = sentinel_core::PoolId::new();
+            let name = name.clone();
+            store
+                .writer()
+                .write(move |tx| {
+                    tenancy::create_pool(tx, Authority::HostLocal, id, &name, kind, now)
+                })
+                .map_err(|error| match error {
+                    sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
+                    other => fail(format!("cannot create the pool: {other}")),
+                })?;
+            println!("{id}");
+        }
+        PoolCommand::Grant { data, pool, tenant } | PoolCommand::Revoke { data, pool, tenant } => {
+            let store = open(data, true)?;
+            let grant = matches!(args.command, PoolCommand::Grant { .. });
+            let (tenant, _) = resolve_target(&store, Some(tenant), None)?;
+            let tenant = tenant.expect("resolved");
+            let owned = pool.clone();
+            let pool = store
+                .read(move |conn| lookup::pool_by_name(conn, &owned))
+                .map_err(|_| fail("no pool with that name"))?;
+            store
+                .writer()
+                .write(move |tx| {
+                    if grant {
+                        tenancy::grant_pool(tx, Authority::HostLocal, pool, tenant, now)
+                    } else {
+                        tenancy::revoke_pool_grant(tx, Authority::HostLocal, pool, tenant, now)
+                    }
+                })
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound => {
+                        fail("that tenant holds no grant on that pool")
+                    }
+                    other => fail(format!("cannot change the grant: {other}")),
+                })?;
+            eprintln!(
+                "{} {pool} for {tenant}",
+                if grant { "granted" } else { "revoked" }
+            );
+        }
+        PoolCommand::List { data, tenant } => {
+            let store = open(data, true)?;
+            let (tenant, _) = resolve_target(&store, Some(tenant), None)?;
+            let tenant = tenant.expect("resolved");
+            let pools = store
+                .read(|conn| tenancy::pools_for_tenant(conn, Authority::HostLocal, tenant))
+                .map_err(|error| fail(format!("cannot list pools: {error}")))?;
+            for record in pools {
+                println!(
+                    "{} {} {}{}",
+                    record.id,
+                    record.name,
+                    match record.kind {
+                        PoolKind::Dedicated(_) => "dedicated",
+                        PoolKind::Shared => "shared",
+                    },
+                    if record.active { "" } else { " inactive" }
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 const fn event_name(event: Event) -> &'static str {
     match event {
         Event::Bootstrap => "bootstrap",
@@ -802,5 +935,14 @@ const fn event_name(event: Event) -> &'static str {
         Event::RecoveryCodeUsed => "recovery-code-used",
         Event::RecoveryCodesIssued => "recovery-codes-issued",
         Event::SessionRevoked => "session-revoked",
+        Event::TenantSuspended => "tenant-suspended",
+        Event::TenantReactivated => "tenant-reactivated",
+        Event::MembershipSet => "membership-set",
+        Event::MembershipRemoved => "membership-removed",
+        Event::GrantChanged => "grant-changed",
+        Event::PoolCreated => "pool-created",
+        Event::PoolGranted => "pool-granted",
+        Event::PoolGrantRevoked => "pool-grant-revoked",
+        Event::NamespaceCreated => "namespace-created",
     }
 }

@@ -125,6 +125,12 @@ identifier!(
     "tok"
 );
 identifier!(
+    /// A worker pool (A07): dedicated to one tenant, or shared under explicit
+    /// grants. Workers enroll into a pool (W01); tenants are placed on it (W02).
+    PoolId,
+    "pol"
+);
+identifier!(
     /// Handle for one browser session (A06), so an account can list and revoke
     /// its sessions by name. The cookie secret is separate and never shown.
     SessionId,

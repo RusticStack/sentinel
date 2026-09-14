@@ -2,7 +2,7 @@
 
 A purpose-built, fully open-source, self-hosted CI engine designed from scratch for maximum performance: fast PR feedback, local-first caching, efficient multi-machine scheduling, and readable diagnostics for humans and coding agents.
 
-**Status: early development; runtime/measurement foundations, core/store/protocol contracts, the pipeline compiler, durable authorization, local login/sessions, scoped API credentials, GitHub sign-in, admission policy and second-factor step-up are implemented. The authenticated API surface and job execution are next.** See [plan.md](plan.md) for architecture, milestones, performance targets, and release criteria. The [Parts 01–02 audit](docs/parts-01-02-audit.md) records open execution-integration gates.
+**Status: early development; runtime/measurement foundations, core/store/protocol contracts, the pipeline compiler, durable authorization, local login/sessions, scoped API credentials, GitHub sign-in, admission policy, second-factor step-up and tenant suspension/pool grants are implemented. The authenticated API surface and job execution are next.** See [plan.md](plan.md) for architecture, milestones, performance targets, and release criteria. The [Parts 01–02 audit](docs/parts-01-02-audit.md) records open execution-integration gates.
 
 Start development from [TODO.md](TODO.md): ordered work packages, stable task IDs, dependencies, the first runnable server/worker slice, and verification gates.
 
@@ -27,6 +27,8 @@ See [GitHub sign-in](docs/github-sign-in.md) for the authorization-code flow, ve
 See [Admission](docs/admission.md) for registration policy, invitations, pending accounts, and the separate decisions of creating a tenant and binding a forge installation.
 
 See the [Part 03 audit](docs/part-03-audit.md) for what was re-read, what was found and fixed, and what is deliberately left as is.
+
+See [Tenancy](docs/tenancy.md) for tenant suspension, what it revokes and cancels, the authorization epoch that long-lived streams re-check, and pool grants.
 
 See [Step-up](docs/step-up.md) for second factors, sealed TOTP seeds, recovery codes, and the step-up that gates changes to who can authenticate.
 
