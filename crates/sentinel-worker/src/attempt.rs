@@ -319,7 +319,16 @@ fn execute(
             }
         };
         record.duration_ns = ns(started);
-        let (outcome, why) = if exit.timed_out {
+        let (outcome, why) = if cancel.load(Ordering::Acquire) {
+            // Ended by the cancel order, however the process went: the
+            // desired state wins over the incidental exit status.
+            (
+                StepOutcome::Signaled {
+                    signal: exit.signal.unwrap_or(0),
+                },
+                Some((FailureClass::Canceled, format!("step {index} canceled"))),
+            )
+        } else if exit.timed_out {
             (
                 StepOutcome::TimedOut,
                 Some((

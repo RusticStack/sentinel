@@ -17,6 +17,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use sentinel_core::{AttemptId, Event, Fence, UnixMillis};
@@ -39,11 +40,29 @@ pub enum Notice {
     Finished(AttemptId, Verdict),
     SpecRefused(AttemptId),
     Stopped(AttemptId),
+    /// A cancel order was carried out; `forced` when the grace ran out.
+    Canceled {
+        attempt: AttemptId,
+        forced: bool,
+    },
+    /// The lease deadline passed with no renewal: every attempt was ended
+    /// without a report, because the controller has already expired them.
+    LeaseLost(Vec<AttemptId>),
 }
+
+/// TERM-to-KILL grace for a cancel when the process sets none.
+pub const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(30);
+/// Subtracted from the controller's lease deadline: the worker acts before
+/// the controller could have expired it, never after.
+pub const LEASE_GUARD: Duration = Duration::from_secs(5);
+/// How often the lease watchdog looks.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 
 struct Live {
     cancel: Cancel,
     logs: Arc<LogPipe>,
+    /// A cancel order is already being carried out.
+    canceling: bool,
 }
 
 struct State {
@@ -57,6 +76,9 @@ struct State {
     /// Values every new attempt's redactor starts with (S05/S06 register
     /// per attempt; until then the operator's list applies to all).
     secrets: Vec<Vec<u8>>,
+    /// Monotonic deadline derived from the last renewal, minus the guard.
+    lease_deadline: Option<Instant>,
+    cancel_grace: Duration,
 }
 
 /// The executor handle the link holds; cheap to clone, one runtime behind it.
@@ -88,7 +110,7 @@ impl Executor {
     ) -> Result<Executor> {
         let runtime = podman::probe()?;
         std::fs::create_dir_all(root.join(crate::workspace::WORKSPACES_DIR))?;
-        Ok(Executor(Arc::new(Inner {
+        let executor = Executor(Arc::new(Inner {
             root,
             worker,
             runtime,
@@ -98,9 +120,27 @@ impl Executor {
                 live: HashMap::new(),
                 pending: Vec::new(),
                 secrets: Vec::new(),
+                lease_deadline: None,
+                cancel_grace: DEFAULT_CANCEL_GRACE,
             }),
             notify: Box::new(notify),
-        })))
+        }));
+        let watched = Arc::downgrade(&executor.0);
+        thread::Builder::new()
+            .name("sentinel-lease-watchdog".into())
+            .spawn(move || {
+                while let Some(inner) = watched.upgrade() {
+                    inner.watch_lease();
+                    drop(inner);
+                    thread::sleep(WATCHDOG_INTERVAL);
+                }
+            })?;
+        Ok(executor)
+    }
+
+    /// How long a canceled step gets between `SIGTERM` and the forced stop.
+    pub fn set_cancel_grace(&self, grace: Duration) {
+        self.state().cancel_grace = grace;
     }
 
     /// Register a value to redact from every attempt started from now on.
@@ -135,6 +175,7 @@ impl Executor {
             Live {
                 cancel: Arc::clone(&cancel),
                 logs: Arc::clone(&logs),
+                canceling: false,
             },
         );
         let executor = Arc::clone(&self.0);
@@ -176,6 +217,38 @@ impl Inner {
     /// Reports that found no session and wait for the next one.
     pub fn pending_reports(&self) -> usize {
         self.state().pending.len()
+    }
+
+    /// The lease watchdog: once the deadline the controller last granted
+    /// (less the guard) has passed without a renewal, no attempt here is
+    /// ours any more. End them all, forced, and report nothing — the
+    /// controller has expired them and any report would be stale.
+    fn watch_lease(&self) {
+        let lost: Vec<(AttemptId, Cancel)> = {
+            let mut state = self.state();
+            let Some(deadline) = state.lease_deadline else {
+                return;
+            };
+            if Instant::now() < deadline || state.live.is_empty() {
+                return;
+            }
+            state.lease_deadline = None;
+            state
+                .live
+                .iter_mut()
+                .map(|(id, live)| {
+                    live.canceling = true;
+                    (*id, Arc::clone(&live.cancel))
+                })
+                .collect()
+        };
+        for (attempt, cancel) in &lost {
+            cancel.store(true, Ordering::Release);
+            let _ = podman::remove_named(&format!("sentinel-{attempt}"));
+        }
+        (self.notify)(Notice::LeaseLost(
+            lost.into_iter().map(|(a, _)| a).collect(),
+        ));
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -241,6 +314,31 @@ impl LinkExecutor for Executor {
         (self.notify)(Notice::Stopped(attempt));
     }
 
+    fn cancel(&self, attempt: AttemptId) {
+        let (cancel, grace) = {
+            let mut state = self.state();
+            let grace = state.cancel_grace;
+            match state.live.get_mut(&attempt) {
+                Some(live) if !live.canceling => {
+                    live.canceling = true;
+                    (Arc::clone(&live.cancel), grace)
+                }
+                _ => return,
+            }
+        };
+        // Desired state first, so a step that ends by itself meanwhile is
+        // still reported as canceled; then the signals, off this thread.
+        cancel.store(true, Ordering::Release);
+        let executor = Arc::clone(&self.0);
+        let _ = thread::Builder::new()
+            .name(format!("sentinel-cancel-{attempt}"))
+            .spawn(move || {
+                let outcome = podman::terminate_named(&format!("sentinel-{attempt}"), grace);
+                let forced = matches!(outcome, Ok(podman::Terminated::Forced));
+                (executor.notify)(Notice::Canceled { attempt, forced });
+            });
+    }
+
     fn held(&self) -> Vec<AttemptId> {
         let state = self.state();
         state
@@ -251,7 +349,14 @@ impl LinkExecutor for Executor {
             .collect()
     }
 
-    fn renewed(&self, _until: UnixMillis) {}
+    fn renewed(&self, until: UnixMillis) {
+        // Monotonic from here on: the wall-clock deadline the controller
+        // granted becomes an `Instant`, less the guard margin.
+        let remaining = until.0.saturating_sub(UnixMillis::now().0).max(0) as u64;
+        let deadline =
+            Instant::now() + Duration::from_millis(remaining).saturating_sub(LEASE_GUARD);
+        self.state().lease_deadline = Some(deadline);
+    }
 
     fn attached(&self, reporter: Reporter) {
         let (pending, pipes) = {

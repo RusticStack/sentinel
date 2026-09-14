@@ -474,6 +474,7 @@ mod worker_role {
             false
         }
         fn stop(&self, _: AttemptId) {}
+        fn cancel(&self, _: AttemptId) {}
         fn held(&self) -> Vec<AttemptId> {
             Vec::new()
         }
@@ -504,6 +505,12 @@ mod worker_role {
                     }
                     sentinel_worker::executor::Notice::Stopped(attempt) => {
                         tracing::info!(event = "attempt_stopped", attempt = %attempt);
+                    }
+                    sentinel_worker::executor::Notice::Canceled { attempt, forced } => {
+                        tracing::info!(event = "attempt_canceled", attempt = %attempt, forced);
+                    }
+                    sentinel_worker::executor::Notice::LeaseLost(attempts) => {
+                        tracing::warn!(event = "lease_lost", attempts = ?attempts, "no renewal before the deadline; attempts ended without a report");
                     }
                 })
             })

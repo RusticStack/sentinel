@@ -189,6 +189,9 @@ pub enum ServerMessage {
         seq: u64,
         lease_until_ms: i64,
         stop: Vec<[u8; 16]>,
+        /// Held attempts whose job has cancellation desired: end them
+        /// gracefully and report `Canceled`.
+        cancel: Vec<[u8; 16]>,
     },
     Offer(WireOffer),
     /// One chunk of the run spec asked for with `NeedSpec`, in order.
@@ -449,11 +452,21 @@ pub trait Admission: Send + Sync {
     ) -> std::result::Result<Admitted, Rejection>;
 }
 
+/// The controller's answer to a heartbeat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Beat {
+    /// Every held attempt the controller recognises is renewed to this.
+    pub lease_until: UnixMillis,
+    /// Attempts the controller no longer counts as held: stop at once.
+    pub stop: Vec<AttemptId>,
+    /// Attempts whose job has cancellation desired: end gracefully.
+    pub cancel: Vec<AttemptId>,
+}
+
 /// What the controller does with an admitted worker's messages.
 pub trait SessionHandler: Send + Sync {
-    /// A heartbeat naming the attempts the worker holds. Returns the renewed
-    /// lease deadline and the attempts the worker must stop.
-    fn ping(&self, worker: WorkerId, held: &[AttemptId]) -> Result<(UnixMillis, Vec<AttemptId>)>;
+    /// A heartbeat naming the attempts the worker holds.
+    fn ping(&self, worker: WorkerId, held: &[AttemptId]) -> Result<Beat>;
     fn acknowledged(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
     fn declined(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
     /// A worker-side state event. The handler applies it under the fence;
@@ -747,11 +760,12 @@ impl WorkerSession {
                         return Err(Error::Protocol("held list"));
                     }
                     let held = ids(&held)?;
-                    let (until, stop) = handler.ping(worker, &held)?;
+                    let beat = handler.ping(worker, &held)?;
                     self.tx.send(&ServerMessage::Pong {
                         seq,
-                        lease_until_ms: until.0,
-                        stop: stop.iter().map(|a| *a.as_bytes()).collect(),
+                        lease_until_ms: beat.lease_until.0,
+                        stop: beat.stop.iter().map(|a| *a.as_bytes()).collect(),
+                        cancel: beat.cancel.iter().map(|a| *a.as_bytes()).collect(),
                     })?;
                 }
                 ClientMessage::Ack { attempt, fence } => {
@@ -1013,6 +1027,9 @@ pub trait Executor: Send + Sync {
     fn offered(&self, offer: &Offer) -> bool;
     /// The controller no longer counts this attempt as held: stop it now.
     fn stop(&self, attempt: AttemptId);
+    /// Cancellation is desired for this attempt's job: end it gracefully
+    /// (TERM, then KILL after the grace period) and report `Canceled`.
+    fn cancel(&self, attempt: AttemptId);
     /// Attempts still held, renewed with every heartbeat.
     fn held(&self) -> Vec<AttemptId>;
     /// The controller renewed every held lease to this deadline.
@@ -1083,6 +1100,7 @@ impl Link {
                 seq,
                 lease_until_ms,
                 stop,
+                cancel,
             } => {
                 if seq != self.seq {
                     return Err(Error::Protocol("pong sequence"));
@@ -1090,6 +1108,9 @@ impl Link {
                 executor.renewed(UnixMillis(lease_until_ms));
                 for attempt in ids(&stop)? {
                     executor.stop(attempt);
+                }
+                for attempt in ids(&cancel)? {
+                    executor.cancel(attempt);
                 }
                 Ok(true)
             }

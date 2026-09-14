@@ -36,8 +36,8 @@ use crate::{
     Error, Result,
     identity::Identity,
     session::{
-        self, Admission, Admitted, Capacity, JobContext, LogVerdict, Offer, Rejection, Sender,
-        SessionHandler,
+        self, Admission, Admitted, Beat, Capacity, JobContext, LogVerdict, Offer, Rejection,
+        Sender, SessionHandler,
     },
     tls,
 };
@@ -61,6 +61,8 @@ pub struct Stats {
     pub stale_reports: AtomicU64,
     pub log_frames: AtomicU64,
     pub log_refused: AtomicU64,
+    pub expired: AtomicU64,
+    pub queue_timeouts: AtomicU64,
 }
 
 struct Peer {
@@ -159,6 +161,23 @@ impl Inner {
     /// a failing one never holds up the rest.
     fn dispatch_pass(&self) {
         let now = UnixMillis::now();
+        // Leases that ran out and attempts that outran their job's timeout
+        // by the grace: infra-failed, capacity back, never replayed.
+        if let Ok(due) = self.store.read(|c| dispatch::expired(c, now)) {
+            for attempt in due {
+                if self
+                    .write(move |tx| dispatch::expire(tx, attempt, now))
+                    .is_ok()
+                {
+                    self.stats.expired.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        if let Ok(count) = self.write(move |tx| dispatch::sweep_queue_timeouts(tx, now)) {
+            self.stats
+                .queue_timeouts
+                .fetch_add(count as u64, Ordering::Relaxed);
+        }
         if let Ok(due) = self.store.read(|c| dispatch::unacknowledged(c, now)) {
             for attempt in due {
                 if self
@@ -343,7 +362,7 @@ impl Admission for Inner {
 }
 
 impl SessionHandler for Inner {
-    fn ping(&self, worker: WorkerId, held: &[AttemptId]) -> Result<(UnixMillis, Vec<AttemptId>)> {
+    fn ping(&self, worker: WorkerId, held: &[AttemptId]) -> Result<Beat> {
         let now = UnixMillis::now();
         let peer = self
             .fleet
@@ -357,10 +376,15 @@ impl SessionHandler for Inner {
         });
         if held.is_empty() && !record_seen {
             // Nothing to renew and liveness recorded recently: no write.
-            return Ok((UnixMillis(now.0 + dispatch::DEFAULT_LEASE_MS), Vec::new()));
+            return Ok(Beat {
+                lease_until: UnixMillis(now.0 + dispatch::DEFAULT_LEASE_MS),
+                stop: Vec::new(),
+                cancel: Vec::new(),
+            });
         }
         let held = held.to_vec();
-        let result = self.write(move |tx| {
+        let wanted = held.clone();
+        let (lease_until, stop) = self.write(move |tx| {
             if record_seen {
                 workers::seen(tx, worker, now)?;
             }
@@ -369,7 +393,20 @@ impl SessionHandler for Inner {
         if record_seen && let Some(peer) = peer {
             peer.seen_recorded_ms.store(now.0, Ordering::Relaxed);
         }
-        Ok(result)
+        // Cancellation desired for anything still held: delivered with every
+        // beat until the worker reports, so a missed pong changes nothing.
+        let cancel = if wanted.is_empty() {
+            Vec::new()
+        } else {
+            self.store
+                .read(|c| dispatch::cancel_requested(c, worker, &wanted))
+                .map_err(|_| Error::Internal("store read"))?
+        };
+        Ok(Beat {
+            lease_until,
+            stop,
+            cancel,
+        })
     }
 
     fn acknowledged(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {

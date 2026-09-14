@@ -44,7 +44,7 @@ pub fn create_run(
     )?;
     let mut ids = Vec::with_capacity(spec.pipeline.jobs.len());
     let mut mark_index = tx.prepare_cached(
-        "UPDATE jobs SET spec_index = ?1, cpu_millis = ?3, memory_bytes = ?4 WHERE id = ?2",
+        "UPDATE jobs SET spec_index = ?1, cpu_millis = ?3, memory_bytes = ?4, timeout_ms = ?5 WHERE id = ?2",
     )?;
     for (index, job) in spec.pipeline.jobs.iter().enumerate() {
         let id = JobId::new();
@@ -62,7 +62,10 @@ pub fn create_run(
             id.as_bytes(),
             i64::from(job.spec.resources.cpu_millis),
             i64::try_from(job.spec.resources.memory_bytes)
-                .map_err(|_| Error::InvalidInput("memory_bytes"))?
+                .map_err(|_| Error::InvalidInput("memory_bytes"))?,
+            i64::try_from(job.spec.timeout_secs)
+                .map_err(|_| Error::InvalidInput("timeout"))?
+                .saturating_mul(1000)
         ])?;
         if let Some(digest) = sentinel_pipeline::run::ImageRef::parse(&job.spec.image)
             .ok()

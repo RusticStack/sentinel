@@ -64,6 +64,26 @@ pub fn tenant_by_slug_any(conn: &Connection, slug: &str) -> Result<TenantId> {
 }
 
 /// A pool by its unique name.
+/// The tenant a job belongs to, for host-local commands that name a job.
+pub fn job_tenant(conn: &Connection, job: sentinel_core::JobId) -> Result<sentinel_core::TenantId> {
+    let tenant: [u8; 16] = conn
+        .prepare_cached("SELECT tenant_id FROM jobs WHERE id = ?1")?
+        .query_row([job.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    sentinel_core::TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))
+}
+
+/// The tenant a run belongs to.
+pub fn run_tenant(conn: &Connection, run: sentinel_core::RunId) -> Result<sentinel_core::TenantId> {
+    let tenant: [u8; 16] = conn
+        .prepare_cached("SELECT tenant_id FROM runs WHERE id = ?1")?
+        .query_row([run.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    sentinel_core::TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))
+}
+
 pub fn pool_by_name(conn: &Connection, name: &str) -> Result<sentinel_core::PoolId> {
     let bytes: [u8; 16] = conn
         .prepare_cached("SELECT id FROM pools WHERE name = ?1")?

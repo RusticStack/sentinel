@@ -188,6 +188,9 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
             attempt,
             follow,
         } => logs(data, attempt, *follow)?,
+        AdminCommand::Cancel { data, job, run } => {
+            cancel(data, job.as_deref(), run.as_deref(), now)?
+        }
     }
     Ok(())
 }
@@ -974,6 +977,49 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
                 })?;
             eprintln!("revoked {id}");
         }
+    }
+    Ok(())
+}
+
+/// Cancellation as desired state, recorded host-locally: an unstarted job is
+/// `canceled` at once; a running one is told through its worker's next
+/// heartbeat and reports its own end. The server's dispatcher notices on
+/// its next pass.
+fn cancel(
+    data: &DataDir,
+    job: Option<&str>,
+    run: Option<&str>,
+    now: UnixMillis,
+) -> Result<(), Error> {
+    let store = open(data, true)?;
+    match (job, run) {
+        (Some(job), None) => {
+            let job: sentinel_core::JobId = job
+                .parse()
+                .map_err(|_| fail("expected a job_ identifier"))?;
+            let tenant = store
+                .read(move |c| lookup::job_tenant(c, job))
+                .map_err(|_| fail("no job with that identifier"))?;
+            let outcome = store
+                .writer()
+                .write(move |tx| sentinel_store::dispatch::cancel(tx, tenant, job, now))
+                .map_err(|error| fail(format!("cannot cancel: {error}")))?;
+            eprintln!("{job}: {outcome:?}");
+        }
+        (None, Some(run)) => {
+            let run: sentinel_core::RunId = run
+                .parse()
+                .map_err(|_| fail("expected a run_ identifier"))?;
+            let tenant = store
+                .read(move |c| lookup::run_tenant(c, run))
+                .map_err(|_| fail("no run with that identifier"))?;
+            let count = store
+                .writer()
+                .write(move |tx| sentinel_store::dispatch::cancel_run(tx, tenant, run, now))
+                .map_err(|error| fail(format!("cannot cancel: {error}")))?;
+            eprintln!("{run}: cancellation recorded for {count} job(s)");
+        }
+        _ => return Err(fail("give exactly one of --job or --run")),
     }
     Ok(())
 }

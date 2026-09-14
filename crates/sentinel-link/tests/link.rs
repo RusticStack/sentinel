@@ -202,6 +202,7 @@ struct Recorder {
     offers: Mutex<mpsc::Sender<(Offer, Instant)>>,
     held: Mutex<Vec<AttemptId>>,
     stopped: Mutex<Vec<AttemptId>>,
+    canceled: Mutex<Vec<AttemptId>>,
     renewed: AtomicI64,
     /// Decline offers for these jobs once, to exercise the lapse path.
     decline_once: Mutex<Vec<JobId>>,
@@ -219,6 +220,7 @@ impl Recorder {
                 offers: Mutex::new(tx),
                 held: Mutex::new(Vec::new()),
                 stopped: Mutex::new(Vec::new()),
+                canceled: Mutex::new(Vec::new()),
                 renewed: AtomicI64::new(0),
                 decline_once: Mutex::new(Vec::new()),
                 reporter: Mutex::new(None),
@@ -258,6 +260,9 @@ impl Executor for Recorder {
     fn stop(&self, attempt: AttemptId) {
         self.stopped.lock().unwrap().push(attempt);
         self.release(attempt);
+    }
+    fn cancel(&self, attempt: AttemptId) {
+        self.canceled.lock().unwrap().push(attempt);
     }
     fn held(&self) -> Vec<AttemptId> {
         self.held.lock().unwrap().clone()
@@ -371,6 +376,7 @@ impl Executor for Idle {
         true
     }
     fn stop(&self, _: AttemptId) {}
+    fn cancel(&self, _: AttemptId) {}
     fn held(&self) -> Vec<AttemptId> {
         Vec::new()
     }
@@ -704,11 +710,39 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     });
     assert!(recorder.stopped.lock().unwrap().is_empty());
 
-    // A clean stop says goodbye; the fleet forgets the worker; leases stay.
+    // Cancellation is desired state on the controller and reaches the
+    // worker with its next beat, repeated until the worker reports.
+    let (test_attempt, test_fence) = (third.0.attempt, third.0.fence);
+    let tenant = d.tenant;
+    assert_eq!(
+        d.store
+            .writer()
+            .write(move |tx| dispatch::cancel(tx, tenant, test, UnixMillis::now()))
+            .unwrap(),
+        dispatch::Cancelled::Requested
+    );
+    eventually("cancel delivered", || {
+        recorder.canceled.lock().unwrap().contains(&test_attempt)
+    });
+    assert_eq!(d.state(test), JobState::Leased);
+    reporter
+        .report(
+            test_attempt,
+            test_fence,
+            Event::Failed(sentinel_core::FailureClass::Canceled),
+        )
+        .unwrap();
+    eventually("canceled", || {
+        d.state(test) == JobState::Terminal(Outcome::Canceled)
+    });
+    recorder.release(test_attempt);
+
+    // A clean stop says goodbye; the fleet forgets the worker; the lease of
+    // the job still running stays until it expires.
     process.stop().unwrap();
     eventually("fleet removal", || d.controller().connected().is_empty());
-    assert_eq!(d.state(test), JobState::Leased);
-    assert_eq!(d.store.read(|c| dispatch::held_by(c, id)).unwrap().len(), 2);
+    assert_eq!(d.state(lint), JobState::Leased);
+    assert_eq!(d.store.read(|c| dispatch::held_by(c, id)).unwrap().len(), 1);
 }
 
 #[test]

@@ -79,7 +79,7 @@ OOM is read from the host's view of the container's cgroup (`/sys/fs/cgroup<Cgro
 
 ## What is not here yet
 
-Log tail/follow over the API is W08 (`admin logs` reads the files host-locally); only bounded tails exist. Cancellation as desired state, lease expiry and graceful/forced termination budgets are W06; a cancel today is a `stop` order or a flag checked between steps. Crash reconciliation of owned containers and leftover workspaces is W07 — the ownership record (`podman::owned`, `Workspace::leftovers`) exists, the reaper does not. Caches, artifacts and secrets are their own parts. Disk quotas on the workspace are not enforced (no `io` delegation in the rootless setup; see F07).
+Log tail/follow over the API is W08 (`admin logs` reads the files host-locally); only bounded tails exist. Cancellation, graceful/forced termination, timeouts and lease expiry are in [cancellation](cancellation.md). Crash reconciliation of owned containers and leftover workspaces is W07 — the ownership record (`podman::owned`, `Workspace::leftovers`) exists, the reaper does not. Caches, artifacts and secrets are their own parts. Disk quotas on the workspace are not enforced (no `io` delegation in the rootless setup; see F07).
 
 ## Verification
 

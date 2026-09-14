@@ -31,7 +31,7 @@ The session is full duplex on one TLS connection: the rustls state sits behind a
 
 The worker sends `Ping { seq, held }` every `HEARTBEAT_INTERVAL` (5 s), where `held` names the attempts it still holds (at most `MAX_LIST_ITEMS`, 64). The controller answers `Pong { seq, lease_until_ms, stop }`: the leases of every held attempt it recognises are renewed to `now + DEFAULT_LEASE_MS` (30 s, never backwards), and `stop` lists what the worker must end at once because the controller no longer counts it as held — lapsed, finished elsewhere, or never its. Liveness is recorded at most once per `SEEN_RECORD_INTERVAL_MS` (60 s), and a beat with nothing to renew and liveness fresh costs no write at all. Either side that hears nothing for `HEARTBEAT_DEADLINE` (15 s, two missed beats: one delayed packet must not tear down a session carrying live work) reports `Lost`. A second hello, an out-of-sequence pong, an oversized frame or a held list over the bound is a protocol violation that ends the session.
 
-`workers::revoke` refuses the fingerprint at its next authentication; the running session is closed by W06's lease reconciliation, and the identity can never enroll again.
+`workers::revoke` refuses the fingerprint at its next authentication; its held attempts expire with their leases ([cancellation](cancellation.md)), and the identity can never enroll again.
 
 ## Dispatch (W02)
 
@@ -69,7 +69,7 @@ sentinel admin worker revoke --data-dir <PATH> --id wrk_...
 
 ## What is not here yet
 
-Lease expiry, a lost worker's acknowledged leases and revocation's reconciliation of held work are W06: today an acknowledged lease of a worker that never returns stays `Leased` until then (its unacknowledged offers lapse in 5 s regardless). Fairness between tenants and aging of large jobs are Q02; placement here is strict priority then age within what fits.
+Lease expiry, cancellation and timeouts are in [cancellation](cancellation.md): an acknowledged lease of a worker that never returns expires at its deadline and the job ends `infra_failed`, never replayed. Fairness between tenants and aging of large jobs are Q02; placement here is strict priority then age within what fits.
 
 ## Verification
 

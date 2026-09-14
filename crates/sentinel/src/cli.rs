@@ -84,6 +84,17 @@ pub enum AdminCommand {
     Pool(PoolArgs),
     /// Enroll, list and revoke workers
     Worker(WorkerArgs),
+    /// Record cancellation for a job or a whole run; running attempts are told on their next heartbeat
+    Cancel {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `job_` identifier
+        #[arg(long, conflicts_with = "run")]
+        job: Option<String>,
+        /// The `run_` identifier
+        #[arg(long)]
+        run: Option<String>,
+    },
     /// Print an attempt's log as stored on the controller; --follow waits for more
     Logs {
         #[command(flatten)]

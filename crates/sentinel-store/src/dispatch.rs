@@ -33,6 +33,15 @@ pub const DEFAULT_LEASE_MS: i64 = 30_000;
 pub const OFFER_ACK_MS: i64 = 5_000;
 /// Attempts one worker may hold at once; also the bound on a renewal list.
 pub const MAX_HELD_ATTEMPTS: usize = MAX_LIST_ITEMS;
+/// How long a job may wait in the queue before it is `QueueTimedOut`.
+/// Server policy, not a pipeline setting; finite so nothing waits forever.
+pub const QUEUE_TIMEOUT_MS: i64 = 6 * 60 * 60 * 1000;
+/// Slack past the job's own timeout before the controller stops trusting
+/// the worker to enforce it: the worker's clock is the real deadline, this
+/// is the backstop for a worker that renews its lease but never finishes.
+pub const EXECUTION_GRACE_MS: i64 = 10 * 60 * 1000;
+/// Rows one sweep handles; the next pass takes the rest.
+const SWEEP_BATCH: usize = 256;
 /// Offers the ack-timeout sweep lapses per pass.
 const SWEEP_LIMIT: usize = 256;
 
@@ -377,6 +386,168 @@ pub fn finish(
         .execute(params![attempt.as_bytes(), now.0])?;
     release_dependents(tx, tenant, run, now)?;
     Ok(next)
+}
+
+/// What cancelling a job did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cancelled {
+    /// No worker owned it: terminal `Canceled` now.
+    Terminal,
+    /// A worker owns it: the desired state is recorded, the worker is told
+    /// on its next heartbeat, and the attempt reports its own end.
+    Requested,
+    /// Already terminal; nothing to do.
+    AlreadyTerminal,
+}
+
+/// Cancellation as durable desired state: recorded first, effective at once
+/// for an unstarted job, delivered to the owning worker for a running one.
+/// Never cleared; a cancelled job cannot be rerun.
+pub fn cancel(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    job: JobId,
+    now: UnixMillis,
+) -> Result<Cancelled> {
+    let row = jobs::get_job(tx, tenant, job)?;
+    if row.state.is_terminal() {
+        return Ok(Cancelled::AlreadyTerminal);
+    }
+    let unstarted = jobs::request_cancel(tx, tenant, job)?;
+    if unstarted {
+        jobs::transition(
+            tx,
+            tenant,
+            job,
+            Actor::Controller,
+            Event::CancelBeforeStart,
+            now,
+        )?;
+        Ok(Cancelled::Terminal)
+    } else {
+        Ok(Cancelled::Requested)
+    }
+}
+
+/// Cancel every job of a run that is not terminal yet.
+pub fn cancel_run(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    run: RunId,
+    now: UnixMillis,
+) -> Result<usize> {
+    let mut count = 0;
+    for (job, state) in runs::run_jobs(tx, tenant, run)? {
+        if !state.is_terminal() {
+            cancel(tx, tenant, job, now)?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Among the attempts a worker holds, those whose job has cancellation
+/// desired: told to the worker with every heartbeat until it reports.
+pub fn cancel_requested(
+    conn: &Connection,
+    worker: WorkerId,
+    held: &[AttemptId],
+) -> Result<Vec<AttemptId>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM attempts a JOIN jobs j ON j.id = a.job_id
+         WHERE a.id = ?1 AND a.worker_id = ?2 AND a.released_ms IS NULL AND j.cancel_requested = 1)",
+    )?;
+    let mut out = Vec::new();
+    for attempt in held {
+        let wanted: bool =
+            stmt.query_row(params![attempt.as_bytes(), worker.as_bytes()], |r| r.get(0))?;
+        if wanted {
+            out.push(*attempt);
+        }
+    }
+    Ok(out)
+}
+
+/// Held attempts whose lease has passed, or which have run past their job's
+/// timeout plus [`EXECUTION_GRACE_MS`] while still acknowledged: the worker
+/// stopped renewing, or renews but is not enforcing. Oldest first.
+pub fn expired(conn: &Connection, now: UnixMillis) -> Result<Vec<AttemptId>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT a.id FROM attempts a
+         WHERE a.released_ms IS NULL AND a.lease_until_ms < ?1
+         ORDER BY a.lease_until_ms LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![now.0, SWEEP_BATCH as i64], |r| {
+        r.get::<_, [u8; 16]>(0)
+    })?;
+    let mut out: Vec<AttemptId> = rows
+        .map(|row| AttemptId::from_bytes(row?).map_err(|_| Error::Corrupt("attempt_id")))
+        .collect::<Result<_>>()?;
+    let mut overrun = conn.prepare_cached(
+        "SELECT a.id FROM attempts a JOIN jobs j ON j.id = a.job_id
+         WHERE a.released_ms IS NULL AND a.acked_ms IS NOT NULL
+           AND a.acked_ms + j.timeout_ms + ?2 < ?1
+         LIMIT ?3",
+    )?;
+    let rows = overrun.query_map(
+        params![now.0, EXECUTION_GRACE_MS, SWEEP_BATCH as i64],
+        |r| r.get::<_, [u8; 16]>(0),
+    )?;
+    for row in rows {
+        let id = AttemptId::from_bytes(row?).map_err(|_| Error::Corrupt("attempt_id"))?;
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// Expire one attempt: `LeaseExpired` through the machine, capacity back,
+/// dependents decided. The job is terminal `infra_failed` — never re-queued
+/// on its own, because whether its side effects happened is unknown.
+pub fn expire(tx: &Transaction<'_>, attempt: AttemptId, now: UnixMillis) -> Result<JobState> {
+    finish(tx, attempt, Actor::Controller, Event::LeaseExpired, now)
+}
+
+/// Queued jobs that waited longer than [`QUEUE_TIMEOUT_MS`]: `QueueTimedOut`.
+/// Returns how many were timed out this pass.
+pub fn sweep_queue_timeouts(tx: &Transaction<'_>, now: UnixMillis) -> Result<usize> {
+    let cutoff = now.0.saturating_sub(QUEUE_TIMEOUT_MS);
+    let rows: Vec<([u8; 16], [u8; 16])> = tx
+        .prepare_cached(
+            "SELECT tenant_id, id FROM jobs WHERE state_code = ?1 AND queued_ms <= ?2
+             ORDER BY queued_ms LIMIT ?3",
+        )?
+        .query_map(params![READY, cutoff, SWEEP_BATCH as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut count = 0;
+    for (tenant, job) in rows {
+        let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?;
+        let job = JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?;
+        jobs::transition(
+            tx,
+            tenant,
+            job,
+            Actor::Controller,
+            Event::QueueTimedOut,
+            now,
+        )?;
+        let run = run_of(tx, tenant, job)?;
+        release_dependents(tx, tenant, run, now)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn run_of(conn: &Connection, tenant: TenantId, job: JobId) -> Result<RunId> {
+    let run: [u8; 16] = conn
+        .prepare_cached("SELECT run_id FROM jobs WHERE id = ?1 AND tenant_id = ?2")?
+        .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))
 }
 
 /// A worker's report over the link: the attempt must be held by that worker

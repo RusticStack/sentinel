@@ -143,6 +143,99 @@ pub struct Container {
     /// after start so its counters can be inspected without placing a
     /// process inside a cgroup that may already be at its limit.
     cgroup: Option<std::path::PathBuf>,
+    /// Host pid of the container's keepalive, spared by a graceful stop.
+    init_pid: Option<i32>,
+}
+
+/// How a termination ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Terminated {
+    /// Every step process left within the grace period after `SIGTERM`.
+    Graceful,
+    /// The grace period passed; the container was stopped and removed.
+    Forced,
+    /// Nothing was running any more.
+    Gone,
+}
+
+/// Inspect a container by name: (host pid of its init, host cgroup path).
+fn inspect_named(name: &str) -> Result<(Option<i32>, Option<std::path::PathBuf>)> {
+    let mut inspect = podman();
+    inspect.args([
+        "inspect",
+        "--format",
+        "{{.State.Pid}} {{.State.CgroupPath}}",
+        "--",
+        name,
+    ]);
+    let output = process::run(inspect, deadline(Duration::from_secs(30)), "podman inspect")?;
+    if !output.success() {
+        return Err(Error::Runtime(format!(
+            "podman inspect: {}",
+            output.stderr_excerpt()
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut fields = text.split_whitespace();
+    let pid = fields
+        .next()
+        .and_then(|p| p.parse::<i32>().ok())
+        .filter(|p| *p > 0);
+    let cgroup = fields
+        .next()
+        .and_then(|path| path.strip_prefix('/').map(str::to_owned))
+        .map(|rel| std::path::Path::new("/sys/fs/cgroup").join(rel))
+        .filter(|full| full.join("cgroup.procs").exists());
+    Ok((pid, cgroup))
+}
+
+/// Host pids of every process in the container's cgroup except its init.
+fn step_pids(cgroup: &std::path::Path, init: Option<i32>) -> Vec<i32> {
+    std::fs::read_to_string(cgroup.join("cgroup.procs"))
+        .map(|text| {
+            text.lines()
+                .filter_map(|l| l.trim().parse::<i32>().ok())
+                .filter(|pid| Some(*pid) != init)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Graceful then forced termination of a container by name (W06): `SIGTERM`
+/// to every step process in the container's cgroup — the keepalive is
+/// spared so the container stays up for the signal to be handled — then,
+/// if any is still there after `grace`, `podman stop -t 0` and removal.
+/// Rootless: the processes are the worker account's, so the signal needs
+/// no privilege.
+pub fn terminate_named(name: &str, grace: Duration) -> Result<Terminated> {
+    let (init, cgroup) = match inspect_named(name) {
+        Ok(found) => found,
+        Err(_) => return Ok(Terminated::Gone),
+    };
+    let Some(cgroup) = cgroup else {
+        remove_named(name)?;
+        return Ok(Terminated::Forced);
+    };
+    let pids = step_pids(&cgroup, init);
+    if pids.is_empty() {
+        return Ok(Terminated::Gone);
+    }
+    for pid in &pids {
+        // SAFETY: a plain signal to a pid we just read from the container's
+        // own cgroup; a pid that exited meanwhile makes kill fail harmlessly.
+        unsafe {
+            libc::kill(*pid, libc::SIGTERM);
+        }
+    }
+    let deadline_at = Instant::now() + grace;
+    while Instant::now() < deadline_at {
+        if step_pids(&cgroup, init).is_empty() {
+            return Ok(Terminated::Graceful);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    remove_named(name)?;
+    Ok(Terminated::Forced)
 }
 
 /// How one step's process ended.
@@ -243,6 +336,7 @@ impl Container {
             name,
             attempt,
             cgroup: None,
+            init_pid: None,
         };
         let mut start = podman();
         start.args(["start", "--", &container.name]);
@@ -252,25 +346,9 @@ impl Container {
             let _ = container.remove();
             return Err(Error::Preparation(format!("container start: {why}")));
         }
-        let mut inspect = podman();
-        inspect.args([
-            "inspect",
-            "--format",
-            "{{.State.CgroupPath}}",
-            "--",
-            &container.name,
-        ]);
-        if let Ok(output) =
-            process::run(inspect, deadline(Duration::from_secs(30)), "podman inspect")
-            && output.success()
-        {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if let Some(rel) = path.strip_prefix('/') {
-                let full = std::path::Path::new("/sys/fs/cgroup").join(rel);
-                if full.join("memory.events").exists() {
-                    container.cgroup = Some(full);
-                }
-            }
+        if let Ok((init, cgroup)) = inspect_named(&container.name) {
+            container.init_pid = init;
+            container.cgroup = cgroup.filter(|c| c.join("memory.events").exists());
         }
         Ok(container)
     }
@@ -428,6 +506,7 @@ pub fn remove_named(name: &str) -> Result<()> {
         name: name.to_owned(),
         attempt: AttemptId::new(),
         cgroup: None,
+        init_pid: None,
     }
     .remove()
 }

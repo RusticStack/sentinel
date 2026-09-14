@@ -160,6 +160,8 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
     // The value a secret binding would inject (S05); registered before any
     // attempt starts, it never reaches a log.
     executor.register_secret(b"hunter2-super-secret");
+    // Cancelled steps get two seconds between TERM and the forced stop.
+    executor.set_cancel_grace(Duration::from_secs(2));
     let handle = Arc::new(Handle::new());
     let link_thread = {
         let (executor, handle) = (executor.clone(), Arc::clone(&handle));
@@ -252,6 +254,20 @@ jobs:
         run: 'sleep 30'
       - id: never
         run: 'true'
+  polite:
+    image: {IMAGE}@{DIGEST}
+    resources: {{ cpu: 1, memory: 128MiB }}
+    steps:
+      - id: wait
+        run: 'echo polite-started; sleep 300'
+      - id: never
+        run: 'true'
+  stubborn:
+    image: {IMAGE}@{DIGEST}
+    resources: {{ cpu: 1, memory: 128MiB }}
+    steps:
+      - id: wait
+        run: 'trap \"\" TERM; echo stubborn-started; while :; do sleep 1; done'
 "
     );
     let spec = RunSpec::new(
@@ -279,13 +295,15 @@ jobs:
     // Compiled order is dependencies first, then by name.
     let compiled = spec_names(&yaml);
     let by_name = |name: &str| ids[compiled.iter().position(|n| n == name).unwrap()];
-    let (broken, inspect, gated, unknown, oom, slow) = (
+    let (broken, inspect, gated, unknown, oom, slow, polite, stubborn) = (
         by_name("broken"),
         by_name("inspect"),
         by_name("gated"),
         by_name("unknown"),
         by_name("oom"),
         by_name("slow"),
+        by_name("polite"),
+        by_name("stubborn"),
     );
     eventually("inspect passed", || {
         state(inspect).state == JobState::Terminal(Outcome::Passed)
@@ -411,6 +429,66 @@ jobs:
     assert_eq!(slow_summary.steps[0].outcome, StepOutcome::TimedOut);
     assert_eq!(slow_summary.steps[1].outcome, StepOutcome::NotRun);
     assert!(slow_summary.steps[0].duration_ns.unwrap() < 10_000_000_000);
+    // Cancellation: recorded on the controller, delivered on the next beat,
+    // carried out gracefully — `polite` dies from TERM within the grace —
+    // or forced: `stubborn` ignores TERM and is killed when the grace runs
+    // out. Both report `Canceled`, both containers are gone.
+    let started = |job| {
+        let attempt = store
+            .read(|c| dispatch::latest_attempt(c, tenant, job))
+            .unwrap();
+        attempt.is_some_and(|attempt| {
+            logs.tail(attempt, 0, 1000)
+                .map(|t| t.frames.iter().any(|f| !f.bytes.is_empty()))
+                .unwrap_or(false)
+        })
+    };
+    eventually("polite started", || started(polite));
+    eventually("stubborn started", || started(stubborn));
+    let asked = Instant::now();
+    store
+        .writer()
+        .write(move |tx| {
+            dispatch::cancel(tx, tenant, polite, UnixMillis::now())?;
+            dispatch::cancel(tx, tenant, stubborn, UnixMillis::now())
+        })
+        .unwrap();
+    eventually("polite canceled", || {
+        state(polite).state == JobState::Terminal(Outcome::Canceled)
+    });
+    eventually("stubborn canceled", || {
+        state(stubborn).state == JobState::Terminal(Outcome::Canceled)
+    });
+    let took = asked.elapsed();
+    assert!(took < Duration::from_secs(30), "cancellation took {took:?}");
+    for job in [polite, stubborn] {
+        assert_eq!(
+            state(job).failure_class,
+            Some(sentinel_core::FailureClass::Canceled)
+        );
+        let summary = summary_of(job);
+        assert!(summary.detail.contains("canceled"), "{}", summary.detail);
+        assert!(
+            summary.steps[1..]
+                .iter()
+                .all(|s| s.outcome == StepOutcome::NotRun)
+        );
+    }
+    let log = notices.lock().unwrap().clone();
+    assert!(
+        log.iter()
+            .any(|n| n.contains("Canceled") && n.contains("forced: false")),
+        "{log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|n| n.contains("Canceled") && n.contains("forced: true")),
+        "{log:?}"
+    );
+    eventually("containers gone", || {
+        podman::owned(worker_id).unwrap().is_empty()
+    });
+
     // Every phase was stamped by the worker's reports, in order.
     let stamps = state(inspect).timestamps;
     assert!(stamps.leased <= stamps.preparing);
@@ -418,14 +496,13 @@ jobs:
     assert!(stamps.running <= stamps.finalizing);
     assert!(stamps.finalizing <= stamps.terminal);
     assert!(stamps.preparing.is_some() && stamps.finalizing.is_some());
-    // Six jobs: four full lifecycles (4 reports) and two preparation
-    // failures (2 reports each: unknown fails inside the steps phase, so it
-    // is a full lifecycle too).
+    // Eight jobs, each a full lifecycle of four reports (a preparation
+    // failure inside the steps phase still passes through every phase).
     let reports = controller
         .stats()
         .reports
         .load(std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(reports, 6 * 4, "every report was applied");
+    assert_eq!(reports, 8 * 4, "every report was applied");
     assert_eq!(
         controller
             .stats()

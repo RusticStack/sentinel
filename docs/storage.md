@@ -43,6 +43,8 @@ Version 14 ([worker link](worker-link.md#dispatch-w02)) copies each job's `cpu_m
 
 Version 15 ([executor](executor.md#steps-w04)) adds `attempts.summary` (at most 32 KiB, the worker's encoded `AttemptSummary`), written once with the terminal report; the recreated `attempt_update` trigger refuses to replace it.
 
+Version 16 ([cancellation](cancellation.md)) copies each job's execution timeout to `jobs.timeout_ms` for the controller's backstop and adds `attempts_held_by_lease` and `jobs_queued_since`, the partial indexes the expiry and queue-timeout sweeps walk.
+
 ## Writer and acknowledgement policy
 
 One thread owns the only write connection. `Writer::write` sends a closure over a bounded channel (256 slots), runs it inside `BEGIN IMMEDIATE`, commits, and only then replies. With `synchronous=FULL` the WAL is fsynced before `COMMIT` returns, so **a write is acknowledged to the caller only when it is on disk**. This is the contract worker acknowledgements, lease grants and cancel requests rely on. `Durability::Normal` exists for replayable data and tests; it is never used for transitions.
