@@ -17,9 +17,11 @@ use sentinel_auth::{
     secret::{Digest, Secret},
 };
 use sentinel_core::{
-    UnixMillis, UserId,
+    SessionId, UnixMillis, UserId,
     auth::{Permissions, Principal},
 };
+
+pub use crate::auth::Authority;
 
 use crate::{Error, Result, Store};
 
@@ -36,6 +38,9 @@ pub struct Policy {
     /// How much of the idle window must be spent before a request pays for a
     /// write to slide the deadline. Without it every request takes the writer.
     pub refresh_after_ms: i64,
+    /// How long a proven second factor keeps a session eligible for privileged
+    /// changes. Short: it bounds what a hijacked, stepped-up session can do.
+    pub step_up_ms: i64,
 }
 
 impl Default for Policy {
@@ -46,6 +51,7 @@ impl Default for Policy {
             max_failures: 10,
             lockout_ms: 15 * 60 * 1000,
             refresh_after_ms: 5 * 60 * 1000,
+            step_up_ms: 10 * 60 * 1000,
         }
     }
 }
@@ -82,6 +88,13 @@ pub enum Event {
     PolicyChanged = 25,
     InstallationBound = 26,
     InstallationUnbound = 27,
+    MfaEnrolled = 28,
+    MfaDisabled = 29,
+    SteppedUp = 30,
+    StepUpFailed = 31,
+    RecoveryCodeUsed = 32,
+    RecoveryCodesIssued = 33,
+    SessionRevoked = 34,
 }
 
 impl Event {
@@ -114,6 +127,13 @@ impl Event {
             25 => Event::PolicyChanged,
             26 => Event::InstallationBound,
             27 => Event::InstallationUnbound,
+            28 => Event::MfaEnrolled,
+            29 => Event::MfaDisabled,
+            30 => Event::SteppedUp,
+            31 => Event::StepUpFailed,
+            32 => Event::RecoveryCodeUsed,
+            33 => Event::RecoveryCodesIssued,
+            34 => Event::SessionRevoked,
             _ => return None,
         })
     }
@@ -141,14 +161,33 @@ pub enum Login {
 /// live state are still checked per query through [`crate::auth`].
 #[derive(Clone, Copy, Debug)]
 pub struct Session {
+    /// Absent only for a session issued before migration 9.
+    pub id: Option<SessionId>,
     pub user: UserId,
     pub super_admin: bool,
     pub csrf: Digest,
     pub idle_deadline: UnixMillis,
     pub absolute_deadline: UnixMillis,
+    /// When this session last proved a second factor, if ever.
+    pub stepped_up: Option<UnixMillis>,
 }
 
 impl Session {
+    /// Whether a second factor was proven recently enough for privileged
+    /// changes. Freshness only; authority is still checked live.
+    pub fn stepped_up_within(&self, policy: Policy, now: UnixMillis) -> bool {
+        self.stepped_up
+            .is_some_and(|at| at <= now && now.0.saturating_sub(at.0) < policy.step_up_ms)
+    }
+
+    pub fn require_step_up(&self, policy: Policy, now: UnixMillis) -> Result<()> {
+        if self.stepped_up_within(policy, now) {
+            Ok(())
+        } else {
+            Err(Error::StepUpRequired)
+        }
+    }
+
     /// A browser session acts as its human, not above them: repository bits plus
     /// tenant administration, which `auth` still verifies against live
     /// membership per tenant. Platform administration is present only for an
@@ -459,14 +498,15 @@ pub fn issue_session(
     let absolute = now.0.saturating_add(policy.absolute_ms);
     tx.execute(
         "INSERT INTO sessions(token_digest, user_id, csrf_digest, created_ms,
-            idle_deadline_ms, absolute_deadline_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            idle_deadline_ms, absolute_deadline_ms, id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             session.digest().0,
             user.as_bytes(),
             csrf.digest().0,
             now.0,
             now.0.saturating_add(policy.idle_ms).min(absolute),
-            absolute
+            absolute,
+            SessionId::new().as_bytes()
         ],
     )?;
     Ok(Issued {
@@ -485,7 +525,7 @@ pub fn authenticate(conn: &Connection, presented: &Secret, now: UnixMillis) -> R
     let row = conn
         .prepare_cached(
             "SELECT s.user_id, s.csrf_digest, s.idle_deadline_ms, s.absolute_deadline_ms,
-                    u.super_admin
+                    u.super_admin, s.id, s.stepped_up_ms
              FROM sessions s JOIN users u ON u.id = s.user_id
              WHERE s.token_digest = ?1 AND s.revoked_ms IS NULL
              AND s.idle_deadline_ms > ?2 AND s.absolute_deadline_ms > ?2
@@ -498,16 +538,23 @@ pub fn authenticate(conn: &Connection, presented: &Secret, now: UnixMillis) -> R
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, bool>(4)?,
+                r.get::<_, Option<[u8; 16]>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
             ))
         })
         .optional()?
         .ok_or(Error::NotFound)?;
     Ok(Session {
+        id: match row.5 {
+            Some(b) => Some(SessionId::from_bytes(b).map_err(|_| Error::Corrupt("session id"))?),
+            None => None,
+        },
         user: UserId::from_bytes(row.0).map_err(|_| Error::Corrupt("user_id"))?,
         super_admin: row.4,
         csrf: Digest(row.1),
         idle_deadline: UnixMillis(row.2),
         absolute_deadline: UnixMillis(row.3),
+        stepped_up: row.6.map(UnixMillis),
     })
 }
 
@@ -671,12 +718,12 @@ pub fn provision_credential(
 /// caller forgets the check.
 pub fn set_super_admin(
     tx: &Transaction<'_>,
-    principal: Principal,
+    authority: Authority,
     target: UserId,
     super_admin: bool,
     now: UnixMillis,
 ) -> Result<()> {
-    crate::auth::require_platform_admin(tx, principal)?;
+    authority.require_privileged(tx)?;
     let changed = tx.execute(
         "UPDATE users SET super_admin = ?2 WHERE id = ?1 AND kind = 0 AND super_admin != ?2",
         params![target.as_bytes(), super_admin],
@@ -691,19 +738,26 @@ pub fn set_super_admin(
     } else {
         Event::SuperAdminRevoked
     };
-    audit(tx, event, Some(principal.user), Some(target), false, None)
+    audit(
+        tx,
+        event,
+        authority.actor(),
+        Some(target),
+        authority.host_local(),
+        None,
+    )
 }
 
 /// Activate or suspend an account. Deactivation revokes sessions and API
 /// credentials in the same transaction; it does not wait for their deadlines.
 pub fn set_active(
     tx: &Transaction<'_>,
-    principal: Principal,
+    authority: Authority,
     target: UserId,
     active: bool,
     now: UnixMillis,
 ) -> Result<()> {
-    crate::auth::require_platform_admin(tx, principal)?;
+    authority.require_privileged(tx)?;
     let changed = tx.execute(
         "UPDATE users SET active = ?2 WHERE id = ?1 AND active != ?2",
         params![target.as_bytes(), active],
@@ -721,7 +775,118 @@ pub fn set_active(
     } else {
         Event::AccountDeactivated
     };
-    audit(tx, event, Some(principal.user), Some(target), false, None)
+    audit(
+        tx,
+        event,
+        authority.actor(),
+        Some(target),
+        authority.host_local(),
+        None,
+    )
+}
+
+/// One session as an account (or an administrator) may see it. No digest, no
+/// cookie value: nothing here can be presented.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub id: Option<SessionId>,
+    pub created: UnixMillis,
+    pub idle_deadline: UnixMillis,
+    pub absolute_deadline: UnixMillis,
+    pub stepped_up: Option<UnixMillis>,
+    pub revoked: bool,
+}
+
+fn may_administer(conn: &Connection, authority: Authority, user: UserId) -> Result<()> {
+    if authority.actor() == Some(user) {
+        return Ok(());
+    }
+    authority
+        .require_platform(conn)
+        .map_err(|_| Error::NotFound)
+}
+
+/// An account's sessions, newest first, at most 100. The account itself or a
+/// platform admin may look.
+pub fn sessions(
+    conn: &Connection,
+    authority: Authority,
+    user: UserId,
+    limit: u16,
+) -> Result<Vec<SessionRecord>> {
+    if !(1..=100).contains(&limit) {
+        return Err(Error::InvalidInput("page size"));
+    }
+    may_administer(conn, authority, user)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, created_ms, idle_deadline_ms, absolute_deadline_ms, stepped_up_ms, revoked_ms
+         FROM sessions WHERE user_id = ?1 ORDER BY created_ms DESC, token_digest LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![user.as_bytes(), limit], |r| {
+        Ok((
+            r.get::<_, Option<[u8; 16]>>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<i64>>(5)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let row = row?;
+        Ok(SessionRecord {
+            id: match row.0 {
+                Some(b) => {
+                    Some(SessionId::from_bytes(b).map_err(|_| Error::Corrupt("session id"))?)
+                }
+                None => None,
+            },
+            created: UnixMillis(row.1),
+            idle_deadline: UnixMillis(row.2),
+            absolute_deadline: UnixMillis(row.3),
+            stepped_up: row.4.map(UnixMillis),
+            revoked: row.5.is_some(),
+        })
+    })
+    .collect()
+}
+
+/// Revoke one named session of an account: its own, or a platform admin's
+/// decision. Immediate and audited; a session issued before migration 9 has no
+/// name and is reached by `logout_all` or `revoke_all` instead.
+pub fn revoke_session(
+    tx: &Transaction<'_>,
+    authority: Authority,
+    user: UserId,
+    session: SessionId,
+    now: UnixMillis,
+) -> Result<()> {
+    may_administer(tx, authority, user)?;
+    let revoked = tx.execute(
+        "UPDATE sessions SET revoked_ms = ?3 WHERE id = ?1 AND user_id = ?2 AND revoked_ms IS NULL",
+        params![session.as_bytes(), user.as_bytes(), now.0],
+    )?;
+    if revoked == 0 {
+        return Err(Error::NotFound);
+    }
+    audit(
+        tx,
+        Event::SessionRevoked,
+        authority.actor(),
+        Some(user),
+        authority.host_local(),
+        None,
+    )
+}
+
+/// Host-local revocation of every session of an account, for an operator
+/// responding to a report without a session of their own.
+pub fn revoke_all_host_local(store: &Store, user: UserId, now: UnixMillis) -> Result<usize> {
+    store.writer().write(move |tx| {
+        let revoked = revoke_all(tx, user, now)?;
+        audit(tx, Event::LogoutAll, None, Some(user), true, None)?;
+        Ok(revoked)
+    })
 }
 
 /// Delete sessions that can no longer authenticate anybody. Bounded per call so

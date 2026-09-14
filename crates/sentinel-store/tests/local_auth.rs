@@ -25,6 +25,14 @@ fn at(ms: i64) -> UnixMillis {
     UnixMillis(ms)
 }
 
+/// An authority whose session proved a second factor just now.
+fn stepped(principal: Principal) -> local_auth::Authority {
+    local_auth::Authority::Credential {
+        principal,
+        stepped_up: true,
+    }
+}
+
 fn accept(login: Login) -> local_auth::Issued {
     match login {
         Login::Accepted(issued) => issued,
@@ -368,9 +376,9 @@ fn the_last_active_super_admin_cannot_be_demoted_suspended_or_deleted() {
             "{raw} was allowed"
         );
     }
-    let refused = store
-        .writer()
-        .write(move |tx| local_auth::set_super_admin(tx, principal, root, false, at(2_200)));
+    let refused = store.writer().write(move |tx| {
+        local_auth::set_super_admin(tx, stepped(principal), root, false, at(2_200))
+    });
     assert!(matches!(refused, Err(Error::Sqlite(_))));
 
     // With a second active super admin, demotion is allowed and revokes the
@@ -380,16 +388,16 @@ fn the_last_active_super_admin_cannot_be_demoted_suspended_or_deleted() {
         .writer()
         .write(move |tx| {
             provisioning::insert_human(tx, deputy, "Deputy", true, at(2_300))?;
-            local_auth::set_super_admin(tx, principal, root, false, at(2_400))
+            local_auth::set_super_admin(tx, stepped(principal), root, false, at(2_400))
         })
         .unwrap();
     assert!(matches!(
         store.read(|conn| local_auth::authenticate(conn, &issued.session, at(2_500))),
         Err(Error::NotFound)
     ));
-    let refused = store
-        .writer()
-        .write(move |tx| local_auth::set_super_admin(tx, principal, deputy, false, at(2_600)));
+    let refused = store.writer().write(move |tx| {
+        local_auth::set_super_admin(tx, stepped(principal), deputy, false, at(2_600))
+    });
     assert!(matches!(refused, Err(Error::Forbidden)));
 }
 
@@ -423,7 +431,7 @@ fn suspending_an_account_invalidates_its_live_cookies_at_once() {
 
     store
         .writer()
-        .write(move |tx| local_auth::set_active(tx, admin, member, false, at(2_500)))
+        .write(move |tx| local_auth::set_active(tx, stepped(admin), member, false, at(2_500)))
         .unwrap();
     assert!(matches!(
         store.read(|conn| local_auth::authenticate(conn, &theirs.session, at(2_600))),
@@ -492,11 +500,13 @@ fn administration_requires_explicit_platform_scope_not_merely_a_session() {
     let narrowed = Principal::new(root, Permissions::REPOSITORY, None, None);
     let refused = store
         .writer()
-        .write(move |tx| local_auth::set_active(tx, narrowed, target, false, at(2_300)));
+        .write(move |tx| local_auth::set_active(tx, stepped(narrowed), target, false, at(2_300)));
     assert!(matches!(refused, Err(Error::Forbidden)));
     store
         .writer()
-        .write(move |tx| local_auth::set_active(tx, session.principal(), target, false, at(2_400)))
+        .write(move |tx| {
+            local_auth::set_active(tx, stepped(session.principal()), target, false, at(2_400))
+        })
         .unwrap();
 }
 

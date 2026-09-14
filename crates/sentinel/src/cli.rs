@@ -72,6 +72,87 @@ pub enum AdminCommand {
     Invite(InviteArgs),
     /// Review pending applications; approve or reject accounts
     Account(AccountArgs),
+    /// Create the sealing key that protects second-factor seeds
+    Key(KeyArgs),
+    /// Inspect or remove an account's second factor
+    Mfa(MfaArgs),
+    /// List and revoke an account's sessions
+    Session(SessionArgs),
+}
+
+#[derive(Args)]
+pub struct KeyArgs {
+    #[command(subcommand)]
+    pub command: KeyCommand,
+}
+
+#[derive(Subcommand)]
+pub enum KeyCommand {
+    /// Write a fresh 32-byte key, owner-only; refuses to overwrite one
+    Create {
+        #[command(flatten)]
+        data: DataDir,
+        /// Where to write it; defaults to master.key inside the data directory
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Args)]
+pub struct MfaArgs {
+    #[command(subcommand)]
+    pub command: MfaCommand,
+}
+
+#[derive(Subcommand)]
+pub enum MfaCommand {
+    /// Whether a second factor is enrolled and how many recovery codes remain
+    Status {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+    },
+    /// Remove the second factor of an account whose device or codes are lost
+    Disable {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+    },
+}
+
+#[derive(Args)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub command: SessionCommand,
+}
+
+#[derive(Subcommand)]
+pub enum SessionCommand {
+    /// List an account's sessions as metadata; no cookie value is ever shown
+    List {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+    },
+    /// Revoke one session by its `ses_` identifier
+    Revoke {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        id: String,
+    },
+    /// Revoke every session of an account
+    LogoutAll {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+    },
 }
 
 #[derive(Args)]

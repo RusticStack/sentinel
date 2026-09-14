@@ -72,6 +72,13 @@ fn fixture() -> (tempfile::TempDir, Store, Ids) {
     (dir, store, i)
 }
 
+fn stepped(i: Ids) -> local_auth::Authority {
+    local_auth::Authority::Credential {
+        principal: admin(i),
+        stepped_up: true,
+    }
+}
+
 fn admin(i: Ids) -> Principal {
     Principal::new(i.root, P::ALL, None, None)
 }
@@ -252,7 +259,7 @@ fn platform_scope_needs_a_super_admin_and_is_dropped_when_the_role_goes() {
         .writer()
         .write(move |tx| {
             provisioning::insert_human(tx, deputy, "Deputy", true, NOW)?;
-            local_auth::set_super_admin(tx, admin(i), i.root, false, at(2_100))
+            local_auth::set_super_admin(tx, stepped(i), i.root, false, at(2_100))
         })
         .unwrap();
     let principal = authenticate(&store, &granted.secret, at(2_200)).unwrap();
@@ -393,7 +400,7 @@ fn revocation_is_immediate_final_and_reaches_the_whole_account() {
     // Suspending the account takes its remaining credentials with it.
     store
         .writer()
-        .write(move |tx| local_auth::set_active(tx, admin(i), i.dev, false, at(2_200)))
+        .write(move |tx| local_auth::set_active(tx, stepped(i), i.dev, false, at(2_200)))
         .unwrap();
     assert!(matches!(
         authenticate(&store, &second.secret, at(2_300)),

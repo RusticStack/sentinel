@@ -5,6 +5,8 @@
 //! No credential material is ever formatted through `Debug`/`Display`.
 
 pub mod cookie;
+pub mod mfa;
 pub mod password;
+pub mod sealed;
 pub mod secret;
 pub mod token;

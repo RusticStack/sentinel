@@ -71,9 +71,7 @@ impl Fixture {
         };
         self.store
             .writer()
-            .write(move |tx| {
-                registration::set_policy(tx, Authority::Credential(admin), policy, at(2))
-            })
+            .write(move |tx| registration::set_policy(tx, stepped(admin), policy, at(2)))
             .unwrap();
     }
 
@@ -81,7 +79,7 @@ impl Fixture {
         let admin = self.admin;
         self.store
             .writer()
-            .write(move |tx| registration::invite(tx, Authority::Credential(admin), terms, at(3)))
+            .write(move |tx| registration::invite(tx, Authority::credential(admin), terms, at(3)))
             .unwrap()
     }
 
@@ -106,6 +104,14 @@ impl Fixture {
             .into_iter()
             .map(|r| r.event)
             .collect()
+    }
+}
+
+/// A platform admin whose session proved a second factor just now.
+fn stepped(principal: Principal) -> Authority {
+    Authority::Credential {
+        principal,
+        stepped_up: true,
     }
 }
 
@@ -166,7 +172,7 @@ fn an_invitation_admits_once_and_only_once() {
     ));
     let records = f
         .store
-        .read(|conn| registration::invitations(conn, Authority::Credential(f.admin), None, 10))
+        .read(|conn| registration::invitations(conn, Authority::credential(f.admin), None, 10))
         .unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].id, invitation.id);
@@ -203,7 +209,7 @@ fn invitations_expire_are_revocable_and_are_bounded_at_creation() {
     f.store
         .writer()
         .write(move |tx| {
-            registration::revoke_invitation(tx, Authority::Credential(admin), id, at(5))
+            registration::revoke_invitation(tx, Authority::credential(admin), id, at(5))
         })
         .unwrap();
     assert!(matches!(
@@ -215,7 +221,7 @@ fn invitations_expire_are_revocable_and_are_bounded_at_creation() {
         let refused = f.store.writer().write(move |tx| {
             registration::invite(
                 tx,
-                Authority::Credential(admin),
+                Authority::credential(admin),
                 Terms {
                     lifetime_ms: lifetime,
                     ..Terms::default()
@@ -318,7 +324,7 @@ fn approval_required_creates_a_pending_account_that_holds_nothing() {
 
     let pending = f
         .store
-        .read(|conn| registration::pending(conn, Authority::Credential(f.admin), 10))
+        .read(|conn| registration::pending(conn, Authority::credential(f.admin), 10))
         .unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].user, user);
@@ -327,7 +333,7 @@ fn approval_required_creates_a_pending_account_that_holds_nothing() {
     let admin = f.admin;
     f.store
         .writer()
-        .write(move |tx| registration::approve(tx, Authority::Credential(admin), user, at(22)))
+        .write(move |tx| registration::approve(tx, Authority::credential(admin), user, at(22)))
         .unwrap();
     assert!(matches!(
         local_auth::login(&f.store, "member", PASSWORD, Policy::default(), at(23)).unwrap(),
@@ -335,7 +341,7 @@ fn approval_required_creates_a_pending_account_that_holds_nothing() {
     ));
     assert!(
         f.store
-            .read(|conn| registration::pending(conn, Authority::Credential(f.admin), 10))
+            .read(|conn| registration::pending(conn, Authority::credential(f.admin), 10))
             .unwrap()
             .is_empty()
     );
@@ -343,7 +349,7 @@ fn approval_required_creates_a_pending_account_that_holds_nothing() {
     let again = f
         .store
         .writer()
-        .write(move |tx| registration::approve(tx, Authority::Credential(admin), user, at(24)));
+        .write(move |tx| registration::approve(tx, Authority::credential(admin), user, at(24)));
     assert!(matches!(again, Err(Error::NotFound)));
 }
 
@@ -358,7 +364,7 @@ fn rejection_ends_access_and_keeps_the_identity_claimed() {
     let admin = f.admin;
     f.store
         .writer()
-        .write(move |tx| registration::approve(tx, Authority::Credential(admin), user, at(20)))
+        .write(move |tx| registration::approve(tx, Authority::credential(admin), user, at(20)))
         .unwrap();
     let issued =
         match local_auth::login(&f.store, "member", PASSWORD, Policy::default(), at(21)).unwrap() {
@@ -368,7 +374,7 @@ fn rejection_ends_access_and_keeps_the_identity_claimed() {
 
     f.store
         .writer()
-        .write(move |tx| registration::reject(tx, Authority::Credential(admin), user, at(22)))
+        .write(move |tx| registration::reject(tx, Authority::credential(admin), user, at(22)))
         .unwrap();
     // The live session stops working, and the password no longer signs in.
     assert!(matches!(
@@ -445,7 +451,7 @@ fn only_a_platform_admin_sets_policy_approves_or_rejects() {
     let refused = f.store.writer().write(move |tx| {
         registration::set_policy(
             tx,
-            Authority::Credential(theirs),
+            stepped(theirs),
             DeploymentPolicy {
                 registration: Registration::ApprovalRequired,
                 tenant_creation: TenantCreation::ApprovedUsers,
@@ -463,23 +469,23 @@ fn only_a_platform_admin_sets_policy_approves_or_rejects() {
     let refused = f
         .store
         .writer()
-        .write(move |tx| registration::approve(tx, Authority::Credential(theirs), member, at(21)));
+        .write(move |tx| registration::approve(tx, Authority::credential(theirs), member, at(21)));
     assert!(matches!(refused, Err(Error::Forbidden)));
     let refused = f
         .store
         .writer()
-        .write(move |tx| registration::reject(tx, Authority::Credential(theirs), member, at(22)));
+        .write(move |tx| registration::reject(tx, Authority::credential(theirs), member, at(22)));
     assert!(matches!(refused, Err(Error::Forbidden)));
     assert!(matches!(
         f.store
-            .read(move |conn| registration::pending(conn, Authority::Credential(theirs), 10)),
+            .read(move |conn| registration::pending(conn, Authority::credential(theirs), 10)),
         Err(Error::Forbidden)
     ));
 
     // Even the admin's own session loses it when the credential is narrowed.
     let narrowed = Principal::new(f.root, P::REPOSITORY, None, None);
     let refused = f.store.writer().write(move |tx| {
-        registration::approve(tx, Authority::Credential(narrowed), member, at(23))
+        registration::approve(tx, Authority::credential(narrowed), member, at(23))
     });
     assert!(matches!(refused, Err(Error::Forbidden)));
 }
@@ -502,7 +508,7 @@ fn a_tenant_admin_may_invite_only_into_the_tenant_they_administer() {
         .write(move |tx| {
             registration::invite(
                 tx,
-                Authority::Credential(theirs),
+                Authority::credential(theirs),
                 Terms {
                     tenant: Some(f.tenant),
                     role: Some(Role::Reader),
@@ -520,7 +526,7 @@ fn a_tenant_admin_may_invite_only_into_the_tenant_they_administer() {
     // A deployment-wide invitation, or one into another tenant, is not theirs
     // to make.
     let refused = f.store.writer().write(move |tx| {
-        registration::invite(tx, Authority::Credential(theirs), Terms::default(), at(21))
+        registration::invite(tx, Authority::credential(theirs), Terms::default(), at(21))
             .map(|_| ())
     });
     assert!(matches!(refused, Err(Error::Forbidden)));
@@ -542,7 +548,7 @@ fn a_tenant_admin_may_invite_only_into_the_tenant_they_administer() {
     let refused = f.store.writer().write(move |tx| {
         registration::invite(
             tx,
-            Authority::Credential(theirs),
+            Authority::credential(theirs),
             Terms {
                 tenant: Some(other),
                 role: Some(Role::Reader),
@@ -581,7 +587,7 @@ fn creating_a_namespace_is_a_separate_decision_from_being_admitted() {
     };
     f.store
         .writer()
-        .write(move |tx| registration::set_policy(tx, Authority::Credential(admin), policy, at(21)))
+        .write(move |tx| registration::set_policy(tx, stepped(admin), policy, at(21)))
         .unwrap();
 
     let personal = TenantId::new();
@@ -759,7 +765,7 @@ fn binding_requires_administering_that_tenant_and_the_policy_to_allow_it() {
     };
     f.store
         .writer()
-        .write(move |tx| registration::set_policy(tx, Authority::Credential(admin), policy, at(24)))
+        .write(move |tx| registration::set_policy(tx, stepped(admin), policy, at(24)))
         .unwrap();
     let refused = f.store.writer().write(move |tx| {
         registration::bind_installation(tx, theirs, installation, f.tenant, at(25))

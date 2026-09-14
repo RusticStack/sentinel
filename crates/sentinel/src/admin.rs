@@ -11,13 +11,13 @@
 use std::io::{IsTerminal, Read};
 
 use sentinel_core::{
-    InvitationId, RepoId, TenantId, TokenId, UnixMillis, UserId,
+    InvitationId, RepoId, SessionId, TenantId, TokenId, UnixMillis, UserId,
     auth::{Permissions, Role},
 };
 use sentinel_store::{
-    Durability, METADATA_FILE, Store,
+    Durability, MASTER_KEY_FILE, METADATA_FILE, Store,
     local_auth::{self, Event},
-    lookup,
+    lookup, mfa,
     registration::{
         self, Authority, DeploymentPolicy, InstallationBinding, Registration, TenantCreation, Terms,
     },
@@ -27,7 +27,8 @@ use sentinel_store::{
 
 use crate::cli::{
     AccountArgs, AccountCommand, AdminArgs, AdminCommand, DataDir, IdentityArgs, IdentityCommand,
-    InviteArgs, InviteCommand, PolicyArgs, PolicyCommand, TokenArgs, TokenCommand,
+    InviteArgs, InviteCommand, KeyArgs, KeyCommand, MfaArgs, MfaCommand, PolicyArgs, PolicyCommand,
+    SessionArgs, SessionCommand, TokenArgs, TokenCommand,
 };
 
 pub struct Error {
@@ -173,6 +174,9 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
         AdminCommand::Policy(args) => policy(args, now)?,
         AdminCommand::Invite(args) => invite(args, now)?,
         AdminCommand::Account(args) => account(args, now)?,
+        AdminCommand::Key(args) => key(args)?,
+        AdminCommand::Mfa(args) => second_factor(args, now)?,
+        AdminCommand::Session(args) => session(args, now)?,
     }
     Ok(())
 }
@@ -663,6 +667,111 @@ fn account(args: &AccountArgs, now: UnixMillis) -> Result<(), Error> {
     Ok(())
 }
 
+fn key(args: &KeyArgs) -> Result<(), Error> {
+    match &args.command {
+        KeyCommand::Create { data, key_file } => {
+            if !data.data_dir.is_absolute() {
+                return Err(fail("data_dir must be an absolute path"));
+            }
+            let path = key_file
+                .clone()
+                .unwrap_or_else(|| data.data_dir.join(MASTER_KEY_FILE));
+            sentinel_auth::sealed::Key::create(&path)
+                .map_err(|error| fail(format!("cannot create the key: {error:?}")))?;
+            eprintln!(
+                "wrote {}; keep it out of database backups and losing it loses every sealed value",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Enrollment needs the person and their device, so it has no host-local form.
+/// Removal does: it is the recovery path for a lost device, and is audited.
+fn second_factor(args: &MfaArgs, now: UnixMillis) -> Result<(), Error> {
+    match &args.command {
+        MfaCommand::Status { data, user } => {
+            let store = open(data, true)?;
+            let user = resolve_user(&store, user)?;
+            let (enrolled, remaining) = store
+                .read(|conn| {
+                    Ok((
+                        mfa::enrolled(conn, user)?,
+                        mfa::recovery_codes_remaining(conn, user)?,
+                    ))
+                })
+                .map_err(|error| fail(format!("cannot read second-factor state: {error}")))?;
+            println!("enrolled: {enrolled}");
+            println!("recovery codes remaining: {remaining}");
+        }
+        MfaCommand::Disable { data, user } => {
+            let store = open(data, true)?;
+            let user = resolve_user(&store, user)?;
+            mfa::disable_host_local(&store, user, now).map_err(|error| match error {
+                sentinel_store::Error::NotFound => fail("that account has no second factor"),
+                other => fail(format!("cannot remove the second factor: {other}")),
+            })?;
+            eprintln!("second factor removed and sessions revoked for {user}");
+        }
+    }
+    Ok(())
+}
+
+fn session(args: &SessionArgs, now: UnixMillis) -> Result<(), Error> {
+    match &args.command {
+        SessionCommand::List { data, user } => {
+            let store = open(data, true)?;
+            let user = resolve_user(&store, user)?;
+            let records = store
+                .read(|conn| local_auth::sessions(conn, Authority::HostLocal, user, 100))
+                .map_err(|error| fail(format!("cannot list sessions: {error}")))?;
+            for record in records {
+                println!(
+                    "{} created={} idle_until={} until={}{}{}",
+                    record
+                        .id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "(unnamed)".into()),
+                    record.created.0,
+                    record.idle_deadline.0,
+                    record.absolute_deadline.0,
+                    record
+                        .stepped_up
+                        .map(|at| format!(" stepped_up={}", at.0))
+                        .unwrap_or_default(),
+                    if record.revoked { " revoked" } else { "" }
+                );
+            }
+        }
+        SessionCommand::Revoke { data, user, id } => {
+            let store = open(data, true)?;
+            let user = resolve_user(&store, user)?;
+            let id: SessionId = id
+                .parse()
+                .map_err(|_| fail("expected a ses_ session identifier"))?;
+            store
+                .writer()
+                .write(move |tx| {
+                    local_auth::revoke_session(tx, Authority::HostLocal, user, id, now)
+                })
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound => fail("no live session with that identifier"),
+                    other => fail(format!("revocation failed: {other}")),
+                })?;
+            eprintln!("revoked {id}");
+        }
+        SessionCommand::LogoutAll { data, user } => {
+            let store = open(data, true)?;
+            let user = resolve_user(&store, user)?;
+            let revoked = local_auth::revoke_all_host_local(&store, user, now)
+                .map_err(|error| fail(format!("logout-all failed: {error}")))?;
+            eprintln!("revoked {revoked} session(s) for {user}");
+        }
+    }
+    Ok(())
+}
+
 const fn event_name(event: Event) -> &'static str {
     match event {
         Event::Bootstrap => "bootstrap",
@@ -692,5 +801,12 @@ const fn event_name(event: Event) -> &'static str {
         Event::PolicyChanged => "policy-changed",
         Event::InstallationBound => "installation-bound",
         Event::InstallationUnbound => "installation-unbound",
+        Event::MfaEnrolled => "mfa-enrolled",
+        Event::MfaDisabled => "mfa-disabled",
+        Event::SteppedUp => "stepped-up",
+        Event::StepUpFailed => "step-up-failed",
+        Event::RecoveryCodeUsed => "recovery-code-used",
+        Event::RecoveryCodesIssued => "recovery-codes-issued",
+        Event::SessionRevoked => "session-revoked",
     }
 }

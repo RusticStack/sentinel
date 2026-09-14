@@ -70,49 +70,7 @@ pub struct DeploymentPolicy {
     pub installation_binding: InstallationBinding,
 }
 
-/// Who is making an admission decision.
-///
-/// Platform administration has two legitimate sources, and the audit trail must
-/// tell them apart: a credential that proves a super admin is acting, and an
-/// operator on the controller's own host, whose authority is the database file
-/// itself. The host-local variant exists so `sentinel admin` does not have to
-/// fabricate a `Principal` for somebody who never authenticated.
-#[derive(Clone, Copy, Debug)]
-pub enum Authority {
-    /// An authenticated caller. Platform administration is checked live.
-    Credential(Principal),
-    /// A process that can already open this database, as with bootstrap and
-    /// recovery. There is no network path to this variant.
-    HostLocal,
-}
-
-impl Authority {
-    /// Require platform administration, and report whether a tenant-admin
-    /// fallback is still available to the caller.
-    fn require_platform(&self, conn: &Connection) -> Result<()> {
-        match self {
-            Authority::Credential(principal) => {
-                crate::auth::require_platform_admin(conn, *principal)
-            }
-            Authority::HostLocal => Ok(()),
-        }
-    }
-
-    fn principal(&self) -> Option<Principal> {
-        match self {
-            Authority::Credential(principal) => Some(*principal),
-            Authority::HostLocal => None,
-        }
-    }
-
-    fn actor(&self) -> Option<UserId> {
-        self.principal().map(|principal| principal.user)
-    }
-
-    const fn host_local(&self) -> bool {
-        matches!(self, Authority::HostLocal)
-    }
-}
+pub use crate::auth::Authority;
 
 /// Read the deployment's admission policy. Cheap single-row read; callers that
 /// need it inside a decision must read it in the same transaction as the write.
@@ -148,15 +106,15 @@ pub fn policy(conn: &Connection) -> Result<DeploymentPolicy> {
     })
 }
 
-/// Change the deployment's admission policy. Platform administration only, and
-/// audited with the resulting values. A06 adds step-up in front of this.
+/// Change the deployment's admission policy. Platform administration with a
+/// recent step-up, audited with the resulting values.
 pub fn set_policy(
     tx: &Transaction<'_>,
     authority: Authority,
     policy: DeploymentPolicy,
     now: UnixMillis,
 ) -> Result<()> {
-    authority.require_platform(tx)?;
+    authority.require_privileged(tx)?;
     tx.execute(
         "UPDATE deployment_policy SET registration = ?1, tenant_creation = ?2,
          installation_binding = ?3, updated_ms = ?4, updated_by = ?5 WHERE id = 1",

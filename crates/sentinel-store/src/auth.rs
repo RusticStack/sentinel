@@ -184,6 +184,88 @@ pub fn list_repos(
     rows.map(|r| decode_repo(r?)).collect()
 }
 
+/// Who is making an administrative decision.
+///
+/// Platform administration has two legitimate sources, and the audit trail must
+/// tell them apart: a credential that proves a super admin is acting, and an
+/// operator on the controller's own host, whose authority is the database file
+/// itself. The host-local variant exists so `sentinel admin` does not have to
+/// fabricate a `Principal` for somebody who never authenticated.
+///
+/// `stepped_up` records whether the caller's session proved a second factor
+/// recently enough (A06). It is freshness, not authority: privileged changes
+/// require both it and a live platform-admin check.
+#[derive(Clone, Copy, Debug)]
+pub enum Authority {
+    /// An authenticated caller. Platform administration is checked live.
+    Credential {
+        principal: Principal,
+        stepped_up: bool,
+    },
+    /// A process that can already open this database, as with bootstrap and
+    /// recovery. There is no network path to this variant, and no step-up can
+    /// be stronger than holding the file.
+    HostLocal,
+}
+
+impl Authority {
+    /// A credential that has not proven presence: enough for routine
+    /// administration, not for changes to who can authenticate.
+    pub const fn credential(principal: Principal) -> Self {
+        Self::Credential {
+            principal,
+            stepped_up: false,
+        }
+    }
+
+    /// A browser session, with its step-up freshness evaluated against policy.
+    pub fn session(
+        session: &crate::local_auth::Session,
+        policy: crate::local_auth::Policy,
+        now: UnixMillis,
+    ) -> Self {
+        Self::Credential {
+            principal: session.principal(),
+            stepped_up: session.stepped_up_within(policy, now),
+        }
+    }
+
+    /// Require platform administration.
+    pub fn require_platform(&self, conn: &Connection) -> Result<()> {
+        match self {
+            Authority::Credential { principal, .. } => require_platform_admin(conn, *principal),
+            Authority::HostLocal => Ok(()),
+        }
+    }
+
+    /// Require platform administration **and** recent proof of presence: the
+    /// bar for changing who can authenticate, or as whom.
+    pub fn require_privileged(&self, conn: &Connection) -> Result<()> {
+        self.require_platform(conn)?;
+        match self {
+            Authority::Credential {
+                stepped_up: false, ..
+            } => Err(Error::StepUpRequired),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn principal(&self) -> Option<Principal> {
+        match self {
+            Authority::Credential { principal, .. } => Some(*principal),
+            Authority::HostLocal => None,
+        }
+    }
+
+    pub fn actor(&self) -> Option<UserId> {
+        self.principal().map(|principal| principal.user)
+    }
+
+    pub const fn host_local(&self) -> bool {
+        matches!(self, Authority::HostLocal)
+    }
+}
+
 pub fn require_platform_admin(conn: &Connection, principal: Principal) -> Result<()> {
     if !principal.permissions.contains(Permissions::PLATFORM_ADMIN)
         || principal.tenant.is_some()

@@ -238,7 +238,18 @@ fn a_suspended_account_cannot_sign_in_through_its_provider() {
     let admin = Principal::new(root, P::ALL, None, None);
     store
         .writer()
-        .write(move |tx| local_auth::set_active(tx, admin, member, false, at(24)))
+        .write(move |tx| {
+            local_auth::set_active(
+                tx,
+                local_auth::Authority::Credential {
+                    principal: admin,
+                    stepped_up: true,
+                },
+                member,
+                false,
+                at(24),
+            )
+        })
         .unwrap();
     assert!(matches!(
         sign_in::complete(&store, GITHUB, SUBJECT, Policy::default(), at(25)).unwrap(),

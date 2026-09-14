@@ -125,6 +125,12 @@ identifier!(
     "tok"
 );
 identifier!(
+    /// Handle for one browser session (A06), so an account can list and revoke
+    /// its sessions by name. The cookie secret is separate and never shown.
+    SessionId,
+    "ses"
+);
+identifier!(
     /// Handle for one invitation (A05). Names the record for listing and
     /// revocation; the redeemable secret is separate and stored only as a digest.
     InvitationId,

@@ -60,7 +60,7 @@ The secret is the only thing on stdout, as with [API credentials](api-credential
 
 ## Who is deciding
 
-Platform administration has two legitimate sources, and the audit trail tells them apart. `Authority::Credential(Principal)` is an authenticated caller, checked live. `Authority::HostLocal` is an operator on the controller's own host, whose authority is the database file itself — the same authority that admits the first administrator. The host-local variant exists so `sentinel admin` does not have to fabricate a `Principal` for somebody who never authenticated, and every host-local decision is recorded as such.
+Platform administration has two legitimate sources, and the audit trail tells them apart. `Authority::Credential { principal, stepped_up }` is an authenticated caller, checked live, carrying whether its session recently proved a second factor. `Authority::HostLocal` is an operator on the controller's own host, whose authority is the database file itself — the same authority that admits the first administrator. The host-local variant exists so `sentinel admin` does not have to fabricate a `Principal` for somebody who never authenticated, and every host-local decision is recorded as such.
 
 ## Installations
 
@@ -74,4 +74,4 @@ Seeing an installation is not trusting it. `record_installation` is trusted inta
 
 The `sentinel admin policy|invite|account` surface was exercised end to end on Linux, including every refusal path and the host-local audit marking.
 
-See [TODO.md](../TODO.md) for commands and results. Step-up in front of policy changes is A06; tenant suspension and role revocation are A07.
+See [TODO.md](../TODO.md) for commands and results. Policy changes require a recent [step-up](step-up.md); tenant suspension and role revocation are A07.

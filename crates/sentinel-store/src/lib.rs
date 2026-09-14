@@ -17,6 +17,7 @@ pub mod idempotency;
 pub mod jobs;
 pub mod local_auth;
 pub mod lookup;
+pub mod mfa;
 pub mod registration;
 pub mod runs;
 pub mod schema;
@@ -44,6 +45,9 @@ pub enum Error {
     /// Row does not exist for this tenant (also returned for other tenants' rows).
     NotFound,
     Forbidden,
+    /// Allowed in principle, but the session must first prove presence with a
+    /// second factor (A06). Distinct from `Forbidden` so a client can prompt.
+    StepUpRequired,
     InvalidInput(&'static str),
     /// The state machine rejected the event.
     Transition(sentinel_core::TransitionError),
@@ -63,6 +67,7 @@ impl fmt::Display for Error {
             Self::Conflict => f.write_str("concurrent modification; retry from a fresh read"),
             Self::NotFound => f.write_str("not found"),
             Self::Forbidden => f.write_str("forbidden"),
+            Self::StepUpRequired => f.write_str("step-up required"),
             Self::InvalidInput(what) => write!(f, "invalid {what}"),
             Self::Transition(e) => write!(f, "transition rejected: {e:?}"),
             Self::Corrupt(what) => write!(f, "corrupt {what}"),
@@ -225,6 +230,11 @@ pub struct Store {
 /// for every role and tool, so a host-local command cannot open a second,
 /// accidentally empty database beside the real one.
 pub const METADATA_FILE: &str = "metadata.sqlite";
+
+/// The sealing key for values that must be recoverable (A06 TOTP seeds). Lives
+/// beside the database by default, but it is the operator's secret: keep it
+/// out of database backups, and treat losing it as losing every sealed value.
+pub const MASTER_KEY_FILE: &str = "master.key";
 
 /// Bounded writer queue: enough for a burst of webhook intake, small enough
 /// that a stalled disk surfaces as `WriterUnavailable` within milliseconds.
