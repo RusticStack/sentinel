@@ -66,6 +66,112 @@ pub enum AdminCommand {
     Token(TokenArgs),
     /// Inspect and remove linked external sign-in identities
     Identity(IdentityArgs),
+    /// Show or change the deployment admission policy
+    Policy(PolicyArgs),
+    /// Create, list and revoke one-time invitations
+    Invite(InviteArgs),
+    /// Review pending applications; approve or reject accounts
+    Account(AccountArgs),
+}
+
+#[derive(Args)]
+pub struct PolicyArgs {
+    #[command(subcommand)]
+    pub command: PolicyCommand,
+}
+
+#[derive(Subcommand)]
+pub enum PolicyCommand {
+    /// Print the current admission policy
+    Show {
+        #[command(flatten)]
+        data: DataDir,
+    },
+    /// Change one or more settings; unspecified settings keep their value
+    Set {
+        #[command(flatten)]
+        data: DataDir,
+        /// closed, invite-only or approval-required
+        #[arg(long)]
+        registration: Option<String>,
+        /// super-admin-only or approved-users (personal namespaces)
+        #[arg(long)]
+        tenant_creation: Option<String>,
+        /// super-admin-only or tenant-admins
+        #[arg(long)]
+        installation_binding: Option<String>,
+    },
+}
+
+#[derive(Args)]
+pub struct InviteArgs {
+    #[command(subcommand)]
+    pub command: InviteCommand,
+}
+
+#[derive(Subcommand)]
+pub enum InviteCommand {
+    /// Issue an invitation and print its secret to stdout, once
+    Create {
+        #[command(flatten)]
+        data: DataDir,
+        /// Join this tenant namespace on acceptance; requires --role
+        #[arg(long, value_name = "SLUG")]
+        tenant: Option<String>,
+        /// reader, operator or admin
+        #[arg(long)]
+        role: Option<String>,
+        /// Bind to one verified identity, as `<provider>:<subject>`
+        #[arg(long, value_name = "PROVIDER:SUBJECT")]
+        identity: Option<String>,
+        /// Lifetime such as 7d or 12h; bounded by the deployment maximum
+        #[arg(long, value_name = "DURATION", default_value = "7d")]
+        expires_in: String,
+    },
+    /// List invitations as metadata; secrets are never shown
+    List {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long, value_name = "SLUG")]
+        tenant: Option<String>,
+    },
+    /// Revoke an unspent invitation
+    Revoke {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `inv_` identifier printed at creation or by `invite list`
+        #[arg(long)]
+        id: String,
+    },
+}
+
+#[derive(Args)]
+pub struct AccountArgs {
+    #[command(subcommand)]
+    pub command: AccountCommand,
+}
+
+#[derive(Subcommand)]
+pub enum AccountCommand {
+    /// List applications waiting for a decision
+    Pending {
+        #[command(flatten)]
+        data: DataDir,
+    },
+    /// Approve a pending account so it can sign in
+    Approve {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+    },
+    /// Reject an account, ending its access and keeping its identity claimed
+    Reject {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+    },
 }
 
 #[derive(Args)]

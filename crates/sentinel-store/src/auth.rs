@@ -251,6 +251,19 @@ pub fn create_namespace(
     now: UnixMillis,
 ) -> Result<()> {
     require_platform_admin(tx, principal)?;
+    insert_namespace(tx, tenant, slug, kind, now)
+}
+
+/// The insertion itself, without an authorization decision. Trusted internal:
+/// `create_namespace` above requires platform administration, and
+/// [`crate::registration`] applies the deployment's tenant-creation policy.
+pub(crate) fn insert_namespace(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    slug: Namespace<'_>,
+    kind: NamespaceKind,
+    now: UnixMillis,
+) -> Result<()> {
     let (code, owner) = match kind {
         NamespaceKind::Organization => (0, None),
         NamespaceKind::Personal(id) => (1, Some(id)),
@@ -447,7 +460,10 @@ pub mod provisioning {
     }
 
     /// Provider is a configured issuer key; subject is the verified immutable
-    /// provider user ID, not a login, email or display name. Never relink on conflict.
+    /// provider user ID, not a login, email or display name. Never relink on
+    /// conflict. A pending account may hold a link — holding one is not using
+    /// one, since sign-in still requires an active account — but a rejected
+    /// account may not acquire one.
     pub fn link_verified_identity(
         tx: &Transaction<'_>,
         user: UserId,
@@ -458,7 +474,7 @@ pub mod provisioning {
         identity_input(provider, subject)?;
         let changed = tx.execute(
             "INSERT INTO external_identities(provider, subject, user_id, created_ms)
-            SELECT ?1, ?2, id, ?4 FROM users WHERE id = ?3 AND kind = 0 AND active = 1",
+            SELECT ?1, ?2, id, ?4 FROM users WHERE id = ?3 AND kind = 0 AND status != 2",
             params![provider, subject, user.as_bytes(), now.0],
         )?;
         if changed == 0 {

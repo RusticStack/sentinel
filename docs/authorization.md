@@ -16,7 +16,7 @@ Implemented in `sentinel-core::auth` and `sentinel-store::auth`, with append-onl
 Effective repository authority is the intersection of:
 
 1. **Authenticated principal and credential/client scope** (`Principal`).
-2. **Live active account and active owning tenant**.
+2. **Live active account and active owning tenant**. Only an approved account is active, so a pending or rejected one ([admission](admission.md)) fails this step without any query having to ask about status.
 3. **Live membership role**, looked up from the actual repository's owner.
 4. **Explicit repository grant**, except for a human tenant admin's own tenant.
 
@@ -46,7 +46,7 @@ Secret-write delegation is independent: an operator's run grant never grants it 
 - Administrative mutations take a `Transaction`, recheck current authority, and write within that transaction. A queued request does not retain a positive permission result from an earlier read.
 - Downgrading a role takes effect on the next query. Removing membership cascades deletion of its repo grants; re-adding membership does not resurrect authority. Setting a grant to `NONE` removes it. Account/tenant active flags are checked live. A07 will add audited suspension workflows and subscription/token/job cancellation propagation.
 
-`jobs`, `runs`, the writer's closure/raw interfaces and `auth::provisioning` are **trusted controller internals**, not public client APIs. The worker state-machine `Actor` is unrelated to a human authorization principal. W08 must call authorized operations (and extend them for status/rerun/cancel) rather than expose raw tenant-scoped helpers. A02 owns first-admin admission and password/session authentication, and adds `local_auth` with the same rules (trusted host-local entry points, authority rechecked inside the writing transaction); A03 adds `tokens` and the trusted `lookup` host-local name resolver; A04 adds `sign_in`, whose `complete` issues a session only for an already-verified provider subject; A05 owns registration. No route may directly expose `provisioning::insert_human(super_admin)`.
+`jobs`, `runs`, the writer's closure/raw interfaces and `auth::provisioning` are **trusted controller internals**, not public client APIs. The worker state-machine `Actor` is unrelated to a human authorization principal. W08 must call authorized operations (and extend them for status/rerun/cancel) rather than expose raw tenant-scoped helpers. A02 owns first-admin admission and password/session authentication, and adds `local_auth` with the same rules (trusted host-local entry points, authority rechecked inside the writing transaction); A03 adds `tokens` and the trusted `lookup` host-local name resolver; A04 adds `sign_in`, whose `complete` issues a session only for an already-verified provider subject; A05 adds `registration`, where `record_installation` is trusted intake and every other entry point takes an explicit `Authority`. No route may directly expose `provisioning::insert_human(super_admin)`.
 
 ## Storage defenses and upgrade
 

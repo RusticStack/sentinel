@@ -17,6 +17,7 @@ pub mod idempotency;
 pub mod jobs;
 pub mod local_auth;
 pub mod lookup;
+pub mod registration;
 pub mod runs;
 pub mod schema;
 pub mod sign_in;

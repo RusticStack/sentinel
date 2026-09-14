@@ -10,16 +10,24 @@
 
 use std::io::{IsTerminal, Read};
 
-use sentinel_core::{RepoId, TenantId, TokenId, UnixMillis, UserId, auth::Permissions};
+use sentinel_core::{
+    InvitationId, RepoId, TenantId, TokenId, UnixMillis, UserId,
+    auth::{Permissions, Role},
+};
 use sentinel_store::{
     Durability, METADATA_FILE, Store,
     local_auth::{self, Event},
-    lookup, sign_in,
+    lookup,
+    registration::{
+        self, Authority, DeploymentPolicy, InstallationBinding, Registration, TenantCreation, Terms,
+    },
+    sign_in,
     tokens::{self, Grant},
 };
 
 use crate::cli::{
-    AdminArgs, AdminCommand, DataDir, IdentityArgs, IdentityCommand, TokenArgs, TokenCommand,
+    AccountArgs, AccountCommand, AdminArgs, AdminCommand, DataDir, IdentityArgs, IdentityCommand,
+    InviteArgs, InviteCommand, PolicyArgs, PolicyCommand, TokenArgs, TokenCommand,
 };
 
 pub struct Error {
@@ -162,6 +170,9 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
         }
         AdminCommand::Token(args) => token(args, now)?,
         AdminCommand::Identity(args) => identity(args, now)?,
+        AdminCommand::Policy(args) => policy(args, now)?,
+        AdminCommand::Invite(args) => invite(args, now)?,
+        AdminCommand::Account(args) => account(args, now)?,
     }
     Ok(())
 }
@@ -238,10 +249,10 @@ fn lifetime_ms(text: &str) -> Result<i64, Error> {
 /// database directly: the operator already has that access, and there is no
 /// session to authorize them with before any credential exists.
 fn resolve_user(store: &Store, value: &str) -> Result<UserId, Error> {
-    let unknown = || fail("no active account with that username or identifier");
+    let unknown = || fail("no account with that username or identifier");
     if let Ok(id) = value.parse::<UserId>() {
         return store
-            .read(move |conn| lookup::active_user(conn, id))
+            .read(move |conn| lookup::known_user(conn, id))
             .map(|()| id)
             .map_err(|_| unknown());
     }
@@ -401,6 +412,257 @@ fn identity(args: &IdentityArgs, now: UnixMillis) -> Result<(), Error> {
     Ok(())
 }
 
+fn policy(args: &PolicyArgs, now: UnixMillis) -> Result<(), Error> {
+    match &args.command {
+        PolicyCommand::Show { data } => {
+            let store = open(data, true)?;
+            let policy = store
+                .read(registration::policy)
+                .map_err(|error| fail(format!("cannot read the policy: {error}")))?;
+            println!("registration: {}", registration_name(policy.registration));
+            println!(
+                "tenant creation: {}",
+                tenant_creation_name(policy.tenant_creation)
+            );
+            println!(
+                "installation binding: {}",
+                installation_binding_name(policy.installation_binding)
+            );
+        }
+        PolicyCommand::Set {
+            data,
+            registration: wanted,
+            tenant_creation,
+            installation_binding,
+        } => {
+            let store = open(data, true)?;
+            let current = store
+                .read(registration::policy)
+                .map_err(|error| fail(format!("cannot read the policy: {error}")))?;
+            let policy = DeploymentPolicy {
+                registration: match wanted.as_deref() {
+                    None => current.registration,
+                    Some("closed") => Registration::Closed,
+                    Some("invite-only") => Registration::InviteOnly,
+                    Some("approval-required") => Registration::ApprovalRequired,
+                    Some(other) => {
+                        return Err(fail(format!(
+                            "unknown registration mode {other}; use closed, invite-only or approval-required"
+                        )));
+                    }
+                },
+                tenant_creation: match tenant_creation.as_deref() {
+                    None => current.tenant_creation,
+                    Some("super-admin-only") => TenantCreation::SuperAdminOnly,
+                    Some("approved-users") => TenantCreation::ApprovedUsers,
+                    Some(other) => {
+                        return Err(fail(format!(
+                            "unknown tenant creation mode {other}; use super-admin-only or approved-users"
+                        )));
+                    }
+                },
+                installation_binding: match installation_binding.as_deref() {
+                    None => current.installation_binding,
+                    Some("super-admin-only") => InstallationBinding::SuperAdminOnly,
+                    Some("tenant-admins") => InstallationBinding::TenantAdmins,
+                    Some(other) => {
+                        return Err(fail(format!(
+                            "unknown installation binding mode {other}; use super-admin-only or tenant-admins"
+                        )));
+                    }
+                },
+            };
+            store
+                .writer()
+                .write(move |tx| registration::set_policy(tx, Authority::HostLocal, policy, now))
+                .map_err(|error| fail(format!("cannot change the policy: {error}")))?;
+            eprintln!(
+                "registration={} tenants={} installations={}",
+                registration_name(policy.registration),
+                tenant_creation_name(policy.tenant_creation),
+                installation_binding_name(policy.installation_binding)
+            );
+        }
+    }
+    Ok(())
+}
+
+const fn registration_name(value: Registration) -> &'static str {
+    match value {
+        Registration::Closed => "closed",
+        Registration::InviteOnly => "invite-only",
+        Registration::ApprovalRequired => "approval-required",
+    }
+}
+const fn tenant_creation_name(value: TenantCreation) -> &'static str {
+    match value {
+        TenantCreation::SuperAdminOnly => "super-admin-only",
+        TenantCreation::ApprovedUsers => "approved-users",
+    }
+}
+const fn installation_binding_name(value: InstallationBinding) -> &'static str {
+    match value {
+        InstallationBinding::SuperAdminOnly => "super-admin-only",
+        InstallationBinding::TenantAdmins => "tenant-admins",
+    }
+}
+
+fn role(value: &str) -> Result<Role, Error> {
+    match value {
+        "reader" => Ok(Role::Reader),
+        "operator" => Ok(Role::Operator),
+        "admin" => Ok(Role::TenantAdmin),
+        other => Err(fail(format!(
+            "unknown role {other}; use reader, operator or admin"
+        ))),
+    }
+}
+
+const fn role_name(value: Role) -> &'static str {
+    match value {
+        Role::Reader => "reader",
+        Role::Operator => "operator",
+        Role::TenantAdmin => "admin",
+    }
+}
+
+fn invite(args: &InviteArgs, now: UnixMillis) -> Result<(), Error> {
+    match &args.command {
+        InviteCommand::Create {
+            data,
+            tenant,
+            role: wanted,
+            identity,
+            expires_in,
+        } => {
+            let store = open(data, true)?;
+            let lifetime_ms = lifetime_ms(expires_in)?;
+            let (tenant, _) = resolve_target(&store, tenant.as_ref(), None)?;
+            let wanted = wanted.as_deref().map(role).transpose()?;
+            if tenant.is_some() != wanted.is_some() {
+                return Err(fail("--tenant and --role are given together or not at all"));
+            }
+            // Owned, so the writer closure can borrow it for the whole write.
+            let bound: Option<(String, String)> = match identity.as_deref() {
+                None => None,
+                Some(value) => {
+                    let (provider, subject) = value.split_once(':').ok_or_else(|| {
+                        fail("--identity is <provider>:<subject>, such as github:4242")
+                    })?;
+                    Some((provider.to_owned(), subject.to_owned()))
+                }
+            };
+            let invitation = store
+                .writer()
+                .write(move |tx| {
+                    registration::invite(
+                        tx,
+                        Authority::HostLocal,
+                        Terms {
+                            tenant,
+                            role: wanted,
+                            identity: bound
+                                .as_ref()
+                                .map(|(provider, subject)| (provider.as_str(), subject.as_str())),
+                            lifetime_ms,
+                        },
+                        now,
+                    )
+                })
+                .map_err(|error| match error {
+                    sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
+                    other => fail(format!("cannot create the invitation: {other}")),
+                })?;
+            // The secret alone on stdout, as with credentials: deliver the link
+            // out of band. There is no way to show it again.
+            println!("{}", sentinel_auth::token::format(&invitation.secret));
+            eprintln!(
+                "issued {} expiring at {} (shown once)",
+                invitation.id, invitation.expires.0
+            );
+        }
+        InviteCommand::List { data, tenant } => {
+            let store = open(data, true)?;
+            let (tenant, _) = resolve_target(&store, tenant.as_ref(), None)?;
+            let records = store
+                .read(|conn| registration::invitations(conn, Authority::HostLocal, tenant, 100))
+                .map_err(|error| fail(format!("cannot list invitations: {error}")))?;
+            for record in records {
+                println!(
+                    "{} expires={}{}{}{}{}",
+                    record.id,
+                    record.expires.0,
+                    record
+                        .role
+                        .map(|role| format!(" role={}", role_name(role)))
+                        .unwrap_or_default(),
+                    record
+                        .identity
+                        .map(|(provider, subject)| format!(" identity={provider}:{subject}"))
+                        .unwrap_or_default(),
+                    if record.redeemed { " redeemed" } else { "" },
+                    if record.revoked { " revoked" } else { "" }
+                );
+            }
+        }
+        InviteCommand::Revoke { data, id } => {
+            let store = open(data, true)?;
+            let id: InvitationId = id
+                .parse()
+                .map_err(|_| fail("expected an inv_ invitation identifier"))?;
+            store
+                .writer()
+                .write(move |tx| registration::revoke_invitation(tx, Authority::HostLocal, id, now))
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound => fail("no invitation with that identifier"),
+                    other => fail(format!("revocation failed: {other}")),
+                })?;
+            eprintln!("revoked {id}");
+        }
+    }
+    Ok(())
+}
+
+fn account(args: &AccountArgs, now: UnixMillis) -> Result<(), Error> {
+    match &args.command {
+        AccountCommand::Pending { data } => {
+            let store = open(data, true)?;
+            let applications = store
+                .read(|conn| registration::pending(conn, Authority::HostLocal, 100))
+                .map_err(|error| fail(format!("cannot list applications: {error}")))?;
+            for application in applications {
+                println!(
+                    "{} applied={} {}",
+                    application.user, application.applied.0, application.display_name
+                );
+            }
+        }
+        AccountCommand::Approve { data, user } | AccountCommand::Reject { data, user } => {
+            let store = open(data, true)?;
+            let user = resolve_user(&store, user)?;
+            let approve = matches!(args.command, AccountCommand::Approve { .. });
+            store
+                .writer()
+                .write(move |tx| {
+                    if approve {
+                        registration::approve(tx, Authority::HostLocal, user, now)
+                    } else {
+                        registration::reject(tx, Authority::HostLocal, user, now)
+                    }
+                })
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound if approve => {
+                        fail("no pending account with that identifier")
+                    }
+                    sentinel_store::Error::NotFound => fail("no account with that identifier"),
+                    other => fail(format!("the decision failed: {other}")),
+                })?;
+            eprintln!("{} {user}", if approve { "approved" } else { "rejected" });
+        }
+    }
+    Ok(())
+}
+
 const fn event_name(event: Event) -> &'static str {
     match event {
         Event::Bootstrap => "bootstrap",
@@ -419,5 +681,16 @@ const fn event_name(event: Event) -> &'static str {
         Event::TokenRevoked => "token-revoked",
         Event::IdentityLinked => "identity-linked",
         Event::IdentityUnlinked => "identity-unlinked",
+        Event::RegistrationAdmitted => "registration-admitted",
+        Event::RegistrationPending => "registration-pending",
+        Event::RegistrationRefused => "registration-refused",
+        Event::AccountApproved => "account-approved",
+        Event::AccountRejected => "account-rejected",
+        Event::InvitationCreated => "invitation-created",
+        Event::InvitationRedeemed => "invitation-redeemed",
+        Event::InvitationRevoked => "invitation-revoked",
+        Event::PolicyChanged => "policy-changed",
+        Event::InstallationBound => "installation-bound",
+        Event::InstallationUnbound => "installation-unbound",
     }
 }

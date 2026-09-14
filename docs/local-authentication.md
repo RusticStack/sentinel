@@ -2,13 +2,14 @@
 
 Implemented in `sentinel-auth` (password hashing, opaque secrets, cookie/CSRF policy), `sentinel-store::local_auth` (bootstrap, credentials, sessions, audit) and the host-local `sentinel admin` command, with append-only metadata migration **5**.
 
-This is authentication only. Admission is [A01's authorization layer](authorization.md): a validated session produces a `Principal`, and every repository, tenant and platform decision is still a live membership/grant check. [API credentials](api-credentials.md) (A03) and [GitHub sign-in](github-sign-in.md) (A04) are the other sources of that `Principal`. Registration and invitations are A05, MFA and step-up are A06.
+This is authentication only. Admission is [A01's authorization layer](authorization.md): a validated session produces a `Principal`, and every repository, tenant and platform decision is still a live membership/grant check. [API credentials](api-credentials.md) (A03) and [GitHub sign-in](github-sign-in.md) (A04) are the other sources of that `Principal`. Registration and invitations are [A05](admission.md), MFA and step-up are A06.
 
 ## First-admin bootstrap
 
 `sentinel admin bootstrap --data-dir <PATH> --username <NAME>` opens the controller's `metadata.sqlite` directly and creates one super admin with a local password. Its authority is the operating system's: only a user who can already open that file can run it. There is no network route to it, the server process does not expose it, and "first visitor wins" is not implemented anywhere.
 
 - The password is read from standard input as raw bytes, minus one trailing newline. It never appears in argv, the process list, shell history, diagnostics or an error message. A terminal stdin is refused with the redirect form instead.
+- Bootstrap is how the first account exists at all: the deployment's registration policy ([admission](admission.md)) governs every later one.
 - Bootstrap refuses once the single-row `bootstrap` latch exists **or** any active super admin exists, so restoring a backup or provisioning an admin another way also closes it. The check is repeated inside the writing transaction; the user, its credential and the latch are one commit.
 - `sentinel admin status --data-dir <PATH>` reports bootstrap availability, active super admins, live sessions and the last ten audit records. It refuses to create a database, so a mistyped path says so rather than answering about a new empty one.
 

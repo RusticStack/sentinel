@@ -71,6 +71,17 @@ pub enum Event {
     TokenRevoked = 14,
     IdentityLinked = 15,
     IdentityUnlinked = 16,
+    RegistrationAdmitted = 17,
+    RegistrationPending = 18,
+    RegistrationRefused = 19,
+    AccountApproved = 20,
+    AccountRejected = 21,
+    InvitationCreated = 22,
+    InvitationRedeemed = 23,
+    InvitationRevoked = 24,
+    PolicyChanged = 25,
+    InstallationBound = 26,
+    InstallationUnbound = 27,
 }
 
 impl Event {
@@ -92,6 +103,17 @@ impl Event {
             14 => Event::TokenRevoked,
             15 => Event::IdentityLinked,
             16 => Event::IdentityUnlinked,
+            17 => Event::RegistrationAdmitted,
+            18 => Event::RegistrationPending,
+            19 => Event::RegistrationRefused,
+            20 => Event::AccountApproved,
+            21 => Event::AccountRejected,
+            22 => Event::InvitationCreated,
+            23 => Event::InvitationRedeemed,
+            24 => Event::InvitationRevoked,
+            25 => Event::PolicyChanged,
+            26 => Event::InstallationBound,
+            27 => Event::InstallationUnbound,
             _ => return None,
         })
     }
@@ -249,7 +271,9 @@ pub fn bootstrap_available(conn: &Connection) -> Result<bool> {
     bootstrap_complete(conn).map(|done| !done)
 }
 
-fn insert_credential(
+/// Trusted internal: the caller decides whether this account may exist.
+/// [`bootstrap`] and [`crate::registration`] are the only writers.
+pub(crate) fn insert_credential(
     tx: &Transaction<'_>,
     user: UserId,
     login_name: &str,

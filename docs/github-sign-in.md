@@ -20,7 +20,7 @@ Implemented in `sentinel-github` (bounded HTTPS client, authorization-code excha
 
 ## What is and is not admission
 
-`NoAccount` is the honest answer, not an error: an unknown identity is not registered, is not given a placeholder account and does not become a tenant. A05 owns invitations, approval and registration policy. Until then, the path to GitHub sign-in is: be admitted locally ([bootstrap](local-authentication.md)), sign in, and link.
+`NoAccount` is the honest answer, not an error: an unknown identity is not registered, is not given a placeholder account and does not become a tenant. Turning one into an account is [admission](admission.md): an invitation bound to that verified identity, or an application awaiting approval. Linking an existing account to a GitHub identity is the other path — be admitted, sign in, and link.
 
 Linking requires an authenticated session — that *is* the authenticated intent. A provider identity belongs to at most one account and is never silently moved: claiming one another account holds fails, and the link row is immutable, so there is no re-verification side effect to exploit. Unlinking is available to the account itself, a platform admin, or a host-local operator repairing a wrong link, and both directions are audited. A suspended account cannot sign in through its provider, because session issuance checks the account's live state.
 

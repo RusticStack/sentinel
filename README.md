@@ -2,7 +2,7 @@
 
 A purpose-built, fully open-source, self-hosted CI engine designed from scratch for maximum performance: fast PR feedback, local-first caching, efficient multi-machine scheduling, and readable diagnostics for humans and coding agents.
 
-**Status: early development; runtime/measurement foundations, core/store/protocol contracts, the pipeline compiler, durable authorization, local login/sessions, scoped API credentials and GitHub sign-in are implemented. The authenticated API surface and job execution are next.** See [plan.md](plan.md) for architecture, milestones, performance targets, and release criteria. The [Parts 01–02 audit](docs/parts-01-02-audit.md) records open execution-integration gates.
+**Status: early development; runtime/measurement foundations, core/store/protocol contracts, the pipeline compiler, durable authorization, local login/sessions, scoped API credentials, GitHub sign-in and admission policy are implemented. The authenticated API surface and job execution are next.** See [plan.md](plan.md) for architecture, milestones, performance targets, and release criteria. The [Parts 01–02 audit](docs/parts-01-02-audit.md) records open execution-integration gates.
 
 Start development from [TODO.md](TODO.md): ordered work packages, stable task IDs, dependencies, the first runnable server/worker slice, and verification gates.
 
@@ -23,6 +23,8 @@ See [Local authentication](docs/local-authentication.md) for host-local first-ad
 See [API credentials](docs/api-credentials.md) for the scoped, expiring bearer credentials that authenticate the CLI and API before OAuth.
 
 See [GitHub sign-in](docs/github-sign-in.md) for the authorization-code flow, verified identity linking and what separates proof from admission.
+
+See [Admission](docs/admission.md) for registration policy, invitations, pending accounts, and the separate decisions of creating a tenant and binding a forge installation.
 
 See [Protocol contracts](docs/protocol.md) for structured errors, idempotency, event cursors, size limits and worker capability negotiation.
 

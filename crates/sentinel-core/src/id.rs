@@ -124,6 +124,18 @@ identifier!(
     TokenId,
     "tok"
 );
+identifier!(
+    /// Handle for one invitation (A05). Names the record for listing and
+    /// revocation; the redeemable secret is separate and stored only as a digest.
+    InvitationId,
+    "inv"
+);
+identifier!(
+    /// One forge App installation known to this deployment (A05). Existing is
+    /// not being trusted: an installation is inactive until bound to a tenant.
+    InstallationId,
+    "ins"
+);
 
 /// Step position inside its job. Steps are compiled in order and referenced by
 /// index; the human name lives in the compiled spec. `u16` bounds a job to

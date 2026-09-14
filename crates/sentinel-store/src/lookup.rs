@@ -11,13 +11,11 @@ use sentinel_core::{RepoId, TenantId, UserId};
 
 use crate::{Error, Result};
 
-/// The account behind a local login name.
+/// The account behind a local login name, whatever its status: an operator
+/// approving or rejecting an application names it the same way.
 pub fn user_by_username(conn: &Connection, username: &str) -> Result<UserId> {
     let bytes: [u8; 16] = conn
-        .prepare_cached(
-            "SELECT c.user_id FROM local_credentials c JOIN users u ON u.id = c.user_id
-             WHERE c.username = ?1 AND u.active = 1",
-        )?
+        .prepare_cached("SELECT user_id FROM local_credentials WHERE username = ?1")?
         .query_row([username], |r| r.get(0))
         .optional()?
         .ok_or(Error::NotFound)?;
@@ -26,10 +24,22 @@ pub fn user_by_username(conn: &Connection, username: &str) -> Result<UserId> {
 
 /// Confirm that an account exists and is active, without revealing anything else.
 pub fn active_user(conn: &Connection, user: UserId) -> Result<()> {
-    let active: bool = conn
-        .prepare_cached("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND active = 1)")?
+    exists(conn, user, "active = 1")
+}
+
+/// Confirm that an account exists at all, whatever its status. Pending and
+/// rejected accounts are exactly the ones an operator needs to name.
+pub fn known_user(conn: &Connection, user: UserId) -> Result<()> {
+    exists(conn, user, "1 = 1")
+}
+
+fn exists(conn: &Connection, user: UserId, predicate: &str) -> Result<()> {
+    let found: bool = conn
+        .prepare_cached(&format!(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND {predicate})"
+        ))?
         .query_row([user.as_bytes()], |r| r.get(0))?;
-    if active { Ok(()) } else { Err(Error::NotFound) }
+    if found { Ok(()) } else { Err(Error::NotFound) }
 }
 
 /// The active namespace with this canonical slug.
