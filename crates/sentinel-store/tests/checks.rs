@@ -500,7 +500,7 @@ fn a_settled_event_owes_a_completed_check_unless_nothing_can_be_told() {
         intake::purge_settled(&tx, UnixMillis(i64::MAX), 100).unwrap(),
         0
     );
-    checks::published(&tx, row.id, row.seq, 42, NOW).unwrap();
+    checks::published(&tx, row.id, row.seq, 42, None, NOW).unwrap();
     assert_eq!(
         intake::purge_settled(&tx, UnixMillis(i64::MAX), 100).unwrap(),
         0
@@ -627,7 +627,7 @@ fn publications_are_retried_and_never_overwrite_a_newer_generation() {
     // Publishing marks the generation; a write from a stale read changes
     // nothing once the job has moved on.
     let tx = f.conn.transaction().unwrap();
-    assert!(checks::published(&tx, build.id, build.seq, 7, NOW).unwrap());
+    assert!(checks::published(&tx, build.id, build.seq, 7, None, NOW).unwrap());
     tx.commit().unwrap();
     step(&mut f, jobs[0], Event::Leased(Fence(1)), NOW.0 + 20);
     let newer = publication(&f, run, &jobs[0].to_string());
@@ -645,7 +645,7 @@ fn publications_are_retried_and_never_overwrite_a_newer_generation() {
     tx.rollback().unwrap();
     let tx = f.conn.transaction().unwrap();
     assert!(
-        !checks::published(&tx, newer.id, build.seq, 9, NOW).unwrap(),
+        !checks::published(&tx, newer.id, build.seq, 9, None, NOW).unwrap(),
         "an older generation cannot be marked published"
     );
     tx.commit().unwrap();

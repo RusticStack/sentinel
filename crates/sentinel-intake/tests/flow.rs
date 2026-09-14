@@ -433,6 +433,65 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
         ),
         Err(IngestError::Unauthenticated)
     );
+    // Control events answer with their durable outcome and deduplicate by
+    // receipt, not by delivery row.
+    let suspend = serde_json::json!({
+        "action": "suspend",
+        "installation": {"id": 42},
+    });
+    let (suspend_body, suspend_sig, _) = sign(suspend, Some("gh-6"));
+    let suspended = ingest::github(
+        &f.store,
+        WEBHOOK_SECRET,
+        "installation",
+        Some("gh-6"),
+        Some(&suspend_sig),
+        &suspend_body,
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        suspended,
+        Github::Controlled {
+            outcome: "installation_disabled".into(),
+            duplicate: false,
+        }
+    );
+    let replay = ingest::github(
+        &f.store,
+        WEBHOOK_SECRET,
+        "installation",
+        Some("gh-6"),
+        Some(&suspend_sig),
+        &suspend_body,
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        replay,
+        Github::Controlled {
+            outcome: "installation_disabled".into(),
+            duplicate: true,
+        }
+    );
+    // The same delivery id under a different signed body conflicts.
+    let deleted = serde_json::json!({
+        "action": "deleted",
+        "installation": {"id": 42},
+    });
+    let (deleted_body, deleted_sig, _) = sign(deleted, Some("gh-6"));
+    assert_eq!(
+        ingest::github(
+            &f.store,
+            WEBHOOK_SECRET,
+            "installation",
+            Some("gh-6"),
+            Some(&deleted_sig),
+            &deleted_body,
+            now
+        ),
+        Err(IngestError::Conflict)
+    );
 }
 
 #[test]

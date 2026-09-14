@@ -211,12 +211,14 @@ impl crate::lane::Publisher for GithubChecks {
             Ok(check) => check,
             Err(outcome) => return outcome,
         };
-        // An earlier attempt may have created the run and timed out before
-        // recording it: adopt it by our own external ID before creating
-        // another one.
+        // An earlier create may have landed without its answer being
+        // recorded — the durable `create_started` mark is what says one may
+        // exist. Only then is the adoption lookup owed; a first attempt goes
+        // straight to create, and a crash between create and record is still
+        // reconciled because the mark was written before the request.
         let existing = match publication.check_run_id {
             Some(id) => Some(id),
-            None => match api::find(
+            None if publication.create_started_ms.is_some() => match api::find(
                 &self.client,
                 self.app.endpoint(),
                 &token,
@@ -231,6 +233,7 @@ impl crate::lane::Publisher for GithubChecks {
                 Ok(found) => found.map(|found| found.check_run_id),
                 Err(refusal) => return self.refusal(publication, refusal, true),
             },
+            None => None,
         };
         let outcome = match existing {
             Some(id) => api::update(
@@ -242,18 +245,41 @@ impl crate::lane::Publisher for GithubChecks {
                 id,
                 &check,
             ),
-            None => api::create(
-                &self.client,
-                self.app.endpoint(),
-                &token,
-                &owner,
-                &name,
-                &check,
-            ),
+            None => {
+                let (id, seq) = (publication.id, publication.seq);
+                match self
+                    .store
+                    .writer()
+                    .write(move |tx| checks::create_started(tx, id, seq, UnixMillis::now()))
+                {
+                    Ok(()) => api::create(
+                        &self.client,
+                        self.app.endpoint(),
+                        &token,
+                        &owner,
+                        &name,
+                        &check,
+                    ),
+                    // The generation moved while the lane held the row: re-read.
+                    Err(StoreError::Conflict) => {
+                        return Publish::Retry {
+                            after_ms: 0,
+                            detail: "generation moved".into(),
+                        };
+                    }
+                    Err(_) => {
+                        return Publish::Retry {
+                            after_ms: 0,
+                            detail: "store".into(),
+                        };
+                    }
+                }
+            }
         };
         match outcome {
             Ok(published) => Publish::Published {
                 check_run_id: published.check_run_id,
+                check_suite_id: published.check_suite_id,
             },
             Err(refusal) => self.refusal(publication, refusal, false),
         }

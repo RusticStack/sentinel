@@ -29,7 +29,8 @@ const BASE_BACKOFF_MS: i64 = 1_000;
 const MAX_BACKOFF_MS: i64 = 5 * 60 * 1000;
 
 const COLUMNS: &str = "id, tenant_id, repo_id, run_id, delivery_id, scope, name, head_sha,
-    external_id, status, conclusion, title, summary, check_run_id, seq, published_seq, state, reason";
+    external_id, status, conclusion, title, summary, check_run_id, seq, published_seq, state, reason,
+    check_suite_id, create_started_ms";
 
 /// A check's desired status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +164,13 @@ pub struct Publication {
     pub title: String,
     pub summary: String,
     pub check_run_id: Option<i64>,
+    /// The check suite the run landed in, recorded from the forge's answer;
+    /// a `check_suite` rerequest resolves runs through it (G05).
+    pub check_suite_id: Option<i64>,
+    /// When a create was last attempted, set durably before the request. Its
+    /// presence means an earlier create may have landed: a later attempt must
+    /// adopt by `external_id` instead of blindly creating another check run.
+    pub create_started_ms: Option<i64>,
     pub seq: i64,
     pub published_seq: i64,
     /// Where the outbox stands: due, delivered, or refused with `reason`.
@@ -716,6 +724,8 @@ type Fields = (
     i64,
     i64,
     Option<String>,
+    Option<i64>,
+    Option<i64>,
 );
 
 fn decode_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Fields> {
@@ -738,6 +748,8 @@ fn decode_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Fields> {
         r.get(15)?,
         r.get(16)?,
         r.get(17)?,
+        r.get(18)?,
+        r.get(19)?,
     ))
 }
 
@@ -761,6 +773,8 @@ fn decode(row: Fields) -> Result<Publication> {
         published_seq,
         state,
         reason,
+        check_suite_id,
+        create_started_ms,
     ) = row;
     Ok(Publication {
         id: CheckId::from_bytes(id).map_err(|_| Error::Corrupt("check id"))?,
@@ -784,6 +798,8 @@ fn decode(row: Fields) -> Result<Publication> {
         title,
         summary,
         check_run_id,
+        check_suite_id,
+        create_started_ms,
         seq,
         published_seq,
         state: State::decode(state).ok_or(Error::Corrupt("check state"))?,
@@ -791,10 +807,29 @@ fn decode(row: Fields) -> Result<Publication> {
     })
 }
 
+/// Mark, durably and before the request, that a create was attempted for this
+/// generation. A crash between GitHub accepting the create and the handle
+/// being recorded then still reconciles through the `external_id` lookup
+/// rather than creating a second check run. The marker sticks across
+/// generations: once any create may have landed, every later create looks
+/// first. `Conflict` means the generation moved — re-read and start over.
+pub fn create_started(tx: &Transaction<'_>, id: CheckId, seq: i64, now: UnixMillis) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE check_publications SET create_started_ms = ?3, updated_ms = ?3
+         WHERE id = ?1 AND seq = ?2",
+        params![id.as_bytes(), seq, now.0],
+    )?;
+    if changed != 1 {
+        return Err(Error::Conflict);
+    }
+    Ok(())
+}
+
 /// Record the run's numeric handle and, when the generation is still the one
 /// the publisher read, mark it current. The handle is recorded either way: a
 /// create that raced a newer generation must not be repeated, or GitHub would
-/// grow a second check run for the same check.
+/// grow a second check run for the same check. The suite the run landed in is
+/// recorded the same way so a `check_suite` rerequest can resolve it.
 ///
 /// Returns whether the *current* generation was marked (the stale-write
 /// protection). `false` is not an error: the newer generation stays pending
@@ -804,11 +839,13 @@ pub fn published(
     id: CheckId,
     seq: i64,
     check_run_id: i64,
+    check_suite_id: Option<i64>,
     now: UnixMillis,
 ) -> Result<bool> {
     tx.execute(
-        "UPDATE check_publications SET check_run_id = ?2, updated_ms = ?3 WHERE id = ?1",
-        params![id.as_bytes(), check_run_id, now.0],
+        "UPDATE check_publications SET check_run_id = ?2,
+            check_suite_id = COALESCE(?4, check_suite_id), updated_ms = ?3 WHERE id = ?1",
+        params![id.as_bytes(), check_run_id, now.0, check_suite_id],
     )?;
     let changed = tx.execute(
         "UPDATE check_publications SET published_seq = ?2, state = 1, reason = NULL,

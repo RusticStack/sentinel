@@ -49,11 +49,15 @@ pub struct Ingested {
 }
 
 /// What a GitHub delivery produced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Github {
     /// The App's webhook setup probe; nothing is stored.
     Pong,
     Ingested(Ingested),
+    Controlled {
+        outcome: String,
+        duplicate: bool,
+    },
     /// A valid delivery that cannot be a trigger here. Reported to GitHub as
     /// accepted — it must not retry — and recorded as a counter, not a row.
     Ignored(&'static str),
@@ -121,6 +125,11 @@ pub fn github(
         return Err(Error::InvalidRequest("delivery header"));
     }
     match event {
+        "check_run"
+        | "check_suite"
+        | "installation"
+        | "installation_repositories"
+        | "repository" => return control(store, event, delivery_id, body, now),
         "push" => {}
         // Pull requests arrive only through a bound App installation, and only
         // the actions that mean "there is something new to test" are intake;
@@ -164,6 +173,64 @@ pub fn github(
         now,
     )
     .map(Github::Ingested)
+}
+
+fn control(
+    store: &Store,
+    event: &str,
+    delivery: &str,
+    body: &[u8],
+    now: UnixMillis,
+) -> Result<Github, Error> {
+    use sentinel_github::webhook::{self, Control as C};
+    use sentinel_store::github_events::{self, Event as E};
+    let Some(control) = webhook::parse_control(event, body)
+        .map_err(|_| Error::InvalidRequest("control payload"))?
+    else {
+        return Ok(Github::Ignored("control_action"));
+    };
+    let control = match control {
+        C::Rerequest {
+            installation,
+            repository,
+            head,
+            check,
+            suite,
+        } => E::Rerequest {
+            installation,
+            repository,
+            head,
+            check,
+            suite,
+        },
+        C::Installation {
+            installation,
+            disable,
+        } => E::Installation {
+            installation,
+            disable,
+        },
+        C::Repositories {
+            installation,
+            removed,
+        } => E::Repositories {
+            installation,
+            removed,
+        },
+        C::Repository {
+            installation,
+            repository,
+        } => E::Repository {
+            installation,
+            repository,
+        },
+    };
+    let digest = webhook::control_digest(event, body);
+    let delivery = delivery.to_owned();
+    let (outcome, duplicate) = store
+        .writer()
+        .write(move |tx| github_events::accept(tx, &delivery, &digest, &control, now))?;
+    Ok(Github::Controlled { outcome, duplicate })
 }
 /// A pull request: known actions only, the base branch as the policy ref, the
 /// tested merge (or the head tip when GitHub computed none) as the revision.

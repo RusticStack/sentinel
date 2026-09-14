@@ -1169,6 +1169,122 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         (status, body["code"].as_str()),
         (400, Some("invalid_request"))
     );
+    // Control events are acknowledged with their outcome, never retried: a
+    // check-suite rerequest for a check we never published resolves to
+    // nothing, and the receipt deduplicates the replay.
+    let suite = serde_json::json!({
+        "action": "rerequested",
+        "installation": {"id": 42},
+        "repository": {"id": GITHUB_REPO_ID},
+        "check_suite": {"id": 777, "head_sha": "e".repeat(40)},
+    });
+    let suite_raw = suite.to_string();
+    let suite_headers = |raw: &str, delivery: &str| {
+        [
+            ("x-hub-signature-256", webhook_signature(raw.as_bytes())),
+            ("x-github-event", "check_suite".to_owned()),
+            ("x-github-delivery", delivery.to_owned()),
+        ]
+    };
+    let suite_headers = suite_headers(&suite_raw, "gh-8");
+    let suite_headers: Vec<(&str, &str)> = suite_headers
+        .iter()
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&suite),
+        None,
+        &suite_headers,
+    );
+    assert_eq!(
+        (
+            status,
+            body["controlled"].as_str(),
+            body["duplicate"].as_bool()
+        ),
+        (200, Some("unknown_check"), Some(false)),
+        "{body}"
+    );
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&suite),
+        None,
+        &suite_headers,
+    );
+    assert_eq!(
+        (
+            status,
+            body["controlled"].as_str(),
+            body["duplicate"].as_bool()
+        ),
+        (200, Some("unknown_check"), Some(true)),
+        "a replayed receipt answers what the first attempt did"
+    );
+    // The same delivery id under a different event is a conflict.
+    let renamed = serde_json::json!({
+        "action": "renamed",
+        "installation": {"id": 42},
+        "repository": {"id": GITHUB_REPO_ID},
+    });
+    let renamed_raw = renamed.to_string();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&renamed),
+        None,
+        &[
+            (
+                "x-hub-signature-256",
+                &webhook_signature(renamed_raw.as_bytes()),
+            ),
+            ("x-github-event", "repository"),
+            ("x-github-delivery", "gh-8"),
+        ],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("conflict")),
+        "{body}"
+    );
+    // A rename under a fresh delivery revokes the binding; an approved remote
+    // never follows a repository's new name.
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&renamed),
+        None,
+        &[
+            (
+                "x-hub-signature-256",
+                &webhook_signature(renamed_raw.as_bytes()),
+            ),
+            ("x-github-event", "repository"),
+            ("x-github-delivery", "gh-9"),
+        ],
+    );
+    assert_eq!(
+        (status, body["controlled"].as_str()),
+        (200, Some("repository_rebind_required")),
+        "{body}"
+    );
+    let revoked: bool = d
+        .store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT revoked FROM source_bindings WHERE repo_id=?1",
+                [d.github_repo.as_bytes()],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert!(revoked, "the rename revoked the binding");
     // The repository owned by the token is what the delivery belongs to: the
     // generic secret is scoped to its repository.
     let (status, _) = call(

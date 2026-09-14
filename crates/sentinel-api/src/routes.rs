@@ -424,6 +424,14 @@ fn github_hook(state: &State, request: &mut Request) -> Reply {
     match outcome {
         ingest::Github::Pong => ok(json!({ "pong": true })),
         ingest::Github::Ignored(why) => ok(json!({ "ignored": why })),
+        ingest::Github::Controlled { outcome, duplicate } => {
+            // A rerequest re-queued terminal jobs inside the same receipt
+            // transaction; the dispatcher still needs its wake.
+            if outcome == "rerequested" && !duplicate {
+                state.controller.wake();
+            }
+            ok(json!({ "controlled": outcome, "duplicate": duplicate }))
+        }
         ingest::Github::Ingested(ingested) => {
             wake_intake(state, ingested.duplicate);
             Ok((

@@ -21,7 +21,7 @@ becomes a GitHub Check when the repository is forge-associated
 | Route | `POST /api/v1/intake/{repo}` | `POST /api/v1/hooks/github` |
 | Credential | per-repository hook secret (`Authorization: Bearer sentinel_hook_…`) | App webhook secret (HMAC-SHA256 over the raw body in `X-Hub-Signature-256`) |
 | Identity | the relay's own stable delivery ID | `X-GitHub-Delivery` |
-| Event | one ref transition (always `ref_update`) | `X-GitHub-Event` (`push`, `pull_request`) |
+| Event | one ref transition (always `ref_update`) | `X-GitHub-Event` (`push`, `pull_request`; control events below) |
 | Body limit | 64 KiB | 4 MiB |
 | Enabled by | a bound source and an issued hook secret | `<data_dir>/github-webhook.json`; without it the route is `not_found` |
 
@@ -52,6 +52,17 @@ of the *bound* App installation — the payload cannot name a tenant, and an
 unbound repository is answered `200 {"ignored": "unbound_repository"}` so
 GitHub does not retry it. Events this build does not handle at all are
 acknowledged the same way: `{"ignored": "unsupported_event"}`.
+
+### Control events
+
+Five further signed events — `check_run`/`check_suite` rerequests,
+`installation`, `installation_repositories` and `repository` lifecycle changes
+— are **control**, not intake: they keep only bounded identifiers, are
+receipted in `github_events` by delivery ID and content digest (a replay
+replays the recorded outcome; a changed body is a `conflict`), and answer
+`200 {"controlled": <outcome>}`. What they do — rerequest handling, revocation
+and the durable refresh lane — is the reconcile contract in
+[checks](checks.md#rerequests-and-lifecycle-reconciliation-g05).
 
 ### Pull requests
 

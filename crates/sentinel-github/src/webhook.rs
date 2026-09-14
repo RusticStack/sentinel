@@ -208,6 +208,117 @@ fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+#[derive(Debug)]
+pub enum Control {
+    Rerequest {
+        installation: u64,
+        repository: u64,
+        head: String,
+        check: Option<(i64, String)>,
+        suite: i64,
+    },
+    Installation {
+        installation: u64,
+        disable: bool,
+    },
+    Repositories {
+        installation: u64,
+        removed: Vec<u64>,
+    },
+    Repository {
+        installation: u64,
+        repository: u64,
+    },
+}
+
+/// Only retained identifiers are trusted. A body is bounded by the HTTP route;
+/// repository arrays have an additional admission bound before any write.
+pub fn parse_control(event: &str, body: &[u8]) -> Result<Option<Control>> {
+    let v: Value = serde_json::from_slice(body).map_err(|_| Error::Response("payload"))?;
+    let number = |v: &Value| {
+        v.as_u64()
+            .filter(|n| *n > 0 && *n <= i64::MAX as u64)
+            .ok_or(Error::Response("identifier"))
+    };
+    let installation = number(&v["installation"]["id"])?;
+    let action = v["action"].as_str().ok_or(Error::Response("action"))?;
+    Ok(match event {
+        "check_run" | "check_suite" if action == "rerequested" => {
+            let c = &v[event];
+            let head = c["head_sha"]
+                .as_str()
+                .filter(|s| matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or(Error::Response("head sha"))?
+                .to_owned();
+            let check = if event == "check_run" {
+                let external = c["external_id"]
+                    .as_str()
+                    .filter(|s| s.starts_with("sentinel:") && s.len() <= 128)
+                    .ok_or(Error::Response("external id"))?;
+                Some((number(&c["id"])? as i64, external.to_owned()))
+            } else {
+                None
+            };
+            let suite = number(if check.is_some() {
+                &c["check_suite"]["id"]
+            } else {
+                &c["id"]
+            })? as i64;
+            Some(Control::Rerequest {
+                installation,
+                repository: number(&v["repository"]["id"])?,
+                head,
+                check,
+                suite,
+            })
+        }
+        "installation"
+            if matches!(
+                action,
+                "created" | "deleted" | "suspend" | "unsuspend" | "new_permissions_accepted"
+            ) =>
+        {
+            Some(Control::Installation {
+                installation,
+                disable: matches!(action, "deleted" | "suspend"),
+            })
+        }
+        "installation_repositories" if matches!(action, "added" | "removed") => {
+            // GitHub sends both arrays; a relay may carry only the populated
+            // one. Absence of `repositories_removed` means nothing was removed.
+            let removed = match v["repositories_removed"].as_array() {
+                Some(list) if list.len() <= 1024 => list
+                    .iter()
+                    .map(|r| number(&r["id"]))
+                    .collect::<Result<Vec<_>>>()?,
+                Some(_) => return Err(Error::Response("repository limit")),
+                None => Vec::new(),
+            };
+            Some(Control::Repositories {
+                installation,
+                removed,
+            })
+        }
+        "repository" if matches!(action, "renamed" | "transferred" | "deleted" | "archived") => {
+            Some(Control::Repository {
+                installation,
+                repository: number(&v["repository"]["id"])?,
+            })
+        }
+        _ => None,
+    })
+}
+
+/// Event kind is part of the receipt digest: replay under a different header
+/// must not be mistaken for the original control event.
+pub fn control_digest(event: &str, body: &[u8]) -> [u8; 32] {
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(event.as_bytes());
+    digest.update(&[0]);
+    digest.update(body);
+    digest.finish().as_ref().try_into().expect("SHA256 length")
+}
+
 const fn nibble(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -369,5 +480,159 @@ mod tests {
 
     fn oversize_ref_rejected(body: &Value) -> bool {
         parse_push(&serde_json::to_vec(body).unwrap()).is_err()
+    }
+
+    #[test]
+    fn control_events_keep_only_bounded_identifiers() {
+        let base = |action: &str| {
+            serde_json::json!({
+                "action": action,
+                "installation": {"id": 42},
+                "repository": {"id": 91},
+            })
+        };
+        // A check-run rerequest carries the check's handles; a suite
+        // rerequest carries the suite's.
+        let mut run = base("rerequested");
+        run["check_run"] = serde_json::json!({
+            "id": 4242,
+            "head_sha": "b".repeat(40),
+            "external_id": "sentinel:run:job",
+            "check_suite": {"id": 9001},
+        });
+        let parsed = parse_control("check_run", &serde_json::to_vec(&run).unwrap())
+            .unwrap()
+            .unwrap();
+        let Control::Rerequest {
+            installation,
+            repository,
+            head,
+            check,
+            suite,
+        } = parsed
+        else {
+            panic!("not a rerequest")
+        };
+        assert_eq!((installation, repository, suite), (42, 91, 9001));
+        assert_eq!(head, "b".repeat(40));
+        assert_eq!(check, Some((4242, "sentinel:run:job".to_owned())));
+        let mut suite_event = base("rerequested");
+        suite_event["check_suite"] = serde_json::json!({"id": 9001, "head_sha": "b".repeat(40)});
+        let parsed = parse_control("check_suite", &serde_json::to_vec(&suite_event).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            parsed,
+            Control::Rerequest {
+                check: None,
+                suite: 9001,
+                ..
+            }
+        ));
+        // An external ID that is not ours is refused, not parsed.
+        run["check_run"]["external_id"] = Value::from("other:123");
+        assert!(parse_control("check_run", &serde_json::to_vec(&run).unwrap()).is_err());
+        // A non-rerequest action and an unknown event are ignored, not errors.
+        let edited = base("edited");
+        assert!(
+            parse_control("repository", &serde_json::to_vec(&edited).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_control("unknown_event", &serde_json::to_vec(&edited).unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn installation_and_repository_control_events_parse() {
+        let installation =
+            |action: &str| serde_json::json!({"action": action, "installation": {"id": 42}});
+        for (action, disable) in [
+            ("created", false),
+            ("deleted", true),
+            ("suspend", true),
+            ("unsuspend", false),
+            ("new_permissions_accepted", false),
+        ] {
+            let parsed = parse_control(
+                "installation",
+                &serde_json::to_vec(&installation(action)).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(parsed, Control::Installation { installation: 42, disable: d } if d == disable),
+                "{action}"
+            );
+        }
+        let removed = serde_json::json!({
+            "action": "removed",
+            "installation": {"id": 42},
+            "repositories_removed": [{"id": 91}, {"id": 92}],
+        });
+        let parsed = parse_control(
+            "installation_repositories",
+            &serde_json::to_vec(&removed).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            parsed,
+            Control::Repositories { installation: 42, ref removed } if *removed == vec![91, 92]
+        ));
+        // An `added` delivery may carry only the populated array.
+        let added = serde_json::json!({
+            "action": "added",
+            "installation": {"id": 42},
+            "repositories_added": [{"id": 91}],
+        });
+        assert!(matches!(
+            parse_control("installation_repositories", &serde_json::to_vec(&added).unwrap())
+                .unwrap()
+                .unwrap(),
+            Control::Repositories { ref removed, .. } if removed.is_empty()
+        ));
+        for action in ["renamed", "transferred", "deleted", "archived"] {
+            let body = serde_json::json!({
+                "action": action,
+                "installation": {"id": 42},
+                "repository": {"id": 91},
+            });
+            assert!(matches!(
+                parse_control("repository", &serde_json::to_vec(&body).unwrap())
+                    .unwrap()
+                    .unwrap(),
+                Control::Repository {
+                    installation: 42,
+                    repository: 91
+                }
+            ));
+        }
+        // The repository array is bounded before any of it is stored.
+        let over = serde_json::json!({
+            "action": "removed",
+            "installation": {"id": 42},
+            "repositories_removed": vec![serde_json::json!({"id": 1}); 1025],
+        });
+        assert!(matches!(
+            parse_control(
+                "installation_repositories",
+                &serde_json::to_vec(&over).unwrap()
+            ),
+            Err(Error::Response("repository limit"))
+        ));
+    }
+
+    #[test]
+    fn the_control_receipt_digest_binds_event_and_body() {
+        let body = br#"{"action":"rerequested"}"#;
+        let digest = control_digest("check_run", body);
+        assert_eq!(digest, control_digest("check_run", body));
+        // The same body under a different event header is a different event.
+        assert_ne!(digest, control_digest("check_suite", body));
+        assert_ne!(digest, control_digest("check_run", b"{}"));
     }
 }

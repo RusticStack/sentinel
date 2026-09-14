@@ -98,10 +98,18 @@ pub struct Check {
     pub completed_at: Option<String>,
 }
 
-/// A check run GitHub accepted: the numeric id the update path needs.
+/// A check run GitHub accepted: the numeric id the update path needs, and
+/// the suite it landed in when the response carried one — that suite id is
+/// what a `check_suite` rerequest names (G05).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Published {
     pub check_run_id: i64,
+    pub check_suite_id: Option<i64>,
+}
+
+/// The check suite of a check-run object, when present.
+fn suite_id(body: &Value) -> Option<i64> {
+    body["check_suite"]["id"].as_i64().filter(|id| *id > 0)
 }
 
 /// Why a publication did not land. The caller decides what is retryable; this
@@ -204,7 +212,10 @@ pub fn create(
         })?;
     match reply.status {
         200 | 201 => match reply.body["id"].as_i64() {
-            Some(id) if id > 0 => Ok(Published { check_run_id: id }),
+            Some(id) if id > 0 => Ok(Published {
+                check_run_id: id,
+                check_suite_id: suite_id(&reply.body),
+            }),
             _ => Err(Refusal::Refused {
                 reason: "no check id".into(),
             }),
@@ -241,7 +252,10 @@ pub fn update(
             reason: format!("request: {e}"),
         })?;
     match reply.status {
-        200 => Ok(Published { check_run_id }),
+        200 => Ok(Published {
+            check_run_id,
+            check_suite_id: suite_id(&reply.body),
+        }),
         401 => Err(Refusal::Unauthorized),
         403 | 429 => Err(github_refusal(&reply)),
         404 => Err(Refusal::Refused {
@@ -297,9 +311,15 @@ pub fn find(
             Ok(list
                 .iter()
                 .find(|run| run["external_id"].as_str() == Some(external_id))
-                .and_then(|run| run["id"].as_i64())
-                .filter(|id| *id > 0)
-                .map(|check_run_id| Published { check_run_id }))
+                .and_then(|run| {
+                    run["id"]
+                        .as_i64()
+                        .filter(|id| *id > 0)
+                        .map(|check_run_id| Published {
+                            check_run_id,
+                            check_suite_id: suite_id(run),
+                        })
+                }))
         }
         401 => Err(Refusal::Unauthorized),
         403 | 429 => Err(github_refusal(&reply)),

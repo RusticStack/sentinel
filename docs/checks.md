@@ -67,8 +67,10 @@ sign-in). A check that belongs to no run — a refused event — has no link, an
 deployment without `public_url` publishes checks without one.
 
 Each check carries `external_id = sentinel:<run id>:<aggregate|job id>` (or
-`sentinel:dlv:<delivery id>`), which is what G05's rerequests resolve back to a
-run, and what reconciles a create GitHub accepted that we never recorded.
+`sentinel:dlv:<delivery id>`), which is what rerequests resolve back to a run,
+and what reconciles a create GitHub accepted that we never recorded. The
+forge's suite handle (`check_suite.id`) is stored beside the check-run handle
+so a suite rerequest can find every publication of a run.
 
 ## Durable delivery
 
@@ -110,13 +112,65 @@ The row's guarded write names the sequence the publisher read. If the desired
 state moved while the request was on the wire, the newer generation stays
 pending and is published next; the older payload is never written over it. The
 check run's numeric handle is recorded **regardless**, so the follow-up is an
-update of the same check run — the reason "reconcile ambiguous API timeouts
-before creating duplicates" is a rule, not a hope: before creating a check run
-the publisher asks GitHub for a run on that commit with our name and adopts the
-one carrying our `external_id`, which covers a create whose response was lost.
+update of the same check run.
+
+A create is ambiguous by nature: the request can land while its answer never
+does. The durable answer to that is `create_started_ms`, written **before** the
+create request goes out. A first attempt skips the lookup entirely — no mark
+means no remote run can exist that we started — and a retry after a lost
+answer finds the mark, asks GitHub for a run on that commit carrying our
+`external_id`, and adopts it instead of creating a second. A crash between the
+mark and the request costs one harmless lookup; a crash after the request is
+what the mark exists for. An update is idempotent, so an ambiguous *update*
+needs no mark: the next attempt updates the same run again.
 
 A late completion from a superseded attempt cannot reach GitHub at all: the
 store's job fence refuses the report before any check row moves.
+
+## Rerequests and lifecycle reconciliation (G05)
+
+GitHub sends control events on the same signed webhook: `check_run` and
+`check_suite` `rerequested`, `installation` lifecycle, `installation_repositories`
+grants, and `repository` identity changes. They are not deliveries and never
+queue a ref update: each is receipted in `github_events` (keyed by delivery ID
+with a SHA-256 digest over the event name and raw body), answered `200
+{"controlled": <outcome>}`, and a replay answers the recorded outcome while a
+changed body under the same delivery ID is a `conflict`. The parsing keeps
+only bounded identifiers; a body never confers a grant — positive-looking
+changes only enqueue durable refresh work.
+
+A **rerequest** resolves through the publications themselves: a check-run
+rerequest must match both the stored check-run handle and its `external_id`,
+and a suite rerequest matches the stored suite ID, with a legacy `NULL` suite
+still resolving when the run is otherwise eligible. Only a terminal,
+non-superseded run of the still-bound repository reruns, as a full immutable
+DAG reset — attempts, fences and image pins are preserved, jobs return to
+queued/blocked, and fresh check desired state is recorded in the same
+transaction. Candidates are capped at 64; more is `rerequest_limit`, never an
+unbounded fan-out.
+
+**Lifecycle events** disable first and verify after. A deletion or suspension
+event disables issuance immediately; an access removal, rename, transfer,
+deletion or archival revokes the binding in the receipt transaction —
+credential destroyed, version bumped. The reconcile lane
+(`sentinel-checks::reconcile`) then drains `github_refresh`, a durable queue
+of installation (kind 0) and repository (kind 1) passes seeded at startup,
+scheduled by control events and re-due every five minutes. Each pass reads its
+target, calls the GitHub API **outside** the writer, and commits the answer
+fenced on the row's sequence — a stale pass can never overwrite a newer
+schedule.
+
+- Kind 0 applies an authenticated installation snapshot through the same
+  `sources_forge::refresh` a binding flow uses (lifecycle-version fenced), then
+  reconciles the bound repository set against the installation's actual list:
+  a repository no longer granted, renamed, transferred or archived loses its
+  binding. The list is paged to a bound of ten pages; a truncated list proves
+  membership, never absence.
+- Kind 1 verifies one binding's repository ID, owner account and exact clone
+  URL; anything but an exact match revokes.
+- A verified installation 404 disables it and revokes every binding that
+  trusted it — a reinstalled App is a new identity. Every other failure is
+  transport-class: retried under bounded back-off, never a revocation.
 
 ## Configuration
 
@@ -155,15 +209,27 @@ holds at most 1024 repository tokens, evicting the earliest expiry at capacity.
   permission set of a checks token.
 - `crates/sentinel-checks/tests/delivery.rs` (loopback stub, real store, real
   lane): creation with `details_url` and one cached token, updates ending in
-  the right conclusions, adoption after an ambiguous create, a rate-limit
+  the right conclusions, adoption after an ambiguous create, a create whose
+  remote effect landed while its answer was dropped — reconciled by external
+  ID with the durable `create_started` mark — a rate-limit
   pause and successful retry for both 403 and 429, a 401 token refresh, a permanent 422 refusal
   (recorded and not retried), a revoked binding refusing without a request, a
   settled delivery's completed check, and a prompt lane stop.
+- `crates/sentinel-store/tests/github_events.rs`: receipt replay and
+  changed-body conflict, check-run and suite rerequests requeueing only a
+  terminal non-superseded run (legacy `NULL` suite rows included), the
+  candidate cap, unbound/revoked refusals, installation disable and
+  repository-set revocation with credentials destroyed, refresh-row sequence
+  fencing, and a confirmed 404 revoking everything.
+- `crates/sentinel-checks/tests/reconcile.rs` (loopback stub): the refresh
+  lane verifying a healthy installation and repository, revoking on rename,
+  removal and a changed clone URL, disabling on a verified 404, keeping a
+  suspended installation disabled until the API clears it, and retrying a
+  transient 500 without revoking.
 - `crates/sentinel/tests/intake_e2e.rs` (Linux, real binaries): the controller
   loads `github-app.json` with a stub endpoint, refreshes and binds an
   installation, accepts a signed fork pull request, refuses it as
   `ignored:fork_pr` and publishes a completed neutral `sentinel / ci` on the
   delivered revision; the CLI shows the durable delivery.
 
-Live GitHub App, required-check and rerequest verification is G06; rerequest
-handling is G05.
+Live GitHub App, required-check and end-to-end rerequest verification is G06.

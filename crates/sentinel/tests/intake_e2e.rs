@@ -96,10 +96,19 @@ struct Server {
 }
 
 impl Server {
-    fn spawn(data_dir: &str) -> Server {
+    fn spawn(root: &Path, data_dir: &str) -> Server {
+        // Ephemeral ports: the two tests run in parallel and must not collide.
+        let config = root.join("server.toml");
+        fs::write(
+            &config,
+            "listen = '127.0.0.1:0'\napi_listen = '127.0.0.1:0'",
+        )
+        .unwrap();
         let mut child = Command::new(binary())
             .args([
                 "server",
+                "--config",
+                config.to_str().unwrap(),
                 "--data-dir",
                 data_dir,
                 "--log-format",
@@ -375,7 +384,7 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
         .unwrap();
     }
 
-    let mut server_process = Server::spawn(data);
+    let mut server_process = Server::spawn(temp.path(), data);
     let api = server_process.event("api_listening");
     let base = format!("http://{}", api["fields"]["addr"].as_str().unwrap());
     let intake = format!("{base}/api/v1/intake/{repo}");
@@ -804,7 +813,7 @@ fn a_refused_fork_pull_request_publishes_a_completed_check() {
         String::from_utf8_lossy(&bound.stderr)
     );
 
-    let mut server_process = Server::spawn(data);
+    let mut server_process = Server::spawn(temp.path(), data);
     let start = server_process.event("checks_enabled");
     assert_eq!(start["fields"]["details_url"], true);
     let api_info = server_process.event("api_listening");

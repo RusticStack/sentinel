@@ -90,6 +90,9 @@ struct Reply {
     status: u16,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
+    /// The remote effect landed but the answer never does: the connection
+    /// closes without a response.
+    lost: bool,
 }
 
 #[derive(Default)]
@@ -176,6 +179,24 @@ impl Stub {
                     .iter()
                     .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                     .collect(),
+                lost: false,
+            },
+        ));
+    }
+
+    /// Script a create whose remote effect lands but whose answer is dropped:
+    /// the run appears in the stub's listing (under the request's own
+    /// external ID) while the connection closes without a response.
+    fn script_lost(&self, method: &str, path: &str, check_run_id: i64) {
+        let mut data = self.data.lock().unwrap();
+        data.scripted.push_back((
+            method.to_owned(),
+            path.to_owned(),
+            Reply {
+                status: 0,
+                body: serde_json::json!({"id": check_run_id}),
+                headers: Vec::new(),
+                lost: true,
             },
         ));
     }
@@ -248,6 +269,15 @@ fn serve(mut stream: TcpStream, data: &Arc<Mutex<Data>>) {
                 None => default_reply(&mut data, &method, &path),
             }
         };
+        if reply.lost {
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            data.lock().unwrap().existing.push(serde_json::json!({
+                "id": reply.body["id"],
+                "external_id": request["external_id"],
+            }));
+            return;
+        }
         let text = reply.body.to_string();
         let mut response = format!(
             "HTTP/1.1 {} X\r\ncontent-length: {}\r\nconnection: keep-alive\r\n",
@@ -322,6 +352,7 @@ fn default_reply(data: &mut Data, method: &str, path: &str) -> Reply {
                 "permissions": {"contents": "read", "checks": "write"},
             }),
             headers: Vec::new(),
+            lost: false,
         };
     }
     if method == "POST" && path.contains("/access_tokens") {
@@ -335,6 +366,7 @@ fn default_reply(data: &mut Data, method: &str, path: &str) -> Reply {
                 "permissions": {"checks": "write", "metadata": "read"},
             }),
             headers: Vec::new(),
+            lost: false,
         };
     }
     if method == "GET" && path.contains(&format!("/repositories/{GITHUB_REPO_ID}")) {
@@ -346,6 +378,7 @@ fn default_reply(data: &mut Data, method: &str, path: &str) -> Reply {
                 "clone_url": "https://github.com/account/app.git",
             }),
             headers: Vec::new(),
+            lost: false,
         };
     }
     if method == "GET" && path.contains("/check-runs") {
@@ -353,14 +386,16 @@ fn default_reply(data: &mut Data, method: &str, path: &str) -> Reply {
             status: 200,
             body: serde_json::json!({"total_count": data.existing.len(), "check_runs": data.existing}),
             headers: Vec::new(),
+            lost: false,
         };
     }
     if method == "POST" && path.contains("/check-runs") {
         data.next_id += 1;
         return Reply {
             status: 201,
-            body: serde_json::json!({"id": data.next_id}),
+            body: serde_json::json!({"id": data.next_id, "check_suite": {"id": 7001}}),
             headers: Vec::new(),
+            lost: false,
         };
     }
     if method == "PATCH" && path.contains("/check-runs/") {
@@ -372,14 +407,16 @@ fn default_reply(data: &mut Data, method: &str, path: &str) -> Reply {
             .unwrap_or(0);
         return Reply {
             status: 200,
-            body: serde_json::json!({"id": id}),
+            body: serde_json::json!({"id": id, "check_suite": {"id": 7002}}),
             headers: Vec::new(),
+            lost: false,
         };
     }
     Reply {
         status: 404,
         body: serde_json::json!({"message": "not found"}),
         headers: Vec::new(),
+        lost: false,
     }
 }
 
@@ -728,6 +765,19 @@ fn an_ambiguous_create_is_adopted_instead_of_duplicated() {
     let mut f = fixture(None);
     let (run, build) = event_run(&mut f);
     let external = format!("sentinel:{run}:{build}");
+    // The durable mark of an earlier create whose answer was lost: only a
+    // marked publication owes the adoption lookup before creating again.
+    let (tenant, run_id, scope) = (f.tenant, run, build.to_string());
+    f.store
+        .writer()
+        .write(move |tx| {
+            let row = checks::of_run(tx, tenant, run_id)?
+                .into_iter()
+                .find(|row| row.scope == scope)
+                .expect("the job's publication");
+            checks::create_started(tx, row.id, row.seq, UnixMillis::now())
+        })
+        .unwrap();
     f.stub.adopt(777, &external);
     let lane = start_lane(&f, publisher(&f));
     let records = f
@@ -753,7 +803,46 @@ fn an_ambiguous_create_is_adopted_instead_of_duplicated() {
         .find(|row| row.scope == build.to_string())
         .unwrap();
     assert_eq!(row.check_run_id, Some(777));
+    assert_eq!(
+        row.check_suite_id,
+        Some(7002),
+        "the patch carried the suite"
+    );
     assert_eq!(row.published_seq, row.seq);
+    drop(lane);
+}
+
+#[test]
+fn a_lost_create_response_is_found_by_external_id() {
+    let mut f = fixture(None);
+    let (run, _) = event_run(&mut f);
+    // The create lands remotely — the stub lists the run afterwards — but its
+    // answer never arrives. The durable create-started mark, written before
+    // the request went out, is what makes the next pass look before creating.
+    f.stub.script_lost("POST", "/check-runs", 888);
+    let lane = start_lane(&f, publisher(&f));
+    let records = f.stub.wait("the adopted update", |records| {
+        records
+            .iter()
+            .any(|r| r.method == "PATCH" && r.path.contains("/check-runs/888"))
+    });
+    // Exactly two creates went out: the lost one and the other publication's.
+    // The lost one's retry adopted by external ID instead of creating again.
+    assert_eq!(posts(&records, "/check-runs").len(), 2, "{records:#?}");
+    assert_eq!(
+        records.iter().filter(|r| r.method == "PATCH").count(),
+        1,
+        "{records:#?}"
+    );
+    wait_settled_run(&f, run, "the reconciled create");
+    let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
+    let adopted = rows
+        .iter()
+        .find(|row| row.check_run_id == Some(888))
+        .expect("the lost run was adopted");
+    assert_eq!(adopted.published_seq, adopted.seq, "{adopted:?}");
+    assert_eq!(adopted.check_suite_id, Some(7002), "{adopted:?}");
+    assert!(adopted.create_started_ms.is_some(), "{adopted:?}");
     drop(lane);
 }
 

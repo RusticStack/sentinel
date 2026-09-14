@@ -33,6 +33,36 @@ pub struct Token {
     pub expires_ms: i64,
 }
 
+/// A repository an installation currently covers, as the API reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallationRepo {
+    pub id: u64,
+    /// `owner/name`, GitHub's canonical spelling of the repository.
+    pub full_name: String,
+    pub archived: bool,
+}
+
+/// The answer to "which repositories does this installation cover".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InstallationRepos {
+    pub repos: Vec<InstallationRepo>,
+    /// The page cap stopped the walk: the list proves membership, never
+    /// absence.
+    pub truncated: bool,
+}
+
+/// What the reconcile lane learned about one bound repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoState {
+    /// Id, owner and clone URL still match the approved binding.
+    Verified,
+    /// Renamed, transferred, archived or disabled: the approved remote no
+    /// longer describes it.
+    Changed,
+    /// The API answered 404: deleted or removed from the installation.
+    Gone,
+}
+
 impl core::fmt::Debug for Token {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("Token(redacted)")
@@ -136,6 +166,129 @@ impl App {
             &self.jwt(now_ms)?,
         )?;
         parse_installation(&value, self.id, id)
+    }
+
+    /// The same read for the reconcile lane (G05): `Ok(None)` is a verified
+    /// 404 — the installation is gone for good — while any other non-200 is a
+    /// transport-class failure the caller retries.
+    pub fn installation_status(&self, id: u64, now_ms: i64) -> Result<Option<Installation>> {
+        let reply = self.http.send_json(
+            "GET",
+            &format!("{}/app/installations/{id}", self.endpoint),
+            &self.jwt(now_ms)?,
+            None,
+        )?;
+        match reply.status {
+            200 => parse_installation(&reply.body, self.id, id).map(Some),
+            404 => Ok(None),
+            _ => Err(Error::Transport(format!("status {}", reply.status))),
+        }
+    }
+
+    /// An installation-wide read token for reconciliation: `contents: read`
+    /// over every repository the installation covers, minted only for an
+    /// installation a fresh snapshot just proved usable. The token stays in
+    /// the controller — it is never issued to a workload — and expires like
+    /// every other installation token.
+    pub fn reconciliation_token(&self, installation: &Installation, now_ms: i64) -> Result<Token> {
+        if installation.suspended || !installation.permissions_valid {
+            return Err(Error::Response("installation access refused"));
+        }
+        let value = self.http.post_authenticated(
+            &format!(
+                "{}/app/installations/{}/access_tokens",
+                self.endpoint, installation.id
+            ),
+            &self.jwt(now_ms)?,
+            &json!({"permissions":{"contents":"read"}}),
+        )?;
+        parse_token(&value, now_ms, &[("contents", "read")])
+    }
+
+    /// The repositories an installation currently covers, in bounded pages.
+    /// `truncated` means the page cap stopped the walk: the list then proves
+    /// membership and naming, never absence — a caller must not revoke what
+    /// it did not see.
+    pub fn installation_repositories(&self, token: &Token) -> Result<InstallationRepos> {
+        const PER_PAGE: u32 = 100;
+        const MAX_PAGES: u32 = 10;
+        let mut repos = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let reply = self.http.send_json_bounded(
+                "GET",
+                &format!(
+                    "{}/installation/repositories?per_page={PER_PAGE}&page={page}",
+                    self.endpoint
+                ),
+                &token.secret,
+                None,
+                1024 * 1024,
+            )?;
+            if reply.status != 200 {
+                return Err(Error::Transport(format!("status {}", reply.status)));
+            }
+            let list = reply.body["repositories"]
+                .as_array()
+                .ok_or(Error::Response("repository list"))?;
+            for repo in list {
+                repos.push(InstallationRepo {
+                    id: repo["id"]
+                        .as_u64()
+                        .filter(|id| *id > 0)
+                        .ok_or(Error::Response("repository id"))?,
+                    full_name: repo["full_name"]
+                        .as_str()
+                        .filter(|name| !name.is_empty() && name.len() <= 255)
+                        .ok_or(Error::Response("repository name"))?
+                        .to_owned(),
+                    archived: repo["archived"].as_bool().unwrap_or(false),
+                });
+            }
+            if (list.len() as u32) < PER_PAGE {
+                return Ok(InstallationRepos {
+                    repos,
+                    truncated: false,
+                });
+            }
+        }
+        Ok(InstallationRepos {
+            repos,
+            truncated: true,
+        })
+    }
+
+    /// Whether the repository a binding approved still is that repository.
+    /// `Gone` and `Changed` both revoke: an approved remote never silently
+    /// follows a removal, rename, transfer or archival. Any other non-200 is
+    /// transport-class — the caller retries rather than revoking on a guess.
+    pub fn repository_state(
+        &self,
+        token: &Token,
+        repo: u64,
+        remote: &str,
+        account: u64,
+    ) -> Result<RepoState> {
+        let reply = self.http.send_json(
+            "GET",
+            &format!("{}/repositories/{repo}", self.endpoint),
+            &token.secret,
+            None,
+        )?;
+        match reply.status {
+            200 => {
+                let v = &reply.body;
+                let same = v["id"].as_u64() == Some(repo)
+                    && v["owner"]["id"].as_u64() == Some(account)
+                    && v["clone_url"].as_str() == Some(remote);
+                if !same || v["archived"].as_bool().unwrap_or(false) {
+                    return Ok(RepoState::Changed);
+                }
+                Ok(RepoState::Verified)
+            }
+            404 => Ok(RepoState::Gone),
+            401 => Err(Error::Response("token refused")),
+            _ => Err(Error::Transport(format!("status {}", reply.status))),
+        }
     }
 
     /// Validate the installation, restrict token scope explicitly, then verify

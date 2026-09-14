@@ -443,7 +443,13 @@ fn migration_preserves_legacy_repositories_without_inventing_bindings() {
         rusqlite::params![repo.as_bytes(), tenant.as_bytes()],
     )
     .unwrap();
-    assert_eq!(sentinel_store::migrate(&mut conn).unwrap(), 20);
+    assert_eq!(
+        sentinel_store::migrate(&mut conn).unwrap(),
+        sentinel_store::schema::MIGRATIONS
+            .last()
+            .map(|(version, _)| *version)
+            .unwrap()
+    );
     assert!(matches!(
         sources::load_metadata(&conn, repo),
         Err(Error::NotFound)

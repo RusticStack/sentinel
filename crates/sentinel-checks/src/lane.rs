@@ -22,8 +22,12 @@ use sentinel_store::{Store, checks};
 /// the store decides what is durable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Publish {
-    /// Delivered: the forge's own check-run handle.
-    Published { check_run_id: i64 },
+    /// Delivered: the forge's own check-run handle, and the suite it landed
+    /// in when the forge named one.
+    Published {
+        check_run_id: i64,
+        check_suite_id: Option<i64>,
+    },
     /// Transient: try again, no earlier than `after_ms` from now.
     Retry { after_ms: i64, detail: String },
     /// Permanent for this generation: recorded with a reason and not retried.
@@ -158,12 +162,14 @@ fn run(
             }
             let (id, seq, name) = (publication.id, publication.seq, publication.name.clone());
             match publisher.publish(&publication) {
-                Publish::Published { check_run_id } => {
+                Publish::Published {
+                    check_run_id,
+                    check_suite_id,
+                } => {
                     let now = UnixMillis::now();
-                    let current = match store
-                        .writer()
-                        .write(move |tx| checks::published(tx, id, seq, check_run_id, now))
-                    {
+                    let current = match store.writer().write(move |tx| {
+                        checks::published(tx, id, seq, check_run_id, check_suite_id, now)
+                    }) {
                         Ok(current) => current,
                         Err(_) => {
                             store_failed = true;

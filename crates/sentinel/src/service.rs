@@ -443,6 +443,8 @@ enum Running {
         lane: Box<sentinel_intake::Lane>,
         /// The Checks outbox lane, when a GitHub App is configured.
         checks: Option<Box<sentinel_checks::Lane>>,
+        /// The lifecycle reconcile lane draining `github_refresh`.
+        reconcile: Option<Box<sentinel_checks::Reconcile>>,
     },
     #[cfg(feature = "worker")]
     Worker {
@@ -555,9 +557,11 @@ fn start_server(
     if github_webhook_secret.is_some() {
         tracing::info!(event = "github_webhook_enabled");
     }
-    // The Checks outbox lane: durable publications are delivered off the
-    // request path. Without an App there is nothing to publish to, so the lane
-    // does not start; with one it shares the captured dispatcher above.
+    // The Checks outbox lane and the lifecycle reconcile lane: both need an
+    // App, so neither starts without one. The reconcile lane drains durable
+    // `github_refresh` work — webhook hints and the periodic pass — and is
+    // also where a lost check answer gets found again by external ID.
+    let mut reconcile = None;
     let checks = match &app {
         Some(app) => {
             tracing::info!(
@@ -565,6 +569,21 @@ fn start_server(
                 endpoint = %app.app.endpoint(),
                 details_url = app.public_url.is_some()
             );
+            let reconcile_dispatch = tracing::dispatcher::get_default(Clone::clone);
+            reconcile = Some(Box::new(sentinel_checks::Reconcile::start(
+                Arc::clone(&store),
+                Arc::clone(&app.app),
+                sentinel_checks::reconcile::Config::default(),
+                move |notice| {
+                    tracing::dispatcher::with_default(&reconcile_dispatch, || {
+                        tracing::info!(
+                            event = "github_reconciled",
+                            kind = notice.kind,
+                            outcome = %notice.outcome
+                        );
+                    });
+                },
+            )));
             let publisher = sentinel_checks::github::GithubChecks::new(
                 Arc::clone(&store),
                 Arc::clone(&app.app),
@@ -630,6 +649,7 @@ fn start_server(
         store,
         lane: Box::new(lane),
         checks,
+        reconcile,
     })
 }
 
@@ -895,8 +915,10 @@ fn initialize_and_wait(
             store,
             lane,
             checks,
+            reconcile,
         } => {
             api.shutdown();
+            drop(reconcile);
             drop(checks);
             drop(lane);
             let sessions_drained = controller.shutdown(LINK_SHUTDOWN);

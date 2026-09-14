@@ -98,6 +98,20 @@ impl Client {
         token: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<Reply> {
+        self.send_json_bounded(method, url, token, body, MAX_BODY)
+    }
+
+    /// The same request with a caller-sized response limit, for the list
+    /// endpoints whose answers are legitimately larger than one object.
+    /// `max_body` is still a hard ceiling — never unlimited.
+    pub fn send_json_bounded(
+        &self,
+        method: &str,
+        url: &str,
+        token: &str,
+        body: Option<&serde_json::Value>,
+        max_body: u64,
+    ) -> Result<Reply> {
         let encoded = match body {
             Some(value) => {
                 Some(serde_json::to_vec(value).map_err(|_| Error::Config("request body"))?)
@@ -123,7 +137,7 @@ impl Client {
             .body(encoded.unwrap_or_default())
             .map_err(|_| Error::Config("request"))?;
         let response = self.agent.run(request).map_err(transport)?;
-        reply(response)
+        reply(response, max_body)
     }
 }
 
@@ -138,7 +152,7 @@ pub struct Reply {
     pub body: serde_json::Value,
 }
 
-fn reply(mut response: ureq::http::Response<ureq::Body>) -> Result<Reply> {
+fn reply(mut response: ureq::http::Response<ureq::Body>, max_body: u64) -> Result<Reply> {
     let status = response.status().as_u16();
     let header = |name: &str| -> Option<String> {
         response
@@ -157,7 +171,7 @@ fn reply(mut response: ureq::http::Response<ureq::Body>) -> Result<Reply> {
     let body = response
         .body_mut()
         .with_config()
-        .limit(MAX_BODY)
+        .limit(max_body)
         .read_to_string()
         .map_err(transport)?;
     // A body that is not JSON (an error page) carries no information beyond
