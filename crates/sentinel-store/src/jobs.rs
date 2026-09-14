@@ -1,4 +1,5 @@
-//! Tenant-scoped row operations. Every function takes the owning `TenantId`
+//! Trusted controller row operations, not client authorization. Client entry
+//! points must use `crate::auth`. Tenant-owned operations take `TenantId`
 //! and includes it in the predicate, so a guessed ID from another tenant is
 //! indistinguishable from a missing row. Transitions are compare-and-set on
 //! `(state_code, fence)` using the pure state machine from `sentinel-core`.

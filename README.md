@@ -2,7 +2,7 @@
 
 A purpose-built, fully open-source, self-hosted CI engine designed from scratch for maximum performance: fast PR feedback, local-first caching, efficient multi-machine scheduling, and readable diagnostics for humans and coding agents.
 
-**Status: early development; CLI configuration and Linux server/worker process lifecycles are implemented, but the CI engine is not implemented yet.** See [plan.md](plan.md) for architecture, milestones, performance targets, and release criteria.
+**Status: early development; runtime/measurement foundations, core/store/protocol contracts, the pipeline compiler and durable authorization are implemented. Authenticated sessions and job execution are next.** See [plan.md](plan.md) for architecture, milestones, performance targets, and release criteria. The [Parts 01–02 audit](docs/parts-01-02-audit.md) records open execution-integration gates.
 
 Start development from [TODO.md](TODO.md): ordered work packages, stable task IDs, dependencies, the first runnable server/worker slice, and verification gates.
 
@@ -15,6 +15,8 @@ For contributor prerequisites, daily check/build commands, and a local two-proce
 See [Core contracts](docs/core-contracts.md) for typed identifiers, the fenced job/run state machine, failure classes and cancellation.
 
 See [Storage](docs/storage.md) for the SQLite metadata store, the engine decision, and the durable single-writer acknowledgement policy.
+
+See [Authorization](docs/authorization.md) for namespaces, human/service identities, memberships, explicit repo grants and live scoped queries.
 
 See [Protocol contracts](docs/protocol.md) for structured errors, idempotency, event cursors, size limits and worker capability negotiation.
 

@@ -1,7 +1,7 @@
 # Sentinel — implementation plan
 
-Status: design and acceptance criteria; Rust workspace, CLI/Linux process lifecycles, developer commands, and tracing/timing/work-lane foundations are implemented. The CI engine is not implemented yet.
-Reviewed: 2026-09-13. Repository: `RusticStack/sentinel`.
+Status: design and acceptance criteria; runtime/measurement foundations, core/store/protocol contracts, pipeline compilation and A01 durable authorization are implemented. Job execution is not implemented yet. See the [Parts 01–02 audit](docs/parts-01-02-audit.md) for outstanding gates.
+Reviewed: 2026-09-14. Repository: `RusticStack/sentinel`.
 
 Development tracker: [TODO.md](TODO.md) splits this design into actionable parts, dependencies, first-slice work, and verification gates. Implementation progress is recorded there.
 
@@ -385,6 +385,8 @@ Account registration, tenant creation, GitHub App installation binding, and runn
 | Service account | Explicit tenant/repo/action scopes and expiry; no interactive registration privileges |
 
 Super-admin control is an explicit platform privilege, not an org role. Do not expose stored secret values in any admin UI. Platform operators with host/database access remain trusted; tenant isolation is not a claim to hide data from the deployment owner. Audit elevated cross-tenant administrative access.
+
+A01's [implemented authorization contract](docs/authorization.md) keeps platform administration separate from repository data access: super admins need ordinary membership/grants for repository queries. Human tenant admins have own-tenant repository authority capped by credential scopes; readers/operators/service accounts need explicit repo grants. Service accounts are permanently tenant-bound and cannot administer identities. Membership is a live ceiling on grants; secret-write is independent of run permission. Client operations derive ownership through repository rows, not a selected tenant context.
 
 **Tenant boundaries:** require tenant scope for every lookup, search, event subscription, object download, cursor, mutation, secret, cache, checkout, and worker grant. UI context/CLI defaults are convenience only; server derives authorization from authenticated membership and resource ownership. No cross-tenant dedup visibility, signed-link reuse, queue-detail leakage, or guessed-ID access. Use tenant-partitioned object namespaces; short-lived download links bind tenant and object. Running session/event streams are reauthorized on membership changes.
 

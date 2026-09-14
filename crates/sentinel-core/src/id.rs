@@ -84,6 +84,11 @@ macro_rules! identifier {
 }
 
 identifier!(
+    /// Human or tenant-bound service principal; never a credential.
+    UserId,
+    "usr"
+);
+identifier!(
     /// Organization or personal namespace; the root of every ownership check.
     TenantId,
     "tnt"

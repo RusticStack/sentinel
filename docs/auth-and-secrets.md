@@ -1,6 +1,6 @@
 # OAuth, CLI/MCP access, and secret management
 
-Status: implementation contract; no running auth service yet. This extends the multi-tenant roles/registration policy in [plan.md](../plan.md). Built for humans and coding agents to use the same scoped operations with little repeated setup.
+Status: OAuth/secrets implementation contract; A01's [durable identity/authorization layer](authorization.md) exists, but there is no running login/token service yet. This extends the multi-tenant roles/registration policy in [plan.md](../plan.md). Built for humans and coding agents to use the same scoped operations with little repeated setup.
 
 ## 1. Identities and tokens
 

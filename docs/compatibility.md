@@ -6,7 +6,7 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 |---|---|---|---|
 | Pipeline schema | `schema: N` in `.sentinel.yml` (currently 1) | `sentinel-pipeline` | repositories |
 | Run spec blob | leading format byte (currently 1) | `sentinel-pipeline::run`, `run_specs.format` | store, workers |
-| Metadata database | `schema_migrations.version` (currently 3) | `sentinel-store` | controller |
+| Metadata database | `schema_migrations.version` (currently 4) | `sentinel-store` | controller |
 | API error | `schema: "sentinel.error/1"` | `sentinel-protocol` | CLI, MCP, UI, workers |
 | Explain output | `schema: "sentinel.explain/1"` | `sentinel-pipeline::explain` | CLI, agents |
 | Event cursor | text prefix `c1` | `sentinel-protocol::cursor` | API clients |
@@ -17,9 +17,11 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 
 **Pipeline schema.** A file names the schema it was written for and is accepted only by builds that implement that exact version. Within a version, changes may only widen what is accepted (new optional keys, new functions, relaxed limits). Rejecting something that was previously accepted, changing the meaning of an accepted construct, or tightening a limit requires a new schema number; the old number stays supported for at least two minor releases and its removal is announced in the changelog. Unknown keys are always errors, so a file cannot silently depend on a feature its declared schema does not have.
 
-**Run spec.** The blob is written once per run and read by every attempt. The format byte identifies the postcard layout. Adding a trailing optional field keeps the byte; any other layout change increments it, and readers reject unknown bytes rather than guess. A controller upgrade never rewrites stored specs; runs created under an old format finish under the code that can read it, which is why old readers are kept for one release after a bump.
+**Run spec.** The blob is written once per run and read by every attempt. The format byte identifies the postcard layout. Layout changes, including trailing optional fields, increment it unless old/new reader fixtures explicitly prove compatibility in both supported directions; optional fields do not imply default-on-EOF behavior. Readers reject unknown bytes rather than guess. A controller upgrade never rewrites stored specs; runs created under an old format finish under the code that can read it, which is why old readers are kept for one release after a bump.
 
 **Database.** Migrations are append-only and forward-only; there is no down migration. A release may add migrations; it must be able to open a database at any version produced by the previous release. Columns are never dropped in the same release that stops writing them. `PRAGMA user_version` is not used; `schema_migrations` is the only truth.
+
+Readers reject a database newer than their highest known migration. Migration 4 preserves version-3 tables and blobs, adds identity/grants, and rejects inconsistent ownership rather than silently repairing it. See [authorization](authorization.md).
 
 **Error and explain shapes.** Fields may be added; existing fields keep their type and meaning; `code` values are never renamed or reused. A breaking change is a new schema string, and clients treat an unknown schema as unparseable (the marker types enforce this). HTTP status codes are derived from `code` and follow it.
 

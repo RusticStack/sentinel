@@ -6,6 +6,7 @@
 
 | Type | Prefix | Meaning |
 |---|---|---|
+| `UserId` | `usr_` | Human or tenant-bound service principal (A01); never a credential |
 | `TenantId` | `tnt_` | Organization or personal namespace; root of every ownership check |
 | `RepoId` | `rep_` | Repository binding inside a tenant, distinct from GitHub's numeric ID |
 | `RunId` | `run_` | One compiled pipeline execution for one source revision |
@@ -16,6 +17,8 @@
 | `Fence` | | `u64` per-job generation; `0` means never leased |
 
 IDs are random UUID v4 stored inline as 16 bytes. Text form is `<prefix>_<canonical lowercase uuid>`, fixed length, and parsing rejects wrong prefixes, uppercase, non-v4 bytes and trailing characters. An ID grants nothing: every query joins through the tenant that owns the row.
+
+A01 adds allocation-free roles, permission bit sets, credential scope bounds and borrowed namespace validation in `auth`. Live database authorization is documented in [Authorization](authorization.md); the state-machine `Actor` below is a separate controller/worker transition contract.
 
 Each lease strictly increments the job's fence. A worker presents its fence with every event; a fence that is not the current one is rejected before the transition table is consulted, so a paused-then-resumed worker, a duplicate acknowledgement or a replayed completion can never touch a newer attempt.
 

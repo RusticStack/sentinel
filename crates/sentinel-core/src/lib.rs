@@ -3,11 +3,14 @@
 //! cancellation desired state and timestamp provenance. Pure, dependency-light
 //! and allocation-free so every process can embed it without cost.
 
+pub mod auth;
 pub mod id;
 pub mod state;
 pub mod time;
 
-pub use id::{AttemptId, Fence, InvalidId, JobId, RepoId, RunId, StepIndex, TenantId, WorkerId};
+pub use id::{
+    AttemptId, Fence, InvalidId, JobId, RepoId, RunId, StepIndex, TenantId, UserId, WorkerId,
+};
 pub use state::{
     Actor, DependencyPolicy, Event, FailureClass, JobControl, JobState, Outcome, RunState,
     TransitionError, aggregate, dependency_decision,

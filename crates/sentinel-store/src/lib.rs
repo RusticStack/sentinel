@@ -3,14 +3,15 @@
 //! One process owns the database. All writes go through a single dedicated
 //! thread that holds the only write connection ([`Writer`]); callers submit a
 //! closure and block for the result, which is returned only after `COMMIT`
-//! has completed with `synchronous=FULL`, so **an acknowledged write is on
-//! disk**. Reads use separate connections in WAL mode and never block the
-//! writer. Every query is tenant-scoped by predicate.
+//! has completed with `synchronous=FULL`. Reads use separate WAL snapshots.
+//! Controller primitives are tenant-scoped; client operations in [`auth`]
+//! additionally enforce live identity, scope, memberships and repository grants.
 //!
 //! Chosen after measuring redb and SQLite on the same dispatch workload: both
 //! are fsync-bound at ~0.5 ms per durable commit; SQLite adds constraints,
 //! indexes, migrations and ad-hoc queries at no extra cost.
 
+pub mod auth;
 pub mod codec;
 pub mod idempotency;
 pub mod jobs;
@@ -37,6 +38,8 @@ pub enum Error {
     Conflict,
     /// Row does not exist for this tenant (also returned for other tenants' rows).
     NotFound,
+    Forbidden,
+    InvalidInput(&'static str),
     /// The state machine rejected the event.
     Transition(sentinel_core::TransitionError),
     /// Persisted value could not be decoded; the database is corrupt or newer.
@@ -54,6 +57,8 @@ impl fmt::Display for Error {
             Self::Sqlite(e) => write!(f, "sqlite: {e}"),
             Self::Conflict => f.write_str("concurrent modification; retry from a fresh read"),
             Self::NotFound => f.write_str("not found"),
+            Self::Forbidden => f.write_str("forbidden"),
+            Self::InvalidInput(what) => write!(f, "invalid {what}"),
             Self::Transition(e) => write!(f, "transition rejected: {e:?}"),
             Self::Corrupt(what) => write!(f, "corrupt {what}"),
             Self::Spec(e) => write!(f, "run spec: {e:?}"),
@@ -110,6 +115,9 @@ pub fn migrate(conn: &mut Connection) -> Result<u32> {
         [],
         |r| r.get(0),
     )?;
+    if current > schema::MIGRATIONS.last().map_or(0, |m| m.0) {
+        return Err(Error::Corrupt("unsupported database version"));
+    }
     for &(version, sql) in schema::MIGRATIONS {
         if version <= current {
             continue;
@@ -241,8 +249,8 @@ impl Store {
         &self.writer
     }
 
-    /// Run a read-only closure on a pooled connection. Reads see the last
-    /// committed state and never wait for the writer.
+    /// Run a read-only closure on a pooled connection using committed WAL
+    /// snapshots. Reader admission/pool bounds remain a server-integration gate.
     pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = match self.readers.lock().unwrap_or_else(|p| p.into_inner()).pop() {
             Some(c) => c,

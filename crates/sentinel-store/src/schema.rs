@@ -1,7 +1,7 @@
 //! Versioned schema. Each migration runs once inside its own transaction and
-//! is recorded in `schema_migrations`; the list is append-only. Every row
-//! carries `tenant_id` so ownership is a column predicate, never a join the
-//! caller can forget: all reads and writes filter by tenant.
+//! is recorded in `schema_migrations`; the list is append-only. Tenant-owned
+//! rows carry tenant_id. Global human identities are authorized through live
+//! memberships; a caller-supplied tenant predicate alone is not authorization.
 //!
 //! Encoding: IDs are 16-byte BLOBs (the raw UUID); state is one INTEGER
 //! (`state_code`, see `codec`); timestamps are UTC milliseconds.
@@ -93,4 +93,5 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     ) WITHOUT ROWID;
     CREATE INDEX idempotency_by_age ON idempotency_keys(created_ms);",
     ),
+    (4, include_str!("migrations/004_identity.sql")),
 ];

@@ -19,7 +19,9 @@ Both durable paths are bound by the same fsync and land within 20% of each other
 
 Migrations are an append-only list of `(version, sql)` in `schema.rs`; each runs in its own `BEGIN IMMEDIATE` transaction and is recorded in `schema_migrations`. Version 1 creates `tenants`, `repos`, `runs`, `jobs` and `attempts` as `WITHOUT ROWID` tables keyed by 16-byte IDs. Version 2 adds `run_specs` (the immutable compiled specification per run: pipeline digest, format byte, postcard blob) and `jobs.spec_index`. Version 3 adds `idempotency_keys`, scoped to (tenant, principal, route): `idempotency::begin` decides execute/replay/mismatch inside the mutation's own transaction and `complete` records the created run, so a duplicate can never execute twice.
 
-Every table after `tenants` carries `tenant_id`. Inserts of runs and jobs are `INSERT … SELECT` from the parent row filtered by tenant, so a run cannot reference another tenant's repo and a job cannot reference another tenant's run; both fail as `NotFound`, the same answer a nonexistent row gets. Every read and transition predicate includes `tenant_id`. Foreign keys are enforced (`PRAGMA foreign_keys=ON`) as a second line of defence.
+Tenant-owned tables carry `tenant_id`; global human users/external identities are linked through memberships. Inserts of runs and jobs are `INSERT … SELECT` from the parent row filtered by tenant; both fail as `NotFound` for a missing or foreign parent. Controller read/transition predicates include `tenant_id`, but these trusted helpers alone do not authorize a user.
+
+Version 4 adds [identity and authorization](authorization.md): namespaces/users/external identities, memberships and explicit repo grants. New grants use composite ownership FKs; triggers enforce equal tenant ownership across the existing parent/child graph even through raw SQL. Migration refuses inconsistent existing rows and unknown newer versions. Client-facing repository and spec queries join current membership/grants and credential scope; authorized dispatch derives the owning tenant inside its writer transaction.
 
 Encodings: IDs are raw UUID bytes; `state_code` is one integer with terminal states at 16 plus the outcome, so the ready-queue partial index is `WHERE state_code = 1` and `>= 16` means finished; `failure_class` uses the core discriminant; timestamps are UTC milliseconds, first entry wins via `COALESCE`.
 
@@ -27,7 +29,7 @@ Encodings: IDs are raw UUID bytes; `state_code` is one integer with terminal sta
 
 One thread owns the only write connection. `Writer::write` sends a closure over a bounded channel (256 slots), runs it inside `BEGIN IMMEDIATE`, commits, and only then replies. With `synchronous=FULL` the WAL is fsynced before `COMMIT` returns, so **a write is acknowledged to the caller only when it is on disk**. This is the contract worker acknowledgements, lease grants and cancel requests rely on. `Durability::Normal` exists for replayable data and tests; it is never used for transitions.
 
-A full queue returns `WriterUnavailable` immediately instead of blocking or growing; callers shed load or retry with back-off. Readers use separate read-only connections from a small pool; in WAL mode they never block the writer and always see the last committed state.
+A full queue returns `WriterUnavailable` immediately instead of blocking or growing; callers shed load or retry with back-off. Readers use separate read-only WAL connections and observe a committed snapshot. The current connection pool has no hard limit, writer result waits/shutdown joins have no deadline, and long read snapshots can constrain checkpoint progress. These are [open integration gates](parts-01-02-audit.md), not bounded-production-service claims.
 
 ## Transitions
 

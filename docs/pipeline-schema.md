@@ -95,7 +95,9 @@ Evaluation is phased. Each path and function has a minimum phase, and an express
 
 Templates render each interpolation as string, integer or boolean; `null` is an error, and output is bounded (256 bytes for concurrency keys and cache keys).
 
-`hash_files` is resolved by the worker against the checkout root with `hash_files(root, patterns)`: segments may contain `*` or be `**`; matches are deduplicated and sorted; symlinks are never followed; the result is the BLAKE3 hex of `path \0 length content` records, so it is identical on every host. Limits: 8 patterns, 10,000 files, 256 MiB. No match is an error, not an empty key, because a missing lockfile is a misconfiguration and a silent constant would make unrelated builds share a cache.
+`hash_files` is intended for worker resolution against the checkout root with `hash_files(root, patterns)`: segments may contain `*` or be `**`; matches are deduplicated and sorted; traversal skips observed symlink entries; the result is the BLAKE3 hex of `path \0 length content` records. Configured limits: 8 patterns, 10,000 files, 256 MiB. No match is an error, not an empty key, because a missing lockfile is a misconfiguration and a silent constant would make unrelated builds share a cache.
+
+**C06 reopened by the [2026-09-14 audit](parts-01-02-audit.md):** the current resolver does not bound all visited directory entries/depth or actual streamed bytes and its later file opens are not race-resistant. Finish those checks and immutable-source/no-follow guarantees before worker integration; parser and static-tree tests do not qualify mutable filesystem input.
 
 ## Bindings and offline validation (C07)
 

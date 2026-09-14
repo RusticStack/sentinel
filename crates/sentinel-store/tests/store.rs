@@ -45,7 +45,7 @@ fn fixture() -> Fixture {
 fn migrations_are_idempotent_and_pragmas_hold() {
     let f = fixture();
     let version = f.store.writer().raw(sentinel_store::migrate).unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     f.store
         .read(|c| {
             let journal: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
