@@ -34,6 +34,15 @@ impl Permissions {
     pub const fn bits(self) -> u8 {
         self.0
     }
+    /// Reconstruct from a persisted value, rejecting undefined bits so a corrupt
+    /// or newer row cannot widen authority by setting one.
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits & !Self::ALL.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
 }
 
 /// A validated credential's upper bound. Identity authenticators must intersect

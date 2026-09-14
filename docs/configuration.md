@@ -84,7 +84,16 @@ printf '%s' "$OPERATOR_PASSWORD" | ./target/release/sentinel admin bootstrap    
 printf '%s' "$NEW_PASSWORD" | ./target/release/sentinel admin recover     --data-dir "$PWD/data/controller" --username root
 ```
 
-Passwords are read from standard input only; no subcommand accepts one in argv, and a terminal stdin is refused. `bootstrap` creates the database if needed and is refused once any active super admin exists; `status` and `recover` refuse a path with no database rather than creating an empty one. Exit code 2 covers every refusal. See [local authentication](local-authentication.md).
+Scoped, expiring API credentials are provisioned the same way, and the secret is the only thing written to stdout:
+
+```sh
+./target/release/sentinel admin token issue --data-dir "$PWD/data/controller" \
+    --user root --name "laptop cli" --scope read,run --expires-in 7d > credential
+./target/release/sentinel admin token list --data-dir "$PWD/data/controller" --user root
+./target/release/sentinel admin token revoke --data-dir "$PWD/data/controller" --id tok_...
+```
+
+Passwords are read from standard input only; no subcommand accepts one in argv, and a terminal stdin is refused. `bootstrap` creates the database if needed and is refused once any active super admin exists; `status` and `recover` refuse a path with no database rather than creating an empty one. Exit code 2 covers every refusal. See [local authentication](local-authentication.md) and [API credentials](api-credentials.md).
 
 ## Shutdown and output
 

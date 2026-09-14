@@ -62,6 +62,56 @@ pub enum AdminCommand {
         #[command(flatten)]
         data: DataDir,
     },
+    /// Provision, list and revoke scoped, expiring API credentials
+    Token(TokenArgs),
+}
+
+#[derive(Args)]
+pub struct TokenArgs {
+    #[command(subcommand)]
+    pub command: TokenCommand,
+}
+
+#[derive(Subcommand)]
+pub enum TokenCommand {
+    /// Issue one credential and print its secret to stdout, once
+    Issue {
+        #[command(flatten)]
+        data: DataDir,
+        /// Account that will act: a local username or a `usr_` identifier
+        #[arg(long)]
+        user: String,
+        /// Operator-facing label, so the credential can be recognized later
+        #[arg(long)]
+        name: String,
+        /// Comma-separated scope: read, run, secrets, tenant-admin, platform-admin
+        #[arg(long, default_value = "read")]
+        scope: String,
+        /// Narrow to one tenant namespace, by slug
+        #[arg(long, value_name = "SLUG")]
+        tenant: Option<String>,
+        /// Narrow to one repository of that tenant, by name; requires --tenant
+        #[arg(long, value_name = "NAME")]
+        repo: Option<String>,
+        /// Lifetime such as 30d, 12h or 90m; bounded by the deployment maximum
+        #[arg(long, value_name = "DURATION", default_value = "30d")]
+        expires_in: String,
+    },
+    /// List an account's credentials as metadata; secrets are never shown
+    List {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+    },
+    /// Revoke one credential immediately and permanently
+    Revoke {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `tok_` identifier printed at issuance or by `token list`
+        #[arg(long)]
+        id: String,
+    },
 }
 
 #[derive(Args)]

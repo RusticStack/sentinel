@@ -16,8 +16,10 @@ pub mod codec;
 pub mod idempotency;
 pub mod jobs;
 pub mod local_auth;
+pub mod lookup;
 pub mod runs;
 pub mod schema;
+pub mod tokens;
 
 use std::{
     fmt,

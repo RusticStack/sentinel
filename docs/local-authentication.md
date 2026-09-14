@@ -2,7 +2,7 @@
 
 Implemented in `sentinel-auth` (password hashing, opaque secrets, cookie/CSRF policy), `sentinel-store::local_auth` (bootstrap, credentials, sessions, audit) and the host-local `sentinel admin` command, with append-only metadata migration **5**.
 
-This is authentication only. Admission is [A01's authorization layer](authorization.md): a validated session produces a `Principal`, and every repository, tenant and platform decision is still a live membership/grant check. GitHub sign-in is A04, registration and invitations are A05, MFA and step-up are A06.
+This is authentication only. Admission is [A01's authorization layer](authorization.md): a validated session produces a `Principal`, and every repository, tenant and platform decision is still a live membership/grant check. [API credentials](api-credentials.md) (A03) are the other source of that `Principal`. GitHub sign-in is A04, registration and invitations are A05, MFA and step-up are A06.
 
 ## First-admin bootstrap
 
@@ -46,7 +46,7 @@ Opaque 256-bit secrets from the OS CSPRNG, stored only as their BLAKE3 digest. A
 
 `auth_audit` is append-only: updates and deletes are refused by trigger, as are updates and deletes of the bootstrap latch. Records carry the event, actor, subject, host-local flag and at most 128 bytes of bounded detail (a login name) — never a password, hash, digest or cookie value.
 
-The deployment must keep one reachable super admin. `set_super_admin` and `set_active` require `PLATFORM_ADMIN` scope and audit the change, and database triggers refuse any update or delete that would empty the active super-admin set — including a raw controller statement or a repair script. Demotion and suspension revoke the account's sessions in the same transaction.
+The deployment must keep one reachable super admin. `set_super_admin` and `set_active` require `PLATFORM_ADMIN` scope and audit the change, and database triggers refuse any update or delete that would empty the active super-admin set — including a raw controller statement or a repair script. Demotion and suspension revoke the account's sessions in the same transaction, and suspension revokes its [API credentials](api-credentials.md) too.
 
 ## Cost
 

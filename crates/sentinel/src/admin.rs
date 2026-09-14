@@ -10,12 +10,15 @@
 
 use std::io::{IsTerminal, Read};
 
+use sentinel_core::{RepoId, TenantId, TokenId, UnixMillis, UserId, auth::Permissions};
 use sentinel_store::{
     Durability, METADATA_FILE, Store,
     local_auth::{self, Event},
+    lookup,
+    tokens::{self, Grant},
 };
 
-use crate::cli::{AdminArgs, AdminCommand, DataDir};
+use crate::cli::{AdminArgs, AdminCommand, DataDir, TokenArgs, TokenCommand};
 
 pub struct Error {
     pub message: String,
@@ -155,6 +158,201 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
                 );
             }
         }
+        AdminCommand::Token(args) => token(args, now)?,
+    }
+    Ok(())
+}
+
+/// Scope vocabulary for the host-local command. These names map onto the stored
+/// permission bits; the OAuth scope vocabulary is a separate surface (A09) and
+/// is not defined by this parser.
+fn scope(text: &str) -> Result<Permissions, Error> {
+    let mut permissions = Permissions::NONE;
+    for name in text.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        permissions = permissions.union(match name {
+            "read" => Permissions::READ,
+            "run" => Permissions::RUN,
+            "secrets" => Permissions::WRITE_SECRETS,
+            "tenant-admin" => Permissions::TENANT_ADMIN,
+            "platform-admin" => Permissions::PLATFORM_ADMIN,
+            other => {
+                return Err(fail(format!(
+                    "unknown scope {other}; use read, run, secrets, tenant-admin or platform-admin"
+                )));
+            }
+        });
+    }
+    if permissions == Permissions::NONE {
+        return Err(fail("a credential needs at least one scope"));
+    }
+    Ok(permissions)
+}
+
+fn scope_names(permissions: Permissions) -> String {
+    let mut names = Vec::with_capacity(5);
+    for (bit, name) in [
+        (Permissions::READ, "read"),
+        (Permissions::RUN, "run"),
+        (Permissions::WRITE_SECRETS, "secrets"),
+        (Permissions::TENANT_ADMIN, "tenant-admin"),
+        (Permissions::PLATFORM_ADMIN, "platform-admin"),
+    ] {
+        if permissions.contains(bit) {
+            names.push(name);
+        }
+    }
+    names.join(",")
+}
+
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Whole units only (`30d`, `12h`, `90m`, `45s`). A lifetime is an operator
+/// decision, so it is stated plainly rather than parsed loosely.
+fn lifetime_ms(text: &str) -> Result<i64, Error> {
+    let (digits, unit) = text.split_at(text.len().saturating_sub(1));
+    let scale = match unit {
+        "d" => DAY_MS,
+        "h" => 60 * 60 * 1000,
+        "m" => 60 * 1000,
+        "s" => 1000,
+        _ => return Err(fail("lifetime must end in d, h, m or s, as in 30d")),
+    };
+    let value: i64 = digits
+        .parse()
+        .map_err(|_| fail("lifetime must be a whole number of units, as in 30d"))?;
+    value
+        .checked_mul(scale)
+        .filter(|ms| (1..=tokens::MAX_LIFETIME_MS).contains(ms))
+        .ok_or_else(|| {
+            fail(format!(
+                "lifetime must be between 1s and {}d",
+                tokens::MAX_LIFETIME_MS / DAY_MS
+            ))
+        })
+}
+
+/// Resolve a `usr_` identifier or a local username. Host-local lookups read the
+/// database directly: the operator already has that access, and there is no
+/// session to authorize them with before any credential exists.
+fn resolve_user(store: &Store, value: &str) -> Result<UserId, Error> {
+    let unknown = || fail("no active account with that username or identifier");
+    if let Ok(id) = value.parse::<UserId>() {
+        return store
+            .read(move |conn| lookup::active_user(conn, id))
+            .map(|()| id)
+            .map_err(|_| unknown());
+    }
+    let owned = value.to_owned();
+    store
+        .read(move |conn| lookup::user_by_username(conn, &owned))
+        .map_err(|_| unknown())
+}
+
+/// Resolve the optional tenant/repository narrowing by their operator-facing
+/// names. The store still refuses a repository outside the named tenant.
+fn resolve_target(
+    store: &Store,
+    tenant: Option<&String>,
+    repo: Option<&String>,
+) -> Result<(Option<TenantId>, Option<RepoId>), Error> {
+    let Some(slug) = tenant else {
+        if repo.is_some() {
+            return Err(fail("--repo requires --tenant"));
+        }
+        return Ok((None, None));
+    };
+    let owned = slug.clone();
+    let tenant = store
+        .read(move |conn| lookup::tenant_by_slug(conn, &owned))
+        .map_err(|_| fail("no active tenant with that slug"))?;
+    let Some(name) = repo else {
+        return Ok((Some(tenant), None));
+    };
+    let owned = name.clone();
+    let repo = store
+        .read(move |conn| lookup::repo_by_name(conn, tenant, &owned))
+        .map_err(|_| fail("no repository with that name in that tenant"))?;
+    Ok((Some(tenant), Some(repo)))
+}
+
+fn token(args: &TokenArgs, now: UnixMillis) -> Result<(), Error> {
+    match &args.command {
+        TokenCommand::Issue {
+            data,
+            user,
+            name,
+            scope: requested,
+            tenant,
+            repo,
+            expires_in,
+        } => {
+            let store = open(data, true)?;
+            let permissions = scope(requested)?;
+            let lifetime_ms = lifetime_ms(expires_in)?;
+            let user = resolve_user(&store, user)?;
+            let (tenant, repo) = resolve_target(&store, tenant.as_ref(), repo.as_ref())?;
+            let granted = tokens::provision(
+                &store,
+                Grant {
+                    user,
+                    name,
+                    permissions,
+                    tenant,
+                    repo,
+                    lifetime_ms,
+                },
+                now,
+            )
+            .map_err(|error| match error {
+                sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
+                other => fail(format!("the account cannot hold that credential: {other}")),
+            })?;
+            // The secret is the only thing on stdout, so a redirect captures it
+            // exactly; everything an operator reads goes to stderr.
+            println!("{}", sentinel_auth::token::format(&granted.secret));
+            eprintln!(
+                "issued {} for {user}, scope {}, expires at {} (shown once)",
+                granted.id,
+                scope_names(permissions),
+                granted.expires.0
+            );
+        }
+        TokenCommand::List { data, user } => {
+            let store = open(data, true)?;
+            let user = resolve_user(&store, user)?;
+            // Host-local listing acts as the account itself, and metadata is all
+            // that exists to read: no secret is recoverable from these rows.
+            let principal =
+                sentinel_core::auth::Principal::new(user, Permissions::NONE, None, None);
+            let records = store
+                .read(|conn| tokens::list(conn, principal, user, 100))
+                .map_err(|error| fail(format!("cannot list credentials: {error}")))?;
+            for record in records {
+                println!(
+                    "{} scope={} expires={}{}{} {}",
+                    record.id,
+                    scope_names(record.permissions),
+                    record.expires.0,
+                    record
+                        .last_used
+                        .map(|at| format!(" last_used={}", at.0))
+                        .unwrap_or_default(),
+                    if record.revoked { " revoked" } else { "" },
+                    record.name
+                );
+            }
+        }
+        TokenCommand::Revoke { data, id } => {
+            let store = open(data, true)?;
+            let id: TokenId = id
+                .parse()
+                .map_err(|_| fail("expected a tok_ credential identifier"))?;
+            tokens::revoke_host_local(&store, id, now).map_err(|error| match error {
+                sentinel_store::Error::NotFound => fail("no credential with that identifier"),
+                other => fail(format!("revocation failed: {other}")),
+            })?;
+            eprintln!("revoked {id}");
+        }
     }
     Ok(())
 }
@@ -173,5 +371,7 @@ const fn event_name(event: Event) -> &'static str {
         Event::SuperAdminRevoked => "super-admin-revoked",
         Event::AccountActivated => "account-activated",
         Event::AccountDeactivated => "account-deactivated",
+        Event::TokenIssued => "token-issued",
+        Event::TokenRevoked => "token-revoked",
     }
 }

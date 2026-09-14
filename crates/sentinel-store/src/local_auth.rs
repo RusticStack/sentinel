@@ -67,6 +67,8 @@ pub enum Event {
     SuperAdminRevoked = 10,
     AccountActivated = 11,
     AccountDeactivated = 12,
+    TokenIssued = 13,
+    TokenRevoked = 14,
 }
 
 impl Event {
@@ -84,6 +86,8 @@ impl Event {
             10 => Event::SuperAdminRevoked,
             11 => Event::AccountActivated,
             12 => Event::AccountDeactivated,
+            13 => Event::TokenIssued,
+            14 => Event::TokenRevoked,
             _ => return None,
         })
     }
@@ -161,7 +165,7 @@ fn bounded_detail(detail: &str) -> &str {
     }
 }
 
-fn audit(
+pub(crate) fn audit(
     tx: &Transaction<'_>,
     event: Event,
     actor: Option<UserId>,
@@ -656,8 +660,8 @@ pub fn set_super_admin(
     audit(tx, event, Some(principal.user), Some(target), false, None)
 }
 
-/// Activate or suspend an account. Deactivation revokes sessions in the same
-/// transaction; it does not wait for their deadlines.
+/// Activate or suspend an account. Deactivation revokes sessions and API
+/// credentials in the same transaction; it does not wait for their deadlines.
 pub fn set_active(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -674,7 +678,9 @@ pub fn set_active(
         return Err(Error::NotFound);
     }
     if !active {
+        // Suspension takes every credential with it, not only browser sessions.
         revoke_all(tx, target, now)?;
+        crate::tokens::revoke_all_for_user(tx, target, now)?;
     }
     let event = if active {
         Event::AccountActivated

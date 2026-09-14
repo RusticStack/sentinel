@@ -118,6 +118,12 @@ identifier!(
     WorkerId,
     "wrk"
 );
+identifier!(
+    /// Handle for one issued API credential (A03). Names the record so it can
+    /// be listed and revoked; it is not the secret and authenticates nothing.
+    TokenId,
+    "tok"
+);
 
 /// Step position inside its job. Steps are compiled in order and referenced by
 /// index; the human name lives in the compiled spec. `u16` bounds a job to

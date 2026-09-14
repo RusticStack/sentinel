@@ -13,6 +13,7 @@
 | `JobId` | `job_` | One job of a run, immutable after compilation |
 | `AttemptId` | `att_` | One execution attempt; reruns create new attempts |
 | `WorkerId` | `wrk_` | Identity a worker generates at enrollment |
+| `TokenId` | `tok_` | Handle for one issued API credential (A03); names the record, never the secret |
 | `StepIndex` | | `u16` position of a step inside its job |
 | `Fence` | | `u64` per-job generation; `0` means never leased |
 
