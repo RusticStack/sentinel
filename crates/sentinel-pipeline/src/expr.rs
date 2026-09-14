@@ -625,6 +625,14 @@ pub struct DependencySummary {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HashFilesError {
+    /// Secure worker filesystem resolution is currently Linux-only.
+    UnsupportedPlatform,
+    TraversalLimit,
+    DepthLimit,
+    PathLimit,
+    InvalidFileName,
+    UnsafeFile,
+    ChangedFile,
     /// No file matched any pattern: a misconfiguration, never a silent key.
     NoMatch,
     TooManyFiles {

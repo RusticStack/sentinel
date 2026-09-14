@@ -531,6 +531,7 @@ version = "0.1.0-dev"
 dependencies = [
  "blake3",
  "postcard",
+ "rustix",
  "sentinel-protocol",
  "serde",
  "serde_json",

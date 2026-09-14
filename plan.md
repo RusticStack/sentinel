@@ -265,6 +265,7 @@ Rust storage module and local worker data paths, not a mandatory storage service
 ### Local-first cache
 
 1. Immutable worker-local entries with writable per-job clones and atomic success publication.
+   Source-derived `hash_files` keys use [bounded Linux descriptor-rooted resolution](docs/hash-files.md) before writable execution, or against an immutable snapshot. No symlink/mount traversal or unsafe non-Linux fallback; filesystem confinement alone does not provide a content snapshot.
 2. Reflinks where supported; benchmark btrfs snapshots for large directory trees before declaring that optimized backend supported.
 3. Ordinary filesystems use safe bounded copies and report backend/cost. Never writable hardlinks. ZFS/overlay-specific backends wait for evidence/conformance tests.
 4. Scope keys by installation/repo ID, trust class, architecture, image/toolchain identity, format version, and user key. PR writes cannot poison protected-branch caches; downward sharing requires explicit policy and secret-free content.

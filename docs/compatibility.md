@@ -23,6 +23,8 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 
 Readers reject a database newer than their highest known migration. Migration 4 preserves version-3 tables and blobs, adds identity/grants, and rejects inconsistent ownership rather than silently repairing it. See [authorization](authorization.md).
 
+**C06 resolver hardening.** The pipeline schema and run-spec layout remain version 1: no compiler-accepted schema shape is tightened, and static regular-file hash records retain their exact bytes. Runtime filesystem admission now rejects unsafe paths and exhausted traversal/read budgets explicitly. Non-Linux direct resolver calls return `UnsupportedPlatform`; offline CLI operations continue to leave hashes unresolved. Terminal `**` now includes recursive regular files. These worker-resolver behaviors are documented in [hash files](hash-files.md); future persisted cache contracts must version any change to digest record bytes.
+
 **Error and explain shapes.** Fields may be added; existing fields keep their type and meaning; `code` values are never renamed or reused. A breaking change is a new schema string, and clients treat an unknown schema as unparseable (the marker types enforce this). HTTP status codes are derived from `code` and follow it.
 
 **Cursors.** Opaque to clients. The version byte changes when the layout does; old cursors are then rejected as `invalid_cursor` and the client restarts from the beginning of the stream, which is always safe because event sequences are dense and idempotent to re-read.
