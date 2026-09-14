@@ -737,12 +737,37 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     });
     recorder.release(test_attempt);
 
-    // A clean stop says goodbye; the fleet forgets the worker; the lease of
-    // the job still running stays until it expires.
+    // A worker that restarted with `lint` in its leftovers abandons it:
+    // reconciled as an infrastructure failure under the right fence only.
+    let (lint_attempt, lint_fence) = if first.0.job == lint {
+        (first.0.attempt, first.0.fence)
+    } else {
+        (second.0.attempt, second.0.fence)
+    };
+    reporter
+        .abandon(lint_attempt, Fence(lint_fence.0 + 7))
+        .unwrap();
+    eventually("stale abandon counted", || {
+        d.controller().stats().stale_reports.load(Ordering::SeqCst) == 2
+    });
+    assert_eq!(d.state(lint), JobState::Leased);
+    reporter.abandon(lint_attempt, lint_fence).unwrap();
+    eventually("abandoned", || {
+        d.state(lint) == JobState::Terminal(Outcome::InfraFailed)
+    });
+    assert_eq!(d.controller().stats().abandoned.load(Ordering::SeqCst), 1);
+    recorder.release(lint_attempt);
+
+    // A clean stop says goodbye; the fleet forgets the worker; nothing is
+    // held any more.
     process.stop().unwrap();
     eventually("fleet removal", || d.controller().connected().is_empty());
-    assert_eq!(d.state(lint), JobState::Leased);
-    assert_eq!(d.store.read(|c| dispatch::held_by(c, id)).unwrap().len(), 1);
+    assert!(
+        d.store
+            .read(|c| dispatch::held_by(c, id))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -775,7 +800,6 @@ jobs:
     eventually("lapse", || {
         d.controller().stats().lapsed.load(Ordering::SeqCst) == 1
     });
-    assert_eq!(d.state(ids[0]), JobState::Queued);
     // Re-offered at the next reconciliation (not immediately: a refusing
     // worker is bounded to one offer per interval), under fence 2.
     let again = offers

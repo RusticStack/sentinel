@@ -468,13 +468,15 @@ pub fn cancel_requested(
     Ok(out)
 }
 
-/// Held attempts whose lease has passed, or which have run past their job's
-/// timeout plus [`EXECUTION_GRACE_MS`] while still acknowledged: the worker
-/// stopped renewing, or renews but is not enforcing. Oldest first.
+/// Acknowledged attempts whose lease has passed, or which have run past
+/// their job's timeout plus [`EXECUTION_GRACE_MS`]: the worker stopped
+/// renewing, or renews but is not enforcing. Oldest first. An offer that
+/// was never acknowledged is not here — it never ran, so it lapses back to
+/// the queue through [`unacknowledged`] instead.
 pub fn expired(conn: &Connection, now: UnixMillis) -> Result<Vec<AttemptId>> {
     let mut stmt = conn.prepare_cached(
         "SELECT a.id FROM attempts a
-         WHERE a.released_ms IS NULL AND a.lease_until_ms < ?1
+         WHERE a.released_ms IS NULL AND a.acked_ms IS NOT NULL AND a.lease_until_ms < ?1
          ORDER BY a.lease_until_ms LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![now.0, SWEEP_BATCH as i64], |r| {
@@ -507,6 +509,84 @@ pub fn expired(conn: &Connection, now: UnixMillis) -> Result<Vec<AttemptId>> {
 /// on its own, because whether its side effects happened is unknown.
 pub fn expire(tx: &Transaction<'_>, attempt: AttemptId, now: UnixMillis) -> Result<JobState> {
     finish(tx, attempt, Actor::Controller, Event::LeaseExpired, now)
+}
+
+/// A worker found this attempt in its own leftovers after a restart and
+/// cannot say what happened: `Reconciled` through the machine as the
+/// reconciler, capacity back, dependents decided, never replayed. The
+/// attempt must still be held by that worker under that fence; anything
+/// else is a stale claim and is refused.
+pub fn abandon(
+    tx: &Transaction<'_>,
+    worker: WorkerId,
+    attempt: AttemptId,
+    fence: Fence,
+    now: UnixMillis,
+) -> Result<JobState> {
+    let held: bool = tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE id = ?1 AND worker_id = ?2 AND fence = ?3
+                           AND released_ms IS NULL)",
+        )?
+        .query_row(
+            params![attempt.as_bytes(), worker.as_bytes(), fence.0 as i64],
+            |r| r.get(0),
+        )?;
+    if !held {
+        return Err(Error::NotFound);
+    }
+    let acked: bool = tx
+        .prepare_cached("SELECT acked_ms IS NOT NULL FROM attempts WHERE id = ?1")?
+        .query_row([attempt.as_bytes()], |r| r.get(0))?;
+    if !acked {
+        // Never acknowledged: it never started, so back to the queue.
+        lapse(tx, attempt, now)?;
+        return Ok(JobState::Queued);
+    }
+    finish(tx, attempt, Actor::Reconciler, Event::Reconciled, now)
+}
+
+/// What a controller start found and settled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Held attempts whose lease had already passed while the controller was
+    /// down: `LeaseExpired`.
+    pub expired: usize,
+    /// Offers never acknowledged within the ack timeout: back to the queue.
+    pub lapsed: usize,
+    /// Attempts held by a worker that has been revoked meanwhile:
+    /// `Reconciled` — no session will ever report them.
+    pub orphaned: usize,
+}
+
+/// Startup reconciliation: the rows are the truth, and every one that could
+/// only have moved with a controller running is moved now, in one
+/// transaction, before any worker is admitted. Nothing is re-queued that
+/// may have run.
+pub fn reconcile_startup(tx: &Transaction<'_>, now: UnixMillis) -> Result<Reconciled> {
+    let mut done = Reconciled::default();
+    for attempt in expired(tx, now)? {
+        expire(tx, attempt, now)?;
+        done.expired += 1;
+    }
+    for attempt in unacknowledged(tx, now)? {
+        lapse(tx, attempt, now)?;
+        done.lapsed += 1;
+    }
+    let orphans: Vec<[u8; 16]> = tx
+        .prepare_cached(
+            "SELECT a.id FROM attempts a JOIN workers w ON w.id = a.worker_id
+             WHERE a.released_ms IS NULL AND a.acked_ms IS NOT NULL AND w.revoked_ms IS NOT NULL
+             LIMIT ?1",
+        )?
+        .query_map([SWEEP_BATCH as i64], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    for attempt in orphans {
+        let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Corrupt("attempt_id"))?;
+        finish(tx, attempt, Actor::Reconciler, Event::Reconciled, now)?;
+        done.orphaned += 1;
+    }
+    Ok(done)
 }
 
 /// Queued jobs that waited longer than [`QUEUE_TIMEOUT_MS`]: `QueueTimedOut`.

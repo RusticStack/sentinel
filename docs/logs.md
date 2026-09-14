@@ -29,7 +29,7 @@ Memory on either side is the window plus one chunk; everything else is on disk. 
 
 ## What is not here yet
 
-The API's tail/follow endpoint is W08; `admin logs` is the host-local reader. Log retention and quotas are D-tasks. Spool recovery after a worker restart (reopen every leftover spool and finish sending) is W07: the cursor and records are already on disk for it.
+The API's tail/follow endpoint is W08; `admin logs` is the host-local reader. Log retention and quotas are D-tasks. Spool recovery after a worker restart is in [reconciliation](reconciliation.md): every leftover spool is delivered from its cursor and closed before the attempt is abandoned.
 
 ## Verification
 

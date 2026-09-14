@@ -63,6 +63,7 @@ pub struct Stats {
     pub log_refused: AtomicU64,
     pub expired: AtomicU64,
     pub queue_timeouts: AtomicU64,
+    pub abandoned: AtomicU64,
 }
 
 struct Peer {
@@ -454,6 +455,17 @@ impl SessionHandler for Inner {
         }
     }
 
+    fn abandoned(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {
+        let settled =
+            self.write(move |tx| dispatch::abandon(tx, worker, attempt, fence, UnixMillis::now()));
+        if settled.is_ok() {
+            self.stats.abandoned.fetch_add(1, Ordering::Relaxed);
+            self.wake();
+        } else {
+            self.stats.stale_reports.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn spec(&self, worker: WorkerId, attempt: AttemptId) -> Option<(JobContext, Vec<u8>)> {
         self.store
             .read(|c| {
@@ -525,6 +537,7 @@ pub struct Controller {
     inner: Arc<Inner>,
     addr: SocketAddr,
     fingerprint: Digest,
+    reconciled: dispatch::Reconciled,
     acceptor: Option<thread::JoinHandle<()>>,
     dispatcher: Option<thread::JoinHandle<()>>,
 }
@@ -540,6 +553,13 @@ impl Controller {
     ) -> Result<Controller> {
         let fingerprint = identity.fingerprint();
         let config = tls::server_config(identity)?;
+        // What the last controller left mid-flight is settled from the rows
+        // before any worker is admitted: expired leases, unanswered offers,
+        // attempts of workers revoked meanwhile.
+        let reconciled = store
+            .writer()
+            .write(|tx| dispatch::reconcile_startup(tx, UnixMillis::now()))
+            .map_err(|_| Error::Internal("startup reconciliation"))?;
         let listener = TcpListener::bind(listen)?;
         let addr = listener.local_addr()?;
         let inner = Arc::new(Inner {
@@ -569,9 +589,15 @@ impl Controller {
             inner,
             addr,
             fingerprint,
+            reconciled,
             acceptor: Some(acceptor),
             dispatcher: Some(dispatcher),
         })
+    }
+
+    /// What starting this controller settled from the previous one's rows.
+    pub fn reconciled(&self) -> dispatch::Reconciled {
+        self.reconciled
     }
 
     pub fn local_addr(&self) -> SocketAddr {

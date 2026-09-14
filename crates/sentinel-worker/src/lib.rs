@@ -24,6 +24,8 @@ pub mod logpipe;
 pub mod podman;
 #[cfg(target_os = "linux")]
 mod process;
+#[cfg(target_os = "linux")]
+pub mod recovery;
 pub mod redact;
 pub mod spool;
 #[cfg(target_os = "linux")]

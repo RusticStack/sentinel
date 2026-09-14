@@ -30,6 +30,7 @@ use crate::{
     attempt::{self, Cancel, Job, Report, Verdict},
     logpipe::LogPipe,
     podman,
+    recovery::{self, Leftover, Recovered},
     redact::Redactor,
 };
 
@@ -48,6 +49,12 @@ pub enum Notice {
     /// The lease deadline passed with no renewal: every attempt was ended
     /// without a report, because the controller has already expired them.
     LeaseLost(Vec<AttemptId>),
+    /// A leftover of the previous process was handed to the controller:
+    /// its spool delivered (or refused) and the attempt abandoned.
+    Abandoned {
+        attempt: AttemptId,
+        log_delivered: bool,
+    },
 }
 
 /// TERM-to-KILL grace for a cancel when the process sets none.
@@ -79,6 +86,10 @@ struct State {
     /// Monotonic deadline derived from the last renewal, minus the guard.
     lease_deadline: Option<Instant>,
     cancel_grace: Duration,
+    /// Attempts of the previous process still to abandon, once a session is up.
+    leftovers: Vec<Leftover>,
+    /// Leftover spools being delivered, so their acknowledgements route.
+    recovering: HashMap<AttemptId, Arc<LogPipe>>,
 }
 
 /// The executor handle the link holds; cheap to clone, one runtime behind it.
@@ -98,6 +109,7 @@ pub struct Inner {
     runtime: podman::Runtime,
     state: Mutex<State>,
     notify: Box<dyn Fn(Notice) + Send + Sync>,
+    recovered: Recovered,
 }
 
 impl Executor {
@@ -110,6 +122,10 @@ impl Executor {
     ) -> Result<Executor> {
         let runtime = podman::probe()?;
         std::fs::create_dir_all(root.join(crate::workspace::WORKSPACES_DIR))?;
+        // Before any offer: what the previous process left is settled on
+        // disk and in the runtime; what it owed the controller waits for
+        // the session.
+        let (recovered, leftovers) = recovery::recover(&root, worker)?;
         let executor = Executor(Arc::new(Inner {
             root,
             worker,
@@ -122,8 +138,11 @@ impl Executor {
                 secrets: Vec::new(),
                 lease_deadline: None,
                 cancel_grace: DEFAULT_CANCEL_GRACE,
+                leftovers,
+                recovering: HashMap::new(),
             }),
             notify: Box::new(notify),
+            recovered,
         }));
         let watched = Arc::downgrade(&executor.0);
         thread::Builder::new()
@@ -188,13 +207,26 @@ impl Executor {
             spec,
             context,
         };
+        // On disk before anything runs: a crash from here on leaves a
+        // marker the next process reconciles.
+        let _ = recovery::mark(&self.root, offer.attempt, offer.fence);
         let spawned = thread::Builder::new()
             .name(format!("sentinel-attempt-{}", offer.attempt))
             .spawn(move || {
                 (executor.notify)(Notice::Started(job.attempt));
                 let output: Arc<dyn attempt::Output> = logs;
                 let (verdict, _) = attempt::run(&executor.root, &job, &*executor, output, &cancel);
-                executor.state().live.remove(&job.attempt);
+                let delivered = {
+                    let mut state = executor.state();
+                    state.live.remove(&job.attempt);
+                    // The marker outlives the report: if the terminal event
+                    // is still waiting for a session, a crash now must be
+                    // reconciled, not forgotten.
+                    !state.pending.iter().any(|p| p.0 == job.attempt)
+                };
+                if delivered {
+                    recovery::unmark(&executor.root, job.attempt);
+                }
                 (executor.notify)(Notice::Finished(job.attempt, verdict));
             });
         if spawned.is_err() {
@@ -208,6 +240,16 @@ impl Inner {
         &self.runtime
     }
 
+    /// What starting this executor found of the previous process.
+    pub fn recovered(&self) -> &Recovered {
+        &self.recovered
+    }
+
+    /// Attempts still to be abandoned to the controller.
+    pub fn leftovers_pending(&self) -> usize {
+        self.state().leftovers.len()
+    }
+
     /// No attempt running or waiting for its spec.
     pub fn state_is_idle(&self) -> bool {
         let state = self.state();
@@ -217,6 +259,46 @@ impl Inner {
     /// Reports that found no session and wait for the next one.
     pub fn pending_reports(&self) -> usize {
         self.state().pending.len()
+    }
+
+    /// Hand the previous process's attempts to the controller: the spool's
+    /// frames and end first (the attempt is still held, so they are
+    /// accepted — or refused if its lease already expired), then the
+    /// abandonment under the fence, then the marker goes.
+    fn abandon_leftovers(&self, leftovers: Vec<Leftover>, reporter: Reporter) {
+        for leftover in leftovers {
+            let delivered = if leftover.spooled {
+                match LogPipe::open(
+                    &self.root,
+                    leftover.attempt,
+                    Redactor::new(),
+                    Some(reporter.clone()),
+                ) {
+                    Ok(pipe) => {
+                        let pipe = Arc::new(pipe);
+                        self.state()
+                            .recovering
+                            .insert(leftover.attempt, Arc::clone(&pipe));
+                        let ok = attempt::Output::complete(&*pipe);
+                        self.state().recovering.remove(&leftover.attempt);
+                        ok
+                    }
+                    Err(_) => false,
+                }
+            } else {
+                true
+            };
+            if reporter.abandon(leftover.attempt, leftover.fence).is_err() {
+                // Session gone: keep it for the next attach.
+                self.state().leftovers.push(leftover);
+                return;
+            }
+            recovery::unmark(&self.root, leftover.attempt);
+            (self.notify)(Notice::Abandoned {
+                attempt: leftover.attempt,
+                log_delivered: delivered,
+            });
+        }
     }
 
     /// The lease watchdog: once the deadline the controller last granted
@@ -253,6 +335,16 @@ impl Inner {
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The log pipe of a live or recovering attempt.
+    fn pipe(&self, attempt: AttemptId) -> Option<Arc<LogPipe>> {
+        let state = self.state();
+        state
+            .live
+            .get(&attempt)
+            .map(|l| Arc::clone(&l.logs))
+            .or_else(|| state.recovering.get(&attempt).cloned())
     }
 
     fn send(&self, attempt: AttemptId, fence: Fence, event: Event, summary: Option<Vec<u8>>) {
@@ -374,6 +466,17 @@ impl LinkExecutor for Executor {
         for pipe in pipes {
             pipe.attached(reporter.clone());
         }
+        // Leftovers of the previous process: deliver what they printed,
+        // close the log, then abandon them — off this thread, since the
+        // delivery waits for acknowledgements.
+        let leftovers = std::mem::take(&mut self.state().leftovers);
+        if !leftovers.is_empty() {
+            let executor = Arc::clone(&self.0);
+            let reporter = reporter.clone();
+            let _ = thread::Builder::new()
+                .name("sentinel-recovery".into())
+                .spawn(move || executor.abandon_leftovers(leftovers, reporter));
+        }
         for (attempt, fence, event, summary) in pending {
             let sent = match &summary {
                 Some(bytes) => reporter
@@ -383,6 +486,8 @@ impl LinkExecutor for Executor {
             };
             if !sent {
                 self.state().pending.push((attempt, fence, event, summary));
+            } else if summary.is_some() || matches!(event, Event::Passed | Event::Failed(_)) {
+                recovery::unmark(&self.root, attempt);
             }
         }
         // Specs asked for on a lost session: ask again.
@@ -404,15 +509,13 @@ impl LinkExecutor for Executor {
     }
 
     fn log_acked(&self, attempt: AttemptId, through: u64) {
-        let pipe = self.state().live.get(&attempt).map(|l| Arc::clone(&l.logs));
-        if let Some(pipe) = pipe {
+        if let Some(pipe) = self.pipe(attempt) {
             pipe.acked(through);
         }
     }
 
     fn log_refused(&self, attempt: AttemptId) {
-        let pipe = self.state().live.get(&attempt).map(|l| Arc::clone(&l.logs));
-        if let Some(pipe) = pipe {
+        if let Some(pipe) = self.pipe(attempt) {
             pipe.refused();
         }
     }

@@ -449,10 +449,14 @@ fn start_server(config: &Config, listen: SocketAddr) -> Result<Running, Error> {
         listen,
     )
     .map_err(|error| Error::runtime(format!("cannot listen on {listen}: {error}")))?;
+    let reconciled = controller.reconciled();
     tracing::info!(
         event = "link_listening",
         addr = %controller.local_addr(),
         fingerprint = %fingerprint,
+        expired = reconciled.expired,
+        lapsed = reconciled.lapsed,
+        orphaned = reconciled.orphaned,
         "workers pin this fingerprint with their enrollment"
     );
     Ok(Running::Server { controller, store })
@@ -509,6 +513,9 @@ mod worker_role {
                     sentinel_worker::executor::Notice::Canceled { attempt, forced } => {
                         tracing::info!(event = "attempt_canceled", attempt = %attempt, forced);
                     }
+                    sentinel_worker::executor::Notice::Abandoned { attempt, log_delivered } => {
+                        tracing::warn!(event = "attempt_abandoned", attempt = %attempt, log_delivered, "left by the previous worker process; reconciled by the controller");
+                    }
                     sentinel_worker::executor::Notice::LeaseLost(attempts) => {
                         tracing::warn!(event = "lease_lost", attempts = ?attempts, "no renewal before the deadline; attempts ended without a report");
                     }
@@ -518,11 +525,15 @@ mod worker_role {
         match sentinel_worker::executor::Executor::start(data_dir.to_path_buf(), worker, notify) {
             Ok(executor) => {
                 let runtime = executor.runtime();
+                let recovered = executor.recovered();
                 tracing::info!(
                     event = "executor_ready",
                     podman = %runtime.version,
                     oci_runtime = %runtime.oci_runtime,
-                    cgroup_manager = %runtime.cgroup_manager
+                    cgroup_manager = %runtime.cgroup_manager,
+                    leftovers = recovered.leftovers.len(),
+                    containers_removed = recovered.containers_removed,
+                    workspaces_removed = recovered.workspaces_removed
                 );
                 Box::new(executor)
             }

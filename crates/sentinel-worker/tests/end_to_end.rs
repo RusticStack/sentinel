@@ -163,6 +163,7 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
     // Cancelled steps get two seconds between TERM and the forced stop.
     executor.set_cancel_grace(Duration::from_secs(2));
     let handle = Arc::new(Handle::new());
+    let (worker_cert, worker_key) = (temp.path().join("w.crt"), temp.path().join("w.key"));
     let link_thread = {
         let (executor, handle) = (executor.clone(), Arc::clone(&handle));
         let config = worker::Config {
@@ -182,10 +183,12 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
                 memory_bytes: 4 << 30,
             },
         };
+        let identity = Identity::generate("worker").unwrap();
+        identity.save(&worker_cert, &worker_key).unwrap();
         thread::spawn(move || {
             worker::run(
                 config,
-                Identity::generate("worker").unwrap(),
+                identity,
                 Some(enrollment),
                 &executor,
                 &handle,
@@ -538,5 +541,153 @@ jobs:
 
     handle.stop();
     link_thread.join().unwrap().unwrap();
+
+    // Restart reconciliation: the previous worker process crashed with an
+    // attempt in flight — a marker with its fence, a running container, a
+    // workspace mid-checkout and a spool with output the controller never
+    // received. Built by hand here, exactly as the executor leaves them.
+    let orphan_yaml = format!(
+        "schema: 1\non: [push]\njobs:\n  orphan:\n    image: {IMAGE}@{DIGEST}\n    steps: [{{ id: s, run: 'true' }}]\n"
+    );
+    let orphan_spec = RunSpec::new(
+        PinnedSource::new(repo.to_str().unwrap(), &sha, Some("main")).unwrap(),
+        compile_str(&orphan_yaml).unwrap(),
+    )
+    .unwrap();
+    let ids = store
+        .writer()
+        .write(move |tx| {
+            let run = RunId::new();
+            let ids = runs::create_run(tx, tenant, repo_id, run, &orphan_spec, UnixMillis::now())?;
+            runs::resolve_image(tx, tenant, ids[0], DIGEST, "linux/amd64")?;
+            Ok(ids)
+        })
+        .unwrap();
+    let orphan = ids[0];
+    let offer = store
+        .writer()
+        .write(move |tx| {
+            let offer = dispatch::place(
+                tx,
+                worker_id,
+                pool,
+                dispatch::DEFAULT_LEASE_MS,
+                UnixMillis::now(),
+            )?
+            .expect("orphan placed");
+            dispatch::acknowledge(tx, worker_id, offer.attempt, offer.fence, UnixMillis::now())?;
+            Ok(offer)
+        })
+        .unwrap();
+    assert_eq!(offer.job, orphan);
+    let (attempt, fence) = (offer.attempt, offer.fence);
+    sentinel_worker::recovery::mark(&worker_dir, attempt, fence).unwrap();
+    let ws = Workspace::create(&worker_dir, attempt).unwrap();
+    fs::write(ws.path().join("partial"), "x").unwrap();
+    let stale = sentinel_worker::podman::Container::start(
+        worker_id,
+        attempt,
+        &format!("{IMAGE}@{DIGEST}"),
+        sentinel_worker::podman::Limits {
+            cpu_millis: 500,
+            memory_bytes: 128 << 20,
+            pids: 64,
+        },
+        ws.path(),
+    )
+    .unwrap();
+    std::mem::forget(stale);
+    {
+        let mut spool = sentinel_worker::spool::Spool::open(&worker_dir, attempt).unwrap();
+        spool
+            .append(
+                0,
+                sentinel_protocol::logs::Stream::Stdout,
+                b"printed before the crash\n",
+            )
+            .unwrap()
+            .unwrap();
+        spool.sync().unwrap();
+    }
+    assert_eq!(podman::owned(worker_id).unwrap().len(), 1);
+
+    // The new process: settles the disk and the runtime before it takes a
+    // single offer, then hands the leftover to the controller once connected.
+    let notices2 = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log2 = Arc::clone(&notices2);
+    let executor2 = Executor::start(worker_dir.clone(), worker_id, move |notice: Notice| {
+        log2.lock().unwrap().push(format!("{notice:?}"));
+    })
+    .unwrap();
+    let recovered = executor2.recovered();
+    assert_eq!(recovered.leftovers, vec![(attempt, fence)]);
+    assert_eq!(recovered.containers_removed, 1);
+    assert_eq!(recovered.workspaces_removed, 1);
+    assert!(podman::owned(worker_id).unwrap().is_empty());
+    assert!(Workspace::leftovers(&worker_dir).unwrap().is_empty());
+    assert_eq!(executor2.leftovers_pending(), 1);
+    let handle2 = Arc::new(Handle::new());
+    let link2 = {
+        let (executor, handle) = (executor2.clone(), Arc::clone(&handle2));
+        let config = worker::Config {
+            controller: controller.local_addr(),
+            server: controller.fingerprint(),
+            worker: worker_id,
+            name: "builder-1".into(),
+            hello: Hello {
+                protocol_min: ProtocolVersion(1),
+                protocol_max: ProtocolVersion(1),
+                capabilities: Capabilities::REQUIRED,
+                arch: Arch::X86_64,
+                software: "test".into(),
+            },
+            capacity: Capacity {
+                cpu_millis: 4_000,
+                memory_bytes: 4 << 30,
+            },
+        };
+        let identity = Identity::load(&worker_cert, &worker_key).unwrap();
+        thread::spawn(move || worker::run(config, identity, None, &executor, &handle, &|_| {}))
+    };
+    eventually("orphan reconciled", || {
+        state(orphan).state == JobState::Terminal(Outcome::InfraFailed)
+    });
+    assert_eq!(
+        state(orphan).failure_class,
+        Some(sentinel_core::FailureClass::Reconciled)
+    );
+    // What it printed before the crash reached the controller and the log
+    // is complete; the spool and the marker are gone; nothing was re-run.
+    let tail = logs.tail(attempt, 0, 10).unwrap();
+    assert!(tail.complete);
+    assert_eq!(tail.frames.len(), 1);
+    assert_eq!(tail.frames[0].bytes, b"printed before the crash\n");
+    eventually("leftover settled", || {
+        notices2
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|n| n.contains("Abandoned") && n.contains("log_delivered: true"))
+    });
+    assert!(
+        sentinel_worker::recovery::leftovers(&worker_dir)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        sentinel_worker::spool::Spool::leftovers(&worker_dir)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        controller
+            .stats()
+            .abandoned
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(executor2.state_is_idle());
+    handle2.stop();
+    link2.join().unwrap().unwrap();
     assert!(controller.shutdown(Duration::from_secs(5)));
 }

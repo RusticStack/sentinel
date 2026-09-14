@@ -38,7 +38,7 @@ A worker that disconnects briefly keeps its work: acknowledged leases run to the
 
 ## What is not here yet
 
-Reconciliation after a restart — reopening leftover spools, reaping owned containers and workspaces the process did not get to finalize, resolving attempts the controller found in an unknown state — is W07. Concurrency groups and supersession cancellation (cancel the older run of the same PR) are C-tasks that call `cancel_run`. Tenant suspension already cancels through the same desired state ([tenancy](tenancy.md)).
+Reconciliation after a restart is in [reconciliation](reconciliation.md). Concurrency groups and supersession cancellation (cancel the older run of the same PR) are C-tasks that call `cancel_run`. Tenant suspension already cancels through the same desired state ([tenancy](tenancy.md)).
 
 ## Verification
 

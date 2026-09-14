@@ -843,6 +843,196 @@ jobs:
 }
 
 #[test]
+fn a_controller_start_settles_what_the_last_one_left_and_abandonment_is_fenced() {
+    let f = fixture();
+    let w = worker(
+        &f,
+        f.pool,
+        Capacity {
+            cpu_millis: 8_000,
+            memory_bytes: 16 << 30,
+        },
+    );
+    let gone = worker(
+        &f,
+        f.pool,
+        Capacity {
+            cpu_millis: 8_000,
+            memory_bytes: 16 << 30,
+        },
+    );
+    let (_, ids) = run(
+        &f,
+        "schema: 1
+on: [push]
+jobs:
+  a:
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }]
+  b:
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }]
+  c:
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }]
+  d:
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }]
+",
+        at(2_000),
+    );
+    // a: acknowledged by `w`, lease lapsed while the controller was down.
+    let a = place(&f, w, f.pool, at(2_100)).unwrap();
+    // b: offered by `w`, never acknowledged.
+    let _b = place(&f, w, f.pool, at(2_100)).unwrap();
+    // c: acknowledged by `gone`, which was revoked meanwhile.
+    let c = place(&f, gone, f.pool, at(2_100)).unwrap();
+    // d: acknowledged by `w`, lease still valid: untouched.
+    let d = place(&f, w, f.pool, at(2_100)).unwrap();
+    let (aa, af, ca, cf, da, df) = (a.attempt, a.fence, c.attempt, c.fence, d.attempt, d.fence);
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::acknowledge(tx, w, aa, af, at(2_200))?;
+            dispatch::acknowledge(tx, gone, ca, cf, at(2_200))?;
+            dispatch::acknowledge(tx, w, da, df, at(2_200))?;
+            dispatch::renew(tx, w, &[da], dispatch::DEFAULT_LEASE_MS, at(40_000))?;
+            workers::revoke(tx, Authority::HostLocal, gone, at(2_300))
+        })
+        .unwrap();
+    let restart = at(2_100 + dispatch::DEFAULT_LEASE_MS + 1);
+    let settled = f
+        .store
+        .writer()
+        .write(move |tx| dispatch::reconcile_startup(tx, restart))
+        .unwrap();
+    assert_eq!(
+        settled,
+        dispatch::Reconciled {
+            expired: 2,
+            lapsed: 1,
+            orphaned: 0
+        }
+    );
+    // `a` expired; `b` was never acknowledged, so it never ran and lapses
+    // back to the queue however long ago it was offered; `c` would be
+    // orphaned but its lease passed first, so it is `LeaseExpired`.
+    // Restart inside the lease and the classes differ:
+    assert_eq!(state(&f, ids[0]), JobState::Terminal(Outcome::InfraFailed));
+    assert_eq!(state(&f, ids[1]), JobState::Queued);
+    assert_eq!(state(&f, ids[2]), JobState::Terminal(Outcome::InfraFailed));
+    assert_eq!(state(&f, ids[3]), JobState::Leased);
+    assert_eq!(
+        f.store
+            .read(|c| sentinel_store::jobs::get_job(c, f.tenant, ids[2]))
+            .unwrap()
+            .failure_class,
+        Some(FailureClass::LeaseExpired)
+    );
+
+    // Same shape, restart inside the lease: the unanswered offer lapses by
+    // the ack timeout and the revoked worker's attempt is orphaned.
+    let (_, ids2) = run(&f, TWO_JOBS, at(50_000));
+    let gone2 = worker(
+        &f,
+        f.pool,
+        Capacity {
+            cpu_millis: 8_000,
+            memory_bytes: 16 << 30,
+        },
+    );
+    let o1 = place(&f, gone2, f.pool, at(50_100)).unwrap();
+    let o2 = place(&f, w, f.pool, at(50_100)).unwrap();
+    let (o1a, o1f) = (o1.attempt, o1.fence);
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::acknowledge(tx, gone2, o1a, o1f, at(50_200))?;
+            workers::revoke(tx, Authority::HostLocal, gone2, at(50_300))
+        })
+        .unwrap();
+    let settled = f
+        .store
+        .writer()
+        .write(move |tx| dispatch::reconcile_startup(tx, at(50_100 + dispatch::OFFER_ACK_MS)))
+        .unwrap();
+    assert_eq!(
+        settled,
+        dispatch::Reconciled {
+            expired: 0,
+            lapsed: 1,
+            orphaned: 1
+        }
+    );
+    assert_eq!(state(&f, ids2[0]), JobState::Terminal(Outcome::InfraFailed));
+    assert_eq!(
+        f.store
+            .read(|c| sentinel_store::jobs::get_job(c, f.tenant, ids2[0]))
+            .unwrap()
+            .failure_class,
+        Some(FailureClass::Reconciled)
+    );
+    assert_eq!(state(&f, ids2[1]), JobState::Queued);
+    let _ = o2;
+
+    // Abandonment: a worker restarted with `d` in its leftovers hands it
+    // back under the fence; a wrong fence or a foreign worker is refused;
+    // an unacknowledged leftover simply lapses back to the queue.
+    assert!(matches!(
+        f.store
+            .writer()
+            .write(move |tx| dispatch::abandon(tx, w, da, Fence(df.0 + 1), at(60_000))),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        f.store.writer().write(move |tx| dispatch::abandon(
+            tx,
+            WorkerId::new(),
+            da,
+            df,
+            at(60_000)
+        )),
+        Err(Error::NotFound)
+    ));
+    assert_eq!(
+        f.store
+            .writer()
+            .write(move |tx| dispatch::abandon(tx, w, da, df, at(60_000)))
+            .unwrap(),
+        JobState::Terminal(Outcome::InfraFailed)
+    );
+    assert_eq!(
+        f.store
+            .read(|c| sentinel_store::jobs::get_job(c, f.tenant, ids[3]))
+            .unwrap()
+            .failure_class,
+        Some(FailureClass::Reconciled)
+    );
+    let again = place(&f, w, f.pool, at(60_100)).unwrap();
+    let (ga, gf) = (again.attempt, again.fence);
+    assert_eq!(
+        f.store
+            .writer()
+            .write(move |tx| dispatch::abandon(tx, w, ga, gf, at(60_200)))
+            .unwrap(),
+        JobState::Queued
+    );
+    // The stale attempt's completion is refused after the reconciliation.
+    assert!(matches!(
+        f.store.writer().write(move |tx| dispatch::report(
+            tx,
+            w,
+            da,
+            df,
+            Event::Passed,
+            None,
+            at(60_300)
+        )),
+        Err(Error::NotFound)
+    ));
+}
+
+#[test]
 fn queued_jobs_time_out_and_their_dependents_are_skipped() {
     let f = fixture();
     let (_, ids) = run(

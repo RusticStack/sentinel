@@ -110,6 +110,12 @@ pub enum ClientMessage {
         last_seq: u64,
         gaps: Vec<(u64, u64)>,
     },
+    /// The worker restarted with this attempt in its leftovers and cannot
+    /// say what happened: the controller reconciles it under the fence.
+    Abandon {
+        attempt: [u8; 16],
+        fence: u64,
+    },
     Bye,
 }
 
@@ -487,6 +493,8 @@ pub trait SessionHandler: Send + Sync {
     fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict;
     /// The attempt's log is complete through `last_seq`.
     fn log_end(&self, worker: WorkerId, attempt: AttemptId, last_seq: u64, gaps: &[(u64, u64)]);
+    /// The worker found the attempt in its leftovers after a restart.
+    fn abandoned(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
 }
 
 /// The rustls state and the socket it writes to. The lock is held only while
@@ -859,6 +867,11 @@ impl WorkerSession {
                     let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
                     handler.log_end(worker, id, last_seq, &gaps);
                 }
+                ClientMessage::Abandon { attempt, fence } => {
+                    let attempt =
+                        AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                    handler.abandoned(worker, attempt, Fence(fence));
+                }
                 ClientMessage::Bye => return Ok(()),
                 ClientMessage::Hello { .. } => return Err(Error::Protocol("second hello")),
             }
@@ -1008,6 +1021,14 @@ impl Reporter {
             step: frame.step,
             stream: frame.stream as u8,
             bytes: frame.bytes.clone(),
+        })
+    }
+
+    /// The attempt was in this worker's leftovers after a restart.
+    pub fn abandon(&self, attempt: AttemptId, fence: Fence) -> Result<()> {
+        self.0.send(&ClientMessage::Abandon {
+            attempt: *attempt.as_bytes(),
+            fence: fence.0,
         })
     }
 
