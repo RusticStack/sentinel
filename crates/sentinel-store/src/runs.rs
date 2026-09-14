@@ -43,7 +43,9 @@ pub fn create_run(
         ],
     )?;
     let mut ids = Vec::with_capacity(spec.pipeline.jobs.len());
-    let mut mark_index = tx.prepare_cached("UPDATE jobs SET spec_index = ?1 WHERE id = ?2")?;
+    let mut mark_index = tx.prepare_cached(
+        "UPDATE jobs SET spec_index = ?1, cpu_millis = ?3, memory_bytes = ?4 WHERE id = ?2",
+    )?;
     for (index, job) in spec.pipeline.jobs.iter().enumerate() {
         let id = JobId::new();
         jobs::insert_job(
@@ -55,7 +57,13 @@ pub fn create_run(
             DEFAULT_PRIORITY,
             index as i64,
         )?;
-        mark_index.execute(params![index as i64, id.as_bytes()])?;
+        mark_index.execute(params![
+            index as i64,
+            id.as_bytes(),
+            i64::from(job.spec.resources.cpu_millis),
+            i64::try_from(job.spec.resources.memory_bytes)
+                .map_err(|_| Error::InvalidInput("memory_bytes"))?
+        ])?;
         if let Some(digest) = sentinel_pipeline::run::ImageRef::parse(&job.spec.image)
             .ok()
             .and_then(|image| image.digest)

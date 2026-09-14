@@ -2,3 +2,5 @@
 data_dir = "/var/lib/sentinel"
 log_format = "text"
 log_level = "info"
+# Where workers connect. Loopback by default; exposing it is an explicit decision.
+listen = "127.0.0.1:7443"

@@ -40,6 +40,7 @@ Outcomes, in aggregation precedence from lowest to highest: `passed`, `skipped`,
 | `CancelBeforeStart` | controller | blocked, queued | canceled |
 | `QueueTimedOut` | controller | blocked, queued | timed_out |
 | `Leased(fence)` | controller | queued | leased (fence must increase) |
+| `OfferLapsed` | controller | leased | queued (fence unchanged; the attempt was declined or never acknowledged) |
 | `PreparationStarted` | worker | leased | preparing |
 | `StepsStarted` | worker | leased, preparing | running |
 | `FinalizationStarted` | worker | preparing, running | finalizing |
@@ -50,7 +51,7 @@ Outcomes, in aggregation precedence from lowest to highest: `passed`, `skipped`,
 | `Reconciled` | reconciler | leased … finalizing | infra_failed |
 | `Rerun` | controller | any terminal, cancel not requested | queued (fence unchanged) |
 
-Anything else is rejected without changing state: `Forbidden` (wrong actor), `StaleFence`, `Invalid` (no such edge), or `AlreadyTerminal` (terminal states absorb every event except a controller `Rerun`, which lets callers treat duplicate completions as idempotent acknowledgements). `Rerun` is the only exit from terminal: it re-queues the job under the same compiled spec without touching the fence, so the next lease advances it and a late report from the previous attempt is stale. A cancelled job cannot be rerun. The tests enumerate every state, event and actor combination and assert the machine never panics and never mutates on error.
+Anything else is rejected without changing state: `Forbidden` (wrong actor), `StaleFence`, `Invalid` (no such edge), or `AlreadyTerminal` (terminal states absorb every event except a controller `Rerun`, which lets callers treat duplicate completions as idempotent acknowledgements). `OfferLapsed` returns an unacknowledged lease to the queue without rewinding the fence, so the lapsed attempt's worker is stale in every direction and the next lease strictly advances. `Rerun` is the only exit from terminal: it re-queues the job under the same compiled spec without touching the fence, so the next lease advances it and a late report from the previous attempt is stale. A cancelled job cannot be rerun. The tests enumerate every state, event and actor combination and assert the machine never panics and never mutates on error.
 
 ## Failure classes
 

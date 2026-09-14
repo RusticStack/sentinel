@@ -2,3 +2,9 @@
 data_dir = "/var/lib/sentinel-worker"
 log_format = "text"
 log_level = "info"
+# Uncomment to connect: the address and the fingerprint the controller logged
+# at `link_listening`, and the one-time enrollment from `sentinel admin worker enroll`.
+# controller = "10.0.0.5:7443"
+# controller_fingerprint = "0000000000000000000000000000000000000000000000000000000000000000"
+# worker_name = "builder-1"
+# enrollment_file = "/etc/sentinel/enrollment"

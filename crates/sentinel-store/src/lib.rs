@@ -13,6 +13,7 @@
 
 pub mod auth;
 pub mod codec;
+pub mod dispatch;
 pub mod idempotency;
 pub mod jobs;
 pub mod local_auth;
@@ -37,7 +38,10 @@ use std::{
     time::Duration,
 };
 
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
+/// The transaction type writer closures receive; re-exported so callers
+/// outside this crate can name it without depending on rusqlite.
+pub use rusqlite::Transaction;
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 #[derive(Debug)]
 pub enum Error {

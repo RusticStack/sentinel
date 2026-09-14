@@ -8,12 +8,17 @@
 //! fingerprint with its enrollment and accepts exactly that server. Identity is
 //! a key you hold, not a name somebody vouched for.
 //!
-//! Nothing here schedules work: offers, leases and logs are W02–W05. This crate
-//! establishes *who is on the other end* and *whether they are still there*.
+//! W02 adds the dispatch loop on top: a `controller` (behind the feature of
+//! that name, which brings in the store) that listens, admits, places work
+//! and pushes fenced offers; and a `worker` loop that reconnects with
+//! back-off, answers offers and renews its leases on every heartbeat.
 
+#[cfg(feature = "controller")]
+pub mod controller;
 pub mod identity;
 pub mod session;
 pub mod tls;
+pub mod worker;
 
 use std::fmt;
 
@@ -30,6 +35,9 @@ pub enum Error {
     Lost,
     /// The controller refused the hello; the worker must not retry unchanged.
     Rejected(session::Rejection),
+    /// The controller's own store refused or failed; the session ends and the
+    /// worker reconnects. Never carries the store's detail across the wire.
+    Internal(&'static str),
     Io(std::io::Error),
 }
 
@@ -41,6 +49,7 @@ impl fmt::Display for Error {
             Self::Protocol(what) => write!(f, "protocol violation: {what}"),
             Self::Lost => f.write_str("peer stopped answering"),
             Self::Rejected(why) => write!(f, "rejected: {why:?}"),
+            Self::Internal(what) => write!(f, "controller: {what}"),
             Self::Io(e) => write!(f, "io: {e}"),
         }
     }

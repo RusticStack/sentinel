@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# The controller's side: listener, admission, fleet and dispatcher over the store.
+controller = ["dep:sentinel-store"]
+
 [dependencies]
 blake3 = "1.8"
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
@@ -17,9 +22,12 @@ rustls-pki-types = "1.15"
 sentinel-auth = { path = "../sentinel-auth" }
 sentinel-core = { path = "../sentinel-core" }
 sentinel-protocol = { path = "../sentinel-protocol" }
+sentinel-store = { path = "../sentinel-store", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
+sentinel-link = { path = ".", features = ["controller"] }
+sentinel-pipeline = { path = "../sentinel-pipeline" }
 sentinel-store = { path = "../sentinel-store" }
 tempfile = "3.20"
 

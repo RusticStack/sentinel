@@ -2,7 +2,7 @@
 
 A purpose-built, fully open-source, self-hosted CI engine designed from scratch for maximum performance: fast PR feedback, local-first caching, efficient multi-machine scheduling, and readable diagnostics for humans and coding agents.
 
-**Status: early development; runtime/measurement foundations, core/store/protocol contracts, the pipeline compiler, durable authorization, local login/sessions, scoped API credentials, GitHub sign-in, admission policy, second-factor step-up and tenant suspension/pool grants and worker enrollment/sessions are implemented. The authenticated API surface and job execution are next.** See [plan.md](plan.md) for architecture, milestones, performance targets, and release criteria. The [Parts 01–02 audit](docs/parts-01-02-audit.md) records open execution-integration gates.
+**Status: early development; runtime/measurement foundations, core/store/protocol contracts, the pipeline compiler, durable authorization, local login/sessions, scoped API credentials, GitHub sign-in, admission policy, second-factor step-up and tenant suspension/pool grants, worker enrollment/sessions and the durable dispatch loop (reservations, fenced offers and leases over the worker link) are implemented. Job execution (W03) and the authenticated API surface are next.** See [plan.md](plan.md) for architecture, milestones, performance targets, and release criteria. The [Parts 01–02 audit](docs/parts-01-02-audit.md) records open execution-integration gates.
 
 Start development from [TODO.md](TODO.md): ordered work packages, stable task IDs, dependencies, the first runnable server/worker slice, and verification gates.
 
@@ -28,7 +28,7 @@ See [Admission](docs/admission.md) for registration policy, invitations, pending
 
 See the [Part 03 audit](docs/part-03-audit.md) for what was re-read, what was found and fixed, and what is deliberately left as is.
 
-See [Worker link](docs/worker-link.md) for one-time worker enrollment, worker-generated TLS identities pinned in both directions, and heartbeat sessions.
+See [Worker link](docs/worker-link.md) for one-time worker enrollment, worker-generated TLS identities pinned in both directions, heartbeat sessions that renew leases, and the wake-driven dispatch loop: the ready queue is the database, a reservation is an attempt, offers are fenced and acknowledged or lapse back to the queue.
 
 See [Tenancy](docs/tenancy.md) for tenant suspension, what it revokes and cancels, the authorization epoch that long-lived streams re-check, and pool grants.
 

@@ -12,9 +12,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Start the Linux controller lifecycle (CI scheduling is not implemented yet)
+    /// Start the Linux controller: metadata store, worker link and dispatcher
     Server(ServiceArgs),
-    /// Start the separate Linux worker lifecycle (job execution is not implemented yet)
+    /// Start the separate Linux worker: connects to its controller (execution lands with W03)
     Worker(ServiceArgs),
     /// Validate or explain a `.sentinel.yml` offline, on any platform
     Pipeline(PipelineArgs),

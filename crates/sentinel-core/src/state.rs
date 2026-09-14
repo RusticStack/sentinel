@@ -113,7 +113,7 @@ pub enum JobState {
     Blocked = 0,
     /// Eligible for dispatch; in the ready queue.
     Queued = 1,
-    /// Offered to a worker and acknowledged; fence assigned.
+    /// Leased to a worker under a fence; the offer is pending or acknowledged.
     Leased = 2,
     /// Worker is checking out, pulling images, restoring caches.
     Preparing = 3,
@@ -169,8 +169,13 @@ pub enum Event {
     DependenciesSatisfied,
     /// Controller: dependency outcome or condition rules the job out.
     Skip,
-    /// Controller: a worker acknowledged the offer; the new fence is recorded.
+    /// Controller: the job is leased to a worker under a new fence and the
+    /// offer is on its way; the worker's acknowledgement lands on the attempt.
     Leased(Fence),
+    /// Controller: the offer was declined or not acknowledged in time. Back
+    /// to the queue; the fence stays advanced so a late acknowledgement or
+    /// report from that attempt is stale.
+    OfferLapsed,
     /// Worker: preparation began.
     PreparationStarted,
     /// Worker: first step process started.
@@ -264,7 +269,10 @@ impl JobControl {
         }
         // Permission check first: a forbidden actor never learns validity details.
         match (actor, event) {
-            (Actor::Controller, Event::DependenciesSatisfied | Event::Skip | Event::Leased(_))
+            (
+                Actor::Controller,
+                Event::DependenciesSatisfied | Event::Skip | Event::Leased(_) | Event::OfferLapsed,
+            )
             | (
                 Actor::Controller,
                 Event::CancelBeforeStart
@@ -314,6 +322,7 @@ impl JobControl {
                 self.fence = fence;
                 JobState::Leased
             }
+            (JobState::Leased, Event::OfferLapsed) => JobState::Queued,
             (JobState::Leased, Event::PreparationStarted) => JobState::Preparing,
             (JobState::Leased | JobState::Preparing, Event::StepsStarted) => JobState::Running,
             (JobState::Preparing | JobState::Running, Event::FinalizationStarted) => {
@@ -455,10 +464,11 @@ mod tests {
         JobState::Terminal(Outcome::Failed),
         JobState::Terminal(Outcome::InfraFailed),
     ];
-    const ALL_EVENTS: [Event; 14] = [
+    const ALL_EVENTS: [Event; 15] = [
         Event::DependenciesSatisfied,
         Event::Skip,
         Event::Leased(Fence(1)),
+        Event::OfferLapsed,
         Event::PreparationStarted,
         Event::StepsStarted,
         Event::FinalizationStarted,
@@ -698,6 +708,43 @@ mod tests {
         assert!(matches!(
             at(JobState::Running, Fence(1)).apply(Actor::Controller, Event::Rerun),
             Err(TransitionError::Forbidden { .. })
+        ));
+    }
+
+    #[test]
+    fn a_lapsed_offer_requeues_without_rewinding_the_fence() {
+        let mut j = at(JobState::Queued, Fence::NONE);
+        j.apply(Actor::Controller, Event::Leased(Fence(1))).unwrap();
+        assert_eq!(
+            j.apply(Actor::Controller, Event::OfferLapsed),
+            Ok(JobState::Queued)
+        );
+        assert_eq!(j.fence, Fence(1));
+        // The lapsed attempt's worker is now stale in every direction.
+        assert!(matches!(
+            j.apply(Actor::Worker(Fence(1)), Event::PreparationStarted),
+            Err(TransitionError::Invalid { .. })
+        ));
+        assert_eq!(
+            j.apply(Actor::Controller, Event::Leased(Fence(2))),
+            Ok(JobState::Leased)
+        );
+        assert!(matches!(
+            j.apply(Actor::Worker(Fence(1)), Event::StepsStarted),
+            Err(TransitionError::StaleFence { .. })
+        ));
+        // Only the controller lapses an offer, and only from Leased.
+        for actor in [Actor::Worker(Fence(2)), Actor::Reconciler] {
+            assert!(matches!(
+                j.apply(actor, Event::OfferLapsed),
+                Err(TransitionError::Forbidden { .. })
+            ));
+        }
+        j.apply(Actor::Worker(Fence(2)), Event::StepsStarted)
+            .unwrap();
+        assert!(matches!(
+            j.apply(Actor::Controller, Event::OfferLapsed),
+            Err(TransitionError::Invalid { .. })
         ));
     }
 

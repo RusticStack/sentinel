@@ -263,7 +263,10 @@ pub fn pick_ready(conn: &Connection) -> Result<Option<(TenantId, JobId)>> {
 }
 
 /// Lease the job to `worker` with the next fence in one transaction: the
-/// attempt row and the `Leased` transition commit together or not at all.
+/// attempt row — which is also the resource reservation, copied from the job
+/// — and the `Leased` transition commit together or not at all. Whether the
+/// worker has room is [`crate::dispatch::place`]'s check, made in the same
+/// transaction; this is the durable half.
 ///
 /// Executable admission: a job whose image digest and platform are not yet
 /// durably resolved is refused with `Unresolved`. Its spec may exist; its
@@ -276,12 +279,14 @@ pub fn lease(
     lease_until: UnixMillis,
     now: UnixMillis,
 ) -> Result<(AttemptId, Fence)> {
-    let resolved: bool = tx
+    let (resolved, cpu_millis, memory_bytes): (bool, i64, i64) = tx
         .prepare_cached(
-            "SELECT image_digest IS NOT NULL AND image_platform IS NOT NULL
+            "SELECT image_digest IS NOT NULL AND image_platform IS NOT NULL, cpu_millis, memory_bytes
              FROM jobs WHERE id = ?1 AND tenant_id = ?2",
         )?
-        .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| r.get(0))
+        .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
         .optional()?
         .ok_or(Error::NotFound)?;
     if !resolved {
@@ -299,15 +304,19 @@ pub fn lease(
     )?;
     let attempt = AttemptId::new();
     tx.execute(
-        "INSERT INTO attempts(id, tenant_id, job_id, fence, worker_id, lease_until_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO attempts(id, tenant_id, job_id, fence, worker_id, lease_until_ms,
+                              cpu_millis, memory_bytes, offered_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             attempt.as_bytes(),
             tenant.as_bytes(),
             job.as_bytes(),
             fence.0 as i64,
             worker.as_bytes(),
-            lease_until.0
+            lease_until.0,
+            cpu_millis,
+            memory_bytes,
+            now.0
         ],
     )?;
     Ok((attempt, fence))

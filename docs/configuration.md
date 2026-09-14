@@ -38,9 +38,18 @@ The complete current file schema is:
 data_dir = "/srv/sentinel/controller"
 log_format = "text"
 log_level = "info"
+# server only: where workers connect (default 127.0.0.1:7443)
+listen = "0.0.0.0:7443"
+# worker only: the controller to reach and the fingerprint it logged at `link_listening`
+controller = "10.0.0.5:7443"
+controller_fingerprint = "<64 lower-case hex characters>"
+worker_name = "builder-1"          # 1-128 bytes, default "worker"
+enrollment_file = "/etc/sentinel/enrollment"  # absolute; read on start, removed once spent
+cpu_millis = 8000                  # override measured capacity (default: every core)
+memory_bytes = 34359738368         # override measured capacity (default: total less a host reserve)
 ```
 
-All three fields are optional in the file. Empty files use the logging defaults above and the role data path:
+The three common fields are optional in the file; `listen` is refused for the worker and the worker keys for the server; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
 
 - Server: `/var/lib/sentinel`
 - Worker: `/var/lib/sentinel-worker`
@@ -72,7 +81,7 @@ Start the worker in another:
 ./target/release/sentinel worker --data-dir "$PWD/data/worker"
 ```
 
-Alternatively use `--config examples/server.toml` or `--config examples/worker.toml`, overriding `--data-dir` for a development account. The server process never starts the worker process. These processes currently have no network connection to one another.
+Alternatively use `--config examples/server.toml` or `--config examples/worker.toml`, overriding `--data-dir` for a development account. The server process never starts the worker process. The server listens for workers on `listen` and logs `link_listening` with the address and the fingerprint workers pin; a worker with `controller`/`controller_fingerprint` configured connects, enrolls on its first hello with the secret in `enrollment_file`, and reconnects with back-off thereafter. See [worker link](worker-link.md#processes).
 
 ## Host-local administration
 
@@ -100,7 +109,7 @@ Passwords are read from standard input only; no subcommand accepts one in argv, 
 - Ctrl+C / `SIGINT`, service-manager `SIGTERM`, and `SIGHUP` request a clean exit. SIGHUP is **shutdown**, not configuration reload.
 - A handler is registered before directory initialization. A capacity-one notification channel retains a shutdown request during startup and coalesces repeated requests; the main thread blocks without polling while idle.
 - Structured startup and lifecycle diagnostics go to stderr. Help, version and successful `--check` output go to stdout. Bootstrap CLI/configuration errors remain plaintext.
-- The main thread closes the bounded I/O/CPU lanes (one second per lane) and drains internal diagnostics (500 ms). Incomplete lane shutdown or diagnostic sink failure returns exit code 1. There are currently no jobs, durable writers or sockets to drain. Future subsystems must add bounded cancellation/drain/flush before reporting stopped; current lifecycle shutdown is not evidence of durable job shutdown.
+- The main thread closes the bounded I/O/CPU lanes (one second per lane) and drains internal diagnostics (500 ms). Incomplete lane shutdown or diagnostic sink failure returns exit code 1. The server then closes worker sessions and stops the dispatcher (2 s) and drains the metadata store (5 s; a stall is reported and exits 1, and the store keeps database ownership until the process exits). The worker closes its session from the shutdown thread, so no heartbeat has to elapse. Nothing executes yet (W03), so there are no jobs to cancel; leases and offers are rows the next start reconciles.
 - Data directories and existing contents survive shutdown. Uncatchable termination such as SIGKILL cannot run cleanup.
 
 | Exit code | Meaning |

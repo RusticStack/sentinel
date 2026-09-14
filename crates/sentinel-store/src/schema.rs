@@ -103,4 +103,5 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (11, include_str!("migrations/011_tenancy.sql")),
     (12, include_str!("migrations/012_image_resolution.sql")),
     (13, include_str!("migrations/013_workers.sql")),
+    (14, include_str!("migrations/014_dispatch.sql")),
 ];

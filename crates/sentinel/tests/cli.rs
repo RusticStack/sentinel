@@ -340,10 +340,23 @@ mod linux {
                 let format = if signal == "-INT" { "text" } else { "json" };
                 let temp = tempdir().unwrap();
                 let data_dir = temp.path().join("data");
+                // The server binds an ephemeral port so parallel tests never collide.
+                let config = temp.path().join("config.toml");
+                fs::write(
+                    &config,
+                    if role == "server" {
+                        "listen = '127.0.0.1:0'"
+                    } else {
+                        ""
+                    },
+                )
+                .unwrap();
                 let mut child = ChildGuard(
                     Command::new(env!("CARGO_BIN_EXE_sentinel"))
                         .args([
                             role,
+                            "--config",
+                            config.to_str().unwrap(),
                             "--data-dir",
                             data_dir.to_str().unwrap(),
                             "--log-format",
@@ -433,5 +446,192 @@ mod linux {
                 }
             }
         }
+    }
+
+    /// A JSON-logging child whose stderr is collected on a thread.
+    struct Logged {
+        child: ChildGuard,
+        lines: mpsc::Receiver<String>,
+        seen: Vec<serde_json::Value>,
+    }
+
+    impl Logged {
+        fn spawn(args: &[&str]) -> Logged {
+            let mut child = ChildGuard(
+                Command::new(env!("CARGO_BIN_EXE_sentinel"))
+                    .args(args)
+                    .args(["--log-format", "json", "--log-level", "debug"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let stderr = child.0.stderr.take().unwrap();
+            let (sender, lines) = mpsc::channel();
+            thread::spawn(move || {
+                for line in BufReader::new(stderr).lines() {
+                    if sender.send(line.unwrap()).is_err() {
+                        break;
+                    }
+                }
+            });
+            Logged {
+                child,
+                lines,
+                seen: Vec::new(),
+            }
+        }
+
+        /// The first record whose `event` field is `event`, waiting up to 15 s.
+        fn event(&mut self, event: &str) -> serde_json::Value {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(found) = self
+                    .seen
+                    .iter()
+                    .find(|record| record["fields"]["event"] == event)
+                {
+                    return found.clone();
+                }
+                let line = self
+                    .lines
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or_else(|_| panic!("no {event} before the deadline: {:?}", self.seen));
+                self.seen
+                    .push(serde_json::from_str(&line).expect("complete JSON event"));
+            }
+        }
+
+        fn terminate(mut self) {
+            assert!(
+                Command::new("kill")
+                    .args(["-TERM", &self.child.0.id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = self.child.0.try_wait().unwrap() {
+                    assert!(status.success(), "{status}");
+                    return;
+                }
+                assert!(Instant::now() < deadline, "shutdown timed out");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// The whole W02 path through the real binaries: an operator prepares a
+    /// pool and an enrollment on the controller's host, the server listens,
+    /// the worker enrolls on its first hello, and both stop cleanly.
+    #[test]
+    fn a_worker_process_enrolls_with_a_running_server_process() {
+        if !(cfg!(feature = "server") && cfg!(feature = "worker")) {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let controller_dir = temp.path().join("controller");
+        let worker_dir = temp.path().join("worker");
+        let admin = |args: &[&str]| {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+                .args(["admin"])
+                .args(args)
+                .args(["--data-dir", controller_dir.to_str().unwrap()])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            // Only bootstrap reads it; the others get EOF.
+            std::io::Write::write_all(
+                child.stdin.as_mut().unwrap(),
+                b"correct horse battery staple",
+            )
+            .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        fs::create_dir_all(&controller_dir).unwrap();
+        admin(&["bootstrap", "--username", "root"]);
+        admin(&["tenant", "create", "--slug", "acme"]);
+        admin(&["pool", "create", "--name", "builders", "--tenant", "acme"]);
+        let secret = admin(&["worker", "enroll", "--pool", "builders"]);
+        let enrollment = temp.path().join("enrollment");
+        fs::write(&enrollment, &secret).unwrap();
+
+        let server_config = temp.path().join("server.toml");
+        fs::write(&server_config, "listen = '127.0.0.1:0'").unwrap();
+        let mut server = Logged::spawn(&[
+            "server",
+            "--config",
+            server_config.to_str().unwrap(),
+            "--data-dir",
+            controller_dir.to_str().unwrap(),
+        ]);
+        let listening = server.event("link_listening");
+        let addr = listening["fields"]["addr"].as_str().unwrap().to_owned();
+        let fingerprint = listening["fields"]["fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(fingerprint.len(), 64);
+        // A second controller on the same data directory is refused.
+        let second = invoke(&[
+            "server",
+            "--config",
+            server_config.to_str().unwrap(),
+            "--data-dir",
+            controller_dir.to_str().unwrap(),
+        ]);
+        assert_eq!(second.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&second.stderr).contains("one controller"));
+
+        let worker_config = temp.path().join("worker.toml");
+        fs::write(
+            &worker_config,
+            format!(
+                "controller = '{addr}'\ncontroller_fingerprint = '{fingerprint}'\nworker_name = 'builder-1'\nenrollment_file = '{}'\ncpu_millis = 2000\nmemory_bytes = 1073741824\n",
+                enrollment.display()
+            ),
+        )
+        .unwrap();
+        let check = invoke(&[
+            "worker",
+            "--config",
+            worker_config.to_str().unwrap(),
+            "--data-dir",
+            worker_dir.to_str().unwrap(),
+            "--check",
+        ]);
+        assert!(check.status.success());
+        assert!(String::from_utf8_lossy(&check.stdout).contains(&format!("controller={addr}")));
+        let mut worker = Logged::spawn(&[
+            "worker",
+            "--config",
+            worker_config.to_str().unwrap(),
+            "--data-dir",
+            worker_dir.to_str().unwrap(),
+        ]);
+        let connected = worker.event("link_connected");
+        assert_eq!(connected["fields"]["enrolled"], true);
+        // The spent enrollment is removed; the identity and id persist.
+        assert!(!enrollment.exists());
+        assert!(worker_dir.join("worker.key").exists());
+        let id = fs::read_to_string(worker_dir.join("worker.id")).unwrap();
+        assert!(id.starts_with("wrk_"));
+        assert_eq!(connected["fields"]["worker"].as_str().unwrap(), id.trim());
+
+        worker.terminate();
+        server.terminate();
+        // The worker is enrolled in the pool for good.
+        let listed = admin(&["worker", "list", "--pool", "builders"]);
+        assert!(listed.contains(id.trim()), "{listed}");
+        assert!(listed.contains("builder-1"));
     }
 }

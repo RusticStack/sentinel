@@ -33,7 +33,7 @@ On Windows, run the Linux checks inside WSL2 with `export CARGO_TARGET_DIR=targe
 |---|---|
 | `crates/sentinel-core` | Pure contracts: IDs, state machine, failure classes; see [docs/core-contracts.md](docs/core-contracts.md) |
 | `crates/sentinel-auth` | Password hashing, opaque secrets, cookie/CSRF policy, TOTP/recovery codes, sealed storage; see [local authentication](docs/local-authentication.md), [API credentials](docs/api-credentials.md), [step-up](docs/step-up.md) |
-| `crates/sentinel-link` | Worker link: generated TLS identity, pinned mutual TLS, framing, hello/heartbeat; see [worker link](docs/worker-link.md) |
+| `crates/sentinel-link` | Worker link: generated TLS identity, pinned mutual TLS, full-duplex framing, hello/heartbeat, the controller's dispatch loop (`controller` feature) and the worker's reconnect loop; see [worker link](docs/worker-link.md) |
 | `crates/sentinel-github` | GitHub sign-in: bounded HTTPS client, code exchange, verified identity; see [GitHub sign-in](docs/github-sign-in.md) |
 | `crates/sentinel-store` | SQLite metadata store, single durable writer; see [docs/storage.md](docs/storage.md) |
 | `crates/sentinel-protocol` | Errors, idempotency, cursors, limits, negotiation; see [docs/protocol.md](docs/protocol.md) |
