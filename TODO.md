@@ -34,7 +34,7 @@ The parts are work packages, not a requirement to finish every checkbox in numer
 | 02 | Core contracts, SQLite and pipeline compiler | Part 01 | M1 |
 | 03 | Identity, tenants and registration | Core ownership schema in Part 02 | M1–M2 |
 | 04 | First durable server/worker execution | Parts 02 and basic authorization in 03 | M1 |
-| 05 | GitHub App and PR feedback | Parts 03–04 | M1 |
+| 05 | Git sources, event intake and GitHub PR feedback | Parts 03–04 | M1 |
 | 06 | Local storage, artifact and log durability | Core transitions/spool in 04 | M1–M3 |
 | 07 | Local cache, compiler and image fast paths | Worker in 04; publication primitives in 06 | M3, prototype earlier |
 | 08 | Fleet scheduling, recovery and Tailcat | Part 04; ownership from 03 | M2 |
@@ -53,7 +53,7 @@ The parts are work packages, not a requirement to finish every checkbox in numer
 
 Sequence: `F01–F05` -> `C01–C05` -> `A01–A03` -> `W01–W09`. Implement the minimum working scope of these parts first, then complete their remaining cases. Use a dedicated Linux test host/VM for rootless runtime checks; Windows/macOS CLI development does not substitute for Linux executor validation.
 
-After that, connect one GitHub App repository through Part 05 and run the first local-cache experiment in Part 07. Baseline capture and performance instrumentation begin in Part 01, not after the UI is finished.
+After that, connect generic Git repositories and one GitHub App repository with native PR Checks through Part 05, and run the first local-cache experiment in Part 07. Baseline capture and performance instrumentation begin in Part 01, not after the UI is finished.
 
 ## Part 00 — Completed groundwork
 
@@ -115,16 +115,20 @@ After that, connect one GitHub App repository through Part 05 and run the first 
 
 **Checkpoint:** an authorized job runs outside the server, reports durable truthful status/log completeness, and recovers predictably. Record ready-to-first-process latency now.
 
-## Part 05 — GitHub App and PR feedback
+## Part 05 — Git sources, event intake and GitHub PR feedback
 
-- [ ] **G01** Implement App installation/repository binding for org and personal accounts, scoped short-lived source tokens, permission validation and installation lifecycle updates.
-- [ ] **G02** Add raw-body webhook signature verification, size limits, durable delivery dedup/acknowledgement and asynchronous bounded pipeline/source resolution.
-- [ ] **G03** Implement push/PR/tag/manual source policies, exact head/base/source SHA provenance, duplicate-event policy and immutable compiled-run creation. Unknown installation/config failure must produce explicit outcomes.
-- [ ] **G04** Implement a durable Checks outbox with retry/backoff/rate-limit handling, per-job and stable required aggregate checks, `details_url`, correct conclusions and stale-attempt protection.
-- [ ] **G05** Handle rerequests and ambiguous check-creation responses without uncontrolled duplicates; reconcile interrupted deliveries/check updates and installation access removal/rename/transfer.
-- [ ] **G06** Verify a real PR on a dedicated pilot repo: pass/fail/config error/cancel/rerun/new push and `gh pr checks`. Record webhook, source resolution, dispatch and GitHub propagation independently.
+**Scope:** provider-independent Git execution/intake for Gitea, Forgejo, GitLab and bare repositories; native GitHub PR feedback remains required. Other forges use Sentinel UI/API results for now; their native webhooks, PR/MR metadata, sign-in and status integrations are deferred. See [Git sources and forge boundaries](plan.md#git-sources-and-forge-boundaries).
 
-**Checkpoint:** the first real PR receives accurate Sentinel checks. Already-accepted work does not wait on GitHub status synchronization.
+- [ ] **G01** Implement tenant-owned generic repository binding (approved clone URL, allowed refs, pipeline path and credential reference), read-only HTTPS credentials/SSH deploy keys with CA/host trust and rotation/revocation, and bounded controller/worker source credential delivery. Reuse sealed storage without waiting for Part 10's general secret UX. Add GitHub App binding for org and personal accounts, scoped short-lived source tokens, permission validation and installation lifecycle updates through an optional forge association; a generic repository needs no installation or GitHub account. Follow the versioned migration/protocol policy for existing bindings and credential delivery.
+- [ ] **G02** Add a shared durable intake path for authenticated generic ref-update events and GitHub webhooks: raw-body GitHub signature verification, size limits, tenant/repo authorization, durable delivery dedup/acknowledgement and asynchronous bounded pipeline/source resolution. Supply a server-side `post-receive` hook/relay example with bounded durable retry, stable delivery IDs and explicit overflow/failure reporting; it submits events rather than running CI in the hook.
+- [ ] **G03** Implement shared push/tag/manual source policies and GitHub PR policies, exact pipeline/head/base/source SHA provenance, duplicate/reordered-event policy and immutable compiled-run creation. Resolve the pipeline from the authorized repository at the policy-selected pinned revision; preserve explicit manual pipeline submission as a separately identified mode. Unknown binding/installation, inaccessible revision and config failure must produce explicit Sentinel outcomes and GitHub Checks where associated; generic refs do not imply PR metadata or fork trust.
+- [ ] **G04** Implement a durable GitHub Checks outbox with retry/backoff/rate-limit handling, per-job and stable required aggregate checks, `details_url`, correct conclusions and stale-attempt protection. Keep delivery mechanics reusable without requiring a forge publisher for generic Git runs.
+- [ ] **G05** Handle GitHub rerequests and ambiguous check-creation responses without uncontrolled duplicates; reconcile interrupted deliveries/check updates and installation access removal/rename/transfer.
+- [ ] **G06** Verify a real GitHub PR on a dedicated pilot repo: pass/fail/config error/cancel/rerun/new push and `gh pr checks`. Record webhook, source resolution, dispatch and GitHub propagation independently. Native GitHub PR feedback is a required Part 05 gate.
+- [ ] **G07** Add opt-in bounded Git ref polling through `git ls-remote` and the G02–G03 intake/resolution path: selected refs, per-host/concurrency/output/time budgets, jitter/backoff, durable observations and restart-safe admission. Define initial discovery, ref creation/deletion, force-push, annotated-tag peeling and overlap with hook deliveries. Polling builds observed ref changes, cannot guarantee every intermediate push, and must not become the scheduler's dispatch clock. Depends on G01–G03.
+- [ ] **G08** Verify generic Git intake against Gitea, Forgejo and GitLab self-hosted fixtures plus a bare repository, without provider APIs: private HTTPS/SSH access, manual/hook/poll triggers, pinned pipeline/source, pass/fail/config error/cancel/rerun, credential revocation, duplicate events, restart and cross-tenant refusals. Verify results through Sentinel UI/API and record trigger/source/dispatch timing and polling overhead separately; unavailable fixtures are explicit blockers. Depends on G01–G03 and G07.
+
+**Checkpoint:** generic Git repositories run with truthful Sentinel UI/API results, and the first real GitHub PR receives accurate native per-job and required aggregate Checks. Already-accepted work does not wait on GitHub status synchronization. Other forge-native PR/MR feedback is not a Part 05 gate.
 
 ## Part 06 — Local storage, artifacts and log durability
 
@@ -338,4 +342,4 @@ Append concise entries as work lands; reference existing test reports/benchmark 
 
 | W09 | Commit titled `test: exercise the vertical slice under cancel, network loss and restarts`; [vertical slice](docs/vertical-slice.md), [cancellation](docs/cancellation.md); verified 2026-09-14 | Added `Controller::handle().disconnect(worker)` (an operator's forced fresh session; the test's network loss) and `Executor::set_prepare_hold` (a zero-by-default pause between checkout and pull so a cancel during preparation is deterministic). Found and fixed: a cancel during preparation was classified `Preparation` and left an unclosed log/spool; the preparation-failure path now checks the cancel flag and closes the output. `crates/sentinel-link/tests/duplicate.rs` (Windows and Linux): a hand-rolled controller repeats an offer; the worker acknowledges twice and its executor is asked once. `crates/sentinel-worker/tests/slice.rs` as `sentinelbench` (rootless Podman, ~22 s): five jobs dispatched and read through the real API — `ok` passed with its log, `bad` failed `command_failed` with stderr, `held` cancelled during its preparation hold as `canceled` with no container, `long` passed across a dropped and re-established session with every log frame exactly once, `slow` passed across a controller restart (same store/logs/identity/address, reconciliation settling nothing, worker reconnecting); five `Started` notices, every fence 1, nothing owned, no workspace, spool or marker left. Lost ack, cancel during run, worker restart and stale lease are the W02/W06/W07 suites, unchanged and green. Windows `fmt-check`/`lint`/`test-cli` (53 suites)/`release-cli` and WSL2 `lint-linux`/`test-linux`/`release-linux` passed. Not covered: the two binaries under these failures (only under enrollment/API/signals), a real 30 s lease wait in the slice, load and network environments (Blocked by the audit's hardware/DERP items). |
 
-**Next task:** G01 — App installation/repository binding for org and personal accounts with scoped short-lived source credentials (the first task of the GitHub intake part, now that Part 04's runtime exists for it to feed).
+**Next task:** G01 — tenant-owned generic Git repository binding and source credentials, with GitHub App installation binding and scoped short-lived tokens as the first forge adapter. Part 05 requires native GitHub PR Checks; other forges initially use generic Git intake and Sentinel UI/API results.

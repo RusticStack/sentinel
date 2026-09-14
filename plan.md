@@ -7,7 +7,7 @@ Development tracker: [TODO.md](TODO.md) splits this design into actionable parts
 
 ## 1. Product contract
 
-Build a fully open-source, self-hosted CI engine optimized for fast feedback on organization **and personal** GitHub repositories. GitHub remains the forge; Sentinel owns execution, scheduling, logs, caches, artifacts, and diagnostics. Borrow Woodpecker's independent-server/runner model and Blacksmith's emphasis on fast startup, local data, and observability.
+Build a fully open-source, self-hosted CI engine optimized for fast feedback on organization **and personal** Git repositories, including self-hosted Gitea, Forgejo, GitLab and bare repositories. GitHub is the first native forge integration, with required PR Checks; other forges initially use generic Git intake and Sentinel UI/API results. Sentinel owns execution, scheduling, logs, caches, artifacts, and diagnostics. Borrow Woodpecker's independent-server/runner model and Blacksmith's emphasis on fast startup, local data, and observability.
 
 - Rust control plane, worker, storage modules, CLI, and MCP integration.
 - One host to start; multiple heterogeneous workers are a v1 requirement.
@@ -51,7 +51,7 @@ Inspected `RusticStack/sentinel` at `ba6c583715c16fde498d646577c98bc60c221adb`: 
 
 ### Scope boundaries
 
-V1: Linux x86_64/arm64 server/workers; multiple org/personal GitHub App installations; authentication and super-admin registrations; OAuth CLI/HTTP MCP; CLI-managed secrets; own YAML and job DAGs; trusted-code rootless containers; local/remote workers; Tailcat; first-class caches/artifacts; UI/CLI/MCP; backup/restore; quotas and operating limits. This is a purpose-built CI engine with specialized scheduling, storage, caching, and diagnostics, not a general automation platform. Different project toolchains run through images/commands without repository-specific scheduler rules.
+V1: Linux x86_64/arm64 server/workers; provider-independent Git repository connections with manual/generic hook/opt-in polling intake; multiple org/personal GitHub App installations and native PR Checks; authentication and super-admin registrations; OAuth CLI/HTTP MCP; CLI-managed secrets; own YAML and job DAGs; trusted-code rootless containers; local/remote workers; Tailcat; first-class caches/artifacts; UI/CLI/MCP; backup/restore; quotas and operating limits. Gitea/Forgejo/GitLab native webhooks, PR/MR metadata, sign-in and status adapters are deferred; generic Git operation needs no GitHub account. This is a purpose-built CI engine with specialized scheduling, storage, caching, and diagnostics, not a general automation platform. Different project toolchains run through images/commands without repository-specific scheduler rules.
 
 Incremental general features: named pipelines, schedules/typed inputs, multi-repository checkout, outputs/finalizers, and conservative declared-input result reuse. Add only with a small general contract and measured value. Later/optional: hostile fork execution, microVM runtime, Docker/Compose compatibility environment, generic matrix expansion, declarative service containers, reusable pipelines, deployment environments/OIDC, Windows/macOS execution, multi-controller HA, and cloud autoscaling. Image builds and registry publishing can be repository commands on compatible authorized workers; no mandatory built-in release engine or VM fleet.
 
@@ -60,7 +60,7 @@ No Actions YAML compatibility or marketplace/plugin runtime in v1. Inventory cur
 ## 3. Architecture and dependencies
 
 ```text
-GitHub webhook -> sentinel server -> durable queue / scheduler
+Git/API/hook/poll -> sentinel server -> durable queue / scheduler
                     |      |                 |
                  UI/API  SQLite      persistent authenticated sessions
                     |                        |
@@ -73,7 +73,7 @@ GitHub webhook -> sentinel server -> durable queue / scheduler
 
 One Rust workspace, initially one `sentinel` binary with subcommands:
 
-- `server`: API, webhook intake, scheduler, GitHub synchronization, embedded UI assets, metadata/storage maintenance.
+- `server`: API, generic Git and forge event intake, bounded source/pipeline resolution and opt-in ref polling, scheduler, GitHub synchronization, embedded UI assets, metadata/storage maintenance.
 - `worker`: executor and local store; connects to server even on the same host.
 - Developer/operator CLI commands.
 - `mcp`: stdio adapter using the same API. Authenticated Streamable HTTP can be served by the server.
@@ -103,9 +103,9 @@ One active controller owns the database. No shared SQLite over NFS and no unsafe
 
 ### Dispatch path
 
-1. Verify webhook signature on raw body; enforce size limits.
+1. Authenticate and authorize the trigger against its tenant-owned repository; verify GitHub webhook signatures on the raw body and enforce size limits. Manual dispatch, generic ref-update events and optional ref polling share intake with forge adapters.
 2. Transactionally deduplicate delivery and persist intake; acknowledge promptly. Fetch pipeline/source metadata asynchronously with bounded retry.
-3. Pin event identity, pipeline revision, source SHA, checkout policy, and compiled spec. Invalid configuration produces a visible failed check.
+3. Pin event identity, pipeline revision, source SHA, checkout policy, and compiled spec. Invalid configuration produces a visible Sentinel failure and, for GitHub-associated work, a failed check.
 4. Persist dependency-ready jobs; immediately wake scheduler after commit.
 5. Filter workers by repository access, trust pool, OS/architecture, runtime, labels, free CPU/RAM/disk, and connectivity.
 6. Reserve resources and create a fenced lease transactionally; offer through an already-connected worker session.
@@ -359,13 +359,13 @@ Serve lightweight build-time UI assets from Rust; choose stack after accessible 
 - Built-in counters/histograms and scrapeable metrics; external observability optional.
 - Tenant/repository switcher with explicit active scope. Super-admin console for registration requests, users/tenants, suspension, pool grants, quotas, and audit; tenant admins get only their own administration views.
 
-## 11. GitHub and authorization
+## 11. Git sources, GitHub and authorization
 
 ### Authentication, registration, and multiple organizations
 
-**Model:** one deployment -> many tenants/namespaces -> authorized GitHub installations/repositories. Users may belong to several tenants with different roles. Personal namespaces use the same model. A tenant can link several GitHub organizations; an installation has one owning tenant by default, preventing accidental duplicate intake or conflicting required checks. Cross-tenant sharing is never inferred from matching names, email domains, or org membership.
+**Model:** one deployment -> many tenants/namespaces -> authorized Git repository connections, optionally associated with a forge installation. Users may belong to several tenants with different roles. Personal namespaces use the same model. A tenant can link several GitHub organizations; an installation has one owning tenant by default, preventing accidental duplicate intake or conflicting required checks. Generic repositories have Sentinel-owned stable IDs and need no installation. Cross-tenant sharing is never inferred from matching URLs, names, email domains, or org membership.
 
-**Authentication:** GitHub sign-in for normal users plus a local administrative login/recovery path so operators are not locked out during GitHub outages. Local passwords use a maintained Argon2id implementation with rate limits, breached-attempt throttling, secure recovery, and no default password. Support TOTP plus hashed one-use recovery codes for local privileged accounts; require step-up for super-admin role/registration/auth-policy changes. External OIDC/SSO can follow through an auth-provider boundary; no mandatory identity server.
+**Authentication:** GitHub sign-in or local Sentinel accounts, with local administrative recovery so operators are not locked out during GitHub outages. Generic Git users need no GitHub identity; human sign-in is independent of repository access credentials. Local passwords use a maintained Argon2id implementation with rate limits, breached-attempt throttling, secure recovery, and no default password. Support TOTP plus hashed one-use recovery codes for local privileged accounts; require step-up for super-admin role/registration/auth-policy changes. External OIDC/SSO can follow through an auth-provider boundary; no mandatory identity server.
 
 - Bootstrap the first super admin with a local operator command or expiring single-use setup secret, not “first visitor wins.” Disable bootstrap after successful setup; provide audited host-local recovery and prevent removing the last active super admin.
 - GitHub identity is provider + immutable user ID. Do not auto-link accounts by email. Account linking requires authentication of both identities. Sign-in uses validated state/redirects and PKCE where supported; exact provider flow is verified at implementation.
@@ -395,7 +395,21 @@ Tenant suspension stops intake/schedules/dispatch, revokes sessions/tokens/grant
 
 Acceptance tests: at least two orgs and a personal namespace on one deployment; overlapping user memberships with different roles; invitation races/reuse; last-admin protection/recovery; pending/closed registration; unbound installation; suspension during streaming/execution; tenant ID/cursor/artifact/cache substitution; queue fairness under one noisy tenant; cross-repo checkout denial; role revocation across UI/CLI/MCP.
 
+### Git sources and forge boundaries
+
+Part 05 implements three separate concerns: trigger adapters -> shared authorized source/pipeline resolution and durable run creation -> existing execution plus optional forge result publishing. GitHub's native PR feedback is required in this part; generic Git runs publish results through Sentinel UI/API. Dedicated Gitea, Forgejo and GitLab adapters are deferred, not prerequisites for their repositories to run.
+
+- **Repository binding (G01):** a tenant-owned stable repository ID binds an administrator-approved clone URL, allowed refs, pipeline path and credential reference. Support self-hosted hostnames/ports, private CA trust and pinned SSH host trust. Restrict transports and destinations through deployment policy; event bodies and pipeline YAML cannot replace the bound remote or grant source access. Migrate existing bindings under the compatibility policy rather than encoding generic repositories as fake GitHub installations.
+- **Source credentials (G01):** public repositories, read-only HTTPS credentials and SSH deploy keys share a scoped source-access path with GitHub App tokens. Generic credentials may be long-lived; seal stored secrets with the existing key-outside-database mechanism, support rotation/revocation and revalidate live grants before issuing fetch access. Deliver credentials only to authorized source-resolution/checkout operations, outside immutable specs, URLs, logs and job environments, over the authenticated worker link under versioned protocol rules. Reuse existing sealed storage now; Part 10 supplies the broader secret-management UX later.
+- **Events (G02):** manual API calls, authenticated generic ref-update events, GitHub webhooks and G07 observations feed one bounded durable intake. The generic contract identifies the bound repository, stable delivery ID, ref and old/new object IDs; authenticate before accepting, scope deduplication to the connection/repository and persist before acknowledgement. A documented server-side `post-receive` hook/relay uses bounded durable retry and exposes delivery/overflow failures; it never waits for CI completion. Hook availability depends on host administration; native forge webhook payloads need translation and are not automatically compatible.
+- **Resolution (G03):** resolve the policy-selected pipeline revision and checkout revision through Git, pin both before compilation/admission, and fail explicitly when a revision is no longer fetchable. Preserve explicit manual pipeline submission as a distinct provenance mode. Bound subprocess time, output, fetched data and concurrent work; remote I/O never holds the database writer. Define branch/tag create/delete, annotated-tag peeling, force-push, duplicate/reordered events and overlap between intake methods. A commit ID alone is not a delivery identity: returning a ref to an earlier commit is a distinct transition. PR head/base/tested-merge provenance and trust policies belong to the GitHub adapter; Git refs alone do not prove PR metadata or trusted fork code.
+- **Polling (G07):** opt-in `git ls-remote` for selected refs, with per-host/concurrency/output/time budgets, jitter and backoff. Persist observations and resulting intake atomically, or through recoverable pending observations, so a crash cannot advance a cursor while losing work. Specify initial discovery and deletion behavior. Polling builds observed ref changes and can miss intermediate pushes; it is not an every-push delivery guarantee or the scheduler's dispatch clock. Prefer events for low latency and measure polling overhead independently.
+- **Feedback (G04–G06):** GitHub App authentication, webhook/PR semantics and Checks publishing remain adapter-specific. Reuse durable outbox delivery mechanics, but do not make a forge publisher mandatory for generic runs or block dispatch on external status updates. Git alone provides neither PR/MR lifecycle nor native merge-protection checks. Generic Git operation therefore has no native PR/MR feedback guarantee for other forges yet.
+- **Acceptance (G06, G08):** retain the real GitHub PR/required-check pilot and add self-hosted Gitea, Forgejo, GitLab and bare-repository fixtures exercised without provider APIs. Cover private HTTPS/SSH, manual/hook/poll intake, pinned pipeline/source, truthful outcomes, revocation, duplicate delivery, restart and tenant isolation. Report unavailable fixtures as blockers and distinguish trigger detection, source resolution, dispatch and external feedback latency.
+
 ### GitHub integration
+
+Native GitHub PR feedback is a required Part 05/M1 capability, alongside generic Git support. The adapter uses the shared source/intake/run path above.
 
 - Org/personal GitHub App installations with selected repos. Store immutable IDs; handle install removal/suspension, repo access change/rename/transfer.
 - Base permissions: contents read, checks write, pull requests read, metadata read. Org members read only for org-membership policies; personal installations use owner/collaborator or explicit grants. Additional features request only necessary permissions.
@@ -454,11 +468,11 @@ Gate: history verified, prerequisites and migration blockers documented, benchma
 
 ### M1 — Durable single-host vertical slice
 
-- Rust server/worker, SQLite migrations, authenticated enrollment/session, strict basic schema, manual dispatch, one App repo, exact checkout, isolated container, spool, Checks outbox.
+- Rust server/worker, SQLite migrations, authenticated enrollment/session, strict basic schema, generic Git bindings and manual/hook/opt-in polling intake, one GitHub App repo, exact checkout, isolated container, spool, GitHub Checks outbox.
 - Leases/reservations/timeouts/cancel/dedup/restart reconciliation from the start; CLI status/logs and minimal new run UI.
 - First-admin bootstrap, local/GitHub login, sessions, tenant-scoped data model, reader/operator/admin authorization, and closed/invite-only registration before real private repository access.
 
-Gate: real PR green/red; duplicate delivery creates no duplicate logical run; restart/cancel tests pass; server never executes jobs. No cache required yet.
+Gate: real GitHub PR green/red with native required Checks; generic Git pilots on self-hosted Gitea/Forgejo/GitLab and a bare repository produce truthful Sentinel UI/API results without provider APIs; duplicate delivery creates no duplicate logical run; restart/cancel tests pass; server never executes jobs. Other forge-native PR/MR feedback is deferred. No cache required yet.
 
 ### M2 — Fleet and queue reliability
 

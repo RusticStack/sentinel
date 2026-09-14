@@ -56,7 +56,7 @@ See [Runtime foundations](docs/runtime-foundation.md) for structured diagnostics
 
 See [Benchmarking](docs/benchmarking.md) for the machine-readable benchmark runner and the no-op rootless-runtime baseline, [CI baseline](docs/ci-baseline.md) for the measured Lockwell CI topology and timings Sentinel must beat, and [feasibility probes](docs/feasibility-probes.md) for the SQLite, Podman, reflink and Tailcat decisions.
 
-The new implementation will use a Rust core and its own pipeline format. GitHub will remain the forge, with results published through Checks. The default deployment will use embedded SQLite and Sentinel-owned local storage, with optional external S3 and Tailcat-connected workers.
+The new implementation will use a Rust core and its own pipeline format. Part 05 will add provider-independent Git repository connections and manual, generic hook and opt-in polling intake for Gitea, Forgejo, GitLab and bare repositories, with results in Sentinel's UI/API. GitHub is the first native forge integration: GitHub App access and native PR Checks are required in Part 05; other forge-native PR/MR integrations are deferred. See [Git sources and forge boundaries](plan.md#git-sources-and-forge-boundaries). The default deployment will use embedded SQLite and Sentinel-owned local storage, with optional external S3 and Tailcat-connected workers.
 
 One deployment will support multiple organizations and personal namespaces, super-admin registration controls, OAuth-authenticated CLI/MCP, CLI-managed secrets, and tenant-scoped workers/data. [Lockwell](docs/lockwell-migration.md) is a representative workload whose CI adapts to Sentinel; it does not dictate the engine's architecture.
 
