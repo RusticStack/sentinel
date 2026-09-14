@@ -1,0 +1,27 @@
+[package]
+name = "sentinel-api"
+description = "The controller's HTTP API: authenticated dispatch, status, cancel, rerun, worker status and log tail/follow, plus the thin web page"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+sentinel-auth = { path = "../sentinel-auth" }
+sentinel-core = { path = "../sentinel-core" }
+sentinel-link = { path = "../sentinel-link", features = ["controller"] }
+sentinel-pipeline = { path = "../sentinel-pipeline" }
+sentinel-protocol = { path = "../sentinel-protocol" }
+sentinel-store = { path = "../sentinel-store" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tiny_http = { version = "0.12", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.20"
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+
+[lints]
+workspace = true

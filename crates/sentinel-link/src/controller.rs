@@ -600,6 +600,12 @@ impl Controller {
         self.reconciled
     }
 
+    /// A cheap handle for other subsystems (the API) to wake the dispatcher
+    /// and ask who is connected, without owning the controller.
+    pub fn handle(&self) -> Handle {
+        Handle(Arc::clone(&self.inner))
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
@@ -688,6 +694,26 @@ fn accept_loop(inner: &Arc<Inner>, listener: &TcpListener) {
         if spawned.is_err() {
             inner.sessions.fetch_sub(1, Ordering::AcqRel);
         }
+    }
+}
+
+/// See [`Controller::handle`].
+#[derive(Clone)]
+pub struct Handle(Arc<Inner>);
+
+impl Handle {
+    pub fn wake(&self) {
+        self.0.wake();
+    }
+
+    pub fn connected(&self) -> Vec<WorkerId> {
+        self.0
+            .fleet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .copied()
+            .collect()
     }
 }
 

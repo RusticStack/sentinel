@@ -36,10 +36,11 @@ On Windows, run the Linux checks inside WSL2 with `export CARGO_TARGET_DIR=targe
 | `crates/sentinel-link` | Worker link: generated TLS identity, pinned mutual TLS, full-duplex framing, hello/heartbeat, the controller's dispatch loop (`controller` feature) and the worker's reconnect loop; see [worker link](docs/worker-link.md) |
 | `crates/sentinel-github` | GitHub sign-in: bounded HTTPS client, code exchange, verified identity; see [GitHub sign-in](docs/github-sign-in.md) |
 | `crates/sentinel-store` | SQLite metadata store, single durable writer; see [docs/storage.md](docs/storage.md) |
+| `crates/sentinel-api` | The controller's HTTP API and the first page; see [API](docs/api.md) |
 | `crates/sentinel-worker` | Linux executor: fresh workspaces, exact-revision checkout, rootless Podman containers, attempt lifecycle, log redaction and spool; see [executor](docs/executor.md), [logs](docs/logs.md) |
 | `crates/sentinel-protocol` | Errors, idempotency, cursors, limits, negotiation; see [docs/protocol.md](docs/protocol.md) |
 | `crates/sentinel-pipeline` | `.sentinel.yml` loader, schema and compiler; see [docs/pipeline-schema.md](docs/pipeline-schema.md) |
-| `crates/sentinel` | CLI plus Linux `server`/`worker` roles behind features |
+| `crates/sentinel` | CLI (`pipeline`, `api` client, host-local `admin`) plus Linux `server`/`worker` roles behind features |
 | `crates/sentinel-bench` | Benchmark runner; see [docs/benchmarking.md](docs/benchmarking.md) |
 | `crates/sentinel-probes` | SQLite/clone probes; see [docs/feasibility-probes.md](docs/feasibility-probes.md) |
 | `bench/` | Committed machine-readable benchmark records |

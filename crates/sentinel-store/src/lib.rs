@@ -24,6 +24,7 @@ pub mod registration;
 pub mod runs;
 pub mod schema;
 pub mod sign_in;
+pub mod status;
 pub mod tenancy;
 pub mod tokens;
 pub mod workers;

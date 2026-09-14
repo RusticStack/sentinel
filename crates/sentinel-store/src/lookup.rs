@@ -84,6 +84,39 @@ pub fn run_tenant(conn: &Connection, run: sentinel_core::RunId) -> Result<sentin
     sentinel_core::TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))
 }
 
+/// The repository a run belongs to.
+pub fn run_repo(conn: &Connection, run: sentinel_core::RunId) -> Result<RepoId> {
+    let repo: [u8; 16] = conn
+        .prepare_cached("SELECT repo_id FROM runs WHERE id = ?1")?
+        .query_row([run.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))
+}
+
+/// The run a job belongs to.
+pub fn job_run(conn: &Connection, job: sentinel_core::JobId) -> Result<sentinel_core::RunId> {
+    let run: [u8; 16] = conn
+        .prepare_cached("SELECT run_id FROM jobs WHERE id = ?1")?
+        .query_row([job.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    sentinel_core::RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))
+}
+
+/// The job an attempt belongs to.
+pub fn attempt_job(
+    conn: &Connection,
+    attempt: sentinel_core::AttemptId,
+) -> Result<sentinel_core::JobId> {
+    let job: [u8; 16] = conn
+        .prepare_cached("SELECT job_id FROM attempts WHERE id = ?1")?
+        .query_row([attempt.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    sentinel_core::JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))
+}
+
 pub fn pool_by_name(conn: &Connection, name: &str) -> Result<sentinel_core::PoolId> {
     let bytes: [u8; 16] = conn
         .prepare_cached("SELECT id FROM pools WHERE name = ?1")?

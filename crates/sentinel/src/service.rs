@@ -22,6 +22,9 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 /// Where the controller listens for workers unless configured otherwise:
 /// loopback, so exposing it is an explicit decision.
 const DEFAULT_LISTEN: &str = "127.0.0.1:7443";
+/// Where the API answers unless configured otherwise: loopback; TLS and
+/// exposure are the reverse proxy's.
+const DEFAULT_API_LISTEN: &str = "127.0.0.1:7080";
 /// Bounded drains at shutdown: sessions and dispatcher, then the store.
 const LINK_SHUTDOWN: Duration = Duration::from_secs(2);
 const STORE_SHUTDOWN: Duration = Duration::from_secs(5);
@@ -56,8 +59,9 @@ struct FileConfig {
     data_dir: Option<PathBuf>,
     log_format: Option<LogFormat>,
     log_level: Option<LogLevel>,
-    // Server: where workers connect.
+    // Server: where workers connect, and where the API answers.
     listen: Option<String>,
+    api_listen: Option<String>,
     // Worker: which controller to reach and how to trust it.
     controller: Option<String>,
     controller_fingerprint: Option<String>,
@@ -80,7 +84,10 @@ struct WorkerLink {
 }
 
 enum Role {
-    Server { listen: SocketAddr },
+    Server {
+        listen: SocketAddr,
+        api_listen: SocketAddr,
+    },
     Worker(Option<WorkerLink>),
 }
 
@@ -183,10 +190,20 @@ impl Config {
                 .map_err(|_| {
                     Error::config("listen must be an IP address and port, as in 0.0.0.0:7443")
                 })?;
-            Role::Server { listen }
+            let api_listen = file
+                .api_listen
+                .as_deref()
+                .unwrap_or(DEFAULT_API_LISTEN)
+                .parse()
+                .map_err(|_| {
+                    Error::config("api_listen must be an IP address and port, as in 127.0.0.1:7080")
+                })?;
+            Role::Server { listen, api_listen }
         } else {
-            if file.listen.is_some() {
-                return Err(Error::config("listen applies to the server role only"));
+            if file.listen.is_some() || file.api_listen.is_some() {
+                return Err(Error::config(
+                    "listen and api_listen apply to the server role only",
+                ));
             }
             let link = match (file.controller, file.controller_fingerprint) {
                 (None, None) => {
@@ -255,7 +272,9 @@ impl Config {
 
     fn describe(&self) -> String {
         match &self.role {
-            Role::Server { listen } => format!("listen={listen}"),
+            Role::Server { listen, api_listen } => {
+                format!("listen={listen} api_listen={api_listen}")
+            }
             Role::Worker(None) => "controller=none (idle)".to_owned(),
             Role::Worker(Some(link)) => format!(
                 "controller={} controller_fingerprint={} worker_name={}",
@@ -414,6 +433,7 @@ enum Running {
     #[cfg(feature = "server")]
     Server {
         controller: sentinel_link::controller::Controller,
+        api: sentinel_api::Server,
         store: Arc<sentinel_store::Store>,
     },
     #[cfg(feature = "worker")]
@@ -424,7 +444,11 @@ enum Running {
 }
 
 #[cfg(feature = "server")]
-fn start_server(config: &Config, listen: SocketAddr) -> Result<Running, Error> {
+fn start_server(
+    config: &Config,
+    listen: SocketAddr,
+    api_listen: SocketAddr,
+) -> Result<Running, Error> {
     let path = config.data_dir.join(sentinel_store::METADATA_FILE);
     let store =
         sentinel_store::Store::open(&path, sentinel_store::Durability::Full).map_err(|error| {
@@ -439,12 +463,13 @@ fn start_server(config: &Config, listen: SocketAddr) -> Result<Running, Error> {
     let store = Arc::new(store);
     let identity = identity(&config.data_dir, "controller")?;
     let fingerprint = hex32(&identity.fingerprint().0);
-    let logs =
+    let logs = Arc::new(
         sentinel_store::logs::LogStore::open(config.data_dir.join(sentinel_store::logs::LOGS_DIR))
-            .map_err(|error| Error::runtime(format!("cannot open the log store: {error}")))?;
+            .map_err(|error| Error::runtime(format!("cannot open the log store: {error}")))?,
+    );
     let controller = sentinel_link::controller::Controller::start(
         Arc::clone(&store),
-        Arc::new(logs),
+        Arc::clone(&logs),
         identity,
         listen,
     )
@@ -459,7 +484,20 @@ fn start_server(config: &Config, listen: SocketAddr) -> Result<Running, Error> {
         orphaned = reconciled.orphaned,
         "workers pin this fingerprint with their enrollment"
     );
-    Ok(Running::Server { controller, store })
+    let api = sentinel_api::Server::start(sentinel_api::Config {
+        listen: api_listen,
+        store: Arc::clone(&store),
+        logs: Arc::clone(&logs),
+        controller: controller.handle(),
+        sessions: sentinel_store::local_auth::Policy::default(),
+    })
+    .map_err(|error| Error::runtime(format!("cannot listen on {api_listen}: {error}")))?;
+    tracing::info!(event = "api_listening", addr = %api.local_addr());
+    Ok(Running::Server {
+        controller,
+        api,
+        store,
+    })
 }
 
 #[cfg(feature = "worker")]
@@ -694,7 +732,7 @@ fn initialize_and_wait(
             .map_err(|error| Error::runtime(format!("cannot initialize data_dir: {error}")))?;
         match &config.role {
             #[cfg(feature = "server")]
-            Role::Server { listen } => start_server(config, *listen),
+            Role::Server { listen, api_listen } => start_server(config, *listen, *api_listen),
             #[cfg(feature = "worker")]
             Role::Worker(Some(link)) => worker_role::start(config, link),
             #[allow(unreachable_patterns)]
@@ -718,7 +756,12 @@ fn initialize_and_wait(
     match running {
         Running::Idle => Ok(()),
         #[cfg(feature = "server")]
-        Running::Server { controller, store } => {
+        Running::Server {
+            controller,
+            api,
+            store,
+        } => {
+            api.shutdown();
             let sessions_drained = controller.shutdown(LINK_SHUTDOWN);
             let store_drained = matches!(
                 Arc::try_unwrap(store)

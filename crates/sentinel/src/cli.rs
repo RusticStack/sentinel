@@ -20,6 +20,95 @@ pub enum Command {
     Pipeline(PipelineArgs),
     /// Host-local administration of local login, on the controller's own host
     Admin(AdminArgs),
+    /// Talk to a controller's API with a credential: dispatch, status, logs, cancel, rerun, workers
+    Api(ApiArgs),
+}
+
+/// Client options: the controller and the credential come from flags or
+/// `SENTINEL_SERVER`/`SENTINEL_TOKEN`; a token file keeps the secret out of
+/// the process list.
+#[derive(Args)]
+pub struct ApiArgs {
+    /// Controller URL, such as http://127.0.0.1:7080
+    #[arg(long, env = "SENTINEL_SERVER")]
+    pub server: Option<String>,
+    /// A `sntl_` credential (prefer --token-file)
+    #[arg(long, env = "SENTINEL_TOKEN", hide_env_values = true)]
+    pub token: Option<String>,
+    /// File holding the credential
+    #[arg(long, value_name = "PATH")]
+    pub token_file: Option<PathBuf>,
+    /// Print the server's JSON instead of text
+    #[arg(long)]
+    pub json: bool,
+    #[command(subcommand)]
+    pub command: ApiCommand,
+}
+
+#[derive(Subcommand)]
+pub enum ApiCommand {
+    /// Who the credential is
+    Me,
+    /// Dispatch a run of a pipeline file against a pinned source revision
+    Run {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        repo: String,
+        /// The `.sentinel.yml` to run; every image must be pinned by digest
+        #[arg(long, value_name = "FILE")]
+        pipeline: PathBuf,
+        /// Clone URL or path the workers fetch from
+        #[arg(long)]
+        source: String,
+        /// Full commit SHA to check out
+        #[arg(long)]
+        sha: String,
+        /// Ref name kept as provenance
+        #[arg(long)]
+        r#ref: Option<String>,
+        /// Idempotency key so a retried dispatch creates one run
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// A run and its jobs
+    Status {
+        #[arg(value_name = "RUN")]
+        run: String,
+    },
+    /// Recent runs of a repository
+    Runs {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        repo: String,
+        #[arg(long, default_value_t = 20)]
+        limit: u16,
+    },
+    /// Record cancellation for a run or a job
+    Cancel {
+        #[arg(long, conflicts_with = "job")]
+        run: Option<String>,
+        #[arg(long)]
+        job: Option<String>,
+    },
+    /// A new attempt of a finished job
+    Rerun {
+        #[arg(value_name = "JOB")]
+        job: String,
+    },
+    /// An attempt's log; --follow waits until it is complete
+    Logs {
+        #[arg(value_name = "ATTEMPT")]
+        attempt: String,
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Pools and workers a tenant may use, with connection state
+    Workers {
+        #[arg(long)]
+        tenant: String,
+    },
 }
 
 /// Authorized by access to the controller's data directory, not by a session.

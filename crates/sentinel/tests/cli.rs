@@ -345,7 +345,7 @@ mod linux {
                 fs::write(
                     &config,
                     if role == "server" {
-                        "listen = '127.0.0.1:0'"
+                        "listen = '127.0.0.1:0'\napi_listen = '127.0.0.1:0'"
                     } else {
                         ""
                     },
@@ -564,9 +564,42 @@ mod linux {
         let secret = admin(&["worker", "enroll", "--pool", "builders"]);
         let enrollment = temp.path().join("enrollment");
         fs::write(&enrollment, &secret).unwrap();
+        // A credential for the CLI, issued host-locally before the server takes
+        // ownership of the database: one controller owns it, and admin
+        // commands run beside a stopped server.
+        let token_file = temp.path().join("token");
+        let issued = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+            .args([
+                "admin",
+                "token",
+                "issue",
+                "--data-dir",
+                controller_dir.to_str().unwrap(),
+                "--user",
+                "root",
+                "--name",
+                "cli",
+                "--scope",
+                "read,run,platform-admin",
+                "--expires-in",
+                "1h",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            issued.status.success(),
+            "{}",
+            String::from_utf8_lossy(&issued.stderr)
+        );
+        let credential = issued.stdout.clone();
+        fs::write(&token_file, "not-a-token\n").unwrap();
 
         let server_config = temp.path().join("server.toml");
-        fs::write(&server_config, "listen = '127.0.0.1:0'").unwrap();
+        fs::write(
+            &server_config,
+            "listen = '127.0.0.1:0'\napi_listen = '127.0.0.1:0'",
+        )
+        .unwrap();
         let mut server = Logged::spawn(&[
             "server",
             "--config",
@@ -575,6 +608,8 @@ mod linux {
             controller_dir.to_str().unwrap(),
         ]);
         let listening = server.event("link_listening");
+        let api = server.event("api_listening");
+        let api_url = format!("http://{}", api["fields"]["addr"].as_str().unwrap());
         let addr = listening["fields"]["addr"].as_str().unwrap().to_owned();
         let fingerprint = listening["fields"]["fingerprint"]
             .as_str()
@@ -626,6 +661,67 @@ mod linux {
         let id = fs::read_to_string(worker_dir.join("worker.id")).unwrap();
         assert!(id.starts_with("wrk_"));
         assert_eq!(connected["fields"]["worker"].as_str().unwrap(), id.trim());
+
+        // The CLI against the running server: a credential issued host-locally,
+        // `me`, a dispatch of a pinned pipeline, its status, and worker status
+        // showing the connected worker. Text and JSON output both.
+        fs::write(&token_file, "not-a-token\n").unwrap();
+        let api = |args: &[&str]| {
+            Command::new(env!("CARGO_BIN_EXE_sentinel"))
+                .args([
+                    "api",
+                    "--server",
+                    &api_url,
+                    "--token-file",
+                    token_file.to_str().unwrap(),
+                ])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let refused = api(&["me"]);
+        assert_eq!(refused.status.code(), Some(2));
+        fs::write(&token_file, &credential).unwrap();
+        let me = api(&["me"]);
+        assert!(
+            me.status.success(),
+            "{}",
+            String::from_utf8_lossy(&me.stderr)
+        );
+        assert!(String::from_utf8_lossy(&me.stdout).contains("via \"bearer\""));
+        let pipeline = temp.path().join("pipeline.yml");
+        fs::write(&pipeline, "schema: 1\non: [push]\njobs:\n  build:\n    image: docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662\n    steps: [{ id: s, run: 'true' }]\n").unwrap();
+        let no_repo = api(&[
+            "run",
+            "--tenant",
+            "acme",
+            "--repo",
+            "app",
+            "--pipeline",
+            pipeline.to_str().unwrap(),
+            "--source",
+            "/nowhere",
+            "--sha",
+            "0123456789abcdef0123456789abcdef01234567",
+        ]);
+        // `root` has no membership in acme yet: the repository is not visible.
+        assert_eq!(
+            no_repo.status.code(),
+            Some(4),
+            "{}",
+            String::from_utf8_lossy(&no_repo.stderr)
+        );
+        assert!(String::from_utf8_lossy(&no_repo.stderr).contains("not_found"));
+        let workers = api(&["--json", "workers", "--tenant", "acme"]);
+        assert!(
+            workers.status.success(),
+            "{}",
+            String::from_utf8_lossy(&workers.stderr)
+        );
+        let view: serde_json::Value = serde_json::from_slice(&workers.stdout).unwrap();
+        assert_eq!(view["pools"][0]["name"], "builders");
+        assert_eq!(view["pools"][0]["workers"][0]["connected"], true);
+        assert_eq!(view["pools"][0]["workers"][0]["id"], id.trim());
 
         worker.terminate();
         server.terminate();

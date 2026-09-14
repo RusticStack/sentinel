@@ -6,6 +6,7 @@ compile_error!(
 #[cfg(all(target_os = "linux", feature = "server"))]
 mod admin;
 mod cli;
+mod client;
 mod pipeline;
 
 #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]
@@ -41,6 +42,15 @@ fn main() -> ExitCode {
         Command::Server(args) => ("server", args),
         Command::Worker(args) => ("worker", args),
         Command::Pipeline(args) => return pipeline::run(args),
+        Command::Api(args) => {
+            return match client::run(args) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {}", error.message);
+                    ExitCode::from(error.code)
+                }
+            };
+        }
         Command::Admin(args) => return run_admin(args),
     };
 
