@@ -418,7 +418,7 @@ impl SessionHandler for Inner {
                 let spec = resolve_spec(
                     &store,
                     key.as_deref(),
-                    app.as_deref(),
+                    app.as_ref(),
                     &destinations,
                     worker,
                     attempt,
@@ -538,47 +538,11 @@ impl SessionHandler for Inner {
         }
     }
 
-    fn spec(&self, worker: WorkerId, attempt: AttemptId) -> Option<(JobContext, Vec<u8>)> {
-        self.store
-            .read(|c| {
-                let context = dispatch::job_context(c, worker, attempt)?;
-                let bytes = dispatch::spec_bytes(c, worker, attempt)?;
-                Ok((
-                    JobContext {
-                        source: {
-                            let bound: bool = c.query_row(
-                                "SELECT EXISTS(SELECT 1 FROM source_bindings WHERE repo_id=?1)",
-                                [context.repo.as_bytes()],
-                                |r| r.get(0),
-                            )?;
-                            if bound {
-                                let now = UnixMillis::now();
-                                let (tenant, repo) =
-                                    sentinel_store::sources::attempt_repo(c, worker, attempt, now)?;
-                                let key = self
-                                    .source_key
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .clone()
-                                    .ok_or(sentinel_store::Error::Forbidden)?;
-                                Some(sentinel_store::sources::issue(c, tenant, repo, &key, now)?)
-                            } else {
-                                None
-                            }
-                        },
-                        run: context.run,
-                        repo: context.repo,
-                        repo_name: context.repo_name,
-                        job: context.job,
-                        job_name: context.job_name,
-                        sha: context.sha,
-                        cancelled: context.cancelled,
-                        needs: context.needs,
-                    },
-                    bytes,
-                ))
-            })
-            .ok()
+    /// The synchronous fallback is never used by this controller: it resolves
+    /// specs on its own thread ([`Inner::spec_requested`]) so that GitHub
+    /// round trips and credential minting happen outside the session thread.
+    fn spec(&self, _worker: WorkerId, _attempt: AttemptId) -> Option<(JobContext, Vec<u8>)> {
+        None
     }
 
     fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict {
@@ -629,17 +593,19 @@ impl SessionHandler for Inner {
 fn resolve_spec(
     store: &Store,
     key: Option<&sentinel_auth::sealed::Key>,
-    app: Option<&sentinel_github::app::App>,
+    app: Option<&Arc<sentinel_github::app::App>>,
     destinations: &[String],
     worker: WorkerId,
     attempt: AttemptId,
 ) -> sentinel_store::Result<(JobContext, Vec<u8>)> {
-    use sentinel_store::{Error as StoreError, sources, sources_forge};
-    let (mut context, bytes, forge) = store.read(|conn| {
+    use sentinel_store::{Error as StoreError, sources};
+    // One read snapshot: the attempt's context and spec, the binding that
+    // authorizes it, and the destination policy.
+    let (mut context, bytes, binding) = store.read(|conn| {
         let tx = conn.unchecked_transaction()?;
         let c = dispatch::job_context(&tx, worker, attempt)?;
         let bytes = dispatch::spec_bytes(&tx, worker, attempt)?;
-        let mut context = JobContext {
+        let context = JobContext {
             source: None,
             run: c.run,
             repo: c.repo,
@@ -647,71 +613,51 @@ fn resolve_spec(
             job: c.job,
             job_name: c.job_name,
             sha: c.sha,
+            event: session::EventContext {
+                name: c.event.name,
+                ref_name: c.event.ref_name,
+                base_ref: c.event.base_ref,
+                pr_number: c.event.pr_number,
+                key: c.event.key,
+            },
             cancelled: c.cancelled,
             needs: c.needs,
         };
-        let forge = match sources::load_metadata(&tx, context.repo) {
-            Err(StoreError::NotFound) => None,
-            Err(e) => return Err(e),
-            Ok(m) => {
-                let authority = sentinel_protocol::source::remote(&m.binding.remote)
+        let binding = match sentinel_intake::source::lookup_conn(&tx, context.repo)? {
+            None => None,
+            Some(binding) => {
+                let authority = sentinel_protocol::source::remote(&binding.metadata.binding.remote)
                     .ok_or(StoreError::Forbidden)?;
                 if !destinations.iter().any(|d| d == authority) {
                     return Err(StoreError::Forbidden);
                 }
                 let now = UnixMillis::now();
                 let (tenant, repo) = sources::attempt_repo(&tx, worker, attempt, now)?;
+                if (tenant, repo) != (binding.tenant, binding.repo) {
+                    return Err(StoreError::Forbidden);
+                }
                 let spec = sentinel_pipeline::RunSpec::decode(&bytes)
                     .map_err(|_| StoreError::Corrupt("run spec"))?;
                 sources::validate_source(&tx, repo, &spec.source)?;
-                if m.forge.is_some() {
-                    Some((tenant, repo, m, sources_forge::grant(&tx, tenant, repo)?))
-                } else {
-                    context.source = Some(sources::issue(
-                        &tx,
-                        tenant,
-                        repo,
-                        key.ok_or(StoreError::Forbidden)?,
-                        now,
-                    )?);
-                    None
-                }
+                Some(binding)
             }
         };
-        Ok((context, bytes, forge))
+        Ok((context, bytes, binding))
     })?;
-    if let Some((tenant, repo, metadata, grant)) = forge {
-        let token = app
-            .ok_or(StoreError::Forbidden)?
-            .source_token(
-                grant.installation,
-                grant.account,
-                grant.repo,
-                &metadata.binding.remote,
-                UnixMillis::now().0,
-            )
+    if let Some(binding) = binding {
+        // The only network step; a revocation that lands while a token is
+        // being minted wins the race (rechecked inside `issue`).
+        let access = sentinel_intake::source::issue(store, key, app, &binding, UnixMillis::now())
             .map_err(|_| StoreError::Forbidden)?;
-        // HTTP ran without any database connection or writer lock held. A
-        // revoked lease, rotated binding or lifecycle update wins this race.
-        store.read(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            if sources::attempt_repo(&tx, worker, attempt, UnixMillis::now())? != (tenant, repo)
-                || sources::load_metadata(&tx, repo)?.version != metadata.version
-                || sources_forge::grant(&tx, tenant, repo)? != grant
-            {
+        // And the lease that authorized this delivery must still be live.
+        let (tenant, repo) = (binding.tenant, binding.repo);
+        store.read(move |conn| {
+            if sources::attempt_repo(conn, worker, attempt, UnixMillis::now())? != (tenant, repo) {
                 return Err(StoreError::Forbidden);
             }
             Ok(())
         })?;
-        context.source = Some(sentinel_protocol::source::Access {
-            binding: metadata.binding,
-            version: metadata.version,
-            expires_ms: token.expires_ms.min(UnixMillis::now().0 + 60_000),
-            credential: sentinel_protocol::source::Credential::Https {
-                username: "x-access-token".into(),
-                secret: token.secret,
-            },
-        });
+        context.source = Some(access);
     }
     Ok((context, bytes))
 }
@@ -723,9 +669,11 @@ fn send_resolved(
     spec: Option<(JobContext, Vec<u8>)>,
 ) -> Result<()> {
     use session::ServerMessage;
-    let Some((context, bytes)) = spec.filter(|(c, b)| {
-        b.len() <= session::MAX_SPEC_BYTES && (c.source.is_none() || protocol >= 2)
-    }) else {
+    // Protocol 3 carries the event context and (from 2) the source access;
+    // anything older is served `NoSpec` rather than a message it cannot decode.
+    let Some((context, bytes)) =
+        spec.filter(|(_, b)| protocol >= 3 && b.len() <= session::MAX_SPEC_BYTES)
+    else {
         return sender.send(&ServerMessage::NoSpec {
             attempt: *attempt.as_bytes(),
         });

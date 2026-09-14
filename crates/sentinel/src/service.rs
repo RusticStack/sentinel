@@ -482,26 +482,46 @@ fn start_server(
         crate::source_admin::load_destinations(&config.data_dir)
             .map_err(|_| Error::runtime("cannot load source destination policy"))?,
     );
-    if let Some(app) = crate::source_admin::load_app(&config.data_dir)
-        .map_err(|_| Error::runtime("cannot load GitHub App configuration"))?
-    {
-        controller.set_source_app(app);
+    let app = crate::source_admin::load_app(&config.data_dir)
+        .map_err(|_| Error::runtime("cannot load GitHub App configuration"))?;
+    if let Some(app) = &app {
+        controller.set_source_app(Arc::clone(app));
     }
     let source_key = config.data_dir.join("master.key");
-    if source_key.exists() {
-        controller.set_source_key(Arc::new(
+    let key = if source_key.exists() {
+        Some(Arc::new(
             sentinel_auth::sealed::Key::load(&source_key)
                 .map_err(|_| Error::runtime("cannot load source sealing key"))?,
-        ));
+        ))
+    } else {
+        None
+    };
+    if let Some(key) = &key {
+        controller.set_source_key(Arc::clone(key));
     }
-    // The durable intake lane: accepted deliveries are resolved off the
-    // request path, bounded, and woken by the intake route. Its thread is not
-    // inside the service's scoped diagnostic dispatcher, so the dispatcher is
-    // captured here and installed around each notice, exactly as `work.rs`
-    // does for its lanes.
+    // The durable intake lane: accepted deliveries are validated and
+    // resolved off the request path, bounded, and woken by the intake route.
+    // Its thread is not inside the service's scoped diagnostic dispatcher, so
+    // the dispatcher is captured here and installed around each notice,
+    // exactly as `work.rs` does for its lanes.
+    let resolver = sentinel_intake::Resolver::new(
+        Arc::clone(&store),
+        key.clone(),
+        app.clone(),
+        Arc::new(sentinel_intake::resolve::GitFetch),
+        config.data_dir.join("intake-work"),
+        sentinel_intake::resolve::Config::default(),
+    )
+    .map_err(|_| Error::runtime("cannot prepare the intake work directory"))?;
+    let dispatch_wake: Arc<dyn Fn() + Send + Sync> = {
+        let handle = controller.handle();
+        Arc::new(move || handle.wake())
+    };
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let lane = sentinel_intake::Lane::start(
         Arc::clone(&store),
+        Some(Arc::new(resolver)),
+        Some(dispatch_wake),
         sentinel_intake::lane::Config::default(),
         move |batch| {
             tracing::dispatcher::with_default(&dispatch, || {
@@ -511,6 +531,9 @@ fn start_server(
                         failed = batch.failed,
                         "deliveries settled with an explicit failure"
                     );
+                }
+                if batch.retried > 0 {
+                    tracing::info!(event = "intake_retried", retried = batch.retried);
                 }
                 for settled in &batch.settled {
                     tracing::info!(
@@ -702,7 +725,7 @@ mod worker_role {
             name: link.name.clone(),
             hello: sentinel_protocol::negotiate::Hello {
                 protocol_min: sentinel_protocol::negotiate::ProtocolVersion(1),
-                protocol_max: sentinel_protocol::negotiate::ProtocolVersion(1),
+                protocol_max: sentinel_protocol::negotiate::SUPPORTED_MAX,
                 capabilities: sentinel_protocol::negotiate::Capabilities::REQUIRED,
                 arch: if cfg!(target_arch = "aarch64") {
                     sentinel_protocol::negotiate::Arch::Aarch64

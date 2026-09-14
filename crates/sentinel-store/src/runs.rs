@@ -141,6 +141,25 @@ pub fn resolve_image(
     Ok(())
 }
 
+/// Every compiled job's digest-pinned image and platform, in job order, or
+/// the first failure: a malformed reference is `InvalidInput`, an unpinned one
+/// `Unresolved` (K05 resolves tags; until then an unpinned image is refused
+/// before a run exists, exactly as for manual dispatch).
+pub fn pinned_images(spec: &RunSpec) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::with_capacity(spec.pipeline.jobs.len());
+    for job in &spec.pipeline.jobs {
+        let image = sentinel_pipeline::ImageRef::parse(&job.spec.image)
+            .map_err(|_| Error::InvalidInput("image reference"))?;
+        let digest = image.digest.ok_or(Error::Unresolved)?;
+        let platform = match job.spec.runs_on.arch {
+            Some(sentinel_pipeline::schema::Arch::Arm64) => "linux/arm64".to_owned(),
+            _ => "linux/amd64".to_owned(),
+        };
+        out.push((digest, platform));
+    }
+    Ok(out)
+}
+
 /// What a job will run, or `Unresolved` if admission must still wait.
 pub fn resolved_image(conn: &Connection, tenant: TenantId, job: JobId) -> Result<ResolvedImage> {
     let row: Option<(Option<String>, Option<String>)> = conn

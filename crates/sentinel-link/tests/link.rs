@@ -187,7 +187,7 @@ use sentinel_core::JobId;
 fn hello() -> Hello {
     Hello {
         protocol_min: ProtocolVersion(1),
-        protocol_max: ProtocolVersion(1),
+        protocol_max: ProtocolVersion(3),
         capabilities: Capabilities::REQUIRED.union(Capabilities::REFLINK),
         arch: Arch::X86_64,
         software: "test".into(),
@@ -308,7 +308,7 @@ impl WorkerProcess {
         enrollment: Option<Secret>,
         executor: Arc<Recorder>,
     ) -> WorkerProcess {
-        Self::start_version(d, identity, id, enrollment, executor, 1)
+        Self::start_version(d, identity, id, enrollment, executor, 3)
     }
 
     fn start_version(
@@ -423,7 +423,7 @@ fn a_worker_enrolls_once_heartbeats_reconnects_and_is_refused_after_revocation()
     // With it: welcomed, negotiated, capacity recorded, beats answered.
     let mut link = d.connect(load(), worker, Some(&secret)).unwrap();
     assert_eq!(link.worker, worker);
-    assert_eq!(link.negotiated.protocol, ProtocolVersion(1));
+    assert_eq!(link.negotiated.protocol, ProtocolVersion(3));
     for _ in 0..3 {
         link.beat(&Idle).unwrap();
     }

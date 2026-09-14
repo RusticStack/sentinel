@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     expr::{Expr, Phase, Template},
+    policy::{MAX_REF_PATTERN_BYTES, MAX_REF_PATTERNS, RefFilter, Triggers, valid_pattern},
     yaml::Node,
 };
 
@@ -30,19 +31,10 @@ pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 60 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pipeline {
-    pub on: Vec<Trigger>,
+    pub on: Triggers,
     pub concurrency: Option<Concurrency>,
     /// Declaration order preserved; compilation sorts deterministically.
     pub jobs: Vec<(String, Job)>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum Trigger {
-    Push = 0,
-    PullRequest = 1,
-    Tag = 2,
-    Manual = 3,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,6 +336,159 @@ fn string_list(path: &str, node: &Node, max: usize, item_max: usize) -> Result<V
         out.push(expect_str(&format!("{path}[{i}]"), item, item_max)?.to_owned());
     }
     Ok(out)
+}
+
+/// Parse the `on:` policy. Two forms are accepted within schema 1:
+///
+/// ```yaml
+/// on: [push, tag]                    # every ref of those kinds
+/// on:
+///   push: {branches: [main, "release/*"]}
+///   tag: {tags: ["v*"]}
+///   pull_request: {branches: [main]}
+///   manual: true
+/// ```
+///
+/// The mapping form is the widening: every filter is optional, and an empty
+/// filter (`push: {}` or `push:`) means every branch of that kind.
+fn parse_triggers(path: &str, node: &Node) -> Result<Triggers> {
+    let mut triggers = Triggers::default();
+    match node {
+        Node::Seq(items) => {
+            if items.is_empty() {
+                return Err(err(path, SchemaErrorKind::Empty));
+            }
+            if items.len() > 4 {
+                return Err(err(path, SchemaErrorKind::TooMany { limit: 4 }));
+            }
+            for (i, item) in items.iter().enumerate() {
+                let p = format!("{path}[{i}]");
+                let kind = expect_str(&p, item, 16)?;
+                let kind = match kind {
+                    "push" => &mut triggers.push,
+                    "pull_request" => &mut triggers.pull_request,
+                    "tag" => &mut triggers.tag,
+                    "manual" => {
+                        if triggers.manual {
+                            return Err(err(
+                                &p,
+                                SchemaErrorKind::Invalid("duplicate trigger".into()),
+                            ));
+                        }
+                        triggers.manual = true;
+                        continue;
+                    }
+                    _ => {
+                        return Err(err(
+                            &p,
+                            SchemaErrorKind::Invalid(
+                                "expected push, pull_request, tag or manual".into(),
+                            ),
+                        ));
+                    }
+                };
+                if kind.is_some() {
+                    return Err(err(
+                        &p,
+                        SchemaErrorKind::Invalid("duplicate trigger".into()),
+                    ));
+                }
+                *kind = Some(RefFilter::default());
+            }
+            Ok(triggers)
+        }
+        Node::Map(_) => {
+            let mut map = Map::new(path, node)?;
+            if let Some(n) = map.take("push") {
+                triggers.push = Some(ref_filter(&map.child("push"), n, RefKind::Branch)?);
+            }
+            if let Some(n) = map.take("pull_request") {
+                triggers.pull_request =
+                    Some(ref_filter(&map.child("pull_request"), n, RefKind::Branch)?);
+            }
+            if let Some(n) = map.take("tag") {
+                triggers.tag = Some(ref_filter(&map.child("tag"), n, RefKind::Tag)?);
+            }
+            if let Some(n) = map.take("manual") {
+                let p = map.child("manual");
+                if !expect_bool(&p, n)? {
+                    return Err(err(
+                        &p,
+                        SchemaErrorKind::Invalid("`manual: true` or omit the key".into()),
+                    ));
+                }
+                triggers.manual = true;
+            }
+            map.finish()?;
+            if triggers.is_empty() {
+                return Err(err(
+                    path,
+                    SchemaErrorKind::Invalid("declares no trigger".into()),
+                ));
+            }
+            Ok(triggers)
+        }
+        other => Err(err(
+            path,
+            SchemaErrorKind::WrongType {
+                expected: "sequence or mapping",
+                found: other.kind(),
+            },
+        )),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefKind {
+    Branch,
+    Tag,
+}
+
+impl RefKind {
+    const fn accepted_key(self) -> &'static str {
+        match self {
+            Self::Branch => "branches",
+            Self::Tag => "tags",
+        }
+    }
+}
+
+/// One kind's ref filter: `null`/`{}` admits every ref of the kind, and only
+/// the kind's own key (`branches` or `tags`) is accepted; the other is an
+/// unknown key, reported by `finish`.
+fn ref_filter(path: &str, node: &Node, kind: RefKind) -> Result<RefFilter> {
+    let mut filter = RefFilter::default();
+    let mut map = match node {
+        Node::Null => return Ok(filter),
+        Node::Map(_) => Map::new(path, node)?,
+        other => {
+            return Err(err(
+                path,
+                SchemaErrorKind::WrongType {
+                    expected: "mapping",
+                    found: other.kind(),
+                },
+            ));
+        }
+    };
+    if let Some(n) = map.take(kind.accepted_key()) {
+        let p = map.child(kind.accepted_key());
+        let patterns = string_list(&p, n, MAX_REF_PATTERNS, MAX_REF_PATTERN_BYTES)?;
+        for (i, pattern) in patterns.iter().enumerate() {
+            valid_pattern(pattern).map_err(|why| {
+                err(
+                    &format!("{p}[{i}]"),
+                    SchemaErrorKind::Invalid(why.to_string()),
+                )
+            })?;
+        }
+        match kind {
+            RefKind::Branch => filter.branches = patterns,
+            RefKind::Tag => filter.tags = patterns,
+        }
+    }
+    map.finish()?;
+    Ok(filter)
 }
 
 /// Identifiers: `[a-z0-9][a-z0-9_-]*`, at most 64 bytes. Lowercase only so
@@ -955,35 +1100,7 @@ pub fn decode(root: &Node, policy: &ResourcePolicy) -> Result<Pipeline> {
     }
     let on = match map.take("on") {
         None => return Err(err("on", SchemaErrorKind::Missing)),
-        Some(n) => {
-            let items = expect_seq("on", n, 4)?;
-            let mut out: Vec<Trigger> = Vec::with_capacity(items.len());
-            for (i, item) in items.iter().enumerate() {
-                let p = format!("on[{i}]");
-                let t = match expect_str(&p, item, 16)? {
-                    "push" => Trigger::Push,
-                    "pull_request" => Trigger::PullRequest,
-                    "tag" => Trigger::Tag,
-                    "manual" => Trigger::Manual,
-                    _ => {
-                        return Err(err(
-                            &p,
-                            SchemaErrorKind::Invalid(
-                                "expected push, pull_request, tag or manual".into(),
-                            ),
-                        ));
-                    }
-                };
-                if out.contains(&t) {
-                    return Err(err(
-                        &p,
-                        SchemaErrorKind::Invalid("duplicate trigger".into()),
-                    ));
-                }
-                out.push(t);
-            }
-            out
-        }
+        Some(node) => parse_triggers("on", node)?,
     };
     let concurrency = match map.take("concurrency") {
         None => None,

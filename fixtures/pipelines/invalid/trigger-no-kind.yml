@@ -1,0 +1,5 @@
+# expect: on: declares no trigger
+schema: 1
+on: {}
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}]}

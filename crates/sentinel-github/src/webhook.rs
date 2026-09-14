@@ -93,6 +93,110 @@ pub fn parse_push(body: &[u8]) -> Result<Push> {
     })
 }
 
+/// A parsed `pull_request` payload. Git refs alone prove nothing about a pull
+/// request; these are the fields the adapter did verify, and the resolver
+/// decides trust from them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequest {
+    /// The repository the delivery is for (the base repository).
+    pub installation: u64,
+    pub repository: u64,
+    pub number: u64,
+    pub action: String,
+    pub draft: bool,
+    pub head_ref: String,
+    pub head_sha: String,
+    /// The immutable numeric repository the head branch lives in: different
+    /// from `repository` means a fork.
+    pub head_repo: u64,
+    pub base_ref: String,
+    pub base_sha: String,
+    /// The merge commit the change would be tested at, when GitHub computed
+    /// one. `None` means there is nothing truthful to check out.
+    pub merge_sha: Option<String>,
+}
+
+/// Parse the fields of a `pull_request` event, bounded exactly like `push`.
+pub fn parse_pull_request(body: &[u8]) -> Result<PullRequest> {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|_| Error::Response("payload is not JSON"))?;
+    let object = value
+        .as_object()
+        .filter(|o| o.len() <= MAX_BODY_FIELDS + 32)
+        .ok_or(Error::Response("payload shape"))?;
+    let map_number = |v: &serde_json::Map<String, Value>, key: &'static str| -> Result<u64> {
+        v.get(key)
+            .and_then(Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or(Error::Response(key))
+    };
+    let installation = map_number(
+        object
+            .get("installation")
+            .and_then(Value::as_object)
+            .ok_or(Error::Response("installation id"))?,
+        "id",
+    )?;
+    let repository = map_number(
+        object
+            .get("repository")
+            .and_then(Value::as_object)
+            .ok_or(Error::Response("repository id"))?,
+        "id",
+    )?;
+    let pull = object
+        .get("pull_request")
+        .and_then(Value::as_object)
+        .ok_or(Error::Response("pull request"))?;
+    let head = pull
+        .get("head")
+        .and_then(Value::as_object)
+        .ok_or(Error::Response("head"))?;
+    let base = pull
+        .get("base")
+        .and_then(Value::as_object)
+        .ok_or(Error::Response("base"))?;
+    let text = |v: &serde_json::Map<String, Value>,
+                key: &'static str,
+                max: usize|
+     -> Result<String> {
+        v.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && s.len() <= max && !s.bytes().any(|b| b < 32 || b == 127))
+            .map(str::to_owned)
+            .ok_or(Error::Response(key))
+    };
+    let merge_sha = match pull.get("merge_commit_sha") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(sha))
+            if !sha.is_empty() && sha.len() <= 64 && !sha.bytes().any(|b| b < 32 || b == 127) =>
+        {
+            Some(sha.clone())
+        }
+        Some(_) => return Err(Error::Response("merge commit")),
+    };
+    Ok(PullRequest {
+        installation,
+        repository,
+        // The event carries `number`; older payloads also repeat it under
+        // `pull_request`, which is where the bounds of this contract live.
+        number: map_number(object, "number").or_else(|_| map_number(pull, "number"))?,
+        action: text(object, "action", 32)?,
+        draft: pull.get("draft").and_then(Value::as_bool).unwrap_or(false),
+        head_ref: text(head, "ref", 512)?,
+        head_sha: text(head, "sha", 64)?,
+        head_repo: map_number(
+            head.get("repo")
+                .and_then(Value::as_object)
+                .ok_or(Error::Response("head repository"))?,
+            "id",
+        )?,
+        base_ref: text(base, "ref", 512)?,
+        base_sha: text(base, "sha", 64)?,
+        merge_sha,
+    })
+}
+
 fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 {
         return None;
@@ -158,6 +262,72 @@ mod tests {
             assert!(!verify_signature(secret, body, bad), "{bad:?}");
         }
         assert!(!verify_signature(b"", body, &header));
+    }
+
+    #[test]
+    fn pull_request_payloads_keep_only_verified_fields() {
+        let body = serde_json::json!({
+            "action": "opened",
+            "number": 7,
+            "installation": {"id": 42},
+            "repository": {"id": 91, "full_name": "account/widget"},
+            "pull_request": {
+                "draft": false,
+                "head": {"ref": "feature", "sha": "c".repeat(40), "repo": {"id": 91}},
+                "base": {"ref": "main", "sha": "d".repeat(40)},
+                "merge_commit_sha": "e".repeat(40),
+            },
+        });
+        let pr = parse_pull_request(&serde_json::to_vec(&body).unwrap()).unwrap();
+        assert_eq!(pr.installation, 42);
+        assert_eq!(pr.repository, 91);
+        assert_eq!(pr.number, 7);
+        assert_eq!(pr.action, "opened");
+        assert_eq!(pr.head_ref, "feature");
+        assert_eq!(pr.head_repo, 91);
+        assert_eq!(pr.base_ref, "main");
+        assert_eq!(pr.merge_sha.as_deref().unwrap().len(), 40);
+        assert!(!pr.draft);
+
+        // A null merge commit is a fact, not an error: there is nothing
+        // truthful to test.
+        let mut no_merge = body.clone();
+        no_merge["pull_request"]["merge_commit_sha"] = Value::Null;
+        assert!(
+            parse_pull_request(&serde_json::to_vec(&no_merge).unwrap())
+                .unwrap()
+                .merge_sha
+                .is_none()
+        );
+        // A fork head is recorded, never flattened into the base repository.
+        let mut fork = body.clone();
+        fork["pull_request"]["head"]["repo"]["id"] = Value::from(999);
+        assert_eq!(
+            parse_pull_request(&serde_json::to_vec(&fork).unwrap())
+                .unwrap()
+                .head_repo,
+            999
+        );
+        // Missing or malformed pieces are refused without echoing them.
+        for (path, value) in [
+            ("pull_request", Value::Null),
+            ("number", Value::Null),
+            ("action", Value::from("")),
+            ("pull_request", Value::Null),
+        ] {
+            let mut broken = body.clone();
+            match path {
+                "pull_request" => broken["pull_request"] = value,
+                other => broken[other] = value,
+            }
+            assert!(parse_pull_request(&serde_json::to_vec(&broken).unwrap()).is_err());
+        }
+        let mut bad_sha = body;
+        bad_sha["pull_request"]["head"]["sha"] = Value::from("not a sha");
+        assert!(
+            parse_pull_request(&serde_json::to_vec(&bad_sha).unwrap()).is_ok(),
+            "bounds are the ingest's job"
+        );
     }
 
     #[test]

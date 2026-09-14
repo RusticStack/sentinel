@@ -1,0 +1,7 @@
+# expect: on.tag: unknown key `branches`
+schema: 1
+on:
+  tag:
+    branches: [main]
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}]}

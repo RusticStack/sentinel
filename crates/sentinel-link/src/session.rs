@@ -241,6 +241,7 @@ pub enum LogVerdict {
 }
 
 /// [`JobContext`] on the wire; dependency outcomes as their stored codes.
+/// Protocol 3 adds the event facts; older workers are served `NoSpec`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WireContext {
     pub attempt: [u8; 16],
@@ -252,11 +253,31 @@ pub struct WireContext {
     pub sha: String,
     pub cancelled: bool,
     pub needs: Vec<(String, u8)>,
+    /// What triggered the run: `push`, `tag`, `pull_request` or `manual`.
+    pub event: String,
+    /// The ref the event concerns, as recorded in the run's provenance.
+    pub event_ref: String,
+    /// The pull request's base branch, when the run came from one.
+    pub base_ref: Option<String>,
+    pub pr_number: Option<u64>,
+    /// A short, stable key for the event: the branch or tag name, `pr-<n>`,
+    /// or `manual`.
+    pub event_key: String,
+}
+
+/// The event facts a worker may evaluate `event.*` against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventContext {
+    pub name: String,
+    pub ref_name: String,
+    pub base_ref: Option<String>,
+    pub pr_number: Option<u64>,
+    pub key: String,
 }
 
 /// What the worker evaluates expressions against: identity of the run,
-/// repository and job, dependency outcomes by name, cancellation. Event
-/// data joins it with intake.
+/// repository and job, the event that triggered it, dependency outcomes by
+/// name, cancellation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobContext {
     pub source: Option<sentinel_protocol::source::Access>,
@@ -266,6 +287,7 @@ pub struct JobContext {
     pub job: JobId,
     pub job_name: String,
     pub sha: String,
+    pub event: EventContext,
     pub cancelled: bool,
     pub needs: Vec<(String, Outcome)>,
 }
@@ -309,6 +331,11 @@ impl JobContext {
                 .iter()
                 .map(|(name, outcome)| (name.clone(), outcome_code(*outcome)))
                 .collect(),
+            event: self.event.name.clone(),
+            event_ref: self.event.ref_name.clone(),
+            base_ref: self.event.base_ref.clone(),
+            pr_number: self.event.pr_number,
+            event_key: self.event.key.clone(),
         }
     }
 
@@ -316,8 +343,6 @@ impl JobContext {
         if wire.needs.len() > MAX_LIST_ITEMS {
             return Err(Error::Protocol("needs list"));
         }
-        let id = |b: [u8; 16]| -> Result<[u8; 16]> { Ok(b) };
-        let _ = id;
         let mut needs = Vec::with_capacity(wire.needs.len());
         for (name, code) in wire.needs {
             needs.push((
@@ -335,6 +360,13 @@ impl JobContext {
                 job: JobId::from_bytes(wire.job).map_err(|_| Error::Protocol("id"))?,
                 job_name: wire.job_name,
                 sha: wire.sha,
+                event: EventContext {
+                    name: wire.event,
+                    ref_name: wire.event_ref,
+                    base_ref: wire.base_ref,
+                    pr_number: wire.pr_number,
+                    key: wire.event_key,
+                },
                 cancelled: wire.cancelled,
                 needs,
             },
@@ -830,12 +862,14 @@ impl WorkerSession {
                     ) {
                         continue;
                     }
+                    // The synchronous fallback (a handler that resolves inline)
+                    // still owes the protocol gate.
+                    if self.admitted.negotiated.protocol.0 < 3 {
+                        self.tx.send(&ServerMessage::NoSpec { attempt })?;
+                        continue;
+                    }
                     match handler.spec(worker, id) {
                         Some((context, bytes)) if bytes.len() <= MAX_SPEC_BYTES => {
-                            if context.source.is_some() && self.admitted.negotiated.protocol.0 < 2 {
-                                self.tx.send(&ServerMessage::NoSpec { attempt })?;
-                                continue;
-                            }
                             self.tx.send(&ServerMessage::Context(context.to_wire(id)))?;
                             if let Some(access) = context.source {
                                 self.tx.send(&ServerMessage::Source { attempt, access })?;

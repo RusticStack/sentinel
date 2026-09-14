@@ -32,14 +32,16 @@ const MAX_BACKOFF_MS: i64 = 5 * 60 * 1000;
 /// Lifecycle of one delivery. Settled states are terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
-    /// Accepted and durable; waiting for resolution.
+    /// Accepted and durable; waiting for source validation.
     Pending,
-    /// The source was validated; the compiled-run path (G03) consumes it.
+    /// The source was validated; waiting for pipeline resolution and dispatch.
     Ready,
     /// Understood and deliberately not a trigger (deletion, foreign event).
     Ignored,
     /// An explicit outcome: the event looked admissible but cannot run.
     Failed,
+    /// A run was created from this delivery; `Delivery.run` names it.
+    Dispatched,
 }
 
 impl State {
@@ -49,6 +51,7 @@ impl State {
             Self::Ready => 1,
             Self::Ignored => 2,
             Self::Failed => 3,
+            Self::Dispatched => 4,
         }
     }
 
@@ -58,6 +61,7 @@ impl State {
             1 => Self::Ready,
             2 => Self::Ignored,
             3 => Self::Failed,
+            4 => Self::Dispatched,
             _ => return None,
         })
     }
@@ -68,7 +72,13 @@ impl State {
             Self::Ready => "ready",
             Self::Ignored => "ignored",
             Self::Failed => "failed",
+            Self::Dispatched => "dispatched",
         }
+    }
+
+    /// True while the delivery still needs work (either lane phase).
+    pub const fn is_open(self) -> bool {
+        matches!(self, Self::Pending | Self::Ready)
     }
 
     pub fn parse(text: &str) -> Option<Self> {
@@ -77,6 +87,7 @@ impl State {
             "ready" => Self::Ready,
             "ignored" => Self::Ignored,
             "failed" => Self::Failed,
+            "dispatched" => Self::Dispatched,
             _ => return None,
         })
     }
@@ -99,6 +110,8 @@ pub struct Delivery {
     pub attempts: u32,
     pub received: UnixMillis,
     pub settled: Option<UnixMillis>,
+    /// The run this delivery dispatched, once it has.
+    pub run: Option<sentinel_core::RunId>,
 }
 
 /// A new delivery's terms. Bounded and canonical: the store validates shape
@@ -147,16 +160,74 @@ fn check(delivery: &NewDelivery<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Pull-request terms for a delivery (G03). Bounded and canonical: numbers,
+/// refs and object ids only, never a payload.
+#[derive(Debug)]
+pub struct PrTerms<'a> {
+    pub number: u64,
+    pub action: &'a str,
+    pub draft: bool,
+    /// The head branch as GitHub reports it (`feature`, not `refs/heads/…`).
+    pub head_ref: &'a str,
+    pub head_sha: &'a str,
+    /// The immutable numeric repository the head lives in: different from the
+    /// base repository means a fork, which the resolver refuses explicitly.
+    pub head_repo: u64,
+    /// The base branch as GitHub reports it.
+    pub base_ref: &'a str,
+    pub base_sha: &'a str,
+    /// The tested merge commit, when GitHub computed one.
+    pub merge_sha: Option<&'a str>,
+}
+
+fn check_pr(pr: &PrTerms<'_>) -> Result<()> {
+    let invalid = pr.number == 0
+        || pr.number > i64::MAX as u64
+        || pr.action.is_empty()
+        || pr.action.len() > 32
+        || !valid_branch_name(pr.head_ref)
+        || !valid_branch_name(pr.base_ref)
+        || !sentinel_protocol::intake::valid_sha(pr.head_sha)
+        || !sentinel_protocol::intake::valid_sha(pr.base_sha)
+        || pr
+            .merge_sha
+            .is_some_and(|s| !sentinel_protocol::intake::valid_sha(s))
+        || pr.head_repo == 0
+        || pr.head_repo > i64::MAX as u64;
+    if invalid {
+        return Err(Error::InvalidInput("pull request"));
+    }
+    Ok(())
+}
+
+/// A branch name as a provider reports it (no `refs/heads/` prefix).
+fn valid_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 512
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.contains("//")
+        && !name.contains("..")
+        && !name
+            .bytes()
+            .any(|b| b <= 32 || b == 127 || b"~^:?*[\\".contains(&b))
+}
+
 /// Store one authenticated delivery. Deduplication and the admission bound
 /// are decided inside the caller's writer transaction, so acknowledgement
-/// cannot precede durability and two redeliveries cannot both be fresh.
+/// cannot precede durability and two redeliveries cannot both be fresh. Pull
+/// requests carry their metadata in the same transaction.
 pub fn accept(
     tx: &Transaction<'_>,
     repo: RepoId,
     delivery: &NewDelivery<'_>,
+    pr: Option<&PrTerms<'_>>,
     now: UnixMillis,
 ) -> Result<Accepted> {
     check(delivery)?;
+    if let Some(pr) = pr {
+        check_pr(pr)?;
+    }
     let tenant = sources::repo_tenant(tx, repo)?;
     let metadata = sources::load_metadata(tx, repo).map_err(|e| match e {
         Error::NotFound => Error::Forbidden,
@@ -178,7 +249,9 @@ pub fn accept(
         return Err(Error::Conflict);
     }
     let pending: i64 = tx
-        .prepare_cached("SELECT count(*) FROM webhook_deliveries WHERE repo_id = ?1 AND state = 0")?
+        .prepare_cached(
+            "SELECT count(*) FROM webhook_deliveries WHERE repo_id = ?1 AND state IN (0, 1)",
+        )?
         .query_row([repo.as_bytes()], |r| r.get(0))?;
     if pending >= MAX_PENDING_PER_REPO {
         return Err(Error::Overloaded);
@@ -201,7 +274,92 @@ pub fn accept(
             now.0
         ],
     )?;
+    if let Some(pr) = pr {
+        tx.execute(
+            "INSERT INTO pr_deliveries(delivery_id, tenant_id, repo_id, number, action, draft,
+                head_ref, head_sha, head_repo_id, base_ref, base_sha, merge_sha)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                id.as_bytes(),
+                tenant.as_bytes(),
+                repo.as_bytes(),
+                pr.number as i64,
+                pr.action,
+                pr.draft,
+                pr.head_ref,
+                pr.head_sha,
+                pr.head_repo as i64,
+                pr.base_ref,
+                pr.base_sha,
+                pr.merge_sha
+            ],
+        )?;
+    }
     Ok(Accepted::Fresh(id))
+}
+
+/// One delivery's pull-request metadata, when it is one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrDelivery {
+    pub number: u64,
+    pub action: String,
+    pub draft: bool,
+    pub head_ref: String,
+    pub head_sha: String,
+    pub head_repo: u64,
+    pub base_ref: String,
+    pub base_sha: String,
+    pub merge_sha: Option<String>,
+}
+
+pub fn pr_for(conn: &Connection, delivery: DeliveryId) -> Result<Option<PrDelivery>> {
+    type Row = (
+        i64,
+        String,
+        bool,
+        String,
+        String,
+        i64,
+        String,
+        String,
+        Option<String>,
+    );
+    let row: Option<Row> = conn
+        .prepare_cached(
+            "SELECT number, action, draft, head_ref, head_sha, head_repo_id, base_ref, base_sha,
+                    merge_sha
+             FROM pr_deliveries WHERE delivery_id = ?1",
+        )?
+        .query_row([delivery.as_bytes()], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+            ))
+        })
+        .optional()?;
+    let Some((number, action, draft, head_ref, head_sha, head_repo, base_ref, base_sha, merge_sha)) =
+        row
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PrDelivery {
+        number: u64::try_from(number).map_err(|_| Error::Corrupt("pull request number"))?,
+        action,
+        draft,
+        head_ref,
+        head_sha,
+        head_repo: u64::try_from(head_repo).map_err(|_| Error::Corrupt("head repository"))?,
+        base_ref,
+        base_sha,
+        merge_sha,
+    }))
 }
 
 fn find(
@@ -377,6 +535,10 @@ pub fn github_target(
     ))
 }
 
+/// Columns every delivery read shares, in decode order.
+const COLUMNS: &str = "id, tenant_id, repo_id, provider, external_id, event, ref_name, old_sha, \
+    new_sha, state, reason, attempts, received_ms, settled_ms, run_id";
+
 /// One row, still raw: decode is where invalid blobs become typed errors.
 type Fields = (
     [u8; 16],
@@ -393,6 +555,7 @@ type Fields = (
     i64,
     i64,
     Option<i64>,
+    Option<[u8; 16]>,
 );
 
 fn map_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Fields> {
@@ -411,6 +574,7 @@ fn map_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Fields> {
         r.get(11)?,
         r.get(12)?,
         r.get(13)?,
+        r.get(14)?,
     ))
 }
 
@@ -430,6 +594,7 @@ fn decode(row: Fields) -> Result<Delivery> {
         attempts,
         received,
         settled,
+        run,
     ) = row;
     Ok(Delivery {
         id: DeliveryId::from_bytes(id).map_err(|_| Error::Corrupt("delivery id"))?,
@@ -446,15 +611,22 @@ fn decode(row: Fields) -> Result<Delivery> {
         attempts: u32::try_from(attempts).map_err(|_| Error::Corrupt("delivery attempts"))?,
         received: UnixMillis(received),
         settled: settled.map(UnixMillis),
+        run: match run {
+            Some(bytes) => Some(
+                sentinel_core::RunId::from_bytes(bytes).map_err(|_| Error::Corrupt("run_id"))?,
+            ),
+            None => None,
+        },
     })
 }
 
 /// Read one delivery by ID. Trusted internal: the caller has already decided
 /// who may see it (the host-local CLI, or the resolution lane).
 pub fn get(conn: &Connection, id: DeliveryId) -> Result<Delivery> {
-    let sql = "SELECT id, tenant_id, repo_id, provider, external_id, event, ref_name, old_sha, new_sha, state, reason, attempts, received_ms, settled_ms FROM webhook_deliveries WHERE id = ?1";
     let row = conn
-        .prepare_cached(sql)?
+        .prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM webhook_deliveries WHERE id = ?1"
+        ))?
         .query_row([id.as_bytes()], map_row)
         .optional()?
         .ok_or(Error::NotFound)?;
@@ -472,10 +644,11 @@ pub fn list(
     if !(1..=100).contains(&limit) {
         return Err(Error::InvalidInput("page size"));
     }
-    let sql = "SELECT id, tenant_id, repo_id, provider, external_id, event, ref_name, old_sha, new_sha, state, reason, attempts, received_ms, settled_ms FROM webhook_deliveries
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {COLUMNS} FROM webhook_deliveries
          WHERE tenant_id = ?1 AND repo_id = ?2 AND (?3 IS NULL OR state = ?3)
-         ORDER BY received_ms DESC, id LIMIT ?4";
-    let mut stmt = conn.prepare_cached(sql)?;
+         ORDER BY received_ms DESC, id LIMIT ?4"
+    ))?;
     let rows = stmt.query_map(
         params![
             tenant.as_bytes(),
@@ -488,13 +661,45 @@ pub fn list(
     rows.map(|row| decode(row?)).collect()
 }
 
-/// Deliveries whose next attempt is due, oldest first.
-pub fn due(conn: &Connection, now: UnixMillis, limit: u16) -> Result<Vec<Delivery>> {
-    let sql = "SELECT id, tenant_id, repo_id, provider, external_id, event, ref_name, old_sha, new_sha, state, reason, attempts, received_ms, settled_ms FROM webhook_deliveries
-         WHERE state = 0 AND (next_attempt_ms IS NULL OR next_attempt_ms <= ?1)
-         ORDER BY received_ms, id LIMIT ?2";
-    let mut stmt = conn.prepare_cached(sql)?;
-    let rows = stmt.query_map(params![now.0, limit], map_row)?;
+/// The newest delivery of one repository that reached a run on `ref_name` in
+/// the same event class (pull requests and ref updates are separate streams
+/// even when they share the base ref). The duplicate/reordered policy
+/// compares new events against it.
+pub fn last_dispatched(
+    conn: &Connection,
+    tenant: TenantId,
+    repo: RepoId,
+    ref_name: &str,
+    pull_request: bool,
+) -> Result<Option<Delivery>> {
+    let row = conn
+        .prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM webhook_deliveries
+             WHERE tenant_id = ?1 AND repo_id = ?2 AND ref_name = ?3 AND state = 4
+             AND (event = 'pull_request') = ?4
+             ORDER BY settled_ms DESC, id DESC LIMIT 1"
+        ))?
+        .query_row(
+            params![
+                tenant.as_bytes(),
+                repo.as_bytes(),
+                ref_name,
+                i64::from(pull_request)
+            ],
+            map_row,
+        )
+        .optional()?;
+    row.map(decode).transpose()
+}
+
+/// Deliveries of one open state whose next attempt is due, oldest first.
+pub fn due(conn: &Connection, state: State, now: UnixMillis, limit: u16) -> Result<Vec<Delivery>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {COLUMNS} FROM webhook_deliveries
+         WHERE state = ?1 AND (next_attempt_ms IS NULL OR next_attempt_ms <= ?2)
+         ORDER BY received_ms, id LIMIT ?3"
+    ))?;
+    let rows = stmt.query_map(params![state.code(), now.0, limit], map_row)?;
     rows.map(|row| decode(row?)).collect()
 }
 
@@ -544,8 +749,8 @@ pub fn validate(conn: &Connection, delivery: &Delivery) -> Result<Resolution> {
     Ok(Resolution::Ready)
 }
 
-/// Settle one pending delivery. A settled delivery is final: the guarded
-/// update reports a conflict rather than rewriting an outcome.
+/// Settle one open delivery (pending or ready). A settled delivery is final:
+/// the guarded update reports a conflict rather than rewriting an outcome.
 pub fn settle(
     tx: &Transaction<'_>,
     id: DeliveryId,
@@ -559,7 +764,7 @@ pub fn settle(
     };
     let changed = tx.execute(
         "UPDATE webhook_deliveries SET state = ?2, reason = ?3, settled_ms = ?4
-         WHERE id = ?1 AND state = 0",
+         WHERE id = ?1 AND state IN (0, 1)",
         params![id.as_bytes(), state.code(), reason, now.0],
     )?;
     if changed != 1 {
@@ -568,31 +773,64 @@ pub fn settle(
     Ok(())
 }
 
-/// Schedule another attempt with capped exponential backoff, or fail the
-/// delivery once the attempt budget is spent. The reason is always explicit.
-pub fn retry(tx: &Transaction<'_>, id: DeliveryId, now: UnixMillis) -> Result<()> {
-    let attempts: i64 = tx
-        .prepare_cached("SELECT attempts FROM webhook_deliveries WHERE id = ?1 AND state = 0")?
-        .query_row([id.as_bytes()], |r| r.get(0))
-        .optional()?
-        .ok_or(Error::Conflict)?;
-    let next = u32::try_from(attempts.saturating_add(1)).unwrap_or(u32::MAX);
-    if next >= MAX_ATTEMPTS {
-        return settle(tx, id, Resolution::Failed("resolution_attempts"), now);
-    }
+/// Settle a ready delivery as dispatched, naming the run it produced. The
+/// run must already exist in this transaction for the foreign key to hold.
+pub fn settle_dispatched(
+    tx: &Transaction<'_>,
+    id: DeliveryId,
+    run: sentinel_core::RunId,
+    now: UnixMillis,
+) -> Result<()> {
     let changed = tx.execute(
-        "UPDATE webhook_deliveries SET attempts = ?2, next_attempt_ms = ?3
-         WHERE id = ?1 AND state = 0",
-        params![
-            id.as_bytes(),
-            next as i64,
-            now.0.saturating_add(backoff_ms(next))
-        ],
+        "UPDATE webhook_deliveries SET state = 4, reason = NULL, settled_ms = ?2, run_id = ?3
+         WHERE id = ?1 AND state = 1",
+        params![id.as_bytes(), now.0, run.as_bytes()],
     )?;
     if changed != 1 {
         return Err(Error::Conflict);
     }
     Ok(())
+}
+
+/// What a retry did. The last attempt settles the delivery as failed with
+/// `resolution_attempts` rather than retrying forever.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retry {
+    /// Another attempt is scheduled with capped backoff.
+    Scheduled { attempts: u32, next_attempt_ms: i64 },
+    /// The attempt budget is spent and the delivery is now failed.
+    Exhausted,
+}
+
+/// Schedule another attempt with capped exponential backoff, or fail the
+/// delivery once the attempt budget is spent. The reason is always explicit.
+/// Applies to either open state: validation and dispatch share the budget.
+pub fn retry(tx: &Transaction<'_>, id: DeliveryId, now: UnixMillis) -> Result<Retry> {
+    let attempts: i64 = tx
+        .prepare_cached(
+            "SELECT attempts FROM webhook_deliveries WHERE id = ?1 AND state IN (0, 1)",
+        )?
+        .query_row([id.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::Conflict)?;
+    let next = u32::try_from(attempts.saturating_add(1)).unwrap_or(u32::MAX);
+    if next >= MAX_ATTEMPTS {
+        settle(tx, id, Resolution::Failed("resolution_attempts"), now)?;
+        return Ok(Retry::Exhausted);
+    }
+    let next_attempt_ms = now.0.saturating_add(backoff_ms(next));
+    let changed = tx.execute(
+        "UPDATE webhook_deliveries SET attempts = ?2, next_attempt_ms = ?3
+         WHERE id = ?1 AND state IN (0, 1)",
+        params![id.as_bytes(), next as i64, next_attempt_ms],
+    )?;
+    if changed != 1 {
+        return Err(Error::Conflict);
+    }
+    Ok(Retry::Scheduled {
+        attempts: next,
+        next_attempt_ms,
+    })
 }
 
 /// Milliseconds to wait before attempt `attempts` (1-based): doubling from
@@ -603,14 +841,14 @@ pub fn backoff_ms(attempts: u32) -> i64 {
         .min(MAX_BACKOFF_MS)
 }
 
-/// One pass of the resolution lane: validate and settle every due delivery.
-/// Runs inside one writer transaction; the caller bounds the batch.
+/// One pass of the validation lane: revalidate and settle every due pending
+/// delivery. Runs inside one writer transaction; the caller bounds the batch.
 pub fn resolve_due(
     tx: &Transaction<'_>,
     now: UnixMillis,
     limit: u16,
 ) -> Result<Vec<(DeliveryId, Resolution)>> {
-    let due = due(tx, now, limit)?;
+    let due = due(tx, State::Pending, now, limit)?;
     let mut settled = Vec::with_capacity(due.len());
     for delivery in due {
         let current = match get(tx, delivery.id) {
@@ -628,13 +866,43 @@ pub fn resolve_due(
     Ok(settled)
 }
 
+/// Create the immutable run for a ready delivery: the compiled spec, one job
+/// row per job with its resolved image, the provenance row and the delivery's
+/// terminal state, all in the caller's transaction. Remote I/O never runs
+/// here — the resolver fetches and compiles first.
+pub fn dispatch(
+    tx: &Transaction<'_>,
+    delivery: &Delivery,
+    spec: &sentinel_pipeline::RunSpec,
+    images: &[(String, String)],
+    provenance: &crate::provenance::Provenance,
+    now: UnixMillis,
+) -> Result<sentinel_core::RunId> {
+    if delivery.state != State::Ready {
+        return Err(Error::Conflict);
+    }
+    if images.len() != spec.pipeline.jobs.len() {
+        return Err(Error::InvalidInput("resolved images"));
+    }
+    let run = sentinel_core::RunId::new();
+    let jobs = crate::runs::create_run(tx, delivery.tenant, delivery.repo, run, spec, now)?;
+    for (job, (digest, platform)) in jobs.iter().zip(images) {
+        crate::runs::resolve_image(tx, delivery.tenant, *job, digest, platform)?;
+    }
+    crate::provenance::insert(tx, provenance, run, now)?;
+    settle_dispatched(tx, delivery.id, run, now)?;
+    Ok(run)
+}
+
 /// Delete settled deliveries older than `before`, in bounded batches. Never
-/// touches a pending row: an unresolved event is work, not history.
+/// touches an open row (an unresolved event is work, not history) and never
+/// one a run's provenance depends on (a dispatched delivery is kept as long
+/// as its run).
 pub fn purge_settled(tx: &Transaction<'_>, before: UnixMillis, limit: u32) -> Result<usize> {
     Ok(tx.execute(
         "DELETE FROM webhook_deliveries WHERE id IN (
             SELECT id FROM webhook_deliveries
-            WHERE state != 0 AND settled_ms <= ?1
+            WHERE state NOT IN (0, 1) AND run_id IS NULL AND settled_ms <= ?1
             ORDER BY settled_ms LIMIT ?2)",
         params![before.0, limit],
     )?)

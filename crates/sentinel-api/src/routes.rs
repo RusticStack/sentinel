@@ -11,7 +11,7 @@ use sentinel_core::{
     auth::{Permissions, Principal},
 };
 use sentinel_intake::ingest;
-use sentinel_pipeline::{PinnedSource, RunSpec, compile_str, schema::Arch};
+use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
 use sentinel_protocol::{
     error::{ApiError, ErrorCode},
     idempotency::{Fingerprint, IdempotencyKey},
@@ -20,7 +20,7 @@ use sentinel_protocol::{
 };
 use sentinel_store::{
     Error as StoreError, auth as authz, auth::Authority, dispatch, idempotency, local_auth, lookup,
-    runs, status, tenancy, workers,
+    provenance, runs, status, tenancy, workers,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -505,6 +505,7 @@ fn run_json(view: &status::RunStatus) -> Value {
         "created_ms": view.created.0,
         "cancel_requested": view.cancel_requested,
         "state": run_state(view.state),
+        "trigger": view.trigger,
         "jobs": view.jobs.iter().map(|j| json!({
             "id": j.id.to_string(),
             "name": j.name,
@@ -630,22 +631,16 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
         .map_err(|e| err(ErrorCode::InvalidRequest, format!("spec: {e:?}")))?;
     // Every image must be pinned by digest: the worker pulls exactly those
     // bytes, and no resolver exists yet for a tag.
-    let mut images = Vec::with_capacity(spec.pipeline.jobs.len());
-    for job in &spec.pipeline.jobs {
-        let image = sentinel_pipeline::ImageRef::parse(&job.spec.image)
-            .map_err(|_| err(ErrorCode::InvalidRequest, "image reference"))?;
-        let digest = image.digest.ok_or_else(|| {
-            err(
-                ErrorCode::InvalidRequest,
-                format!("jobs.{}: image must be pinned by digest", job.name),
-            )
-        })?;
-        let platform = match job.spec.runs_on.arch {
-            Some(Arch::Arm64) => "linux/arm64",
-            _ => "linux/amd64",
-        };
-        images.push((digest, platform));
-    }
+    let images = runs::pinned_images(&spec).map_err(|error| match error {
+        StoreError::InvalidInput(_) => err(ErrorCode::InvalidRequest, "image reference"),
+        _ => err(
+            ErrorCode::InvalidRequest,
+            "every image must be pinned by digest",
+        ),
+    })?;
+    let digest = spec.pipeline.digest.to_le_bytes();
+    let pipeline_sha = spec.source.sha.clone();
+    let source_ref = spec.source.ref_name.clone();
     let (slug, name) = (slug.to_owned(), name.to_owned());
     let principal = who.principal;
     let principal_text = who.user.to_string();
@@ -674,6 +669,31 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
             for (job, (digest, platform)) in jobs.iter().zip(&images) {
                 runs::resolve_image(tx, tenant, *job, digest, platform)?;
             }
+            // The explicit manual mode is a separately identified provenance:
+            // no delivery and no provider, and the submitted pipeline was the
+            // authority rather than a bound path at a selected revision.
+            provenance::insert(
+                tx,
+                &provenance::Provenance {
+                    tenant,
+                    repo,
+                    trigger: "manual".into(),
+                    delivery: None,
+                    provider: None,
+                    ref_name: source_ref.clone(),
+                    old_sha: None,
+                    new_sha: Some(pipeline_sha.clone()),
+                    head_sha: None,
+                    base_sha: None,
+                    merge_sha: None,
+                    pipeline_sha: pipeline_sha.clone(),
+                    pipeline_path: None,
+                    pipeline_digest: digest,
+                    pr_number: None,
+                },
+                run,
+                now,
+            )?;
             if let Some(key) = key {
                 idempotency::complete(tx, scope, key, run)?;
             }

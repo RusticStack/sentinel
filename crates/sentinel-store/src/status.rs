@@ -35,6 +35,9 @@ pub struct RunStatus {
     pub created: UnixMillis,
     pub cancel_requested: bool,
     pub state: RunState,
+    /// What triggered the run (`push`, `tag`, `pull_request`, `manual`);
+    /// `None` only for a run created without provenance.
+    pub trigger: Option<String>,
     /// In compiled order.
     pub jobs: Vec<JobStatus>,
 }
@@ -109,6 +112,7 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
         created: UnixMillis(created),
         cancel_requested: cancel != 0,
         state,
+        trigger: crate::provenance::trigger_of(conn, run)?,
         jobs,
     })
 }

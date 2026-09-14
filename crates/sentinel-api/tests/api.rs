@@ -814,6 +814,22 @@ fn push_payload(repository: u64) -> serde_json::Value {
     })
 }
 
+/// A GitHub `pull_request` payload for one repository and head repository.
+fn pr_payload(action: &str, head_repo: u64, merge: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "action": action,
+        "number": 7,
+        "installation": {"id": 42},
+        "repository": {"id": GITHUB_REPO_ID, "full_name": "account/widget"},
+        "pull_request": {
+            "draft": false,
+            "head": {"ref": "feature", "sha": "c".repeat(40), "repo": {"id": head_repo}},
+            "base": {"ref": "main", "sha": "d".repeat(40)},
+            "merge_commit_sha": merge,
+        },
+    })
+}
+
 /// The App webhook signature over exactly the bytes the request carries.
 fn webhook_signature(body: &[u8]) -> String {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, WEBHOOK_SECRET);
@@ -1071,8 +1087,8 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
     );
     assert_eq!((status, again["duplicate"].as_bool()), (202, Some(true)));
     assert_eq!(again["delivery"].as_str(), Some(id.as_str()));
-    // An event this deployment does not handle yet is acknowledged and
-    // ignored, not retried.
+    // An event this deployment does not handle is acknowledged and ignored,
+    // not retried.
     let (status, body) = call(
         &d,
         "POST",
@@ -1081,13 +1097,77 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         None,
         &[
             ("x-hub-signature-256", &signed),
-            ("x-github-event", "pull_request"),
+            ("x-github-event", "workflow_run"),
             ("x-github-delivery", "gh-4"),
         ],
     );
     assert_eq!(
         (status, body["ignored"].as_str()),
         (200, Some("unsupported_event"))
+    );
+    // A pull request is intake now: the base branch is the policy ref and the
+    // tested merge is what it stands for. Only the actions that mean new work
+    // are stored; others are acknowledged and ignored.
+    let pr = pr_payload("opened", GITHUB_REPO_ID, Some(&"e".repeat(40)));
+    let pr_raw = pr.to_string();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&pr),
+        None,
+        &[
+            ("x-hub-signature-256", &webhook_signature(pr_raw.as_bytes())),
+            ("x-github-event", "pull_request"),
+            ("x-github-delivery", "gh-5"),
+        ],
+    );
+    assert_eq!(
+        (status, body["duplicate"].as_bool()),
+        (202, Some(false)),
+        "{body}"
+    );
+    let pr_id = body["delivery"].as_str().unwrap().to_owned();
+    assert_eq!(delivery_state(&d, &pr_id), intake::State::Pending);
+    let labeled = pr_payload("labeled", GITHUB_REPO_ID, Some(&"e".repeat(40)));
+    let labeled_raw = labeled.to_string();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&labeled),
+        None,
+        &[
+            (
+                "x-hub-signature-256",
+                &webhook_signature(labeled_raw.as_bytes()),
+            ),
+            ("x-github-event", "pull_request"),
+            ("x-github-delivery", "gh-6"),
+        ],
+    );
+    assert_eq!((status, body["ignored"].as_str()), (200, Some("pr_action")));
+    // A malformed pull-request body is a request error, not a crash.
+    let broken = serde_json::json!({ "action": "opened", "number": 7 });
+    let broken_raw = broken.to_string();
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/hooks/github",
+        Some(&broken),
+        None,
+        &[
+            (
+                "x-hub-signature-256",
+                &webhook_signature(broken_raw.as_bytes()),
+            ),
+            ("x-github-event", "pull_request"),
+            ("x-github-delivery", "gh-7"),
+        ],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
     );
     // The repository owned by the token is what the delivery belongs to: the
     // generic secret is scoped to its repository.

@@ -106,7 +106,7 @@ fn private_https_checkout_checks_ca_rotated_credentials_and_cleanup() {
         Command::new("python3")
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/git_https.py"
+                "/../../fixtures/git_https.py"
             ))
             .arg(temp.path())
             .arg(&cert)

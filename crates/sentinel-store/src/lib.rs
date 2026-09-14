@@ -21,6 +21,7 @@ pub mod local_auth;
 pub mod logs;
 pub mod lookup;
 pub mod mfa;
+pub mod provenance;
 pub mod registration;
 pub mod runs;
 pub mod schema;
@@ -43,10 +44,12 @@ use std::{
     time::Duration,
 };
 
+/// The connection type read closures receive; re-exported for the same reason.
+pub use rusqlite::Connection;
 /// The transaction type writer closures receive; re-exported so callers
 /// outside this crate can name it without depending on rusqlite.
 pub use rusqlite::Transaction;
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{OpenFlags, TransactionBehavior};
 
 #[derive(Debug)]
 pub enum Error {

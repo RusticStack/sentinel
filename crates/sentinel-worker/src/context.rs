@@ -2,10 +2,11 @@
 //! cache key can see once the pinned checkout exists.
 //!
 //! Every value comes from the controller's `JobContext` or the run spec;
-//! `hash_files` reads the attempt's private workspace. Anything the run
-//! does not record yet — event fields before intake exists — answers
-//! `Unresolved`, and the attempt then fails preparation naming the field
-//! rather than defaulting it.
+//! `hash_files` reads the attempt's private workspace. The event facts
+//! (`event.name|ref|base_ref|key|pr_number`) are recorded as the run's
+//! provenance (G03); a field the event does not carry answers `null`, and a
+//! field the run does not hold answers `Unresolved` so the attempt fails
+//! preparation naming it rather than defaulting it.
 
 use std::path::{Path, PathBuf};
 
@@ -38,13 +39,20 @@ impl Context for WorkerContext<'_> {
 
     fn lookup(&self, path: &[String]) -> Lookup {
         let key: Vec<&str> = path.iter().map(String::as_str).collect();
+        let event = &self.job.event;
         let value = match key.as_slice() {
             ["event", "sha"] => Value::Str(self.job.sha.clone()),
-            ["event", "ref"] => match &self.spec.source.ref_name {
-                Some(name) => Value::Str(name.clone()),
-                None => return Lookup::Unresolved,
+            ["event", "name"] => Value::Str(event.name.clone()),
+            ["event", "ref"] => Value::Str(event.ref_name.clone()),
+            ["event", "key"] => Value::Str(event.key.clone()),
+            ["event", "base_ref"] => match &event.base_ref {
+                Some(base) => Value::Str(base.clone()),
+                None => Value::Null,
             },
-            // Event name, key, base ref and PR number arrive with intake.
+            ["event", "pr_number"] => match event.pr_number {
+                Some(number) => Value::Int(number as i64),
+                None => Value::Null,
+            },
             ["event", _] => return Lookup::Unresolved,
             ["repo", "id"] => Value::Str(self.job.repo.to_string()),
             ["repo", "name"] => Value::Str(self.job.repo_name.clone()),

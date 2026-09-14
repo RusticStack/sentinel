@@ -9,8 +9,11 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+sentinel-auth = { path = "../sentinel-auth" }
 sentinel-core = { path = "../sentinel-core" }
+sentinel-git = { path = "../sentinel-git" }
 sentinel-github = { path = "../sentinel-github" }
+sentinel-pipeline = { path = "../sentinel-pipeline" }
 sentinel-protocol = { path = "../sentinel-protocol" }
 sentinel-store = { path = "../sentinel-store" }
 serde_json = "1.0"
@@ -20,6 +23,7 @@ ring = "0.17"
 sentinel-auth = { path = "../sentinel-auth" }
 sentinel-pipeline = { path = "../sentinel-pipeline" }
 tempfile = "3.20"
+time = { version = "0.3", features = ["formatting"] }
 
 [lints]
 workspace = true

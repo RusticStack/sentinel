@@ -270,7 +270,7 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
             name: "builder-1".into(),
             hello: Hello {
                 protocol_min: ProtocolVersion(1),
-                protocol_max: ProtocolVersion(1),
+                protocol_max: ProtocolVersion(3),
                 capabilities: Capabilities::REQUIRED,
                 arch: Arch::X86_64,
                 software: "test".into(),

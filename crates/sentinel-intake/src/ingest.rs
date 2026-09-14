@@ -93,6 +93,7 @@ pub fn generic(
             old_sha: &update.old_sha,
             new_sha: &update.new_sha,
         },
+        None,
         now,
     )
 }
@@ -115,13 +116,18 @@ pub fn github(
     if event == "ping" {
         return Ok(Github::Pong);
     }
-    // Only ref updates are intake in G02; PR policies are G03.
-    if event != "push" {
-        return Ok(Github::Ignored("unsupported_event"));
-    }
     let delivery_id = delivery_id.ok_or(Error::InvalidRequest("delivery header"))?;
     if !valid_delivery_id(delivery_id) {
         return Err(Error::InvalidRequest("delivery header"));
+    }
+    match event {
+        "push" => {}
+        // Pull requests arrive only through a bound App installation, and only
+        // the actions that mean "there is something new to test" are intake;
+        // every other action is acknowledged and ignored so GitHub does not
+        // retry it.
+        "pull_request" => return pull_request(store, delivery_id, body, now),
+        _ => return Ok(Github::Ignored("unsupported_event")),
     }
     let push =
         sentinel_github::webhook::parse_push(body).map_err(|_| Error::InvalidRequest("payload"))?;
@@ -154,6 +160,65 @@ pub fn github(
             old_sha: &push.before,
             new_sha: &push.after,
         },
+        None,
+        now,
+    )
+    .map(Github::Ingested)
+}
+/// A pull request: known actions only, the base branch as the policy ref, the
+/// tested merge (or the head tip when GitHub computed none) as the revision.
+/// The head repository is stored, so a fork is a fact the resolver can refuse
+/// explicitly rather than an inference.
+fn pull_request(
+    store: &Store,
+    delivery_id: &str,
+    body: &[u8],
+    now: UnixMillis,
+) -> Result<Github, Error> {
+    let pr = sentinel_github::webhook::parse_pull_request(body)
+        .map_err(|_| Error::InvalidRequest("payload"))?;
+    if !matches!(pr.action.as_str(), "opened" | "synchronize" | "reopened") {
+        return Ok(Github::Ignored("pr_action"));
+    }
+    if !valid_sha(&pr.head_sha) || !valid_sha(&pr.base_sha) {
+        return Err(Error::InvalidRequest("payload object id"));
+    }
+    if pr.merge_sha.as_deref().is_some_and(|s| !valid_sha(s)) {
+        return Err(Error::InvalidRequest("payload object id"));
+    }
+    let repository = i64::try_from(pr.repository).map_err(|_| Error::InvalidRequest("payload"))?;
+    let installation = pr.installation.to_string();
+    let target = match store.read(|c| intake::github_target(c, &installation, repository)) {
+        Ok(target) => target,
+        Err(sentinel_store::Error::NotFound) => {
+            return Ok(Github::Ignored("unbound_repository"));
+        }
+        Err(e) => return Err(Error::from(e)),
+    };
+    let base_ref = format!("refs/heads/{}", pr.base_ref);
+    let terms = intake::PrTerms {
+        number: pr.number,
+        action: &pr.action,
+        draft: pr.draft,
+        head_ref: &pr.head_ref,
+        head_sha: &pr.head_sha,
+        head_repo: pr.head_repo,
+        base_ref: &pr.base_ref,
+        base_sha: &pr.base_sha,
+        merge_sha: pr.merge_sha.as_deref(),
+    };
+    accept(
+        store,
+        target.1,
+        intake::NewDelivery {
+            provider: "github",
+            external_id: delivery_id,
+            event: "pull_request",
+            ref_name: &base_ref,
+            old_sha: &pr.base_sha,
+            new_sha: pr.merge_sha.as_deref().unwrap_or(&pr.head_sha),
+        },
+        Some(terms),
         now,
     )
     .map(Github::Ingested)
@@ -163,6 +228,7 @@ fn accept(
     store: &Store,
     repo: RepoId,
     delivery: intake::NewDelivery<'_>,
+    pr: Option<intake::PrTerms<'_>>,
     now: UnixMillis,
 ) -> Result<Ingested, Error> {
     // Own the borrowed terms so the writer closure can be `'static`.
@@ -174,7 +240,29 @@ fn accept(
         old_sha: delivery.old_sha.to_owned(),
         new_sha: delivery.new_sha.to_owned(),
     };
+    let pr = pr.map(|pr| OwnedPr {
+        number: pr.number,
+        action: pr.action.to_owned(),
+        draft: pr.draft,
+        head_ref: pr.head_ref.to_owned(),
+        head_sha: pr.head_sha.to_owned(),
+        head_repo: pr.head_repo,
+        base_ref: pr.base_ref.to_owned(),
+        base_sha: pr.base_sha.to_owned(),
+        merge_sha: pr.merge_sha.map(str::to_owned),
+    });
     let accepted = store.writer().write(move |tx| {
+        let terms = pr.as_ref().map(|pr| intake::PrTerms {
+            number: pr.number,
+            action: &pr.action,
+            draft: pr.draft,
+            head_ref: &pr.head_ref,
+            head_sha: &pr.head_sha,
+            head_repo: pr.head_repo,
+            base_ref: &pr.base_ref,
+            base_sha: &pr.base_sha,
+            merge_sha: pr.merge_sha.as_deref(),
+        });
         intake::accept(
             tx,
             repo,
@@ -186,6 +274,7 @@ fn accept(
                 old_sha: &delivery.old_sha,
                 new_sha: &delivery.new_sha,
             },
+            terms.as_ref(),
             now,
         )
     })?;
@@ -193,6 +282,19 @@ fn accept(
         id: accepted.id(),
         duplicate: accepted.duplicate(),
     })
+}
+
+/// Owned pull-request terms for the writer closure.
+struct OwnedPr {
+    number: u64,
+    action: String,
+    draft: bool,
+    head_ref: String,
+    head_sha: String,
+    head_repo: u64,
+    base_ref: String,
+    base_sha: String,
+    merge_sha: Option<String>,
 }
 
 struct OwnedDelivery {

@@ -175,6 +175,28 @@ fn signed_push(repository: i64, delivery: Option<&str>) -> (Vec<u8>, String, Opt
         "installation": {"id": 42},
         "repository": {"id": repository, "full_name": "account/widget"},
     });
+    sign(payload, delivery)
+}
+
+/// A `pull_request` payload for the bound repository, same-repository head.
+fn signed_pr(action: &str, delivery: &str) -> (Vec<u8>, String) {
+    let payload = serde_json::json!({
+        "action": action,
+        "number": 7,
+        "installation": {"id": 42},
+        "repository": {"id": GITHUB_REPO_ID, "full_name": "account/widget"},
+        "pull_request": {
+            "draft": false,
+            "head": {"ref": "feature", "sha": "c".repeat(40), "repo": {"id": GITHUB_REPO_ID}},
+            "base": {"ref": "main", "sha": "d".repeat(40)},
+            "merge_commit_sha": "e".repeat(40),
+        },
+    });
+    let (body, signature, _) = sign(payload, Some(delivery));
+    (body, signature)
+}
+
+fn sign(payload: serde_json::Value, delivery: Option<&str>) -> (Vec<u8>, String, Option<String>) {
     let body = serde_json::to_vec(&payload).unwrap();
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, WEBHOOK_SECRET);
     let tag = ring::hmac::sign(&key, &body);
@@ -289,12 +311,13 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
         .unwrap(),
         Github::Ignored("unbound_repository")
     );
-    // An event that is not a ref update yet.
+    // An event this deployment does not handle yet is acknowledged and
+    // ignored, not retried.
     assert_eq!(
         ingest::github(
             &f.store,
             WEBHOOK_SECRET,
-            "pull_request",
+            "workflow_run",
             Some("gh-3"),
             Some(&signature),
             &body,
@@ -303,6 +326,62 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
         .unwrap(),
         Github::Ignored("unsupported_event")
     );
+    // A pull request for the bound repository is intake: only the actions that
+    // mean new work are stored, and the others are acknowledged and ignored.
+    let pr = signed_pr("opened", "gh-4");
+    assert!(matches!(
+        ingest::github(
+            &f.store,
+            WEBHOOK_SECRET,
+            "pull_request",
+            Some("gh-4"),
+            Some(&pr.1),
+            &pr.0,
+            now
+        )
+        .unwrap(),
+        Github::Ingested(_)
+    ));
+    let labeled = signed_pr("labeled", "gh-5");
+    assert_eq!(
+        ingest::github(
+            &f.store,
+            WEBHOOK_SECRET,
+            "pull_request",
+            Some("gh-5"),
+            Some(&labeled.1),
+            &labeled.0,
+            now
+        )
+        .unwrap(),
+        Github::Ignored("pr_action")
+    );
+    // The stored terms are the base branch and the tested merge, with the head
+    // repository recorded rather than inferred.
+    let delivery_id = f
+        .store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT id FROM webhook_deliveries WHERE external_id = 'gh-4'",
+                [],
+                |r| r.get::<_, [u8; 16]>(0),
+            )?)
+        })
+        .map(|bytes| sentinel_core::DeliveryId::from_bytes(bytes).unwrap())
+        .unwrap();
+    let row = f.store.read(move |c| intake::get(c, delivery_id)).unwrap();
+    assert_eq!(row.event, "pull_request");
+    assert_eq!(row.ref_name.as_deref(), Some("refs/heads/main"));
+    assert_eq!(row.new_sha.as_deref(), Some("e".repeat(40).as_str()));
+    let terms = f
+        .store
+        .read(move |c| intake::pr_for(c, delivery_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(terms.number, 7);
+    assert_eq!(terms.head_repo, GITHUB_REPO_ID as u64);
+    assert_eq!(terms.base_ref, "main");
+    assert_eq!(terms.merge_sha.as_deref(), Some("e".repeat(40).as_str()));
     // The bound repository accepts the push and deduplicates a redelivery.
     let accepted = ingest::github(
         &f.store,
@@ -335,7 +414,12 @@ fn the_github_path_verifies_the_raw_body_and_maps_the_installation() {
             ..accepted
         })
     );
-    assert_eq!(state(&f, f.github_repo), vec![State::Pending]);
+    // The push and the pull request are both durable and pending; the
+    // redelivery and the ignored action added nothing.
+    assert_eq!(
+        state(&f, f.github_repo),
+        vec![State::Pending, State::Pending]
+    );
     // A wrong secret never reaches the payload.
     assert_eq!(
         ingest::github(
@@ -357,6 +441,8 @@ fn the_lane_resolves_on_a_wake_and_on_its_tick() {
     let (tx, rx) = mpsc::channel::<Batch>();
     let lane = Lane::start(
         Arc::clone(&f.store),
+        None,
+        None,
         Config {
             idle: Duration::from_millis(25),
             ..Config::default()

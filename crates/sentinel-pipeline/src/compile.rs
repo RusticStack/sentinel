@@ -9,14 +9,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     expr::{Phase, Template},
-    schema::{Job, Pipeline, Step, Trigger},
+    policy::Triggers,
+    schema::{Job, Pipeline, Step},
 };
 
 pub const MAX_STEPS_TOTAL: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledPipeline {
-    pub on: Vec<Trigger>,
+    pub on: Triggers,
     pub concurrency: Option<crate::schema::Concurrency>,
     /// Jobs in a canonical topological order: dependencies first; ties broken
     /// by name so the order is stable across edits elsewhere in the file.
@@ -356,15 +357,25 @@ fn digest_step(d: &mut Digest, s: &Step) {
 }
 
 fn digest_of(
-    on: &[Trigger],
+    on: &Triggers,
     concurrency: Option<&crate::schema::Concurrency>,
     jobs: &[CompiledJob],
 ) -> u128 {
     let mut d = Digest::new();
-    d.str("sentinel.pipeline/1");
-    d.u64(on.len() as u64);
-    for t in on {
-        d.u64(*t as u64);
+    d.str("sentinel.pipeline/2");
+    d.u64(u64::from(on.push.is_some()));
+    d.u64(u64::from(on.pull_request.is_some()));
+    d.u64(u64::from(on.tag.is_some()));
+    d.u64(u64::from(on.manual));
+    for filter in [&on.push, &on.pull_request, &on.tag].into_iter().flatten() {
+        d.u64(filter.branches.len() as u64);
+        for p in &filter.branches {
+            d.str(p);
+        }
+        d.u64(filter.tags.len() as u64);
+        for p in &filter.tags {
+            d.str(p);
+        }
     }
     match concurrency {
         None => d.u64(0),

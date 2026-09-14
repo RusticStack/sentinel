@@ -9,8 +9,8 @@ use serde::Serialize;
 use crate::{
     compile::CompiledPipeline,
     expr::{Expr, Phase, Template},
+    policy::Triggers,
     run::ImageRef,
-    schema::Trigger,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -18,6 +18,9 @@ pub struct Explanation {
     pub schema: &'static str,
     pub digest: String,
     pub triggers: Vec<&'static str>,
+    /// Ref filters of the declared triggers, in kind order; a kind with no
+    /// filter appears as the empty pattern lists.
+    pub trigger_filters: Vec<TriggerFilterExplanation>,
     pub concurrency: Option<ConcurrencyExplanation>,
     /// Execution order: every job's dependencies appear before it.
     pub jobs: Vec<JobExplanation>,
@@ -25,6 +28,13 @@ pub struct Explanation {
     pub requires: Requirements,
     /// Every input that cannot be known offline, with the phase that resolves it.
     pub unresolved: Vec<Unresolved>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TriggerFilterExplanation {
+    pub kind: &'static str,
+    pub branches: Vec<String>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -97,6 +107,41 @@ const fn phase_name(p: Phase) -> &'static str {
         Phase::Schedule => "schedule",
         Phase::Worker => "worker",
     }
+}
+
+fn trigger_kinds(on: &Triggers) -> Vec<&'static str> {
+    let mut kinds = Vec::with_capacity(4);
+    if on.push.is_some() {
+        kinds.push("push");
+    }
+    if on.pull_request.is_some() {
+        kinds.push("pull_request");
+    }
+    if on.tag.is_some() {
+        kinds.push("tag");
+    }
+    if on.manual {
+        kinds.push("manual");
+    }
+    kinds
+}
+
+fn trigger_filters(on: &Triggers) -> Vec<TriggerFilterExplanation> {
+    let mut out = Vec::with_capacity(3);
+    for (kind, filter) in [
+        ("push", &on.push),
+        ("pull_request", &on.pull_request),
+        ("tag", &on.tag),
+    ] {
+        if let Some(filter) = filter {
+            out.push(TriggerFilterExplanation {
+                kind,
+                branches: filter.branches.clone(),
+                tags: filter.tags.clone(),
+            });
+        }
+    }
+    out
 }
 
 fn note_expr(out: &mut Vec<Unresolved>, path: String, e: &Expr) {
@@ -216,16 +261,8 @@ impl Explanation {
         Explanation {
             schema: "sentinel.explain/1",
             digest: format!("{:032x}", p.digest),
-            triggers: p
-                .on
-                .iter()
-                .map(|t| match t {
-                    Trigger::Push => "push",
-                    Trigger::PullRequest => "pull_request",
-                    Trigger::Tag => "tag",
-                    Trigger::Manual => "manual",
-                })
-                .collect(),
+            triggers: trigger_kinds(&p.on),
+            trigger_filters: trigger_filters(&p.on),
             concurrency,
             jobs,
             requires,
@@ -239,6 +276,18 @@ impl Explanation {
         let mut s = String::new();
         let _ = writeln!(s, "pipeline digest {}", self.digest);
         let _ = writeln!(s, "triggers: {}", self.triggers.join(", "));
+        for filter in &self.trigger_filters {
+            if filter.branches.is_empty() && filter.tags.is_empty() {
+                continue;
+            }
+            let patterns: Vec<&str> = filter
+                .branches
+                .iter()
+                .chain(filter.tags.iter())
+                .map(String::as_str)
+                .collect();
+            let _ = writeln!(s, "  {} on {}", filter.kind, patterns.join(", "));
+        }
         if let Some(c) = &self.concurrency {
             let _ = writeln!(
                 s,

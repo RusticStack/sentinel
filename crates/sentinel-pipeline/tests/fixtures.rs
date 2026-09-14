@@ -1,9 +1,8 @@
 use std::{fs, path::Path};
 
 use sentinel_pipeline::{
-    compile_str,
+    RefFilter, Triggers, compile_str,
     expr::{Context, DependencySummary, HashFilesError, Lookup, Phase, Value},
-    schema::Trigger,
 };
 
 fn fixture_dir(sub: &str) -> std::path::PathBuf {
@@ -62,7 +61,12 @@ fn full_fixture_decodes_every_field() {
     let p = compile_str(&text).unwrap();
     assert_eq!(
         p.on,
-        vec![Trigger::Push, Trigger::PullRequest, Trigger::Manual]
+        Triggers {
+            push: Some(RefFilter::default()),
+            pull_request: Some(RefFilter::default()),
+            tag: None,
+            manual: true,
+        }
     );
     assert!(p.concurrency.as_ref().unwrap().cancel_in_progress);
     assert_eq!(p.jobs.len(), 2);

@@ -22,6 +22,12 @@ Anchors, aliases, tags, non-string keys and duplicate keys are errors with line 
 ```yaml
 schema: 1                       # required, exactly 1
 on: [push, pull_request, tag, manual]   # 1–4 distinct triggers
+# or the filtered form:
+# on:
+#   push: {branches: [main, "release/*"]}
+#   tag: {tags: ["v*"]}
+#   pull_request: {branches: [main]}
+#   manual: true
 concurrency:                    # optional
   group: "${{ repo.id }}:${{ event.key }}"
   cancel_in_progress: true
@@ -49,6 +55,44 @@ jobs:                           # 1–64, names [a-z0-9][a-z0-9_-]{0,63}
 ```
 
 Unknown keys anywhere are rejected with their path, for example `jobs.test: unknown key `imgae``. Durations are `<int>s|m|h` sums such as `1h30m`. Sizes use binary units only, `MiB` or `GiB`. CPU is whole cores or a quoted decimal such as `"0.5"`, stored as millicores. Paths are normalised relative paths with no `..`, `//`, leading `./` or trailing `/`; cache paths may also be absolute inside the container but never `/`. `concurrency.group` and cache `key` are templates; job and step `if` are expressions (see below).
+
+## Source policies (`on:`)
+
+`on:` is either the list form above (every ref of those kinds) or a mapping
+that names kinds with optional ref filters:
+
+```yaml
+on:                                  # every branch, every tag, manual only
+  push:                              # `branches` patterns; empty = every branch
+    branches: [main, "release/*"]
+  tag:
+    tags: ["v*"]                     # `tags` patterns; empty = every tag
+  pull_request:
+    branches: [main]                 # matched against the base branch
+  manual: true                       # `true` or the key is omitted
+```
+
+Filter rules, enforced strictly:
+
+- the list form takes 1–4 distinct kinds and no filters; the mapping form names
+  at most those four kinds, and at least one must be present;
+- a kind takes only its own key (`branches` for `push` and `pull_request`,
+  `tags` for `tag`); the other is an unknown key;
+- at most 32 patterns of at most 256 bytes each. `*` matches any run of
+  characters inside one path segment and `**` matches zero or more whole
+  segments, anchored to the whole branch or tag name (`release/*` does not
+  match `release/1.0/x`; `release/**` does). An empty list is an error — omit
+  the key to admit every ref;
+- `manual: true` declares the trigger the API's explicit dispatch uses; an
+  event-driven delivery never matches it, and a `manual` pipeline never runs
+  from a push.
+
+Which ref a policy is judged against is fixed by the event: a push is judged
+against its branch, a tag against its tag, and a pull request against its
+**base** branch. An event whose kind and ref disagree (a tag ref arriving as a
+push) never matches, and neither does an event the pipeline does not declare.
+The decision is made by the controller when it resolves the delivery
+([intake](intake.md)); a mismatch is `ignored:no_trigger`, not a failure.
 
 ## Resource policy
 
@@ -93,6 +137,18 @@ The spec is persisted as one format byte plus a postcard-encoded blob in the sto
 - Functions: `success()`, `failure()`, `always()`, `cancelled()`, `contains(a, b)`, `starts_with(a, b)`, `ends_with(a, b)`, `hash_files('pattern', …)`. Nothing else: no arithmetic, no string building, no user functions, no network.
 - Limits: 1,024 bytes, 256 tokens, depth 16, 8 arguments, 4 path segments.
 
+The event paths are real values recorded as the run's immutable provenance
+([intake](intake.md)), not defaults:
+
+| Path | Value |
+|---|---|
+| `event.name` | `push`, `tag`, `pull_request` or `manual` |
+| `event.sha` | the checked-out revision (the pushed commit, the peeled tag commit, the tested merge) |
+| `event.ref` | the pushed ref, the tag ref, or `refs/pull/<n>/merge` for a pull request |
+| `event.base_ref` | the pull request's base branch (`main`); `null` for anything else |
+| `event.pr_number` | the pull request number; `null` for anything else |
+| `event.key` | a short, stable key: the branch or tag name, `pr-<n>`, or `manual` |
+
 Evaluation is phased. Each path and function has a minimum phase, and an expression evaluated earlier yields an `Unresolved` error rather than a default: `event`, `repo`, `run`, `job` and `cancelled()` at **dispatch**; `needs.*`, `success()`, `failure()`, `always()` at **schedule** (once every dependency is terminal); `hash_files` at **worker** (after the pinned checkout). The compiler enforces placement: `concurrency.group` may only use dispatch context; a job `if` may not use `hash_files` and may only name jobs in its own `needs`; step `if` and cache keys may use everything but also only name jobs in `needs`. A condition must evaluate to a boolean; a literal non-boolean `if` is rejected at compile time, and a string at evaluation time is an error, never truthy. `success()` and `failure()` summarise dependency outcomes; `always()` is true unless the run is cancelled.
 
 Templates render each interpolation as string, integer or boolean; `null` is an error, and output is bounded (256 bytes for concurrency keys and cache keys).
@@ -109,7 +165,7 @@ Three kinds of binding connect a job to state outside its container, and each is
 - **artifacts**: named path sets published after the job under a `when` policy and a retention period; publication needs artifact storage.
 - **secrets**: names only. The worker injects each granted secret as an environment variable of that name; the file never carries a value, and a job that names a secret the repository has not been granted fails at dispatch, not silently with an empty variable.
 
-`sentinel pipeline validate <file>` runs the same loader, decoder and compiler as the server on any platform, prints nothing on success, and on failure prints `<file>: <stage>: <path>: <message>` and exits 1. `sentinel pipeline explain <file> [--json]` prints the compiled view: digest, triggers, concurrency, every job in execution order with its dependencies, image and pin status, condition, budgets, steps, caches, artifacts and secrets; a **requires** section (repository read, secret names to grant, cache scopes, artifact storage, registry access for unpinned images); and an **unresolved until runtime** list naming each expression with the phase that resolves it. Nothing unresolved is given a value: `hash_files` keys are shown as their template, secrets as names, and unpinned images as needing resolution at first pull. `--json` emits the `sentinel.explain/1` shape for tools and agents.
+`sentinel pipeline validate <file>` runs the same loader, decoder and compiler as the server on any platform, prints nothing on success, and on failure prints `<file>: <stage>: <path>: <message>` and exits 1. `sentinel pipeline explain <file> [--json]` prints the compiled view: digest, triggers (with their ref filters), concurrency, every job in execution order with its dependencies, image and pin status, condition, budgets, steps, caches, artifacts and secrets; a **requires** section (repository read, secret names to grant, cache scopes, artifact storage, registry access for unpinned images); and an **unresolved until runtime** list naming each expression with the phase that resolves it. Nothing unresolved is given a value: `hash_files` keys are shown as their template, secrets as names, and unpinned images as needing resolution at first pull. `--json` emits the `sentinel.explain/1` shape for tools and agents; `trigger_filters` lists each declared kind's patterns (empty for an unfiltered kind).
 
 ## Shell semantics
 

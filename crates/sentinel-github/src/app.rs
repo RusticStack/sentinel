@@ -82,6 +82,20 @@ impl App {
         })
     }
 
+    /// The same App against another API endpoint: a GitHub Enterprise host,
+    /// or a test stub. The URL must be absolute and use HTTPS, except for a
+    /// loopback host, which is how the token path is exercised offline.
+    #[must_use]
+    pub fn with_endpoint(mut self, endpoint: &str) -> Self {
+        let loopback = endpoint
+            .strip_prefix("http://")
+            .is_some_and(|rest| rest.starts_with("127.0.0.1:") || rest.starts_with("localhost:"));
+        if endpoint.starts_with("https://") || loopback {
+            self.endpoint = endpoint.trim_end_matches('/').to_owned();
+        }
+        self
+    }
+
     fn jwt(&self, now_ms: i64) -> Result<String> {
         if now_ms < 60_000 {
             return Err(Error::Config("App clock"));

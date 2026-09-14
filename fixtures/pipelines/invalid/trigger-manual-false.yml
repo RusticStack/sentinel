@@ -1,0 +1,6 @@
+# expect: on.manual: `manual: true` or omit the key
+schema: 1
+on:
+  manual: false
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}]}

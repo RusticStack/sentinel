@@ -1,0 +1,7 @@
+# expect: on: unknown key `deploy`
+schema: 1
+on:
+  push:
+  deploy: true
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}]}

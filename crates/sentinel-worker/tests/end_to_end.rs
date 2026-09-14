@@ -173,7 +173,7 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
             name: "builder-1".into(),
             hello: Hello {
                 protocol_min: ProtocolVersion(1),
-                protocol_max: ProtocolVersion(1),
+                protocol_max: ProtocolVersion(3),
                 capabilities: Capabilities::REQUIRED,
                 arch: Arch::X86_64,
                 software: "test".into(),
@@ -636,7 +636,7 @@ jobs:
             name: "builder-1".into(),
             hello: Hello {
                 protocol_min: ProtocolVersion(1),
-                protocol_max: ProtocolVersion(1),
+                protocol_max: ProtocolVersion(3),
                 capabilities: Capabilities::REQUIRED,
                 arch: Arch::X86_64,
                 software: "test".into(),

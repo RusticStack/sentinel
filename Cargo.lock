@@ -1223,6 +1223,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-git"
+version = "0.1.0-dev"
+dependencies = [
+ "libc",
+ "sentinel-core",
+ "sentinel-pipeline",
+ "sentinel-protocol",
+ "tempfile",
+]
+
+[[package]]
 name = "sentinel-github"
 version = "0.1.0-dev"
 dependencies = [
@@ -1244,12 +1255,14 @@ dependencies = [
  "ring",
  "sentinel-auth",
  "sentinel-core",
+ "sentinel-git",
  "sentinel-github",
  "sentinel-pipeline",
  "sentinel-protocol",
  "sentinel-store",
  "serde_json",
  "tempfile",
+ "time",
 ]
 
 [[package]]
@@ -1264,6 +1277,7 @@ dependencies = [
  "sentinel-auth",
  "sentinel-core",
  "sentinel-github",
+ "sentinel-intake",
  "sentinel-link",
  "sentinel-pipeline",
  "sentinel-protocol",
@@ -1329,6 +1343,7 @@ dependencies = [
  "sentinel-api",
  "sentinel-auth",
  "sentinel-core",
+ "sentinel-git",
  "sentinel-link",
  "sentinel-pipeline",
  "sentinel-protocol",

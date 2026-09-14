@@ -680,8 +680,8 @@ pub fn attempt_summary(
 }
 
 /// What the worker needs to evaluate the job's expressions: identity of the
-/// run, repository and job, the dependency outcomes by name, and whether
-/// cancellation is desired. Event data lands here with intake (G-tasks).
+/// run, repository and job, the event that triggered it, the dependency
+/// outcomes by name, and whether cancellation is desired.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobContext {
     pub run: RunId,
@@ -690,6 +690,8 @@ pub struct JobContext {
     pub job: JobId,
     pub job_name: String,
     pub sha: String,
+    /// The event facts recorded as the run's provenance.
+    pub event: crate::provenance::EventFacts,
     pub cancelled: bool,
     /// `(dependency job name, outcome)` for every `needs` entry.
     pub needs: Vec<(String, Outcome)>,
@@ -769,6 +771,7 @@ pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> R
         job: JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?,
         job_name,
         sha,
+        event: crate::provenance::event_facts(conn, run)?,
         cancelled: cancel != 0,
         needs,
     })

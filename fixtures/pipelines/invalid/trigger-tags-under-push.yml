@@ -1,0 +1,7 @@
+# expect: on.push: unknown key `tags`
+schema: 1
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  a: {image: busybox, steps: [{id: s, run: x}]}

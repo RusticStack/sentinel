@@ -161,8 +161,9 @@ pub enum SpecError {
 }
 
 /// Bump when the encoded layout changes incompatibly; older blobs are then
-/// rejected rather than misread.
-pub const SPEC_FORMAT: u8 = 1;
+/// rejected rather than misread. Format 2: `on` carries ref filters
+/// (`policy::Triggers`) instead of a trigger list.
+pub const SPEC_FORMAT: u8 = 2;
 
 impl RunSpec {
     pub fn new(source: PinnedSource, pipeline: CompiledPipeline) -> Result<Self, SpecError> {

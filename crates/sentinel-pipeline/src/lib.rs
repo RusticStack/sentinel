@@ -6,7 +6,9 @@
 pub mod compile;
 pub mod explain;
 pub mod expr;
+pub(crate) mod glob;
 pub mod hash_files;
+pub mod policy;
 pub mod run;
 pub mod schema;
 pub mod yaml;
@@ -17,6 +19,7 @@ pub use compile::{CompileError, CompiledJob, CompiledPipeline};
 pub use explain::Explanation;
 pub use expr::{Context, Expr, Phase, Template, Value};
 pub use hash_files::hash_files;
+pub use policy::{Event, EventKind, RefFilter, Triggers};
 pub use run::{ImageRef, PinnedSource, RunSpec, StepCommand};
 pub use schema::{Pipeline, ResourcePolicy, SCHEMA_VERSION, SchemaError};
 pub use yaml::YamlError;

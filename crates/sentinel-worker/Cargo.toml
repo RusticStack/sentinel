@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 sentinel-core = { path = "../sentinel-core" }
+sentinel-git = { path = "../sentinel-git" }
 sentinel-link = { path = "../sentinel-link" }
 sentinel-pipeline = { path = "../sentinel-pipeline" }
 sentinel-protocol = { path = "../sentinel-protocol" }

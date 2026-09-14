@@ -328,10 +328,10 @@ fn first_spec(d: &Deployment, protocol: u16) -> (Option<session::JobContext>, Ve
 }
 
 #[test]
-fn a_bound_source_reaches_a_protocol_two_worker_with_its_credential() {
+fn a_bound_source_reaches_a_current_worker_with_its_credential_and_event() {
     let d = deployment();
-    let (context, bytes) = first_spec(&d, 2);
-    let context = context.expect("protocol 2 must receive the spec");
+    let (context, bytes) = first_spec(&d, 3);
+    let context = context.expect("protocol 3 must receive the spec");
     assert!(RunSpec::decode(&bytes).is_ok());
     let access = context.source.expect("bound source must be delivered");
     assert_eq!(access.binding.remote, REMOTE);
@@ -345,12 +345,26 @@ fn a_bound_source_reaches_a_protocol_two_worker_with_its_credential() {
     assert_eq!(access.version, 1);
     assert!(access.expires_ms > UnixMillis::now().0);
     assert!(!format!("{:?}", access.credential).contains(SECRET));
+    // The run has no provenance here (the test creates it with the store
+    // primitive), so the event facts are the manual fallback: recorded, never
+    // invented.
+    assert_eq!(context.event.name, "manual");
+    assert_eq!(context.event.key, "manual");
+    assert!(context.event.base_ref.is_none());
+    assert!(context.event.pr_number.is_none());
 }
 
 #[test]
-fn a_protocol_one_worker_is_refused_rather_than_running_without_a_credential() {
-    let d = deployment();
-    let (context, bytes) = first_spec(&d, 1);
-    assert!(context.is_none(), "old workers must not see a bound source");
-    assert!(bytes.is_empty());
+fn a_worker_below_the_context_protocol_is_refused_rather_than_misreading_it() {
+    for protocol in [1, 2] {
+        // A fresh deployment per protocol: the first worker leases the only
+        // job, and a leased job is not re-offered.
+        let d = deployment();
+        let (context, bytes) = first_spec(&d, protocol);
+        assert!(
+            context.is_none(),
+            "protocol {protocol} must not see a context it cannot decode"
+        );
+        assert!(bytes.is_empty());
+    }
 }

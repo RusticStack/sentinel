@@ -50,6 +50,8 @@ pub fn run(args: &IntakeArgs) -> Result<(), Error> {
                         "attempts": d.attempts,
                         "received_ms": d.received.0,
                         "settled_ms": d.settled.map(|t| t.0),
+                        // The run a dispatched delivery produced (G03).
+                        "run": d.run.map(|run| run.to_string()),
                     })
                 })
                 .collect();

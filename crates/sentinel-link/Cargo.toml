@@ -11,7 +11,7 @@ publish.workspace = true
 [features]
 default = []
 # The controller's side: listener, admission, fleet and dispatcher over the store.
-controller = ["dep:sentinel-store", "dep:sentinel-github", "dep:sentinel-pipeline"]
+controller = ["dep:sentinel-store", "dep:sentinel-github", "dep:sentinel-pipeline", "dep:sentinel-intake"]
 
 [dependencies]
 blake3 = "1.8"
@@ -25,6 +25,7 @@ sentinel-protocol = { path = "../sentinel-protocol" }
 sentinel-store = { path = "../sentinel-store", optional = true }
 sentinel-github = { path = "../sentinel-github", optional = true }
 sentinel-pipeline = { path = "../sentinel-pipeline", optional = true }
+sentinel-intake = { path = "../sentinel-intake", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]

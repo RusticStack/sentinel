@@ -50,9 +50,11 @@ Delivery is scoped to one attempt:
    the job is preparing or running, that cancellation is not desired, and that
    the tenant and pool may still run it. Any failure is `NoSpec`.
 3. The credential is opened and sent as a `Source` message ahead of the spec
-   chunks — **protocol 2**. A worker that negotiated protocol 1 is served
-   `NoSpec` instead: checking out a bound repository without its credential
-   would either fail or, worse, succeed against a public mirror.
+   chunks, together with the event facts the spec's expressions may read —
+   **protocol 3**. A worker below protocol 3 is served `NoSpec` instead:
+   checking out a bound repository without its credential would either fail
+   or, worse, succeed against a public mirror, and a worker that cannot decode
+   the context must not misread it.
 
 The token never reaches a URL, `.git/config`, the job environment or a log
 line. Errors carry one bounded, control-character-free line of Git/SSH output
@@ -108,6 +110,13 @@ invalidated by `admin source remove-installation`; a webhook (G02) is a hint
 to refresh, never authority to revive an installation that was removed or
 transferred.
 
+The same access is what event resolution uses ([intake](intake.md)): before it
+reads the pipeline from the bound remote, the controller mints the sealed
+credential or the App token exactly as above, rechecks the binding's version
+and lifecycle after any round trip, and then discards the credential with the
+resolution's scratch directory. A generic repository's events never touch the
+App, and a forge-associated one never falls back to a generic credential.
+
 ## Commands
 
 ```sh
@@ -160,11 +169,13 @@ Sentinel stores and delivers them, and cannot make a write-capable token safe.
 
 Migration 17 adds `source_bindings` and `source_audit` and extends
 `installations`; migration 18 adds `source_intake_tokens` and
-`webhook_deliveries` ([intake](intake.md)). Existing repositories stay unbound
-and unbound legacy runs keep working. Protocol 2 adds the `Source` message;
-workers negotiate `1..=2`. The HTTP API gains `POST /api/v1/hooks/github` and
-`POST /api/v1/intake/{repo}`; both are additive under the `/api/v1` path
-policy. See [compatibility](compatibility.md).
+`webhook_deliveries` ([intake](intake.md)); migration 19 adds the resolved
+delivery states and per-run provenance ([intake](intake.md)). Existing
+repositories stay unbound and unbound legacy runs keep working. Protocol 2
+adds the `Source` message and protocol 3 the event context; workers negotiate
+`1..=3`, and anything below 3 is served `NoSpec`. The HTTP API gains
+`POST /api/v1/hooks/github` and `POST /api/v1/intake/{repo}`; both are additive
+under the `/api/v1` path policy. See [compatibility](compatibility.md).
 
 ## Verification
 
