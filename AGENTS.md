@@ -37,6 +37,7 @@ On Windows, run the Linux checks inside WSL2 with `export CARGO_TARGET_DIR=targe
 | `crates/sentinel-github` | GitHub sign-in: bounded HTTPS client, code exchange, verified identity; see [GitHub sign-in](docs/github-sign-in.md) |
 | `crates/sentinel-git` | Bounded Git: exact-revision checkout, file-at-revision reads, one credential and process-group discipline; shared by the worker and the controller's source resolution |
 | `crates/sentinel-store` | SQLite metadata store, single durable writer; see [docs/storage.md](docs/storage.md) |
+| `crates/sentinel-checks` | Durable check delivery: the outbox lane and the GitHub Checks publisher; see [checks](docs/checks.md) |
 | `crates/sentinel-api` | The controller's HTTP API and the first page; see [API](docs/api.md) |
 | `crates/sentinel-worker` | Linux executor: fresh workspaces, exact-revision checkout, rootless Podman containers, attempt lifecycle, log redaction and spool; see [executor](docs/executor.md), [logs](docs/logs.md) |
 | `crates/sentinel-protocol` | Errors, idempotency, cursors, limits, negotiation; see [docs/protocol.md](docs/protocol.md) |

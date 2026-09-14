@@ -154,6 +154,12 @@ identifier!(
     DeliveryId,
     "dlv"
 );
+identifier!(
+    /// One durable check publication (G04): the outbox row that tracks what
+    /// GitHub was told about a run, a job or a refused event.
+    CheckId,
+    "chk"
+);
 
 /// Step position inside its job. Steps are compiled in order and referenced by
 /// index; the human name lives in the compiled spec. `u16` bounds a job to

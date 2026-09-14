@@ -16,6 +16,7 @@
 //! are metadata, never an identity key.
 
 pub mod app;
+pub mod checks;
 pub mod http;
 pub mod oauth;
 pub mod webhook;
@@ -27,6 +28,14 @@ use std::fmt;
 ///
 /// [`sentinel-store`'s external identity table]: https://github.com/RusticStack/sentinel
 pub const PROVIDER: &str = "github";
+
+/// Wall-clock milliseconds, for comparing against an absolute time a server
+/// sent (a rate-limit reset). Durations this crate measures itself are
+/// monotonic; this is provenance, not a measurement.
+pub(crate) fn now_ms() -> i64 {
+    let nanos = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+    i64::try_from(nanos / 1_000_000).unwrap_or(i64::MAX)
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {

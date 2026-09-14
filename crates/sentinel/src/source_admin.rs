@@ -46,9 +46,38 @@ fn file(path: &Path, limit: usize) -> Result<Vec<u8>, Error> {
 struct AppConfig {
     app_id: u64,
     private_key_file: std::path::PathBuf,
+    /// Where GitHub should link a check's details: the API's public base URL.
+    /// Absent means checks carry no `details_url`.
+    public_url: Option<String>,
+    /// Another GitHub API endpoint (Enterprise, or a test stub). Absent means
+    /// `https://api.github.com`.
+    api_url: Option<String>,
 }
 
-pub fn load_app(root: &Path) -> Result<Option<Arc<sentinel_github::app::App>>, Error> {
+/// The App plus the deployment-facing settings beside it.
+pub struct GithubApp {
+    pub app: Arc<sentinel_github::app::App>,
+    pub public_url: Option<String>,
+}
+
+/// An absolute `http(s)` base URL with no query, fragment or credentials.
+fn public_url(raw: &str) -> Result<String, Error> {
+    let trimmed = raw.trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .ok_or_else(|| fail("public URL must be http(s)"))?;
+    if rest.is_empty()
+        || trimmed.len() > 256
+        || rest.contains(['?', '#', '@', ' '])
+        || !rest.contains('.') && !rest.starts_with("localhost") && !rest.starts_with("127.0.0.1")
+    {
+        return Err(fail("invalid public URL"));
+    }
+    Ok(trimmed.to_owned())
+}
+
+pub fn load_app(root: &Path) -> Result<Option<GithubApp>, Error> {
     let path = root.join("github-app.json");
     if !path.exists() {
         return Ok(None);
@@ -69,9 +98,18 @@ pub fn load_app(root: &Path) -> Result<Option<Arc<sentinel_github::app::App>>, E
     }
     let bytes = bounded(input, 16 * 1024)?;
     let pem = std::str::from_utf8(&bytes).map_err(|_| fail("invalid App key"))?;
-    Ok(Some(Arc::new(
-        sentinel_github::app::App::new(config.app_id, pem).map_err(|_| fail("invalid App key"))?,
-    )))
+    let mut app =
+        sentinel_github::app::App::new(config.app_id, pem).map_err(|_| fail("invalid App key"))?;
+    if let Some(api_url) = &config.api_url {
+        app = app
+            .with_endpoint(api_url)
+            .map_err(|_| fail("invalid GitHub API endpoint"))?;
+    }
+    let public_url = config.public_url.as_deref().map(public_url).transpose()?;
+    Ok(Some(GithubApp {
+        app: Arc::new(app),
+        public_url,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -260,6 +298,7 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
             let app = load_app(&args.data.data_dir)?
                 .ok_or_else(|| fail("GitHub App is not configured"))?;
             let snapshot = app
+                .app
                 .installation(*external_id, now.0)
                 .map_err(|_| fail("GitHub installation refresh failed"))?;
             let expected = *expected;

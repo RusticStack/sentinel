@@ -39,6 +39,11 @@ All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](p
 | `GET /attempts/{id}/logs?after&limit&wait=1` | `read` | frames after a sequence from the same files the controller writes ([logs](logs.md)); `wait=1` parks up to 25 s for more; `complete` and `gaps` say when the log is closed |
 | `GET /workers?tenant=slug` | member | the pools the tenant may use and their workers, each with `connected` from the live fleet |
 
+The first page (`GET /`) is a single static document; it accepts a
+`#/runs/<run id>` fragment and opens that run, which is what a check's
+`details_url` points at ([checks](checks.md)). Signing in with a fragment
+present opens the run immediately afterwards.
+
 ## The CLI
 
 ```sh

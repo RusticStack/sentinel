@@ -12,6 +12,7 @@
 //! indexes, migrations and ad-hoc queries at no extra cost.
 
 pub mod auth;
+pub mod checks;
 pub mod codec;
 pub mod dispatch;
 pub mod idempotency;

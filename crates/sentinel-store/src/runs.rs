@@ -89,6 +89,9 @@ pub fn create_run(
         }
         ids.push(id);
     }
+    // Every compiled job has its check row from the start, so a required
+    // aggregate never waits for the first transition to appear. The callers
+    // record it after provenance exists (only event-driven runs publish).
     Ok(ids)
 }
 

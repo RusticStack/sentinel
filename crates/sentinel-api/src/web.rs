@@ -62,6 +62,7 @@ $("login").onsubmit = async (e) => {
   try {
     const me = await api("POST", "/api/v1/login", { username: $("username").value, password: $("password").value });
     csrf = me.csrf; $("who").textContent = `signed in as ${me.user}`; $("password").value = "";
+    openHash();
   } catch (err) { $("who").textContent = err.message; }
 };
 $("load").onclick = async () => {
@@ -106,6 +107,13 @@ async function follow(attempt) {
     if (page.complete) { $("logtitle").textContent = `${attempt} — complete${page.gaps.length ? " (gaps: " + JSON.stringify(page.gaps) + ")" : ""}`; return; }
   }
 }
+// A check's details_url points at #/runs/<id>; open it, before or after sign-in.
+async function openHash() {
+  const m = location.hash.match(/^#\/runs\/(run_[0-9a-f-]{36})$/);
+  if (m) await showRun(m[1]);
+}
+window.addEventListener("hashchange", openHash);
+openHash();
 </script>
 </body>
 </html>

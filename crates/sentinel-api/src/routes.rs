@@ -19,8 +19,8 @@ use sentinel_protocol::{
     limits::{MAX_API_BODY_BYTES, MAX_PAGE_ITEMS, page_size},
 };
 use sentinel_store::{
-    Error as StoreError, auth as authz, auth::Authority, dispatch, idempotency, local_auth, lookup,
-    provenance, runs, status, tenancy, workers,
+    Error as StoreError, auth as authz, auth::Authority, checks, dispatch, idempotency, local_auth,
+    lookup, provenance, runs, status, tenancy, workers,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -694,6 +694,10 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
                 run,
                 now,
             )?;
+            // A manual run publishes nothing: its inline pipeline is a
+            // diagnostic and must never satisfy the required aggregate. The
+            // call is explicit so the rule lives in one place.
+            checks::record_run(tx, tenant, run, now)?;
             if let Some(key) = key {
                 idempotency::complete(tx, scope, key, run)?;
             }

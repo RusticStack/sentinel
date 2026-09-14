@@ -427,7 +427,10 @@ fn identity(data_dir: &Path, stem: &str) -> Result<sentinel_link::identity::Iden
     Ok(generated)
 }
 
-/// What the running role holds until shutdown, drained in order.
+/// What the running role holds until shutdown, drained in order. Constructed
+/// once per process and never moved in bulk, so its size is not worth another
+/// indirection; both lanes are boxed to keep it from growing further.
+#[allow(clippy::large_enum_variant)]
 enum Running {
     Idle,
     #[cfg(feature = "server")]
@@ -438,6 +441,8 @@ enum Running {
         /// Boxed: the enum is constructed once per process, and this keeps
         /// the variant from dominating its size.
         lane: Box<sentinel_intake::Lane>,
+        /// The Checks outbox lane, when a GitHub App is configured.
+        checks: Option<Box<sentinel_checks::Lane>>,
     },
     #[cfg(feature = "worker")]
     Worker {
@@ -485,7 +490,7 @@ fn start_server(
     let app = crate::source_admin::load_app(&config.data_dir)
         .map_err(|_| Error::runtime("cannot load GitHub App configuration"))?;
     if let Some(app) = &app {
-        controller.set_source_app(Arc::clone(app));
+        controller.set_source_app(Arc::clone(&app.app));
     }
     let source_key = config.data_dir.join("master.key");
     let key = if source_key.exists() {
@@ -507,7 +512,7 @@ fn start_server(
     let resolver = sentinel_intake::Resolver::new(
         Arc::clone(&store),
         key.clone(),
-        app.clone(),
+        app.as_ref().map(|app| Arc::clone(&app.app)),
         Arc::new(sentinel_intake::resolve::GitFetch),
         config.data_dir.join("intake-work"),
         sentinel_intake::resolve::Config::default(),
@@ -550,6 +555,55 @@ fn start_server(
     if github_webhook_secret.is_some() {
         tracing::info!(event = "github_webhook_enabled");
     }
+    // The Checks outbox lane: durable publications are delivered off the
+    // request path. Without an App there is nothing to publish to, so the lane
+    // does not start; with one it shares the captured dispatcher above.
+    let checks = match &app {
+        Some(app) => {
+            tracing::info!(
+                event = "checks_enabled",
+                endpoint = %app.app.endpoint(),
+                details_url = app.public_url.is_some()
+            );
+            let publisher = sentinel_checks::github::GithubChecks::new(
+                Arc::clone(&store),
+                Arc::clone(&app.app),
+                app.public_url.clone(),
+            );
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            Some(Box::new(sentinel_checks::Lane::start(
+                Arc::clone(&store),
+                Box::new(publisher),
+                sentinel_checks::lane::Config::default(),
+                move |batch| {
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        if batch.refused > 0 {
+                            tracing::warn!(
+                                event = "checks_failed",
+                                refused = batch.refused,
+                                "publications were refused"
+                            );
+                        }
+                        if let Some(until) = batch.paused_until_ms {
+                            tracing::warn!(event = "checks_paused", until_ms = until);
+                        }
+                        for entry in &batch.entries {
+                            tracing::info!(
+                                event = "check_settled",
+                                check = %entry.id,
+                                name = %entry.name,
+                                outcome = %entry.outcome
+                            );
+                        }
+                    });
+                },
+            )))
+        }
+        None => {
+            tracing::info!(event = "checks_disabled", "no GitHub App");
+            None
+        }
+    };
     tracing::info!(
         event = "link_listening",
         addr = %controller.local_addr(),
@@ -575,6 +629,7 @@ fn start_server(
         api,
         store,
         lane: Box::new(lane),
+        checks,
     })
 }
 
@@ -839,8 +894,10 @@ fn initialize_and_wait(
             api,
             store,
             lane,
+            checks,
         } => {
             api.shutdown();
+            drop(checks);
             drop(lane);
             let sessions_drained = controller.shutdown(LINK_SHUTDOWN);
             let store_drained = matches!(

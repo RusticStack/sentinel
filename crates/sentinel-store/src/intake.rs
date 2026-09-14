@@ -770,6 +770,11 @@ pub fn settle(
     if changed != 1 {
         return Err(Error::Conflict);
     }
+    // An event that was understood but produced no run still owes the forge a
+    // completed aggregate, or a required check would stay pending forever.
+    if let Some(reason) = reason {
+        crate::checks::record_delivery(tx, id, reason, now)?;
+    }
     Ok(())
 }
 
@@ -890,6 +895,9 @@ pub fn dispatch(
         crate::runs::resolve_image(tx, delivery.tenant, *job, digest, platform)?;
     }
     crate::provenance::insert(tx, provenance, run, now)?;
+    // Provenance exists now: an event-driven run on a forge-associated
+    // repository owes the stable aggregate and one check per job.
+    crate::checks::record_run(tx, delivery.tenant, run, now)?;
     settle_dispatched(tx, delivery.id, run, now)?;
     Ok(run)
 }
@@ -897,12 +905,14 @@ pub fn dispatch(
 /// Delete settled deliveries older than `before`, in bounded batches. Never
 /// touches an open row (an unresolved event is work, not history) and never
 /// one a run's provenance depends on (a dispatched delivery is kept as long
-/// as its run).
+/// as its run), or a delivery retained by a check publication.
 pub fn purge_settled(tx: &Transaction<'_>, before: UnixMillis, limit: u32) -> Result<usize> {
     Ok(tx.execute(
         "DELETE FROM webhook_deliveries WHERE id IN (
             SELECT id FROM webhook_deliveries
-            WHERE state NOT IN (0, 1) AND run_id IS NULL AND settled_ms <= ?1
+             WHERE state NOT IN (0, 1) AND run_id IS NULL AND settled_ms <= ?1
+               AND NOT EXISTS (SELECT 1 FROM check_publications p
+                               WHERE p.delivery_id = webhook_deliveries.id)
             ORDER BY settled_ms LIMIT ?2)",
         params![before.0, limit],
     )?)

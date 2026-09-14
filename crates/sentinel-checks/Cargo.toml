@@ -1,0 +1,25 @@
+[package]
+name = "sentinel-checks"
+description = "Durable external check delivery: the outbox lane and the GitHub Checks publisher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+sentinel-core = { path = "../sentinel-core" }
+sentinel-github = { path = "../sentinel-github" }
+sentinel-store = { path = "../sentinel-store" }
+
+[dev-dependencies]
+sentinel-auth = { path = "../sentinel-auth" }
+sentinel-pipeline = { path = "../sentinel-pipeline" }
+sentinel-protocol = { path = "../sentinel-protocol" }
+serde_json = "1.0"
+tempfile = "3.20"
+time = { version = "0.3", features = ["formatting"] }
+
+[lints]
+workspace = true

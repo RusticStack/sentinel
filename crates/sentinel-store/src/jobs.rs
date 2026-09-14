@@ -207,6 +207,10 @@ pub fn transition(
     if changed != 1 {
         return Err(Error::Conflict);
     }
+    // One funnel for every job state change: the Checks outbox row (when the
+    // repository has a forge association) is coalesced here, so no path can
+    // move a job without its check following.
+    crate::checks::record_job(tx, tenant, job, now)?;
     Ok(next)
 }
 

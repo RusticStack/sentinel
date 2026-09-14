@@ -10,8 +10,9 @@ Resolution has two phases, both on the same lane. **Validation** re-checks the
 source binding and ref and settles the delivery as `ready`. **Dispatch** then
 resolves the pipeline from the authorized repository at the policy-selected
 pinned revision through Git, asks the compiled pipeline whether it admits the
-event, and creates one immutable run — or settles an explicit outcome and, for
-a GitHub-associated delivery, the outcome G04 turns into a Check.
+event, and creates one immutable run — or settles an explicit outcome, which
+becomes a GitHub Check when the repository is forge-associated
+([checks](checks.md)).
 
 ## Two authenticated shapes, one store
 
@@ -186,7 +187,10 @@ than unresolved fields (see the [pipeline schema](pipeline-schema.md)).
 
 Settled rows are terminal — the store's trigger refuses reopening one — and
 each settlement is logged as `intake_settled` with its delivery and outcome,
-and a failed batch as `intake_failed`.
+and a failed batch as `intake_failed`. A settled delivery on a
+forge-associated repository also queues the completed check its outcome owes
+([checks](checks.md)); a dispatched run queues the aggregate and one check per
+job in the same transaction that creates the run.
 
 Admission is bounded: at most 1024 open deliveries per repository, after which
 a new event is `429 rate_limited` (a duplicate is still acknowledged).
@@ -203,6 +207,7 @@ never one a run's provenance depends on.
 | `<data_dir>/source-destinations.json` | the deployment's approved authorities ([sources](sources.md)); intake refuses a repository whose binding is outside it by construction |
 | `<data_dir>/master.key` | seals source credentials ([sources](sources.md)); intake tokens are digests and need no key |
 | `<data_dir>/intake-work/` | per-delivery scratch repositories for phase two; discarded and recreated on start |
+| `<data_dir>/github-app.json` | the App that authorizes source access **and** publishes Checks ([checks](checks.md)) |
 
 ## Verification
 

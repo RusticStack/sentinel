@@ -804,7 +804,8 @@ fn a_same_repository_pull_request_dispatches_at_the_tested_merge() {
     let app = Arc::new(
         sentinel_github::app::App::new(1234, &pem)
             .unwrap()
-            .with_endpoint(&stub.endpoint()),
+            .with_endpoint(&stub.endpoint())
+            .unwrap(),
     );
     let resolver = Resolver::new(
         Arc::clone(&f.store),

@@ -473,3 +473,404 @@ fn a_ref_update_is_accepted_durably_and_dispatches_through_the_source_policy() {
     assert_eq!(remaining[0]["id"], id);
     assert_eq!(remaining[0]["run"], run);
 }
+
+/// A test-only RSA key; it authenticates nothing.
+const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCn0jnG5Bokc3Af
+NRpzCYPskbFJvhtol1PCsuD1plfDG/Zl2UPU8U9Wv1d+kggr9b+yphtg4u2R1IXL
+5VcSrVtEz4mHDQeRUtndXvPyCe3i+WIFkWd5YrVnFHzEyYyAXc2gxKlxvo715SEB
+Zd+de78/2q706hZwHQ7SdODjQW5ly0JDwletAUTXMvzV7JaJ0ocwya9oIZi71PYW
+v4QxOD8SQNHynMmJDJv5HADHijrFAaQyFAtsQjRGQfY/WxocdlB6YdNDCg5OOkke
+tOri30xDGAPZvoPgtQp7WuEQY1AnyKKKkLjVVpNYraHy7GI2qGGKzHXylyjnqVTm
+lzDfjRKBAgMBAAECggEAA1EJGZr4wJ9UEsHQEoBDI6yOFjjUE4E+GLBuorGACtfl
+dYYm1tv9Uee5I8QLYPcGgVIoDgZIufjlu1hTxrI3W15F8lh5vaT8r5PIpWVjK/j6
+t2/JXYxBAoGp+jzzcmFS3CpWy5Z/qRth8hmgeDJxs/eEkqGCV60zVZ8VXK22hVDH
+/P36FENSTBHuCkONObeb6seoTiFq1bsFm09K4DwOHkZvG47DIbiXslMi6vjOklP9
+MkRqq3qO6LL1fzLzEsO02hyVil+iyPMYHGntwf78wD/vGnhXD6+i/nH0PpqxTTtk
+H36BMVpbmsfqyzEtkr5h8LprcS4GJu5DAwDPcRHJWQKBgQDXvsrQ23pfLuDAsmOO
+T4wLTSADVcipAmkEZWPFbssXSHLrQfynnWCIbWOHhcrH4M5gdPA8p8DZztAcjAuN
+qBf5b1vb/VxTrq5M3oqnC72SAjLIc9B+PXXLKdVnE9Ci+f3v3CVgXo0t/8bmOUf2
+AotKKMbv0tLkp1YHhracj41CBQKBgQDHIk89X8LwtwB7SQGbCMtywMtbI8Nhz0Ib
+Ec1te9famnzicSMb/oERrzNFJw1y/xpJ+vOXcayppMR3M91pygfoUx19dRTodoYT
+mwwFuYiPSCwWpxoo0M0QdRPAtCTMGCSgyHO1he4zm96/EFIk/w0cTW1LK16J97QA
+VZntcnILTQKBgE8MxGmEkbEAjy9r7Zh+QxT8/GbcbrqmfG407DqyHs34KMtUkUul
+GXLDif1lI2jbUSL8le3TlZD4+z4Kfk04MxidGe5gRg0PayQVQn50idBO5+aUsOcg
+g+GeAWhUVVTx/n59jmBiJJ6fInTGtjxIsFrK2CGVgNpxCc+WJ6Dz5FE1AoGBAJnp
+fNF1GJkw+OBRNzp6+7TAKu1QoQ0SQoflpJ/Anr/JtEjZJUfX2C6w+bGzU4PUhJ81
+pd0h8VBVl7yCi9neW2pIA30aZ4SdR1gT+KDcHB6Sq/D+SwvNBxJ3S0MgeWh+KKFV
+DYn58HhXOzz2Amex8pIzjgwRg0qj965ie0y5rkfpAoGBAJ/J+9Py38IDhHs6K4Ek
+GNuPWmoSiHHsvDN99rO5TahlKUw6E6Zy7hc5We0ET1HdcH+H9sQakOXf9dxgLEm7
+rxl8y5pZ+rkMirxkGkfSo5k0JPL96DYRYd5GPPxxAaymC2DaaSIbBT20vtXZKyCO
+BXHyoYy6w9e7POYAfdFeqKcU
+-----END PRIVATE KEY-----";
+
+/// A stub GitHub API over loopback: the installation, a checks token, the
+/// repository check and the check-run creations the publisher makes.
+struct GithubApi {
+    addr: std::net::SocketAddr,
+    records: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl GithubApi {
+    fn start() -> GithubApi {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = {
+            let (records, stop) = (
+                std::sync::Arc::clone(&records),
+                std::sync::Arc::clone(&stop),
+            );
+            thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => github_reply(stream, &records),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        GithubApi {
+            addr,
+            records,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn records(&self) -> Vec<serde_json::Value> {
+        self.records.lock().unwrap().clone()
+    }
+
+    fn wait_for_check(&self) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(check) = self.records().into_iter().find(|r| {
+                r["method"] == "POST"
+                    && r["path"]
+                        .as_str()
+                        .is_some_and(|p| p.ends_with("/check-runs"))
+            }) {
+                return check;
+            }
+            assert!(Instant::now() < deadline, "no check-run request arrived");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for GithubApi {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn github_reply(
+    mut stream: std::net::TcpStream,
+    records: &std::sync::Mutex<Vec<serde_json::Value>>,
+) {
+    use std::io::{Read, Write};
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+        }
+        if let Some(position) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            break position;
+        }
+    };
+    let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+    let request = head.lines().next().unwrap_or_default().to_owned();
+    let mut parts = request.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_owned();
+    let path = parts.next().unwrap_or_default().to_owned();
+    let mut length = 0usize;
+    for line in head.lines().skip(1) {
+        if let Some((key, value)) = line.split_once(':')
+            && key.trim().eq_ignore_ascii_case("content-length")
+        {
+            length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut body = buffer[header_end + 4..].to_vec();
+    while body.len() < length {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let parsed = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    records.lock().unwrap().push(serde_json::json!({
+        "method": method,
+        "path": path,
+        "body": parsed,
+    }));
+    let expires = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    let expires = expires
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let (status, response) = if method == "GET" && path.contains("/app/installations/42") {
+        (
+            200,
+            serde_json::json!({
+                "id": 42,
+                "app_id": 1234,
+                "account": {"id": 73, "login": "account", "type": "Organization"},
+                "suspended_at": null,
+                "permissions": {"contents": "read", "checks": "write"},
+            }),
+        )
+    } else if method == "POST" && path.contains("/access_tokens") {
+        (
+            201,
+            serde_json::json!({
+                "token": "ghs_e2e_token",
+                "expires_at": expires,
+                "permissions": {"checks": "write", "metadata": "read"},
+            }),
+        )
+    } else if method == "GET" && path.contains("/repositories/91") {
+        (
+            200,
+            serde_json::json!({
+                "id": 91,
+                "owner": {"id": 73},
+                "clone_url": "https://github.com/account/widget.git",
+            }),
+        )
+    } else if method == "GET" && path.contains("/check-runs") {
+        (200, serde_json::json!({"total_count": 0, "check_runs": []}))
+    } else if method == "POST" && path.contains("/check-runs") {
+        (201, serde_json::json!({"id": 707}))
+    } else {
+        (404, serde_json::json!({"message": "not found"}))
+    };
+    let text = response.to_string();
+    let _ = stream.write_all(
+        format!(
+            "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\ncontent-type: application/json\r\n\r\n{text}",
+            text.len()
+        )
+        .as_bytes(),
+    );
+}
+
+fn webhook_signature(secret: &[u8], body: &[u8]) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+    let tag = ring::hmac::sign(&key, body);
+    let mut out = String::from("sha256=");
+    for byte in tag.as_ref() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+#[test]
+fn a_refused_fork_pull_request_publishes_a_completed_check() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("controller");
+    fs::create_dir(&data).unwrap();
+    let data = data.to_str().unwrap();
+    admin_path(data, &["bootstrap"], &["--username", "root"]);
+    admin_path(data, &["key", "create"], &[]);
+    let tenant = admin_path(data, &["tenant", "create"], &["--slug", "acme"])
+        .trim()
+        .to_owned();
+    let status = admin_path(data, &["status"], &[]);
+    let actor = status
+        .split("subject=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("bootstrap audit names the account")
+        .to_owned();
+    let source = ["source", "--actor", actor.as_str()];
+    let created = admin_path(
+        data,
+        &source,
+        &["create", "--tenant", &tenant, "--name", "widget"],
+    );
+    let repo = created
+        .split("\"repo\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("create prints the repository")
+        .to_owned();
+
+    // The App and its API are a loopback stub; the deployment has a public URL
+    // for `details_url`.
+    let api = GithubApi::start();
+    let app_key = temp.path().join("app.pem");
+    fs::write(&app_key, TEST_KEY).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&app_key, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fs::write(
+        temp.path().join("controller/github-app.json"),
+        serde_json::json!({
+            "app_id": 1234,
+            "private_key_file": app_key.to_str().unwrap(),
+            "api_url": api.endpoint(),
+            "public_url": "https://ci.example",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("controller/github-webhook.json"),
+        serde_json::json!({"secret": "a-webhook-secret-value"}).to_string(),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            temp.path().join("controller/github-webhook.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    // The App association is refreshed through the stub, then bound.
+    let refreshed = admin_path(
+        data,
+        &source,
+        &[
+            "refresh-installation",
+            "--external-id",
+            "42",
+            "--expected",
+            "0",
+        ],
+    );
+    let installation = refreshed
+        .split("\"installation\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("refresh prints the installation")
+        .to_owned();
+    let bound = admin_path(
+        data,
+        &source,
+        &[
+            "bind-installation",
+            "--installation",
+            &installation,
+            "--tenant",
+            &tenant,
+        ],
+    );
+    assert!(bound.contains("\"bound\":true"), "{bound}");
+    fs::write(
+        temp.path().join("controller/source-destinations.json"),
+        "[\"https://github.com\"]",
+    )
+    .unwrap();
+    let bind = serde_json::json!({
+        "binding": {
+            "remote": "https://github.com/account/widget.git",
+            "allowed_refs": ["refs/heads/main"],
+            "pipeline_path": ".sentinel.yml",
+            "trust": "",
+        },
+        "credential": "Public",
+        "forge": {"installation": installation, "repository_id": 91},
+    });
+    let bound = admin_stdin(
+        data,
+        &source,
+        &["bind", "--repo", &repo, "--expected", "0"],
+        bind.to_string().as_bytes(),
+    );
+    assert!(
+        bound.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bound.stderr)
+    );
+
+    let mut server_process = Server::spawn(data);
+    let start = server_process.event("checks_enabled");
+    assert_eq!(start["fields"]["details_url"], true);
+    let api_info = server_process.event("api_listening");
+    let base = format!("http://{}", api_info["fields"]["addr"].as_str().unwrap());
+
+    // A pull request whose head lives in another repository is refused before
+    // any fetch, and that refusal still owes a completed check.
+    let merge = "e".repeat(40);
+    let pr = serde_json::json!({
+        "action": "opened",
+        "number": 7,
+        "installation": {"id": 42},
+        "repository": {"id": 91, "full_name": "account/widget"},
+        "pull_request": {
+            "draft": false,
+            "head": {"ref": "feature", "sha": "c".repeat(40), "repo": {"id": 999}},
+            "base": {"ref": "main", "sha": "d".repeat(40)},
+            "merge_commit_sha": merge,
+        },
+    });
+    let raw = pr.to_string();
+    let (status, body) = post(&format!("{base}/api/v1/hooks/github"), "irrelevant", &pr);
+    // The generic `post` helper sends no signature; use the signed path.
+    assert_eq!(status, 401, "{body}");
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let signature = webhook_signature(b"a-webhook-secret-value", raw.as_bytes());
+    let response = agent
+        .post(format!("{base}/api/v1/hooks/github"))
+        .header("content-type", "application/json")
+        .header("x-hub-signature-256", &signature)
+        .header("x-github-event", "pull_request")
+        .header("x-github-delivery", "pr-1")
+        .send(raw.as_bytes())
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 202);
+
+    let settled = server_process.wait(
+        |record| {
+            record["fields"]["event"] == "intake_settled"
+                && record["fields"]["outcome"] == "ignored:fork_pr"
+        },
+        "the fork refusal",
+    );
+    assert_eq!(settled["fields"]["outcome"], "ignored:fork_pr");
+    let check = api.wait_for_check();
+    assert_eq!(check["body"]["name"], "sentinel / ci");
+    assert_eq!(check["body"]["status"], "completed");
+    assert_eq!(check["body"]["conclusion"], "neutral");
+    assert_eq!(check["body"]["head_sha"], merge);
+    assert!(
+        check["body"]["output"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("fork"),
+        "{check}"
+    );
+    // A settled delivery with no run has no details link.
+    assert!(check["body"]["details_url"].is_null(), "{check}");
+
+    server_process.stop();
+    let listed = admin_path(data, &["intake"], &["list", "--repo", &repo]);
+    let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed["deliveries"][0]["reason"], "fork_pr");
+    assert_eq!(listed["deliveries"][0]["state"], "ignored");
+}

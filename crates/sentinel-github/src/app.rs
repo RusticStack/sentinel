@@ -83,17 +83,27 @@ impl App {
     }
 
     /// The same App against another API endpoint: a GitHub Enterprise host,
-    /// or a test stub. The URL must be absolute and use HTTPS, except for a
-    /// loopback host, which is how the token path is exercised offline.
-    #[must_use]
-    pub fn with_endpoint(mut self, endpoint: &str) -> Self {
-        let loopback = endpoint
+    /// or a test stub. The URL must be absolute, bounded, free of query and
+    /// fragment, and use HTTPS — HTTP is accepted only for a loopback host,
+    /// which is how the token and Checks paths are exercised offline.
+    pub fn with_endpoint(mut self, endpoint: &str) -> Result<Self> {
+        let trimmed = endpoint.trim_end_matches('/');
+        let loopback = trimmed
             .strip_prefix("http://")
             .is_some_and(|rest| rest.starts_with("127.0.0.1:") || rest.starts_with("localhost:"));
-        if endpoint.starts_with("https://") || loopback {
-            self.endpoint = endpoint.trim_end_matches('/').to_owned();
+        if !(trimmed.starts_with("https://") || loopback)
+            || trimmed.len() > 256
+            || trimmed.contains(['?', '#', ' '])
+        {
+            return Err(Error::Config("github endpoint"));
         }
-        self
+        self.endpoint = trimmed.to_owned();
+        Ok(self)
+    }
+
+    /// The endpoint this App talks to, for diagnostics (never a secret).
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     fn jwt(&self, now_ms: i64) -> Result<String> {
@@ -138,6 +148,46 @@ impl App {
         remote: &str,
         now_ms: i64,
     ) -> Result<Token> {
+        self.repository_token(
+            installation,
+            account,
+            repo,
+            remote,
+            now_ms,
+            &[("contents", "read")],
+        )
+    }
+
+    /// A token for publishing Checks (G04): `checks: write` and nothing else,
+    /// for the same one immutable repository and with the same verification.
+    /// A different permission set is a different token, never a wider one.
+    pub fn checks_token(
+        &self,
+        installation: u64,
+        account: u64,
+        repo: u64,
+        remote: &str,
+        now_ms: i64,
+    ) -> Result<Token> {
+        self.repository_token(
+            installation,
+            account,
+            repo,
+            remote,
+            now_ms,
+            &[("checks", "write")],
+        )
+    }
+
+    fn repository_token(
+        &self,
+        installation: u64,
+        account: u64,
+        repo: u64,
+        remote: &str,
+        now_ms: i64,
+        permissions: &[(&str, &str)],
+    ) -> Result<Token> {
         let installed = self.installation(installation, now_ms)?;
         if installed.suspended
             || !installed.permissions_valid
@@ -146,15 +196,19 @@ impl App {
         {
             return Err(Error::Response("installation access refused"));
         }
+        let granted: serde_json::Map<String, Value> = permissions
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), Value::from(*value)))
+            .collect();
         let value = self.http.post_authenticated(
             &format!(
                 "{}/app/installations/{installation}/access_tokens",
                 self.endpoint
             ),
             &self.jwt(now_ms)?,
-            &json!({"repository_ids":[repo],"permissions":{"contents":"read"}}),
+            &json!({"repository_ids":[repo],"permissions":granted}),
         )?;
-        let token = parse_token(&value, now_ms)?;
+        let token = parse_token(&value, now_ms, permissions)?;
         let repository = self.http.get_authenticated(
             &format!("{}/repositories/{repo}", self.endpoint),
             &token.secret,
@@ -206,7 +260,7 @@ fn parse_installation(v: &Value, app: u64, id: u64) -> Result<Installation> {
     })
 }
 
-fn parse_token(v: &Value, now_ms: i64) -> Result<Token> {
+fn parse_token(v: &Value, now_ms: i64, requested: &[(&str, &str)]) -> Result<Token> {
     let secret = v["token"]
         .as_str()
         .filter(|s| {
@@ -218,11 +272,15 @@ fn parse_token(v: &Value, now_ms: i64) -> Result<Token> {
     let permissions = v["permissions"]
         .as_object()
         .ok_or(Error::Response("token permissions"))?;
-    if permissions.get("contents").and_then(Value::as_str) != Some("read")
-        || permissions.iter().any(|(k, v)| {
-            !matches!(k.as_str(), "contents" | "metadata") || v.as_str() != Some("read")
-        })
-    {
+    // The token must carry exactly what was requested (metadata read is the
+    // implicit companion), never more: a narrowed token is the whole point.
+    let allows_metadata = permissions
+        .iter()
+        .all(|(key, _)| key == "metadata" || requested.iter().any(|(k, _)| k == key));
+    let exact = requested
+        .iter()
+        .all(|(key, value)| permissions.get(*key).and_then(Value::as_str) == Some(*value));
+    if !allows_metadata || !exact {
         return Err(Error::Response("token permission scope"));
     }
     let expiry = v["expires_at"]
@@ -262,11 +320,20 @@ mod tests {
     fn token_is_read_only_short_lived_and_debug_redacted() {
         let now = 1_789_344_000_000;
         let mut v = json!({"token":"ghs_private_value","expires_at":"2026-09-14T01:00:00Z","permissions":{"contents":"read","metadata":"read"}});
-        let token = parse_token(&v, now).unwrap();
+        let source = [("contents", "read")];
+        let token = parse_token(&v, now, &source).unwrap();
         assert!(!format!("{token:?}").contains("private"));
         v["permissions"]["checks"] = json!("write");
-        assert!(parse_token(&v, now).is_err());
+        assert!(parse_token(&v, now, &source).is_err());
         v["permissions"].as_object_mut().unwrap().remove("checks");
-        assert!(parse_token(&v, token.expires_ms).is_err());
+        assert!(parse_token(&v, token.expires_ms, &source).is_err());
+        // The checks token is a different, equally exact permission set.
+        assert!(parse_token(&v, now, &[("checks", "write")]).is_err());
+        v["permissions"] = json!({"checks":"write","metadata":"read"});
+        assert!(parse_token(&v, now, &[("checks", "write")]).is_ok());
+        assert!(parse_token(&v, now, &source).is_err());
+        // A wider grant than requested is refused, not narrowed silently.
+        v["permissions"] = json!({"checks":"write","contents":"read","metadata":"read"});
+        assert!(parse_token(&v, now, &[("checks", "write")]).is_err());
     }
 }

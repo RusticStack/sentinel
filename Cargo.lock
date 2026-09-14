@@ -1154,8 +1154,10 @@ version = "0.1.0-dev"
 dependencies = [
  "clap",
  "ctrlc",
+ "ring",
  "sentinel-api",
  "sentinel-auth",
+ "sentinel-checks",
  "sentinel-core",
  "sentinel-github",
  "sentinel-intake",
@@ -1167,6 +1169,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "time",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -1213,6 +1216,21 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "sentinel-checks"
+version = "0.1.0-dev"
+dependencies = [
+ "sentinel-auth",
+ "sentinel-core",
+ "sentinel-github",
+ "sentinel-pipeline",
+ "sentinel-protocol",
+ "sentinel-store",
+ "serde_json",
+ "tempfile",
+ "time",
 ]
 
 [[package]]
