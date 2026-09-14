@@ -19,6 +19,7 @@ pub mod local_auth;
 pub mod lookup;
 pub mod runs;
 pub mod schema;
+pub mod sign_in;
 pub mod tokens;
 
 use std::{

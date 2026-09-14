@@ -64,6 +64,36 @@ pub enum AdminCommand {
     },
     /// Provision, list and revoke scoped, expiring API credentials
     Token(TokenArgs),
+    /// Inspect and remove linked external sign-in identities
+    Identity(IdentityArgs),
+}
+
+#[derive(Args)]
+pub struct IdentityArgs {
+    #[command(subcommand)]
+    pub command: IdentityCommand,
+}
+
+#[derive(Subcommand)]
+pub enum IdentityCommand {
+    /// Show which external accounts can sign in as this account
+    List {
+        #[command(flatten)]
+        data: DataDir,
+        /// A local username or a `usr_` identifier
+        #[arg(long)]
+        user: String,
+    },
+    /// Remove a link, so that external account can no longer sign in as this one
+    Unlink {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+        /// Configured provider key, such as `github`
+        #[arg(long, default_value = "github")]
+        provider: String,
+    },
 }
 
 #[derive(Args)]

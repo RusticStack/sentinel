@@ -93,7 +93,7 @@ Scoped, expiring API credentials are provisioned the same way, and the secret is
 ./target/release/sentinel admin token revoke --data-dir "$PWD/data/controller" --id tok_...
 ```
 
-Passwords are read from standard input only; no subcommand accepts one in argv, and a terminal stdin is refused. `bootstrap` creates the database if needed and is refused once any active super admin exists; `status` and `recover` refuse a path with no database rather than creating an empty one. Exit code 2 covers every refusal. See [local authentication](local-authentication.md) and [API credentials](api-credentials.md).
+Passwords are read from standard input only; no subcommand accepts one in argv, and a terminal stdin is refused. `bootstrap` creates the database if needed and is refused once any active super admin exists; `status` and `recover` refuse a path with no database rather than creating an empty one. Exit code 2 covers every refusal. Linked external sign-in identities are inspected with `admin identity list` and removed with `admin identity unlink`; linking itself only follows a verified provider sign-in. See [local authentication](local-authentication.md), [API credentials](api-credentials.md) and [GitHub sign-in](github-sign-in.md).
 
 ## Shutdown and output
 

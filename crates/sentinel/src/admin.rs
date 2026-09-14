@@ -14,11 +14,13 @@ use sentinel_core::{RepoId, TenantId, TokenId, UnixMillis, UserId, auth::Permiss
 use sentinel_store::{
     Durability, METADATA_FILE, Store,
     local_auth::{self, Event},
-    lookup,
+    lookup, sign_in,
     tokens::{self, Grant},
 };
 
-use crate::cli::{AdminArgs, AdminCommand, DataDir, TokenArgs, TokenCommand};
+use crate::cli::{
+    AdminArgs, AdminCommand, DataDir, IdentityArgs, IdentityCommand, TokenArgs, TokenCommand,
+};
 
 pub struct Error {
     pub message: String,
@@ -159,6 +161,7 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
             }
         }
         AdminCommand::Token(args) => token(args, now)?,
+        AdminCommand::Identity(args) => identity(args, now)?,
     }
     Ok(())
 }
@@ -357,6 +360,47 @@ fn token(args: &TokenArgs, now: UnixMillis) -> Result<(), Error> {
     Ok(())
 }
 
+/// Linking only ever happens through a verified provider sign-in, so there is
+/// no host-local link command: an operator who could type a subject could sign
+/// in as anybody. Removing a wrong link is the host-local repair path.
+fn identity(args: &IdentityArgs, now: UnixMillis) -> Result<(), Error> {
+    match &args.command {
+        IdentityCommand::List { data, user } => {
+            let store = open(data, true)?;
+            let user = resolve_user(&store, user)?;
+            let principal =
+                sentinel_core::auth::Principal::new(user, Permissions::NONE, None, None);
+            let identities = store
+                .read(|conn| sign_in::identities(conn, principal, user))
+                .map_err(|error| fail(format!("cannot list identities: {error}")))?;
+            for identity in identities {
+                println!(
+                    "{} subject={} linked={}",
+                    identity.provider, identity.subject, identity.linked.0
+                );
+            }
+        }
+        IdentityCommand::Unlink {
+            data,
+            user,
+            provider,
+        } => {
+            let store = open(data, true)?;
+            let user = resolve_user(&store, user)?;
+            sign_in::unlink_host_local(&store, user, provider, now).map_err(
+                |error| match error {
+                    sentinel_store::Error::NotFound => {
+                        fail("that account has no link with that provider")
+                    }
+                    other => fail(format!("unlink failed: {other}")),
+                },
+            )?;
+            eprintln!("unlinked {provider} from {user}");
+        }
+    }
+    Ok(())
+}
+
 const fn event_name(event: Event) -> &'static str {
     match event {
         Event::Bootstrap => "bootstrap",
@@ -373,5 +417,7 @@ const fn event_name(event: Event) -> &'static str {
         Event::AccountDeactivated => "account-deactivated",
         Event::TokenIssued => "token-issued",
         Event::TokenRevoked => "token-revoked",
+        Event::IdentityLinked => "identity-linked",
+        Event::IdentityUnlinked => "identity-unlinked",
     }
 }

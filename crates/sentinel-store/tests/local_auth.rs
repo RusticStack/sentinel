@@ -571,10 +571,11 @@ fn expired_and_revoked_sessions_are_purged_without_touching_live_ones() {
 fn the_cookie_and_csrf_policy_binds_a_state_change_to_its_own_session() {
     let (_dir, store) = store();
     let (_root, issued) = bootstrapped(&store);
-    let header = cookie::issue(&issued.session, issued.max_age_secs);
+    let header = cookie::issue(cookie::SESSION_COOKIE, &issued.session, issued.max_age_secs);
     assert!(header.contains("; Secure; HttpOnly; SameSite=Strict"));
 
-    let presented = cookie::read(header.split(';').next().unwrap()).unwrap();
+    let presented =
+        cookie::read(cookie::SESSION_COOKIE, header.split(';').next().unwrap()).unwrap();
     let session = store
         .read(|conn| local_auth::authenticate(conn, &presented, at(2_200)))
         .unwrap();

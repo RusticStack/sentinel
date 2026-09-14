@@ -2,7 +2,7 @@
 
 Implemented in `sentinel-auth` (password hashing, opaque secrets, cookie/CSRF policy), `sentinel-store::local_auth` (bootstrap, credentials, sessions, audit) and the host-local `sentinel admin` command, with append-only metadata migration **5**.
 
-This is authentication only. Admission is [A01's authorization layer](authorization.md): a validated session produces a `Principal`, and every repository, tenant and platform decision is still a live membership/grant check. [API credentials](api-credentials.md) (A03) are the other source of that `Principal`. GitHub sign-in is A04, registration and invitations are A05, MFA and step-up are A06.
+This is authentication only. Admission is [A01's authorization layer](authorization.md): a validated session produces a `Principal`, and every repository, tenant and platform decision is still a live membership/grant check. [API credentials](api-credentials.md) (A03) and [GitHub sign-in](github-sign-in.md) (A04) are the other sources of that `Principal`. Registration and invitations are A05, MFA and step-up are A06.
 
 ## First-admin bootstrap
 

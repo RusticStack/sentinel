@@ -1,0 +1,22 @@
+[package]
+name = "sentinel-github"
+description = "GitHub sign-in: bounded HTTPS client, OAuth code exchange and verified identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json = "1.0"
+ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip"] }
+
+[dev-dependencies]
+sentinel-auth = { path = "../sentinel-auth" }
+sentinel-core = { path = "../sentinel-core" }
+sentinel-store = { path = "../sentinel-store" }
+tempfile = "3.20"
+
+[lints]
+workspace = true

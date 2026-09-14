@@ -6,9 +6,14 @@
 
 use crate::secret::{Digest, Secret, digest_eq};
 
-/// Host-only cookie: no `Domain`, so a sibling hostname cannot set or read it.
-/// `__Host-` additionally requires `Secure` and `Path=/` in conforming browsers.
+/// Host-only cookies: no `Domain`, so a sibling hostname cannot set or read
+/// them. `__Host-` additionally requires `Secure` and `Path=/` in conforming
+/// browsers.
 pub const SESSION_COOKIE: &str = "__Host-sentinel_session";
+
+/// Carries the pending sign-in state during an external authorization round
+/// trip, so a callback must present the browser's own half of it (A04).
+pub const SIGN_IN_COOKIE: &str = "__Host-sentinel_signin";
 
 /// The header carrying the session's CSRF secret. A header cannot be set by a
 /// cross-site form post, and `SameSite=Strict` keeps the cookie off those requests.
@@ -18,11 +23,11 @@ pub const CSRF_HEADER: &str = "x-sentinel-csrf";
 /// arrive already authenticated, and top-level GET navigation mutates nothing.
 const ATTRIBUTES: &str = "; Path=/; Secure; HttpOnly; SameSite=Strict";
 
-/// `Set-Cookie` value issuing `secret` for `max_age_secs`. The secret appears
-/// here and nowhere else; the caller must not log the returned string.
-pub fn issue(secret: &Secret, max_age_secs: u32) -> String {
-    let mut header = String::with_capacity(SESSION_COOKIE.len() + Secret::TEXT_LEN + 64);
-    header.push_str(SESSION_COOKIE);
+/// `Set-Cookie` value issuing `secret` under `name` for `max_age_secs`. The
+/// secret appears here and nowhere else; the caller must not log the result.
+pub fn issue(name: &str, secret: &Secret, max_age_secs: u32) -> String {
+    let mut header = String::with_capacity(name.len() + Secret::TEXT_LEN + 64);
+    header.push_str(name);
     header.push('=');
     secret.expose(&mut header);
     header.push_str(ATTRIBUTES);
@@ -31,21 +36,21 @@ pub fn issue(secret: &Secret, max_age_secs: u32) -> String {
     header
 }
 
-/// `Set-Cookie` value that removes the session cookie. Used on logout and on
-/// every rejected session, so a revoked secret is not presented again.
-pub fn clear() -> String {
-    format!("{SESSION_COOKIE}={ATTRIBUTES}; Max-Age=0")
+/// `Set-Cookie` value that removes a cookie. Used on logout, on every rejected
+/// session, and on a completed sign-in, so a spent secret is not presented again.
+pub fn clear(name: &str) -> String {
+    format!("{name}={ATTRIBUTES}; Max-Age=0")
 }
 
-/// Read the session secret out of a `Cookie` header. Returns `None` for a
+/// Read one named secret out of a `Cookie` header. Returns `None` for a
 /// missing, duplicated or malformed value rather than trying the first match:
-/// two cookies of this name mean something is injecting them.
-pub fn read(header: &str) -> Option<Secret> {
+/// two cookies of one name mean something is injecting them.
+pub fn read(name: &str, header: &str) -> Option<Secret> {
     let mut found = None;
     for pair in header.split(';') {
         let pair = pair.trim_start();
         let Some(value) = pair
-            .strip_prefix(SESSION_COOKIE)
+            .strip_prefix(name)
             .and_then(|rest| rest.strip_prefix('='))
         else {
             continue;
@@ -89,7 +94,7 @@ mod tests {
     #[test]
     fn issued_cookies_carry_the_full_transport_policy() {
         let secret = Secret::generate();
-        let header = issue(&secret, 43200);
+        let header = issue(SESSION_COOKIE, &secret, 43200);
         let mut text = String::new();
         secret.expose(&mut text);
         assert!(
@@ -109,7 +114,10 @@ mod tests {
             );
         }
         assert!(!header.contains("Domain="), "{header}");
-        assert!(clear().contains("Max-Age=0"));
+        assert!(clear(SESSION_COOKIE).contains("Max-Age=0"));
+        let pending = issue(SIGN_IN_COOKIE, &secret, 600);
+        assert!(pending.starts_with(SIGN_IN_COOKIE), "{pending}");
+        assert!(pending.contains("SameSite=Strict") && pending.contains("Max-Age=600"));
     }
 
     #[test]
@@ -119,13 +127,29 @@ mod tests {
         secret.expose(&mut text);
         let single = format!("other=1; {SESSION_COOKIE}={text}; last=2");
         assert!(digest_eq(
-            &read(&single).unwrap().digest(),
+            &read(SESSION_COOKIE, &single).unwrap().digest(),
             &secret.digest()
         ));
-        assert!(read(&format!("{SESSION_COOKIE}={text}; {SESSION_COOKIE}={text}")).is_none());
-        assert!(read(&format!("{SESSION_COOKIE}_other={text}")).is_none());
-        assert!(read(&format!("{SESSION_COOKIE}=zz{}", &text[2..])).is_none());
-        assert!(read("").is_none());
+        assert!(
+            read(SIGN_IN_COOKIE, &single).is_none(),
+            "names are distinct"
+        );
+        assert!(
+            read(
+                SESSION_COOKIE,
+                &format!("{SESSION_COOKIE}={text}; {SESSION_COOKIE}={text}")
+            )
+            .is_none()
+        );
+        assert!(read(SESSION_COOKIE, &format!("{SESSION_COOKIE}_other={text}")).is_none());
+        assert!(
+            read(
+                SESSION_COOKIE,
+                &format!("{SESSION_COOKIE}=zz{}", &text[2..])
+            )
+            .is_none()
+        );
+        assert!(read(SESSION_COOKIE, "").is_none());
     }
 
     #[test]

@@ -6,7 +6,7 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 |---|---|---|---|
 | Pipeline schema | `schema: N` in `.sentinel.yml` (currently 1) | `sentinel-pipeline` | repositories |
 | Run spec blob | leading format byte (currently 1) | `sentinel-pipeline::run`, `run_specs.format` | store, workers |
-| Metadata database | `schema_migrations.version` (currently 6) | `sentinel-store` | controller |
+| Metadata database | `schema_migrations.version` (currently 7) | `sentinel-store` | controller |
 | API error | `schema: "sentinel.error/1"` | `sentinel-protocol` | CLI, MCP, UI, workers |
 | Explain output | `schema: "sentinel.explain/1"` | `sentinel-pipeline::explain` | CLI, agents |
 | Event cursor | text prefix `c1` | `sentinel-protocol::cursor` | API clients |
@@ -21,7 +21,7 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 
 **Database.** Migrations are append-only and forward-only; there is no down migration. A release may add migrations; it must be able to open a database at any version produced by the previous release. Columns are never dropped in the same release that stops writing them. `PRAGMA user_version` is not used; `schema_migrations` is the only truth.
 
-Readers reject a database newer than their highest known migration. Migration 4 preserves version-3 tables and blobs, adds identity/grants, and rejects inconsistent ownership rather than silently repairing it. Migration 5 adds local credentials, sessions, the append-only authentication audit and the single-row bootstrap latch; stored password records are PHC strings carrying their own parameters, so a parameter upgrade rehashes on next login instead of invalidating accounts. Migration 6 adds scoped, expiring API credentials, stored as digests with immutable scope. See [authorization](authorization.md), [local authentication](local-authentication.md) and [API credentials](api-credentials.md).
+Readers reject a database newer than their highest known migration. Migration 4 preserves version-3 tables and blobs, adds identity/grants, and rejects inconsistent ownership rather than silently repairing it. Migration 5 adds local credentials, sessions, the append-only authentication audit and the single-row bootstrap latch; stored password records are PHC strings carrying their own parameters, so a parameter upgrade rehashes on next login instead of invalidating accounts. Migration 6 adds scoped, expiring API credentials, stored as digests with immutable scope; migration 7 adds single-use, expiring external sign-in state. The `github` provider key in `external_identities` is part of a stored primary key: changing it orphans existing links. See [authorization](authorization.md), [local authentication](local-authentication.md), [API credentials](api-credentials.md) and [GitHub sign-in](github-sign-in.md).
 
 **C06 resolver hardening.** The pipeline schema and run-spec layout remain version 1: no compiler-accepted schema shape is tightened, and static regular-file hash records retain their exact bytes. Runtime filesystem admission now rejects unsafe paths and exhausted traversal/read budgets explicitly. Non-Linux direct resolver calls return `UnsupportedPlatform`; offline CLI operations continue to leave hashes unresolved. Terminal `**` now includes recursive regular files. These worker-resolver behaviors are documented in [hash files](hash-files.md); future persisted cache contracts must version any change to digest record bytes.
 

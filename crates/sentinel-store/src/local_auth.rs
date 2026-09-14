@@ -69,6 +69,8 @@ pub enum Event {
     AccountDeactivated = 12,
     TokenIssued = 13,
     TokenRevoked = 14,
+    IdentityLinked = 15,
+    IdentityUnlinked = 16,
 }
 
 impl Event {
@@ -88,6 +90,8 @@ impl Event {
             12 => Event::AccountDeactivated,
             13 => Event::TokenIssued,
             14 => Event::TokenRevoked,
+            15 => Event::IdentityLinked,
+            16 => Event::IdentityUnlinked,
             _ => return None,
         })
     }
@@ -95,6 +99,7 @@ impl Event {
 
 /// The credentials handed to the browser exactly once. `session` goes into the
 /// `__Host-` cookie; `csrf` goes into the page, to be echoed in a header.
+#[derive(Debug)]
 pub struct Issued {
     pub user: UserId,
     pub session: Secret,
@@ -372,9 +377,6 @@ pub fn login(
         return Ok(Login::Rejected);
     }
 
-    let session = Secret::generate();
-    let csrf = Secret::generate();
-    let (token_digest, csrf_digest) = (session.digest(), csrf.digest());
     let issued = store.writer().write(move |tx| {
         let current: Option<(String, i64)> = tx
             .prepare_cached(
@@ -397,7 +399,7 @@ pub fn login(
              WHERE user_id = ?1",
             params![user.as_bytes(), upgraded, now.0],
         )?;
-        insert_session(tx, user, token_digest, csrf_digest, policy, now)?;
+        let issued = issue_session(tx, user, policy, now)?;
         audit(
             tx,
             Event::LoginAccepted,
@@ -405,42 +407,50 @@ pub fn login(
             Some(user),
             false,
             None,
-        )
+        )?;
+        Ok(issued)
     });
     match issued {
-        Ok(()) => Ok(Login::Accepted(Issued {
-            user,
-            session,
-            csrf,
-            max_age_secs: (policy.idle_ms / 1000).clamp(0, i64::from(u32::MAX)) as u32,
-        })),
+        Ok(issued) => Ok(Login::Accepted(issued)),
         Err(Error::Conflict) => Ok(Login::Rejected),
         Err(error) => Err(error),
     }
 }
 
-fn insert_session(
+/// Mint and record one session for an already-authenticated account.
+///
+/// This is the only way a session comes into existence: the password path calls
+/// it, and so does external sign-in ([`crate::sign_in`]). Callers must have
+/// established identity first — this function authenticates nobody. The insert
+/// trigger still refuses a suspended or non-human account, so a race with
+/// suspension fails the transaction instead of issuing a usable cookie.
+pub fn issue_session(
     tx: &Transaction<'_>,
     user: UserId,
-    token: Digest,
-    csrf: Digest,
     policy: Policy,
     now: UnixMillis,
-) -> Result<()> {
+) -> Result<Issued> {
+    let session = Secret::generate();
+    let csrf = Secret::generate();
     let absolute = now.0.saturating_add(policy.absolute_ms);
     tx.execute(
         "INSERT INTO sessions(token_digest, user_id, csrf_digest, created_ms,
             idle_deadline_ms, absolute_deadline_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
-            token.0,
+            session.digest().0,
             user.as_bytes(),
-            csrf.0,
+            csrf.digest().0,
             now.0,
             now.0.saturating_add(policy.idle_ms).min(absolute),
             absolute
         ],
     )?;
-    Ok(())
+    Ok(Issued {
+        user,
+        session,
+        csrf,
+        max_age_secs: (policy.idle_ms / 1000).clamp(0, i64::from(u32::MAX)) as u32,
+    })
 }
 
 /// Validate a presented cookie value. One primary-key probe; expiry, revocation
