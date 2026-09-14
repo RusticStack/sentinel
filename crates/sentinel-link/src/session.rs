@@ -23,11 +23,13 @@ use std::{
 use rustls::{ClientConnection, ServerConnection, pki_types::ServerName};
 use sentinel_auth::secret::{Digest, Secret};
 use sentinel_core::{
-    AttemptId, Event, FailureClass, Fence, JobId, RunId, TenantId, UnixMillis, WorkerId,
+    AttemptId, Event, FailureClass, Fence, JobId, Outcome, RepoId, RunId, TenantId, UnixMillis,
+    WorkerId,
 };
 use sentinel_protocol::{
     limits::{MAX_API_BODY_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_LIST_ITEMS},
     negotiate::{Hello, Negotiated, Rejected},
+    summary::MAX_SUMMARY_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -79,11 +81,13 @@ pub enum ClientMessage {
         attempt: [u8; 16],
         fence: u64,
     },
-    /// The attempt moved: a worker-side state event under its fence.
+    /// The attempt moved: a worker-side state event under its fence. A
+    /// terminal report may carry the attempt's encoded summary.
     Report {
         attempt: [u8; 16],
         fence: u64,
         event: WireEvent,
+        summary: Option<Vec<u8>>,
     },
     /// The worker needs the run spec of an attempt it holds.
     NeedSpec {
@@ -131,6 +135,7 @@ impl WireEvent {
                 5 => FailureClass::Canceled,
                 6 => FailureClass::Preparation,
                 10 => FailureClass::Publication,
+                11 => FailureClass::Runtime,
                 _ => return Err(Error::Protocol("failure class")),
             }),
         })
@@ -180,6 +185,109 @@ pub enum ServerMessage {
     NoSpec {
         attempt: [u8; 16],
     },
+    /// Precedes the `Spec` chunks: what the worker needs to evaluate the
+    /// job's expressions.
+    Context(WireContext),
+}
+
+/// [`JobContext`] on the wire; dependency outcomes as their stored codes.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WireContext {
+    pub attempt: [u8; 16],
+    pub run: [u8; 16],
+    pub repo: [u8; 16],
+    pub repo_name: String,
+    pub job: [u8; 16],
+    pub job_name: String,
+    pub sha: String,
+    pub cancelled: bool,
+    pub needs: Vec<(String, u8)>,
+}
+
+/// What the worker evaluates expressions against: identity of the run,
+/// repository and job, dependency outcomes by name, cancellation. Event
+/// data joins it with intake.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobContext {
+    pub run: RunId,
+    pub repo: RepoId,
+    pub repo_name: String,
+    pub job: JobId,
+    pub job_name: String,
+    pub sha: String,
+    pub cancelled: bool,
+    pub needs: Vec<(String, Outcome)>,
+}
+
+const fn outcome_code(outcome: Outcome) -> u8 {
+    match outcome {
+        Outcome::Passed => 0,
+        Outcome::Skipped => 1,
+        Outcome::Canceled => 2,
+        Outcome::TimedOut => 3,
+        Outcome::Failed => 4,
+        Outcome::InfraFailed => 5,
+    }
+}
+
+const fn outcome_from_code(code: u8) -> Option<Outcome> {
+    Some(match code {
+        0 => Outcome::Passed,
+        1 => Outcome::Skipped,
+        2 => Outcome::Canceled,
+        3 => Outcome::TimedOut,
+        4 => Outcome::Failed,
+        5 => Outcome::InfraFailed,
+        _ => return None,
+    })
+}
+
+impl JobContext {
+    fn to_wire(&self, attempt: AttemptId) -> WireContext {
+        WireContext {
+            attempt: *attempt.as_bytes(),
+            run: *self.run.as_bytes(),
+            repo: *self.repo.as_bytes(),
+            repo_name: self.repo_name.clone(),
+            job: *self.job.as_bytes(),
+            job_name: self.job_name.clone(),
+            sha: self.sha.clone(),
+            cancelled: self.cancelled,
+            needs: self
+                .needs
+                .iter()
+                .map(|(name, outcome)| (name.clone(), outcome_code(*outcome)))
+                .collect(),
+        }
+    }
+
+    fn from_wire(wire: WireContext) -> Result<(AttemptId, JobContext)> {
+        if wire.needs.len() > MAX_LIST_ITEMS {
+            return Err(Error::Protocol("needs list"));
+        }
+        let id = |b: [u8; 16]| -> Result<[u8; 16]> { Ok(b) };
+        let _ = id;
+        let mut needs = Vec::with_capacity(wire.needs.len());
+        for (name, code) in wire.needs {
+            needs.push((
+                name,
+                outcome_from_code(code).ok_or(Error::Protocol("outcome"))?,
+            ));
+        }
+        Ok((
+            AttemptId::from_bytes(wire.attempt).map_err(|_| Error::Protocol("id"))?,
+            JobContext {
+                run: RunId::from_bytes(wire.run).map_err(|_| Error::Protocol("id"))?,
+                repo: RepoId::from_bytes(wire.repo).map_err(|_| Error::Protocol("id"))?,
+                repo_name: wire.repo_name,
+                job: JobId::from_bytes(wire.job).map_err(|_| Error::Protocol("id"))?,
+                job_name: wire.job_name,
+                sha: wire.sha,
+                cancelled: wire.cancelled,
+                needs,
+            },
+        ))
+    }
 }
 
 /// An offer as the worker sees it: a fenced lease it must acknowledge within
@@ -313,10 +421,18 @@ pub trait SessionHandler: Send + Sync {
     fn acknowledged(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
     fn declined(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
     /// A worker-side state event. The handler applies it under the fence;
-    /// a stale one changes nothing.
-    fn reported(&self, worker: WorkerId, attempt: AttemptId, fence: Fence, event: Event);
-    /// The encoded run spec of an attempt this worker holds, or `None`.
-    fn spec(&self, worker: WorkerId, attempt: AttemptId) -> Option<Vec<u8>>;
+    /// a stale one changes nothing. `summary` accompanies a terminal event.
+    fn reported(
+        &self,
+        worker: WorkerId,
+        attempt: AttemptId,
+        fence: Fence,
+        event: Event,
+        summary: Option<Vec<u8>>,
+    );
+    /// The job context and encoded run spec of an attempt this worker
+    /// holds, or `None`.
+    fn spec(&self, worker: WorkerId, attempt: AttemptId) -> Option<(JobContext, Vec<u8>)>;
 }
 
 /// The rustls state and the socket it writes to. The lock is held only while
@@ -611,15 +727,23 @@ impl WorkerSession {
                     attempt,
                     fence,
                     event,
+                    summary,
                 } => {
                     let attempt =
                         AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    handler.reported(worker, attempt, Fence(fence), event.to_event()?);
+                    if summary
+                        .as_ref()
+                        .is_some_and(|s| s.len() > MAX_SUMMARY_BYTES)
+                    {
+                        return Err(Error::Protocol("summary size"));
+                    }
+                    handler.reported(worker, attempt, Fence(fence), event.to_event()?, summary);
                 }
                 ClientMessage::NeedSpec { attempt } => {
                     let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
                     match handler.spec(worker, id) {
-                        Some(bytes) if bytes.len() <= MAX_SPEC_BYTES => {
+                        Some((context, bytes)) if bytes.len() <= MAX_SPEC_BYTES => {
+                            self.tx.send(&ServerMessage::Context(context.to_wire(id)))?;
                             let chunks = bytes.chunks(SPEC_CHUNK_BYTES);
                             let count = chunks.len().max(1);
                             if bytes.is_empty() {
@@ -728,7 +852,8 @@ pub fn connect(
         ServerMessage::Pong { .. }
         | ServerMessage::Offer(_)
         | ServerMessage::Spec { .. }
-        | ServerMessage::NoSpec { .. } => Err(Error::Protocol("message before welcome")),
+        | ServerMessage::NoSpec { .. }
+        | ServerMessage::Context(_) => Err(Error::Protocol("message before welcome")),
     }
 }
 
@@ -746,6 +871,27 @@ impl Reporter {
             attempt: *attempt.as_bytes(),
             fence: fence.0,
             event,
+            summary: None,
+        })
+    }
+
+    /// The terminal report with the attempt's encoded summary.
+    pub fn finish(
+        &self,
+        attempt: AttemptId,
+        fence: Fence,
+        event: Event,
+        summary: Vec<u8>,
+    ) -> Result<()> {
+        let event = WireEvent::from_event(event).ok_or(Error::Protocol("not a worker event"))?;
+        if summary.len() > MAX_SUMMARY_BYTES {
+            return Err(Error::Protocol("summary size"));
+        }
+        self.0.send(&ClientMessage::Report {
+            attempt: *attempt.as_bytes(),
+            fence: fence.0,
+            event,
+            summary: Some(summary),
         })
     }
 
@@ -771,8 +917,9 @@ pub trait Executor: Send + Sync {
     /// until `detached`. Pending reports from a lost session are resent here.
     fn attached(&self, reporter: Reporter);
     fn detached(&self);
-    /// The run spec asked for with `Reporter::need_spec`, whole.
-    fn spec(&self, attempt: AttemptId, bytes: Vec<u8>);
+    /// The run spec asked for with `Reporter::need_spec`, whole, with the
+    /// job context that precedes it.
+    fn spec(&self, attempt: AttemptId, context: JobContext, bytes: Vec<u8>);
     /// The controller has no spec for the attempt: it is not held here.
     fn no_spec(&self, attempt: AttemptId);
 }
@@ -870,13 +1017,23 @@ impl Link {
                 buffer.1 += 1;
                 if last {
                     let (bytes, _) = state.specs.remove(&attempt).expect("just inserted");
-                    executor.spec(attempt, bytes);
+                    let context = state
+                        .contexts
+                        .remove(&attempt)
+                        .ok_or(Error::Protocol("spec without context"))?;
+                    executor.spec(attempt, context, bytes);
                 }
+                Ok(false)
+            }
+            ServerMessage::Context(wire) => {
+                let (attempt, context) = JobContext::from_wire(wire)?;
+                state.contexts.insert(attempt, context);
                 Ok(false)
             }
             ServerMessage::NoSpec { attempt } => {
                 let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
                 state.specs.remove(&attempt);
+                state.contexts.remove(&attempt);
                 executor.no_spec(attempt);
                 Ok(false)
             }
@@ -940,6 +1097,7 @@ impl Link {
 struct Inbound {
     seen: std::collections::HashSet<AttemptId>,
     specs: std::collections::HashMap<AttemptId, (Vec<u8>, usize)>,
+    contexts: std::collections::HashMap<AttemptId, JobContext>,
 }
 
 /// Bind a listener for tests and the controller alike.

@@ -29,6 +29,7 @@ use sentinel_link::{
 };
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
 use sentinel_protocol::negotiate::{Arch, Capabilities, Hello, ProtocolVersion};
+use sentinel_protocol::summary::{AttemptSummary, StepOutcome};
 use sentinel_store::{
     Durability, Store,
     auth::{self, Authority, NamespaceKind, provisioning},
@@ -66,6 +67,15 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .unwrap();
     assert!(output.status.success());
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn spec_names(yaml: &str) -> Vec<String> {
+    compile_str(yaml)
+        .unwrap()
+        .jobs
+        .iter()
+        .map(|j| j.name.clone())
+        .collect()
 }
 
 fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
@@ -197,7 +207,42 @@ jobs:
     resources: {{ cpu: 1, memory: 256MiB }}
     steps:
       - id: fail
-        run: 'echo about to fail; exit 3'
+        run: 'echo about to fail; false; echo never'
+      - id: after
+        run: 'true'
+  gated:
+    image: {IMAGE}@{DIGEST}
+    needs: [inspect]
+    resources: {{ cpu: 1, memory: 256MiB }}
+    steps:
+      - id: skipped
+        if: ${{{{ job.name == 'nope' }}}}
+        run: 'exit 9'
+      - id: runs
+        if: ${{{{ needs.inspect.result == 'passed' && hash_files('greeting.txt') != '' && event.sha == '{sha}' && success() }}}}
+        run: 'true'
+  unknown:
+    image: {IMAGE}@{DIGEST}
+    resources: {{ cpu: 1, memory: 256MiB }}
+    steps:
+      - id: needs-intake
+        if: ${{{{ event.name == 'push' }}}}
+        run: 'true'
+  oom:
+    image: {IMAGE}@{DIGEST}
+    resources: {{ cpu: 1, memory: 128MiB }}
+    steps:
+      - id: fill
+        run: 'dd if=/dev/zero of=/tmp/x bs=1M count=300'
+  slow:
+    image: {IMAGE}@{DIGEST}
+    resources: {{ cpu: 1, memory: 128MiB }}
+    timeout: 2s
+    steps:
+      - id: sleep
+        run: 'sleep 30'
+      - id: never
+        run: 'true'
 "
     );
     let spec = RunSpec::new(
@@ -222,8 +267,17 @@ jobs:
             .read(|c| sentinel_store::jobs::get_job(c, tenant, job))
             .unwrap()
     };
-    // Compiled order is by name: broken, inspect.
-    let (broken, inspect) = (ids[0], ids[1]);
+    // Compiled order is dependencies first, then by name.
+    let compiled = spec_names(&yaml);
+    let by_name = |name: &str| ids[compiled.iter().position(|n| n == name).unwrap()];
+    let (broken, inspect, gated, unknown, oom, slow) = (
+        by_name("broken"),
+        by_name("inspect"),
+        by_name("gated"),
+        by_name("unknown"),
+        by_name("oom"),
+        by_name("slow"),
+    );
     eventually("inspect passed", || {
         state(inspect).state == JobState::Terminal(Outcome::Passed)
     });
@@ -235,6 +289,92 @@ jobs:
         failed.failure_class,
         Some(sentinel_core::FailureClass::CommandFailed)
     );
+    // `sh -e`: the first failing command ends the step with its status and
+    // the following step never starts; the summary says so per step.
+    let summary_of = |job| {
+        let attempt = store
+            .read(|c| dispatch::latest_attempt(c, tenant, job))
+            .unwrap()
+            .unwrap();
+        let bytes = store
+            .read(|c| dispatch::attempt_summary(c, tenant, attempt))
+            .unwrap()
+            .expect("summary stored with the terminal report");
+        AttemptSummary::decode(&bytes).unwrap()
+    };
+    let broken_summary = summary_of(broken);
+    assert_eq!(
+        broken_summary
+            .steps
+            .iter()
+            .map(|s| (s.id.as_str(), s.outcome))
+            .collect::<Vec<_>>(),
+        vec![
+            ("fail", StepOutcome::Failed { code: 1 }),
+            ("after", StepOutcome::NotRun)
+        ]
+    );
+    assert!(broken_summary.steps[0].duration_ns.is_some());
+    assert!(broken_summary.steps[1].duration_ns.is_none());
+    assert!(broken_summary.detail.contains("step 0 exited with 1"));
+    let inspect_summary = summary_of(inspect);
+    assert!(inspect_summary.checkout_ns.is_some());
+    assert!(inspect_summary.image_pull_ns.is_some());
+    assert!(inspect_summary.container_start_ns.is_some());
+    assert!(inspect_summary.steps_ns.is_some());
+    assert!(inspect_summary.finalize_ns.is_some());
+    assert!(inspect_summary.detail.is_empty());
+    assert!(
+        inspect_summary
+            .steps
+            .iter()
+            .all(|s| s.outcome == StepOutcome::Passed)
+    );
+
+    // Conditions: a false `if` skips; dependency results, hash_files on the
+    // checkout, event.sha and success() resolve on the worker; an event field
+    // intake has not recorded is a preparation failure, never a default.
+    eventually("gated passed", || {
+        state(gated).state == JobState::Terminal(Outcome::Passed)
+    });
+    assert_eq!(
+        summary_of(gated)
+            .steps
+            .iter()
+            .map(|s| s.outcome)
+            .collect::<Vec<_>>(),
+        vec![StepOutcome::Skipped, StepOutcome::Passed]
+    );
+    eventually("unknown infra-failed", || {
+        state(unknown).state == JobState::Terminal(Outcome::InfraFailed)
+    });
+    assert_eq!(
+        state(unknown).failure_class,
+        Some(sentinel_core::FailureClass::Preparation)
+    );
+    assert!(summary_of(unknown).detail.contains("step 0 `if`"));
+
+    // The memory limit is an OOM, not a plain signal; the job timeout bounds
+    // the steps and is a timeout, not a failed command.
+    eventually("oom failed", || {
+        state(oom).state == JobState::Terminal(Outcome::Failed)
+    });
+    assert_eq!(
+        state(oom).failure_class,
+        Some(sentinel_core::FailureClass::OutOfMemory)
+    );
+    assert_eq!(summary_of(oom).steps[0].outcome, StepOutcome::OutOfMemory);
+    eventually("slow timed out", || {
+        state(slow).state == JobState::Terminal(Outcome::TimedOut)
+    });
+    assert_eq!(
+        state(slow).failure_class,
+        Some(sentinel_core::FailureClass::ExecutionTimeout)
+    );
+    let slow_summary = summary_of(slow);
+    assert_eq!(slow_summary.steps[0].outcome, StepOutcome::TimedOut);
+    assert_eq!(slow_summary.steps[1].outcome, StepOutcome::NotRun);
+    assert!(slow_summary.steps[0].duration_ns.unwrap() < 10_000_000_000);
     // Every phase was stamped by the worker's reports, in order.
     let stamps = state(inspect).timestamps;
     assert!(stamps.leased <= stamps.preparing);
@@ -242,12 +382,20 @@ jobs:
     assert!(stamps.running <= stamps.finalizing);
     assert!(stamps.finalizing <= stamps.terminal);
     assert!(stamps.preparing.is_some() && stamps.finalizing.is_some());
+    // Six jobs: four full lifecycles (4 reports) and two preparation
+    // failures (2 reports each: unknown fails inside the steps phase, so it
+    // is a full lifecycle too).
+    let reports = controller
+        .stats()
+        .reports
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(reports, 6 * 4, "every report was applied");
     assert_eq!(
         controller
             .stats()
-            .reports
+            .stale_reports
             .load(std::sync::atomic::Ordering::SeqCst),
-        8
+        0
     );
 
     // Capacity is released, nothing is left in the runtime or on disk.

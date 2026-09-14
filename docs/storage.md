@@ -41,6 +41,8 @@ Encodings: IDs are raw UUID bytes; `state_code` is one integer with terminal sta
 
 Version 14 ([worker link](worker-link.md#dispatch-w02)) copies each job's `cpu_millis`/`memory_bytes` from its spec, records a worker's reported capacity, and makes the attempt row the reservation: `cpu_millis`, `memory_bytes`, `offered_ms`, `acked_ms` and `released_ms`, with `attempts_held_by_worker` (partial, `released_ms IS NULL`) for the capacity sum and `attempts_pending_ack` (partial, unacknowledged and held) for the ack-timeout sweep. A trigger fixes an attempt's identity, worker and reservation at the lease and refuses to undo an acknowledgement or a release.
 
+Version 15 ([executor](executor.md#steps-w04)) adds `attempts.summary` (at most 32 KiB, the worker's encoded `AttemptSummary`), written once with the terminal report; the recreated `attempt_update` trigger refuses to replace it.
+
 ## Writer and acknowledgement policy
 
 One thread owns the only write connection. `Writer::write` sends a closure over a bounded channel (256 slots), runs it inside `BEGIN IMMEDIATE`, commits, and only then replies. With `synchronous=FULL` the WAL is fsynced before `COMMIT` returns, so **a write is acknowledged to the caller only when it is on disk**. This is the contract worker acknowledgements, lease grants and cancel requests rely on. `Durability::Normal` exists for replayable data and tests; it is never used for transitions.

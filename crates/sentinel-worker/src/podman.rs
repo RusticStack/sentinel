@@ -139,6 +139,10 @@ pub struct Limits {
 pub struct Container {
     name: String,
     attempt: AttemptId,
+    /// The container's cgroup on the host (`/sys/fs/cgroup<path>`), read
+    /// after start so its counters can be inspected without placing a
+    /// process inside a cgroup that may already be at its limit.
+    cgroup: Option<std::path::PathBuf>,
 }
 
 /// How one step's process ended.
@@ -153,6 +157,21 @@ pub struct Exit {
     /// Bounded tails of the process's output.
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+impl Exit {
+    /// The last non-empty stderr line, printable characters only.
+    pub fn stderr_excerpt(&self) -> String {
+        let text = String::from_utf8_lossy(&self.stderr);
+        text.lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("no diagnostic output")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect()
+    }
 }
 
 impl Container {
@@ -220,7 +239,11 @@ impl Container {
                 created.stderr_excerpt()
             )));
         }
-        let container = Container { name, attempt };
+        let mut container = Container {
+            name,
+            attempt,
+            cgroup: None,
+        };
         let mut start = podman();
         start.args(["start", "--", &container.name]);
         let started = process::run(start, deadline(CONTAINER_START_TIMEOUT), "podman start")?;
@@ -228,6 +251,26 @@ impl Container {
             let why = started.stderr_excerpt();
             let _ = container.remove();
             return Err(Error::Preparation(format!("container start: {why}")));
+        }
+        let mut inspect = podman();
+        inspect.args([
+            "inspect",
+            "--format",
+            "{{.State.CgroupPath}}",
+            "--",
+            &container.name,
+        ]);
+        if let Ok(output) =
+            process::run(inspect, deadline(Duration::from_secs(30)), "podman inspect")
+            && output.success()
+        {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if let Some(rel) = path.strip_prefix('/') {
+                let full = std::path::Path::new("/sys/fs/cgroup").join(rel);
+                if full.join("memory.events").exists() {
+                    container.cgroup = Some(full);
+                }
+            }
         }
         Ok(container)
     }
@@ -270,6 +313,40 @@ impl Container {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// The cgroup's OOM-kill counter, compared before and after a failed
+    /// step to tell a memory kill from any other death by `SIGKILL`. Read
+    /// from the host's view of the cgroup: after an OOM the pages that
+    /// caused it (a tmpfs, say) stay charged, and a process exec'd inside
+    /// to read the counter could be the next victim.
+    pub fn oom_kills(&self) -> Result<u64> {
+        let text = match &self.cgroup {
+            Some(dir) => std::fs::read_to_string(dir.join("memory.events"))?,
+            None => {
+                let mut cmd = podman();
+                cmd.args([
+                    "exec",
+                    "--",
+                    &self.name,
+                    "cat",
+                    "/sys/fs/cgroup/memory.events",
+                ]);
+                let output = process::run(cmd, deadline(Duration::from_secs(30)), "memory.events")?;
+                if !output.success() {
+                    return Err(Error::Runtime(format!(
+                        "memory.events: {}",
+                        output.stderr_excerpt()
+                    )));
+                }
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            }
+        };
+        Ok(text
+            .lines()
+            .find_map(|line| line.strip_prefix("oom_kill "))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0))
     }
 
     /// `podman stop`: TERM to the container's processes, KILL after `grace`.
@@ -339,6 +416,7 @@ pub fn remove_named(name: &str) -> Result<()> {
     Container {
         name: name.to_owned(),
         attempt: AttemptId::new(),
+        cgroup: None,
     }
     .remove()
 }

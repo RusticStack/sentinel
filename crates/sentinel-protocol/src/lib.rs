@@ -8,6 +8,7 @@ pub mod error;
 pub mod idempotency;
 pub mod limits;
 pub mod negotiate;
+pub mod summary;
 
 pub use cursor::{Cursor, CursorError, Page, Seq, StreamKind};
 pub use error::{ApiError, ERROR_SCHEMA, ErrorCode, ErrorSchema};

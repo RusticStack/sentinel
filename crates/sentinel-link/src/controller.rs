@@ -34,7 +34,9 @@ use sentinel_store::{Store, dispatch, workers};
 use crate::{
     Error, Result,
     identity::Identity,
-    session::{self, Admission, Admitted, Capacity, Offer, Rejection, Sender, SessionHandler},
+    session::{
+        self, Admission, Admitted, Capacity, JobContext, Offer, Rejection, Sender, SessionHandler,
+    },
     tls,
 };
 
@@ -334,9 +336,24 @@ impl SessionHandler for Inner {
         // attempt is not its own from the stop list on its next beat.
     }
 
-    fn reported(&self, worker: WorkerId, attempt: AttemptId, fence: Fence, event: Event) {
+    fn reported(
+        &self,
+        worker: WorkerId,
+        attempt: AttemptId,
+        fence: Fence,
+        event: Event,
+        summary: Option<Vec<u8>>,
+    ) {
         let finished = self.write(move |tx| {
-            dispatch::report(tx, worker, attempt, fence, event, UnixMillis::now())
+            dispatch::report(
+                tx,
+                worker,
+                attempt,
+                fence,
+                event,
+                summary.as_deref(),
+                UnixMillis::now(),
+            )
         });
         match finished {
             Ok(state) => {
@@ -354,9 +371,25 @@ impl SessionHandler for Inner {
         }
     }
 
-    fn spec(&self, worker: WorkerId, attempt: AttemptId) -> Option<Vec<u8>> {
+    fn spec(&self, worker: WorkerId, attempt: AttemptId) -> Option<(JobContext, Vec<u8>)> {
         self.store
-            .read(|c| dispatch::spec_bytes(c, worker, attempt))
+            .read(|c| {
+                let context = dispatch::job_context(c, worker, attempt)?;
+                let bytes = dispatch::spec_bytes(c, worker, attempt)?;
+                Ok((
+                    JobContext {
+                        run: context.run,
+                        repo: context.repo,
+                        repo_name: context.repo_name,
+                        job: context.job,
+                        job_name: context.job_name,
+                        sha: context.sha,
+                        cancelled: context.cancelled,
+                        needs: context.needs,
+                    },
+                    bytes,
+                ))
+            })
             .ok()
     }
 

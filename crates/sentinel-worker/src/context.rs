@@ -1,0 +1,77 @@
+//! The worker-phase expression context (W04): what a step's `if` and a
+//! cache key can see once the pinned checkout exists.
+//!
+//! Every value comes from the controller's `JobContext` or the run spec;
+//! `hash_files` reads the attempt's private workspace. Anything the run
+//! does not record yet — event fields before intake exists — answers
+//! `Unresolved`, and the attempt then fails preparation naming the field
+//! rather than defaulting it.
+
+use std::path::{Path, PathBuf};
+
+use sentinel_link::session::JobContext;
+use sentinel_pipeline::{
+    RunSpec,
+    expr::{Context, DependencySummary, HashFilesError, Lookup, Phase, Value},
+};
+
+pub struct WorkerContext<'a> {
+    pub job: &'a JobContext,
+    pub spec: &'a RunSpec,
+    pub workspace: PathBuf,
+}
+
+impl<'a> WorkerContext<'a> {
+    pub fn new(job: &'a JobContext, spec: &'a RunSpec, workspace: &Path) -> Self {
+        WorkerContext {
+            job,
+            spec,
+            workspace: workspace.to_path_buf(),
+        }
+    }
+}
+
+impl Context for WorkerContext<'_> {
+    fn phase(&self) -> Phase {
+        Phase::Worker
+    }
+
+    fn lookup(&self, path: &[String]) -> Lookup {
+        let key: Vec<&str> = path.iter().map(String::as_str).collect();
+        let value = match key.as_slice() {
+            ["event", "sha"] => Value::Str(self.job.sha.clone()),
+            ["event", "ref"] => match &self.spec.source.ref_name {
+                Some(name) => Value::Str(name.clone()),
+                None => return Lookup::Unresolved,
+            },
+            // Event name, key, base ref and PR number arrive with intake.
+            ["event", _] => return Lookup::Unresolved,
+            ["repo", "id"] => Value::Str(self.job.repo.to_string()),
+            ["repo", "name"] => Value::Str(self.job.repo_name.clone()),
+            ["run", "id"] => Value::Str(self.job.run.to_string()),
+            ["job", "id"] => Value::Str(self.job.job.to_string()),
+            ["job", "name"] => Value::Str(self.job.job_name.clone()),
+            ["needs", name, "result"] => match self.job.needs.iter().find(|(n, _)| n == name) {
+                Some((_, outcome)) => Value::Str(outcome.as_str().to_owned()),
+                None => return Lookup::Unresolved,
+            },
+            _ => return Lookup::Unresolved,
+        };
+        Lookup::Value(value)
+    }
+
+    fn dependency_summary(&self) -> Option<DependencySummary> {
+        Some(DependencySummary {
+            all_succeeded: self.job.needs.iter().all(|(_, o)| o.is_success()),
+            any_failed: self.job.needs.iter().any(|(_, o)| !o.is_success()),
+        })
+    }
+
+    fn cancelled(&self) -> Option<bool> {
+        Some(self.job.cancelled)
+    }
+
+    fn hash_files(&self, patterns: &[&str]) -> Result<String, HashFilesError> {
+        sentinel_pipeline::hash_files(&self.workspace, patterns)
+    }
+}

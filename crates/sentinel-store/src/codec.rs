@@ -56,6 +56,7 @@ pub const fn decode_failure(code: i64) -> Option<FailureClass> {
         8 => FailureClass::WorkerLost,
         9 => FailureClass::Reconciled,
         10 => FailureClass::Publication,
+        11 => FailureClass::Runtime,
         _ => return None,
     })
 }
@@ -91,10 +92,10 @@ mod tests {
 
     #[test]
     fn failure_codes_round_trip() {
-        for code in 0..=10 {
+        for code in 0..=11 {
             let class = decode_failure(code).unwrap();
             assert_eq!(encode_failure(class), code);
         }
-        assert_eq!(decode_failure(11), None);
+        assert_eq!(decode_failure(12), None);
     }
 }

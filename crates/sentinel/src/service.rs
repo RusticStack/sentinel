@@ -473,7 +473,7 @@ mod worker_role {
         fn renewed(&self, _: sentinel_core::UnixMillis) {}
         fn attached(&self, _: sentinel_link::session::Reporter) {}
         fn detached(&self) {}
-        fn spec(&self, _: AttemptId, _: Vec<u8>) {}
+        fn spec(&self, _: AttemptId, _: sentinel_link::session::JobContext, _: Vec<u8>) {}
         fn no_spec(&self, _: AttemptId) {}
     }
 

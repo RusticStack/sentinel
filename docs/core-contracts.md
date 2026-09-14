@@ -62,9 +62,9 @@ Each class maps to exactly one outcome, so storage can never hold a contradictor
 | failed | `command_failed`, `command_signaled`, `out_of_memory` |
 | timed_out | `execution_timeout`, `queue_timeout` |
 | canceled | `canceled` |
-| infra_failed | `preparation`, `lease_expired`, `worker_lost`, `reconciled`, `publication` |
+| infra_failed | `preparation`, `lease_expired`, `worker_lost`, `reconciled`, `publication`, `runtime` |
 
-`infra_failed` is never attributed to the repository and is what the CLI, GitHub check and MCP diagnostics distinguish from a real test failure.
+`runtime` (W04) is the container runtime failing to run a step — the exec never started or the runtime errored — as opposed to the command failing. `infra_failed` is never attributed to the repository and is what the CLI, GitHub check and MCP diagnostics distinguish from a real test failure.
 
 ## Cancellation
 

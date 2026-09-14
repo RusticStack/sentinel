@@ -119,6 +119,34 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
     );
     let exit = container.exec(&sh("kill -9 $$", 30), &[]).unwrap();
     assert_eq!((exit.code, exit.signal), (None, Some(9)));
+    // `sh -e`: the first failing command ends the script with its status.
+    let exit = container
+        .exec(&sh("echo before; false; echo after", 30), &[])
+        .unwrap();
+    assert_eq!(exit.code, Some(1));
+    assert_eq!(String::from_utf8_lossy(&exit.stdout).trim(), "before");
+    // A missing command inside the shell is the command's failure (127 with
+    // the shell's message), not the runtime's (`Error:` from Podman).
+    let exit = container
+        .exec(&sh("no-such-command-here", 30), &[])
+        .unwrap();
+    assert_eq!(exit.code, Some(127));
+    assert!(
+        !exit.stderr_excerpt().starts_with("Error:"),
+        "{}",
+        exit.stderr_excerpt()
+    );
+    let mut missing_workdir = sh("true", 30);
+    missing_workdir.workdir = Some("does-not-exist".into());
+    let exit = container.exec(&missing_workdir, &[]).unwrap();
+    assert!(matches!(exit.code, Some(125..=127)), "{exit:?}");
+    assert!(
+        exit.stderr_excerpt().starts_with("Error:"),
+        "{}",
+        exit.stderr_excerpt()
+    );
+    // The cgroup's OOM counter is readable and starts at zero.
+    assert_eq!(container.oom_kills().unwrap(), 0);
     // The pipeline's environment cannot override the worker's context.
     let mut cmd = sh("echo $SENTINEL_ATTEMPT", 30);
     cmd.env = vec![("SENTINEL_ATTEMPT".into(), "spoofed".into())];

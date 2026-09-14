@@ -183,6 +183,9 @@ fn hello() -> Hello {
     }
 }
 
+/// A spec delivery: the attempt, its context (none when refused), the bytes.
+type SpecRecord = (AttemptId, Option<session::JobContext>, Vec<u8>);
+
 /// An executor that records what it is told and holds what it accepts.
 struct Recorder {
     offers: Mutex<mpsc::Sender<(Offer, Instant)>>,
@@ -192,7 +195,7 @@ struct Recorder {
     /// Decline offers for these jobs once, to exercise the lapse path.
     decline_once: Mutex<Vec<JobId>>,
     reporter: Mutex<Option<session::Reporter>>,
-    specs: Mutex<Vec<(AttemptId, Vec<u8>)>>,
+    specs: Mutex<Vec<SpecRecord>>,
 }
 
 impl Recorder {
@@ -253,11 +256,14 @@ impl Executor for Recorder {
     fn detached(&self) {
         self.reporter.lock().unwrap().take();
     }
-    fn spec(&self, attempt: AttemptId, bytes: Vec<u8>) {
-        self.specs.lock().unwrap().push((attempt, bytes));
+    fn spec(&self, attempt: AttemptId, context: session::JobContext, bytes: Vec<u8>) {
+        self.specs
+            .lock()
+            .unwrap()
+            .push((attempt, Some(context), bytes));
     }
     fn no_spec(&self, attempt: AttemptId) {
-        self.specs.lock().unwrap().push((attempt, Vec::new()));
+        self.specs.lock().unwrap().push((attempt, None, Vec::new()));
     }
 }
 
@@ -350,7 +356,7 @@ impl Executor for Idle {
     fn renewed(&self, _: UnixMillis) {}
     fn attached(&self, _: session::Reporter) {}
     fn detached(&self) {}
-    fn spec(&self, _: AttemptId, _: Vec<u8>) {}
+    fn spec(&self, _: AttemptId, _: session::JobContext, _: Vec<u8>) {}
     fn no_spec(&self, _: AttemptId) {}
 }
 
@@ -587,14 +593,19 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     let reporter = recorder.reporter.lock().unwrap().clone().unwrap();
     reporter.need_spec(attempt).unwrap();
     eventually("spec", || !recorder.specs.lock().unwrap().is_empty());
-    let (spec_attempt, bytes) = recorder.specs.lock().unwrap()[0].clone();
+    let (spec_attempt, context, bytes) = recorder.specs.lock().unwrap()[0].clone();
     assert_eq!(spec_attempt, attempt);
     let spec = RunSpec::decode(&bytes).unwrap();
     assert_eq!(spec.pipeline.jobs.len(), 3);
+    let context = context.unwrap();
+    assert_eq!((context.job, context.job_name.as_str()), (build, "build"));
+    assert_eq!(context.repo_name, "app");
+    assert_eq!(context.sha, SHA);
+    assert!(context.needs.is_empty() && !context.cancelled);
     // A spec for an attempt this worker does not hold is refused.
     reporter.need_spec(AttemptId::new()).unwrap();
     eventually("no spec", || recorder.specs.lock().unwrap().len() == 2);
-    assert!(recorder.specs.lock().unwrap()[1].1.is_empty());
+    assert!(recorder.specs.lock().unwrap()[1].2.is_empty());
 
     // The worker reports its progress over the wire; the terminal report
     // frees the capacity, queues `test` and wakes the dispatcher — no

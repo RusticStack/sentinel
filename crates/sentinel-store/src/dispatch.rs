@@ -13,10 +13,10 @@
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{
-    Actor, AttemptId, DependencyPolicy, Event, Fence, JobId, JobState, PoolId, RunId, TenantId,
-    UnixMillis, WorkerId, dependency_decision,
+    Actor, AttemptId, DependencyPolicy, Event, Fence, JobId, JobState, Outcome, PoolId, RepoId,
+    RunId, TenantId, UnixMillis, WorkerId, dependency_decision,
 };
-use sentinel_protocol::limits::MAX_LIST_ITEMS;
+use sentinel_protocol::{limits::MAX_LIST_ITEMS, summary::MAX_SUMMARY_BYTES};
 
 use crate::{
     Error, Result,
@@ -268,6 +268,23 @@ pub struct Held {
     pub lease_until: UnixMillis,
 }
 
+/// The newest attempt of a job (highest fence), for status and tests.
+pub fn latest_attempt(
+    conn: &Connection,
+    tenant: TenantId,
+    job: JobId,
+) -> Result<Option<AttemptId>> {
+    conn.prepare_cached(
+        "SELECT id FROM attempts WHERE job_id = ?1 AND tenant_id = ?2 ORDER BY fence DESC LIMIT 1",
+    )?
+    .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| {
+        r.get::<_, [u8; 16]>(0)
+    })
+    .optional()?
+    .map(|b| AttemptId::from_bytes(b).map_err(|_| Error::Corrupt("attempt_id")))
+    .transpose()
+}
+
 /// Every attempt still reserved on `worker`, oldest offer first.
 pub fn held_by(conn: &Connection, worker: WorkerId) -> Result<Vec<Held>> {
     let mut stmt = conn.prepare_cached(
@@ -363,13 +380,15 @@ pub fn finish(
 }
 
 /// A worker's report over the link: the attempt must be held by that worker
-/// under that fence, then [`finish`] applies the event as the worker.
+/// under that fence, then [`finish`] applies the event as the worker. A
+/// terminal report may carry the attempt's summary, written once.
 pub fn report(
     tx: &Transaction<'_>,
     worker: WorkerId,
     attempt: AttemptId,
     fence: Fence,
     event: Event,
+    summary: Option<&[u8]>,
     now: UnixMillis,
 ) -> Result<JobState> {
     let held: bool = tx
@@ -384,7 +403,124 @@ pub fn report(
     if !held {
         return Err(Error::NotFound);
     }
-    finish(tx, attempt, Actor::Worker(fence), event, now)
+    let next = finish(tx, attempt, Actor::Worker(fence), event, now)?;
+    if let Some(summary) = summary
+        && next.is_terminal()
+    {
+        if summary.len() > MAX_SUMMARY_BYTES {
+            return Err(Error::InvalidInput("attempt summary"));
+        }
+        tx.prepare_cached("UPDATE attempts SET summary = ?2 WHERE id = ?1 AND summary IS NULL")?
+            .execute(params![attempt.as_bytes(), summary])?;
+    }
+    Ok(next)
+}
+
+/// The summary a worker sent with the attempt's terminal report, if any.
+pub fn attempt_summary(
+    conn: &Connection,
+    tenant: TenantId,
+    attempt: AttemptId,
+) -> Result<Option<Vec<u8>>> {
+    conn.prepare_cached("SELECT summary FROM attempts WHERE id = ?1 AND tenant_id = ?2")?
+        .query_row(params![attempt.as_bytes(), tenant.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)
+}
+
+/// What the worker needs to evaluate the job's expressions: identity of the
+/// run, repository and job, the dependency outcomes by name, and whether
+/// cancellation is desired. Event data lands here with intake (G-tasks).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobContext {
+    pub run: RunId,
+    pub repo: RepoId,
+    pub repo_name: String,
+    pub job: JobId,
+    pub job_name: String,
+    pub sha: String,
+    pub cancelled: bool,
+    /// `(dependency job name, outcome)` for every `needs` entry.
+    pub needs: Vec<(String, Outcome)>,
+}
+
+type ContextRow = (
+    [u8; 16],
+    [u8; 16],
+    [u8; 16],
+    String,
+    [u8; 16],
+    String,
+    String,
+    i64,
+    i64,
+);
+
+/// Context for an attempt the worker holds. One statement for the identity
+/// row, one for the run's job states; the spec (already sent to the worker)
+/// names the dependencies.
+pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Result<JobContext> {
+    let row: Option<ContextRow> = conn
+        .prepare_cached(
+            "SELECT j.tenant_id, j.run_id, r.repo_id, p.name, j.id, j.name, r.source_sha,
+                    j.cancel_requested, j.spec_index
+             FROM attempts a JOIN jobs j ON j.id = a.job_id JOIN runs r ON r.id = j.run_id
+             JOIN repos p ON p.id = r.repo_id
+             WHERE a.id = ?1 AND a.worker_id = ?2 AND a.released_ms IS NULL",
+        )?
+        .query_row(params![attempt.as_bytes(), worker.as_bytes()], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+            ))
+        })
+        .optional()?;
+    let Some((tenant, run, repo, repo_name, job, job_name, sha, cancel, index)) = row else {
+        return Err(Error::NotFound);
+    };
+    let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?;
+    let run = RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?;
+    let states = runs::run_jobs(conn, tenant, run)?;
+    let spec = runs::get_run_spec(conn, tenant, run)?;
+    let compiled = spec
+        .pipeline
+        .jobs
+        .get(usize::try_from(index).map_err(|_| Error::Corrupt("spec_index"))?)
+        .ok_or(Error::Corrupt("run_specs.spec"))?;
+    let mut needs = Vec::with_capacity(compiled.needs.len());
+    for need in &compiled.needs {
+        let upstream = spec
+            .pipeline
+            .jobs
+            .get(usize::from(*need))
+            .ok_or(Error::Corrupt("run_specs.spec"))?;
+        let state = states
+            .get(usize::from(*need))
+            .map(|(_, s)| *s)
+            .ok_or(Error::Corrupt("run_specs.spec"))?;
+        let JobState::Terminal(outcome) = state else {
+            // A queued job's dependencies are terminal by construction.
+            return Err(Error::Corrupt("dependency not terminal"));
+        };
+        needs.push((upstream.name.clone(), outcome));
+    }
+    Ok(JobContext {
+        run,
+        repo: RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?,
+        repo_name,
+        job: JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?,
+        job_name,
+        sha,
+        cancelled: cancel != 0,
+        needs,
+    })
 }
 
 /// The encoded run spec of an attempt the worker holds, exactly as stored.

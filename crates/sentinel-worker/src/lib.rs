@@ -15,6 +15,8 @@ pub mod attempt;
 #[cfg(target_os = "linux")]
 pub mod checkout;
 #[cfg(target_os = "linux")]
+pub mod context;
+#[cfg(target_os = "linux")]
 pub mod executor;
 #[cfg(target_os = "linux")]
 pub mod podman;
@@ -27,7 +29,7 @@ use std::fmt;
 
 /// Why preparation or execution could not proceed. `Preparation` and
 /// `Runtime` are infrastructure failures, never a failed command: a step's
-/// own exit status is reported as an [`attempt::StepExit`], not an error.
+/// own exit status is a `StepOutcome` in the attempt summary, not an error.
 #[derive(Debug)]
 pub enum Error {
     /// Checkout, image pull or container creation failed. Carries a bounded,

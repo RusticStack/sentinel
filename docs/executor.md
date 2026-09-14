@@ -1,4 +1,4 @@
-# Worker execution: workspaces, checkout and rootless containers (W03)
+# Worker execution: workspaces, checkout, rootless containers and steps (W03–W04)
 
 Implemented in `crates/sentinel-worker` (Linux only; empty elsewhere), with the report and spec messages added to the [worker link](worker-link.md) and the `dispatch::report`/`spec_bytes` store operations. `sentinel worker` uses it whenever rootless Podman answers; otherwise it declines every offer and says why.
 
@@ -53,13 +53,39 @@ The container's main process is a keepalive (`/bin/sh` loop that exits on `TERM`
 
 On the controller, `dispatch::report` checks that the attempt is held by that worker under that fence and then applies the event through the state machine; a stale or foreign report changes nothing and is counted. A terminal report releases the reservation, decides dependents and wakes the dispatcher.
 
+## Steps (W04)
+
+Steps run in order in the attempt's container, each as the run spec compiled it: `/bin/sh -e -c` (fail at the first failing command, with its status) or `bash -eo pipefail -c` (the image must provide Bash); the job's environment, then the step's overriding by name, then the worker's context (`SENTINEL_RUN|JOB|ATTEMPT|SHA|WORKSPACE`, `CI`) last so a pipeline cannot spoof it; the working directory joined under `/workspace`; the step's timeout, or the job's, **bounded by what is left of the job's budget** so a job cannot outlive its timeout through many steps each within theirs. A step after a failed one never starts and is recorded as `NotRun`.
+
+A step's `if:` is evaluated on the worker (`Phase::Worker`, the C06 evaluator) against the job context the controller sends with the spec — `job.id|name`, `repo.id|name`, `run.id`, `event.sha` (the pinned commit), `event.ref` (the run's ref name), `needs.<job>.result` and `success()`/`failure()`/`always()`/`cancelled()` from the dependency outcomes and cancel state — and `hash_files` over the private checkout. `false` skips the step (`Skipped`); a non-boolean, a type error or a value the run does not hold is a `Preparation` failure naming the step and the reason, never a default. Event fields intake does not record yet (`event.name|key|base_ref|pr_number`) are exactly that case until the G-tasks land.
+
+The verdict keeps every distinction the plan asks for, and the summary records it per step:
+
+| What happened | Failure class | Step outcome |
+|---|---|---|
+| exit 0 | — | `Passed` |
+| `if` false | — | `Skipped` |
+| non-zero exit | `CommandFailed` | `Failed { code }` |
+| killed by a signal, OOM counter unchanged | `CommandSignaled` | `Signaled { signal }` |
+| killed and the cgroup's `oom_kill` counter moved | `OutOfMemory` | `OutOfMemory` |
+| past its (bounded) timeout; the container is stopped | `ExecutionTimeout` | `TimedOut` |
+| Podman could not run it (exit 125–127 with its `Error:` line; a shell's own 126/127 stays a command failure) | `Runtime` (new class, `infra_failed`) | `Runtime` |
+| fetch, pull, container start, `if` unresolved | `Preparation` | — |
+| cancel seen between steps | `Canceled` | — |
+
+OOM is read from the host's view of the container's cgroup (`/sys/fs/cgroup<CgroupPath>/memory.events`, path from `podman inspect`), before and after a failed step: after an OOM the pages that caused it stay charged, so a process exec'd inside to read the counter could be the next victim — the first version of this did exactly that and misreported an OOM as a signal.
+
+**Timings.** Every phase is measured with a monotonic clock in nanoseconds: checkout, image pull, container start, all steps, finalization, and each step. Absent means not measured. They travel in the `AttemptSummary` (`sentinel-protocol::summary`, format byte 1, at most 32 KiB) with the terminal `Report` and are stored once on the attempt row (migration 15; the trigger refuses a replacement). `dispatch::attempt_summary` reads it back; W08 exposes it.
+
 ## What is not here yet
 
-Step conditions (`if:`), phase timings and the exact failure taxonomy (OOM detection, signal versus timeout races) are W04. Log capture and streaming are W05; only bounded tails exist. Cancellation as desired state, lease expiry and graceful/forced termination budgets are W06; a cancel today is a `stop` order or a flag checked between steps. Crash reconciliation of owned containers and leftover workspaces is W07 — the ownership record (`podman::owned`, `Workspace::leftovers`) exists, the reaper does not. Caches, artifacts and secrets are their own parts. Disk quotas on the workspace are not enforced (no `io` delegation in the rootless setup; see F07).
+Log capture and streaming are W05; only bounded tails exist. Cancellation as desired state, lease expiry and graceful/forced termination budgets are W06; a cancel today is a `stop` order or a flag checked between steps. Crash reconciliation of owned containers and leftover workspaces is W07 — the ownership record (`podman::owned`, `Workspace::leftovers`) exists, the reaper does not. Caches, artifacts and secrets are their own parts. Disk quotas on the workspace are not enforced (no `io` delegation in the rootless setup; see F07).
 
 ## Verification
 
 `crates/sentinel-worker/tests/checkout.rs` (any Linux, needs `git`): the pinned commit is checked out even when it is not the branch head and only it is fetched; a workspace is never reused and destroying it removes the checkout; an unknown revision is a `Preparation` failure that leaves no checkout; a transport Git refuses and an option-shaped repository are refused in bounded time; a credential delivered through askpass leaves neither the helper nor the secret behind.
+
+`crates/sentinel-worker/tests/podman.rs` additionally checks `sh -e` stops at the first failing command with its status, that a command missing inside the shell is exit 127 without Podman's `Error:` line while a missing working directory is the runtime's error, and that the OOM counter reads zero on a fresh container. `tests/end_to_end.rs` (W04) runs six jobs: `inspect` passes with every phase timed; `broken` fails at `false` with `Failed { code: 1 }` and its second step `NotRun`; `gated` skips a false `if` and passes a step whose `if` uses `needs.inspect.result`, `hash_files` on the checkout, `event.sha` and `success()`; `unknown` (`event.name`) is a `Preparation` failure naming the step; `oom` (128 MiB, 300 MiB into tmpfs) is `OutOfMemory`; `slow` (job timeout 2 s, `sleep 30`) is `ExecutionTimeout` with the next step `NotRun`; 24 reports applied, none stale; every summary is stored and decodes.
 
 `crates/sentinel-worker/tests/podman.rs` and `tests/end_to_end.rs` run only with `SENTINEL_PODMAN_TESTS=1` as an account with rootless Podman (they report "skipped" otherwise, never a pass). Executed on 2026-09-14 in WSL2 as `sentinelbench` (Podman 4.9.3, runc, cgroup v2 via systemd) against `busybox@sha256:73aaf…`:
 

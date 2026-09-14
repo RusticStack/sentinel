@@ -1,13 +1,22 @@
 //! One attempt from offer to terminal: prepare (workspace, checkout, image,
 //! container), run the steps in order, finalize (tear everything down), and
-//! report each phase under the attempt's fence.
+//! report each phase under the attempt's fence with a measured summary.
 //!
-//! The verdict follows the run spec's contract: exit 0 passes, any other
-//! status is `CommandFailed`, death by signal `CommandSignaled`, a step past
-//! its timeout `ExecutionTimeout`. Anything that stops the steps from
-//! starting — a fetch that fails, an image that will not pull, a container
-//! that will not start — is `Preparation`, never a failed command. A cancel
-//! seen between steps is `Canceled`. Teardown runs on every path.
+//! Step semantics are the run spec's: `/bin/sh -e -c` or `bash -eo
+//! pipefail -c`, job environment then step environment then the worker's
+//! own context, working directory under the workspace, per-step timeout
+//! bounded by what is left of the job's. A step's `if` is evaluated in the
+//! worker phase against the job context and the checkout; false skips the
+//! step, anything else than a boolean fails preparation. Steps after a
+//! failed one never start.
+//!
+//! The verdict keeps the plan's distinctions: exit 0 passes; any other
+//! status is `CommandFailed`; death by signal `CommandSignaled`, unless the
+//! cgroup's OOM counter moved, which is `OutOfMemory`; a step past its
+//! budget `ExecutionTimeout`; a runtime that could not run the step
+//! `Runtime`; anything that stops the steps from starting `Preparation`; a
+//! cancel seen between steps `Canceled`. Every phase is timed monotonically
+//! and the summary travels with the terminal report.
 
 use std::{
     path::Path,
@@ -15,45 +24,44 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
-use sentinel_core::{AttemptId, Event, FailureClass, Fence, JobId, RunId, WorkerId};
-use sentinel_pipeline::RunSpec;
+use sentinel_core::{AttemptId, Event, FailureClass, Fence, WorkerId};
+use sentinel_link::session::JobContext;
+use sentinel_pipeline::{RunSpec, expr::EvalError};
+use sentinel_protocol::summary::{AttemptSummary, StepOutcome, StepRecord};
 
 use crate::{
     Error, Result,
     checkout::{self, CHECKOUT_TIMEOUT},
+    context::WorkerContext,
     podman::{self, Container, DEFAULT_PIDS_LIMIT, Limits},
     workspace::Workspace,
 };
 
-/// What the attempt is: identity, fence, the spec and which job of it.
+/// What the attempt is: identity, fence, the spec, which job of it, and
+/// the controller's context for its expressions.
 pub struct Job {
     pub worker: WorkerId,
     pub attempt: AttemptId,
     pub fence: Fence,
-    pub run: RunId,
-    pub job: JobId,
     pub job_index: usize,
     /// `sha256:…`, as the controller resolved it; the name is the spec's.
     pub digest: String,
     pub spec: RunSpec,
+    pub context: JobContext,
 }
 
 /// Where the phases are reported. Ordered per attempt; the link's reporter
 /// or a test's recorder.
 pub trait Report: Send + Sync {
     fn event(&self, attempt: AttemptId, fence: Fence, event: Event);
+    /// The terminal event with the encoded summary.
+    fn finish(&self, attempt: AttemptId, fence: Fence, event: Event, summary: Vec<u8>);
 }
 
-/// How a step ended, for diagnostics beyond the verdict.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StepExit {
-    pub index: usize,
-    pub exit: podman::Exit,
-}
-
-/// The attempt's verdict as reported.
+/// The attempt's verdict as reported, with the bounded reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Passed,
@@ -63,38 +71,54 @@ pub enum Verdict {
 /// The per-attempt cancel flag the executor flips on `stop`.
 pub type Cancel = Arc<AtomicBool>;
 
-/// Run the whole attempt. Returns the verdict that was reported and every
-/// step's exit for the caller's diagnostics.
+fn ns(started: Instant) -> Option<u64> {
+    Some(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
+}
+
+/// Run the whole attempt. Returns the verdict and the summary that were
+/// reported.
 pub fn run(
     root: &Path,
     job: &Job,
     report: &dyn Report,
     cancel: &Cancel,
-) -> (Verdict, Vec<StepExit>) {
+) -> (Verdict, AttemptSummary) {
     report.event(job.attempt, job.fence, Event::PreparationStarted);
-    let mut steps = Vec::new();
-    let verdict = match prepare(root, job, cancel) {
+    let mut summary = AttemptSummary::default();
+    let verdict = match prepare(root, job, cancel, &mut summary) {
         Err(e) => Verdict::Failed(FailureClass::Preparation, e.to_string()),
         Ok((workspace, container)) => {
             report.event(job.attempt, job.fence, Event::StepsStarted);
-            let verdict = execute(job, &container, cancel, &mut steps);
+            let started = Instant::now();
+            let verdict = execute(job, &container, workspace.path(), cancel, &mut summary);
+            summary.steps_ns = ns(started);
             report.event(job.attempt, job.fence, Event::FinalizationStarted);
+            let started = Instant::now();
             finalize(workspace, container);
+            summary.finalize_ns = ns(started);
             verdict
         }
     };
-    report.event(
-        job.attempt,
-        job.fence,
-        match &verdict {
-            Verdict::Passed => Event::Passed,
-            Verdict::Failed(class, _) => Event::Failed(*class),
-        },
-    );
-    (verdict, steps)
+    let event = match &verdict {
+        Verdict::Passed => Event::Passed,
+        Verdict::Failed(class, why) => {
+            summary.detail = why.chars().take(500).collect();
+            Event::Failed(*class)
+        }
+    };
+    match summary.encode() {
+        Ok(bytes) => report.finish(job.attempt, job.fence, event, bytes),
+        Err(_) => report.event(job.attempt, job.fence, event),
+    }
+    (verdict, summary)
 }
 
-fn prepare(root: &Path, job: &Job, cancel: &Cancel) -> Result<(Workspace, Container)> {
+fn prepare(
+    root: &Path,
+    job: &Job,
+    cancel: &Cancel,
+    summary: &mut AttemptSummary,
+) -> Result<(Workspace, Container)> {
     let compiled = job
         .spec
         .pipeline
@@ -108,16 +132,21 @@ fn prepare(root: &Path, job: &Job, cancel: &Cancel) -> Result<(Workspace, Contai
     let image = format!("{}@{}", image.name, job.digest);
     let workspace = Workspace::create(root, job.attempt)?;
     let outcome = (|| {
+        let started = Instant::now();
         checkout::checkout(workspace.path(), &job.spec.source, None, CHECKOUT_TIMEOUT)?;
+        summary.checkout_ns = ns(started);
         if cancel.load(Ordering::Acquire) {
             return Err(Error::Preparation("canceled".into()));
         }
+        let started = Instant::now();
         podman::pull(&image, podman::IMAGE_PULL_TIMEOUT)?;
+        summary.image_pull_ns = ns(started);
         if cancel.load(Ordering::Acquire) {
             return Err(Error::Preparation("canceled".into()));
         }
         let resources = compiled.spec.resources;
-        Container::start(
+        let started = Instant::now();
+        let container = Container::start(
             job.worker,
             job.attempt,
             &image,
@@ -127,7 +156,9 @@ fn prepare(root: &Path, job: &Job, cancel: &Cancel) -> Result<(Workspace, Contai
                 pids: DEFAULT_PIDS_LIMIT,
             },
             workspace.path(),
-        )
+        )?;
+        summary.container_start_ns = ns(started);
+        Ok(container)
     })();
     match outcome {
         Ok(container) => Ok((workspace, container)),
@@ -138,15 +169,29 @@ fn prepare(root: &Path, job: &Job, cancel: &Cancel) -> Result<(Workspace, Contai
     }
 }
 
+/// Podman's own exit codes for an exec that never ran the command. 126 and
+/// 127 are also what a shell returns for an unrunnable or missing command,
+/// so the runtime's `Error:` line on stderr is what settles it.
+fn runtime_failure(exit: &podman::Exit) -> bool {
+    let text = String::from_utf8_lossy(&exit.stderr);
+    let last = text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    matches!(exit.code, Some(125..=127)) && last.starts_with("Error:")
+}
+
 fn execute(
     job: &Job,
     container: &Container,
+    workspace: &Path,
     cancel: &Cancel,
-    steps: &mut Vec<StepExit>,
+    summary: &mut AttemptSummary,
 ) -> Verdict {
     let extra = [
-        ("SENTINEL_RUN".to_owned(), job.run.to_string()),
-        ("SENTINEL_JOB".to_owned(), job.job.to_string()),
+        ("SENTINEL_RUN".to_owned(), job.context.run.to_string()),
+        ("SENTINEL_JOB".to_owned(), job.context.job.to_string()),
         ("SENTINEL_ATTEMPT".to_owned(), job.attempt.to_string()),
         ("SENTINEL_SHA".to_owned(), job.spec.source.sha.clone()),
         (
@@ -155,42 +200,149 @@ fn execute(
         ),
         ("CI".to_owned(), "true".to_owned()),
     ];
-    let count = job.spec.pipeline.jobs[job.job_index].spec.steps.len();
-    for index in 0..count {
-        if cancel.load(Ordering::Acquire) {
-            return Verdict::Failed(FailureClass::Canceled, "canceled before the step".into());
-        }
-        let Some(command) = job.spec.step_command(job.job_index, index) else {
-            return Verdict::Failed(FailureClass::Preparation, "step outside the spec".into());
+    let compiled = &job.spec.pipeline.jobs[job.job_index].spec;
+    let job_deadline = Instant::now() + Duration::from_secs(compiled.timeout_secs.max(1));
+    let context = WorkerContext::new(&job.context, &job.spec, workspace);
+    let mut oom_seen = container.oom_kills().unwrap_or(0);
+    let mut failure: Option<(FailureClass, String)> = None;
+    for (index, step) in compiled.steps.iter().enumerate() {
+        let mut record = StepRecord {
+            index: index as u32,
+            id: step.id.clone(),
+            outcome: StepOutcome::NotRun,
+            duration_ns: None,
         };
+        if failure.is_some() {
+            summary.steps.push(record);
+            continue;
+        }
+        if cancel.load(Ordering::Acquire) {
+            summary.steps.push(record);
+            failure = Some((
+                FailureClass::Canceled,
+                format!("canceled before step {index}"),
+            ));
+            continue;
+        }
+        if let Some(condition) = &step.condition {
+            match condition.eval(&context).map(|v| v.as_condition()) {
+                Ok(Some(true)) => {}
+                Ok(Some(false)) => {
+                    record.outcome = StepOutcome::Skipped;
+                    summary.steps.push(record);
+                    continue;
+                }
+                Ok(None) => {
+                    summary.steps.push(record);
+                    failure = Some((
+                        FailureClass::Preparation,
+                        format!("step {index} `if` did not evaluate to a boolean"),
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    summary.steps.push(record);
+                    failure = Some((
+                        FailureClass::Preparation,
+                        format!("step {index} `if`: {}", describe(&e)),
+                    ));
+                    continue;
+                }
+            }
+        }
+        let Some(mut command) = job.spec.step_command(job.job_index, index) else {
+            summary.steps.push(record);
+            failure = Some((
+                FailureClass::Preparation,
+                format!("step {index} outside the spec"),
+            ));
+            continue;
+        };
+        // The job's budget bounds every step's; a job cannot outlive its
+        // timeout by having many steps each within theirs.
+        let remaining = job_deadline.saturating_duration_since(Instant::now());
+        command.timeout_secs = command.timeout_secs.min(remaining.as_secs().max(1));
+        let started = Instant::now();
         let exit = match container.exec(&command, &extra) {
             Ok(exit) => exit,
-            Err(e) => return Verdict::Failed(FailureClass::Preparation, e.to_string()),
+            Err(e) => {
+                record.outcome = StepOutcome::Runtime;
+                record.duration_ns = ns(started);
+                summary.steps.push(record);
+                failure = Some((FailureClass::Runtime, format!("step {index}: {e}")));
+                continue;
+            }
         };
-        let verdict = if exit.timed_out {
-            Some((
-                FailureClass::ExecutionTimeout,
-                format!("step {index} exceeded {} s", command.timeout_secs),
-            ))
-        } else if let Some(signal) = exit.signal {
-            Some((
-                FailureClass::CommandSignaled,
-                format!("step {index} died from signal {signal}"),
-            ))
-        } else if exit.code != Some(0) {
-            Some((
-                FailureClass::CommandFailed,
-                format!("step {index} exited with {}", exit.code.unwrap_or(-1)),
-            ))
+        record.duration_ns = ns(started);
+        let (outcome, why) = if exit.timed_out {
+            (
+                StepOutcome::TimedOut,
+                Some((
+                    FailureClass::ExecutionTimeout,
+                    format!("step {index} exceeded {} s", command.timeout_secs),
+                )),
+            )
+        } else if runtime_failure(&exit) {
+            (
+                StepOutcome::Runtime,
+                Some((
+                    FailureClass::Runtime,
+                    format!("step {index}: {}", exit.stderr_excerpt()),
+                )),
+            )
+        } else if exit.signal.is_some() || exit.code != Some(0) {
+            let oom_now = container.oom_kills().unwrap_or(oom_seen);
+            let oom = oom_now > oom_seen;
+            oom_seen = oom_now;
+            if oom {
+                (
+                    StepOutcome::OutOfMemory,
+                    Some((
+                        FailureClass::OutOfMemory,
+                        format!("step {index} exceeded the memory limit"),
+                    )),
+                )
+            } else if let Some(signal) = exit.signal {
+                (
+                    StepOutcome::Signaled { signal },
+                    Some((
+                        FailureClass::CommandSignaled,
+                        format!("step {index} died from signal {signal}"),
+                    )),
+                )
+            } else {
+                let code = exit.code.unwrap_or(-1);
+                (
+                    StepOutcome::Failed { code },
+                    Some((
+                        FailureClass::CommandFailed,
+                        format!("step {index} exited with {code}"),
+                    )),
+                )
+            }
         } else {
-            None
+            (StepOutcome::Passed, None)
         };
-        steps.push(StepExit { index, exit });
-        if let Some((class, why)) = verdict {
-            return Verdict::Failed(class, why);
-        }
+        record.outcome = outcome;
+        summary.steps.push(record);
+        failure = why;
     }
-    Verdict::Passed
+    match failure {
+        None => Verdict::Passed,
+        Some((class, why)) => Verdict::Failed(class, why),
+    }
+}
+
+fn describe(error: &EvalError) -> String {
+    match error {
+        EvalError::Unresolved { needs, .. } => {
+            format!("value not known to this run (needs {needs:?} context)")
+        }
+        EvalError::TypeMismatch { expected, found } => {
+            format!("expected {expected}, found {found}")
+        }
+        EvalError::HashFiles(e) => format!("hash_files: {e:?}"),
+    }
 }
 
 fn finalize(workspace: Workspace, container: Container) {

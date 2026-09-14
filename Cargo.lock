@@ -1241,6 +1241,7 @@ dependencies = [
 name = "sentinel-protocol"
 version = "0.1.0-dev"
 dependencies = [
+ "postcard",
  "sentinel-core",
  "serde",
  "serde_json",

@@ -467,6 +467,133 @@ fn renewal_is_fenced_per_attempt_and_names_what_to_stop() {
 }
 
 #[test]
+fn a_report_carries_the_job_context_and_writes_the_summary_once() {
+    let f = fixture();
+    let w = worker(
+        &f,
+        f.pool,
+        Capacity {
+            cpu_millis: 8_000,
+            memory_bytes: 16 << 30,
+        },
+    );
+    let (_, ids) = run(
+        &f,
+        "schema: 1
+on: [push]
+jobs:
+  build:
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }]
+  test:
+    image: alpine:3
+    needs: [build]
+    steps: [{ id: s, run: 'true' }]
+",
+        at(2_000),
+    );
+    let (build, test) = (ids[0], ids[1]);
+    let offer = place(&f, w, f.pool, at(2_100)).unwrap();
+    let (attempt, fence) = (offer.attempt, offer.fence);
+    // Context before acknowledgement is refused only for a foreign worker;
+    // the held attempt answers with its identity and no dependencies.
+    assert!(matches!(
+        f.store
+            .read(|c| dispatch::job_context(c, WorkerId::new(), attempt)),
+        Err(Error::NotFound)
+    ));
+    let context = f
+        .store
+        .read(|c| dispatch::job_context(c, w, attempt))
+        .unwrap();
+    assert_eq!((context.job, context.job_name.as_str()), (build, "build"));
+    assert_eq!(context.repo_name, "app");
+    assert_eq!(context.sha, SHA);
+    assert!(context.needs.is_empty() && !context.cancelled);
+    // A report from a worker that does not hold the attempt is refused;
+    // the holder's terminal report stores the summary exactly once.
+    let summary = vec![1u8, 2, 3];
+    let stray = summary.clone();
+    assert!(matches!(
+        f.store.writer().write(move |tx| dispatch::report(
+            tx,
+            WorkerId::new(),
+            attempt,
+            fence,
+            Event::Passed,
+            Some(&stray),
+            at(2_200)
+        )),
+        Err(Error::NotFound)
+    ));
+    let bytes = summary.clone();
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::acknowledge(tx, w, attempt, fence, at(2_200))?;
+            dispatch::report(tx, w, attempt, fence, Event::StepsStarted, None, at(2_300))?;
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::FinalizationStarted,
+                None,
+                at(2_400),
+            )?;
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::Passed,
+                Some(&bytes),
+                at(2_500),
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        f.store
+            .read(|c| dispatch::attempt_summary(c, f.tenant, attempt))
+            .unwrap(),
+        Some(summary)
+    );
+    assert_eq!(
+        f.store
+            .read(|c| dispatch::latest_attempt(c, f.tenant, build))
+            .unwrap(),
+        Some(attempt)
+    );
+    // Neither the machine nor raw SQL replaces it.
+    assert!(matches!(
+        f.store.writer().write(move |tx| dispatch::report(
+            tx,
+            w,
+            attempt,
+            fence,
+            Event::Passed,
+            Some(&[9u8]),
+            at(2_600)
+        )),
+        Err(Error::NotFound)
+    ));
+    let overwrite = f.store.writer().write(move |tx| {
+        tx.execute("UPDATE attempts SET summary = X'00'", [])?;
+        Ok(())
+    });
+    assert!(matches!(overwrite, Err(Error::Sqlite(_))));
+    // The dependent's context names its dependency's outcome.
+    let next = place(&f, w, f.pool, at(2_700)).unwrap();
+    assert_eq!(next.job, test);
+    let context = f
+        .store
+        .read(|c| dispatch::job_context(c, w, next.attempt))
+        .unwrap();
+    assert_eq!(context.needs, vec![("build".to_owned(), Outcome::Passed)]);
+    assert_eq!(context.job_name, "test");
+}
+
+#[test]
 fn finishing_releases_capacity_and_decides_dependents_in_the_same_transaction() {
     let f = fixture();
     let w = worker(

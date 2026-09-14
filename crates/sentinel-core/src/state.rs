@@ -70,6 +70,9 @@ pub enum FailureClass {
     Reconciled = 9,
     /// Log spool, artifact or cache publication failed durably.
     Publication = 10,
+    /// The container runtime failed while a step was being run — the exec
+    /// could not start or the runtime errored — not the command itself.
+    Runtime = 11,
 }
 
 impl FailureClass {
@@ -86,6 +89,7 @@ impl FailureClass {
             Self::WorkerLost => "worker_lost",
             Self::Reconciled => "reconciled",
             Self::Publication => "publication",
+            Self::Runtime => "runtime",
         }
     }
 
@@ -99,7 +103,8 @@ impl FailureClass {
             | Self::LeaseExpired
             | Self::WorkerLost
             | Self::Reconciled
-            | Self::Publication => Outcome::InfraFailed,
+            | Self::Publication
+            | Self::Runtime => Outcome::InfraFailed,
         }
     }
 }
@@ -605,6 +610,7 @@ mod tests {
         assert_eq!(FailureClass::QueueTimeout.outcome(), Outcome::TimedOut);
         assert_eq!(FailureClass::Canceled.outcome(), Outcome::Canceled);
         assert_eq!(FailureClass::Publication.outcome(), Outcome::InfraFailed);
+        assert_eq!(FailureClass::Runtime.outcome(), Outcome::InfraFailed);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::{
 };
 
 use sentinel_core::{AttemptId, Event, Fence, UnixMillis};
-use sentinel_link::session::{Executor as LinkExecutor, Offer, Reporter};
+use sentinel_link::session::{Executor as LinkExecutor, JobContext, Offer, Reporter};
 use sentinel_pipeline::RunSpec;
 use sentinel_protocol::limits::MAX_LIST_ITEMS;
 
@@ -48,8 +48,9 @@ struct State {
     /// Offers taken and waiting for their spec.
     awaiting: HashMap<AttemptId, Offer>,
     live: HashMap<AttemptId, Live>,
-    /// Reports that found no session, in order.
-    pending: Vec<(AttemptId, Fence, Event)>,
+    /// Reports that found no session, in order, with the summary of a
+    /// terminal one.
+    pending: Vec<(AttemptId, Fence, Event, Option<Vec<u8>>)>,
 }
 
 /// The executor handle the link holds; cheap to clone, one runtime behind it.
@@ -95,7 +96,7 @@ impl Executor {
         })))
     }
 
-    fn spawn(&self, offer: Offer, spec: RunSpec, job_index: usize) {
+    fn spawn(&self, offer: Offer, spec: RunSpec, context: JobContext, job_index: usize) {
         let cancel: Cancel = Arc::new(AtomicBool::new(false));
         self.state().live.insert(
             offer.attempt,
@@ -108,11 +109,10 @@ impl Executor {
             worker: self.worker,
             attempt: offer.attempt,
             fence: offer.fence,
-            run: offer.run,
-            job: offer.job,
             job_index,
             digest: offer.image_digest.clone(),
             spec,
+            context,
         };
         let spawned = thread::Builder::new()
             .name(format!("sentinel-attempt-{}", offer.attempt))
@@ -148,21 +148,27 @@ impl Inner {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn send(&self, attempt: AttemptId, fence: Fence, event: Event) {
+    fn send(&self, attempt: AttemptId, fence: Fence, event: Event, summary: Option<Vec<u8>>) {
         let mut state = self.state();
-        let sent = match &state.reporter {
-            Some(reporter) => reporter.report(attempt, fence, event).is_ok(),
-            None => false,
+        let sent = match (&state.reporter, &summary) {
+            (Some(reporter), Some(summary)) => reporter
+                .finish(attempt, fence, event, summary.clone())
+                .is_ok(),
+            (Some(reporter), None) => reporter.report(attempt, fence, event).is_ok(),
+            (None, _) => false,
         };
         if !sent {
-            state.pending.push((attempt, fence, event));
+            state.pending.push((attempt, fence, event, summary));
         }
     }
 }
 
 impl Report for Inner {
     fn event(&self, attempt: AttemptId, fence: Fence, event: Event) {
-        self.send(attempt, fence, event);
+        self.send(attempt, fence, event, None);
+    }
+    fn finish(&self, attempt: AttemptId, fence: Fence, event: Event, summary: Vec<u8>) {
+        self.send(attempt, fence, event, Some(summary));
     }
 }
 
@@ -219,9 +225,15 @@ impl LinkExecutor for Executor {
             state.reporter = Some(reporter.clone());
             std::mem::take(&mut state.pending)
         };
-        for (attempt, fence, event) in pending {
-            if reporter.report(attempt, fence, event).is_err() {
-                self.state().pending.push((attempt, fence, event));
+        for (attempt, fence, event, summary) in pending {
+            let sent = match &summary {
+                Some(bytes) => reporter
+                    .finish(attempt, fence, event, bytes.clone())
+                    .is_ok(),
+                None => reporter.report(attempt, fence, event).is_ok(),
+            };
+            if !sent {
+                self.state().pending.push((attempt, fence, event, summary));
             }
         }
         // Specs asked for on a lost session: ask again.
@@ -235,20 +247,21 @@ impl LinkExecutor for Executor {
         self.state().reporter = None;
     }
 
-    fn spec(&self, attempt: AttemptId, bytes: Vec<u8>) {
+    fn spec(&self, attempt: AttemptId, context: JobContext, bytes: Vec<u8>) {
         let Some(offer) = self.state().awaiting.remove(&attempt) else {
             return;
         };
         match RunSpec::decode(&bytes) {
             Ok(spec) => {
                 let job_index = offer.job_index as usize;
-                self.spawn(offer, spec, job_index);
+                self.spawn(offer, spec, context, job_index);
             }
             Err(_) => {
                 self.send(
                     attempt,
                     offer.fence,
                     Event::Failed(sentinel_core::FailureClass::Preparation),
+                    None,
                 );
             }
         }
