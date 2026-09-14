@@ -17,7 +17,7 @@ use std::{
 
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
-    Actor, AttemptId, Event, Fence, JobState, Outcome, PoolId, RepoId, RunId, TenantId, UnixMillis,
+    AttemptId, Event, Fence, JobState, Outcome, PoolId, RepoId, RunId, TenantId, UnixMillis,
     UserId, WorkerId,
     auth::{Namespace, Permissions as P, Principal},
 };
@@ -191,6 +191,8 @@ struct Recorder {
     renewed: AtomicI64,
     /// Decline offers for these jobs once, to exercise the lapse path.
     decline_once: Mutex<Vec<JobId>>,
+    reporter: Mutex<Option<session::Reporter>>,
+    specs: Mutex<Vec<(AttemptId, Vec<u8>)>>,
 }
 
 impl Recorder {
@@ -203,6 +205,8 @@ impl Recorder {
                 stopped: Mutex::new(Vec::new()),
                 renewed: AtomicI64::new(0),
                 decline_once: Mutex::new(Vec::new()),
+                reporter: Mutex::new(None),
+                specs: Mutex::new(Vec::new()),
             }),
             rx,
         )
@@ -242,6 +246,18 @@ impl Executor for Recorder {
     }
     fn renewed(&self, until: UnixMillis) {
         self.renewed.store(until.0, Ordering::SeqCst);
+    }
+    fn attached(&self, reporter: session::Reporter) {
+        *self.reporter.lock().unwrap() = Some(reporter);
+    }
+    fn detached(&self) {
+        self.reporter.lock().unwrap().take();
+    }
+    fn spec(&self, attempt: AttemptId, bytes: Vec<u8>) {
+        self.specs.lock().unwrap().push((attempt, bytes));
+    }
+    fn no_spec(&self, attempt: AttemptId) {
+        self.specs.lock().unwrap().push((attempt, Vec::new()));
     }
 }
 
@@ -332,6 +348,10 @@ impl Executor for Idle {
         Vec::new()
     }
     fn renewed(&self, _: UnixMillis) {}
+    fn attached(&self, _: session::Reporter) {}
+    fn detached(&self) {}
+    fn spec(&self, _: AttemptId, _: Vec<u8>) {}
+    fn no_spec(&self, _: AttemptId) {}
 }
 
 #[test]
@@ -563,38 +583,39 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
         &second.0
     };
     let (attempt, fence) = (build_attempt.attempt, build_attempt.fence);
+    // The worker asks for the spec it will run and gets the stored bytes.
+    let reporter = recorder.reporter.lock().unwrap().clone().unwrap();
+    reporter.need_spec(attempt).unwrap();
+    eventually("spec", || !recorder.specs.lock().unwrap().is_empty());
+    let (spec_attempt, bytes) = recorder.specs.lock().unwrap()[0].clone();
+    assert_eq!(spec_attempt, attempt);
+    let spec = RunSpec::decode(&bytes).unwrap();
+    assert_eq!(spec.pipeline.jobs.len(), 3);
+    // A spec for an attempt this worker does not hold is refused.
+    reporter.need_spec(AttemptId::new()).unwrap();
+    eventually("no spec", || recorder.specs.lock().unwrap().len() == 2);
+    assert!(recorder.specs.lock().unwrap()[1].1.is_empty());
+
+    // The worker reports its progress over the wire; the terminal report
+    // frees the capacity, queues `test` and wakes the dispatcher — no
+    // `wake()` call from the test.
     recorder.release(attempt);
-    let next = d
-        .store
-        .writer()
-        .write(move |tx| {
-            dispatch::finish(
-                tx,
-                attempt,
-                Actor::Worker(fence),
-                Event::StepsStarted,
-                UnixMillis::now(),
-            )?;
-            dispatch::finish(
-                tx,
-                attempt,
-                Actor::Worker(fence),
-                Event::FinalizationStarted,
-                UnixMillis::now(),
-            )?;
-            dispatch::finish(
-                tx,
-                attempt,
-                Actor::Worker(fence),
-                Event::Passed,
-                UnixMillis::now(),
-            )
-        })
-        .unwrap();
-    assert_eq!(next, JobState::Terminal(Outcome::Passed));
-    assert_eq!(d.state(test), JobState::Queued);
+    for event in [
+        Event::StepsStarted,
+        Event::FinalizationStarted,
+        Event::Passed,
+    ] {
+        reporter.report(attempt, fence, event).unwrap();
+    }
     let woken = Instant::now();
-    d.controller().wake();
+    eventually("terminal", || {
+        d.state(build) == JobState::Terminal(Outcome::Passed)
+    });
+    // A stale fence is refused without effect.
+    reporter.report(attempt, Fence(0), Event::Passed).unwrap();
+    eventually("stale report counted", || {
+        d.controller().stats().stale_reports.load(Ordering::SeqCst) == 1
+    });
     let third = offers.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(third.0.job, test);
     assert!(third.1.duration_since(woken) < RECONCILE_INTERVAL / 2);

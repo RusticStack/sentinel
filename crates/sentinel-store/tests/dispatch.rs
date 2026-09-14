@@ -419,8 +419,17 @@ fn renewal_is_fenced_per_attempt_and_names_what_to_stop() {
         .unwrap();
     assert_eq!(until, at(50_000));
     assert_eq!(stop, vec![ba, ghost]);
-    let held = f.store.read(|c| dispatch::held_by(c, w)).unwrap();
-    assert_eq!(held[0].lease_until, at(50_000));
+    let lease_of = |attempt: AttemptId| {
+        f.store
+            .read(|c| dispatch::held_by(c, w))
+            .unwrap()
+            .into_iter()
+            .find(|h| h.attempt == attempt)
+            .unwrap()
+            .lease_until
+    };
+    assert_eq!(lease_of(aa), at(50_000));
+    assert_eq!(lease_of(ba), at(2_100 + dispatch::DEFAULT_LEASE_MS));
     // Renewal never moves a lease backwards, and another worker cannot renew it.
     let (_, stop) = f
         .store
@@ -428,10 +437,7 @@ fn renewal_is_fenced_per_attempt_and_names_what_to_stop() {
         .write(move |tx| dispatch::renew(tx, w, &[aa], dispatch::DEFAULT_LEASE_MS, at(10_000)))
         .unwrap();
     assert!(stop.is_empty());
-    assert_eq!(
-        f.store.read(|c| dispatch::held_by(c, w)).unwrap()[0].lease_until,
-        at(50_000)
-    );
+    assert_eq!(lease_of(aa), at(50_000));
     let (_, stop) = f
         .store
         .writer()

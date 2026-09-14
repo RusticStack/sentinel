@@ -29,6 +29,8 @@ podman info --debug
 podman unshare cat /proc/self/uid_map /proc/self/gid_map
 ```
 
+The executor's own tests (`crates/sentinel-worker/tests/podman.rs`, `tests/end_to_end.rs`) run real containers and therefore only as such an account: build them as usual, then run the binaries with `SENTINEL_PODMAN_TESTS=1` from a login shell of the worker account (for example `sudo -iu sentinelbench env SENTINEL_PODMAN_TESTS=1 <target>/debug/deps/podman-<hash>`); without the variable they print `skipped` and pass nothing. The checkout tests need only `git`.
+
 The benchmark runner records runtime/kernel/filesystem/cgroup details automatically; see [Benchmarking](benchmarking.md) for the F05 baseline. No host resource budget is qualified yet. Podman is a worker execution prerequisite, not a dependency for the controller lifecycle or portable CLI.
 
 ## Daily checks

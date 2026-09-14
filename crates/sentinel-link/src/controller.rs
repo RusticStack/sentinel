@@ -27,7 +27,7 @@ use std::{
 };
 
 use sentinel_auth::secret::{Digest, Secret};
-use sentinel_core::{AttemptId, Fence, PoolId, UnixMillis, WorkerId};
+use sentinel_core::{AttemptId, Event, Fence, PoolId, UnixMillis, WorkerId};
 use sentinel_protocol::negotiate::Hello;
 use sentinel_store::{Store, dispatch, workers};
 
@@ -53,6 +53,8 @@ pub struct Stats {
     pub acknowledged: AtomicU64,
     pub lapsed: AtomicU64,
     pub sessions_ended: AtomicU64,
+    pub reports: AtomicU64,
+    pub stale_reports: AtomicU64,
 }
 
 struct Peer {
@@ -187,6 +189,7 @@ impl Inner {
                     memory_bytes: placed.memory_bytes as u64,
                     image_digest: placed.image.digest,
                     image_platform: placed.image.platform,
+                    job_index: placed.job_index,
                 };
                 if session::offer(&peer.sender, &offer).is_err() {
                     // The session is gone: give the job back at once rather
@@ -329,6 +332,32 @@ impl SessionHandler for Inner {
         }
         // A stale acknowledgement changes nothing; the worker learns the
         // attempt is not its own from the stop list on its next beat.
+    }
+
+    fn reported(&self, worker: WorkerId, attempt: AttemptId, fence: Fence, event: Event) {
+        let finished = self.write(move |tx| {
+            dispatch::report(tx, worker, attempt, fence, event, UnixMillis::now())
+        });
+        match finished {
+            Ok(state) => {
+                self.stats.reports.fetch_add(1, Ordering::Relaxed);
+                if state.is_terminal() {
+                    // Capacity came back and dependents may be queued.
+                    self.wake();
+                }
+            }
+            // Stale fence, unknown attempt or a terminal duplicate: the
+            // machine refused it and nothing changed.
+            Err(_) => {
+                self.stats.stale_reports.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn spec(&self, worker: WorkerId, attempt: AttemptId) -> Option<Vec<u8>> {
+        self.store
+            .read(|c| dispatch::spec_bytes(c, worker, attempt))
+            .ok()
     }
 
     fn declined(&self, _worker: WorkerId, attempt: AttemptId, _fence: Fence) {

@@ -1,0 +1,270 @@
+//! The link's `Executor`, backed by real attempts on threads.
+//!
+//! An offer is taken when the runtime is usable and the worker holds fewer
+//! than its bound of attempts; the spec is then asked for over the link and
+//! the attempt starts once it arrives. Reports go out on the live session
+//! from the attempt's own thread, in order; when there is no session they
+//! queue in memory and are replayed at the next attach (a durable spool is
+//! W05). A `stop` from the controller flips the attempt's cancel flag and
+//! ends its container; it is not reported, because the controller already
+//! counts the attempt as gone.
+
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+};
+
+use sentinel_core::{AttemptId, Event, Fence, UnixMillis};
+use sentinel_link::session::{Executor as LinkExecutor, Offer, Reporter};
+use sentinel_pipeline::RunSpec;
+use sentinel_protocol::limits::MAX_LIST_ITEMS;
+
+use crate::{
+    Result,
+    attempt::{self, Cancel, Job, Report, Verdict},
+    podman,
+};
+
+/// What happened, for the process's diagnostics.
+#[derive(Debug)]
+pub enum Notice {
+    Started(AttemptId),
+    Finished(AttemptId, Verdict),
+    SpecRefused(AttemptId),
+    Stopped(AttemptId),
+}
+
+struct Live {
+    cancel: Cancel,
+}
+
+struct State {
+    reporter: Option<Reporter>,
+    /// Offers taken and waiting for their spec.
+    awaiting: HashMap<AttemptId, Offer>,
+    live: HashMap<AttemptId, Live>,
+    /// Reports that found no session, in order.
+    pending: Vec<(AttemptId, Fence, Event)>,
+}
+
+/// The executor handle the link holds; cheap to clone, one runtime behind it.
+#[derive(Clone)]
+pub struct Executor(Arc<Inner>);
+
+impl std::ops::Deref for Executor {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.0
+    }
+}
+
+pub struct Inner {
+    root: PathBuf,
+    worker: sentinel_core::WorkerId,
+    runtime: podman::Runtime,
+    state: Mutex<State>,
+    notify: Box<dyn Fn(Notice) + Send + Sync>,
+}
+
+impl Executor {
+    /// Probe the runtime and prepare the data directory. Refuses to exist
+    /// without rootless Podman: an executor that cannot isolate is not one.
+    pub fn start(
+        root: PathBuf,
+        worker: sentinel_core::WorkerId,
+        notify: impl Fn(Notice) + Send + Sync + 'static,
+    ) -> Result<Executor> {
+        let runtime = podman::probe()?;
+        std::fs::create_dir_all(root.join(crate::workspace::WORKSPACES_DIR))?;
+        Ok(Executor(Arc::new(Inner {
+            root,
+            worker,
+            runtime,
+            state: Mutex::new(State {
+                reporter: None,
+                awaiting: HashMap::new(),
+                live: HashMap::new(),
+                pending: Vec::new(),
+            }),
+            notify: Box::new(notify),
+        })))
+    }
+
+    fn spawn(&self, offer: Offer, spec: RunSpec, job_index: usize) {
+        let cancel: Cancel = Arc::new(AtomicBool::new(false));
+        self.state().live.insert(
+            offer.attempt,
+            Live {
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        let executor = Arc::clone(&self.0);
+        let job = Job {
+            worker: self.worker,
+            attempt: offer.attempt,
+            fence: offer.fence,
+            run: offer.run,
+            job: offer.job,
+            job_index,
+            digest: offer.image_digest.clone(),
+            spec,
+        };
+        let spawned = thread::Builder::new()
+            .name(format!("sentinel-attempt-{}", offer.attempt))
+            .spawn(move || {
+                (executor.notify)(Notice::Started(job.attempt));
+                let (verdict, _) = attempt::run(&executor.root, &job, &*executor, &cancel);
+                executor.state().live.remove(&job.attempt);
+                (executor.notify)(Notice::Finished(job.attempt, verdict));
+            });
+        if spawned.is_err() {
+            self.state().live.remove(&offer.attempt);
+        }
+    }
+}
+
+impl Inner {
+    pub fn runtime(&self) -> &podman::Runtime {
+        &self.runtime
+    }
+
+    /// No attempt running or waiting for its spec.
+    pub fn state_is_idle(&self) -> bool {
+        let state = self.state();
+        state.live.is_empty() && state.awaiting.is_empty()
+    }
+
+    /// Reports that found no session and wait for the next one.
+    pub fn pending_reports(&self) -> usize {
+        self.state().pending.len()
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn send(&self, attempt: AttemptId, fence: Fence, event: Event) {
+        let mut state = self.state();
+        let sent = match &state.reporter {
+            Some(reporter) => reporter.report(attempt, fence, event).is_ok(),
+            None => false,
+        };
+        if !sent {
+            state.pending.push((attempt, fence, event));
+        }
+    }
+}
+
+impl Report for Inner {
+    fn event(&self, attempt: AttemptId, fence: Fence, event: Event) {
+        self.send(attempt, fence, event);
+    }
+}
+
+impl LinkExecutor for Executor {
+    fn offered(&self, offer: &Offer) -> bool {
+        let reporter = {
+            let mut state = self.state();
+            if state.live.len() + state.awaiting.len() >= MAX_LIST_ITEMS {
+                return false;
+            }
+            let Some(reporter) = state.reporter.clone() else {
+                return false;
+            };
+            state.awaiting.insert(offer.attempt, offer.clone());
+            reporter
+        };
+        if reporter.need_spec(offer.attempt).is_err() {
+            self.state().awaiting.remove(&offer.attempt);
+            return false;
+        }
+        true
+    }
+
+    fn stop(&self, attempt: AttemptId) {
+        let live = {
+            let mut state = self.state();
+            state.awaiting.remove(&attempt);
+            state.live.get(&attempt).map(|l| Arc::clone(&l.cancel))
+        };
+        if let Some(cancel) = live {
+            cancel.store(true, Ordering::Release);
+            // End the container now, outside the lock; the attempt thread
+            // finalizes what is left and exits.
+            let _ = podman::remove_named(&format!("sentinel-{attempt}"));
+        }
+        (self.notify)(Notice::Stopped(attempt));
+    }
+
+    fn held(&self) -> Vec<AttemptId> {
+        let state = self.state();
+        state
+            .live
+            .keys()
+            .chain(state.awaiting.keys())
+            .copied()
+            .collect()
+    }
+
+    fn renewed(&self, _until: UnixMillis) {}
+
+    fn attached(&self, reporter: Reporter) {
+        let pending = {
+            let mut state = self.state();
+            state.reporter = Some(reporter.clone());
+            std::mem::take(&mut state.pending)
+        };
+        for (attempt, fence, event) in pending {
+            if reporter.report(attempt, fence, event).is_err() {
+                self.state().pending.push((attempt, fence, event));
+            }
+        }
+        // Specs asked for on a lost session: ask again.
+        let awaiting: Vec<AttemptId> = self.state().awaiting.keys().copied().collect();
+        for attempt in awaiting {
+            let _ = reporter.need_spec(attempt);
+        }
+    }
+
+    fn detached(&self) {
+        self.state().reporter = None;
+    }
+
+    fn spec(&self, attempt: AttemptId, bytes: Vec<u8>) {
+        let Some(offer) = self.state().awaiting.remove(&attempt) else {
+            return;
+        };
+        match RunSpec::decode(&bytes) {
+            Ok(spec) => {
+                let job_index = offer.job_index as usize;
+                self.spawn(offer, spec, job_index);
+            }
+            Err(_) => {
+                self.send(
+                    attempt,
+                    offer.fence,
+                    Event::Failed(sentinel_core::FailureClass::Preparation),
+                );
+            }
+        }
+    }
+
+    fn no_spec(&self, attempt: AttemptId) {
+        self.state().awaiting.remove(&attempt);
+        (self.notify)(Notice::SpecRefused(attempt));
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Ask every live attempt to stop; their threads finalize on their own.
+        for live in self.state().live.values() {
+            live.cancel.store(true, Ordering::Release);
+        }
+    }
+}

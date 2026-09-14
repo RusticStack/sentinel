@@ -1142,6 +1142,7 @@ dependencies = [
  "sentinel-pipeline",
  "sentinel-protocol",
  "sentinel-store",
+ "sentinel-worker",
  "serde",
  "serde_json",
  "tempfile",
@@ -1254,6 +1255,20 @@ dependencies = [
  "sentinel-core",
  "sentinel-pipeline",
  "sentinel-protocol",
+ "tempfile",
+]
+
+[[package]]
+name = "sentinel-worker"
+version = "0.1.0-dev"
+dependencies = [
+ "libc",
+ "sentinel-auth",
+ "sentinel-core",
+ "sentinel-link",
+ "sentinel-pipeline",
+ "sentinel-protocol",
+ "sentinel-store",
  "tempfile",
 ]
 

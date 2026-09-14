@@ -22,9 +22,11 @@ use std::{
 
 use rustls::{ClientConnection, ServerConnection, pki_types::ServerName};
 use sentinel_auth::secret::{Digest, Secret};
-use sentinel_core::{AttemptId, Fence, JobId, RunId, TenantId, UnixMillis, WorkerId};
+use sentinel_core::{
+    AttemptId, Event, FailureClass, Fence, JobId, RunId, TenantId, UnixMillis, WorkerId,
+};
 use sentinel_protocol::{
-    limits::{MAX_CONTROL_MESSAGE_BYTES, MAX_LIST_ITEMS},
+    limits::{MAX_API_BODY_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_LIST_ITEMS},
     negotiate::{Hello, Negotiated, Rejected},
 };
 use serde::{Deserialize, Serialize};
@@ -38,6 +40,10 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(15);
 /// Bytes read from the socket per call; one TLS record fits.
 const TLS_READ_BYTES: usize = 16 * 1024 + 512;
+/// A run spec crosses the link in chunks of this size, reassembled up to
+/// [`MAX_SPEC_BYTES`]; a spec is bounded by the pipeline file it came from.
+pub const SPEC_CHUNK_BYTES: usize = 48 * 1024;
+pub const MAX_SPEC_BYTES: usize = MAX_API_BODY_BYTES;
 
 /// What a worker has, as it measures at each hello.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +79,62 @@ pub enum ClientMessage {
         attempt: [u8; 16],
         fence: u64,
     },
+    /// The attempt moved: a worker-side state event under its fence.
+    Report {
+        attempt: [u8; 16],
+        fence: u64,
+        event: WireEvent,
+    },
+    /// The worker needs the run spec of an attempt it holds.
+    NeedSpec {
+        attempt: [u8; 16],
+    },
     Bye,
+}
+
+/// A worker's state event on the wire; mirrors the worker-raised half of
+/// `sentinel_core::Event` with the failure class as its stored code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireEvent {
+    PreparationStarted,
+    StepsStarted,
+    FinalizationStarted,
+    Passed,
+    Failed(u8),
+}
+
+impl WireEvent {
+    /// Only the events a worker may raise are representable; the controller
+    /// still runs them through the state machine under the worker's fence.
+    pub fn from_event(event: Event) -> Option<WireEvent> {
+        Some(match event {
+            Event::PreparationStarted => WireEvent::PreparationStarted,
+            Event::StepsStarted => WireEvent::StepsStarted,
+            Event::FinalizationStarted => WireEvent::FinalizationStarted,
+            Event::Passed => WireEvent::Passed,
+            Event::Failed(class) => WireEvent::Failed(class as u8),
+            _ => return None,
+        })
+    }
+
+    pub fn to_event(self) -> Result<Event> {
+        Ok(match self {
+            WireEvent::PreparationStarted => Event::PreparationStarted,
+            WireEvent::StepsStarted => Event::StepsStarted,
+            WireEvent::FinalizationStarted => Event::FinalizationStarted,
+            WireEvent::Passed => Event::Passed,
+            WireEvent::Failed(code) => Event::Failed(match code {
+                0 => FailureClass::CommandFailed,
+                1 => FailureClass::CommandSignaled,
+                2 => FailureClass::OutOfMemory,
+                3 => FailureClass::ExecutionTimeout,
+                5 => FailureClass::Canceled,
+                6 => FailureClass::Preparation,
+                10 => FailureClass::Publication,
+                _ => return Err(Error::Protocol("failure class")),
+            }),
+        })
+    }
 }
 
 /// A lease on the wire; typed as [`Offer`] on both ends.
@@ -89,6 +150,7 @@ pub struct WireOffer {
     pub memory_bytes: u64,
     pub image_digest: String,
     pub image_platform: String,
+    pub job_index: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -107,6 +169,17 @@ pub enum ServerMessage {
         stop: Vec<[u8; 16]>,
     },
     Offer(WireOffer),
+    /// One chunk of the run spec asked for with `NeedSpec`, in order.
+    Spec {
+        attempt: [u8; 16],
+        seq: u32,
+        last: bool,
+        bytes: Vec<u8>,
+    },
+    /// The attempt is not held by this worker or has no spec: stop it.
+    NoSpec {
+        attempt: [u8; 16],
+    },
 }
 
 /// An offer as the worker sees it: a fenced lease it must acknowledge within
@@ -121,8 +194,11 @@ pub struct Offer {
     pub lease_until: UnixMillis,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+    /// `name@sha256:…` as resolved on the run; what the worker pulls.
     pub image_digest: String,
     pub image_platform: String,
+    /// Position of the job in the run's compiled spec.
+    pub job_index: u32,
 }
 
 impl Offer {
@@ -138,6 +214,7 @@ impl Offer {
             memory_bytes: self.memory_bytes,
             image_digest: self.image_digest.clone(),
             image_platform: self.image_platform.clone(),
+            job_index: self.job_index,
         }
     }
 
@@ -153,6 +230,7 @@ impl Offer {
             memory_bytes: wire.memory_bytes,
             image_digest: wire.image_digest,
             image_platform: wire.image_platform,
+            job_index: wire.job_index,
         })
     }
 }
@@ -234,6 +312,11 @@ pub trait SessionHandler: Send + Sync {
     fn ping(&self, worker: WorkerId, held: &[AttemptId]) -> Result<(UnixMillis, Vec<AttemptId>)>;
     fn acknowledged(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
     fn declined(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
+    /// A worker-side state event. The handler applies it under the fence;
+    /// a stale one changes nothing.
+    fn reported(&self, worker: WorkerId, attempt: AttemptId, fence: Fence, event: Event);
+    /// The encoded run spec of an attempt this worker holds, or `None`.
+    fn spec(&self, worker: WorkerId, attempt: AttemptId) -> Option<Vec<u8>>;
 }
 
 /// The rustls state and the socket it writes to. The lock is held only while
@@ -524,6 +607,41 @@ impl WorkerSession {
                         AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
                     handler.declined(worker, attempt, Fence(fence));
                 }
+                ClientMessage::Report {
+                    attempt,
+                    fence,
+                    event,
+                } => {
+                    let attempt =
+                        AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                    handler.reported(worker, attempt, Fence(fence), event.to_event()?);
+                }
+                ClientMessage::NeedSpec { attempt } => {
+                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                    match handler.spec(worker, id) {
+                        Some(bytes) if bytes.len() <= MAX_SPEC_BYTES => {
+                            let chunks = bytes.chunks(SPEC_CHUNK_BYTES);
+                            let count = chunks.len().max(1);
+                            if bytes.is_empty() {
+                                self.tx.send(&ServerMessage::Spec {
+                                    attempt,
+                                    seq: 0,
+                                    last: true,
+                                    bytes: Vec::new(),
+                                })?;
+                            }
+                            for (seq, chunk) in chunks.enumerate() {
+                                self.tx.send(&ServerMessage::Spec {
+                                    attempt,
+                                    seq: seq as u32,
+                                    last: seq + 1 == count,
+                                    bytes: chunk.to_vec(),
+                                })?;
+                            }
+                        }
+                        _ => self.tx.send(&ServerMessage::NoSpec { attempt })?,
+                    }
+                }
                 ClientMessage::Bye => return Ok(()),
                 ClientMessage::Hello { .. } => return Err(Error::Protocol("second hello")),
             }
@@ -607,9 +725,34 @@ pub fn connect(
             seq: 0,
         }),
         ServerMessage::Reject(why) => Err(Error::Rejected(why)),
-        ServerMessage::Pong { .. } | ServerMessage::Offer(_) => {
-            Err(Error::Protocol("message before welcome"))
-        }
+        ServerMessage::Pong { .. }
+        | ServerMessage::Offer(_)
+        | ServerMessage::Spec { .. }
+        | ServerMessage::NoSpec { .. } => Err(Error::Protocol("message before welcome")),
+    }
+}
+
+/// The executor's way to speak on the session from its own threads: state
+/// events under the attempt's fence, and spec requests. Sending fails once
+/// the session is gone; the executor keeps the event and resends it when it
+/// is attached to the next session.
+#[derive(Clone)]
+pub struct Reporter(Sender);
+
+impl Reporter {
+    pub fn report(&self, attempt: AttemptId, fence: Fence, event: Event) -> Result<()> {
+        let event = WireEvent::from_event(event).ok_or(Error::Protocol("not a worker event"))?;
+        self.0.send(&ClientMessage::Report {
+            attempt: *attempt.as_bytes(),
+            fence: fence.0,
+            event,
+        })
+    }
+
+    pub fn need_spec(&self, attempt: AttemptId) -> Result<()> {
+        self.0.send(&ClientMessage::NeedSpec {
+            attempt: *attempt.as_bytes(),
+        })
     }
 }
 
@@ -624,6 +767,14 @@ pub trait Executor: Send + Sync {
     fn held(&self) -> Vec<AttemptId>;
     /// The controller renewed every held lease to this deadline.
     fn renewed(&self, until: UnixMillis);
+    /// A session is live: reports and spec requests go through `reporter`
+    /// until `detached`. Pending reports from a lost session are resent here.
+    fn attached(&self, reporter: Reporter);
+    fn detached(&self);
+    /// The run spec asked for with `Reporter::need_spec`, whole.
+    fn spec(&self, attempt: AttemptId, bytes: Vec<u8>);
+    /// The controller has no spec for the attempt: it is not held here.
+    fn no_spec(&self, attempt: AttemptId);
 }
 
 impl Link {
@@ -650,13 +801,13 @@ impl Link {
     pub fn beat(&mut self, executor: &dyn Executor) -> Result<()> {
         self.ping(executor)?;
         let deadline = std::time::Instant::now() + HEARTBEAT_DEADLINE;
-        let mut seen = std::collections::HashSet::new();
+        let mut state = Inbound::default();
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match self.rx.recv_timeout::<ServerMessage>(remaining)? {
                 None => return Err(Error::Lost),
                 Some(message) => {
-                    if self.handle(message, executor, &mut seen)? {
+                    if self.handle(message, executor, &mut state)? {
                         return Ok(());
                     }
                 }
@@ -669,8 +820,9 @@ impl Link {
         &mut self,
         message: ServerMessage,
         executor: &dyn Executor,
-        seen: &mut std::collections::HashSet<AttemptId>,
+        state: &mut Inbound,
     ) -> Result<bool> {
+        let seen = &mut state.seen;
         match message {
             ServerMessage::Pong {
                 seq,
@@ -703,6 +855,31 @@ impl Link {
                 })?;
                 Ok(false)
             }
+            ServerMessage::Spec {
+                attempt,
+                seq,
+                last,
+                bytes,
+            } => {
+                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                let buffer = state.specs.entry(attempt).or_default();
+                if seq as usize != buffer.1 || buffer.0.len() + bytes.len() > MAX_SPEC_BYTES {
+                    return Err(Error::Protocol("spec chunk"));
+                }
+                buffer.0.extend_from_slice(&bytes);
+                buffer.1 += 1;
+                if last {
+                    let (bytes, _) = state.specs.remove(&attempt).expect("just inserted");
+                    executor.spec(attempt, bytes);
+                }
+                Ok(false)
+            }
+            ServerMessage::NoSpec { attempt } => {
+                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                state.specs.remove(&attempt);
+                executor.no_spec(attempt);
+                Ok(false)
+            }
             ServerMessage::Welcome { .. } | ServerMessage::Reject(_) => {
                 Err(Error::Protocol("unexpected message"))
             }
@@ -719,7 +896,14 @@ impl Link {
     /// message and beat) or the controller is lost: beats at the interval,
     /// offers answered the moment they arrive.
     pub fn run(&mut self, executor: &dyn Executor, mut until: impl FnMut() -> bool) -> Result<()> {
-        let mut seen = std::collections::HashSet::new();
+        executor.attached(Reporter(self.tx.clone()));
+        let outcome = self.serve(executor, &mut until);
+        executor.detached();
+        outcome
+    }
+
+    fn serve(&mut self, executor: &dyn Executor, until: &mut impl FnMut() -> bool) -> Result<()> {
+        let mut state = Inbound::default();
         let mut next_ping = std::time::Instant::now();
         let mut awaiting: Option<std::time::Instant> = None;
         while !until() {
@@ -739,16 +923,23 @@ impl Link {
                 None => next_ping.saturating_duration_since(now),
             };
             if let Some(message) = self.rx.recv_timeout::<ServerMessage>(wait)?
-                && self.handle(message, executor, &mut seen)?
+                && self.handle(message, executor, &mut state)?
             {
                 awaiting = None;
                 // Forget answered attempts the executor no longer holds.
                 let held = executor.held();
-                seen.retain(|a| held.contains(a));
+                state.seen.retain(|a| held.contains(a));
             }
         }
         self.tx.send(&ClientMessage::Bye)
     }
+}
+
+/// Per-session inbound state: offers already answered, specs in flight.
+#[derive(Default)]
+struct Inbound {
+    seen: std::collections::HashSet<AttemptId>,
+    specs: std::collections::HashMap<AttemptId, (Vec<u8>, usize)>,
 }
 
 /// Bind a listener for tests and the controller alike.

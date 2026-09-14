@@ -99,6 +99,8 @@ pub struct Offer {
     pub cpu_millis: i64,
     pub memory_bytes: i64,
     pub image: ResolvedImage,
+    /// Position of the job in the run's compiled spec.
+    pub job_index: u32,
 }
 
 /// Place one job on `worker`: the oldest ready job of the best priority that
@@ -125,7 +127,7 @@ pub fn place(
     let picked = tx
         .prepare_cached(
             "SELECT j.tenant_id, j.id, j.run_id, j.cpu_millis, j.memory_bytes,
-                    j.image_digest, j.image_platform
+                    j.image_digest, j.image_platform, j.spec_index
              FROM jobs j
              JOIN tenants t ON t.id = j.tenant_id AND t.active = 1
              JOIN pools p ON p.id = ?1 AND p.active = 1
@@ -147,11 +149,12 @@ pub fn place(
                     r.get::<_, i64>(4)?,
                     r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7)?,
                 ))
             },
         )
         .optional()?;
-    let Some((tenant, job, run, cpu_millis, memory_bytes, digest, platform)) = picked else {
+    let Some((tenant, job, run, cpu_millis, memory_bytes, digest, platform, index)) = picked else {
         return Ok(None);
     };
     let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?;
@@ -169,6 +172,7 @@ pub fn place(
         cpu_millis,
         memory_bytes,
         image: ResolvedImage { digest, platform },
+        job_index: u32::try_from(index).map_err(|_| Error::Corrupt("spec_index"))?,
     }))
 }
 
@@ -356,6 +360,43 @@ pub fn finish(
         .execute(params![attempt.as_bytes(), now.0])?;
     release_dependents(tx, tenant, run, now)?;
     Ok(next)
+}
+
+/// A worker's report over the link: the attempt must be held by that worker
+/// under that fence, then [`finish`] applies the event as the worker.
+pub fn report(
+    tx: &Transaction<'_>,
+    worker: WorkerId,
+    attempt: AttemptId,
+    fence: Fence,
+    event: Event,
+    now: UnixMillis,
+) -> Result<JobState> {
+    let held: bool = tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE id = ?1 AND worker_id = ?2 AND fence = ?3
+                           AND acked_ms IS NOT NULL AND released_ms IS NULL)",
+        )?
+        .query_row(
+            params![attempt.as_bytes(), worker.as_bytes(), fence.0 as i64],
+            |r| r.get(0),
+        )?;
+    if !held {
+        return Err(Error::NotFound);
+    }
+    finish(tx, attempt, Actor::Worker(fence), event, now)
+}
+
+/// The encoded run spec of an attempt the worker holds, exactly as stored.
+pub fn spec_bytes(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Result<Vec<u8>> {
+    conn.prepare_cached(
+        "SELECT s.spec FROM attempts a JOIN jobs j ON j.id = a.job_id
+         JOIN run_specs s ON s.run_id = j.run_id
+         WHERE a.id = ?1 AND a.worker_id = ?2 AND a.released_ms IS NULL",
+    )?
+    .query_row(params![attempt.as_bytes(), worker.as_bytes()], |r| r.get(0))
+    .optional()?
+    .ok_or(Error::NotFound)
 }
 
 /// Decide every blocked job of the run whose dependencies have all finished:

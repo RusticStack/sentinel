@@ -2,7 +2,7 @@
 
 A purpose-built, fully open-source, self-hosted CI engine designed from scratch for maximum performance: fast PR feedback, local-first caching, efficient multi-machine scheduling, and readable diagnostics for humans and coding agents.
 
-**Status: early development; runtime/measurement foundations, core/store/protocol contracts, the pipeline compiler, durable authorization, local login/sessions, scoped API credentials, GitHub sign-in, admission policy, second-factor step-up and tenant suspension/pool grants, worker enrollment/sessions and the durable dispatch loop (reservations, fenced offers and leases over the worker link) are implemented. Job execution (W03) and the authenticated API surface are next.** See [plan.md](plan.md) for architecture, milestones, performance targets, and release criteria. The [Parts 01–02 audit](docs/parts-01-02-audit.md) records open execution-integration gates.
+**Status: early development; runtime/measurement foundations, core/store/protocol contracts, the pipeline compiler, durable authorization, local login/sessions, scoped API credentials, GitHub sign-in, admission policy, second-factor step-up and tenant suspension/pool grants, worker enrollment/sessions, the durable dispatch loop and the first executor (fresh workspaces, exact-revision checkout, rootless Podman containers with enforced limits and no privileges, phase reports over the link) are implemented. Step semantics/failure taxonomy (W04), logs (W05) and the authenticated API surface are next.** See [plan.md](plan.md) for architecture, milestones, performance targets, and release criteria. The [Parts 01–02 audit](docs/parts-01-02-audit.md) records open execution-integration gates.
 
 Start development from [TODO.md](TODO.md): ordered work packages, stable task IDs, dependencies, the first runnable server/worker slice, and verification gates.
 
@@ -27,6 +27,8 @@ See [GitHub sign-in](docs/github-sign-in.md) for the authorization-code flow, ve
 See [Admission](docs/admission.md) for registration policy, invitations, pending accounts, and the separate decisions of creating a tenant and binding a forge installation.
 
 See the [Part 03 audit](docs/part-03-audit.md) for what was re-read, what was found and fixed, and what is deliberately left as is.
+
+See [Executor](docs/executor.md) for what a job runs in: a fresh workspace, the pinned commit, a rootless container with the job's limits and every capability dropped, and the attempt lifecycle reported under its fence.
 
 See [Worker link](docs/worker-link.md) for one-time worker enrollment, worker-generated TLS identities pinned in both directions, heartbeat sessions that renew leases, and the wake-driven dispatch loop: the ready queue is the database, a reservation is an attempt, offers are fenced and acknowledged or lapse back to the queue.
 

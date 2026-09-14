@@ -1,0 +1,27 @@
+[package]
+name = "sentinel-worker"
+description = "Worker execution: fresh workspaces, exact-revision checkout, rootless Podman containers, attempt lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+sentinel-core = { path = "../sentinel-core" }
+sentinel-link = { path = "../sentinel-link" }
+sentinel-pipeline = { path = "../sentinel-pipeline" }
+sentinel-protocol = { path = "../sentinel-protocol" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+sentinel-auth = { path = "../sentinel-auth" }
+sentinel-link = { path = "../sentinel-link", features = ["controller"] }
+sentinel-store = { path = "../sentinel-store" }
+tempfile = "3.20"
+
+[lints]
+workspace = true

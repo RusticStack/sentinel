@@ -457,13 +457,13 @@ mod worker_role {
     use sentinel_core::AttemptId;
     use sentinel_link::session::{Capacity, Executor as LinkExecutor, Offer};
 
-    /// Until W03 lands an executor there is nothing to run an offer with:
-    /// every offer is declined, so the job stays queued instead of sitting
-    /// leased on a machine that cannot start it.
+    /// Without a usable rootless runtime there is nothing to run an offer
+    /// with: every offer is declined, so the job stays queued instead of
+    /// sitting leased on a machine that cannot start it.
     struct NoExecutor;
     impl LinkExecutor for NoExecutor {
         fn offered(&self, offer: &Offer) -> bool {
-            tracing::debug!(event = "offer_declined", attempt = %offer.attempt, job = %offer.job, "no executor yet (W03)");
+            tracing::warn!(event = "offer_declined", attempt = %offer.attempt, job = %offer.job, "no executor: rootless Podman is unavailable");
             false
         }
         fn stop(&self, _: AttemptId) {}
@@ -471,6 +471,50 @@ mod worker_role {
             Vec::new()
         }
         fn renewed(&self, _: sentinel_core::UnixMillis) {}
+        fn attached(&self, _: sentinel_link::session::Reporter) {}
+        fn detached(&self) {}
+        fn spec(&self, _: AttemptId, _: Vec<u8>) {}
+        fn no_spec(&self, _: AttemptId) {}
+    }
+
+    /// The real executor when rootless Podman answers, else the decliner.
+    fn executor(data_dir: &Path, worker: sentinel_core::WorkerId) -> Box<dyn LinkExecutor> {
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let span = tracing::Span::current();
+        let notify = move |notice: sentinel_worker::executor::Notice| {
+            tracing::dispatcher::with_default(&dispatch, || {
+                span.in_scope(|| match notice {
+                    sentinel_worker::executor::Notice::Started(attempt) => {
+                        tracing::info!(event = "attempt_started", attempt = %attempt);
+                    }
+                    sentinel_worker::executor::Notice::Finished(attempt, verdict) => {
+                        tracing::info!(event = "attempt_finished", attempt = %attempt, verdict = ?verdict);
+                    }
+                    sentinel_worker::executor::Notice::SpecRefused(attempt) => {
+                        tracing::warn!(event = "attempt_spec_refused", attempt = %attempt);
+                    }
+                    sentinel_worker::executor::Notice::Stopped(attempt) => {
+                        tracing::info!(event = "attempt_stopped", attempt = %attempt);
+                    }
+                })
+            })
+        };
+        match sentinel_worker::executor::Executor::start(data_dir.to_path_buf(), worker, notify) {
+            Ok(executor) => {
+                let runtime = executor.runtime();
+                tracing::info!(
+                    event = "executor_ready",
+                    podman = %runtime.version,
+                    oci_runtime = %runtime.oci_runtime,
+                    cgroup_manager = %runtime.cgroup_manager
+                );
+                Box::new(executor)
+            }
+            Err(error) => {
+                tracing::warn!(event = "executor_unavailable", error = %error, "offers will be declined");
+                Box::new(NoExecutor)
+            }
+        }
     }
 
     /// Measured capacity: every core, and total memory less a host reserve of
@@ -562,6 +606,7 @@ mod worker_role {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
         let enrollment_file = link.enrollment_file.clone();
+        let executor = executor(&config.data_dir, worker);
         let thread = std::thread::Builder::new()
             .name("sentinel-worker-link".into())
             .spawn(move || {
@@ -571,7 +616,7 @@ mod worker_role {
                             settings,
                             identity,
                             enrollment,
-                            &NoExecutor,
+                            &*executor,
                             &grip,
                             &|event| match event {
                                 sentinel_link::worker::Event::Connected { worker, enrolled } => {
