@@ -15,6 +15,7 @@
 //! account ID. Logins, names and emails are renameable and reusable, so they
 //! are metadata, never an identity key.
 
+pub mod app;
 pub mod http;
 pub mod oauth;
 

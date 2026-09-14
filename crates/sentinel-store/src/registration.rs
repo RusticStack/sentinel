@@ -836,6 +836,34 @@ pub struct InstallationRecord {
     pub tenant: Option<TenantId>,
 }
 
+/// Host-local binding: the caller already holds the database file. The
+/// installation and the tenant both still have to exist and be usable, so a
+/// guessed identifier fails loudly instead of creating a dead binding.
+pub fn bind_installation_trusted(
+    tx: &Transaction<'_>,
+    installation: InstallationId,
+    tenant: TenantId,
+    now: UnixMillis,
+) -> Result<()> {
+    let known: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM installations i JOIN tenants t ON t.id = ?2 AND t.active = 1 WHERE i.id = ?1)",
+        params![installation.as_bytes(), tenant.as_bytes()],
+        |r| r.get(0),
+    )?;
+    if !known {
+        return Err(Error::NotFound);
+    }
+    let bound = tx.execute(
+        "UPDATE installations SET tenant_id = ?2, bound_by = NULL, bound_ms = ?3
+         WHERE id = ?1 AND tenant_id IS NULL",
+        params![installation.as_bytes(), tenant.as_bytes(), now.0],
+    )?;
+    if bound == 0 {
+        return Err(Error::Conflict);
+    }
+    audit(tx, Event::InstallationBound, None, None, true, None)
+}
+
 /// The tenant an installation is bound to, if any. Trusted internal lookup for
 /// intake: a webhook has no principal to authorize with, and an unbound
 /// installation must resolve to nothing rather than to a guess.

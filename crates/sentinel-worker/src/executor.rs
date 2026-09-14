@@ -382,22 +382,25 @@ impl Report for Inner {
 
 impl LinkExecutor for Executor {
     fn offered(&self, offer: &Offer) -> bool {
-        let reporter = {
-            let mut state = self.state();
-            if state.live.len() + state.awaiting.len() >= MAX_LIST_ITEMS {
-                return false;
-            }
-            let Some(reporter) = state.reporter.clone() else {
-                return false;
-            };
-            state.awaiting.insert(offer.attempt, offer.clone());
-            reporter
-        };
-        if reporter.need_spec(offer.attempt).is_err() {
-            self.state().awaiting.remove(&offer.attempt);
+        let mut state = self.state();
+        if state.live.len() + state.awaiting.len() >= MAX_LIST_ITEMS || state.reporter.is_none() {
             return false;
         }
+        state.awaiting.insert(offer.attempt, offer.clone());
         true
+    }
+
+    fn accepted(&self, attempt: AttemptId) {
+        let reporter = {
+            let state = self.state();
+            if !state.awaiting.contains_key(&attempt) {
+                return;
+            }
+            state.reporter.clone()
+        };
+        if let Some(reporter) = reporter {
+            let _ = reporter.need_spec(attempt);
+        }
     }
 
     fn stop(&self, attempt: AttemptId) {

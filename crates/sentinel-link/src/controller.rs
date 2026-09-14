@@ -78,6 +78,10 @@ struct Peer {
 }
 
 struct Inner {
+    source_destinations: Mutex<Arc<Vec<String>>>,
+    source_app: Mutex<Option<Arc<sentinel_github::app::App>>>,
+    source_active: Arc<AtomicUsize>,
+    source_key: Mutex<Option<Arc<sentinel_auth::sealed::Key>>>,
     store: Arc<Store>,
     logs: Arc<LogStore>,
     config: Arc<rustls::ServerConfig>,
@@ -363,6 +367,74 @@ impl Admission for Inner {
 }
 
 impl SessionHandler for Inner {
+    fn spec_requested(
+        &self,
+        worker: WorkerId,
+        attempt: AttemptId,
+        sender: Sender,
+        protocol: u16,
+    ) -> bool {
+        // No unbounded queue, and no GitHub round trip on heartbeat/dispatch.
+        if self
+            .source_active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < 8).then_some(n + 1)
+            })
+            .is_err()
+        {
+            let _ = sender.send(&session::ServerMessage::NoSpec {
+                attempt: *attempt.as_bytes(),
+            });
+            return true;
+        }
+        let active = Arc::clone(&self.source_active);
+        let store = Arc::clone(&self.store);
+        let key = self
+            .source_key
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let app = self
+            .source_app
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let failed = sender.clone();
+        let destinations = self
+            .source_destinations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if thread::Builder::new()
+            .name("sentinel-source".into())
+            .spawn(move || {
+                struct Permit(Arc<AtomicUsize>);
+                impl Drop for Permit {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+                let _permit = Permit(active);
+                let spec = resolve_spec(
+                    &store,
+                    key.as_deref(),
+                    app.as_deref(),
+                    &destinations,
+                    worker,
+                    attempt,
+                )
+                .ok();
+                let _ = send_resolved(&sender, attempt, protocol, spec);
+            })
+            .is_err()
+        {
+            self.source_active.fetch_sub(1, Ordering::AcqRel);
+            let _ = failed.send(&session::ServerMessage::NoSpec {
+                attempt: *attempt.as_bytes(),
+            });
+        }
+        true
+    }
     fn ping(&self, worker: WorkerId, held: &[AttemptId]) -> Result<Beat> {
         let now = UnixMillis::now();
         let peer = self
@@ -473,6 +545,27 @@ impl SessionHandler for Inner {
                 let bytes = dispatch::spec_bytes(c, worker, attempt)?;
                 Ok((
                     JobContext {
+                        source: {
+                            let bound: bool = c.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM source_bindings WHERE repo_id=?1)",
+                                [context.repo.as_bytes()],
+                                |r| r.get(0),
+                            )?;
+                            if bound {
+                                let now = UnixMillis::now();
+                                let (tenant, repo) =
+                                    sentinel_store::sources::attempt_repo(c, worker, attempt, now)?;
+                                let key = self
+                                    .source_key
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .clone()
+                                    .ok_or(sentinel_store::Error::Forbidden)?;
+                                Some(sentinel_store::sources::issue(c, tenant, repo, &key, now)?)
+                            } else {
+                                None
+                            }
+                        },
                         run: context.run,
                         repo: context.repo,
                         repo_name: context.repo_name,
@@ -533,6 +626,139 @@ impl SessionHandler for Inner {
 }
 
 /// A running controller: listener, fleet and dispatcher.
+fn resolve_spec(
+    store: &Store,
+    key: Option<&sentinel_auth::sealed::Key>,
+    app: Option<&sentinel_github::app::App>,
+    destinations: &[String],
+    worker: WorkerId,
+    attempt: AttemptId,
+) -> sentinel_store::Result<(JobContext, Vec<u8>)> {
+    use sentinel_store::{Error as StoreError, sources, sources_forge};
+    let (mut context, bytes, forge) = store.read(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        let c = dispatch::job_context(&tx, worker, attempt)?;
+        let bytes = dispatch::spec_bytes(&tx, worker, attempt)?;
+        let mut context = JobContext {
+            source: None,
+            run: c.run,
+            repo: c.repo,
+            repo_name: c.repo_name,
+            job: c.job,
+            job_name: c.job_name,
+            sha: c.sha,
+            cancelled: c.cancelled,
+            needs: c.needs,
+        };
+        let forge = match sources::load_metadata(&tx, context.repo) {
+            Err(StoreError::NotFound) => None,
+            Err(e) => return Err(e),
+            Ok(m) => {
+                let authority = sentinel_protocol::source::remote(&m.binding.remote)
+                    .ok_or(StoreError::Forbidden)?;
+                if !destinations.iter().any(|d| d == authority) {
+                    return Err(StoreError::Forbidden);
+                }
+                let now = UnixMillis::now();
+                let (tenant, repo) = sources::attempt_repo(&tx, worker, attempt, now)?;
+                let spec = sentinel_pipeline::RunSpec::decode(&bytes)
+                    .map_err(|_| StoreError::Corrupt("run spec"))?;
+                sources::validate_source(&tx, repo, &spec.source)?;
+                if m.forge.is_some() {
+                    Some((tenant, repo, m, sources_forge::grant(&tx, tenant, repo)?))
+                } else {
+                    context.source = Some(sources::issue(
+                        &tx,
+                        tenant,
+                        repo,
+                        key.ok_or(StoreError::Forbidden)?,
+                        now,
+                    )?);
+                    None
+                }
+            }
+        };
+        Ok((context, bytes, forge))
+    })?;
+    if let Some((tenant, repo, metadata, grant)) = forge {
+        let token = app
+            .ok_or(StoreError::Forbidden)?
+            .source_token(
+                grant.installation,
+                grant.account,
+                grant.repo,
+                &metadata.binding.remote,
+                UnixMillis::now().0,
+            )
+            .map_err(|_| StoreError::Forbidden)?;
+        // HTTP ran without any database connection or writer lock held. A
+        // revoked lease, rotated binding or lifecycle update wins this race.
+        store.read(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            if sources::attempt_repo(&tx, worker, attempt, UnixMillis::now())? != (tenant, repo)
+                || sources::load_metadata(&tx, repo)?.version != metadata.version
+                || sources_forge::grant(&tx, tenant, repo)? != grant
+            {
+                return Err(StoreError::Forbidden);
+            }
+            Ok(())
+        })?;
+        context.source = Some(sentinel_protocol::source::Access {
+            binding: metadata.binding,
+            version: metadata.version,
+            expires_ms: token.expires_ms.min(UnixMillis::now().0 + 60_000),
+            credential: sentinel_protocol::source::Credential::Https {
+                username: "x-access-token".into(),
+                secret: token.secret,
+            },
+        });
+    }
+    Ok((context, bytes))
+}
+
+fn send_resolved(
+    sender: &Sender,
+    attempt: AttemptId,
+    protocol: u16,
+    spec: Option<(JobContext, Vec<u8>)>,
+) -> Result<()> {
+    use session::ServerMessage;
+    let Some((context, bytes)) = spec.filter(|(c, b)| {
+        b.len() <= session::MAX_SPEC_BYTES && (c.source.is_none() || protocol >= 2)
+    }) else {
+        return sender.send(&ServerMessage::NoSpec {
+            attempt: *attempt.as_bytes(),
+        });
+    };
+    sender.send(&ServerMessage::Context(context.to_wire(attempt)))?;
+    if let Some(access) = context.source {
+        sender.send(&ServerMessage::Source {
+            attempt: *attempt.as_bytes(),
+            access,
+        })?;
+    }
+    let chunks = bytes.chunks(session::SPEC_CHUNK_BYTES);
+    let count = chunks.len();
+    if count == 0 {
+        return sender.send(&ServerMessage::Spec {
+            attempt: *attempt.as_bytes(),
+            seq: 0,
+            last: true,
+            bytes: Vec::new(),
+        });
+    }
+    for (seq, chunk) in chunks.enumerate() {
+        sender.send(&ServerMessage::Spec {
+            attempt: *attempt.as_bytes(),
+            seq: seq as u32,
+            last: seq + 1 == count,
+            bytes: chunk.to_vec(),
+        })?;
+    }
+    Ok(())
+}
+
+/// A running controller: listener, fleet and dispatcher.
 pub struct Controller {
     inner: Arc<Inner>,
     addr: SocketAddr,
@@ -543,6 +769,27 @@ pub struct Controller {
 }
 
 impl Controller {
+    pub fn set_source_destinations(&self, destinations: Vec<String>) {
+        *self
+            .inner
+            .source_destinations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Arc::new(destinations);
+    }
+    pub fn set_source_app(&self, app: Arc<sentinel_github::app::App>) {
+        *self
+            .inner
+            .source_app
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(app);
+    }
+    pub fn set_source_key(&self, key: Arc<sentinel_auth::sealed::Key>) {
+        *self
+            .inner
+            .source_key
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(key);
+    }
     /// Bind `listen`, present `identity`, and start serving workers of
     /// `store`. Returns once the socket is bound; workers may connect.
     pub fn start(
@@ -563,6 +810,10 @@ impl Controller {
         let listener = TcpListener::bind(listen)?;
         let addr = listener.local_addr()?;
         let inner = Arc::new(Inner {
+            source_destinations: Mutex::new(Arc::new(Vec::new())),
+            source_app: Mutex::new(None),
+            source_active: Arc::new(AtomicUsize::new(0)),
+            source_key: Mutex::new(None),
             store,
             logs,
             config,

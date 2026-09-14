@@ -225,6 +225,11 @@ pub enum ServerMessage {
     LogRefused {
         attempt: [u8; 16],
     },
+    /// Protocol 2 only; follows Context, before spec bytes. Never persisted.
+    Source {
+        attempt: [u8; 16],
+        access: sentinel_protocol::source::Access,
+    },
 }
 
 /// What the controller did with a log frame.
@@ -254,6 +259,7 @@ pub struct WireContext {
 /// data joins it with intake.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobContext {
+    pub source: Option<sentinel_protocol::source::Access>,
     pub run: RunId,
     pub repo: RepoId,
     pub repo_name: String,
@@ -288,7 +294,7 @@ const fn outcome_from_code(code: u8) -> Option<Outcome> {
 }
 
 impl JobContext {
-    fn to_wire(&self, attempt: AttemptId) -> WireContext {
+    pub(crate) fn to_wire(&self, attempt: AttemptId) -> WireContext {
         WireContext {
             attempt: *attempt.as_bytes(),
             run: *self.run.as_bytes(),
@@ -322,6 +328,7 @@ impl JobContext {
         Ok((
             AttemptId::from_bytes(wire.attempt).map_err(|_| Error::Protocol("id"))?,
             JobContext {
+                source: None,
                 run: RunId::from_bytes(wire.run).map_err(|_| Error::Protocol("id"))?,
                 repo: RepoId::from_bytes(wire.repo).map_err(|_| Error::Protocol("id"))?,
                 repo_name: wire.repo_name,
@@ -471,6 +478,17 @@ pub struct Beat {
 
 /// What the controller does with an admitted worker's messages.
 pub trait SessionHandler: Send + Sync {
+    /// A controller may resolve source access off the heartbeat thread.
+    /// True means it owns sending Spec/NoSpec on this exact session.
+    fn spec_requested(
+        &self,
+        _worker: WorkerId,
+        _attempt: AttemptId,
+        _sender: Sender,
+        _protocol: u16,
+    ) -> bool {
+        false
+    }
     /// A heartbeat naming the attempts the worker holds.
     fn ping(&self, worker: WorkerId, held: &[AttemptId]) -> Result<Beat>;
     fn acknowledged(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
@@ -804,9 +822,24 @@ impl WorkerSession {
                 }
                 ClientMessage::NeedSpec { attempt } => {
                     let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                    if handler.spec_requested(
+                        worker,
+                        id,
+                        self.tx.clone(),
+                        self.admitted.negotiated.protocol.0,
+                    ) {
+                        continue;
+                    }
                     match handler.spec(worker, id) {
                         Some((context, bytes)) if bytes.len() <= MAX_SPEC_BYTES => {
+                            if context.source.is_some() && self.admitted.negotiated.protocol.0 < 2 {
+                                self.tx.send(&ServerMessage::NoSpec { attempt })?;
+                                continue;
+                            }
                             self.tx.send(&ServerMessage::Context(context.to_wire(id)))?;
+                            if let Some(access) = context.source {
+                                self.tx.send(&ServerMessage::Source { attempt, access })?;
+                            }
                             let chunks = bytes.chunks(SPEC_CHUNK_BYTES);
                             let count = chunks.len().max(1);
                             if bytes.is_empty() {
@@ -960,6 +993,7 @@ pub fn connect(
         | ServerMessage::Spec { .. }
         | ServerMessage::NoSpec { .. }
         | ServerMessage::Context(_)
+        | ServerMessage::Source { .. }
         | ServerMessage::LogAck { .. }
         | ServerMessage::LogRefused { .. } => Err(Error::Protocol("message before welcome")),
     }
@@ -1044,6 +1078,8 @@ impl Reporter {
 /// What a worker does with the offers and orders it receives. Implemented by
 /// the executor (W03); the link owns dedup, acknowledgement and renewal.
 pub trait Executor: Send + Sync {
+    /// Called after the acknowledgement is on the wire.
+    fn accepted(&self, _attempt: AttemptId) {}
     /// Take the offer or not. Called once per attempt per session.
     fn offered(&self, offer: &Offer) -> bool;
     /// The controller no longer counts this attempt as held: stop it now.
@@ -1150,6 +1186,9 @@ impl Link {
                 } else {
                     ClientMessage::Decline { attempt, fence }
                 })?;
+                if take {
+                    executor.accepted(offer.attempt);
+                }
                 Ok(false)
             }
             ServerMessage::Spec {
@@ -1178,6 +1217,20 @@ impl Link {
             ServerMessage::Context(wire) => {
                 let (attempt, context) = JobContext::from_wire(wire)?;
                 state.contexts.insert(attempt, context);
+                Ok(false)
+            }
+            ServerMessage::Source { attempt, access } => {
+                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                if !access.validate(UnixMillis::now().0) {
+                    return Err(Error::Protocol("source access"));
+                }
+                let context = state
+                    .contexts
+                    .get_mut(&attempt)
+                    .ok_or(Error::Protocol("source without context"))?;
+                if context.source.replace(access).is_some() {
+                    return Err(Error::Protocol("duplicate source"));
+                }
                 Ok(false)
             }
             ServerMessage::LogAck { attempt, through } => {

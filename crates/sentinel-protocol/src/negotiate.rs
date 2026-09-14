@@ -12,7 +12,7 @@ pub struct ProtocolVersion(pub u16);
 
 /// Versions this controller build can serve, inclusive.
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(1);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(2);
 
 /// Capabilities are a bit set: cheap to store, compare and intersect, and
 /// unknown bits from a newer worker are ignored rather than rejected.
@@ -162,7 +162,13 @@ mod tests {
                 .union(future_bit),
         );
         let n = negotiate(&h).unwrap();
-        assert_eq!(n.protocol, ProtocolVersion(1));
+        assert_eq!(n.protocol, ProtocolVersion(2));
+        assert_eq!(
+            negotiate(&hello(1, 1, Capabilities::REQUIRED))
+                .unwrap()
+                .protocol,
+            ProtocolVersion(1)
+        );
         assert!(n.capabilities.contains(Capabilities::REFLINK));
         assert!(!n.capabilities.contains(future_bit));
     }
@@ -170,7 +176,7 @@ mod tests {
     #[test]
     fn version_mismatch_says_who_must_upgrade() {
         assert_eq!(
-            negotiate(&hello(2, 5, Capabilities::REQUIRED)),
+            negotiate(&hello(3, 5, Capabilities::REQUIRED)),
             Err(Rejected::UnsupportedVersion {
                 supported_min: SUPPORTED_MIN,
                 supported_max: SUPPORTED_MAX,

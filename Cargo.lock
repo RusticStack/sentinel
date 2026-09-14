@@ -1157,6 +1157,7 @@ dependencies = [
  "sentinel-api",
  "sentinel-auth",
  "sentinel-core",
+ "sentinel-github",
  "sentinel-link",
  "sentinel-pipeline",
  "sentinel-protocol",
@@ -1221,11 +1222,14 @@ dependencies = [
 name = "sentinel-github"
 version = "0.1.0-dev"
 dependencies = [
+ "base64",
+ "ring",
  "sentinel-auth",
  "sentinel-core",
  "sentinel-store",
  "serde_json",
  "tempfile",
+ "time",
  "ureq",
 ]
 
@@ -1240,6 +1244,7 @@ dependencies = [
  "rustls-pki-types",
  "sentinel-auth",
  "sentinel-core",
+ "sentinel-github",
  "sentinel-link",
  "sentinel-pipeline",
  "sentinel-protocol",
@@ -1293,6 +1298,7 @@ dependencies = [
  "sentinel-core",
  "sentinel-pipeline",
  "sentinel-protocol",
+ "serde_json",
  "tempfile",
 ]
 

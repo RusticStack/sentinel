@@ -30,6 +30,7 @@ pub fn create_run(
     spec: &RunSpec,
     now: UnixMillis,
 ) -> Result<Vec<JobId>> {
+    crate::sources::validate_source(tx, repo, &spec.source)?;
     jobs::insert_run(tx, tenant, repo, run, &spec.source.sha, now)?;
     let bytes = spec.encode().map_err(Error::Spec)?;
     tx.execute(

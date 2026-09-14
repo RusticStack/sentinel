@@ -25,6 +25,27 @@ impl Default for Client {
 }
 
 impl Client {
+    pub fn post_authenticated(
+        &self,
+        url: &str,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::to_vec(body).map_err(|_| Error::Config("request body"))?;
+        if body.len() > MAX_BODY as usize {
+            return Err(Error::Config("request size"));
+        }
+        let response = self
+            .agent
+            .post(url)
+            .header("accept", "application/vnd.github+json")
+            .header("content-type", "application/json")
+            .header("x-github-api-version", "2022-11-28")
+            .header("authorization", &format!("Bearer {token}"))
+            .send(body.as_slice())
+            .map_err(transport)?;
+        json(response)
+    }
     pub fn new() -> Client {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(TIMEOUT))

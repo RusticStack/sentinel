@@ -475,6 +475,22 @@ fn start_server(
     )
     .map_err(|error| Error::runtime(format!("cannot listen on {listen}: {error}")))?;
     let reconciled = controller.reconciled();
+    controller.set_source_destinations(
+        crate::source_admin::load_destinations(&config.data_dir)
+            .map_err(|_| Error::runtime("cannot load source destination policy"))?,
+    );
+    if let Some(app) = crate::source_admin::load_app(&config.data_dir)
+        .map_err(|_| Error::runtime("cannot load GitHub App configuration"))?
+    {
+        controller.set_source_app(app);
+    }
+    let source_key = config.data_dir.join("master.key");
+    if source_key.exists() {
+        controller.set_source_key(Arc::new(
+            sentinel_auth::sealed::Key::load(&source_key)
+                .map_err(|_| Error::runtime("cannot load source sealing key"))?,
+        ));
+    }
     tracing::info!(
         event = "link_listening",
         addr = %controller.local_addr(),

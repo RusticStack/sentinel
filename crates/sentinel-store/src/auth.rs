@@ -522,6 +522,20 @@ pub fn create_repo(
     crate::jobs::insert_repo(tx, tenant, repo, name, now)
 }
 
+/// The insertion itself, without an authorization decision: the host-local
+/// CLI path and trusted provisioning use it, the client path goes through
+/// [`create_repo`] below.
+pub fn create_repo_trusted(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    repo: RepoId,
+    name: &str,
+    now: UnixMillis,
+) -> Result<()> {
+    bounded_text(name, 128, "repository name")?;
+    crate::jobs::insert_repo(tx, tenant, repo, name, now)
+}
+
 /// Grant/revoke repository actions; NONE deletes a grant. Membership is a
 /// ceiling: a reader with a RUN bit still cannot run. Secrets are independent.
 pub fn set_repo_grant(

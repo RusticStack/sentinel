@@ -154,7 +154,7 @@ impl Deployment {
     fn run(&self, yaml: &str) -> (RunId, Vec<JobId>) {
         let (tenant, repo, run) = (self.tenant, self.repo, RunId::new());
         let spec = RunSpec::new(
-            PinnedSource::new("https://github.com/o/r.git", SHA, Some("main")).unwrap(),
+            PinnedSource::new("https://github.com/o/r.git", SHA, Some("refs/heads/main")).unwrap(),
             compile_str(yaml).unwrap(),
         )
         .unwrap();
@@ -308,6 +308,17 @@ impl WorkerProcess {
         enrollment: Option<Secret>,
         executor: Arc<Recorder>,
     ) -> WorkerProcess {
+        Self::start_version(d, identity, id, enrollment, executor, 1)
+    }
+
+    fn start_version(
+        d: &Deployment,
+        identity: Identity,
+        id: WorkerId,
+        enrollment: Option<Secret>,
+        executor: Arc<Recorder>,
+        protocol: u16,
+    ) -> WorkerProcess {
         let handle = Arc::new(worker::Handle::new());
         let events = Arc::new(Mutex::new(Vec::new()));
         let config = worker::Config {
@@ -315,7 +326,11 @@ impl WorkerProcess {
             server: d.controller().fingerprint(),
             worker: id,
             name: "builder-1".into(),
-            hello: hello(),
+            hello: {
+                let mut h = hello();
+                h.protocol_max = ProtocolVersion(protocol);
+                h
+            },
             capacity: CAPACITY,
         };
         let (grip, log) = (Arc::clone(&handle), Arc::clone(&events));

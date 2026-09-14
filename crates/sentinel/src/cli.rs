@@ -128,6 +128,8 @@ pub struct DataDir {
 
 #[derive(Subcommand)]
 pub enum AdminCommand {
+    /// Bind source repositories, rotate deploy credentials and manage App installations
+    Source(SourceArgs),
     /// Admit the first super admin; refused once any active super admin exists
     Bootstrap {
         #[command(flatten)]
@@ -194,6 +196,61 @@ pub enum AdminCommand {
         /// Keep printing until the log is complete
         #[arg(long)]
         follow: bool,
+    },
+}
+
+#[derive(Args)]
+pub struct SourceArgs {
+    #[command(flatten)]
+    pub data: DataDir,
+    /// Acting administrator's immutable usr_ ID; live authority is checked
+    #[arg(long)]
+    pub actor: String,
+    #[command(subcommand)]
+    pub command: SourceCommand,
+}
+
+#[derive(Subcommand)]
+pub enum SourceCommand {
+    Create {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        name: String,
+    },
+    /// Read binding and credential JSON from bounded stdin; expected=0 creates
+    Bind {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        expected: u64,
+    },
+    Show {
+        #[arg(long)]
+        repo: String,
+    },
+    Revoke {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        expected: u64,
+    },
+    /// Fetch a fresh authenticated GitHub App installation snapshot
+    RefreshInstallation {
+        #[arg(long)]
+        external_id: u64,
+        #[arg(long)]
+        expected: u64,
+    },
+    BindInstallation {
+        #[arg(long)]
+        installation: String,
+        #[arg(long)]
+        tenant: String,
+    },
+    RemoveInstallation {
+        #[arg(long)]
+        installation: String,
     },
 }
 

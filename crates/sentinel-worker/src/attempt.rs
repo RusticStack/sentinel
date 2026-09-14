@@ -187,7 +187,15 @@ fn prepare(
     let workspace = Workspace::create(root, job.attempt)?;
     let outcome = (|| {
         let started = Instant::now();
-        checkout::checkout(workspace.path(), &job.spec.source, None, CHECKOUT_TIMEOUT)?;
+        match &job.context.source {
+            Some(access) => checkout::checkout_authorized(
+                workspace.path(),
+                &job.spec.source,
+                access,
+                CHECKOUT_TIMEOUT,
+            )?,
+            None => checkout::checkout(workspace.path(), &job.spec.source, None, CHECKOUT_TIMEOUT)?,
+        };
         summary.checkout_ns = ns(started);
         if !job.prepare_hold.is_zero() {
             let until = Instant::now() + job.prepare_hold;

@@ -75,7 +75,7 @@ fn read_password() -> Result<Vec<u8>, Error> {
 /// Open the controller's database in its data directory. Reporting refuses to
 /// create one: `status` against a mistyped path must say so, not answer about a
 /// new empty database it just made.
-fn open(data: &DataDir, reporting: bool) -> Result<Store, Error> {
+pub(crate) fn open(data: &DataDir, reporting: bool) -> Result<Store, Error> {
     if !data.data_dir.is_absolute() {
         return Err(fail("data_dir must be an absolute path"));
     }
@@ -93,6 +93,7 @@ fn open(data: &DataDir, reporting: bool) -> Result<Store, Error> {
 pub fn run(args: AdminArgs) -> Result<(), Error> {
     let now = sentinel_core::UnixMillis::now();
     match &args.command {
+        AdminCommand::Source(args) => crate::source_admin::run(args)?,
         AdminCommand::Bootstrap {
             data,
             username,

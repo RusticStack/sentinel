@@ -8,6 +8,8 @@ mod admin;
 mod cli;
 mod client;
 mod pipeline;
+#[cfg(all(target_os = "linux", feature = "server"))]
+mod source_admin;
 
 #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]
 mod service;
