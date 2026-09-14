@@ -1,6 +1,6 @@
 # Identity and authorization (A01)
 
-Implemented in `sentinel-core::auth` and `sentinel-store::auth`, with append-only metadata migration **4**. This is the durable authorization layer for A02/A03 and the first API slice. Login, credentials and HTTP routes arrive in those tasks; there is no unauthenticated development endpoint.
+Implemented in `sentinel-core::auth` and `sentinel-store::auth`, with append-only metadata migration **4**. This is the durable authorization layer for A02/A03 and the first API slice. A02 implements [local authentication](local-authentication.md) on top of it: host-local bootstrap, password credentials and opaque sessions that produce the `Principal` this layer authorizes. HTTP routes arrive with W08; there is no unauthenticated development endpoint.
 
 ## Durable identities and namespaces
 
@@ -46,7 +46,7 @@ Secret-write delegation is independent: an operator's run grant never grants it 
 - Administrative mutations take a `Transaction`, recheck current authority, and write within that transaction. A queued request does not retain a positive permission result from an earlier read.
 - Downgrading a role takes effect on the next query. Removing membership cascades deletion of its repo grants; re-adding membership does not resurrect authority. Setting a grant to `NONE` removes it. Account/tenant active flags are checked live. A07 will add audited suspension workflows and subscription/token/job cancellation propagation.
 
-`jobs`, `runs`, the writer's closure/raw interfaces and `auth::provisioning` are **trusted controller internals**, not public client APIs. The worker state-machine `Actor` is unrelated to a human authorization principal. W08 must call authorized operations (and extend them for status/rerun/cancel) rather than expose raw tenant-scoped helpers. A02 owns first-admin admission and password/session authentication; A04/A05 own verified linking and registration. No route may directly expose `provisioning::insert_human(super_admin)`.
+`jobs`, `runs`, the writer's closure/raw interfaces and `auth::provisioning` are **trusted controller internals**, not public client APIs. The worker state-machine `Actor` is unrelated to a human authorization principal. W08 must call authorized operations (and extend them for status/rerun/cancel) rather than expose raw tenant-scoped helpers. A02 owns first-admin admission and password/session authentication, and adds `local_auth` with the same rules (trusted host-local entry points, authority rechecked inside the writing transaction); A04/A05 own verified linking and registration. No route may directly expose `provisioning::insert_human(super_admin)`.
 
 ## Storage defenses and upgrade
 

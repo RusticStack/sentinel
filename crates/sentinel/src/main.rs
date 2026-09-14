@@ -3,6 +3,8 @@ compile_error!(
     "Sentinel server and worker builds require Linux; omit these features for CLI builds."
 );
 
+#[cfg(all(target_os = "linux", feature = "server"))]
+mod admin;
 mod cli;
 mod pipeline;
 
@@ -14,12 +16,32 @@ use std::process::ExitCode;
 
 use cli::{Cli, Command};
 
+#[cfg(all(target_os = "linux", feature = "server"))]
+fn run_admin(args: cli::AdminArgs) -> ExitCode {
+    match admin::run(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {}", error.message);
+            ExitCode::from(2)
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", feature = "server")))]
+fn run_admin(_args: cli::AdminArgs) -> ExitCode {
+    eprintln!(
+        "error: admin runs on the controller's own host; use a Linux binary built with --features server"
+    );
+    ExitCode::from(2)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let (role, args) = match cli.command {
         Command::Server(args) => ("server", args),
         Command::Worker(args) => ("worker", args),
         Command::Pipeline(args) => return pipeline::run(args),
+        Command::Admin(args) => return run_admin(args),
     };
 
     #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]

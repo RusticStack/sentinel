@@ -18,6 +18,50 @@ pub enum Command {
     Worker(ServiceArgs),
     /// Validate or explain a `.sentinel.yml` offline, on any platform
     Pipeline(PipelineArgs),
+    /// Host-local administration of local login, on the controller's own host
+    Admin(AdminArgs),
+}
+
+/// Authorized by access to the controller's data directory, not by a session.
+/// Passwords are read from standard input; no subcommand accepts one in argv.
+#[derive(Args)]
+pub struct AdminArgs {
+    #[command(subcommand)]
+    pub command: AdminCommand,
+}
+
+#[derive(Args)]
+pub struct DataDir {
+    /// Absolute controller data directory holding the metadata database
+    #[arg(long, value_name = "PATH")]
+    pub data_dir: PathBuf,
+}
+
+#[derive(Subcommand)]
+pub enum AdminCommand {
+    /// Admit the first super admin; refused once any active super admin exists
+    Bootstrap {
+        #[command(flatten)]
+        data: DataDir,
+        /// Canonical login name: lower-case letters, digits, '.', '-' or '_'
+        #[arg(long)]
+        username: String,
+        /// Bounded display metadata, not a login identity
+        #[arg(long, default_value = "Administrator")]
+        display_name: String,
+    },
+    /// Reset a local password, clear its lockout and revoke its sessions
+    Recover {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        username: String,
+    },
+    /// Report bootstrap availability, super admins, live sessions and audit
+    Status {
+        #[command(flatten)]
+        data: DataDir,
+    },
 }
 
 #[derive(Args)]

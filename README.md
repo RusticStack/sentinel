@@ -2,7 +2,7 @@
 
 A purpose-built, fully open-source, self-hosted CI engine designed from scratch for maximum performance: fast PR feedback, local-first caching, efficient multi-machine scheduling, and readable diagnostics for humans and coding agents.
 
-**Status: early development; runtime/measurement foundations, core/store/protocol contracts, the pipeline compiler and durable authorization are implemented. Authenticated sessions and job execution are next.** See [plan.md](plan.md) for architecture, milestones, performance targets, and release criteria. The [Parts 01–02 audit](docs/parts-01-02-audit.md) records open execution-integration gates.
+**Status: early development; runtime/measurement foundations, core/store/protocol contracts, the pipeline compiler, durable authorization and local login/sessions are implemented. The authenticated API surface and job execution are next.** See [plan.md](plan.md) for architecture, milestones, performance targets, and release criteria. The [Parts 01–02 audit](docs/parts-01-02-audit.md) records open execution-integration gates.
 
 Start development from [TODO.md](TODO.md): ordered work packages, stable task IDs, dependencies, the first runnable server/worker slice, and verification gates.
 
@@ -17,6 +17,8 @@ See [Core contracts](docs/core-contracts.md) for typed identifiers, the fenced j
 See [Storage](docs/storage.md) for the SQLite metadata store, the engine decision, and the durable single-writer acknowledgement policy.
 
 See [Authorization](docs/authorization.md) for namespaces, human/service identities, memberships, explicit repo grants and live scoped queries.
+
+See [Local authentication](docs/local-authentication.md) for host-local first-admin bootstrap, Argon2id passwords, opaque sessions, cookie/CSRF policy and audited recovery.
 
 See [Protocol contracts](docs/protocol.md) for structured errors, idempotency, event cursors, size limits and worker capability negotiation.
 

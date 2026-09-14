@@ -1,0 +1,17 @@
+[package]
+name = "sentinel-auth"
+description = "Local password hashing, opaque session secrets, cookie and CSRF policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "password-hash", "zeroize"] }
+blake3 = "1.8"
+getrandom = "0.4"
+
+[lints]
+workspace = true

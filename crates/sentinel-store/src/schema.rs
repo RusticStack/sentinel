@@ -94,4 +94,5 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     CREATE INDEX idempotency_by_age ON idempotency_keys(created_ms);",
     ),
     (4, include_str!("migrations/004_identity.sql")),
+    (5, include_str!("migrations/005_local_auth.sql")),
 ];

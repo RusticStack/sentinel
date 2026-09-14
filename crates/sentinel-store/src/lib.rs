@@ -15,6 +15,7 @@ pub mod auth;
 pub mod codec;
 pub mod idempotency;
 pub mod jobs;
+pub mod local_auth;
 pub mod runs;
 pub mod schema;
 
@@ -215,6 +216,11 @@ pub struct Store {
     writer: Writer,
     readers: Mutex<Vec<Connection>>,
 }
+
+/// The controller's metadata database inside its data directory. One file name
+/// for every role and tool, so a host-local command cannot open a second,
+/// accidentally empty database beside the real one.
+pub const METADATA_FILE: &str = "metadata.sqlite";
 
 /// Bounded writer queue: enough for a burst of webhook intake, small enough
 /// that a stalled disk surfaces as `WriterUnavailable` within milliseconds.
