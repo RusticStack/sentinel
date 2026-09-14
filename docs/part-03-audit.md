@@ -33,7 +33,7 @@ Audited 2026-09-14 after `e1218fd`, by re-reading every trust-boundary module in
 ## Still open in Part 03
 
 - ~~**A07**~~ — done after this audit: [tenancy](tenancy.md) flips `tenants.active`, revokes scoped credentials and invitations, cancels live jobs and moves an authorization epoch that streams re-check.
-- **A08** — the cross-tenant sweep with two organizations, a personal namespace, overlapping memberships, invitation races, guessed IDs, cross-tenant cursors and downloads, and last-admin recovery. Parts of this exist across the per-task suites; the consolidated sweep is not written.
+- ~~**A08**~~ — done: `crates/sentinel-store/tests/cross_tenant.rs` is the consolidated sweep. Downloads are not yet covered because no object storage exists (D01–D02); the suite is to be extended as storage and MCP are connected.
 - **No HTTP routes exist (W08).** Every contract above is verified at the library boundary and, for GitHub, against a loopback provider. The cookie, CSRF, state and bearer policies are the bytes the routes must use; they are not yet used by a route.
 - **Rate limiting of `login` is per-account lockout only.** Password spraying across many usernames is audited (`LoginRejected` with no subject) but not throttled; that needs a request-level limiter in the server, not the store.
 
