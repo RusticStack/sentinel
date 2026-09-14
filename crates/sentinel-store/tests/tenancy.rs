@@ -13,11 +13,13 @@ use sentinel_store::{
     jobs,
     local_auth::{self, Event},
     registration::{self, Terms},
+    runs,
     tenancy::{self, PoolKind},
     tokens::{self, Grant},
 };
 
 const NOW: UnixMillis = UnixMillis(1_000);
+const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 fn at(ms: i64) -> UnixMillis {
     UnixMillis(ms)
@@ -109,6 +111,7 @@ fn seed_jobs(f: &Fixture) -> (JobId, JobId, JobId) {
                 JobEvent::DependenciesSatisfied,
                 NOW,
             )?;
+            runs::resolve_image(tx, tenant, leased, DIGEST, "linux/amd64")?;
             jobs::lease(tx, tenant, leased, WorkerId::new(), at(9_999), NOW)?;
             Ok(())
         })

@@ -73,6 +73,8 @@ The compiler validates cross-job references and produces a canonical form:
 
 ## Run specification (C05)
 
+> Execution admission: a job's image digest **and** platform must be durably recorded on the job (`runs::resolve_image`, migration 12) before `jobs::lease` will hand it to a worker; a tag-only or digest-only reference is not yet executable. See the [Parts 01–02 audit](parts-01-02-audit.md).
+
 `RunSpec` binds one compiled pipeline to one exact source and is written once per run, never edited. It holds a `PinnedSource` (repository, full lowercase hex SHA-1 or SHA-256, optional ref name kept as provenance only), the `CompiledPipeline`, and one `ImageRef` per job. An image reference is parsed into name, tag and digest; it is *pinned* when it carries a `sha256` digest. Tag-only references are resolved by the first worker to pull them and the digest is recorded on the run, so every later attempt uses the same bytes; a pin can be set once and never changed.
 
 The spec is persisted as one format byte plus a postcard-encoded blob in the store's `run_specs` table alongside the run, in the same transaction that creates the job rows. Jobs with no dependencies are created `Queued`, the rest `Blocked`; dependency indices are read from the spec, not duplicated in rows. `get_run_spec` returns exactly what was written and rejects blobs with an unknown format byte instead of misreading them.

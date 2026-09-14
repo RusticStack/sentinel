@@ -264,6 +264,10 @@ pub fn pick_ready(conn: &Connection) -> Result<Option<(TenantId, JobId)>> {
 
 /// Lease the job to `worker` with the next fence in one transaction: the
 /// attempt row and the `Leased` transition commit together or not at all.
+///
+/// Executable admission: a job whose image digest and platform are not yet
+/// durably resolved is refused with `Unresolved`. Its spec may exist; its
+/// existence is not readiness.
 pub fn lease(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -272,6 +276,17 @@ pub fn lease(
     lease_until: UnixMillis,
     now: UnixMillis,
 ) -> Result<(AttemptId, Fence)> {
+    let resolved: bool = tx
+        .prepare_cached(
+            "SELECT image_digest IS NOT NULL AND image_platform IS NOT NULL
+             FROM jobs WHERE id = ?1 AND tenant_id = ?2",
+        )?
+        .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    if !resolved {
+        return Err(Error::Unresolved);
+    }
     let row = read_job(tx, tenant, job)?;
     let fence = row.fence.next();
     transition(

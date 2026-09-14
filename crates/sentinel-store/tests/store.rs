@@ -5,7 +5,9 @@ use sentinel_core::{
     Actor, Event, FailureClass, Fence, JobId, JobState, Outcome, RepoId, RunId, RunState, TenantId,
     UnixMillis, WorkerId,
 };
-use sentinel_store::{Durability, Error, Store, jobs};
+use sentinel_store::{Durability, Error, Store, jobs, runs};
+
+const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -79,7 +81,10 @@ fn full_lifecycle_with_fenced_lease_and_timestamps() {
     assert_eq!(f.store.read(jobs::pick_ready).unwrap(), Some((tenant, job)));
     let worker = WorkerId::new();
     let (_attempt, fence) = w
-        .write(move |tx| jobs::lease(tx, tenant, job, worker, t(60_000), t(20)))
+        .write(move |tx| {
+            runs::resolve_image(tx, tenant, job, DIGEST, "linux/amd64")?;
+            jobs::lease(tx, tenant, job, worker, t(60_000), t(20))
+        })
         .unwrap();
     assert_eq!(fence, Fence(1));
     assert_eq!(f.store.read(jobs::pick_ready).unwrap(), None);
@@ -132,6 +137,7 @@ fn stale_worker_fence_and_wrong_tenant_are_rejected() {
     })
     .unwrap();
     w.write(move |tx| {
+        runs::resolve_image(tx, tenant, job, DIGEST, "linux/amd64")?;
         jobs::lease(
             tx,
             tenant,

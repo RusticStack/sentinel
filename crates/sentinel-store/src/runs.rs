@@ -56,6 +56,15 @@ pub fn create_run(
             index as i64,
         )?;
         mark_index.execute(params![index as i64, id.as_bytes()])?;
+        if let Some(digest) = sentinel_pipeline::run::ImageRef::parse(&job.spec.image)
+            .ok()
+            .and_then(|image| image.digest)
+        {
+            tx.execute(
+                "UPDATE jobs SET image_digest = ?1 WHERE id = ?2",
+                params![digest, id.as_bytes()],
+            )?;
+        }
         if job.needs.is_empty() {
             jobs::transition(
                 tx,
@@ -69,6 +78,72 @@ pub fn create_run(
         ids.push(id);
     }
     Ok(ids)
+}
+
+/// The image a job will actually run: digest and platform, both durable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedImage {
+    pub digest: String,
+    pub platform: String,
+}
+
+/// Record what the image reference resolved to, once. A spec pinned by digest
+/// pre-fills the digest, so resolution must agree with it; the platform is
+/// always the resolver's to state. Refuses to change either afterwards, and
+/// refuses malformed values before touching the row.
+pub fn resolve_image(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    job: JobId,
+    digest: &str,
+    platform: &str,
+) -> Result<()> {
+    sentinel_pipeline::run::ImageRef::parse(&format!("x@{digest}"))
+        .map_err(|_| Error::InvalidInput("image digest"))?;
+    if !(5..=64).contains(&platform.len())
+        || !platform
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'/' || b == b'-')
+        || !platform.contains('/')
+    {
+        return Err(Error::InvalidInput("image platform"));
+    }
+    let current: Option<(Option<String>, Option<String>)> = tx
+        .prepare_cached(
+            "SELECT image_digest, image_platform FROM jobs WHERE id = ?1 AND tenant_id = ?2",
+        )?
+        .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?;
+    let Some((stored_digest, stored_platform)) = current else {
+        return Err(Error::NotFound);
+    };
+    if stored_platform.is_some() || stored_digest.as_deref().is_some_and(|d| d != digest) {
+        return Err(Error::Conflict);
+    }
+    tx.execute(
+        "UPDATE jobs SET image_digest = ?3, image_platform = ?4 WHERE id = ?1 AND tenant_id = ?2",
+        params![job.as_bytes(), tenant.as_bytes(), digest, platform],
+    )?;
+    Ok(())
+}
+
+/// What a job will run, or `Unresolved` if admission must still wait.
+pub fn resolved_image(conn: &Connection, tenant: TenantId, job: JobId) -> Result<ResolvedImage> {
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .prepare_cached(
+            "SELECT image_digest, image_platform FROM jobs WHERE id = ?1 AND tenant_id = ?2",
+        )?
+        .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?;
+    match row {
+        None => Err(Error::NotFound),
+        Some((Some(digest), Some(platform))) => Ok(ResolvedImage { digest, platform }),
+        Some(_) => Err(Error::Unresolved),
+    }
 }
 
 /// The spec exactly as written at creation.

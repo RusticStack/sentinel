@@ -5,6 +5,7 @@ use sentinel_core::{
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
 use sentinel_store::{Durability, Error, Store, jobs, runs};
 
+const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA: &str = "0c87e0181c794fe2bbfeb15dc34e7b6aae375d8b";
 
 fn spec() -> RunSpec {
@@ -129,6 +130,7 @@ fn rerun_is_a_new_attempt_of_the_same_spec() {
     // Attempt 1 fails.
     let (_, fence) = w
         .write(move |tx| {
+            runs::resolve_image(tx, tenant, job, DIGEST, "linux/amd64")?;
             jobs::lease(
                 tx,
                 tenant,

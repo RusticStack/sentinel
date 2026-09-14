@@ -18,6 +18,8 @@ use sentinel_store::{
 
 const SHA: &str = "0c87e0181c794fe2bbfeb15dc34e7b6aae375d8b";
 
+const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
 fn spec() -> RunSpec {
     let text = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -183,6 +185,10 @@ fn concurrent_leases_of_one_job_succeed_exactly_once() {
         .write(move |tx| runs::create_run(tx, tenant, repo, run, &s, UnixMillis(1)))
         .unwrap();
     let job = ids[0];
+    store
+        .writer()
+        .write(move |tx| runs::resolve_image(tx, tenant, job, DIGEST, "linux/amd64"))
+        .unwrap();
     let store = Arc::new(store);
     let barrier = Arc::new(Barrier::new(8));
     let handles: Vec<_> = (0..8)

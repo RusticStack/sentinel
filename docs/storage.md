@@ -2,6 +2,20 @@
 
 `crates/sentinel-store` is the controller's local metadata store: SQLite in WAL mode behind one dedicated writer thread, tenant-scoped row operations, and fenced compare-and-set transitions built on [core contracts](core-contracts.md).
 
+## Bounds and failure behavior
+
+Closed by the Parts 01–02 audit's C02/W02 gate. Every bound is a constant on the crate and every behavior has a wall-clock-asserted test in `crates/sentinel-store/tests/bounds.rs`.
+
+| Resource | Bound | When exceeded |
+|---|---|---|
+| Read connections | `READER_LIMIT` (8) opened in total, idle ones pooled and reused | A caller waits up to `READ_ADMISSION` (2 s) for a freed reader, then gets `Error::Overloaded` — back-pressure, never a new connection. |
+| Writer queue | `WRITER_QUEUE` (256) accepted jobs | `Error::WriterUnavailable` immediately; nothing was attempted. |
+| Writer answer | `WRITE_WAIT` (10 s) | `Error::WriteAmbiguous`. The work is still queued or running and **may yet commit**; the store never claims a timed-out write rolled back. Re-read before retrying anything non-idempotent. |
+| Panicking closure | caught on the writer thread | Its transaction unwinds and rolls back; the caller gets `Error::WriterPanicked`; the writer keeps serving. |
+| Shutdown | `Store::shutdown(timeout)` | `Drained`, or `Stalled` when accepted work outlives the bound. Stalled work is never discarded, and the store then **keeps database ownership** until the process exits rather than inviting a second controller in underneath unfinished writes. |
+
+**One controller owns the database.** `Store::open` takes an advisory OS lock on `<database>.lock` for the life of the store; a second opener — another process, or a misconfigured second controller — gets `Error::AlreadyOwned` at startup instead of a conflict at its first write. The lock is released by the OS on exit, including a crash. SQLite serializing writes is not a multi-controller scheduler design, and this is what enforces that.
+
 ## Engine decision
 
 Measured 2026-09-13 with `cargo probe sqlite` and `cargo probe redb` on the same workload (2,000 single-transaction enqueues, a 100,000-row backlog, 2,000 pick-and-lease transactions), WSL2 ext4, two repeats; record in [`bench/c02-engines.jsonl`](../bench/c02-engines.jsonl).
