@@ -7,6 +7,7 @@ pub mod cursor;
 pub mod error;
 pub mod idempotency;
 pub mod limits;
+pub mod logs;
 pub mod negotiate;
 pub mod summary;
 

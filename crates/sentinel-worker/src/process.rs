@@ -5,11 +5,21 @@ use std::{
     io::Read,
     os::unix::process::CommandExt,
     process::{Command, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
+use sentinel_protocol::logs::Stream;
+
 use crate::{Error, Result};
+
+/// Where a helper's output streams as it is produced (W05). Called from the
+/// reader threads with chunks of at most `CHUNK_BYTES`; must not block
+/// for long, since the child's pipe fills behind it.
+pub type Sink = Arc<dyn Fn(Stream, &[u8]) + Send + Sync>;
+/// Bytes read from a pipe per call; well under one log frame.
+pub const CHUNK_BYTES: usize = 8192;
 
 /// Bytes of each stream kept for diagnostics; older output is dropped.
 pub const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
@@ -45,15 +55,23 @@ impl Output {
     }
 }
 
-/// Read a stream to its end, keeping only the last [`OUTPUT_TAIL_BYTES`].
-fn drain(mut stream: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+/// Read a stream to its end, keeping only the last [`OUTPUT_TAIL_BYTES`]
+/// and handing every chunk to the sink as it arrives.
+fn drain(
+    mut stream: impl Read + Send + 'static,
+    which: Stream,
+    sink: Option<Sink>,
+) -> thread::JoinHandle<Vec<u8>> {
     thread::spawn(move || {
         let mut tail = Vec::with_capacity(4096);
-        let mut chunk = [0u8; 8192];
+        let mut chunk = [0u8; CHUNK_BYTES];
         loop {
             match stream.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    if let Some(sink) = &sink {
+                        sink(which, &chunk[..n]);
+                    }
                     tail.extend_from_slice(&chunk[..n]);
                     if tail.len() > OUTPUT_TAIL_BYTES {
                         let excess = tail.len() - OUTPUT_TAIL_BYTES;
@@ -69,15 +87,29 @@ fn drain(mut stream: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> 
 /// Run `command` as the leader of a new process group, with stdin closed,
 /// and wait until it exits or `deadline` passes — then the whole group is
 /// killed and `Timeout(what)` returned.
-pub fn run(mut command: Command, deadline: Instant, what: &'static str) -> Result<Output> {
+pub fn run(command: Command, deadline: Instant, what: &'static str) -> Result<Output> {
+    run_with(command, deadline, what, None)
+}
+
+/// [`run`] with the output also streamed to `sink`.
+pub fn run_with(
+    mut command: Command,
+    deadline: Instant,
+    what: &'static str,
+    sink: Option<Sink>,
+) -> Result<Output> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
     let mut child = command.spawn()?;
-    let stdout = drain(child.stdout.take().expect("piped"));
-    let stderr = drain(child.stderr.take().expect("piped"));
+    let stdout = drain(
+        child.stdout.take().expect("piped"),
+        Stream::Stdout,
+        sink.clone(),
+    );
+    let stderr = drain(child.stderr.take().expect("piped"), Stream::Stderr, sink);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;

@@ -17,6 +17,7 @@ pub mod dispatch;
 pub mod idempotency;
 pub mod jobs;
 pub mod local_auth;
+pub mod logs;
 pub mod lookup;
 pub mod mfa;
 pub mod registration;
@@ -108,6 +109,11 @@ impl std::error::Error for Error {}
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
         Self::Sqlite(e)
+    }
+}
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
     }
 }
 impl From<sentinel_core::TransitionError> for Error {

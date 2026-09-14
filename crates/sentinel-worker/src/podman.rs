@@ -280,6 +280,17 @@ impl Container {
     /// directory under the workspace, its timeout. A timeout stops the
     /// whole container: steps are sequential and the attempt is over.
     pub fn exec(&self, step: &StepCommand, extra: &[(String, String)]) -> Result<Exit> {
+        self.exec_streaming(step, extra, None)
+    }
+
+    /// [`Container::exec`] with the step's output streamed to `sink` as it
+    /// is produced, in addition to the bounded tails.
+    pub fn exec_streaming(
+        &self,
+        step: &StepCommand,
+        extra: &[(String, String)],
+        sink: Option<process::Sink>,
+    ) -> Result<Exit> {
         let mut cmd = podman();
         cmd.args(["exec", "--workdir"]);
         cmd.arg(match &step.workdir {
@@ -291,7 +302,7 @@ impl Container {
         }
         cmd.arg("--").arg(&self.name).args(&step.argv);
         let timeout = Duration::from_secs(step.timeout_secs.max(1));
-        match process::run(cmd, deadline(timeout), "step") {
+        match process::run_with(cmd, deadline(timeout), "step", sink) {
             Ok(output) => Ok(Exit {
                 // Podman reports a signal death as 128 + n; 125–127 are the
                 // client's own failures, which we surface as-is.

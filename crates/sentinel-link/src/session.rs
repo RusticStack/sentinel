@@ -27,7 +27,8 @@ use sentinel_core::{
     WorkerId,
 };
 use sentinel_protocol::{
-    limits::{MAX_API_BODY_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_LIST_ITEMS},
+    limits::{MAX_API_BODY_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_LIST_ITEMS, MAX_LOG_FRAME_BYTES},
+    logs::{Frame, MAX_GAPS, Stream},
     negotiate::{Hello, Negotiated, Rejected},
     summary::MAX_SUMMARY_BYTES,
 };
@@ -92,6 +93,22 @@ pub enum ClientMessage {
     /// The worker needs the run spec of an attempt it holds.
     NeedSpec {
         attempt: [u8; 16],
+    },
+    /// One log frame of an attempt the worker holds, in sequence. At most
+    /// `MAX_UNACKED_LOG_FRAMES` may be in flight per attempt.
+    Log {
+        attempt: [u8; 16],
+        seq: u64,
+        step: u32,
+        stream: u8,
+        bytes: Vec<u8>,
+    },
+    /// No more frames will come: the log is complete through `last_seq`,
+    /// with the ranges the worker could not deliver declared as gaps.
+    LogEnd {
+        attempt: [u8; 16],
+        last_seq: u64,
+        gaps: Vec<(u64, u64)>,
     },
     Bye,
 }
@@ -188,6 +205,25 @@ pub enum ServerMessage {
     /// Precedes the `Spec` chunks: what the worker needs to evaluate the
     /// job's expressions.
     Context(WireContext),
+    /// Frames through `through` are durably stored; the worker may drop
+    /// them from its spool.
+    LogAck {
+        attempt: [u8; 16],
+        through: u64,
+    },
+    /// The controller will store no more frames of this attempt (size cap,
+    /// or the attempt is not held here); the worker stops sending.
+    LogRefused {
+        attempt: [u8; 16],
+    },
+}
+
+/// What the controller did with a log frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogVerdict {
+    /// Stored and synced through this sequence.
+    Acked(u64),
+    Refused,
 }
 
 /// [`JobContext`] on the wire; dependency outcomes as their stored codes.
@@ -433,6 +469,11 @@ pub trait SessionHandler: Send + Sync {
     /// The job context and encoded run spec of an attempt this worker
     /// holds, or `None`.
     fn spec(&self, worker: WorkerId, attempt: AttemptId) -> Option<(JobContext, Vec<u8>)>;
+    /// A log frame of an attempt this worker holds. Acknowledged only once
+    /// durable; a frame out of sequence or past the size cap is refused.
+    fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict;
+    /// The attempt's log is complete through `last_seq`.
+    fn log_end(&self, worker: WorkerId, attempt: AttemptId, last_seq: u64, gaps: &[(u64, u64)]);
 }
 
 /// The rustls state and the socket it writes to. The lock is held only while
@@ -766,6 +807,44 @@ impl WorkerSession {
                         _ => self.tx.send(&ServerMessage::NoSpec { attempt })?,
                     }
                 }
+                ClientMessage::Log {
+                    attempt,
+                    seq,
+                    step,
+                    stream,
+                    bytes,
+                } => {
+                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                    if bytes.len() > MAX_LOG_FRAME_BYTES {
+                        return Err(Error::Protocol("log frame size"));
+                    }
+                    let stream = Stream::from_code(stream).ok_or(Error::Protocol("stream"))?;
+                    let frame = Frame {
+                        seq,
+                        step,
+                        stream,
+                        bytes,
+                    };
+                    match handler.log(worker, id, frame) {
+                        LogVerdict::Acked(through) => {
+                            self.tx.send(&ServerMessage::LogAck { attempt, through })?;
+                        }
+                        LogVerdict::Refused => {
+                            self.tx.send(&ServerMessage::LogRefused { attempt })?;
+                        }
+                    }
+                }
+                ClientMessage::LogEnd {
+                    attempt,
+                    last_seq,
+                    gaps,
+                } => {
+                    if gaps.len() > MAX_GAPS {
+                        return Err(Error::Protocol("gap list"));
+                    }
+                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                    handler.log_end(worker, id, last_seq, &gaps);
+                }
                 ClientMessage::Bye => return Ok(()),
                 ClientMessage::Hello { .. } => return Err(Error::Protocol("second hello")),
             }
@@ -853,7 +932,9 @@ pub fn connect(
         | ServerMessage::Offer(_)
         | ServerMessage::Spec { .. }
         | ServerMessage::NoSpec { .. }
-        | ServerMessage::Context(_) => Err(Error::Protocol("message before welcome")),
+        | ServerMessage::Context(_)
+        | ServerMessage::LogAck { .. }
+        | ServerMessage::LogRefused { .. } => Err(Error::Protocol("message before welcome")),
     }
 }
 
@@ -900,6 +981,29 @@ impl Reporter {
             attempt: *attempt.as_bytes(),
         })
     }
+
+    /// One frame from the spool. The executor keeps at most
+    /// `MAX_UNACKED_LOG_FRAMES` in flight per attempt.
+    pub fn log(&self, attempt: AttemptId, frame: &Frame) -> Result<()> {
+        if frame.bytes.len() > MAX_LOG_FRAME_BYTES {
+            return Err(Error::Protocol("log frame size"));
+        }
+        self.0.send(&ClientMessage::Log {
+            attempt: *attempt.as_bytes(),
+            seq: frame.seq,
+            step: frame.step,
+            stream: frame.stream as u8,
+            bytes: frame.bytes.clone(),
+        })
+    }
+
+    pub fn log_end(&self, attempt: AttemptId, last_seq: u64, gaps: &[(u64, u64)]) -> Result<()> {
+        self.0.send(&ClientMessage::LogEnd {
+            attempt: *attempt.as_bytes(),
+            last_seq,
+            gaps: gaps.to_vec(),
+        })
+    }
 }
 
 /// What a worker does with the offers and orders it receives. Implemented by
@@ -922,6 +1026,10 @@ pub trait Executor: Send + Sync {
     fn spec(&self, attempt: AttemptId, context: JobContext, bytes: Vec<u8>);
     /// The controller has no spec for the attempt: it is not held here.
     fn no_spec(&self, attempt: AttemptId);
+    /// Frames through `through` are durable on the controller.
+    fn log_acked(&self, attempt: AttemptId, through: u64);
+    /// The controller stores no more frames of this attempt.
+    fn log_refused(&self, attempt: AttemptId);
 }
 
 impl Link {
@@ -1028,6 +1136,16 @@ impl Link {
             ServerMessage::Context(wire) => {
                 let (attempt, context) = JobContext::from_wire(wire)?;
                 state.contexts.insert(attempt, context);
+                Ok(false)
+            }
+            ServerMessage::LogAck { attempt, through } => {
+                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                executor.log_acked(attempt, through);
+                Ok(false)
+            }
+            ServerMessage::LogRefused { attempt } => {
+                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                executor.log_refused(attempt);
                 Ok(false)
             }
             ServerMessage::NoSpec { attempt } => {

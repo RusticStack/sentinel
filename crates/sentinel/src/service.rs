@@ -439,9 +439,16 @@ fn start_server(config: &Config, listen: SocketAddr) -> Result<Running, Error> {
     let store = Arc::new(store);
     let identity = identity(&config.data_dir, "controller")?;
     let fingerprint = hex32(&identity.fingerprint().0);
-    let controller =
-        sentinel_link::controller::Controller::start(Arc::clone(&store), identity, listen)
-            .map_err(|error| Error::runtime(format!("cannot listen on {listen}: {error}")))?;
+    let logs =
+        sentinel_store::logs::LogStore::open(config.data_dir.join(sentinel_store::logs::LOGS_DIR))
+            .map_err(|error| Error::runtime(format!("cannot open the log store: {error}")))?;
+    let controller = sentinel_link::controller::Controller::start(
+        Arc::clone(&store),
+        Arc::new(logs),
+        identity,
+        listen,
+    )
+    .map_err(|error| Error::runtime(format!("cannot listen on {listen}: {error}")))?;
     tracing::info!(
         event = "link_listening",
         addr = %controller.local_addr(),
@@ -475,6 +482,8 @@ mod worker_role {
         fn detached(&self) {}
         fn spec(&self, _: AttemptId, _: sentinel_link::session::JobContext, _: Vec<u8>) {}
         fn no_spec(&self, _: AttemptId) {}
+        fn log_acked(&self, _: AttemptId, _: u64) {}
+        fn log_refused(&self, _: AttemptId) {}
     }
 
     /// The real executor when rootless Podman answers, else the decliner.

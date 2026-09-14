@@ -523,6 +523,16 @@ pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> R
     })
 }
 
+/// Whether the attempt is reserved on `worker` and not yet released: the
+/// gate for log frames and reports.
+pub fn is_held(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE id = ?1 AND worker_id = ?2 AND released_ms IS NULL)",
+        )?
+        .query_row(params![attempt.as_bytes(), worker.as_bytes()], |r| r.get(0))?)
+}
+
 /// The encoded run spec of an attempt the worker holds, exactly as stored.
 pub fn spec_bytes(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Result<Vec<u8>> {
     conn.prepare_cached(

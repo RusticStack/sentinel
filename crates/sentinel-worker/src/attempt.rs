@@ -30,7 +30,10 @@ use std::{
 use sentinel_core::{AttemptId, Event, FailureClass, Fence, WorkerId};
 use sentinel_link::session::JobContext;
 use sentinel_pipeline::{RunSpec, expr::EvalError};
-use sentinel_protocol::summary::{AttemptSummary, StepOutcome, StepRecord};
+use sentinel_protocol::{
+    logs::Stream,
+    summary::{AttemptSummary, StepOutcome, StepRecord},
+};
 
 use crate::{
     Error, Result,
@@ -61,6 +64,24 @@ pub trait Report: Send + Sync {
     fn finish(&self, attempt: AttemptId, fence: Fence, event: Event, summary: Vec<u8>);
 }
 
+/// Where step output goes (W05): the executor's spool and link. Writes are
+/// called from the reader threads with small chunks and must be quick;
+/// `complete` runs after the last step and blocks, bounded, until the log
+/// is acknowledged and closed, returning whether that happened.
+pub trait Output: Send + Sync {
+    fn write(&self, step: u32, stream: Stream, bytes: &[u8]);
+    fn complete(&self) -> bool;
+}
+
+/// An output that discards everything, for callers without a log.
+pub struct NoOutput;
+impl Output for NoOutput {
+    fn write(&self, _: u32, _: Stream, _: &[u8]) {}
+    fn complete(&self) -> bool {
+        true
+    }
+}
+
 /// The attempt's verdict as reported, with the bounded reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -81,6 +102,7 @@ pub fn run(
     root: &Path,
     job: &Job,
     report: &dyn Report,
+    output: Arc<dyn Output>,
     cancel: &Cancel,
 ) -> (Verdict, AttemptSummary) {
     report.event(job.attempt, job.fence, Event::PreparationStarted);
@@ -90,13 +112,30 @@ pub fn run(
         Ok((workspace, container)) => {
             report.event(job.attempt, job.fence, Event::StepsStarted);
             let started = Instant::now();
-            let verdict = execute(job, &container, workspace.path(), cancel, &mut summary);
+            let verdict = execute(
+                job,
+                &container,
+                workspace.path(),
+                &output,
+                cancel,
+                &mut summary,
+            );
             summary.steps_ns = ns(started);
             report.event(job.attempt, job.fence, Event::FinalizationStarted);
             let started = Instant::now();
             finalize(workspace, container);
+            // The log is part of finalization: the attempt is not done until
+            // what it printed is durable on the controller, or the wait ran
+            // out and the failure is on record.
+            let published = output.complete();
             summary.finalize_ns = ns(started);
-            verdict
+            match (verdict, published) {
+                (Verdict::Passed, false) => Verdict::Failed(
+                    FailureClass::Publication,
+                    "log frames were not acknowledged in time".into(),
+                ),
+                (verdict, _) => verdict,
+            }
         }
     };
     let event = match &verdict {
@@ -186,6 +225,7 @@ fn execute(
     job: &Job,
     container: &Container,
     workspace: &Path,
+    output: &Arc<dyn Output>,
     cancel: &Cancel,
     summary: &mut AttemptSummary,
 ) -> Verdict {
@@ -263,7 +303,12 @@ fn execute(
         let remaining = job_deadline.saturating_duration_since(Instant::now());
         command.timeout_secs = command.timeout_secs.min(remaining.as_secs().max(1));
         let started = Instant::now();
-        let exit = match container.exec(&command, &extra) {
+        let sink: crate::process::Sink = {
+            let output = Arc::clone(output);
+            let step_index = index as u32;
+            Arc::new(move |stream, bytes: &[u8]| output.write(step_index, stream, bytes))
+        };
+        let exit = match container.exec_streaming(&command, &extra, Some(sink)) {
             Ok(exit) => exit,
             Err(e) => {
                 record.outcome = StepOutcome::Runtime;

@@ -27,7 +27,9 @@ use sentinel_protocol::limits::MAX_LIST_ITEMS;
 use crate::{
     Result,
     attempt::{self, Cancel, Job, Report, Verdict},
+    logpipe::LogPipe,
     podman,
+    redact::Redactor,
 };
 
 /// What happened, for the process's diagnostics.
@@ -41,6 +43,7 @@ pub enum Notice {
 
 struct Live {
     cancel: Cancel,
+    logs: Arc<LogPipe>,
 }
 
 struct State {
@@ -51,6 +54,9 @@ struct State {
     /// Reports that found no session, in order, with the summary of a
     /// terminal one.
     pending: Vec<(AttemptId, Fence, Event, Option<Vec<u8>>)>,
+    /// Values every new attempt's redactor starts with (S05/S06 register
+    /// per attempt; until then the operator's list applies to all).
+    secrets: Vec<Vec<u8>>,
 }
 
 /// The executor handle the link holds; cheap to clone, one runtime behind it.
@@ -91,17 +97,44 @@ impl Executor {
                 awaiting: HashMap::new(),
                 live: HashMap::new(),
                 pending: Vec::new(),
+                secrets: Vec::new(),
             }),
             notify: Box::new(notify),
         })))
     }
 
+    /// Register a value to redact from every attempt started from now on.
+    pub fn register_secret(&self, value: &[u8]) {
+        self.state().secrets.push(value.to_vec());
+    }
+
     fn spawn(&self, offer: Offer, spec: RunSpec, context: JobContext, job_index: usize) {
         let cancel: Cancel = Arc::new(AtomicBool::new(false));
+        let logs = {
+            let state = self.state();
+            let mut redactor = Redactor::new();
+            for secret in &state.secrets {
+                redactor.register(secret);
+            }
+            match LogPipe::open(&self.root, offer.attempt, redactor, state.reporter.clone()) {
+                Ok(pipe) => Arc::new(pipe),
+                Err(_) => {
+                    drop(state);
+                    self.send(
+                        offer.attempt,
+                        offer.fence,
+                        Event::Failed(sentinel_core::FailureClass::Publication),
+                        None,
+                    );
+                    return;
+                }
+            }
+        };
         self.state().live.insert(
             offer.attempt,
             Live {
                 cancel: Arc::clone(&cancel),
+                logs: Arc::clone(&logs),
             },
         );
         let executor = Arc::clone(&self.0);
@@ -118,7 +151,8 @@ impl Executor {
             .name(format!("sentinel-attempt-{}", offer.attempt))
             .spawn(move || {
                 (executor.notify)(Notice::Started(job.attempt));
-                let (verdict, _) = attempt::run(&executor.root, &job, &*executor, &cancel);
+                let output: Arc<dyn attempt::Output> = logs;
+                let (verdict, _) = attempt::run(&executor.root, &job, &*executor, output, &cancel);
                 executor.state().live.remove(&job.attempt);
                 (executor.notify)(Notice::Finished(job.attempt, verdict));
             });
@@ -220,11 +254,21 @@ impl LinkExecutor for Executor {
     fn renewed(&self, _until: UnixMillis) {}
 
     fn attached(&self, reporter: Reporter) {
-        let pending = {
+        let (pending, pipes) = {
             let mut state = self.state();
             state.reporter = Some(reporter.clone());
-            std::mem::take(&mut state.pending)
+            (
+                std::mem::take(&mut state.pending),
+                state
+                    .live
+                    .values()
+                    .map(|l| Arc::clone(&l.logs))
+                    .collect::<Vec<_>>(),
+            )
         };
+        for pipe in pipes {
+            pipe.attached(reporter.clone());
+        }
         for (attempt, fence, event, summary) in pending {
             let sent = match &summary {
                 Some(bytes) => reporter
@@ -244,7 +288,28 @@ impl LinkExecutor for Executor {
     }
 
     fn detached(&self) {
-        self.state().reporter = None;
+        let pipes: Vec<Arc<LogPipe>> = {
+            let mut state = self.state();
+            state.reporter = None;
+            state.live.values().map(|l| Arc::clone(&l.logs)).collect()
+        };
+        for pipe in pipes {
+            pipe.detached();
+        }
+    }
+
+    fn log_acked(&self, attempt: AttemptId, through: u64) {
+        let pipe = self.state().live.get(&attempt).map(|l| Arc::clone(&l.logs));
+        if let Some(pipe) = pipe {
+            pipe.acked(through);
+        }
+    }
+
+    fn log_refused(&self, attempt: AttemptId) {
+        let pipe = self.state().live.get(&attempt).map(|l| Arc::clone(&l.logs));
+        if let Some(pipe) = pipe {
+            pipe.refused();
+        }
     }
 
     fn spec(&self, attempt: AttemptId, context: JobContext, bytes: Vec<u8>) {

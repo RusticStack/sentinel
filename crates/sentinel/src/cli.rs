@@ -84,6 +84,17 @@ pub enum AdminCommand {
     Pool(PoolArgs),
     /// Enroll, list and revoke workers
     Worker(WorkerArgs),
+    /// Print an attempt's log as stored on the controller; --follow waits for more
+    Logs {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `att_` identifier of the attempt
+        #[arg(long)]
+        attempt: String,
+        /// Keep printing until the log is complete
+        #[arg(long)]
+        follow: bool,
+    },
 }
 
 #[derive(Args)]

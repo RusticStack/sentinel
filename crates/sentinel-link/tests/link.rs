@@ -29,11 +29,14 @@ use sentinel_link::{
     tls, worker,
 };
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
+use sentinel_protocol::logs::{Frame, Stream};
 use sentinel_protocol::negotiate::{Arch, Capabilities, Hello, ProtocolVersion};
 use sentinel_store::{
     Durability, Store,
     auth::{self, Authority, NamespaceKind, provisioning},
-    dispatch, runs,
+    dispatch,
+    logs::LogStore,
+    runs,
     tenancy::{self, PoolKind},
     workers,
 };
@@ -48,6 +51,7 @@ const CAPACITY: Capacity = Capacity {
 struct Deployment {
     _dir: tempfile::TempDir,
     store: Arc<Store>,
+    logs: Arc<LogStore>,
     controller: Option<Controller>,
     identity_files: (std::path::PathBuf, std::path::PathBuf),
     tenant: TenantId,
@@ -86,11 +90,18 @@ fn deployment() -> Deployment {
     let identity = Identity::generate("controller").unwrap();
     let files = (dir.path().join("c.crt"), dir.path().join("c.key"));
     identity.save(&files.0, &files.1).unwrap();
-    let controller =
-        Controller::start(Arc::clone(&store), identity, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let logs = Arc::new(LogStore::open(dir.path().join("logs")).unwrap());
+    let controller = Controller::start(
+        Arc::clone(&store),
+        Arc::clone(&logs),
+        identity,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
     Deployment {
         _dir: dir,
         store,
+        logs,
         controller: Some(controller),
         identity_files: files,
         tenant,
@@ -196,6 +207,8 @@ struct Recorder {
     decline_once: Mutex<Vec<JobId>>,
     reporter: Mutex<Option<session::Reporter>>,
     specs: Mutex<Vec<SpecRecord>>,
+    log_acks: Mutex<Vec<(AttemptId, u64)>>,
+    log_refusals: Mutex<Vec<AttemptId>>,
 }
 
 impl Recorder {
@@ -210,6 +223,8 @@ impl Recorder {
                 decline_once: Mutex::new(Vec::new()),
                 reporter: Mutex::new(None),
                 specs: Mutex::new(Vec::new()),
+                log_acks: Mutex::new(Vec::new()),
+                log_refusals: Mutex::new(Vec::new()),
             }),
             rx,
         )
@@ -264,6 +279,12 @@ impl Executor for Recorder {
     }
     fn no_spec(&self, attempt: AttemptId) {
         self.specs.lock().unwrap().push((attempt, None, Vec::new()));
+    }
+    fn log_acked(&self, attempt: AttemptId, through: u64) {
+        self.log_acks.lock().unwrap().push((attempt, through));
+    }
+    fn log_refused(&self, attempt: AttemptId) {
+        self.log_refusals.lock().unwrap().push(attempt);
     }
 }
 
@@ -358,6 +379,8 @@ impl Executor for Idle {
     fn detached(&self) {}
     fn spec(&self, _: AttemptId, _: session::JobContext, _: Vec<u8>) {}
     fn no_spec(&self, _: AttemptId) {}
+    fn log_acked(&self, _: AttemptId, _: u64) {}
+    fn log_refused(&self, _: AttemptId) {}
 }
 
 #[test]
@@ -607,6 +630,48 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     eventually("no spec", || recorder.specs.lock().unwrap().len() == 2);
     assert!(recorder.specs.lock().unwrap()[1].2.is_empty());
 
+    // Log frames of a held attempt are acknowledged only once stored and
+    // synced on the controller: what the acknowledgement covers is exactly
+    // what a reader sees. A resend is acknowledged again without a second
+    // copy; a jump is refused; the end marker completes the log.
+    let text = |seq: u64, s: &str| Frame {
+        seq,
+        step: 0,
+        stream: Stream::Stdout,
+        bytes: s.as_bytes().to_vec(),
+    };
+    reporter.log(attempt, &text(1, "one\n")).unwrap();
+    reporter.log(attempt, &text(2, "two\n")).unwrap();
+    eventually("log acks", || {
+        recorder.log_acks.lock().unwrap().last() == Some(&(attempt, 2))
+    });
+    let tail = d.logs.tail(attempt, 0, 10).unwrap();
+    assert_eq!(tail.frames.len(), 2);
+    assert!(!tail.complete);
+    reporter.log(attempt, &text(2, "two\n")).unwrap();
+    eventually("duplicate acked", || {
+        recorder.log_acks.lock().unwrap().len() == 3
+    });
+    assert_eq!(d.logs.tail(attempt, 0, 10).unwrap().frames.len(), 2);
+    reporter.log(attempt, &text(9, "nine\n")).unwrap();
+    eventually("jump refused", || {
+        recorder.log_refusals.lock().unwrap().as_slice() == [attempt]
+    });
+    // Frames for an attempt this worker does not hold are refused too.
+    let foreign = AttemptId::new();
+    reporter.log(foreign, &text(1, "x")).unwrap();
+    eventually("foreign refused", || {
+        recorder.log_refusals.lock().unwrap().len() == 2
+    });
+    assert!(matches!(
+        d.logs.tail(foreign, 0, 10),
+        Err(sentinel_store::Error::NotFound)
+    ));
+    reporter.log_end(attempt, 2, &[]).unwrap();
+    eventually("log complete", || {
+        d.logs.tail(attempt, 0, 10).unwrap().complete
+    });
+
     // The worker reports its progress over the wire; the terminal report
     // frees the capacity, queues `test` and wakes the dispatcher — no
     // `wake()` call from the test.
@@ -767,7 +832,8 @@ fn a_worker_reconnects_with_backoff_after_the_controller_restarts() {
     process.wait_for("Backoff", 1);
     // Same identity, same address: the worker's pin still holds.
     let identity = Identity::load(&d.identity_files.0, &d.identity_files.1).unwrap();
-    d.controller = Some(Controller::start(Arc::clone(&d.store), identity, addr).unwrap());
+    d.controller =
+        Some(Controller::start(Arc::clone(&d.store), Arc::clone(&d.logs), identity, addr).unwrap());
     process.wait_for("Connected { worker: wrk_", 2);
     let events = process.events.lock().unwrap().clone();
     // The second connection presented no enrollment.

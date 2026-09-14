@@ -19,9 +19,13 @@ pub mod context;
 #[cfg(target_os = "linux")]
 pub mod executor;
 #[cfg(target_os = "linux")]
+pub mod logpipe;
+#[cfg(target_os = "linux")]
 pub mod podman;
 #[cfg(target_os = "linux")]
 mod process;
+pub mod redact;
+pub mod spool;
 #[cfg(target_os = "linux")]
 pub mod workspace;
 

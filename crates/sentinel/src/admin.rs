@@ -183,6 +183,11 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
         AdminCommand::Tenant(args) => tenant(args, now)?,
         AdminCommand::Pool(args) => pool(args, now)?,
         AdminCommand::Worker(args) => worker(args, now)?,
+        AdminCommand::Logs {
+            data,
+            attempt,
+            follow,
+        } => logs(data, attempt, *follow)?,
     }
     Ok(())
 }
@@ -971,6 +976,58 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Print an attempt's log from the controller's own files. Host-local like
+/// everything here; the API (W08) reads the same files with authorization.
+fn logs(data: &DataDir, attempt: &str, follow: bool) -> Result<(), Error> {
+    use std::io::Write;
+    let attempt: sentinel_core::AttemptId = attempt
+        .parse()
+        .map_err(|_| fail("expected an att_ attempt identifier"))?;
+    let path = data
+        .data_dir
+        .join(sentinel_store::logs::LOGS_DIR)
+        .join(format!("{attempt}.log"));
+    let (mut stdout, mut stderr) = (std::io::stdout().lock(), std::io::stderr().lock());
+    let mut after = 0u64;
+    loop {
+        let tail = match sentinel_store::logs::read_tail(&path, after, 1024) {
+            Ok(tail) => tail,
+            Err(sentinel_store::Error::NotFound) if follow => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                continue;
+            }
+            Err(sentinel_store::Error::NotFound) => {
+                return Err(fail("no log for that attempt on this controller"));
+            }
+            Err(error) => return Err(fail(format!("cannot read the log: {error}"))),
+        };
+        for frame in &tail.frames {
+            let out: &mut dyn Write = match frame.stream {
+                sentinel_protocol::logs::Stream::Stdout => &mut stdout,
+                sentinel_protocol::logs::Stream::Stderr => &mut stderr,
+            };
+            out.write_all(&frame.bytes)
+                .map_err(|error| fail(format!("cannot write: {error}")))?;
+            after = frame.seq;
+        }
+        stdout.flush().ok();
+        stderr.flush().ok();
+        if tail.complete {
+            for (from, to) in &tail.gaps {
+                eprintln!("[sentinel: frames {from}-{to} were lost on the worker]");
+            }
+            return Ok(());
+        }
+        if !follow {
+            eprintln!("[sentinel: log incomplete; use --follow to wait for the rest]");
+            return Ok(());
+        }
+        if tail.frames.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
 }
 
 const fn event_name(event: Event) -> &'static str {

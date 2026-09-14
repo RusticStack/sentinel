@@ -33,7 +33,7 @@ Submodules and LFS are not fetched. Extra checkouts and mirrors are later tasks.
 
 The container's main process is a keepalive (`/bin/sh` loop that exits on `TERM`); steps run in it with `podman exec` — the image must provide `/bin/sh`, which the run spec's shells already require. There is no Docker socket, no privileged flag, and no pipeline key that loosens any of this.
 
-`Container::exec` runs one `StepCommand`: its argv, its environment with the worker's context appended **after** the pipeline's (`SENTINEL_RUN`, `SENTINEL_JOB`, `SENTINEL_ATTEMPT`, `SENTINEL_SHA`, `SENTINEL_WORKSPACE`, `CI`), so a pipeline cannot spoof them; its working directory under `/workspace`; its timeout. Exit status and signal (Podman's `128 + n`) are reported as such; a step past its timeout stops the whole container — steps are sequential and the attempt is over. Output tails of 64 KiB per stream are kept for diagnostics; streaming logs are W05.
+`Container::exec` runs one `StepCommand`: its argv, its environment with the worker's context appended **after** the pipeline's (`SENTINEL_RUN`, `SENTINEL_JOB`, `SENTINEL_ATTEMPT`, `SENTINEL_SHA`, `SENTINEL_WORKSPACE`, `CI`), so a pipeline cannot spoof them; its working directory under `/workspace`; its timeout. Exit status and signal (Podman's `128 + n`) are reported as such; a step past its timeout stops the whole container — steps are sequential and the attempt is over. Output tails of 64 KiB per stream are kept for diagnostics; the same bytes stream through the [log pipeline](logs.md) as they are produced.
 
 `Container::destroy` is `podman stop -t 2` then `podman rm -f`. Finalization runs both teardowns even when one fails.
 
@@ -79,7 +79,7 @@ OOM is read from the host's view of the container's cgroup (`/sys/fs/cgroup<Cgro
 
 ## What is not here yet
 
-Log capture and streaming are W05; only bounded tails exist. Cancellation as desired state, lease expiry and graceful/forced termination budgets are W06; a cancel today is a `stop` order or a flag checked between steps. Crash reconciliation of owned containers and leftover workspaces is W07 — the ownership record (`podman::owned`, `Workspace::leftovers`) exists, the reaper does not. Caches, artifacts and secrets are their own parts. Disk quotas on the workspace are not enforced (no `io` delegation in the rootless setup; see F07).
+Log tail/follow over the API is W08 (`admin logs` reads the files host-locally); only bounded tails exist. Cancellation as desired state, lease expiry and graceful/forced termination budgets are W06; a cancel today is a `stop` order or a flag checked between steps. Crash reconciliation of owned containers and leftover workspaces is W07 — the ownership record (`podman::owned`, `Workspace::leftovers`) exists, the reaper does not. Caches, artifacts and secrets are their own parts. Disk quotas on the workspace are not enforced (no `io` delegation in the rootless setup; see F07).
 
 ## Verification
 

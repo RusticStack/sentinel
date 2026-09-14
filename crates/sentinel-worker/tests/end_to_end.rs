@@ -33,7 +33,9 @@ use sentinel_protocol::summary::{AttemptSummary, StepOutcome};
 use sentinel_store::{
     Durability, Store,
     auth::{self, Authority, NamespaceKind, provisioning},
-    dispatch, runs,
+    dispatch,
+    logs::LogStore,
+    runs,
     tenancy::{self, PoolKind},
     workers,
 };
@@ -129,8 +131,10 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
             )
         })
         .unwrap();
+    let logs = Arc::new(LogStore::open(temp.path().join("logs")).unwrap());
     let controller = Controller::start(
         Arc::clone(&store),
+        Arc::clone(&logs),
         Identity::generate("controller").unwrap(),
         "127.0.0.1:0".parse().unwrap(),
     )
@@ -153,6 +157,9 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
         log.lock().unwrap().push(format!("{notice:?}"));
     })
     .unwrap();
+    // The value a secret binding would inject (S05); registered before any
+    // attempt starts, it never reaches a log.
+    executor.register_secret(b"hunter2-super-secret");
     let handle = Arc::new(Handle::new());
     let link_thread = {
         let (executor, handle) = (executor.clone(), Arc::clone(&handle));
@@ -202,6 +209,8 @@ jobs:
         run: 'test \"$(cat greeting.txt)\" = \"hello from git\" && test \"$SENTINEL_SHA\" = {sha}'
       - id: write
         run: 'echo built > out.txt && test -f out.txt && id -u'
+      - id: chatty
+        run: 'echo \"token=hunter2-super-secret ok\"; echo warned >&2; i=0; while [ $i -lt 2000 ]; do echo \"line $i of the log\"; i=$((i+1)); done'
   broken:
     image: {IMAGE}@{DIGEST}
     resources: {{ cpu: 1, memory: 256MiB }}
@@ -317,6 +326,33 @@ jobs:
     assert!(broken_summary.steps[0].duration_ns.is_some());
     assert!(broken_summary.steps[1].duration_ns.is_none());
     assert!(broken_summary.detail.contains("step 0 exited with 1"));
+    // The log reached the controller through the spool and the window,
+    // redacted before it left the worker, complete, in order, with the
+    // streams told apart, and the spool is gone.
+    let inspect_attempt = store
+        .read(|c| dispatch::latest_attempt(c, tenant, inspect))
+        .unwrap()
+        .unwrap();
+    let tail = logs.tail(inspect_attempt, 0, 100_000).unwrap();
+    assert!(tail.complete && tail.gaps.is_empty());
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut last_seq = 0;
+    for f in &tail.frames {
+        assert_eq!(f.seq, last_seq + 1, "frames in sequence");
+        last_seq = f.seq;
+        match f.stream {
+            sentinel_protocol::logs::Stream::Stdout => stdout.extend(&f.bytes),
+            sentinel_protocol::logs::Stream::Stderr => stderr.extend(&f.bytes),
+        }
+    }
+    let stdout = String::from_utf8(stdout).unwrap();
+    assert!(stdout.contains("token=*** ok\n"), "{stdout}");
+    assert!(!stdout.contains("hunter2"));
+    assert!(stdout.contains("line 1999 of the log\n"));
+    assert_eq!(stdout.matches(" of the log\n").count(), 2000);
+    assert_eq!(String::from_utf8(stderr).unwrap(), "warned\n");
+    assert!(tail.frames.iter().any(|f| f.step == 2));
     let inspect_summary = summary_of(inspect);
     assert!(inspect_summary.checkout_ns.is_some());
     assert!(inspect_summary.image_pull_ns.is_some());
@@ -409,6 +445,12 @@ jobs:
     assert!(executor.state_is_idle());
     assert!(podman::owned(worker_id).unwrap().is_empty());
     assert!(Workspace::leftovers(&worker_dir).unwrap().is_empty());
+    // Every spool was acknowledged, closed and removed.
+    assert!(
+        sentinel_worker::spool::Spool::leftovers(&worker_dir)
+            .unwrap()
+            .is_empty()
+    );
     let log = notices.lock().unwrap().clone();
     assert!(
         log.iter()

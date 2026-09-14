@@ -16,7 +16,7 @@
 //! reconstructs the queue and the reservations by reading them.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Condvar, Mutex,
@@ -28,14 +28,16 @@ use std::{
 
 use sentinel_auth::secret::{Digest, Secret};
 use sentinel_core::{AttemptId, Event, Fence, PoolId, UnixMillis, WorkerId};
+use sentinel_protocol::logs::Frame;
 use sentinel_protocol::negotiate::Hello;
-use sentinel_store::{Store, dispatch, workers};
+use sentinel_store::{Store, dispatch, logs::LogStore, workers};
 
 use crate::{
     Error, Result,
     identity::Identity,
     session::{
-        self, Admission, Admitted, Capacity, JobContext, Offer, Rejection, Sender, SessionHandler,
+        self, Admission, Admitted, Capacity, JobContext, LogVerdict, Offer, Rejection, Sender,
+        SessionHandler,
     },
     tls,
 };
@@ -57,6 +59,8 @@ pub struct Stats {
     pub sessions_ended: AtomicU64,
     pub reports: AtomicU64,
     pub stale_reports: AtomicU64,
+    pub log_frames: AtomicU64,
+    pub log_refused: AtomicU64,
 }
 
 struct Peer {
@@ -65,10 +69,14 @@ struct Peer {
     generation: u64,
     /// When liveness was last written, so a beat costs a write once a minute.
     seen_recorded_ms: AtomicI64,
+    /// Attempts verified as held by this worker for log frames, so the
+    /// check costs one read per attempt rather than one per frame.
+    logging: Mutex<HashSet<AttemptId>>,
 }
 
 struct Inner {
     store: Arc<Store>,
+    logs: Arc<LogStore>,
     config: Arc<rustls::ServerConfig>,
     fleet: Mutex<HashMap<WorkerId, Arc<Peer>>>,
     generation: AtomicU64,
@@ -135,6 +143,7 @@ impl Inner {
             pool,
             generation,
             seen_recorded_ms: AtomicI64::new(0),
+            logging: Mutex::new(HashSet::new()),
         });
         self.register(worker, peer);
         self.wake();
@@ -224,6 +233,43 @@ impl Inner {
             }
             self.dispatch_pass();
         }
+    }
+}
+
+impl Inner {
+    fn peer(&self, worker: WorkerId) -> Option<Arc<Peer>> {
+        self.fleet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&worker)
+            .cloned()
+    }
+
+    /// Whether `attempt` is held by `worker`, checked against the store
+    /// once per attempt and remembered on the session.
+    fn holds(&self, worker: WorkerId, attempt: AttemptId) -> bool {
+        let Some(peer) = self.peer(worker) else {
+            return false;
+        };
+        if peer
+            .logging
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&attempt)
+        {
+            return true;
+        }
+        let held = self
+            .store
+            .read(|c| dispatch::is_held(c, worker, attempt))
+            .unwrap_or(false);
+        if held {
+            peer.logging
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(attempt);
+        }
+        held
     }
 }
 
@@ -393,6 +439,37 @@ impl SessionHandler for Inner {
             .ok()
     }
 
+    fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict {
+        if !self.holds(worker, attempt) {
+            self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
+            return LogVerdict::Refused;
+        }
+        match self.logs.append(attempt, &frame) {
+            Ok(sentinel_store::logs::Appended::Stored { through })
+            | Ok(sentinel_store::logs::Appended::Duplicate { through }) => {
+                self.stats.log_frames.fetch_add(1, Ordering::Relaxed);
+                LogVerdict::Acked(through)
+            }
+            Err(_) => {
+                self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
+                LogVerdict::Refused
+            }
+        }
+    }
+
+    fn log_end(&self, worker: WorkerId, attempt: AttemptId, last_seq: u64, gaps: &[(u64, u64)]) {
+        if !self.holds(worker, attempt) {
+            return;
+        }
+        let _ = self.logs.finish(attempt, last_seq, gaps);
+        if let Some(peer) = self.peer(worker) {
+            peer.logging
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&attempt);
+        }
+    }
+
     fn declined(&self, _worker: WorkerId, attempt: AttemptId, _fence: Fence) {
         if self
             .write(move |tx| dispatch::lapse(tx, attempt, UnixMillis::now()))
@@ -418,13 +495,19 @@ pub struct Controller {
 impl Controller {
     /// Bind `listen`, present `identity`, and start serving workers of
     /// `store`. Returns once the socket is bound; workers may connect.
-    pub fn start(store: Arc<Store>, identity: Identity, listen: SocketAddr) -> Result<Controller> {
+    pub fn start(
+        store: Arc<Store>,
+        logs: Arc<LogStore>,
+        identity: Identity,
+        listen: SocketAddr,
+    ) -> Result<Controller> {
         let fingerprint = identity.fingerprint();
         let config = tls::server_config(identity)?;
         let listener = TcpListener::bind(listen)?;
         let addr = listener.local_addr()?;
         let inner = Arc::new(Inner {
             store,
+            logs,
             config,
             fleet: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(1),
