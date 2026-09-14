@@ -54,6 +54,10 @@ pub struct Job {
     pub digest: String,
     pub spec: RunSpec,
     pub context: JobContext,
+    /// A pause between checkout and image pull, so a cancel that arrives
+    /// during preparation can be exercised deterministically. Zero in
+    /// production.
+    pub prepare_hold: std::time::Duration,
 }
 
 /// Where the phases are reported. Ordered per attempt; the link's reporter
@@ -108,7 +112,18 @@ pub fn run(
     report.event(job.attempt, job.fence, Event::PreparationStarted);
     let mut summary = AttemptSummary::default();
     let verdict = match prepare(root, job, cancel, &mut summary) {
-        Err(e) => Verdict::Failed(FailureClass::Preparation, e.to_string()),
+        // A cancel that lands while preparing is a cancel, whatever step of
+        // the preparation it interrupted. The log — empty or not — is closed
+        // on this path too, so nothing waits in the spool for steps that
+        // never ran.
+        Err(_) if cancel.load(Ordering::Acquire) => {
+            let _ = output.complete();
+            Verdict::Failed(FailureClass::Canceled, "canceled during preparation".into())
+        }
+        Err(e) => {
+            let _ = output.complete();
+            Verdict::Failed(FailureClass::Preparation, e.to_string())
+        }
         Ok((workspace, container)) => {
             report.event(job.attempt, job.fence, Event::StepsStarted);
             let started = Instant::now();
@@ -174,6 +189,12 @@ fn prepare(
         let started = Instant::now();
         checkout::checkout(workspace.path(), &job.spec.source, None, CHECKOUT_TIMEOUT)?;
         summary.checkout_ns = ns(started);
+        if !job.prepare_hold.is_zero() {
+            let until = Instant::now() + job.prepare_hold;
+            while Instant::now() < until && !cancel.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         if cancel.load(Ordering::Acquire) {
             return Err(Error::Preparation("canceled".into()));
         }

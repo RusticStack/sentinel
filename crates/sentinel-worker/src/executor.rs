@@ -86,6 +86,7 @@ struct State {
     /// Monotonic deadline derived from the last renewal, minus the guard.
     lease_deadline: Option<Instant>,
     cancel_grace: Duration,
+    prepare_hold: Duration,
     /// Attempts of the previous process still to abandon, once a session is up.
     leftovers: Vec<Leftover>,
     /// Leftover spools being delivered, so their acknowledgements route.
@@ -138,6 +139,7 @@ impl Executor {
                 secrets: Vec::new(),
                 lease_deadline: None,
                 cancel_grace: DEFAULT_CANCEL_GRACE,
+                prepare_hold: Duration::ZERO,
                 leftovers,
                 recovering: HashMap::new(),
             }),
@@ -160,6 +162,12 @@ impl Executor {
     /// How long a canceled step gets between `SIGTERM` and the forced stop.
     pub fn set_cancel_grace(&self, grace: Duration) {
         self.state().cancel_grace = grace;
+    }
+
+    /// Hold every attempt between checkout and image pull; a test aid for
+    /// cancellation during preparation. Zero (the default) holds nothing.
+    pub fn set_prepare_hold(&self, hold: Duration) {
+        self.state().prepare_hold = hold;
     }
 
     /// Register a value to redact from every attempt started from now on.
@@ -206,6 +214,7 @@ impl Executor {
             digest: offer.image_digest.clone(),
             spec,
             context,
+            prepare_hold: self.state().prepare_hold,
         };
         // On disk before anything runs: a crash from here on leaves a
         // marker the next process reconciles.

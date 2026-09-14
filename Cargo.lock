@@ -1301,13 +1301,16 @@ name = "sentinel-worker"
 version = "0.1.0-dev"
 dependencies = [
  "libc",
+ "sentinel-api",
  "sentinel-auth",
  "sentinel-core",
  "sentinel-link",
  "sentinel-pipeline",
  "sentinel-protocol",
  "sentinel-store",
+ "serde_json",
  "tempfile",
+ "ureq",
 ]
 
 [[package]]

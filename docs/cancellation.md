@@ -20,7 +20,7 @@ Implemented in `sentinel-store::dispatch` (`cancel`, `cancel_run`, `cancel_reque
 3. Wait up to the grace period (`DEFAULT_CANCEL_GRACE`, 30 s; `Executor::set_cancel_grace`) for the cgroup to empty of step processes.
 4. **Forced:** if anything is still there, `podman stop -t 0` and `podman rm -f` — the whole container and process group, not one pid.
 
-The step's `exec` returns as the process dies (signal 15, or the script's own exit); the attempt loop sees the flag, records the step `Signaled`/`NotRun` for the rest, finalizes as usual — workspace and container gone, log closed — and reports `Failed(Canceled)`. `Notice::Canceled { forced }` says which way it went.
+A cancel that lands during preparation — between checkout and image pull, before any container exists — ends the attempt as `canceled` too, with its (empty) log closed. Otherwise the step's `exec` returns as the process dies (signal 15, or the script's own exit); the attempt loop sees the flag, records the step `Signaled`/`NotRun` for the rest, finalizes as usual — workspace and container gone, log closed — and reports `Failed(Canceled)`. `Notice::Canceled { forced }` says which way it went.
 
 ## Timeouts
 

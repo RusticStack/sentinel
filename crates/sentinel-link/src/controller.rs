@@ -715,6 +715,26 @@ impl Handle {
             .copied()
             .collect()
     }
+
+    /// Close a worker's session from the controller's side. Its leases stay
+    /// until they expire and it may reconnect at once; an operator's way to
+    /// force a fresh session, and the test's way to lose the network.
+    pub fn disconnect(&self, worker: WorkerId) -> bool {
+        let peer = self
+            .0
+            .fleet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&worker)
+            .cloned();
+        match peer {
+            Some(peer) => {
+                peer.sender.close();
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 impl std::fmt::Debug for Controller {
