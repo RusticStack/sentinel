@@ -588,23 +588,23 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     let (tenant, repo) = (d.tenant, d.repo);
     let _ = repo;
     let worker = sentinel_core::WorkerId::new();
-    let attempt = {
-        let job: sentinel_core::JobId = run2["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
-        d.store
-            .writer()
-            .write(move |tx| {
-                let (attempt, _) = sentinel_store::jobs::lease(
-                    tx,
-                    tenant,
-                    job,
-                    worker,
-                    UnixMillis(i64::MAX / 2),
-                    UnixMillis::now(),
-                )?;
-                Ok(attempt)
-            })
-            .unwrap()
-    };
+    let run_id: RunId = run2["id"].as_str().unwrap().parse().unwrap();
+    let job_id: sentinel_core::JobId = run2["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
+    let attempt = d
+        .store
+        .writer()
+        .write(move |tx| {
+            let (attempt, _) = sentinel_store::jobs::lease(
+                tx,
+                tenant,
+                job_id,
+                worker,
+                UnixMillis(i64::MAX / 2),
+                UnixMillis::now(),
+            )?;
+            Ok(attempt)
+        })
+        .unwrap();
     let (status, body) = call(
         &d,
         "GET",
@@ -621,10 +621,15 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         bytes: text.as_bytes().to_vec(),
     };
     d.logs
-        .append(attempt, &frame(1, "hello\n", Stream::Stdout))
+        .append(
+            run_id,
+            job_id,
+            attempt,
+            &frame(1, "hello\n", Stream::Stdout),
+        )
         .unwrap();
     d.logs
-        .append(attempt, &frame(2, "warn\n", Stream::Stderr))
+        .append(run_id, job_id, attempt, &frame(2, "warn\n", Stream::Stderr))
         .unwrap();
     let (status, body) = call(
         &d,
@@ -644,6 +649,8 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     let writer = thread::spawn(move || {
         thread::sleep(Duration::from_millis(400));
         logs.append(
+            run_id,
+            job_id,
             attempt,
             &Frame {
                 seq: 3,
@@ -653,7 +660,7 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
             },
         )
         .unwrap();
-        logs.finish(attempt, 3, &[]).unwrap();
+        logs.finish(run_id, job_id, attempt, 3, &[]).unwrap();
     });
     let started = std::time::Instant::now();
     let (status, body) = call(
@@ -679,6 +686,25 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         &[],
     );
     assert_eq!((status, body["complete"].as_bool()), (200, Some(true)));
+    // The step filter serves only that step's frames.
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/attempts/{attempt}/logs?step=1"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["frames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![3]
+    );
     let (status, body) = call(
         &d,
         "GET",

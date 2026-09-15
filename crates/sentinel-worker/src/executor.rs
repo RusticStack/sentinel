@@ -783,6 +783,12 @@ impl LinkExecutor for Executor {
         }
     }
 
+    fn log_ended(&self, attempt: AttemptId) {
+        if let Some(pipe) = self.pipe(attempt) {
+            pipe.end_acked();
+        }
+    }
+
     fn spec(&self, attempt: AttemptId, context: JobContext, bytes: Vec<u8>) {
         let Some(offer) = self.state().awaiting.remove(&attempt) else {
             return;

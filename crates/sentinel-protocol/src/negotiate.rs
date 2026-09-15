@@ -12,9 +12,11 @@ pub struct ProtocolVersion(pub u16);
 
 /// Versions this controller build can serve, inclusive. Protocol 4 adds the
 /// artifact publication messages (`ArtifactBegin`…`ArtifactAbsent` and the
-/// `ArtifactGrant`/`ArtifactVerdict` answers).
+/// `ArtifactGrant`/`ArtifactVerdict` answers). Protocol 5 adds `LogEndAck`:
+/// the controller answers `LogEnd` once the end marker is durable, and the
+/// worker drops its spool only then.
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(4);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(5);
 
 /// Capabilities are a bit set: cheap to store, compare and intersect, and
 /// unknown bits from a newer worker are ignored rather than rejected.
@@ -158,7 +160,7 @@ mod tests {
         let future_bit = Capabilities(1 << 40);
         let h = hello(
             1,
-            4,
+            9,
             Capabilities::REQUIRED
                 .union(Capabilities::REFLINK)
                 .union(future_bit),
@@ -184,7 +186,7 @@ mod tests {
     #[test]
     fn version_mismatch_says_who_must_upgrade() {
         assert_eq!(
-            negotiate(&hello(5, 6, Capabilities::REQUIRED)),
+            negotiate(&hello(6, 7, Capabilities::REQUIRED)),
             Err(Rejected::UnsupportedVersion {
                 supported_min: SUPPORTED_MIN,
                 supported_max: SUPPORTED_MAX,

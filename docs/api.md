@@ -36,7 +36,7 @@ All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](p
 | `POST /runs/{id}/cancel` | `run` | `cancel_run` ([cancellation](cancellation.md)) |
 | `POST /jobs/{id}/cancel` | `run` | `cancel` → `terminal`, `requested` or `alreadyterminal` |
 | `POST /jobs/{id}/rerun` | `run` | a new attempt of a finished job; `conflict` for a running or cancelled one |
-| `GET /attempts/{id}/logs?after&limit&wait=1` | `read` | frames after a sequence from the same files the controller writes ([logs](logs.md)); `wait=1` parks up to 25 s for more; `complete` and `gaps` say when the log is closed |
+| `GET /attempts/{id}/logs?after&limit&wait=1&step` | `read` | frames after a sequence from the segmented store the controller writes ([logs](logs.md)); `step` serves one step only; `wait=1` parks up to 25 s for more; `complete` and `gaps` say when the log is closed; pre-D04 flat logs still read |
 | `GET /runs/{id}/artifacts` | `read` | every artifact row of the run: name, job, attempt, `captured`/`absent`/`failed`, entries, bytes, retention and creation ([storage](storage.md#artifact-records-d03)) |
 | `GET /runs/{id}/artifacts/{arf}` | `read` | one row plus, when captured, its immutable manifest: version, digest, payload length and each entry's path/digest/len/mode; entry bytes download via `GET /tenants/{slug}/objects/{digest}` |
 | `GET /workers?tenant=slug` | member | the pools the tenant may use and their workers, each with `connected` from the live fleet |

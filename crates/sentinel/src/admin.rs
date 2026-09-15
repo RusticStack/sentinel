@@ -1098,14 +1098,37 @@ fn logs(data: &DataDir, attempt: &str, follow: bool) -> Result<(), Error> {
     let attempt: sentinel_core::AttemptId = attempt
         .parse()
         .map_err(|_| fail("expected an att_ attempt identifier"))?;
-    let path = data
-        .data_dir
-        .join(sentinel_store::logs::LOGS_DIR)
-        .join(format!("{attempt}.log"));
+    let root = data.data_dir.join(sentinel_store::logs::LOGS_DIR);
+    // D04 segments live under logs/<run>/<job>/<attempt>; resolve through
+    // the database, falling back to the pre-D04 flat file.
+    let dir = open(data, true).ok().and_then(|store| {
+        store
+            .read(|c| {
+                let job = sentinel_store::lookup::attempt_job(c, attempt)?;
+                let run = sentinel_store::lookup::job_run(c, job)?;
+                Ok(root
+                    .join(run.to_string())
+                    .join(job.to_string())
+                    .join(attempt.to_string()))
+            })
+            .ok()
+    });
+    let flat = root.join(format!("{attempt}.log"));
     let (mut stdout, mut stderr) = (std::io::stdout().lock(), std::io::stderr().lock());
     let mut after = 0u64;
     loop {
-        let tail = match sentinel_store::logs::read_tail(&path, after, 1024) {
+        let result = match &dir {
+            Some(dir) => {
+                sentinel_store::logs::read_dir(dir, after, 1024, None).or_else(|e| match e {
+                    sentinel_store::Error::NotFound => {
+                        sentinel_store::logs::read_tail(&flat, after, 1024)
+                    }
+                    e => Err(e),
+                })
+            }
+            None => sentinel_store::logs::read_tail(&flat, after, 1024),
+        };
+        let tail = match result {
             Ok(tail) => tail,
             Err(sentinel_store::Error::NotFound) if follow => {
                 std::thread::sleep(std::time::Duration::from_millis(250));

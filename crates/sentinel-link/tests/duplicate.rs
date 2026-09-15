@@ -71,7 +71,9 @@ impl SessionHandler for FakeController {
     fn log(&self, _: WorkerId, _: AttemptId, _: Frame) -> LogVerdict {
         LogVerdict::Refused
     }
-    fn log_end(&self, _: WorkerId, _: AttemptId, _: u64, _: &[(u64, u64)]) {}
+    fn log_end(&self, _: WorkerId, _: AttemptId, _: u64, _: &[(u64, u64)]) -> LogVerdict {
+        LogVerdict::Refused
+    }
     fn abandoned(&self, _: WorkerId, _: AttemptId, _: Fence) {}
 }
 

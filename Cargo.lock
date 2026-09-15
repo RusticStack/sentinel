@@ -1346,6 +1346,7 @@ name = "sentinel-store"
 version = "0.1.0-dev"
 dependencies = [
  "blake3",
+ "flate2",
  "rusqlite",
  "sentinel-auth",
  "sentinel-core",

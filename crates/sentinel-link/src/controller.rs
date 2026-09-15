@@ -16,7 +16,7 @@
 //! reconstructs the queue and the reservations by reading them.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Condvar, Mutex,
@@ -27,7 +27,9 @@ use std::{
 };
 
 use sentinel_auth::secret::{Digest, Secret};
-use sentinel_core::{AttemptId, Event, Fence, PoolId, RunId, TenantId, UnixMillis, WorkerId};
+use sentinel_core::{
+    AttemptId, Event, Fence, JobId, PoolId, RunId, TenantId, UnixMillis, WorkerId,
+};
 use sentinel_protocol::limits::{MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES, MAX_RUN_ARTIFACT_BYTES};
 use sentinel_protocol::logs::Frame;
 use sentinel_protocol::negotiate::Hello;
@@ -80,9 +82,10 @@ struct Peer {
     generation: u64,
     /// When liveness was last written, so a beat costs a write once a minute.
     seen_recorded_ms: AtomicI64,
-    /// Attempts verified as held by this worker for log frames, so the
-    /// check costs one read per attempt rather than one per frame.
-    logging: Mutex<HashSet<AttemptId>>,
+    /// Attempts verified as held by this worker for log frames, mapped to
+    /// their (run, job) so the store path costs one read per attempt
+    /// rather than one per frame.
+    logging: Mutex<HashMap<AttemptId, (RunId, JobId)>>,
 }
 
 /// A file currently receiving `ArtifactData` chunks.
@@ -198,7 +201,7 @@ impl Inner {
             pool,
             generation,
             seen_recorded_ms: AtomicI64::new(0),
-            logging: Mutex::new(HashSet::new()),
+            logging: Mutex::new(HashMap::new()),
         });
         self.register(worker, peer);
         self.wake();
@@ -320,28 +323,34 @@ impl Inner {
     /// Whether `attempt` is held by `worker`, checked against the store
     /// once per attempt and remembered on the session.
     fn holds(&self, worker: WorkerId, attempt: AttemptId) -> bool {
-        let Some(peer) = self.peer(worker) else {
-            return false;
-        };
-        if peer
+        self.log_scope(worker, attempt).is_some()
+    }
+
+    /// The attempt's `(run, job)` when held by `worker`: resolved against
+    /// the store once per attempt, then remembered on the session.
+    fn log_scope(&self, worker: WorkerId, attempt: AttemptId) -> Option<(RunId, JobId)> {
+        let peer = self.peer(worker)?;
+        if let Some(scope) = peer
             .logging
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .contains(&attempt)
+            .get(&attempt)
         {
-            return true;
+            return Some(*scope);
         }
-        let held = self
+        let scope = self
             .store
-            .read(|c| dispatch::is_held(c, worker, attempt))
-            .unwrap_or(false);
-        if held {
-            peer.logging
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(attempt);
-        }
-        held
+            .read(|c| {
+                let tx = c.unchecked_transaction()?;
+                let (_, run, job, _) = dispatch::attempt_scope(&tx, worker, attempt)?;
+                Ok((run, job))
+            })
+            .ok()?;
+        peer.logging
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(attempt, scope);
+        Some(scope)
     }
 
     /// Record the settled outcome of a declared artifact: `state`, the
@@ -657,11 +666,11 @@ impl SessionHandler for Inner {
     }
 
     fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict {
-        if !self.holds(worker, attempt) {
+        let Some((run, job)) = self.log_scope(worker, attempt) else {
             self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
             return LogVerdict::Refused;
-        }
-        match self.logs.append(attempt, &frame) {
+        };
+        match self.logs.append(run, job, attempt, &frame) {
             Ok(sentinel_store::logs::Appended::Stored { through })
             | Ok(sentinel_store::logs::Appended::Duplicate { through }) => {
                 self.stats.log_frames.fetch_add(1, Ordering::Relaxed);
@@ -674,16 +683,31 @@ impl SessionHandler for Inner {
         }
     }
 
-    fn log_end(&self, worker: WorkerId, attempt: AttemptId, last_seq: u64, gaps: &[(u64, u64)]) {
-        if !self.holds(worker, attempt) {
-            return;
-        }
-        let _ = self.logs.finish(attempt, last_seq, gaps);
-        if let Some(peer) = self.peer(worker) {
-            peer.logging
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&attempt);
+    fn log_end(
+        &self,
+        worker: WorkerId,
+        attempt: AttemptId,
+        last_seq: u64,
+        gaps: &[(u64, u64)],
+    ) -> LogVerdict {
+        let Some((run, job)) = self.log_scope(worker, attempt) else {
+            self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
+            return LogVerdict::Refused;
+        };
+        match self.logs.finish(run, job, attempt, last_seq, gaps) {
+            Ok(()) => {
+                if let Some(peer) = self.peer(worker) {
+                    peer.logging
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&attempt);
+                }
+                LogVerdict::Acked(last_seq)
+            }
+            Err(_) => {
+                self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
+                LogVerdict::Refused
+            }
         }
     }
 

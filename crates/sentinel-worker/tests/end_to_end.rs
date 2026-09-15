@@ -242,8 +242,10 @@ jobs:
     image: {IMAGE}@{DIGEST}
     resources: {{ cpu: 1, memory: 256MiB }}
     steps:
-      - id: needs-intake
-        if: ${{{{ event.name == 'push' }}}}
+      - id: poison
+        run: 'ln -s /etc/passwd escape'
+      - id: needs-eval
+        if: ${{{{ hash_files('*') != '' }}}}
         run: 'true'
   oom:
     image: {IMAGE}@{DIGEST}
@@ -357,7 +359,9 @@ jobs:
         .read(|c| dispatch::latest_attempt(c, tenant, inspect))
         .unwrap()
         .unwrap();
-    let tail = logs.tail(inspect_attempt, 0, 100_000).unwrap();
+    let tail = logs
+        .tail(run, inspect, inspect_attempt, 0, 100_000, None)
+        .unwrap();
     assert!(tail.complete && tail.gaps.is_empty());
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -392,8 +396,9 @@ jobs:
     );
 
     // Conditions: a false `if` skips; dependency results, hash_files on the
-    // checkout, event.sha and success() resolve on the worker; an event field
-    // intake has not recorded is a preparation failure, never a default.
+    // checkout, event.sha and success() resolve on the worker; a context
+    // evaluation the worker cannot complete is a preparation failure, never a
+    // default.
     eventually("gated passed", || {
         state(gated).state == JobState::Terminal(Outcome::Passed)
     });
@@ -412,7 +417,7 @@ jobs:
         state(unknown).failure_class,
         Some(sentinel_core::FailureClass::Preparation)
     );
-    assert!(summary_of(unknown).detail.contains("step 0 `if`"));
+    assert!(summary_of(unknown).detail.contains("step 1 `if`"));
 
     // The memory limit is an OOM, not a plain signal; the job timeout bounds
     // the steps and is a timeout, not a failed command.
@@ -444,7 +449,7 @@ jobs:
             .read(|c| dispatch::latest_attempt(c, tenant, job))
             .unwrap();
         attempt.is_some_and(|attempt| {
-            logs.tail(attempt, 0, 1000)
+            logs.tail(run, job, attempt, 0, 1000, None)
                 .map(|t| t.frames.iter().any(|f| !f.bytes.is_empty()))
                 .unwrap_or(false)
         })
@@ -557,13 +562,13 @@ jobs:
         compile_str(&orphan_yaml).unwrap(),
     )
     .unwrap();
-    let ids = store
+    let (orphan_run, ids) = store
         .writer()
         .write(move |tx| {
             let run = RunId::new();
             let ids = runs::create_run(tx, tenant, repo_id, run, &orphan_spec, UnixMillis::now())?;
             runs::resolve_image(tx, tenant, ids[0], DIGEST, "linux/amd64")?;
-            Ok(ids)
+            Ok((run, ids))
         })
         .unwrap();
     let orphan = ids[0];
@@ -661,7 +666,7 @@ jobs:
     );
     // What it printed before the crash reached the controller and the log
     // is complete; the spool and the marker are gone; nothing was re-run.
-    let tail = logs.tail(attempt, 0, 10).unwrap();
+    let tail = logs.tail(orphan_run, orphan, attempt, 0, 10, None).unwrap();
     assert!(tail.complete);
     assert_eq!(tail.frames.len(), 1);
     assert_eq!(tail.frames[0].bytes, b"printed before the crash\n");

@@ -215,6 +215,7 @@ struct Recorder {
     specs: Mutex<Vec<SpecRecord>>,
     log_acks: Mutex<Vec<(AttemptId, u64)>>,
     log_refusals: Mutex<Vec<AttemptId>>,
+    log_ends: Mutex<Vec<AttemptId>>,
     artifact_grants: Mutex<Vec<(AttemptId, String)>>,
     artifact_verdicts: Mutex<Vec<(AttemptId, String, session::ArtifactCode)>>,
 }
@@ -234,6 +235,7 @@ impl Recorder {
                 specs: Mutex::new(Vec::new()),
                 log_acks: Mutex::new(Vec::new()),
                 log_refusals: Mutex::new(Vec::new()),
+                log_ends: Mutex::new(Vec::new()),
                 artifact_grants: Mutex::new(Vec::new()),
                 artifact_verdicts: Mutex::new(Vec::new()),
             }),
@@ -299,6 +301,9 @@ impl Executor for Recorder {
     }
     fn log_refused(&self, attempt: AttemptId) {
         self.log_refusals.lock().unwrap().push(attempt);
+    }
+    fn log_ended(&self, attempt: AttemptId) {
+        self.log_ends.lock().unwrap().push(attempt);
     }
     fn artifact_granted(&self, attempt: AttemptId, name: &str) {
         self.artifact_grants
@@ -679,7 +684,9 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     // Log frames of a held attempt are acknowledged only once stored and
     // synced on the controller: what the acknowledgement covers is exactly
     // what a reader sees. A resend is acknowledged again without a second
-    // copy; a jump is refused; the end marker completes the log.
+    // copy; a jump is stored with its hole recorded; the end marker
+    // completes the log with the hole folded into the gaps.
+    let (run, job) = (build_attempt.run, build_attempt.job);
     let text = |seq: u64, s: &str| Frame {
         seq,
         step: 0,
@@ -691,32 +698,54 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     eventually("log acks", || {
         recorder.log_acks.lock().unwrap().last() == Some(&(attempt, 2))
     });
-    let tail = d.logs.tail(attempt, 0, 10).unwrap();
+    let tail = d.logs.tail(run, job, attempt, 0, 10, None).unwrap();
     assert_eq!(tail.frames.len(), 2);
     assert!(!tail.complete);
     reporter.log(attempt, &text(2, "two\n")).unwrap();
     eventually("duplicate acked", || {
         recorder.log_acks.lock().unwrap().len() == 3
     });
-    assert_eq!(d.logs.tail(attempt, 0, 10).unwrap().frames.len(), 2);
+    assert_eq!(
+        d.logs
+            .tail(run, job, attempt, 0, 10, None)
+            .unwrap()
+            .frames
+            .len(),
+        2
+    );
     reporter.log(attempt, &text(9, "nine\n")).unwrap();
-    eventually("jump refused", || {
-        recorder.log_refusals.lock().unwrap().as_slice() == [attempt]
+    eventually("jump stored", || {
+        recorder.log_acks.lock().unwrap().last() == Some(&(attempt, 9))
     });
-    // Frames for an attempt this worker does not hold are refused too.
+    // Frames for an attempt this worker does not hold are refused.
     let foreign = AttemptId::new();
     reporter.log(foreign, &text(1, "x")).unwrap();
     eventually("foreign refused", || {
-        recorder.log_refusals.lock().unwrap().len() == 2
+        recorder.log_refusals.lock().unwrap().as_slice() == [foreign]
     });
     assert!(matches!(
-        d.logs.tail(foreign, 0, 10),
+        d.logs.tail(run, job, foreign, 0, 10, None),
         Err(sentinel_store::Error::NotFound)
     ));
+    // An end below what was stored is refused; the end through the
+    // frontier completes the log and folds the hole into the gaps.
     reporter.log_end(attempt, 2, &[]).unwrap();
-    eventually("log complete", || {
-        d.logs.tail(attempt, 0, 10).unwrap().complete
+    eventually("short end refused", || {
+        recorder.log_refusals.lock().unwrap().as_slice() == [foreign, attempt]
     });
+    reporter.log_end(attempt, 9, &[]).unwrap();
+    eventually("log complete", || {
+        d.logs
+            .tail(run, job, attempt, 0, 10, None)
+            .unwrap()
+            .complete
+    });
+    assert_eq!(
+        d.logs.tail(run, job, attempt, 0, 10, None).unwrap().gaps,
+        vec![(3, 8)]
+    );
+    // Protocol 3: the end is durable but no LogEndAck exists to send.
+    assert!(recorder.log_ends.lock().unwrap().is_empty());
 
     // The worker reports its progress over the wire; the terminal report
     // frees the capacity, queues `test` and wakes the dispatcher — no
@@ -1108,5 +1137,60 @@ fn an_old_protocol_session_cannot_publish_artifacts() {
     assert!(!reporter.artifacts());
     assert!(reporter.artifact_begin(AttemptId::new(), "x").is_err());
     assert!(reporter.artifact_absent(AttemptId::new(), "x", 0).is_err());
+    process.stop().unwrap();
+}
+
+#[test]
+fn protocol5_acknowledges_the_durable_log_end() {
+    let d = deployment();
+    let secret = d.enrollment(60_000);
+    let (recorder, offers) = Recorder::new();
+    let id = WorkerId::new();
+    let process = WorkerProcess::start_version(
+        &d,
+        Identity::generate("w").unwrap(),
+        id,
+        Some(secret),
+        Arc::clone(&recorder),
+        5,
+    );
+    process.wait_for("Connected", 1);
+
+    let (run, _) = d.run(PIPELINE);
+    let offer = offers.recv_timeout(Duration::from_secs(5)).unwrap().0;
+    eventually("attempt held", || {
+        d.store
+            .read(|c| dispatch::held_by(c, id))
+            .unwrap()
+            .iter()
+            .any(|h| h.attempt == offer.attempt && h.acknowledged)
+    });
+    let reporter = recorder.reporter.lock().unwrap().clone().unwrap();
+    assert_eq!(reporter.protocol(), 5);
+    reporter
+        .log(
+            offer.attempt,
+            &Frame {
+                seq: 1,
+                step: 0,
+                stream: Stream::Stdout,
+                bytes: b"a\n".to_vec(),
+            },
+        )
+        .unwrap();
+    eventually("frame acked", || {
+        recorder.log_acks.lock().unwrap().last() == Some(&(offer.attempt, 1))
+    });
+    reporter.log_end(offer.attempt, 1, &[]).unwrap();
+    // LogEndAck crosses the wire only after the end marker is durable.
+    eventually("end acknowledged", || {
+        recorder.log_ends.lock().unwrap().as_slice() == [offer.attempt]
+    });
+    assert!(
+        d.logs
+            .tail(run, offer.job, offer.attempt, 0, 10, None)
+            .unwrap()
+            .complete
+    );
     process.stop().unwrap();
 }

@@ -360,25 +360,34 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
         ("GET", ["api", "v1", "attempts", attempt, "logs"]) => {
             let who = identify(state, request, false)?;
             let attempt: AttemptId = id(attempt, "attempt")?;
-            state
+            let (run, job) = state
                 .store
                 .read(|c| {
                     let job = lookup::attempt_job(c, attempt)?;
                     let run = lookup::job_run(c, job)?;
                     let repo = lookup::run_repo(c, run)?;
-                    authz::require_repo(c, who.principal, repo, Permissions::READ)
+                    authz::require_repo(c, who.principal, repo, Permissions::READ)?;
+                    Ok((run, job))
                 })
                 .map_err(store_error)?;
             let after: u64 = query_param(query, "after")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
             let limit = page_size(query_param(query, "limit").and_then(|v| v.parse().ok()));
+            let step: Option<u32> = query_param(query, "step").and_then(|v| v.parse().ok());
             let wait = query_param(query, "wait").is_some_and(|v| v == "1" || v == "true");
             let deadline = std::time::Instant::now() + LOG_WAIT;
             let tail = loop {
                 let tail = state
                     .logs
-                    .tail(attempt, after, limit)
+                    .tail(run, job, attempt, after, limit, step)
+                    .or_else(|e| match e {
+                        // A pre-D04 flat log file is the only fallback.
+                        sentinel_store::Error::NotFound => {
+                            state.logs.tail_legacy(attempt, after, limit, step)
+                        }
+                        e => Err(e),
+                    })
                     .map_err(store_error)?;
                 if !wait || !tail.frames.is_empty() || tail.complete {
                     break tail;

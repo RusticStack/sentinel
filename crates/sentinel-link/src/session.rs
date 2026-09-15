@@ -263,6 +263,11 @@ pub enum ServerMessage {
     LogRefused {
         attempt: [u8; 16],
     },
+    /// Protocol 5. The attempt's end marker is durable on the controller;
+    /// the worker may drop the spool it replayed from.
+    LogEndAck {
+        attempt: [u8; 16],
+    },
     /// Protocol 2 only; follows Context, before spec bytes. Never persisted.
     Source {
         attempt: [u8; 16],
@@ -660,8 +665,19 @@ pub trait SessionHandler: Send + Sync {
     /// A log frame of an attempt this worker holds. Acknowledged only once
     /// durable; a frame out of sequence or past the size cap is refused.
     fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict;
-    /// The attempt's log is complete through `last_seq`.
-    fn log_end(&self, worker: WorkerId, attempt: AttemptId, last_seq: u64, gaps: &[(u64, u64)]);
+    /// The attempt's log is complete through `last_seq`. `Acked` means the
+    /// end marker is durable; the session answers `LogEndAck` when the
+    /// negotiated protocol carries it. The default refuses: nothing was
+    /// recorded.
+    fn log_end(
+        &self,
+        _worker: WorkerId,
+        _attempt: AttemptId,
+        _last_seq: u64,
+        _gaps: &[(u64, u64)],
+    ) -> LogVerdict {
+        LogVerdict::Refused
+    }
     /// The worker found the attempt in its leftovers after a restart.
     fn abandoned(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
     /// Protocol 4. Begin publishing artifact `name` of a held attempt:
@@ -1101,7 +1117,17 @@ impl WorkerSession {
                         return Err(Error::Protocol("gap list"));
                     }
                     let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    handler.log_end(worker, id, last_seq, &gaps);
+                    match handler.log_end(worker, id, last_seq, &gaps) {
+                        // Protocol 5 names the durable-end boundary;
+                        // earlier versions sent nothing here.
+                        LogVerdict::Acked(_) if self.admitted.negotiated.protocol.0 >= 5 => {
+                            self.tx.send(&ServerMessage::LogEndAck { attempt })?;
+                        }
+                        LogVerdict::Acked(_) => {}
+                        LogVerdict::Refused => {
+                            self.tx.send(&ServerMessage::LogRefused { attempt })?;
+                        }
+                    }
                 }
                 ClientMessage::Abandon { attempt, fence } => {
                     let attempt =
@@ -1308,6 +1334,7 @@ pub fn connect(
         | ServerMessage::Source { .. }
         | ServerMessage::LogAck { .. }
         | ServerMessage::LogRefused { .. }
+        | ServerMessage::LogEndAck { .. }
         | ServerMessage::ArtifactGrant { .. }
         | ServerMessage::ArtifactVerdict { .. } => Err(Error::Protocol("message before welcome")),
     }
@@ -1373,6 +1400,12 @@ impl Reporter {
             stream: frame.stream as u8,
             bytes: frame.bytes.clone(),
         })
+    }
+
+    /// The protocol this session negotiated; the log pipe uses it to
+    /// know whether `LogEnd` is answered by `LogEndAck`.
+    pub fn protocol(&self) -> u16 {
+        self.protocol
     }
 
     /// The attempt was in this worker's leftovers after a restart.
@@ -1489,6 +1522,9 @@ pub trait Executor: Send + Sync {
     fn log_acked(&self, attempt: AttemptId, through: u64);
     /// The controller stores no more frames of this attempt.
     fn log_refused(&self, attempt: AttemptId);
+    /// Protocol 5. The attempt's end marker is durable on the controller:
+    /// the spool may be dropped.
+    fn log_ended(&self, _attempt: AttemptId) {}
     /// The artifact named in `artifact_begin` was granted; the executor may
     /// stream its files.
     fn artifact_granted(&self, _attempt: AttemptId, _name: &str) {}
@@ -1631,6 +1667,11 @@ impl Link {
             ServerMessage::LogRefused { attempt } => {
                 let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
                 executor.log_refused(attempt);
+                Ok(false)
+            }
+            ServerMessage::LogEndAck { attempt } => {
+                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                executor.log_ended(attempt);
                 Ok(false)
             }
             ServerMessage::ArtifactGrant { attempt, name } => {

@@ -39,7 +39,7 @@ The container's main process is a keepalive (`/bin/sh` loop that exits on `TERM`
 
 ## The attempt
 
-`attempt::run` is the lifecycle the controller's state machine expects, reported under the attempt's fence: `PreparationStarted` → workspace, checkout, image pull, container start → `StepsStarted` → each step in order → `FinalizationStarted` → **artifact capture while the workspace still exists** → teardown → durable log completion → `Passed` or `Failed(class)`:
+`attempt::run` is the lifecycle the controller's state machine expects, reported under the attempt's fence: `PreparationStarted` → workspace, checkout, image pull, container start → `StepsStarted` → each step in order → `FinalizationStarted` → **artifact capture while the workspace still exists** → teardown → durable log completion (the spool is kept until the controller's `LogEndAck` on protocol 5, or the `LogEnd` send on older links — [logs](logs.md)) → `Passed` or `Failed(class)`:
 
 | What happened | Class |
 |---|---|

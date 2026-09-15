@@ -1453,12 +1453,12 @@ fn tenant_from(bytes: Vec<u8>) -> Result<TenantId> {
 /// the store's durable roles run on Linux and directory fsync is not part
 /// of the portable surface.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     File::open(dir)?.sync_all()?;
     Ok(())
 }
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> Result<()> {
+pub(crate) fn sync_dir(_dir: &Path) -> Result<()> {
     Ok(())
 }
 

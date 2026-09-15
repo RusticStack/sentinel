@@ -40,7 +40,13 @@ struct PipeState {
     sent: u64,
     unsynced: u32,
     ended: bool,
+    /// `LogEnd` was handed to the current session.
     end_sent: bool,
+    /// The controller answered `LogEndAck` (protocol 5): the end marker
+    /// is durable there and the spool may be dropped.
+    end_acked: bool,
+    /// The last attached session's protocol answers `LogEnd`.
+    end_acked_protocol: bool,
     refused: bool,
 }
 
@@ -69,6 +75,8 @@ impl LogPipe {
                 unsynced: 0,
                 ended: false,
                 end_sent: false,
+                end_acked: false,
+                end_acked_protocol: false,
                 refused: false,
             }),
             progress: Condvar::new(),
@@ -136,10 +144,23 @@ impl LogPipe {
         self.progress.notify_all();
     }
 
-    /// A session is live: resend from the last acknowledgement.
+    /// Protocol 5: the controller's end marker is durable.
+    pub fn end_acked(&self) {
+        let mut st = self.lock();
+        st.end_acked = true;
+        self.progress.notify_all();
+    }
+
+    /// A session is live: resend from the last acknowledgement. The end
+    /// marker goes out again too — it was only ever durable once the
+    /// controller said so.
     pub fn attached(&self, reporter: Reporter) {
         let mut st = self.lock();
+        st.end_acked_protocol = reporter.protocol() >= 5;
         st.reporter = Some(reporter);
+        if !st.end_acked {
+            st.end_sent = false;
+        }
         if let Some(spool) = st.spool.as_mut() {
             let acked = spool.acked();
             let _ = spool.rewind(acked);
@@ -201,7 +222,9 @@ impl Output for LogPipe {
         }
         self.pump(&mut st);
         let deadline = Instant::now() + LOG_FLUSH_TIMEOUT;
-        while !st.end_sent && !st.refused {
+        // Protocol 5 keeps the spool until the controller's end marker is
+        // durable (`LogEndAck`); earlier sessions keep the send boundary.
+        while !(st.end_acked || (st.end_sent && !st.end_acked_protocol)) && !st.refused {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
@@ -213,7 +236,7 @@ impl Output for LogPipe {
                 .0;
             self.pump(&mut st);
         }
-        if st.end_sent
+        if (st.end_acked || (st.end_sent && !st.end_acked_protocol))
             && let Some(spool) = st.spool.take()
         {
             let _ = spool.remove();
