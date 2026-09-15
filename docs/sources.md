@@ -135,6 +135,11 @@ sentinel admin source revoke --data-dir "$DATA" --actor usr_... --repo rep_... -
 sentinel admin source hook-token --data-dir "$DATA" --actor usr_... --repo rep_...
 sentinel admin source hook-token --data-dir "$DATA" --actor usr_... --repo rep_... --revoke
 
+# Opt-in ref polling (G07); the first poll records a baseline and admits nothing
+sentinel admin source poll --data-dir "$DATA" --actor usr_... --repo rep_... \
+  --interval 60s --refs 'refs/heads/main,refs/tags/v*'
+sentinel admin source poll --data-dir "$DATA" --actor usr_... --repo rep_... --disable
+
 # GitHub App lifecycle (platform administration)
 sentinel admin source refresh-installation --data-dir "$DATA" --actor usr_... \
   --external-id 12345678 --expected 0
@@ -147,7 +152,9 @@ sentinel admin source remove-installation --data-dir "$DATA" --actor usr_... \
 `sentinel admin intake list --data-dir "$DATA" --repo rep_… [--state …]` shows
 the newest event deliveries and `admin intake purge --older-than 7d` retires
 settled ones ([intake](intake.md)). The `post-receive` hook and its relay live
-in `examples/hooks/`. A GitHub App installation is bound with
+in `examples/hooks/`, and `admin source poll` opts a bound repository into
+`git ls-remote` observation where no hook can be installed
+([intake](intake.md#ref-polling-g07)). A GitHub App installation is bound with
 `admin source bind-installation`; its webhook secret is the operator's to set
 in `<data_dir>/github-webhook.json`.
 

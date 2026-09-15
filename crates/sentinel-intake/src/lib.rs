@@ -13,9 +13,11 @@
 //! explicit outcome an operator and G04's Checks publisher can read.
 pub mod ingest;
 pub mod lane;
+pub mod poll;
 pub mod resolve;
 pub mod source;
 
 pub use ingest::{Error, Github, Ingested};
 pub use lane::{Batch, Lane, Settled, Waker};
+pub use poll::{GitLister, ListRequest, Lister, Notice, Poll};
 pub use resolve::{Fetch, FileRequest, GitFetch, Outcome, Resolver};

@@ -103,6 +103,17 @@ pub fn bind(
     if changed != 1 {
         return Err(Error::Conflict);
     }
+    // A new binding may point at a different remote; poll cursors recorded
+    // against the old one would fabricate transitions, so the next poll
+    // rebuilds its baseline.
+    tx.execute(
+        "UPDATE poll_configs SET baseline_ms=NULL,updated_ms=?2 WHERE repo_id=?1",
+        params![update.repo.as_bytes(), now.0],
+    )?;
+    tx.execute(
+        "DELETE FROM poll_observations WHERE repo_id=?1",
+        [update.repo.as_bytes()],
+    )?;
     let recorded = actor.or_else(|| authority.actor());
     let recorded = recorded.map(|a| *a.as_bytes());
     tx.execute("INSERT INTO source_audit(tenant_id,repo_id,version,actor,action,at_ms) VALUES(?1,?2,?3,?4,'bind',?5)",params![tenant.as_bytes(),update.repo.as_bytes(),version as i64,recorded,now.0])?;
@@ -132,6 +143,15 @@ pub fn revoke(
     // A revoked binding's hook secret must not keep accepting events.
     tx.execute(
         "DELETE FROM source_intake_tokens WHERE repo_id = ?1",
+        [repo.as_bytes()],
+    )?;
+    // Nor may its poll configuration keep observing the remote.
+    tx.execute(
+        "DELETE FROM poll_configs WHERE repo_id = ?1",
+        [repo.as_bytes()],
+    )?;
+    tx.execute(
+        "DELETE FROM poll_observations WHERE repo_id = ?1",
         [repo.as_bytes()],
     )?;
     let recorded = actor.or_else(|| authority.actor());

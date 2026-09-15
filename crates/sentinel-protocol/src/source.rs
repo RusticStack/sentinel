@@ -28,7 +28,7 @@ mod tests {
             trust: "127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n".into(),
         };
         assert!(remote(&b.remote).is_some(), "remote");
-        assert!(valid_ref("refs/heads/main"), "ref");
+        assert!(valid_ref_pattern("refs/heads/main"), "ref");
         assert!(b.validate(), "validate");
     }
 
@@ -97,7 +97,7 @@ impl Binding {
         remote(&self.remote).is_some()
             && !self.allowed_refs.is_empty()
             && self.allowed_refs.len() <= MAX_REFS
-            && self.allowed_refs.iter().all(|r| valid_ref(r))
+            && self.allowed_refs.iter().all(|r| valid_ref_pattern(r))
             && !self.pipeline_path.is_empty()
             && self.pipeline_path.len() <= 1024
             && !self.pipeline_path.starts_with('/')
@@ -115,16 +115,16 @@ impl Binding {
     }
 
     pub fn allows(&self, reference: &str) -> bool {
-        valid_ref(reference)
+        valid_ref_pattern(reference)
             && !reference.contains('*')
-            && self.allowed_refs.iter().any(|r| {
-                r.strip_suffix('*')
-                    .map_or(r == reference, |prefix| reference.starts_with(prefix))
-            })
+            && self.allowed_refs.iter().any(|r| ref_matches(r, reference))
     }
 }
 
-fn valid_ref(r: &str) -> bool {
+/// A ref selector as bindings and ref polling share it: an exact ref under
+/// `refs/heads/` or `refs/tags/`, or one trailing `*` making the rest a
+/// prefix (`refs/heads/feature-*`). Anything else is not a pattern.
+pub fn valid_ref_pattern(r: &str) -> bool {
     (r.starts_with("refs/heads/") || r.starts_with("refs/tags/"))
         && r.len() <= 1024
         && !r.ends_with('/')
@@ -138,6 +138,14 @@ fn valid_ref(r: &str) -> bool {
         && !r
             .bytes()
             .any(|b| b <= 32 || b == 127 || b"~^:?\\[".contains(&b))
+}
+
+/// Does `pattern` — a valid ref pattern — cover `reference`? An exact match,
+/// or a prefix match when the pattern ends in `*`.
+pub fn ref_matches(pattern: &str, reference: &str) -> bool {
+    pattern
+        .strip_suffix('*')
+        .map_or(pattern == reference, |prefix| reference.starts_with(prefix))
 }
 
 /// Exact deployment-allowlist key: transport plus hostname and explicit port.

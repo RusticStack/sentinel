@@ -13,7 +13,8 @@ use crate::{
 use sentinel_core::{InstallationId, RepoId, TenantId, UnixMillis, UserId};
 use sentinel_protocol::source::{Binding, Credential, MAX_SOURCE_BYTES};
 use sentinel_store::{
-    MASTER_KEY_FILE, auth, intake, registration, registration::Authority, sources, sources_forge,
+    MASTER_KEY_FILE, auth, intake, poll, registration, registration::Authority, sources,
+    sources_forge,
 };
 use serde::Deserialize;
 use std::{io::Read, path::Path, sync::Arc};
@@ -245,17 +246,21 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
         }
         SourceCommand::Show { repo: r } => {
             let repo = repo(r)?;
-            let (m, hook_token) = store
+            let (m, hook_token, polling) = store
                 .read(|c| {
                     Ok((
                         sources::metadata_trusted(c, repo)?,
                         intake::token_issued(c, repo)?,
+                        poll::of_repo(c, repo)?,
                     ))
                 })
                 .map_err(denied)?;
+            let polling = polling.map(|p| {
+                serde_json::json!({"interval_ms":p.interval_ms,"refs":p.refs,"next_poll_ms":p.next_poll_ms,"failures":p.failures,"last_error":p.last_error,"baselined":p.baselined})
+            });
             println!(
                 "{}",
-                serde_json::json!({"repo":repo.to_string(),"binding":m.binding,"version":m.version,"revoked":m.revoked,"hook_token_ms":hook_token.map(|t|t.0),"forge":m.forge.map(|(i,r)|serde_json::json!({"installation":i.to_string(),"repository_id":r}))})
+                serde_json::json!({"repo":repo.to_string(),"binding":m.binding,"version":m.version,"revoked":m.revoked,"hook_token_ms":hook_token.map(|t|t.0),"poll":polling,"forge":m.forge.map(|(i,r)|serde_json::json!({"installation":i.to_string(),"repository_id":r}))})
             );
         }
         SourceCommand::Revoke { repo: r, expected } => {
@@ -289,6 +294,49 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                 // The one presentation: only the secret reaches stdout, so a
                 // shell can redirect it without a parser in between.
                 println!("{}", intake::hook_token_text(&secret));
+            }
+        }
+        SourceCommand::Poll {
+            repo: r,
+            interval,
+            refs,
+            disable,
+        } => {
+            let repo = repo(r)?;
+            if *disable {
+                store
+                    .writer()
+                    .write(move |tx| poll::disable(tx, host, Some(actor), repo, now))
+                    .map_err(denied)?;
+                println!(
+                    "{}",
+                    serde_json::json!({"repo":repo.to_string(),"polling":false})
+                );
+            } else {
+                let interval = interval
+                    .as_deref()
+                    .ok_or_else(|| fail("--interval is required to enable polling"))?;
+                let interval_ms = admin::duration_ms(interval, poll::MAX_INTERVAL_MS)?;
+                let refs: Vec<String> = refs
+                    .as_deref()
+                    .ok_or_else(|| fail("--refs is required to enable polling"))?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .map(String::from)
+                    .collect();
+                let spec = poll::Spec {
+                    interval_ms,
+                    refs: refs.clone(),
+                };
+                store
+                    .writer()
+                    .write(move |tx| poll::configure(tx, host, Some(actor), repo, &spec, now))
+                    .map_err(|e| fail(&format!("poll configuration refused: {e}")))?;
+                println!(
+                    "{}",
+                    serde_json::json!({"repo":repo.to_string(),"polling":true,"interval_ms":interval_ms,"refs":refs})
+                );
             }
         }
         SourceCommand::RefreshInstallation {

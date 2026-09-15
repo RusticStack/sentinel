@@ -23,6 +23,7 @@ pub mod local_auth;
 pub mod logs;
 pub mod lookup;
 pub mod mfa;
+pub mod poll;
 pub mod provenance;
 pub mod registration;
 pub mod runs;

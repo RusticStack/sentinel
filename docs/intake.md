@@ -142,6 +142,74 @@ install hooks into repositories. Providers with their own webhooks (Gitea,
 Forgejo, GitLab) translate into the same generic route; native payloads are not
 accepted here, and G08 verifies those fixtures.
 
+## Ref polling (G07)
+
+Repositories whose forge has no delivery mechanism — or where installing a
+hook is not an option — can opt into bounded `git ls-remote` polling:
+
+```sh
+sentinel admin source poll --actor usr_… --repo rep_… \
+    --interval 60s --refs 'refs/heads/main,refs/tags/v*'
+```
+
+The configuration is tenant-owned and requires a live binding: the remote,
+credential and trust the poll uses are exactly the binding's, issued per poll
+the same way resolution issues them. Ref selectors follow the binding's own
+rules — exact refs under `refs/heads/` or `refs/tags/`, or one trailing
+wildcard. Polling refs outside the binding's `allowed_refs` is permitted, but
+the deliveries it produces settle `failed:ref_not_allowed`, exactly as a hook
+reporting the same refs would.
+
+**Initial discovery records a baseline and admits nothing**: enabling polling
+never replays history. From then on, each advertisement is diffed against the
+durable cursor and every transition becomes an ordinary `poll`-provider
+`ref_update` delivery through the same `accept` a hook uses — validation,
+dedup, `no_trigger` matching, resolution, dispatch, provenance and Checks are
+unchanged:
+
+- a ref that moved (including a force-push or a rewind) admits `old → new`;
+- a newly advertised ref admits `zero → new`;
+- a ref that disappeared admits `old → zero`, which resolves to
+  `ignored:ref_deleted`;
+- an annotated tag is tracked by its tag object id with the peeled commit
+  recorded alongside — retagging is a move, and resolution peels the tag to
+  its commit for checkout exactly as a hook-reported tag does.
+
+The cursor and the deliveries it produced commit in one transaction, and a
+transition's delivery ID is the digest of `(ref, old, new)`: a crash
+mid-flight replays the advertisement, and the replay is a no-op wherever the
+delivery already landed. Nothing is acknowledged from memory.
+
+**Budgets.** Each `ls-remote` runs under the same discipline as every Git
+call — no prompts, no host configuration, a process group with a deadline
+(20 s by default), credential helper files that exist only for the call, and
+bounded, redacted diagnostics. Its output is byte- and count-capped (4,096
+refs); a remote answering more is a bounded refusal, not a truncation. The
+lane polls at most 8 due repositories per pass on a 250 ms tick — one thread,
+no fan-out per ref — so a slow or hostile remote consumes only its own
+schedule. Intervals run 10 s–24 h; a stable per-repository jitter of up to a
+quarter of the interval, derived from the repository ID, keeps same-interval
+repositories from synchronizing, including after a restart, since the
+schedule is durable. A failed poll records `failures` and `last_error` and
+backs off exponentially from the interval to a 15-minute ceiling; the next
+success clears it.
+
+**Lifecycle.** `admin source show` reports the configuration and schedule;
+`admin source poll --repo rep_… --disable` removes it. Rebinding (a possibly
+different remote) and changing the ref selection both rebuild the baseline —
+stale cursors cannot fabricate deletions — and revoking the binding removes
+the configuration outright; a configuration that outlives its binding is
+dropped the next time the lane sees it, never polled again.
+
+**What polling is not.** An advertisement is a point-in-time snapshot: a push
+that lands and is superseded between polls is never observed, so polling is
+not an every-push guarantee and it is not the scheduler's dispatch clock —
+the intake lane remains the only clock that turns deliveries into runs. Where
+a forge can deliver events, prefer them for latency; polling exists so bound
+repositories without one still get observed. Its cost is its own lane's and
+shows up as `poll_observed` / `poll_failed` log events, measurable
+independently of the intake lane.
+
 ## Resolution
 
 The lane is one thread in the controller. It drains due deliveries in batches
@@ -225,6 +293,7 @@ never one a run's provenance depends on.
 | `<data_dir>/source-destinations.json` | the deployment's approved authorities ([sources](sources.md)); intake refuses a repository whose binding is outside it by construction |
 | `<data_dir>/master.key` | seals source credentials ([sources](sources.md)); intake tokens are digests and need no key |
 | `<data_dir>/intake-work/` | per-delivery scratch repositories for phase two; discarded and recreated on start |
+| `<data_dir>/poll-work/` | per-repository scratch for poll credential helpers; discarded and recreated on start |
 | `<data_dir>/github-app.json` | the App that authorizes source access **and** publishes Checks ([checks](checks.md)) |
 
 ## Verification
@@ -257,6 +326,20 @@ never one a run's provenance depends on.
 - `crates/sentinel-intake/tests/flow.rs`: both ingest paths over a real store,
   including signature/tamper refusals, pull-request terms, and lane resolution
   on a wake and on the idle tick.
+- `crates/sentinel-store/tests/poll.rs`: opt-in configuration under tenant
+  authority and its bounds, the baseline-then-diff protocol, deterministic
+  delivery identities across replays, creation/move/deletion transitions,
+  annotated-tag tracking, the overloaded-queue deferral keeping its cursor,
+  and rebind/revoke cleanup.
+- `crates/sentinel-git/tests/ls_remote.rs` (Linux, needs `git`): real
+  `ls-remote` exchanges — heads and tags with annotated peels, oversized
+  advertisements, unreachable and option-shaped remotes.
+- `crates/sentinel-intake/tests/poll.rs`: the lane end to end — an observed
+  move becoming a delivery that dispatches a run, remote failures backing
+  the schedule off, and a vanished binding retiring the configuration.
+- `crates/sentinel-intake/tests/dispatch.rs` (above) also polls the real
+  loopback remote through `GitLister`: baseline, transition, delivery,
+  dispatch and provenance with no injected pieces.
 - `crates/sentinel-api/tests/api.rs`: the routes over loopback — unscoped
   secrets, size limits, dedup, conflicts, ping, unbound and unsupported
   events, and pull-request actions.

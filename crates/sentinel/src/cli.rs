@@ -245,6 +245,21 @@ pub enum SourceCommand {
         #[arg(long)]
         revoke: bool,
     },
+    /// Opt this repository into bounded `git ls-remote` ref polling (G07); the
+    /// first poll only records the baseline
+    Poll {
+        #[arg(long)]
+        repo: String,
+        /// Poll interval such as 60s, 5m or 1h (10s–24h)
+        #[arg(long, value_name = "DURATION")]
+        interval: Option<String>,
+        /// Ref selectors, comma-separated: exact refs or a trailing wildcard (refs/heads/*)
+        #[arg(long, value_name = "PATTERNS")]
+        refs: Option<String>,
+        /// Stop polling this repository
+        #[arg(long)]
+        disable: bool,
+    },
     /// Fetch a fresh authenticated GitHub App installation snapshot
     RefreshInstallation {
         #[arg(long)]

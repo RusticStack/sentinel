@@ -26,7 +26,7 @@ mod unix;
 #[cfg(unix)]
 pub use unix::{
     CHECKOUT_TIMEOUT, Checkout, Credential, FetchedFile, MAX_PATH_BYTES, Output, checkout,
-    checkout_authorized, file_at, file_at_merge, run,
+    checkout_authorized, file_at, file_at_merge, ls_remote, run,
 };
 
 #[cfg(not(unix))]
@@ -35,7 +35,7 @@ mod stub;
 #[cfg(not(unix))]
 pub use stub::{
     CHECKOUT_TIMEOUT, Checkout, Credential, FetchedFile, Output, checkout, checkout_authorized,
-    file_at, file_at_merge, run,
+    file_at, file_at_merge, ls_remote, run,
 };
 
 use std::fmt;
@@ -49,6 +49,18 @@ pub struct Merge<'a> {
     pub r#ref: &'a str,
     /// The delivered head commit, as a full object id.
     pub head: &'a str,
+}
+
+/// One head or tag a remote advertises to [`ls_remote`], with the commit an
+/// annotated tag peels to recorded alongside its tag object id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefTip {
+    /// The advertised ref, e.g. `refs/heads/main`.
+    pub name: String,
+    /// The object id the ref points at — a tag object for an annotated tag.
+    pub oid: String,
+    /// The peeled commit (`name^{}` line) an annotated tag advertises.
+    pub peeled: Option<String>,
 }
 
 #[derive(Debug)]

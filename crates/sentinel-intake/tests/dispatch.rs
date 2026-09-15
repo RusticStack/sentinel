@@ -102,6 +102,7 @@ impl Drop for Server {
 struct Fixture {
     dir: tempfile::TempDir,
     store: Arc<Store>,
+    key: Arc<Key>,
     resolver: Resolver,
     tenant: TenantId,
     repo: RepoId,
@@ -361,6 +362,7 @@ fn fixture() -> Fixture {
     Fixture {
         dir,
         store,
+        key,
         resolver,
         tenant,
         repo,
@@ -1042,4 +1044,109 @@ fn a_revoked_binding_settles_with_a_reason() {
         }
     );
     assert_eq!(row.reason.as_deref(), Some("binding_revoked"));
+}
+
+/// G07 over the real remote: `git ls-remote` against the loopback server
+/// discovers the baseline, a pushed commit becomes a `poll` delivery, and it
+/// resolves through the same G03 path a hook delivery takes.
+#[test]
+fn a_polled_ref_observation_becomes_a_real_dispatch() {
+    if !prerequisites() {
+        return;
+    }
+    let f = fixture();
+    let repo = f.repo;
+    f.store
+        .writer()
+        .write(move |tx| {
+            sentinel_store::poll::configure(
+                tx,
+                sentinel_store::registration::Authority::HostLocal,
+                None,
+                repo,
+                &sentinel_store::poll::Spec {
+                    interval_ms: 10_000,
+                    refs: vec![REF.into()],
+                },
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+    let work = f.dir.path().join("poll-work");
+    let poller = sentinel_intake::Poll::start(
+        Arc::clone(&f.store),
+        Some(Arc::clone(&f.key)),
+        None,
+        Arc::new(sentinel_intake::GitLister),
+        work,
+        sentinel_intake::poll::Config {
+            idle: Duration::from_millis(10),
+            ..sentinel_intake::poll::Config::default()
+        },
+        |_| {},
+    )
+    .unwrap();
+    // The first real ls-remote only establishes the baseline.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let baselined = loop {
+        let done = f
+            .store
+            .read(|c| {
+                sentinel_store::poll::of_repo(c, repo).map(|c| c.is_some_and(|c| c.baselined))
+            })
+            .unwrap();
+        if done {
+            break true;
+        }
+        if std::time::Instant::now() > deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(baselined, "the first poll never recorded a baseline");
+    let deliveries = |f: &Fixture| {
+        f.store
+            .read(|c| intake::list(c, f.tenant, f.repo, None, 50))
+            .unwrap()
+    };
+    assert!(deliveries(&f).is_empty(), "the baseline admits nothing");
+
+    // The remote moves; the next poll admits the transition as a delivery.
+    let repo_git = Repo {
+        git: f.dir.path().join("repo"),
+    };
+    let head = repo_git.commit("three", &[(".sentinel.yml", &pipeline("[push]"))]);
+    f.store
+        .writer()
+        .write(move |tx| sentinel_store::poll::schedule(tx, repo, 0, 0, None, UnixMillis::now()))
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let delivery = loop {
+        if let Some(d) = deliveries(&f).into_iter().next() {
+            break d;
+        }
+        assert!(std::time::Instant::now() < deadline, "no poll delivery");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(delivery.provider, "poll");
+    assert!(delivery.external_id.starts_with("poll:"));
+    assert_eq!(delivery.ref_name.as_deref(), Some(REF));
+    assert_eq!(delivery.new_sha.as_deref(), Some(head.as_str()));
+
+    // Validate and resolve exactly as the intake lane would: the delivery
+    // produces a real run whose spec pins the polled revision.
+    let delivery = f.validate(delivery.id);
+    assert_eq!(delivery.state, State::Ready);
+    let (outcome, delivery) = f.resolve(delivery.id);
+    let Outcome::Dispatched { run } = outcome else {
+        panic!("expected a dispatch, got {outcome:?}");
+    };
+    assert_eq!(delivery.state, State::Dispatched);
+    let spec = f.spec_of(run);
+    assert_eq!(spec.source.sha, head);
+    assert_eq!(spec.source.repo, f.remote);
+    let recorded = f.provenance_of(run);
+    assert_eq!(recorded.provider.as_deref(), Some("poll"));
+    assert_eq!(recorded.new_sha.as_deref(), Some(head.as_str()));
+    drop(poller);
 }

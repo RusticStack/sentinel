@@ -560,6 +560,113 @@ pub fn file_at_merge(
     Ok(FetchedFile { commit, bytes })
 }
 
+/// Advertise `remote`'s heads and tags without fetching anything — the ref
+/// poller's whole view of a remote. `dir` is scratch only: credential
+/// helpers live next to it for the duration of the one command, and Git's
+/// own configuration is ignored as everywhere else. Output and the ref
+/// count are both capped; an annotated tag arrives as its object id with the
+/// peeled commit recorded on the same tip.
+pub fn ls_remote(
+    dir: &Path,
+    remote: &str,
+    access: Option<&Access>,
+    max_refs: usize,
+    timeout: Duration,
+) -> Result<Vec<crate::RefTip>> {
+    if remote.starts_with('-') {
+        return Err(Error::Preparation("repository looks like an option".into()));
+    }
+    if let Some(access) = access
+        && (!access.validate(UnixMillis::now().0) || access.binding.remote != remote)
+    {
+        return Err(Error::Preparation("source access refused".into()));
+    }
+    fs::create_dir_all(dir)?;
+    let deadline = Instant::now() + timeout;
+    let private = access.map(|a| Private::install(dir, a)).transpose()?;
+    let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
+    let mut cmd = git(dir);
+    if let Some(private) = &private {
+        private.configure(&mut cmd);
+    }
+    // `--heads --tags` keeps the advertisement to the refs a binding can
+    // name; `--` keeps the remote itself unambiguous as an argument.
+    cmd.args(["ls-remote", "--heads", "--tags", "--", remote]);
+    let cap = max_refs.min(65_536).saturating_mul(1_200);
+    let output = run_capped(cmd, deadline, "git ls-remote", Some(cap))?;
+    drop(private);
+    if !output.success() {
+        let mut excerpt = output.stderr_excerpt();
+        for secret in &secrets {
+            excerpt = excerpt.replace(secret, "[redacted]");
+        }
+        return Err(Error::Preparation(format!(
+            "git ls-remote failed: {excerpt}"
+        )));
+    }
+    parse_tips(&output.stdout, max_refs)
+}
+
+/// `oid<TAB>ref` lines, with `<ref>^{}` lines folding onto their base ref.
+/// Anything that is not that shape is not an ls-remote answer.
+fn parse_tips(out: &[u8], max_refs: usize) -> Result<Vec<crate::RefTip>> {
+    let mut tips: Vec<crate::RefTip> = Vec::new();
+    let mut peeled: Vec<crate::RefTip> = Vec::new();
+    for line in out.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(line) else {
+            return Err(Error::Preparation("unexpected ls-remote output".into()));
+        };
+        let Some((oid, name)) = line.split_once('\t') else {
+            return Err(Error::Preparation("unexpected ls-remote output".into()));
+        };
+        if !valid_sha(oid) {
+            return Err(Error::Preparation("unexpected ls-remote output".into()));
+        }
+        let tip = if let Some(base) = name.strip_suffix("^{}") {
+            crate::RefTip {
+                name: base.to_owned(),
+                oid: oid.to_owned(),
+                peeled: Some(oid.to_owned()),
+            }
+        } else {
+            crate::RefTip {
+                name: name.to_owned(),
+                oid: oid.to_owned(),
+                peeled: None,
+            }
+        };
+        if !advertised(&tip.name) {
+            return Err(Error::Preparation("unexpected ls-remote output".into()));
+        }
+        if tip.peeled.is_some() {
+            peeled.push(tip);
+        } else {
+            tips.push(tip);
+        }
+    }
+    if tips.len() > max_refs {
+        return Err(Error::TooLarge("git ls-remote"));
+    }
+    for peel in peeled {
+        if let Some(tip) = tips.iter_mut().find(|t| t.name == peel.name) {
+            tip.peeled = peel.peeled;
+        }
+    }
+    Ok(tips)
+}
+
+/// An advertised ref name: under `refs/`, printable and bounded. Selection
+/// is the caller's; this only rejects lines that are not refs at all.
+fn advertised(name: &str) -> bool {
+    name.starts_with("refs/")
+        && name.len() <= 1024
+        && !name.contains("..")
+        && !name.bytes().any(|b| !(0x21..=0x7e).contains(&b))
+}
+
 /// Fetch-only files are siblings of the work directory, never mounted in a
 /// job. Mode is set at creation, including on every partial-failure path.
 struct Private {

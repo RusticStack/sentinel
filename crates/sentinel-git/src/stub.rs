@@ -9,7 +9,7 @@ use std::{
 use sentinel_pipeline::PinnedSource;
 use sentinel_protocol::source::Access;
 
-use crate::{Error, Merge, Result};
+use crate::{Error, Merge, RefTip, Result};
 
 pub const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -85,5 +85,15 @@ pub fn file_at_merge(
     _: usize,
     _: Duration,
 ) -> Result<FetchedFile> {
+    Err(Error::UnsupportedPlatform)
+}
+
+pub fn ls_remote(
+    _: &Path,
+    _: &str,
+    _: Option<&Access>,
+    _: usize,
+    _: Duration,
+) -> Result<Vec<RefTip>> {
     Err(Error::UnsupportedPlatform)
 }

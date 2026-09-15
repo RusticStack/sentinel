@@ -205,3 +205,191 @@ fn a_host_local_operator_binds_a_source_and_sees_no_credential() {
     ]);
     assert!(shown.contains("\"revoked\":true"));
 }
+
+#[test]
+fn a_bound_repository_opts_into_polling_and_back_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_path = dir.path().join("controller");
+    fs::create_dir(&data_path).unwrap();
+    let data = data_path.to_str().unwrap();
+    let bootstrap = with_stdin(
+        &[
+            "admin",
+            "bootstrap",
+            "--data-dir",
+            data,
+            "--username",
+            "root",
+        ],
+        "correct horse battery staple",
+    );
+    assert!(
+        bootstrap.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bootstrap.stderr)
+    );
+    let status = ok(&["admin", "status", "--data-dir", data]);
+    let actor = status
+        .split("subject=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("bootstrap audit names the account")
+        .to_owned();
+    ok(&["admin", "key", "create", "--data-dir", data]);
+    let tenant = ok(&[
+        "admin",
+        "tenant",
+        "create",
+        "--data-dir",
+        data,
+        "--slug",
+        "acme",
+    ]);
+    let tenant = tenant.trim().to_owned();
+    fs::write(
+        data_path.join("source-destinations.json"),
+        "[\"https://git.example:8443\"]",
+    )
+    .unwrap();
+    let created = ok(&[
+        "admin",
+        "source",
+        "--data-dir",
+        data,
+        "--actor",
+        &actor,
+        "create",
+        "--tenant",
+        &tenant,
+        "--name",
+        "app",
+    ]);
+    let repo = created
+        .split("\"repo\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("create prints the repository")
+        .to_owned();
+    // Polling needs a live binding; an unbound repository is a refusal.
+    fails(&[
+        "admin",
+        "source",
+        "--data-dir",
+        data,
+        "--actor",
+        &actor,
+        "poll",
+        "--repo",
+        &repo,
+        "--interval",
+        "60s",
+        "--refs",
+        "refs/heads/main",
+    ]);
+    let bound = with_stdin(
+        &[
+            "admin",
+            "source",
+            "--data-dir",
+            data,
+            "--actor",
+            &actor,
+            "bind",
+            "--repo",
+            &repo,
+            "--expected",
+            "0",
+        ],
+        "{\"binding\":{\"remote\":\"https://git.example:8443/team/repo.git\",\"allowed_refs\":[\"refs/heads/main\"],\"pipeline_path\":\".sentinel.yml\",\"trust\":\"\"},\"credential\":{\"Https\":{\"username\":\"deploy\",\"secret\":\"s3cret-token\"}},\"forge\":null}",
+    );
+    assert!(
+        bound.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bound.stderr)
+    );
+    // Enabling requires both an interval and a selection.
+    fails(&[
+        "admin",
+        "source",
+        "--data-dir",
+        data,
+        "--actor",
+        &actor,
+        "poll",
+        "--repo",
+        &repo,
+        "--interval",
+        "60s",
+    ]);
+    fails(&[
+        "admin",
+        "source",
+        "--data-dir",
+        data,
+        "--actor",
+        &actor,
+        "poll",
+        "--repo",
+        &repo,
+        "--interval",
+        "60s",
+        "--refs",
+        "feature/*",
+    ]);
+    let enabled = ok(&[
+        "admin",
+        "source",
+        "--data-dir",
+        data,
+        "--actor",
+        &actor,
+        "poll",
+        "--repo",
+        &repo,
+        "--interval",
+        "60s",
+        "--refs",
+        "refs/heads/main,refs/tags/v*",
+    ]);
+    assert!(enabled.contains("\"polling\":true"));
+    let shown = ok(&[
+        "admin",
+        "source",
+        "--data-dir",
+        data,
+        "--actor",
+        &actor,
+        "show",
+        "--repo",
+        &repo,
+    ]);
+    assert!(
+        shown.contains("\"interval_ms\":60000") && shown.contains("refs/tags/v*"),
+        "{shown}"
+    );
+    let disabled = ok(&[
+        "admin",
+        "source",
+        "--data-dir",
+        data,
+        "--actor",
+        &actor,
+        "poll",
+        "--repo",
+        &repo,
+        "--disable",
+    ]);
+    assert!(disabled.contains("\"polling\":false"));
+    let shown = ok(&[
+        "admin",
+        "source",
+        "--data-dir",
+        data,
+        "--actor",
+        &actor,
+        "show",
+        "--repo",
+        &repo,
+    ]);
+    assert!(shown.contains("\"poll\":null"), "{shown}");
+}

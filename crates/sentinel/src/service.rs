@@ -441,6 +441,8 @@ enum Running {
         /// Boxed: the enum is constructed once per process, and this keeps
         /// the variant from dominating its size.
         lane: Box<sentinel_intake::Lane>,
+        /// The opt-in ref poller feeding the same intake path.
+        poll: Box<sentinel_intake::Poll>,
         /// The Checks outbox lane, when a GitHub App is configured.
         checks: Option<Box<sentinel_checks::Lane>>,
         /// The lifecycle reconcile lane draining `github_refresh`.
@@ -555,6 +557,36 @@ fn start_server(
             });
         },
     );
+    // The opt-in ref poller (G07): nothing is configured until an operator
+    // opts a repository in, but the lane runs so a new configuration takes
+    // effect without a restart. Its deliveries ride the intake lane above.
+    let poll_dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let poll = sentinel_intake::Poll::start(
+        Arc::clone(&store),
+        key.clone(),
+        app.as_ref().map(|app| Arc::clone(&app.app)),
+        Arc::new(sentinel_intake::GitLister),
+        config.data_dir.join("poll-work"),
+        sentinel_intake::poll::Config::default(),
+        move |notice| {
+            tracing::dispatcher::with_default(&poll_dispatch, || {
+                if notice.failed {
+                    tracing::warn!(
+                        event = "poll_failed",
+                        repo = %notice.repo,
+                        outcome = %notice.outcome
+                    );
+                } else {
+                    tracing::info!(
+                        event = "poll_observed",
+                        repo = %notice.repo,
+                        outcome = %notice.outcome
+                    );
+                }
+            });
+        },
+    )
+    .map_err(|_| Error::runtime("cannot prepare the poll work directory"))?;
     let github_webhook_secret = crate::source_admin::load_webhook_secret(&config.data_dir)
         .map_err(|_| Error::runtime("cannot load the GitHub webhook secret"))?;
     if github_webhook_secret.is_some() {
@@ -651,6 +683,7 @@ fn start_server(
         api,
         store,
         lane: Box::new(lane),
+        poll: Box::new(poll),
         checks,
         reconcile,
     })
@@ -917,12 +950,14 @@ fn initialize_and_wait(
             api,
             store,
             lane,
+            poll,
             checks,
             reconcile,
         } => {
             api.shutdown();
             drop(reconcile);
             drop(checks);
+            drop(poll);
             drop(lane);
             let sessions_drained = controller.shutdown(LINK_SHUTDOWN);
             let store_drained = matches!(
