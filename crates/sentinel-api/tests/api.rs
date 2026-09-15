@@ -19,6 +19,7 @@ use sentinel_store::{
     auth::{self, Authority, NamespaceKind, provisioning},
     intake, local_auth,
     logs::LogStore,
+    objects::Objects,
     registration,
     sources::{self, Update},
     sources_forge,
@@ -217,6 +218,7 @@ fn deployment() -> Deployment {
         listen: "127.0.0.1:0".parse().unwrap(),
         store: Arc::clone(&store),
         logs: Arc::clone(&logs),
+        objects: Arc::new(Objects::open(dir.path()).unwrap()),
         controller: controller.handle(),
         sessions: local_auth::Policy::default(),
         github_webhook_secret: Some(Arc::from(WEBHOOK_SECRET)),
@@ -1350,4 +1352,406 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         &[],
     );
     assert_eq!((status, again["duplicate"].as_bool()), (202, Some(true)));
+}
+
+// ---- D02: resumable uploads and authorized range downloads ----
+
+/// Raw bytes in and out plus Content-Range, for the transfer routes.
+fn raw(
+    d: &Deployment,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    auth: Option<&str>,
+    extra: &[(&str, &str)],
+) -> (u16, Vec<u8>, Option<String>) {
+    let url = format!("{}{path}", d.base);
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let mut request = match method {
+        "GET" => agent.get(&url).force_send_body(),
+        "PUT" => agent.put(&url),
+        "POST" => agent.post(&url),
+        "DELETE" => agent.delete(&url).force_send_body(),
+        _ => unreachable!(),
+    };
+    if let Some(auth) = auth {
+        request = request.header("authorization", auth);
+    }
+    for (k, v) in extra {
+        request = request.header(*k, *v);
+    }
+    let response = match body {
+        Some(bytes) => request.send(bytes).unwrap(),
+        None => request.send_empty().unwrap(),
+    };
+    let status = response.status().as_u16();
+    let range = response
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let bytes = response.into_body().read_to_vec().unwrap();
+    (status, bytes, range)
+}
+
+/// An upload request that sends its headers and one byte, then stalls: the
+/// server's body read blocks, holding a transfer slot until the socket dies.
+fn held_upload(d: &Deployment, path: &str, auth: &str, len: usize) -> std::net::TcpStream {
+    use std::io::Write as _;
+    let addr = d.base.strip_prefix("http://").unwrap().to_owned();
+    let mut socket = std::net::TcpStream::connect(addr).unwrap();
+    write!(
+        socket,
+        "PUT {path} HTTP/1.1\r\nhost: sentinel\r\nauthorization: {auth}\r\ncontent-length: {len}\r\n\r\nx"
+    )
+    .unwrap();
+    socket
+}
+
+#[test]
+fn uploads_resume_commit_and_downloads_range_through_the_api() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let content: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    let digest = blake3::hash(&content).to_hex().to_string();
+
+    // Begin the session under the tenant's slug.
+    let (status, begin) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": content.len(), "digest": digest })),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, begin["state"].as_str()), (201, Some("open")));
+    assert_eq!(begin["received"], 0);
+    let upload = begin["upload"].as_str().unwrap().to_owned();
+
+    // Send the tail first, retry it identically, then fill the gap.
+    let (status, _, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}?offset=30000"),
+        Some(&content[30_000..]),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    let (status, ack, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}?offset=30000"),
+        Some(&content[30_000..]),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&ack).unwrap()["received"],
+        10_000
+    );
+    let (status, st) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/uploads/{upload}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(st["received"], 10_000);
+    assert_eq!(st["ranges"][0][0], 30_000);
+
+    // Sealing before the ranges tile is refused; nothing is committed yet.
+    let (status, body) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/uploads/{upload}/commit"),
+        Some(&serde_json::json!({})),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+    let (status, _body, _) = raw(
+        &d,
+        "GET",
+        &format!("/api/v1/tenants/acme/objects/{digest}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 404);
+
+    // Out-of-bounds and missing-offset chunks are refused.
+    let (status, _, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}"),
+        Some(&content[..1]),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 400);
+    let (status, _, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}?offset={}", content.len() - 1),
+        Some(&content[..2]),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 400);
+
+    // Fill the head and commit; the digest comes back and the object serves.
+    let (status, _, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}?offset=0"),
+        Some(&content[..30_000]),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    let (status, sealed) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/uploads/{upload}/commit"),
+        Some(&serde_json::json!({})),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, sealed["digest"].as_str()),
+        (200, Some(digest.as_str()))
+    );
+    // Committing again answers the same digest (idempotent close).
+    let (status, sealed) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/uploads/{upload}/commit"),
+        Some(&serde_json::json!({})),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, sealed["digest"].as_str()),
+        (200, Some(digest.as_str()))
+    );
+
+    let object = format!("/api/v1/tenants/acme/objects/{digest}");
+    let (status, bytes, range) = raw(&d, "GET", &object, None, Some(&auth), &[]);
+    assert_eq!(status, 200);
+    assert_eq!(bytes, content);
+    assert!(range.is_none());
+
+    let (status, bytes, range) = raw(
+        &d,
+        "GET",
+        &object,
+        None,
+        Some(&auth),
+        &[("range", "bytes=10-19")],
+    );
+    assert_eq!(status, 206);
+    assert_eq!(bytes, content[10..20]);
+    assert_eq!(range.as_deref(), Some("bytes 10-19/40000"));
+
+    let (status, bytes, _) = raw(
+        &d,
+        "GET",
+        &object,
+        None,
+        Some(&auth),
+        &[("range", "bytes=-7")],
+    );
+    assert_eq!(status, 206);
+    assert_eq!(bytes, content[39_993..]);
+
+    for spec in ["bytes=99-4", "bytes=40000-", "items=0-1", "bytes=0-1,4-5"] {
+        let (status, _, _) = raw(&d, "GET", &object, None, Some(&auth), &[("range", spec)]);
+        assert_eq!(status, 400, "{spec} must be refused");
+    }
+
+    // Without credentials every transfer route refuses.
+    for (method, path) in [
+        ("POST", "/api/v1/tenants/acme/uploads"),
+        ("GET", &format!("/api/v1/uploads/{upload}")),
+        ("PUT", &format!("/api/v1/uploads/{upload}?offset=0")),
+        ("DELETE", &format!("/api/v1/uploads/{upload}")),
+        ("GET", &object),
+    ] {
+        let (status, _, _) = raw(&d, method, path, None, None, &[]);
+        assert_eq!(status, 401, "{method} {path}");
+    }
+
+    // A credential scoped to another tenant cannot see the upload or object.
+    let other_tenant = TenantId::new();
+    let root = d.root;
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::create_namespace(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                other_tenant,
+                Namespace::parse("other").unwrap(),
+                NamespaceKind::Organization,
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+    let outsider = tokens::provision(
+        &d.store,
+        Grant {
+            user: d.root,
+            name: "foreign",
+            permissions: P::ALL,
+            tenant: Some(other_tenant),
+            repo: None,
+            lifetime_ms: 60_000,
+        },
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let foreign = format!("Bearer {}", sentinel_auth::token::format(&outsider.secret));
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/uploads/{upload}"),
+        None,
+        Some(&foreign),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    let (status, _, _) = raw(&d, "GET", &object, None, Some(&foreign), &[]);
+    assert_eq!(status, 404);
+    let (status, body) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": 4 })),
+        Some(&foreign),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+
+    // Aborting a second open upload drops it; writes after abort conflict.
+    let (status, begin) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": 4 })),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201);
+    let doomed = begin["upload"].as_str().unwrap().to_owned();
+    let (status, _, _) = raw(
+        &d,
+        "DELETE",
+        &format!("/api/v1/uploads/{doomed}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    let (status, body, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{doomed}?offset=0"),
+        Some(b"ab"),
+        Some(&auth),
+        &[],
+    );
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!((status, body["code"].as_str()), (409, Some("conflict")));
+}
+
+#[test]
+fn transfer_slots_are_bounded() {
+    let d = deployment();
+    let auth = bearer(&d);
+    // A small committed object to download once slots are free again.
+    let content = b"downloadable".repeat(64);
+    let digest = blake3::hash(&content).to_hex().to_string();
+    let (status, begin) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": content.len(), "digest": digest })),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201);
+    let upload = begin["upload"].as_str().unwrap().to_owned();
+    let (status, _, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}?offset=0"),
+        Some(&content),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    let (status, _) = call(
+        &d,
+        "POST",
+        &format!("/api/v1/uploads/{upload}/commit"),
+        Some(&serde_json::json!({})),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+
+    // Pin every slot with an upload whose body never finishes arriving.
+    let (status, begin) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": 4 << 20 })),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201);
+    let pending = begin["upload"].as_str().unwrap().to_owned();
+    let held: Vec<std::net::TcpStream> = (0..sentinel_api::TRANSFERS)
+        .map(|_| {
+            held_upload(
+                &d,
+                &format!("/api/v1/uploads/{pending}?offset=0"),
+                &auth,
+                4 << 20,
+            )
+        })
+        .collect();
+    // Give the workers a moment to reach their blocked body reads.
+    thread::sleep(Duration::from_millis(300));
+    let object = format!("/api/v1/tenants/acme/objects/{digest}");
+    let (status, body, _) = raw(&d, "GET", &object, None, Some(&auth), &[]);
+    assert_eq!(status, 429);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
+        "rate_limited"
+    );
+    drop(held);
+    // The dead sockets release their slots as their blocked reads fail;
+    // retry briefly rather than assume an instant release.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let (status, bytes) = loop {
+        let (status, bytes, _) = raw(&d, "GET", &object, None, Some(&auth), &[]);
+        if status == 200 || std::time::Instant::now() > deadline {
+            break (status, bytes);
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(status, 200);
+    assert_eq!(bytes.len(), content.len());
 }

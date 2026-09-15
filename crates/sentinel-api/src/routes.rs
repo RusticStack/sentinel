@@ -3,11 +3,11 @@
 //! for every refusal. Nothing here reads a tenant's rows without the
 //! `auth` predicate that says the caller may.
 
-use std::io::Read;
+use std::{io::Read, io::Seek, io::SeekFrom, sync::Arc};
 
 use sentinel_auth::cookie;
 use sentinel_core::{
-    AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis,
+    AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis, UploadId,
     auth::{Permissions, Principal},
 };
 use sentinel_intake::ingest;
@@ -20,19 +20,25 @@ use sentinel_protocol::{
 };
 use sentinel_store::{
     Error as StoreError, auth as authz, auth::Authority, checks, dispatch, idempotency, local_auth,
-    lookup, provenance, runs, status, tenancy, workers,
+    lookup, objects::Digest, provenance, runs, status, tenancy, workers,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tiny_http::{Header, Request, Response, StatusCode};
 
 use crate::{
-    LOG_WAIT, State,
+    LOG_WAIT, MAX_UPLOAD_CHUNK, State, TRANSFERS,
     auth::{self, Identity, Refusal},
     web,
 };
 
-type Reply = Result<(u16, Value, Vec<Header>), ApiError>;
+/// What a route answers: a JSON body, or a bounded stream from the object
+/// store. Streams carry an explicit length so the response is never chunked.
+enum Reply {
+    Json(u16, Value, Vec<Header>),
+    Stream(u16, Box<dyn Read + Send>, u64, Vec<Header>),
+}
+type Route = Result<Reply, ApiError>;
 
 const JSON: &str = "application/json";
 
@@ -40,8 +46,8 @@ fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static header")
 }
 
-fn ok(value: Value) -> Reply {
-    Ok((200, value, Vec::new()))
+fn ok(value: Value) -> Route {
+    Ok(Reply::Json(200, value, Vec::new()))
 }
 
 fn err(code: ErrorCode, message: impl Into<String>) -> ApiError {
@@ -86,18 +92,38 @@ pub(crate) fn handle(state: &State, mut request: Request) {
         return;
     }
     let outcome = route(state, &mut request, &method, &path, &query);
-    let (status, body, headers) = match outcome {
+    let reply = match outcome {
         Ok(reply) => reply,
-        Err(error) => (error.http_status(), json!(error), Vec::new()),
+        Err(error) => Reply::Json(error.http_status(), json!(error), Vec::new()),
     };
-    let mut response = Response::from_string(body.to_string())
-        .with_status_code(StatusCode(status))
-        .with_header(header("content-type", JSON))
-        .with_header(header("cache-control", "no-store"));
-    for h in headers {
-        response = response.with_header(h);
+    match reply {
+        Reply::Json(status, body, headers) => {
+            let mut response = Response::from_string(body.to_string())
+                .with_status_code(StatusCode(status))
+                .with_header(header("content-type", JSON))
+                .with_header(header("cache-control", "no-store"));
+            for h in headers {
+                response = response.with_header(h);
+            }
+            let _ = request.respond(response);
+        }
+        Reply::Stream(status, reader, len, headers) => {
+            let mut response = Response::new(
+                StatusCode(status),
+                vec![
+                    header("content-type", "application/octet-stream"),
+                    header("cache-control", "no-store"),
+                ],
+                reader,
+                Some(len as usize),
+                None,
+            );
+            for h in headers {
+                response = response.with_header(h);
+            }
+            let _ = request.respond(response);
+        }
     }
-    let _ = request.respond(response);
 }
 
 fn header_value<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
@@ -173,7 +199,7 @@ fn id<T: std::str::FromStr>(text: &str, what: &str) -> Result<T, ApiError> {
     })
 }
 
-fn route(state: &State, request: &mut Request, method: &str, path: &str, query: &str) -> Reply {
+fn route(state: &State, request: &mut Request, method: &str, path: &str, query: &str) -> Route {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match (method, parts.as_slice()) {
         ("GET", ["api", "v1", "health"]) => ok(json!({ "ok": true })),
@@ -355,6 +381,16 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
                 })).collect::<Vec<_>>()
             }))
         }
+        ("POST", ["api", "v1", "tenants", slug, "uploads"]) => upload_begin(state, request, slug),
+        ("GET", ["api", "v1", "uploads", upload]) => upload_status(state, request, upload),
+        ("PUT", ["api", "v1", "uploads", upload]) => upload_chunk(state, request, upload, query),
+        ("POST", ["api", "v1", "uploads", upload, "commit"]) => {
+            upload_commit(state, request, upload)
+        }
+        ("DELETE", ["api", "v1", "uploads", upload]) => upload_abort(state, request, upload),
+        ("GET", ["api", "v1", "tenants", slug, "objects", digest]) => {
+            object_download(state, request, slug, digest)
+        }
         _ => Err(err(ErrorCode::NotFound, "no such route")),
     }
 }
@@ -402,7 +438,7 @@ fn wake_intake(state: &State, duplicate: bool) {
 /// Once the signature verifies, everything GitHub may legitimately send is
 /// answered 2xx — an unbound repository is a normal state, and an error would
 /// make GitHub disable the hook and hide future real events.
-fn github_hook(state: &State, request: &mut Request) -> Reply {
+fn github_hook(state: &State, request: &mut Request) -> Route {
     let Some(secret) = state.github_webhook_secret.as_deref() else {
         return Err(err(ErrorCode::NotFound, "no such route"));
     };
@@ -434,7 +470,7 @@ fn github_hook(state: &State, request: &mut Request) -> Reply {
         }
         ingest::Github::Ingested(ingested) => {
             wake_intake(state, ingested.duplicate);
-            Ok((
+            Ok(Reply::Json(
                 202,
                 json!({ "delivery": ingested.id.to_string(), "duplicate": ingested.duplicate }),
                 Vec::new(),
@@ -444,7 +480,7 @@ fn github_hook(state: &State, request: &mut Request) -> Reply {
 }
 
 /// Generic ref-update intake: a repository hook secret over the raw body.
-fn generic_intake(state: &State, request: &mut Request, repo: &str) -> Reply {
+fn generic_intake(state: &State, request: &mut Request, repo: &str) -> Route {
     let repo: RepoId = id(repo, "repository")?;
     let presented = bounded_header(request, "authorization", 128)
         .and_then(|header| authorization_value(&header).map(str::to_owned))
@@ -458,7 +494,7 @@ fn generic_intake(state: &State, request: &mut Request, repo: &str) -> Reply {
     let ingested = ingest::generic(&state.store, &presented, repo, &body, UnixMillis::now())
         .map_err(intake_error)?;
     wake_intake(state, ingested.duplicate);
-    Ok((
+    Ok(Reply::Json(
         202,
         json!({ "delivery": ingested.id.to_string(), "duplicate": ingested.duplicate }),
         Vec::new(),
@@ -541,7 +577,7 @@ struct LoginBody {
     password: String,
 }
 
-fn login(state: &State, request: &mut Request) -> Reply {
+fn login(state: &State, request: &mut Request) -> Route {
     let bytes = body(request)?;
     let creds: LoginBody = parse(&bytes)?;
     let outcome = local_auth::login(
@@ -558,7 +594,7 @@ fn login(state: &State, request: &mut Request) -> Reply {
             issued.csrf.expose(&mut csrf);
             let set_cookie =
                 cookie::issue(cookie::SESSION_COOKIE, &issued.session, issued.max_age_secs);
-            Ok((
+            Ok(Reply::Json(
                 200,
                 json!({ "user": issued.user.to_string(), "csrf": csrf }),
                 vec![header("set-cookie", &set_cookie)],
@@ -571,7 +607,7 @@ fn login(state: &State, request: &mut Request) -> Reply {
     }
 }
 
-fn logout(state: &State, request: &mut Request) -> Reply {
+fn logout(state: &State, request: &mut Request) -> Route {
     let who = identify(state, request, true)?;
     if who.via != auth::Via::Session {
         return Err(err(
@@ -584,7 +620,7 @@ fn logout(state: &State, request: &mut Request) -> Reply {
     {
         let _ = local_auth::logout(&state.store, &secret, UnixMillis::now());
     }
-    Ok((
+    Ok(Reply::Json(
         200,
         json!({ "ok": true }),
         vec![header("set-cookie", &cookie::clear(cookie::SESSION_COOKIE))],
@@ -608,7 +644,7 @@ struct DispatchBody {
 /// Dispatch: compile the pipeline, pin the source, create the run and its
 /// jobs under the caller's `run` grant, resolve every digest-pinned image,
 /// and wake the dispatcher. Idempotent under `Idempotency-Key`.
-fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) -> Reply {
+fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) -> Route {
     let who = identify(state, request, true)?;
     let key = header_value(request, "idempotency-key")
         .map(|raw| {
@@ -719,7 +755,7 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
                 .store
                 .read(|c| status::run(c, tenant, run))
                 .map_err(store_error)?;
-            Ok((201, run_json(&view), Vec::new()))
+            Ok(Reply::Json(201, run_json(&view), Vec::new()))
         }
         Err(Some(run)) => {
             let view = state
@@ -730,11 +766,261 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
                     status::run(c, tenant, run)
                 })
                 .map_err(store_error)?;
-            Ok((200, run_json(&view), Vec::new()))
+            Ok(Reply::Json(200, run_json(&view), Vec::new()))
         }
         Err(None) => Err(err(
             ErrorCode::IdempotencyMismatch,
             "Idempotency-Key was used with a different body",
         )),
+    }
+}
+
+/// A held upload/download slot; dropping frees it for the next request.
+/// The bound exists so bounded-heap processes never queue unbounded
+/// transfer work.
+struct Slot<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn slot(state: &State) -> Result<Slot<'_>, ApiError> {
+    use std::sync::atomic::Ordering;
+    let mut held = state.transfers.load(Ordering::Acquire);
+    loop {
+        if held >= TRANSFERS {
+            return Err(err(
+                ErrorCode::RateLimited,
+                "transfer slots exhausted; retry",
+            ));
+        }
+        match state.transfers.compare_exchange_weak(
+            held,
+            held + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(Slot(&state.transfers)),
+            Err(next) => held = next,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct UploadBody {
+    len: u64,
+    #[serde(default)]
+    digest: Option<String>,
+    #[serde(default)]
+    ttl_ms: Option<i64>,
+}
+
+/// Resolve an upload's owning tenant and require the caller's live
+/// membership of it. Foreign and missing ids answer identically.
+fn upload_tenant(
+    state: &State,
+    principal: Principal,
+    upload: UploadId,
+    write: bool,
+) -> Result<sentinel_core::TenantId, ApiError> {
+    state
+        .store
+        .read(|c| {
+            let tenant = state.objects.upload_owner(c, upload)?;
+            authz::require_tenant_member(c, principal, tenant, write)?;
+            Ok(tenant)
+        })
+        .map_err(store_error)
+}
+
+fn upload_json(upload: UploadId, status: &sentinel_store::objects::UploadStatus) -> Value {
+    json!({
+        "upload": upload.to_string(),
+        "state": match status.state {
+            sentinel_store::objects::UploadState::Open => "open",
+            sentinel_store::objects::UploadState::Committed => "committed",
+            sentinel_store::objects::UploadState::Aborted => "aborted",
+        },
+        "declared_len": status.declared_len,
+        "received": status.received,
+        "ranges": status.ranges.iter().map(|(s, e)| json!([s, e])).collect::<Vec<_>>(),
+        "expires_ms": status.expires_ms,
+    })
+}
+
+/// Begin a resumable upload against a tenant the caller operates in.
+fn upload_begin(state: &State, request: &mut Request, slug: &str) -> Route {
+    let who = identify(state, request, true)?;
+    let body: UploadBody = parse(&body(request)?)?;
+    let digest = body
+        .digest
+        .map(|text| {
+            Digest::parse(&text).map_err(|_| err(ErrorCode::InvalidRequest, "malformed digest"))
+        })
+        .transpose()?;
+    let ttl = body
+        .ttl_ms
+        .unwrap_or(sentinel_store::objects::MAX_UPLOAD_TTL_MS);
+    let (slug, principal) = (slug.to_owned(), who.principal);
+    let objects = Arc::clone(&state.objects);
+    let upload = state
+        .store
+        .writer()
+        .write(move |tx| {
+            let tenant = lookup::tenant_by_slug(tx, &slug)?;
+            authz::require_tenant_member(tx, principal, tenant, true)?;
+            objects.begin_upload(tx, tenant, body.len, digest, ttl, UnixMillis::now())
+        })
+        .map_err(store_error)?;
+    let status = state
+        .store
+        .read(|c| {
+            let tenant = state.objects.upload_owner(c, upload)?;
+            state.objects.upload(c, tenant, upload)
+        })
+        .map_err(store_error)?;
+    Ok(Reply::Json(201, upload_json(upload, &status), Vec::new()))
+}
+
+/// Where a resumable upload stands; the client's resume plan.
+fn upload_status(state: &State, request: &mut Request, upload: &str) -> Route {
+    let who = identify(state, request, false)?;
+    let upload: UploadId = id(upload, "upload")?;
+    let tenant = upload_tenant(state, who.principal, upload, true)?;
+    let status = state
+        .store
+        .read(|c| state.objects.upload(c, tenant, upload))
+        .map_err(store_error)?;
+    ok(upload_json(upload, &status))
+}
+
+/// One chunk: `PUT /api/v1/uploads/<upl>?offset=N` with a raw body.
+fn upload_chunk(state: &State, request: &mut Request, upload: &str, query: &str) -> Route {
+    let who = identify(state, request, true)?;
+    let upload: UploadId = id(upload, "upload")?;
+    let tenant = upload_tenant(state, who.principal, upload, true)?;
+    let offset: u64 = query_param(query, "offset")
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| err(ErrorCode::InvalidRequest, "offset query parameter required"))?;
+    let _slot = slot(state)?;
+    let bytes = body_limit(request, MAX_UPLOAD_CHUNK)?;
+    if bytes.is_empty() {
+        return Err(err(ErrorCode::InvalidRequest, "empty chunk"));
+    }
+    let objects = Arc::clone(&state.objects);
+    let received = state
+        .store
+        .writer()
+        .write(move |tx| objects.put_chunk(tx, tenant, upload, offset, &bytes, UnixMillis::now()))
+        .map_err(store_error)?;
+    ok(json!({ "upload": upload.to_string(), "received": received }))
+}
+
+/// Seal: the ranges must tile the declared length and match the digest.
+fn upload_commit(state: &State, request: &mut Request, upload: &str) -> Route {
+    let who = identify(state, request, true)?;
+    let upload: UploadId = id(upload, "upload")?;
+    let tenant = upload_tenant(state, who.principal, upload, true)?;
+    let objects = Arc::clone(&state.objects);
+    let digest = state
+        .store
+        .writer()
+        .write(move |tx| objects.seal_upload(tx, tenant, upload, UnixMillis::now()))
+        .map_err(store_error)?;
+    ok(json!({ "upload": upload.to_string(), "digest": digest.to_string() }))
+}
+
+/// Give up an open upload and drop its staged bytes.
+fn upload_abort(state: &State, request: &mut Request, upload: &str) -> Route {
+    let who = identify(state, request, true)?;
+    let upload: UploadId = id(upload, "upload")?;
+    let tenant = upload_tenant(state, who.principal, upload, true)?;
+    let objects = Arc::clone(&state.objects);
+    state
+        .store
+        .writer()
+        .write(move |tx| objects.abort_upload(tx, tenant, upload))
+        .map_err(store_error)?;
+    ok(json!({ "upload": upload.to_string(), "aborted": true }))
+}
+
+/// `Range: bytes=a-b`, `bytes=a-` or `bytes=-n` to a `[start, end)` pair.
+/// Multiple ranges are refused rather than served partially.
+fn byte_range(spec: &str, len: u64) -> Result<(u64, u64), ApiError> {
+    let invalid = || err(ErrorCode::InvalidRequest, "unsatisfiable range");
+    let spec = spec.strip_prefix("bytes=").ok_or_else(invalid)?;
+    if spec.contains(',') {
+        return Err(err(
+            ErrorCode::InvalidRequest,
+            "multiple ranges unsupported",
+        ));
+    }
+    let (a, b) = spec.split_once('-').ok_or_else(invalid)?;
+    let (start, end) = if a.is_empty() {
+        let n: u64 = b.parse().map_err(|_| invalid())?;
+        if n == 0 || len == 0 {
+            return Err(invalid());
+        }
+        (len.saturating_sub(n), len)
+    } else {
+        let start: u64 = a.parse().map_err(|_| invalid())?;
+        let end = if b.is_empty() {
+            len
+        } else {
+            b.parse::<u64>()
+                .map_err(|_| invalid())?
+                .checked_add(1)
+                .ok_or_else(invalid)?
+                .min(len)
+        };
+        (start, end)
+    };
+    if start >= end {
+        return Err(invalid());
+    }
+    Ok((start, end))
+}
+
+/// Stream a committed object, whole or a `Range`. The reader registration
+/// keeps the file un-reclaimable until the response finishes.
+fn object_download(state: &State, request: &mut Request, slug: &str, digest: &str) -> Route {
+    let who = identify(state, request, false)?;
+    let digest =
+        Digest::parse(digest).map_err(|_| err(ErrorCode::InvalidRequest, "malformed digest"))?;
+    let (slug, principal) = (slug.to_owned(), who.principal);
+    let (mut reader, len) = state
+        .store
+        .read(|c| {
+            let tenant = lookup::tenant_by_slug(c, &slug)?;
+            authz::require_tenant_member(c, principal, tenant, false)?;
+            state.objects.open_read(c, tenant, digest)
+        })
+        .map_err(store_error)?;
+    let _slot = slot(state)?;
+    let tag = digest.to_string();
+    let mut headers = vec![
+        header("accept-ranges", "bytes"),
+        header("etag", &format!("\"{tag}\"")),
+    ];
+    match header_value(request, "range") {
+        None => Ok(Reply::Stream(200, Box::new(reader.take(len)), len, headers)),
+        Some(spec) => {
+            let (start, end) = byte_range(spec, len)?;
+            reader
+                .seek(SeekFrom::Start(start))
+                .map_err(|_| err(ErrorCode::Internal, "controller fault"))?;
+            headers.push(header(
+                "content-range",
+                &format!("bytes {start}-{}/{len}", end - 1),
+            ));
+            Ok(Reply::Stream(
+                206,
+                Box::new(reader.take(end - start)),
+                end - start,
+                headers,
+            ))
+        }
     }
 }

@@ -230,6 +230,7 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
         listen: "127.0.0.1:0".parse().unwrap(),
         store: Arc::clone(&store),
         logs: Arc::clone(&logs),
+        objects: Arc::new(sentinel_store::objects::Objects::open(temp.path()).unwrap()),
         controller: controller.as_ref().unwrap().handle(),
         sessions: local_auth::Policy::default(),
         github_webhook_secret: None,

@@ -1077,6 +1077,16 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
                 })
             );
         }
+        ObjectsCommand::Sweep => {
+            // Retiring expired sessions removes their incoming/ files; under
+            // a live controller a client could be mid-chunk, so stopped only.
+            let store = open(&args.data, true)?;
+            let swept = store
+                .writer()
+                .write(move |tx| objects.sweep_uploads(tx, sentinel_core::UnixMillis::now()))
+                .map_err(|error| fail(format!("sweep failed: {error}")))?;
+            println!("{}", serde_json::json!({ "expired": swept }));
+        }
     }
     Ok(())
 }

@@ -498,6 +498,19 @@ fn start_server(
             "object store recovery found inconsistencies"
         );
     }
+    // Expired resumable uploads are retired and their staging files dropped;
+    // open-but-live ones keep their bytes for the client to resume.
+    let objects = Arc::new(objects);
+    let swept = store
+        .writer()
+        .write({
+            let objects = Arc::clone(&objects);
+            move |tx| objects.sweep_uploads(tx, sentinel_core::UnixMillis::now())
+        })
+        .map_err(|error| Error::runtime(format!("cannot sweep expired uploads: {error}")))?;
+    if swept > 0 {
+        tracing::info!(event = "uploads_swept", expired = swept);
+    }
     let controller = sentinel_link::controller::Controller::start(
         Arc::clone(&store),
         Arc::clone(&logs),
@@ -690,6 +703,7 @@ fn start_server(
         listen: api_listen,
         store: Arc::clone(&store),
         logs: Arc::clone(&logs),
+        objects,
         controller: controller.handle(),
         sessions: sentinel_store::local_auth::Policy::default(),
         github_webhook_secret,

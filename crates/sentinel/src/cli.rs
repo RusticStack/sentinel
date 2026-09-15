@@ -326,6 +326,8 @@ pub enum ObjectsCommand {
     Recover,
     /// Rehash every committed object and report content that no longer matches
     Verify,
+    /// Retire expired resumable uploads and drop their staged bytes
+    Sweep,
 }
 
 #[derive(Args)]

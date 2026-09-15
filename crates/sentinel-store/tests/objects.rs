@@ -450,3 +450,385 @@ fn corrupt_manifest_file_is_detected_on_read() {
     ));
     let _ = objects::MAX_MANIFEST_ENTRIES;
 }
+
+// ---- D02: resumable uploads, tracked readers, verified materialization ----
+
+impl Fixture {
+    fn begin(
+        &mut self,
+        tenant: TenantId,
+        len: u64,
+        digest: Option<Digest>,
+    ) -> sentinel_core::UploadId {
+        let tx = self.conn.transaction().unwrap();
+        let id = self
+            .objects
+            .begin_upload(&tx, tenant, len, digest, objects::MAX_UPLOAD_TTL_MS, NOW)
+            .unwrap();
+        tx.commit().unwrap();
+        id
+    }
+
+    fn chunk(
+        &mut self,
+        tenant: TenantId,
+        id: sentinel_core::UploadId,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<u64, Error> {
+        let tx = self.conn.transaction().unwrap();
+        let result = self.objects.put_chunk(&tx, tenant, id, offset, bytes, NOW);
+        match result {
+            Ok(received) => {
+                tx.commit().unwrap();
+                Ok(received)
+            }
+            Err(e) => {
+                tx.rollback().unwrap();
+                Err(e)
+            }
+        }
+    }
+
+    fn seal(&mut self, tenant: TenantId, id: sentinel_core::UploadId) -> Result<Digest, Error> {
+        let tx = self.conn.transaction().unwrap();
+        let result = self.objects.seal_upload(&tx, tenant, id, NOW);
+        match result {
+            Ok(digest) => {
+                tx.commit().unwrap();
+                Ok(digest)
+            }
+            Err(e) => {
+                tx.rollback().unwrap();
+                Err(e)
+            }
+        }
+    }
+}
+
+#[test]
+fn upload_chunks_seal_into_a_verified_object() {
+    let mut fx = fixture();
+    let body = b"resumable upload body".repeat(500);
+    let declared = Digest::from_bytes(*blake3::hash(&body).as_bytes());
+    let id = fx.begin(fx.tenant, body.len() as u64, Some(declared));
+    // Out-of-order chunks are fine; the ranges tile in the record.
+    assert_eq!(
+        fx.chunk(fx.tenant, id, 4000, &body[4000..]).unwrap(),
+        body.len() as u64 - 4000
+    );
+    let status = fx.objects.upload(&fx.conn, fx.tenant, id).unwrap();
+    assert_eq!(status.received, body.len() as u64 - 4000);
+    assert_eq!(status.ranges, vec![(4000, body.len() as u64)]);
+    assert_eq!(
+        fx.chunk(fx.tenant, id, 0, &body[..4000]).unwrap(),
+        body.len() as u64
+    );
+    let digest = fx.seal(fx.tenant, id).unwrap();
+    assert_eq!(digest, declared);
+    // The staged file is gone and the committed object reads back.
+    assert!(!fx.dir.path().join("incoming").join(id.to_string()).exists());
+    let mut out = Vec::new();
+    fx.objects
+        .read(&fx.conn, fx.tenant, digest, &mut out)
+        .unwrap();
+    assert_eq!(out, body);
+}
+
+#[test]
+fn uploads_resume_after_the_store_reopens() {
+    let mut fx = fixture();
+    let id = fx.begin(fx.tenant, 8, None);
+    assert_eq!(fx.chunk(fx.tenant, id, 0, b"abcd").unwrap(), 4);
+    // A new Objects over the same tree is the restart boundary.
+    let objects = Objects::open(fx.dir.path()).unwrap();
+    let status = objects.upload(&fx.conn, fx.tenant, id).unwrap();
+    assert_eq!(status.state, objects::UploadState::Open);
+    assert_eq!(status.received, 4);
+    assert_eq!(status.ranges, vec![(0, 4)]);
+    let tx = fx.conn.transaction().unwrap();
+    objects
+        .put_chunk(&tx, fx.tenant, id, 4, b"efgh", NOW)
+        .unwrap();
+    tx.commit().unwrap();
+    let tx = fx.conn.transaction().unwrap();
+    let digest = objects.seal_upload(&tx, fx.tenant, id, NOW).unwrap();
+    tx.commit().unwrap();
+    let mut out = Vec::new();
+    objects.read(&fx.conn, fx.tenant, digest, &mut out).unwrap();
+    assert_eq!(out, b"abcdefgh");
+}
+
+#[test]
+fn resent_chunks_are_idempotent_and_ranges_merge() {
+    let mut fx = fixture();
+    let id = fx.begin(fx.tenant, 10, None);
+    assert_eq!(fx.chunk(fx.tenant, id, 0, b"0123").unwrap(), 4);
+    // A retried identical chunk counts once.
+    assert_eq!(fx.chunk(fx.tenant, id, 0, b"0123").unwrap(), 4);
+    // Overlapping retries merge; the status still reports real bytes.
+    assert_eq!(fx.chunk(fx.tenant, id, 2, b"234567").unwrap(), 8);
+    let status = fx.objects.upload(&fx.conn, fx.tenant, id).unwrap();
+    assert_eq!(status.ranges, vec![(0, 8)]);
+    // An empty write is a protocol bug, not a chunk.
+    assert!(matches!(
+        fx.chunk(fx.tenant, id, 0, b""),
+        Err(Error::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn chunks_outside_the_declared_length_are_refused() {
+    let mut fx = fixture();
+    let id = fx.begin(fx.tenant, 4, None);
+    assert!(matches!(
+        fx.chunk(fx.tenant, id, 3, b"xx"),
+        Err(Error::InvalidInput("chunk range"))
+    ));
+    assert!(matches!(
+        fx.chunk(fx.tenant, id, u64::MAX - 1, b"xx"),
+        Err(Error::InvalidInput("chunk range"))
+    ));
+    let status = fx.objects.upload(&fx.conn, fx.tenant, id).unwrap();
+    assert_eq!(status.received, 0);
+}
+
+#[test]
+fn seal_requires_tiled_ranges_and_the_declared_digest() {
+    let mut fx = fixture();
+    let id = fx.begin(fx.tenant, 8, None);
+    fx.chunk(fx.tenant, id, 0, b"aaaa").unwrap();
+    assert!(matches!(
+        fx.seal(fx.tenant, id),
+        Err(Error::InvalidInput("upload incomplete"))
+    ));
+    // A wrong declared digest refuses the seal but keeps the staged bytes:
+    // the client rewrites the bad ranges and seals again.
+    let wrong = fx.begin(
+        fx.tenant,
+        4,
+        Some(Digest::from_bytes(*blake3::hash(b"good").as_bytes())),
+    );
+    fx.chunk(fx.tenant, wrong, 0, b"real").unwrap();
+    assert!(matches!(
+        fx.seal(fx.tenant, wrong),
+        Err(Error::InvalidInput("upload digest"))
+    ));
+    let status = fx.objects.upload(&fx.conn, fx.tenant, wrong).unwrap();
+    assert_eq!(status.state, objects::UploadState::Open);
+    fx.chunk(fx.tenant, wrong, 0, b"good").unwrap();
+    assert_eq!(
+        fx.seal(fx.tenant, wrong).unwrap(),
+        Digest::from_bytes(*blake3::hash(b"good").as_bytes())
+    );
+}
+
+#[test]
+fn sealing_twice_returns_the_same_digest_and_abort_is_final() {
+    let mut fx = fixture();
+    let id = fx.begin(fx.tenant, 4, None);
+    fx.chunk(fx.tenant, id, 0, b"data").unwrap();
+    let first = fx.seal(fx.tenant, id).unwrap();
+    assert_eq!(fx.seal(fx.tenant, id).unwrap(), first);
+    assert!(matches!(
+        fx.chunk(fx.tenant, id, 0, b"data"),
+        Err(Error::Conflict)
+    ));
+    // Aborting an open upload drops the staged file and refuses everything after.
+    let other = fx.begin(fx.tenant, 4, None);
+    fx.chunk(fx.tenant, other, 0, b"zz").unwrap();
+    let tx = fx.conn.transaction().unwrap();
+    fx.objects.abort_upload(&tx, fx.tenant, other).unwrap();
+    tx.commit().unwrap();
+    assert!(
+        !fx.dir
+            .path()
+            .join("incoming")
+            .join(other.to_string())
+            .exists()
+    );
+    assert!(matches!(fx.seal(fx.tenant, other), Err(Error::Conflict)));
+    // Aborting a committed upload is impossible — the object is reachable.
+    let tx = fx.conn.transaction().unwrap();
+    assert!(matches!(
+        fx.objects.abort_upload(&tx, fx.tenant, id),
+        Err(Error::Conflict)
+    ));
+    tx.rollback().unwrap();
+}
+
+#[test]
+fn uploads_do_not_cross_tenants() {
+    let mut fx = fixture();
+    let id = fx.begin(fx.tenant, 4, None);
+    assert!(matches!(
+        fx.objects.upload(&fx.conn, fx.other, id),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        fx.chunk(fx.other, id, 0, b"data"),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(fx.seal(fx.other, id), Err(Error::NotFound)));
+    let tx = fx.conn.transaction().unwrap();
+    assert!(matches!(
+        fx.objects.abort_upload(&tx, fx.other, id),
+        Err(Error::NotFound)
+    ));
+    tx.rollback().unwrap();
+}
+
+#[test]
+fn expired_uploads_are_swept_and_cannot_be_resumed() {
+    let mut fx = fixture();
+    let tx = fx.conn.transaction().unwrap();
+    let id = fx
+        .objects
+        .begin_upload(&tx, fx.tenant, 4, None, 100, NOW)
+        .unwrap();
+    let keep = fx
+        .objects
+        .begin_upload(&tx, fx.tenant, 4, None, objects::MAX_UPLOAD_TTL_MS, NOW)
+        .unwrap();
+    tx.commit().unwrap();
+    fx.chunk(fx.tenant, id, 0, b"ab").unwrap();
+    let later = UnixMillis(NOW.0 + 200);
+    let tx = fx.conn.transaction().unwrap();
+    assert_eq!(fx.objects.sweep_uploads(&tx, later).unwrap(), 1);
+    tx.commit().unwrap();
+    assert!(!fx.dir.path().join("incoming").join(id.to_string()).exists());
+    assert!(
+        fx.dir
+            .path()
+            .join("incoming")
+            .join(keep.to_string())
+            .exists()
+    );
+    let tx = fx.conn.transaction().unwrap();
+    assert!(matches!(
+        fx.objects.put_chunk(&tx, fx.tenant, id, 2, b"cd", later),
+        Err(Error::Conflict)
+    ));
+    tx.rollback().unwrap();
+    // A live upload past its expiry is refused even without a sweep.
+    let tx = fx.conn.transaction().unwrap();
+    let stale = fx
+        .objects
+        .begin_upload(&tx, fx.tenant, 4, None, 50, NOW)
+        .unwrap();
+    tx.commit().unwrap();
+    let tx = fx.conn.transaction().unwrap();
+    assert!(matches!(
+        fx.objects.put_chunk(&tx, fx.tenant, stale, 0, b"zz", later),
+        Err(Error::InvalidInput("upload expired"))
+    ));
+    tx.rollback().unwrap();
+}
+
+#[test]
+fn readers_are_counted_and_released_on_drop() {
+    let mut fx = fixture();
+    let digest = fx.put(fx.tenant, b"reader payload");
+    let (reader, len) = fx.objects.open_read(&fx.conn, fx.tenant, digest).unwrap();
+    assert_eq!(len, 14);
+    assert!(fx.objects.reader_active(fx.tenant, digest));
+    let (reader2, _) = fx.objects.open_read(&fx.conn, fx.tenant, digest).unwrap();
+    assert!(fx.objects.reader_active(fx.tenant, digest));
+    drop(reader);
+    assert!(fx.objects.reader_active(fx.tenant, digest));
+    drop(reader2);
+    assert!(!fx.objects.reader_active(fx.tenant, digest));
+    // Uncommitted and foreign digests register nothing.
+    assert!(matches!(
+        fx.objects
+            .open_read(&fx.conn, fx.tenant, Digest::from_bytes([7; 32])),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        fx.objects.open_read(&fx.conn, fx.other, digest),
+        Err(Error::NotFound)
+    ));
+}
+
+#[test]
+fn recovery_keeps_open_uploads_and_removes_dead_staging() {
+    let mut fx = fixture();
+    let id = fx.begin(fx.tenant, 8, None);
+    fx.chunk(fx.tenant, id, 0, b"live").unwrap();
+    // A staging file with no row is dead; an aborted row's file is dead too.
+    let orphan = fx.dir.path().join("incoming").join("upl_deadbeef");
+    std::fs::write(&orphan, b"nobody").unwrap();
+    let dead = fx.begin(fx.tenant, 4, None);
+    let tx = fx.conn.transaction().unwrap();
+    fx.objects.abort_upload(&tx, fx.tenant, dead).unwrap();
+    tx.commit().unwrap();
+    std::fs::write(
+        fx.dir.path().join("incoming").join(dead.to_string()),
+        b"left",
+    )
+    .unwrap();
+    let report = fx.objects.recover(&fx.conn).unwrap();
+    assert!(fx.dir.path().join("incoming").join(id.to_string()).exists());
+    assert!(!orphan.exists());
+    assert!(
+        !fx.dir
+            .path()
+            .join("incoming")
+            .join(dead.to_string())
+            .exists()
+    );
+    assert_eq!(report.staged, 2);
+}
+
+#[test]
+fn materialize_writes_verified_entries() {
+    let mut fx = fixture();
+    let a = fx.put(fx.tenant, b"file one");
+    let b = fx.put(fx.tenant, b"file two is longer");
+    let tx = fx.conn.transaction().unwrap();
+    fx.objects
+        .commit_manifest(
+            &tx,
+            fx.tenant,
+            Kind::Artifact,
+            "dist",
+            &[entry("out/a.txt", a, 8), entry("out/deep/b.txt", b, 18)],
+        )
+        .unwrap();
+    tx.commit().unwrap();
+    let dest = fx.dir.path().join("extract");
+    assert_eq!(
+        fx.objects
+            .materialize(&fx.conn, fx.tenant, Kind::Artifact, "dist", None, &dest)
+            .unwrap(),
+        26
+    );
+    assert_eq!(std::fs::read(dest.join("out/a.txt")).unwrap(), b"file one");
+    assert_eq!(
+        std::fs::read(dest.join("out/deep/b.txt")).unwrap(),
+        b"file two is longer"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_refuses_symlinked_ancestors() {
+    let mut fx = fixture();
+    let a = fx.put(fx.tenant, b"payload");
+    let tx = fx.conn.transaction().unwrap();
+    fx.objects
+        .commit_manifest(&tx, fx.tenant, Kind::Artifact, "m", &[entry("sub/x", a, 7)])
+        .unwrap();
+    tx.commit().unwrap();
+    let dest = fx.dir.path().join("dest");
+    let outside = fx.dir.path().join("outside");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, dest.join("sub")).unwrap();
+    assert!(matches!(
+        fx.objects
+            .materialize(&fx.conn, fx.tenant, Kind::Artifact, "m", None, &dest),
+        Err(Error::InvalidInput("materialize path"))
+    ));
+    assert!(!outside.join("x").exists());
+}

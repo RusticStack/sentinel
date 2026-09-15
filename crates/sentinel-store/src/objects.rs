@@ -37,7 +37,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -45,14 +45,18 @@ use std::{
     },
 };
 
-use rusqlite::{Connection, OptionalExtension, Transaction};
-use sentinel_core::{TenantId, UnixMillis};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use sentinel_core::{TenantId, UnixMillis, UploadId};
 
 use crate::{Error, Result};
 
 pub const OBJECTS_DIR: &str = "objects";
 pub const MANIFESTS_DIR: &str = "manifests";
 pub const TMP_DIR: &str = "tmp";
+/// Resumable upload staging: `incoming/<upl_…>` files sized to the declared
+/// length at `begin_upload`. Unlike `tmp/` these survive a restart — an open
+/// upload's bytes are how the client resumes.
+pub const INCOMING_DIR: &str = "incoming";
 /// Bytes per streamed chunk for staging, reads and verification.
 const CHUNK: usize = 128 << 10;
 /// Manifest format version; bump only under `docs/compatibility.md`.
@@ -65,6 +69,13 @@ pub const MAX_MANIFEST_ENTRIES: usize = 65_536;
 pub const MAX_ENTRY_PATH: usize = 1024;
 /// Longest manifest name, in bytes (matches the column check).
 pub const MAX_MANIFEST_NAME: usize = 255;
+/// Distinct byte ranges one upload may accumulate; a client that fragments
+/// past this is refused and should send ordered chunks instead.
+pub const MAX_UPLOAD_RANGES: usize = 256;
+/// Longest an upload session may stay open.
+pub const MAX_UPLOAD_TTL_MS: i64 = 24 * 3_600_000;
+/// One sweep handles this many expired uploads at a time.
+const SWEEP_BATCH: i64 = 256;
 
 /// BLAKE3-256 content digest. Hex text form is 64 lowercase characters.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -225,14 +236,17 @@ pub struct Objects {
     /// tenant's subtree needs one fsync chain, not one per object.
     durable_dirs: Mutex<HashSet<PathBuf>>,
     tmp_seq: AtomicU64,
+    /// Live readers per (tenant, digest). Reclamation must never unlink a
+    /// file a reader is streaming; [`Objects::reader_active`] is how GC asks.
+    readers: std::sync::Arc<Mutex<HashMap<(TenantId, Digest), u64>>>,
 }
 
 impl Objects {
-    /// Open (creating) `objects/`, `manifests/` and `tmp/` under `root`.
-    /// Does not recover; call [`Objects::recover`] at startup.
+    /// Open (creating) `objects/`, `manifests/`, `tmp/` and `incoming/`
+    /// under `root`. Does not recover; call [`Objects::recover`] at startup.
     pub fn open(root: impl Into<PathBuf>) -> Result<Objects> {
         let root = root.into();
-        for dir in [OBJECTS_DIR, MANIFESTS_DIR, TMP_DIR] {
+        for dir in [OBJECTS_DIR, MANIFESTS_DIR, TMP_DIR, INCOMING_DIR] {
             fs::create_dir_all(root.join(dir))?;
         }
         sync_dir(&root)?;
@@ -240,6 +254,7 @@ impl Objects {
             root,
             durable_dirs: Mutex::new(HashSet::new()),
             tmp_seq: AtomicU64::new(0),
+            readers: std::sync::Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -270,6 +285,9 @@ impl Objects {
             .join(kind.code().to_string())
             .join(blake3::hash(name).to_hex().to_string())
             .join(version.to_string())
+    }
+    fn upload_path(&self, upload: UploadId) -> PathBuf {
+        self.root.join(INCOMING_DIR).join(upload.to_string())
     }
 
     /// Create and fsync `dir` and every ancestor down to `root`, once per
@@ -646,6 +664,28 @@ impl Objects {
             report.missing.push(self.object_path(tenant, &digest));
         }
         self.recover_manifests(conn, &mut report)?;
+        // Staging files for resumable uploads: an open row keeps its file;
+        // anything else under incoming/ is swept — no committed object can
+        // have come from it, since sealing renames the file away.
+        let mut open = HashSet::new();
+        let mut rows = conn.prepare("SELECT id FROM uploads WHERE state_code = 0")?;
+        let mut query = rows.query([])?;
+        while let Some(row) = query.next()? {
+            if let Ok(id) = <[u8; 16]>::try_from(row.get::<_, Vec<u8>>(0)?.as_slice())
+                && let Ok(id) = UploadId::from_bytes(id)
+            {
+                open.insert(self.upload_path(id));
+            }
+        }
+        drop(query);
+        drop(rows);
+        for entry in fs::read_dir(self.root.join(INCOMING_DIR))? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() && !open.contains(&entry.path()) {
+                fs::remove_file(entry.path())?;
+                report.staged += 1;
+            }
+        }
         Ok(report)
     }
 
@@ -777,6 +817,512 @@ impl Objects {
         }
         Ok(corrupt)
     }
+
+    /// Open a committed object for ranged reads while registering a live
+    /// reader. The returned guard keeps the object counted until it is
+    /// dropped; reclamation must consult [`Objects::reader_active`].
+    pub fn open_read(
+        &self,
+        conn: &Connection,
+        tenant: TenantId,
+        digest: Digest,
+    ) -> Result<(Reader, u64)> {
+        let meta = self.meta(conn, tenant, digest)?;
+        let file = File::open(self.object_path(tenant, &digest)).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => Error::Corrupt("object missing"),
+            _ => Error::Io(e),
+        })?;
+        let mut readers = self.readers.lock().unwrap_or_else(|p| p.into_inner());
+        *readers.entry((tenant, digest)).or_insert(0) += 1;
+        Ok((
+            Reader {
+                file,
+                key: (tenant, digest),
+                readers: std::sync::Arc::clone(&self.readers),
+            },
+            meta.len,
+        ))
+    }
+
+    /// Whether any reader currently holds this object. Reclamation checks
+    /// this before unlinking; the check and the unlink are the GC stage's
+    /// responsibility to serialize.
+    pub fn reader_active(&self, tenant: TenantId, digest: Digest) -> bool {
+        self.readers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&(tenant, digest))
+    }
+
+    /// Begin a resumable upload: the row and a staging file sized to the
+    /// declared length, in the same transaction. `digest` may be omitted;
+    /// `seal_upload` then reports whatever the content hashed to.
+    pub fn begin_upload(
+        &self,
+        tx: &Transaction<'_>,
+        tenant: TenantId,
+        declared_len: u64,
+        digest: Option<Digest>,
+        ttl_ms: i64,
+        now: UnixMillis,
+    ) -> Result<UploadId> {
+        if ttl_ms <= 0 || ttl_ms > MAX_UPLOAD_TTL_MS {
+            return Err(Error::InvalidInput("upload ttl"));
+        }
+        self.ensure_dir(&self.root.join(INCOMING_DIR))?;
+        let id = UploadId::new();
+        let path = self.upload_path(id);
+        {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)?;
+            let result = file.set_len(declared_len).and_then(|()| file.sync_data());
+            if result.is_err() {
+                let _ = fs::remove_file(&path);
+            }
+            result?;
+        }
+        let written = tx.execute(
+            "INSERT INTO uploads(id, tenant_id, declared_len, digest, ranges, expires_ms, created_ms)
+             VALUES (?1, ?2, ?3, ?4, X'', ?5, ?6)",
+            params![
+                id.as_bytes().as_slice(),
+                tenant.as_bytes().as_slice(),
+                declared_len as i64,
+                digest.map(|d| d.as_bytes().to_vec()),
+                now.0 + ttl_ms,
+                now.0,
+            ],
+        );
+        if written.is_err() {
+            let _ = fs::remove_file(&path);
+        }
+        written?;
+        Ok(id)
+    }
+
+    /// The tenant that owns an upload row. The API resolves this before
+    /// checking the caller's membership so a foreign id is indistinguishable
+    /// from a missing one.
+    pub fn upload_owner(&self, conn: &Connection, id: UploadId) -> Result<TenantId> {
+        conn.query_row(
+            "SELECT tenant_id FROM uploads WHERE id = ?1",
+            params![id.as_bytes().as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .map(tenant_from)
+        .transpose()?
+        .ok_or(Error::NotFound)
+    }
+
+    /// A resumable upload's durable state: what the client still owes.
+    pub fn upload(
+        &self,
+        conn: &Connection,
+        tenant: TenantId,
+        id: UploadId,
+    ) -> Result<UploadStatus> {
+        let row = upload_row(conn, tenant, id)?.ok_or(Error::NotFound)?;
+        Ok(UploadStatus {
+            state: row.state,
+            declared_len: row.declared_len,
+            received: row.received,
+            ranges: row.ranges,
+            expires_ms: row.expires_ms,
+        })
+    }
+
+    /// Write one chunk at `offset` into the staging file, then record the
+    /// range — bytes before bookkeeping, so a crash can never claim bytes it
+    /// does not have. Re-sending an identical range is idempotent (the
+    /// ranges merge; `received` counts bytes once).
+    pub fn put_chunk(
+        &self,
+        tx: &Transaction<'_>,
+        tenant: TenantId,
+        id: UploadId,
+        offset: u64,
+        bytes: &[u8],
+        now: UnixMillis,
+    ) -> Result<u64> {
+        let row = upload_row(tx, tenant, id)?.ok_or(Error::NotFound)?;
+        if row.state != UploadState::Open {
+            return Err(Error::Conflict);
+        }
+        if row.expires_ms <= now.0 {
+            // Touching an expired session retires it: the row can no longer
+            // be resumed and the staged bytes become recoverable garbage.
+            tx.execute(
+                "UPDATE uploads SET state_code = 2 WHERE id = ?1 AND state_code = 0",
+                params![id.as_bytes().as_slice()],
+            )?;
+            let _ = fs::remove_file(self.upload_path(id));
+            return Err(Error::InvalidInput("upload expired"));
+        }
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .filter(|end| *end <= row.declared_len)
+            .ok_or(Error::InvalidInput("chunk range"))?;
+        let mut file = OpenOptions::new().write(true).open(self.upload_path(id))?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(bytes)?;
+        file.sync_data()?;
+        let mut ranges = row.ranges;
+        ranges_insert(&mut ranges, offset, end)?;
+        let received: u64 = ranges.iter().map(|(s, e)| e - s).sum();
+        tx.execute(
+            "UPDATE uploads SET ranges = ?2, received = ?3 WHERE id = ?1 AND state_code = 0",
+            params![
+                id.as_bytes().as_slice(),
+                encode_ranges(&ranges),
+                received as i64
+            ],
+        )?;
+        Ok(received)
+    }
+
+    /// Finish the upload: the ranges must tile the declared length, the
+    /// content must match the declared digest when one was given, then the
+    /// file is renamed into `objects/` and the reference committed — all
+    /// inside the caller's transaction. Sealing twice answers the same
+    /// digest; sealing an aborted upload is a conflict. An expired session
+    /// is retired rather than published.
+    pub fn seal_upload(
+        &self,
+        tx: &Transaction<'_>,
+        tenant: TenantId,
+        id: UploadId,
+        now: UnixMillis,
+    ) -> Result<Digest> {
+        let row = upload_row(tx, tenant, id)?.ok_or(Error::NotFound)?;
+        if row.state == UploadState::Committed {
+            return row.object_digest.ok_or(Error::Corrupt("upload digest"));
+        }
+        if row.state == UploadState::Aborted {
+            return Err(Error::Conflict);
+        }
+        if row.expires_ms <= now.0 {
+            tx.execute(
+                "UPDATE uploads SET state_code = 2 WHERE id = ?1 AND state_code = 0",
+                params![id.as_bytes().as_slice()],
+            )?;
+            let _ = fs::remove_file(self.upload_path(id));
+            return Err(Error::InvalidInput("upload expired"));
+        }
+        let path = self.upload_path(id);
+        let complete = row.ranges.as_slice() == [(0, row.declared_len)]
+            || row.declared_len == 0 && row.ranges.is_empty();
+        if !complete {
+            return Err(Error::InvalidInput("upload incomplete"));
+        }
+        let digest = {
+            let mut file = File::open(&path)?;
+            let mut hasher = blake3::Hasher::new();
+            let mut buf = vec![0u8; CHUNK];
+            let mut len = 0u64;
+            loop {
+                let got = file.read(&mut buf)?;
+                if got == 0 {
+                    break;
+                }
+                len += got as u64;
+                hasher.update(&buf[..got]);
+            }
+            if len != row.declared_len {
+                return Err(Error::Corrupt("upload length"));
+            }
+            Digest(*hasher.finalize().as_bytes())
+        };
+        // A mismatch is not fatal: the staged bytes stay, so the client can
+        // rewrite whichever ranges were wrong and seal again.
+        if row.digest.is_some_and(|declared| declared != digest) {
+            return Err(Error::InvalidInput("upload digest"));
+        }
+        let object = self.object_path(tenant, &digest);
+        self.ensure_dir(object.parent().expect("object path has a parent"))?;
+        if !object.exists() {
+            fs::rename(&path, &object)?;
+            if let Some(dir) = object.parent() {
+                sync_dir(dir)?;
+            }
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+        self.commit(
+            tx,
+            &Staged {
+                tenant,
+                digest,
+                len: row.declared_len,
+                path: object,
+            },
+        )?;
+        tx.execute(
+            "UPDATE uploads SET state_code = 1, object_digest = ?2 WHERE id = ?1",
+            params![id.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+        )?;
+        Ok(digest)
+    }
+
+    /// Give up on an open upload and remove its staging file. A committed
+    /// upload cannot be aborted — its object is already reachable.
+    pub fn abort_upload(&self, tx: &Transaction<'_>, tenant: TenantId, id: UploadId) -> Result<()> {
+        let row = upload_row(tx, tenant, id)?.ok_or(Error::NotFound)?;
+        if row.state != UploadState::Open {
+            return Err(Error::Conflict);
+        }
+        tx.execute(
+            "UPDATE uploads SET state_code = 2 WHERE id = ?1",
+            params![id.as_bytes().as_slice()],
+        )?;
+        let _ = fs::remove_file(self.upload_path(id));
+        Ok(())
+    }
+
+    /// Abort open uploads past their expiry and drop their staging files.
+    /// Returns how many were retired; at most [`SWEEP_BATCH`] per call.
+    pub fn sweep_uploads(&self, tx: &Transaction<'_>, now: UnixMillis) -> Result<u32> {
+        let mut stmt = tx
+            .prepare("SELECT id FROM uploads WHERE state_code = 0 AND expires_ms <= ?1 LIMIT ?2")?;
+        let expired: Vec<UploadId> = stmt
+            .query_map(params![now.0, SWEEP_BATCH], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|id| {
+                UploadId::from_bytes(
+                    <[u8; 16]>::try_from(id?.as_slice())
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                )
+                .map_err(|_| rusqlite::Error::InvalidQuery)
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        let mut swept = 0u32;
+        for id in expired {
+            tx.execute(
+                "UPDATE uploads SET state_code = 2 WHERE id = ?1",
+                params![id.as_bytes().as_slice()],
+            )?;
+            let _ = fs::remove_file(self.upload_path(id));
+            swept += 1;
+        }
+        Ok(swept)
+    }
+
+    /// Write a manifest's objects into `dest` as regular files. Entry paths
+    /// are re-validated, every ancestor under `dest` is checked for symlinks
+    /// and the file itself is created `O_EXCL`-style (existing targets are
+    /// refused), so a prepared directory cannot redirect the extract outside
+    /// itself. Content is verified while streaming.
+    pub fn materialize(
+        &self,
+        conn: &Connection,
+        tenant: TenantId,
+        kind: Kind,
+        name: &str,
+        version: Option<u64>,
+        dest: &Path,
+    ) -> Result<u64> {
+        let manifest = self.manifest(conn, tenant, kind, name, version)?;
+        fs::create_dir_all(dest)?;
+        let mut written = 0u64;
+        for entry in &manifest.entries {
+            let mut path = dest.to_path_buf();
+            for part in entry.path.split('/') {
+                path.push(part);
+                // A symlinked component could redirect the write outside
+                // dest; refuse it and anything else that is not a directory
+                // before descending.
+                match fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(Error::InvalidInput("materialize path"));
+                    }
+                    Ok(meta) if !meta.is_dir() && path != *dest => {
+                        return Err(Error::InvalidInput("materialize path"));
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+            }
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::AlreadyExists => Error::InvalidInput("materialize target"),
+                    _ => Error::Io(e),
+                })?;
+            self.read(conn, tenant, entry.digest, &mut file)?;
+            file.sync_data()?;
+            #[cfg(unix)]
+            if entry.mode != 0 {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(entry.mode))?;
+            }
+            written += entry.len;
+        }
+        sync_dir(dest)?;
+        Ok(written)
+    }
+}
+
+/// A live object reader: the file plus the registration that keeps GC from
+/// reclaiming it. Drops itself out of the count.
+pub struct Reader {
+    file: File,
+    key: (TenantId, Digest),
+    readers: std::sync::Arc<Mutex<HashMap<(TenantId, Digest), u64>>>,
+}
+
+impl Read for Reader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl Seek for Reader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        let mut readers = self.readers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = readers.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                readers.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// Durable upload session state (the `uploads` row decoded).
+struct UploadRow {
+    state: UploadState,
+    declared_len: u64,
+    /// The digest the client declared at `begin_upload`; verified at seal.
+    digest: Option<Digest>,
+    received: u64,
+    ranges: Vec<(u64, u64)>,
+    expires_ms: i64,
+    object_digest: Option<Digest>,
+}
+
+/// Where an upload session stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadState {
+    Open = 0,
+    Committed = 1,
+    Aborted = 2,
+}
+
+/// What a resuming client needs to know.
+#[derive(Clone, Debug)]
+pub struct UploadStatus {
+    pub state: UploadState,
+    pub declared_len: u64,
+    pub received: u64,
+    /// Sorted, disjoint, non-adjacent byte ranges the controller holds.
+    pub ranges: Vec<(u64, u64)>,
+    pub expires_ms: i64,
+}
+
+fn upload_row(conn: &Connection, tenant: TenantId, id: UploadId) -> Result<Option<UploadRow>> {
+    conn.query_row(
+        "SELECT state_code, declared_len, digest, received, ranges, expires_ms, object_digest
+         FROM uploads WHERE id = ?1 AND tenant_id = ?2",
+        params![id.as_bytes().as_slice(), tenant.as_bytes().as_slice()],
+        |row| {
+            let blob = |index: usize| -> std::result::Result<Option<Digest>, rusqlite::Error> {
+                row.get::<_, Option<Vec<u8>>>(index)?
+                    .map(|d| {
+                        <[u8; 32]>::try_from(d.as_slice())
+                            .map(Digest::from_bytes)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)
+                    })
+                    .transpose()
+            };
+            Ok(UploadRow {
+                state: match row.get::<_, i64>(0)? {
+                    0 => UploadState::Open,
+                    1 => UploadState::Committed,
+                    _ => UploadState::Aborted,
+                },
+                declared_len: row.get::<_, i64>(1)? as u64,
+                digest: blob(2)?,
+                received: row.get::<_, i64>(3)? as u64,
+                ranges: decode_ranges(&row.get::<_, Vec<u8>>(4)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                expires_ms: row.get(5)?,
+                object_digest: blob(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Error::from)
+}
+
+fn encode_ranges(ranges: &[(u64, u64)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ranges.len() * 16);
+    for (start, end) in ranges {
+        out.extend_from_slice(&start.to_le_bytes());
+        out.extend_from_slice(&end.to_le_bytes());
+    }
+    out
+}
+
+fn decode_ranges(bytes: &[u8]) -> Result<Vec<(u64, u64)>> {
+    if !bytes.len().is_multiple_of(16) || bytes.len() / 16 > MAX_UPLOAD_RANGES {
+        return Err(Error::Corrupt("upload ranges"));
+    }
+    Ok(bytes
+        .chunks_exact(16)
+        .map(|pair| {
+            (
+                u64::from_le_bytes(pair[..8].try_into().unwrap()),
+                u64::from_le_bytes(pair[8..].try_into().unwrap()),
+            )
+        })
+        .collect())
+}
+
+/// Merge `[start, end)` into a sorted disjoint range set, coalescing
+/// overlaps and adjacency. Refuses once the set would exceed
+/// [`MAX_UPLOAD_RANGES`] — a fragmented upload is a client bug to fix by
+/// sending ordered chunks, not something the store should track forever.
+fn ranges_insert(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) -> Result<()> {
+    if start >= end {
+        return Err(Error::InvalidInput("chunk range"));
+    }
+    let (mut start, mut end) = (start, end);
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(ranges.len() + 1);
+    let mut placed = false;
+    for &(s, e) in ranges.iter() {
+        if e < start {
+            out.push((s, e));
+        } else if s > end {
+            if !placed {
+                out.push((start, end));
+                placed = true;
+            }
+            out.push((s, e));
+        } else {
+            start = start.min(s);
+            end = end.max(e);
+        }
+    }
+    if !placed {
+        out.push((start, end));
+    }
+    if out.len() > MAX_UPLOAD_RANGES {
+        return Err(Error::InvalidInput("upload fragmentation"));
+    }
+    *ranges = out;
+    Ok(())
 }
 
 fn manifest_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(u64, Digest, u64, UnixMillis)> {

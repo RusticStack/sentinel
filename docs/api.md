@@ -38,6 +38,12 @@ All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](p
 | `POST /jobs/{id}/rerun` | `run` | a new attempt of a finished job; `conflict` for a running or cancelled one |
 | `GET /attempts/{id}/logs?after&limit&wait=1` | `read` | frames after a sequence from the same files the controller writes ([logs](logs.md)); `wait=1` parks up to 25 s for more; `complete` and `gaps` say when the log is closed |
 | `GET /workers?tenant=slug` | member | the pools the tenant may use and their workers, each with `connected` from the live fleet |
+| `POST /tenants/{slug}/uploads` `{len, digest?, ttl_ms?}` | member (operator+) | open a resumable upload session → `201` `{upload, received, ranges, expires_ms}` ([storage](storage.md#resumable-uploads-reads-and-materialization-d02)) |
+| `GET /uploads/{upl}` | member (operator+) | the durable resume state: held byte ranges and expiry |
+| `PUT /uploads/{upl}?offset=N` | member (operator+) | one chunk, raw body ≤ 8 MiB; re-sent ranges merge, so retries are safe |
+| `POST /uploads/{upl}/commit` | member (operator+) | tile check + digest verification → publish the object → `{digest}`; repeating returns the same digest |
+| `DELETE /uploads/{upl}` | member (operator+) | abort and drop the staged bytes |
+| `GET /tenants/{slug}/objects/{digest}` | member | stream a committed object; `Range: bytes=a-b`/`a-`/`-n` → `206` with `Content-Range`; invalid ranges are `invalid_request`. At most four transfer bodies are in flight at once — the next is `rate_limited` |
 
 The first page (`GET /`) is a single static document; it accepts a
 `#/runs/<run id>` fragment and opens that run, which is what a check's

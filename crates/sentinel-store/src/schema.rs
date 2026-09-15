@@ -113,4 +113,5 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (21, include_str!("migrations/021_github_reconcile.sql")),
     (22, include_str!("migrations/022_ref_polling.sql")),
     (23, include_str!("migrations/023_objects.sql")),
+    (24, include_str!("migrations/024_uploads.sql")),
 ];

@@ -316,6 +316,53 @@ pub fn require_tenant_admin(
     }
 }
 
+/// Tenant-scoped object transfer authority (D02). The tenant comes from the
+/// resource row or the namespace lookup — never trusted from the request.
+/// `write` distinguishes upload sessions (membership at operator role or
+/// above, plus the RUN bit) from object downloads (any live member). A
+/// caller without the relationship sees `NotFound`, never the difference.
+pub fn require_tenant_member(
+    conn: &Connection,
+    principal: Principal,
+    tenant: TenantId,
+    write: bool,
+) -> Result<()> {
+    let required = if write {
+        Permissions::RUN
+    } else {
+        Permissions::READ
+    };
+    if !principal.permissions.contains(required)
+        || principal.repo.is_some()
+        || principal.tenant.is_some_and(|id| id != tenant)
+    {
+        return Err(Error::NotFound);
+    }
+    let allowed: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(
+        SELECT 1 FROM users u JOIN tenants t ON t.id = ?2
+        LEFT JOIN memberships m ON m.tenant_id = t.id AND m.user_id = u.id
+        WHERE u.id = ?1 AND u.active = 1 AND t.active = 1
+        AND (u.kind = 0 OR u.service_tenant_id = t.id)
+        AND (m.role >= ?3 OR (u.kind = 0 AND u.super_admin = 1 AND ?4)))",
+        )?
+        .query_row(
+            params![
+                principal.user.as_bytes(),
+                tenant.as_bytes(),
+                if write { 2 } else { 1 },
+                principal.permissions.contains(Permissions::PLATFORM_ADMIN)
+            ],
+            |r| r.get(0),
+        )?;
+    if allowed {
+        Ok(())
+    } else {
+        Err(Error::NotFound)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum NamespaceKind {
     Organization,

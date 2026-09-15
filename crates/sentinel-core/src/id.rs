@@ -160,6 +160,12 @@ identifier!(
     CheckId,
     "chk"
 );
+identifier!(
+    /// One resumable object upload session (D02). Names the durable staging
+    /// record so a client can resume or abort it; it is not an object.
+    UploadId,
+    "upl"
+);
 
 /// Step position inside its job. Steps are compiled in order and referenced by
 /// index; the human name lives in the compiled spec. `u16` bounds a job to
