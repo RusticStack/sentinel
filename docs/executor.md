@@ -39,7 +39,7 @@ The container's main process is a keepalive (`/bin/sh` loop that exits on `TERM`
 
 ## The attempt
 
-`attempt::run` is the lifecycle the controller's state machine expects, reported under the attempt's fence: `PreparationStarted` → workspace, checkout, image pull, container start → `StepsStarted` → each step in order → `FinalizationStarted` → teardown → `Passed` or `Failed(class)`:
+`attempt::run` is the lifecycle the controller's state machine expects, reported under the attempt's fence: `PreparationStarted` → workspace, checkout, image pull, container start → `StepsStarted` → each step in order → `FinalizationStarted` → **artifact capture while the workspace still exists** → teardown → durable log completion → `Passed` or `Failed(class)`:
 
 | What happened | Class |
 |---|---|
@@ -48,10 +48,13 @@ The container's main process is a keepalive (`/bin/sh` loop that exits on `TERM`
 | a step died from a signal | `CommandSignaled` |
 | a step passed its timeout | `ExecutionTimeout` |
 | cancel seen between steps | `Canceled` |
+| a `required` artifact absent or unpublished | `Publication` (`infra_failed`) |
 
 `executor::Executor` is the link's `Executor`: it takes an offer when the runtime is usable and fewer than 64 attempts are held, asks for the run spec over the link (`NeedSpec` → `Spec` chunks of 48 KiB, at most 1 MiB), decodes it and starts the attempt on its own thread. Reports go out on the live session in order; without a session they queue in memory and are replayed at the next attach (a durable spool is W05). A `stop` from the controller flips the attempt's cancel flag and removes its container; it is not reported, because the controller already counts the attempt as gone.
 
 On the controller, `dispatch::report` checks that the attempt is held by that worker under that fence and then applies the event through the state machine; a stale or foreign report changes nothing and is counted. A terminal report releases the reservation, decides dependents and wakes the dispatcher.
+
+**Artifact capture (D03).** Once the steps settle, `artifacts::capture` walks each declared artifact whose `when` matches the step verdict — the same descriptor-rooted resolver as `hash_files` (`openat2` `BENEATH | NO_SYMLINKS | NO_XDEV` under the pinned workspace root, shared traversal budgets), so a pattern can never escape into the host or follow a link planted by the job. Each file streams to the controller in `ArtifactData` chunks — nothing buffers a whole artifact — and the controller stages, digests and commits it into the object store, ending in the `{job}/{name}` manifest and the durable `artifacts` row ([storage](storage.md#artifact-records-d03)). Capture runs before workspace teardown and before the terminal report, so a controller-side verdict is always known before the attempt goes terminal; a required artifact that ends `absent`/`failed`/unpublished converts to `Publication`, an optional one is recorded and the job keeps its verdict. On a protocol-3 link the sink reports itself incapable and every declaration resolves `absent` without touching the filesystem.
 
 ## Steps (W04)
 
@@ -79,7 +82,7 @@ OOM is read from the host's view of the container's cgroup (`/sys/fs/cgroup<Cgro
 
 ## What is not here yet
 
-Log tail/follow over the API is W08 (`admin logs` reads the files host-locally); only bounded tails exist. Cancellation, graceful/forced termination, timeouts and lease expiry are in [cancellation](cancellation.md). Crash reconciliation of owned containers, leftover workspaces and spools is in [reconciliation](reconciliation.md). Caches, artifacts and secrets are their own parts. Disk quotas on the workspace are not enforced (no `io` delegation in the rootless setup; see F07).
+Log tail/follow over the API is W08 (`admin logs` reads the files host-locally); only bounded tails exist. Cancellation, graceful/forced termination, timeouts and lease expiry are in [cancellation](cancellation.md). Crash reconciliation of owned containers, leftover workspaces and spools is in [reconciliation](reconciliation.md). Caches and secrets are their own parts. Disk quotas on the workspace are not enforced (no `io` delegation in the rootless setup; see F07).
 
 ## Verification
 

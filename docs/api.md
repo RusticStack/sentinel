@@ -37,6 +37,8 @@ All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](p
 | `POST /jobs/{id}/cancel` | `run` | `cancel` → `terminal`, `requested` or `alreadyterminal` |
 | `POST /jobs/{id}/rerun` | `run` | a new attempt of a finished job; `conflict` for a running or cancelled one |
 | `GET /attempts/{id}/logs?after&limit&wait=1` | `read` | frames after a sequence from the same files the controller writes ([logs](logs.md)); `wait=1` parks up to 25 s for more; `complete` and `gaps` say when the log is closed |
+| `GET /runs/{id}/artifacts` | `read` | every artifact row of the run: name, job, attempt, `captured`/`absent`/`failed`, entries, bytes, retention and creation ([storage](storage.md#artifact-records-d03)) |
+| `GET /runs/{id}/artifacts/{arf}` | `read` | one row plus, when captured, its immutable manifest: version, digest, payload length and each entry's path/digest/len/mode; entry bytes download via `GET /tenants/{slug}/objects/{digest}` |
 | `GET /workers?tenant=slug` | member | the pools the tenant may use and their workers, each with `connected` from the live fleet |
 | `POST /tenants/{slug}/uploads` `{len, digest?, ttl_ms?}` | member (operator+) | open a resumable upload session → `201` `{upload, received, ranges, expires_ms}` ([storage](storage.md#resumable-uploads-reads-and-materialization-d02)) |
 | `GET /uploads/{upl}` | member (operator+) | the durable resume state: held byte ranges and expiry |

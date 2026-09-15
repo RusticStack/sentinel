@@ -215,10 +215,12 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
     let controller_identity = Identity::generate("controller").unwrap();
     let (c_cert, c_key) = (temp.path().join("c.crt"), temp.path().join("c.key"));
     controller_identity.save(&c_cert, &c_key).unwrap();
+    let objects = Arc::new(sentinel_store::objects::Objects::open(temp.path()).unwrap());
     let mut controller = Some(
         Controller::start(
             Arc::clone(&store),
             Arc::clone(&logs),
+            Arc::clone(&objects),
             controller_identity,
             "127.0.0.1:0".parse().unwrap(),
         )
@@ -230,7 +232,7 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
         listen: "127.0.0.1:0".parse().unwrap(),
         store: Arc::clone(&store),
         logs: Arc::clone(&logs),
-        objects: Arc::new(sentinel_store::objects::Objects::open(temp.path()).unwrap()),
+        objects: Arc::clone(&objects),
         controller: controller.as_ref().unwrap().handle(),
         sessions: local_auth::Policy::default(),
         github_webhook_secret: None,
@@ -271,7 +273,7 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
             name: "builder-1".into(),
             hello: Hello {
                 protocol_min: ProtocolVersion(1),
-                protocol_max: ProtocolVersion(3),
+                protocol_max: ProtocolVersion(4),
                 capabilities: Capabilities::REQUIRED,
                 arch: Arch::X86_64,
                 software: "test".into(),
@@ -325,6 +327,80 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
             .unwrap()
             .iter()
             .any(|f| f["stream"] == "stderr" && f["text"] == "boom\n")
+    );
+
+    // 1b. Artifacts: a captured file commits through the object store and is
+    // listed, detailed and downloadable through the API; a declared artifact
+    // that matches nothing is recorded absent, not missing.
+    let artifact_pipeline = "schema: 1\non: [push]\njobs:\n  pack:\n    image: ".to_owned()
+        + IMAGE
+        + "@"
+        + DIGEST
+        + "\n    resources: { cpu: 1, memory: 128MiB }\n    steps:\n      - id: s\n        run: 'mkdir -p out && echo report > out/report.txt'\n    artifacts:\n      - { name: report, paths: ['out/**'], when: always, required: true }\n      - { name: coverage, paths: ['cov/**'], when: always }\n";
+    let packed = api.dispatch(&artifact_pipeline, &repo, &sha);
+    let packed_id = packed["id"].as_str().unwrap().to_owned();
+    eventually("pack passed", || api.run(&packed_id)["state"] == "passed");
+    let (status, list) = api.call("GET", &format!("/api/v1/runs/{packed_id}/artifacts"), None);
+    assert_eq!(status, 200, "{list}");
+    let rows = list["artifacts"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let report = rows.iter().find(|r| r["name"] == "report").unwrap();
+    assert_eq!(report["state"], "captured");
+    assert_eq!(report["job_name"], "pack");
+    let coverage = rows.iter().find(|r| r["name"] == "coverage").unwrap();
+    assert_eq!(coverage["state"], "absent");
+    let (status, detail) = api.call(
+        "GET",
+        &format!(
+            "/api/v1/runs/{packed_id}/artifacts/{}",
+            report["id"].as_str().unwrap()
+        ),
+        None,
+    );
+    assert_eq!(status, 200, "{detail}");
+    let entries = detail["manifest"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["path"], "out/report.txt");
+    // The entry digest is downloadable through the tenant object route.
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let got = agent
+        .get(&format!(
+            "{}/api/v1/tenants/acme/objects/{}",
+            api.base,
+            entries[0]["digest"].as_str().unwrap()
+        ))
+        .header("authorization", &format!("Bearer {}", api.token))
+        .call()
+        .unwrap();
+    assert_eq!(got.status().as_u16(), 200);
+    assert_eq!(got.into_body().read_to_string().unwrap(), "report\n");
+
+    // A required artifact that matches nothing fails the job as a
+    // publication failure — it cannot silently disappear.
+    let required_missing = "schema: 1\non: [push]\njobs:\n  must:\n    image: ".to_owned()
+        + IMAGE
+        + "@"
+        + DIGEST
+        + "\n    resources: { cpu: 1, memory: 128MiB }\n    steps:\n      - id: s\n        run: 'true'\n    artifacts:\n      - { name: needed, paths: ['nope/**'], when: always, required: true }\n";
+    let must = api.dispatch(&required_missing, &repo, &sha);
+    let must_id = must["id"].as_str().unwrap().to_owned();
+    eventually("must infra_failed", || {
+        api.run(&must_id)["state"] == "infra_failed"
+    });
+    assert_eq!(api.job(&must_id, "must")["failure_class"], "publication");
+    let (status, list) = api.call("GET", &format!("/api/v1/runs/{must_id}/artifacts"), None);
+    assert_eq!(status, 200, "{list}");
+    assert!(
+        list["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == "needed" && r["state"] == "absent"),
+        "{list}"
     );
 
     // 2. Cancel during preparation: the hold between checkout and pull is
@@ -401,6 +477,7 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
     let restarted = Controller::start(
         Arc::clone(&store),
         Arc::clone(&logs),
+        Arc::clone(&objects),
         Identity::load(&c_cert, &c_key).unwrap(),
         link_addr,
     )
@@ -433,8 +510,10 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
         .iter()
         .filter(|n| n.starts_with("Started("))
         .count();
-    assert_eq!(started, 5, "{:?}", notices.lock().unwrap());
-    for id in [&ok_id, &bad_id, &held_id, &long_id, &slow_id] {
+    assert_eq!(started, 7, "{:?}", notices.lock().unwrap());
+    for id in [
+        &ok_id, &bad_id, &packed_id, &must_id, &held_id, &long_id, &slow_id,
+    ] {
         assert_eq!(api.run(id)["jobs"][0]["fence"], 1);
     }
     eventually("executor idle", || executor.state_is_idle());

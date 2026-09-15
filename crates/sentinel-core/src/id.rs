@@ -166,6 +166,11 @@ identifier!(
     UploadId,
     "upl"
 );
+identifier!(
+    /// One published (or reported absent) artifact of an attempt (D03).
+    ArtifactId,
+    "arf"
+);
 
 /// Step position inside its job. Steps are compiled in order and referenced by
 /// index; the human name lives in the compiled spec. `u16` bounds a job to

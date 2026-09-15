@@ -85,6 +85,14 @@ Downloads go through `open_read`, which registers a live `Reader` per `(tenant, 
 
 The API exposes this as `POST /tenants/{slug}/uploads`, `GET|PUT|DELETE /uploads/{upl}` (`PUT` takes `?offset=` and a raw body of at most 8 MiB), `POST /uploads/{upl}/commit` and `GET /tenants/{slug}/objects/{digest}` with `Range: bytes=…` support. Upload sessions require operator-level tenant membership; downloads require membership. An upload id resolves its owner before authorization so a foreign id is indistinguishable from a missing one. At most four transfer bodies are in flight at once (`TRANSFERS`); the next request is `rate_limited` rather than queued work.
 
+## Artifact records (D03)
+
+The `artifacts` table (migration 25) is the durable outcome of each declared artifact on an attempt: one row per `(attempt_id, name)` with the job and run for scoping, a terminal `state_code` (`captured`, `absent`, `failed`), entry and byte counts, the `manifests` version when captured, the retention deadline and the creation timestamp. `UNIQUE(attempt_id, name)` makes a redelivery a conflict rather than a duplicate; the state/identity columns sit behind the usual immutability triggers.
+
+A captured row and its manifest commit in **one writer transaction**: the controller stages each file body through `stage_begin`/`stage_write`/`stage_seal` (the streaming counterpart of `stage` — a `Staged` keeps the same rename-then-commit discipline and refuses to discard a file another committer won), commits the object references, commits the `{job_id}/{name}` manifest under `Kind::Artifact`, then inserts the artifact row. Absent and failed outcomes write only the row. A partial publication that never reaches `ArtifactEnd` leaves staged files that `recover` sweeps and in-flight byte accounting that the session drop releases; no artifact row exists for it, so nothing claims it.
+
+The API lists a run's artifacts (`GET /runs/{run}/artifacts`) and shows one row's detail (`GET /runs/{run}/artifacts/{arf}`), the latter inlining the manifest's entry paths, digests, lengths and modes; entry bytes download through the existing `GET /tenants/{slug}/objects/{digest}` route.
+
 ## Verification
 
 Thirteen integration tests. Runs: spec persisted and read back byte-for-byte, job states seeded from dependencies, cross-tenant read denied, duplicate run creation rejected with the original intact, rerun keeps the fence and stales the old attempt, rerun refused for running and cancelled jobs. Core: migrations idempotent with WAL and foreign keys on; full lifecycle with fence, timestamps and run aggregation; stale fence and wrong tenant rejected; compare-and-set conflict rolls back the whole transaction; dangling and cross-tenant inserts fail; ready-queue ordering and index use; durable cancel flag; acknowledged writes survive drop-without-checkpoint and reopen; writer back-pressure rejects only overflow. Plus two codec round-trip tests. All pass on Windows and Linux.

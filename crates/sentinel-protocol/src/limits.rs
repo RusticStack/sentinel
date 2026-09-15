@@ -27,10 +27,25 @@ pub const MAX_DIAGNOSTIC_TEXT_BYTES: usize = 64 << 10;
 pub const MAX_NAME_BYTES: usize = 128;
 /// Capability strings, worker labels and similar enumerations per message.
 pub const MAX_LIST_ITEMS: usize = 64;
+/// One `ArtifactData` frame payload on the worker link.
+pub const MAX_ARTIFACT_CHUNK_BYTES: usize = 48 << 10;
+/// Files one artifact may hold; bounds `ArtifactFile` messages per artifact.
+pub const MAX_ARTIFACT_ENTRIES: usize = 4096;
+/// One artifact's total published bytes.
+pub const MAX_ARTIFACT_BYTES: u64 = 4 << 30;
+/// All captured artifact bytes of one run, across jobs and attempts.
+pub const MAX_RUN_ARTIFACT_BYTES: u64 = 16 << 30;
+/// Artifact names are pipeline ids (`expect_id`), at most this long.
+pub const MAX_ARTIFACT_NAME_BYTES: usize = 64;
+/// One file path on the artifact wire; the store's entry-path bound agrees.
+pub const MAX_ARTIFACT_PATH_BYTES: usize = 1024;
 
 // Invariants between limits, checked at compile time.
 const _: () = {
     assert!(MAX_LOG_FRAME_BYTES < MAX_CONTROL_MESSAGE_BYTES);
+    // An artifact frame is a postcard-encoded ClientMessage: the payload
+    // plus id/sequence/envelope must fit the one control-message bound.
+    assert!(MAX_ARTIFACT_CHUNK_BYTES + 64 <= MAX_CONTROL_MESSAGE_BYTES);
     assert!(MAX_PIPELINE_FILE_BYTES < MAX_API_BODY_BYTES);
     assert!(DEFAULT_DIAGNOSTIC_TEXT_BYTES < MAX_DIAGNOSTIC_TEXT_BYTES);
     assert!(DEFAULT_PAGE_ITEMS <= MAX_PAGE_ITEMS);

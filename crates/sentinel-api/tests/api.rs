@@ -6,25 +6,29 @@
 use std::{sync::Arc, thread, time::Duration};
 
 use sentinel_core::{
-    AttemptId, PoolId, RepoId, TenantId, UnixMillis, UserId,
+    AttemptId, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Namespace, Permissions as P, Principal},
 };
 use sentinel_link::{controller::Controller, identity::Identity};
+use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
 use sentinel_protocol::{
     logs::{Frame, Stream},
+    negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion},
     source::{Binding, Credential},
 };
 use sentinel_store::{
-    Durability, Store,
+    Durability, Store, artifacts,
     auth::{self, Authority, NamespaceKind, provisioning},
+    dispatch::{self, Capacity},
     intake, local_auth,
     logs::LogStore,
-    objects::Objects,
-    registration,
+    objects::{Entry, Expect, Kind, Objects},
+    registration, runs,
     sources::{self, Update},
     sources_forge,
     tenancy::{self, PoolKind},
     tokens::{self, Grant},
+    workers::{self, Presentation},
 };
 
 const DIGEST: &str = "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
@@ -207,9 +211,11 @@ fn deployment() -> Deployment {
         UnixMillis::now(),
     )
     .unwrap();
+    let objects = Arc::new(Objects::open(dir.path()).unwrap());
     let controller = Controller::start(
         Arc::clone(&store),
         Arc::clone(&logs),
+        Arc::clone(&objects),
         Identity::generate("controller").unwrap(),
         "127.0.0.1:0".parse().unwrap(),
     )
@@ -218,7 +224,7 @@ fn deployment() -> Deployment {
         listen: "127.0.0.1:0".parse().unwrap(),
         store: Arc::clone(&store),
         logs: Arc::clone(&logs),
-        objects: Arc::new(Objects::open(dir.path()).unwrap()),
+        objects,
         controller: controller.handle(),
         sessions: local_auth::Policy::default(),
         github_webhook_secret: Some(Arc::from(WEBHOOK_SECRET)),
@@ -1754,4 +1760,202 @@ fn transfer_slots_are_bounded() {
     };
     assert_eq!(status, 200);
     assert_eq!(bytes.len(), content.len());
+}
+
+#[test]
+fn artifact_routes_are_authorized_and_scoped() {
+    let d = deployment();
+    let (tenant, repo) = (d.tenant, d.intake_repo);
+    let now = UnixMillis::now();
+    // A run over the bound intake repository: one queued job, one placed
+    // attempt, one captured artifact with a manifest and one absent row.
+    let run = RunId::new();
+    let spec = RunSpec::new(
+        PinnedSource::new(
+            "https://git.example:8443/team/repo.git",
+            "0123456789abcdef0123456789abcdef01234567",
+            Some("refs/heads/main"),
+        )
+        .unwrap(),
+        compile_str(
+            "schema: 1\non: [push]\njobs:\n  build:\n    image: alpine:3\n    steps: [{ id: s, run: 'true' }]\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let job = d
+        .store
+        .writer()
+        .write(move |tx| {
+            let ids = runs::create_run(tx, tenant, repo, run, &spec, now)?;
+            for job in &ids {
+                runs::resolve_image(tx, tenant, *job, DIGEST, "linux/amd64")?;
+            }
+            Ok(ids[0])
+        })
+        .unwrap();
+    let (pool, worker) = (PoolId::new(), WorkerId::new());
+    d.store
+        .writer()
+        .write(move |tx| {
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                pool,
+                "artifacts",
+                PoolKind::Dedicated(tenant),
+                now,
+            )?;
+            let issued = workers::issue_enrollment(tx, Authority::HostLocal, pool, 60_000, now)?;
+            let mut text = String::new();
+            issued.secret.expose(&mut text);
+            workers::enroll(
+                tx,
+                &sentinel_auth::secret::Secret::parse(&text).unwrap(),
+                Presentation {
+                    worker,
+                    fingerprint: sentinel_auth::secret::Secret::generate().digest(),
+                    name: "w",
+                    negotiated: Negotiated {
+                        protocol: ProtocolVersion(4),
+                        capabilities: Capabilities::REQUIRED,
+                        arch: Arch::X86_64,
+                    },
+                },
+                now,
+            )?;
+            dispatch::report_capacity(
+                tx,
+                worker,
+                Capacity {
+                    cpu_millis: 4_000,
+                    memory_bytes: 8 << 30,
+                },
+            )
+        })
+        .unwrap();
+    let offer = d
+        .store
+        .writer()
+        .write(move |tx| dispatch::place(tx, worker, pool, dispatch::DEFAULT_LEASE_MS, now))
+        .unwrap()
+        .expect("the queued job was placed");
+    assert_eq!((offer.run, offer.job), (run, job));
+    // The captured row carries a committed manifest; the absent one does not.
+    let objects = Objects::open(d._dir.path()).unwrap();
+    let staged = objects
+        .stage(tenant, &b"report-bytes"[..], u64::MAX, Expect::default())
+        .unwrap();
+    let (captured, absent) = {
+        let objects = Objects::open(d._dir.path()).unwrap();
+        d.store
+            .writer()
+            .write(move |tx| {
+                objects.commit(tx, &staged)?;
+                let version = objects.commit_manifest(
+                    tx,
+                    tenant,
+                    Kind::Artifact,
+                    &artifacts::manifest_name(job, "report"),
+                    &[Entry {
+                        path: "out/report.txt".into(),
+                        digest: staged.digest(),
+                        len: staged.len(),
+                        mode: 0o644,
+                    }],
+                )?;
+                let captured = artifacts::record(
+                    tx,
+                    tenant,
+                    run,
+                    job,
+                    offer.attempt,
+                    "report",
+                    artifacts::State::Captured,
+                    Some(version),
+                    1,
+                    staged.len(),
+                    UnixMillis(now.0 + 7 * 86_400_000),
+                    now,
+                )?;
+                let absent = artifacts::record(
+                    tx,
+                    tenant,
+                    run,
+                    job,
+                    offer.attempt,
+                    "coverage",
+                    artifacts::State::Absent,
+                    None,
+                    0,
+                    0,
+                    UnixMillis(now.0 + 7 * 86_400_000),
+                    now,
+                )?;
+                Ok((captured, absent))
+            })
+            .unwrap()
+    };
+    let auth = bearer(&d);
+    // The listing answers both rows, newest states included.
+    let (status, rows) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run}/artifacts"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    let rows = rows["artifacts"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    // Detail returns the manifest's entry list for the captured row.
+    let (status, detail) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run}/artifacts/{captured}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(detail["state"], "captured");
+    assert_eq!(detail["name"], "report");
+    let manifest = &detail["manifest"];
+    assert_eq!(manifest["version"], 1);
+    let entries = manifest["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["path"], "out/report.txt");
+    assert_eq!(entries[0]["len"], 12);
+    // The absent row has no manifest.
+    let (status, detail) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run}/artifacts/{absent}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, detail["state"].as_str()), (200, Some("absent")));
+    assert!(detail.get("manifest").is_none() || detail["manifest"].is_null());
+    // Anonymous calls refuse; a foreign run or artifact id is invisible.
+    for path in [
+        format!("/api/v1/runs/{run}/artifacts"),
+        format!("/api/v1/runs/{run}/artifacts/{captured}"),
+    ] {
+        let (status, _) = call(&d, "GET", &path, None, None, &[]);
+        assert_eq!(status, 401, "{path}");
+    }
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!(
+            "/api/v1/runs/{run}/artifacts/{}",
+            sentinel_core::ArtifactId::new()
+        ),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
 }

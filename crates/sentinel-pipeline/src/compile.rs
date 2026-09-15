@@ -436,6 +436,7 @@ fn digest_of(
             }
             d.u64(a.when as u64);
             d.u64(a.retain_secs);
+            d.u64(u64::from(a.required));
         }
     }
     d.0

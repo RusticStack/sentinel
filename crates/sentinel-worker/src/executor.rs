@@ -21,12 +21,13 @@ use std::{
 };
 
 use sentinel_core::{AttemptId, Event, Fence, UnixMillis};
-use sentinel_link::session::{Executor as LinkExecutor, JobContext, Offer, Reporter};
+use sentinel_link::session::{ArtifactCode, Executor as LinkExecutor, JobContext, Offer, Reporter};
 use sentinel_pipeline::RunSpec;
 use sentinel_protocol::limits::MAX_LIST_ITEMS;
 
 use crate::{
     Result,
+    artifacts::{self, REPLY_TIMEOUT},
     attempt::{self, Cancel, Job, Report, Verdict},
     logpipe::LogPipe,
     podman,
@@ -91,6 +92,72 @@ struct State {
     leftovers: Vec<Leftover>,
     /// Leftover spools being delivered, so their acknowledgements route.
     recovering: HashMap<AttemptId, Arc<LogPipe>>,
+    /// Artifact reply waiters, one per attempt: the link admits one
+    /// in-flight publication per attempt and the attempt thread captures
+    /// its artifacts sequentially.
+    artifact_waits: HashMap<AttemptId, Arc<Watch>>,
+}
+
+/// The controller's next artifact answer, shared with the attempt thread.
+/// `gate` makes the check-and-send of each in-flight frame atomic against
+/// a verdict resolving the watch: a frame can never be sent after the
+/// controller has closed the artifact.
+#[derive(Default)]
+struct Watch {
+    reply: Mutex<Option<Reply>>,
+    cv: std::sync::Condvar,
+    gate: Mutex<()>,
+}
+
+/// What a watch can carry: the grant that opens a stream, or the terminal
+/// verdict that closes it.
+#[derive(Clone, Copy)]
+enum Reply {
+    Granted,
+    Done(ArtifactCode),
+}
+
+impl Watch {
+    /// The latest answer wins; a verdict can always follow a grant.
+    fn resolve(&self, reply: Reply) {
+        *self.reply.lock().unwrap_or_else(|p| p.into_inner()) = Some(reply);
+        self.cv.notify_all();
+    }
+    /// The current answer without consuming it.
+    fn peek(&self) -> Option<Reply> {
+        *self.reply.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    /// Wait for the first answer — `Granted` or a verdict.
+    fn wait_reply(&self, timeout: Duration) -> Option<Reply> {
+        let slot = self.reply.lock().unwrap_or_else(|p| p.into_inner());
+        let (slot, waited) = self
+            .cv
+            .wait_timeout_while(slot, timeout, |r| r.is_none())
+            .unwrap_or_else(|p| p.into_inner());
+        if waited.timed_out() {
+            return None;
+        }
+        *slot
+    }
+    /// Wait for the terminal verdict only; a stale `Granted` is not it.
+    fn wait_done(&self, timeout: Duration) -> Option<ArtifactCode> {
+        let deadline = Instant::now() + timeout;
+        let mut slot = self.reply.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(Reply::Done(code)) = *slot {
+                return Some(code);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let (s, _) = self
+                .cv
+                .wait_timeout(slot, remaining)
+                .unwrap_or_else(|p| p.into_inner());
+            slot = s;
+        }
+    }
 }
 
 /// The executor handle the link holds; cheap to clone, one runtime behind it.
@@ -142,6 +209,7 @@ impl Executor {
                 prepare_hold: Duration::ZERO,
                 leftovers,
                 recovering: HashMap::new(),
+                artifact_waits: HashMap::new(),
             }),
             notify: Box::new(notify),
             recovered,
@@ -224,10 +292,13 @@ impl Executor {
             .spawn(move || {
                 (executor.notify)(Notice::Started(job.attempt));
                 let output: Arc<dyn attempt::Output> = logs;
-                let (verdict, _) = attempt::run(&executor.root, &job, &*executor, output, &cancel);
+                let sink: &dyn artifacts::Sink = &*executor;
+                let (verdict, _) =
+                    attempt::run(&executor.root, &job, &*executor, output, sink, &cancel);
                 let delivered = {
                     let mut state = executor.state();
                     state.live.remove(&job.attempt);
+                    state.artifact_waits.remove(&job.attempt);
                     // The marker outlives the report: if the terminal event
                     // is still waiting for a session, a crash now must be
                     // reconciled, not forgotten.
@@ -369,6 +440,32 @@ impl Inner {
             state.pending.push((attempt, fence, event, summary));
         }
     }
+
+    /// One in-flight artifact frame under the send gate: refuses once the
+    /// stream is closed, and a dead wire resolves the watch `Store` so the
+    /// capture settles without another wait.
+    fn stream(
+        &self,
+        attempt: AttemptId,
+        send: impl FnOnce(&Reporter) -> std::result::Result<(), sentinel_link::Error>,
+    ) -> bool {
+        let Some(watch) = self.state().artifact_waits.get(&attempt).cloned() else {
+            return false;
+        };
+        let _gate = watch.gate.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(watch.peek(), Some(Reply::Done(_))) {
+            return false;
+        }
+        let Some(reporter) = self.state().reporter.clone() else {
+            watch.resolve(Reply::Done(ArtifactCode::Store));
+            return false;
+        };
+        if send(&reporter).is_err() {
+            watch.resolve(Reply::Done(ArtifactCode::Store));
+            return false;
+        }
+        true
+    }
 }
 
 impl Report for Inner {
@@ -377,6 +474,134 @@ impl Report for Inner {
     }
     fn finish(&self, attempt: AttemptId, fence: Fence, event: Event, summary: Vec<u8>) {
         self.send(attempt, fence, event, Some(summary));
+    }
+}
+
+impl artifacts::Sink for Inner {
+    fn capable(&self) -> bool {
+        self.state()
+            .reporter
+            .as_ref()
+            .is_some_and(Reporter::artifacts)
+    }
+
+    fn begin(&self, attempt: AttemptId, name: &str) -> Option<ArtifactCode> {
+        let watch = Arc::new(Watch::default());
+        let reporter = {
+            let mut state = self.state();
+            let reporter = state.reporter.clone();
+            match &reporter {
+                Some(r) if r.artifacts() => {
+                    state.artifact_waits.insert(attempt, Arc::clone(&watch));
+                }
+                _ => return Some(ArtifactCode::Stale),
+            }
+            reporter
+        };
+        if reporter
+            .expect("capability checked")
+            .artifact_begin(attempt, name)
+            .is_err()
+        {
+            self.state().artifact_waits.remove(&attempt);
+            return Some(ArtifactCode::Store);
+        }
+        match watch.wait_reply(REPLY_TIMEOUT) {
+            Some(Reply::Granted) => None,
+            answer => {
+                self.state().artifact_waits.remove(&attempt);
+                match answer {
+                    Some(Reply::Done(code)) => Some(code),
+                    _ => Some(ArtifactCode::Store),
+                }
+            }
+        }
+    }
+
+    fn file(&self, attempt: AttemptId, path: &str, len: u64, mode: u32) -> bool {
+        self.stream(attempt, |reporter| {
+            reporter.artifact_file(attempt, path, len, mode)
+        })
+    }
+
+    fn data(&self, attempt: AttemptId, seq: u32, bytes: &[u8]) -> bool {
+        self.stream(attempt, |reporter| {
+            reporter.artifact_data(attempt, seq, bytes)
+        })
+    }
+
+    fn end(&self, attempt: AttemptId, name: &str) -> ArtifactCode {
+        let Some(watch) = self.state().artifact_waits.get(&attempt).cloned() else {
+            return ArtifactCode::Stale;
+        };
+        {
+            let _gate = watch.gate.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(Reply::Done(code)) = watch.peek() {
+                self.state().artifact_waits.remove(&attempt);
+                return code;
+            }
+            match self.state().reporter.clone() {
+                Some(reporter) => {
+                    if reporter.artifact_end(attempt, name).is_err() {
+                        watch.resolve(Reply::Done(ArtifactCode::Store));
+                    }
+                }
+                None => watch.resolve(Reply::Done(ArtifactCode::Store)),
+            }
+        }
+        let code = watch
+            .wait_done(REPLY_TIMEOUT)
+            .unwrap_or(ArtifactCode::Store);
+        self.state().artifact_waits.remove(&attempt);
+        code
+    }
+
+    fn absent(&self, attempt: AttemptId, name: &str, reason: u8) -> ArtifactCode {
+        let watch = {
+            let mut state = self.state();
+            match state.artifact_waits.get(&attempt) {
+                Some(watch) => Arc::clone(watch),
+                None => {
+                    if state.reporter.is_none() {
+                        return ArtifactCode::Stale;
+                    }
+                    let watch = Arc::new(Watch::default());
+                    state.artifact_waits.insert(attempt, Arc::clone(&watch));
+                    watch
+                }
+            }
+        };
+        {
+            let _gate = watch.gate.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(Reply::Done(code)) = watch.peek() {
+                self.state().artifact_waits.remove(&attempt);
+                return code;
+            }
+            match self.state().reporter.clone() {
+                Some(reporter) => {
+                    if reporter.artifact_absent(attempt, name, reason).is_err() {
+                        watch.resolve(Reply::Done(ArtifactCode::Store));
+                    }
+                }
+                None => watch.resolve(Reply::Done(ArtifactCode::Store)),
+            }
+        }
+        let code = watch
+            .wait_done(REPLY_TIMEOUT)
+            .unwrap_or(ArtifactCode::Store);
+        self.state().artifact_waits.remove(&attempt);
+        code
+    }
+
+    fn settle(&self, attempt: AttemptId, _name: &str) -> ArtifactCode {
+        let Some(watch) = self.state().artifact_waits.get(&attempt).cloned() else {
+            return ArtifactCode::Store;
+        };
+        let code = watch
+            .wait_done(REPLY_TIMEOUT)
+            .unwrap_or(ArtifactCode::Store);
+        self.state().artifact_waits.remove(&attempt);
+        code
     }
 }
 
@@ -510,13 +735,39 @@ impl LinkExecutor for Executor {
     }
 
     fn detached(&self) {
-        let pipes: Vec<Arc<LogPipe>> = {
+        let (pipes, watches): (Vec<Arc<LogPipe>>, Vec<Arc<Watch>>) = {
             let mut state = self.state();
             state.reporter = None;
-            state.live.values().map(|l| Arc::clone(&l.logs)).collect()
+            (
+                state.live.values().map(|l| Arc::clone(&l.logs)).collect(),
+                state.artifact_waits.drain().map(|(_, w)| w).collect(),
+            )
         };
         for pipe in pipes {
             pipe.detached();
+        }
+        // Any capture waiting on a controller reply is told the link is
+        // gone; nothing was committed, so the artifact fails to publish.
+        for watch in watches {
+            watch.resolve(Reply::Done(ArtifactCode::Store));
+        }
+    }
+
+    fn artifact_granted(&self, attempt: AttemptId, _name: &str) {
+        let watch = self.state().artifact_waits.get(&attempt).cloned();
+        if let Some(watch) = watch {
+            // Resolve under the send gate: an `ArtifactFile` either ships
+            // before this grant is seen or sees it first — never both.
+            let _gate = watch.gate.lock().unwrap_or_else(|p| p.into_inner());
+            watch.resolve(Reply::Granted);
+        }
+    }
+
+    fn artifact_verdict(&self, attempt: AttemptId, _name: &str, code: ArtifactCode) {
+        let watch = self.state().artifact_waits.get(&attempt).cloned();
+        if let Some(watch) = watch {
+            let _gate = watch.gate.lock().unwrap_or_else(|p| p.into_inner());
+            watch.resolve(Reply::Done(code));
         }
     }
 

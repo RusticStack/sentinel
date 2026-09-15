@@ -122,6 +122,9 @@ pub struct Artifact {
     pub paths: Vec<String>,
     pub when: ArtifactWhen,
     pub retain_secs: u64,
+    /// A required artifact that matches nothing or cannot be published is a
+    /// finalization failure; an optional one is recorded absent.
+    pub required: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -905,12 +908,17 @@ fn artifact(path: &str, node: &Node) -> Result<Artifact> {
             days * 24 * 3600
         }
     };
+    let required = match map.take("required") {
+        None => false,
+        Some(n) => expect_bool(&map.child("required"), n)?,
+    };
     map.finish()?;
     Ok(Artifact {
         name,
         paths,
         when,
         retain_secs,
+        required,
     })
 }
 

@@ -10,9 +10,11 @@ use serde::{Deserialize, Serialize};
 #[repr(transparent)]
 pub struct ProtocolVersion(pub u16);
 
-/// Versions this controller build can serve, inclusive.
+/// Versions this controller build can serve, inclusive. Protocol 4 adds the
+/// artifact publication messages (`ArtifactBegin`…`ArtifactAbsent` and the
+/// `ArtifactGrant`/`ArtifactVerdict` answers).
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(3);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(4);
 
 /// Capabilities are a bit set: cheap to store, compare and intersect, and
 /// unknown bits from a newer worker are ignored rather than rejected.
@@ -162,7 +164,7 @@ mod tests {
                 .union(future_bit),
         );
         let n = negotiate(&h).unwrap();
-        assert_eq!(n.protocol, ProtocolVersion(3));
+        assert_eq!(n.protocol, SUPPORTED_MAX);
         assert_eq!(
             negotiate(&hello(1, 2, Capabilities::REQUIRED))
                 .unwrap()
@@ -182,7 +184,7 @@ mod tests {
     #[test]
     fn version_mismatch_says_who_must_upgrade() {
         assert_eq!(
-            negotiate(&hello(4, 5, Capabilities::REQUIRED)),
+            negotiate(&hello(5, 6, Capabilities::REQUIRED)),
             Err(Rejected::UnsupportedVersion {
                 supported_min: SUPPORTED_MIN,
                 supported_max: SUPPORTED_MAX,

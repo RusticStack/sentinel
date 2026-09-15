@@ -52,6 +52,7 @@ struct Deployment {
     _dir: tempfile::TempDir,
     store: Arc<Store>,
     logs: Arc<LogStore>,
+    objects: Arc<sentinel_store::objects::Objects>,
     controller: Option<Controller>,
     identity_files: (std::path::PathBuf, std::path::PathBuf),
     tenant: TenantId,
@@ -91,9 +92,12 @@ fn deployment() -> Deployment {
     let files = (dir.path().join("c.crt"), dir.path().join("c.key"));
     identity.save(&files.0, &files.1).unwrap();
     let logs = Arc::new(LogStore::open(dir.path().join("logs")).unwrap());
+    let objects =
+        Arc::new(sentinel_store::objects::Objects::open(dir.path().join("objects")).unwrap());
     let controller = Controller::start(
         Arc::clone(&store),
         Arc::clone(&logs),
+        Arc::clone(&objects),
         identity,
         "127.0.0.1:0".parse().unwrap(),
     )
@@ -102,6 +106,7 @@ fn deployment() -> Deployment {
         _dir: dir,
         store,
         logs,
+        objects,
         controller: Some(controller),
         identity_files: files,
         tenant,
@@ -210,6 +215,8 @@ struct Recorder {
     specs: Mutex<Vec<SpecRecord>>,
     log_acks: Mutex<Vec<(AttemptId, u64)>>,
     log_refusals: Mutex<Vec<AttemptId>>,
+    artifact_grants: Mutex<Vec<(AttemptId, String)>>,
+    artifact_verdicts: Mutex<Vec<(AttemptId, String, session::ArtifactCode)>>,
 }
 
 impl Recorder {
@@ -227,6 +234,8 @@ impl Recorder {
                 specs: Mutex::new(Vec::new()),
                 log_acks: Mutex::new(Vec::new()),
                 log_refusals: Mutex::new(Vec::new()),
+                artifact_grants: Mutex::new(Vec::new()),
+                artifact_verdicts: Mutex::new(Vec::new()),
             }),
             rx,
         )
@@ -290,6 +299,18 @@ impl Executor for Recorder {
     }
     fn log_refused(&self, attempt: AttemptId) {
         self.log_refusals.lock().unwrap().push(attempt);
+    }
+    fn artifact_granted(&self, attempt: AttemptId, name: &str) {
+        self.artifact_grants
+            .lock()
+            .unwrap()
+            .push((attempt, name.to_owned()));
+    }
+    fn artifact_verdict(&self, attempt: AttemptId, name: &str, code: session::ArtifactCode) {
+        self.artifact_verdicts
+            .lock()
+            .unwrap()
+            .push((attempt, name.to_owned(), code));
     }
 }
 
@@ -476,8 +497,12 @@ fn a_worker_enrolls_once_heartbeats_reconnects_and_is_refused_after_revocation()
     let fresh = d.enrollment(60_000);
     let refused = d.connect(load(), worker, Some(&fresh)).unwrap_err();
     assert!(matches!(refused, Error::Rejected(Rejection::Identity)));
+    // The client learns of a rejection from the reply bytes; the server-side
+    // counter updates as its accept call returns, a hair later.
+    eventually("rejection count", || {
+        d.controller().stats().rejected.load(Ordering::SeqCst) == 4
+    });
     assert_eq!(d.controller().stats().admitted.load(Ordering::SeqCst), 2);
-    assert_eq!(d.controller().stats().rejected.load(Ordering::SeqCst), 4);
 }
 
 #[test]
@@ -905,8 +930,16 @@ fn a_worker_reconnects_with_backoff_after_the_controller_restarts() {
     process.wait_for("Backoff", 1);
     // Same identity, same address: the worker's pin still holds.
     let identity = Identity::load(&d.identity_files.0, &d.identity_files.1).unwrap();
-    d.controller =
-        Some(Controller::start(Arc::clone(&d.store), Arc::clone(&d.logs), identity, addr).unwrap());
+    d.controller = Some(
+        Controller::start(
+            Arc::clone(&d.store),
+            Arc::clone(&d.logs),
+            Arc::clone(&d.objects),
+            identity,
+            addr,
+        )
+        .unwrap(),
+    );
     process.wait_for("Connected { worker: wrk_", 2);
     let events = process.events.lock().unwrap().clone();
     // The second connection presented no enrollment.
@@ -919,5 +952,161 @@ fn a_worker_reconnects_with_backoff_after_the_controller_restarts() {
         "{events:?}"
     );
     eventually("fleet", || d.controller().connected() == vec![id]);
+    process.stop().unwrap();
+}
+
+const ARTIFACT_PIPELINE: &str = "schema: 1
+on: [push]
+jobs:
+  build:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+    artifacts:
+      - { name: dist, paths: ['out/**'], when: always, required: true }
+      - { name: cov, paths: ['coverage/**'], when: always }
+";
+
+#[test]
+fn artifact_publication_commits_and_refusals_are_terminal() {
+    let d = deployment();
+    let secret = d.enrollment(60_000);
+    let (recorder, offers) = Recorder::new();
+    let id = WorkerId::new();
+    let process = WorkerProcess::start_version(
+        &d,
+        Identity::generate("w").unwrap(),
+        id,
+        Some(secret),
+        Arc::clone(&recorder),
+        4,
+    );
+    process.wait_for("Connected", 1);
+
+    let (run, ids) = d.run(ARTIFACT_PIPELINE);
+    let offer = offers.recv_timeout(Duration::from_secs(5)).unwrap().0;
+    eventually("attempt held", || {
+        d.store
+            .read(|c| dispatch::held_by(c, id))
+            .unwrap()
+            .iter()
+            .any(|h| h.attempt == offer.attempt && h.acknowledged)
+    });
+    let reporter = recorder.reporter.lock().unwrap().clone().unwrap();
+    assert!(reporter.artifacts());
+
+    // The happy path: begin is granted, the file streams in order, end is
+    // stored — and the row plus manifest are committed durably.
+    reporter.artifact_begin(offer.attempt, "dist").unwrap();
+    eventually("grant", || {
+        recorder
+            .artifact_grants
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(a, n)| *a == offer.attempt && n == "dist")
+    });
+    reporter
+        .artifact_file(offer.attempt, "out/a.txt", 4, 0o644)
+        .unwrap();
+    reporter.artifact_data(offer.attempt, 0, b"data").unwrap();
+    reporter.artifact_end(offer.attempt, "dist").unwrap();
+    eventually("stored verdict", || {
+        recorder
+            .artifact_verdicts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v.0 == offer.attempt && v.1 == "dist" && v.2 == session::ArtifactCode::Stored)
+    });
+
+    let tenant = d.tenant;
+    let rows = d
+        .store
+        .read(move |c| sentinel_store::artifacts::for_run(c, tenant, run))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.state, sentinel_store::artifacts::State::Captured);
+    assert_eq!((row.entries, row.bytes), (1, 4));
+    let manifest = d
+        .store
+        .read(|c| {
+            d.objects.manifest(
+                c,
+                tenant,
+                sentinel_store::objects::Kind::Artifact,
+                &sentinel_store::artifacts::manifest_name(ids[0], "dist"),
+                row.manifest_version,
+            )
+        })
+        .unwrap();
+    assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(manifest.entries[0].path, "out/a.txt");
+    assert_eq!(manifest.entries[0].mode, 0o644);
+    let mut body = Vec::new();
+    d.store
+        .read(|c| {
+            d.objects
+                .read(c, tenant, manifest.entries[0].digest, &mut body)
+        })
+        .unwrap();
+    assert_eq!(body, b"data");
+
+    // Absent is recorded as absent; the second declared artifact.
+    reporter.artifact_absent(offer.attempt, "cov", 0).unwrap();
+    eventually("absent verdict", || {
+        recorder
+            .artifact_verdicts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v.1 == "cov" && v.2 == session::ArtifactCode::Absent)
+    });
+    let rows = d
+        .store
+        .read(move |c| sentinel_store::artifacts::for_run(c, tenant, run))
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .any(|r| r.name == "cov" && r.state == sentinel_store::artifacts::State::Absent)
+    );
+
+    // Undeclared names and repeats of a finished record are terminal
+    // verdicts, not grants.
+    reporter
+        .artifact_begin(offer.attempt, "undeclared")
+        .unwrap();
+    reporter.artifact_begin(offer.attempt, "dist").unwrap();
+    eventually("terminal refusals", || {
+        let v = recorder.artifact_verdicts.lock().unwrap();
+        v.iter()
+            .any(|v| v.1 == "undeclared" && v.2 == session::ArtifactCode::NotDeclared)
+            && v.iter()
+                .any(|v| v.1 == "dist" && v.2 == session::ArtifactCode::Duplicate)
+    });
+    process.stop().unwrap();
+}
+
+#[test]
+fn an_old_protocol_session_cannot_publish_artifacts() {
+    let d = deployment();
+    let secret = d.enrollment(60_000);
+    let (recorder, _offers) = Recorder::new();
+    let process = WorkerProcess::start_version(
+        &d,
+        Identity::generate("w").unwrap(),
+        WorkerId::new(),
+        Some(secret),
+        Arc::clone(&recorder),
+        3,
+    );
+    process.wait_for("Connected", 1);
+    eventually("reporter", || recorder.reporter.lock().unwrap().is_some());
+    let reporter = recorder.reporter.lock().unwrap().clone().unwrap();
+    assert!(!reporter.artifacts());
+    assert!(reporter.artifact_begin(AttemptId::new(), "x").is_err());
+    assert!(reporter.artifact_absent(AttemptId::new(), "x", 0).is_err());
     process.stop().unwrap();
 }

@@ -22,6 +22,50 @@ pub fn hash_files(root: &std::path::Path, patterns: &[&str]) -> Result<String, H
     }
 }
 
+/// What [`resolve_paths`] returns on Linux: the pinned root descriptor and the
+/// sorted unique matches. Entries open beneath the descriptor — never through
+/// a path lookup — so symlinks and mounts cannot be smuggled in by a rename.
+#[cfg(target_os = "linux")]
+pub struct Resolved {
+    root: std::fs::File,
+    /// Sorted, de-duplicated relative paths that matched.
+    pub paths: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl Resolved {
+    /// Pin one matched path (`O_PATH`, confined beneath the root) and report
+    /// its metadata. The descriptor classifies the entry; it is not readable.
+    pub fn pin(&self, path: &str) -> Result<(std::fs::File, std::fs::Metadata), HashFilesError> {
+        let pinned = linux::pin(&self.root, path)?;
+        let meta = pinned
+            .metadata()
+            .map_err(|_| HashFilesError::Io("filesystem operation failed".into()))?;
+        Ok((pinned, meta))
+    }
+
+    /// A readable descriptor for a `pin`ned regular file, via procfs.
+    pub fn readable(&self, pinned: &std::fs::File) -> Result<std::fs::File, HashFilesError> {
+        linux::readable(pinned)
+    }
+}
+
+/// Resolve `patterns` under `root` with the same bounded, symlink- and
+/// mount-confined walk `hash_files` uses; `cap` bounds the file count and
+/// `NoMatch` means every pattern resolved to nothing. Linux only.
+#[cfg(target_os = "linux")]
+pub fn resolve_paths(
+    root: &std::path::Path,
+    patterns: &[&str],
+    cap: usize,
+) -> Result<Resolved, HashFilesError> {
+    let (root, paths) = linux::resolve(root, patterns, cap)?;
+    if paths.is_empty() {
+        return Err(HashFilesError::NoMatch);
+    }
+    Ok(Resolved { root, paths })
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
@@ -37,6 +81,7 @@ mod linux {
     struct Tree {
         root: File,
         visits: usize,
+        cap: usize,
         matches: BTreeSet<String>,
     }
 
@@ -58,10 +103,8 @@ mod linux {
             if self.matches.contains(path) {
                 return Ok(());
             }
-            if self.matches.len() == MAX_HASH_FILES {
-                return Err(HashFilesError::TooManyFiles {
-                    limit: MAX_HASH_FILES,
-                });
+            if self.matches.len() == self.cap {
+                return Err(HashFilesError::TooManyFiles { limit: self.cap });
             }
             self.matches.insert(path.to_owned());
             Ok(())
@@ -93,7 +136,7 @@ mod linux {
                     path.as_str(),
                     OFlags::PATH | OFlags::CLOEXEC,
                     Mode::empty(),
-                    resolve(),
+                    resolve_flags(),
                 );
                 match fd {
                     Err(rustix::io::Errno::NOENT) => {}
@@ -165,7 +208,7 @@ mod linux {
         }
     }
 
-    fn resolve() -> ResolveFlags {
+    fn resolve_flags() -> ResolveFlags {
         ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV
     }
 
@@ -175,7 +218,7 @@ mod linux {
             path,
             flags | OFlags::CLOEXEC,
             Mode::empty(),
-            resolve(),
+            resolve_flags(),
         )
         .map(File::from)
         .map_err(io)
@@ -193,7 +236,15 @@ mod linux {
         Ok(saved)
     }
 
-    pub(super) fn hash(root: &Path, patterns: &[&str]) -> Result<String, HashFilesError> {
+    /// The shared confined walk: validate patterns, pin the root, collect the
+    /// sorted unique matches. `cap` bounds the file count; the returned root
+    /// descriptor lets the caller open entries beneath it without re-walking
+    /// names through the filesystem.
+    pub(super) fn resolve(
+        root: &Path,
+        patterns: &[&str],
+        cap: usize,
+    ) -> Result<(File, Vec<String>), HashFilesError> {
         if patterns.is_empty() || patterns.len() > MAX_HASH_PATTERNS {
             return Err(HashFilesError::InvalidPattern("pattern count".into()));
         }
@@ -220,22 +271,42 @@ mod linux {
         let mut tree = Tree {
             root,
             visits: 0,
+            cap,
             matches: BTreeSet::new(),
         };
         let mut path = String::new();
         for pattern in patterns {
             tree.walk(&mut path, &pattern.split('/').collect::<Vec<_>>(), 0)?;
         }
-        if tree.matches.is_empty() {
+        Ok((tree.root, tree.matches.into_iter().collect()))
+    }
+
+    /// Pin a resolved entry beneath a resolved root: `O_PATH` beneath the
+    /// pinned descriptor, no symlinks, no mounts. Classify with `metadata`;
+    /// reopen for reading through `/proc/self/fd`.
+    pub(super) fn pin(root: &File, path: &str) -> Result<File, HashFilesError> {
+        confined(root, path, OFlags::PATH)
+    }
+
+    /// A readable descriptor for a pinned entry, via procfs so no pathname is
+    /// re-resolved. Fails for anything but a regular file pinned by `pin`.
+    pub(super) fn readable(pinned: &File) -> Result<File, HashFilesError> {
+        use std::os::fd::AsRawFd;
+        File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd())).map_err(io)
+    }
+
+    pub(super) fn hash(root: &Path, patterns: &[&str]) -> Result<String, HashFilesError> {
+        let (root, matches) = resolve(root, patterns, MAX_HASH_FILES)?;
+        if matches.is_empty() {
             return Err(HashFilesError::NoMatch);
         }
         let mut hasher = blake3::Hasher::new();
         let mut remaining = MAX_HASH_BYTES;
         let mut buf = vec![0u8; 64 << 10];
-        for path in &tree.matches {
+        for path in &matches {
             // O_PATH classifies special files without opening a device/FIFO for
             // I/O. Reopen the pinned regular inode via procfs, never its pathname.
-            let pinned = confined(&tree.root, path, OFlags::PATH)?;
+            let pinned = confined(&root, path, OFlags::PATH)?;
             let before = pinned.metadata().map_err(io)?;
             if !before.is_file() {
                 return Err(HashFilesError::UnsafeFile);
@@ -245,9 +316,7 @@ mod linux {
                     limit: MAX_HASH_BYTES,
                 });
             }
-            use std::os::fd::AsRawFd;
-            let mut file =
-                File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd())).map_err(io)?;
+            let mut file = readable(&pinned)?;
             hasher.update(path.as_bytes());
             hasher.update(&[0]);
             hasher.update(&before.len().to_le_bytes());
@@ -436,6 +505,7 @@ mod linux {
             let mut tree = Tree {
                 root: File::open(d.path()).unwrap(),
                 visits: MAX_HASH_VISITS - 1,
+                cap: MAX_HASH_FILES,
                 matches: BTreeSet::new(),
             };
             assert_eq!(
@@ -457,6 +527,7 @@ mod linux {
             let mut tree = Tree {
                 root: File::open(d.path()).unwrap(),
                 visits: MAX_HASH_VISITS - 32,
+                cap: MAX_HASH_FILES,
                 matches: BTreeSet::new(),
             };
             assert_eq!(
@@ -499,6 +570,7 @@ mod linux {
             let mut tree = Tree {
                 root: File::open(d.path()).unwrap(),
                 visits: 0,
+                cap: MAX_HASH_FILES,
                 matches: BTreeSet::new(),
             };
             tree.walk(&mut String::new(), &["sub", "file"], 0).unwrap();

@@ -50,7 +50,7 @@ jobs:                           # 1–64, names [a-z0-9][a-z0-9_-]{0,63}
     cache:                      # ≤ 8, unique names
       - {name: cargo, key: "cargo-${{ hash_files('Cargo.lock') }}", paths: [/usr/local/cargo/registry, target]}
     artifacts:                  # ≤ 8, unique names
-      - {name: release, paths: [target/release/app], when: success|failure|always, retain: 7d}
+      - {name: release, paths: [target/release/app], when: success|failure|always, retain: 7d, required: false}
     secrets: [DEPLOY_TOKEN]     # ≤ 16 names [A-Z_][A-Z0-9_]*; values never appear in YAML
 ```
 
@@ -162,7 +162,7 @@ The [C06 resolver contract](hash-files.md) closes the filesystem gaps from the [
 Three kinds of binding connect a job to state outside its container, and each is declared by name so grants can be checked before anything runs:
 
 - **cache**: a name, a key template and container paths. The worker materialises the named cache scope for the rendered key; the key is unknown offline whenever it interpolates runtime context.
-- **artifacts**: named path sets published after the job under a `when` policy and a retention period; publication needs artifact storage.
+- **artifacts**: named path sets published after the job's steps under a `when` policy (`success`, `failure` or `always`, matched against the step verdict) and a `retain` period of `1d`–`365d` (default `7d`). `paths` use the `hash_files` pattern language resolved against the job workspace: a declaration that resolves to no files is recorded `absent`; one that cannot resolve or publish is recorded `failed`. `required: true` (default `false`) turns an absent or failed outcome into a publication-class job failure; an optional artifact never changes the verdict. Each artifact publishes as an immutable manifest of content-addressed objects (D03); per-artifact and per-run byte and entry budgets are enforced during capture.
 - **secrets**: names only. The worker injects each granted secret as an environment variable of that name; the file never carries a value, and a job that names a secret the repository has not been granted fails at dispatch, not silently with an empty variable.
 
 `sentinel pipeline validate <file>` runs the same loader, decoder and compiler as the server on any platform, prints nothing on success, and on failure prints `<file>: <stage>: <path>: <message>` and exits 1. `sentinel pipeline explain <file> [--json]` prints the compiled view: digest, triggers (with their ref filters), concurrency, every job in execution order with its dependencies, image and pin status, condition, budgets, steps, caches, artifacts and secrets; a **requires** section (repository read, secret names to grant, cache scopes, artifact storage, registry access for unpinned images); and an **unresolved until runtime** list naming each expression with the phase that resolves it. Nothing unresolved is given a value: `hash_files` keys are shown as their template, secrets as names, and unpinned images as needing resolution at first pull. `--json` emits the `sentinel.explain/1` shape for tools and agents; `trigger_filters` lists each declared kind's patterns (empty for an unfiltered kind).

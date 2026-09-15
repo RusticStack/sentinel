@@ -27,17 +27,23 @@ use std::{
 };
 
 use sentinel_auth::secret::{Digest, Secret};
-use sentinel_core::{AttemptId, Event, Fence, PoolId, UnixMillis, WorkerId};
+use sentinel_core::{AttemptId, Event, Fence, PoolId, RunId, TenantId, UnixMillis, WorkerId};
+use sentinel_protocol::limits::{MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES, MAX_RUN_ARTIFACT_BYTES};
 use sentinel_protocol::logs::Frame;
 use sentinel_protocol::negotiate::Hello;
-use sentinel_store::{Store, dispatch, logs::LogStore, workers};
+use sentinel_store::{
+    Store, artifacts, dispatch,
+    logs::LogStore,
+    objects::{self, Objects},
+    workers,
+};
 
 use crate::{
     Error, Result,
     identity::Identity,
     session::{
-        self, Admission, Admitted, Beat, Capacity, JobContext, LogVerdict, Offer, Rejection,
-        Sender, SessionHandler,
+        self, Admission, Admitted, ArtifactCode, ArtifactReply, Beat, Capacity, JobContext,
+        LogVerdict, Offer, Rejection, Sender, SessionHandler,
     },
     tls,
 };
@@ -64,6 +70,8 @@ pub struct Stats {
     pub expired: AtomicU64,
     pub queue_timeouts: AtomicU64,
     pub abandoned: AtomicU64,
+    /// Artifacts committed through the object store (protocol 4).
+    pub artifacts: AtomicU64,
 }
 
 struct Peer {
@@ -77,6 +85,44 @@ struct Peer {
     logging: Mutex<HashSet<AttemptId>>,
 }
 
+/// A file currently receiving `ArtifactData` chunks.
+struct OpenFile {
+    path: String,
+    mode: u32,
+    declared: u64,
+    next_seq: u32,
+    staging: objects::Staging,
+}
+
+/// An artifact publication in flight (protocol 4): granted by
+/// `artifact_begin`, settled by `artifact_end`/`artifact_absent` or a
+/// mid-flight failure. The session orders the messages; this owns the
+/// staging and the run-budget accounting.
+struct InFlight {
+    tenant: TenantId,
+    run: RunId,
+    job: sentinel_core::JobId,
+    name: String,
+    retain_secs: u64,
+    /// Sealed-but-uncommitted files in wire order; committed at `end`.
+    done: Vec<(String, u32, objects::Staged)>,
+    /// Bytes charged to the run budget: sealed files plus the open file's
+    /// declared length. Equals the artifact's total when `end` lands.
+    accounted: u64,
+    /// The path most recently declared; wire order must be strictly
+    /// increasing so the manifest lands sorted.
+    last_path: String,
+    file: Option<OpenFile>,
+}
+
+#[derive(Default)]
+struct ArtifactState {
+    in_flight: HashMap<AttemptId, InFlight>,
+    /// Accounted in-flight bytes per run: the per-run budget stays exact
+    /// while attempts on different workers publish concurrently.
+    runs: HashMap<RunId, u64>,
+}
+
 struct Inner {
     source_destinations: Mutex<Arc<Vec<String>>>,
     source_app: Mutex<Option<Arc<sentinel_github::app::App>>>,
@@ -84,6 +130,8 @@ struct Inner {
     source_key: Mutex<Option<Arc<sentinel_auth::sealed::Key>>>,
     store: Arc<Store>,
     logs: Arc<LogStore>,
+    objects: Arc<Objects>,
+    artifacts: Mutex<ArtifactState>,
     config: Arc<rustls::ServerConfig>,
     fleet: Mutex<HashMap<WorkerId, Arc<Peer>>>,
     generation: AtomicU64,
@@ -294,6 +342,69 @@ impl Inner {
                 .insert(attempt);
         }
         held
+    }
+
+    /// Record the settled outcome of a declared artifact: `state`, the
+    /// committed manifest version when captured, and the charged bytes.
+    /// A store fault changes nothing the verdict reports.
+    fn record_artifact(
+        &self,
+        f: &InFlight,
+        attempt: AttemptId,
+        state: artifacts::State,
+        manifest_version: Option<u64>,
+    ) {
+        let (tenant, run, job) = (f.tenant, f.run, f.job);
+        let name = f.name.clone();
+        // Sealed files only: a file that never completed reports nothing.
+        let entries = f.done.len() as u64;
+        let bytes = f.done.iter().map(|(_, _, s)| s.len()).sum::<u64>();
+        let retain_until = UnixMillis(
+            UnixMillis::now()
+                .0
+                .saturating_add(f.retain_secs.saturating_mul(1000) as i64),
+        );
+        let _ = self.write(move |tx| {
+            artifacts::record(
+                tx,
+                tenant,
+                run,
+                job,
+                attempt,
+                &name,
+                state,
+                manifest_version,
+                entries,
+                bytes,
+                retain_until,
+                UnixMillis::now(),
+            )
+        });
+    }
+
+    /// Drop an in-flight publication: release the run budget, discard the
+    /// sealed-but-uncommitted files it created, and — for a declared
+    /// artifact that failed after opening — record `failed` so the run's
+    /// output stays explainable. `Stale` means nothing was granted.
+    fn artifact_fail(
+        &self,
+        state: &mut ArtifactState,
+        attempt: AttemptId,
+        code: ArtifactCode,
+    ) -> ArtifactCode {
+        let Some(f) = state.in_flight.remove(&attempt) else {
+            return ArtifactCode::Stale;
+        };
+        if let Some(r) = state.runs.get_mut(&f.run) {
+            *r = r.saturating_sub(f.accounted);
+        }
+        if code != ArtifactCode::Stale {
+            self.record_artifact(&f, attempt, artifacts::State::Failed, None);
+        }
+        for (_, _, staged) in f.done {
+            staged.discard();
+        }
+        code
     }
 }
 
@@ -587,6 +698,350 @@ impl SessionHandler for Inner {
             // refusing to one offer per interval instead of a tight loop.
         }
     }
+
+    fn artifact_begin(&self, worker: WorkerId, attempt: AttemptId, name: &str) -> ArtifactReply {
+        use crate::session::ArtifactReply::Verdict;
+        if !self.holds(worker, attempt) {
+            return Verdict(ArtifactCode::Stale);
+        }
+        // One read snapshot: the attempt's ownership scope, its encoded spec,
+        // whether the artifact already has a row, and the run's budget base.
+        let scope = self.store.read(|c| {
+            let tx = c.unchecked_transaction()?;
+            let (tenant, run, job, index) = dispatch::attempt_scope(&tx, worker, attempt)?;
+            let spec = dispatch::spec_bytes(&tx, worker, attempt)?;
+            let duplicate = artifacts::exists(&tx, attempt, name)?;
+            let committed = artifacts::run_bytes(&tx, tenant, run)?;
+            Ok((tenant, run, job, index, spec, duplicate, committed))
+        });
+        let Ok((tenant, run, job, index, spec, duplicate, committed)) = scope else {
+            return Verdict(ArtifactCode::Stale);
+        };
+        if duplicate {
+            return Verdict(ArtifactCode::Duplicate);
+        }
+        let declared = sentinel_pipeline::RunSpec::decode(&spec)
+            .ok()
+            .and_then(|s| s.pipeline.jobs.get(index as usize).cloned())
+            .and_then(|j| j.spec.artifacts.into_iter().find(|a| a.name == name));
+        let Some(decl) = declared else {
+            return Verdict(ArtifactCode::NotDeclared);
+        };
+        let mut state = self.artifacts.lock().unwrap_or_else(|p| p.into_inner());
+        if state.in_flight.contains_key(&attempt) {
+            // The session already orders one publication per attempt; a
+            // second begin here means the worker raced its own stream.
+            return Verdict(ArtifactCode::Invalid);
+        }
+        if committed.saturating_add(*state.runs.get(&run).unwrap_or(&0)) >= MAX_RUN_ARTIFACT_BYTES {
+            return Verdict(ArtifactCode::TooLarge);
+        }
+        state.in_flight.insert(
+            attempt,
+            InFlight {
+                tenant,
+                run,
+                job,
+                name: name.to_string(),
+                retain_secs: decl.retain_secs,
+                done: Vec::new(),
+                accounted: 0,
+                last_path: String::new(),
+                file: None,
+            },
+        );
+        ArtifactReply::Grant
+    }
+
+    fn artifact_file(
+        &self,
+        _worker: WorkerId,
+        attempt: AttemptId,
+        path: &str,
+        len: u64,
+        mode: u32,
+    ) -> Option<ArtifactCode> {
+        let mut state = self.artifacts.lock().unwrap_or_else(|p| p.into_inner());
+        enum Out {
+            Ok,
+            Fail(ArtifactCode),
+        }
+        let out = {
+            let Some(f) = state.in_flight.get(&attempt) else {
+                return Some(ArtifactCode::Stale);
+            };
+            let (tenant, run, accounted) = (f.tenant, f.run, f.accounted);
+            if f.file.is_some()
+                || !objects::valid_entry_path(path)
+                || f.done.len() >= MAX_ARTIFACT_ENTRIES
+                || (!f.last_path.is_empty() && path <= f.last_path.as_str())
+            {
+                Out::Fail(ArtifactCode::Invalid)
+            } else {
+                // The run budget is committed bytes plus what every
+                // in-flight artifact of the run already charges.
+                let committed = self
+                    .store
+                    .read(|c| artifacts::run_bytes(c, tenant, run))
+                    .unwrap_or(u64::MAX);
+                let charged = state.runs.get(&run).copied().unwrap_or(0);
+                if committed.saturating_add(charged).saturating_add(len) > MAX_RUN_ARTIFACT_BYTES
+                    || accounted.saturating_add(len) > MAX_ARTIFACT_BYTES
+                {
+                    Out::Fail(ArtifactCode::TooLarge)
+                } else {
+                    match self.objects.stage_begin(len) {
+                        Ok(staging) => {
+                            *state.runs.entry(run).or_default() += len;
+                            let f = state.in_flight.get_mut(&attempt).expect("checked present");
+                            f.last_path = path.to_string();
+                            f.accounted += len;
+                            f.file = Some(OpenFile {
+                                path: path.to_string(),
+                                mode: mode & crate::session::ARTIFACT_MODE_BITS,
+                                declared: len,
+                                next_seq: 0,
+                                staging,
+                            });
+                            // An empty file sends no data frames: seal it at
+                            // once, or `artifact_end` would find it still open.
+                            if len == 0 {
+                                let file = f.file.take().expect("just opened");
+                                match self.objects.stage_seal(tenant, file.staging, 0) {
+                                    Ok(staged) => {
+                                        f.done.push((file.path, file.mode, staged));
+                                        Out::Ok
+                                    }
+                                    Err(_) => Out::Fail(ArtifactCode::Store),
+                                }
+                            } else {
+                                Out::Ok
+                            }
+                        }
+                        Err(_) => Out::Fail(ArtifactCode::Store),
+                    }
+                }
+            }
+        };
+        match out {
+            Out::Ok => None,
+            Out::Fail(code) => Some(self.artifact_fail(&mut state, attempt, code)),
+        }
+    }
+
+    fn artifact_data(
+        &self,
+        _worker: WorkerId,
+        attempt: AttemptId,
+        seq: u32,
+        bytes: &[u8],
+    ) -> Option<ArtifactCode> {
+        let mut state = self.artifacts.lock().unwrap_or_else(|p| p.into_inner());
+        enum Out {
+            Ok,
+            Fail(ArtifactCode),
+        }
+        let out = {
+            let Some(f) = state.in_flight.get_mut(&attempt) else {
+                return Some(ArtifactCode::Stale);
+            };
+            let Some(file) = f.file.as_mut() else {
+                return Some(self.artifact_fail(&mut state, attempt, ArtifactCode::Invalid));
+            };
+            if file.next_seq != seq
+                || file.staging.written().saturating_add(bytes.len() as u64) > file.declared
+            {
+                Out::Fail(ArtifactCode::Invalid)
+            } else if self.objects.stage_write(&mut file.staging, bytes).is_err() {
+                Out::Fail(ArtifactCode::Store)
+            } else {
+                file.next_seq += 1;
+                if file.staging.written() == file.declared {
+                    let file = f.file.take().expect("open file checked");
+                    match self
+                        .objects
+                        .stage_seal(f.tenant, file.staging, file.declared)
+                    {
+                        Ok(staged) => f.done.push((file.path, file.mode, staged)),
+                        Err(_) => {
+                            return Some(self.artifact_fail(
+                                &mut state,
+                                attempt,
+                                ArtifactCode::Store,
+                            ));
+                        }
+                    }
+                }
+                Out::Ok
+            }
+        };
+        match out {
+            Out::Ok => None,
+            Out::Fail(code) => Some(self.artifact_fail(&mut state, attempt, code)),
+        }
+    }
+
+    fn artifact_end(&self, _worker: WorkerId, attempt: AttemptId, name: &str) -> ArtifactCode {
+        let mut state = self.artifacts.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(f) = state.in_flight.get(&attempt) else {
+            return ArtifactCode::Stale;
+        };
+        if f.name != name || f.file.is_some() {
+            let code = self.artifact_fail(&mut state, attempt, ArtifactCode::Invalid);
+            return code;
+        }
+        let f = state.in_flight.remove(&attempt).expect("checked present");
+        if let Some(r) = state.runs.get_mut(&f.run) {
+            *r = r.saturating_sub(f.accounted);
+        }
+        drop(state);
+        let entries: Vec<objects::Entry> = f
+            .done
+            .iter()
+            .map(|(path, mode, staged)| objects::Entry {
+                path: path.clone(),
+                digest: staged.digest(),
+                len: staged.len(),
+                mode: *mode,
+            })
+            .collect();
+        let manifest = artifacts::manifest_name(f.job, &f.name);
+        let retain_until = UnixMillis(
+            UnixMillis::now()
+                .0
+                .saturating_add(f.retain_secs.saturating_mul(1000) as i64),
+        );
+        let staged: Vec<objects::Staged> = f.done.into_iter().map(|(_, _, s)| s).collect();
+        let objects = Arc::clone(&self.objects);
+        let (tenant, run, job) = (f.tenant, f.run, f.job);
+        let artifact_name = f.name;
+        let bytes = entries.iter().map(|e| e.len).sum::<u64>();
+        let count = entries.len() as u64;
+        // One transaction: object references, the manifest row and file,
+        // then the artifact row that names its version. A crash mid-commit
+        // can only leave adoptable orphans under `objects/`.
+        self.write(move |tx| {
+            for s in &staged {
+                objects.commit(tx, s)?;
+            }
+            let version = objects.commit_manifest(
+                tx,
+                tenant,
+                objects::Kind::Artifact,
+                &manifest,
+                &entries,
+            )?;
+            artifacts::record(
+                tx,
+                tenant,
+                run,
+                job,
+                attempt,
+                &artifact_name,
+                artifacts::State::Captured,
+                Some(version),
+                count,
+                bytes,
+                retain_until,
+                UnixMillis::now(),
+            )?;
+            Ok(())
+        })
+        .map(|()| {
+            self.stats.artifacts.fetch_add(1, Ordering::Relaxed);
+            ArtifactCode::Stored
+        })
+        .unwrap_or(ArtifactCode::Store)
+    }
+
+    fn artifact_absent(
+        &self,
+        worker: WorkerId,
+        attempt: AttemptId,
+        name: &str,
+        reason: u8,
+    ) -> ArtifactCode {
+        let outcome = if reason == 0 {
+            artifacts::State::Absent
+        } else {
+            artifacts::State::Failed
+        };
+        // An in-flight publication of the same name is abandoned; its scope
+        // comes with the state and needs no lookup.
+        {
+            let mut state = self.artifacts.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(f) = state.in_flight.remove(&attempt) {
+                if let Some(r) = state.runs.get_mut(&f.run) {
+                    *r = r.saturating_sub(f.accounted);
+                }
+                drop(state);
+                self.record_artifact(&f, attempt, outcome, None);
+                for (_, _, staged) in f.done {
+                    staged.discard();
+                }
+                return if reason == 0 {
+                    ArtifactCode::Absent
+                } else {
+                    ArtifactCode::CaptureFailed
+                };
+            }
+        }
+        if !self.holds(worker, attempt) {
+            return ArtifactCode::Stale;
+        }
+        let scope = self.store.read(|c| {
+            let tx = c.unchecked_transaction()?;
+            let (tenant, run, job, index) = dispatch::attempt_scope(&tx, worker, attempt)?;
+            let spec = dispatch::spec_bytes(&tx, worker, attempt)?;
+            let duplicate = artifacts::exists(&tx, attempt, name)?;
+            Ok((tenant, run, job, index, spec, duplicate))
+        });
+        let Ok((tenant, run, job, index, spec, duplicate)) = scope else {
+            return ArtifactCode::Stale;
+        };
+        if duplicate {
+            return ArtifactCode::Duplicate;
+        }
+        let declared = sentinel_pipeline::RunSpec::decode(&spec)
+            .ok()
+            .and_then(|s| s.pipeline.jobs.get(index as usize).cloned())
+            .and_then(|j| j.spec.artifacts.into_iter().find(|a| a.name == name));
+        let Some(decl) = declared else {
+            return ArtifactCode::NotDeclared;
+        };
+        let retain_until = UnixMillis(
+            UnixMillis::now()
+                .0
+                .saturating_add(decl.retain_secs.saturating_mul(1000) as i64),
+        );
+        let artifact_name = name.to_string();
+        let recorded = self.write(move |tx| {
+            artifacts::record(
+                tx,
+                tenant,
+                run,
+                job,
+                attempt,
+                &artifact_name,
+                outcome,
+                None,
+                0,
+                0,
+                retain_until,
+                UnixMillis::now(),
+            )
+        });
+        match recorded {
+            Ok(_) => {
+                if reason == 0 {
+                    ArtifactCode::Absent
+                } else {
+                    ArtifactCode::CaptureFailed
+                }
+            }
+            Err(_) => ArtifactCode::Store,
+        }
+    }
 }
 
 /// A running controller: listener, fleet and dispatcher.
@@ -743,6 +1198,7 @@ impl Controller {
     pub fn start(
         store: Arc<Store>,
         logs: Arc<LogStore>,
+        objects: Arc<Objects>,
         identity: Identity,
         listen: SocketAddr,
     ) -> Result<Controller> {
@@ -764,6 +1220,8 @@ impl Controller {
             source_key: Mutex::new(None),
             store,
             logs,
+            objects,
+            artifacts: Mutex::new(ArtifactState::default()),
             config,
             fleet: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(1),

@@ -27,7 +27,10 @@ use sentinel_core::{
     WorkerId,
 };
 use sentinel_protocol::{
-    limits::{MAX_API_BODY_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_LIST_ITEMS, MAX_LOG_FRAME_BYTES},
+    limits::{
+        MAX_API_BODY_BYTES, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_CHUNK_BYTES, MAX_ARTIFACT_NAME_BYTES,
+        MAX_ARTIFACT_PATH_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_LIST_ITEMS, MAX_LOG_FRAME_BYTES,
+    },
     logs::{Frame, MAX_GAPS, Stream},
     negotiate::{Hello, Negotiated, Rejected},
     summary::MAX_SUMMARY_BYTES,
@@ -115,6 +118,41 @@ pub enum ClientMessage {
     Abandon {
         attempt: [u8; 16],
         fence: u64,
+    },
+    /// Protocol 4. Begin publishing artifact `name` of the attempt's job;
+    /// the controller validates it against the run spec and answers
+    /// `ArtifactGrant` or a refusing `ArtifactVerdict`. One artifact is in
+    /// flight per attempt at a time.
+    ArtifactBegin {
+        attempt: [u8; 16],
+        name: String,
+    },
+    /// Protocol 4. The next file of the in-flight artifact: its `ArtifactData`
+    /// frames follow with `seq` from 0 and exactly `len` bytes in order.
+    ArtifactFile {
+        attempt: [u8; 16],
+        path: String,
+        len: u64,
+        mode: u32,
+    },
+    /// Protocol 4. One ordered chunk of the in-flight file.
+    ArtifactData {
+        attempt: [u8; 16],
+        seq: u32,
+        bytes: Vec<u8>,
+    },
+    /// Protocol 4. The artifact's file set is complete; the controller
+    /// commits the objects, manifest and record and answers a verdict.
+    ArtifactEnd {
+        attempt: [u8; 16],
+        name: String,
+    },
+    /// Protocol 4. No publishable content, also closing an in-flight
+    /// artifact: `reason` 0 = no paths matched, 1 = capture failed.
+    ArtifactAbsent {
+        attempt: [u8; 16],
+        name: String,
+        reason: u8,
     },
     Bye,
 }
@@ -230,6 +268,19 @@ pub enum ServerMessage {
         attempt: [u8; 16],
         access: sentinel_protocol::source::Access,
     },
+    /// Protocol 4. The artifact named in `ArtifactBegin` was validated
+    /// against the run spec and budgets; the worker may stream its files.
+    ArtifactGrant {
+        attempt: [u8; 16],
+        name: String,
+    },
+    /// Protocol 4. The terminal answer for an artifact: stored, recorded
+    /// absent/failed, or refused (`ArtifactCode`); the artifact is closed.
+    ArtifactVerdict {
+        attempt: [u8; 16],
+        name: String,
+        code: u8,
+    },
 }
 
 /// What the controller did with a log frame.
@@ -238,6 +289,74 @@ pub enum LogVerdict {
     /// Stored and synced through this sequence.
     Acked(u64),
     Refused,
+}
+
+/// A file's permission bits inside an artifact manifest; only the low mode
+/// bits are meaningful on the wire.
+pub const ARTIFACT_MODE_BITS: u32 = 0o7777;
+
+/// The terminal code of an `ArtifactVerdict`: what the controller did with
+/// an artifact publication, so the worker learns how it was recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactCode {
+    /// Committed and recorded present.
+    Stored,
+    /// The job's spec declared no artifact of that name.
+    NotDeclared,
+    /// Duplicates a finished artifact record for this attempt.
+    Duplicate,
+    /// Name/path/frame/length/ordering constraint violated.
+    Invalid,
+    /// The per-artifact or per-run byte budget was exceeded.
+    TooLarge,
+    /// The artifact holds no matching content (recorded absent).
+    Absent,
+    /// Recorded as failed: capture or publication could not complete.
+    CaptureFailed,
+    /// The attempt is not held here under that fence.
+    Stale,
+    /// Storage faulted; nothing was recorded, the worker may retry once.
+    Store,
+}
+
+impl ArtifactCode {
+    /// The wire code.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::Stored => 0,
+            Self::NotDeclared => 1,
+            Self::Duplicate => 2,
+            Self::Invalid => 3,
+            Self::TooLarge => 4,
+            Self::Absent => 5,
+            Self::CaptureFailed => 6,
+            Self::Stale => 7,
+            Self::Store => 8,
+        }
+    }
+    /// Decode a verdict code; unrecognised values read as `Stale` — to an
+    /// older worker the safest reading is that nothing landed.
+    pub fn from_u8(code: u8) -> Self {
+        match code {
+            0 => Self::Stored,
+            1 => Self::NotDeclared,
+            2 => Self::Duplicate,
+            3 => Self::Invalid,
+            4 => Self::TooLarge,
+            5 => Self::Absent,
+            6 => Self::CaptureFailed,
+            _ => Self::Stale,
+        }
+    }
+}
+
+/// The grant-or-verdict answer to `ArtifactBegin`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactReply {
+    /// Validated; the worker may stream the artifact's files.
+    Grant,
+    /// Terminal; the artifact is closed on the controller.
+    Verdict(ArtifactCode),
 }
 
 /// [`JobContext`] on the wire; dependency outcomes as their stored codes.
@@ -545,6 +664,51 @@ pub trait SessionHandler: Send + Sync {
     fn log_end(&self, worker: WorkerId, attempt: AttemptId, last_seq: u64, gaps: &[(u64, u64)]);
     /// The worker found the attempt in its leftovers after a restart.
     fn abandoned(&self, worker: WorkerId, attempt: AttemptId, fence: Fence);
+    /// Protocol 4. Begin publishing artifact `name` of a held attempt:
+    /// validate it against the run spec and the byte budgets. `Grant` lets
+    /// the worker stream; a verdict closes the artifact at once. The
+    /// default answers `Stale`: nothing was granted.
+    fn artifact_begin(&self, _worker: WorkerId, _attempt: AttemptId, _name: &str) -> ArtifactReply {
+        ArtifactReply::Verdict(ArtifactCode::Stale)
+    }
+    /// Protocol 4. The next file of the in-flight artifact, `len` bytes of
+    /// `ArtifactData` to follow. `Some` fails the artifact at once.
+    fn artifact_file(
+        &self,
+        _worker: WorkerId,
+        _attempt: AttemptId,
+        _path: &str,
+        _len: u64,
+        _mode: u32,
+    ) -> Option<ArtifactCode> {
+        Some(ArtifactCode::Stale)
+    }
+    /// Protocol 4. Ordered chunk `seq` of the in-flight file. `Some` fails
+    /// the artifact at once.
+    fn artifact_data(
+        &self,
+        _worker: WorkerId,
+        _attempt: AttemptId,
+        _seq: u32,
+        _bytes: &[u8],
+    ) -> Option<ArtifactCode> {
+        Some(ArtifactCode::Stale)
+    }
+    /// Protocol 4. Commit the in-flight artifact; the code is terminal.
+    fn artifact_end(&self, _worker: WorkerId, _attempt: AttemptId, _name: &str) -> ArtifactCode {
+        ArtifactCode::Stale
+    }
+    /// Protocol 4. Record `name` absent (`reason` 0) or failed (1); also
+    /// abandons an in-flight publication of the same name.
+    fn artifact_absent(
+        &self,
+        _worker: WorkerId,
+        _attempt: AttemptId,
+        _name: &str,
+        _reason: u8,
+    ) -> ArtifactCode {
+        ArtifactCode::Stale
+    }
 }
 
 /// The rustls state and the socket it writes to. The lock is held only while
@@ -811,6 +975,11 @@ impl WorkerSession {
     /// stops answering, or breaks protocol.
     pub fn serve(&mut self, handler: &dyn SessionHandler) -> Result<()> {
         let worker = self.admitted.worker;
+        // In-flight artifact per attempt (protocol 4): set when a begin is
+        // granted, cleared by every verdict. Names the verdict a mid-flight
+        // failure answers with and orders begin/file/data/end.
+        let mut artifacts: std::collections::HashMap<AttemptId, String> =
+            std::collections::HashMap::new();
         loop {
             match self.rx.recv::<ClientMessage>(HEARTBEAT_DEADLINE)? {
                 ClientMessage::Ping { seq, held } => {
@@ -939,6 +1108,115 @@ impl WorkerSession {
                         AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
                     handler.abandoned(worker, attempt, Fence(fence));
                 }
+                ClientMessage::ArtifactBegin { attempt, name } => {
+                    if self.admitted.negotiated.protocol.0 < 4 {
+                        return Err(Error::Protocol("artifact needs protocol 4"));
+                    }
+                    if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
+                        return Err(Error::Protocol("artifact name"));
+                    }
+                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                    if artifacts.contains_key(&id) {
+                        return Err(Error::Protocol("artifact in flight"));
+                    }
+                    match handler.artifact_begin(worker, id, &name) {
+                        ArtifactReply::Grant => {
+                            artifacts.insert(id, name.clone());
+                            self.tx
+                                .send(&ServerMessage::ArtifactGrant { attempt, name })?;
+                        }
+                        ArtifactReply::Verdict(code) => {
+                            self.tx.send(&ServerMessage::ArtifactVerdict {
+                                attempt,
+                                name,
+                                code: code.to_u8(),
+                            })?;
+                        }
+                    }
+                }
+                ClientMessage::ArtifactFile {
+                    attempt,
+                    path,
+                    len,
+                    mode,
+                } => {
+                    if path.is_empty()
+                        || path.len() > MAX_ARTIFACT_PATH_BYTES
+                        || len > MAX_ARTIFACT_BYTES
+                    {
+                        return Err(Error::Protocol("artifact file"));
+                    }
+                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                    let name = artifacts
+                        .get(&id)
+                        .cloned()
+                        .ok_or(Error::Protocol("artifact file without begin"))?;
+                    if let Some(code) = handler.artifact_file(worker, id, &path, len, mode) {
+                        artifacts.remove(&id);
+                        self.tx.send(&ServerMessage::ArtifactVerdict {
+                            attempt,
+                            name,
+                            code: code.to_u8(),
+                        })?;
+                    }
+                }
+                ClientMessage::ArtifactData {
+                    attempt,
+                    seq,
+                    bytes,
+                } => {
+                    if bytes.len() > MAX_ARTIFACT_CHUNK_BYTES {
+                        return Err(Error::Protocol("artifact chunk"));
+                    }
+                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                    let name = artifacts
+                        .get(&id)
+                        .cloned()
+                        .ok_or(Error::Protocol("artifact data without begin"))?;
+                    if let Some(code) = handler.artifact_data(worker, id, seq, &bytes) {
+                        artifacts.remove(&id);
+                        self.tx.send(&ServerMessage::ArtifactVerdict {
+                            attempt,
+                            name,
+                            code: code.to_u8(),
+                        })?;
+                    }
+                }
+                ClientMessage::ArtifactEnd { attempt, name } => {
+                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                    if artifacts.get(&id) != Some(&name) {
+                        return Err(Error::Protocol("artifact end without begin"));
+                    }
+                    artifacts.remove(&id);
+                    let code = handler.artifact_end(worker, id, &name);
+                    self.tx.send(&ServerMessage::ArtifactVerdict {
+                        attempt,
+                        name,
+                        code: code.to_u8(),
+                    })?;
+                }
+                ClientMessage::ArtifactAbsent {
+                    attempt,
+                    name,
+                    reason,
+                } => {
+                    if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
+                        return Err(Error::Protocol("artifact name"));
+                    }
+                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                    if let Some(open) = artifacts.get(&id)
+                        && open != &name
+                    {
+                        return Err(Error::Protocol("artifact absent of another"));
+                    }
+                    artifacts.remove(&id);
+                    let code = handler.artifact_absent(worker, id, &name, reason);
+                    self.tx.send(&ServerMessage::ArtifactVerdict {
+                        attempt,
+                        name,
+                        code: code.to_u8(),
+                    })?;
+                }
                 ClientMessage::Bye => return Ok(()),
                 ClientMessage::Hello { .. } => return Err(Error::Protocol("second hello")),
             }
@@ -1029,7 +1307,9 @@ pub fn connect(
         | ServerMessage::Context(_)
         | ServerMessage::Source { .. }
         | ServerMessage::LogAck { .. }
-        | ServerMessage::LogRefused { .. } => Err(Error::Protocol("message before welcome")),
+        | ServerMessage::LogRefused { .. }
+        | ServerMessage::ArtifactGrant { .. }
+        | ServerMessage::ArtifactVerdict { .. } => Err(Error::Protocol("message before welcome")),
     }
 }
 
@@ -1038,12 +1318,15 @@ pub fn connect(
 /// the session is gone; the executor keeps the event and resends it when it
 /// is attached to the next session.
 #[derive(Clone)]
-pub struct Reporter(Sender);
+pub struct Reporter {
+    tx: Sender,
+    protocol: u16,
+}
 
 impl Reporter {
     pub fn report(&self, attempt: AttemptId, fence: Fence, event: Event) -> Result<()> {
         let event = WireEvent::from_event(event).ok_or(Error::Protocol("not a worker event"))?;
-        self.0.send(&ClientMessage::Report {
+        self.tx.send(&ClientMessage::Report {
             attempt: *attempt.as_bytes(),
             fence: fence.0,
             event,
@@ -1063,7 +1346,7 @@ impl Reporter {
         if summary.len() > MAX_SUMMARY_BYTES {
             return Err(Error::Protocol("summary size"));
         }
-        self.0.send(&ClientMessage::Report {
+        self.tx.send(&ClientMessage::Report {
             attempt: *attempt.as_bytes(),
             fence: fence.0,
             event,
@@ -1072,7 +1355,7 @@ impl Reporter {
     }
 
     pub fn need_spec(&self, attempt: AttemptId) -> Result<()> {
-        self.0.send(&ClientMessage::NeedSpec {
+        self.tx.send(&ClientMessage::NeedSpec {
             attempt: *attempt.as_bytes(),
         })
     }
@@ -1083,7 +1366,7 @@ impl Reporter {
         if frame.bytes.len() > MAX_LOG_FRAME_BYTES {
             return Err(Error::Protocol("log frame size"));
         }
-        self.0.send(&ClientMessage::Log {
+        self.tx.send(&ClientMessage::Log {
             attempt: *attempt.as_bytes(),
             seq: frame.seq,
             step: frame.step,
@@ -1094,17 +1377,85 @@ impl Reporter {
 
     /// The attempt was in this worker's leftovers after a restart.
     pub fn abandon(&self, attempt: AttemptId, fence: Fence) -> Result<()> {
-        self.0.send(&ClientMessage::Abandon {
+        self.tx.send(&ClientMessage::Abandon {
             attempt: *attempt.as_bytes(),
             fence: fence.0,
         })
     }
 
     pub fn log_end(&self, attempt: AttemptId, last_seq: u64, gaps: &[(u64, u64)]) -> Result<()> {
-        self.0.send(&ClientMessage::LogEnd {
+        self.tx.send(&ClientMessage::LogEnd {
             attempt: *attempt.as_bytes(),
             last_seq,
             gaps: gaps.to_vec(),
+        })
+    }
+
+    /// Whether this session can publish artifacts at all. A worker on an
+    /// older protocol records every capture `failed` without sending.
+    pub fn artifacts(&self) -> bool {
+        self.protocol >= 4
+    }
+
+    /// Begin publishing artifact `name`; the answer arrives as
+    /// `Executor::artifact_granted` or `artifact_verdict`.
+    pub fn artifact_begin(&self, attempt: AttemptId, name: &str) -> Result<()> {
+        if self.protocol < 4 {
+            return Err(Error::Protocol("artifact needs protocol 4"));
+        }
+        if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
+            return Err(Error::Protocol("artifact name"));
+        }
+        self.tx.send(&ClientMessage::ArtifactBegin {
+            attempt: *attempt.as_bytes(),
+            name: name.to_string(),
+        })
+    }
+
+    /// The next file of the granted artifact; `len` bytes of `artifact_data`
+    /// follow it, seq from 0.
+    pub fn artifact_file(&self, attempt: AttemptId, path: &str, len: u64, mode: u32) -> Result<()> {
+        if path.is_empty() || path.len() > MAX_ARTIFACT_PATH_BYTES || len > MAX_ARTIFACT_BYTES {
+            return Err(Error::Protocol("artifact file"));
+        }
+        self.tx.send(&ClientMessage::ArtifactFile {
+            attempt: *attempt.as_bytes(),
+            path: path.to_string(),
+            len,
+            mode,
+        })
+    }
+
+    /// One ordered chunk of the in-flight file.
+    pub fn artifact_data(&self, attempt: AttemptId, seq: u32, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > MAX_ARTIFACT_CHUNK_BYTES {
+            return Err(Error::Protocol("artifact chunk"));
+        }
+        self.tx.send(&ClientMessage::ArtifactData {
+            attempt: *attempt.as_bytes(),
+            seq,
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    /// The artifact's file set is complete; the verdict is terminal.
+    pub fn artifact_end(&self, attempt: AttemptId, name: &str) -> Result<()> {
+        self.tx.send(&ClientMessage::ArtifactEnd {
+            attempt: *attempt.as_bytes(),
+            name: name.to_string(),
+        })
+    }
+
+    /// No publishable content for `name`: `reason` 0 no match, 1 capture
+    /// failed. Also abandons an in-flight publication of the same name.
+    pub fn artifact_absent(&self, attempt: AttemptId, name: &str, reason: u8) -> Result<()> {
+        if self.protocol < 4 {
+            return Err(Error::Protocol("artifact needs protocol 4"));
+        }
+        self.tx.send(&ClientMessage::ArtifactAbsent {
+            attempt: *attempt.as_bytes(),
+            name: name.to_string(),
+            reason,
         })
     }
 }
@@ -1138,6 +1489,11 @@ pub trait Executor: Send + Sync {
     fn log_acked(&self, attempt: AttemptId, through: u64);
     /// The controller stores no more frames of this attempt.
     fn log_refused(&self, attempt: AttemptId);
+    /// The artifact named in `artifact_begin` was granted; the executor may
+    /// stream its files.
+    fn artifact_granted(&self, _attempt: AttemptId, _name: &str) {}
+    /// The artifact's terminal answer; the publication is over either way.
+    fn artifact_verdict(&self, _attempt: AttemptId, _name: &str, _code: ArtifactCode) {}
 }
 
 impl Link {
@@ -1277,6 +1633,20 @@ impl Link {
                 executor.log_refused(attempt);
                 Ok(false)
             }
+            ServerMessage::ArtifactGrant { attempt, name } => {
+                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                executor.artifact_granted(attempt, &name);
+                Ok(false)
+            }
+            ServerMessage::ArtifactVerdict {
+                attempt,
+                name,
+                code,
+            } => {
+                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                executor.artifact_verdict(attempt, &name, ArtifactCode::from_u8(code));
+                Ok(false)
+            }
             ServerMessage::NoSpec { attempt } => {
                 let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
                 state.specs.remove(&attempt);
@@ -1300,7 +1670,10 @@ impl Link {
     /// message and beat) or the controller is lost: beats at the interval,
     /// offers answered the moment they arrive.
     pub fn run(&mut self, executor: &dyn Executor, mut until: impl FnMut() -> bool) -> Result<()> {
-        executor.attached(Reporter(self.tx.clone()));
+        executor.attached(Reporter {
+            tx: self.tx.clone(),
+            protocol: self.negotiated.protocol.0,
+        });
         let outcome = self.serve(executor, &mut until);
         executor.detached();
         outcome

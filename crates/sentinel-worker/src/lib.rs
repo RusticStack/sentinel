@@ -11,6 +11,8 @@
 //! Linux only: on other targets the crate is empty, like the resolver.
 
 #[cfg(target_os = "linux")]
+pub mod artifacts;
+#[cfg(target_os = "linux")]
 pub mod attempt;
 #[cfg(target_os = "linux")]
 pub mod checkout;

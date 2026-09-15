@@ -11,6 +11,7 @@
 //! are fsync-bound at ~0.5 ms per durable commit; SQLite adds constraints,
 //! indexes, migrations and ad-hoc queries at no extra cost.
 
+pub mod artifacts;
 pub mod auth;
 pub mod checks;
 pub mod codec;

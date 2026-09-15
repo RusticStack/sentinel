@@ -36,7 +36,7 @@ use sentinel_protocol::{
 };
 
 use crate::{
-    Error, Result,
+    Error, Result, artifacts,
     checkout::{self, CHECKOUT_TIMEOUT},
     context::WorkerContext,
     podman::{self, Container, DEFAULT_PIDS_LIMIT, Limits},
@@ -101,12 +101,14 @@ fn ns(started: Instant) -> Option<u64> {
 }
 
 /// Run the whole attempt. Returns the verdict and the summary that were
-/// reported.
+/// reported. `sink` publishes declared artifacts during finalization, while
+/// the workspace still exists.
 pub fn run(
     root: &Path,
     job: &Job,
     report: &dyn Report,
     output: Arc<dyn Output>,
+    sink: &dyn artifacts::Sink,
     cancel: &Cancel,
 ) -> (Verdict, AttemptSummary) {
     report.event(job.attempt, job.fence, Event::PreparationStarted);
@@ -138,18 +140,36 @@ pub fn run(
             summary.steps_ns = ns(started);
             report.event(job.attempt, job.fence, Event::FinalizationStarted);
             let started = Instant::now();
+            // Artifacts are part of finalization: resolved against the live
+            // workspace and committed on the controller before teardown —
+            // `when: always` captures even a canceled run's remains.
+            let declared = job
+                .spec
+                .pipeline
+                .jobs
+                .get(job.job_index)
+                .map(|j| j.spec.artifacts.as_slice())
+                .unwrap_or(&[]);
+            let artifact_failure = capture_artifacts(
+                job.attempt,
+                workspace.path(),
+                declared,
+                matches!(verdict, Verdict::Passed),
+                sink,
+            );
             finalize(workspace, container);
             // The log is part of finalization: the attempt is not done until
             // what it printed is durable on the controller, or the wait ran
             // out and the failure is on record.
             let published = output.complete();
             summary.finalize_ns = ns(started);
-            match (verdict, published) {
-                (Verdict::Passed, false) => Verdict::Failed(
+            match (verdict, published, artifact_failure) {
+                (Verdict::Passed, false, _) => Verdict::Failed(
                     FailureClass::Publication,
                     "log frames were not acknowledged in time".into(),
                 ),
-                (verdict, _) => verdict,
+                (Verdict::Passed, _, Some(why)) => Verdict::Failed(FailureClass::Publication, why),
+                (verdict, _, _) => verdict,
             }
         }
     };
@@ -414,6 +434,32 @@ fn execute(
         None => Verdict::Passed,
         Some((class, why)) => Verdict::Failed(class, why),
     }
+}
+
+/// Capture every declared artifact whose `when` matches the step verdict.
+/// A required artifact that does not publish — no match, capture failure or
+/// a refused verdict — is a finalization failure; optional outcomes are
+/// recorded and left out of the verdict.
+pub fn capture_artifacts(
+    attempt: AttemptId,
+    workspace: &Path,
+    declared: &[sentinel_pipeline::schema::Artifact],
+    passed: bool,
+    sink: &dyn artifacts::Sink,
+) -> Option<String> {
+    let mut failed = None;
+    for decl in declared {
+        if !artifacts::due(decl, passed) {
+            continue;
+        }
+        let outcome = artifacts::capture(workspace, decl, sink, attempt);
+        if decl.required && outcome != artifacts::Outcome::Published {
+            failed.get_or_insert_with(|| {
+                format!("required artifact `{}` was not published", decl.name)
+            });
+        }
+    }
+    failed
 }
 
 fn describe(error: &EvalError) -> String {

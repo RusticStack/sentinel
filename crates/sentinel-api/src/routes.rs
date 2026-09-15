@@ -7,7 +7,7 @@ use std::{io::Read, io::Seek, io::SeekFrom, sync::Arc};
 
 use sentinel_auth::cookie;
 use sentinel_core::{
-    AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis, UploadId,
+    ArtifactId, AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis, UploadId,
     auth::{Permissions, Principal},
 };
 use sentinel_intake::ingest;
@@ -19,8 +19,8 @@ use sentinel_protocol::{
     limits::{MAX_API_BODY_BYTES, MAX_PAGE_ITEMS, page_size},
 };
 use sentinel_store::{
-    Error as StoreError, auth as authz, auth::Authority, checks, dispatch, idempotency, local_auth,
-    lookup, objects::Digest, provenance, runs, status, tenancy, workers,
+    Error as StoreError, artifacts, auth as authz, auth::Authority, checks, dispatch, idempotency,
+    local_auth, lookup, objects::Digest, provenance, runs, status, tenancy, workers,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -303,6 +303,59 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
                 .map_err(store_error)?;
             state.controller.wake();
             ok(json!({ "job": job.to_string(), "state": next.as_str() }))
+        }
+        ("GET", ["api", "v1", "runs", run, "artifacts"]) => {
+            let who = identify(state, request, false)?;
+            let run: RunId = id(run, "run")?;
+            let rows = state
+                .store
+                .read(|c| {
+                    let repo = lookup::run_repo(c, run)?;
+                    let tenant = authz::require_repo(c, who.principal, repo, Permissions::READ)?;
+                    artifacts::for_run(c, tenant, run)
+                })
+                .map_err(store_error)?;
+            ok(json!({
+                "artifacts": rows.iter().map(artifact_json).collect::<Vec<_>>()
+            }))
+        }
+        ("GET", ["api", "v1", "runs", run, "artifacts", art]) => {
+            let who = identify(state, request, false)?;
+            let (run, art): (RunId, ArtifactId) = (id(run, "run")?, id(art, "artifact")?);
+            let (row, manifest) = state
+                .store
+                .read(|c| {
+                    let repo = lookup::run_repo(c, run)?;
+                    let tenant = authz::require_repo(c, who.principal, repo, Permissions::READ)?;
+                    let row = artifacts::get(c, tenant, run, art)?;
+                    let manifest = match row.manifest_version {
+                        Some(version) => Some(state.objects.manifest(
+                            c,
+                            tenant,
+                            sentinel_store::objects::Kind::Artifact,
+                            &artifacts::manifest_name(row.job, &row.name),
+                            Some(version),
+                        )?),
+                        None => None,
+                    };
+                    Ok((row, manifest))
+                })
+                .map_err(store_error)?;
+            let mut body = artifact_json(&row);
+            if let Some(manifest) = manifest {
+                body["manifest"] = json!({
+                    "version": manifest.version,
+                    "digest": manifest.digest.to_string(),
+                    "payload_len": manifest.payload_len,
+                    "entries": manifest.entries.iter().map(|e| json!({
+                        "path": e.path,
+                        "digest": e.digest.to_string(),
+                        "len": e.len,
+                        "mode": e.mode,
+                    })).collect::<Vec<_>>(),
+                });
+            }
+            ok(body)
         }
         ("GET", ["api", "v1", "attempts", attempt, "logs"]) => {
             let who = identify(state, request, false)?;
@@ -833,6 +886,23 @@ fn upload_tenant(
             Ok(tenant)
         })
         .map_err(store_error)
+}
+
+/// One artifact row as JSON; the detail route adds `manifest` on top.
+fn artifact_json(row: &artifacts::Row) -> Value {
+    json!({
+        "id": row.id.to_string(),
+        "job": row.job.to_string(),
+        "job_name": row.job_name,
+        "attempt": row.attempt.to_string(),
+        "name": row.name,
+        "state": row.state.as_str(),
+        "manifest_version": row.manifest_version,
+        "entries": row.entries,
+        "bytes": row.bytes,
+        "retain_until_ms": row.retain_until_ms.0,
+        "created_ms": row.created_ms.0,
+    })
 }
 
 fn upload_json(upload: UploadId, status: &sentinel_store::objects::UploadStatus) -> Value {

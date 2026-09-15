@@ -149,9 +149,12 @@ jobs:
         })
         .unwrap();
     let logs = Arc::new(LogStore::open(dir.path().join("logs")).unwrap());
+    let objects =
+        Arc::new(sentinel_store::objects::Objects::open(dir.path().join("objects")).unwrap());
     let controller = Controller::start(
         Arc::clone(&store),
         logs,
+        objects,
         Identity::generate("controller").unwrap(),
         "127.0.0.1:0".parse().unwrap(),
     )

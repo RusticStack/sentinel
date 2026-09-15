@@ -135,6 +135,39 @@ pub struct Staged {
     digest: Digest,
     len: u64,
     path: PathBuf,
+    /// This stage created the final-path file; a dedup hit did not, so
+    /// `discard` must not remove what a concurrent commit may own.
+    created: bool,
+}
+
+/// An open staged write under `tmp/`, for bodies that arrive in pieces —
+/// link artifact frames, where no `Read` exists. Dropping without
+/// [`Objects::stage_seal`] removes the temp file.
+pub struct Staging {
+    file: File,
+    tmp: PathBuf,
+    hasher: blake3::Hasher,
+    written: u64,
+    limit: u64,
+}
+
+impl Staging {
+    /// Bytes accepted so far.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+    /// Consume the handle without the Drop removal firing.
+    fn into_parts(self) -> (File, PathBuf) {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `file` and `tmp` are read once and `this` is never dropped.
+        unsafe { (std::ptr::read(&this.file), std::ptr::read(&this.tmp)) }
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.tmp);
+    }
 }
 
 impl Staged {
@@ -148,10 +181,13 @@ impl Staged {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
-    /// Remove the staged file (it is already at its final path; without a
-    /// committed row it is an orphan either way).
+    /// Remove the staged file — only when this stage created it. A dedup
+    /// hit shares its path with an earlier stage or committed object, so
+    /// removing it could delete live content.
     pub fn discard(self) {
-        let _ = fs::remove_file(&self.path);
+        if self.created {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -369,21 +405,87 @@ impl Objects {
         }
         let path = self.object_path(tenant, &digest);
         self.ensure_dir(path.parent().expect("object path has a parent"))?;
-        if !path.exists() {
+        let created = if !path.exists() {
             fs::rename(&tmp, &path)?;
             if let Some(dir) = path.parent() {
                 sync_dir(dir)?;
             }
+            true
         } else {
             // Same tenant, same digest: the committed bytes are identical,
             // so the duplicate stage is simply redundant work.
             let _ = fs::remove_file(&tmp);
-        }
+            false
+        };
         Ok(Staged {
             tenant,
             digest,
             len,
             path,
+            created,
+        })
+    }
+
+    /// Open a staged write under `tmp/` for a body that arrives in pieces —
+    /// link artifact frames, where no `Read` exists. `limit` bounds the
+    /// total; dropping the [`Staging`] discards the temp file.
+    pub fn stage_begin(&self, limit: u64) -> Result<Staging> {
+        let tmp = self.tmp();
+        let file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+        Ok(Staging {
+            file,
+            tmp,
+            hasher: blake3::Hasher::new(),
+            written: 0,
+            limit,
+        })
+    }
+
+    /// Append to an open staged write. Over the declared `limit` is refused
+    /// without writing; the file keeps what it already holds.
+    pub fn stage_write(&self, staging: &mut Staging, bytes: &[u8]) -> Result<()> {
+        let next = staging
+            .written
+            .checked_add(bytes.len() as u64)
+            .ok_or(Error::InvalidInput("object size"))?;
+        if next > staging.limit {
+            return Err(Error::InvalidInput("object size"));
+        }
+        staging.file.write_all(bytes)?;
+        staging.hasher.update(bytes);
+        staging.written = next;
+        Ok(())
+    }
+
+    /// Verify the write total is `expected`, `fdatasync`, rename into
+    /// `objects/<tenant>/` and fsync the directory: the durable half of the
+    /// commit, identical to what [`Objects::stage`] leaves behind. The
+    /// returned [`Staged`] publishes through [`Objects::commit`].
+    pub fn stage_seal(&self, tenant: TenantId, staging: Staging, expected: u64) -> Result<Staged> {
+        if staging.written != expected {
+            return Err(Error::InvalidInput("object length"));
+        }
+        staging.file.sync_data()?;
+        let digest = Digest(*staging.hasher.finalize().as_bytes());
+        let path = self.object_path(tenant, &digest);
+        self.ensure_dir(path.parent().expect("object path has a parent"))?;
+        let created = if !path.exists() {
+            fs::rename(&staging.tmp, &path)?;
+            if let Some(dir) = path.parent() {
+                sync_dir(dir)?;
+            }
+            true
+        } else {
+            false
+        };
+        // `into_parts` consumes without the Drop removal firing.
+        let _ = staging.into_parts();
+        Ok(Staged {
+            tenant,
+            digest,
+            len: expected,
+            path,
+            created,
         })
     }
 
@@ -1042,14 +1144,16 @@ impl Objects {
         }
         let object = self.object_path(tenant, &digest);
         self.ensure_dir(object.parent().expect("object path has a parent"))?;
-        if !object.exists() {
+        let created = if !object.exists() {
             fs::rename(&path, &object)?;
             if let Some(dir) = object.parent() {
                 sync_dir(dir)?;
             }
+            true
         } else {
             let _ = fs::remove_file(&path);
-        }
+            false
+        };
         self.commit(
             tx,
             &Staged {
@@ -1057,6 +1161,7 @@ impl Objects {
                 digest,
                 len: row.declared_len,
                 path: object,
+                created,
             },
         )?;
         tx.execute(
@@ -1361,7 +1466,7 @@ fn sync_dir(_dir: &Path) -> Result<()> {
 /// component non-empty and never `.` or `..`, and free of separators and
 /// characters that could escape or reinterpret under extraction (`\`, `:`,
 /// NUL, a leading `/` or drive prefix).
-fn valid_entry_path(path: &str) -> bool {
+pub fn valid_entry_path(path: &str) -> bool {
     if path.is_empty() || path.len() > MAX_ENTRY_PATH || path.starts_with('/') {
         return false;
     }

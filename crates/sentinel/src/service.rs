@@ -514,6 +514,7 @@ fn start_server(
     let controller = sentinel_link::controller::Controller::start(
         Arc::clone(&store),
         Arc::clone(&logs),
+        Arc::clone(&objects),
         identity,
         listen,
     )

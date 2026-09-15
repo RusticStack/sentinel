@@ -132,9 +132,12 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
         })
         .unwrap();
     let logs = Arc::new(LogStore::open(temp.path().join("logs")).unwrap());
+    let objects =
+        Arc::new(sentinel_store::objects::Objects::open(temp.path().join("objects")).unwrap());
     let controller = Controller::start(
         Arc::clone(&store),
         Arc::clone(&logs),
+        objects,
         Identity::generate("controller").unwrap(),
         "127.0.0.1:0".parse().unwrap(),
     )

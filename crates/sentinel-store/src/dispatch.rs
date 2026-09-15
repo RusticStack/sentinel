@@ -787,6 +787,49 @@ pub fn is_held(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Resul
         .query_row(params![attempt.as_bytes(), worker.as_bytes()], |r| r.get(0))?)
 }
 
+/// The tenant/run/job/spec-index a held attempt executes under — the
+/// artifact publisher's scope. `NotFound` when the attempt is not held by
+/// `worker` (released, foreign or unknown), so a stale fence cannot publish.
+pub fn attempt_scope(
+    conn: &Connection,
+    worker: WorkerId,
+    attempt: AttemptId,
+) -> Result<(TenantId, RunId, JobId, u32)> {
+    let Some((tenant, run, job, index)) = conn
+        .prepare_cached(
+            "SELECT j.tenant_id, j.run_id, j.id, j.spec_index
+             FROM attempts a JOIN jobs j ON j.id = a.job_id
+             WHERE a.id = ?1 AND a.worker_id = ?2 AND a.released_ms IS NULL",
+        )?
+        .query_row(params![attempt.as_bytes(), worker.as_bytes()], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })
+        .optional()?
+    else {
+        return Err(Error::NotFound);
+    };
+    Ok((
+        TenantId::from_bytes(
+            <[u8; 16]>::try_from(tenant.as_slice()).map_err(|_| Error::Corrupt("tenant_id"))?,
+        )
+        .map_err(|_| Error::Corrupt("tenant_id"))?,
+        RunId::from_bytes(
+            <[u8; 16]>::try_from(run.as_slice()).map_err(|_| Error::Corrupt("run_id"))?,
+        )
+        .map_err(|_| Error::Corrupt("run_id"))?,
+        JobId::from_bytes(
+            <[u8; 16]>::try_from(job.as_slice()).map_err(|_| Error::Corrupt("job_id"))?,
+        )
+        .map_err(|_| Error::Corrupt("job_id"))?,
+        u32::try_from(index).map_err(|_| Error::Corrupt("spec_index"))?,
+    ))
+}
+
 /// The encoded run spec of an attempt the worker holds, exactly as stored.
 pub fn spec_bytes(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Result<Vec<u8>> {
     conn.prepare_cached(
