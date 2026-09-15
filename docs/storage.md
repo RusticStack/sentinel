@@ -55,6 +55,24 @@ A full queue returns `WriterUnavailable` immediately instead of blocking or grow
 
 `jobs::transition` reads the row, lets `JobControl::apply` decide (actor permission, fence, edge), then executes one static `UPDATE … WHERE id=? AND tenant_id=? AND state_code=? AND fence=?`. Zero rows changed means the row moved between read and write: `Conflict`, and the transaction rolls back. `jobs::lease` bumps the fence, transitions to `Leased` and inserts the attempt row in the same transaction. `jobs::pick_ready` is a single indexed `ORDER BY priority, created_seq LIMIT 1`; the test asserts the query plan uses `jobs_ready`. `jobs::run_state` recomputes the run outcome from job rows through the core aggregation. `runs::create_run` writes the run, its spec and its job rows in one transaction (dependency-free jobs start `Queued`); `runs::rerun_job` applies the core `Rerun` edge with a compare-and-set that clears attempt history and keeps the fence.
 
+## Objects and manifests (D01)
+
+`sentinel-store::objects` is the controller's content-addressed body store, under the same data directory as the database:
+
+```text
+<data>/objects/<tenant>/<hex[0..2]>/<hex-digest>        committed objects
+<data>/manifests/<tenant>/<kind>/<name-hash>/<version>  manifest files
+<data>/tmp/<unique>                                     staging, never committed
+```
+
+Objects are addressed by their BLAKE3-256 digest and deduplicated **within one tenant only** — identical bytes stored by two tenants are two objects, so object existence never leaks across tenant boundaries. A reference commit is the `objects` row (migration 23): `stage` streams the body to `tmp/` hashing in one pass, verifies any declared length/digest and the caller's byte cap, `fdatasync`s the file, atomically renames it into the tenant's namespace and `fsync`s the directory chain; `commit` then inserts the row inside the caller's transaction. A crash between rename and commit leaves an **orphan** — wasted space, never a published incomplete object. The triggers on both tables refuse `UPDATE` and `DELETE`: reference removal is the reclamation stage (D06+), not a write path.
+
+Manifests are named, monotonically versioned lists of object references (`kind`, `name`, `version` → immutable file + row). `commit_manifest` chooses `MAX(version)+1` inside the transaction, **refuses references to objects the tenant has not committed**, writes the manifest through the same stage discipline and inserts the row — a manifest can never dangle. Entry paths are `/`-separated relative archive names; `.`/`..`, absolute, drive-prefixed and separator-bearing components are refused at commit. The row records the manifest file's own digest and the summed payload length for quota and retention accounting without reopening the file.
+
+Reads are verified: `read` streams the object while rehashing and compares digest *and* length to the committed row; `manifest` parses the file and checks it against its committed digest and identity. A committed row whose file is absent or short is `Corrupt`, not `NotFound`.
+
+**Recovery.** The server opens the store and runs `recover` at startup (logged as `objects_recovered`); `sentinel admin objects recover` runs the same reconciliation host-locally while the controller is stopped. It removes anything in `tmp/` (incomplete staged writes), then walks both trees against the committed rows: files with no row are **orphans** (reported, never deleted — a staged-but-uncommitted file and a leaked file are indistinguishable), files whose row disagrees on length are **corrupt**, and rows with no file are **missing**. `verify` — `sentinel admin objects verify` — rehashes every committed object for the deeper integrity check that catches content rot a length check cannot see; it is a drill, not a per-request cost.
+
 ## Verification
 
 Thirteen integration tests. Runs: spec persisted and read back byte-for-byte, job states seeded from dependencies, cross-tenant read denied, duplicate run creation rejected with the original intact, rerun keeps the fence and stales the old attempt, rerun refused for running and cancelled jobs. Core: migrations idempotent with WAL and foreign keys on; full lifecycle with fence, timestamps and run aggregation; stale fence and wrong tenant rejected; compare-and-set conflict rolls back the whole transaction; dangling and cross-tenant inserts fail; ready-queue ordering and index use; durable cancel flag; acknowledged writes survive drop-without-checkpoint and reopen; writer back-pressure rejects only overflow. Plus two codec round-trip tests. All pass on Windows and Linux.

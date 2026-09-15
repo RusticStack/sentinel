@@ -29,9 +29,9 @@ use sentinel_store::{
 
 use crate::cli::{
     AccountArgs, AccountCommand, AdminArgs, AdminCommand, DataDir, IdentityArgs, IdentityCommand,
-    InviteArgs, InviteCommand, KeyArgs, KeyCommand, MfaArgs, MfaCommand, PolicyArgs, PolicyCommand,
-    PoolArgs, PoolCommand, SessionArgs, SessionCommand, TenantArgs, TenantCommand, TokenArgs,
-    TokenCommand, WorkerArgs, WorkerCommand,
+    InviteArgs, InviteCommand, KeyArgs, KeyCommand, MfaArgs, MfaCommand, ObjectsArgs,
+    ObjectsCommand, PolicyArgs, PolicyCommand, PoolArgs, PoolCommand, SessionArgs, SessionCommand,
+    TenantArgs, TenantCommand, TokenArgs, TokenCommand, WorkerArgs, WorkerCommand,
 };
 
 pub struct Error {
@@ -95,6 +95,7 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
     match &args.command {
         AdminCommand::Source(args) => crate::source_admin::run(args)?,
         AdminCommand::Intake(args) => crate::intake_admin::run(args)?,
+        AdminCommand::Objects(args) => objects(args)?,
         AdminCommand::Bootstrap {
             data,
             username,
@@ -1028,6 +1029,54 @@ fn cancel(
             eprintln!("{run}: cancellation recorded for {count} job(s)");
         }
         _ => return Err(fail("give exactly one of --job or --run")),
+    }
+    Ok(())
+}
+
+/// Reconcile or rehash the object store. Host-local: the commands read the
+/// database directly and must run while no controller owns it, or they open
+/// their own read connection — `recover` sweeps `tmp/`, which a running
+/// controller may be writing into, so it requires the store stopped.
+fn objects(args: &ObjectsArgs) -> Result<(), Error> {
+    let objects = sentinel_store::objects::Objects::open(&args.data.data_dir)
+        .map_err(|error| fail(format!("cannot open the object store: {error}")))?;
+    match args.command {
+        ObjectsCommand::Recover => {
+            // tmp/ is staging for in-flight writes; sweeping it under a live
+            // controller would delete staged bodies mid-upload.
+            let store = open(&args.data, true)?;
+            let report = store
+                .read(|conn| objects.recover(conn))
+                .map_err(|error| fail(format!("recovery failed: {error}")))?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "staged": report.staged,
+                    "orphans": report.orphans.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                    "corrupt": report.corrupt.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                    "missing": report.missing.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                })
+            );
+        }
+        ObjectsCommand::Verify => {
+            let store = open(&args.data, true)?;
+            let corrupt = store
+                .read(|conn| objects.verify(conn))
+                .map_err(|error| fail(format!("verification failed: {error}")))?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "corrupt": corrupt
+                        .iter()
+                        .map(|c| serde_json::json!({
+                            "tenant": c.tenant.to_string(),
+                            "digest": c.digest.to_string(),
+                            "path": c.path.display().to_string(),
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            );
+        }
     }
     Ok(())
 }

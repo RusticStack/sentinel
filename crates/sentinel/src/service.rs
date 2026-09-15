@@ -479,6 +479,25 @@ fn start_server(
         sentinel_store::logs::LogStore::open(config.data_dir.join(sentinel_store::logs::LOGS_DIR))
             .map_err(|error| Error::runtime(format!("cannot open the log store: {error}")))?,
     );
+    // Reconcile the object tree against committed rows before serving:
+    // staged leftovers are swept, orphans/corrupt/missing are reported.
+    let objects = sentinel_store::objects::Objects::open(&config.data_dir)
+        .map_err(|error| Error::runtime(format!("cannot open the object store: {error}")))?;
+    let recovery = store
+        .read(|conn| objects.recover(conn))
+        .map_err(|error| Error::runtime(format!("cannot recover the object store: {error}")))?;
+    if recovery.orphans.is_empty() && recovery.corrupt.is_empty() && recovery.missing.is_empty() {
+        tracing::info!(event = "objects_recovered", staged = recovery.staged);
+    } else {
+        tracing::warn!(
+            event = "objects_recovered",
+            staged = recovery.staged,
+            orphans = recovery.orphans.len(),
+            corrupt = recovery.corrupt.len(),
+            missing = recovery.missing.len(),
+            "object store recovery found inconsistencies"
+        );
+    }
     let controller = sentinel_link::controller::Controller::start(
         Arc::clone(&store),
         Arc::clone(&logs),

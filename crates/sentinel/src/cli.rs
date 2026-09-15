@@ -132,6 +132,8 @@ pub enum AdminCommand {
     Source(SourceArgs),
     /// Inspect and purge durable event intake records
     Intake(IntakeArgs),
+    /// Reconcile or verify committed objects and manifests against the filesystem
+    Objects(ObjectsArgs),
     /// Admit the first super admin; refused once any active super admin exists
     Bootstrap {
         #[command(flatten)]
@@ -308,6 +310,22 @@ pub enum IntakeCommand {
         #[arg(long, default_value = "1000")]
         limit: u32,
     },
+}
+
+#[derive(Args)]
+pub struct ObjectsArgs {
+    #[command(flatten)]
+    pub data: DataDir,
+    #[command(subcommand)]
+    pub command: ObjectsCommand,
+}
+
+#[derive(Subcommand)]
+pub enum ObjectsCommand {
+    /// Sweep incomplete staged writes and report orphans, corrupt and missing objects
+    Recover,
+    /// Rehash every committed object and report content that no longer matches
+    Verify,
 }
 
 #[derive(Args)]
