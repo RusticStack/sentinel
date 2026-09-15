@@ -620,6 +620,7 @@ fn run_json(view: &status::RunStatus) -> Value {
             "failure_class": j.failure_class.map(|c| c.as_str()),
             "cancel_requested": j.cancel_requested,
             "attempt": j.attempt.map(|a| a.to_string()),
+            "log_state": j.log_state.map(|s| s.as_str()),
             "fence": j.fence,
             "timestamps": {
                 "queued_ms": j.timestamps.queued.map(|t| t.0),

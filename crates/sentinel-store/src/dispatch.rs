@@ -13,15 +13,17 @@
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{
-    Actor, AttemptId, DependencyPolicy, Event, Fence, JobId, JobState, Outcome, PoolId, RepoId,
-    RunId, TenantId, UnixMillis, WorkerId, dependency_decision,
+    Actor, AttemptId, DependencyPolicy, Event, FailureClass, Fence, JobId, JobState, Outcome,
+    PoolId, RepoId, RunId, TenantId, UnixMillis, WorkerId, dependency_decision,
 };
+use sentinel_pipeline::schema::ArtifactWhen;
 use sentinel_protocol::{limits::MAX_LIST_ITEMS, summary::MAX_SUMMARY_BYTES};
 
 use crate::{
-    Error, Result,
+    Error, Result, artifacts,
     codec::{READY, decode_state},
     jobs,
+    logs::LogStore,
     runs::{self, ResolvedImage},
 };
 
@@ -44,6 +46,45 @@ pub const EXECUTION_GRACE_MS: i64 = 10 * 60 * 1000;
 const SWEEP_BATCH: usize = 256;
 /// Offers the ack-timeout sweep lapses per pass.
 const SWEEP_LIMIT: usize = 256;
+
+/// Whether the attempt's `end` marker was durable when its job went terminal
+/// (`attempts.log_state`, migration 26). The codes order the states — the
+/// `attempt_update` trigger refuses any regression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum LogState {
+    /// The attempt is live, or its end marker was never seen.
+    Pending = 0,
+    /// The job reached terminal before a durable end marker: worker loss, a
+    /// `LogEnd` acknowledged-but-dropped on an older protocol, or the flush
+    /// timeout running out. Reads still report the stored frames and gaps;
+    /// a retransmitted end from the owning worker — released or not —
+    /// upgrades this.
+    Incomplete = 1,
+    /// The `end` marker was durable.
+    Complete = 2,
+}
+
+impl LogState {
+    fn code(self) -> i64 {
+        self as i64
+    }
+    pub fn from_code(code: i64) -> Result<LogState> {
+        match code {
+            0 => Ok(LogState::Pending),
+            1 => Ok(LogState::Incomplete),
+            2 => Ok(LogState::Complete),
+            _ => Err(Error::Corrupt("log_state")),
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogState::Pending => "pending",
+            LogState::Incomplete => "incomplete",
+            LogState::Complete => "complete",
+        }
+    }
+}
 
 /// Resources as the scheduler counts them: CPU in thousandths of a core and
 /// bytes of memory. A zero capacity is a worker that takes no work.
@@ -352,40 +393,160 @@ pub fn renew(
     Ok((until, stop))
 }
 
+/// Artifact coverage of a finishing attempt under `passed`: the declarations
+/// due under that outcome that have no row at all — each gets a `failed` row
+/// so the loss is on record — and whether any due *required* artifact lacks
+/// a `captured` row, which a reported `Passed` cannot stand over. The
+/// declarations come from the stored run spec, so a report cannot omit one
+/// silently.
+fn due_coverage(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    run: RunId,
+    spec_index: u32,
+    attempt: AttemptId,
+    passed: bool,
+) -> Result<(Vec<sentinel_pipeline::schema::Artifact>, bool)> {
+    let spec = runs::get_run_spec(tx, tenant, run)?;
+    let job = spec
+        .pipeline
+        .jobs
+        .get(spec_index as usize)
+        .ok_or(Error::Corrupt("spec_index"))?;
+    let settled = artifacts::for_attempt(tx, attempt)?;
+    let mut missing = Vec::new();
+    let mut required_lost = false;
+    for decl in &job.spec.artifacts {
+        let due = match decl.when {
+            ArtifactWhen::Success => passed,
+            ArtifactWhen::Failure => !passed,
+            ArtifactWhen::Always => true,
+        };
+        if !due {
+            continue;
+        }
+        match settled.iter().find(|(n, _)| *n == decl.name) {
+            None => {
+                missing.push(decl.clone());
+                required_lost |= decl.required;
+            }
+            Some((_, state)) if decl.required && *state != artifacts::State::Captured => {
+                required_lost = true;
+            }
+            _ => {}
+        }
+    }
+    Ok((missing, required_lost))
+}
+
 /// End an attempt: apply `event` as `actor` through the state machine, release
 /// the reservation, and if the job reached terminal, decide its dependents.
 /// A worker's report is fenced by the machine; a stale one changes nothing.
+///
+/// Terminal publication persists the attempt's data status first: a reported
+/// `Passed` stands only if every due *required* artifact has a `captured`
+/// row — otherwise the event is applied as `Failed(Publication)`; every due
+/// artifact without a row gets `failed` so the loss is on record; and
+/// `log_state` records whether the log's end marker was durable (`logs`
+/// answers it; `None` for callers without a log store answers incomplete).
 pub fn finish(
     tx: &Transaction<'_>,
     attempt: AttemptId,
     actor: Actor,
     event: Event,
     now: UnixMillis,
+    logs: Option<&LogStore>,
 ) -> Result<JobState> {
-    let row: Option<([u8; 16], [u8; 16], [u8; 16])> = tx
+    let row = tx
         .prepare_cached(
-            "SELECT a.tenant_id, a.job_id, j.run_id FROM attempts a JOIN jobs j ON j.id = a.job_id
+            "SELECT a.tenant_id, a.job_id, j.run_id, j.spec_index
+             FROM attempts a JOIN jobs j ON j.id = a.job_id
              WHERE a.id = ?1 AND a.released_ms IS NULL",
         )?
         .query_row([attempt.as_bytes()], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            Ok((
+                r.get::<_, [u8; 16]>(0)?,
+                r.get::<_, [u8; 16]>(1)?,
+                r.get::<_, [u8; 16]>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
         })
         .optional()?;
-    let Some((tenant, job, run)) = row else {
+    let Some((tenant, job, run, index)) = row else {
         return Err(Error::NotFound);
     };
     let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?;
     let job = JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?;
     let run = RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?;
+    let index = u32::try_from(index).map_err(|_| Error::Corrupt("spec_index"))?;
+    let finishing = matches!(
+        event,
+        Event::Passed
+            | Event::Failed(_)
+            | Event::LeaseExpired
+            | Event::WorkerLost
+            | Event::Reconciled
+    );
+    let mut missing = Vec::new();
+    let mut event = event;
+    if finishing {
+        let lost;
+        (missing, lost) = due_coverage(tx, tenant, run, index, attempt, event == Event::Passed)?;
+        if event == Event::Passed && lost {
+            event = Event::Failed(FailureClass::Publication);
+        }
+    }
     let next = jobs::transition(tx, tenant, job, actor, event, now)?;
     if !next.is_terminal() {
         // Preparing/Running/Finalizing keep the reservation.
         return Ok(next);
     }
-    tx.prepare_cached("UPDATE attempts SET released_ms = ?2 WHERE id = ?1")?
-        .execute(params![attempt.as_bytes(), now.0])?;
+    let ended = logs.is_some_and(|l| l.has_end(run, job, attempt));
+    tx.prepare_cached(
+        "UPDATE attempts SET released_ms = ?2,
+             log_state = CASE WHEN log_state = 0 THEN ?3 ELSE log_state END
+         WHERE id = ?1",
+    )?
+    .execute(params![
+        attempt.as_bytes(),
+        now.0,
+        if ended {
+            LogState::Complete
+        } else {
+            LogState::Incomplete
+        }
+        .code(),
+    ])?;
+    for decl in &missing {
+        artifacts::record(
+            tx,
+            tenant,
+            run,
+            job,
+            attempt,
+            &decl.name,
+            artifacts::State::Failed,
+            None,
+            0,
+            0,
+            UnixMillis(
+                now.0
+                    .saturating_add(decl.retain_secs.saturating_mul(1000) as i64),
+            ),
+            now,
+        )?;
+    }
     release_dependents(tx, tenant, run, now)?;
     Ok(next)
+}
+
+/// The attempt's log end marker is durable on the controller: the row says
+/// so before the worker is acknowledged. Monotonic — a recorded `complete`
+/// is never taken back.
+pub fn log_ended(tx: &Transaction<'_>, attempt: AttemptId) -> Result<()> {
+    tx.prepare_cached("UPDATE attempts SET log_state = ?2 WHERE id = ?1 AND log_state <> ?2")?
+        .execute(params![attempt.as_bytes(), LogState::Complete.code()])?;
+    Ok(())
 }
 
 /// What cancelling a job did.
@@ -507,8 +668,20 @@ pub fn expired(conn: &Connection, now: UnixMillis) -> Result<Vec<AttemptId>> {
 /// Expire one attempt: `LeaseExpired` through the machine, capacity back,
 /// dependents decided. The job is terminal `infra_failed` — never re-queued
 /// on its own, because whether its side effects happened is unknown.
-pub fn expire(tx: &Transaction<'_>, attempt: AttemptId, now: UnixMillis) -> Result<JobState> {
-    finish(tx, attempt, Actor::Controller, Event::LeaseExpired, now)
+pub fn expire(
+    tx: &Transaction<'_>,
+    attempt: AttemptId,
+    now: UnixMillis,
+    logs: Option<&LogStore>,
+) -> Result<JobState> {
+    finish(
+        tx,
+        attempt,
+        Actor::Controller,
+        Event::LeaseExpired,
+        now,
+        logs,
+    )
 }
 
 /// A worker found this attempt in its own leftovers after a restart and
@@ -522,6 +695,7 @@ pub fn abandon(
     attempt: AttemptId,
     fence: Fence,
     now: UnixMillis,
+    logs: Option<&LogStore>,
 ) -> Result<JobState> {
     let held: bool = tx
         .prepare_cached(
@@ -543,7 +717,7 @@ pub fn abandon(
         lapse(tx, attempt, now)?;
         return Ok(JobState::Queued);
     }
-    finish(tx, attempt, Actor::Reconciler, Event::Reconciled, now)
+    finish(tx, attempt, Actor::Reconciler, Event::Reconciled, now, logs)
 }
 
 /// What a controller start found and settled.
@@ -563,10 +737,14 @@ pub struct Reconciled {
 /// only have moved with a controller running is moved now, in one
 /// transaction, before any worker is admitted. Nothing is re-queued that
 /// may have run.
-pub fn reconcile_startup(tx: &Transaction<'_>, now: UnixMillis) -> Result<Reconciled> {
+pub fn reconcile_startup(
+    tx: &Transaction<'_>,
+    now: UnixMillis,
+    logs: Option<&LogStore>,
+) -> Result<Reconciled> {
     let mut done = Reconciled::default();
     for attempt in expired(tx, now)? {
-        expire(tx, attempt, now)?;
+        expire(tx, attempt, now, logs)?;
         done.expired += 1;
     }
     for attempt in unacknowledged(tx, now)? {
@@ -583,7 +761,7 @@ pub fn reconcile_startup(tx: &Transaction<'_>, now: UnixMillis) -> Result<Reconc
         .collect::<std::result::Result<_, _>>()?;
     for attempt in orphans {
         let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Corrupt("attempt_id"))?;
-        finish(tx, attempt, Actor::Reconciler, Event::Reconciled, now)?;
+        finish(tx, attempt, Actor::Reconciler, Event::Reconciled, now, logs)?;
         done.orphaned += 1;
     }
     Ok(done)
@@ -633,6 +811,7 @@ fn run_of(conn: &Connection, tenant: TenantId, job: JobId) -> Result<RunId> {
 /// A worker's report over the link: the attempt must be held by that worker
 /// under that fence, then [`finish`] applies the event as the worker. A
 /// terminal report may carry the attempt's summary, written once.
+#[allow(clippy::too_many_arguments)]
 pub fn report(
     tx: &Transaction<'_>,
     worker: WorkerId,
@@ -641,6 +820,7 @@ pub fn report(
     event: Event,
     summary: Option<&[u8]>,
     now: UnixMillis,
+    logs: Option<&LogStore>,
 ) -> Result<JobState> {
     let held: bool = tx
         .prepare_cached(
@@ -654,7 +834,7 @@ pub fn report(
     if !held {
         return Err(Error::NotFound);
     }
-    let next = finish(tx, attempt, Actor::Worker(fence), event, now)?;
+    let next = finish(tx, attempt, Actor::Worker(fence), event, now, logs)?;
     if let Some(summary) = summary
         && next.is_terminal()
     {
@@ -827,6 +1007,39 @@ pub fn attempt_scope(
         )
         .map_err(|_| Error::Corrupt("job_id"))?,
         u32::try_from(index).map_err(|_| Error::Corrupt("spec_index"))?,
+    ))
+}
+
+/// The attempt's run/job for log purposes: owned by that worker, released
+/// or not. A released attempt may still receive retransmitted frames and its
+/// end — the log is evidence, and late bytes only complete the record. The
+/// verdict itself was already decided.
+pub fn attempt_log_scope(
+    conn: &Connection,
+    worker: WorkerId,
+    attempt: AttemptId,
+) -> Result<(RunId, JobId)> {
+    let Some((run, job)) = conn
+        .prepare_cached(
+            "SELECT j.run_id, j.id FROM attempts a JOIN jobs j ON j.id = a.job_id
+             WHERE a.id = ?1 AND a.worker_id = ?2",
+        )?
+        .query_row(params![attempt.as_bytes(), worker.as_bytes()], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
+        .optional()?
+    else {
+        return Err(Error::NotFound);
+    };
+    Ok((
+        RunId::from_bytes(
+            <[u8; 16]>::try_from(run.as_slice()).map_err(|_| Error::Corrupt("run_id"))?,
+        )
+        .map_err(|_| Error::Corrupt("run_id"))?,
+        JobId::from_bytes(
+            <[u8; 16]>::try_from(job.as_slice()).map_err(|_| Error::Corrupt("job_id"))?,
+        )
+        .map_err(|_| Error::Corrupt("job_id"))?,
     ))
 }
 

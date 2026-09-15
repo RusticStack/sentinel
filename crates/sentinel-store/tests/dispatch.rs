@@ -522,7 +522,8 @@ jobs:
             fence,
             Event::Passed,
             Some(&stray),
-            at(2_200)
+            at(2_200),
+            None,
         )),
         Err(Error::NotFound)
     ));
@@ -531,7 +532,16 @@ jobs:
         .writer()
         .write(move |tx| {
             dispatch::acknowledge(tx, w, attempt, fence, at(2_200))?;
-            dispatch::report(tx, w, attempt, fence, Event::StepsStarted, None, at(2_300))?;
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::StepsStarted,
+                None,
+                at(2_300),
+                None,
+            )?;
             dispatch::report(
                 tx,
                 w,
@@ -540,6 +550,7 @@ jobs:
                 Event::FinalizationStarted,
                 None,
                 at(2_400),
+                None,
             )?;
             dispatch::report(
                 tx,
@@ -549,6 +560,7 @@ jobs:
                 Event::Passed,
                 Some(&bytes),
                 at(2_500),
+                None,
             )
         })
         .unwrap();
@@ -573,7 +585,8 @@ jobs:
             fence,
             Event::Passed,
             Some(&[9u8]),
-            at(2_600)
+            at(2_600),
+            None,
         )),
         Err(Error::NotFound)
     ));
@@ -672,6 +685,7 @@ fn cancellation_is_desired_state_immediate_before_start_and_delivered_while_owne
                 Event::Failed(FailureClass::Canceled),
                 None,
                 at(2_500),
+                None,
             )
         })
         .unwrap();
@@ -777,7 +791,7 @@ jobs:
     let next = f
         .store
         .writer()
-        .write(move |tx| dispatch::expire(tx, attempt, overrun))
+        .write(move |tx| dispatch::expire(tx, attempt, overrun, None))
         .unwrap();
     assert_eq!(next, JobState::Terminal(Outcome::InfraFailed));
     let row = f
@@ -804,7 +818,8 @@ jobs:
             fence,
             Event::Passed,
             None,
-            overrun
+            overrun,
+            None,
         )),
         Err(Error::NotFound)
     ));
@@ -837,7 +852,7 @@ jobs:
     );
     f.store
         .writer()
-        .write(move |tx| dispatch::expire(tx, a2, lapsed))
+        .write(move |tx| dispatch::expire(tx, a2, lapsed, None))
         .unwrap();
     assert_eq!(state(&f, ids[0]), JobState::Terminal(Outcome::InfraFailed));
 }
@@ -904,7 +919,7 @@ jobs:
     let settled = f
         .store
         .writer()
-        .write(move |tx| dispatch::reconcile_startup(tx, restart))
+        .write(move |tx| dispatch::reconcile_startup(tx, restart, None))
         .unwrap();
     assert_eq!(
         settled,
@@ -954,7 +969,7 @@ jobs:
     let settled = f
         .store
         .writer()
-        .write(move |tx| dispatch::reconcile_startup(tx, at(50_100 + dispatch::OFFER_ACK_MS)))
+        .write(move |tx| dispatch::reconcile_startup(tx, at(50_100 + dispatch::OFFER_ACK_MS), None))
         .unwrap();
     assert_eq!(
         settled,
@@ -981,7 +996,7 @@ jobs:
     assert!(matches!(
         f.store
             .writer()
-            .write(move |tx| dispatch::abandon(tx, w, da, Fence(df.0 + 1), at(60_000))),
+            .write(move |tx| { dispatch::abandon(tx, w, da, Fence(df.0 + 1), at(60_000), None) }),
         Err(Error::NotFound)
     ));
     assert!(matches!(
@@ -990,14 +1005,15 @@ jobs:
             WorkerId::new(),
             da,
             df,
-            at(60_000)
+            at(60_000),
+            None,
         )),
         Err(Error::NotFound)
     ));
     assert_eq!(
         f.store
             .writer()
-            .write(move |tx| dispatch::abandon(tx, w, da, df, at(60_000)))
+            .write(move |tx| dispatch::abandon(tx, w, da, df, at(60_000), None))
             .unwrap(),
         JobState::Terminal(Outcome::InfraFailed)
     );
@@ -1013,7 +1029,7 @@ jobs:
     assert_eq!(
         f.store
             .writer()
-            .write(move |tx| dispatch::abandon(tx, w, ga, gf, at(60_200)))
+            .write(move |tx| dispatch::abandon(tx, w, ga, gf, at(60_200), None))
             .unwrap(),
         JobState::Queued
     );
@@ -1026,7 +1042,8 @@ jobs:
             df,
             Event::Passed,
             None,
-            at(60_300)
+            at(60_300),
+            None,
         )),
         Err(Error::NotFound)
     ));
@@ -1133,13 +1150,21 @@ jobs:
         .writer()
         .write(move |tx| {
             dispatch::acknowledge(tx, w, attempt, fence, at(2_200))?;
-            dispatch::finish(tx, attempt, worker_actor, Event::StepsStarted, at(2_300))?;
+            dispatch::finish(
+                tx,
+                attempt,
+                worker_actor,
+                Event::StepsStarted,
+                at(2_300),
+                None,
+            )?;
             dispatch::finish(
                 tx,
                 attempt,
                 worker_actor,
                 Event::FinalizationStarted,
                 at(2_400),
+                None,
             )
         })
         .unwrap();
@@ -1158,14 +1183,17 @@ jobs:
             attempt,
             Actor::Worker(Fence(0)),
             Event::Passed,
-            at(2_500)
+            at(2_500),
+            None,
         )),
         Err(Error::Transition(_))
     ));
     let next = f
         .store
         .writer()
-        .write(move |tx| dispatch::finish(tx, attempt, worker_actor, Event::Passed, at(2_500)))
+        .write(move |tx| {
+            dispatch::finish(tx, attempt, worker_actor, Event::Passed, at(2_500), None)
+        })
         .unwrap();
     assert_eq!(next, JobState::Terminal(Outcome::Passed));
     assert_eq!(
@@ -1184,7 +1212,8 @@ jobs:
             attempt,
             worker_actor,
             Event::Passed,
-            at(2_600)
+            at(2_600),
+            None,
         )),
         Err(Error::NotFound)
     ));
@@ -1203,6 +1232,7 @@ jobs:
                 Actor::Worker(fence),
                 Event::Failed(FailureClass::CommandFailed),
                 at(2_900),
+                None,
             )
         })
         .unwrap();

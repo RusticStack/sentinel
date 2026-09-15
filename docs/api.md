@@ -32,7 +32,7 @@ All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](p
 | `GET /tenants/{slug}/repos` | member | repositories visible to the caller |
 | `GET /tenants/{slug}/repos/{name}/runs?limit` | `read` | newest runs first |
 | `POST /tenants/{slug}/repos/{name}/runs` `{pipeline, source:{repo,sha,ref}}` | `run` | compile, pin, create the run and its jobs, resolve every digest-pinned image, record manual provenance, wake the dispatcher → `201` run status. `Idempotency-Key` replays the same run (`200`) and refuses a different body (`idempotency_mismatch`). Every image must be pinned by digest until a resolver exists |
-| `GET /runs/{id}` | `read` | the run and its jobs: state, failure class, trigger (`push`, `tag`, `pull_request`, `manual`), cancel flag, newest attempt, fence, phase timestamps |
+| `GET /runs/{id}` | `read` | the run and its jobs: state, failure class, trigger (`push`, `tag`, `pull_request`, `manual`), cancel flag, newest attempt, `log_state` (`pending`/`incomplete`/`complete` of that attempt's durable log end, `null` until an attempt exists), fence, phase timestamps |
 | `POST /runs/{id}/cancel` | `run` | `cancel_run` ([cancellation](cancellation.md)) |
 | `POST /jobs/{id}/cancel` | `run` | `cancel` → `terminal`, `requested` or `alreadyterminal` |
 | `POST /jobs/{id}/rerun` | `run` | a new attempt of a finished job; `conflict` for a running or cancelled one |

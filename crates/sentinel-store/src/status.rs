@@ -11,6 +11,7 @@ use sentinel_core::{
 use crate::{
     Error, Result,
     codec::{decode_failure, decode_state},
+    dispatch::LogState,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,6 +24,9 @@ pub struct JobStatus {
     pub timestamps: AttemptTimestamps,
     /// The newest attempt, if any was ever leased.
     pub attempt: Option<AttemptId>,
+    /// Whether that attempt's log end marker is durable — `None` until an
+    /// attempt exists.
+    pub log_state: Option<LogState>,
     pub fence: u64,
 }
 
@@ -59,7 +63,8 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
     let mut stmt = conn.prepare_cached(
         "SELECT j.id, j.name, j.state_code, j.failure_class, j.cancel_requested, j.fence,
                 j.queued_ms, j.leased_ms, j.preparing_ms, j.running_ms, j.finalizing_ms, j.terminal_ms,
-                (SELECT a.id FROM attempts a WHERE a.job_id = j.id ORDER BY a.fence DESC LIMIT 1)
+                (SELECT a.id FROM attempts a WHERE a.job_id = j.id ORDER BY a.fence DESC LIMIT 1),
+                (SELECT a.log_state FROM attempts a WHERE a.job_id = j.id ORDER BY a.fence DESC LIMIT 1)
          FROM jobs j WHERE j.run_id = ?1 AND j.tenant_id = ?2 ORDER BY j.spec_index",
     )?;
     let rows = stmt.query_map(params![run.as_bytes(), tenant.as_bytes()], |r| {
@@ -82,11 +87,12 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
                 terminal: ms(11)?,
             },
             r.get::<_, Option<[u8; 16]>>(12)?,
+            r.get::<_, Option<i64>>(13)?,
         ))
     })?;
     let mut jobs = Vec::new();
     for row in rows {
-        let (id, name, code, class, cancel, fence, timestamps, attempt) = row?;
+        let (id, name, code, class, cancel, fence, timestamps, attempt, log_state) = row?;
         jobs.push(JobStatus {
             id: JobId::from_bytes(id).map_err(|_| Error::Corrupt("job_id"))?,
             name,
@@ -100,6 +106,7 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
             attempt: attempt
                 .map(|a| AttemptId::from_bytes(a).map_err(|_| Error::Corrupt("attempt_id")))
                 .transpose()?,
+            log_state: log_state.map(LogState::from_code).transpose()?,
             fence: fence as u64,
         });
     }

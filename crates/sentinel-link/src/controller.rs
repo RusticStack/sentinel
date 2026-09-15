@@ -221,8 +221,9 @@ impl Inner {
         // by the grace: infra-failed, capacity back, never replayed.
         if let Ok(due) = self.store.read(|c| dispatch::expired(c, now)) {
             for attempt in due {
+                let logs = Arc::clone(&self.logs);
                 if self
-                    .write(move |tx| dispatch::expire(tx, attempt, now))
+                    .write(move |tx| dispatch::expire(tx, attempt, now, Some(&logs)))
                     .is_ok()
                 {
                     self.stats.expired.fetch_add(1, Ordering::Relaxed);
@@ -320,14 +321,19 @@ impl Inner {
             .cloned()
     }
 
-    /// Whether `attempt` is held by `worker`, checked against the store
-    /// once per attempt and remembered on the session.
+    /// Whether `attempt` is still held by `worker`: the gate for artifact
+    /// publication, where a released attempt is stale. Logs use the wider
+    /// [`Self::log_scope`]: late retransmissions only complete the record.
     fn holds(&self, worker: WorkerId, attempt: AttemptId) -> bool {
-        self.log_scope(worker, attempt).is_some()
+        self.store
+            .read(|c| dispatch::is_held(c, worker, attempt))
+            .unwrap_or(false)
     }
 
-    /// The attempt's `(run, job)` when held by `worker`: resolved against
-    /// the store once per attempt, then remembered on the session.
+    /// The attempt's `(run, job)` when owned by `worker` — held or released:
+    /// resolved against the store once per attempt, then remembered on the
+    /// session. A released attempt still accepts log frames and its end;
+    /// the verdict is long decided and the bytes are evidence.
     fn log_scope(&self, worker: WorkerId, attempt: AttemptId) -> Option<(RunId, JobId)> {
         let peer = self.peer(worker)?;
         if let Some(scope) = peer
@@ -342,8 +348,7 @@ impl Inner {
             .store
             .read(|c| {
                 let tx = c.unchecked_transaction()?;
-                let (_, run, job, _) = dispatch::attempt_scope(&tx, worker, attempt)?;
-                Ok((run, job))
+                dispatch::attempt_log_scope(&tx, worker, attempt)
             })
             .ok()?;
         peer.logging
@@ -620,6 +625,7 @@ impl SessionHandler for Inner {
         event: Event,
         summary: Option<Vec<u8>>,
     ) {
+        let logs = Arc::clone(&self.logs);
         let finished = self.write(move |tx| {
             dispatch::report(
                 tx,
@@ -629,6 +635,7 @@ impl SessionHandler for Inner {
                 event,
                 summary.as_deref(),
                 UnixMillis::now(),
+                Some(&logs),
             )
         });
         match finished {
@@ -648,8 +655,10 @@ impl SessionHandler for Inner {
     }
 
     fn abandoned(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {
-        let settled =
-            self.write(move |tx| dispatch::abandon(tx, worker, attempt, fence, UnixMillis::now()));
+        let logs = Arc::clone(&self.logs);
+        let settled = self.write(move |tx| {
+            dispatch::abandon(tx, worker, attempt, fence, UnixMillis::now(), Some(&logs))
+        });
         if settled.is_ok() {
             self.stats.abandoned.fetch_add(1, Ordering::Relaxed);
             self.wake();
@@ -696,6 +705,16 @@ impl SessionHandler for Inner {
         };
         match self.logs.finish(run, job, attempt, last_seq, gaps) {
             Ok(()) => {
+                // The acknowledgement — and the spool it releases — waits for
+                // the row that says the end marker is durable. If the write
+                // fails the worker re-sends `LogEnd`; `finish` is idempotent.
+                if self
+                    .write(move |tx| dispatch::log_ended(tx, attempt))
+                    .is_err()
+                {
+                    self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
+                    return LogVerdict::Refused;
+                }
                 if let Some(peer) = self.peer(worker) {
                     peer.logging
                         .lock()
@@ -1231,9 +1250,12 @@ impl Controller {
         // What the last controller left mid-flight is settled from the rows
         // before any worker is admitted: expired leases, unanswered offers,
         // attempts of workers revoked meanwhile.
+        let reconcile_logs = Arc::clone(&logs);
         let reconciled = store
             .writer()
-            .write(|tx| dispatch::reconcile_startup(tx, UnixMillis::now()))
+            .write(move |tx| {
+                dispatch::reconcile_startup(tx, UnixMillis::now(), Some(&reconcile_logs))
+            })
             .map_err(|_| Error::Internal("startup reconciliation"))?;
         let listener = TcpListener::bind(listen)?;
         let addr = listener.local_addr()?;

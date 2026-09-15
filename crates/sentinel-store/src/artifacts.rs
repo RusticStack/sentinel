@@ -133,6 +133,20 @@ pub fn exists(conn: &Connection, attempt: AttemptId, name: &str) -> Result<bool>
         })?)
 }
 
+/// Every `(name, state)` row of one attempt — the terminal coverage check
+/// reads the set once instead of probing per declaration.
+pub fn for_attempt(conn: &Connection, attempt: AttemptId) -> Result<Vec<(String, State)>> {
+    let rows = conn
+        .prepare_cached("SELECT name, state_code FROM artifacts WHERE attempt_id = ?1")?
+        .query_map([attempt.as_bytes().as_slice()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(name, code)| Ok((name, State::from_code(code)?)))
+        .collect()
+}
+
 /// Total captured bytes of a run, across every job and attempt: the durable
 /// half of the per-run artifact budget.
 pub fn run_bytes(conn: &Connection, tenant: TenantId, run: RunId) -> Result<u64> {

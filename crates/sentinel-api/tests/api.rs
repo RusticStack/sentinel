@@ -543,6 +543,8 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     assert_eq!(status, 200);
     assert_eq!(view["jobs"][0]["state"], "canceled");
     assert_eq!(view["jobs"][0]["failure_class"], "canceled");
+    // Never attempted: no log state exists to report.
+    assert!(view["jobs"][0]["log_state"].is_null());
     let (status, body) = call(
         &d,
         "POST",
@@ -646,6 +648,7 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     assert_eq!(body["frames"][0]["text"], "warn\n");
     // Follow: the request parks until a frame arrives.
     let logs = Arc::clone(&d.logs);
+    let store = Arc::clone(&d.store);
     let writer = thread::spawn(move || {
         thread::sleep(Duration::from_millis(400));
         logs.append(
@@ -661,6 +664,11 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         )
         .unwrap();
         logs.finish(run_id, job_id, attempt, 3, &[]).unwrap();
+        // What the controller's `log_end` does: the row lands with the marker.
+        store
+            .writer()
+            .write(move |tx| sentinel_store::dispatch::log_ended(tx, attempt))
+            .unwrap();
     });
     let started = std::time::Instant::now();
     let (status, body) = call(
@@ -686,6 +694,20 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         &[],
     );
     assert_eq!((status, body["complete"].as_bool()), (200, Some(true)));
+    // The durable end is also visible on the run: `log_state` says the
+    // attempt's end marker is on disk, not merely that frames stopped.
+    let (status, view) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run_id}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, view["jobs"][0]["log_state"].as_str()),
+        (200, Some("complete"))
+    );
     // The step filter serves only that step's frames.
     let (status, body) = call(
         &d,

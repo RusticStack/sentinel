@@ -243,6 +243,20 @@ impl LogStore {
             .join(attempt.to_string())
     }
 
+    /// Whether the attempt's `end` marker is durable — the in-memory writer
+    /// knows once `finish` has synced it; a writer this process never opened
+    /// is answered by the marker file itself. A rename the writer has not yet
+    /// synced still answers `false`: the marker is not yet the durable truth.
+    pub fn has_end(&self, run: RunId, job: JobId, attempt: AttemptId) -> bool {
+        {
+            let open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(w) = open.get(&attempt) {
+                return w.ended.is_some();
+            }
+        }
+        end_marker(&self.attempt_dir(run, job, attempt)).is_some()
+    }
+
     /// Recover interrupted compressions: plain segments whose successor
     /// or `.z` twin exists, or whose log ended, are sealed — queue them
     /// and drop stale compressor temporaries.

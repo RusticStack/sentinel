@@ -1182,7 +1182,8 @@ fn protocol5_acknowledges_the_durable_log_end() {
         recorder.log_acks.lock().unwrap().last() == Some(&(offer.attempt, 1))
     });
     reporter.log_end(offer.attempt, 1, &[]).unwrap();
-    // LogEndAck crosses the wire only after the end marker is durable.
+    // LogEndAck crosses the wire only after the end marker is durable — and
+    // the row that records it committed first.
     eventually("end acknowledged", || {
         recorder.log_ends.lock().unwrap().as_slice() == [offer.attempt]
     });
@@ -1191,6 +1192,19 @@ fn protocol5_acknowledges_the_durable_log_end() {
             .tail(run, offer.job, offer.attempt, 0, 10, None)
             .unwrap()
             .complete
+    );
+    let tenant = d.tenant;
+    let view = d
+        .store
+        .read(move |c| sentinel_store::status::run(c, tenant, run))
+        .unwrap();
+    assert_eq!(
+        view.jobs
+            .iter()
+            .find(|j| j.id == offer.job)
+            .unwrap()
+            .log_state,
+        Some(dispatch::LogState::Complete)
     );
     process.stop().unwrap();
 }
