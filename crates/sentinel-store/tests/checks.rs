@@ -456,7 +456,8 @@ fn a_manual_run_never_satisfies_the_required_aggregate() {
 #[test]
 fn a_settled_event_owes_a_completed_check_unless_nothing_can_be_told() {
     let mut f = fixture();
-    // A refused pull request publishes a neutral aggregate on the merge.
+    // A refused pull request publishes a neutral aggregate on the head: the
+    // pull-request view reads checks on the head, not the tested merge.
     let merge = "c".repeat(40);
     let tx = f.conn.transaction().unwrap();
     let accepted = intake::accept(
@@ -491,7 +492,7 @@ fn a_settled_event_owes_a_completed_check_unless_nothing_can_be_told() {
     assert_eq!(row.name, checks::AGGREGATE_NAME);
     assert_eq!(row.status, Status::Completed);
     assert_eq!(row.conclusion, Some(Conclusion::Neutral));
-    assert_eq!(row.head_sha, merge);
+    assert_eq!(row.head_sha, SHA_A);
     assert_eq!(row.external_id, format!("sentinel:dlv:{accepted}"));
     assert!(row.summary.contains("fork"), "{}", row.summary);
     assert!(row.run.is_none());

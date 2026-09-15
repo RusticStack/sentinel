@@ -532,6 +532,9 @@ fn start_server(
         sentinel_intake::lane::Config::default(),
         move |batch| {
             tracing::dispatcher::with_default(&dispatch, || {
+                if let Some(error) = &batch.error {
+                    tracing::warn!(event = "intake_stalled", error = %error, "intake lane pass failed");
+                }
                 if batch.failed > 0 {
                     tracing::warn!(
                         event = "intake_failed",

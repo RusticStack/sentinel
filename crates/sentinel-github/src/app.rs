@@ -419,7 +419,8 @@ fn parse_token(v: &Value, now_ms: i64, requested: &[(&str, &str)]) -> Result<Tok
         .filter(|s| {
             !s.is_empty()
                 && s.len() <= 4096
-                && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
         })
         .ok_or(Error::Response("installation token"))?;
     let permissions = v["permissions"]

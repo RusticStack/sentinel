@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use sentinel_git::{Error, file_at};
+use sentinel_git::{Error, Merge, file_at, file_at_merge};
 use sentinel_protocol::source::{Access, Binding, Credential};
 
 struct Repo {
@@ -214,6 +214,98 @@ fn missing_oversized_and_unsafe_inputs_are_refused_explicitly() {
         ),
         Err(Error::Preparation(_))
     ));
+}
+
+#[test]
+fn a_merge_ref_is_read_only_when_it_names_the_delivered_head() {
+    let repo = repository();
+    let remote = repo.path.to_str().unwrap();
+    let timeout = Duration::from_secs(30);
+    // A pull-request merge ref: a head commit on a branch merged into main.
+    git(&repo.path, &["checkout", "-qb", "feature", &repo.second]);
+    fs::write(repo.path.join("feature.txt"), "the head's change\n").unwrap();
+    git(&repo.path, &["add", "feature.txt"]);
+    git(&repo.path, &["commit", "-qm", "head"]);
+    let head = git(&repo.path, &["rev-parse", "HEAD"]);
+    git(&repo.path, &["checkout", "-q", "main"]);
+    git(
+        &repo.path,
+        &["merge", "-q", "--no-ff", "-m", "test merge", "feature"],
+    );
+    let merge = git(&repo.path, &["rev-parse", "HEAD"]);
+    git(&repo.path, &["update-ref", "refs/pull/7/merge", &merge]);
+
+    // The merge's own file contents are served, at the merge commit.
+    let fetched = file_at_merge(
+        &work(&repo, "merge"),
+        remote,
+        None,
+        Merge {
+            r#ref: "refs/pull/7/merge",
+            head: &head,
+        },
+        "feature.txt",
+        64 * 1024,
+        timeout,
+    )
+    .unwrap();
+    assert_eq!(fetched.commit, merge);
+    assert_eq!(fetched.bytes, b"the head's change\n");
+
+    // A merge ref that does not name the delivered head is not trusted — it
+    // may still name a merge the forge computed for an older head.
+    assert!(matches!(
+        file_at_merge(
+            &work(&repo, "stale"),
+            remote,
+            None,
+            Merge {
+                r#ref: "refs/pull/7/merge",
+                head: &repo.second,
+            },
+            ".sentinel.yml",
+            64 * 1024,
+            timeout,
+        ),
+        Err(Error::Merge)
+    ));
+    // A ref that does not exist at all is the same class: not computed yet.
+    assert!(matches!(
+        file_at_merge(
+            &work(&repo, "absent"),
+            remote,
+            None,
+            Merge {
+                r#ref: "refs/pull/9/merge",
+                head: &head,
+            },
+            ".sentinel.yml",
+            64 * 1024,
+            timeout,
+        ),
+        Err(Error::Merge)
+    ));
+    // Inputs that are not a ref under refs/ and a full head id never reach Git.
+    for (index, (merge_ref, head_sha)) in [("pull/7/merge", &*head), ("refs/pull/7/merge", "main")]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(matches!(
+            file_at_merge(
+                &work(&repo, &format!("unsafe-{index}")),
+                remote,
+                None,
+                Merge {
+                    r#ref: merge_ref,
+                    head: head_sha,
+                },
+                ".sentinel.yml",
+                64 * 1024,
+                timeout,
+            ),
+            Err(Error::Preparation(_))
+        ));
+    }
 }
 
 #[test]

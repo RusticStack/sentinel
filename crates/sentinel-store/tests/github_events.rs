@@ -285,6 +285,12 @@ fn a_check_run_rerequest_requeues_the_terminal_run() {
             .all(|row| row.seq > 1 && row.published_seq < row.seq),
         "{after:?}"
     );
+    // The completed check runs are immutable on the forge: the rerun's new
+    // generations carry no handle, so the publisher creates fresh runs.
+    assert!(
+        after.iter().all(|row| row.check_run_id.is_none()),
+        "{after:?}"
+    );
     // A replayed delivery does not requeue a second time inside the same
     // generation; the receipt answers what the first attempt did.
     let replay = accept(
@@ -300,8 +306,9 @@ fn a_check_run_rerequest_requeues_the_terminal_run() {
         },
     );
     assert_eq!(replay, ("rerequested".to_owned(), true));
-    // And the reset run is active, so a *new* rerequest of the same check
-    // refuses to rerun it.
+    // A *new* rerequest of the old check run cannot aim the rerun again: the
+    // handle was cleared when the generation moved past `completed`, so the
+    // pair no longer resolves — and the run is active besides.
     let again = accept(
         &mut f,
         "d-rerequest-2",
@@ -314,7 +321,7 @@ fn a_check_run_rerequest_requeues_the_terminal_run() {
             suite: 9001,
         },
     );
-    assert_eq!(again.0, "active_or_superseded");
+    assert_eq!(again.0, "unknown_check");
 }
 
 #[test]

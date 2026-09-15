@@ -247,5 +247,9 @@ pub fn rerun_job(
     if changed != 1 {
         return Err(Error::Conflict);
     }
+    // Same funnel as every other job move: a rerun requeues the job, and its
+    // check (plus the aggregate's) must show the new work — a fresh check
+    // run, since a completed one cannot be reopened.
+    crate::checks::record_job(tx, tenant, job, now)?;
     Ok(next)
 }

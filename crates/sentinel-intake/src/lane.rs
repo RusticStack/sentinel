@@ -60,6 +60,9 @@ pub struct Batch {
     pub failed: usize,
     /// Transient faults: the delivery stays open with a scheduled attempt.
     pub retried: usize,
+    /// The pass itself failed before settling anything; carries the error.
+    /// Silent stalls are how a wedged lane looks healthy in the log.
+    pub error: Option<String>,
 }
 
 /// Wake the lane from another thread. Cheap to clone; the intake route holds
@@ -134,8 +137,12 @@ impl Lane {
                                 continue;
                             }
                             Ok(None) => {}
-                            Err(()) => {
+                            Err(e) => {
                                 failures = failures.saturating_add(1);
+                                notice(&Batch {
+                                    error: Some(e.to_string()),
+                                    ..Batch::default()
+                                });
                                 waker.wait(backoff(&config, failures));
                                 continue;
                             }
@@ -155,8 +162,12 @@ impl Lane {
                                 failures = 0;
                                 waker.wait(config.idle);
                             }
-                            Err(()) => {
+                            Err(e) => {
                                 failures = failures.saturating_add(1);
+                                notice(&Batch {
+                                    error: Some(e.to_string()),
+                                    ..Batch::default()
+                                });
                                 waker.wait(backoff(&config, failures));
                             }
                         }
@@ -196,15 +207,11 @@ fn backoff(config: &Config, failures: u32) -> Duration {
 
 /// Phase one: revalidate due pending deliveries in one writer transaction.
 /// `Ok(Some(batch))` means at least one delivery settled.
-fn validate(store: &Store, config: &Config) -> Result<Option<Batch>, ()> {
+fn validate(store: &Store, config: &Config) -> Result<Option<Batch>, sentinel_store::Error> {
     let batch_size = config.batch;
-    let settled = match store
+    let settled = store
         .writer()
-        .write(move |tx| intake::resolve_due(tx, UnixMillis::now(), batch_size))
-    {
-        Ok(settled) => settled,
-        Err(_) => return Err(()),
-    };
+        .write(move |tx| intake::resolve_due(tx, UnixMillis::now(), batch_size))?;
     if settled.is_empty() {
         return Ok(None);
     }
@@ -226,24 +233,17 @@ fn dispatch(
     resolver: &Resolver,
     wake: Option<&(dyn Fn() + Send + Sync)>,
     config: &Config,
-) -> Result<Option<Batch>, ()> {
-    let ready = match store
-        .read(|c| intake::due(c, intake::State::Ready, UnixMillis::now(), config.batch))
-    {
-        Ok(ready) => ready,
-        Err(_) => return Err(()),
-    };
+) -> Result<Option<Batch>, sentinel_store::Error> {
+    let ready =
+        store.read(|c| intake::due(c, intake::State::Ready, UnixMillis::now(), config.batch))?;
     if ready.is_empty() {
         return Ok(None);
     }
     let mut batch = Batch::default();
     for delivery in ready {
-        let outcome = match resolver.resolve(&delivery, UnixMillis::now()) {
-            Ok(outcome) => outcome,
-            // A store fault while resolving: leave the delivery ready and let
-            // the next pass (after a backoff) try again.
-            Err(_) => return Err(()),
-        };
+        // A store fault while resolving leaves the delivery ready for the
+        // next pass (after a backoff).
+        let outcome = resolver.resolve(&delivery, UnixMillis::now())?;
         if matches!(outcome, Outcome::Dispatched { .. })
             && let Some(wake) = wake
         {

@@ -209,6 +209,18 @@ impl Stub {
         }));
     }
 
+    /// List a check run the way GitHub reports one that has finished: the
+    /// adoption lookup must pass it by, because a completed run cannot be
+    /// reopened — only a fresh create shows new work.
+    fn adopt_completed(&self, check_run_id: i64, external_id: &str) {
+        let mut data = self.data.lock().unwrap();
+        data.existing.push(serde_json::json!({
+            "id": check_run_id,
+            "external_id": external_id,
+            "status": "completed",
+        }));
+    }
+
     fn records(&self) -> Vec<Record> {
         self.data.lock().unwrap().records.clone()
     }
@@ -843,6 +855,79 @@ fn a_lost_create_response_is_found_by_external_id() {
     assert_eq!(adopted.published_seq, adopted.seq, "{adopted:?}");
     assert_eq!(adopted.check_suite_id, Some(7002), "{adopted:?}");
     assert!(adopted.create_started_ms.is_some(), "{adopted:?}");
+    drop(lane);
+}
+
+#[test]
+fn a_rerun_creates_fresh_check_runs_because_completed_ones_are_immutable() {
+    let mut f = fixture(None);
+    let (run, build) = event_run(&mut f);
+    let lane = start_lane(&f, publisher(&f));
+
+    // Finish the run: both checks are created, then updated to completed.
+    f.stub.wait("the queued creates", |records| {
+        posts(records, "/check-runs").len() == 2
+    });
+    step(&mut f, build, Actor::Controller, Event::Leased(Fence(1)));
+    step(
+        &mut f,
+        build,
+        Actor::Worker(Fence(1)),
+        Event::PreparationStarted,
+    );
+    step(&mut f, build, Actor::Worker(Fence(1)), Event::StepsStarted);
+    step(
+        &mut f,
+        build,
+        Actor::Worker(Fence(1)),
+        Event::FinalizationStarted,
+    );
+    step(&mut f, build, Actor::Worker(Fence(1)), Event::Passed);
+    f.stub.wait("the completed checks", |records| {
+        records
+            .iter()
+            .filter(|r| r.method == "PATCH" && r.body["status"] == "completed")
+            .count()
+            == 2
+    });
+    wait_settled_run(&f, run, "the settled run");
+
+    // GitHub keeps completed check runs immutable: list them the way its
+    // lookup reports them, so the adoption path has the chance to go wrong.
+    let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
+    let dead: Vec<i64> = rows.iter().filter_map(|row| row.check_run_id).collect();
+    assert_eq!(dead.len(), 2);
+    for row in &rows {
+        f.stub
+            .adopt_completed(row.check_run_id.unwrap(), &row.external_id);
+    }
+    let before = f.stub.records().len();
+
+    // Rerunning the job starts new generations; the publisher must create
+    // fresh check runs rather than PATCH the completed ones, which GitHub
+    // would accept and silently ignore.
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| runs::rerun_job(tx, tenant, build, UnixMillis::now()))
+        .unwrap();
+    let records = f.stub.wait("the rerun's fresh creates", |records| {
+        posts(records, "/check-runs").len() == 4
+    });
+    let later = &records[before..];
+    assert!(
+        later.iter().all(|r| {
+            r.method != "PATCH" || dead.iter().all(|id| !r.path.contains(&id.to_string()))
+        }),
+        "{later:#?}"
+    );
+    wait_settled_run(&f, run, "the rerun's publications");
+    let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
+    assert!(
+        rows.iter()
+            .all(|row| row.check_run_id.is_some_and(|id| !dead.contains(&id))),
+        "{rows:?}"
+    );
     drop(lane);
 }
 

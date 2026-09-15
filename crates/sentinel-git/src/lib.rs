@@ -12,6 +12,9 @@
 //! Two entries are offered: [`checkout`], which materialises one exact revision
 //! into a workspace, and [`file_at`], which reads one file from a revision —
 //! peeling an annotated tag to its commit — for source resolution.
+//! [`file_at_merge`] is the pull-request variant: it fetches the forge's
+//! tested-merge ref and refuses a merge commit that does not name the
+//! delivered head among its parents.
 //!
 //! Unix only: elsewhere every entry point refuses with
 //! [`Error::UnsupportedPlatform`], because the helper discipline (process
@@ -23,7 +26,7 @@ mod unix;
 #[cfg(unix)]
 pub use unix::{
     CHECKOUT_TIMEOUT, Checkout, Credential, FetchedFile, MAX_PATH_BYTES, Output, checkout,
-    checkout_authorized, file_at, run,
+    checkout_authorized, file_at, file_at_merge, run,
 };
 
 #[cfg(not(unix))]
@@ -32,10 +35,21 @@ mod stub;
 #[cfg(not(unix))]
 pub use stub::{
     CHECKOUT_TIMEOUT, Checkout, Credential, FetchedFile, Output, checkout, checkout_authorized,
-    file_at, run,
+    file_at, file_at_merge, run,
 };
 
 use std::fmt;
+
+/// A forge's tested-merge request for [`file_at_merge`]: the ref to fetch and
+/// the head the merge commit must name among its parents — a merge computed
+/// for an older head is not truthful to test.
+#[derive(Debug, Clone, Copy)]
+pub struct Merge<'a> {
+    /// The merge ref, e.g. `refs/pull/7/merge`.
+    pub r#ref: &'a str,
+    /// The delivered head commit, as a full object id.
+    pub head: &'a str,
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -44,6 +58,9 @@ pub enum Error {
     Preparation(String),
     /// The requested path does not exist at the requested revision.
     Missing,
+    /// The tested-merge ref is absent or names a merge for another head; the
+    /// forge may simply not have computed it yet, so this is retryable.
+    Merge,
     /// The command exceeded its deadline and its process group was killed.
     Timeout(&'static str),
     /// The command produced more output than the caller allowed.
@@ -58,6 +75,7 @@ impl fmt::Display for Error {
         match self {
             Self::Preparation(what) => write!(f, "git: {what}"),
             Self::Missing => f.write_str("git: path is not present at that revision"),
+            Self::Merge => f.write_str("git: the tested merge is absent or names another head"),
             Self::Timeout(what) => write!(f, "{what} exceeded its deadline"),
             Self::TooLarge(what) => write!(f, "{what} produced too much output"),
             Self::UnsupportedPlatform => f.write_str("git access requires a Unix host"),

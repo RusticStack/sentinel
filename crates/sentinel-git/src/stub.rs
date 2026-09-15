@@ -9,7 +9,7 @@ use std::{
 use sentinel_pipeline::PinnedSource;
 use sentinel_protocol::source::Access;
 
-use crate::{Error, Result};
+use crate::{Error, Merge, Result};
 
 pub const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -69,6 +69,18 @@ pub fn file_at(
     _: &str,
     _: Option<&Access>,
     _: &str,
+    _: &str,
+    _: usize,
+    _: Duration,
+) -> Result<FetchedFile> {
+    Err(Error::UnsupportedPlatform)
+}
+
+pub fn file_at_merge(
+    _: &Path,
+    _: &str,
+    _: Option<&Access>,
+    _: Merge<'_>,
     _: &str,
     _: usize,
     _: Duration,

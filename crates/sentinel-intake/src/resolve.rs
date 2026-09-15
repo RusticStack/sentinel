@@ -92,6 +92,23 @@ pub struct FileRequest<'a> {
     pub budget: Duration,
 }
 
+/// One bounded merge-ref read (pull requests): the forge's tested-merge ref is
+/// resolved live, and the commit it names must list `head` among its parents.
+/// A payload's claimed merge can be stale — GitHub computes the merge
+/// asynchronously — so the ref and its parents are the authority.
+pub struct MergeRequest<'a> {
+    pub work: &'a std::path::Path,
+    pub remote: &'a str,
+    pub access: Option<&'a sentinel_protocol::source::Access>,
+    /// The merge ref, e.g. `refs/pull/7/merge`.
+    pub merge_ref: &'a str,
+    /// The delivered pull-request head the merge must name as a parent.
+    pub head: &'a str,
+    pub path: &'a str,
+    pub max_bytes: usize,
+    pub budget: Duration,
+}
+
 /// Where the pipeline file comes from. Production uses bounded Git
 /// ([`GitFetch`]); a test can supply a fake because a GitHub-App-bound remote
 /// is not reachable offline.
@@ -100,9 +117,13 @@ pub trait Fetch: Send + Sync {
         &self,
         request: FileRequest<'_>,
     ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error>;
+    fn merge_at(
+        &self,
+        request: MergeRequest<'_>,
+    ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error>;
 }
 
-/// The production fetcher: `sentinel-git`'s bounded file-at-revision read.
+/// The production fetcher: `sentinel-git`'s bounded file-at-revision reads.
 pub struct GitFetch;
 
 impl Fetch for GitFetch {
@@ -115,6 +136,24 @@ impl Fetch for GitFetch {
             request.remote,
             request.access,
             request.sha,
+            request.path,
+            request.max_bytes,
+            request.budget,
+        )
+    }
+
+    fn merge_at(
+        &self,
+        request: MergeRequest<'_>,
+    ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error> {
+        sentinel_git::file_at_merge(
+            request.work,
+            request.remote,
+            request.access,
+            sentinel_git::Merge {
+                r#ref: request.merge_ref,
+                head: request.head,
+            },
             request.path,
             request.max_bytes,
             request.budget,
@@ -236,24 +275,58 @@ impl Resolver {
                 );
             }
             Err(source::Error::Unavailable(why)) => {
-                return self.retry(delivery, why, None, now);
+                return self.retry(
+                    delivery,
+                    why,
+                    None,
+                    intake::Resolution::Failed("resolution_attempts"),
+                    now,
+                );
             }
         };
 
         // The pipeline file, read from the policy-selected revision; a tag
-        // object is peeled to its commit.
+        // object is peeled to its commit. A pull request reads it at the
+        // forge's *verified* tested merge: the payload's `merge_commit_sha`
+        // can name a merge computed for an older head, so the merge ref and
+        // its parents are the authority. A merge the forge has not recomputed
+        // yet is retried, then settles `merge_unavailable`.
         let work = self.work_root.join(delivery.id.to_string());
         let _scratch = Scratch(work.clone());
         fs::create_dir(&work)?;
-        let fetched = match self.fetch.file_at(FileRequest {
-            work: &work,
-            remote: &binding.metadata.binding.remote,
-            access: Some(&access),
-            sha: &plan.pipeline_sha,
-            path: &binding.metadata.binding.pipeline_path,
-            max_bytes: self.config.max_pipeline_bytes,
-            budget: self.config.budget,
-        }) {
+        let fetched = match &plan.source {
+            Revision::Commit(sha) => self.fetch.file_at(FileRequest {
+                work: &work,
+                remote: &binding.metadata.binding.remote,
+                access: Some(&access),
+                sha,
+                path: &binding.metadata.binding.pipeline_path,
+                max_bytes: self.config.max_pipeline_bytes,
+                budget: self.config.budget,
+            }),
+            Revision::Merge { merge_ref, head } => match self.fetch.merge_at(MergeRequest {
+                work: &work,
+                remote: &binding.metadata.binding.remote,
+                access: Some(&access),
+                merge_ref,
+                head,
+                path: &binding.metadata.binding.pipeline_path,
+                max_bytes: self.config.max_pipeline_bytes,
+                budget: self.config.budget,
+            }) {
+                Err(sentinel_git::Error::Merge) => {
+                    return self.retry(
+                        delivery,
+                        "merge_pending",
+                        None,
+                        intake::Resolution::Ignored("merge_unavailable"),
+                        now,
+                    );
+                }
+                other => other,
+            },
+        };
+        let fetched = match fetched {
             Ok(fetched) => fetched,
             Err(sentinel_git::Error::Missing) => {
                 return self.settle(
@@ -286,7 +359,13 @@ impl Resolver {
                 );
             }
             Err(e) => {
-                return self.retry(delivery, "source_unreachable", Some(e.to_string()), now);
+                return self.retry(
+                    delivery,
+                    "source_unreachable",
+                    Some(e.to_string()),
+                    intake::Resolution::Failed("resolution_attempts"),
+                    now,
+                );
             }
         };
 
@@ -406,11 +485,10 @@ impl Resolver {
                 Ok(Plan {
                     kind,
                     policy_ref: ref_name.clone(),
-                    pipeline_sha: new_sha.clone(),
+                    source: Revision::Commit(new_sha.clone()),
                     checkout_ref: ref_name.clone(),
                     head_sha: None,
                     base_sha: None,
-                    merge_sha: None,
                     pr_number: None,
                 })
             }
@@ -435,19 +513,23 @@ impl Resolver {
                 if pr.head_repo != bound_repo {
                     return Err(Outcome::Ignored("fork_pr"));
                 }
-                let Some(merge) = pr.merge_sha.clone() else {
-                    // No tested merge (conflicts, or GitHub could not compute
-                    // one): there is nothing truthful to check out.
-                    return Err(Outcome::Ignored("merge_unavailable"));
-                };
+                // The tested merge is resolved from the live merge ref, not
+                // the payload's `merge_commit_sha`: GitHub computes it
+                // asynchronously, so the payload value can be absent (opened)
+                // or name a merge computed for an older head.
                 Ok(Plan {
                     kind: EventKind::PullRequest,
                     policy_ref: format!("refs/heads/{}", pr.base_ref),
-                    pipeline_sha: merge.clone(),
-                    checkout_ref: format!("refs/heads/{}", pr.head_ref),
+                    source: Revision::Merge {
+                        merge_ref: format!("refs/pull/{}/merge", pr.number),
+                        head: pr.head_sha.clone(),
+                    },
+                    // The spec names the ref the run is accountable to: the
+                    // authorized base. The head branch is provenance only —
+                    // allowing it would mean approving every feature branch.
+                    checkout_ref: format!("refs/heads/{}", pr.base_ref),
                     head_sha: Some(pr.head_sha.clone()),
                     base_sha: Some(pr.base_sha.clone()),
-                    merge_sha: Some(merge),
                     pr_number: Some(pr.number),
                 })
             }
@@ -487,29 +569,47 @@ impl Resolver {
     }
 
     /// Schedule another attempt under the shared budget; the last attempt
-    /// settles the delivery as failed.
+    /// settles the delivery with `exhausted`.
     fn retry(
         &self,
         delivery: &Delivery,
         reason: &'static str,
         detail: Option<String>,
+        exhausted: intake::Resolution,
         now: UnixMillis,
     ) -> Result<Outcome, StoreError> {
         let id = delivery.id;
         match self
             .store
             .writer()
-            .write(move |tx| intake::retry(tx, id, now))
+            .write(move |tx| intake::retry(tx, id, now, exhausted))
         {
             Ok(intake::Retry::Scheduled { .. }) => Ok(Outcome::Retried { reason, detail }),
-            Ok(intake::Retry::Exhausted) => Ok(Outcome::Failed {
-                reason: "resolution_attempts",
-                detail,
+            Ok(intake::Retry::Exhausted) => Ok(match exhausted {
+                intake::Resolution::Ignored(reason) => Outcome::Ignored(reason),
+                intake::Resolution::Failed(reason) => Outcome::Failed {
+                    reason,
+                    detail: None,
+                },
+                // `intake::retry` refuses it too; keep the outcome honest.
+                intake::Resolution::Ready => Outcome::Failed {
+                    reason: "resolution_attempts",
+                    detail,
+                },
             }),
             Err(StoreError::Conflict) => Ok(Outcome::Skipped),
             Err(e) => Err(e),
         }
     }
+}
+
+/// Where the pipeline file is read from.
+enum Revision {
+    /// The peeled event commit (push, tag).
+    Commit(String),
+    /// The pull request's tested-merge ref, verified live: the commit it
+    /// names must list `head` among its parents before it is trusted.
+    Merge { merge_ref: String, head: String },
 }
 
 /// A dispatchable event, fully planned from stored facts.
@@ -519,13 +619,12 @@ struct Plan {
     /// pushed ref, the tag ref, or the pull-request base branch.
     policy_ref: String,
     /// The revision the pipeline file is read from.
-    pipeline_sha: String,
-    /// The ref recorded as provenance (the pushed ref, the tag, or the PR head
-    /// branch).
+    source: Revision,
+    /// The ref recorded as provenance and rechecked against the binding: the
+    /// pushed ref, the tag, or the pull-request base branch.
     checkout_ref: String,
     head_sha: Option<String>,
     base_sha: Option<String>,
-    merge_sha: Option<String>,
     pr_number: Option<u64>,
 }
 
@@ -557,7 +656,13 @@ impl Plan {
             new_sha: delivery.new_sha.clone(),
             head_sha: self.head_sha.clone(),
             base_sha: self.base_sha.clone(),
-            merge_sha: self.merge_sha.clone(),
+            // For a pull request the merge recorded is the verified commit the
+            // merge ref named — what was actually tested — not the payload's
+            // possibly-stale claim.
+            merge_sha: match &self.source {
+                Revision::Merge { .. } => Some(commit.to_owned()),
+                Revision::Commit(_) => None,
+            },
             // The peeled commit the pipeline was read at: for a tag that is
             // not the tag object the event named.
             pipeline_sha: commit.to_owned(),

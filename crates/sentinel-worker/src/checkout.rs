@@ -19,6 +19,12 @@ fn map(error: sentinel_git::Error) -> Error {
     match error {
         sentinel_git::Error::Preparation(what) => Error::Preparation(what),
         sentinel_git::Error::Missing => Error::Preparation("revision is not present".into()),
+        // The worker checks out an already-verified revision; a merge result
+        // here means the pinned merge was never for this head — treat it as
+        // unusable source.
+        sentinel_git::Error::Merge => {
+            Error::Preparation("the pinned merge is not for this head".into())
+        }
         sentinel_git::Error::Timeout(what) => Error::Timeout(what),
         sentinel_git::Error::TooLarge(what) => {
             Error::Preparation(format!("{what} produced too much output"))

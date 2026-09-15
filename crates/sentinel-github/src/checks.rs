@@ -308,18 +308,7 @@ pub fn find(
                     reason: "unreadable list".into(),
                 });
             };
-            Ok(list
-                .iter()
-                .find(|run| run["external_id"].as_str() == Some(external_id))
-                .and_then(|run| {
-                    run["id"]
-                        .as_i64()
-                        .filter(|id| *id > 0)
-                        .map(|check_run_id| Published {
-                            check_run_id,
-                            check_suite_id: suite_id(run),
-                        })
-                }))
+            Ok(select(list, external_id))
         }
         401 => Err(Refusal::Unauthorized),
         403 | 429 => Err(github_refusal(&reply)),
@@ -328,6 +317,26 @@ pub fn find(
             reason: format!("status {}", reply.status),
         }),
     }
+}
+
+/// Pick the adoptable run from a lookup list. A `completed` run is immutable
+/// on GitHub — a PATCH reopening it is silently ignored — so adopting one
+/// would doom every later update; only a live run may be adopted.
+fn select(list: &[Value], external_id: &str) -> Option<Published> {
+    list.iter()
+        .find(|run| {
+            run["external_id"].as_str() == Some(external_id)
+                && run["status"].as_str() != Some("completed")
+        })
+        .and_then(|run| {
+            run["id"]
+                .as_i64()
+                .filter(|id| *id > 0)
+                .map(|check_run_id| Published {
+                    check_run_id,
+                    check_suite_id: suite_id(run),
+                })
+        })
 }
 
 /// An RFC3339 UTC timestamp for `completed_at`; empty when the clock is
@@ -470,5 +479,29 @@ mod tests {
         assert!(payload(&check).is_ok());
         check.completed_at = Some(String::new());
         assert!(payload(&check).is_err());
+    }
+
+    #[test]
+    fn adoption_skips_completed_runs() {
+        // A completed check run is immutable: GitHub answers a reopening PATCH
+        // with 200 and keeps it completed, so adoption must pass it by.
+        let ext = "sentinel:run_1:aggregate";
+        let list = serde_json::json!([
+            {"id": 7, "external_id": ext, "status": "completed",
+             "check_suite": {"id": 90}},
+            {"id": 8, "external_id": ext, "status": "in_progress",
+             "check_suite": {"id": 91}},
+            {"id": 9, "external_id": "sentinel:other", "status": "in_progress"},
+        ]);
+        let found = select(list.as_array().unwrap(), ext).unwrap();
+        assert_eq!(found.check_run_id, 8);
+        assert_eq!(found.check_suite_id, Some(91));
+        // Only a completed run matches: nothing is adoptable, a fresh create
+        // is owed instead.
+        let done = serde_json::json!([
+            {"id": 7, "external_id": ext, "status": "completed"},
+        ]);
+        assert!(select(done.as_array().unwrap(), ext).is_none());
+        assert!(select(&[], ext).is_none());
     }
 }

@@ -315,7 +315,7 @@ struct RunFacts {
 fn run_facts(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Option<RunFacts>> {
     let row: Option<(String, [u8; 16], i64, Option<String>)> = conn
         .prepare_cached(
-            "SELECT r.source_sha, r.repo_id, (b.installation_id IS NOT NULL), p.trigger
+            "SELECT COALESCE(p.head_sha, r.source_sha), r.repo_id, (b.installation_id IS NOT NULL), p.trigger
              FROM runs r
              LEFT JOIN source_bindings b ON b.repo_id = r.repo_id AND b.revoked = 0
              LEFT JOIN run_provenance p ON p.run_id = r.id
@@ -359,7 +359,9 @@ struct Draft<'a> {
 
 /// One statement: create the row or coalesce the newest desired state into it.
 /// A new generation resets the cursor to pending and clears any previous
-/// refusal or retry schedule.
+/// refusal or retry schedule. A generation that follows a `completed` one
+/// also drops the check-run handle: the remote run is terminal and GitHub
+/// silently keeps a completed run completed, so new work needs a fresh run.
 fn upsert(tx: &Transaction<'_>, draft: Draft<'_>, now: UnixMillis) -> Result<()> {
     let id = CheckId::new();
     tx.execute(
@@ -369,6 +371,8 @@ fn upsert(tx: &Transaction<'_>, draft: Draft<'_>, now: UnixMillis) -> Result<()>
          ON CONFLICT(run_id, scope) WHERE run_id IS NOT NULL DO UPDATE SET
             status = excluded.status, conclusion = excluded.conclusion,
             title = excluded.title, summary = excluded.summary,
+            check_run_id = CASE WHEN check_publications.status = 'completed'
+                THEN NULL ELSE check_publications.check_run_id END,
              seq = check_publications.seq + 1, state = 0, reason = NULL, attempts = 0,
             next_attempt_ms = NULL, settled_ms = NULL, updated_ms = excluded.updated_ms",
         params![
@@ -580,11 +584,14 @@ pub fn record_delivery(
     let Some(conclusion) = Conclusion::of_reason(reason) else {
         return Ok(());
     };
+    // A pull-request delivery's check belongs on its head: the pull-request
+    // view reads checks on the head commit, not the tested merge.
     let row: Option<Row> = tx
         .prepare_cached(
-            "SELECT d.tenant_id, d.repo_id, d.new_sha, d.ref_name,
+            "SELECT d.tenant_id, d.repo_id, COALESCE(p.head_sha, d.new_sha), d.ref_name,
                     (b.installation_id IS NOT NULL), b.revoked
              FROM webhook_deliveries d
+             LEFT JOIN pr_deliveries p ON p.delivery_id = d.id
              LEFT JOIN source_bindings b ON b.repo_id = d.repo_id
              WHERE d.id = ?1",
         )?

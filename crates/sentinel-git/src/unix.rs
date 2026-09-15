@@ -21,7 +21,7 @@ use sentinel_core::UnixMillis;
 use sentinel_pipeline::PinnedSource;
 use sentinel_protocol::source::{Access, Credential as SourceCredential};
 
-use crate::{Error, Result};
+use crate::{Error, Merge, Result};
 
 /// A whole checkout — every Git invocation together — must finish in this.
 pub const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -301,6 +301,65 @@ fn fetch(
     fetched.map(|_| ())
 }
 
+/// A full ref name under `refs/` — the merge ref a forge computes for a pull
+/// request. Anything else never reaches Git.
+fn valid_ref_name(name: &str) -> bool {
+    name.starts_with("refs/")
+        && name.len() <= 256
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.'))
+        && !name.contains("..")
+        && !name.ends_with('/')
+}
+
+/// The commit `FETCH_HEAD` names after a fetch, peeled if it is a tag object.
+fn fetch_head(work: &Path, deadline: Instant, secrets: &[String]) -> Result<String> {
+    let mut peel = git(work);
+    peel.args(["rev-parse", "--verify", "FETCH_HEAD^{commit}"]);
+    let output = step(peel, deadline, "git rev-parse", secrets)?;
+    let commit = trim(&output.stdout);
+    if !valid_sha(&commit) {
+        return Err(Error::Preparation(
+            "the fetched revision is not a commit".into(),
+        ));
+    }
+    Ok(commit)
+}
+
+/// Read `path` at `commit` in `work`, probing the size first so an oversized
+/// file is refused without being read.
+fn read_path(
+    work: &Path,
+    commit: &str,
+    path: &str,
+    max_bytes: usize,
+    deadline: Instant,
+    secrets: &[String],
+) -> Result<Vec<u8>> {
+    let mut size = git(work);
+    size.args(["cat-file", "-s", &format!("{commit}:{path}")]);
+    let output = match step(size, deadline, "git cat-file", secrets) {
+        Ok(output) => output,
+        Err(_) => return Err(Error::Missing),
+    };
+    let bytes: usize = match trim(&output.stdout).parse() {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(Error::Missing),
+    };
+    if bytes > max_bytes {
+        return Err(Error::TooLarge("the file at that revision"));
+    }
+
+    let mut cat = git(work);
+    cat.args(["cat-file", "blob", &format!("{commit}:{path}")]);
+    let output = run_capped(cat, deadline, "git cat-file", Some(max_bytes))?;
+    if !output.success() {
+        return Err(Error::Missing);
+    }
+    Ok(output.stdout)
+}
+
 /// Check out `source.sha` from `source.repo` into `workspace` (which must be
 /// empty), within `timeout`. `credential` is presented through the askpass
 /// helper for the fetch only.
@@ -406,42 +465,99 @@ pub fn file_at(
     let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
     fetch(work, remote, sha, private.as_ref(), None, deadline)?;
     drop(private);
+    let commit = fetch_head(work, deadline, &secrets)?;
+    let bytes = read_path(work, &commit, path, max_bytes, deadline, &secrets)?;
+    Ok(FetchedFile { commit, bytes })
+}
 
-    let mut peel = git(work);
-    peel.args(["rev-parse", "--verify", "FETCH_HEAD^{commit}"]);
-    let output = step(peel, deadline, "git rev-parse", &secrets)?;
-    let commit = trim(&output.stdout);
-    if !valid_sha(&commit) {
+/// Fetch `merge_ref` — the tested-merge ref a forge computes for a pull
+/// request — from `remote` into `work` (which must be empty), require the
+/// commit it names to list `head` among its parents, and read `path` at it.
+/// A payload's claimed merge can be stale: only a merge commit that actually
+/// names the delivered head is truthful to test. `Error::Merge` means the ref
+/// is absent or still names a merge for another head — the forge may simply
+/// not have recomputed it yet.
+pub fn file_at_merge(
+    work: &Path,
+    remote: &str,
+    access: Option<&Access>,
+    merge: Merge<'_>,
+    path: &str,
+    max_bytes: usize,
+    timeout: Duration,
+) -> Result<FetchedFile> {
+    let Merge {
+        r#ref: merge_ref,
+        head,
+    } = merge;
+    if !valid_ref_name(merge_ref) || !valid_sha(head) {
+        return Err(Error::Preparation("merge revision is not usable".into()));
+    }
+    if !valid_path(path) {
         return Err(Error::Preparation(
-            "the fetched revision is not a commit".into(),
+            "path is not a safe relative path".into(),
         ));
     }
-
-    // Probe the size first so an oversized file is refused without reading it.
-    let mut size = git(work);
-    size.args(["cat-file", "-s", &format!("{commit}:{path}")]);
-    let output = match step(size, deadline, "git cat-file", &secrets) {
-        Ok(output) => output,
-        Err(_) => return Err(Error::Missing),
-    };
-    let bytes: usize = match trim(&output.stdout).parse() {
-        Ok(bytes) => bytes,
-        Err(_) => return Err(Error::Missing),
-    };
-    if bytes > max_bytes {
-        return Err(Error::TooLarge("the file at that revision"));
+    if let Some(access) = access
+        && (!access.validate(UnixMillis::now().0) || access.binding.remote != remote)
+    {
+        return Err(Error::Preparation("source access refused".into()));
     }
-
-    let mut cat = git(work);
-    cat.args(["cat-file", "blob", &format!("{commit}:{path}")]);
-    let output = run_capped(cat, deadline, "git cat-file", Some(max_bytes))?;
+    let deadline = Instant::now() + timeout;
+    init(work, deadline)?;
+    let private = access.map(|a| Private::install(work, a)).transpose()?;
+    let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
+    if remote.starts_with('-') {
+        return Err(Error::Preparation("repository looks like an option".into()));
+    }
+    let mut fetch = git(work);
+    if let Some(private) = &private {
+        private.configure(&mut fetch);
+    }
+    fetch.args([
+        "fetch",
+        "-q",
+        "--no-tags",
+        "--depth",
+        "1",
+        "--",
+        remote,
+        merge_ref,
+    ]);
+    let output = run(fetch, deadline, "git fetch")?;
     if !output.success() {
-        return Err(Error::Missing);
+        let mut excerpt = output.stderr_excerpt();
+        for secret in &secrets {
+            excerpt = excerpt.replace(secret, "[redacted]");
+        }
+        // A missing ref means the forge has not computed the merge (yet);
+        // every other failure is the remote itself.
+        if excerpt.contains("remote ref") || excerpt.contains("not found") {
+            return Err(Error::Merge);
+        }
+        return Err(Error::Preparation(format!("git fetch failed: {excerpt}")));
     }
-    Ok(FetchedFile {
-        commit,
-        bytes: output.stdout,
-    })
+    drop(private);
+    let commit = fetch_head(work, deadline, &secrets)?;
+
+    // The merge must name the delivered head among its parents; a merge
+    // computed for an earlier head would test the wrong change.
+    let mut object = git(work);
+    object.args(["cat-file", "-p", &commit]);
+    let output = run_capped(object, deadline, "git cat-file", Some(64 * 1024))?;
+    if !output.success() {
+        return Err(Error::Preparation("git cat-file failed".into()));
+    }
+    let parents = output.stdout.split(|&b| b == b'\n').filter(|line| {
+        line.strip_prefix(b"parent ")
+            .is_some_and(|sha| sha == head.as_bytes())
+    });
+    if parents.count() == 0 {
+        return Err(Error::Merge);
+    }
+
+    let bytes = read_path(work, &commit, path, max_bytes, deadline, &secrets)?;
+    Ok(FetchedFile { commit, bytes })
 }
 
 /// Fetch-only files are siblings of the work directory, never mounted in a

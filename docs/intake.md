@@ -71,10 +71,9 @@ and the durable refresh lane — is the reconcile contract in
 closing) is answered `200 {"ignored": "pr_action"}` without a stored row.
 
 The delivery records what Git refs cannot prove: its ref is the **base**
-branch (`refs/heads/<base.ref>`, the branch whose policy the change targets)
-and its revision is the tested **merge** commit GitHub computed, falling back
-to the head tip when there is none. The head branch, head repository, head tip
-and base tip are stored beside it (`pr_deliveries`, migration 19), so fork
+branch (`refs/heads/<base.ref>`, the branch whose policy the change targets).
+The head branch, head repository, head tip, base tip and the merge commit the
+payload claims are stored beside it (`pr_deliveries`, migration 19), so fork
 provenance is a fact on record rather than an inference.
 
 Trust is decided from those facts, and only those facts:
@@ -84,10 +83,17 @@ Trust is decided from those facts, and only those facts:
   later feature, never a default;
 - an App association is required: a pull request for a repository bound
   without one is `failed:no_forge_association`;
-- a pull request without a tested merge is `ignored:merge_unavailable`: there
-  is nothing truthful to check out;
-- the run checks out the **tested merge** and reads the pipeline from that same
-  revision, so what runs is exactly what was proposed for the base branch.
+- the payload's `merge_commit_sha` is a hint, never authority — GitHub may not
+  have recomputed it when the event fires, and it can name a merge built for
+  an *older* head. Resolution fetches the live `refs/pull/<n>/merge` ref and
+  requires the commit it names to list the delivered head among its parents;
+  an absent or still-stale ref is `merge_pending` and retried under the same
+  attempt budget as a fetch fault, and a merge that never materialises
+  settles `ignored:merge_unavailable`;
+- the run checks out the **verified tested merge** and reads the pipeline
+  from that same revision, so what runs is exactly what was proposed for the
+  base branch — and provenance records the verified merge commit, not the
+  payload's claim.
 
 ## Hook secrets
 
@@ -179,6 +185,7 @@ The compiled `on:` policy decides whether the event is one this pipeline wants
 | `failed:no_forge_association`, `failed:pr_metadata` | A pull request arrived without the association or terms that prove it. |
 | `failed:source_unavailable` | No usable credential exists for the binding. |
 | `retried:source_unreachable`, `retried:github_unavailable` | A transient fetch or provider fault; the delivery stays open and the same attempt budget applies. |
+| `retried:merge_pending` | The pull request's merge ref is absent or still names a merge for an older head; GitHub may simply not have recomputed it yet, so the delivery stays open under the same budget. |
 | `failed:resolution_attempts` | Repeated transient faults spent the attempt budget. |
 
 Duplicate and reordered events are compared per stream: the newest dispatched

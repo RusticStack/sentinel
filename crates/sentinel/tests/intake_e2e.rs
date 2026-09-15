@@ -866,7 +866,8 @@ fn a_refused_fork_pull_request_publishes_a_completed_check() {
     assert_eq!(check["body"]["name"], "sentinel / ci");
     assert_eq!(check["body"]["status"], "completed");
     assert_eq!(check["body"]["conclusion"], "neutral");
-    assert_eq!(check["body"]["head_sha"], merge);
+    // A pull-request check belongs on the delivered head, not the merge.
+    assert_eq!(check["body"]["head_sha"], "c".repeat(40));
     assert!(
         check["body"]["output"]["summary"]
             .as_str()

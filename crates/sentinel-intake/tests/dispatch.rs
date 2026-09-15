@@ -635,23 +635,54 @@ fn an_unreachable_remote_retries_within_the_attempt_budget() {
     assert!(attempts >= 3, "it retried rather than failing at once");
 }
 
-/// A fetcher that serves one pipeline at one revision, for the pull request
-/// path a GitHub-App-bound remote cannot reach offline.
+/// A fetcher that serves one pipeline at one verified merge, for the pull
+/// request path a GitHub-App-bound remote cannot reach offline.
 struct FakeFetch {
     pipeline: String,
-    commit: String,
+    /// The merge commit the live merge ref resolves to.
+    merge: String,
+    /// The head the merge must name as a parent.
+    head: String,
 }
 
 impl Fetch for FakeFetch {
     fn file_at(
         &self,
-        request: sentinel_intake::resolve::FileRequest<'_>,
+        _: sentinel_intake::resolve::FileRequest<'_>,
     ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error> {
-        assert_eq!(request.sha, self.commit, "the pipeline revision asked for");
+        panic!("a pull request resolves the merge ref, not a payload sha");
+    }
+
+    fn merge_at(
+        &self,
+        request: sentinel_intake::resolve::MergeRequest<'_>,
+    ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error> {
+        assert_eq!(request.merge_ref, "refs/pull/7/merge");
+        assert_eq!(request.head, self.head, "the merge's required parent");
         Ok(sentinel_git::FetchedFile {
-            commit: self.commit.clone(),
+            commit: self.merge.clone(),
             bytes: self.pipeline.as_bytes().to_vec(),
         })
+    }
+}
+
+/// A fetcher whose merge ref is absent or stale: every call fails as a merge
+/// that is not computed for this head.
+struct PendingMerge;
+
+impl Fetch for PendingMerge {
+    fn file_at(
+        &self,
+        _: sentinel_intake::resolve::FileRequest<'_>,
+    ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error> {
+        panic!("a pull request resolves the merge ref, not a payload sha");
+    }
+
+    fn merge_at(
+        &self,
+        _: sentinel_intake::resolve::MergeRequest<'_>,
+    ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error> {
+        Err(sentinel_git::Error::Merge)
     }
 }
 
@@ -784,18 +815,12 @@ fn serve_github(mut stream: std::net::TcpStream) {
     );
 }
 
-#[test]
-fn a_same_repository_pull_request_dispatches_at_the_tested_merge() {
-    if !prerequisites() {
-        return;
-    }
-    let f = fixture();
-    let merge = "e".repeat(40);
-    let head = "c".repeat(40);
-    let base = "d".repeat(40);
+/// A resolver backed by the stub App and an injected fetcher — the path a
+/// pull-request delivery takes against a forge-bound remote.
+fn app_resolver(f: &Fixture, name: &str, fetch: Arc<dyn Fetch>) -> (Resolver, GithubStub) {
     // An App whose API is a loopback stub: the token path a real installation
     // takes, without github.com.
-    let key_file = f.dir.path().join("app.pem");
+    let key_file = f.dir.path().join(format!("{name}.pem"));
     run(Command::new("openssl")
         .args(["genrsa", "-out"])
         .arg(&key_file));
@@ -810,28 +835,49 @@ fn a_same_repository_pull_request_dispatches_at_the_tested_merge() {
     let resolver = Resolver::new(
         Arc::clone(&f.store),
         None,
-        Some(Arc::clone(&app)),
-        Arc::new(FakeFetch {
-            pipeline: pipeline("[pull_request, push]"),
-            commit: merge.clone(),
-        }),
-        f.dir.path().join("work-fake"),
+        Some(app),
+        fetch,
+        f.dir.path().join(format!("work-{name}")),
         Config {
             budget: Duration::from_secs(5),
             max_pipeline_bytes: 64 * 1024,
         },
     )
     .unwrap();
-    let accepted = f.accept_pr("pr-1", GITHUB_REPO_ID, Some(&merge));
+    (resolver, stub)
+}
+
+#[test]
+fn a_same_repository_pull_request_dispatches_at_the_tested_merge() {
+    if !prerequisites() {
+        return;
+    }
+    let f = fixture();
+    let merge = "e".repeat(40);
+    let head = "c".repeat(40);
+    let base = "d".repeat(40);
+    let (resolver, _stub) = app_resolver(
+        &f,
+        "fake",
+        Arc::new(FakeFetch {
+            pipeline: pipeline("[pull_request, push]"),
+            merge: merge.clone(),
+            head: head.clone(),
+        }),
+    );
+    // The payload's merge claim is not consulted: an `opened` delivery that
+    // has none still resolves the live merge ref.
+    let accepted = f.accept_pr("pr-1", GITHUB_REPO_ID, None);
     let _ = f.validate(accepted);
     let (outcome, _) = f.resolve_with(&resolver, accepted);
     let Outcome::Dispatched { run } = outcome else {
         panic!("expected a pull-request dispatch, got {outcome:?}");
     };
-    // The tested merge is what runs; the head branch is provenance.
+    // The verified tested merge is what runs; the spec is accountable to the
+    // authorized base ref, and the head is provenance.
     let spec = f.spec_of(run);
     assert_eq!(spec.source.sha, merge);
-    assert_eq!(spec.source.ref_name.as_deref(), Some("refs/heads/feature"));
+    assert_eq!(spec.source.ref_name.as_deref(), Some("refs/heads/main"));
     let recorded = f.provenance_of(run);
     assert_eq!(recorded.trigger, "pull_request");
     assert_eq!(recorded.provider.as_deref(), Some("github"));
@@ -862,12 +908,36 @@ fn a_fork_or_unmergeable_pull_request_is_refused_before_any_fetch() {
     let (outcome, row) = f.resolve(accepted);
     assert_eq!(outcome, Outcome::Ignored("fork_pr"));
     assert_eq!(row.reason.as_deref(), Some("fork_pr"));
-    // A pull request without a tested merge has nothing truthful to check out.
+    // A merge ref the forge has not computed yet is retried, then settles
+    // merge_unavailable rather than testing a merge for another head.
+    let (resolver, _stub) = app_resolver(&f, "pending", Arc::new(PendingMerge));
     let accepted = f.accept_pr("pr-unmergeable", GITHUB_REPO_ID, None);
     let _ = f.validate(accepted);
-    let (outcome, row) = f.resolve(accepted);
-    assert_eq!(outcome, Outcome::Ignored("merge_unavailable"));
-    assert_eq!(row.reason.as_deref(), Some("merge_unavailable"));
+    let (outcome, row) = f.resolve_with(&resolver, accepted);
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Retried {
+                reason: "merge_pending",
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(row.state, State::Ready);
+    loop {
+        let (outcome, row) = f.resolve_with(&resolver, accepted);
+        if !matches!(outcome, Outcome::Retried { .. }) {
+            assert_eq!(outcome, Outcome::Ignored("merge_unavailable"));
+            assert_eq!(row.state, State::Ignored);
+            assert_eq!(row.reason.as_deref(), Some("merge_unavailable"));
+            break;
+        }
+        assert!(
+            row.attempts <= intake::MAX_ATTEMPTS,
+            "the budget is bounded"
+        );
+    }
     let runs: i64 = f
         .store
         .read(|c| Ok(c.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))?))

@@ -14,6 +14,15 @@ pub struct Snapshot<'a> {
     pub expected: u64,
 }
 
+/// What a refresh reads back to decide whether the installation row changed.
+struct Row {
+    account: Option<i64>,
+    personal: Option<i64>,
+    login: String,
+    suspended: i64,
+    permissions_valid: i64,
+}
+
 /// Call only with a freshly authenticated GitHub App API response. The
 /// expected local version was read before starting that bounded request.
 pub fn refresh(tx: &Transaction<'_>, s: Snapshot<'_>, now: UnixMillis) -> Result<InstallationId> {
@@ -31,14 +40,36 @@ pub fn refresh(tx: &Transaction<'_>, s: Snapshot<'_>, now: UnixMillis) -> Result
         s.login,
         now,
     )?;
-    let old: Option<i64> = tx.query_row(
-        "SELECT account_id FROM installations WHERE id=?1",
-        [id.as_bytes()],
-        |r| r.get(0),
-    )?;
-    if old.is_some_and(|old| old != s.account_id as i64) {
+    let old = tx
+        .query_row(
+            "SELECT account_id,account_personal,account_login,suspended,permissions_valid FROM installations WHERE id=?1",
+            [id.as_bytes()],
+            |r| {
+                Ok(Row {
+                    account: r.get(0)?,
+                    personal: r.get(1)?,
+                    login: r.get(2)?,
+                    suspended: r.get(3)?,
+                    permissions_valid: r.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    let old_account = old.as_ref().and_then(|row| row.account);
+    if old_account.is_some_and(|old| old != s.account_id as i64) {
         // A transfer never silently reauthorizes old source bindings.
         tx.execute("UPDATE source_bindings SET revoked=1,credential=x'',version=version+1 WHERE installation_id=?1 AND revoked=0",[id.as_bytes()])?;
+    }
+    // A refresh that changes nothing is not a new lifecycle: bumping the
+    // version would fail every grant re-check an in-flight issuance holds.
+    if old.is_some_and(|row| {
+        row.account == Some(s.account_id as i64)
+            && row.personal == Some(i64::from(s.personal))
+            && row.login == s.login
+            && row.suspended == i64::from(s.suspended)
+            && row.permissions_valid == i64::from(s.permissions_valid)
+    }) {
+        return Ok(id);
     }
     if tx.execute("UPDATE installations SET account_id=?2,account_personal=?3,account_login=?4,suspended=?5,permissions_valid=?6,lifecycle_version=lifecycle_version+1 WHERE id=?1 AND lifecycle_version=?7",params![id.as_bytes(),s.account_id as i64,s.personal,s.login,s.suspended,s.permissions_valid,s.expected as i64])? != 1 { return Err(Error::Conflict); }
     Ok(id)

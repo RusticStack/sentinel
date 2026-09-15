@@ -797,20 +797,30 @@ pub fn settle_dispatched(
     Ok(())
 }
 
-/// What a retry did. The last attempt settles the delivery as failed with
-/// `resolution_attempts` rather than retrying forever.
+/// What a retry did. The last attempt settles the delivery with the caller's
+/// terminal resolution rather than retrying forever.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Retry {
     /// Another attempt is scheduled with capped backoff.
     Scheduled { attempts: u32, next_attempt_ms: i64 },
-    /// The attempt budget is spent and the delivery is now failed.
+    /// The attempt budget is spent and the delivery is settled.
     Exhausted,
 }
 
-/// Schedule another attempt with capped exponential backoff, or fail the
-/// delivery once the attempt budget is spent. The reason is always explicit.
-/// Applies to either open state: validation and dispatch share the budget.
-pub fn retry(tx: &Transaction<'_>, id: DeliveryId, now: UnixMillis) -> Result<Retry> {
+/// Schedule another attempt with capped exponential backoff, or settle the
+/// delivery with `exhausted` once the attempt budget is spent. The reason is
+/// always explicit; `exhausted` must be terminal (never `Ready`). Applies to
+/// either open state: validation and dispatch share the budget.
+pub fn retry(
+    tx: &Transaction<'_>,
+    id: DeliveryId,
+    now: UnixMillis,
+    exhausted: Resolution,
+) -> Result<Retry> {
+    debug_assert!(
+        !matches!(exhausted, Resolution::Ready),
+        "an exhausted retry must settle"
+    );
     let attempts: i64 = tx
         .prepare_cached(
             "SELECT attempts FROM webhook_deliveries WHERE id = ?1 AND state IN (0, 1)",
@@ -820,7 +830,7 @@ pub fn retry(tx: &Transaction<'_>, id: DeliveryId, now: UnixMillis) -> Result<Re
         .ok_or(Error::Conflict)?;
     let next = u32::try_from(attempts.saturating_add(1)).unwrap_or(u32::MAX);
     if next >= MAX_ATTEMPTS {
-        settle(tx, id, Resolution::Failed("resolution_attempts"), now)?;
+        settle(tx, id, exhausted, now)?;
         return Ok(Retry::Exhausted);
     }
     let next_attempt_ms = now.0.saturating_add(backoff_ms(next));

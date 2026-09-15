@@ -557,7 +557,13 @@ fn retries_back_off_doubling_and_stop_at_the_attempt_budget() {
     let accepted = accept(&mut f, "retry", REF, SHA_A, SHA_B).id();
     // A retry is invisible to `due` until its next attempt is reached.
     let tx = f.conn.transaction().unwrap();
-    intake::retry(&tx, accepted, NOW).unwrap();
+    intake::retry(
+        &tx,
+        accepted,
+        NOW,
+        Resolution::Failed("resolution_attempts"),
+    )
+    .unwrap();
     tx.commit().unwrap();
     assert_eq!(fetch(&f, accepted).attempts, 1);
     assert!(
@@ -575,14 +581,26 @@ fn retries_back_off_doubling_and_stop_at_the_attempt_budget() {
 
     for attempt in 2..intake::MAX_ATTEMPTS {
         let tx = f.conn.transaction().unwrap();
-        intake::retry(&tx, accepted, NOW).unwrap();
+        intake::retry(
+            &tx,
+            accepted,
+            NOW,
+            Resolution::Failed("resolution_attempts"),
+        )
+        .unwrap();
         tx.commit().unwrap();
         assert_eq!(fetch(&f, accepted).attempts, attempt);
     }
     // At the budget the delivery fails with an explicit reason instead of
     // being retried forever.
     let tx = f.conn.transaction().unwrap();
-    intake::retry(&tx, accepted, NOW).unwrap();
+    intake::retry(
+        &tx,
+        accepted,
+        NOW,
+        Resolution::Failed("resolution_attempts"),
+    )
+    .unwrap();
     tx.commit().unwrap();
     let delivery = fetch(&f, accepted);
     assert_eq!(delivery.state, State::Failed);
@@ -590,7 +608,12 @@ fn retries_back_off_doubling_and_stop_at_the_attempt_budget() {
     assert_eq!(delivery.settled, Some(NOW));
     let tx = f.conn.transaction().unwrap();
     assert!(matches!(
-        intake::retry(&tx, accepted, NOW),
+        intake::retry(
+            &tx,
+            accepted,
+            NOW,
+            Resolution::Failed("resolution_attempts")
+        ),
         Err(Error::Conflict)
     ));
     tx.rollback().unwrap();

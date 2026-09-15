@@ -119,10 +119,20 @@ does. The durable answer to that is `create_started_ms`, written **before** the
 create request goes out. A first attempt skips the lookup entirely — no mark
 means no remote run can exist that we started — and a retry after a lost
 answer finds the mark, asks GitHub for a run on that commit carrying our
-`external_id`, and adopts it instead of creating a second. A crash between the
+`external_id`, and adopts it instead of creating a second. Adoption only ever
+takes a **live** run: GitHub treats a completed check run as immutable — a
+PATCH reopening it is answered `200` and silently changes nothing — so a
+completed run is passed by, never adopted. A crash between the
 mark and the request costs one harmless lookup; a crash after the request is
 what the mark exists for. An update is idempotent, so an ambiguous *update*
 needs no mark: the next attempt updates the same run again.
+
+A completed remote run being immutable shapes new generations too: when a
+desired generation follows a publication whose last delivered status was
+`completed` — a rerun, a rerequest, a retried check — the stored
+`check_run_id` is cleared on the upsert, so the publisher *creates* a fresh
+check run instead of PATCHing a dead one. The run's in-progress phase is then
+visible on GitHub, which a reopened-then-ignored update never was.
 
 A late completion from a superseded attempt cannot reach GitHub at all: the
 store's job fence refuses the report before any check row moves.
@@ -146,8 +156,12 @@ still resolving when the run is otherwise eligible. Only a terminal,
 non-superseded run of the still-bound repository reruns, as a full immutable
 DAG reset — attempts, fences and image pins are preserved, jobs return to
 queued/blocked, and fresh check desired state is recorded in the same
-transaction. Candidates are capped at 64; more is `rerequest_limit`, never an
-unbounded fan-out.
+transaction. Because the reset follows a completed generation, every stored
+handle is cleared (above), so the rerequest surfaces as **new** check runs —
+and a second rerequest sent against the old, superseded check-run handle no
+longer resolves to the active generation: it is `unknown_check`, never a
+double rerun. Candidates are capped at 64; more is `rerequest_limit`, never
+an unbounded fan-out.
 
 **Lifecycle events** disable first and verify after. A deletion or suspension
 event disables issuance immediately; an access removal, rename, transfer,
