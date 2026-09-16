@@ -4,6 +4,7 @@ use sentinel_pipeline::{
     RefFilter, Triggers, compile_str,
     expr::{Context, DependencySummary, HashFilesError, Lookup, Phase, Value},
 };
+use sentinel_protocol::cache::Class;
 
 fn fixture_dir(sub: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -91,6 +92,18 @@ fn full_fixture_decodes_every_field() {
     assert_eq!(build.spec.resources.disk_bytes, 10 << 30, "policy default");
     assert_eq!(build.spec.timeout_secs, 5400);
     assert_eq!(build.spec.artifacts[0].retain_secs, 7 * 86_400);
+}
+
+#[test]
+fn cache_classes_fixture_assigns_each_class() {
+    let text = fs::read_to_string(fixture_dir("valid").join("cache-classes.yml")).unwrap();
+    let p = compile_str(&text).unwrap();
+    let classes: Vec<Class> = p.jobs[0].spec.cache.iter().map(|c| c.class).collect();
+    assert_eq!(
+        classes,
+        [Class::Downloads, Class::Dependencies, Class::Compiler],
+        "declared, defaulted, declared"
+    );
 }
 
 #[test]

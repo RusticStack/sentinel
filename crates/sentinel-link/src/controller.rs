@@ -1212,6 +1212,8 @@ fn resolve_spec(
             },
             cancelled: c.cancelled,
             needs: c.needs,
+            tenant: Some(c.tenant),
+            trust: c.trust,
         };
         let binding = match sentinel_intake::source::lookup_conn(&tx, context.repo)? {
             None => None,
@@ -1268,7 +1270,10 @@ fn send_resolved(
             attempt: *attempt.as_bytes(),
         });
     };
-    sender.send(&ServerMessage::Context(context.to_wire(attempt)))?;
+    // `Context2` carries the tenant and cache trust class from protocol 6;
+    // earlier workers get the original shape and scope themselves to
+    // pull-request state.
+    sender.send(&session::context_message(protocol, &context, attempt))?;
     if let Some(access) = context.source {
         sender.send(&ServerMessage::Source {
             attempt: *attempt.as_bytes(),

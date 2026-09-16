@@ -5,13 +5,16 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | Contract | Marker | Where | Consumers |
 |---|---|---|---|
 | Pipeline schema | `schema: N` in `.sentinel.yml` (currently 1) | `sentinel-pipeline` | repositories |
-| Run spec blob | leading format byte (currently 3) | `sentinel-pipeline::run`, `run_specs.format` | store, workers |
+| Run spec blob | leading format byte (currently 4; reads 3–4) | `sentinel-pipeline::run`, `run_specs.format` | store, workers |
+| Cache manifest | `sentinel.cache` magic + format `u8` (currently 1) | `sentinel-cache::manifest` | workers |
+| Cache file listing | `sentinel.files` magic + format `u8` (currently 1) | `sentinel-cache::manifest` | workers |
+| Cache miss reasons | `Miss::as_str` vocabulary | `sentinel-cache::outcome` | workers, reports |
 | Metadata database | `schema_migrations.version` (currently 27) | `sentinel-store` | controller |
 | Manifest file | `SNMF` magic + format `u16` (currently 1) | `sentinel-store::objects` | controller |
 | API error | `schema: "sentinel.error/1"` | `sentinel-protocol` | CLI, MCP, UI, workers |
 | Explain output | `schema: "sentinel.explain/1"` | `sentinel-pipeline::explain` | CLI, agents |
 | Event cursor | text prefix `c1` | `sentinel-protocol::cursor` | API clients |
-| Worker protocol | `protocol_min..=protocol_max` in `Hello` (currently 1..=5) | `sentinel-protocol::negotiate` | workers |
+| Worker protocol | `protocol_min..=protocol_max` in `Hello` (currently 1..=6) | `sentinel-protocol::negotiate` | workers |
 | Log segment index | `SNLI` magic + format `u16` (currently 1) | `sentinel-store::logs` | controller |
 | Compressed log segment | `SNLZ` magic + format `u16` + codec `u8` (currently 1, zlib) | `sentinel-store::logs` | controller |
 | Log end marker | `SNLE` magic + format `u16` (currently 1) | `sentinel-store::logs` | controller |
@@ -30,6 +33,8 @@ Readers reject a database newer than their highest known migration. Migration 4 
 **C06 resolver hardening.** The pipeline schema and run-spec layout remain version 1: no compiler-accepted schema shape is tightened, and static regular-file hash records retain their exact bytes. Runtime filesystem admission now rejects unsafe paths and exhausted traversal/read budgets explicitly. Non-Linux direct resolver calls return `UnsupportedPlatform`; offline CLI operations continue to leave hashes unresolved. Terminal `**` now includes recursive regular files. These worker-resolver behaviors are documented in [hash files](hash-files.md); future persisted cache contracts must version any change to digest record bytes.
 
 **Error and explain shapes.** Fields may be added; existing fields keep their type and meaning; `code` values are never renamed or reused. A breaking change is a new schema string, and clients treat an unknown schema as unparseable (the marker types enforce this). HTTP status codes are derived from `code` and follow it.
+
+**K01 cache scopes.** Run spec format 4 adds `class` to each cache entry; format 3 blobs still decode through their own layout and upgrade every entry to `dependencies`, the only class a `class`-less schema 1 document could produce — `run_specs.format` accepts 3–4 and the format byte, not trailing-byte luck, selects the layout. Worker protocol 6 adds `Context2`: the run's tenant and the `Trust` class derived once from recorded provenance (`pull_request` → pull-request scope, everything else → protected). Workers at 1–5 still receive `Context` and scope to pull-request state; an undecodable trust byte is a protocol error, never a guess. The cache manifest and `files` blob are new formats at version 1, each a magic + format byte + reserved byte + bounded postcard body; every read failure is a typed miss, and the `Miss` name strings are the stable report vocabulary. See [cache](cache.md).
 
 **Cursors.** Opaque to clients. The version byte changes when the layout does; old cursors are then rejected as `invalid_cursor` and the client restarts from the beginning of the stream, which is always safe because event sequences are dense and idempotent to re-read.
 

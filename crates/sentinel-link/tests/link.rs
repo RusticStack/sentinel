@@ -29,6 +29,7 @@ use sentinel_link::{
     tls, worker,
 };
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
+use sentinel_protocol::cache::Trust;
 use sentinel_protocol::logs::{Frame, Stream};
 use sentinel_protocol::negotiate::{Arch, Capabilities, Hello, ProtocolVersion};
 use sentinel_store::{
@@ -676,6 +677,11 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     assert_eq!(context.repo_name, "app");
     assert_eq!(context.sha, SHA);
     assert!(context.needs.is_empty() && !context.cancelled);
+    // Protocol 3's wire cannot carry the cache boundary: the worker reads
+    // no tenant and the pull-request trust class — the scope that can
+    // never touch protected state.
+    assert_eq!(context.tenant, None);
+    assert_eq!(context.trust, Trust::PullRequest);
     // A spec for an attempt this worker does not hold is refused.
     reporter.need_spec(AttemptId::new()).unwrap();
     eventually("no spec", || recorder.specs.lock().unwrap().len() == 2);
@@ -1206,5 +1212,47 @@ fn protocol5_acknowledges_the_durable_log_end() {
             .log_state,
         Some(dispatch::LogState::Complete)
     );
+    process.stop().unwrap();
+}
+
+#[test]
+fn protocol6_context_carries_the_tenant_and_derived_cache_trust() {
+    let d = deployment();
+    let secret = d.enrollment(60_000);
+    let (recorder, offers) = Recorder::new();
+    let id = WorkerId::new();
+    let process = WorkerProcess::start_version(
+        &d,
+        Identity::generate("w").unwrap(),
+        id,
+        Some(secret),
+        Arc::clone(&recorder),
+        6,
+    );
+    process.wait_for("Connected", 1);
+
+    let (_, _) = d.run(PIPELINE);
+    let offer = offers.recv_timeout(Duration::from_secs(5)).unwrap().0;
+    eventually("attempt held", || {
+        d.store
+            .read(|c| dispatch::held_by(c, id))
+            .unwrap()
+            .iter()
+            .any(|h| h.attempt == offer.attempt && h.acknowledged)
+    });
+    let reporter = recorder.reporter.lock().unwrap().clone().unwrap();
+    assert_eq!(reporter.protocol(), 6);
+    reporter.need_spec(offer.attempt).unwrap();
+    eventually("spec", || !recorder.specs.lock().unwrap().is_empty());
+    let (_, context, bytes) = recorder.specs.lock().unwrap()[0].clone();
+    assert_eq!(RunSpec::decode(&bytes).unwrap().pipeline.jobs.len(), 3);
+    let context = context.unwrap();
+    // `Context2` reached the worker: the run's tenant, and the trust class
+    // the store derived from recorded provenance — this run has none, so
+    // `manual` maps to the protected scope.
+    assert_eq!(context.tenant, Some(d.tenant));
+    assert_eq!(context.trust, Trust::Protected);
+    assert_eq!(context.event.name, "manual");
+    assert_eq!(context.job, offer.job);
     process.stop().unwrap();
 }

@@ -1,0 +1,23 @@
+schema: 1
+on: [push]
+jobs:
+  rust:
+    image: rust:1-bookworm
+    cache:
+      # Tool-addressed blob store: survives lockfile edits.
+      - name: registry
+        class: downloads
+        key: "cargo-${{ hash_files('Cargo.lock') }}"
+        paths: [/usr/local/cargo/registry]
+      # Exact materialization; the schema default when `class` is absent.
+      - name: sysroot
+        key: "deps-${{ hash_files('Cargo.lock') }}"
+        paths: [vendor]
+      # Stable toolchain namespace; the compiler invalidates per input.
+      - name: objects
+        class: compiler
+        key: "obj-${{ hash_files('Cargo.lock') }}"
+        paths: [target]
+    steps:
+      - id: build
+        run: cargo build --locked

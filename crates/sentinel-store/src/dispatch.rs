@@ -861,9 +861,15 @@ pub fn attempt_summary(
 
 /// What the worker needs to evaluate the job's expressions: identity of the
 /// run, repository and job, the event that triggered it, the dependency
-/// outcomes by name, and whether cancellation is desired.
+/// outcomes by name, and whether cancellation is desired. `tenant` and
+/// `trust` are the cache boundary (protocol 6): the tenant the run belongs
+/// to and the trust class derived here, once, from the recorded event —
+/// `pull_request` scopes to pull-request state, everything else to
+/// protected (docs/cache.md).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobContext {
+    /// The tenant the run belongs to; every cache scope is under it.
+    pub tenant: TenantId,
     pub run: RunId,
     pub repo: RepoId,
     pub repo_name: String,
@@ -872,6 +878,11 @@ pub struct JobContext {
     pub sha: String,
     /// The event facts recorded as the run's provenance.
     pub event: crate::provenance::EventFacts,
+    /// `sentinel_protocol::cache::Trust::of_event` applied to `event.name`:
+    /// exactly `pull_request` is pull-request trust, every other event —
+    /// or none recorded — is protected. Derived here so no consumer can
+    /// pick a different rule.
+    pub trust: sentinel_protocol::cache::Trust,
     pub cancelled: bool,
     /// `(dependency job name, outcome)` for every `needs` entry.
     pub needs: Vec<(String, Outcome)>,
@@ -944,14 +955,17 @@ pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> R
         };
         needs.push((upstream.name.clone(), outcome));
     }
+    let event = crate::provenance::event_facts(conn, run)?;
     Ok(JobContext {
+        tenant,
         run,
         repo: RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?,
         repo_name,
         job: JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?,
         job_name,
         sha,
-        event: crate::provenance::event_facts(conn, run)?,
+        trust: sentinel_protocol::cache::Trust::of_event(&event.name),
+        event,
         cancelled: cancel != 0,
         needs,
     })

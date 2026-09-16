@@ -3,6 +3,7 @@
 //! event cursors, size limits, and worker capability negotiation. Pure
 //! types and functions; transports plug in above this crate.
 
+pub mod cache;
 pub mod cursor;
 pub mod error;
 pub mod idempotency;
@@ -10,8 +11,10 @@ pub mod intake;
 pub mod limits;
 pub mod logs;
 pub mod negotiate;
+pub mod source;
 pub mod summary;
 
+pub use cache::{Class, Trust};
 pub use cursor::{Cursor, CursorError, Page, Seq, StreamKind};
 pub use error::{ApiError, ERROR_SCHEMA, ErrorCode, ErrorSchema};
 pub use idempotency::{Decision, Fingerprint, IdempotencyKey, KeyError, Stored};
@@ -68,4 +71,3 @@ impl From<Rejected> for ApiError {
         }
     }
 }
-pub mod source;
