@@ -37,12 +37,15 @@ pub const MAX_HELD: usize = 1024;
 const FOLLOW_POLL: Duration = Duration::from_millis(50);
 
 /// What does the pulling: `podman::pull` in production, a stub in tests.
-type Download = Arc<dyn Fn(&str, Duration) -> Result<()> + Send + Sync>;
+/// The bool is the `image exists` fast path — true when the store already
+/// held the reference and nothing was downloaded.
+type Download = Arc<dyn Fn(&str, Duration) -> Result<bool> + Send + Sync>;
 
 /// One in-flight pull: the outcome the leader publishes exactly once.
+/// `Ok` carries the leader's present/downloaded answer to every follower.
 #[derive(Default)]
 struct Pull {
-    result: Mutex<Option<std::result::Result<(), Shared>>>,
+    result: Mutex<Option<std::result::Result<bool, Shared>>>,
     done: Condvar,
     /// Followers parked on this pull, so the count is observable.
     waiters: AtomicUsize,
@@ -110,10 +113,12 @@ impl Images {
         Self::with_download(podman::pull)
     }
 
-    /// A pull backend other than podman's — the test seam.
+    /// A pull backend other than podman's — the test seam. The closure's
+    /// `Ok(bool)` is `podman::pull`'s contract: `true` when the store
+    /// already held the image.
     #[doc(hidden)]
     pub fn with_download(
-        download: impl Fn(&str, Duration) -> Result<()> + Send + Sync + 'static,
+        download: impl Fn(&str, Duration) -> Result<bool> + Send + Sync + 'static,
     ) -> Self {
         Images {
             inner: Arc::new(Inner {
@@ -130,14 +135,16 @@ impl Images {
     /// Make `image` — the exact `name@sha256:…` reference handed to the
     /// pull — available in the local store, sharing the in-flight pull
     /// for it if there is one. The leader's outcome is what every waiter
-    /// gets: on success the image is present, on failure the same typed
-    /// error (`Preparation` for a refused or failed pull, `Timeout` past
-    /// the deadline, `Io` for a helper that would not start).
+    /// gets: `Ok(true)` when the `image exists` fast path served it
+    /// (nothing was downloaded), `Ok(false)` when it was pulled, and on
+    /// failure the same typed error (`Preparation` for a refused or
+    /// failed pull, `Timeout` past the deadline, `Io` for a helper that
+    /// would not start).
     ///
     /// A follower's wait is bounded by `timeout` and ends early on
     /// `cancel`; the pull it watched may still complete for the others.
     /// The leader is not interruptible, exactly as a lone pull is not.
-    pub fn pull(&self, image: &str, timeout: Duration, cancel: &Cancel) -> Result<()> {
+    pub fn pull(&self, image: &str, timeout: Duration, cancel: &Cancel) -> Result<bool> {
         if cancel.load(Ordering::Acquire) {
             return Err(Error::Preparation("canceled".into()));
         }
@@ -160,7 +167,7 @@ impl Images {
             // Publish before the slot leaves the map: a caller between the
             // two still follows this pull rather than leading a second one.
             *slot.result.lock().unwrap_or_else(|p| p.into_inner()) =
-                Some(outcome.as_ref().map(|_| ()).map_err(Shared::of));
+                Some(outcome.as_ref().copied().map_err(Shared::of));
             slot.done.notify_all();
             self.state().pulling.remove(image);
             return outcome;
@@ -302,12 +309,13 @@ mod tests {
         entered: mpsc::Sender<()>,
         release: Arc<Barrier>,
         /// `Err("…")` maps to `Error::Timeout` — one typed error is enough
-        /// to prove the leader's outcome is what followers get.
-        outcome: std::result::Result<(), &'static str>,
+        /// to prove the leader's outcome is what followers get; `Ok`
+        /// carries the exists/downloaded bool.
+        outcome: std::result::Result<bool, &'static str>,
     }
 
     impl Stub {
-        fn new(outcome: std::result::Result<(), &'static str>) -> (Stub, mpsc::Receiver<()>) {
+        fn new(outcome: std::result::Result<bool, &'static str>) -> (Stub, mpsc::Receiver<()>) {
             let (entered, rx) = mpsc::channel();
             (
                 Stub {
@@ -338,7 +346,7 @@ mod tests {
 
     #[test]
     fn concurrent_pulls_share_one_download() {
-        let (stub, entered) = Stub::new(Ok(()));
+        let (stub, entered) = Stub::new(Ok(false));
         let images = stub.images();
         let callers: Vec<_> = (0..5)
             .map(|_| {
@@ -352,7 +360,9 @@ mod tests {
         parked(&images, IMAGE, 4);
         stub.release.wait();
         for caller in callers {
-            caller.join().unwrap().unwrap();
+            // The leader's exists/downloaded answer is what every
+            // follower gets (K08): this stub downloaded.
+            assert!(!caller.join().unwrap().unwrap());
         }
         assert_eq!(
             stub.calls.load(Ordering::SeqCst),
@@ -404,7 +414,7 @@ mod tests {
 
     #[test]
     fn a_canceled_follower_stops_waiting_without_ending_the_pull() {
-        let (stub, entered) = Stub::new(Ok(()));
+        let (stub, entered) = Stub::new(Ok(true));
         let images = stub.images();
         let leader = {
             let (images, cancel) = (images.clone(), cancel());
@@ -428,7 +438,7 @@ mod tests {
         }
         assert_eq!(images.in_flight(), 1, "the leader's pull goes on");
         stub.release.wait();
-        leader.join().unwrap().unwrap();
+        assert!(leader.join().unwrap().unwrap());
         assert_eq!(images.in_flight(), 0);
         assert!(images.holds(DIGEST), "the completed pull still records");
     }
@@ -440,7 +450,7 @@ mod tests {
             let calls = Arc::clone(&calls);
             move |_, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(true)
             }
         });
         images
@@ -460,7 +470,7 @@ mod tests {
 
     #[test]
     fn the_held_record_is_bounded_and_evicts_the_oldest() {
-        let images = Images::with_download(|_, _| Ok(()));
+        let images = Images::with_download(|_, _| Ok(false));
         let flag = cancel();
         for i in 0..MAX_HELD + 1 {
             let image = format!("example.test/i@sha256:{i:064}");

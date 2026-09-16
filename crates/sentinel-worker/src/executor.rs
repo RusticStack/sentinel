@@ -69,6 +69,42 @@ pub enum Notice {
     /// A bounded reclamation pass over the cache root removed something —
     /// expired leases, dead staging or generations past retention/budget.
     CacheSwept(sentinel_cache::gc::GcStats),
+    /// A nominal cache hit paid rebuild-scale restore cost — the K08
+    /// costly-hit rule (docs/cache.md) tripped. Diagnostics only; the
+    /// attempt's verdict never depends on it.
+    CostlyCacheHit {
+        attempt: AttemptId,
+        /// The declared cache's name.
+        name: String,
+        /// Which clause tripped (`copied_all`/`slow`).
+        costly: sentinel_cache::Costly,
+        /// The restore's measured stats — the evidence.
+        stats: sentinel_cache::Stats,
+    },
+    /// The worker's compact availability snapshot (K08), emitted after
+    /// each bounded cache sweep — at start and after every attempt's
+    /// finalization, never on a timer. Part 08's placement consumes it.
+    Availability(Availability),
+}
+
+/// The snapshot [`Notice::Availability`] carries — bounded, learned from
+/// pull outcomes and the sweep's own walk; never a store scan.
+#[derive(Clone, Debug)]
+pub struct Availability {
+    /// Image digests the local store is known to hold — sorted, bounded
+    /// by `images::MAX_HELD`.
+    pub images_held: Vec<String>,
+    /// Image pulls in flight right now.
+    pub images_in_flight: usize,
+    /// Cache entry directories the sweep saw.
+    pub cache_entries: u64,
+    /// Generation directories the sweep saw.
+    pub cache_generations: u64,
+    /// Payload bytes the store holds now — what the pass saw less what it
+    /// freed (`bytes_freed`).
+    pub cache_bytes: u64,
+    /// The pass hit its work bound — the occupancy counts are partial.
+    pub truncated: bool,
 }
 
 /// TERM-to-KILL grace for a cancel when the process sets none.
@@ -465,7 +501,11 @@ impl Inner {
 
     /// One bounded reclamation pass over the cache root — skipped while
     /// another runs, because the running pass already covers its work.
-    /// A pass that touched nothing stays quiet.
+    /// A pass that touched nothing stays quiet, but every pass ends by
+    /// emitting the K08 availability snapshot: the sweep is the bounded
+    /// cadence (start plus post-attempt) that Part 08's placement feed
+    /// rides, so the occupancy it already computed costs a second walk
+    /// never.
     fn sweep_caches(&self) {
         let _guard = match self.gc_lock.try_lock() {
             Ok(guard) => guard,
@@ -477,6 +517,14 @@ impl Inner {
             sentinel_cache::gc::DEFAULT_BUDGET_BYTES,
             sentinel_cache::gc::DEFAULT_PASS_WORK,
         );
+        (self.notify)(Notice::Availability(Availability {
+            images_held: self.images.held(),
+            images_in_flight: self.images.in_flight(),
+            cache_entries: stats.entries_seen,
+            cache_generations: stats.generations_seen,
+            cache_bytes: stats.payload_bytes.saturating_sub(stats.bytes_freed),
+            truncated: stats.truncated,
+        }));
         if stats.did_work() {
             (self.notify)(Notice::CacheSwept(stats));
         }
@@ -580,6 +628,22 @@ impl Report for Inner {
     /// controller's summary format is not theirs to ride.
     fn cache_note(&self, attempt: AttemptId, note: CacheNote) {
         (self.notify)(Notice::CachePublished { attempt, note });
+    }
+    /// The costly-hit flag is the same kind of diagnostic — the summary's
+    /// per-entry record carries the flag; the notice carries the numbers.
+    fn costly_hit(
+        &self,
+        attempt: AttemptId,
+        name: &str,
+        costly: sentinel_cache::Costly,
+        stats: &sentinel_cache::Stats,
+    ) {
+        (self.notify)(Notice::CostlyCacheHit {
+            attempt,
+            name: name.to_owned(),
+            costly,
+            stats: *stats,
+        });
     }
 }
 

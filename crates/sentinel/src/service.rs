@@ -896,6 +896,12 @@ mod worker_role {
                     sentinel_worker::executor::Notice::CacheSwept(stats) => {
                         tracing::info!(event = "cache_swept", stats = ?stats);
                     }
+                    sentinel_worker::executor::Notice::CostlyCacheHit { attempt, name, costly, stats } => {
+                        tracing::warn!(event = "cache_costly_hit", attempt = %attempt, cache = %name, reason = costly.as_str(), copied_bytes = stats.copied_bytes, bytes = stats.bytes, lock_wait_ns = ?stats.lock_wait_ns, clone_ns = ?stats.clone_ns, "nominal hit paid rebuild-scale restore cost (docs/cache.md)");
+                    }
+                    sentinel_worker::executor::Notice::Availability(snapshot) => {
+                        tracing::info!(event = "availability", images_held = snapshot.images_held.len(), images_in_flight = snapshot.images_in_flight, cache_entries = snapshot.cache_entries, cache_generations = snapshot.cache_generations, cache_bytes = snapshot.cache_bytes, truncated = snapshot.truncated);
+                    }
                 })
             })
         };

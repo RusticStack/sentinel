@@ -26,7 +26,7 @@ pub mod publish;
 pub mod restore;
 pub mod scope;
 
-pub use attach::{Attached, Stats, Target};
+pub use attach::{Attached, Committed, Costly, Stats, Target};
 pub use clone::Backend;
 pub use manifest::{Boundary, Compat, FileEntry, FilesBlob, Manifest, Request};
 pub use outcome::{Hit, Miss, Outcome};

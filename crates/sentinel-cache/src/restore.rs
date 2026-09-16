@@ -44,6 +44,11 @@ use crate::{
 /// fits in 32 bytes; 128 is generous headroom, never unbounded.
 const MAX_CURRENT_BYTES: u64 = 128;
 
+/// The first-read sample size (K08): one small read of a representative
+/// file per target — enough to fault a cold extent, never enough to
+/// matter.
+const FIRST_TOUCH_BYTES: usize = 4 * 1024;
+
 fn ns(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
@@ -151,8 +156,11 @@ pub fn restore(
         env.backend,
         &mut attached.stats,
     ) {
-        Ok(()) => {
+        Ok(blob) => {
             attached.stats.clone_ns = Some(ns(started));
+            // K08: the first-touch sample is timed separately — cold-extent
+            // read cost is not the clone's wall time.
+            attached.stats.first_touch_ns = first_touch(&blob, &attached.targets);
             attached.generation = Some(name);
             attached.lease = Some(lease);
             attached.outcome = Outcome::Hit(hit);
@@ -223,25 +231,34 @@ fn files_blob(gen_dir: &Path, manifest: &manifest::Manifest) -> Result<FilesBlob
 
 /// The `<i>` in a `payload/<i>/<relpath>` listing entry.
 fn payload_index(path: &str) -> Option<usize> {
+    payload_parts(path).map(|(index, _)| index)
+}
+
+/// `payload/<i>/<rel>` → `(i, rel)` — the listing's own shape, which
+/// materialization validated before this is ever asked.
+fn payload_parts(path: &str) -> Option<(usize, &str)> {
     let rest = path.strip_prefix("payload/")?;
     let (index, rel) = rest.split_once('/')?;
     if rel.is_empty() {
         return None;
     }
-    index.parse().ok()
+    Some((index.parse().ok()?, rel))
 }
 
 /// Clone every `payload/<i>` to its target. The listing is re-validated
 /// here — `decode` already checked each path is relative, and a clone
 /// input is checked twice rather than trusted once. Payload bytes are
 /// not re-hashed: that would defeat the reflink path (docs/cache.md).
+/// `Ok` carries the verified listing so the caller can run the bounded
+/// first-touch sample after it has stamped `clone_ns` — the sample's cost
+/// must not land inside the clone's wall time (K08).
 fn materialize(
     gen_dir: &Path,
     manifest: &manifest::Manifest,
     targets: &[Target],
     backend: Backend,
     stats: &mut Stats,
-) -> Result<(), Miss> {
+) -> Result<FilesBlob, Miss> {
     let blob = files_blob(gen_dir, manifest)?;
     for entry in &blob.entries {
         let ok = valid_relative_path(&entry.path)
@@ -282,7 +299,48 @@ fn materialize(
             Err(_) => return Err(Miss::Unavailable),
         }
     }
-    Ok(())
+    Ok(blob)
+}
+
+/// One bounded first-read sample per target after a hit's clone
+/// materialized: open the largest listed file and read its first
+/// [`FIRST_TOUCH_BYTES`]. A clone's cost is per file, but the first real
+/// read is what faults a cold extent — the K02 probe showed that cost is
+/// real, so it is measured separately rather than folded into `clone_ns`.
+/// `None` when the listing held no file to sample; a file that will not
+/// open is simply not measured, never a miss.
+fn first_touch(blob: &FilesBlob, targets: &[Target]) -> Option<u64> {
+    if blob.entries.is_empty() {
+        return None;
+    }
+    // The largest listed file per target, in one pass over the listing.
+    let mut largest: Vec<Option<(u64, &str)>> = vec![None; targets.len()];
+    for entry in &blob.entries {
+        let Some((index, rel)) = payload_parts(&entry.path) else {
+            continue;
+        };
+        let Some(slot) = largest.get_mut(index) else {
+            continue;
+        };
+        match slot {
+            Some((size, _)) if *size >= entry.size => {}
+            _ => *slot = Some((entry.size, rel)),
+        }
+    }
+    let started = Instant::now();
+    let mut sampled = false;
+    for (target, pick) in targets.iter().zip(&largest) {
+        let Some((_, rel)) = pick else {
+            continue;
+        };
+        let Ok(mut file) = fs::File::open(target.dir.join(rel)) else {
+            continue;
+        };
+        // One read; a short read still faulted the extent, which is the
+        // cost being measured.
+        sampled |= file.read(&mut [0u8; FIRST_TOUCH_BYTES]).is_ok();
+    }
+    if sampled { Some(ns(started)) } else { None }
 }
 
 /// Resolve one declared path to its `Target`, creating the writable
@@ -475,6 +533,7 @@ mod tests {
             .entry_dir(cache_root, attach::entry_key(s.entry_of.class, s.entry_key));
         let name = scope::gen_name(1_700_000_000_000, 0x00ab_cdef);
         let gdir = entry_dir.join(&name);
+        fs::create_dir_all(&gdir).unwrap();
         let mut entries = Vec::new();
         let mut total = 0u64;
         for (i, files) in s.payloads.iter().enumerate() {
@@ -568,10 +627,12 @@ mod tests {
         let entry = s.entry_dir(&root, attach::entry_key(Class::Dependencies, KEY));
         let gen_dir = entry.join(a.generation.as_ref().unwrap());
         assert_eq!(fs::read(gen_dir.join("payload/0/b")).unwrap(), b"bb");
-        // Measured, all three phases.
+        // Measured, all four phases — the clone ran, and the first-touch
+        // sample read the largest listed file's first bytes per target.
         assert!(a.stats.lookup_ns.is_some());
         assert!(a.stats.lock_wait_ns.is_some());
         assert!(a.stats.clone_ns.is_some());
+        assert!(a.stats.first_touch_ns.is_some());
         assert_eq!(a.stats.files, 3);
         assert_eq!(a.stats.bytes, 6);
         assert_eq!(a.stats.copied_bytes, 6);
@@ -595,6 +656,28 @@ mod tests {
         assert!(a.targets[0].dir.is_dir());
         assert!(a.stats.lookup_ns.is_some(), "the lookup ran and failed");
         assert!(a.stats.clone_ns.is_none(), "a miss never clones");
+        assert!(
+            a.stats.first_touch_ns.is_none(),
+            "nothing materialized to touch"
+        );
+    }
+
+    #[test]
+    fn a_hit_without_listed_files_measures_no_first_touch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, ws) = (temp.path().join("cache"), temp.path().join("ws"));
+        fs::create_dir(&ws).unwrap();
+        let s = scope();
+        // A declared path the generation never carried: the hit is real
+        // but the listing is empty, so there is nothing to sample.
+        let d = decl(&["vendor"]);
+        let compat = attach::declared_compat(&d, KEY, s.platform);
+        seal(&root, &Seal::at(&s, KEY, &compat, &[&[]]));
+        let a = restore_one(&root, &ws, &d, s);
+        assert!(a.outcome.is_hit());
+        assert_eq!(a.stats.files, 0);
+        assert!(a.stats.clone_ns.is_some());
+        assert!(a.stats.first_touch_ns.is_none());
     }
 
     #[test]

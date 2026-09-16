@@ -104,7 +104,10 @@ pub fn probe() -> Result<Runtime> {
 }
 
 /// Make `image` (a `name@sha256:…` reference) available locally.
-pub fn pull(image: &str, timeout: Duration) -> Result<()> {
+/// `Ok(true)` means the store already held it — the `image exists` fast
+/// path, nothing downloaded — and `Ok(false)` means `podman pull` fetched
+/// it (K08's `image_present` signal).
+pub fn pull(image: &str, timeout: Duration) -> Result<bool> {
     if !image.contains("@sha256:") {
         return Err(Error::Preparation("image is not pinned by digest".into()));
     }
@@ -117,13 +120,13 @@ pub fn pull(image: &str, timeout: Duration) -> Result<()> {
     )?
     .success()
     {
-        return Ok(());
+        return Ok(true);
     }
     let mut cmd = podman();
     cmd.args(["pull", "-q", "--", image]);
     let output = process::run(cmd, deadline(timeout), "podman pull")?;
     if output.success() {
-        Ok(())
+        Ok(false)
     } else {
         Err(Error::Preparation(format!(
             "image pull: {}",

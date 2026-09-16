@@ -33,7 +33,7 @@ use sentinel_pipeline::{RunSpec, expr::EvalError};
 use sentinel_protocol::{
     logs::Stream,
     negotiate::Arch,
-    summary::{AttemptSummary, StepOutcome, StepRecord},
+    summary::{AttemptSummary, CacheRecord, MAX_CACHE_RECORDS, StepOutcome, StepRecord},
 };
 
 use crate::{
@@ -84,6 +84,17 @@ pub trait Report: Send + Sync {
     /// A cache publication's outcome from finalization — diagnostics only,
     /// never the verdict. The default drops it.
     fn cache_note(&self, _attempt: AttemptId, _note: CacheNote) {}
+    /// A nominal hit's restore tripped the costly-hit rule (K08,
+    /// docs/cache.md) — diagnostics only, never the verdict. `stats` is
+    /// the measured evidence. The default drops it.
+    fn costly_hit(
+        &self,
+        _attempt: AttemptId,
+        _name: &str,
+        _costly: sentinel_cache::Costly,
+        _stats: &sentinel_cache::Stats,
+    ) {
+    }
 }
 
 /// One cache's publication outcome, reported once per attempted entry.
@@ -156,7 +167,16 @@ pub fn run(
 ) -> (Verdict, AttemptSummary) {
     report.event(job.attempt, job.fence, Event::PreparationStarted);
     let mut summary = AttemptSummary::default();
-    let verdict = match prepare(root, job, cancel, &mut summary) {
+    let prepared = prepare(root, job, cancel, &mut summary);
+    // K08: a nominal hit that paid rebuild-scale restore cost is a
+    // diagnostic on the attempt, never its verdict — flagged once per
+    // entry now that preparation has filled `job.caches`.
+    for attached in &job.caches {
+        if let Some(costly) = attached.costly_hit() {
+            report.costly_hit(job.attempt, &attached.name, costly, &attached.stats);
+        }
+    }
+    let verdict = match prepared {
         // A cancel that lands while preparing is a cancel, whatever step of
         // the preparation it interrupted. The log — empty or not — is closed
         // on this path too, so nothing waits in the spool for steps that
@@ -232,6 +252,14 @@ pub fn run(
             Event::Failed(*class)
         }
     };
+    // K08: one bounded record per declared cache rides the terminal
+    // summary; a phase that never ran stays absent, never zero.
+    summary.caches = job
+        .caches
+        .iter()
+        .take(MAX_CACHE_RECORDS)
+        .map(cache_record)
+        .collect();
     match summary.encode() {
         Ok(bytes) => report.finish(job.attempt, job.fence, event, bytes),
         Err(_) => report.event(job.attempt, job.fence, event),
@@ -312,8 +340,11 @@ fn prepare(
         }
         let started = Instant::now();
         let pulled = job.images.pull(&image, podman::IMAGE_PULL_TIMEOUT, cancel);
-        if pulled.is_ok() {
+        if let Ok(present) = &pulled {
             summary.image_pull_ns = ns(started);
+            // K08: whether the `image exists` fast path served or a
+            // download ran — the availability signal placement reads.
+            summary.image_present = Some(*present);
         }
         // Join before the workspace could be torn down under a checkout
         // still running. The first failure wins — the checkout's ahead of
@@ -689,41 +720,107 @@ fn cache_worthy(verdict: &Verdict) -> bool {
     }
 }
 
+/// K08: the summary's per-entry record from the carrier restore filled
+/// and the commit answered — stable vocabulary throughout: `"hit"` or a
+/// `Miss` reason for the lookup, `"sealed"` or a `SkipReason`/`"failed"`
+/// for the publish, and the documented costly-hit flag.
+fn cache_record(attached: &sentinel_cache::attach::Attached) -> CacheRecord {
+    let stats = &attached.stats;
+    let (staged, reused, dirty, publish) = match stats.committed {
+        Some(sentinel_cache::Committed::Sealed {
+            staged_bytes,
+            reused_bytes,
+        }) => (
+            Some(staged_bytes),
+            Some(reused_bytes),
+            // The dirty side: what the job's view rewrote versus the
+            // source generation — staged minus reused (reused is a
+            // subset of staged by construction; saturating anyway, a
+            // record must never panic).
+            Some(staged_bytes.saturating_sub(reused_bytes)),
+            Some("sealed".to_owned()),
+        ),
+        Some(sentinel_cache::Committed::Skipped(why)) => {
+            (None, None, None, Some(why.as_str().to_owned()))
+        }
+        Some(sentinel_cache::Committed::Failed) => (None, None, None, Some("failed".to_owned())),
+        None => (None, None, None, None),
+    };
+    CacheRecord {
+        name: attached.name.clone(),
+        class: attached.scope.class.to_u8(),
+        outcome: match &attached.outcome {
+            sentinel_cache::Outcome::Hit(_) => "hit".to_owned(),
+            sentinel_cache::Outcome::Miss(miss) => miss.as_str().to_owned(),
+        },
+        lookup_ns: stats.lookup_ns,
+        lock_wait_ns: stats.lock_wait_ns,
+        clone_ns: stats.clone_ns,
+        first_touch_ns: stats.first_touch_ns,
+        files: stats.files,
+        bytes: stats.bytes,
+        copied_bytes: stats.copied_bytes,
+        reflink: stats.reflink,
+        commit_ns: stats.commit_ns,
+        staged_bytes: staged,
+        reused_bytes: reused,
+        dirty_bytes: dirty,
+        publish,
+        costly_hit: attached.costly_hit().is_some(),
+    }
+}
+
 /// Commit each attached cache under its own scope, while the workspace's
 /// writable views still exist. Publication is off the verdict's path: the
 /// whole batch is bounded by `CACHE_PUBLISH_TIMEOUT`, each entry's outcome
-/// is reported as a `CacheNote`, and nothing here changes what the attempt
-/// reported.
-fn publish_caches(root: &Path, job: &Job, report: &dyn Report, cancel: &Cancel) {
+/// is reported as a `CacheNote` and stamped on the carrier's stats (K08)
+/// for the summary's per-entry record, and nothing here changes what the
+/// attempt reported.
+fn publish_caches(root: &Path, job: &mut Job, report: &dyn Report, cancel: &Cancel) {
     if job.caches.is_empty() {
         return;
     }
     let cache_root = root.join(sentinel_cache::CACHE_DIR);
     let deadline = Instant::now() + sentinel_cache::publish::CACHE_PUBLISH_TIMEOUT;
     let canceled = || cancel.load(Ordering::Acquire);
-    for attached in &job.caches {
-        let outcome = match sentinel_cache::publish::commit(
+    for attached in &mut job.caches {
+        let started = Instant::now();
+        let committed = sentinel_cache::publish::commit(
             &cache_root,
             attached,
             job.context.trust,
             sentinel_core::UnixMillis::now(),
             deadline,
             &canceled,
-        ) {
+        );
+        // The commit's cost and answer land on the carrier — the summary
+        // reads them back for the attempt's per-entry records.
+        attached.stats.commit_ns = ns(started);
+        let outcome = match committed {
             Ok(sentinel_cache::publish::Published::Sealed {
                 generation,
                 bytes,
                 reused_bytes,
                 ..
-            }) => CacheOutcome::Sealed {
-                generation,
-                bytes,
-                reused_bytes,
-            },
+            }) => {
+                attached.stats.committed = Some(sentinel_cache::Committed::Sealed {
+                    staged_bytes: bytes,
+                    reused_bytes,
+                });
+                CacheOutcome::Sealed {
+                    generation,
+                    bytes,
+                    reused_bytes,
+                }
+            }
             Ok(sentinel_cache::publish::Published::Skipped(why)) => {
+                attached.stats.committed = Some(sentinel_cache::Committed::Skipped(why));
                 CacheOutcome::Skipped(why.as_str())
             }
-            Err(e) => CacheOutcome::Failed(e.to_string()),
+            Err(e) => {
+                attached.stats.committed = Some(sentinel_cache::Committed::Failed);
+                CacheOutcome::Failed(e.to_string())
+            }
         };
         report.cache_note(
             job.attempt,
@@ -737,7 +834,7 @@ fn publish_caches(root: &Path, job: &Job, report: &dyn Report, cancel: &Cancel) 
 
 fn finalize(
     root: &Path,
-    job: &Job,
+    job: &mut Job,
     verdict: &Verdict,
     report: &dyn Report,
     workspace: Workspace,
@@ -759,7 +856,7 @@ fn finalize(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, sync::Mutex};
 
     use sentinel_core::{JobId, RepoId, RunId};
     use sentinel_link::session::EventContext;
@@ -885,5 +982,119 @@ mod tests {
         assert_eq!(mounts[0].container, "/opt/cc");
         assert_eq!(mounts[0].host, attached.targets[1].dir);
         assert!(mounts[0].host.is_dir());
+
+        // K08: the summary's record for the entry — the miss's reason and
+        // the lookup measurement, everything else absent.
+        let record = cache_record(attached);
+        assert_eq!(record.name, "deps");
+        assert_eq!(
+            record.class,
+            sentinel_protocol::cache::Class::Dependencies.to_u8()
+        );
+        assert_eq!(record.outcome, "absent");
+        assert!(record.lookup_ns.is_some());
+        assert!(record.clone_ns.is_none() && record.first_touch_ns.is_none());
+        assert!(record.commit_ns.is_none() && record.publish.is_none());
+        assert!(!record.costly_hit);
+    }
+
+    /// A report sink that records the diagnostics `run` emits.
+    #[derive(Default)]
+    struct Notes {
+        cache_notes: Mutex<Vec<CacheNote>>,
+        costly: Mutex<Vec<(String, sentinel_cache::Costly)>>,
+    }
+    impl Report for Notes {
+        fn event(&self, _: AttemptId, _: Fence, _: Event) {}
+        fn finish(&self, _: AttemptId, _: Fence, _: Event, _: Vec<u8>) {}
+        fn cache_note(&self, _: AttemptId, note: CacheNote) {
+            self.cache_notes.lock().unwrap().push(note);
+        }
+        fn costly_hit(
+            &self,
+            _: AttemptId,
+            name: &str,
+            costly: sentinel_cache::Costly,
+            _: &sentinel_cache::Stats,
+        ) {
+            self.costly.lock().unwrap().push((name.to_owned(), costly));
+        }
+    }
+
+    /// A job that wrote into its view publishes; the commit's cost and
+    /// byte split land on the carrier and ride the summary record.
+    #[test]
+    fn publish_stamps_commit_stats_and_the_record_carries_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, ws) = (temp.path().join("worker"), temp.path().join("ws"));
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("f.lock"), b"locked").unwrap();
+        let mut job = job(spec());
+        let declared = job.spec.pipeline.jobs[0].spec.cache.clone();
+        let image = format!("example.test/i@{}", job.digest);
+        restore_caches(&root, &mut job, &declared, &ws, &image);
+        // The job's own work: one new file in the declared path's view.
+        fs::write(ws.join("vendor/lib"), b"new").unwrap();
+        let notes = Notes::default();
+        let flag: Cancel = Arc::new(AtomicBool::new(false));
+        publish_caches(&root, &mut job, &notes, &flag);
+
+        let attached = &job.caches[0];
+        assert!(attached.stats.commit_ns.is_some());
+        assert!(matches!(
+            attached.stats.committed,
+            Some(sentinel_cache::Committed::Sealed {
+                staged_bytes: 3,
+                reused_bytes: 0
+            })
+        ));
+        let record = cache_record(attached);
+        assert_eq!(record.publish.as_deref(), Some("sealed"));
+        assert_eq!(record.staged_bytes, Some(3));
+        assert_eq!(record.reused_bytes, Some(0));
+        assert_eq!(record.dirty_bytes, Some(3));
+        assert!(matches!(
+            notes.cache_notes.lock().unwrap().as_slice(),
+            [CacheNote {
+                outcome: CacheOutcome::Sealed { .. },
+                ..
+            }]
+        ));
+    }
+
+    /// The record's flag is the carrier's rule: a reflink-root hit that
+    /// copied every byte reads `costly_hit` — the notice goes through
+    /// `report.costly_hit` the same way.
+    #[test]
+    fn a_hit_that_paid_full_copy_records_the_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, ws) = (temp.path().join("worker"), temp.path().join("ws"));
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("f.lock"), b"locked").unwrap();
+        let mut job = job(spec());
+        let declared = job.spec.pipeline.jobs[0].spec.cache.clone();
+        let image = format!("example.test/i@{}", job.digest);
+        restore_caches(&root, &mut job, &declared, &ws, &image);
+        // Shape the carrier the way a reflink root that refused every
+        // file leaves it: a hit whose copy covered all bytes.
+        let attached = &mut job.caches[0];
+        attached.outcome = sentinel_cache::Outcome::Hit(Box::new(sentinel_cache::Hit {
+            manifest: sentinel_cache::Manifest::writing(
+                &attached.scope,
+                &attached.key,
+                attached.compat.clone(),
+            ),
+            bytes: 100,
+        }));
+        attached.stats.reflink = true;
+        attached.stats.bytes = 100;
+        attached.stats.copied_bytes = 100;
+        assert_eq!(
+            attached.costly_hit(),
+            Some(sentinel_cache::Costly::CopiedAll)
+        );
+        let record = cache_record(attached);
+        assert!(record.costly_hit);
+        assert_eq!(record.outcome, "hit");
     }
 }
