@@ -21,6 +21,8 @@ pub mod context;
 #[cfg(target_os = "linux")]
 pub mod executor;
 #[cfg(target_os = "linux")]
+pub mod images;
+#[cfg(target_os = "linux")]
 pub mod logpipe;
 #[cfg(target_os = "linux")]
 pub mod podman;
