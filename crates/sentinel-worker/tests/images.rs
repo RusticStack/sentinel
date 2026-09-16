@@ -146,8 +146,11 @@ fn the_pull_overlaps_the_checkout() {
             },
             cancelled: false,
             needs: Vec::new(),
+            tenant: None,
+            trust: sentinel_protocol::cache::Trust::Protected,
         },
         images: images.clone(),
+        caches: Vec::new(),
         prepare_hold: Duration::ZERO,
     };
     let rec = Rec {

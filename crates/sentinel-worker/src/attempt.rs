@@ -59,6 +59,12 @@ pub struct Job {
     /// The worker's image pulls: concurrent attempts share one download
     /// per `name@sha256:…`.
     pub images: Images,
+    /// The job's declared caches as restored for this attempt: filled by
+    /// preparation (K02), read back by finalization (K03). The carrier is
+    /// `sentinel_cache::Attached` — each entry holds its scope, rendered
+    /// key, the outcome that produced the view and the private writable
+    /// directory the container saw.
+    pub caches: Vec<sentinel_cache::attach::Attached>,
     /// A pause between starting the checkout and pulling the image, so a
     /// cancel that arrives during preparation can be exercised
     /// deterministically. Zero in production.

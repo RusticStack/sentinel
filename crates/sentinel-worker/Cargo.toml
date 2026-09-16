@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+sentinel-cache = { path = "../sentinel-cache" }
 sentinel-core = { path = "../sentinel-core" }
 sentinel-git = { path = "../sentinel-git" }
 sentinel-link = { path = "../sentinel-link" }

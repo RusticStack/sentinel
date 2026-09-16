@@ -288,6 +288,7 @@ impl Executor {
             spec,
             context,
             images: self.images.clone(),
+            caches: Vec::new(),
             prepare_hold: self.state().prepare_hold,
         };
         // On disk before anything runs: a crash from here on leaves a

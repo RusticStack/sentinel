@@ -16,6 +16,7 @@
 //! leases and garbage collection are K02/K03; this crate owns what they
 //! share: paths, formats and reasons.
 
+pub mod attach;
 pub mod clone;
 pub mod gc;
 pub mod lease;

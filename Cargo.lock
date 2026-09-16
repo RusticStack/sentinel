@@ -1360,6 +1360,7 @@ dependencies = [
  "libc",
  "sentinel-api",
  "sentinel-auth",
+ "sentinel-cache",
  "sentinel-core",
  "sentinel-git",
  "sentinel-link",
