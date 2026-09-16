@@ -363,10 +363,7 @@ type CheckoutThread = std::thread::JoinHandle<Result<(checkout::Outcome, Option<
 /// that could not produce its result is a preparation failure like the
 /// checkout's own; `checkout_ns` is stamped only when the checkout
 /// completed, as a lone call was.
-fn join_checkout(
-    co: &mut Option<CheckoutThread>,
-    summary: &mut AttemptSummary,
-) -> Result<()> {
+fn join_checkout(co: &mut Option<CheckoutThread>, summary: &mut AttemptSummary) -> Result<()> {
     let Some(handle) = co.take() else {
         return Ok(());
     };
