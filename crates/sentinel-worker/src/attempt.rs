@@ -80,6 +80,33 @@ pub trait Report: Send + Sync {
     fn event(&self, attempt: AttemptId, fence: Fence, event: Event);
     /// The terminal event with the encoded summary.
     fn finish(&self, attempt: AttemptId, fence: Fence, event: Event, summary: Vec<u8>);
+    /// A cache publication's outcome from finalization — diagnostics only,
+    /// never the verdict. The default drops it.
+    fn cache_note(&self, _attempt: AttemptId, _note: CacheNote) {}
+}
+
+/// One cache's publication outcome, reported once per attempted entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheNote {
+    /// The declared cache's name.
+    pub name: String,
+    pub outcome: CacheOutcome,
+}
+
+/// What publication did with one attached cache.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CacheOutcome {
+    /// A new generation was sealed and is now `current`.
+    Sealed {
+        generation: String,
+        bytes: u64,
+        /// Of `bytes`, how much was staged from the source generation.
+        reused_bytes: u64,
+    },
+    /// Nothing committed; the publish module's stable reason.
+    Skipped(&'static str),
+    /// The commit failed; bounded detail, never the job's failure.
+    Failed(String),
 }
 
 /// Where step output goes (W05): the executor's spool and link. Writes are
@@ -175,7 +202,7 @@ pub fn run(
                 matches!(verdict, Verdict::Passed),
                 sink,
             );
-            finalize(workspace, container);
+            finalize(root, job, &verdict, report, workspace, container, cancel);
             // The log is part of finalization: the attempt is not done until
             // what it printed is durable on the controller, or the wait ran
             // out and the failure is on record.
@@ -556,10 +583,122 @@ fn describe(error: &EvalError) -> String {
     }
 }
 
-fn finalize(workspace: Workspace, container: Container) {
+/// Whether the steps' verdict leaves cache state worth keeping: the job's
+/// commands ran, so their writes are real work the next attempt can reuse.
+/// A canceled, timed-out or never-started attempt publishes nothing.
+fn cache_worthy(verdict: &Verdict) -> bool {
+    match verdict {
+        Verdict::Passed => true,
+        Verdict::Failed(class, _) => matches!(
+            class,
+            FailureClass::CommandFailed | FailureClass::CommandSignaled | FailureClass::OutOfMemory
+        ),
+    }
+}
+
+/// Commit each attached cache under its own scope, while the workspace's
+/// writable views still exist. Publication is off the verdict's path: the
+/// whole batch is bounded by `CACHE_PUBLISH_TIMEOUT`, each entry's outcome
+/// is reported as a `CacheNote`, and nothing here changes what the attempt
+/// reported.
+fn publish_caches(root: &Path, job: &Job, report: &dyn Report, cancel: &Cancel) {
+    if job.caches.is_empty() {
+        return;
+    }
+    let cache_root = root.join(sentinel_cache::CACHE_DIR);
+    let deadline = Instant::now() + sentinel_cache::publish::CACHE_PUBLISH_TIMEOUT;
+    let canceled = || cancel.load(Ordering::Acquire);
+    for attached in &job.caches {
+        let outcome = match sentinel_cache::publish::commit(
+            &cache_root,
+            attached,
+            job.context.trust,
+            sentinel_core::UnixMillis::now(),
+            deadline,
+            &canceled,
+        ) {
+            Ok(sentinel_cache::publish::Published::Sealed {
+                generation,
+                bytes,
+                reused_bytes,
+                ..
+            }) => CacheOutcome::Sealed {
+                generation,
+                bytes,
+                reused_bytes,
+            },
+            Ok(sentinel_cache::publish::Published::Skipped(why)) => {
+                CacheOutcome::Skipped(why.as_str())
+            }
+            Err(e) => CacheOutcome::Failed(e.to_string()),
+        };
+        report.cache_note(
+            job.attempt,
+            CacheNote {
+                name: attached.name.clone(),
+                outcome,
+            },
+        );
+    }
+}
+
+fn finalize(
+    root: &Path,
+    job: &Job,
+    verdict: &Verdict,
+    report: &dyn Report,
+    workspace: Workspace,
+    container: Container,
+    cancel: &Cancel,
+) {
+    // Cache publication is finalization work: it reads the job's writable
+    // views, so it must precede the teardown — and a verdict that never ran
+    // the job's commands leaves nothing worth keeping.
+    if cache_worthy(verdict) {
+        publish_caches(root, job, report, cancel);
+    }
     // Both run even when one fails: a container that will not stop must not
     // keep a workspace alive, and vice versa. The failure is a reconciliation
     // matter for W07, which lists what this worker still owns.
     let _ = container.destroy();
     let _ = workspace.destroy();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_follows_whether_the_commands_ran() {
+        // Passed and command-level failures publish; everything that
+        // stopped the commands from running — or the operator's cancel —
+        // keeps nothing.
+        assert!(cache_worthy(&Verdict::Passed));
+        for class in [
+            FailureClass::CommandFailed,
+            FailureClass::CommandSignaled,
+            FailureClass::OutOfMemory,
+        ] {
+            assert!(
+                cache_worthy(&Verdict::Failed(class, String::new())),
+                "{class:?}"
+            );
+        }
+        for class in [
+            FailureClass::ExecutionTimeout,
+            FailureClass::Canceled,
+            FailureClass::Preparation,
+            FailureClass::Runtime,
+            FailureClass::Publication,
+            FailureClass::LeaseExpired,
+            FailureClass::WorkerLost,
+            FailureClass::Reconciled,
+            FailureClass::QueueTimeout,
+        ] {
+            assert!(
+                !cache_worthy(&Verdict::Failed(class, String::new())),
+                "{class:?}"
+            );
+        }
+    }
 }

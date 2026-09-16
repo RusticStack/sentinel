@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use crate::scope::LEASE_NAME;
+use crate::scope::{LEASE_NAME, WRITING_NAME};
 
 /// A lease's declared expiry may never exceed this far past its file's
 /// mtime — the bound that lets a corrupt lease age out.
@@ -128,6 +128,90 @@ impl Drop for Lease {
     }
 }
 
+/// The writer-ownership marker inside `<entry>/writing/` (K03). One
+/// writer per entry: the marker is `create_new`, so acquisition can never
+/// share or wait — a held marker is `Busy`, a stale one is a dead
+/// writer's and is reaped in place.
+pub const WRITE_LOCK_NAME: &str = ".lock";
+
+/// A held claim on `entry`'s staging area. The marker is not a lease and
+/// does not pin the entry against collection — its body carries the same
+/// `<expires> <owner>` shape so `live()` reads it with the same
+/// conservative staleness rule, and GC removes the `writing/` tree only
+/// once the marker provably aged out.
+pub struct WriteLock {
+    file: PathBuf,
+}
+
+impl WriteLock {
+    /// Take exclusive staging ownership of `entry` for `owner`. `Ok(None)`
+    /// is a live writer already holding it — callers skip, they never
+    /// block a job on cache publication. A marker whose declared expiry or
+    /// mtime bound has passed is removed and the acquisition retried.
+    pub fn acquire(entry: &Path, owner: &str) -> Result<Option<WriteLock>, LeaseError> {
+        if !valid_owner(owner) {
+            return Err(LeaseError::BadOwner);
+        }
+        let dir = entry.join(WRITING_NAME);
+        let file = dir.join(WRITE_LOCK_NAME);
+        // Three turns: the first can race the directory's absence or a
+        // stale marker, the second reaps either, the third takes it.
+        for _ in 0..3 {
+            match fs::File::create_new(&file) {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let expires = unix_ms() + MAX_TTL.as_millis() as i64;
+                    f.write_all(format!("{expires} {owner}").as_bytes())?;
+                    f.sync_data()?;
+                    return Ok(Some(WriteLock { file }));
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    if live(&file, unix_ms()) {
+                        return Ok(None);
+                    }
+                    // A dead writer's marker: reap and retry.
+                    let _ = fs::remove_file(&file);
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    // `writing/` is not there yet (or was removed under
+                    // us); make it and retry the marker.
+                    fs::create_dir_all(&dir)?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(LeaseError::Io(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "write lock did not settle",
+        )))
+    }
+
+    /// The marker path, for diagnostics.
+    pub fn path(&self) -> &Path {
+        &self.file
+    }
+}
+
+impl Drop for WriteLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.file);
+        // The staging dir itself goes only while empty: a next writer's
+        // fresh marker or staging inside it fails this remove, so the
+        // release can never pull `writing/` out from under a live writer.
+        if let Some(dir) = self.file.parent() {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+}
+
+/// Whether `entry`'s staging area is held by a live writer at `now_ms`.
+/// The marker reads live while `min(declared expiry, mtime + MAX_TTL)` is
+/// in the future — the same conservative reading a lease marker gets, so
+/// a torn lock file pins until it is provably old.
+pub fn writing_lock_live(entry: &Path, now_ms: i64) -> bool {
+    live(&entry.join(WRITING_NAME).join(WRITE_LOCK_NAME), now_ms)
+}
+
 /// What a sweep found of `entry`'s leases.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Leases {
@@ -201,7 +285,7 @@ fn unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn rand_u32() -> u32 {
+pub(crate) fn rand_u32() -> u32 {
     // Cheap uniqueness, not entropy: pid xor a per-call counter.
     use std::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(0x9e3779b9);

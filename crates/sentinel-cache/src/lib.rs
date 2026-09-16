@@ -29,3 +29,7 @@ pub mod scope;
 pub use manifest::{Boundary, Compat, FileEntry, FilesBlob, Manifest, Request};
 pub use outcome::{Hit, Miss, Outcome};
 pub use scope::{Os, Platform, Scope};
+
+/// The cache root inside the worker's data directory — every scope path
+/// (`Scope::dir`) hangs under `<data_dir>/cache`.
+pub const CACHE_DIR: &str = "cache";

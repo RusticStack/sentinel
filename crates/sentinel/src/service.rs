@@ -890,6 +890,12 @@ mod worker_role {
                     sentinel_worker::executor::Notice::MirrorsUnavailable(why) => {
                         tracing::warn!(event = "mirrors_unavailable", reason = %why, "checkouts will fetch directly for this process");
                     }
+                    sentinel_worker::executor::Notice::CachePublished { attempt, note } => {
+                        tracing::info!(event = "cache_published", attempt = %attempt, cache = %note.name, outcome = ?note.outcome);
+                    }
+                    sentinel_worker::executor::Notice::CacheSwept(stats) => {
+                        tracing::info!(event = "cache_swept", stats = ?stats);
+                    }
                 })
             })
         };
