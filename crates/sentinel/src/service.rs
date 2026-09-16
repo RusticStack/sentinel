@@ -69,6 +69,9 @@ struct FileConfig {
     enrollment_file: Option<PathBuf>,
     cpu_millis: Option<u64>,
     memory_bytes: Option<u64>,
+    // Worker: keep per-repository object mirrors under the data directory
+    // (default on; `false` checks out every attempt directly).
+    git_mirrors: Option<bool>,
     // Server: disk admission watermarks, quotas and retention (D06).
     storage: Option<StorageFile>,
 }
@@ -148,6 +151,7 @@ struct WorkerLink {
     enrollment_file: Option<PathBuf>,
     cpu_millis: Option<u64>,
     memory_bytes: Option<u64>,
+    git_mirrors: bool,
 }
 
 enum Role {
@@ -246,9 +250,10 @@ impl Config {
                 || file.enrollment_file.is_some()
                 || file.cpu_millis.is_some()
                 || file.memory_bytes.is_some()
+                || file.git_mirrors.is_some()
             {
                 return Err(Error::config(
-                    "controller, controller_fingerprint, worker_name, enrollment_file, cpu_millis and memory_bytes apply to the worker role only",
+                    "controller, controller_fingerprint, worker_name, enrollment_file, cpu_millis, memory_bytes and git_mirrors apply to the worker role only",
                 ));
             }
             let listen = file
@@ -280,6 +285,7 @@ impl Config {
                         || file.enrollment_file.is_some()
                         || file.cpu_millis.is_some()
                         || file.memory_bytes.is_some()
+                        || file.git_mirrors.is_some()
                     {
                         return Err(Error::config(
                             "worker link settings need controller and controller_fingerprint",
@@ -321,6 +327,7 @@ impl Config {
                         enrollment_file: file.enrollment_file,
                         cpu_millis: file.cpu_millis,
                         memory_bytes: file.memory_bytes,
+                        git_mirrors: file.git_mirrors.unwrap_or(true),
                     })
                 }
                 _ => {
@@ -849,7 +856,11 @@ mod worker_role {
     }
 
     /// The real executor when rootless Podman answers, else the decliner.
-    fn executor(data_dir: &Path, worker: sentinel_core::WorkerId) -> Box<dyn LinkExecutor> {
+    fn executor(
+        data_dir: &Path,
+        worker: sentinel_core::WorkerId,
+        git_mirrors: bool,
+    ) -> Box<dyn LinkExecutor> {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
         let notify = move |notice: sentinel_worker::executor::Notice| {
@@ -876,10 +887,18 @@ mod worker_role {
                     sentinel_worker::executor::Notice::LeaseLost(attempts) => {
                         tracing::warn!(event = "lease_lost", attempts = ?attempts, "no renewal before the deadline; attempts ended without a report");
                     }
+                    sentinel_worker::executor::Notice::MirrorsUnavailable(why) => {
+                        tracing::warn!(event = "mirrors_unavailable", reason = %why, "checkouts will fetch directly for this process");
+                    }
                 })
             })
         };
-        match sentinel_worker::executor::Executor::start(data_dir.to_path_buf(), worker, notify) {
+        match sentinel_worker::executor::Executor::start(
+            data_dir.to_path_buf(),
+            worker,
+            notify,
+            git_mirrors,
+        ) {
             Ok(executor) => {
                 let runtime = executor.runtime();
                 let recovered = executor.recovered();
@@ -990,7 +1009,7 @@ mod worker_role {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
         let enrollment_file = link.enrollment_file.clone();
-        let executor = executor(&config.data_dir, worker);
+        let executor = executor(&config.data_dir, worker, link.git_mirrors);
         let thread = std::thread::Builder::new()
             .name("sentinel-worker-link".into())
             .spawn(move || {

@@ -48,6 +48,7 @@ worker_name = "builder-1"          # 1-128 bytes, default "worker"
 enrollment_file = "/etc/sentinel/enrollment"  # absolute; read on start, removed once spent
 cpu_millis = 8000                  # override measured capacity (default: every core)
 memory_bytes = 34359738368         # override measured capacity (default: total less a host reserve)
+git_mirrors = true                 # keep per-repository object mirrors under <data_dir>/mirrors (default on; [mirrors](mirrors.md))
 
 # server only: disk admission, quotas and retention ([storage](storage.md#disk-admission-quotas-and-reclamation-d06))
 [storage]

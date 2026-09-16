@@ -21,6 +21,8 @@ pub struct Credential {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Checkout {
     pub sha: String,
+    pub fetch_ns: u64,
+    pub materialize_ns: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -156,9 +156,14 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
     let notices = Arc::new(Mutex::new(Vec::<String>::new()));
     let log = Arc::clone(&notices);
     let worker_id = WorkerId::new();
-    let executor = Executor::start(worker_dir.clone(), worker_id, move |notice: Notice| {
-        log.lock().unwrap().push(format!("{notice:?}"));
-    })
+    let executor = Executor::start(
+        worker_dir.clone(),
+        worker_id,
+        move |notice: Notice| {
+            log.lock().unwrap().push(format!("{notice:?}"));
+        },
+        true,
+    )
     .unwrap();
     // The value a secret binding would inject (S05); registered before any
     // attempt starts, it never reaches a log.
@@ -623,9 +628,14 @@ jobs:
     // single offer, then hands the leftover to the controller once connected.
     let notices2 = Arc::new(Mutex::new(Vec::<String>::new()));
     let log2 = Arc::clone(&notices2);
-    let executor2 = Executor::start(worker_dir.clone(), worker_id, move |notice: Notice| {
-        log2.lock().unwrap().push(format!("{notice:?}"));
-    })
+    let executor2 = Executor::start(
+        worker_dir.clone(),
+        worker_id,
+        move |notice: Notice| {
+            log2.lock().unwrap().push(format!("{notice:?}"));
+        },
+        true,
+    )
     .unwrap();
     let recovered = executor2.recovered();
     assert_eq!(recovered.leftovers, vec![(attempt, fence)]);

@@ -24,6 +24,9 @@
 mod unix;
 
 #[cfg(unix)]
+pub mod mirror;
+
+#[cfg(unix)]
 pub use unix::{
     CHECKOUT_TIMEOUT, Checkout, Credential, FetchedFile, MAX_PATH_BYTES, Output, checkout,
     checkout_authorized, file_at, file_at_merge, ls_remote, run,
@@ -68,6 +71,11 @@ pub enum Error {
     /// Git refused or the repository/path cannot be used; the message carries
     /// a bounded, credential-free excerpt.
     Preparation(String),
+    /// The local object mirror could not serve: a lock wait ran out, the
+    /// mirror store is damaged, a lease or copy failed. This is never about
+    /// the requested revision — callers may fall back to a direct checkout
+    /// and record the reason.
+    Mirror(String),
     /// The requested path does not exist at the requested revision.
     Missing,
     /// The tested-merge ref is absent or names a merge for another head; the
@@ -86,6 +94,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Preparation(what) => write!(f, "git: {what}"),
+            Self::Mirror(what) => write!(f, "git mirror: {what}"),
             Self::Missing => f.write_str("git: path is not present at that revision"),
             Self::Merge => f.write_str("git: the tested merge is absent or names another head"),
             Self::Timeout(what) => write!(f, "{what} exceeded its deadline"),

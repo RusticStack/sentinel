@@ -55,6 +55,9 @@ pub struct Job {
     pub digest: String,
     pub spec: RunSpec,
     pub context: JobContext,
+    /// The worker's shared object mirrors, when the process could open them;
+    /// `None` runs every checkout direct.
+    pub mirrors: Option<checkout::Mirrors>,
     /// A pause between checkout and image pull, so a cancel that arrives
     /// during preparation can be exercised deterministically. Zero in
     /// production.
@@ -217,16 +220,22 @@ fn prepare(
     let workspace = Workspace::create(root, job.attempt)?;
     let outcome = (|| {
         let started = Instant::now();
-        match &job.context.source {
-            Some(access) => checkout::checkout_authorized(
-                workspace.path(),
-                &job.spec.source,
-                access,
-                CHECKOUT_TIMEOUT,
-            )?,
-            None => checkout::checkout(workspace.path(), &job.spec.source, None, CHECKOUT_TIMEOUT)?,
-        };
+        let outcome = checkout::checkout_mirrored(
+            workspace.path(),
+            job.mirrors.as_ref(),
+            &job.context.repo,
+            &job.spec.source,
+            job.context.source.as_ref(),
+            &job.attempt.to_string(),
+            CHECKOUT_TIMEOUT,
+        )?;
         summary.checkout_ns = ns(started);
+        summary.checkout_fetch_ns = Some(outcome.checkout.fetch_ns);
+        summary.checkout_materialize_ns = Some(outcome.checkout.materialize_ns);
+        summary.checkout_route = Some(outcome.route);
+        if let Some(why) = outcome.fallback_reason {
+            summary.detail = why;
+        }
         if !job.prepare_hold.is_zero() {
             let until = Instant::now() + job.prepare_hold;
             while Instant::now() < until && !cancel.load(Ordering::Acquire) {

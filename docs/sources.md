@@ -78,7 +78,11 @@ remote, allowed ref) before starting Git, then:
   redirects are off, and the credential helper list is empty.
 
 Everything the checkout installs lives in a sibling `*-askpass` directory
-created `0700` and removed on every path, including failure.
+created `0700` and removed on every path, including failure. On the worker
+the fetch itself usually runs against the repository's [local
+mirror](mirrors.md) — the same access object authorizes it, fetched under
+the mirror's serialized writer lock, with only the binding's allowed refs
+ever becoming mirror refs.
 
 ## GitHub App association
 
