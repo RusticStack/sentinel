@@ -1205,6 +1205,7 @@ name = "sentinel-cache"
 version = "0.1.0-dev"
 dependencies = [
  "blake3",
+ "libc",
  "postcard",
  "sentinel-core",
  "sentinel-pipeline",

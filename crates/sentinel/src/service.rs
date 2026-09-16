@@ -984,6 +984,12 @@ mod worker_role {
             None => None,
         };
         let capacity = capacity(link);
+        // The reflink bit is the cache root's own probe answer, so the
+        // advertised capability and the backend restore uses never disagree.
+        let mut capabilities = sentinel_protocol::negotiate::Capabilities::REQUIRED;
+        if sentinel_worker::cache_reflink(&config.data_dir) {
+            capabilities = capabilities.union(sentinel_protocol::negotiate::Capabilities::REFLINK);
+        }
         let settings = sentinel_link::worker::Config {
             controller: link.controller,
             server: sentinel_auth::secret::Digest(link.fingerprint),
@@ -992,7 +998,7 @@ mod worker_role {
             hello: sentinel_protocol::negotiate::Hello {
                 protocol_min: sentinel_protocol::negotiate::ProtocolVersion(1),
                 protocol_max: sentinel_protocol::negotiate::SUPPORTED_MAX,
-                capabilities: sentinel_protocol::negotiate::Capabilities::REQUIRED,
+                capabilities,
                 arch: if cfg!(target_arch = "aarch64") {
                     sentinel_protocol::negotiate::Arch::Aarch64
                 } else {

@@ -69,6 +69,7 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
             pids: 32,
         },
         ws.path(),
+        &[],
     )
     .unwrap();
     assert_eq!(container.name(), format!("sentinel-{attempt}"));

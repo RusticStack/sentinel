@@ -1,6 +1,6 @@
-# Worker-local cache: classes, scopes and manifests (K01)
+# Worker-local cache: classes, scopes, manifests and restore (K01+K02)
 
-Sentinel keeps its caches on the worker that runs the job: no network fetch on a warm hit, no shared mutable volume between tenants. This document is the metadata contract — which cache classes exist, what boundary a generation is sealed under, and the vocabulary a lookup answers with. Immutable generations, writable clones, publication leases, garbage collection and remote hydration are later tasks (K02+); everything here is what they share: paths, formats and reasons.
+Sentinel keeps its caches on the worker that runs the job: no network fetch on a warm hit, no shared mutable volume between tenants. This document is the metadata contract — which cache classes exist, what boundary a generation is sealed under, how a job receives its private writable view, and the vocabulary a lookup answers with. Publication, garbage collection and remote hydration are later tasks (K03+); everything here is what they share: paths, formats and reasons.
 
 ## Why three classes
 
@@ -64,8 +64,32 @@ A lookup answers an `Outcome`, never an error: `Hit` (the verified manifest plus
 | `wrong_key` | the rendered key differs (or, for `downloads`/`compiler`, the stem does) |
 | `incompatible` | the class's own inputs differ: lockfile digest, installer, flags, ABI tag or tool |
 | `invalid` | decoded but semantically wrong: bad IDs, invalid name, a `compat` payload from another class |
+| `unavailable` | a transient filesystem or lease failure on the restore path — the bytes may be fine and the miss is worth retrying |
 
 A cache must degrade a build to a rebuild, never break it: every failure mode above is a reasoned miss on the lookup path, and nothing in the read path panics or guesses.
+
+## Restore: private views of immutable generations (K02)
+
+A sealed generation is immutable forever — a job never writes into the store. Preparation (`attempt.rs`, after checkout and image pull, before container start) gives every declared `cache:` entry a private writable view:
+
+1. The key renders against the fresh checkout — `hash_files` reads real bytes — with a 1024-byte cap (`attach::MAX_KEY_BYTES`). A key that will not render is an explainable miss, not a failure.
+2. `entry/current` names the live generation; it is read bounded (128 bytes) and must name a `gen-<unix_ms>-<rand>`-shaped directory.
+3. `manifest::lookup` reads the manifest and applies the request's boundary — the `Miss` vocabulary above is the whole answer set.
+4. On a hit the entry is pinned with a `lease` (`Lease::acquire`, the attempt id as owner, `DEFAULT_TTL`) so GC can never take the generation mid-clone, and the `files` blob's BLAKE3 digest is verified against the manifest — that one digest is the trust anchor for the whole payload, so materialization skips per-file hashing (re-reading every byte would defeat reflinking).
+5. Each `payload/<i>` tree is materialized into the declared path's target and the `Attached` carrier — scope, key, compat, generation, outcome, targets, lease, stats — lands on `job.caches` in declaration order for publish (K03).
+
+The clone (`clone::tree`) is capability-detected once per cache root: **`FICLONE` reflink per file** where the filesystem answers (cost per file, not per byte), and a **bounded 256 KiB byte copy** everywhere else. A capable filesystem can still refuse an individual file — that file falls back to copying while the rest reflink. Hardlinks are never used: a shared inode would let one job's write corrupt the generation for every other. Symlinks are recreated verbatim and never followed — a link inside a generation is data, not a path — and entries that are neither file, directory nor symlink are skipped and counted. Whatever the backend, a job's writes can never reach the sealed generation.
+
+The target mapping is the contract a job sees:
+
+- A **relative** declared path materializes inside the workspace and reaches the container through the existing `/workspace` mount.
+- An **absolute** declared path gets a private host directory under `.sentinel-cache/<name>/<index>` inside the workspace plus a bind mount to the declared container path — the job's writes stay private without the workspace mount ever serving outside its tree.
+- On **any miss** the declared paths still exist as empty writable directories: a job always sees writable cache paths.
+- Path components are re-validated against the schema's rule (`..`, absolute-inside-workspace and the `.sentinel-cache` name as a relative declaration are refused `invalid`), existing components are never resolved through symlinks, and a symlink sitting exactly at a target is replaced with the real directory it hid.
+
+Restore is total from the attempt's perspective: nothing on the cache path is fatal. The stats the carrier records — `lookup_ns`, `lock_wait_ns`, `clone_ns`, files, bytes, copied bytes, the backend flag — feed the availability summaries (K08); a phase that never ran stays absent, never zero.
+
+The worker advertises `Capabilities::REFLINK` in its Hello exactly when `clone::detect(<data_dir>/cache)` reports `Backend::Reflink` — the same probe restore uses, so the advertised bit and the backend in use can never disagree.
 
 ## Publication (K03)
 

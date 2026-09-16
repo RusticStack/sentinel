@@ -28,6 +28,22 @@ pub const UNKNOWN_TENANT: TenantId = match TenantId::from_bytes([
     Err(_) => panic!("constant is a valid v4 uuid"),
 };
 
+/// The worker's cache store is `<data_dir>/cache` — restore reads it,
+/// publish (K03) writes it, and the reflink probe runs against it so the
+/// `Capabilities::REFLINK` bit and the clone backend agree.
+pub const ROOT_DIR: &str = "cache";
+
+/// The rendered key's byte cap — the same bound `manifest` enforces on
+/// decode (`MAX_KEY_BYTES` there), so a key that cannot serve is refused
+/// at render rather than at the manifest boundary.
+pub const MAX_KEY_BYTES: usize = 1024;
+
+/// Absolute declared paths are materialized under this directory inside
+/// the workspace and bound into the container. A relative declaration
+/// that names it is refused: the private area is the cache machinery's,
+/// not a job's.
+pub const PRIVATE_DIR: &str = ".sentinel-cache";
+
 /// The `Compat` a bare `cache:` declaration carries (docs/cache.md).
 /// Recipes (K07) pin real tool/installer values; for a bare declaration
 /// the name is the tool identity, the rendered key is the exact

@@ -73,3 +73,14 @@ impl From<std::io::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Whether the worker's cache root — `<data_dir>/cache` — can serve
+/// reflink clones: the `Capabilities::REFLINK` bit a `worker` role's Hello
+/// advertises. The answer is `clone::detect`'s, probed once per root and
+/// remembered, so the capability and the backend restore actually uses can
+/// never disagree. An unanswerable probe is `false` — the copy fallback.
+#[cfg(target_os = "linux")]
+pub fn cache_reflink(data_dir: &std::path::Path) -> bool {
+    sentinel_cache::clone::detect(&data_dir.join(sentinel_cache::attach::ROOT_DIR))
+        == sentinel_cache::clone::Backend::Reflink
+}

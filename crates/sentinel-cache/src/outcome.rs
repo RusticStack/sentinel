@@ -42,6 +42,10 @@ pub enum Miss {
     /// The manifest decoded but is semantically wrong: bad IDs, an
     /// invalid name, a `compat` payload from another class.
     Invalid,
+    /// The entry could not be read this time: a transient filesystem or
+    /// lease failure on the restore path (K02). Distinct from `Corrupt` —
+    /// the bytes may be fine, the store was not — and worth retrying.
+    Unavailable,
 }
 
 impl Miss {
@@ -62,6 +66,7 @@ impl Miss {
             Self::WrongKey => "wrong_key",
             Self::Incompatible => "incompatible",
             Self::Invalid => "invalid",
+            Self::Unavailable => "unavailable",
         }
     }
 }
@@ -119,6 +124,7 @@ mod tests {
             (Miss::WrongKey, "wrong_key"),
             (Miss::Incompatible, "incompatible"),
             (Miss::Invalid, "invalid"),
+            (Miss::Unavailable, "unavailable"),
         ];
         for (miss, name) in all {
             assert_eq!(miss.as_str(), name);
