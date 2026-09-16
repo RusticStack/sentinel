@@ -154,7 +154,7 @@ pub struct Request<'a> {
 /// volatile hash tail, and `downloads`/`compiler` namespaces serve by
 /// stem. A key with no `-` is its own stem, so the rule degrades to an
 /// exact match.
-fn key_stem(key: &str) -> &str {
+pub(crate) fn key_stem(key: &str) -> &str {
     key.rsplit_once('-').map_or(key, |(stem, _)| stem)
 }
 

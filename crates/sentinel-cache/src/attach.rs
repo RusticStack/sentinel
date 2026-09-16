@@ -1,10 +1,66 @@
 //! The carrier between restore (K02) and publish (K03): what one declared
 //! `cache:` entry became for one attempt. Preparation fills one per
 //! declaration; finalization reads them to publish the job's writes.
+//! Both directions share the derivations here — a write must record
+//! exactly what reads ask for, or the two never meet.
 
 use std::path::PathBuf;
 
-use crate::{Compat, Outcome, Scope};
+use sentinel_core::TenantId;
+use sentinel_pipeline::schema::Cache;
+use sentinel_protocol::cache::Class;
+
+use crate::{
+    lease::Lease,
+    manifest::{Compat, key_stem},
+    outcome::Outcome,
+    scope::{Platform, Scope},
+};
+
+/// The tenant a scope records when the job context carries none — a
+/// protocol <6 peer cannot name one. A fixed, valid v4 UUID: never
+/// random, so two tenant-less jobs still share a scope path, and a
+/// manifest recorded here can never collide with a real tenant's claim.
+pub const UNKNOWN_TENANT: TenantId = match TenantId::from_bytes([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+]) {
+    Ok(tenant) => tenant,
+    Err(_) => panic!("constant is a valid v4 uuid"),
+};
+
+/// The `Compat` a bare `cache:` declaration carries (docs/cache.md).
+/// Recipes (K07) pin real tool/installer values; for a bare declaration
+/// the name is the tool identity, the rendered key is the exact
+/// materialization input and the compiler namespaces modes internally —
+/// the pins record the shape without information a caller could vary.
+/// Restore and publish both derive through this function.
+pub fn declared_compat(decl: &Cache, key: &str, platform: Platform) -> Compat {
+    match decl.class {
+        Class::Downloads => Compat::Downloads {
+            tool: decl.name.clone(),
+        },
+        Class::Dependencies => Compat::Dependencies {
+            lock: *blake3::hash(key.as_bytes()).as_bytes(),
+            installer: "pipeline".to_owned(),
+            flags: String::new(),
+            abi: platform.component(),
+        },
+        Class::Compiler => Compat::Compiler {
+            flags: String::new(),
+        },
+    }
+}
+
+/// The key an entry directory answers to: the stem for `downloads` and
+/// `compiler` (the classes that serve across compatible key tails), the
+/// full rendered key for `dependencies` (exact match only). Restore and
+/// publish must derive the same entry or they never meet.
+pub fn entry_key(class: Class, key: &str) -> &str {
+    match class {
+        Class::Downloads | Class::Compiler => key_stem(key),
+        Class::Dependencies => key,
+    }
+}
 
 /// One declared cache, resolved for a job.
 pub struct Attached {
@@ -17,14 +73,60 @@ pub struct Attached {
     /// checkout, so it is evaluated only after it lands).
     pub key: String,
     /// The class's compatibility inputs for this request — what a
-    /// published manifest will record.
+    /// published manifest records.
     pub compat: Compat,
     /// The generation the private view was cloned from; `None` on a miss.
+    /// Publish reads it for incremental reuse.
     pub generation: Option<String>,
     /// What the lookup answered — hit, or the explainable miss reason.
     pub outcome: Outcome,
-    /// The job-private writable directory the declared paths resolve to.
-    /// On a hit this is the generation's clone; on a miss a fresh empty
-    /// directory, so a job always sees a writable cache path.
+    /// One resolved declared path per `cache.paths` entry, in
+    /// declaration order: `targets[i]` materializes the generation's
+    /// `payload/<i>/` tree and publish reads it back.
+    pub targets: Vec<Target>,
+    /// The pin on the entry for the attempt's run: keeps the source
+    /// generation (and this writer's staging) away from GC, and lets an
+    /// incremental publish still read the generation it cloned from.
+    /// Released with the `Attached`.
+    pub lease: Option<Lease>,
+    /// Restore-path measurements for the availability summaries (K08);
+    /// `None` where a phase never ran — a miss never clones.
+    pub stats: Stats,
+}
+
+/// One declared path resolved for the job.
+pub struct Target {
+    /// The declared path exactly as written.
+    pub declared: String,
+    /// The host directory holding the job's writable view. Relative
+    /// declared paths materialize inside the workspace (the existing
+    /// mount carries them); absolute ones get a private directory plus
+    /// a bind mount.
     pub dir: PathBuf,
+    /// The path the container sees for `dir`: `/workspace/...` for
+    /// workspace-relative declarations, the declared absolute path for
+    /// mounts.
+    pub container: String,
+    /// True when `dir` reaches the container through a bind mount —
+    /// absolute declared paths only.
+    pub mount: bool,
+}
+
+/// Restore-path measurements. Durations are `Option` per the reporting
+/// convention: a phase that never ran is absent, never zero.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stats {
+    /// Manifest read plus compatibility check.
+    pub lookup_ns: Option<u64>,
+    /// Lease-acquisition wait.
+    pub lock_wait_ns: Option<u64>,
+    /// Payload materialization (clone or copy).
+    pub clone_ns: Option<u64>,
+    /// Files and payload bytes materialized.
+    pub files: u64,
+    pub bytes: u64,
+    /// Bytes actually copied — reflinked files don't count.
+    pub copied_bytes: u64,
+    /// The backend the clone used.
+    pub reflink: bool,
 }
