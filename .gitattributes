@@ -1,0 +1,3 @@
+# Text files check out LF on every platform: hook scripts, fixtures and
+# tests compare against LF bytes, and the Linux roles run the same tree.
+* text=auto eol=lf
