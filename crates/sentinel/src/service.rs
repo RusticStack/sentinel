@@ -876,6 +876,12 @@ mod worker_role {
                     sentinel_worker::executor::Notice::LeaseLost(attempts) => {
                         tracing::warn!(event = "lease_lost", attempts = ?attempts, "no renewal before the deadline; attempts ended without a report");
                     }
+                    sentinel_worker::executor::Notice::CachePublished { attempt, note } => {
+                        tracing::info!(event = "cache_published", attempt = %attempt, cache = %note.name, outcome = ?note.outcome);
+                    }
+                    sentinel_worker::executor::Notice::CacheSwept(stats) => {
+                        tracing::info!(event = "cache_swept", stats = ?stats);
+                    }
                 })
             })
         };

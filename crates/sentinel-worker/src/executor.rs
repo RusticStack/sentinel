@@ -28,7 +28,7 @@ use sentinel_protocol::limits::MAX_LIST_ITEMS;
 use crate::{
     Result,
     artifacts::{self, REPLY_TIMEOUT},
-    attempt::{self, Cancel, Job, Report, Verdict},
+    attempt::{self, CacheNote, Cancel, Job, Report, Verdict},
     images::Images,
     logpipe::LogPipe,
     podman,
@@ -57,6 +57,15 @@ pub enum Notice {
         attempt: AttemptId,
         log_delivered: bool,
     },
+    /// A declared cache's publication settled during finalization —
+    /// sealed, skipped or failed; the attempt's verdict never depends on it.
+    CachePublished {
+        attempt: AttemptId,
+        note: CacheNote,
+    },
+    /// A bounded reclamation pass over the cache root removed something —
+    /// expired leases, dead staging or generations past retention/budget.
+    CacheSwept(sentinel_cache::gc::GcStats),
 }
 
 /// TERM-to-KILL grace for a cancel when the process sets none.
@@ -180,6 +189,9 @@ pub struct Inner {
     /// the record of what the local store holds.
     images: Images,
     state: Mutex<State>,
+    /// One cache reclamation pass at a time; a second caller skips rather
+    /// than waits, because the running pass already covers its work.
+    gc_lock: Mutex<()>,
     notify: Box<dyn Fn(Notice) + Send + Sync>,
     recovered: Recovered,
 }
@@ -217,8 +229,21 @@ impl Executor {
                 artifact_waits: HashMap::new(),
             }),
             notify: Box::new(notify),
+            gc_lock: Mutex::new(()),
             recovered,
         }));
+        // One bounded reclamation pass at start: what a dead process left —
+        // expired leases, a torn staging dir, generations a crashed publish
+        // abandoned — collects here rather than under a running job. Off
+        // this thread, so a large store cannot hold executor start.
+        let watched = Arc::downgrade(&executor.0);
+        let _ = thread::Builder::new()
+            .name("sentinel-cache-gc".into())
+            .spawn(move || {
+                if let Some(inner) = watched.upgrade() {
+                    inner.sweep_caches();
+                }
+            });
         let watched = Arc::downgrade(&executor.0);
         thread::Builder::new()
             .name("sentinel-lease-watchdog".into())
@@ -326,6 +351,9 @@ impl Executor {
                     recovery::unmark(&executor.root, job.attempt);
                 }
                 (executor.notify)(Notice::Finished(job.attempt, verdict));
+                // Finalization is where the store grows: one bounded pass
+                // now keeps publication's remains from accumulating.
+                executor.sweep_caches();
             });
         if spawned.is_err() {
             self.state().live.remove(&offer.attempt);
@@ -409,6 +437,25 @@ impl Inner {
                 attempt: leftover.attempt,
                 log_delivered: delivered,
             });
+        }
+    }
+
+    /// One bounded reclamation pass over the cache root — skipped while
+    /// another runs, because the running pass already covers its work.
+    /// A pass that touched nothing stays quiet.
+    fn sweep_caches(&self) {
+        let _guard = match self.gc_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        let stats = sentinel_cache::gc::sweep(
+            &self.root.join(sentinel_cache::CACHE_DIR),
+            sentinel_cache::gc::DEFAULT_BUDGET_BYTES,
+            sentinel_cache::gc::DEFAULT_PASS_WORK,
+        );
+        if stats.did_work() {
+            (self.notify)(Notice::CacheSwept(stats));
         }
     }
 
@@ -505,6 +552,11 @@ impl Report for Inner {
     }
     fn finish(&self, attempt: AttemptId, fence: Fence, event: Event, summary: Vec<u8>) {
         self.send(attempt, fence, event, Some(summary));
+    }
+    /// Cache notes are process diagnostics, not wire traffic: the
+    /// controller's summary format is not theirs to ride.
+    fn cache_note(&self, attempt: AttemptId, note: CacheNote) {
+        (self.notify)(Notice::CachePublished { attempt, note });
     }
 }
 
