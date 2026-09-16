@@ -31,6 +31,11 @@ pub const MAX_PATH_BYTES: usize = 1024;
 const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
 const POLL: Duration = Duration::from_millis(20);
 
+/// Monotonic nanoseconds since `started`, saturated at `u64::MAX`.
+pub(crate) fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
 /// What a helper produced. `code` is `None` when it died from a signal.
 #[derive(Debug)]
 pub struct Output {
@@ -66,10 +71,16 @@ pub struct Credential {
     pub secret: String,
 }
 
-/// What was checked out: the verified revision.
+/// What was checked out: the verified revision, with the fetch and the
+/// worktree materialization measured separately (monotonic nanoseconds).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Checkout {
     pub sha: String,
+    /// Getting the objects: the remote fetch, or the mirror update.
+    pub fetch_ns: u64,
+    /// Turning objects into the worktree: init, object copy, checkout and
+    /// the final `HEAD` verification.
+    pub materialize_ns: u64,
 }
 
 /// One file read from one revision; `commit` is the peeled commit the file
@@ -80,7 +91,7 @@ pub struct FetchedFile {
     pub bytes: Vec<u8>,
 }
 
-fn git(dir: &Path) -> Command {
+pub(crate) fn git(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -205,7 +216,12 @@ fn run_capped(
     })
 }
 
-fn step(cmd: Command, deadline: Instant, what: &'static str, secrets: &[String]) -> Result<Output> {
+pub(crate) fn step(
+    cmd: Command,
+    deadline: Instant,
+    what: &'static str,
+    secrets: &[String],
+) -> Result<Output> {
     let output = run(cmd, deadline, what)?;
     if output.success() {
         Ok(output)
@@ -220,7 +236,7 @@ fn step(cmd: Command, deadline: Instant, what: &'static str, secrets: &[String])
     }
 }
 
-fn trim(bytes: &[u8]) -> String {
+pub(crate) fn trim(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_owned()
 }
 
@@ -249,7 +265,7 @@ pub fn valid_path(path: &str) -> bool {
         && !path.bytes().any(|b| b <= 32 || b == 127)
 }
 
-fn init(work: &Path, deadline: Instant) -> Result<()> {
+pub(crate) fn init(work: &Path, deadline: Instant) -> Result<()> {
     let mut init = git(work);
     init.args(["init", "-q", "--initial-branch=main", "."]);
     step(init, deadline, "git init", &[])?;
@@ -303,7 +319,7 @@ fn fetch(
 
 /// A full ref name under `refs/` — the merge ref a forge computes for a pull
 /// request. Anything else never reaches Git.
-fn valid_ref_name(name: &str) -> bool {
+pub(crate) fn valid_ref_name(name: &str) -> bool {
     name.starts_with("refs/")
         && name.len() <= 256
         && name
@@ -403,8 +419,15 @@ fn checkout_inner(
     if source.repo.starts_with('-') {
         return Err(Error::Preparation("repository looks like an option".into()));
     }
+    // Materialization is everything except the fetch itself: the init and
+    // credential install that precede it, and the detach plus verification
+    // that follow. The segments are timed separately, never subtracted.
+    let pre_started = Instant::now();
     init(workspace, deadline)?;
     let private = access.map(|a| Private::install(workspace, a)).transpose()?;
+    let pre_ns = elapsed_ns(pre_started);
+
+    let fetch_started = Instant::now();
     fetch(
         workspace,
         &source.repo,
@@ -414,7 +437,9 @@ fn checkout_inner(
         deadline,
     )?;
     drop(private);
+    let fetch_ns = elapsed_ns(fetch_started);
 
+    let post_started = Instant::now();
     let mut detach = git(workspace);
     detach.args(["checkout", "-q", "--detach", "FETCH_HEAD"]);
     step(detach, deadline, "git checkout", &[])?;
@@ -428,7 +453,11 @@ fn checkout_inner(
             "checkout produced {sha}, not the pinned revision"
         )));
     }
-    Ok(Checkout { sha })
+    Ok(Checkout {
+        sha,
+        fetch_ns,
+        materialize_ns: pre_ns.saturating_add(elapsed_ns(post_started)),
+    })
 }
 
 /// Fetch `sha` from `remote` into `work` (which must be empty), peel it to its
@@ -669,7 +698,7 @@ fn advertised(name: &str) -> bool {
 
 /// Fetch-only files are siblings of the work directory, never mounted in a
 /// job. Mode is set at creation, including on every partial-failure path.
-struct Private {
+pub(crate) struct Private {
     dir: PathBuf,
     ssh: bool,
     ca: bool,
@@ -678,7 +707,7 @@ struct Private {
 }
 
 impl Private {
-    fn install(work: &Path, access: &Access) -> Result<Self> {
+    pub(crate) fn install(work: &Path, access: &Access) -> Result<Self> {
         let dir = work.with_extension("askpass");
         fs::DirBuilder::new().mode(0o700).create(&dir)?;
         let mut private = Self {
@@ -718,11 +747,11 @@ impl Private {
         Ok(())
     }
 
-    fn secrets(&self) -> Vec<String> {
+    pub(crate) fn secrets(&self) -> Vec<String> {
         self.secret.iter().cloned().collect()
     }
 
-    fn configure(&self, cmd: &mut Command) {
+    pub(crate) fn configure(&self, cmd: &mut Command) {
         cmd.args([
             "-c",
             "http.followRedirects=false",
@@ -766,14 +795,14 @@ impl Drop for Private {
 /// The legacy askpass helper: an owner-only script beside the workspace that
 /// answers Git's username/password prompts from its own environment and is
 /// removed as soon as the fetch has finished.
-struct Askpass {
-    path: PathBuf,
-    username: String,
-    secret: String,
+pub(crate) struct Askpass {
+    pub(crate) path: PathBuf,
+    pub(crate) username: String,
+    pub(crate) secret: String,
 }
 
 impl Askpass {
-    fn install(workspace: &Path, credential: &Credential) -> Result<Askpass> {
+    pub(crate) fn install(workspace: &Path, credential: &Credential) -> Result<Askpass> {
         let dir = workspace.with_extension("askpass");
         fs::DirBuilder::new().mode(0o700).create(&dir)?;
         let path = dir.join("askpass.sh");

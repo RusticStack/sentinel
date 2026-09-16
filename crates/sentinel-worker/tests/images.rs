@@ -151,6 +151,7 @@ fn the_pull_overlaps_the_checkout() {
         },
         images: images.clone(),
         caches: Vec::new(),
+        mirrors: None,
         prepare_hold: Duration::ZERO,
     };
     let rec = Rec {

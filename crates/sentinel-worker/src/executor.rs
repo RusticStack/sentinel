@@ -57,6 +57,9 @@ pub enum Notice {
         attempt: AttemptId,
         log_delivered: bool,
     },
+    /// The mirrors root could not be opened at start; every checkout runs
+    /// direct for the life of this process. The reason is bounded.
+    MirrorsUnavailable(String),
 }
 
 /// TERM-to-KILL grace for a cancel when the process sets none.
@@ -179,6 +182,10 @@ pub struct Inner {
     /// One in-flight pull per image reference across every attempt, and
     /// the record of what the local store holds.
     images: Images,
+    /// The worker-local object mirrors, opened once here so the reflink
+    /// probe and the root are settled for the process's life. `None` —
+    /// configured off, or open failed — runs every checkout direct.
+    mirrors: Option<crate::checkout::Mirrors>,
     state: Mutex<State>,
     notify: Box<dyn Fn(Notice) + Send + Sync>,
     recovered: Recovered,
@@ -187,13 +194,27 @@ pub struct Inner {
 impl Executor {
     /// Probe the runtime and prepare the data directory. Refuses to exist
     /// without rootless Podman: an executor that cannot isolate is not one.
+    /// `git_mirrors` is the operator's escape hatch; when on, a mirror root
+    /// that cannot be opened is reported once and checkouts run direct.
     pub fn start(
         root: PathBuf,
         worker: sentinel_core::WorkerId,
         notify: impl Fn(Notice) + Send + Sync + 'static,
+        git_mirrors: bool,
     ) -> Result<Executor> {
         let runtime = podman::probe()?;
         std::fs::create_dir_all(root.join(crate::workspace::WORKSPACES_DIR))?;
+        let mirrors = if git_mirrors {
+            match crate::checkout::Mirrors::open(&root.join(crate::checkout::MIRRORS_DIR)) {
+                Ok(mirrors) => Some(mirrors),
+                Err(error) => {
+                    notify(Notice::MirrorsUnavailable(error.to_string()));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // Before any offer: what the previous process left is settled on
         // disk and in the runtime; what it owed the controller waits for
         // the session.
@@ -203,6 +224,7 @@ impl Executor {
             worker,
             runtime,
             images: Images::new(),
+            mirrors,
             state: Mutex::new(State {
                 reporter: None,
                 awaiting: HashMap::new(),
@@ -289,6 +311,7 @@ impl Executor {
             context,
             images: self.images.clone(),
             caches: Vec::new(),
+            mirrors: self.mirrors.clone(),
             prepare_hold: self.state().prepare_hold,
         };
         // On disk before anything runs: a crash from here on leaves a

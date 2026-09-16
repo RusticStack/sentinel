@@ -257,9 +257,14 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
     let notices = Arc::new(Mutex::new(Vec::<String>::new()));
     let log = Arc::clone(&notices);
     let worker_id = WorkerId::new();
-    let executor = Executor::start(worker_dir.clone(), worker_id, move |notice: Notice| {
-        log.lock().unwrap().push(format!("{notice:?}"));
-    })
+    let executor = Executor::start(
+        worker_dir.clone(),
+        worker_id,
+        move |notice: Notice| {
+            log.lock().unwrap().push(format!("{notice:?}"));
+        },
+        true,
+    )
     .unwrap();
     executor.set_cancel_grace(Duration::from_secs(2));
     executor.set_prepare_hold(Duration::from_secs(3));

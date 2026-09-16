@@ -8,3 +8,4 @@ log_level = "info"
 # controller_fingerprint = "0000000000000000000000000000000000000000000000000000000000000000"
 # worker_name = "builder-1"
 # enrollment_file = "/etc/sentinel/enrollment"
+# git_mirrors = true               # per-repository object mirrors under <data_dir>/mirrors (default on)

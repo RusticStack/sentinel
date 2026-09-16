@@ -10,9 +10,11 @@ Every attempt gets `<data_dir>/workspaces/<attempt>`, created empty exactly once
 
 `checkout::checkout` asks Git for the pinned SHA itself: `git init`, `git fetch --no-tags --depth 1 -- <repo> <sha>`, `git checkout --detach FETCH_HEAD`, then `git rev-parse HEAD` must equal the SHA or the checkout is a `Preparation` failure. The branch name on the run is provenance only. Every Git invocation runs with a cleared environment, `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null`, in its own process group under one shared deadline (`CHECKOUT_TIMEOUT`, 10 min); past it the whole group is killed. A repository argument that looks like an option is refused before Git sees it.
 
+By default the checkout runs through the worker's per-repository [object mirrors](mirrors.md): a serialized incremental fetch into `<data_dir>/mirrors/<rep_id>/`, the pinned SHA verified as a commit, then a private object store materialized into the workspace — reflink-copied where the filesystem allows, byte-copied otherwise — while a reader lease keeps GC from pruning mid-copy. A mirror that cannot serve (lock wait, IO, a damaged store) falls back to the direct fetch above with the reason recorded; the remote's own answer never retries, and `git_mirrors = false` disables mirrors entirely.
+
 Credentials reach Git through `GIT_ASKPASS` — an owner-only helper script that answers from its own environment — or, for SSH deploy keys, through a `GIT_SSH` wrapper that pins `ssh -F /dev/null` with `BatchMode`, `IdentitiesOnly`, `StrictHostKeyChecking` and the bound `known_hosts`. Bound source access arrives with the spec ([sources](sources.md)) and is verified before Git starts: exact remote, allowed ref, unexpired. Everything the checkout installs lives in a sibling `*-askpass` directory created `0700` and deleted on every path, including failure. The credential is never in a URL, never in `.git/config`, never in the job's environment, never in a log line; a failure excerpt is one bounded line with the credential replaced. HTTP redirects are off, the credential helper list is empty, and exactly one Git protocol is allowed. Unbound repositories keep the explicit manual mode: a remote named by the run, no credential.
 
-Submodules and LFS are not fetched. Extra checkouts and mirrors are later tasks.
+Submodules and LFS are not fetched. Extra checkouts are a later task.
 
 ## The container
 
@@ -88,7 +90,7 @@ The verdict keeps every distinction the plan asks for, and the summary records i
 
 OOM is read from the host's view of the container's cgroup (`/sys/fs/cgroup<CgroupPath>/memory.events`, path from `podman inspect`), before and after a failed step: after an OOM the pages that caused it stay charged, so a process exec'd inside to read the counter could be the next victim — the first version of this did exactly that and misreported an OOM as a signal.
 
-**Timings.** Every phase is measured with a monotonic clock in nanoseconds: checkout, image pull, container start, all steps, finalization, and each step. Absent means not measured. They travel in the `AttemptSummary` (`sentinel-protocol::summary`, format byte 1, at most 32 KiB) with the terminal `Report` and are stored once on the attempt row (migration 15; the trigger refuses a replacement). `dispatch::attempt_summary` reads it back; W08 exposes it.
+**Timings.** Every phase is measured with a monotonic clock in nanoseconds: checkout, image pull, container start, all steps, finalization, and each step. Absent means not measured. They travel in the `AttemptSummary` (`sentinel-protocol::summary`, format byte 2, at most 32 KiB) with the terminal `Report` and are stored once on the attempt row (migration 15; the trigger refuses a replacement). `checkout_ns` stays the whole checkout; `checkout_fetch_ns` and `checkout_materialize_ns` split the mirror update from the worktree materialization, and `checkout_route` says which path produced it ([mirrors](mirrors.md)). `dispatch::attempt_summary` reads it back; W08 exposes it.
 
 ## What is not here yet
 

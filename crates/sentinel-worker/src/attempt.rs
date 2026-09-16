@@ -65,6 +65,9 @@ pub struct Job {
     /// key, the outcome that produced the view and the private writable
     /// directory the container saw.
     pub caches: Vec<sentinel_cache::attach::Attached>,
+    /// The worker's shared object mirrors, when the process could open them;
+    /// `None` runs every checkout direct.
+    pub mirrors: Option<checkout::Mirrors>,
     /// A pause between starting the checkout and pulling the image, so a
     /// cancel that arrives during preparation can be exercised
     /// deterministically. Zero in production.
@@ -231,20 +234,28 @@ fn prepare(
         // checkout runs on its own thread while the pull overlaps it here,
         // joined before the container starts. Each summary field still
         // measures its own phase's wall time, so `checkout_ns` and
-        // `image_pull_ns` together can exceed the preparation's.
+        // `image_pull_ns` together can exceed the preparation's. The
+        // thread returns the mirror-aware outcome so the fetch and
+        // materialization halves land on the summary too.
         let mut co = Some(std::thread::spawn({
             let path = workspace.path().to_path_buf();
             let source = job.spec.source.clone();
             let access = job.context.source.clone();
-            move || -> Result<Option<u64>> {
+            let mirrors = job.mirrors.clone();
+            let repo = job.context.repo;
+            let lease = job.attempt.to_string();
+            move || -> Result<(checkout::Outcome, Option<u64>)> {
                 let started = Instant::now();
-                match &access {
-                    Some(access) => {
-                        checkout::checkout_authorized(&path, &source, access, CHECKOUT_TIMEOUT)?
-                    }
-                    None => checkout::checkout(&path, &source, None, CHECKOUT_TIMEOUT)?,
-                };
-                Ok(ns(started))
+                let outcome = checkout::checkout_mirrored(
+                    &path,
+                    mirrors.as_ref(),
+                    &repo,
+                    &source,
+                    access.as_ref(),
+                    &lease,
+                    CHECKOUT_TIMEOUT,
+                )?;
+                Ok((outcome, ns(started)))
             }
         }));
         if !job.prepare_hold.is_zero() {
@@ -308,7 +319,7 @@ fn prepare(
 /// checkout's own; `checkout_ns` is stamped only when the checkout
 /// completed, as a lone call was.
 fn join_checkout(
-    co: &mut Option<std::thread::JoinHandle<Result<Option<u64>>>>,
+    co: &mut Option<std::thread::JoinHandle<Result<(checkout::Outcome, Option<u64>)>>>,
     summary: &mut AttemptSummary,
 ) -> Result<()> {
     let Some(handle) = co.take() else {
@@ -317,8 +328,14 @@ fn join_checkout(
     let done = handle
         .join()
         .unwrap_or_else(|_| Err(Error::Preparation("checkout thread failed".into())));
-    summary.checkout_ns = done.as_ref().ok().copied().flatten();
-    done?;
+    let (outcome, taken) = done?;
+    summary.checkout_ns = taken;
+    summary.checkout_fetch_ns = Some(outcome.checkout.fetch_ns);
+    summary.checkout_materialize_ns = Some(outcome.checkout.materialize_ns);
+    summary.checkout_route = Some(outcome.route);
+    if let Some(why) = outcome.fallback_reason {
+        summary.detail = why;
+    }
     Ok(())
 }
 

@@ -151,6 +151,19 @@ pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover
         // The askpass helper of a checkout that was under way, if any.
         let _ = fs::remove_dir_all(path.with_extension("askpass"));
     }
+    // The same for a mirror fetch the previous process died inside: its
+    // credential helper is a `<repo>.askpass` sibling of the mirror.
+    if let Ok(entries) = fs::read_dir(root.join(sentinel_git::mirror::MIRRORS_DIR)) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".askpass"))
+            {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
     let spooled: Vec<AttemptId> = Spool::leftovers(root)?;
     let markers = leftovers(root)?;
     let mut pending = Vec::with_capacity(markers.len());
