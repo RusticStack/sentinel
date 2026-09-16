@@ -19,7 +19,6 @@ sentinel-protocol = { path = "../sentinel-protocol" }
 sentinel-store = { path = "../sentinel-store" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tiny_http = { version = "0.12", default-features = false }
 
 [dev-dependencies]
 blake3 = "1.8"

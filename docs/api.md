@@ -1,6 +1,6 @@
 # API, CLI and the first page (W08)
 
-Implemented in `crates/sentinel-api` (HTTP/1.1 on a bounded thread pool, `tiny_http`), `sentinel api …` (the CLI client in `crates/sentinel`), and one static page the server serves at `/`. `sentinel server` opens the API on `api_listen` (default `127.0.0.1:7080`) beside the worker link.
+Implemented in `crates/sentinel-api` (HTTP/1.1 on the crate's own bounded acceptor — 64 connections, 8 handler permits, deadline-bounded heads/bodies/writes), `sentinel api …` (the CLI client in `crates/sentinel`), and one static page the server serves at `/`. `sentinel server` opens the API on `api_listen` (default `127.0.0.1:7080`) beside the worker link.
 
 ## One surface
 

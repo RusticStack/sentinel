@@ -1,11 +1,8 @@
 //! The controller's HTTP API (W08): the one surface the CLI, the web page
-//! and later MCP share. Plain HTTP/1.1 on a bounded pool of handler
-//! threads; TLS is the reverse proxy's job (the session cookie is
-//! `__Host-`, which a browser accepts from `localhost` or over HTTPS
-//! only). `tiny_http` spawns one reader thread per accepted connection
-//! with no cap and no idle timeout, so the connection count is bounded by
-//! the fronting proxy — a direct-exposure deployment must put one there,
-//! which the cookie policy already requires beyond localhost.
+//! and later MCP share. Plain HTTP/1.1 on a bounded set of connection
+//! threads and handler permits; TLS is the reverse proxy's job (the
+//! session cookie is `__Host-`, which a browser accepts from `localhost`
+//! or over HTTPS only).
 //!
 //! Every route authenticates a bearer credential or a session cookie into
 //! a `Principal` and then authorizes through `sentinel-store::auth` — the
@@ -14,6 +11,7 @@
 //! `Idempotency-Key`; bodies are bounded before they are read.
 
 pub mod auth;
+mod http;
 mod routes;
 mod web;
 
@@ -21,16 +19,15 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize},
     },
-    thread,
     time::Duration,
 };
 
 use sentinel_link::controller::Handle;
 use sentinel_store::{Store, logs::LogStore, objects::Objects};
 
-/// Threads answering requests at once; the rest queue on the listener.
+/// Requests being handled at once; further connections wait on a permit.
 pub const WORKERS: usize = 8;
 /// How long a `wait=1` log poll holds before answering with nothing new.
 pub const LOG_WAIT: Duration = Duration::from_secs(25);
@@ -65,26 +62,21 @@ pub(crate) struct State {
     pub intake: Option<sentinel_intake::Waker>,
     /// Upload/download bodies currently in flight.
     pub transfers: AtomicUsize,
-    pub stop: AtomicBool,
+    /// Set by `Server::shutdown`; the `wait=1` log poll checks it so a
+    /// stop does not ride out the full poll interval.
+    pub stop: Arc<AtomicBool>,
 }
 
 pub struct Server {
     addr: SocketAddr,
-    server: Arc<tiny_http::Server>,
-    state: Arc<State>,
-    threads: Vec<thread::JoinHandle<()>>,
+    conns: http::Conns,
 }
 
 impl Server {
     pub fn start(config: Config) -> std::io::Result<Server> {
-        let server = tiny_http::Server::http(config.listen)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let addr = match server.server_addr() {
-            tiny_http::ListenAddr::IP(addr) => addr,
-            #[allow(unreachable_patterns)]
-            _ => config.listen,
-        };
-        let server = Arc::new(server);
+        let listener = std::net::TcpListener::bind(config.listen)?;
+        let addr = listener.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::new(State {
             store: config.store,
             logs: config.logs,
@@ -94,43 +86,23 @@ impl Server {
             github_webhook_secret: config.github_webhook_secret,
             intake: config.intake,
             transfers: AtomicUsize::new(0),
-            stop: AtomicBool::new(false),
+            stop: Arc::clone(&stop),
         });
-        let mut threads = Vec::with_capacity(WORKERS);
-        for index in 0..WORKERS {
-            let (server, state) = (Arc::clone(&server), Arc::clone(&state));
-            threads.push(
-                thread::Builder::new()
-                    .name(format!("sentinel-api-{index}"))
-                    .spawn(move || {
-                        while !state.stop.load(Ordering::Acquire) {
-                            match server.recv_timeout(Duration::from_millis(250)) {
-                                Ok(Some(request)) => routes::handle(&state, request),
-                                Ok(None) => {}
-                                Err(_) => break,
-                            }
-                        }
-                    })?,
-            );
-        }
-        Ok(Server {
-            addr,
-            server,
-            state,
-            threads,
-        })
+        let conns = http::listen(
+            listener,
+            Arc::new(move |request| routes::handle(&state, request)),
+            stop,
+            http::Tune::DEFAULT,
+        )?;
+        Ok(Server { addr, conns })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
 
-    /// Stop accepting and wait for the worker threads.
+    /// Stop accepting, close live connections and wait out the readers.
     pub fn shutdown(self) {
-        self.state.stop.store(true, Ordering::Release);
-        self.server.unblock();
-        for thread in self.threads {
-            let _ = thread.join();
-        }
+        self.conns.close();
     }
 }

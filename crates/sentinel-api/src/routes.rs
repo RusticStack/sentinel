@@ -5,6 +5,7 @@
 
 use std::{io::Read, io::Seek, io::SeekFrom, sync::Arc};
 
+use crate::http::{Header, Request, Response, StatusCode};
 use sentinel_auth::cookie;
 use sentinel_core::{
     ArtifactId, AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis, UploadId,
@@ -24,7 +25,6 @@ use sentinel_store::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tiny_http::{Header, Request, Response, StatusCode};
 
 use crate::{
     LOG_WAIT, MAX_UPLOAD_CHUNK, State, TRANSFERS,
@@ -80,8 +80,8 @@ fn store_error(e: StoreError) -> ApiError {
 }
 
 /// Serve one request end to end; nothing here panics on client input.
-pub(crate) fn handle(state: &State, mut request: Request) {
-    let method = request.method().as_str().to_owned();
+pub(crate) fn handle(state: &State, request: &mut Request) {
+    let method = request.method().to_owned();
     let url = request.url().to_owned();
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p.to_owned(), q.to_owned()),
@@ -93,7 +93,7 @@ pub(crate) fn handle(state: &State, mut request: Request) {
         let _ = request.respond(response);
         return;
     }
-    let outcome = route(state, &mut request, &method, &path, &query);
+    let outcome = route(state, request, &method, &path, &query);
     let reply = match outcome {
         Ok(reply) => reply,
         Err(error) => Reply::Json(error.http_status(), json!(error), Vec::new()),

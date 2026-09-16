@@ -78,15 +78,18 @@ retried lane pass, or cleanup a sweep reclaims:
 - **Filesystem**: admission watermarks close discretionary writes before
   the reserve; per-tenant quotas; sweeps are batch-bounded per pass.
 
-## Residual, recorded
+## Residual, recorded — since fixed
 
-- **`tiny_http` accepts a connection per thread with no cap and no read
-  timeout.** Handler threads are bounded; connection reader threads are
-  not — a connection flood or slow clients grow threads until the proxy in
-  front (required anyway for TLS/`__Host-` cookies beyond localhost)
-  bounds them. `Listener` is a closed enum, so no accept gate can be
-  added; a bounded HTTP acceptor is a task of its own, documented in
-  `sentinel-api`'s module docs.
+- **`tiny_http` accepted a connection per thread with no cap and no read
+  timeout.** Handler threads were bounded; connection reader threads were
+  not. **Fixed:** `sentinel-api` now serves HTTP/1.1 through its own
+  bounded layer (`src/http.rs`) — one acceptor, at most 64 connection
+  threads (`Tune::connections`), `WORKERS = 8` handler permits, a 16 KiB
+  cumulative head cap, 15 s head/idle deadline, 120 s body deadline,
+  poll-bounded reads and writes so `Server::shutdown` wakes parked I/O on
+  every OS, and `Conns::close` waits out every reader so no thread keeps
+  `State` — and the store — alive past shutdown. `tiny_http` is gone from
+  the dependency tree.
 - **Reconcile settle/finish writes that fail leave the row due** — the
   retry is the recovery, now reported as `"store"`.
 - **A reader-thread panic on a step's output** ends that stream silently
