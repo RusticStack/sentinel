@@ -361,12 +361,19 @@ impl Inner {
                             .insert(leftover.attempt, Arc::clone(&pipe));
                         let ok = attempt::Output::complete(&*pipe);
                         self.state().recovering.remove(&leftover.attempt);
+                        if ok {
+                            // The spool is gone now; a crash before the
+                            // abandon lands must still call this delivered.
+                            recovery::mark_ended(&self.root, leftover.attempt);
+                        }
                         ok
                     }
                     Err(_) => false,
                 }
             } else {
-                true
+                // No spool: either its end was already durable when it went
+                // (`ended`), or the frames are genuinely gone — say which.
+                leftover.ended
             };
             if reporter.abandon(leftover.attempt, leftover.fence).is_err() {
                 // Session gone: keep it for the next attach.

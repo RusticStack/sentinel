@@ -9,7 +9,11 @@ use std::fs;
 
 use sentinel_core::{AttemptId, Fence, WorkerId};
 use sentinel_protocol::logs::Stream;
-use sentinel_worker::{recovery, spool::Spool, workspace::Workspace};
+use sentinel_worker::{
+    recovery::{self, Marker},
+    spool::Spool,
+    workspace::Workspace,
+};
 
 #[test]
 fn leftovers_are_settled_on_disk_and_kept_for_the_controller() {
@@ -37,7 +41,11 @@ fn leftovers_are_settled_on_disk_and_kept_for_the_controller() {
 
     assert_eq!(
         recovery::leftovers(root).unwrap(),
-        vec![(running, Fence(3))]
+        vec![Marker {
+            attempt: running,
+            fence: Fence(3),
+            ended: false,
+        }]
     );
     let (recovered, pending) = recovery::recover(root, WorkerId::new()).unwrap();
     assert_eq!(recovered.leftovers, vec![(running, Fence(3))]);
@@ -52,8 +60,13 @@ fn leftovers_are_settled_on_disk_and_kept_for_the_controller() {
     );
     assert_eq!(pending.len(), 1);
     assert_eq!(
-        (pending[0].attempt, pending[0].fence, pending[0].spooled),
-        (running, Fence(3), true)
+        (
+            pending[0].attempt,
+            pending[0].fence,
+            pending[0].spooled,
+            pending[0].ended,
+        ),
+        (running, Fence(3), true, false)
     );
     // The running attempt's spool survives with its frames; the finished
     // attempt's spool is gone.
@@ -65,4 +78,39 @@ fn leftovers_are_settled_on_disk_and_kept_for_the_controller() {
     // Nothing left to reconcile once the marker is gone.
     recovery::unmark(root, running);
     assert!(recovery::leftovers(root).unwrap().is_empty());
+}
+
+#[test]
+fn a_marker_without_a_spool_reports_whether_the_end_was_delivered() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (lost, done, gone) = (AttemptId::new(), AttemptId::new(), AttemptId::new());
+    // `lost`: marker, frames spooled, then the spool itself is lost —
+    // recovery must not call that delivered.
+    recovery::mark(root, lost, Fence(7)).unwrap();
+    let mut spool = Spool::open(root, lost).unwrap();
+    spool.append(0, Stream::Stdout, b"work\n").unwrap();
+    spool.sync().unwrap();
+    drop(spool);
+    fs::remove_dir_all(root.join("spool").join(lost.to_string())).unwrap();
+    // `done`: the end went out and the spool was removed, then the crash
+    // took the marker removal — a completed delivery, not a loss.
+    recovery::mark(root, done, Fence(8)).unwrap();
+    recovery::mark_ended(root, done);
+    // `gone`: marker only, mid-run — nothing was ever spooled.
+    recovery::mark(root, gone, Fence(9)).unwrap();
+
+    let markers = recovery::leftovers(root).unwrap();
+    assert_eq!(markers.len(), 3);
+    assert!(!markers.iter().find(|m| m.attempt == lost).unwrap().ended);
+    assert!(markers.iter().find(|m| m.attempt == done).unwrap().ended);
+
+    let (_, pending) = recovery::recover(root, WorkerId::new()).unwrap();
+    let flag = |a: AttemptId| {
+        let l = pending.iter().find(|l| l.attempt == a).unwrap();
+        (l.spooled, l.ended)
+    };
+    assert_eq!(flag(lost), (false, false));
+    assert_eq!(flag(done), (false, true));
+    assert_eq!(flag(gone), (false, false));
 }

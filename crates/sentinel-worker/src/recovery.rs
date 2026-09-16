@@ -14,7 +14,8 @@
 //! under this worker's label without a marker are stale and reaped too.
 
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -24,6 +25,18 @@ use crate::{Result, podman, spool::Spool, workspace};
 
 pub const ATTEMPTS_DIR: &str = "attempts";
 
+/// A marker an earlier process left: the attempt and its fence, plus
+/// whether its log end had already gone out before the end report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Marker {
+    pub attempt: AttemptId,
+    pub fence: Fence,
+    /// `complete` had the log's end out (acked under protocol 5, sent on
+    /// earlier protocols) when the marker outlived the spool — a crash in
+    /// that window is a completed delivery, not a loss.
+    pub ended: bool,
+}
+
 /// One attempt the previous process did not finish.
 #[derive(Debug)]
 pub struct Leftover {
@@ -31,6 +44,8 @@ pub struct Leftover {
     pub fence: Fence,
     /// Whether a spool with unsent frames exists for it.
     pub spooled: bool,
+    /// Whether its log end was already delivered when no spool remains.
+    pub ended: bool,
 }
 
 /// What the reconciliation found and did.
@@ -52,13 +67,27 @@ pub fn mark(root: &Path, attempt: AttemptId, fence: Fence) -> Result<()> {
     Ok(())
 }
 
+/// The log's end went out as far as this protocol can prove: `LogEndAck`
+/// under protocol 5, handed to the session on earlier ones. If the marker
+/// then outlives the spool — removal raced a crash — recovery reports a
+/// completed delivery rather than a loss.
+pub fn mark_ended(root: &Path, attempt: AttemptId) {
+    if let Ok(mut marker) = OpenOptions::new()
+        .append(true)
+        .open(marker_path(root, attempt))
+        && marker.write_all(b"ended\n").is_ok()
+    {
+        let _ = marker.sync_data();
+    }
+}
+
 /// The attempt's end has been reported: nothing to reconcile for it.
 pub fn unmark(root: &Path, attempt: AttemptId) {
     let _ = fs::remove_file(marker_path(root, attempt));
 }
 
 /// Markers left by an earlier process, with their fences.
-pub fn leftovers(root: &Path) -> Result<Vec<(AttemptId, Fence)>> {
+pub fn leftovers(root: &Path) -> Result<Vec<Marker>> {
     let dir = root.join(ATTEMPTS_DIR);
     let mut found = Vec::new();
     let entries = match fs::read_dir(&dir) {
@@ -74,14 +103,21 @@ pub fn leftovers(root: &Path) -> Result<Vec<(AttemptId, Fence)>> {
         else {
             continue;
         };
-        let fence = fs::read_to_string(entry.path())
-            .ok()
+        let text = fs::read_to_string(entry.path()).unwrap_or_default();
+        let mut lines = text.lines();
+        let fence = lines
+            .next()
             .and_then(|t| t.trim().parse::<u64>().ok())
             .map(Fence)
             .unwrap_or(Fence::NONE);
-        found.push((attempt, fence));
+        let ended = lines.any(|l| l.trim() == "ended");
+        found.push(Marker {
+            attempt,
+            fence,
+            ended,
+        });
     }
-    found.sort_by_key(|(a, _)| *a.as_bytes());
+    found.sort_by_key(|m| *m.attempt.as_bytes());
     Ok(found)
 }
 
@@ -110,23 +146,24 @@ pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover
     let spooled: Vec<AttemptId> = Spool::leftovers(root)?;
     let markers = leftovers(root)?;
     let mut pending = Vec::with_capacity(markers.len());
-    for (attempt, fence) in &markers {
+    for marker in &markers {
         pending.push(Leftover {
-            attempt: *attempt,
-            fence: *fence,
-            spooled: spooled.contains(attempt),
+            attempt: marker.attempt,
+            fence: marker.fence,
+            spooled: spooled.contains(&marker.attempt),
+            ended: marker.ended,
         });
     }
     // A spool without a marker belongs to an attempt whose end was reported
     // (the marker went first) but whose spool removal did not complete: the
     // controller has its end record or never will; nothing to send.
     for attempt in spooled {
-        if !markers.iter().any(|(a, _)| *a == attempt)
+        if !markers.iter().any(|m| m.attempt == attempt)
             && let Ok(spool) = Spool::open(root, attempt)
         {
             let _ = spool.remove();
         }
     }
-    done.leftovers = markers;
+    done.leftovers = markers.into_iter().map(|m| (m.attempt, m.fence)).collect();
     Ok((done, pending))
 }

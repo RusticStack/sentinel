@@ -1261,12 +1261,12 @@ fn logs(data: &DataDir, attempt: &str, follow: bool) -> Result<(), Error> {
             Some(dir) => {
                 sentinel_store::logs::read_dir(dir, after, 1024, None).or_else(|e| match e {
                     sentinel_store::Error::NotFound => {
-                        sentinel_store::logs::read_tail(&flat, after, 1024)
+                        sentinel_store::logs::read_tail(&flat, after, 1024, None)
                     }
                     e => Err(e),
                 })
             }
-            None => sentinel_store::logs::read_tail(&flat, after, 1024),
+            None => sentinel_store::logs::read_tail(&flat, after, 1024, None),
         };
         let tail = match result {
             Ok(tail) => tail,

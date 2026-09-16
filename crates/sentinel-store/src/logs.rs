@@ -201,6 +201,9 @@ pub struct LogStore {
     worker: Mutex<Option<JoinHandle<()>>>,
     /// Disk admission (D06); unset admits every append as before.
     admission: OnceLock<Arc<Admission>>,
+    /// Stored bytes one attempt's log may occupy — `MAX_LOG_BYTES`
+    /// normally, lower under `open_with_limit`.
+    max_bytes: u64,
 }
 
 /// What appending a frame did.
@@ -214,6 +217,12 @@ pub enum Appended {
 
 impl LogStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<LogStore> {
+        Self::open_with_limit(dir, MAX_LOG_BYTES)
+    }
+
+    /// `open` under a caller-set per-attempt byte cap — the same contract
+    /// where the default is too generous (and for tests).
+    pub fn open_with_limit(dir: impl Into<PathBuf>, max_bytes: u64) -> Result<LogStore> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
         let compressor = Arc::new(Compressor {
@@ -233,6 +242,7 @@ impl LogStore {
             compressor,
             worker: Mutex::new(Some(worker)),
             admission: OnceLock::new(),
+            max_bytes,
         };
         store.sweep();
         Ok(store)
@@ -547,6 +557,22 @@ impl LogStore {
                 w.file = Some(file);
             }
         }
+        // A finished log whose marker was lost: `finish` sealed the end
+        // record into what is then the last segment, and a covered top
+        // means nothing followed that seal. Decode it once — bounded by
+        // SEGMENT_BYTES — so a lost marker cannot silently reopen the log.
+        if w.ended.is_none()
+            && let Some(n) = top
+            && covered == Some(n)
+        {
+            let mut decoder = seg_decoder(&w.dir, n, segs[&n])?;
+            while let Some(record) = decoder.next()? {
+                if let Record::End { last_seq, gaps } = record {
+                    w.ended = Some(last_seq);
+                    merge_holes(&mut w.holes, &gaps);
+                }
+            }
+        }
         if let Some(last) = w.ended {
             // The stream carries the end record but the marker never
             // landed: repair it so completeness is one file read.
@@ -602,7 +628,7 @@ impl LogStore {
             .encode(&mut w.scratch)
             .map_err(|_| Error::InvalidInput("log frame"))?;
         let record_len = w.scratch.len() as u64;
-        if w.len + record_len > MAX_LOG_BYTES {
+        if w.len + record_len > self.max_bytes {
             return Err(Error::InvalidInput("log size"));
         }
         if w.seg_len > 0 && w.seg_len + record_len > SEGMENT_BYTES {
@@ -731,9 +757,9 @@ impl LogStore {
         read_dir(&self.attempt_dir(run, job, attempt), after, limit, step)
     }
 
-    /// Pre-D04 flat logs (`<logs>/<attempt>.log`), kept readable. The
-    /// whole file is already loaded by the legacy reader, so the step
-    /// filter applies after.
+    /// Pre-D04 flat logs (`<logs>/<attempt>.log`), kept readable. The read
+    /// streams in bounded chunks like a segmented log; the step filter
+    /// applies during the scan so foreign frames never eat the limit.
     pub fn tail_legacy(
         &self,
         attempt: AttemptId,
@@ -741,12 +767,7 @@ impl LogStore {
         limit: usize,
         step: Option<u32>,
     ) -> Result<Tail> {
-        let mut tail = read_tail(&self.dir.join(format!("{attempt}.log")), after, usize::MAX)?;
-        if let Some(step) = step {
-            tail.frames.retain(|f| f.step == step);
-        }
-        tail.frames.truncate(limit);
-        Ok(tail)
+        read_tail(&self.dir.join(format!("{attempt}.log")), after, limit, step)
     }
 }
 
@@ -1230,10 +1251,11 @@ pub fn read_dir(dir: &Path, after: u64, limit: usize, step: Option<u32>) -> Resu
 }
 
 /// The W05 flat-file reader, kept for logs written before D04 and for
-/// spool-shaped fixtures.
-pub fn read_tail(path: &Path, after: u64, limit: usize) -> Result<Tail> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+/// spool-shaped fixtures. Bounded however long the file: frames collect to
+/// `limit` while the scan keeps streaming to the end marker.
+pub fn read_tail(path: &Path, after: u64, limit: usize, step: Option<u32>) -> Result<Tail> {
+    let file = match File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::NotFound),
         Err(e) => return Err(e.into()),
     };
@@ -1242,22 +1264,23 @@ pub fn read_tail(path: &Path, after: u64, limit: usize) -> Result<Tail> {
         complete: false,
         gaps: Vec::new(),
     };
-    let mut at = 0;
-    while at < bytes.len() {
-        match Record::decode(&bytes[at..]) {
-            Ok((Record::Frame(f), used)) => {
-                at += used;
-                if f.seq > after && tail.frames.len() < limit {
+    let mut decoder = Decoder {
+        reader: Box::new(file),
+        buf: Vec::new(),
+        complete: 0,
+    };
+    while let Some(record) = decoder.next()? {
+        match record {
+            Record::Frame(f) => {
+                if f.seq > after && step.is_none_or(|s| f.step == s) && tail.frames.len() < limit {
                     tail.frames.push(f);
                 }
             }
-            Ok((Record::End { gaps, .. }, _)) => {
+            Record::End { gaps, .. } => {
                 tail.complete = true;
                 tail.gaps = gaps;
                 break;
             }
-            Err(RecordError::Incomplete) => break,
-            Err(RecordError::Invalid) => return Err(Error::Corrupt("log record")),
         }
     }
     Ok(tail)

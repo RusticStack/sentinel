@@ -188,9 +188,10 @@ impl Output for LogPipe {
             return;
         };
         for chunk in out.chunks(MAX_LOG_FRAME_BYTES) {
-            if spool.append(step, stream, chunk).is_err() {
-                break;
-            }
+            // Every chunk spends its sequence whether the write lands, the
+            // cap refuses it, or the disk fails — `append` declares what it
+            // could not hold, and the next chunk must still spend its own.
+            let _ = spool.append(step, stream, chunk);
         }
         st.unsynced += 1;
         if st.unsynced >= SYNC_EVERY

@@ -40,6 +40,7 @@ use crate::{
     checkout::{self, CHECKOUT_TIMEOUT},
     context::WorkerContext,
     podman::{self, Container, DEFAULT_PIDS_LIMIT, Limits},
+    recovery,
     workspace::Workspace,
 };
 
@@ -119,11 +120,15 @@ pub fn run(
         // on this path too, so nothing waits in the spool for steps that
         // never ran.
         Err(_) if cancel.load(Ordering::Acquire) => {
-            let _ = output.complete();
+            if output.complete() {
+                recovery::mark_ended(root, job.attempt);
+            }
             Verdict::Failed(FailureClass::Canceled, "canceled during preparation".into())
         }
         Err(e) => {
-            let _ = output.complete();
+            if output.complete() {
+                recovery::mark_ended(root, job.attempt);
+            }
             Verdict::Failed(FailureClass::Preparation, e.to_string())
         }
         Ok((workspace, container)) => {
@@ -162,6 +167,11 @@ pub fn run(
             // what it printed is durable on the controller, or the wait ran
             // out and the failure is on record.
             let published = output.complete();
+            if published {
+                // The spool went with it; if the report below never leaves,
+                // recovery must still call the log delivered, not lost.
+                recovery::mark_ended(root, job.attempt);
+            }
             summary.finalize_ns = ns(started);
             match (verdict, published, artifact_failure) {
                 (Verdict::Passed, false, _) => Verdict::Failed(

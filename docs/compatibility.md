@@ -6,7 +6,7 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 |---|---|---|---|
 | Pipeline schema | `schema: N` in `.sentinel.yml` (currently 1) | `sentinel-pipeline` | repositories |
 | Run spec blob | leading format byte (currently 3) | `sentinel-pipeline::run`, `run_specs.format` | store, workers |
-| Metadata database | `schema_migrations.version` (currently 26) | `sentinel-store` | controller |
+| Metadata database | `schema_migrations.version` (currently 27) | `sentinel-store` | controller |
 | Manifest file | `SNMF` magic + format `u16` (currently 1) | `sentinel-store::objects` | controller |
 | API error | `schema: "sentinel.error/1"` | `sentinel-protocol` | CLI, MCP, UI, workers |
 | Explain output | `schema: "sentinel.explain/1"` | `sentinel-pipeline::explain` | CLI, agents |
