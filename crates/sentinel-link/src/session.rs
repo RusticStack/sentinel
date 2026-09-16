@@ -27,6 +27,7 @@ use sentinel_core::{
     WorkerId,
 };
 use sentinel_protocol::{
+    cache::Trust,
     limits::{
         MAX_API_BODY_BYTES, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_CHUNK_BYTES, MAX_ARTIFACT_NAME_BYTES,
         MAX_ARTIFACT_PATH_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_LIST_ITEMS, MAX_LOG_FRAME_BYTES,
@@ -286,6 +287,12 @@ pub enum ServerMessage {
         name: String,
         code: u8,
     },
+    /// Protocol 6. The job context with its cache boundary: the tenant the
+    /// run belongs to and the trust class derived from the recorded event.
+    /// Sent instead of `Context` to workers that negotiated it; earlier
+    /// workers get `Context` and default to the pull-request scope.
+    /// Appended last: postcard encodes enum variants positionally.
+    Context2(WireContext2),
 }
 
 /// What the controller did with a log frame.
@@ -389,6 +396,39 @@ pub struct WireContext {
     pub event_key: String,
 }
 
+/// [`JobContext`] on the wire from protocol 6: everything `WireContext`
+/// carries, plus the cache boundary — the run's tenant and the trust class
+/// the controller derived from the recorded event (`Trust::of_event`).
+/// `tenant` is all-zero when the context carries none; `trust` is a
+/// `Trust` wire code, never defaulted: an undecodable byte is a protocol
+/// error rather than a guessed boundary.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WireContext2 {
+    pub attempt: [u8; 16],
+    pub run: [u8; 16],
+    pub repo: [u8; 16],
+    pub repo_name: String,
+    pub job: [u8; 16],
+    pub job_name: String,
+    pub sha: String,
+    pub cancelled: bool,
+    pub needs: Vec<(String, u8)>,
+    /// What triggered the run: `push`, `tag`, `pull_request` or `manual`.
+    pub event: String,
+    /// The ref the event concerns, as recorded in the run's provenance.
+    pub event_ref: String,
+    /// The pull request's base branch, when the run came from one.
+    pub base_ref: Option<String>,
+    pub pr_number: Option<u64>,
+    /// A short, stable key for the event: the branch or tag name, `pr-<n>`,
+    /// or `manual`.
+    pub event_key: String,
+    /// The tenant the run belongs to; all-zero encodes "none recorded".
+    pub tenant: [u8; 16],
+    /// `Trust` wire code for the cache scope this job may use.
+    pub trust: u8,
+}
+
 /// The event facts a worker may evaluate `event.*` against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventContext {
@@ -401,7 +441,9 @@ pub struct EventContext {
 
 /// What the worker evaluates expressions against: identity of the run,
 /// repository and job, the event that triggered it, dependency outcomes by
-/// name, cancellation.
+/// name, cancellation. `tenant`/`trust` are the cache boundary (protocol 6;
+/// absent on older wires, where the worker defaults to the pull-request
+/// scope and no recorded tenant).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobContext {
     pub source: Option<sentinel_protocol::source::Access>,
@@ -414,6 +456,13 @@ pub struct JobContext {
     pub event: EventContext,
     pub cancelled: bool,
     pub needs: Vec<(String, Outcome)>,
+    /// The tenant the run belongs to; `None` on a protocol <6 context,
+    /// which could not carry it.
+    pub tenant: Option<TenantId>,
+    /// The cache trust class derived from `event` (`Trust::of_event`);
+    /// `PullRequest` on a protocol <6 context — the scope that can never
+    /// touch protected state.
+    pub trust: Trust,
 }
 
 const fn outcome_code(outcome: Outcome) -> u8 {
@@ -440,6 +489,8 @@ const fn outcome_from_code(code: u8) -> Option<Outcome> {
 }
 
 impl JobContext {
+    /// The protocol <6 shape: `tenant` and `trust` do not exist on that
+    /// wire — the receiver defaults them to `None`/`PullRequest`.
     pub(crate) fn to_wire(&self, attempt: AttemptId) -> WireContext {
         WireContext {
             attempt: *attempt.as_bytes(),
@@ -463,17 +514,33 @@ impl JobContext {
         }
     }
 
+    /// The protocol 6 shape: same facts plus the cache boundary.
+    pub(crate) fn to_wire2(&self, attempt: AttemptId) -> WireContext2 {
+        WireContext2 {
+            attempt: *attempt.as_bytes(),
+            run: *self.run.as_bytes(),
+            repo: *self.repo.as_bytes(),
+            repo_name: self.repo_name.clone(),
+            job: *self.job.as_bytes(),
+            job_name: self.job_name.clone(),
+            sha: self.sha.clone(),
+            cancelled: self.cancelled,
+            needs: self
+                .needs
+                .iter()
+                .map(|(name, outcome)| (name.clone(), outcome_code(*outcome)))
+                .collect(),
+            event: self.event.name.clone(),
+            event_ref: self.event.ref_name.clone(),
+            base_ref: self.event.base_ref.clone(),
+            pr_number: self.event.pr_number,
+            event_key: self.event.key.clone(),
+            tenant: self.tenant.map(|id| *id.as_bytes()).unwrap_or([0; 16]),
+            trust: self.trust.to_u8(),
+        }
+    }
+
     fn from_wire(wire: WireContext) -> Result<(AttemptId, JobContext)> {
-        if wire.needs.len() > MAX_LIST_ITEMS {
-            return Err(Error::Protocol("needs list"));
-        }
-        let mut needs = Vec::with_capacity(wire.needs.len());
-        for (name, code) in wire.needs {
-            needs.push((
-                name,
-                outcome_from_code(code).ok_or(Error::Protocol("outcome"))?,
-            ));
-        }
         Ok((
             AttemptId::from_bytes(wire.attempt).map_err(|_| Error::Protocol("id"))?,
             JobContext {
@@ -492,9 +559,76 @@ impl JobContext {
                     key: wire.event_key,
                 },
                 cancelled: wire.cancelled,
-                needs,
+                needs: decode_needs(wire.needs)?,
+                // The wire could not say it: the safest scope is the one a
+                // pull request would get.
+                tenant: None,
+                trust: Trust::PullRequest,
             },
         ))
+    }
+
+    fn from_wire2(wire: WireContext2) -> Result<(AttemptId, JobContext)> {
+        // A trust byte this build cannot decode is a protocol error, never
+        // a guessed boundary.
+        let trust = Trust::from_u8(wire.trust).ok_or(Error::Protocol("trust"))?;
+        let tenant = if wire.tenant == [0; 16] {
+            None
+        } else {
+            Some(TenantId::from_bytes(wire.tenant).map_err(|_| Error::Protocol("id"))?)
+        };
+        Ok((
+            AttemptId::from_bytes(wire.attempt).map_err(|_| Error::Protocol("id"))?,
+            JobContext {
+                source: None,
+                run: RunId::from_bytes(wire.run).map_err(|_| Error::Protocol("id"))?,
+                repo: RepoId::from_bytes(wire.repo).map_err(|_| Error::Protocol("id"))?,
+                repo_name: wire.repo_name,
+                job: JobId::from_bytes(wire.job).map_err(|_| Error::Protocol("id"))?,
+                job_name: wire.job_name,
+                sha: wire.sha,
+                event: EventContext {
+                    name: wire.event,
+                    ref_name: wire.event_ref,
+                    base_ref: wire.base_ref,
+                    pr_number: wire.pr_number,
+                    key: wire.event_key,
+                },
+                cancelled: wire.cancelled,
+                needs: decode_needs(wire.needs)?,
+                tenant,
+                trust,
+            },
+        ))
+    }
+}
+
+/// Dependency outcomes as their stored codes; bounded like every list.
+fn decode_needs(wire: Vec<(String, u8)>) -> Result<Vec<(String, Outcome)>> {
+    if wire.len() > MAX_LIST_ITEMS {
+        return Err(Error::Protocol("needs list"));
+    }
+    let mut needs = Vec::with_capacity(wire.len());
+    for (name, code) in wire {
+        needs.push((
+            name,
+            outcome_from_code(code).ok_or(Error::Protocol("outcome"))?,
+        ));
+    }
+    Ok(needs)
+}
+
+/// The context message for the negotiated protocol: `Context2` from
+/// protocol 6, the original `Context` before it.
+pub(crate) fn context_message(
+    protocol: u16,
+    context: &JobContext,
+    attempt: AttemptId,
+) -> ServerMessage {
+    if protocol >= 6 {
+        ServerMessage::Context2(context.to_wire2(attempt))
+    } else {
+        ServerMessage::Context(context.to_wire(attempt))
     }
 }
 
@@ -1055,7 +1189,11 @@ impl WorkerSession {
                     }
                     match handler.spec(worker, id) {
                         Some((context, bytes)) if bytes.len() <= MAX_SPEC_BYTES => {
-                            self.tx.send(&ServerMessage::Context(context.to_wire(id)))?;
+                            self.tx.send(&context_message(
+                                self.admitted.negotiated.protocol.0,
+                                &context,
+                                id,
+                            ))?;
                             if let Some(access) = context.source {
                                 self.tx.send(&ServerMessage::Source { attempt, access })?;
                             }
@@ -1331,6 +1469,7 @@ pub fn connect(
         | ServerMessage::Spec { .. }
         | ServerMessage::NoSpec { .. }
         | ServerMessage::Context(_)
+        | ServerMessage::Context2(_)
         | ServerMessage::Source { .. }
         | ServerMessage::LogAck { .. }
         | ServerMessage::LogRefused { .. }
@@ -1645,6 +1784,13 @@ impl Link {
                 state.contexts.insert(attempt, context);
                 Ok(false)
             }
+            // Protocol 6 shape: carries the tenant and the cache trust
+            // class; same in-flight bookkeeping as `Context`.
+            ServerMessage::Context2(wire) => {
+                let (attempt, context) = JobContext::from_wire2(wire)?;
+                state.contexts.insert(attempt, context);
+                Ok(false)
+            }
             ServerMessage::Source { attempt, access } => {
                 let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
                 if !access.validate(UnixMillis::now().0) {
@@ -1764,4 +1910,135 @@ struct Inbound {
 /// Bind a listener for tests and the controller alike.
 pub fn listen(addr: SocketAddr) -> Result<TcpListener> {
     Ok(TcpListener::bind(addr)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(tenant: Option<TenantId>, trust: Trust) -> JobContext {
+        JobContext {
+            source: None,
+            run: RunId::new(),
+            repo: RepoId::new(),
+            repo_name: "org/repo".to_string(),
+            job: JobId::new(),
+            job_name: "test".to_string(),
+            sha: "0".repeat(40),
+            event: EventContext {
+                name: "push".to_string(),
+                ref_name: "refs/heads/main".to_string(),
+                base_ref: None,
+                pr_number: None,
+                key: "main".to_string(),
+            },
+            cancelled: false,
+            needs: vec![("build".to_string(), Outcome::Passed)],
+            tenant,
+            trust,
+        }
+    }
+
+    #[test]
+    fn context2_round_trip_keeps_tenant_and_trust() {
+        let attempt = AttemptId::new();
+        let tenant = TenantId::new();
+        for trust in Trust::ALL {
+            let expected = context(Some(tenant), trust);
+            let (decoded_attempt, decoded) =
+                JobContext::from_wire2(expected.to_wire2(attempt)).unwrap();
+            assert_eq!(decoded_attempt, attempt);
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn context2_absent_tenant_stays_absent() {
+        let (.., decoded) =
+            JobContext::from_wire2(context(None, Trust::PullRequest).to_wire2(AttemptId::new()))
+                .unwrap();
+        assert_eq!(decoded.tenant, None);
+        assert_eq!(decoded.trust, Trust::PullRequest);
+    }
+
+    #[test]
+    fn context2_rejects_unknown_trust_code() {
+        let attempt = AttemptId::new();
+        for bad in [2u8, 9, 255] {
+            let mut wire = context(Some(TenantId::new()), Trust::Protected).to_wire2(attempt);
+            wire.trust = bad;
+            assert!(
+                JobContext::from_wire2(wire).is_err(),
+                "trust {bad} must not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn context2_rejects_oversized_needs() {
+        let mut wire = context(None, Trust::Protected).to_wire2(AttemptId::new());
+        wire.needs = vec![("x".to_string(), 0); MAX_LIST_ITEMS + 1];
+        assert!(JobContext::from_wire2(wire).is_err());
+    }
+
+    #[test]
+    fn context_v5_decode_defaults_to_pr_scope() {
+        // A protocol <6 context carries no tenant/trust: the decode must
+        // land the worker in the scope that cannot touch protected state.
+        let wire_attempt = AttemptId::new();
+        let (attempt, decoded) = JobContext::from_wire(
+            context(Some(TenantId::new()), Trust::Protected).to_wire(wire_attempt),
+        )
+        .unwrap();
+        assert_eq!(attempt, wire_attempt);
+        assert_eq!(decoded.tenant, None);
+        assert_eq!(decoded.trust, Trust::PullRequest);
+        assert_eq!(decoded.needs, vec![("build".to_string(), Outcome::Passed)]);
+    }
+
+    #[test]
+    fn context_message_follows_the_negotiated_protocol() {
+        let attempt = AttemptId::new();
+        let context = context(Some(TenantId::new()), Trust::Protected);
+        for protocol in 1..=5 {
+            assert!(
+                matches!(
+                    context_message(protocol, &context, attempt),
+                    ServerMessage::Context(_)
+                ),
+                "protocol {protocol}"
+            );
+        }
+        assert!(matches!(
+            context_message(6, &context, attempt),
+            ServerMessage::Context2(_)
+        ));
+        // A future version still gets the newer shape.
+        assert!(matches!(
+            context_message(7, &context, attempt),
+            ServerMessage::Context2(_)
+        ));
+    }
+
+    #[test]
+    fn wire_context2_survives_postcard() {
+        // The variant index is positional: Context2 must remain the last
+        // variant or every older peer breaks.
+        let attempt = AttemptId::new();
+        let message = context_message(
+            6,
+            &context(Some(TenantId::new()), Trust::Protected),
+            attempt,
+        );
+        let bytes = postcard::to_allocvec(&message).unwrap();
+        match postcard::from_bytes::<ServerMessage>(&bytes).unwrap() {
+            ServerMessage::Context2(wire) => {
+                let (decoded_attempt, decoded) = JobContext::from_wire2(wire).unwrap();
+                assert_eq!(decoded_attempt, attempt);
+                assert_eq!(decoded.trust, Trust::Protected);
+                assert!(decoded.tenant.is_some());
+            }
+            _ => panic!("Context2 must decode"),
+        }
+    }
 }

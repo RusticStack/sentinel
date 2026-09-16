@@ -8,9 +8,13 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use sentinel_protocol::cache::Class;
+
 use crate::{
-    compile::CompiledPipeline,
-    schema::{Job, Shell, Step},
+    compile::{CompiledJob, CompiledPipeline},
+    expr::{Expr, Template},
+    policy::Triggers,
+    schema::{Artifact, Cache, Concurrency, Job, Resources, RunsOn, Shell, Step},
 };
 
 /// Exact source inputs. `sha` is the commit actually checked out; `ref_name`
@@ -160,11 +164,17 @@ pub enum SpecError {
     Decode,
 }
 
-/// Bump when the encoded layout changes incompatibly; older blobs are then
-/// rejected rather than misread. Format 2: `on` carries ref filters
-/// (`policy::Triggers`) instead of a trigger list. Format 3: artifacts
-/// carry `required`.
-pub const SPEC_FORMAT: u8 = 3;
+/// Bump when the encoded layout changes; blobs older than
+/// [`SPEC_FORMAT_READ_MIN`] are rejected rather than misread. Format 2:
+/// `on` carries ref filters (`policy::Triggers`) instead of a trigger
+/// list. Format 3: artifacts carry `required`. Format 4: caches carry
+/// `class`.
+pub const SPEC_FORMAT: u8 = 4;
+
+/// The oldest format `decode` still accepts. Format 3 differs from 4 only
+/// in the absent `cache.class`; its blobs upgrade to `Dependencies` —
+/// exactly what a `class`-less schema 1 document compiles to.
+pub const SPEC_FORMAT_READ_MIN: u8 = 3;
 
 impl RunSpec {
     pub fn new(source: PinnedSource, pipeline: CompiledPipeline) -> Result<Self, SpecError> {
@@ -193,9 +203,18 @@ impl RunSpec {
             .map_err(|_| SpecError::Encode)
     }
 
+    /// The byte that heads a stored spec decides which layout follows.
+    /// Format 3 decodes through the shadow types below and upgrades every
+    /// cache to `Dependencies`; any other format byte, or a body its
+    /// layout cannot parse, is `Decode`. Postcard ignores trailing bytes,
+    /// so the format byte alone chooses the type — a v3 body is never fed
+    /// to the v4 layout hoping the extra field swallows leftover bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, SpecError> {
         match bytes.split_first() {
             Some((&SPEC_FORMAT, body)) => postcard::from_bytes(body).map_err(|_| SpecError::Decode),
+            Some((&SPEC_FORMAT_READ_MIN, body)) => postcard::from_bytes::<RunSpecV3>(body)
+                .map(RunSpec::from)
+                .map_err(|_| SpecError::Decode),
             _ => Err(SpecError::Decode),
         }
     }
@@ -205,6 +224,110 @@ impl RunSpec {
         let j = &self.pipeline.jobs.get(job)?.spec;
         let s = j.steps.get(step)?;
         Some(StepCommand::new(j, s))
+    }
+}
+
+// --- Format 3 shadow layout ------------------------------------------------
+// postcard encodes fields positionally, so a readable old format needs the
+// old type graph, not a `serde(default)` field. These mirror the format-3
+// `Job`/`Cache` exactly — every other type they touch is unchanged —
+// and the conversion below lands every cache on `Dependencies`, the class
+// a `class`-less schema 1 document always compiled to.
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheV3 {
+    name: String,
+    key: Template,
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JobV3 {
+    image: String,
+    needs: Vec<String>,
+    condition: Option<Expr>,
+    runs_on: RunsOn,
+    resources: Resources,
+    timeout_secs: u64,
+    env: Vec<(String, String)>,
+    workdir: Option<String>,
+    steps: Vec<Step>,
+    cache: Vec<CacheV3>,
+    artifacts: Vec<Artifact>,
+    secrets: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompiledJobV3 {
+    name: String,
+    needs: Vec<u16>,
+    spec: JobV3,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompiledPipelineV3 {
+    on: Triggers,
+    concurrency: Option<Concurrency>,
+    jobs: Vec<CompiledJobV3>,
+    digest: u128,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSpecV3 {
+    source: PinnedSource,
+    pipeline: CompiledPipelineV3,
+    images: Vec<ImageRef>,
+}
+
+impl From<JobV3> for Job {
+    fn from(v3: JobV3) -> Job {
+        Job {
+            image: v3.image,
+            needs: v3.needs,
+            condition: v3.condition,
+            runs_on: v3.runs_on,
+            resources: v3.resources,
+            timeout_secs: v3.timeout_secs,
+            env: v3.env,
+            workdir: v3.workdir,
+            steps: v3.steps,
+            cache: v3
+                .cache
+                .into_iter()
+                .map(|c| Cache {
+                    name: c.name,
+                    class: Class::Dependencies,
+                    key: c.key,
+                    paths: c.paths,
+                })
+                .collect(),
+            artifacts: v3.artifacts,
+            secrets: v3.secrets,
+        }
+    }
+}
+
+impl From<RunSpecV3> for RunSpec {
+    fn from(v3: RunSpecV3) -> RunSpec {
+        RunSpec {
+            source: v3.source,
+            pipeline: CompiledPipeline {
+                on: v3.pipeline.on,
+                concurrency: v3.pipeline.concurrency,
+                jobs: v3
+                    .pipeline
+                    .jobs
+                    .into_iter()
+                    .map(|j| CompiledJob {
+                        name: j.name,
+                        needs: j.needs,
+                        spec: Job::from(j.spec),
+                    })
+                    .collect(),
+                digest: v3.pipeline.digest,
+            },
+            images: v3.images,
+        }
     }
 }
 
@@ -270,6 +393,68 @@ mod tests {
 
     const SHA: &str = "0c87e0181c794fe2bbfeb15dc34e7b6aae375d8b";
 
+    /// Encode `spec` in the format-3 layout: the shadow type graph, format
+    /// byte 3. This is what pre-class builds wrote into `run_specs`.
+    fn encode_v3(spec: &RunSpec) -> Vec<u8> {
+        let shadow = RunSpecV3 {
+            source: spec.source.clone(),
+            pipeline: CompiledPipelineV3 {
+                on: spec.pipeline.on.clone(),
+                concurrency: spec.pipeline.concurrency.clone(),
+                digest: spec.pipeline.digest,
+                jobs: spec
+                    .pipeline
+                    .jobs
+                    .iter()
+                    .map(|j| CompiledJobV3 {
+                        name: j.name.clone(),
+                        needs: j.needs.clone(),
+                        spec: JobV3 {
+                            image: j.spec.image.clone(),
+                            needs: j.spec.needs.clone(),
+                            condition: j.spec.condition.clone(),
+                            runs_on: j.spec.runs_on.clone(),
+                            resources: j.spec.resources,
+                            timeout_secs: j.spec.timeout_secs,
+                            env: j.spec.env.clone(),
+                            workdir: j.spec.workdir.clone(),
+                            steps: j.spec.steps.clone(),
+                            cache: j
+                                .spec
+                                .cache
+                                .iter()
+                                .map(|c| CacheV3 {
+                                    name: c.name.clone(),
+                                    key: c.key.clone(),
+                                    paths: c.paths.clone(),
+                                })
+                                .collect(),
+                            artifacts: j.spec.artifacts.clone(),
+                            secrets: j.spec.secrets.clone(),
+                        },
+                    })
+                    .collect(),
+            },
+            images: spec.images.clone(),
+        };
+        let mut out = vec![SPEC_FORMAT_READ_MIN];
+        out.extend(postcard::to_allocvec(&shadow).unwrap());
+        out
+    }
+
+    fn full_spec() -> RunSpec {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/pipelines/valid/full.yml"
+        ))
+        .unwrap();
+        RunSpec::new(
+            PinnedSource::new("repo", SHA, None).unwrap(),
+            compile_str(&text).unwrap(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn sources_require_a_full_hex_sha() {
         assert!(PinnedSource::new("git@x:y.git", SHA, Some("main")).is_ok());
@@ -319,19 +504,25 @@ mod tests {
 
     #[test]
     fn run_spec_round_trips_and_derives_commands() {
-        let text = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/pipelines/valid/full.yml"
-        ))
-        .unwrap();
-        let pipeline = compile_str(&text).unwrap();
-        let spec = RunSpec::new(PinnedSource::new("repo", SHA, None).unwrap(), pipeline).unwrap();
+        let spec = full_spec();
         let bytes = spec.encode().unwrap();
         assert_eq!(bytes[0], SPEC_FORMAT);
         assert_eq!(RunSpec::decode(&bytes).unwrap(), spec);
-        assert_eq!(RunSpec::decode(&[9, 0]), Err(SpecError::Decode));
+        for bad_format in [0u8, 1, 2, 9, 255] {
+            assert_eq!(
+                RunSpec::decode(&[bad_format, 0]),
+                Err(SpecError::Decode),
+                "format {bad_format}"
+            );
+        }
         assert_eq!(
             RunSpec::decode(&bytes[..bytes.len() - 1]),
+            Err(SpecError::Decode)
+        );
+        assert_eq!(RunSpec::decode(&[]), Err(SpecError::Decode));
+        // A format-4 head on a truncated body is not a spec either.
+        assert_eq!(
+            RunSpec::decode(&bytes[..bytes.len() / 2]),
             Err(SpecError::Decode)
         );
 
@@ -349,6 +540,45 @@ mod tests {
         assert_eq!(test.env.len(), 2);
         assert!(spec.step_command(0, 9).is_none());
         assert!(!spec.images[0].is_pinned());
+    }
+
+    #[test]
+    fn run_spec_v3_blobs_decode_with_default_class() {
+        let spec = full_spec();
+        let v3 = encode_v3(&spec);
+        assert_eq!(v3[0], 3);
+        let decoded = RunSpec::decode(&v3).unwrap();
+        // A format-3 blob cannot carry a class: every cache lands on
+        // `dependencies`, the class a class-less schema 1 file compiles to.
+        // The fixture declares none, so the upgrade is lossless.
+        for job in &decoded.pipeline.jobs {
+            for c in &job.spec.cache {
+                assert_eq!(c.class, Class::Dependencies);
+            }
+        }
+        assert_eq!(decoded, spec);
+        // Truncated or corrupt v3 bodies still fail typed, never panic.
+        assert_eq!(RunSpec::decode(&v3[..v3.len() - 1]), Err(SpecError::Decode));
+        assert_eq!(RunSpec::decode(&v3[..4]), Err(SpecError::Decode));
+        let mut corrupt = v3.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
+        let _ = RunSpec::decode(&corrupt); // may decode or not; must not panic
+    }
+
+    #[test]
+    fn run_spec_v4_carries_cache_class() {
+        let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    cache:\n      - name: dl\n        class: downloads\n        key: k\n        paths: [/root/.cargo/registry]\n    steps:\n      - id: s\n        run: echo hi\n";
+        let spec = RunSpec::new(
+            PinnedSource::new("r", SHA, None).unwrap(),
+            compile_str(text).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(spec.pipeline.jobs[0].spec.cache[0].class, Class::Downloads);
+        let bytes = spec.encode().unwrap();
+        assert_eq!(bytes[0], 4);
+        let decoded = RunSpec::decode(&bytes).unwrap();
+        assert_eq!(decoded, spec);
     }
 
     #[test]

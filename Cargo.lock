@@ -1201,6 +1201,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-cache"
+version = "0.1.0-dev"
+dependencies = [
+ "blake3",
+ "postcard",
+ "sentinel-core",
+ "sentinel-pipeline",
+ "sentinel-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "sentinel-checks"
 version = "0.1.0-dev"
 dependencies = [

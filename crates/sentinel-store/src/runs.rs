@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{
     Actor, Event, JobControl, JobId, JobState, RepoId, RunId, TenantId, UnixMillis,
 };
-use sentinel_pipeline::run::{RunSpec, SPEC_FORMAT};
+use sentinel_pipeline::run::{RunSpec, SPEC_FORMAT, SPEC_FORMAT_READ_MIN};
 
 use crate::{
     Error, Result,
@@ -190,7 +190,9 @@ pub fn get_run_spec(conn: &Connection, tenant: TenantId, run: RunId) -> Result<R
         )
         .optional()?
         .ok_or(Error::NotFound)?;
-    if format != SPEC_FORMAT as i64 {
+    // Stored formats `SPEC_FORMAT_READ_MIN..=SPEC_FORMAT` all decode; the
+    // body carries its own format byte that selects the layout.
+    if !(SPEC_FORMAT_READ_MIN as i64..=SPEC_FORMAT as i64).contains(&format) {
         return Err(Error::Corrupt("run_specs.format"));
     }
     RunSpec::decode(&bytes).map_err(|_| Error::Corrupt("run_specs.spec"))

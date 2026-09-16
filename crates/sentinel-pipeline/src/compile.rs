@@ -417,6 +417,9 @@ fn digest_of(
         d.u64(s.cache.len() as u64);
         for c in &s.cache {
             d.str(&c.name);
+            // The class decides the entry's validity rule, so it is part
+            // of what the compiled pipeline means.
+            d.u64(u64::from(c.class.to_u8()));
             d.encoded(&c.key);
             d.u64(c.paths.len() as u64);
             for p in &c.paths {

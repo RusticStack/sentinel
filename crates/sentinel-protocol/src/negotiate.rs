@@ -14,9 +14,10 @@ pub struct ProtocolVersion(pub u16);
 /// artifact publication messages (`ArtifactBegin`…`ArtifactAbsent` and the
 /// `ArtifactGrant`/`ArtifactVerdict` answers). Protocol 5 adds `LogEndAck`:
 /// the controller answers `LogEnd` once the end marker is durable, and the
-/// worker drops its spool only then.
+/// worker drops its spool only then. Protocol 6 adds `Context2`, the job
+/// context carrying the tenant and the cache trust class.
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(5);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(6);
 
 /// Capabilities are a bit set: cheap to store, compare and intersect, and
 /// unknown bits from a newer worker are ignored rather than rejected.
@@ -66,6 +67,16 @@ impl Capabilities {
 pub enum Arch {
     X86_64,
     Aarch64,
+}
+
+impl Arch {
+    /// The stable lowercase spelling used in cache scope paths and logs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
 }
 
 /// First message on a worker session. Bounded: every field is fixed-size or
@@ -186,7 +197,7 @@ mod tests {
     #[test]
     fn version_mismatch_says_who_must_upgrade() {
         assert_eq!(
-            negotiate(&hello(6, 7, Capabilities::REQUIRED)),
+            negotiate(&hello(7, 8, Capabilities::REQUIRED)),
             Err(Rejected::UnsupportedVersion {
                 supported_min: SUPPORTED_MIN,
                 supported_max: SUPPORTED_MAX,

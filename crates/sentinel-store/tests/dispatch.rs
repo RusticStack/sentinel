@@ -10,11 +10,13 @@ use sentinel_core::{
     auth::{Namespace, Permissions as P, Principal},
 };
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
+use sentinel_protocol::cache::Trust;
 use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
 use sentinel_store::{
     Durability, Error, Store,
     auth::{self, Authority, NamespaceKind, provisioning},
     dispatch::{self, Capacity, WaitReason},
+    provenance::{self, Provenance},
     runs,
     tenancy::{self, PoolKind},
     workers::{self, Presentation},
@@ -604,6 +606,91 @@ jobs:
         .unwrap();
     assert_eq!(context.needs, vec![("build".to_owned(), Outcome::Passed)]);
     assert_eq!(context.job_name, "test");
+}
+
+#[test]
+fn job_context_derives_cache_trust_from_recorded_provenance() {
+    let f = fixture();
+    let w = worker(
+        &f,
+        f.pool,
+        Capacity {
+            cpu_millis: 8_000,
+            memory_bytes: 16 << 30,
+        },
+    );
+    let yaml = "schema: 1
+on: [push]
+jobs:
+  only:
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }]
+";
+    // Exactly `pull_request` scopes a job's caches to pull-request state;
+    // every other recorded trigger — and no provenance at all, which reads
+    // back as `manual` — scopes to protected.
+    for (trigger, trust) in [
+        (Some("pull_request"), Trust::PullRequest),
+        (Some("push"), Trust::Protected),
+        (Some("merge_queue"), Trust::Protected),
+        (None, Trust::Protected),
+    ] {
+        let (run_id, ids) = run(&f, yaml, at(2_000));
+        if let Some(trigger) = trigger {
+            let (tenant, repo) = (f.tenant, f.repo);
+            f.store
+                .writer()
+                .write(move |tx| {
+                    provenance::insert(
+                        tx,
+                        &Provenance {
+                            tenant,
+                            repo,
+                            trigger: trigger.into(),
+                            delivery: None,
+                            provider: None,
+                            ref_name: Some("refs/heads/main".into()),
+                            old_sha: None,
+                            new_sha: Some(SHA.into()),
+                            head_sha: None,
+                            base_sha: None,
+                            merge_sha: None,
+                            pipeline_sha: SHA.into(),
+                            pipeline_path: Some(".sentinel.yml".into()),
+                            pipeline_digest: [0; 16],
+                            pr_number: (trigger == "pull_request").then_some(7),
+                        },
+                        run_id,
+                        NOW,
+                    )
+                })
+                .unwrap();
+        }
+        let offer = place(&f, w, f.pool, at(2_100)).unwrap();
+        assert_eq!(offer.job, ids[0]);
+        let context = f
+            .store
+            .read(|c| dispatch::job_context(c, w, offer.attempt))
+            .unwrap();
+        assert_eq!(context.tenant, f.tenant);
+        assert_eq!(context.trust, trust, "{trigger:?}");
+        // Finish the job so the next iteration's run is the one placed.
+        f.store
+            .writer()
+            .write(move |tx| {
+                dispatch::acknowledge(tx, w, offer.attempt, offer.fence, at(2_200))?;
+                for (ms, event) in [
+                    (2_300, Event::PreparationStarted),
+                    (2_400, Event::StepsStarted),
+                    (2_500, Event::FinalizationStarted),
+                    (2_600, Event::Passed),
+                ] {
+                    dispatch::report(tx, w, offer.attempt, offer.fence, event, None, at(ms), None)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
 }
 
 #[test]

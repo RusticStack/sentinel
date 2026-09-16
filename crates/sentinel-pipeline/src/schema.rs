@@ -6,6 +6,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use sentinel_protocol::cache::Class;
+
 use crate::{
     expr::{Expr, Phase, Template},
     policy::{MAX_REF_PATTERN_BYTES, MAX_REF_PATTERNS, RefFilter, Triggers, valid_pattern},
@@ -111,6 +113,10 @@ pub enum Shell {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cache {
     pub name: String,
+    /// Which validity rule this entry follows (docs/cache.md). A
+    /// `class`-less document compiles to `Dependencies`: the exact
+    /// materialization rule, the only one that is never wrong to assume.
+    pub class: Class,
     /// Rendered by the worker after checkout (`hash_files` allowed).
     pub key: Template,
     pub paths: Vec<String>,
@@ -834,6 +840,19 @@ fn cache(path: &str, node: &Node) -> Result<Cache> {
         .ok_or_else(|| err(&format!("{path}.name"), SchemaErrorKind::Missing))
         .and_then(|n| expect_id(&map.child("name"), n))?
         .to_owned();
+    let class = match map.take("class") {
+        None => Class::Dependencies,
+        Some(n) => {
+            let child = map.child("class");
+            let s = expect_str(&child, n, 16)?;
+            Class::of_name(s).ok_or_else(|| {
+                err(
+                    &child,
+                    SchemaErrorKind::Invalid("expected downloads, dependencies or compiler".into()),
+                )
+            })?
+        }
+    };
     let key_path = map.child("key");
     let key = map
         .take("key")
@@ -853,7 +872,12 @@ fn cache(path: &str, node: &Node) -> Result<Cache> {
         }
     }
     map.finish()?;
-    Ok(Cache { name, key, paths })
+    Ok(Cache {
+        name,
+        class,
+        key,
+        paths,
+    })
 }
 
 fn artifact(path: &str, node: &Node) -> Result<Artifact> {
@@ -1210,5 +1234,63 @@ mod tests {
         assert!(valid_image("rust:1-bookworm"));
         assert!(valid_image("ghcr.io/o/i@sha256:abc"));
         assert!(!valid_image("a b"));
+    }
+
+    fn cache_of(text: &str) -> std::result::Result<Cache, crate::Error> {
+        let doc = format!(
+            "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    cache:\n{text}    steps:\n      - id: s\n        run: echo\n"
+        );
+        crate::compile_str(&doc).map(|p| p.jobs[0].spec.cache[0].clone())
+    }
+
+    #[test]
+    fn cache_class_parses_or_defaults() {
+        // Absent `class` is `dependencies`: the exact rule is the only one
+        // that is never wrong to assume.
+        let default =
+            cache_of("      - name: c\n        key: k\n        paths: [target]\n").unwrap();
+        assert_eq!(default.class, Class::Dependencies);
+        for (word, class) in [
+            ("downloads", Class::Downloads),
+            ("dependencies", Class::Dependencies),
+            ("compiler", Class::Compiler),
+        ] {
+            let c = cache_of(&format!(
+                "      - name: c\n        class: {word}\n        key: k\n        paths: [target]\n"
+            ))
+            .unwrap();
+            assert_eq!(c.class, class, "{word}");
+        }
+        // Unknown values name what was accepted, not what was given.
+        let error = cache_of(
+            "      - name: c\n        class: everything\n        key: k\n        paths: [target]\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("expected downloads, dependencies or compiler"),
+            "{error}"
+        );
+        // Wrong type, duplicate and unknown keys all still fail strictly.
+        assert!(
+            cache_of(
+                "      - name: c\n        class: 3\n        key: k\n        paths: [target]\n"
+            )
+            .is_err()
+        );
+        let dup = cache_of(
+            "      - name: c\n        class: compiler\n        class: downloads\n        key: k\n        paths: [target]\n",
+        );
+        assert!(dup.is_err(), "a second `class` key must not pass");
+        let unknown = cache_of(
+            "      - name: c\n        klass: compiler\n        key: k\n        paths: [target]\n",
+        );
+        assert!(
+            unknown
+                .unwrap_err()
+                .to_string()
+                .contains("unknown key `klass`")
+        );
     }
 }

@@ -71,6 +71,9 @@ pub struct StepExplanation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CacheExplanation {
     pub name: String,
+    /// `downloads`, `dependencies` or `compiler`: which validity rule the
+    /// entry follows (docs/cache.md). Schema 1 default: `dependencies`.
+    pub class: &'static str,
     /// The key template as written; interpolations are not evaluated.
     pub key: String,
     /// `true` when the key is a literal and therefore known offline.
@@ -226,6 +229,7 @@ impl Explanation {
                     push_unique(&mut requires.caches, &c.name);
                     CacheExplanation {
                         name: c.name.clone(),
+                        class: c.class.as_str(),
                         key: c.key.to_string(),
                         key_known: c.key.is_literal(),
                     }
@@ -331,8 +335,9 @@ impl Explanation {
             for c in &j.caches {
                 let _ = writeln!(
                     s,
-                    "  cache {}: key {}{}",
+                    "  cache {} [{}]: key {}{}",
                     c.name,
+                    c.class,
                     c.key,
                     if c.key_known {
                         ""
@@ -387,6 +392,8 @@ mod tests {
             "/../../fixtures/pipelines/valid/conditions.yml"
         ))
         .unwrap()
+        // A CRLF checkout would leave the surgical replace below a no-op.
+        .replace("\r\n", "\n")
         .replace(
             "    image: busybox\n    cache:",
             "    image: busybox\n    secrets: [DEPLOY_TOKEN]\n    cache:",
@@ -405,6 +412,8 @@ mod tests {
         assert!(e.requires.repository_read);
         let cache = &e.jobs[1].caches[0];
         assert!(!cache.key_known);
+        // A `class`-less document explains itself as the default class.
+        assert_eq!(cache.class, "dependencies");
         assert!(
             cache
                 .key
@@ -425,9 +434,26 @@ mod tests {
         assert_eq!(e.unresolved[2].resolves_at, "schedule");
         let text = e.render_text();
         assert!(text.contains("secret DEPLOY_TOKEN granted"));
+        assert!(text.contains("cache deps [dependencies]: key"));
         assert!(text.contains("resolved by worker"));
         assert!(!text.contains("sha256"), "no invented hash values");
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"schema\":\"sentinel.explain/1\""));
+        assert!(json.contains("\"class\":\"dependencies\""));
+    }
+
+    #[test]
+    fn explanation_reports_each_cache_class() {
+        let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    cache:\n      - name: dl\n        class: downloads\n        key: k1\n        paths: [/root/.cargo/registry]\n      - name: obj\n        class: compiler\n        key: k2\n        paths: [target]\n    steps:\n      - id: s\n        run: echo\n";
+        let p = compile_str(text).unwrap();
+        let e = Explanation::of(&p);
+        assert_eq!(e.jobs[0].caches[0].class, "downloads");
+        assert_eq!(e.jobs[0].caches[1].class, "compiler");
+        let text = e.render_text();
+        assert!(text.contains("cache dl [downloads]: key k1"));
+        assert!(text.contains("cache obj [compiler]: key k2"));
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"class\":\"downloads\""));
+        assert!(json.contains("\"class\":\"compiler\""));
     }
 }
