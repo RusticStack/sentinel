@@ -40,7 +40,7 @@ All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](p
 | `GET /runs/{id}/artifacts` | `read` | every artifact row of the run: name, job, attempt, `captured`/`absent`/`failed`, entries, bytes, retention and creation ([storage](storage.md#artifact-records-d03)) |
 | `GET /runs/{id}/artifacts/{arf}` | `read` | one row plus, when captured, its immutable manifest: version, digest, payload length and each entry's path/digest/len/mode; entry bytes download via `GET /tenants/{slug}/objects/{digest}` |
 | `GET /workers?tenant=slug` | member | the pools the tenant may use and their workers, each with `connected` from the live fleet |
-| `POST /tenants/{slug}/uploads` `{len, digest?, ttl_ms?}` | member (operator+) | open a resumable upload session → `201` `{upload, received, ranges, expires_ms}` ([storage](storage.md#resumable-uploads-reads-and-materialization-d02)) |
+| `POST /tenants/{slug}/uploads` `{len, digest?, ttl_ms?}` | member (operator+) | open a resumable upload session → `201` `{upload, received, ranges, expires_ms}` ([storage](storage.md#resumable-uploads-reads-and-materialization-d02)); `quota_exceeded` when the tenant's budget cannot take the declared length, `storage_full` below the disk watermarks |
 | `GET /uploads/{upl}` | member (operator+) | the durable resume state: held byte ranges and expiry |
 | `PUT /uploads/{upl}?offset=N` | member (operator+) | one chunk, raw body ≤ 8 MiB; re-sent ranges merge, so retries are safe |
 | `POST /uploads/{upl}/commit` | member (operator+) | tile check + digest verification → publish the object → `{digest}`; repeating returns the same digest |

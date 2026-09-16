@@ -73,6 +73,8 @@ fn store_error(e: StoreError) -> ApiError {
         StoreError::WriterUnavailable | StoreError::Overloaded | StoreError::WriteAmbiguous => {
             err(ErrorCode::RateLimited, "controller busy; retry")
         }
+        StoreError::StorageFull => err(ErrorCode::StorageFull, "storage below watermark; retry"),
+        StoreError::QuotaExceeded => err(ErrorCode::QuotaExceeded, "tenant storage quota exceeded"),
         _ => err(ErrorCode::Internal, "controller fault"),
     }
 }

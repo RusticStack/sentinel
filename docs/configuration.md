@@ -48,9 +48,18 @@ worker_name = "builder-1"          # 1-128 bytes, default "worker"
 enrollment_file = "/etc/sentinel/enrollment"  # absolute; read on start, removed once spent
 cpu_millis = 8000                  # override measured capacity (default: every core)
 memory_bytes = 34359738368         # override measured capacity (default: total less a host reserve)
+
+# server only: disk admission, quotas and retention ([storage](storage.md#disk-admission-quotas-and-reclamation-d06))
+[storage]
+reserve_bytes = 1073741824         # held back for metadata and log evidence (≥ 64 MiB, default 1 GiB)
+low_watermark_bytes = 2147483648   # discretionary writes refuse below free-reserve under this (default 2 GiB)
+high_watermark_bytes = 4294967296  # …and admit again above this (≥ low, default 4 GiB)
+tenant_quota_bytes = 0             # default committed-bytes cap per tenant; 0 = unlimited (default)
+log_retention_secs = 1209600       # finished attempt logs kept this long (1 h .. 1 yr, default 14 d)
+sweep_interval_secs = 300          # the maintenance pass rides the dispatch loop at most this often (5..86400)
 ```
 
-The three common fields are optional in the file; `listen` and `api_listen` are refused for the worker and the worker keys for the server; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
+The three common fields are optional in the file; `listen`, `api_listen` and `[storage]` are refused for the worker and the worker keys for the server; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
 
 - Server: `/var/lib/sentinel`
 - Worker: `/var/lib/sentinel-worker`

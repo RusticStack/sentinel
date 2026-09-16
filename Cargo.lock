@@ -1348,12 +1348,14 @@ dependencies = [
  "blake3",
  "flate2",
  "rusqlite",
+ "rustix",
  "sentinel-auth",
  "sentinel-core",
  "sentinel-pipeline",
  "sentinel-protocol",
  "serde_json",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

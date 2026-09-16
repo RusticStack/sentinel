@@ -328,6 +328,12 @@ pub enum ObjectsCommand {
     Verify,
     /// Retire expired resumable uploads and drop their staged bytes
     Sweep,
+    /// Run one storage maintenance pass: expire uploads and leases, retire
+    /// artifacts past retention, index manifest references, reclaim
+    /// unreferenced objects and sweep orphan files
+    Reclaim,
+    /// Report free space, watermarks and per-tenant usage against quota
+    Status,
 }
 
 #[derive(Args)]
@@ -394,6 +400,19 @@ pub enum TenantCommand {
         data: DataDir,
         #[arg(long, value_name = "SLUG")]
         tenant: String,
+    },
+    /// Show or change a tenant's storage quota in committed bytes
+    Quota {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long, value_name = "SLUG")]
+        tenant: String,
+        /// The cap in bytes; without --bytes or --clear, shows the current value
+        #[arg(long, value_name = "BYTES")]
+        bytes: Option<u64>,
+        /// Remove the tenant's row so the configured default applies again
+        #[arg(long)]
+        clear: bool,
     },
 }
 

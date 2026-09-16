@@ -6,8 +6,9 @@
 //! artifact is never half-published. `absent` records a declaration that
 //! matched no files, `failed` one whose capture or transfer broke — both
 //! keep the run's outcome explainable instead of silently missing.
-//! Retention is the declared `retain` rendered as a deadline; nothing is
-//! reclaimed here (that is a later stage, D06+).
+//! Retention is the declared `retain` rendered as a deadline; D06's
+//! [`sweep_expired`] retires rows past it, deleting the artifact row and
+//! its manifest version in one transaction.
 //!
 //! Recording is fenced through the attempt: the caller proves the attempt
 //! is still held before the row is written, and the ownership trigger in
@@ -17,7 +18,10 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{ArtifactId, AttemptId, JobId, RunId, TenantId, UnixMillis};
 
-use crate::{Error, Result};
+use crate::{
+    Error, Result,
+    objects::{self, Objects},
+};
 
 /// Terminal artifact state; stored as `state_code`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,4 +346,51 @@ pub fn captured(
         retain_until_ms: UnixMillis(retain),
         created_ms: UnixMillis(created),
     })
+}
+/// Retire artifact rows whose retention deadline passed: a captured row's
+/// manifest version is deleted with it (cascading its `manifest_refs`
+/// edges, which is what later lets the objects be reclaimed), and the row
+/// itself goes. Returns the manifest file paths the caller unlinks once the
+/// transaction commits; at most `limit` rows per pass.
+pub fn sweep_expired(
+    tx: &Transaction<'_>,
+    objects: &Objects,
+    now: UnixMillis,
+    limit: i64,
+) -> Result<Vec<std::path::PathBuf>> {
+    // (id, tenant_id, job_id, name, manifest_version)
+    type Due = (Vec<u8>, Vec<u8>, Vec<u8>, String, Option<i64>);
+    let due: Vec<Due> = tx
+        .prepare(
+            "SELECT id, tenant_id, job_id, name, manifest_version
+             FROM artifacts WHERE retain_until_ms <= ?1 LIMIT ?2",
+        )?
+        .query_map(params![now.0, limit], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut paths = Vec::new();
+    for (id, tenant, job, name, version) in due {
+        if let Some(version) = version {
+            let tenant = objects::tenant_from(tenant)?;
+            let job = JobId::from_bytes(
+                <[u8; 16]>::try_from(job.as_slice()).map_err(|_| Error::Corrupt("job id"))?,
+            )
+            .map_err(|_| Error::Corrupt("job id"))?;
+            if let Some(path) = objects.retire_manifest(
+                tx,
+                tenant,
+                objects::Kind::Artifact,
+                &manifest_name(job, &name),
+                version as u64,
+            )? {
+                paths.push(path);
+            }
+        }
+        tx.execute(
+            "DELETE FROM artifacts WHERE id = ?1",
+            params![id.as_slice()],
+        )?;
+    }
+    Ok(paths)
 }

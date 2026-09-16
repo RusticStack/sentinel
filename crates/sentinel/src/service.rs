@@ -69,6 +69,73 @@ struct FileConfig {
     enrollment_file: Option<PathBuf>,
     cpu_millis: Option<u64>,
     memory_bytes: Option<u64>,
+    // Server: disk admission watermarks, quotas and retention (D06).
+    storage: Option<StorageFile>,
+}
+
+/// The `[storage]` section: all fields optional, resolved to defaults.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageFile {
+    /// Free bytes held back for metadata and log evidence.
+    reserve_bytes: Option<u64>,
+    /// Discretionary writes refuse below this free figure...
+    low_watermark_bytes: Option<u64>,
+    /// ...and admit again above this one (hysteresis).
+    high_watermark_bytes: Option<u64>,
+    /// Default committed-bytes cap per tenant; 0 is unlimited.
+    tenant_quota_bytes: Option<u64>,
+    /// Finished attempt logs are kept this long.
+    log_retention_secs: Option<u64>,
+    /// The maintenance pass rides the dispatch loop at most this often.
+    sweep_interval_secs: Option<u64>,
+}
+
+/// Resolved storage settings; constructed only for the server role (the
+/// worker build links no `sentinel_store`, and refuses `[storage]` at load).
+#[cfg(feature = "server")]
+#[derive(Clone, Copy)]
+struct Storage {
+    marks: sentinel_store::space::Watermarks,
+    tenant_quota: u64,
+    log_retention_ms: i64,
+    sweep_interval_ms: i64,
+}
+
+#[cfg(feature = "server")]
+impl StorageFile {
+    fn resolve(&self) -> Result<Storage, Error> {
+        let reserve = self.reserve_bytes.unwrap_or(1 << 30);
+        let low = self.low_watermark_bytes.unwrap_or(2 << 30);
+        let high = self.high_watermark_bytes.unwrap_or(4 << 30);
+        let log_retention_secs = self.log_retention_secs.unwrap_or(14 * 86_400);
+        let sweep_interval_secs = self.sweep_interval_secs.unwrap_or(300);
+        if reserve < (64 << 20) || low < reserve || high < low {
+            return Err(Error::config(
+                "storage watermarks must satisfy 64 MiB <= reserve_bytes <= low_watermark_bytes <= high_watermark_bytes",
+            ));
+        }
+        if !(5..=86_400).contains(&sweep_interval_secs)
+            || !(3_600..=86_400 * 365).contains(&log_retention_secs)
+        {
+            return Err(Error::config(
+                "storage sweep_interval_secs must be 5..=86400 and log_retention_secs 3600..=31536000",
+            ));
+        }
+        Ok(Storage {
+            marks: sentinel_store::space::Watermarks {
+                reserve,
+                low,
+                high,
+                // Log evidence keeps the top slice of the reserve so the
+                // metadata database keeps the rest.
+                floor: reserve / 8,
+            },
+            tenant_quota: self.tenant_quota_bytes.unwrap_or(0),
+            log_retention_ms: (log_retention_secs * 1000) as i64,
+            sweep_interval_ms: (sweep_interval_secs * 1000) as i64,
+        })
+    }
 }
 
 /// The worker's link settings; absent when no controller is configured, in
@@ -95,6 +162,8 @@ struct Config {
     data_dir: PathBuf,
     log_format: LogFormat,
     log_level: LogLevel,
+    #[cfg(feature = "server")]
+    storage: Storage,
     role: Role,
 }
 
@@ -134,7 +203,7 @@ impl Config {
                 bootstrap_work(cpu, move || {
                     // Do not echo parser diagnostics: they can contain pasted credentials.
                     toml::from_str::<FileConfig>(&text).map_err(|_| Error::config(
-                        "invalid configuration: expected strict TOML with only data_dir, log_format, log_level and the role's link keys (no duplicate/unknown keys or invalid values)",
+                        "invalid configuration: expected strict TOML with only data_dir, log_format, log_level, [storage] and the role's link keys (no duplicate/unknown keys or invalid values)",
                     ))
                 })??
             }
@@ -262,10 +331,24 @@ impl Config {
             };
             Role::Worker(link)
         };
+        #[cfg(feature = "server")]
+        let storage = match (&role, file.storage) {
+            (Role::Server { .. }, file) => file.unwrap_or_default().resolve()?,
+            (Role::Worker(_), Some(_)) => {
+                return Err(Error::config("[storage] applies to the server role only"));
+            }
+            (Role::Worker(_), None) => StorageFile::default().resolve()?,
+        };
+        #[cfg(not(feature = "server"))]
+        if file.storage.is_some() {
+            return Err(Error::config("[storage] applies to the server role only"));
+        }
         Ok(Self {
             data_dir,
             log_format: args.log_format.or(file.log_format).unwrap_or_default(),
             log_level: args.log_level.or(file.log_level).unwrap_or_default(),
+            #[cfg(feature = "server")]
+            storage,
             role,
         })
     }
@@ -479,10 +562,19 @@ fn start_server(
         sentinel_store::logs::LogStore::open(config.data_dir.join(sentinel_store::logs::LOGS_DIR))
             .map_err(|error| Error::runtime(format!("cannot open the log store: {error}")))?,
     );
+    // Disk admission (D06): one gate over the data directory's filesystem
+    // shared by objects and logs; staged writes and uploads charge it.
+    let admission = Arc::new(
+        sentinel_store::space::Admission::new(config.data_dir.clone(), config.storage.marks)
+            .map_err(|error| Error::runtime(format!("invalid storage watermarks: {error}")))?,
+    );
+    logs.set_admission(Arc::clone(&admission));
     // Reconcile the object tree against committed rows before serving:
     // staged leftovers are swept, orphans/corrupt/missing are reported.
     let objects = sentinel_store::objects::Objects::open(&config.data_dir)
         .map_err(|error| Error::runtime(format!("cannot open the object store: {error}")))?;
+    objects.set_admission(Arc::clone(&admission));
+    objects.set_default_quota(config.storage.tenant_quota);
     let recovery = store
         .read(|conn| objects.recover(conn))
         .map_err(|error| Error::runtime(format!("cannot recover the object store: {error}")))?;
@@ -520,6 +612,10 @@ fn start_server(
     )
     .map_err(|error| Error::runtime(format!("cannot listen on {listen}: {error}")))?;
     let reconciled = controller.reconciled();
+    controller.set_storage_policy(sentinel_link::controller::StoragePolicy {
+        log_retention_ms: config.storage.log_retention_ms,
+        interval_ms: config.storage.sweep_interval_ms,
+    });
     controller.set_source_destinations(
         crate::source_admin::load_destinations(&config.data_dir)
             .map_err(|_| Error::runtime("cannot load source destination policy"))?,
@@ -1016,5 +1112,76 @@ fn initialize_and_wait(
             tracing::info!(event = "link_stopped", joined);
             Ok(())
         }
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    fn resolve_ok(file: StorageFile) -> Storage {
+        match file.resolve() {
+            Ok(s) => s,
+            Err(_) => panic!("storage config must resolve"),
+        }
+    }
+
+    #[test]
+    fn storage_defaults_and_validation() {
+        let resolved = resolve_ok(StorageFile::default());
+        assert_eq!(
+            resolved.marks,
+            sentinel_store::space::Watermarks {
+                reserve: 1 << 30,
+                low: 2 << 30,
+                high: 4 << 30,
+                floor: (1 << 30) / 8,
+            }
+        );
+        assert_eq!(resolved.tenant_quota, 0);
+        assert_eq!(resolved.log_retention_ms, 14 * 86_400_000);
+        assert_eq!(resolved.sweep_interval_ms, 300_000);
+
+        // reserve under 64 MiB, low under reserve, high under low: refused.
+        for (reserve, low, high) in [
+            (Some(1u64 << 20), None, None),
+            (None, Some((1 << 30) - 1), None),
+            (None, None, Some(1 << 30)),
+        ] {
+            let file = StorageFile {
+                reserve_bytes: reserve,
+                low_watermark_bytes: low,
+                high_watermark_bytes: high,
+                ..Default::default()
+            };
+            assert!(file.resolve().is_err(), "{reserve:?} {low:?} {high:?}");
+        }
+        // Sweep and retention bounds.
+        for (sweep, retention) in [
+            (Some(4u64), None),
+            (Some(86_401), None),
+            (None, Some(3_599)),
+            (None, Some(31_536_001)),
+        ] {
+            let file = StorageFile {
+                sweep_interval_secs: sweep,
+                log_retention_secs: retention,
+                ..Default::default()
+            };
+            assert!(file.resolve().is_err(), "{sweep:?} {retention:?}");
+        }
+        // A full override resolves.
+        let file = StorageFile {
+            reserve_bytes: Some(1 << 30),
+            low_watermark_bytes: Some(2 << 30),
+            high_watermark_bytes: Some(3 << 30),
+            tenant_quota_bytes: Some(1 << 40),
+            log_retention_secs: Some(7_200),
+            sweep_interval_secs: Some(60),
+        };
+        let resolved = resolve_ok(file);
+        assert_eq!(resolved.marks.high, 3 << 30);
+        assert_eq!(resolved.tenant_quota, 1 << 40);
+        assert_eq!(resolved.log_retention_ms, 7_200_000);
     }
 }

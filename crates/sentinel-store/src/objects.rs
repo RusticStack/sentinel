@@ -40,7 +40,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -48,7 +48,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{TenantId, UnixMillis, UploadId};
 
-use crate::{Error, Result};
+use crate::{Error, Result, space::Admission};
 
 pub const OBJECTS_DIR: &str = "objects";
 pub const MANIFESTS_DIR: &str = "manifests";
@@ -138,17 +138,33 @@ pub struct Staged {
     /// This stage created the final-path file; a dedup hit did not, so
     /// `discard` must not remove what a concurrent commit may own.
     created: bool,
+    /// Bytes admitted while the file sat uncommitted. Released when the
+    /// stage leaves scope — commit, discard or drop — since the probe then
+    /// accounts the bytes itself (or they are gone).
+    charge: Option<(Arc<Admission>, u64)>,
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if let Some((admission, bytes)) = self.charge.take() {
+            admission.release(self.tenant, bytes);
+        }
+    }
 }
 
 /// An open staged write under `tmp/`, for bodies that arrive in pieces —
 /// link artifact frames, where no `Read` exists. Dropping without
-/// [`Objects::stage_seal`] removes the temp file.
+/// [`Objects::stage_seal`] removes the temp file and releases the admission
+/// charge the written bytes held.
 pub struct Staging {
     file: File,
     tmp: PathBuf,
     hasher: blake3::Hasher,
     written: u64,
     limit: u64,
+    tenant: TenantId,
+    admission: Option<Arc<Admission>>,
+    charged: u64,
 }
 
 impl Staging {
@@ -156,16 +172,28 @@ impl Staging {
     pub fn written(&self) -> u64 {
         self.written
     }
-    /// Consume the handle without the Drop removal firing.
-    fn into_parts(self) -> (File, PathBuf) {
+    /// Consume the handle without the Drop removal firing; the admission
+    /// charge moves with the result so [`Objects::stage_seal`] can hand it
+    /// to the `Staged` it builds.
+    fn into_parts(self) -> (File, PathBuf, Option<(Arc<Admission>, u64)>) {
         let this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: `file` and `tmp` are read once and `this` is never dropped.
-        unsafe { (std::ptr::read(&this.file), std::ptr::read(&this.tmp)) }
+        // SAFETY: every field is read at most once and `this` is never
+        // dropped, so nothing is released twice.
+        unsafe {
+            (
+                std::ptr::read(&this.file),
+                std::ptr::read(&this.tmp),
+                std::ptr::read(&this.admission).map(|a| (a, this.charged)),
+            )
+        }
     }
 }
 
 impl Drop for Staging {
     fn drop(&mut self) {
+        if let Some(admission) = &self.admission {
+            admission.release(self.tenant, self.charged);
+        }
         let _ = fs::remove_file(&self.tmp);
     }
 }
@@ -264,6 +292,28 @@ pub struct Corrupt {
     pub path: PathBuf,
 }
 
+/// How long an unreferenced, unleased object row must sit before
+/// reclamation may collect it: generous enough that a manifest commit a
+/// client is still preparing cannot lose its objects underneath it.
+pub const UNREFERENCED_GRACE_MS: i64 = 24 * 3_600_000;
+/// A file under the object/manifest/tmp trees with no row and no writer
+/// this old is commit-crash garbage and is swept.
+pub const FILE_ORPHAN_GRACE_MS: i64 = 3_600_000;
+/// Longest a single lease may pin an object.
+pub const MAX_LEASE_TTL_MS: i64 = 30 * 24 * 3_600_000;
+/// Reclamation and index passes move this many rows per call, so a sweep
+/// never holds the writer through a whole-store walk.
+const RECLAIM_BATCH: i64 = 256;
+
+/// What one [`Objects::reclaim`] pass removed: rows deleted and the file
+/// paths the caller unlinks once the transaction commits.
+#[derive(Debug, Default)]
+pub struct Reclaimed {
+    pub objects: u32,
+    pub bytes: u64,
+    pub paths: Vec<PathBuf>,
+}
+
 /// The object and manifest tree under one data directory. Filesystem work
 /// happens here; reference commits happen inside the caller's transaction.
 pub struct Objects {
@@ -275,6 +325,12 @@ pub struct Objects {
     /// Live readers per (tenant, digest). Reclamation must never unlink a
     /// file a reader is streaming; [`Objects::reader_active`] is how GC asks.
     readers: std::sync::Arc<Mutex<HashMap<(TenantId, Digest), u64>>>,
+    /// Disk admission; unset admits everything (tests and hosts without
+    /// watermarks behave exactly as before D06).
+    admission: OnceLock<Arc<Admission>>,
+    /// Quota applied to tenants without a `tenant_quotas` row; 0 means
+    /// unlimited.
+    default_quota: AtomicU64,
 }
 
 impl Objects {
@@ -291,7 +347,152 @@ impl Objects {
             durable_dirs: Mutex::new(HashSet::new()),
             tmp_seq: AtomicU64::new(0),
             readers: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            admission: OnceLock::new(),
+            default_quota: AtomicU64::new(0),
         })
+    }
+
+    /// Install the disk admission gate; staged writes and uploads charge
+    /// against it. Set once at startup.
+    pub fn set_admission(&self, admission: Arc<Admission>) {
+        let _ = self.admission.set(admission);
+    }
+    /// The configured admission gate, when one was installed.
+    pub fn admission(&self) -> Option<&Arc<Admission>> {
+        self.admission.get()
+    }
+    /// Quota applied to tenants without their own `tenant_quotas` row;
+    /// 0 means unlimited.
+    pub fn set_default_quota(&self, bytes: u64) {
+        self.default_quota.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Committed bytes owed by `tenant`: objects plus the declared length
+    /// of its open uploads.
+    pub fn usage(&self, conn: &Connection, tenant: TenantId) -> Result<u64> {
+        Ok(conn
+            .prepare_cached("SELECT bytes FROM tenant_usage WHERE tenant_id = ?1")?
+            .query_row([tenant.as_bytes().as_slice()], |r| r.get::<_, i64>(0))
+            .optional()?
+            .unwrap_or(0) as u64)
+    }
+
+    /// The tenant's quota in bytes: its own row, else the default; 0 means
+    /// unlimited.
+    pub fn quota(&self, conn: &Connection, tenant: TenantId) -> Result<u64> {
+        Ok(conn
+            .prepare_cached("SELECT quota_bytes FROM tenant_quotas WHERE tenant_id = ?1")?
+            .query_row([tenant.as_bytes().as_slice()], |r| r.get::<_, i64>(0))
+            .optional()?
+            .map(|q| q as u64)
+            .unwrap_or_else(|| self.default_quota.load(Ordering::Relaxed)))
+    }
+
+    /// What the tenant owes against its quota right now: committed usage
+    /// plus staged-but-uncommitted bytes the admission gate is holding.
+    fn owed(&self, conn: &Connection, tenant: TenantId) -> Result<u64> {
+        let inflight = self.admission.get().map_or(0, |a| a.inflight(tenant));
+        Ok(self.usage(conn, tenant)?.saturating_add(inflight))
+    }
+
+    /// Set or replace a tenant's quota (admin).
+    pub fn set_quota(&self, tx: &Transaction<'_>, tenant: TenantId, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Err(Error::InvalidInput("quota"));
+        }
+        tx.execute(
+            "INSERT INTO tenant_quotas(tenant_id, quota_bytes) VALUES (?1, ?2)
+             ON CONFLICT(tenant_id) DO UPDATE SET quota_bytes = excluded.quota_bytes",
+            params![tenant.as_bytes().as_slice(), bytes as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a tenant's quota row — the default applies again.
+    pub fn clear_quota(&self, tx: &Transaction<'_>, tenant: TenantId) -> Result<()> {
+        tx.execute(
+            "DELETE FROM tenant_quotas WHERE tenant_id = ?1",
+            params![tenant.as_bytes().as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// Pin an object for `holder` until `now + ttl_ms` — reclamation skips
+    /// leased objects. Re-issuing renews; [`Objects::release_lease`] frees
+    /// early. The object must be committed (the foreign key enforces it).
+    pub fn lease(
+        &self,
+        tx: &Transaction<'_>,
+        tenant: TenantId,
+        digest: Digest,
+        holder: &str,
+        ttl_ms: i64,
+        now: UnixMillis,
+    ) -> Result<()> {
+        if holder.is_empty() || holder.len() > 255 {
+            return Err(Error::InvalidInput("lease holder"));
+        }
+        if ttl_ms <= 0 || ttl_ms > MAX_LEASE_TTL_MS {
+            return Err(Error::InvalidInput("lease ttl"));
+        }
+        tx.execute(
+            "INSERT INTO object_leases(tenant_id, digest, holder, until_ms, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(tenant_id, digest, holder)
+             DO UPDATE SET until_ms = excluded.until_ms",
+            params![
+                tenant.as_bytes().as_slice(),
+                digest.as_bytes().as_slice(),
+                holder,
+                now.0 + ttl_ms,
+                now.0,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Drop one holder's lease; no row is not an error.
+    pub fn release_lease(
+        &self,
+        tx: &Transaction<'_>,
+        tenant: TenantId,
+        digest: Digest,
+        holder: &str,
+    ) -> Result<()> {
+        tx.execute(
+            "DELETE FROM object_leases
+             WHERE tenant_id = ?1 AND digest = ?2 AND holder = ?3",
+            params![
+                tenant.as_bytes().as_slice(),
+                digest.as_bytes().as_slice(),
+                holder
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove expired lease rows; at most [`RECLAIM_BATCH`] per call.
+    /// WITHOUT ROWID has no rowid LIMIT trick, so the keys come out first.
+    pub fn sweep_leases(&self, tx: &Transaction<'_>, now: UnixMillis) -> Result<u32> {
+        let mut stmt = tx.prepare(
+            "SELECT tenant_id, digest, holder FROM object_leases
+             WHERE until_ms <= ?1 LIMIT ?2",
+        )?;
+        let expired: Vec<(Vec<u8>, Vec<u8>, String)> = stmt
+            .query_map(params![now.0, RECLAIM_BATCH], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        let mut swept = 0u32;
+        for (tenant, digest, holder) in expired {
+            swept += tx.execute(
+                "DELETE FROM object_leases
+                 WHERE tenant_id = ?1 AND digest = ?2 AND holder = ?3",
+                params![tenant, digest, holder],
+            )? as u32;
+        }
+        Ok(swept)
     }
 
     fn objects_root(&self) -> PathBuf {
@@ -364,10 +565,12 @@ impl Objects {
         limit: u64,
         expect: Expect,
     ) -> Result<Staged> {
+        let admission = self.admission.get().cloned();
+        let mut charged = 0u64;
         let tmp = self.tmp();
-        let (digest, len) = {
-            let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
-            let result = (|| -> Result<(Digest, u64)> {
+        let outcome = (|| -> Result<Staged> {
+            let (digest, len) = {
+                let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
                 let mut hasher = blake3::Hasher::new();
                 let mut buf = vec![0u8; CHUNK];
                 let mut len = 0u64;
@@ -380,56 +583,70 @@ impl Objects {
                     if len > limit {
                         return Err(Error::InvalidInput("object size"));
                     }
+                    // Admit before the bytes land so a refused stage leaves
+                    // nothing but the temp file it already wrote.
+                    if let Some(a) = &admission {
+                        a.admit(tenant, got as u64)?;
+                        charged += got as u64;
+                    }
                     hasher.update(&buf[..got]);
                     file.write_all(&buf[..got])?;
                 }
                 file.sync_data()?;
-                Ok((Digest(*hasher.finalize().as_bytes()), len))
-            })();
-            if result.is_err() {
+                (Digest(*hasher.finalize().as_bytes()), len)
+            };
+            if let Some(declared) = expect.len
+                && declared != len
+            {
+                return Err(Error::InvalidInput("object length"));
+            }
+            if let Some(declared) = expect.digest
+                && declared != digest
+            {
+                return Err(Error::InvalidInput("object digest"));
+            }
+            let path = self.object_path(tenant, &digest);
+            self.ensure_dir(path.parent().expect("object path has a parent"))?;
+            let created = if !path.exists() {
+                fs::rename(&tmp, &path)?;
+                if let Some(dir) = path.parent() {
+                    sync_dir(dir)?;
+                }
+                true
+            } else {
+                // Same tenant, same digest: the committed bytes are
+                // identical, so the duplicate stage is redundant work.
                 let _ = fs::remove_file(&tmp);
+                false
+            };
+            Ok(Staged {
+                tenant,
+                digest,
+                len,
+                path,
+                created,
+                charge: None,
+            })
+        })();
+        match outcome {
+            Ok(mut staged) => {
+                staged.charge = admission.map(|a| (a, charged));
+                Ok(staged)
             }
-            result?
-        };
-        if let Some(declared) = expect.len
-            && declared != len
-        {
-            let _ = fs::remove_file(&tmp);
-            return Err(Error::InvalidInput("object length"));
-        }
-        if let Some(declared) = expect.digest
-            && declared != digest
-        {
-            let _ = fs::remove_file(&tmp);
-            return Err(Error::InvalidInput("object digest"));
-        }
-        let path = self.object_path(tenant, &digest);
-        self.ensure_dir(path.parent().expect("object path has a parent"))?;
-        let created = if !path.exists() {
-            fs::rename(&tmp, &path)?;
-            if let Some(dir) = path.parent() {
-                sync_dir(dir)?;
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                if let Some(a) = &admission {
+                    a.release(tenant, charged);
+                }
+                Err(e)
             }
-            true
-        } else {
-            // Same tenant, same digest: the committed bytes are identical,
-            // so the duplicate stage is simply redundant work.
-            let _ = fs::remove_file(&tmp);
-            false
-        };
-        Ok(Staged {
-            tenant,
-            digest,
-            len,
-            path,
-            created,
-        })
+        }
     }
 
     /// Open a staged write under `tmp/` for a body that arrives in pieces —
     /// link artifact frames, where no `Read` exists. `limit` bounds the
     /// total; dropping the [`Staging`] discards the temp file.
-    pub fn stage_begin(&self, limit: u64) -> Result<Staging> {
+    pub fn stage_begin(&self, tenant: TenantId, limit: u64) -> Result<Staging> {
         let tmp = self.tmp();
         let file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
         Ok(Staging {
@@ -438,6 +655,9 @@ impl Objects {
             hasher: blake3::Hasher::new(),
             written: 0,
             limit,
+            tenant,
+            admission: self.admission.get().cloned(),
+            charged: 0,
         })
     }
 
@@ -451,7 +671,16 @@ impl Objects {
         if next > staging.limit {
             return Err(Error::InvalidInput("object size"));
         }
-        staging.file.write_all(bytes)?;
+        if let Some(a) = &staging.admission {
+            a.admit(staging.tenant, bytes.len() as u64)?;
+        }
+        if let Err(e) = staging.file.write_all(bytes) {
+            if let Some(a) = &staging.admission {
+                a.release(staging.tenant, bytes.len() as u64);
+            }
+            return Err(e.into());
+        }
+        staging.charged += bytes.len() as u64;
         staging.hasher.update(bytes);
         staging.written = next;
         Ok(())
@@ -478,20 +707,24 @@ impl Objects {
         } else {
             false
         };
-        // `into_parts` consumes without the Drop removal firing.
-        let _ = staging.into_parts();
+        // `into_parts` consumes without the Drop removal firing; the
+        // admission charge moves into the `Staged` it becomes.
+        let (_, _, charge) = staging.into_parts();
         Ok(Staged {
             tenant,
             digest,
             len: expected,
             path,
             created,
+            charge,
         })
     }
 
     /// Publish a staged object: the reference commit. Idempotent — a second
     /// commit of the same (tenant, digest) reports `false`. Fails `NotFound`
-    /// for an unknown tenant via the foreign key.
+    /// for an unknown tenant via the foreign key. A commit that would take
+    /// the tenant over quota fails `QuotaExceeded`; returning `Err` leaves
+    /// the transaction uncommitted — the caller must not swallow it.
     pub fn commit(&self, tx: &Transaction<'_>, staged: &Staged) -> Result<bool> {
         let changed = tx.execute(
             "INSERT OR IGNORE INTO objects(tenant_id, digest, len, created_ms)
@@ -503,6 +736,16 @@ impl Objects {
                 UnixMillis::now().0,
             ),
         )?;
+        if changed == 1 && staged.charge.is_some() {
+            // A stage-sourced commit: `len` just entered usage and is still
+            // counted in-flight, so `owed - len` is what the tenant owns
+            // once the charge releases. Upload seals skip the check — they
+            // swap a declared reservation for the object, never add usage.
+            let quota = self.quota(tx, staged.tenant)?;
+            if quota > 0 && self.owed(tx, staged.tenant)?.saturating_sub(staged.len) > quota {
+                return Err(Error::QuotaExceeded);
+            }
+        }
         Ok(changed == 1)
     }
 
@@ -624,23 +867,39 @@ impl Objects {
         let digest = Digest(*blake3::hash(&body).as_bytes());
         let path = self.manifest_path(tenant, kind, name.as_bytes(), version);
         let tmp = self.tmp();
-        // Write the manifest through the same stage discipline as objects.
-        self.ensure_dir(path.parent().expect("manifest path has a parent"))?;
-        {
-            let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
-            let result = file.write_all(&body).and_then(|()| file.sync_data());
-            if result.is_err() {
-                let _ = fs::remove_file(&tmp);
-            }
-            result?;
+        // Manifest files are small but real bytes: admit them so a burst of
+        // manifests cannot race the watermark either. The charge releases
+        // once the file is durable — the probe accounts it from then on.
+        let admission = self.admission.get().cloned();
+        if let Some(a) = &admission {
+            a.admit(tenant, body.len() as u64)?;
         }
-        fs::rename(&tmp, &path)?;
-        if let Some(dir) = path.parent() {
-            sync_dir(dir)?;
+        let landed = (|| -> Result<()> {
+            // Write the manifest through the same stage discipline as objects.
+            self.ensure_dir(path.parent().expect("manifest path has a parent"))?;
+            {
+                let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+                file.write_all(&body).and_then(|()| file.sync_data())?;
+            }
+            fs::rename(&tmp, &path)?;
+            if let Some(dir) = path.parent() {
+                sync_dir(dir)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = landed {
+            let _ = fs::remove_file(&tmp);
+            if let Some(a) = &admission {
+                a.release(tenant, body.len() as u64);
+            }
+            return Err(e);
+        }
+        if let Some(a) = &admission {
+            a.release(tenant, body.len() as u64);
         }
         let written = tx.execute(
-            "INSERT INTO manifests(tenant_id, kind, name, version, digest, entries, payload_len, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO manifests(tenant_id, kind, name, version, digest, entries, payload_len, created_ms, refs_indexed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
             (
                 tenant.as_bytes().as_slice(),
                 kind.code() as i64,
@@ -656,6 +915,19 @@ impl Objects {
             let _ = fs::remove_file(&path);
         }
         written?;
+        let mut ref_stmt = tx.prepare(
+            "INSERT OR IGNORE INTO manifest_refs(tenant_id, kind, name, version, digest)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for entry in entries {
+            ref_stmt.execute(params![
+                tenant.as_bytes().as_slice(),
+                kind.code() as i64,
+                name.as_bytes(),
+                version as i64,
+                entry.digest.as_bytes().as_slice(),
+            ])?;
+        }
         Ok(version)
     }
 
@@ -971,6 +1243,15 @@ impl Objects {
         if ttl_ms <= 0 || ttl_ms > MAX_UPLOAD_TTL_MS {
             return Err(Error::InvalidInput("upload ttl"));
         }
+        // The declared length is reserved in `tenant_usage` the moment the
+        // row inserts, so the projected total is what the tenant will owe.
+        let quota = self.quota(tx, tenant)?;
+        if quota > 0 && self.owed(tx, tenant)?.saturating_add(declared_len) > quota {
+            return Err(Error::QuotaExceeded);
+        }
+        if let Some(a) = self.admission.get() {
+            a.check(declared_len)?;
+        }
         self.ensure_dir(&self.root.join(INCOMING_DIR))?;
         let id = UploadId::new();
         let path = self.upload_path(id);
@@ -1060,6 +1341,9 @@ impl Objects {
                 "UPDATE uploads SET state_code = 2 WHERE id = ?1 AND state_code = 0",
                 params![id.as_bytes().as_slice()],
             )?;
+            if let Some(a) = self.admission.get() {
+                a.release_upload(id);
+            }
             let _ = fs::remove_file(self.upload_path(id));
             return Err(Error::InvalidInput("upload expired"));
         }
@@ -1067,21 +1351,38 @@ impl Objects {
             .checked_add(bytes.len() as u64)
             .filter(|end| *end <= row.declared_len)
             .ok_or(Error::InvalidInput("chunk range"))?;
-        let mut file = OpenOptions::new().write(true).open(self.upload_path(id))?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(bytes)?;
-        file.sync_data()?;
-        let mut ranges = row.ranges;
+        // Admit only the bytes this chunk actually adds — resent ranges
+        // merge to a zero delta and stay free.
+        let mut ranges = row.ranges.clone();
         ranges_insert(&mut ranges, offset, end)?;
         let received: u64 = ranges.iter().map(|(s, e)| e - s).sum();
-        tx.execute(
-            "UPDATE uploads SET ranges = ?2, received = ?3 WHERE id = ?1 AND state_code = 0",
-            params![
-                id.as_bytes().as_slice(),
-                encode_ranges(&ranges),
-                received as i64
-            ],
-        )?;
+        let delta = received - row.received;
+        if let Some(a) = self.admission.get() {
+            a.admit_untracked(id, delta)?;
+        }
+        let landed = (|| -> Result<()> {
+            let mut file = OpenOptions::new().write(true).open(self.upload_path(id))?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(bytes)?;
+            file.sync_data()?;
+            tx.execute(
+                "UPDATE uploads SET ranges = ?2, received = ?3 WHERE id = ?1 AND state_code = 0",
+                params![
+                    id.as_bytes().as_slice(),
+                    encode_ranges(&ranges),
+                    received as i64
+                ],
+            )?;
+            Ok(())
+        })();
+        if landed.is_err()
+            && let Some(a) = self.admission.get()
+        {
+            // The ranges row never recorded them, so a retry charges the
+            // same delta again — return this one rather than double-count.
+            a.release_upload_delta(id, delta);
+        }
+        landed?;
         Ok(received)
     }
 
@@ -1110,6 +1411,9 @@ impl Objects {
                 "UPDATE uploads SET state_code = 2 WHERE id = ?1 AND state_code = 0",
                 params![id.as_bytes().as_slice()],
             )?;
+            if let Some(a) = self.admission.get() {
+                a.release_upload(id);
+            }
             let _ = fs::remove_file(self.upload_path(id));
             return Err(Error::InvalidInput("upload expired"));
         }
@@ -1119,7 +1423,15 @@ impl Objects {
         if !complete {
             return Err(Error::InvalidInput("upload incomplete"));
         }
-        let digest = {
+        // A previous seal may have renamed into objects/ and then lost its
+        // transaction: the staging file is gone but the upload row stayed
+        // open. Recover through the declared digest rather than wedging —
+        // without one the computed destination is unknowable and the
+        // upload is genuinely unrecoverable.
+        let recovered = !path.exists();
+        let digest = if recovered {
+            row.digest.ok_or(Error::Corrupt("upload file"))?
+        } else {
             let mut file = File::open(&path)?;
             let mut hasher = blake3::Hasher::new();
             let mut buf = vec![0u8; CHUNK];
@@ -1144,16 +1456,25 @@ impl Objects {
         }
         let object = self.object_path(tenant, &digest);
         self.ensure_dir(object.parent().expect("object path has a parent"))?;
-        let created = if !object.exists() {
+        let created = if object.exists() {
+            let _ = fs::remove_file(&path);
+            false
+        } else if recovered {
+            return Err(Error::Corrupt("upload file"));
+        } else {
             fs::rename(&path, &object)?;
             if let Some(dir) = object.parent() {
                 sync_dir(dir)?;
             }
             true
-        } else {
-            let _ = fs::remove_file(&path);
-            false
         };
+        // Close the upload first: its declared-length reservation leaves
+        // `tenant_usage` as the object row's length enters it, so the seal
+        // is net-zero against the tenant's quota rather than double-counted.
+        tx.execute(
+            "UPDATE uploads SET state_code = 1, object_digest = ?2 WHERE id = ?1",
+            params![id.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+        )?;
         self.commit(
             tx,
             &Staged {
@@ -1162,12 +1483,12 @@ impl Objects {
                 len: row.declared_len,
                 path: object,
                 created,
+                charge: None,
             },
         )?;
-        tx.execute(
-            "UPDATE uploads SET state_code = 1, object_digest = ?2 WHERE id = ?1",
-            params![id.as_bytes().as_slice(), digest.as_bytes().as_slice()],
-        )?;
+        if let Some(a) = self.admission.get() {
+            a.release_upload(id);
+        }
         Ok(digest)
     }
 
@@ -1182,6 +1503,9 @@ impl Objects {
             "UPDATE uploads SET state_code = 2 WHERE id = ?1",
             params![id.as_bytes().as_slice()],
         )?;
+        if let Some(a) = self.admission.get() {
+            a.release_upload(id);
+        }
         let _ = fs::remove_file(self.upload_path(id));
         Ok(())
     }
@@ -1208,13 +1532,269 @@ impl Objects {
                 "UPDATE uploads SET state_code = 2 WHERE id = ?1",
                 params![id.as_bytes().as_slice()],
             )?;
+            if let Some(a) = self.admission.get() {
+                a.release_upload(id);
+            }
             let _ = fs::remove_file(self.upload_path(id));
             swept += 1;
         }
         Ok(swept)
     }
 
-    /// Write a manifest's objects into `dest` as regular files. Entry paths
+    /// Backfill `manifest_refs` for manifests committed before the edges
+    /// existed (`refs_indexed = 0`). Reads each manifest file, inserts its
+    /// edges and flips the flag — all inside the caller's transaction, at
+    /// most `limit` manifests per call. A manifest that will not decode is
+    /// skipped: its tenant's objects stay unreclaimable until it is fixed.
+    pub fn index_refs(&self, tx: &Transaction<'_>, limit: i64) -> Result<u32> {
+        let pending: Vec<(Vec<u8>, i64, Vec<u8>, i64)> = tx
+            .prepare(
+                "SELECT tenant_id, kind, name, version FROM manifests
+                 WHERE refs_indexed = 0 LIMIT ?1",
+            )?
+            .query_map(params![limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut indexed = 0u32;
+        for (tenant, kind, name, version) in pending {
+            let tenant = tenant_from(tenant)?;
+            let kind = Kind::from_code(kind as u8)?;
+            let version = version as u64;
+            let path = self.manifest_path(tenant, kind, &name, version);
+            let entries = fs::read(&path)
+                .ok()
+                .and_then(|body| decode_manifest(&body).ok().map(|(_, _, e)| e));
+            let Some(entries) = entries else {
+                // Corrupt or missing: leave unindexed — reclamation refuses
+                // to collect objects under a tenant it cannot fully see.
+                continue;
+            };
+            {
+                let mut ref_stmt = tx.prepare(
+                    "INSERT OR IGNORE INTO manifest_refs(tenant_id, kind, name, version, digest)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?;
+                for entry in &entries {
+                    ref_stmt.execute(params![
+                        tenant.as_bytes().as_slice(),
+                        kind.code() as i64,
+                        name.as_slice(),
+                        version as i64,
+                        entry.digest.as_bytes().as_slice(),
+                    ])?;
+                }
+            }
+            tx.execute(
+                "UPDATE manifests SET refs_indexed = 1
+                 WHERE tenant_id = ?1 AND kind = ?2 AND name = ?3 AND version = ?4",
+                params![
+                    tenant.as_bytes().as_slice(),
+                    kind.code() as i64,
+                    name.as_slice(),
+                    version as i64
+                ],
+            )?;
+            indexed += 1;
+        }
+        Ok(indexed)
+    }
+
+    /// Delete one manifest version's row; its `manifest_refs` edges cascade.
+    /// Returns the file path for the caller to unlink once the transaction
+    /// commits — a crash between commit and unlink leaves an orphan the
+    /// file sweep later collects.
+    pub fn retire_manifest(
+        &self,
+        tx: &Transaction<'_>,
+        tenant: TenantId,
+        kind: Kind,
+        name: &str,
+        version: u64,
+    ) -> Result<Option<PathBuf>> {
+        let deleted = tx.execute(
+            "DELETE FROM manifests
+             WHERE tenant_id = ?1 AND kind = ?2 AND name = ?3 AND version = ?4",
+            params![
+                tenant.as_bytes().as_slice(),
+                kind.code() as i64,
+                name.as_bytes(),
+                version as i64
+            ],
+        )?;
+        Ok((deleted == 1).then(|| self.manifest_path(tenant, kind, name.as_bytes(), version)))
+    }
+
+    /// Collect reclaimable objects: committed past `UNREFERENCED_GRACE_MS`,
+    /// not referenced by any indexed manifest, not leased, not still
+    /// decodable through an unindexed manifest (a tenant with any
+    /// `refs_indexed = 0` row is skipped entirely), and not being streamed
+    /// by a live reader. Rows are deleted in this transaction; the caller
+    /// unlinks the returned paths after commit.
+    pub fn reclaim(&self, tx: &Transaction<'_>, now: UnixMillis, limit: i64) -> Result<Reclaimed> {
+        let cutoff = now.0 - UNREFERENCED_GRACE_MS;
+        let candidates: Vec<(Vec<u8>, Vec<u8>, i64)> = tx
+            .prepare(
+                "SELECT o.tenant_id, o.digest, o.len FROM objects o
+                 WHERE o.created_ms <= ?1
+                   AND NOT EXISTS(SELECT 1 FROM manifest_refs r
+                                  WHERE r.tenant_id = o.tenant_id
+                                    AND r.digest = o.digest)
+                   AND NOT EXISTS(SELECT 1 FROM object_leases l
+                                  WHERE l.tenant_id = o.tenant_id
+                                    AND l.digest = o.digest
+                                    AND l.until_ms > ?2)
+                   AND NOT EXISTS(SELECT 1 FROM manifests m
+                                  WHERE m.tenant_id = o.tenant_id
+                                    AND m.refs_indexed = 0)
+                 LIMIT ?3",
+            )?
+            .query_map(params![cutoff, now.0, limit.min(RECLAIM_BATCH)], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut reclaimed = Reclaimed::default();
+        for (tenant, digest, len) in candidates {
+            let tenant = tenant_from(tenant)?;
+            let digest = Digest::from_bytes(
+                <[u8; 32]>::try_from(digest.as_slice())
+                    .map_err(|_| Error::Corrupt("object digest"))?,
+            );
+            if self.reader_active(tenant, digest) {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM objects WHERE tenant_id = ?1 AND digest = ?2",
+                params![tenant.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+            )?;
+            reclaimed.objects += 1;
+            reclaimed.bytes += len as u64;
+            reclaimed.paths.push(self.object_path(tenant, &digest));
+        }
+        Ok(reclaimed)
+    }
+
+    /// Sweep files with no row: objects or manifests a commit orphaned, and
+    /// `tmp/` leftovers a restart's `recover` never saw. Only files whose
+    /// mtime is older than `FILE_ORPHAN_GRACE_MS` go — an in-flight commit's
+    /// just-renamed file is younger than its row insert by milliseconds.
+    /// Returns the number unlinked, at most `limit`.
+    pub fn sweep_orphans(&self, conn: &Connection, limit: u32) -> Result<u32> {
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64)
+            - FILE_ORPHAN_GRACE_MS;
+        let mut swept = 0u32;
+        let gone = |path: &Path, swept: &mut u32, limit: u32| -> bool {
+            if *swept >= limit {
+                return false;
+            }
+            let old = fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|age| (age.as_millis() as i64) < cutoff);
+            if old && fs::remove_file(path).is_ok() {
+                *swept += 1;
+            }
+            true
+        };
+        // Committed manifest files: the path set is small enough to hold.
+        let mut manifests = HashSet::new();
+        let mut rows = conn.prepare("SELECT tenant_id, kind, name, version FROM manifests")?;
+        let mut query = rows.query([])?;
+        while let Some(row) = query.next()? {
+            manifests.insert(self.manifest_path(
+                tenant_from(row.get::<_, Vec<u8>>(0)?)?,
+                Kind::from_code(row.get::<_, i64>(1)? as u8)?,
+                &row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)? as u64,
+            ));
+        }
+        drop(query);
+        drop(rows);
+        let root = self.manifests_root();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push(path);
+                } else if !manifests.contains(&path) && !gone(&path, &mut swept, limit) {
+                    return Ok(swept);
+                }
+            }
+        }
+        // Object files check their row directly — one prepared statement,
+        // no whole-table materialization.
+        let mut has_row = conn
+            .prepare("SELECT EXISTS(SELECT 1 FROM objects WHERE tenant_id = ?1 AND digest = ?2)")?;
+        let objects = self.objects_root();
+        let Ok(tenants) = fs::read_dir(&objects) else {
+            return Ok(swept);
+        };
+        for tenant_dir in tenants.flatten() {
+            let Ok(tenant) = tenant_dir.file_name().to_string_lossy().parse::<TenantId>() else {
+                if tenant_dir.path().is_file() && !gone(&tenant_dir.path(), &mut swept, limit) {
+                    return Ok(swept);
+                }
+                continue;
+            };
+            let Ok(prefixes) = fs::read_dir(tenant_dir.path()) else {
+                continue;
+            };
+            for prefix in prefixes.flatten() {
+                if prefix.file_type().is_ok_and(|t| t.is_file()) {
+                    // Stray file directly under objects/<tenant>/ — no row
+                    // can own a path outside the prefix layout.
+                    if !gone(&prefix.path(), &mut swept, limit) {
+                        return Ok(swept);
+                    }
+                    continue;
+                }
+                let Ok(entries) = fs::read_dir(prefix.path()) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                        continue;
+                    }
+                    let Ok(digest) = Digest::parse(&entry.file_name().to_string_lossy()) else {
+                        if !gone(&path, &mut swept, limit) {
+                            return Ok(swept);
+                        }
+                        continue;
+                    };
+                    let committed = has_row
+                        .query_row(
+                            params![tenant.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+                            |r| r.get::<_, bool>(0),
+                        )
+                        .unwrap_or(true);
+                    if !committed && !gone(&path, &mut swept, limit) {
+                        return Ok(swept);
+                    }
+                }
+            }
+        }
+        // `tmp/` leftovers: no row can ever claim them — the grace alone
+        // decides (a live stage's file is always fresh).
+        let tmp = self.root.join(TMP_DIR);
+        if let Ok(entries) = fs::read_dir(&tmp) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_file())
+                    && !gone(&entry.path(), &mut swept, limit)
+                {
+                    return Ok(swept);
+                }
+            }
+        }
+        Ok(swept)
+    }
     /// are re-validated, every ancestor under `dest` is checked for symlinks
     /// and the file itself is created `O_EXCL`-style (existing targets are
     /// refused), so a prepared directory cannot redirect the extract outside
@@ -1442,7 +2022,7 @@ fn manifest_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(u64, Digest, u64, 
     ))
 }
 
-fn tenant_from(bytes: Vec<u8>) -> Result<TenantId> {
+pub(crate) fn tenant_from(bytes: Vec<u8>) -> Result<TenantId> {
     TenantId::from_bytes(
         <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| Error::Corrupt("tenant id"))?,
     )

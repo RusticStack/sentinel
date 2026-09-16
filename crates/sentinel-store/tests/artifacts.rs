@@ -398,13 +398,13 @@ fn staging_streams_in_pieces_and_seals_only_the_declared_total() {
     let f = fixture();
     let tenant = f.tenant;
 
-    let mut staging = f.objects.stage_begin(11).unwrap();
+    let mut staging = f.objects.stage_begin(tenant, 11).unwrap();
     f.objects.stage_write(&mut staging, b"hello ").unwrap();
     f.objects.stage_write(&mut staging, b"world").unwrap();
     // Past the declared limit the write is refused without appending.
     assert!(f.objects.stage_write(&mut staging, b"!").is_err());
     // A different declared length cannot seal what was written.
-    let mut again = f.objects.stage_begin(5).unwrap();
+    let mut again = f.objects.stage_begin(tenant, 5).unwrap();
     f.objects.stage_write(&mut again, b"hi").unwrap();
     assert!(f.objects.stage_seal(tenant, again, 5).is_err());
     let staged = f.objects.stage_seal(tenant, staging, 11).unwrap();

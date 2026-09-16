@@ -33,6 +33,7 @@ pub mod schema;
 pub mod sign_in;
 pub mod sources;
 pub mod sources_forge;
+pub mod space;
 pub mod status;
 pub mod tenancy;
 pub mod tokens;
@@ -92,6 +93,12 @@ pub enum Error {
     /// A job cannot be admitted to execution because its image digest and
     /// platform have not been durably resolved (C05/W03 gate).
     Unresolved,
+    /// A discretionary write was refused: free space is below the
+    /// watermarks or the admission charge would not fit (D06).
+    StorageFull,
+    /// A write was refused because the tenant reached its storage quota
+    /// (D06). Not transient: bytes must be reclaimed or the quota raised.
+    QuotaExceeded,
     Io(std::io::Error),
 }
 
@@ -113,6 +120,8 @@ impl fmt::Display for Error {
             Self::Overloaded => f.write_str("reader pool exhausted"),
             Self::AlreadyOwned => f.write_str("database is owned by another process"),
             Self::Unresolved => f.write_str("image digest and platform not yet resolved"),
+            Self::StorageFull => f.write_str("storage admission refused: disk below watermark"),
+            Self::QuotaExceeded => f.write_str("tenant storage quota exceeded"),
             Self::Io(e) => write!(f, "io: {e}"),
         }
     }

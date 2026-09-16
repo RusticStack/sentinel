@@ -809,6 +809,54 @@ fn tenant(args: &TenantArgs, now: UnixMillis) -> Result<(), Error> {
             println!("{id}");
             return Ok(());
         }
+        TenantCommand::Quota {
+            data,
+            tenant,
+            bytes,
+            clear,
+        } => {
+            if *bytes == Some(0) || (bytes.is_some() && *clear) {
+                return Err(fail("give --bytes with a positive value, or --clear"));
+            }
+            let store = open(data, true)?;
+            let owned = tenant.clone();
+            let id = store
+                .read(move |conn| lookup::tenant_by_slug_any(conn, &owned))
+                .map_err(|_| fail("no tenant with that slug"))?;
+            let objects = sentinel_store::objects::Objects::open(&data.data_dir)
+                .map_err(|error| fail(format!("cannot open the object store: {error}")))?;
+            match (bytes, clear) {
+                (Some(bytes), _) => {
+                    let bytes = *bytes;
+                    store
+                        .writer()
+                        .write(move |tx| objects.set_quota(tx, id, bytes))
+                        .map_err(|error| fail(format!("cannot set the quota: {error}")))?;
+                    eprintln!("quota for {id} set to {bytes} bytes");
+                }
+                (None, true) => {
+                    store
+                        .writer()
+                        .write(move |tx| objects.clear_quota(tx, id))
+                        .map_err(|error| fail(format!("cannot clear the quota: {error}")))?;
+                    eprintln!("quota for {id} cleared; the configured default applies");
+                }
+                (None, false) => {
+                    let report = store
+                        .read(move |conn| Ok((objects.usage(conn, id)?, objects.quota(conn, id)?)))
+                        .map_err(|error| fail(format!("cannot read the quota: {error}")))?;
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "tenant": id.to_string(),
+                            "used_bytes": report.0,
+                            "quota_bytes": report.1,
+                        })
+                    );
+                }
+            }
+            return Ok(());
+        }
         TenantCommand::Suspend { data, tenant } => (data, tenant, true),
         TenantCommand::Reactivate { data, tenant } => (data, tenant, false),
     };
@@ -1086,6 +1134,98 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
                 .write(move |tx| objects.sweep_uploads(tx, sentinel_core::UnixMillis::now()))
                 .map_err(|error| fail(format!("sweep failed: {error}")))?;
             println!("{}", serde_json::json!({ "expired": swept }));
+        }
+        ObjectsCommand::Reclaim => {
+            // The full maintenance pass: expired sessions and leases, expired
+            // artifacts (their manifest versions retire, releasing the object
+            // references), the manifest backfill, then reclamation of
+            // unreferenced, unleased objects and orphan files. Row deletions
+            // commit before their files unlink, so a stopped store is safe.
+            let store = open(&args.data, true)?;
+            let now = sentinel_core::UnixMillis::now();
+            let objects = std::sync::Arc::new(objects);
+            let report = store
+                .writer()
+                .write({
+                    let objects = std::sync::Arc::clone(&objects);
+                    move |tx| {
+                        let uploads = objects.sweep_uploads(tx, now)?;
+                        let leases = objects.sweep_leases(tx, now)?;
+                        let mut paths =
+                            sentinel_store::artifacts::sweep_expired(tx, &objects, now, 4096)?;
+                        let indexed = objects.index_refs(tx, 4096)?;
+                        let reclaimed = objects.reclaim(tx, now, 4096)?;
+                        paths.extend(reclaimed.paths);
+                        Ok::<_, sentinel_store::Error>((
+                            uploads,
+                            leases,
+                            paths,
+                            indexed,
+                            reclaimed.objects,
+                            reclaimed.bytes,
+                        ))
+                    }
+                })
+                .map_err(|error| fail(format!("reclaim failed: {error}")))?;
+            for path in &report.2 {
+                let _ = std::fs::remove_file(path);
+            }
+            let orphans = store
+                .read(|conn| objects.sweep_orphans(conn, 4096))
+                .map_err(|error| fail(format!("orphan sweep failed: {error}")))?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "expired_uploads": report.0,
+                    "expired_leases": report.1,
+                    "manifest_files_removed": report.2.len(),
+                    "manifests_indexed": report.3,
+                    "objects_reclaimed": report.4,
+                    "bytes_reclaimed": report.5,
+                    "orphan_files_removed": orphans,
+                })
+            );
+        }
+        ObjectsCommand::Status => {
+            let store = open(&args.data, true)?;
+            let report = store
+                .read(|conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT u.tenant_id, u.bytes,
+                                (SELECT quota_bytes FROM tenant_quotas q
+                                 WHERE q.tenant_id = u.tenant_id)
+                         FROM tenant_usage u ORDER BY u.bytes DESC",
+                    )?;
+                    let mut tenants = Vec::new();
+                    let mut rows = stmt.query([])?;
+                    while let Some(row) = rows.next()? {
+                        let raw = row.get::<_, Vec<u8>>(0)?;
+                        let tenant = TenantId::from_bytes(
+                            <[u8; 16]>::try_from(raw.as_slice())
+                                .map_err(|_| sentinel_store::Error::Corrupt("tenant id"))?,
+                        )
+                        .map_err(|_| sentinel_store::Error::Corrupt("tenant id"))?;
+                        tenants.push((
+                            tenant.to_string(),
+                            row.get::<_, i64>(1)? as u64,
+                            row.get::<_, Option<i64>>(2)?.map(|q| q as u64),
+                        ));
+                    }
+                    Ok(tenants)
+                })
+                .map_err(|error| fail(format!("cannot read storage state: {error}")))?;
+            let free = sentinel_store::space::free_bytes(&args.data.data_dir).ok();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "free_bytes": free,
+                    "tenants": report.iter().map(|(t, used, quota)| serde_json::json!({
+                        "tenant": t,
+                        "used_bytes": used,
+                        "quota_bytes": quota,
+                    })).collect::<Vec<_>>(),
+                })
+            );
         }
     }
     Ok(())

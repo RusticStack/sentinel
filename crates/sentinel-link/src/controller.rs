@@ -56,6 +56,19 @@ pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 /// Sessions accepted at once; beyond this a connection is closed unserved.
 pub const MAX_SESSIONS: usize = 1024;
 
+/// Rows one storage maintenance pass may touch.
+const STORAGE_BATCH: i64 = 256;
+
+/// How the controller runs storage maintenance (D06). Unset disables the
+/// pass entirely — no deletions, no quota bookkeeping side effects.
+#[derive(Clone, Copy, Debug)]
+pub struct StoragePolicy {
+    /// Finished attempt logs are kept this long; `<= 0` keeps them.
+    pub log_retention_ms: i64,
+    /// The pass runs at most this often, riding the dispatch loop's wake.
+    pub interval_ms: i64,
+}
+
 /// Counters for diagnostics and tests. Monotonic, never reset.
 #[derive(Debug, Default)]
 pub struct Stats {
@@ -135,6 +148,9 @@ struct Inner {
     logs: Arc<LogStore>,
     objects: Arc<Objects>,
     artifacts: Mutex<ArtifactState>,
+    /// Storage maintenance policy and when it last ran (D06).
+    storage: Mutex<Option<StoragePolicy>>,
+    last_storage: AtomicI64,
     config: Arc<rustls::ServerConfig>,
     fleet: Mutex<HashMap<WorkerId, Arc<Peer>>>,
     generation: AtomicU64,
@@ -212,11 +228,24 @@ impl Inner {
         // run to expiry (W06), so a brief reconnect keeps its work.
     }
 
-    /// One dispatch pass: sweep lapsed offers, then fill every connected
-    /// worker until nothing fits. Each placement is its own transaction, so
-    /// a failing one never holds up the rest.
+    /// One dispatch pass: storage maintenance when due, sweep lapsed
+    /// offers, then fill every connected worker until nothing fits. Each
+    /// placement is its own transaction, so a failing one never holds up
+    /// the rest.
     fn dispatch_pass(&self) {
         let now = UnixMillis::now();
+        let policy = *self.storage.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(policy) = policy {
+            let last = self.last_storage.load(Ordering::Relaxed);
+            if now.0 - last >= policy.interval_ms
+                && self
+                    .last_storage
+                    .compare_exchange(last, now.0, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                self.storage_pass(now, policy);
+            }
+        }
         // Leases that ran out and attempts that outran their job's timeout
         // by the grace: infra-failed, capacity back, never replayed.
         if let Ok(due) = self.store.read(|c| dispatch::expired(c, now)) {
@@ -245,13 +274,19 @@ impl Inner {
                 }
             }
         }
-        let peers: Vec<(WorkerId, Arc<Peer>)> = self
-            .fleet
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .map(|(w, p)| (*w, Arc::clone(p)))
-            .collect();
+        // Below the low watermark, no new work is placed: a job that cannot
+        // store its output must not consume capacity discovering that.
+        let admit_work = self.objects.admission().is_none_or(|a| a.is_open());
+        let peers: Vec<(WorkerId, Arc<Peer>)> = if !admit_work {
+            Vec::new()
+        } else {
+            self.fleet
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .map(|(w, p)| (*w, Arc::clone(p)))
+                .collect()
+        };
         for (worker, peer) in peers {
             let pool = peer.pool;
             for _ in 0..dispatch::MAX_HELD_ATTEMPTS {
@@ -289,6 +324,38 @@ impl Inner {
                 self.stats.offers.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Storage maintenance (D06): retire expired uploads and leases, expire
+    /// artifact rows past their declared retention (their manifest versions
+    /// retire with them, releasing object references), index un-indexed
+    /// manifests, reclaim unreferenced objects, then sweep orphan files and
+    /// out-of-retention logs. Every stage is bounded; none holds the
+    /// writer through a whole-store walk.
+    fn storage_pass(&self, now: UnixMillis, policy: StoragePolicy) {
+        let objects = Arc::clone(&self.objects);
+        if let Ok(paths) = self.write(move |tx| {
+            objects.sweep_uploads(tx, now)?;
+            objects.sweep_leases(tx, now)?;
+            let mut paths = artifacts::sweep_expired(tx, &objects, now, STORAGE_BATCH)?;
+            objects.index_refs(tx, STORAGE_BATCH)?;
+            paths.extend(objects.reclaim(tx, now, STORAGE_BATCH)?.paths);
+            Ok(paths)
+        }) {
+            // Manifest files are only safe to unlink now that the rows are
+            // committed gone; a failure leaves an orphan the file sweep
+            // collects.
+            for path in paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        let objects = Arc::clone(&self.objects);
+        let _ = self
+            .store
+            .read(move |c| objects.sweep_orphans(c, STORAGE_BATCH as u32));
+        let _ = self
+            .logs
+            .sweep_expired(now, policy.log_retention_ms, STORAGE_BATCH as u32);
     }
 
     fn dispatch_loop(&self) {
@@ -776,7 +843,9 @@ impl SessionHandler for Inner {
             // second begin here means the worker raced its own stream.
             return Verdict(ArtifactCode::Invalid);
         }
-        if committed.saturating_add(*state.runs.get(&run).unwrap_or(&0)) >= MAX_RUN_ARTIFACT_BYTES {
+        if committed.saturating_add(*state.runs.get(&run).unwrap_or(&0)) >= MAX_RUN_ARTIFACT_BYTES
+            || self.objects.admission().is_some_and(|a| !a.is_open())
+        {
             return Verdict(ArtifactCode::TooLarge);
         }
         state.in_flight.insert(
@@ -830,10 +899,13 @@ impl SessionHandler for Inner {
                 let charged = state.runs.get(&run).copied().unwrap_or(0);
                 if committed.saturating_add(charged).saturating_add(len) > MAX_RUN_ARTIFACT_BYTES
                     || accounted.saturating_add(len) > MAX_ARTIFACT_BYTES
+                    // Disk admission closed: the stream would refuse its
+                    // writes anyway, so the file is never opened.
+                    || self.objects.admission().is_some_and(|a| a.check(len).is_err())
                 {
                     Out::Fail(ArtifactCode::TooLarge)
                 } else {
-                    match self.objects.stage_begin(len) {
+                    match self.objects.stage_begin(tenant, len) {
                         Ok(staging) => {
                             *state.runs.entry(run).or_default() += len;
                             let f = state.in_flight.get_mut(&attempt).expect("checked present");
@@ -1236,6 +1308,10 @@ impl Controller {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(key);
     }
+    /// Enable storage maintenance (D06). Unset keeps every byte forever.
+    pub fn set_storage_policy(&self, policy: StoragePolicy) {
+        *self.inner.storage.lock().unwrap_or_else(|p| p.into_inner()) = Some(policy);
+    }
     /// Bind `listen`, present `identity`, and start serving workers of
     /// `store`. Returns once the socket is bound; workers may connect.
     pub fn start(
@@ -1268,6 +1344,8 @@ impl Controller {
             logs,
             objects,
             artifacts: Mutex::new(ArtifactState::default()),
+            storage: Mutex::new(None),
+            last_storage: AtomicI64::new(0),
             config,
             fleet: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(1),

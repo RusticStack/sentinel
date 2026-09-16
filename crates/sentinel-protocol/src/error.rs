@@ -33,6 +33,11 @@ pub enum ErrorCode {
     InvalidCursor = 9,
     /// Unexpected server failure; the request ID identifies the log record.
     Internal = 10,
+    /// The write was refused because disk space is below the watermarks;
+    /// retry once the controller has headroom again.
+    StorageFull = 11,
+    /// The tenant reached its storage quota; reclaim space or raise it.
+    QuotaExceeded = 12,
 }
 
 impl ErrorCode {
@@ -49,6 +54,8 @@ impl ErrorCode {
             Self::UnsupportedVersion => "unsupported_version",
             Self::InvalidCursor => "invalid_cursor",
             Self::Internal => "internal",
+            Self::StorageFull => "storage_full",
+            Self::QuotaExceeded => "quota_exceeded",
         }
     }
 
@@ -64,12 +71,14 @@ impl ErrorCode {
             Self::RateLimited => 429,
             Self::UnsupportedVersion => 426,
             Self::Internal => 500,
+            Self::StorageFull => 507,
+            Self::QuotaExceeded => 403,
         }
     }
 
     /// Whether an identical retry can succeed without the client changing anything.
     pub const fn retryable(self) -> bool {
-        matches!(self, Self::RateLimited | Self::Internal)
+        matches!(self, Self::RateLimited | Self::Internal | Self::StorageFull)
     }
 }
 
@@ -174,6 +183,12 @@ mod tests {
         assert_eq!(ErrorCode::UnsupportedVersion.http_status(), 426);
         assert!(ErrorCode::RateLimited.retryable());
         assert!(!ErrorCode::Conflict.retryable());
+        // D06 storage admissions: the disk-full refusal is transient and
+        // retryable; the quota refusal is the tenant's to resolve.
+        assert_eq!(ErrorCode::StorageFull.http_status(), 507);
+        assert!(ErrorCode::StorageFull.retryable());
+        assert_eq!(ErrorCode::QuotaExceeded.http_status(), 403);
+        assert!(!ErrorCode::QuotaExceeded.retryable());
         let minimal = serde_json::to_string(&ApiError::new(ErrorCode::Internal, "x")).unwrap();
         assert!(!minimal.contains("request_id"), "absent fields are omitted");
     }

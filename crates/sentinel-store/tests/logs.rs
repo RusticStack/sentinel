@@ -40,8 +40,11 @@ fn at_step(seq: u64, step: u32, text: &str) -> Frame {
 
 fn wait_compressed(dir: &std::path::Path, seg: u32) {
     let done = dir.join(format!("seg-{seg:06}.z"));
+    let plain = dir.join(format!("seg-{seg:06}"));
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !done.exists() {
+    // The compressor lands `.z`, fsyncs the directory and only then unlinks
+    // the plain segment — waiting for `.z` alone races the removal.
+    while !done.exists() || plain.exists() {
         assert!(Instant::now() < deadline, "seg-{seg:06} never compressed");
         std::thread::sleep(Duration::from_millis(25));
     }

@@ -37,7 +37,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -47,7 +47,7 @@ use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use sentinel_core::{AttemptId, JobId, RunId, UnixMillis};
 use sentinel_protocol::logs::{FRAME_HEADER_BYTES, Frame, Record, RecordError};
 
-use crate::{Error, Result, objects::sync_dir};
+use crate::{Error, Result, objects::sync_dir, space::Admission};
 
 pub const LOGS_DIR: &str = "logs";
 /// Bytes an attempt's log may hold; past it frames are refused as
@@ -199,6 +199,8 @@ pub struct LogStore {
     open: Mutex<HashMap<AttemptId, Open>>,
     compressor: Arc<Compressor>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// Disk admission (D06); unset admits every append as before.
+    admission: OnceLock<Arc<Admission>>,
 }
 
 /// What appending a frame did.
@@ -230,9 +232,103 @@ impl LogStore {
             open: Mutex::new(HashMap::new()),
             compressor,
             worker: Mutex::new(Some(worker)),
+            admission: OnceLock::new(),
         };
         store.sweep();
         Ok(store)
+    }
+
+    /// Install the disk admission gate; appends refuse once free space
+    /// falls below the log floor. Set once at startup.
+    pub fn set_admission(&self, admission: Arc<Admission>) {
+        let _ = self.admission.set(admission);
+    }
+
+    /// Remove attempt directories and legacy flat logs whose newest byte is
+    /// older than `now - retention_ms`. Open writers are never touched; the
+    /// deletion is of durable evidence only. Returns directories/files
+    /// removed, at most `limit`.
+    pub fn sweep_expired(&self, now: UnixMillis, retention_ms: i64, limit: u32) -> Result<u32> {
+        if retention_ms <= 0 || limit == 0 {
+            return Ok(0);
+        }
+        let cutoff = now.0 - retention_ms;
+        let held: std::collections::HashSet<AttemptId> = self
+            .open
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        let newest_ms = |dir: &Path| -> i64 {
+            fs::read_dir(dir).map_or(0, |entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| {
+                        e.metadata()
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_millis() as i64)
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+        };
+        let mut swept = 0u32;
+        let Ok(runs) = fs::read_dir(&self.dir) else {
+            return Ok(0);
+        };
+        'runs: for run in runs.flatten() {
+            let run_path = run.path();
+            if run_path.is_file() {
+                // Legacy flat log: `logs/<attempt>.log` from before D04.
+                if run_path.extension().is_some_and(|e| e == "log")
+                    && fs::metadata(&run_path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .is_some_and(|age| (age.as_millis() as i64) < cutoff)
+                    && fs::remove_file(&run_path).is_ok()
+                {
+                    swept += 1;
+                    if swept >= limit {
+                        break;
+                    }
+                }
+                continue;
+            }
+            let Ok(jobs) = fs::read_dir(&run_path) else {
+                continue;
+            };
+            for job in jobs.flatten() {
+                let Ok(attempts) = fs::read_dir(job.path()) else {
+                    continue;
+                };
+                for attempt in attempts.flatten() {
+                    let dir = attempt.path();
+                    if !dir.is_dir() {
+                        continue;
+                    }
+                    if let Ok(id) = attempt.file_name().to_string_lossy().parse::<AttemptId>()
+                        && held.contains(&id)
+                    {
+                        continue;
+                    }
+                    if newest_ms(&dir) < cutoff && fs::remove_dir_all(&dir).is_ok() {
+                        swept += 1;
+                        // Prune the emptied job/run parents.
+                        let _ = fs::remove_dir(job.path());
+                        if swept >= limit {
+                            break 'runs;
+                        }
+                    }
+                }
+                let _ = fs::remove_dir(job.path());
+            }
+            let _ = fs::remove_dir(&run_path);
+        }
+        Ok(swept)
     }
 
     /// The attempt's segment directory.
@@ -489,6 +585,14 @@ impl LogStore {
             return Ok(Appended::Duplicate {
                 through: w.last_seq,
             });
+        }
+        // Evidence keeps its reserve: a frame refused for space is reported
+        // as refused, never silently dropped — and never recorded as a hole,
+        // since nothing was stored.
+        if let Some(a) = self.admission.get()
+            && !a.headroom()
+        {
+            return Err(Error::StorageFull);
         }
         if frame.seq > w.last_seq + 1 {
             add_hole(&mut w.holes, w.last_seq + 1, frame.seq - 1);

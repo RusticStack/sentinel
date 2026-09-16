@@ -19,6 +19,8 @@ Every error response is one JSON object with `schema: "sentinel.error/1"`, a sta
 | `unsupported_version` | 426 | no | Version or capability set cannot be served |
 | `rate_limited` | 429 | yes | Client rate or writer queue full; back off |
 | `internal` | 500 | yes | Server fault; `request_id` locates the log record |
+| `storage_full` | 507 | yes | Write refused below the disk watermarks ([storage](storage.md#disk-admission-quotas-and-reclamation-d06)); retry once the controller has headroom |
+| `quota_exceeded` | 403 | no | The tenant reached its storage quota; reclaim space or raise it |
 
 `message` and `details` never echo request payloads, secrets or parser fragments.
 
