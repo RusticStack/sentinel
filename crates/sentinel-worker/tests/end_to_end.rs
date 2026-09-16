@@ -602,6 +602,7 @@ jobs:
             pids: 64,
         },
         ws.path(),
+        &[],
     )
     .unwrap();
     std::mem::forget(stale);

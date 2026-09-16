@@ -122,7 +122,7 @@ fn the_pull_overlaps_the_checkout() {
         compile_str(&yaml).unwrap(),
     )
     .unwrap();
-    let job = Job {
+    let mut job = Job {
         worker: WorkerId::new(),
         attempt,
         fence: Fence(1),
@@ -159,7 +159,7 @@ fn the_pull_overlaps_the_checkout() {
     };
     let (verdict, summary) = attempt::run(
         &root,
-        &job,
+        &mut job,
         &rec,
         Arc::new(NoOutput),
         &NoSink,

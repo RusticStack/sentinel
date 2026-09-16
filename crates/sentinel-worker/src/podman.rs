@@ -140,6 +140,17 @@ pub struct Limits {
     pub pids: u32,
 }
 
+/// One extra writable bind mount: `host` appears at `container`. Cache
+/// entries that declare an absolute path use it (K02) — the workspace
+/// mount already covers every relative path, so nothing else asks.
+#[derive(Clone, Debug)]
+pub struct Mount {
+    /// The host directory bound in; must exist.
+    pub host: std::path::PathBuf,
+    /// The absolute path the container sees (`/cache`, …).
+    pub container: String,
+}
+
 /// One running container, created with the limits and torn down whole.
 #[derive(Debug)]
 pub struct Container {
@@ -281,12 +292,15 @@ impl Container {
     /// Create and start the attempt's container with `workspace` mounted at
     /// `/workspace` and a keepalive as its main process. Steps then run in
     /// it with [`Container::exec`]; the image must provide `/bin/sh`.
+    /// `mounts` are extra writable binds (cache paths declared absolute);
+    /// a mount whose `container` is not absolute makes `create` fail.
     pub fn start(
         worker: WorkerId,
         attempt: AttemptId,
         image: &str,
         limits: Limits,
         workspace: &Path,
+        mounts: &[Mount],
     ) -> Result<Container> {
         let name = format!("sentinel-{attempt}");
         let mut cmd = podman();
@@ -323,14 +337,16 @@ impl Container {
                 "never",
             ])
             .arg("--volume")
-            .arg(format!("{}:{WORKSPACE_MOUNT}", workspace.display()))
-            .arg("--")
-            .arg(image)
-            .args([
-                "/bin/sh",
-                "-c",
-                "trap 'exit 0' TERM INT; while :; do sleep 1; done",
-            ]);
+            .arg(format!("{}:{WORKSPACE_MOUNT}", workspace.display()));
+        for mount in mounts {
+            cmd.arg("--volume")
+                .arg(format!("{}:{}:rw", mount.host.display(), mount.container));
+        }
+        cmd.arg("--").arg(image).args([
+            "/bin/sh",
+            "-c",
+            "trap 'exit 0' TERM INT; while :; do sleep 1; done",
+        ]);
         let created = process::run(cmd, deadline(CONTAINER_START_TIMEOUT), "podman create")?;
         if !created.success() {
             return Err(Error::Preparation(format!(

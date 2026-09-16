@@ -32,6 +32,7 @@ use sentinel_link::session::JobContext;
 use sentinel_pipeline::{RunSpec, expr::EvalError};
 use sentinel_protocol::{
     logs::Stream,
+    negotiate::Arch,
     summary::{AttemptSummary, StepOutcome, StepRecord},
 };
 
@@ -113,10 +114,11 @@ fn ns(started: Instant) -> Option<u64> {
 
 /// Run the whole attempt. Returns the verdict and the summary that were
 /// reported. `sink` publishes declared artifacts during finalization, while
-/// the workspace still exists.
+/// the workspace still exists. `job` is mutable because preparation fills
+/// `job.caches` — the restored-cache carrier finalization reads (K02/K03).
 pub fn run(
     root: &Path,
-    job: &Job,
+    job: &mut Job,
     report: &dyn Report,
     output: Arc<dyn Output>,
     sink: &dyn artifacts::Sink,
@@ -209,7 +211,7 @@ pub fn run(
 
 fn prepare(
     root: &Path,
-    job: &Job,
+    job: &mut Job,
     cancel: &Cancel,
     summary: &mut AttemptSummary,
 ) -> Result<(Workspace, Container)> {
@@ -224,6 +226,11 @@ fn prepare(
     let image = sentinel_pipeline::run::ImageRef::parse(&compiled.spec.image)
         .map_err(|_| Error::Preparation("image reference".into()))?;
     let image = format!("{}@{}", image.name, job.digest);
+    // Lift what the closure needs out of the `job` borrow: the declared
+    // caches feed `restore_caches`, which takes `&mut Job` to record the
+    // attachments, so the slice cannot stay borrowed from `job`.
+    let declared = compiled.spec.cache.clone();
+    let resources = compiled.spec.resources;
     let workspace = Workspace::create(root, job.attempt)?;
     let outcome = (|| {
         // The checkout and the image pull are independent — one fills the
@@ -278,7 +285,12 @@ fn prepare(
             return Err(Error::Preparation("canceled".into()));
         }
         checked_out.and(pulled)?;
-        let resources = compiled.spec.resources;
+        // K02: attach the declared caches — each hit is cloned into the
+        // job's private view, each miss still leaves the writable target
+        // directories a job always sees. Never fatal: a cache-path error
+        // is an explainable miss recorded on the entry. Absolute declared
+        // paths reach the container through the collected bind mounts.
+        let mounts = restore_caches(root, job, &declared, workspace.path(), &image);
         let started = Instant::now();
         let container = Container::start(
             job.worker,
@@ -290,6 +302,7 @@ fn prepare(
                 pids: DEFAULT_PIDS_LIMIT,
             },
             workspace.path(),
+            &mounts,
         )?;
         summary.container_start_ns = ns(started);
         Ok(container)
@@ -320,6 +333,84 @@ fn join_checkout(
     summary.checkout_ns = done.as_ref().ok().copied().flatten();
     done?;
     Ok(())
+}
+
+/// K02: resolve every declared `cache:` entry against the fresh checkout —
+/// render its key (`hash_files` reads the workspace), derive the scope
+/// through the shared `attach` derivations, look the entry up and clone a
+/// hit into the job's private view. `job.caches` receives one `Attached`
+/// per declaration, in order, for finalization (K03) to publish; the
+/// returned mounts carry the absolute declared paths into the container.
+/// Never fails the attempt: any error on the cache path is an explainable
+/// miss recorded on the entry, and the declared paths stay writable
+/// directories either way. `image` is the pinned `name@digest` — the
+/// toolchain descriptor every scope is built under.
+fn restore_caches(
+    root: &Path,
+    job: &mut Job,
+    declared: &[sentinel_pipeline::schema::Cache],
+    workspace: &Path,
+    image: &str,
+) -> Vec<podman::Mount> {
+    if declared.is_empty() {
+        return Vec::new();
+    }
+    let context = WorkerContext::new(&job.context, &job.spec, workspace);
+    let cache_root = root.join(sentinel_cache::attach::ROOT_DIR);
+    let env = sentinel_cache::restore::Context {
+        cache_root: &cache_root,
+        workspace,
+        workspace_mount: podman::WORKSPACE_MOUNT,
+        backend: sentinel_cache::clone::detect(&cache_root),
+    };
+    let tenant = job
+        .context
+        .tenant
+        .unwrap_or(sentinel_cache::attach::UNKNOWN_TENANT);
+    let platform = sentinel_cache::Platform {
+        os: sentinel_cache::Os::Linux,
+        arch: if cfg!(target_arch = "aarch64") {
+            Arch::Aarch64
+        } else {
+            Arch::X86_64
+        },
+    };
+    let toolchain = sentinel_cache::Scope::toolchain_digest(image.as_bytes());
+    let owner = job.attempt.to_string();
+    job.caches = declared
+        .iter()
+        .filter_map(|decl| {
+            // A name `Scope::new` rejects never passed the schema; a spec
+            // built by hand gets no entry rather than a guessed one. A key
+            // that will not render is an explainable miss, not a failure.
+            let scope = sentinel_cache::Scope::new(
+                tenant,
+                job.context.repo,
+                decl.class,
+                job.context.trust,
+                platform,
+                toolchain,
+                &decl.name,
+            )
+            .ok()?;
+            let key = decl
+                .key
+                .render(&context, sentinel_cache::attach::MAX_KEY_BYTES)
+                .ok();
+            Some(sentinel_cache::restore::restore(
+                &env, decl, key, scope, &owner,
+            ))
+        })
+        .collect();
+    job.caches
+        .iter()
+        .flat_map(|a| a.targets.iter())
+        .filter(|t| t.mount)
+        .map(|t| podman::Mount {
+            host: t.dir.clone(),
+            container: t.container.clone(),
+        })
+        .collect()
 }
 
 /// Podman's own exit codes for an exec that never ran the command. 126 and
@@ -545,4 +636,100 @@ fn finalize(workspace: Workspace, container: Container) {
     // matter for W07, which lists what this worker still owns.
     let _ = container.destroy();
     let _ = workspace.destroy();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use sentinel_core::{JobId, RepoId, RunId};
+    use sentinel_link::session::EventContext;
+    use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
+    use sentinel_protocol::cache::Trust;
+
+    use super::*;
+
+    /// The smallest spec that carries cache declarations: a push pipeline
+    /// whose `key` renders through `hash_files` against the checkout.
+    fn spec() -> RunSpec {
+        let yaml = "schema: 1\non: [push]\njobs:\n  main:\n    image: example.test/i:1@sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n    resources: { cpu: 1, memory: 128MiB }\n    cache:\n      - name: deps\n        key: deps-${{ hash_files('f.lock') }}\n        paths: [vendor, /opt/cc]\n    steps: [{ id: s, run: 'true' }]\n";
+        RunSpec::new(
+            PinnedSource::new("file:///nowhere", &"a".repeat(40), Some("main")).unwrap(),
+            compile_str(yaml).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn job(spec: RunSpec) -> Job {
+        Job {
+            worker: WorkerId::new(),
+            attempt: AttemptId::new(),
+            fence: Fence(1),
+            job_index: 0,
+            digest: "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+                .into(),
+            spec,
+            context: JobContext {
+                source: None,
+                run: RunId::new(),
+                repo: RepoId::new(),
+                repo_name: "app".into(),
+                job: JobId::new(),
+                job_name: "main".into(),
+                sha: "a".repeat(40),
+                event: EventContext {
+                    name: "push".into(),
+                    ref_name: "main".into(),
+                    base_ref: None,
+                    pr_number: None,
+                    key: "k".into(),
+                },
+                cancelled: false,
+                needs: Vec::new(),
+                tenant: None,
+                trust: Trust::Protected,
+            },
+            images: Images::new(),
+            caches: Vec::new(),
+            prepare_hold: Duration::ZERO,
+        }
+    }
+
+    /// The job-side contract of a miss: `job.caches` is populated in
+    /// declaration order with the explainable outcome, and every declared
+    /// path is a writable directory the job can just use.
+    #[test]
+    fn a_cache_miss_still_leaves_writable_targets_and_populates_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, ws) = (temp.path().join("worker"), temp.path().join("ws"));
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("f.lock"), b"locked").unwrap();
+        let mut job = job(spec());
+        let declared = job.spec.pipeline.jobs[0].spec.cache.clone();
+        let image = format!("example.test/i@{}", job.digest);
+        let mounts = restore_caches(&root, &mut job, &declared, &ws, &image);
+
+        assert_eq!(job.caches.len(), 1);
+        let attached = &job.caches[0];
+        assert_eq!(attached.name, "deps");
+        assert!(
+            attached.key.starts_with("deps-") && attached.key.len() > 5,
+            "the key rendered through hash_files: {:?}",
+            attached.key
+        );
+        assert_eq!(
+            attached.outcome,
+            sentinel_cache::Outcome::Miss(sentinel_cache::Miss::Absent)
+        );
+        assert_eq!(attached.targets.len(), 2);
+        // The relative target materialized under the workspace and a job
+        // can write it; the absolute one is private and mounts in.
+        let vendor = ws.join("vendor");
+        assert!(vendor.is_dir());
+        fs::write(vendor.join("fresh"), b"x").unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].container, "/opt/cc");
+        assert_eq!(mounts[0].host, attached.targets[1].dir);
+        assert!(mounts[0].host.is_dir());
+    }
 }

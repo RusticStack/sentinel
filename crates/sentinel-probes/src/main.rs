@@ -27,7 +27,8 @@ enum Command {
     Redb(redb_probe::RedbArgs),
     /// Generate a file tree fixture of many small files
     Generate(GenerateArgs),
-    /// Clone a directory tree by reflink, explicit read/write copy, or std::fs::copy
+    /// Clone a directory tree by reflink, explicit read/write copy,
+    /// std::fs::copy, or a whole-tree btrfs snapshot
     Clone(CloneArgs),
 }
 
@@ -64,6 +65,17 @@ struct GenerateArgs {
     /// Files per directory level
     #[arg(long, default_value_t = 256)]
     fan_out: u64,
+    /// Large files written alongside the small ones (0 disables them);
+    /// a real cache tree is many small files plus a few big archives
+    #[arg(long, default_value_t = 0)]
+    large_files: u64,
+    /// Size of each large file
+    #[arg(long, default_value_t = 64 << 20)]
+    large_bytes: u64,
+    /// Create `dest` as a btrfs subvolume — `clone --mode snapshot`
+    /// requires its source to be one
+    #[arg(long)]
+    subvolume: bool,
 }
 
 #[derive(clap::Args)]
@@ -88,6 +100,9 @@ enum CloneMode {
     Copy,
     /// std::fs::copy (copy_file_range on Linux, which may reflink transparently)
     FsCopy,
+    /// `btrfs subvolume snapshot`: one syscall for the whole tree, but the
+    /// source must itself be a subvolume — a layout commitment, not a flag
+    Snapshot,
 }
 
 #[derive(Serialize)]
@@ -275,14 +290,33 @@ fn sqlite(args: SqliteArgs) -> Result<String, String> {
 struct GenerateReport {
     probe: &'static str,
     dest: String,
+    subvolume: bool,
     files: u64,
+    large_files: u64,
     bytes: u64,
     wall_ns: u64,
 }
 
 fn generate(args: GenerateArgs) -> Result<String, String> {
     let t = Instant::now();
-    fs::create_dir_all(&args.dest).map_err(|e| e.to_string())?;
+    if args.subvolume {
+        // A snapshot source must be a subvolume; creating one also proves
+        // the destination filesystem is btrfs before any work lands in it.
+        let out = std::process::Command::new("btrfs")
+            .args(["subvolume", "create"])
+            .arg(&args.dest)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!(
+                "btrfs subvolume create {}: {}",
+                args.dest.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    } else {
+        fs::create_dir_all(&args.dest).map_err(|e| e.to_string())?;
+    }
     let mut buf = vec![0u8; args.bytes_per_file as usize];
     for i in 0..args.files {
         let dir = args.dest.join(format!("d{:04}", i / args.fan_out));
@@ -295,11 +329,22 @@ fn generate(args: GenerateArgs) -> Result<String, String> {
         }
         fs::write(dir.join(format!("f{i}.bin")), &buf).map_err(|e| e.to_string())?;
     }
+    // A few large files: package archives and toolchain blobs, which are
+    // where reflink's per-byte advantage over copy actually shows.
+    let mut large = vec![0u8; args.large_bytes as usize];
+    for i in 0..args.large_files {
+        for (j, b) in large.iter_mut().enumerate() {
+            *b = (i as usize ^ j).to_le_bytes()[0];
+        }
+        fs::write(args.dest.join(format!("large{i}.bin")), &large).map_err(|e| e.to_string())?;
+    }
     let report = GenerateReport {
         probe: "generate/1",
         dest: args.dest.display().to_string(),
-        files: args.files,
-        bytes: args.files * args.bytes_per_file,
+        subvolume: args.subvolume,
+        files: args.files + args.large_files,
+        large_files: args.large_files,
+        bytes: args.files * args.bytes_per_file + args.large_files * args.large_bytes,
         wall_ns: ns(t),
     };
     serde_json::to_string(&report).map_err(|e| e.to_string())
@@ -311,17 +356,30 @@ struct CloneReport {
     mode: CloneMode,
     source: String,
     dest: String,
+    /// Why the mode cannot run here — a snapshot on a non-btrfs target.
+    /// The clone never ran; the timing fields are absent, not zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unsupported: Option<String>,
     files: u64,
     dirs: u64,
     bytes: u64,
-    clone_wall_ns: u64,
-    per_file: Stats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clone_wall_ns: Option<u64>,
+    /// Wall rate for the comparison `docs/feasibility-probes.md` tabulates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files_per_s: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_file: Option<Stats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     verify_read_ns: Option<u64>,
 }
 
 fn clone(args: CloneArgs) -> Result<String, String> {
     if args.dest.exists() {
         return Err(format!("destination exists: {}", args.dest.display()));
+    }
+    if args.mode == CloneMode::Snapshot {
+        return snapshot(&args);
     }
     let mut per_file = Vec::new();
     let mut bytes = 0u64;
@@ -354,14 +412,131 @@ fn clone(args: CloneArgs) -> Result<String, String> {
         mode: args.mode,
         source: args.source.display().to_string(),
         dest: args.dest.display().to_string(),
+        unsupported: None,
         files: per_file.len() as u64,
         dirs,
         bytes,
-        clone_wall_ns,
-        per_file: stats(per_file),
+        clone_wall_ns: Some(clone_wall_ns),
+        files_per_s: Some(per_file.len() as u64 * 1_000_000_000 / clone_wall_ns.max(1)),
+        per_file: Some(stats(per_file)),
         verify_read_ns,
     };
     serde_json::to_string(&report).map_err(|e| e.to_string())
+}
+
+/// Whole-tree clone: `btrfs subvolume snapshot`. The mode's whole case is
+/// that one syscall replaces the walk — but it only exists on btrfs, and
+/// only when the source is itself a subvolume, so the filesystem decides
+/// first and the report says `unsupported` rather than guessing.
+fn snapshot(args: &CloneArgs) -> Result<String, String> {
+    let fstype = fs_type(&args.source).or_else(|| fs_type(&args.dest));
+    if fstype.as_deref() != Some("btrfs") {
+        let report = CloneReport {
+            probe: "clone/1",
+            mode: args.mode,
+            source: args.source.display().to_string(),
+            dest: args.dest.display().to_string(),
+            unsupported: Some(match fstype {
+                Some(t) => format!("not btrfs: {t}"),
+                None => "filesystem type unknown".into(),
+            }),
+            files: 0,
+            dirs: 0,
+            bytes: 0,
+            clone_wall_ns: None,
+            files_per_s: None,
+            per_file: None,
+            verify_read_ns: None,
+        };
+        return serde_json::to_string(&report).map_err(|e| e.to_string());
+    }
+    // Count first, untimed: files/second needs the tree's size, and the
+    // walk is not what snapshot replaces.
+    let (files, dirs, bytes) = count_tree(&args.source)?;
+    let t = Instant::now();
+    let out = std::process::Command::new("btrfs")
+        .args(["subvolume", "snapshot", "--"])
+        .arg(&args.source)
+        .arg(&args.dest)
+        .output()
+        .map_err(|e| e.to_string())?;
+    let clone_wall_ns = ns(t);
+    if !out.status.success() {
+        return Err(format!(
+            "btrfs subvolume snapshot: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let verify_read_ns = if args.verify_read {
+        let t = Instant::now();
+        read_tree(&args.dest)?;
+        Some(ns(t))
+    } else {
+        None
+    };
+    let report = CloneReport {
+        probe: "clone/1",
+        mode: args.mode,
+        source: args.source.display().to_string(),
+        dest: args.dest.display().to_string(),
+        unsupported: None,
+        files,
+        dirs,
+        bytes,
+        clone_wall_ns: Some(clone_wall_ns),
+        files_per_s: Some(files * 1_000_000_000 / clone_wall_ns.max(1)),
+        per_file: None,
+        verify_read_ns,
+    };
+    serde_json::to_string(&report).map_err(|e| e.to_string())
+}
+
+/// The filesystem type `path` sits on: the longest matching mount point
+/// in `/proc/self/mounts` — Linux-only by nature, `None` elsewhere.
+#[cfg(target_os = "linux")]
+fn fs_type(path: &Path) -> Option<String> {
+    let path = fs::canonicalize(path).ok()?;
+    let mounts = fs::read_to_string("/proc/self/mounts").ok()?;
+    let mut best: Option<(usize, String)> = None;
+    for line in mounts.lines() {
+        let mut fields = line.split(' ');
+        let (Some(_dev), Some(point), Some(fstype)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        // Mount points are octal-escaped; the only escape a path we mount
+        // can carry is space.
+        let point = point.replace("\\040", " ");
+        if path.starts_with(&point) && best.as_ref().is_none_or(|(len, _)| point.len() > *len) {
+            best = Some((point.len(), fstype.to_owned()));
+        }
+    }
+    best.map(|(_, fstype)| fstype)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fs_type(_path: &Path) -> Option<String> {
+    None
+}
+
+/// Files, directories and bytes under `dir` — the source's own measure,
+/// used where a mode never walks the tree it clones.
+fn count_tree(dir: &Path) -> Result<(u64, u64, u64), String> {
+    let (mut files, mut dirs, mut bytes) = (0, 0, 0);
+    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let meta = entry.metadata().map_err(|e| e.to_string())?;
+        if meta.is_dir() {
+            let (f, d, b) = count_tree(&entry.path())?;
+            files += f;
+            dirs += d + 1;
+            bytes += b;
+        } else if meta.is_file() {
+            files += 1;
+            bytes += meta.len();
+        }
+    }
+    Ok((files, dirs, bytes))
 }
 
 fn clone_tree(
@@ -392,6 +567,8 @@ fn clone_tree(
                 CloneMode::Reflink => reflink(&from, &to)?,
                 CloneMode::Copy => explicit_copy(&from, &to, buf)?,
                 CloneMode::FsCopy => fs::copy(&from, &to).map_err(|e| e.to_string())?,
+                // Whole-tree mode is handled in `snapshot` before any walk.
+                CloneMode::Snapshot => unreachable!("snapshot does not walk"),
             };
             per_file.push(ns(t));
             *bytes += n;

@@ -279,7 +279,7 @@ impl Executor {
             },
         );
         let executor = Arc::clone(&self.0);
-        let job = Job {
+        let mut job = Job {
             worker: self.worker,
             attempt: offer.attempt,
             fence: offer.fence,
@@ -312,7 +312,7 @@ impl Executor {
                 let output: Arc<dyn attempt::Output> = logs;
                 let sink: &dyn artifacts::Sink = &*executor;
                 let (verdict, _) =
-                    attempt::run(&executor.root, &job, &*executor, output, sink, &cancel);
+                    attempt::run(&executor.root, &mut job, &*executor, output, sink, &cancel);
                 let delivered = {
                     let mut state = executor.state();
                     state.live.remove(&job.attempt);
