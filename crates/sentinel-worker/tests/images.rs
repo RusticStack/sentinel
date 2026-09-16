@@ -110,7 +110,9 @@ fn the_pull_overlaps_the_checkout() {
                 thread::sleep(Duration::from_millis(2));
             }
             seen.lock().unwrap().appeared_during = workspace.join("greeting.txt").exists();
-            Ok(())
+            // The stub stands in for a download: `false` is `podman
+            // pull`'s "the store did not already hold it" answer.
+            Ok(false)
         }
     });
 
@@ -185,6 +187,9 @@ fn the_pull_overlaps_the_checkout() {
     // the run pinned joins the worker's held record.
     assert!(summary.checkout_ns.is_some());
     assert!(summary.image_pull_ns.is_some());
+    // K08: the stub downloaded, so the summary records `image_present:
+    // false` — the exists fast path did not serve.
+    assert_eq!(summary.image_present, Some(false));
     assert!(images.holds(DIGEST));
     // There is no podman image behind the stub, so the container start —
     // or the helper spawn — is what preparation reports.

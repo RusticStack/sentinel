@@ -43,11 +43,20 @@ const MAX_CURRENT_BYTES: u64 = 256;
 /// <toolchain16>/<name>` — entries are the directories at depth 7.
 const ENTRY_DEPTH: u32 = 7;
 
-/// What one pass did, for the worker's diagnostics.
+/// What one pass did — and what it saw, for the worker's diagnostics and
+/// the availability snapshot (K08).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GcStats {
     /// Entry directories visited.
     pub entries_seen: u64,
+    /// Generation directories seen across those entries — partial when
+    /// `truncated`.
+    pub generations_seen: u64,
+    /// Payload bytes across those generations, per their sealed
+    /// manifests — what the store held when the pass walked it, before
+    /// any eviction the pass itself performed (`bytes_freed` covers
+    /// that). Partial when `truncated`.
+    pub payload_bytes: u64,
     /// Lease markers still live.
     pub leases_active: u64,
     /// Expired lease markers removed.
@@ -200,9 +209,13 @@ impl Gc {
             self.writing(entry);
         }
         let (current, mut gens) = self.generations(entry);
-        // Pinned entries still account their bytes — the budget sees the
-        // whole store — but nothing inside them is ever removed.
-        self.total_bytes += gens.iter().map(|g| g.bytes).sum::<u64>();
+        // Pinned entries still account their bytes — the budget and the
+        // availability snapshot both see the whole store — but nothing
+        // inside them is ever removed.
+        self.stats.generations_seen += gens.len() as u64;
+        let seen: u64 = gens.iter().map(|g| g.bytes).sum();
+        self.total_bytes += seen;
+        self.stats.payload_bytes += seen;
         if pinned {
             return;
         }

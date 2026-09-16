@@ -124,6 +124,10 @@ fn an_active_lease_keeps_every_generation() {
     assert_eq!(stats.leases_active, 1);
     assert_eq!(stats.generations_removed, 0);
     assert_eq!(gens(&entry).len(), 3);
+    // K08: a pinned entry still reports its occupancy — the availability
+    // snapshot sees the whole store, removals or not.
+    assert_eq!(stats.generations_seen, 3);
+    assert_eq!(stats.payload_bytes, 300);
     pin.release().unwrap();
 }
 
@@ -193,6 +197,9 @@ fn retention_keeps_current_plus_one_spare_oldest_first() {
         ["gen-2-00000002".to_owned(), "gen-4-00000004".to_owned()]
     );
     assert_eq!(stats.bytes_freed, 10 + 12);
+    // Occupancy counts what the pass saw, before its own removals.
+    assert_eq!(stats.generations_seen, 4);
+    assert_eq!(stats.payload_bytes, 10 + 11 + 12 + 13);
 }
 
 #[test]

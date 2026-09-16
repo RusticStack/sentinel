@@ -89,6 +89,8 @@ The target mapping is the contract a job sees:
 
 Restore is total from the attempt's perspective: nothing on the cache path is fatal. The stats the carrier records — `lookup_ns`, `lock_wait_ns`, `clone_ns`, files, bytes, copied bytes, the backend flag — feed the availability summaries (K08); a phase that never ran stays absent, never zero.
 
+**First touch.** After a hit's clone materializes, restore measures one bounded first-read sample per target (`attach::Stats::first_touch_ns`): open the largest listed file and read its first 4 KiB. The clone's wall time is per-file work — `FICLONE` returns without touching extents — while the first real read is what faults a cold extent, so that cost is measured separately rather than folded into `clone_ns`. At most one small read per target; a file that will not open is simply not measured, and a miss or an empty listing records `None`.
+
 The worker advertises `Capabilities::REFLINK` in its Hello exactly when `clone::detect(<data_dir>/cache)` reports `Backend::Reflink` — the same probe restore uses, so the advertised bit and the backend in use can never disagree.
 
 ## Publication (K03)
@@ -106,6 +108,19 @@ Publication is finalization work, off the verdict's path: after a job's steps fi
 **Sealing and promotion.** The `files` blob is sorted by path, then `manifest` records `bytes`, `files` and `files_digest` and is sealed. Promotion is two renames: the sealed generation lands inside the entry (durable via directory sync on unix), then `current.tmp` is written and synced and renamed over `current`. A reader resolving `current` sees the old generation or the new one — never a torn name, never a directory still being written. A canceled or failed publish removes its staging and leaves `current` untouched.
 
 **Skip vocabulary.** A commit that published nothing answers a stable reason: `busy` (a live writer holds the entry), `canceled` (cancel or deadline), `empty` (zero files across every target), `unchanged` (the staged listing is identical to the source generation's — the bytes are already published).
+
+## Measured availability and the costly hit (K08)
+
+Every declared entry's carrier (`attach::Attached`) accumulates what the attempt measured, and finalization stamps the commit's half back onto it: `commit_ns` plus a `Committed` answer — `Sealed { staged_bytes, reused_bytes }` (the dirty side is `staged − reused`: what the job's view rewrote versus the source generation), `Skipped(reason)`, or `Failed`. The terminal `AttemptSummary` (format 3) carries one bounded `CacheRecord` per entry in declaration order — at most `MAX_CACHE_RECORDS` (16; the schema caps declarations at 8) — with the class's wire code, the outcome as `"hit"` or the `Miss` reason, every restore/commit duration as `Option` (a phase that never ran is absent, never zero), file/byte/copied counts, the backend flag, the commit's staged/reused/dirty bytes and publish answer (`"sealed"`, a skip reason or `"failed"`, absent when the verdict left nothing to publish), and the `costly_hit` flag below. `image_present` records whether the pinned image was already in the worker's store — the `podman image exists` fast path — versus an actual download.
+
+**The costly-hit rule** (`attach::Attached::costly_hit`) flags a *nominal* hit whose restore plausibly cost more than rebuilding the dependency would have — because that is exactly when a cache is hurting rather than helping. A hit is flagged when either clause holds:
+
+- `copied_all` — the clone backend is `Backend::Reflink` yet `copied_bytes == bytes` with a non-empty payload: the filesystem refused every file, so the "hit" paid a full copy anyway.
+- `slow` — `lock_wait_ns + clone_ns` exceeds `COSTLY_HIT_NS` (5 s). A healthy restore — a per-file `FICLONE` pass, or a warm copy of a typical dependency payload at even 100 MiB/s — is nowhere near that; five seconds is deliberately generous so only implausible restores are flagged.
+
+The flag is a diagnostic, never a verdict: it lands as `costly_hit` on the summary record and as a `cache_costly_hit` notice (`executor::Notice::CostlyCacheHit`) carrying the measured stats as evidence. It never fails an attempt.
+
+The same sweep that reclaims (`gc::sweep`, at worker start and after every attempt's finalization) also produces the worker's **availability snapshot** — the pass already counts entries, generations and payload bytes, so the snapshot costs no second walk: `Notice::Availability` carries the sorted held-image digests (bounded by `images::MAX_HELD`), the in-flight pull count, and cache-root occupancy (entries, generations, payload bytes held — partial when the pass truncated). Part 08's placement consumes this feed; see [executor](executor.md).
 
 ## Leases and reclamation (K03)
 

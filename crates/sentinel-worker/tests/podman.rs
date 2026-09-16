@@ -34,7 +34,8 @@ fn a_present_image_skips_the_download() {
         return;
     }
     podman::pull(IMAGE, Duration::from_secs(600)).unwrap();
-    podman::pull(IMAGE, Duration::from_millis(1)).unwrap();
+    // `true` is the exists fast path's answer (K08): nothing downloaded.
+    assert!(podman::pull(IMAGE, Duration::from_millis(1)).unwrap());
 }
 
 fn sh(script: &str, timeout_secs: u64) -> StepCommand {

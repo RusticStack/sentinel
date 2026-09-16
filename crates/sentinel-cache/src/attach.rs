@@ -14,6 +14,7 @@ use crate::{
     lease::Lease,
     manifest::{Compat, key_stem},
     outcome::Outcome,
+    publish::SkipReason,
     scope::{Platform, Scope},
 };
 
@@ -105,9 +106,82 @@ pub struct Attached {
     /// incremental publish still read the generation it cloned from.
     /// Released with the `Attached`.
     pub lease: Option<Lease>,
-    /// Restore-path measurements for the availability summaries (K08);
-    /// `None` where a phase never ran — a miss never clones.
+    /// Restore- and commit-path measurements for the availability
+    /// summaries (K08); `None` where a phase never ran — a miss never
+    /// clones, and an unworthy verdict never commits.
     pub stats: Stats,
+}
+
+/// The wall-time bound on a nominal hit's wait-plus-clone (K08), part of
+/// the costly-hit rule `docs/cache.md` states. A healthy restore — a
+/// per-file `FICLONE` pass, or a warm copy of a dependency payload at
+/// even 100 MiB/s — is nowhere near it; five seconds is deliberately
+/// generous so only a restore that plausibly cost more than rebuilding
+/// the dependency is flagged, and flagged is all it ever is: a diagnostic,
+/// never a verdict.
+pub const COSTLY_HIT_NS: u64 = 5_000_000_000;
+
+/// Which costly-hit clause a nominal hit tripped (docs/cache.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Costly {
+    /// The root is `Backend::Reflink` yet every payload byte was copied:
+    /// the filesystem refused each file, so the "hit" paid a full copy.
+    CopiedAll,
+    /// `lock_wait_ns + clone_ns` exceeded [`COSTLY_HIT_NS`].
+    Slow,
+}
+
+impl Costly {
+    /// The stable lowercase spelling for logs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CopiedAll => "copied_all",
+            Self::Slow => "slow",
+        }
+    }
+}
+
+/// What a commit did with the job's writable views (K03), recorded for
+/// the summary's per-entry record (K08).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Committed {
+    /// A new generation was sealed: `staged_bytes` of payload, of which
+    /// `reused_bytes` were hardlinked out of the source generation — the
+    /// rest, `staged_bytes - reused_bytes`, is what the job's view
+    /// rewrote.
+    Sealed {
+        staged_bytes: u64,
+        reused_bytes: u64,
+    },
+    /// The commit answered a stable skip reason; nothing was staged.
+    Skipped(SkipReason),
+    /// The commit errored; the bounded detail went to the cache note.
+    Failed,
+}
+
+impl Attached {
+    /// The K08 costly-hit rule evaluated on a finished restore: `Some`
+    /// when a nominal hit paid rebuild-scale cost — a reflink root that
+    /// ended up copying every payload byte, or a wait-plus-clone past
+    /// [`COSTLY_HIT_NS`]. `None` on a miss and on a plausible hit.
+    pub fn costly_hit(&self) -> Option<Costly> {
+        if !self.outcome.is_hit() {
+            return None;
+        }
+        if self.stats.reflink && self.stats.bytes > 0 && self.stats.copied_bytes == self.stats.bytes
+        {
+            return Some(Costly::CopiedAll);
+        }
+        let waited = self
+            .stats
+            .lock_wait_ns
+            .unwrap_or(0)
+            .saturating_add(self.stats.clone_ns.unwrap_or(0));
+        if waited > COSTLY_HIT_NS {
+            return Some(Costly::Slow);
+        }
+        None
+    }
 }
 
 /// One declared path resolved for the job.
@@ -128,8 +202,8 @@ pub struct Target {
     pub mount: bool,
 }
 
-/// Restore-path measurements. Durations are `Option` per the reporting
-/// convention: a phase that never ran is absent, never zero.
+/// Restore- and commit-path measurements. Durations are `Option` per the
+/// reporting convention: a phase that never ran is absent, never zero.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
     /// Manifest read plus compatibility check.
@@ -138,6 +212,11 @@ pub struct Stats {
     pub lock_wait_ns: Option<u64>,
     /// Payload materialization (clone or copy).
     pub clone_ns: Option<u64>,
+    /// The bounded first-read sample after a hit's clone materialized —
+    /// one ≤4 KiB read of the largest listed file per target. Cold-extent
+    /// cost the clone's wall time hides (the K02 probe showed it is
+    /// real); absent when no regular file was listed to sample.
+    pub first_touch_ns: Option<u64>,
     /// Files and payload bytes materialized.
     pub files: u64,
     pub bytes: u64,
@@ -145,4 +224,122 @@ pub struct Stats {
     pub copied_bytes: u64,
     /// The backend the clone used.
     pub reflink: bool,
+    /// The commit's wall time; `None` while no publish ran — an unworthy
+    /// verdict or a finalization that never reached it.
+    pub commit_ns: Option<u64>,
+    /// What the commit settled into.
+    pub committed: Option<Committed>,
+}
+
+#[cfg(test)]
+mod tests {
+    use sentinel_core::RepoId;
+    use sentinel_protocol::{cache::Trust, negotiate::Arch};
+
+    use super::*;
+    use crate::{
+        manifest::Manifest,
+        outcome::Hit,
+        scope::{Os, Platform},
+    };
+
+    /// The smallest `Attached` the rule reads: an outcome plus the stats
+    /// fields the clauses inspect; the rest is carrier shape.
+    fn attached(outcome: Outcome) -> Attached {
+        let scope = Scope::new(
+            TenantId::new(),
+            RepoId::new(),
+            Class::Dependencies,
+            Trust::Protected,
+            Platform {
+                os: Os::Linux,
+                arch: Arch::X86_64,
+            },
+            [7; 32],
+            "deps",
+        )
+        .unwrap();
+        Attached {
+            name: "deps".into(),
+            scope,
+            key: "k".into(),
+            compat: Compat::Downloads { tool: "t".into() },
+            generation: None,
+            outcome,
+            targets: Vec::new(),
+            lease: None,
+            stats: Stats::default(),
+        }
+    }
+
+    fn hit() -> Outcome {
+        let scope = Scope::new(
+            TenantId::new(),
+            RepoId::new(),
+            Class::Dependencies,
+            Trust::Protected,
+            Platform {
+                os: Os::Linux,
+                arch: Arch::X86_64,
+            },
+            [7; 32],
+            "deps",
+        )
+        .unwrap();
+        Outcome::Hit(Box::new(Hit {
+            manifest: Manifest::writing(&scope, "k", Compat::Downloads { tool: "t".into() }),
+            bytes: 0,
+        }))
+    }
+
+    /// The K08 rule (docs/cache.md): a nominal hit that paid a full copy
+    /// on a reflink root, or waited and cloned past the bound, is flagged
+    /// — a miss never is, and neither is a plausible restore.
+    #[test]
+    fn the_costly_hit_rule_flags_only_implausible_hits() {
+        // A miss with damning-looking stats is still just a miss.
+        let mut miss = attached(Outcome::Miss(crate::Miss::Absent));
+        miss.stats.reflink = true;
+        miss.stats.bytes = 100;
+        miss.stats.copied_bytes = 100;
+        assert_eq!(miss.costly_hit(), None);
+
+        let mut full_copy = attached(hit());
+        full_copy.stats.reflink = true;
+        full_copy.stats.bytes = 100;
+        full_copy.stats.copied_bytes = 100;
+        assert_eq!(full_copy.costly_hit(), Some(Costly::CopiedAll));
+
+        // A partial copy on a reflink root is the documented fallback,
+        // not a flag; on a copy root a full copy is simply the backend.
+        full_copy.stats.copied_bytes = 99;
+        assert_eq!(full_copy.costly_hit(), None);
+        let mut copied = attached(hit());
+        copied.stats.bytes = 100;
+        copied.stats.copied_bytes = 100;
+        assert_eq!(copied.costly_hit(), None);
+        // An empty payload cannot have paid a copy.
+        let mut empty = attached(hit());
+        empty.stats.reflink = true;
+        assert_eq!(empty.costly_hit(), None);
+
+        // Wait plus clone strictly over the bound trips `Slow`; at the
+        // bound it does not, and the first clause still wins when both do.
+        let mut slow = attached(hit());
+        slow.stats.lock_wait_ns = Some(COSTLY_HIT_NS - 1);
+        slow.stats.clone_ns = Some(1);
+        assert_eq!(slow.costly_hit(), None);
+        slow.stats.clone_ns = Some(2);
+        assert_eq!(slow.costly_hit(), Some(Costly::Slow));
+        slow.stats.reflink = true;
+        slow.stats.bytes = 4;
+        slow.stats.copied_bytes = 4;
+        assert_eq!(slow.costly_hit(), Some(Costly::CopiedAll));
+    }
+
+    #[test]
+    fn costly_reasons_have_stable_names() {
+        assert_eq!(Costly::CopiedAll.as_str(), "copied_all");
+        assert_eq!(Costly::Slow.as_str(), "slow");
+    }
 }
