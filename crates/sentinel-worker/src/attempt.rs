@@ -341,12 +341,17 @@ fn prepare(
     }
 }
 
+/// The checkout thread's handle: the mirror-aware outcome carries the
+/// fetch/materialization split and route; the `Option<u64>` is the phase's
+/// own wall time so a joined thread can still stamp `checkout_ns`.
+type CheckoutThread = std::thread::JoinHandle<Result<(checkout::Outcome, Option<u64>)>>;
+
 /// Join the checkout thread, once — `None` after the first call. A thread
 /// that could not produce its result is a preparation failure like the
 /// checkout's own; `checkout_ns` is stamped only when the checkout
 /// completed, as a lone call was.
 fn join_checkout(
-    co: &mut Option<std::thread::JoinHandle<Result<(checkout::Outcome, Option<u64>)>>>,
+    co: &mut Option<CheckoutThread>,
     summary: &mut AttemptSummary,
 ) -> Result<()> {
     let Some(handle) = co.take() else {
