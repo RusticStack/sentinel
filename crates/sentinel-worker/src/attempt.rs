@@ -39,6 +39,7 @@ use crate::{
     Error, Result, artifacts,
     checkout::{self, CHECKOUT_TIMEOUT},
     context::WorkerContext,
+    images::Images,
     podman::{self, Container, DEFAULT_PIDS_LIMIT, Limits},
     recovery,
     workspace::Workspace,
@@ -55,9 +56,12 @@ pub struct Job {
     pub digest: String,
     pub spec: RunSpec,
     pub context: JobContext,
-    /// A pause between checkout and image pull, so a cancel that arrives
-    /// during preparation can be exercised deterministically. Zero in
-    /// production.
+    /// The worker's image pulls: concurrent attempts share one download
+    /// per `name@sha256:…`.
+    pub images: Images,
+    /// A pause between starting the checkout and pulling the image, so a
+    /// cancel that arrives during preparation can be exercised
+    /// deterministically. Zero in production.
     pub prepare_hold: std::time::Duration,
 }
 
@@ -216,17 +220,27 @@ fn prepare(
     let image = format!("{}@{}", image.name, job.digest);
     let workspace = Workspace::create(root, job.attempt)?;
     let outcome = (|| {
-        let started = Instant::now();
-        match &job.context.source {
-            Some(access) => checkout::checkout_authorized(
-                workspace.path(),
-                &job.spec.source,
-                access,
-                CHECKOUT_TIMEOUT,
-            )?,
-            None => checkout::checkout(workspace.path(), &job.spec.source, None, CHECKOUT_TIMEOUT)?,
-        };
-        summary.checkout_ns = ns(started);
+        // The checkout and the image pull are independent — one fills the
+        // fresh workspace, the other the worker's content store — so the
+        // checkout runs on its own thread while the pull overlaps it here,
+        // joined before the container starts. Each summary field still
+        // measures its own phase's wall time, so `checkout_ns` and
+        // `image_pull_ns` together can exceed the preparation's.
+        let mut co = Some(std::thread::spawn({
+            let path = workspace.path().to_path_buf();
+            let source = job.spec.source.clone();
+            let access = job.context.source.clone();
+            move || -> Result<Option<u64>> {
+                let started = Instant::now();
+                match &access {
+                    Some(access) => {
+                        checkout::checkout_authorized(&path, &source, access, CHECKOUT_TIMEOUT)?
+                    }
+                    None => checkout::checkout(&path, &source, None, CHECKOUT_TIMEOUT)?,
+                };
+                Ok(ns(started))
+            }
+        }));
         if !job.prepare_hold.is_zero() {
             let until = Instant::now() + job.prepare_hold;
             while Instant::now() < until && !cancel.load(Ordering::Acquire) {
@@ -234,14 +248,30 @@ fn prepare(
             }
         }
         if cancel.load(Ordering::Acquire) {
+            // The checkout owns the workspace until it finishes; join it
+            // before the teardown below destroys the directory.
+            let _ = join_checkout(&mut co, summary);
             return Err(Error::Preparation("canceled".into()));
         }
+        // A checkout that has already failed — an unknown revision says so
+        // in milliseconds — still skips the pull, exactly as when the two
+        // ran in sequence.
+        if co.as_ref().is_some_and(|co| co.is_finished()) {
+            join_checkout(&mut co, summary)?;
+        }
         let started = Instant::now();
-        podman::pull(&image, podman::IMAGE_PULL_TIMEOUT)?;
-        summary.image_pull_ns = ns(started);
+        let pulled = job.images.pull(&image, podman::IMAGE_PULL_TIMEOUT, cancel);
+        if pulled.is_ok() {
+            summary.image_pull_ns = ns(started);
+        }
+        // Join before the workspace could be torn down under a checkout
+        // still running. The first failure wins — the checkout's ahead of
+        // the pull's, as when the two ran in sequence.
+        let checked_out = join_checkout(&mut co, summary);
         if cancel.load(Ordering::Acquire) {
             return Err(Error::Preparation("canceled".into()));
         }
+        checked_out.and(pulled)?;
         let resources = compiled.spec.resources;
         let started = Instant::now();
         let container = Container::start(
@@ -265,6 +295,25 @@ fn prepare(
             Err(e)
         }
     }
+}
+
+/// Join the checkout thread, once — `None` after the first call. A thread
+/// that could not produce its result is a preparation failure like the
+/// checkout's own; `checkout_ns` is stamped only when the checkout
+/// completed, as a lone call was.
+fn join_checkout(
+    co: &mut Option<std::thread::JoinHandle<Result<Option<u64>>>>,
+    summary: &mut AttemptSummary,
+) -> Result<()> {
+    let Some(handle) = co.take() else {
+        return Ok(());
+    };
+    let done = handle
+        .join()
+        .unwrap_or_else(|_| Err(Error::Preparation("checkout thread failed".into())));
+    summary.checkout_ns = done.as_ref().ok().copied().flatten();
+    done?;
+    Ok(())
 }
 
 /// Podman's own exit codes for an exec that never ran the command. 126 and

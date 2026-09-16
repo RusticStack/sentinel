@@ -29,6 +29,7 @@ use crate::{
     Result,
     artifacts::{self, REPLY_TIMEOUT},
     attempt::{self, Cancel, Job, Report, Verdict},
+    images::Images,
     logpipe::LogPipe,
     podman,
     recovery::{self, Leftover, Recovered},
@@ -175,6 +176,9 @@ pub struct Inner {
     root: PathBuf,
     worker: sentinel_core::WorkerId,
     runtime: podman::Runtime,
+    /// One in-flight pull per image reference across every attempt, and
+    /// the record of what the local store holds.
+    images: Images,
     state: Mutex<State>,
     notify: Box<dyn Fn(Notice) + Send + Sync>,
     recovered: Recovered,
@@ -198,6 +202,7 @@ impl Executor {
             root,
             worker,
             runtime,
+            images: Images::new(),
             state: Mutex::new(State {
                 reporter: None,
                 awaiting: HashMap::new(),
@@ -282,6 +287,7 @@ impl Executor {
             digest: offer.image_digest.clone(),
             spec,
             context,
+            images: self.images.clone(),
             prepare_hold: self.state().prepare_hold,
         };
         // On disk before anything runs: a crash from here on leaves a
@@ -329,6 +335,12 @@ impl Executor {
 impl Inner {
     pub fn runtime(&self) -> &podman::Runtime {
         &self.runtime
+    }
+
+    /// The worker's image pulls and what its store is known to hold —
+    /// the locality record a later part advertises to placement.
+    pub fn images(&self) -> &Images {
+        &self.images
     }
 
     /// What starting this executor found of the previous process.

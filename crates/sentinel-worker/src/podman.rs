@@ -44,6 +44,12 @@ pub struct Runtime {
     pub cgroup_manager: String,
 }
 
+/// `podman` inherits the worker's environment: `HOME`/`XDG_CONFIG_HOME`
+/// (`~/.config/containers/auth.json`) and `REGISTRY_AUTH_FILE` carry the
+/// registry credentials private images need. Only `DOCKER_HOST` is
+/// removed — a stray daemon address must not redirect a rootless pull.
+/// Contrast the checkout, which deliberately runs Git with a cleared
+/// environment; authorization here is the account's own.
 fn podman() -> Command {
     let mut cmd = Command::new("podman");
     cmd.env_remove("DOCKER_HOST");
@@ -509,4 +515,40 @@ pub fn remove_named(name: &str) -> Result<()> {
         init_pid: None,
     }
     .remove()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Private-image authorization reaches the helper: `podman` removes
+    /// `DOCKER_HOST` and nothing else, so `HOME`, `XDG_CONFIG_HOME` and
+    /// `REGISTRY_AUTH_FILE` — the rootless user's registry credentials —
+    /// are passed through by `Command`'s inherited environment.
+    #[test]
+    fn podman_commands_keep_the_workers_environment() {
+        let cmd = podman();
+        let overrides: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(overrides, vec![("DOCKER_HOST".to_owned(), None)]);
+    }
+
+    /// And the plumbing delivers an environment variable to a helper
+    /// process, which is all `REGISTRY_AUTH_FILE` needs from us.
+    #[test]
+    fn a_helper_receives_its_callers_environment() {
+        let mut cmd = Command::new("sh");
+        cmd.env("REGISTRY_AUTH_FILE", "/run/sentinel-test/auth.json");
+        cmd.args(["-c", "printf %s \"$REGISTRY_AUTH_FILE\""]);
+        let output = process::run(cmd, deadline(Duration::from_secs(10)), "env probe").unwrap();
+        assert!(output.success());
+        assert_eq!(output.stdout, b"/run/sentinel-test/auth.json");
+    }
 }

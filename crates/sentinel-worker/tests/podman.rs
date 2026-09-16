@@ -24,6 +24,19 @@ fn enabled() -> bool {
     false
 }
 
+/// With the pull deadline already spent, only the `image exists` fast
+/// path can return `Ok` — a real `podman pull` would outlive a
+/// millisecond and be killed as a timeout. Proves a present image never
+/// reaches the download.
+#[test]
+fn a_present_image_skips_the_download() {
+    if !enabled() {
+        return;
+    }
+    podman::pull(IMAGE, Duration::from_secs(600)).unwrap();
+    podman::pull(IMAGE, Duration::from_millis(1)).unwrap();
+}
+
 fn sh(script: &str, timeout_secs: u64) -> StepCommand {
     StepCommand {
         argv: vec!["/bin/sh".into(), "-e".into(), "-c".into(), script.into()],
