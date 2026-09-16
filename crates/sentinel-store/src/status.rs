@@ -63,9 +63,11 @@ pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus>
     let mut stmt = conn.prepare_cached(
         "SELECT j.id, j.name, j.state_code, j.failure_class, j.cancel_requested, j.fence,
                 j.queued_ms, j.leased_ms, j.preparing_ms, j.running_ms, j.finalizing_ms, j.terminal_ms,
-                (SELECT a.id FROM attempts a WHERE a.job_id = j.id ORDER BY a.fence DESC LIMIT 1),
-                (SELECT a.log_state FROM attempts a WHERE a.job_id = j.id ORDER BY a.fence DESC LIMIT 1)
-         FROM jobs j WHERE j.run_id = ?1 AND j.tenant_id = ?2 ORDER BY j.spec_index",
+                a.id, a.log_state
+         FROM jobs j
+         LEFT JOIN attempts a ON a.id = (
+            SELECT a2.id FROM attempts a2 WHERE a2.job_id = j.id ORDER BY a2.fence DESC LIMIT 1)
+         WHERE j.run_id = ?1 AND j.tenant_id = ?2 ORDER BY j.spec_index",
     )?;
     let rows = stmt.query_map(params![run.as_bytes(), tenant.as_bytes()], |r| {
         let ms = |i: usize| -> rusqlite::Result<Option<UnixMillis>> {
@@ -158,15 +160,39 @@ pub fn recent_runs(
     )?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, sha, created) = row?;
-        let id = RunId::from_bytes(id).map_err(|_| Error::Corrupt("run_id"))?;
-        let state = crate::jobs::run_state(conn, tenant, id)?;
-        out.push(RunSummary {
-            id,
-            sha,
-            created: UnixMillis(created),
-            state,
-        });
+        out.push(row?);
     }
-    Ok(out)
+    // One grouped scan for every listed run's job states — the `IN`
+    // subquery is the same selection, materialized once — rather than a
+    // `run_state` query per row.
+    let mut states: std::collections::HashMap<[u8; 16], Vec<JobState>> =
+        std::collections::HashMap::with_capacity(out.len());
+    if !out.is_empty() {
+        let mut jobs = conn.prepare_cached(
+            "SELECT run_id, state_code FROM jobs WHERE tenant_id = ?1 AND run_id IN (
+                 SELECT id FROM runs WHERE tenant_id = ?1 AND repo_id = ?2
+                 ORDER BY created_ms DESC, id DESC LIMIT ?3)",
+        )?;
+        let rows = jobs.query_map(
+            params![tenant.as_bytes(), repo.as_bytes(), i64::from(limit)],
+            |r| Ok((r.get::<_, [u8; 16]>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+        for row in rows {
+            let (run, code) = row?;
+            states
+                .entry(run)
+                .or_default()
+                .push(decode_state(code).ok_or(Error::Corrupt("state_code"))?);
+        }
+    }
+    out.into_iter()
+        .map(|(id, sha, created)| {
+            Ok(RunSummary {
+                id: RunId::from_bytes(id).map_err(|_| Error::Corrupt("run_id"))?,
+                sha,
+                created: UnixMillis(created),
+                state: aggregate(states.get(&id).into_iter().flatten().copied()),
+            })
+        })
+        .collect()
 }

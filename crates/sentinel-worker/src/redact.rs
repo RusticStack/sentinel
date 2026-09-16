@@ -20,6 +20,9 @@ pub const REPLACEMENT: &[u8] = b"***";
 #[derive(Default)]
 pub struct Redactor {
     secrets: BTreeSet<Vec<u8>>,
+    /// 256-bit set of every secret's first byte — the per-byte fast path
+    /// that keeps a miss at one bit test instead of a scan of all secrets.
+    first: [u64; 4],
     longest: usize,
     /// Held-back tail per stream, indexed by `Stream as usize`.
     carry: [Vec<u8>; 3],
@@ -36,6 +39,7 @@ impl Redactor {
             return false;
         }
         self.longest = self.longest.max(secret.len());
+        self.first[(secret[0] >> 6) as usize] |= 1 << (secret[0] & 63);
         self.secrets.insert(secret.to_vec());
         true
     }
@@ -60,6 +64,14 @@ impl Redactor {
         // bounds this. Longest match first so a prefix of a longer secret
         // does not leave the rest exposed.
         while at < buf.len() {
+            // Most bytes start no secret and can start no partial one
+            // either — the partial check needs `window` to prefix a secret,
+            // which needs its first byte in the set.
+            if self.first[(buf[at] >> 6) as usize] & (1 << (buf[at] & 63)) == 0 {
+                out.push(buf[at]);
+                at += 1;
+                continue;
+            }
             let window = &buf[at..];
             let hit = self
                 .secrets

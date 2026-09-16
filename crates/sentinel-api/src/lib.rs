@@ -1,7 +1,11 @@
 //! The controller's HTTP API (W08): the one surface the CLI, the web page
-//! and later MCP share. Plain HTTP/1.1 on a bounded thread pool; TLS is
-//! the reverse proxy's job (the session cookie is `__Host-`, which a
-//! browser accepts from `localhost` or over HTTPS only).
+//! and later MCP share. Plain HTTP/1.1 on a bounded pool of handler
+//! threads; TLS is the reverse proxy's job (the session cookie is
+//! `__Host-`, which a browser accepts from `localhost` or over HTTPS
+//! only). `tiny_http` spawns one reader thread per accepted connection
+//! with no cap and no idle timeout, so the connection count is bounded by
+//! the fronting proxy — a direct-exposure deployment must put one there,
+//! which the cookie policy already requires beyond localhost.
 //!
 //! Every route authenticates a bearer credential or a session cookie into
 //! a `Principal` and then authorizes through `sentinel-store::auth` — the

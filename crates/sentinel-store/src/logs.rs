@@ -134,6 +134,11 @@ struct Open {
     seg_len: u64,
     /// The index file, appended provisionally and fsynced at seals.
     index: File,
+    /// Bytes of the index that decode cleanly — the valid tail. A failed
+    /// append is truncated back here so later entries never sit behind a
+    /// torn one; `u64::MAX` means the index is abandoned until reopen
+    /// rebuilds it.
+    index_len: u64,
     /// Highest stored sequence.
     last_seq: u64,
     /// Ranges below `last_seq` that were never stored, sorted and
@@ -448,6 +453,7 @@ impl LogStore {
                 .write(true)
                 .truncate(false)
                 .open(&index_path)?,
+            index_len: 0,
             last_seq: 0,
             holes: Vec::new(),
             len: 0,
@@ -498,7 +504,9 @@ impl LogStore {
             w.index.set_len(0)?;
             w.index.write_all(INDEX_MAGIC)?;
             w.index.write_all(&INDEX_FORMAT.to_le_bytes())?;
+            keep = 6;
         }
+        w.index_len = keep as u64;
         w.index.seek(SeekFrom::End(0))?;
         let top = segs.keys().next_back().copied();
         let mut pending = Vec::new();
@@ -584,7 +592,7 @@ impl LogStore {
             w.seg = top.map_or(0, |n| n + 1);
         }
         if !pending.is_empty() {
-            w.index.write_all(&pending)?;
+            index_write(&mut w, &pending)?;
             w.index.sync_data()?;
         }
         for path in queue {
@@ -677,7 +685,7 @@ impl LogStore {
     fn seal(&self, w: &mut Open) -> Result<()> {
         let mut entry = Vec::with_capacity(INDEX_ENTRY_BYTES);
         seal_entry(w, w.seg, &mut entry);
-        w.index.write_all(&entry)?;
+        index_write(w, &entry)?;
         w.index.sync_data()?;
         if let Some(file) = w.file.take() {
             file.sync_data()?;
@@ -907,9 +915,34 @@ fn read_index(bytes: &[u8]) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
+/// Append `bytes` at the index's valid tail. A failed write is truncated
+/// back to `index_len` so a torn entry never hides what follows it; if the
+/// repair itself fails the index is abandoned — readers decode less, never
+/// more, and reopen rebuilds from the segments.
+fn index_write(w: &mut Open, bytes: &[u8]) -> Result<()> {
+    if w.index_len == u64::MAX {
+        return Err(Error::Corrupt("log index"));
+    }
+    match w.index.write_all(bytes) {
+        Ok(()) => {
+            w.index_len += bytes.len() as u64;
+            Ok(())
+        }
+        Err(e) => {
+            if w.index.set_len(w.index_len).is_err()
+                || w.index.seek(SeekFrom::Start(w.index_len)).is_err()
+            {
+                w.index_len = u64::MAX;
+            }
+            Err(e.into())
+        }
+    }
+}
+
 /// A checkpoint for the frame just stored (`line`/`bytes` include it).
 /// Provisional: no fsync here — the seal fsyncs; a crash loses these and
-/// the reopen regenerates them from the segment itself.
+/// the reopen regenerates them from the segment itself. A failed write
+/// leaves no torn entry (`index_write` repairs), so ignoring it is safe.
 fn checkpoint(w: &mut Open) {
     let entry = Entry {
         kind: KIND_CHECKPOINT,
@@ -920,7 +953,7 @@ fn checkpoint(w: &mut Open) {
         bytes: w.len,
         ms: UnixMillis::now().0,
     };
-    let _ = w.index.write_all(&entry.bytes());
+    let _ = index_write(w, &entry.bytes());
 }
 
 /// A seal record for segment `seg` carrying the running totals.

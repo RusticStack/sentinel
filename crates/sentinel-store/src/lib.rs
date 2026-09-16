@@ -421,17 +421,22 @@ impl Store {
     /// Run a read-only closure on a pooled connection using committed WAL
     /// snapshots. At most [`READER_LIMIT`] connections exist; a caller that
     /// finds them all busy waits up to [`READ_ADMISSION`] and is then shed
-    /// with `Overloaded`.
+    /// with `Overloaded`. A panic inside the closure still returns the
+    /// connection — a borrowed `Transaction` drops (and rolls back) with
+    /// the unwind — so one bad read can never shrink the pool.
     pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self.admit()?;
-        let result = f(&conn);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&conn)));
         self.readers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .idle
             .push(conn);
         self.freed.notify_one();
-        result
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     fn admit(&self) -> Result<Connection> {

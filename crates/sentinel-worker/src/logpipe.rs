@@ -163,8 +163,15 @@ impl LogPipe {
         }
         if let Some(spool) = st.spool.as_mut() {
             let acked = spool.acked();
-            let _ = spool.rewind(acked);
-            st.sent = acked;
+            st.sent = match spool.rewind(acked) {
+                // Resend from the last acknowledgement.
+                Ok(()) => acked,
+                // The send cursor stayed ahead of `acked`; keeping `sent`
+                // there too counts the unread tail as in-flight, so the
+                // window cannot overflow. What was skipped reaches the
+                // controller as a declared gap, never a silent one.
+                Err(_) => spool.last_seq(),
+            };
         }
         self.pump(&mut st);
     }

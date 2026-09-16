@@ -285,8 +285,19 @@ impl Executor {
             prepare_hold: self.state().prepare_hold,
         };
         // On disk before anything runs: a crash from here on leaves a
-        // marker the next process reconciles.
-        let _ = recovery::mark(&self.root, offer.attempt, offer.fence);
+        // marker the next process reconciles. If the marker cannot be
+        // written the attempt must not start — a crash would leave a
+        // spool with no marker, which recovery discards as reported.
+        if recovery::mark(&self.root, offer.attempt, offer.fence).is_err() {
+            self.state().live.remove(&offer.attempt);
+            self.send(
+                offer.attempt,
+                offer.fence,
+                Event::Failed(sentinel_core::FailureClass::Publication),
+                None,
+            );
+            return;
+        }
         let spawned = thread::Builder::new()
             .name(format!("sentinel-attempt-{}", offer.attempt))
             .spawn(move || {
@@ -715,11 +726,27 @@ impl LinkExecutor for Executor {
         // delivery waits for acknowledgements.
         let leftovers = std::mem::take(&mut self.state().leftovers);
         if !leftovers.is_empty() {
+            // Handed through a slot so a failed spawn re-queues them for
+            // the next attach instead of waiting for a process restart.
+            let slot = Arc::new(Mutex::new(Some(leftovers)));
+            let hand = Arc::clone(&slot);
             let executor = Arc::clone(&self.0);
             let reporter = reporter.clone();
-            let _ = thread::Builder::new()
+            let spawned = thread::Builder::new()
                 .name("sentinel-recovery".into())
-                .spawn(move || executor.abandon_leftovers(leftovers, reporter));
+                .spawn(move || {
+                    let leftovers = hand
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take()
+                        .unwrap_or_default();
+                    executor.abandon_leftovers(leftovers, reporter);
+                });
+            if spawned.is_err()
+                && let Some(leftovers) = slot.lock().unwrap_or_else(|p| p.into_inner()).take()
+            {
+                self.state().leftovers = leftovers;
+            }
         }
         for (attempt, fence, event, summary) in pending {
             let sent = match &summary {

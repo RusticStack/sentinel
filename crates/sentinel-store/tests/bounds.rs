@@ -148,6 +148,30 @@ fn tenant_count_result(store: &Store) -> Result<i64, Error> {
 }
 
 #[test]
+fn a_panicking_read_returns_its_connection_to_the_pool() {
+    let (_dir, store) = store();
+    // Panic through every pooled connection: each must go back to the pool
+    // before the panic resumes, so `READER_LIMIT` panics cannot drain it.
+    for _ in 0..READER_LIMIT + 1 {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.read(|_| -> Result<(), Error> { panic!("read bug") });
+        }));
+        assert!(panicked.is_err());
+    }
+    assert_eq!(tenant_count(&store), 0);
+    // And the panic was a panic, not a quiet error.
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = store.read(|_| -> Result<(), Error> { panic!("read bug") });
+    }));
+    assert!(
+        panicked
+            .unwrap_err()
+            .downcast_ref::<&'static str>()
+            .is_some_and(|m| *m == "read bug")
+    );
+}
+
+#[test]
 fn shutdown_drains_accepted_work_and_reports_a_stall_honestly() {
     let (dir, store) = store();
     let path = dir.path().join("metadata.sqlite");

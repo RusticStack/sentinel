@@ -289,17 +289,23 @@ impl Inner {
         };
         for (worker, peer) in peers {
             let pool = peer.pool;
-            for _ in 0..dispatch::MAX_HELD_ATTEMPTS {
-                let placed = self.write(move |tx| {
-                    dispatch::place(
-                        tx,
-                        worker,
-                        pool,
-                        dispatch::DEFAULT_LEASE_MS,
-                        UnixMillis::now(),
-                    )
-                });
-                let Ok(Some(placed)) = placed else { break };
+            // All of this worker's placements in one transaction: `place`
+            // sees the leases it just wrote, and the commits collapse to
+            // one writer round trip per worker per wake.
+            let now = UnixMillis::now();
+            let placed = self.write(move |tx| {
+                let mut placed = Vec::new();
+                for _ in 0..dispatch::MAX_HELD_ATTEMPTS {
+                    match dispatch::place(tx, worker, pool, dispatch::DEFAULT_LEASE_MS, now)? {
+                        Some(offer) => placed.push(offer),
+                        None => break,
+                    }
+                }
+                Ok(placed)
+            });
+            let Ok(placed) = placed else { continue };
+            let mut unsent = placed.into_iter();
+            while let Some(placed) = unsent.next() {
                 let offer = Offer {
                     attempt: placed.attempt,
                     tenant: placed.tenant,
@@ -314,10 +320,17 @@ impl Inner {
                     job_index: placed.job_index,
                 };
                 if session::offer(&peer.sender, &offer).is_err() {
-                    // The session is gone: give the job back at once rather
-                    // than letting the ack timeout find it.
-                    let attempt = offer.attempt;
-                    let _ = self.write(move |tx| dispatch::lapse(tx, attempt, UnixMillis::now()));
+                    // The session is gone: give this attempt and every
+                    // placement never sent back at once rather than letting
+                    // the ack timeout find them.
+                    let mut attempts = vec![offer.attempt];
+                    attempts.extend(unsent.by_ref().map(|p| p.attempt));
+                    let _ = self.write(move |tx| {
+                        for attempt in attempts {
+                            dispatch::lapse(tx, attempt, UnixMillis::now())?;
+                        }
+                        Ok(())
+                    });
                     peer.sender.close();
                     break;
                 }
@@ -504,15 +517,22 @@ impl Admission for Inner {
             cpu_millis: i64::try_from(capacity.cpu_millis).map_err(|_| Rejection::Capacity)?,
             memory_bytes: i64::try_from(capacity.memory_bytes).map_err(|_| Rejection::Capacity)?,
         };
-        if let Ok(known) = self.store.read(|c| workers::authenticate(c, fingerprint)) {
-            let id = known.id;
-            self.write(move |tx| dispatch::report_capacity(tx, id, capacity))
-                .map_err(|_| Rejection::Unavailable)?;
-            return Ok(Admitted {
-                worker: known.id,
-                pool: known.pool,
-                negotiated: known.negotiated,
-            });
+        match self.store.read(|c| workers::authenticate(c, fingerprint)) {
+            Ok(known) => {
+                let id = known.id;
+                self.write(move |tx| dispatch::report_capacity(tx, id, capacity))
+                    .map_err(|_| Rejection::Unavailable)?;
+                return Ok(Admitted {
+                    worker: known.id,
+                    pool: known.pool,
+                    negotiated: known.negotiated,
+                });
+            }
+            Err(sentinel_store::Error::NotFound) => {}
+            // A store fault is not an unknown fingerprint: answering the
+            // enrollment path would refuse a known worker with the wrong
+            // error — say it is the store, retryably.
+            Err(_) => return Err(Rejection::Unavailable),
         }
         let Some(secret) = enrollment else {
             return Err(Rejection::NotEnrolled);

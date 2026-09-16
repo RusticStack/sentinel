@@ -19,7 +19,7 @@ One transaction, before the listener binds. `Controller::reconciled()` reports t
 
 ## The worker keeps a marker
 
-The moment an attempt is spawned, before checkout starts, the executor writes `<data_dir>/attempts/<attempt>` holding the fence. The marker outlives the attempt's end: it is removed only once the terminal report has actually been **sent** — a crash between "passed" and "delivered" is a crash the next process must reconcile, not one to forget. When finalization gets the log's end out (acknowledged under protocol 5, sent on earlier protocols), `mark_ended` adds an `ended` line to the marker — the signal that lets a marker without a spool tell "delivered, then lost" apart from "lost before delivery".
+Before an attempt's thread spawns — before checkout starts — the executor writes `<data_dir>/attempts/<attempt>` holding the fence and syncs it; an attempt whose marker cannot be written durably is refused (`Failed(Publication)`) rather than run unrecoverable, since a crash would leave a spool with no marker that recovery would discard as reported. The marker outlives the attempt's end: it is removed only once the terminal report has actually been **sent** — a crash between "passed" and "delivered" is a crash the next process must reconcile, not one to forget. When finalization gets the log's end out (acknowledged under protocol 5, sent on earlier protocols), `mark_ended` adds a synced `ended` line to the marker — the signal that lets a marker without a spool tell "delivered, then lost" apart from "lost before delivery".
 
 On start, before a single offer is taken, `recovery::recover`:
 

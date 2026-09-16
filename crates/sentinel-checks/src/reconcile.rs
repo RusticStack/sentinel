@@ -231,23 +231,33 @@ impl Worker {
     }
 
     /// Park the row after a transient failure (`retry=true`, bounded
-    /// back-off) or for the next periodic pass (`false`).
+    /// back-off) or for the next periodic pass (`false`). A failed write
+    /// leaves the row due — the next pass retries — but the notice must
+    /// not claim the row settled.
     fn settle(&self, work: &github_events::Refresh, retry: bool) -> &'static str {
         let work = *work;
-        let _ = self
+        if self
             .store
             .writer()
-            .write(move |tx| github_events::settled(tx, &work, UnixMillis::now(), retry));
+            .write(move |tx| github_events::settled(tx, &work, UnixMillis::now(), retry))
+            .is_err()
+        {
+            return "store";
+        }
         if retry { "retry" } else { "settled" }
     }
 
     /// The row's target vanished; drop it, fenced by the read sequence.
     fn finish(&self, work: &github_events::Refresh) -> &'static str {
         let work = *work;
-        let _ = self
+        if self
             .store
             .writer()
-            .write(move |tx| github_events::finished(tx, &work));
+            .write(move |tx| github_events::finished(tx, &work))
+            .is_err()
+        {
+            return "store";
+        }
         "target gone"
     }
 
@@ -269,11 +279,16 @@ impl Worker {
             Ok(Some(installed)) => installed,
             Ok(None) => {
                 let work = *work;
-                let _ = self
+                let gone = self
                     .store
                     .writer()
-                    .write(move |tx| github_events::installation_gone(tx, &work, &work.id));
-                return "installation gone".into();
+                    .write(move |tx| github_events::installation_gone(tx, &work, &work.id))
+                    .is_ok();
+                return if gone {
+                    "installation gone".into()
+                } else {
+                    "store".into()
+                };
             }
             Err(_) => return self.settle(work, true).into(),
         };
@@ -368,21 +383,34 @@ impl Worker {
             TokenOutcome::Ready(token) => token,
             TokenOutcome::Gone => {
                 let (work, installation) = (*work, target.installation);
-                let _ = self
+                let gone = self
                     .store
                     .writer()
-                    .write(move |tx| github_events::installation_gone(tx, &work, &installation));
-                return "installation gone".into();
+                    .write(move |tx| github_events::installation_gone(tx, &work, &installation))
+                    .is_ok();
+                return if gone {
+                    "installation gone".into()
+                } else {
+                    "store".into()
+                };
             }
             TokenOutcome::Refused => {
                 // The installation row needs the kind-0 pass; it owns the
                 // suspended/permissions state this token mint just proved.
                 let (work, installation) = (*work, target.installation);
-                let _ = self.store.writer().write(move |tx| {
-                    github_events::schedule(tx, &installation, 0, UnixMillis::now())?;
-                    github_events::settled(tx, &work, UnixMillis::now(), false)
-                });
-                return "installation refresh scheduled".into();
+                let scheduled = self
+                    .store
+                    .writer()
+                    .write(move |tx| {
+                        github_events::schedule(tx, &installation, 0, UnixMillis::now())?;
+                        github_events::settled(tx, &work, UnixMillis::now(), false)
+                    })
+                    .is_ok();
+                return if scheduled {
+                    "installation refresh scheduled".into()
+                } else {
+                    "store".into()
+                };
             }
             TokenOutcome::Retry => return self.settle(work, true).into(),
         };
@@ -392,16 +420,30 @@ impl Worker {
         {
             Ok(RepoState::Verified) => {
                 let (work, repo) = (*work, target.repo);
-                let _ = self.store.writer().write(move |tx| {
-                    github_events::apply_repository(tx, &work, repo, false, UnixMillis::now())
-                });
+                if self
+                    .store
+                    .writer()
+                    .write(move |tx| {
+                        github_events::apply_repository(tx, &work, repo, false, UnixMillis::now())
+                    })
+                    .is_err()
+                {
+                    return "store".into();
+                }
                 "verified".into()
             }
             Ok(state) => {
                 let (work, repo) = (*work, target.repo);
-                let _ = self.store.writer().write(move |tx| {
-                    github_events::apply_repository(tx, &work, repo, true, UnixMillis::now())
-                });
+                if self
+                    .store
+                    .writer()
+                    .write(move |tx| {
+                        github_events::apply_repository(tx, &work, repo, true, UnixMillis::now())
+                    })
+                    .is_err()
+                {
+                    return "store".into();
+                }
                 match state {
                     RepoState::Changed => "binding revoked: changed".into(),
                     _ => "binding revoked: gone".into(),

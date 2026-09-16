@@ -194,21 +194,24 @@ fn run(
                     let outcome = store
                         .writer()
                         .write(move |tx| checks::retry(tx, id, seq, now, after_ms));
-                    match outcome {
-                        Ok(checks::Retry::Scheduled { .. }) => batch.retried += 1,
+                    let outcome = match outcome {
+                        Ok(checks::Retry::Scheduled { .. }) => {
+                            batch.retried += 1;
+                            format!("retried: {}", brief(&detail))
+                        }
                         // The budget is spent: the row is refused with an
                         // explicit reason rather than retried forever.
-                        Ok(checks::Retry::Exhausted) => batch.refused += 1,
+                        Ok(checks::Retry::Exhausted) => {
+                            batch.refused += 1;
+                            format!("refused: retry budget spent ({})", brief(&detail))
+                        }
+                        // The batch is dropped below; this entry never ships.
                         Err(_) => {
                             store_failed = true;
                             break;
                         }
-                    }
-                    batch.entries.push(Notice {
-                        id,
-                        name,
-                        outcome: format!("retried: {}", brief(&detail)),
-                    });
+                    };
+                    batch.entries.push(Notice { id, name, outcome });
                 }
                 Publish::Refused { reason } => {
                     let now = UnixMillis::now();
@@ -234,18 +237,28 @@ fn run(
                     // the row must not be first in line when the pass resumes.
                     let now = UnixMillis::now();
                     let wait_ms = until_ms.saturating_sub(now.0);
-                    if store
+                    let outcome = match store
                         .writer()
                         .write(move |tx| checks::retry(tx, id, seq, now, wait_ms))
-                        .is_err()
                     {
-                        store_failed = true;
-                    }
+                        Ok(checks::Retry::Scheduled { .. }) => "throttled",
+                        // The park spent the last attempt: the row is durably
+                        // refused, not parked — say what happened.
+                        Ok(checks::Retry::Exhausted) => {
+                            batch.refused += 1;
+                            "throttled: retry budget spent, refused"
+                        }
+                        // The batch is dropped below; this entry never ships.
+                        Err(_) => {
+                            store_failed = true;
+                            "store"
+                        }
+                    };
                     pause_until = Some(until_ms);
                     batch.entries.push(Notice {
                         id,
                         name,
-                        outcome: "throttled".into(),
+                        outcome: outcome.into(),
                     });
                     break;
                 }

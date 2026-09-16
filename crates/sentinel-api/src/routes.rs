@@ -683,7 +683,10 @@ fn logout(state: &State, request: &mut Request) -> Route {
     if let Some(secret) =
         header_value(request, "cookie").and_then(|h| cookie::read(cookie::SESSION_COOKIE, h))
     {
-        let _ = local_auth::logout(&state.store, &secret, UnixMillis::now());
+        // The session row must go before the client is told it logged out:
+        // a failed delete leaves the secret valid, so the error surfaces
+        // rather than letting `ok` stand over a live session.
+        local_auth::logout(&state.store, &secret, UnixMillis::now()).map_err(store_error)?;
     }
     Ok(Reply::Json(
         200,

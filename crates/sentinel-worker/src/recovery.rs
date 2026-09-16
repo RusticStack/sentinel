@@ -60,10 +60,18 @@ fn marker_path(root: &Path, attempt: AttemptId) -> PathBuf {
     root.join(ATTEMPTS_DIR).join(attempt.to_string())
 }
 
-/// Record that this process holds `attempt` under `fence`.
+/// Record that this process holds `attempt` under `fence`. Synced: a
+/// marker that only reached the page cache can vanish with the process
+/// and leave a spool recovery would discard as already reported.
 pub fn mark(root: &Path, attempt: AttemptId, fence: Fence) -> Result<()> {
     fs::create_dir_all(root.join(ATTEMPTS_DIR))?;
-    fs::write(marker_path(root, attempt), format!("{}\n", fence.0))?;
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(marker_path(root, attempt))?;
+    marker.write_all(format!("{}\n", fence.0).as_bytes())?;
+    marker.sync_data()?;
     Ok(())
 }
 
