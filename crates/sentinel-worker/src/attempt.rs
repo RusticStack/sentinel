@@ -527,6 +527,11 @@ fn execute(
     let context = WorkerContext::new(&job.context, &job.spec, workspace);
     let mut oom_seen = container.oom_kills().unwrap_or(0);
     let mut failure: Option<(FailureClass, String)> = None;
+    // Every declared step is considered in order — the restored-cache
+    // outcome is never consulted here (K06). `job.caches` is written by
+    // `restore_caches` during preparation and read only by
+    // `publish_caches` during finalization, so a cache hit restores
+    // bytes, never a verdict: there is no path by which a hit skips work.
     for (index, step) in compiled.steps.iter().enumerate() {
         let mut record = StepRecord {
             index: index as u32,
@@ -1096,5 +1101,139 @@ mod tests {
         let record = cache_record(attached);
         assert!(record.costly_hit);
         assert_eq!(record.outcome, "hit");
+    }
+
+    /// A spec with a `class: compiler` cache and two steps: the K06
+    /// carrier for proving a hit never becomes a cached verdict.
+    fn spec_compiler() -> RunSpec {
+        let yaml = "schema: 1\non: [push]\njobs:\n  main:\n    image: example.test/i:1@sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n    resources: { cpu: 1, memory: 128MiB }\n    cache:\n      - name: cc\n        class: compiler\n        key: cc-normal-${{ hash_files('f.lock') }}\n        paths: [ccache]\n    steps: [{ id: build, run: 'cc -c a.c' }, { id: test, run: './run-tests' }]\n";
+        RunSpec::new(
+            PinnedSource::new("file:///nowhere", &"a".repeat(40), Some("main")).unwrap(),
+            compile_str(yaml).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Seal a compiler generation exactly where `restore_caches` will
+    /// look: the same tenant/repo/trust/platform/toolchain derivation,
+    /// the rendered key's stem as the entry, the rendered key itself in
+    /// the manifest — so `cc-normal-<h1>` is what a `cc-normal-<h2>`
+    /// request serves.
+    fn seal_compiler(
+        root: &Path,
+        job: &Job,
+        ws: &Path,
+        decl: &sentinel_pipeline::schema::Cache,
+        files: &[(&str, &[u8])],
+    ) {
+        use sentinel_cache::{
+            manifest::{FileEntry, FilesBlob, Manifest},
+            scope::{self, Os, Platform, Scope},
+        };
+        let platform = Platform {
+            os: Os::Linux,
+            arch: if cfg!(target_arch = "aarch64") {
+                Arch::Aarch64
+            } else {
+                Arch::X86_64
+            },
+        };
+        let image = format!("example.test/i@{}", job.digest);
+        let scope = Scope::new(
+            sentinel_cache::attach::UNKNOWN_TENANT,
+            job.context.repo,
+            decl.class,
+            job.context.trust,
+            platform,
+            Scope::toolchain_digest(image.as_bytes()),
+            &decl.name,
+        )
+        .unwrap();
+        // Render the key exactly as `restore_caches` will: `hash_files`
+        // reads the workspace that is already standing.
+        let context = WorkerContext::new(&job.context, &job.spec, ws);
+        let key = decl
+            .key
+            .render(&context, sentinel_cache::attach::MAX_KEY_BYTES)
+            .unwrap();
+        let compat = sentinel_cache::attach::declared_compat(decl, &key, platform);
+        // `restore_caches` resolves entries under `<root>/cache`.
+        let cache_root = root.join(sentinel_cache::attach::ROOT_DIR);
+        let entry = scope.entry_dir(
+            &cache_root,
+            sentinel_cache::attach::entry_key(decl.class, &key),
+        );
+        let name = scope::gen_name(1_700_000_000_000, 0x00ab_cdef);
+        let gdir = entry.join(&name);
+        let mut entries = Vec::new();
+        let mut total = 0u64;
+        for (rel, body) in files {
+            let path = gdir.join("payload/0").join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+            entries.push(FileEntry {
+                path: format!("payload/0/{rel}"),
+                size: body.len() as u64,
+                // BLAKE3 of the content — the same digest the store
+                // computes, reached through the public toolchain hash.
+                digest: Scope::toolchain_digest(body),
+                mode: 0o644,
+            });
+            total += body.len() as u64;
+        }
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let blob = FilesBlob { entries };
+        fs::write(gdir.join(scope::FILES_NAME), blob.encode()).unwrap();
+        let mut manifest = Manifest::writing(&scope, &key, compat);
+        manifest.bytes = total;
+        manifest.files = blob.entries.len() as u32;
+        manifest.files_digest = blob.digest();
+        manifest.seal(sentinel_core::UnixMillis(1_700_000_000_001));
+        fs::write(gdir.join(scope::MANIFEST_NAME), manifest.encode()).unwrap();
+        fs::write(entry.join(scope::CURRENT_NAME), format!("{name}\n")).unwrap();
+    }
+
+    /// K06: a cache hit restores bytes into the job's private view and
+    /// nothing else. `execute` iterates `compiled.steps` unconditionally
+    /// — `job.caches` is written by `restore_caches` and read only by
+    /// `publish_caches` at finalization — so a hit can never suppress a
+    /// step or carry a verdict. This test proves the observable half:
+    /// after a hit, the spec `execute` runs is the freshly compiled one,
+    /// every declared step still present.
+    #[test]
+    fn a_cache_hit_restores_bytes_and_never_touches_the_step_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, ws) = (temp.path().join("worker"), temp.path().join("ws"));
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("f.lock"), b"locked").unwrap();
+        let mut job = job(spec_compiler());
+        let declared = job.spec.pipeline.jobs[0].spec.cache.clone();
+        let image = format!("example.test/i@{}", job.digest);
+        // A generation sealed under `cc-normal-<h1>`; the request renders
+        // `cc-normal-<h2>` — same stem, small lockfile edit.
+        seal_compiler(&root, &job, &ws, &declared[0], &[("obj/a.o", b"object")]);
+
+        let mounts = restore_caches(&root, &mut job, &declared, &ws, &image);
+
+        assert_eq!(job.caches.len(), 1);
+        let attached = &job.caches[0];
+        assert!(
+            matches!(attached.outcome, sentinel_cache::Outcome::Hit(_)),
+            "the sealed stem must serve the moved tail: {:?}",
+            attached.outcome
+        );
+        assert_eq!(
+            fs::read(ws.join("ccache/obj/a.o")).unwrap(),
+            b"object",
+            "the hit materialized real bytes into the job's view"
+        );
+        assert!(mounts.is_empty(), "a relative path needs no bind mount");
+        // The step plan is untouched by the hit: the spec `execute` will
+        // run is identical to a fresh compile, both steps still present.
+        assert_eq!(job.spec, spec_compiler());
+        let steps = &job.spec.pipeline.jobs[0].spec.steps;
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].id, "build");
+        assert_eq!(steps[1].id, "test");
     }
 }
