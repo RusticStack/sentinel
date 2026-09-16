@@ -61,6 +61,13 @@ pub fn declared_compat(decl: &Cache, key: &str, platform: Platform) -> Compat {
             flags: String::new(),
             abi: platform.component(),
         },
+        // K06: a bare `class: compiler` declaration's namespace is the key
+        // stem alone — `entry_key` already gives each stem its own entry
+        // directory (and `current` pointer) and `compatible` re-verifies
+        // the stem inside it, so recording `key_stem(key)` here would only
+        // ever duplicate the check the manifest just ran. `flags` stays
+        // empty as the reserved channel a recipe fills with a rendered
+        // namespace token when it wants a pin tighter than the stem.
         Class::Compiler => Compat::Compiler {
             flags: String::new(),
         },
