@@ -141,36 +141,39 @@ pub fn report_capacity(tx: &Transaction<'_>, worker: WorkerId, capacity: Capacit
 /// `host_id` are subtracted — worker identities on one machine must not
 /// each claim the whole machine's memory, CPU or scratch — while a worker
 /// with no host on record accounts for its own attempts alone. One statement
-/// over the held-attempts partial index; values may go negative when a
-/// report shrinks under existing reservations.
+/// over the held-attempts partial index, driven from `workers` into
+/// `attempts_held_by_worker` (asserted by a test): summing held attempts
+/// must never scan the attempts table. Values may go negative when a report
+/// shrinks under existing reservations.
+const FREE_CAPACITY_SQL: &str = "SELECT w.cpu_millis - COALESCE((
+                SELECT SUM(a.cpu_millis) FROM attempts a JOIN workers h ON h.id = a.worker_id
+                WHERE a.released_ms IS NULL
+                  AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
+                       OR (w.host_id IS NULL AND h.id = w.id))), 0),
+            w.memory_bytes - COALESCE((
+                SELECT SUM(a.memory_bytes) FROM attempts a JOIN workers h ON h.id = a.worker_id
+                WHERE a.released_ms IS NULL
+                  AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
+                       OR (w.host_id IS NULL AND h.id = w.id))), 0),
+            CASE WHEN w.disk_bytes = 0 THEN 0 ELSE w.disk_bytes - COALESCE((
+                SELECT SUM(a.disk_bytes) FROM attempts a JOIN workers h ON h.id = a.worker_id
+                WHERE a.released_ms IS NULL
+                  AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
+                       OR (w.host_id IS NULL AND h.id = w.id))), 0) END
+     FROM workers w WHERE w.id = ?1 AND w.revoked_ms IS NULL";
+
+/// What the worker has left; see [`FREE_CAPACITY_SQL`].
 pub fn free_capacity(conn: &Connection, worker: WorkerId) -> Result<Capacity> {
-    conn.prepare_cached(
-        "SELECT w.cpu_millis - COALESCE((
-                    SELECT SUM(a.cpu_millis) FROM attempts a JOIN workers h ON h.id = a.worker_id
-                    WHERE a.released_ms IS NULL
-                      AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
-                           OR (w.host_id IS NULL AND h.id = w.id))), 0),
-                w.memory_bytes - COALESCE((
-                    SELECT SUM(a.memory_bytes) FROM attempts a JOIN workers h ON h.id = a.worker_id
-                    WHERE a.released_ms IS NULL
-                      AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
-                           OR (w.host_id IS NULL AND h.id = w.id))), 0),
-                CASE WHEN w.disk_bytes = 0 THEN 0 ELSE w.disk_bytes - COALESCE((
-                    SELECT SUM(a.disk_bytes) FROM attempts a JOIN workers h ON h.id = a.worker_id
-                    WHERE a.released_ms IS NULL
-                      AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
-                           OR (w.host_id IS NULL AND h.id = w.id))), 0) END
-         FROM workers w WHERE w.id = ?1 AND w.revoked_ms IS NULL",
-    )?
-    .query_row([worker.as_bytes()], |r| {
-        Ok(Capacity {
-            cpu_millis: r.get(0)?,
-            memory_bytes: r.get(1)?,
-            disk_bytes: r.get(2)?,
+    conn.prepare_cached(FREE_CAPACITY_SQL)?
+        .query_row([worker.as_bytes()], |r| {
+            Ok(Capacity {
+                cpu_millis: r.get(0)?,
+                memory_bytes: r.get(1)?,
+                disk_bytes: r.get(2)?,
+            })
         })
-    })
-    .optional()?
-    .ok_or(Error::NotFound)
+        .optional()?
+        .ok_or(Error::NotFound)
 }
 
 /// Labels one worker or job may carry (protocol 7 profile bound). The blob
@@ -529,19 +532,19 @@ const CANDIDATES_SQL: &str = "SELECT j.tenant_id, j.id, j.run_id, j.cpu_millis, 
      ORDER BY j.priority, j.queued_ms, j.created_seq
      LIMIT 32";
 
+/// Tenants with ready work: one `EXISTS` descent per tenant into the ready
+/// index, never a `GROUP BY` over the whole ready set.
+const READY_TENANTS_SQL: &str = "SELECT t.id FROM tenants t
+     WHERE t.active = 1 AND EXISTS(
+         SELECT 1 FROM jobs j
+         WHERE j.tenant_id = t.id AND j.state_code = 1
+           AND j.cancel_requested = 0 AND j.image_digest IS NOT NULL
+         LIMIT 1)";
+
 fn ready_tenants(conn: &Connection, _pool: PoolId) -> Result<Vec<TenantId>> {
     // `state_code = 1` stays a literal: SQLite only uses the partial
-    // ready-queue indexes when the predicate is a constant. Probing each
-    // tenant with EXISTS costs one index descent per tenant; grouping the
-    // ready set itself would visit every queued job.
-    let mut stmt = conn.prepare_cached(
-        "SELECT t.id FROM tenants t
-         WHERE t.active = 1 AND EXISTS(
-             SELECT 1 FROM jobs j
-             WHERE j.tenant_id = t.id AND j.state_code = 1
-               AND j.cancel_requested = 0 AND j.image_digest IS NOT NULL
-             LIMIT 1)",
-    )?;
+    // ready-queue indexes when the predicate is a constant.
+    let mut stmt = conn.prepare_cached(READY_TENANTS_SQL)?;
     let rows = stmt.query_map([], |r| r.get::<_, [u8; 16]>(0))?;
     let mut out = Vec::new();
     for row in rows {
@@ -676,6 +679,15 @@ const _: () = assert!(
     "LARGE_WAITING_SQL hardcodes the large-job threshold; migration 028's jobs_ready_large index does too"
 );
 
+/// A pull-request job this worker could run is waiting. The planner drives
+/// this from the ready side (`jobs_queued_since`) and probes provenance by
+/// run id, so the cost is bounded by the ready queue, not by PR history; a
+/// test asserts that shape.
+const PR_WAITING_SQL: &str = "SELECT EXISTS(
+        SELECT 1 FROM run_provenance p JOIN jobs j ON j.run_id = p.run_id
+        WHERE p.trigger = 'pull_request'
+          AND j.state_code = 1 AND j.cancel_requested = 0)";
+
 fn waiting_fairness(
     conn: &Connection,
     worker: WorkerId,
@@ -689,12 +701,7 @@ fn waiting_fairness(
         .optional()?;
     fairness.large = large;
     let pr: bool = conn
-        .prepare_cached(
-            "SELECT EXISTS(
-                SELECT 1 FROM run_provenance p JOIN jobs j ON j.run_id = p.run_id
-                WHERE p.trigger = 'pull_request'
-                  AND j.state_code = 1 AND j.cancel_requested = 0)",
-        )?
+        .prepare_cached(PR_WAITING_SQL)?
         .query_row([], |r| r.get(0))?;
     if pr {
         fairness.pull_request = true;
@@ -2086,4 +2093,71 @@ pub fn wait_reason(
         return Ok(WaitReason::WorkerOffline);
     }
     Ok(WaitReason::Capacity)
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::*;
+
+    /// Placement runs on every offer, so each probe must stay an index
+    /// search. A bound parameter where a constant is required silently turns
+    /// a partial index into a scan of the whole ready queue — the defect the
+    /// Q09 load run found — so these plans are asserted, not assumed.
+    #[test]
+    fn placement_probes_stay_index_searches() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::migrate(&mut conn).unwrap();
+        let plan = |sql: &str| -> Vec<String> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let values = vec![rusqlite::types::Value::Null; stmt.parameter_count()];
+            stmt.query_map(rusqlite::params_from_iter(values), |r| r.get(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let explain = |sql: &str| plan(&format!("EXPLAIN QUERY PLAN {sql}"));
+
+        for (name, sql, index) in [
+            ("candidate scan", CANDIDATES_SQL, "jobs_ready_tenant"),
+            ("large-job probe", LARGE_WAITING_SQL, "jobs_ready_large"),
+            ("ready tenants", READY_TENANTS_SQL, "jobs_ready_tenant"),
+            (
+                "free capacity",
+                FREE_CAPACITY_SQL,
+                "attempts_held_by_worker",
+            ),
+        ] {
+            let plans = explain(sql);
+            assert!(
+                plans.iter().any(|p| p.contains(index)),
+                "{name} does not use {index}: {plans:?}"
+            );
+            assert!(
+                plans.iter().all(|p| !p.contains("TEMP B-TREE")),
+                "{name} sorts the queue: {plans:?}"
+            );
+            assert!(
+                plans
+                    .iter()
+                    .all(|p| !p.starts_with("SCAN jobs") && !p.starts_with("SCAN attempts")),
+                "{name} scans the queue: {plans:?}"
+            );
+        }
+
+        // The PR probe keys on the ready side and probes provenance by run
+        // id, so its cost follows the queue rather than PR history.
+        let plans = explain(PR_WAITING_SQL);
+        assert!(
+            plans.iter().all(|p| !p.starts_with("SCAN p")),
+            "provenance is scanned: {plans:?}"
+        );
+        assert!(
+            plans
+                .iter()
+                .any(|p| p.contains("SEARCH p USING PRIMARY KEY")),
+            "provenance is not probed by run id: {plans:?}"
+        );
+    }
 }
