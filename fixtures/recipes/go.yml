@@ -1,0 +1,43 @@
+# K07 recipe — Go. GOPROXY is a checked-out file:// module proxy (a local
+# mirror in production), GOSUMDB is off because the module set is
+# private, and GOMODCACHE/GOCACHE live on cache mounts.
+#
+#   gomod  (downloads)    — the module store: zips and extracted modules
+#                           stay useful across go.sum edits under the
+#                           `go-mod-` stem.
+#   vendor (dependencies) — `go mod vendor` materializes the exact locked
+#                           set; served only under the identical key.
+#   gocache (compiler)    — the build cache; `cc-normal-` stem, volatile
+#                           lockfile-hash tail.
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/library/golang:1.25-alpine
+    resources: { cpu: 2, memory: 1GiB }
+    timeout: 10m
+    env:
+      GOPROXY: file:///workspace/goproxy
+      GOSUMDB: "off"
+      GOMODCACHE: /dl/gomod
+      GOCACHE: /dl/gocache
+    cache:
+      - name: gomod
+        class: downloads
+        key: "go-mod-${{ hash_files('go.sum') }}"
+        paths: [/dl/gomod]
+      - name: vendor
+        class: dependencies
+        key: "go-deps-${{ hash_files('go.sum') }}"
+        paths: [vendor]
+      - name: gocache
+        class: compiler
+        key: "cc-normal-${{ hash_files('go.sum') }}"
+        paths: [/dl/gocache]
+    steps:
+      - id: deps
+        run: go mod vendor
+      - id: build
+        run: go build -mod=vendor -o bin/app .
+      - id: test
+        run: ./bin/app

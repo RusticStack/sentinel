@@ -1,0 +1,40 @@
+# K07 recipe — npm. `npm_config_cache` points at the downloads mount so
+# pacote's cacache store lands in the cache; the fixture's deps are
+# checked-in file: tarballs (a private registry in production), and
+# `npm install --prefer-offline` reuses the restored node_modules.
+#
+#   npm-cache    (downloads)    — cacache content store; stem-served
+#                                 across package-lock.json edits.
+#   node-modules (dependencies) — the exact materialization; served only
+#                                 under the identical lock hash.
+#   app-build    (compiler)     — the bundler-style output cache under
+#                                 `cc-normal-`.
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/library/node:22-alpine
+    resources: { cpu: 1, memory: 512MiB }
+    timeout: 5m
+    env:
+      npm_config_cache: /dl/npm
+    cache:
+      - name: npm-cache
+        class: downloads
+        key: "npm-dl-${{ hash_files('package-lock.json') }}"
+        paths: [/dl/npm]
+      - name: node-modules
+        class: dependencies
+        key: "npm-deps-${{ hash_files('package-lock.json') }}"
+        paths: [node_modules]
+      - name: app-build
+        class: compiler
+        key: "cc-normal-${{ hash_files('package-lock.json') }}"
+        paths: [dist]
+    steps:
+      - id: install
+        run: npm install --prefer-offline --no-audit --no-fund
+      - id: build
+        run: node tools/build.js
+      - id: test
+        run: node test/check.js

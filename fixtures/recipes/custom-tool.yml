@@ -1,0 +1,45 @@
+# K07 recipe — a custom toolchain (fixtures/compiler/fakecc.sh) on the
+# smallest pinned image. The tool owns its content-keyed object cache;
+# Sentinel restores the namespace and the tool decides freshness per
+# input, so a hit can never serve a stale artifact.
+#
+# Cache classes:
+#   tool-store (downloads)  — pkgs fetched into the tool's own store;
+#                             stem-served so old blobs keep serving when
+#                             deps.txt gains a version.
+#   vendor     (dependencies) — the exact materialization of deps.txt;
+#                             served only under the identical key.
+#   cc         (compiler)   — fakecc's content-keyed object dir; the
+#                             `cc-normal-` stem is the namespace, the
+#                             hash tail its volatile component.
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/library/busybox:1.36
+    resources: { cpu: 1, memory: 128MiB }
+    timeout: 5m
+    cache:
+      - name: tool-store
+        class: downloads
+        key: "custom-dl-${{ hash_files('deps.txt') }}"
+        paths: [/dl/pkgs]
+      - name: vendor
+        class: dependencies
+        key: "custom-deps-${{ hash_files('deps.txt') }}"
+        paths: [vendor]
+      - name: cc
+        class: compiler
+        key: "cc-normal-${{ hash_files('deps.txt') }}"
+        paths: [/dl/cc]
+    steps:
+      - id: deps
+        run: sh tools/fetch-deps.sh deps.txt /dl/pkgs vendor
+      - id: build
+        run: sh tools/fakecc.sh /dl/cc src/main.c src/lib.c
+      - id: test
+        run: |
+          test -f vendor/liba/lib.txt
+          test -f vendor/libb/lib.txt
+          ls /dl/cc/main.c.*.o >/dev/null
+          ls /dl/cc/lib.c.*.o >/dev/null

@@ -536,3 +536,45 @@ fn unsupported_entries_are_skipped_not_followed() {
     };
     assert_eq!(files, 1, "only the regular file may be staged");
 }
+
+/// K07: an executable staged into the payload must keep its exec bit —
+/// restore re-applies the payload file's own mode, so a 0666&umask
+/// staging would degrade every cached tool binary to Permission denied.
+#[test]
+#[cfg(unix)]
+fn sealed_payload_files_carry_the_recorded_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cache");
+    let view = tmp.path().join("view");
+    put(&view, "bin/tool", b"#!/bin/sh\n");
+    fs::set_permissions(view.join("bin/tool"), fs::Permissions::from_mode(0o755)).unwrap();
+    put(&view, "data.txt", b"bytes");
+
+    let scope = test_scope(Trust::Protected);
+    let a = attached(scope, vec![target(view)]);
+    let out = commit(&root, &a, 1_000).unwrap();
+    let Published::Sealed { generation, .. } = out else {
+        panic!("expected sealed, got {out:?}")
+    };
+    let entry = entry_of(&root, &a);
+    let (manifest, blob) = sealed(&entry, &generation);
+    assert_eq!(manifest.files, 2);
+    let tool = blob
+        .entries
+        .iter()
+        .find(|e| e.path.ends_with("tool"))
+        .unwrap();
+    assert_eq!(tool.mode & 0o777, 0o755, "manifest records the exec bit");
+    let payload = entry.join(&generation).join("payload").join("0");
+    assert_eq!(
+        fs::metadata(payload.join("bin/tool"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "the staged payload file itself carries the recorded mode"
+    );
+}

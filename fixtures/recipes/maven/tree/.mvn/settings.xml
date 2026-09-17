@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Every repository — plugins and deps — resolves through the checked-in
+     file mirror (a local-mirror/airgapped layout). In production this is
+     a private mirror URL; the recipe's behavior is identical either way. -->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+  <mirrors>
+    <mirror>
+      <id>workspace-mirror</id>
+      <name>workspace file mirror</name>
+      <url>file:///workspace/m2-mirror</url>
+      <mirrorOf>*</mirrorOf>
+    </mirror>
+  </mirrors>
+</settings>

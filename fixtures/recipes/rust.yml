@@ -1,0 +1,36 @@
+# K07 recipe — Rust. `.cargo/config.toml` replaces crates.io with a
+# checked-out local registry (the vendored-mirror pattern), so every
+# resolve runs cargo's real registry machinery offline.
+#
+#   cargo-store (downloads) — all of CARGO_HOME: .crate blobs, unpacked
+#                             sources, the index cache and cargo's own
+#                             bookkeeping (which must be writable, so the
+#                             whole home mounts as one store). Stem-served
+#                             across Cargo.lock edits.
+#   target      (compiler)  — CARGO_TARGET_DIR, rustc's incremental
+#                             namespace; `cc-normal-` stem.
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/library/rust:1-alpine
+    resources: { cpu: 2, memory: 1GiB }
+    timeout: 10m
+    env:
+      CARGO_HOME: /dl/cargo
+      CARGO_TARGET_DIR: /build/target
+      CARGO_NET_OFFLINE: "true"
+    cache:
+      - name: cargo-store
+        class: downloads
+        key: "cargo-dl-${{ hash_files('Cargo.lock') }}"
+        paths: [/dl/cargo]
+      - name: target
+        class: compiler
+        key: "cc-normal-${{ hash_files('Cargo.lock') }}"
+        paths: [/build/target]
+    steps:
+      - id: build
+        run: cargo build
+      - id: test
+        run: cargo test

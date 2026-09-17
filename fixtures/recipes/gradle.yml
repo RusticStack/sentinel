@@ -1,0 +1,35 @@
+# K07 recipe — Gradle. build.gradle resolves deps from a checked-out
+# file:// maven repo and gradle.lockfile pins them.
+#
+#   gradle-store (downloads) — the whole GRADLE_USER_HOME: modules-2
+#                              artifacts plus gradle's own caches and
+#                              bookkeeping — a tool-managed store that
+#                              must be writable wholesale, stem-served
+#                              across gradle.lockfile edits.
+#   gradle-build (compiler)  — the project's incremental state: task
+#                              outputs under build/ and the .gradle/
+#                              fingerprint db under `cc-normal-`.
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/library/gradle:8-jdk17-alpine
+    resources: { cpu: 2, memory: 2GiB }
+    timeout: 10m
+    env:
+      GRADLE_USER_HOME: /dl/guhome
+      GRADLE_OPTS: -Dorg.gradle.daemon=false
+    cache:
+      - name: gradle-store
+        class: downloads
+        key: "gradle-dl-${{ hash_files('gradle.lockfile') }}"
+        paths: [/dl/guhome]
+      - name: gradle-build
+        class: compiler
+        key: "cc-normal-${{ hash_files('gradle.lockfile') }}"
+        paths: [build, .gradle]
+    steps:
+      - id: build
+        run: gradle --no-daemon build
+      - id: test
+        run: java -cp 'build/libs/app.jar:build/deps/*' com.acme.App
