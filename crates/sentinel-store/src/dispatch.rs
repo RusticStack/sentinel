@@ -661,6 +661,21 @@ fn host_millis(conn: &Connection, worker: WorkerId) -> Result<i64> {
         .query_row([worker.as_bytes()], |r| r.get(0))?)
 }
 
+/// The largest waiting job this worker could run at or above
+/// [`LARGE_JOB_CPU`]. `state_code = 1` and the `8000` threshold are literals
+/// on purpose: SQLite only uses the partial [`LARGE_JOB_CPU`] index when its
+/// predicate is implied by constants, and this query runs on every placement.
+/// A bound threshold silently turns it into a scan of the whole ready index.
+const LARGE_WAITING_SQL: &str = "SELECT cpu_millis, queued_ms FROM jobs
+     WHERE state_code = 1 AND cancel_requested = 0
+       AND cpu_millis >= 8000 AND cpu_millis <= ?1
+     ORDER BY cpu_millis DESC LIMIT 1";
+
+const _: () = assert!(
+    LARGE_JOB_CPU == 8000,
+    "LARGE_WAITING_SQL hardcodes the large-job threshold; migration 028's jobs_ready_large index does too"
+);
+
 fn waiting_fairness(
     conn: &Connection,
     worker: WorkerId,
@@ -669,15 +684,8 @@ fn waiting_fairness(
 ) -> Result<Fairness> {
     let mut fairness = Fairness::default();
     let large: Option<(i64, i64)> = conn
-        .prepare_cached(
-            "SELECT cpu_millis, queued_ms FROM jobs
-             WHERE state_code = 1 AND cancel_requested = 0
-               AND cpu_millis >= ?1 AND cpu_millis <= ?2
-             ORDER BY cpu_millis DESC LIMIT 1",
-        )?
-        .query_row(params![LARGE_JOB_CPU, facts.cpu_millis], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+        .prepare_cached(LARGE_WAITING_SQL)?
+        .query_row(params![facts.cpu_millis], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     fairness.large = large;
     let pr: bool = conn

@@ -101,24 +101,31 @@ fn wait_until(what: &str, within: Duration, mut ready: impl FnMut() -> bool) {
 }
 
 /// A container serving `port` with an echo behind it, optionally restricted
-/// to one worker node key. Dropping it removes the container.
+/// to one worker node key. Dropping it removes the container; the key
+/// directory is the caller's, so a restart with the same one keeps the same
+/// helper identity (and therefore the same address).
 struct Server {
     name: String,
     address: Address,
-    _keys: tempfile::TempDir,
 }
 
 impl Server {
     /// `allow` is the worker node key the helper accepts; `None` serves any
-    /// peer (tailcat's default), `Some(key)` passes `--allow=<key>`.
-    fn start(binary: &Path, name: &str, port: u16, allow: Option<&NodeKey>) -> Self {
-        let keys = tempfile::tempdir().unwrap();
+    /// peer (tailcat's default), `Some(key)` passes `--allow=<key>`. The key
+    /// exists after the first start, so a restart reuses the same identity.
+    fn start(binary: &Path, name: &str, port: u16, allow: Option<&NodeKey>, keys: &Path) -> Self {
         let bind = binary.parent().unwrap();
         let allow_arg = allow
             .map(|key| format!("--allow={}", key.expose()))
             .unwrap_or_default();
-        let script =
-            format!("nc -lk -p {port} -e cat & HOME=/home /tc/tailcat serve {allow_arg} {port}");
+        let key_file = "/home/.config/tailcat/keys/default.private.json";
+        let script = format!(
+            "nc -lk -p {port} -e cat & \
+             if [ ! -f {key_file} ]; then \
+                 HOME=/home /tc/tailcat genkey --key=default --fixed-region >/dev/null 2>&1; \
+             fi; \
+             HOME=/home /tc/tailcat serve {allow_arg} {port}"
+        );
         let status = Command::new("podman")
             .args([
                 "run",
@@ -128,7 +135,7 @@ impl Server {
                 "-v",
                 &format!("{}:/tc:ro", bind.display()),
                 "-v",
-                &format!("{}:/home", keys.path().display()),
+                &format!("{}:/home", keys.display()),
                 "alpine:3",
                 "sh",
                 "-c",
@@ -142,7 +149,6 @@ impl Server {
         let mut server = Self {
             name: name.to_owned(),
             address: Address::parse("tcplaceholderplaceholder").unwrap(),
-            _keys: keys,
         };
         server.address = server.wait_address();
         server
@@ -171,11 +177,18 @@ impl Server {
         panic!("container {} never reported an address", self.name);
     }
 
-    /// Restart the same container with a different allow list: revocation is
-    /// a new helper generation, not an edit under a running one.
-    fn restart_with(&self, binary: &Path, port: u16, allow: Option<&NodeKey>) -> Server {
+    /// Restart the same container with a different allow list. The key
+    /// directory is reused, so the helper keeps its identity and address:
+    /// the allow list is then the only variable a refusal can come from.
+    fn restart_with(
+        &self,
+        binary: &Path,
+        port: u16,
+        allow: Option<&NodeKey>,
+        keys: &Path,
+    ) -> Server {
         self.stop();
-        Server::start(binary, &self.name, port, allow)
+        Server::start(binary, &self.name, port, allow, keys)
     }
 
     fn stop(&self) {
@@ -236,7 +249,14 @@ fn the_helper_carries_the_link_port_and_reports_telemetry() {
         tailcat::ensure_key(&config, data_dir.path(), Role::Worker).unwrap()
     );
 
-    let server = Server::start(&binary, "sentinel-live-serve", port, Some(&key));
+    let server_keys = tempfile::tempdir().unwrap();
+    let server = Server::start(
+        &binary,
+        "sentinel-live-serve",
+        port,
+        Some(&key),
+        server_keys.path(),
+    );
     let forward =
         tailcat::start_forward_every(&config, data_dir.path(), &server.address, PROBE_EVERY)
             .unwrap();
@@ -287,24 +307,48 @@ fn a_revoked_peer_loses_the_tunnel_and_a_new_endpoint_is_dialed() {
     let config = config(&binary, data_dir.path(), port);
     let key = tailcat::ensure_key(&config, data_dir.path(), Role::Worker).unwrap();
 
-    let server = Server::start(&binary, "sentinel-live-revoke", port, Some(&key));
+    let server_keys = tempfile::tempdir().unwrap();
+    let server = Server::start(
+        &binary,
+        "sentinel-live-revoke",
+        port,
+        Some(&key),
+        server_keys.path(),
+    );
     let forward =
         tailcat::start_forward_every(&config, data_dir.path(), &server.address, PROBE_EVERY)
             .unwrap();
     wait_until("the tunnel", READY, || forward.telemetry().ready);
     assert_eq!(echo(port, b"before-revoke"), b"before-revoke");
 
-    // Revocation: the server comes back allowing a different peer. The
-    // worker's probe must stop trusting the tunnel within the bound.
+    // Revocation: the same helper identity comes back allowing a different
+    // peer, so the only variable is the allow list and a refusal can only be
+    // a rejection — not an endpoint that moved.
+    let before = server.address.expose().to_owned();
     let other = NodeKey::parse(&format!("nodekey:{}", "ab".repeat(32))).unwrap();
-    let server = server.restart_with(&binary, port, Some(&other));
+    let server = server.restart_with(&binary, port, Some(&other), server_keys.path());
+    assert_eq!(
+        before,
+        server.address.expose(),
+        "the restarted helper must keep its identity"
+    );
     wait_until("the revocation to show", PROBLEM, || {
         forward.telemetry().problem.is_some() && forward.probe().is_err()
     });
+    // Release the loopback port: a second forward must bind it, and only one
+    // listener per host port exists.
+    forward.shutdown();
 
     // A changed endpoint is a new address: a second server with its own key
     // serves the same port, and a fresh forward dials it.
-    let server_b = Server::start(&binary, "sentinel-live-endpoint", port, Some(&key));
+    let endpoint_keys = tempfile::tempdir().unwrap();
+    let server_b = Server::start(
+        &binary,
+        "sentinel-live-endpoint",
+        port,
+        Some(&key),
+        endpoint_keys.path(),
+    );
     assert_ne!(server.address.expose(), server_b.address.expose());
     let forward_b =
         tailcat::start_forward_every(&config, data_dir.path(), &server_b.address, PROBE_EVERY)
@@ -313,7 +357,6 @@ fn a_revoked_peer_loses_the_tunnel_and_a_new_endpoint_is_dialed() {
     assert_eq!(echo(port, b"new-endpoint"), b"new-endpoint");
 
     forward_b.shutdown();
-    forward.shutdown();
 }
 
 #[test]
@@ -400,7 +443,14 @@ fn relay_only_paths_report_derp() {
     let port = free_port();
     let config = config(&binary, data_dir.path(), port);
     let key = tailcat::ensure_key(&config, data_dir.path(), Role::Worker).unwrap();
-    let server = Server::start(&binary, "sentinel-live-relay", port, Some(&key));
+    let server_keys = tempfile::tempdir().unwrap();
+    let server = Server::start(
+        &binary,
+        "sentinel-live-relay",
+        port,
+        Some(&key),
+        server_keys.path(),
+    );
 
     let Some(_block) = UdpBlock::engage() else {
         eprintln!("iptables unavailable; skipping relay-only assertion");
