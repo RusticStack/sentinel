@@ -1,0 +1,44 @@
+# K07 recipe — pnpm (vendored under tool/pnpm so the toolchain itself is
+# part of the checked-out environment). `.npmrc` pins store-dir onto the
+# downloads mount and selects the hoisted linker so node_modules is plain
+# files.
+#
+#   pnpm-store   (downloads)    — pnpm's content-addressed store;
+#                                 stem-served across pnpm-lock.yaml edits.
+#   node-modules (dependencies) — the exact materialization of the lock.
+#   app-build    (compiler)     — bundler-style output under `cc-normal-`.
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/library/node:22-alpine
+    resources: { cpu: 1, memory: 512MiB }
+    timeout: 5m
+    env:
+      # Read-only rootfs: PNPM_HOME (global-bin dir, unused by `install`)
+      # goes to the tmpfs, only the store lands on a cache mount.
+      PNPM_HOME: /tmp/pnpm-home
+      # .npmrc also sets store-dir; the env var is the recipe-visible wiring
+      # and wins if the checked-in file ever drifts.
+      npm_config_store_dir: /dl/pnpm-store
+      PATH: /workspace/tool/pnpm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    cache:
+      - name: pnpm-store
+        class: downloads
+        key: "pnpm-store-${{ hash_files('pnpm-lock.yaml') }}"
+        paths: [/dl/pnpm-store]
+      - name: node-modules
+        class: dependencies
+        key: "pnpm-deps-${{ hash_files('pnpm-lock.yaml') }}"
+        paths: [node_modules]
+      - name: app-build
+        class: compiler
+        key: "cc-normal-${{ hash_files('pnpm-lock.yaml') }}"
+        paths: [dist]
+    steps:
+      - id: install
+        run: pnpm install --prefer-offline
+      - id: build
+        run: node tools/build.js
+      - id: test
+        run: node test/check.js

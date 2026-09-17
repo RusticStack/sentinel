@@ -577,7 +577,17 @@ fn materialize(
             // mid-publish can never produce a listing its generation does
             // not satisfy.
             None => match copy_hashed(&planned.job, &dst) {
-                Ok(staged) => staged,
+                Ok(staged) => {
+                    // The payload file itself must carry the recorded
+                    // mode: restore re-applies the staged file's own
+                    // permission bits (clone::file), so a File::create
+                    // default would leak 0666&umask in place of an
+                    // executable's 0755. Hardlinked entries are not
+                    // stamped — they share the source generation's inode,
+                    // which already carries that mode.
+                    stamp_mode(&dst, planned.mode)?;
+                    staged
+                }
                 Err(e) if e.kind() == ErrorKind::NotFound => {
                     let _ = fs::remove_file(&dst);
                     plan.skipped += 1;
@@ -650,6 +660,22 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Stamp a staged payload file with the mode the manifest records for it,
+/// minus the bits restore never applies (clone::mode_of keeps 0o777).
+/// No-op off unix, where mode is not tracked.
+fn stamp_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
 }
 
 /// The permission bits worth keeping — the exec bit on tools. Off unix a

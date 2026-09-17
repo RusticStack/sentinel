@@ -1,0 +1,7 @@
+# Deps resolve from the checked-out local registry — the vendored-mirror
+# pattern. In production this points at a local-registry dir produced by
+# `cargo vendor` or a private mirror.
+[source.crates-io]
+replace-with = "local-registry"
+[source.local-registry]
+local-registry = "/workspace/local-registry"

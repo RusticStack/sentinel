@@ -1,0 +1,34 @@
+# K07 recipe — Maven. `.mvn/settings.xml` mirrors every repository to a
+# checked-out file:// repo (the local-mirror pattern) and MAVEN_OPTS
+# moves the local repository onto the downloads mount.
+#
+#   maven-m2 (downloads) — the local repository: a tool-managed store
+#                          that accumulates across pom edits under the
+#                          `maven-m2-` stem — a pom change serves every
+#                          artifact the new build still needs.
+#   target   (compiler)  — javac's incremental output under `cc-normal-`.
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/library/maven:3.9-eclipse-temurin-17-alpine
+    resources: { cpu: 2, memory: 1GiB }
+    timeout: 10m
+    env:
+      MAVEN_OPTS: -Dmaven.repo.local=/dl/m2
+    cache:
+      - name: maven-m2
+        class: downloads
+        key: "maven-m2-${{ hash_files('pom.xml') }}"
+        paths: [/dl/m2]
+      - name: target
+        class: compiler
+        key: "cc-normal-${{ hash_files('pom.xml') }}"
+        paths: [target]
+    steps:
+      - id: build
+        # Fully-qualified goal: a `dependency:` prefix would need plugin
+        # group metadata (maven-metadata.xml) in the mirror.
+        run: mvn -B -s .mvn/settings.xml package org.apache.maven.plugins:maven-dependency-plugin:3.6.1:copy-dependencies -DoutputDirectory=target/deps
+      - id: test
+        run: java -cp 'target/app-1.0.jar:target/deps/*' com.acme.App

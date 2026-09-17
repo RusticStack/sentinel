@@ -148,6 +148,10 @@ A `class: compiler` entry is a stable toolchain namespace whose tool owns per-in
 
 **A hit is never a cached verdict.** A compiler-cache hit restores *bytes* — the writable view the job's steps read — and nothing else. `execute` runs every declared step unconditionally; `job.caches` is consulted only by restore during preparation and publish during finalization, and the `Outcome::Hit` type itself carries only a manifest and a byte count. Go's documented build-cache/test-result distinction applies: forcing fresh test execution (`-count=1`) does not require discarding compiler reuse. A cache hit can never suppress a test, skip a step, or inherit a previous run's verdict. The Linux fixture `fixtures/compiler/fakecc.sh` — a content-keyed compiler stand-in — exercises this through real container mounts and restore/publish round-trips in `sentinel-worker/tests/compiler_cache.rs` and `sentinel-cache/tests/compiler.rs`.
 
+## Recipe library (K07)
+
+[recipes](recipes.md) publishes nine tested pipelines — a custom compiler tool, Go, Rust, npm, pnpm, Bun, Python, Maven and Gradle — showing how each toolchain's stores map onto these classes, which environment variables wire the mounts, how lockfile and toolchain changes move through the key and scope, and the measured cold/warm/small-edit/changed-dependency/changed-toolchain behavior.
+
 ## Versioned surface
 
 The manifest and `files` blob formats are versioned contracts under [compatibility](compatibility.md); the miss-reason strings are the report vocabulary and change only there too. The pipeline-facing half — `cache.class`, its default, and the compiled digest — is schema 1 behavior documented in [pipeline schema](pipeline-schema.md).
