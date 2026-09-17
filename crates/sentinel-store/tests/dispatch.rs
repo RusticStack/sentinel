@@ -164,7 +164,7 @@ fn placement_is_pool_scoped_capacity_checked_and_reserves_with_the_lease() {
     let f = fixture();
     let cap = Capacity {
         cpu_millis: 4_000,
-        memory_bytes: 8 << 30,
+        memory_bytes: 8 << 30, disk_bytes: 0
     };
     let w = worker(&f, f.pool, cap);
     // Nothing queued: nothing offered, and the full capacity is free.
@@ -187,7 +187,7 @@ fn placement_is_pool_scoped_capacity_checked_and_reserves_with_the_lease() {
         f.store.read(|c| dispatch::free_capacity(c, w)).unwrap(),
         Capacity {
             cpu_millis: 3_000,
-            memory_bytes: 7 << 30
+            memory_bytes: 7 << 30, disk_bytes: 0
         }
     );
     // The big job no longer fits this worker while the small one holds it.
@@ -225,7 +225,7 @@ fn placement_is_pool_scoped_capacity_checked_and_reserves_with_the_lease() {
         other,
         Capacity {
             cpu_millis: 64_000,
-            memory_bytes: 256 << 30,
+            memory_bytes: 256 << 30, disk_bytes: 0
         },
     );
     assert_eq!(place(&f, outsider, other, at(2_300)), None);
@@ -286,7 +286,7 @@ fn offers_lapse_back_to_the_queue_and_stale_acknowledgements_are_refused() {
         f.pool,
         Capacity {
             cpu_millis: 8_000,
-            memory_bytes: 16 << 30,
+            memory_bytes: 16 << 30, disk_bytes: 0
         },
     );
     let (_, ids) = run(&f, TWO_JOBS, at(2_000));
@@ -391,7 +391,7 @@ fn renewal_is_fenced_per_attempt_and_names_what_to_stop() {
         f.pool,
         Capacity {
             cpu_millis: 8_000,
-            memory_bytes: 16 << 30,
+            memory_bytes: 16 << 30, disk_bytes: 0
         },
     );
     let (_, ids) = run(&f, TWO_JOBS, at(2_000));
@@ -476,7 +476,7 @@ fn a_report_carries_the_job_context_and_writes_the_summary_once() {
         f.pool,
         Capacity {
             cpu_millis: 8_000,
-            memory_bytes: 16 << 30,
+            memory_bytes: 16 << 30, disk_bytes: 0
         },
     );
     let (_, ids) = run(
@@ -616,7 +616,7 @@ fn job_context_derives_cache_trust_from_recorded_provenance() {
         f.pool,
         Capacity {
             cpu_millis: 8_000,
-            memory_bytes: 16 << 30,
+            memory_bytes: 16 << 30, disk_bytes: 0
         },
     );
     let yaml = "schema: 1
@@ -701,7 +701,7 @@ fn cancellation_is_desired_state_immediate_before_start_and_delivered_while_owne
         f.pool,
         Capacity {
             cpu_millis: 8_000,
-            memory_bytes: 16 << 30,
+            memory_bytes: 16 << 30, disk_bytes: 0
         },
     );
     let (run_id, ids) = run(&f, TWO_JOBS, at(2_000));
@@ -820,7 +820,7 @@ fn expired_leases_and_overrun_attempts_are_infra_failures_that_are_never_replaye
         f.pool,
         Capacity {
             cpu_millis: 8_000,
-            memory_bytes: 16 << 30,
+            memory_bytes: 16 << 30, disk_bytes: 0
         },
     );
     let (_, ids) = run(
@@ -952,7 +952,7 @@ fn a_controller_start_settles_what_the_last_one_left_and_abandonment_is_fenced()
         f.pool,
         Capacity {
             cpu_millis: 8_000,
-            memory_bytes: 16 << 30,
+            memory_bytes: 16 << 30, disk_bytes: 0
         },
     );
     let gone = worker(
@@ -960,7 +960,7 @@ fn a_controller_start_settles_what_the_last_one_left_and_abandonment_is_fenced()
         f.pool,
         Capacity {
             cpu_millis: 8_000,
-            memory_bytes: 16 << 30,
+            memory_bytes: 16 << 30, disk_bytes: 0
         },
     );
     let (_, ids) = run(
@@ -1040,7 +1040,7 @@ jobs:
         f.pool,
         Capacity {
             cpu_millis: 8_000,
-            memory_bytes: 16 << 30,
+            memory_bytes: 16 << 30, disk_bytes: 0
         },
     );
     let o1 = place(&f, gone2, f.pool, at(50_100)).unwrap();
@@ -1197,7 +1197,7 @@ fn finishing_releases_capacity_and_decides_dependents_in_the_same_transaction() 
         f.pool,
         Capacity {
             cpu_millis: 8_000,
-            memory_bytes: 16 << 30,
+            memory_bytes: 16 << 30, disk_bytes: 0
         },
     );
     let (_, ids) = run(

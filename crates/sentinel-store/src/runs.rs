@@ -9,12 +9,16 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{
     Actor, Event, JobControl, JobId, JobState, RepoId, RunId, TenantId, UnixMillis,
 };
-use sentinel_pipeline::run::{RunSpec, SPEC_FORMAT, SPEC_FORMAT_READ_MIN};
+use sentinel_pipeline::{
+    expr::{Context, DependencySummary, HashFilesError, Lookup, Phase, Value},
+    run::{RunSpec, SPEC_FORMAT, SPEC_FORMAT_READ_MIN},
+};
 
 use crate::{
-    Error, Result,
-    codec::{decode_state, encode_state},
+    Error, Result, dispatch,
+    codec::{TERMINAL_BASE, decode_state, encode_state},
     jobs,
+    provenance::{self, EventFacts},
 };
 
 /// Default queue priority; lower runs first. Scheduling policy (fairness,
@@ -44,8 +48,15 @@ pub fn create_run(
         ],
     )?;
     let mut ids = Vec::with_capacity(spec.pipeline.jobs.len());
+    // The concurrency group is applied here when its template needs only
+    // facts the store already holds; a template over `event.*` waits for the
+    // run's provenance (recorded after this transaction's run row) and is
+    // applied by [`apply_concurrency`] then.
+    let group = create_group(tx, tenant, repo, run, spec)?;
     let mut mark_index = tx.prepare_cached(
-        "UPDATE jobs SET spec_index = ?1, cpu_millis = ?3, memory_bytes = ?4, timeout_ms = ?5 WHERE id = ?2",
+        "UPDATE jobs SET spec_index = ?1, cpu_millis = ?3, memory_bytes = ?4, timeout_ms = ?5,
+                disk_bytes = ?6, arch = ?7, labels = ?8, concurrency_group = ?9
+         WHERE id = ?2",
     )?;
     for (index, job) in spec.pipeline.jobs.iter().enumerate() {
         let id = JobId::new();
@@ -66,7 +77,12 @@ pub fn create_run(
                 .map_err(|_| Error::InvalidInput("memory_bytes"))?,
             i64::try_from(job.spec.timeout_secs)
                 .map_err(|_| Error::InvalidInput("timeout"))?
-                .saturating_mul(1000)
+                .saturating_mul(1000),
+            i64::try_from(job.spec.resources.disk_bytes)
+                .map_err(|_| Error::InvalidInput("disk_bytes"))?,
+            job_arch(job.spec.runs_on.arch),
+            dispatch::encode_labels(&job.spec.runs_on.labels)?,
+            group,
         ])?;
         if let Some(digest) = sentinel_pipeline::run::ImageRef::parse(&job.spec.image)
             .ok()
@@ -89,10 +105,211 @@ pub fn create_run(
         }
         ids.push(id);
     }
+    if let (Some(group), Some(concurrency)) = (group.as_deref(), spec.pipeline.concurrency.as_ref())
+        && concurrency.cancel_in_progress
+    {
+        supersede(tx, tenant, repo, run, group, now)?;
+    }
     // Every compiled job has its check row from the start, so a required
     // aggregate never waits for the first transition to appear. The callers
     // record it after provenance exists (only event-driven runs publish).
     Ok(ids)
+}
+
+/// The worker-facing architecture spelling stored on a job: the same words
+/// `workers.arch` records, so placement compares one string.
+fn job_arch(arch: Option<sentinel_pipeline::schema::Arch>) -> Option<&'static str> {
+    match arch {
+        Some(sentinel_pipeline::schema::Arch::Amd64) => Some("x86_64"),
+        Some(sentinel_pipeline::schema::Arch::Arm64) => Some("aarch64"),
+        None => None,
+    }
+}
+
+/// Longest rendered concurrency group, matching the schema's template bound.
+const MAX_GROUP_BYTES: usize = 256;
+
+/// Run-level facts a dispatch-phase template may read: the repository, the
+/// run and — when the run's provenance is already recorded — its event. A
+/// path this context does not hold stays `Unresolved`, so a template that
+/// needs it fails rendering instead of keying on a default.
+struct RunContext {
+    repo: RepoId,
+    repo_name: String,
+    run: RunId,
+    sha: String,
+    event: Option<EventFacts>,
+}
+
+impl Context for RunContext {
+    fn phase(&self) -> Phase {
+        Phase::Dispatch
+    }
+
+    fn lookup(&self, path: &[String]) -> Lookup {
+        let key: Vec<&str> = path.iter().map(String::as_str).collect();
+        match key.as_slice() {
+            ["event", "sha"] => Lookup::Value(Value::Str(self.sha.clone())),
+            ["event", _] => match &self.event {
+                None => Lookup::Unresolved,
+                Some(event) => Lookup::Value(match key[1] {
+                    "name" => Value::Str(event.name.clone()),
+                    "ref" => Value::Str(event.ref_name.clone()),
+                    "key" => Value::Str(event.key.clone()),
+                    "base_ref" => match &event.base_ref {
+                        Some(base) => Value::Str(base.clone()),
+                        None => Value::Null,
+                    },
+                    "pr_number" => match event.pr_number {
+                        Some(number) => Value::Int(number as i64),
+                        None => Value::Null,
+                    },
+                    _ => return Lookup::Unresolved,
+                }),
+            },
+            ["repo", "id"] => Lookup::Value(Value::Str(self.repo.to_string())),
+            ["repo", "name"] => Lookup::Value(Value::Str(self.repo_name.clone())),
+            ["run", "id"] => Lookup::Value(Value::Str(self.run.to_string())),
+            _ => Lookup::Unresolved,
+        }
+    }
+
+    fn dependency_summary(&self) -> Option<DependencySummary> {
+        None
+    }
+
+    fn cancelled(&self) -> Option<bool> {
+        Some(false)
+    }
+
+    fn hash_files(&self, _patterns: &[&str]) -> std::result::Result<String, HashFilesError> {
+        Err(HashFilesError::UnsupportedPlatform)
+    }
+}
+
+/// Render the run's concurrency group, or `None` when the pipeline declares
+/// none or the template needs facts that are not available yet.
+fn render_group(
+    conn: &Connection,
+    tenant: TenantId,
+    repo: RepoId,
+    run: RunId,
+    spec: &RunSpec,
+    event: Option<EventFacts>,
+) -> Result<Option<String>> {
+    let Some(concurrency) = spec.pipeline.concurrency.as_ref() else {
+        return Ok(None);
+    };
+    let repo_name: String = conn
+        .prepare_cached("SELECT name FROM repos WHERE id = ?1 AND tenant_id = ?2")?
+        .query_row(params![repo.as_bytes(), tenant.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    let context = RunContext {
+        repo,
+        repo_name,
+        run,
+        sha: spec.source.sha.clone(),
+        event,
+    };
+    Ok(concurrency.group.render(&context, MAX_GROUP_BYTES).ok())
+}
+
+/// The group `create_run` may apply before provenance exists: rendered with
+/// event paths unresolved, so a template that reads `event.*` is deferred
+/// rather than keyed on a guess about the event that will arrive.
+fn create_group(
+    conn: &Connection,
+    tenant: TenantId,
+    repo: RepoId,
+    run: RunId,
+    spec: &RunSpec,
+) -> Result<Option<String>> {
+    if spec.pipeline.concurrency.is_none() {
+        return Ok(None);
+    }
+    match provenance::of_run(conn, run)? {
+        Some(_) => {
+            let event = provenance::event_facts(conn, run)?;
+            render_group(conn, tenant, repo, run, spec, Some(event))
+        }
+        None => render_group(conn, tenant, repo, run, spec, None),
+    }
+}
+
+/// Apply the run's concurrency group once its provenance exists — for an
+/// event-driven run, recorded after the run row by the same dispatch
+/// transaction. Writes the rendered group onto the run's jobs and, when the
+/// pipeline asked to cancel in progress, cancels every live run of the
+/// repository still holding that group. Idempotent: calling it again
+/// recomputes the same group and finds no live superseded run.
+pub fn apply_concurrency(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    run: RunId,
+    now: UnixMillis,
+) -> Result<()> {
+    let spec = get_run_spec(tx, tenant, run)?;
+    let Some(concurrency) = spec.pipeline.concurrency.as_ref() else {
+        return Ok(());
+    };
+    let repo: [u8; 16] = tx
+        .prepare_cached("SELECT repo_id FROM runs WHERE id = ?1 AND tenant_id = ?2")?
+        .query_row(params![run.as_bytes(), tenant.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    let repo = RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?;
+    let event = provenance::event_facts(tx, run)?;
+    let Some(group) = render_group(tx, tenant, repo, run, &spec, Some(event))? else {
+        return Ok(());
+    };
+    tx.prepare_cached(
+        "UPDATE jobs SET concurrency_group = ?1 WHERE run_id = ?2 AND tenant_id = ?3
+           AND (concurrency_group IS NULL OR concurrency_group <> ?1)",
+    )?
+    .execute(params![group, run.as_bytes(), tenant.as_bytes()])?;
+    if concurrency.cancel_in_progress {
+        supersede(tx, tenant, repo, run, &group, now)?;
+    }
+    Ok(())
+}
+
+/// Cancel every live run of the repository already holding `group`, older
+/// than this run: a group is a (tenant, repository, key) lock, never a
+/// global branch string. Workers learn through the usual cancel path — a
+/// running attempt is told on its next heartbeat, an unstarted job ends now.
+fn supersede(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    repo: RepoId,
+    run: RunId,
+    group: &str,
+    now: UnixMillis,
+) -> Result<usize> {
+    let live: Vec<[u8; 16]> = tx
+        .prepare_cached(
+            "SELECT DISTINCT r.id FROM runs r JOIN jobs j ON j.run_id = r.id
+             WHERE r.tenant_id = ?1 AND r.repo_id = ?2 AND r.id <> ?3
+               AND r.created_ms < (SELECT created_ms FROM runs WHERE id = ?3)
+               AND j.concurrency_group = ?4 AND j.state_code < ?5",
+        )?
+        .query_map(
+            params![
+                tenant.as_bytes(),
+                repo.as_bytes(),
+                run.as_bytes(),
+                group,
+                TERMINAL_BASE
+            ],
+            |r| r.get::<_, [u8; 16]>(0),
+        )?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut cancelled = 0;
+    for old in live {
+        let old = RunId::from_bytes(old).map_err(|_| Error::Corrupt("run_id"))?;
+        cancelled += dispatch::cancel_run(tx, tenant, old, now)?;
+    }
+    Ok(cancelled)
 }
 
 /// The image a job will actually run: digest and platform, both durable.

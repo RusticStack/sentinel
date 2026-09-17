@@ -292,6 +292,48 @@ pub fn revoke(
     )
 }
 
+/// Drain a worker: it finishes the attempts it holds and takes no new
+/// offers. Durable and idempotent — re-draining keeps the first timestamp,
+/// so the moment the operator asked is not rewritten by a retry. A revoked
+/// worker has no drain to record: `NotFound`, the same as an unknown one.
+pub fn drain(
+    tx: &Transaction<'_>,
+    authority: Authority,
+    worker: WorkerId,
+    now: UnixMillis,
+) -> Result<()> {
+    authority.require_platform(tx)?;
+    let changed = tx.execute(
+        "UPDATE workers SET drain_ms = COALESCE(drain_ms, ?2)
+         WHERE id = ?1 AND revoked_ms IS NULL",
+        params![worker.as_bytes(), now.0],
+    )?;
+    if changed == 0 {
+        return Err(Error::NotFound);
+    }
+    Ok(())
+}
+
+/// Return a drained worker to service: it takes offers again under the
+/// capacity it last reported. The attempts it kept finish on their own;
+/// undraining never revives a revoked worker.
+pub fn undrain(tx: &Transaction<'_>, authority: Authority, worker: WorkerId) -> Result<()> {
+    authority.require_platform(tx)?;
+    // A worker that was not draining is already undrained: idempotent, but
+    // still only a live worker answers.
+    let changed = tx.execute(
+        "UPDATE workers SET drain_ms = NULL WHERE id = ?1 AND revoked_ms IS NULL AND drain_ms IS NOT NULL",
+        [worker.as_bytes()],
+    )?;
+    let known: bool = tx
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM workers WHERE id = ?1 AND revoked_ms IS NULL)")?
+        .query_row([worker.as_bytes()], |r| r.get(0))?;
+    if changed == 0 && !known {
+        return Err(Error::NotFound);
+    }
+    Ok(())
+}
+
 /// Live workers of a pool, for the scheduler and the operator. Platform
 /// administration, or membership of a tenant the pool admits.
 pub fn in_pool(conn: &Connection, authority: Authority, pool: PoolId) -> Result<Vec<Worker>> {

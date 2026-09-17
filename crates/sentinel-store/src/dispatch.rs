@@ -21,7 +21,7 @@ use sentinel_protocol::{limits::MAX_LIST_ITEMS, summary::MAX_SUMMARY_BYTES};
 
 use crate::{
     Error, Result, artifacts,
-    codec::{READY, decode_state},
+    codec::{READY, TERMINAL_BASE, decode_state},
     jobs,
     logs::LogStore,
     runs::{self, ResolvedImage},
@@ -46,6 +46,22 @@ pub const EXECUTION_GRACE_MS: i64 = 10 * 60 * 1000;
 const SWEEP_BATCH: usize = 256;
 /// Offers the ack-timeout sweep lapses per pass.
 const SWEEP_LIMIT: usize = 256;
+
+/// A job at or above this CPU (millicores) reserves a path: capacity that
+/// would leave the worker unable to run a waiting large job is not spent on
+/// smaller work while that job waits (Q02).
+pub const LARGE_JOB_CPU: i64 = 8_000;
+/// The fraction of a host's reported millicpu kept free for pull-request
+/// feedback while one of its jobs waits: a quarter (plan §2).
+pub const PR_RESERVE_DIVISOR: i64 = 4;
+/// How long a job may wait for a worker with its image warm before any
+/// eligible worker may take it. Bounded so locality never strands a job.
+pub const LOCALITY_WAIT_MS: i64 = 30_000;
+/// Ready jobs one placement considers before giving up; a bound on the
+/// fairness scan, not a queue bound.
+const PLACEMENT_CANDIDATES: usize = 64;
+/// Waiting jobs the fairness reserve examines per placement.
+const FAIRNESS_SCAN: usize = 32;
 
 /// Whether the attempt's `end` marker was durable when its job went terminal
 /// (`attempts.log_state`, migration 26). The codes order the states — the
@@ -86,29 +102,36 @@ impl LogState {
     }
 }
 
-/// Resources as the scheduler counts them: CPU in thousandths of a core and
-/// bytes of memory. A zero capacity is a worker that takes no work.
+/// Resources as the scheduler counts them: CPU in thousandths of a core,
+/// bytes of memory and bytes of scratch disk. A zero capacity is a worker
+/// that takes no work. `disk_bytes = 0` on a worker additionally means it
+/// has never reported disk capacity (migration 28), and disk is then not
+/// part of its admission: unreported is not the same as zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capacity {
     pub cpu_millis: i64,
     pub memory_bytes: i64,
+    pub disk_bytes: i64,
 }
 
 /// Record what a worker has, as it reported at its hello. Replaces the
 /// previous report: the measurement is the worker's, made each session.
+/// Protocol 6 workers report no disk, and `disk_bytes = 0` records that
+/// absence rather than claiming a zero-sized scratch area.
 pub fn report_capacity(tx: &Transaction<'_>, worker: WorkerId, capacity: Capacity) -> Result<()> {
-    if capacity.cpu_millis < 0 || capacity.memory_bytes < 0 {
+    if capacity.cpu_millis < 0 || capacity.memory_bytes < 0 || capacity.disk_bytes < 0 {
         return Err(Error::InvalidInput("capacity"));
     }
     let changed = tx
         .prepare_cached(
-            "UPDATE workers SET cpu_millis = ?2, memory_bytes = ?3
+            "UPDATE workers SET cpu_millis = ?2, memory_bytes = ?3, disk_bytes = ?4
              WHERE id = ?1 AND revoked_ms IS NULL",
         )?
         .execute(params![
             worker.as_bytes(),
             capacity.cpu_millis,
-            capacity.memory_bytes
+            capacity.memory_bytes,
+            capacity.disk_bytes
         ])?;
     if changed == 0 {
         return Err(Error::NotFound);
@@ -116,24 +139,180 @@ pub fn report_capacity(tx: &Transaction<'_>, worker: WorkerId, capacity: Capacit
     Ok(())
 }
 
-/// What the worker has left: its reported capacity less every attempt it
-/// still holds. One statement over the held-attempts partial index.
+/// What the worker has left: its reported capacity less every attempt still
+/// held that the host counts. Attempts of every worker sharing the same
+/// `host_id` are subtracted — worker identities on one machine must not
+/// each claim the whole machine's memory, CPU or scratch — while a worker
+/// with no host on record accounts for its own attempts alone. One statement
+/// over the held-attempts partial index; values may go negative when a
+/// report shrinks under existing reservations.
 pub fn free_capacity(conn: &Connection, worker: WorkerId) -> Result<Capacity> {
     conn.prepare_cached(
-        "SELECT w.cpu_millis - COALESCE(h.cpu, 0), w.memory_bytes - COALESCE(h.mem, 0)
-         FROM workers w LEFT JOIN (
-            SELECT worker_id, SUM(cpu_millis) AS cpu, SUM(memory_bytes) AS mem
-            FROM attempts WHERE worker_id = ?1 AND released_ms IS NULL) h ON h.worker_id = w.id
-         WHERE w.id = ?1 AND w.revoked_ms IS NULL",
+        "SELECT w.cpu_millis - COALESCE((
+                    SELECT SUM(a.cpu_millis) FROM attempts a JOIN workers h ON h.id = a.worker_id
+                    WHERE a.released_ms IS NULL
+                      AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
+                           OR (w.host_id IS NULL AND h.id = w.id))), 0),
+                w.memory_bytes - COALESCE((
+                    SELECT SUM(a.memory_bytes) FROM attempts a JOIN workers h ON h.id = a.worker_id
+                    WHERE a.released_ms IS NULL
+                      AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
+                           OR (w.host_id IS NULL AND h.id = w.id))), 0),
+                w.disk_bytes - COALESCE((
+                    SELECT SUM(a.disk_bytes) FROM attempts a JOIN workers h ON h.id = a.worker_id
+                    WHERE a.released_ms IS NULL
+                      AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
+                           OR (w.host_id IS NULL AND h.id = w.id))), 0)
+         FROM workers w WHERE w.id = ?1 AND w.revoked_ms IS NULL",
     )?
     .query_row([worker.as_bytes()], |r| {
         Ok(Capacity {
             cpu_millis: r.get(0)?,
             memory_bytes: r.get(1)?,
+            disk_bytes: r.get(2)?,
         })
     })
     .optional()?
     .ok_or(Error::NotFound)
+}
+
+/// Labels one worker or job may carry (protocol 7 profile bound). The blob
+/// is sorted and newline-separated, so equality is one comparison and
+/// containment one pass — the format is private to placement.
+pub const MAX_LABELS: usize = 16;
+/// Longest single label, matching the pipeline's identifier bound.
+pub const MAX_LABEL_BYTES: usize = 64;
+/// Worker cache images are keyed by the first 8 bytes of the image digest.
+pub const IMAGE_KEY_BYTES: usize = 8;
+
+/// Encode labels for the `labels` blob columns: sorted, newline-separated.
+/// Ids are bounded and control-free; anything else is `InvalidInput` rather
+/// than a blob another reader would misparse.
+pub fn encode_labels(labels: &[String]) -> Result<Vec<u8>> {
+    if labels.len() > MAX_LABELS {
+        return Err(Error::InvalidInput("labels"));
+    }
+    let mut sorted: Vec<&str> = labels.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out = Vec::new();
+    for label in sorted {
+        if label.is_empty()
+            || label.len() > MAX_LABEL_BYTES
+            || label.chars().any(|c| c.is_control() || c == '\n')
+        {
+            return Err(Error::InvalidInput("label"));
+        }
+        if !out.is_empty() {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(label.as_bytes());
+    }
+    Ok(out)
+}
+
+/// The labels a blob holds. One saved blob is always one of ours, so a
+/// malformed one is corruption, never input.
+fn parse_labels(blob: &[u8]) -> Result<Vec<String>> {
+    if blob.is_empty() {
+        return Ok(Vec::new());
+    }
+    let text = std::str::from_utf8(blob).map_err(|_| Error::Corrupt("labels"))?;
+    if text.lines().count() > MAX_LABELS {
+        return Err(Error::Corrupt("labels"));
+    }
+    Ok(text.lines().map(str::to_owned).collect())
+}
+
+/// Whether every label the job asks for is one the worker carries. An empty
+/// request is satisfied by any worker; a request the worker never reported
+/// is not.
+fn labels_subset(job: &[u8], worker: &[u8]) -> Result<bool> {
+    let worker = parse_labels(worker)?;
+    Ok(parse_labels(job)?.iter().all(|l| worker.contains(l)))
+}
+
+/// The 8-byte key of a `sha256:<hex>` image digest, as a worker reports
+/// cached images. Anything else has no key and never matches a cache.
+fn image_key(digest: &str) -> Option<[u8; IMAGE_KEY_BYTES]> {
+    let hex = digest.strip_prefix("sha256:")?.as_bytes();
+    if hex.len() < IMAGE_KEY_BYTES * 2 {
+        return None;
+    }
+    let mut key = [0u8; IMAGE_KEY_BYTES];
+    for (i, slot) in key.iter_mut().enumerate() {
+        let pair = std::str::from_utf8(&hex[i * 2..i * 2 + 2]).ok()?;
+        *slot = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(key)
+}
+
+/// Whether a worker's `avail_images` blob holds `key`.
+fn caches_image(avail_images: &[u8], key: &[u8; IMAGE_KEY_BYTES]) -> bool {
+    avail_images
+        .chunks_exact(IMAGE_KEY_BYTES)
+        .any(|chunk| chunk == key)
+}
+
+/// What a protocol-7 worker reports of itself beyond CPU and memory, written
+/// by [`report_profile`]. Everything is optional measurement: unreported
+/// facts stay absent rather than claiming a value.
+pub struct ReportedProfile<'a> {
+    /// Placement labels, bounded by [`MAX_LABELS`].
+    pub labels: &'a [String],
+    /// The machine hosting this worker; a host-level failure sweep and
+    /// host-level reservations key on it. `None` when unreported.
+    pub host_id: Option<[u8; 16]>,
+    /// Images warm on the worker, as 8-byte keys.
+    pub avail_images: &'a [[u8; IMAGE_KEY_BYTES]],
+    /// Warm cache bytes it can offer. `None` when unmeasured.
+    pub cache_bytes: Option<i64>,
+    /// Last reported load. `None` when unmeasured.
+    pub load_ns: Option<i64>,
+}
+
+/// Record the placement half of a worker's profile. Disjoint from
+/// [`report_capacity`], which owns CPU, memory and disk: either call order
+/// leaves both halves current.
+pub fn report_profile(
+    tx: &Transaction<'_>,
+    worker: WorkerId,
+    profile: &ReportedProfile<'_>,
+) -> Result<()> {
+    let labels = encode_labels(profile.labels)?;
+    if let Some(cache_bytes) = profile.cache_bytes
+        && cache_bytes < 0
+    {
+        return Err(Error::InvalidInput("cache_bytes"));
+    }
+    if let Some(load_ns) = profile.load_ns
+        && load_ns < 0
+    {
+        return Err(Error::InvalidInput("load_ns"));
+    }
+    let mut images = Vec::with_capacity(profile.avail_images.len() * IMAGE_KEY_BYTES);
+    for key in profile.avail_images {
+        images.extend_from_slice(key);
+    }
+    let changed = tx
+        .prepare_cached(
+            "UPDATE workers SET labels = ?2, host_id = COALESCE(?3, host_id),
+                    avail_images = ?4, cache_bytes = COALESCE(?5, cache_bytes),
+                    load_ns = COALESCE(?6, load_ns)
+             WHERE id = ?1 AND revoked_ms IS NULL",
+        )?
+        .execute(params![
+            worker.as_bytes(),
+            labels,
+            profile.host_id.as_ref().map(|h| h.as_slice()),
+            images,
+            profile.cache_bytes,
+            profile.load_ns
+        ])?;
+    if changed == 0 {
+        return Err(Error::NotFound);
+    }
+    Ok(())
 }
 
 /// A lease the controller has just taken on a worker's behalf: everything the
@@ -153,11 +332,452 @@ pub struct Offer {
     pub job_index: u32,
 }
 
-/// Place one job on `worker`: the oldest ready job of the best priority that
-/// this pool may serve and that fits the worker's free capacity, leased with
-/// its reservation in the calling transaction. `None` means nothing fits
-/// right now. A larger job at the head of the queue is passed over for a
-/// smaller one behind it; keeping it from starving is Q02's aging.
+/// A ready job as placement sees it: what it needs, whom it belongs to and
+/// the facts fairness keys on. Blobs stay raw so the SQL and the Rust pass
+/// read the same bytes.
+#[derive(Clone, Debug)]
+struct Pick {
+    tenant: TenantId,
+    job: JobId,
+    run: RunId,
+    cpu_millis: i64,
+    memory_bytes: i64,
+    disk_bytes: i64,
+    image_digest: String,
+    image_platform: String,
+    spec_index: i64,
+    arch: Option<String>,
+    labels: Vec<u8>,
+    pull_request: bool,
+    queued_ms: i64,
+}
+
+type PickRow = (
+    [u8; 16],
+    [u8; 16],
+    [u8; 16],
+    i64,
+    i64,
+    i64,
+    String,
+    String,
+    i64,
+    Option<String>,
+    Vec<u8>,
+    i64,
+    i64,
+);
+
+fn pick_of(row: PickRow) -> Result<Pick> {
+    let (
+        tenant,
+        job,
+        run,
+        cpu_millis,
+        memory_bytes,
+        disk_bytes,
+        image_digest,
+        image_platform,
+        spec_index,
+        arch,
+        labels,
+        queued_ms,
+        pull_request,
+    ) = row;
+    Ok(Pick {
+        tenant: TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?,
+        job: JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?,
+        run: RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?,
+        cpu_millis,
+        memory_bytes,
+        disk_bytes,
+        image_digest,
+        image_platform,
+        spec_index,
+        arch,
+        labels,
+        pull_request: pull_request != 0,
+        queued_ms,
+    })
+}
+
+/// Everything placement needs to know about one worker beyond capacity.
+#[derive(Clone, Debug)]
+struct WorkerFacts {
+    pool: PoolId,
+    arch: String,
+    labels: Vec<u8>,
+    draining: bool,
+    /// `false` when the worker has never reported disk (protocol 6): disk is
+    /// then not part of its admission, never read as a zero-sized scratch.
+    disk_reported: bool,
+    avail_images: Vec<u8>,
+    cpu_millis: i64,
+    memory_bytes: i64,
+    disk_bytes: i64,
+}
+
+fn worker_facts(conn: &Connection, worker: WorkerId) -> Result<Option<(WorkerId, WorkerFacts)>> {
+    let row: Option<([u8; 16], String, Vec<u8>, bool, i64, Vec<u8>, i64, i64)> = conn
+        .prepare_cached(
+            "SELECT pool_id, arch, labels, drain_ms IS NOT NULL, disk_bytes, avail_images,
+                    cpu_millis, memory_bytes
+             FROM workers WHERE id = ?1 AND revoked_ms IS NULL",
+        )?
+        .query_row([worker.as_bytes()], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })
+        .optional()?;
+    let Some((pool, arch, labels, draining, disk_bytes, avail_images, cpu, memory)) = row else {
+        return Ok(None);
+    };
+    let id = WorkerId::from_bytes(worker.as_bytes()).map_err(|_| Error::Corrupt("worker id"))?;
+    Ok(Some((
+        id,
+        WorkerFacts {
+            pool: PoolId::from_bytes(pool).map_err(|_| Error::Corrupt("pool id"))?,
+            arch,
+            labels,
+            draining,
+            disk_reported: disk_bytes > 0,
+            avail_images,
+            cpu_millis: cpu,
+            memory_bytes: memory,
+            disk_bytes,
+        },
+    )))
+}
+
+/// Every worker of a pool the tenant may use: the candidate set both
+/// placement and the queue explanation read. Pool access is A07's rule —
+/// tenant active, pool active, owner or explicitly granted — evaluated per
+/// call so suspension and withdrawal stop the next transaction.
+fn pool_workers(conn: &Connection, tenant: TenantId) -> Result<Vec<(WorkerId, WorkerFacts)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT w.id, w.pool_id, w.arch, w.labels, w.drain_ms IS NOT NULL, w.disk_bytes,
+                w.avail_images, w.cpu_millis, w.memory_bytes
+         FROM workers w
+         JOIN pools p ON p.id = w.pool_id AND p.active = 1
+         JOIN tenants t ON t.id = ?1 AND t.active = 1
+         LEFT JOIN pool_grants g ON g.pool_id = p.id AND g.tenant_id = t.id
+         WHERE w.revoked_ms IS NULL AND (p.owner_tenant_id = t.id OR g.tenant_id IS NOT NULL)",
+    )?;
+    let rows = stmt.query_map([tenant.as_bytes()], |r| {
+        Ok((
+            r.get::<_, [u8; 16]>(0)?,
+            r.get::<_, [u8; 16]>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Vec<u8>>(3)?,
+            r.get::<_, bool>(4)?,
+            r.get::<_, i64>(5)?,
+            r.get::<_, Vec<u8>>(6)?,
+            r.get::<_, i64>(7)?,
+            r.get::<_, i64>(8)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, pool, arch, labels, draining, disk, images, cpu, memory) = row?;
+        out.push((
+            WorkerId::from_bytes(id).map_err(|_| Error::Corrupt("worker id"))?,
+            WorkerFacts {
+                pool: PoolId::from_bytes(pool).map_err(|_| Error::Corrupt("pool id"))?,
+                arch,
+                labels,
+                draining,
+                disk_reported: disk > 0,
+                avail_images: images,
+                cpu_millis: cpu,
+                memory_bytes: memory,
+                disk_bytes: disk,
+            },
+        ));
+    }
+    Ok(out)
+}
+
+/// The pool's ready queue as the worker may serve it, best first: the tenant
+/// currently executing least, then the oldest waiting repository, then
+/// priority and arrival order. Concurrency groups hold before the resource
+/// fit: a job whose group another run of the tenant still holds is not a
+/// candidate at all.
+const CANDIDATES_SQL: &str = "SELECT j.tenant_id, j.id, j.run_id, j.cpu_millis, j.memory_bytes,
+            j.disk_bytes, j.image_digest, j.image_platform, j.spec_index, j.arch, j.labels,
+            j.queued_ms, COALESCE(p.trigger = 'pull_request', 0)
+     FROM jobs j
+     JOIN runs r ON r.id = j.run_id
+     JOIN tenants t ON t.id = j.tenant_id AND t.active = 1
+     JOIN pools p2 ON p2.id = ?1 AND p2.active = 1
+     LEFT JOIN pool_grants g ON g.pool_id = p2.id AND g.tenant_id = t.id
+     LEFT JOIN run_provenance p ON p.run_id = j.run_id
+     WHERE j.state_code = ?2 AND j.cancel_requested = 0
+       AND j.image_digest IS NOT NULL AND j.image_platform IS NOT NULL
+       AND (p2.owner_tenant_id = t.id OR g.tenant_id IS NOT NULL)
+       AND (j.arch IS NULL OR j.arch = ?3)
+       AND j.cpu_millis <= ?4 AND j.memory_bytes <= ?5
+       AND (j.disk_bytes = 0 OR ?6 = 0 OR j.disk_bytes <= ?7)
+       AND NOT EXISTS (
+           SELECT 1 FROM jobs o
+           WHERE o.tenant_id = j.tenant_id AND o.concurrency_group IS NOT NULL
+             AND o.concurrency_group = j.concurrency_group AND o.run_id <> j.run_id
+             AND o.state_code < ?8)
+     ORDER BY (SELECT COUNT(*) FROM attempts a
+               WHERE a.tenant_id = j.tenant_id AND a.released_ms IS NULL),
+              (SELECT MIN(j2.queued_ms) FROM jobs j2 JOIN runs r2 ON r2.id = j2.run_id
+               WHERE r2.repo_id = r.repo_id AND j2.state_code = ?2),
+              j.priority, j.queued_ms, j.created_seq
+     LIMIT ?9";
+
+fn candidates(
+    conn: &Connection,
+    pool: PoolId,
+    facts: &WorkerFacts,
+    free: Capacity,
+) -> Result<Vec<Pick>> {
+    let reported = if facts.disk_reported { 1i64 } else { 0 };
+    let mut stmt = conn.prepare_cached(CANDIDATES_SQL)?;
+    let rows = stmt.query_map(
+        params![
+            pool.as_bytes(),
+            READY,
+            facts.arch,
+            free.cpu_millis,
+            free.memory_bytes,
+            reported,
+            free.disk_bytes,
+            TERMINAL_BASE,
+            PLACEMENT_CANDIDATES as i64
+        ],
+        |r| {
+            Ok((
+                r.get::<_, [u8; 16]>(0)?,
+                r.get::<_, [u8; 16]>(1)?,
+                r.get::<_, [u8; 16]>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, i64>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, Vec<u8>>(10)?,
+                r.get::<_, i64>(11)?,
+                r.get::<_, i64>(12)?,
+            ))
+        },
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(pick_of(row?)?);
+    }
+    Ok(out)
+}
+
+/// What waiting work reserves on a worker's free capacity: a path for the
+/// largest waiting large job and, while a pull-request job waits, a quarter
+/// of the host's reported millicpu.
+#[derive(Clone, Copy, Debug, Default)]
+struct Fairness {
+    /// `(cpu_millis, queued_ms)` of the largest waiting job at or above
+    /// [`LARGE_JOB_CPU`] this worker could run, and when it first waited.
+    large: Option<(i64, i64)>,
+    /// A pull-request job this worker could run is waiting.
+    pull_request: bool,
+    /// The host's reported millicpu: the base of the PR reserve.
+    host_cpu_millis: i64,
+}
+
+/// Total millicpu of the workers sharing this worker's host, or its own when
+/// no host is on record.
+fn host_millis(conn: &Connection, worker: WorkerId) -> Result<i64> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT COALESCE(SUM(cpu_millis), 0) FROM workers WHERE revoked_ms IS NULL
+               AND (id = ?1 OR (host_id IS NOT NULL
+                    AND host_id = (SELECT host_id FROM workers WHERE id = ?1)))",
+        )?
+        .query_row([worker.as_bytes()], |r| r.get(0))?)
+}
+
+fn waiting_fairness(
+    conn: &Connection,
+    worker: WorkerId,
+    pool: PoolId,
+    facts: &WorkerFacts,
+) -> Result<Fairness> {
+    let reported = if facts.disk_reported { 1i64 } else { 0 };
+    let mut stmt = conn.prepare_cached(
+        "SELECT j.cpu_millis, j.memory_bytes, j.disk_bytes, j.arch, j.labels, j.queued_ms,
+                COALESCE(p.trigger = 'pull_request', 0)
+         FROM jobs j
+         JOIN runs r ON r.id = j.run_id
+         JOIN tenants t ON t.id = j.tenant_id AND t.active = 1
+         JOIN pools p2 ON p2.id = ?1 AND p2.active = 1
+         LEFT JOIN pool_grants g ON g.pool_id = p2.id AND g.tenant_id = t.id
+         LEFT JOIN run_provenance p ON p.run_id = j.run_id
+         WHERE j.state_code = ?2 AND j.cancel_requested = 0
+           AND (p2.owner_tenant_id = t.id OR g.tenant_id IS NOT NULL)
+           AND j.cpu_millis <= ?3 AND j.memory_bytes <= ?4
+           AND (j.disk_bytes = 0 OR ?5 = 0 OR j.disk_bytes <= ?6)
+         ORDER BY j.queued_ms LIMIT ?7",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            pool.as_bytes(),
+            READY,
+            facts.cpu_millis,
+            facts.memory_bytes,
+            reported,
+            facts.disk_bytes,
+            FAIRNESS_SCAN as i64
+        ],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Vec<u8>>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        },
+    )?;
+    let mut fairness = Fairness::default();
+    for row in rows {
+        let (cpu, arch, labels, queued, pr) = row?;
+        if !arch
+            .as_deref()
+            .is_none_or(|arch| arch == facts.arch.as_str())
+            || !labels_subset(&labels, &facts.labels)?
+        {
+            continue;
+        }
+        fairness.pull_request |= pr != 0;
+        if cpu >= LARGE_JOB_CPU {
+            fairness.large = Some(match fairness.large {
+                None => (cpu, queued),
+                Some((largest, since)) => (largest.max(cpu), since.min(queued)),
+            });
+        }
+    }
+    if fairness.pull_request {
+        fairness.host_cpu_millis = host_millis(conn, worker)?;
+    }
+    Ok(fairness)
+}
+
+/// Whether placing `pick` would spend capacity a waiting job reserved.
+fn fairness_hold(fairness: &Fairness, pick: &Pick, free_cpu: i64) -> bool {
+    let after = free_cpu.saturating_sub(pick.cpu_millis);
+    if let Some((need, since)) = fairness.large
+        && pick.cpu_millis < need
+        && after < need
+        && since <= pick.queued_ms
+    {
+        return true;
+    }
+    fairness.pull_request
+        && !pick.pull_request
+        && after < fairness.host_cpu_millis / PR_RESERVE_DIVISOR
+}
+
+/// A worker that could run a waiting job and has its image warm.
+struct LocalityWorker {
+    arch: String,
+    labels: Vec<u8>,
+    cpu_millis: i64,
+    memory_bytes: i64,
+    disk_bytes: i64,
+    avail_images: Vec<u8>,
+    /// Earliest lease release among the attempts it holds; `None` when free.
+    free_at: Option<i64>,
+}
+
+/// Workers other than `exclude` that a warm job could run on, for the
+/// bounded locality wait.
+fn locality_view(
+    conn: &Connection,
+    tenant: TenantId,
+    exclude: WorkerId,
+) -> Result<Vec<LocalityWorker>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT w.arch, w.labels, w.cpu_millis, w.memory_bytes, w.disk_bytes, w.avail_images,
+                (SELECT MIN(a.lease_until_ms) FROM attempts a
+                 WHERE a.worker_id = w.id AND a.released_ms IS NULL)
+         FROM workers w
+         JOIN pools p ON p.id = w.pool_id AND p.active = 1
+         JOIN tenants t ON t.id = ?2 AND t.active = 1
+         LEFT JOIN pool_grants g ON g.pool_id = p.id AND g.tenant_id = t.id
+         WHERE w.id <> ?1 AND w.revoked_ms IS NULL AND w.drain_ms IS NULL
+           AND (p.owner_tenant_id = t.id OR g.tenant_id IS NOT NULL)",
+    )?;
+    let rows = stmt.query_map(params![exclude.as_bytes(), tenant.as_bytes()], |r| {
+        Ok(LocalityWorker {
+            arch: r.get(0)?,
+            labels: r.get(1)?,
+            cpu_millis: r.get(2)?,
+            memory_bytes: r.get(3)?,
+            disk_bytes: r.get(4)?,
+            avail_images: r.get(5)?,
+            free_at: r.get(6)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<_, _>>()
+        .map_err(Error::from)
+}
+
+/// Whether this job should wait for a worker that has its image warm: only
+/// while it is inside [`LOCALITY_WAIT_MS`] and a worker that could run it
+/// holds the image and is expected to free within the bound. Past the bound
+/// any eligible worker takes it, so locality never strands work.
+fn locality_hold(view: &[LocalityWorker], pick: &Pick, now: UnixMillis) -> Result<bool> {
+    if now.0.saturating_sub(pick.queued_ms) >= LOCALITY_WAIT_MS {
+        return Ok(false);
+    }
+    let Some(key) = image_key(&pick.image_digest) else {
+        return Ok(false);
+    };
+    let bound = now.0.saturating_add(LOCALITY_WAIT_MS);
+    for worker in view {
+        if !pick
+            .arch
+            .as_deref()
+            .is_none_or(|arch| arch == worker.arch.as_str())
+        {
+            continue;
+        }
+        if !labels_subset(&pick.labels, &worker.labels)?
+            || worker.cpu_millis < pick.cpu_millis
+            || worker.memory_bytes < pick.memory_bytes
+            || (pick.disk_bytes > 0
+                && worker.disk_bytes > 0
+                && worker.disk_bytes < pick.disk_bytes)
+            || !caches_image(&worker.avail_images, &key)
+        {
+            continue;
+        }
+        if worker.free_at.is_none_or(|until| until <= bound) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Place one job on `worker`: the next ready job of the pool's fair order
+/// that fits the worker's free capacity, leased with its reservation in the
+/// calling transaction. `None` means nothing may be placed here now — no
+/// eligible job, a draining worker, or a waiting large job whose path this
+/// placement would spend. A job behind a large one is backfilled while the
+/// large job keeps its reserved remainder, and a job whose image is warm
+/// elsewhere waits only inside [`LOCALITY_WAIT_MS`].
 ///
 /// Pool access is A07's rule, evaluated here per placement rather than
 /// cached: the tenant active, the pool active, the tenant its owner or
@@ -170,60 +790,62 @@ pub fn place(
     lease_ms: i64,
     now: UnixMillis,
 ) -> Result<Option<Offer>> {
+    let Some((_, facts)) = worker_facts(tx, worker)? else {
+        return Ok(None);
+    };
+    if facts.pool != pool || facts.draining {
+        return Ok(None);
+    }
     let free = free_capacity(tx, worker)?;
     if free.cpu_millis <= 0 || free.memory_bytes <= 0 {
         return Ok(None);
     }
-    let picked = tx
-        .prepare_cached(
-            "SELECT j.tenant_id, j.id, j.run_id, j.cpu_millis, j.memory_bytes,
-                    j.image_digest, j.image_platform, j.spec_index
-             FROM jobs j
-             JOIN tenants t ON t.id = j.tenant_id AND t.active = 1
-             JOIN pools p ON p.id = ?1 AND p.active = 1
-             LEFT JOIN pool_grants g ON g.pool_id = p.id AND g.tenant_id = t.id
-             WHERE j.state_code = ?2 AND j.cancel_requested = 0
-               AND j.image_digest IS NOT NULL AND j.image_platform IS NOT NULL
-               AND (p.owner_tenant_id = t.id OR g.tenant_id IS NOT NULL)
-               AND j.cpu_millis <= ?3 AND j.memory_bytes <= ?4
-             ORDER BY j.priority, j.created_seq LIMIT 1",
-        )?
-        .query_row(
-            params![pool.as_bytes(), READY, free.cpu_millis, free.memory_bytes],
-            |r| {
-                Ok((
-                    r.get::<_, [u8; 16]>(0)?,
-                    r.get::<_, [u8; 16]>(1)?,
-                    r.get::<_, [u8; 16]>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                    r.get::<_, i64>(7)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((tenant, job, run, cpu_millis, memory_bytes, digest, platform, index)) = picked else {
+    if facts.disk_reported && free.disk_bytes <= 0 {
         return Ok(None);
-    };
-    let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?;
-    let job = JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?;
-    let run = RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?;
-    let lease_until = UnixMillis(now.0.saturating_add(lease_ms));
-    let (attempt, fence) = jobs::lease(tx, tenant, job, worker, lease_until, now)?;
-    Ok(Some(Offer {
-        attempt,
-        tenant,
-        run,
-        job,
-        fence,
-        lease_until,
-        cpu_millis,
-        memory_bytes,
-        image: ResolvedImage { digest, platform },
-        job_index: u32::try_from(index).map_err(|_| Error::Corrupt("spec_index"))?,
-    }))
+    }
+    let candidates = candidates(tx, pool, &facts, free)?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let fairness = waiting_fairness(tx, worker, pool, &facts)?;
+    let mut locality: Option<Vec<LocalityWorker>> = None;
+    for pick in candidates {
+        if !labels_subset(&pick.labels, &facts.labels)? {
+            continue;
+        }
+        if fairness_hold(&fairness, &pick, free.cpu_millis) {
+            continue;
+        }
+        let cold = image_key(&pick.image_digest)
+            .is_some_and(|key| !caches_image(&facts.avail_images, &key));
+        if cold {
+            if locality.is_none() {
+                locality = Some(locality_view(tx, pick.tenant, worker)?);
+            }
+            let view = locality.as_deref().unwrap_or_default();
+            if locality_hold(view, &pick, now)? {
+                continue;
+            }
+        }
+        let lease_until = UnixMillis(now.0.saturating_add(lease_ms));
+        let (attempt, fence) = jobs::lease(tx, pick.tenant, pick.job, worker, lease_until, now)?;
+        return Ok(Some(Offer {
+            attempt,
+            tenant: pick.tenant,
+            run: pick.run,
+            job: pick.job,
+            fence,
+            lease_until,
+            cpu_millis: pick.cpu_millis,
+            memory_bytes: pick.memory_bytes,
+            image: ResolvedImage {
+                digest: pick.image_digest,
+                platform: pick.image_platform,
+            },
+            job_index: u32::try_from(pick.spec_index).map_err(|_| Error::Corrupt("spec_index"))?,
+        }));
+    }
+    Ok(None)
 }
 
 /// The worker accepted the offer. Compare-and-set on worker and fence; a
@@ -1130,11 +1752,97 @@ pub enum WaitReason {
     Policy(&'static str),
     /// No enrolled worker of a pool this tenant may use could ever fit it.
     NoMatchingWorker { cpu_short: i64, memory_short: i64 },
+    /// Workers could fit its CPU and memory, but none that reported disk has
+    /// room for the scratch it reserves.
+    DiskShort { disk_short: i64 },
+    /// No worker of an admissible pool runs the architecture it asks for.
+    ArchMismatch,
+    /// No worker of an admissible pool carries every label it asks for.
+    LabelMissing,
+    /// A live run of the tenant still holds its concurrency group.
+    ConcurrencyLimit,
     /// Workers that could fit it exist, but none is connected.
     WorkerOffline,
     /// A connected worker could fit it once its current work releases.
     Capacity,
+    /// Every worker that could fit it is draining.
+    Drain,
+    /// A connected worker has the capacity, but placement is holding it for
+    /// a waiting large job or for pull-request feedback.
+    FairnessHold,
+    /// A worker that has its image warm is expected to free inside the
+    /// bounded locality wait; past the bound any eligible worker takes it.
+    LocalityWait,
 }
+
+/// One waiting job and why it has not started, for the queue listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedJob {
+    pub job: JobId,
+    pub run: RunId,
+    pub repo: RepoId,
+    /// How long it has waited, from the controller's clock at this read;
+    /// zero for a job still blocked on its dependencies.
+    pub age_ms: i64,
+    pub reason: WaitReason,
+}
+
+/// Every waiting job of a tenant — ready and blocked — oldest queued first,
+/// each with the live reason it has not started. No cap here: the caller
+/// bounds what it renders. `connected` is the controller's live session set,
+/// the one fact the database does not hold.
+pub fn list_queue(
+    conn: &Connection,
+    tenant: TenantId,
+    connected: &[WorkerId],
+) -> Result<Vec<QueuedJob>> {
+    let now = UnixMillis::now();
+    let mut stmt = conn.prepare_cached(
+        "SELECT j.id, j.run_id, r.repo_id, j.queued_ms
+         FROM jobs j JOIN runs r ON r.id = j.run_id
+         WHERE j.tenant_id = ?1 AND j.state_code IN (0, ?2)
+         ORDER BY j.queued_ms IS NULL, j.queued_ms, j.created_seq",
+    )?;
+    let rows = stmt.query_map(params![tenant.as_bytes(), READY], |r| {
+        Ok((
+            r.get::<_, [u8; 16]>(0)?,
+            r.get::<_, [u8; 16]>(1)?,
+            r.get::<_, [u8; 16]>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (job, run, repo, queued) = row?;
+        let job = JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?;
+        out.push(QueuedJob {
+            job,
+            run: RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?,
+            repo: RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?,
+            age_ms: queued.map_or(0, |queued| now.0.saturating_sub(queued).max(0)),
+            reason: wait_reason(conn, tenant, job, connected)?,
+        });
+    }
+    Ok(out)
+}
+
+type WaitRow = (
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    Option<String>,
+    Vec<u8>,
+    Option<i64>,
+    [u8; 16],
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+    bool,
+    i64,
+);
 
 /// Explain a queued or blocked job. `connected` is the controller's live
 /// session set — the one fact the database does not hold.
@@ -1144,17 +1852,54 @@ pub fn wait_reason(
     job: JobId,
     connected: &[WorkerId],
 ) -> Result<WaitReason> {
-    let row: Option<(i64, i64, i64, i64, bool)> = conn
+    let row: Option<WaitRow> = conn
         .prepare_cached(
-            "SELECT state_code, cpu_millis, memory_bytes, cancel_requested,
-                    image_digest IS NOT NULL AND image_platform IS NOT NULL
-             FROM jobs WHERE id = ?1 AND tenant_id = ?2",
+            "SELECT j.state_code, j.cpu_millis, j.memory_bytes, j.disk_bytes, j.cancel_requested,
+                    j.arch, j.labels, j.queued_ms, j.run_id, j.image_digest, j.image_platform,
+                    j.spec_index, j.concurrency_group,
+                    j.image_digest IS NOT NULL AND j.image_platform IS NOT NULL,
+                    COALESCE(p.trigger = 'pull_request', 0)
+             FROM jobs j LEFT JOIN run_provenance p ON p.run_id = j.run_id
+             WHERE j.id = ?1 AND j.tenant_id = ?2",
         )?
         .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+                r.get(12)?,
+                r.get(13)?,
+                r.get(14)?,
+            ))
         })
         .optional()?;
-    let Some((code, cpu, memory, cancel, resolved)) = row else {
+    let Some((
+        code,
+        cpu,
+        memory,
+        disk,
+        cancel,
+        arch,
+        labels,
+        queued,
+        run,
+        digest,
+        platform,
+        spec_index,
+        group,
+        resolved,
+        pull_request,
+    )) = row
+    else {
         return Err(Error::NotFound);
     };
     match decode_state(code).ok_or(Error::Corrupt("state_code"))? {
@@ -1168,40 +1913,134 @@ pub fn wait_reason(
     if !resolved {
         return Ok(WaitReason::Policy("image unresolved"));
     }
-    let mut stmt = conn.prepare_cached(
-        "SELECT w.id, w.cpu_millis, w.memory_bytes
-         FROM workers w JOIN pools p ON p.id = w.pool_id AND p.active = 1
-         JOIN tenants t ON t.id = ?1 AND t.active = 1
-         LEFT JOIN pool_grants g ON g.pool_id = p.id AND g.tenant_id = t.id
-         WHERE w.revoked_ms IS NULL AND (p.owner_tenant_id = t.id OR g.tenant_id IS NOT NULL)",
-    )?;
-    let rows = stmt.query_map([tenant.as_bytes()], |r| {
-        Ok((
-            r.get::<_, [u8; 16]>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, i64>(2)?,
-        ))
-    })?;
-    let (mut best_cpu, mut best_memory) = (0i64, 0i64);
-    let mut fits_offline = false;
-    for row in rows {
-        let (id, wcpu, wmem) = row?;
-        best_cpu = best_cpu.max(wcpu);
-        best_memory = best_memory.max(wmem);
-        if wcpu >= cpu && wmem >= memory {
-            let id = WorkerId::from_bytes(id).map_err(|_| Error::Corrupt("worker id"))?;
-            if connected.contains(&id) {
-                return Ok(WaitReason::Capacity);
-            }
-            fits_offline = true;
+    let run = RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?;
+    // `place` never considers a job whose group another run of the tenant
+    // still holds; saying `capacity` here would be a lie.
+    if let Some(group) = group.as_deref() {
+        let held: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM jobs o
+                 WHERE o.tenant_id = ?1 AND o.concurrency_group = ?2 AND o.run_id <> ?3
+                   AND o.state_code < ?4)",
+            )?
+            .query_row(
+                params![tenant.as_bytes(), group, run.as_bytes(), TERMINAL_BASE],
+                |r| r.get(0),
+            )?;
+        if held {
+            return Ok(WaitReason::ConcurrencyLimit);
         }
     }
-    Ok(if fits_offline {
-        WaitReason::WorkerOffline
-    } else {
-        WaitReason::NoMatchingWorker {
-            cpu_short: (cpu - best_cpu).max(0),
-            memory_short: (memory - best_memory).max(0),
+    let pick = Pick {
+        tenant,
+        job,
+        run,
+        cpu_millis: cpu,
+        memory_bytes: memory,
+        disk_bytes: disk,
+        image_digest: digest.unwrap_or_default(),
+        image_platform: platform.unwrap_or_default(),
+        spec_index,
+        arch,
+        labels,
+        pull_request: pull_request != 0,
+        queued_ms: queued.unwrap_or(0),
+    };
+    let workers = pool_workers(conn, tenant)?;
+    let (mut best_cpu, mut best_memory, mut best_disk) = (0i64, 0i64, 0i64);
+    let (mut arch_ok, mut labels_ok, mut fits_compute, mut fits_disk) = (false, false, false, false);
+    let (mut draining_fit, mut offline_fit) = (false, false);
+    let mut connected_fit: Option<&(WorkerId, WorkerFacts)> = None;
+    for entry in &workers {
+        let (id, facts) = entry;
+        let arch_matches = pick
+            .arch
+            .as_deref()
+            .is_none_or(|arch| arch == facts.arch.as_str());
+        let labels_match = labels_subset(&pick.labels, &facts.labels)?;
+        if arch_matches && labels_match {
+            best_cpu = best_cpu.max(facts.cpu_millis);
+            best_memory = best_memory.max(facts.memory_bytes);
         }
-    })
+        if !arch_matches {
+            continue;
+        }
+        arch_ok = true;
+        if !labels_match {
+            continue;
+        }
+        labels_ok = true;
+        if facts.cpu_millis < pick.cpu_millis || facts.memory_bytes < pick.memory_bytes {
+            continue;
+        }
+        fits_compute = true;
+        best_disk = best_disk.max(facts.disk_bytes);
+        if pick.disk_bytes > 0 && facts.disk_reported && facts.disk_bytes < pick.disk_bytes {
+            continue;
+        }
+        fits_disk = true;
+        if facts.draining {
+            draining_fit = true;
+        } else if connected.contains(id) {
+            if connected_fit.is_none() {
+                connected_fit = Some(entry);
+            }
+        } else {
+            offline_fit = true;
+        }
+    }
+    if !arch_ok {
+        // No worker at all is a capacity story, not an architecture one: a
+        // suspended tenant or an empty pool must not be told to change arch.
+        return Ok(if workers.is_empty() {
+            WaitReason::NoMatchingWorker {
+                cpu_short: pick.cpu_millis,
+                memory_short: pick.memory_bytes,
+            }
+        } else {
+            WaitReason::ArchMismatch
+        });
+    }
+    if !labels_ok {
+        return Ok(WaitReason::LabelMissing);
+    }
+    if !fits_compute {
+        return Ok(WaitReason::NoMatchingWorker {
+            cpu_short: (pick.cpu_millis - best_cpu).max(0),
+            memory_short: (pick.memory_bytes - best_memory).max(0),
+        });
+    }
+    if !fits_disk {
+        return Ok(WaitReason::DiskShort {
+            disk_short: (pick.disk_bytes - best_disk).max(0),
+        });
+    }
+    if let Some((worker, facts)) = connected_fit {
+        let free = free_capacity(conn, *worker)?;
+        let free_fits = free.cpu_millis >= pick.cpu_millis
+            && free.memory_bytes >= pick.memory_bytes
+            && (pick.disk_bytes == 0 || !facts.disk_reported || free.disk_bytes >= pick.disk_bytes);
+        if free_fits {
+            let fairness = waiting_fairness(conn, *worker, facts.pool, facts)?;
+            if fairness_hold(&fairness, &pick, free.cpu_millis) {
+                return Ok(WaitReason::FairnessHold);
+            }
+            let cold = image_key(&pick.image_digest)
+                .is_some_and(|key| !caches_image(&facts.avail_images, &key));
+            if cold {
+                let view = locality_view(conn, tenant, *worker)?;
+                if locality_hold(&view, &pick, UnixMillis::now())? {
+                    return Ok(WaitReason::LocalityWait);
+                }
+            }
+        }
+        return Ok(WaitReason::Capacity);
+    }
+    if draining_fit {
+        return Ok(WaitReason::Drain);
+    }
+    if offline_fit {
+        return Ok(WaitReason::WorkerOffline);
+    }
+    Ok(WaitReason::Capacity)
 }

@@ -283,13 +283,14 @@ pub fn lease(
     lease_until: UnixMillis,
     now: UnixMillis,
 ) -> Result<(AttemptId, Fence)> {
-    let (resolved, cpu_millis, memory_bytes): (bool, i64, i64) = tx
+    let (resolved, cpu_millis, memory_bytes, disk_bytes): (bool, i64, i64, i64) = tx
         .prepare_cached(
-            "SELECT image_digest IS NOT NULL AND image_platform IS NOT NULL, cpu_millis, memory_bytes
+            "SELECT image_digest IS NOT NULL AND image_platform IS NOT NULL, cpu_millis,
+                    memory_bytes, disk_bytes
              FROM jobs WHERE id = ?1 AND tenant_id = ?2",
         )?
         .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })
         .optional()?
         .ok_or(Error::NotFound)?;
@@ -309,8 +310,8 @@ pub fn lease(
     let attempt = AttemptId::new();
     tx.execute(
         "INSERT INTO attempts(id, tenant_id, job_id, fence, worker_id, lease_until_ms,
-                              cpu_millis, memory_bytes, offered_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                              cpu_millis, memory_bytes, disk_bytes, offered_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             attempt.as_bytes(),
             tenant.as_bytes(),
@@ -320,6 +321,7 @@ pub fn lease(
             lease_until.0,
             cpu_millis,
             memory_bytes,
+            disk_bytes,
             now.0
         ],
     )?;

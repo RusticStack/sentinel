@@ -905,6 +905,10 @@ pub fn dispatch(
         crate::runs::resolve_image(tx, delivery.tenant, *job, digest, platform)?;
     }
     crate::provenance::insert(tx, provenance, run, now)?;
+    // The event that triggered the run is recorded now: a concurrency group
+    // template over `event.*` resolves here, and a run with
+    // `cancel_in_progress` supersedes the live run it replaces.
+    crate::runs::apply_concurrency(tx, delivery.tenant, run, now)?;
     // Provenance exists now: an event-driven run on a forge-associated
     // repository owes the stable aggregate and one check per job.
     crate::checks::record_run(tx, delivery.tenant, run, now)?;

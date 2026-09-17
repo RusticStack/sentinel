@@ -466,7 +466,7 @@ fn a_worker_enrolls_once_heartbeats_reconnects_and_is_refused_after_revocation()
             .unwrap(),
         dispatch::Capacity {
             cpu_millis: 4_000,
-            memory_bytes: 8 << 30
+            memory_bytes: 8 << 30, disk_bytes: 0
         }
     );
     eventually("fleet registration", || {

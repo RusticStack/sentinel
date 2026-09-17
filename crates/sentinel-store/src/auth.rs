@@ -77,7 +77,12 @@ pub fn create_run(
     now: UnixMillis,
 ) -> Result<Vec<sentinel_core::JobId>> {
     let tenant = require_repo(tx, principal, repo, Permissions::RUN)?;
-    crate::runs::create_run(tx, tenant, repo, run, spec, now)
+    let jobs = crate::runs::create_run(tx, tenant, repo, run, spec, now)?;
+    // A manual dispatch records no provenance: a group template over
+    // `event.*` resolves to the manual event facts here instead of waiting
+    // for an event that will never arrive.
+    crate::runs::apply_concurrency(tx, tenant, run, now)?;
+    Ok(jobs)
 }
 
 /// Check access and load the immutable blob in ONE read snapshot/query, joining
