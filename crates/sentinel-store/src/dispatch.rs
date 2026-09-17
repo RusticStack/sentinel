@@ -136,15 +136,9 @@ pub fn report_capacity(tx: &Transaction<'_>, worker: WorkerId, capacity: Capacit
     Ok(())
 }
 
-/// What the worker has left: its reported capacity less every attempt still
-/// held that the host counts. Attempts of every worker sharing the same
-/// `host_id` are subtracted — worker identities on one machine must not
-/// each claim the whole machine's memory, CPU or scratch — while a worker
-/// with no host on record accounts for its own attempts alone. One statement
-/// over the held-attempts partial index, driven from `workers` into
-/// `attempts_held_by_worker` (asserted by a test): summing held attempts
-/// must never scan the attempts table. Values may go negative when a report
-/// shrinks under existing reservations.
+/// [`free_capacity`]'s statement: one pass over the held-attempts partial
+/// index, driven from `workers` into `attempts_held_by_worker` (asserted by
+/// a test), so summing held attempts never scans the attempts table.
 const FREE_CAPACITY_SQL: &str = "SELECT w.cpu_millis - COALESCE((
                 SELECT SUM(a.cpu_millis) FROM attempts a JOIN workers h ON h.id = a.worker_id
                 WHERE a.released_ms IS NULL
@@ -162,7 +156,12 @@ const FREE_CAPACITY_SQL: &str = "SELECT w.cpu_millis - COALESCE((
                        OR (w.host_id IS NULL AND h.id = w.id))), 0) END
      FROM workers w WHERE w.id = ?1 AND w.revoked_ms IS NULL";
 
-/// What the worker has left; see [`FREE_CAPACITY_SQL`].
+/// What the worker has left: its reported capacity less every attempt still
+/// held that the host counts. Attempts of every worker sharing the same
+/// `host_id` are subtracted — worker identities on one machine must not
+/// each claim the whole machine's memory, CPU or scratch — while a worker
+/// with no host on record accounts for its own attempts alone. Values may
+/// go negative when a report shrinks under existing reservations.
 pub fn free_capacity(conn: &Connection, worker: WorkerId) -> Result<Capacity> {
     conn.prepare_cached(FREE_CAPACITY_SQL)?
         .query_row([worker.as_bytes()], |r| {
@@ -666,7 +665,7 @@ fn host_millis(conn: &Connection, worker: WorkerId) -> Result<i64> {
 
 /// The largest waiting job this worker could run at or above
 /// [`LARGE_JOB_CPU`]. `state_code = 1` and the `8000` threshold are literals
-/// on purpose: SQLite only uses the partial [`LARGE_JOB_CPU`] index when its
+/// on purpose: SQLite only uses the partial `jobs_ready_large` index when its
 /// predicate is implied by constants, and this query runs on every placement.
 /// A bound threshold silently turns it into a scan of the whole ready index.
 const LARGE_WAITING_SQL: &str = "SELECT cpu_millis, queued_ms FROM jobs
