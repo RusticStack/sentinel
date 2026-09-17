@@ -514,28 +514,35 @@ const CANDIDATES_SQL: &str = "SELECT j.tenant_id, j.id, j.run_id, j.cpu_millis, 
      JOIN pools p2 ON p2.id = ?1 AND p2.active = 1
      LEFT JOIN pool_grants g ON g.pool_id = p2.id AND g.tenant_id = t.id
      LEFT JOIN run_provenance p ON p.run_id = j.run_id
-     WHERE j.state_code = ?2 AND j.cancel_requested = 0
+     WHERE j.state_code = 1 AND j.cancel_requested = 0
        AND j.image_digest IS NOT NULL AND j.image_platform IS NOT NULL
        AND (p2.owner_tenant_id = t.id OR g.tenant_id IS NOT NULL)
-       AND (j.arch IS NULL OR j.arch = ?3)
-       AND j.cpu_millis <= ?4 AND j.memory_bytes <= ?5
-       AND (j.disk_bytes = 0 OR ?6 = 0 OR j.disk_bytes <= ?7)
+       AND (j.arch IS NULL OR j.arch = ?2)
+       AND j.cpu_millis <= ?3 AND j.memory_bytes <= ?4
+       AND (j.disk_bytes = 0 OR ?5 = 0 OR j.disk_bytes <= ?6)
        AND NOT EXISTS (
            SELECT 1 FROM jobs o
            WHERE o.tenant_id = j.tenant_id AND o.concurrency_group IS NOT NULL
              AND o.concurrency_group = j.concurrency_group AND o.run_id <> j.run_id
-             AND o.state_code < ?8)
-       AND j.tenant_id = ?9
+             AND o.state_code < ?7)
+       AND j.tenant_id = ?8
      ORDER BY j.priority, j.queued_ms, j.created_seq
      LIMIT 32";
 
 fn ready_tenants(conn: &Connection, _pool: PoolId) -> Result<Vec<TenantId>> {
+    // `state_code = 1` stays a literal: SQLite only uses the partial
+    // ready-queue indexes when the predicate is a constant. Probing each
+    // tenant with EXISTS costs one index descent per tenant; grouping the
+    // ready set itself would visit every queued job.
     let mut stmt = conn.prepare_cached(
-        "SELECT tenant_id FROM jobs
-         WHERE state_code = ?1 AND cancel_requested = 0 AND image_digest IS NOT NULL
-         GROUP BY tenant_id",
+        "SELECT t.id FROM tenants t
+         WHERE t.active = 1 AND EXISTS(
+             SELECT 1 FROM jobs j
+             WHERE j.tenant_id = t.id AND j.state_code = 1
+               AND j.cancel_requested = 0 AND j.image_digest IS NOT NULL
+             LIMIT 1)",
     )?;
-    let rows = stmt.query_map(params![READY], |r| r.get::<_, [u8; 16]>(0))?;
+    let rows = stmt.query_map([], |r| r.get::<_, [u8; 16]>(0))?;
     let mut out = Vec::new();
     for row in rows {
         out.push(TenantId::from_bytes(row?).map_err(|_| Error::Corrupt("tenant_id"))?);
@@ -544,17 +551,25 @@ fn ready_tenants(conn: &Connection, _pool: PoolId) -> Result<Vec<TenantId>> {
 }
 
 fn tenant_held(conn: &Connection) -> Result<HashMap<TenantId, i64>> {
+    // Per-tenant index counts over the held-attempts partial index: counting
+    // all held rows once per placement would scale with fleet load, not with
+    // the number of tenants.
     let mut stmt = conn.prepare_cached(
-        "SELECT tenant_id, COUNT(*) FROM attempts WHERE released_ms IS NULL GROUP BY tenant_id",
+        "SELECT t.id,
+                (SELECT COUNT(*) FROM attempts a
+                 WHERE a.tenant_id = t.id AND a.released_ms IS NULL)
+         FROM tenants t",
     )?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, [u8; 16]>(0)?, r.get::<_, i64>(1)?)))?;
     let mut out = HashMap::new();
     for row in rows {
         let (id, n) = row?;
-        out.insert(
-            TenantId::from_bytes(id).map_err(|_| Error::Corrupt("tenant_id"))?,
-            n,
-        );
+        if n > 0 {
+            out.insert(
+                TenantId::from_bytes(id).map_err(|_| Error::Corrupt("tenant_id"))?,
+                n,
+            );
+        }
     }
     Ok(out)
 }
@@ -567,14 +582,19 @@ fn candidates(
 ) -> Result<Vec<Pick>> {
     let reported = if facts.disk_reported { 1i64 } else { 0 };
     let tenants = ready_tenants(conn, pool)?;
-    let held = tenant_held(conn)?;
+    // The held counts only rank tenants against each other; with one tenant
+    // there is nothing to rank and the count scan is wasted work.
+    let held = if tenants.len() > 1 {
+        tenant_held(conn)?
+    } else {
+        HashMap::new()
+    };
     let mut stmt = conn.prepare_cached(CANDIDATES_SQL)?;
     let mut out = Vec::new();
     for tenant in tenants {
         let rows = stmt.query_map(
             params![
                 pool.as_bytes(),
-                READY,
                 facts.arch,
                 free.cpu_millis,
                 free.memory_bytes,
@@ -651,11 +671,11 @@ fn waiting_fairness(
     let large: Option<(i64, i64)> = conn
         .prepare_cached(
             "SELECT cpu_millis, queued_ms FROM jobs
-             WHERE state_code = ?1 AND cancel_requested = 0
-               AND cpu_millis >= ?2 AND cpu_millis <= ?3
+             WHERE state_code = 1 AND cancel_requested = 0
+               AND cpu_millis >= ?1 AND cpu_millis <= ?2
              ORDER BY cpu_millis DESC LIMIT 1",
         )?
-        .query_row(params![READY, LARGE_JOB_CPU, facts.cpu_millis], |r| {
+        .query_row(params![LARGE_JOB_CPU, facts.cpu_millis], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })
         .optional()?;
@@ -665,9 +685,9 @@ fn waiting_fairness(
             "SELECT EXISTS(
                 SELECT 1 FROM run_provenance p JOIN jobs j ON j.run_id = p.run_id
                 WHERE p.trigger = 'pull_request'
-                  AND j.state_code = ?1 AND j.cancel_requested = 0)",
+                  AND j.state_code = 1 AND j.cancel_requested = 0)",
         )?
-        .query_row(params![READY], |r| r.get(0))?;
+        .query_row([], |r| r.get(0))?;
     if pr {
         fairness.pull_request = true;
         fairness.host_cpu_millis = host_millis(conn, worker)?;
@@ -819,7 +839,20 @@ pub fn place(
             .is_some_and(|key| !caches_image(&facts.avail_images, &key));
         if cold {
             if locality.is_none() {
-                let view = locality_view(tx, pick.tenant, worker)?;
+                // Skip the workers scan entirely when no worker in the fleet
+                // has reported an image: locality can never hold then, and
+                // the scan would cost one pass over the fleet per placement.
+                let any_images: bool = tx
+                    .prepare_cached(
+                        "SELECT EXISTS(SELECT 1 FROM workers
+                          WHERE revoked_ms IS NULL AND avail_images <> X'')",
+                    )?
+                    .query_row([], |r| r.get(0))?;
+                let view = if any_images {
+                    locality_view(tx, pick.tenant, worker)?
+                } else {
+                    Vec::new()
+                };
                 let useful = view.iter().any(|w| !w.avail_images.is_empty());
                 locality = Some(if useful { view } else { Vec::new() });
             }

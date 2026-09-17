@@ -436,9 +436,11 @@ impl Executor for Recorder {
     fn log_refused(&self, _: AttemptId) {}
 }
 
-/// Wait until `predicate` holds, within fifteen seconds.
+/// Wait until `predicate` holds, within thirty seconds. This is a wait, not a
+/// latency claim: the burst has to lease under loaded CI machines, and the
+/// promptness bound out of an idle fleet is asserted separately.
 fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !predicate() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         thread::sleep(Duration::from_millis(10));

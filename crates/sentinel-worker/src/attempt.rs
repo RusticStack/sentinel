@@ -1138,7 +1138,7 @@ mod tests {
             _: &sentinel_cache::remote::Need,
             _: Instant,
             _: &mut dyn sentinel_cache::remote::Sink,
-        ) -> Result<(), sentinel_cache::remote::Refusal> {
+        ) -> std::result::Result<(), sentinel_cache::remote::Refusal> {
             Err(sentinel_cache::remote::Refusal::NoBundle)
         }
         fn offer(
@@ -1146,8 +1146,7 @@ mod tests {
             upload: &sentinel_cache::remote::Upload,
             _: Instant,
             source: &mut dyn std::io::Read,
-        ) -> Result<(), sentinel_cache::remote::Refusal> {
-            use std::io::Read;
+        ) -> std::result::Result<(), sentinel_cache::remote::Refusal> {
             let mut bytes = Vec::new();
             source
                 .read_to_end(&mut bytes)

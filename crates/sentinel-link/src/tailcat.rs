@@ -192,10 +192,13 @@ pub struct Address(String);
 
 impl Address {
     /// Parses the address token the helper prints on its `listening` line.
+    /// Addresses embed the node's key *and* its DERP region information, so a
+    /// real `serve` address runs well past a hundred characters; the cap only
+    /// exists so a malformed line cannot grow memory.
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         let text = text.trim().trim_end_matches([',', '.', ')', ']']);
-        if text.len() > 128 {
+        if text.len() > 256 {
             return None;
         }
         let body = text.strip_prefix("tc")?;
@@ -1094,12 +1097,18 @@ fn drain<R: Read + Send + 'static>(pipe: R) -> thread::JoinHandle<Vec<u8>> {
 }
 
 /// Creates the helper's key if needed and records the node key it printed.
+/// The helper's own naming rule applies: a server key is `default`, a client
+/// key is `client-default` — `genkey --client --key=default` is refused.
 fn ensure(network: &Network, role: Role) -> Result<NodeKey> {
-    let record = network.keydir.join(format!("{KEY_NAME}.nodekey"));
+    let name = match role {
+        Role::Controller => KEY_NAME,
+        Role::Worker => "client-default",
+    };
+    let record = network.keydir.join(format!("{name}.nodekey"));
     if let Some(key) = read_key(&record)? {
         return Ok(key);
     }
-    let mut args = vec!["genkey".to_owned(), format!("--key={KEY_NAME}")];
+    let mut args = vec!["genkey".to_owned(), format!("--key={name}")];
     if role == Role::Worker {
         args.push("--client".to_owned());
     }

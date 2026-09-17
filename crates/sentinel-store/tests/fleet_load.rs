@@ -141,6 +141,7 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
         .unwrap();
     assert_eq!(created.len(), RUNS);
     assert!(created.iter().all(|ids| ids.len() == JOBS_PER_RUN));
+    eprintln!("setup done: {JOBS} jobs queued");
 
     // Round after round, fill every worker to its free capacity, take the
     // offers and retire the attempts; the reservation returns and the next
@@ -149,9 +150,15 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
     let started = Instant::now();
     let mut placed: HashSet<JobId> = HashSet::with_capacity(JOBS);
     let mut latencies: Vec<u64> = Vec::with_capacity(JOBS);
+    let mut phase_totals = [0u64; 3];
     let mut rounds = 0usize;
     while placed.len() < JOBS {
         rounds += 1;
+        eprintln!(
+            "round {rounds}: {} of {JOBS} after {:?}",
+            placed.len(),
+            started.elapsed()
+        );
         assert!(
             rounds <= 256,
             "placement stalled after {rounds} rounds at {} of {JOBS}",
@@ -160,11 +167,12 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
         let mut progress = 0usize;
         for worker in &workers {
             let worker = *worker;
-            let (jobs, mut times) = store
+            let (jobs, mut times, phases) = store
                 .writer()
                 .write(move |tx| {
                     let mut jobs = Vec::new();
                     let mut times = Vec::new();
+                    let mut phases = [0u64; 3];
                     for _ in 0..dispatch::MAX_HELD_ATTEMPTS {
                         let begun = Instant::now();
                         let Some(offer) =
@@ -173,10 +181,14 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
                             break;
                         };
                         times.push(begun.elapsed().as_nanos() as u64);
+                        phases[0] += begun.elapsed().as_nanos() as u64;
+                        let begun = Instant::now();
                         // A real worker acknowledges, then fails preparation:
                         // the one terminal report that frees capacity without
                         // pretending any work ran.
                         dispatch::acknowledge(tx, worker, offer.attempt, offer.fence, NOW)?;
+                        phases[1] += begun.elapsed().as_nanos() as u64;
+                        let begun = Instant::now();
                         dispatch::report(
                             tx,
                             worker,
@@ -187,11 +199,15 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
                             NOW,
                             None,
                         )?;
+                        phases[2] += begun.elapsed().as_nanos() as u64;
                         jobs.push(offer.job);
                     }
-                    Ok((jobs, times))
+                    Ok((jobs, times, phases))
                 })
                 .unwrap();
+            phase_totals[0] += phases[0];
+            phase_totals[1] += phases[1];
+            phase_totals[2] += phases[2];
             progress += jobs.len();
             latencies.append(&mut times);
             for job in jobs {
@@ -217,15 +233,23 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
         "rounds": rounds,
         "placement_calls": latencies.len(),
         "placement_us": { "p50": us(0.50), "p95": us(0.95), "p99": us(0.99) },
+        "phase_ms": {
+            "place": phase_totals[0] / 1_000_000,
+            "acknowledge": phase_totals[1] / 1_000_000,
+            "report": phase_totals[2] / 1_000_000
+        },
         "elapsed_ms": elapsed.as_millis() as u64,
     });
     println!("{report}");
 
-    // A generous ceiling for a debug build on a laptop: it is here to catch
-    // a quadratic placement scan, a lost wake or a stalled round, not to
-    // measure micro-latency.
+    // A ceiling for a laptop, not a micro-latency claim: it is here to catch
+    // a quadratic placement scan, a lost wake or a stalled round. The
+    // reference machine (i7-13700KF, Windows) measures 52-92 s debug and
+    // release unloaded-to-loaded; the pre-index-fix debug run was 258 s and
+    // climbing.
+    const BOUND: Duration = Duration::from_secs(180);
     assert!(
-        elapsed < Duration::from_secs(120),
+        elapsed < BOUND,
         "placement took {elapsed:?} for {JOBS} jobs in {rounds} rounds: {report}"
     );
 }

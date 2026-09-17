@@ -331,7 +331,7 @@ impl Config {
                     "controller, controller_fingerprint, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, disk_bytes and tailcat_address apply to the worker role only",
                 ));
             }
-            let listen = file
+            let listen: SocketAddr = file
                 .listen
                 .as_deref()
                 .unwrap_or(DEFAULT_LISTEN)
@@ -672,9 +672,7 @@ enum Running {
         /// The lifecycle reconcile lane draining `github_refresh`.
         reconcile: Option<Box<sentinel_checks::Reconcile>>,
         /// The Q06 helper carrying the link port; absent with direct TLS.
-        tailcat: Option<Arc<sentinel_link::tailcat::Server>>,
-        /// Stops the allow-list refresher before the helper is dropped.
-        tailcat_stop: Option<Arc<AtomicBool>>,
+        tailcat: Option<TailcatServer>,
     },
     #[cfg(feature = "worker")]
     Worker {
@@ -690,22 +688,23 @@ enum Running {
 /// `tailcat_address`), and keep the admitted node keys current from
 /// `<data_dir>/tailcat-allow`. `None` means direct TLS, unchanged.
 #[cfg(feature = "server")]
+struct TailcatServer {
+    server: Arc<sentinel_link::tailcat::Server>,
+    /// Stops the allow-list refresher before the helper is dropped.
+    stop: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "server")]
 fn start_tailcat(
     config: &Config,
     file: Option<&TailcatFile>,
     listen: SocketAddr,
-) -> Result<
-    (
-        Option<Arc<sentinel_link::tailcat::Server>>,
-        Option<Arc<AtomicBool>>,
-    ),
-    Error,
-> {
+) -> Result<Option<TailcatServer>, Error> {
     let Some(file) = file else {
-        return Ok((None, None));
+        return Ok(None);
     };
     if file.enabled != Some(true) {
-        return Ok((None, None));
+        return Ok(None);
     }
     let binary = file
         .binary
@@ -729,9 +728,12 @@ fn start_tailcat(
     match server.wait_ready(Duration::from_secs(60)) {
         // The address is a credential: only this operator-facing line ever
         // carries it, and never a Debug-formatted field.
-        Some(address) => tracing::info!(event = "tailcat_listening", address = address.expose()),
-        None => tracing::warn!(
+        Ok(address) => {
+            tracing::info!(event = "tailcat_listening", address = address.expose())
+        }
+        Err(problem) => tracing::warn!(
             event = "tailcat_not_ready",
+            problem = %problem,
             "the helper did not report an address within 60s; workers cannot dial it yet"
         ),
     }
@@ -777,7 +779,7 @@ fn start_tailcat(
             })?
     };
     drop(refresher);
-    Ok((Some(server), Some(stop)))
+    Ok(Some(TailcatServer { server, stop }))
 }
 
 #[cfg(feature = "server")]
@@ -873,7 +875,7 @@ fn start_server(
         })?;
         controller.set_remote_cache(root);
     }
-    let (tailcat, tailcat_stop) = start_tailcat(config, tailcat, listen)?;
+    let tailcat = start_tailcat(config, tailcat, listen)?;
     controller.set_source_destinations(
         crate::source_admin::load_destinations(&config.data_dir)
             .map_err(|_| Error::runtime("cannot load source destination policy"))?,
@@ -1075,7 +1077,6 @@ fn start_server(
         checks,
         reconcile,
         tailcat,
-        tailcat_stop,
     })
 }
 
@@ -1315,7 +1316,10 @@ mod worker_role {
         ),
         Error,
     > {
-        let mut stats = sentinel_link::session::TransportStats::default();
+        let mut stats = sentinel_link::session::TransportStats {
+            path: sentinel_link::session::Path::Direct,
+            ..sentinel_link::session::TransportStats::default()
+        };
         let Some(file) = &link.tailcat else {
             return Ok((link.controller, stats, None));
         };
@@ -1330,8 +1334,9 @@ mod worker_role {
             .tailcat_address
             .as_deref()
             .ok_or_else(|| Error::config("tailcat_address is required when tailcat is enabled"))?;
-        let address = sentinel_link::tailcat::Address::parse(address_text)
-            .map_err(|error| Error::config(format!("tailcat_address: {error}")))?;
+        let address = sentinel_link::tailcat::Address::parse(address_text).ok_or_else(|| {
+            Error::config("tailcat_address must be a tailcat address, as in tc<20+ characters>")
+        })?;
         let config = sentinel_link::tailcat::TailcatConfig {
             enabled: true,
             binary,
@@ -1345,6 +1350,7 @@ mod worker_role {
         };
         let forward = sentinel_link::tailcat::start_forward(&config, data_dir, &address)
             .map_err(|error| Error::runtime(format!("cannot start the tailcat helper: {error}")))?;
+        stats.path = sentinel_link::session::Path::Relay;
         stats.helper_version = forward.telemetry().version;
         // The helper's health probe is a measured round trip (ping plus a
         // connect through the forward); it seeds the telemetry until the
@@ -1550,13 +1556,12 @@ fn initialize_and_wait(
             checks,
             reconcile,
             tailcat,
-            tailcat_stop,
         } => {
             api.shutdown();
-            if let Some(stop) = tailcat_stop {
-                stop.store(true, Ordering::Release);
+            if let Some(tailcat) = tailcat {
+                tailcat.stop.store(true, Ordering::Release);
+                tailcat.server.shutdown();
             }
-            drop(tailcat);
             drop(reconcile);
             drop(checks);
             drop(poll);

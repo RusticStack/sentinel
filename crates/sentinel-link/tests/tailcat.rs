@@ -38,7 +38,9 @@ impl Fake {
     fn write(body: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("argv.log");
-        let binary = dir.path().join("tailcat");
+        // Not "tailcat": that name is the key directory inside the data dir,
+        // which is this same temporary directory.
+        let binary = dir.path().join("helper");
         let script = format!(
             "#!/bin/sh\nprintf 'argv %s\\n' \"$*\" >> \"{log}\"\ncase \"$1\" in\n  --version) printf 'tailcat v0.6.0\\n'; exit 0 ;;\n  genkey) printf 'nodekey:{key}\\n'; exit 0 ;;\n{body}esac\nexit 64\n",
             log = log.display(),

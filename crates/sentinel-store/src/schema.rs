@@ -118,4 +118,5 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (26, include_str!("migrations/026_log_state.sql")),
     (27, include_str!("migrations/027_storage.sql")),
     (28, include_str!("migrations/028_fleet.sql")),
+    (29, include_str!("migrations/029_ready_indexes.sql")),
 ];
