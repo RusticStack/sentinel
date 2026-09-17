@@ -19,8 +19,8 @@ pub use cursor::{Cursor, CursorError, Page, Seq, StreamKind};
 pub use error::{ApiError, ERROR_SCHEMA, ErrorCode, ErrorSchema};
 pub use idempotency::{Decision, Fingerprint, IdempotencyKey, KeyError, Stored};
 pub use negotiate::{
-    Arch, Capabilities, Hello, Negotiated, ProtocolVersion, Rejected, SUPPORTED_MAX, SUPPORTED_MIN,
-    negotiate,
+    Arch, Availability, Capabilities, Hello, MAX_PROFILE_LABELS, Negotiated, PROFILE_MIN, Profile,
+    ProtocolVersion, Rejected, SUPPORTED_MAX, SUPPORTED_MIN, negotiate,
 };
 
 impl From<CursorError> for ApiError {

@@ -190,6 +190,8 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
                 cpu_millis: 4_000,
                 memory_bytes: 4 << 30,
             },
+            profile: sentinel_protocol::negotiate::Profile::default(),
+            transport: sentinel_link::session::TransportStats::default(),
         };
         let identity = Identity::generate("worker").unwrap();
         identity.save(&worker_cert, &worker_key).unwrap();
@@ -664,6 +666,8 @@ jobs:
                 cpu_millis: 4_000,
                 memory_bytes: 4 << 30,
             },
+            profile: sentinel_protocol::negotiate::Profile::default(),
+            transport: sentinel_link::session::TransportStats::default(),
         };
         let identity = Identity::load(&worker_cert, &worker_key).unwrap();
         thread::spawn(move || worker::run(config, identity, None, &executor, &handle, &|_| {}))

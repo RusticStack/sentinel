@@ -9,12 +9,12 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | Cache manifest | `sentinel.cache` magic + format `u8` (currently 1) | `sentinel-cache::manifest` | workers |
 | Cache file listing | `sentinel.files` magic + format `u8` (currently 1) | `sentinel-cache::manifest` | workers |
 | Cache miss reasons | `Miss::as_str` vocabulary | `sentinel-cache::outcome` | workers, reports |
-| Metadata database | `schema_migrations.version` (currently 27) | `sentinel-store` | controller |
+| Metadata database | `schema_migrations.version` (currently 28) | `sentinel-store` | controller |
 | Manifest file | `SNMF` magic + format `u16` (currently 1) | `sentinel-store::objects` | controller |
 | API error | `schema: "sentinel.error/1"` | `sentinel-protocol` | CLI, MCP, UI, workers |
 | Explain output | `schema: "sentinel.explain/1"` | `sentinel-pipeline::explain` | CLI, agents |
 | Event cursor | text prefix `c1` | `sentinel-protocol::cursor` | API clients |
-| Worker protocol | `protocol_min..=protocol_max` in `Hello` (currently 1..=6) | `sentinel-protocol::negotiate` | workers |
+| Worker protocol | `protocol_min..=protocol_max` in `Hello` (currently 1..=7) | `sentinel-protocol::negotiate` | workers |
 | Log segment index | `SNLI` magic + format `u16` (currently 1) | `sentinel-store::logs` | controller |
 | Compressed log segment | `SNLZ` magic + format `u16` + codec `u8` (currently 1, zlib) | `sentinel-store::logs` | controller |
 | Log end marker | `SNLE` magic + format `u16` (currently 1) | `sentinel-store::logs` | controller |
@@ -47,6 +47,8 @@ Readers reject a database newer than their highest known migration. Migration 4 
 **K08 cache metrics.** AttemptSummary moves to format 3 (above): dual decode keeps formats 1–2 readable, and the added `CacheRecord` strings reuse existing stable vocabularies — `Miss::as_str`, `SkipReason::as_str`, `"hit"`/`"sealed"`/`"failed"` — plus the `Costly` names (`copied_all`, `slow`). No worker-protocol or on-disk change: the availability snapshot travels inside the existing summary blob and the process-local `Notice` channel, so the protocol range stays 1..=6 and no capability bit is allocated. The `image_present` flag is recorded only — `podman pull`'s exists fast path semantics are unchanged.
 
 **Cursors.** Opaque to clients. The version byte changes when the layout does; old cursors are then rejected as `invalid_cursor` and the client restarts from the beginning of the stream, which is always safe because event sequences are dense and idempotent to re-read.
+
+**Protocol 7 (Q05/Q07/Q08).** Additive only: every pre-existing message keeps its shape and enum index, and a 6-negotiated session is byte-for-byte what it was. The additions are new *variants* — `Profile`, `BulkHello`, `Transport`, the cache transfer messages — never new struct fields, because a postcard struct decodes exactly the field list its reader knows: adding a trailing field to `Hello` would make an older worker's hello undecodable and `#[serde(default)]` could never fire. A protocol-6 worker is still served exactly as before: it sends no profile, so its disk is 0 and its labels are empty, and jobs that require disk or labels simply never place there while unconstrained jobs place normally. Protocol 7 adds a second connection (bulk) to a session; a worker that negotiated it may still send bulk-class messages on the control connection, so an environment that blocks the second connection degrades in latency, never in correctness. Capability bit availability is unchanged: protocol 7 allocates no new bit.
 
 **Worker protocol.** The controller serves an inclusive range. Adding an optional message field is compatible; anything else bumps the maximum and, after one release of overlap, the minimum. A worker outside the range receives a typed rejection naming which side must upgrade. Capability bits are allocated once and never reused; unknown bits from newer workers are masked, not rejected.
 

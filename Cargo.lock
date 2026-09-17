@@ -1136,6 +1136,7 @@ version = "0.1.0-dev"
 dependencies = [
  "clap",
  "ctrlc",
+ "libc",
  "ring",
  "sentinel-api",
  "sentinel-auth",
@@ -1290,6 +1291,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sentinel-auth",
+ "sentinel-cache",
  "sentinel-core",
  "sentinel-github",
  "sentinel-intake",

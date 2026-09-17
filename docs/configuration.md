@@ -49,6 +49,22 @@ enrollment_file = "/etc/sentinel/enrollment"  # absolute; read on start, removed
 cpu_millis = 8000                  # override measured capacity (default: every core)
 memory_bytes = 34359738368         # override measured capacity (default: total less a host reserve)
 git_mirrors = true                 # keep per-repository object mirrors under <data_dir>/mirrors (default on; [mirrors](mirrors.md))
+labels = ["linux", "gpu"]          # scheduling labels this worker selects work by; at most 16, each 1-128 bytes (default none)
+disk_bytes = 1073741824            # scratch disk offered to jobs; default: the data directory's free space less an eighth (clamped to 512 MiB-2 GiB)
+tailcat_address = "tc…"            # required with `[tailcat] enabled = true`: the controller's address, exactly as logged at `tailcat_listening`
+
+# either role: the optional pinned Tailcat transport (Q06); absent or `enabled = false` = direct TLS
+[tailcat]
+enabled = false                    # default
+binary = "/usr/local/bin/tailcat"  # absolute path to the helper executable
+sha256 = "d46582…"                 # default: the pinned v0.6.0 build; a mismatch refuses to run the helper
+derpmap_url = "https://derp.example/map"  # optional operator-owned DERP map
+region = "eu-1"                    # optional region name inside that map
+listen_port = 7443                 # server: must match `listen`; worker: the loopback port it dials
+
+# either role: remote cache hydration (Q08); absent or `enabled = false` keeps every lookup local
+[remote_cache]
+enabled = true                     # default; the controller holds offered objects, the worker fetches/offers them
 
 # server only: disk admission, quotas and retention ([storage](storage.md#disk-admission-quotas-and-reclamation-d06))
 [storage]
@@ -60,7 +76,7 @@ log_retention_secs = 1209600       # finished attempt logs kept this long (1 h .
 sweep_interval_secs = 300          # the maintenance pass rides the dispatch loop at most this often (5..86400)
 ```
 
-The three common fields are optional in the file; `listen`, `api_listen` and `[storage]` are refused for the worker and the worker keys for the server; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
+The three common fields are optional in the file; `listen`, `api_listen` and `[storage]` are refused for the worker and the worker keys (`labels`, `disk_bytes`, `tailcat_address`) for the server; `[tailcat]` is accepted by both roles; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
 
 - Server: `/var/lib/sentinel`
 - Worker: `/var/lib/sentinel-worker`
@@ -69,15 +85,37 @@ Use separate directories for the two roles. Paths must be absolute, non-root, an
 
 Configuration input must be a regular file, valid UTF-8, and at most **64 KiB**. Unknown/duplicate keys, wrong field types and malformed TOML fail validation. Parser failures report the expected schema without echoing input values. There are no credential fields in this schema; enrollment credentials have a separate interface, and source credentials are sealed in the database.
 
-Two optional controller files configure sources ([sources](sources.md)) and event intake ([intake](intake.md)); both are read at startup when present:
+Optional on-disk controller state configures sources ([sources](sources.md)), event intake ([intake](intake.md)) and the remote cache; each is used at startup when present:
 
 - `<data_dir>/source-destinations.json` — a JSON array of at most 128 approved authorities (`https://host[:port]`, `ssh://user@host[:port]`). A source binding whose remote is not exactly one of them is refused. Absent means no binding can be created.
 - `<data_dir>/github-app.json` — `{"app_id": 1234, "private_key_file": "/absolute/owner-only.pem"}` for the GitHub App association, plus two optional fields: `public_url`, the deployment-facing base URL used for a check's `details_url` ([checks](checks.md)), and `api_url`, another GitHub API endpoint (Enterprise, or a loopback stub). The PEM must be a regular file, not group- or world-readable, at most 16 KiB, PKCS#1 or unencrypted PKCS#8. The App key is never stored in the database.
+- `<data_dir>/remote-cache/` — the controller's remote cache store (Q08): objects workers offered so another worker can hydrate them without the WAN. Created at server start; with the directory absent every cache need is refused `NoBundle`. The API also sets it through `Controller::set_remote_cache`.
 - `<data_dir>/github-webhook.json` — `{"secret": "…"}` for GitHub webhook signature verification; the secret is 16–256 printable ASCII bytes and the file must be owner-only. Without it the GitHub intake route does not exist.
 
 Source credentials themselves are sealed with `<data_dir>/master.key` (`admin key create`), the same key-outside-database file second factors use. Repository hook secrets are digests and need no key. Resolution also uses `<data_dir>/intake-work/` as per-delivery scratch space for the repository fetches it makes; it is emptied at startup and never reused.
 
 `--check` validates syntax, effective path shape and currently inspectable filesystem metadata. It does not prove future write access, reserve the directory or validate networking/runtime prerequisites. Actual startup creates missing directories and reports initialization failures.
+
+### Optional Tailcat transport
+
+An optional `[tailcat]` section in the server or worker file runs the **pinned** Tailcat helper as an alternative transport for exactly this deployment's link port. Everything else — enrollment, identity, authorization, leases — is unchanged, and with `enabled = false` (or no section) the link uses direct TLS exactly as before.
+
+|Key|Behavior|
+|---|---|
+|`enabled`|`false` (default) leaves direct TLS in place.|
+|`binary`|Absolute path to the helper executable.|
+|`sha256`|The executable's SHA-256; defaults to the pinned v0.6.0 build `d46582137d21f03d15345e2be425d6317d49e5b8c8bb4f6fc56037f4c08cce73`. The helper is hashed before *every* execution, and a mismatch refuses to run it.|
+|`derpmap_url`|Optional `https://` URL of an operator-owned DERP map, passed to the helper. Public relays are best-effort; self-hosted relay infrastructure is supported without any Tailscale-hosted account.|
+|`region`|Optional region name in that map (`--region=…`); the controller otherwise asks the helper for a fixed region so its address survives restarts.|
+|`listen_port`|The link port the helper carries (default 7443): the server serves it (it must match `listen`), the worker binds it on loopback and dials `127.0.0.1:<listen_port>`.|
+
+Keys live under `<data_dir>/tailcat` (owner-only) and persist across restarts, so a node's address is stable. The controller admits workers from `<data_dir>/tailcat-allow`, one `nodekey:…` per line (owner-only); the worker's own node key is printed by its first start under Tailcat, and the controller's `tc…` address is what it logged at `tailcat_listening` (the worker's `tailcat_address`). Both are credentials: `Debug`/`Display` redact node keys and addresses, and they never appear in normal diagnostics. Helper health is a live Sentinel session, or `tailcat ping` plus a connect through the forward — an open loopback port alone is not health. The helper carries only the link port (never `serve all`, an exit node, a shell or its file mode), and the worker binds loopback only.
+
+### Remote cache
+
+`[remote_cache] enabled = true` (the default) is what makes the two Q08 halves line up: the controller keeps objects workers offer under `<data_dir>/remote-cache`, and a worker fetches, offers and resumes objects over its bulk connection. Set it to `false` on either side to make every remote lookup a local miss — a worker then never asks and never offers, and a controller without the section serves nothing (`NoBundle`). A local cache hit never touches the link in any configuration.
+
+With the helper enabled, the worker's `Transport` telemetry carries the helper's version and the control session's measured round-trip time; the direct/relay distinction stays `Unknown` unless a probe can actually tell, never guessed.
 
 ## Run the processes
 

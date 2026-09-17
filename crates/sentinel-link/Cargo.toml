@@ -20,6 +20,7 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1.15"
 sentinel-auth = { path = "../sentinel-auth" }
+sentinel-cache = { path = "../sentinel-cache" }
 sentinel-core = { path = "../sentinel-core" }
 sentinel-protocol = { path = "../sentinel-protocol" }
 sentinel-store = { path = "../sentinel-store", optional = true }

@@ -8,20 +8,38 @@
 //! controller sends pongs and offers, in either order. Anything else on the
 //! wire is a protocol violation and ends the session.
 //!
+//! From protocol 7 a session has two connections with one identity. The
+//! first is the **control** connection: negotiation, heartbeats, offers and
+//! reports — everything whose latency decides whether live work survives. A
+//! protocol-7 worker then dials a second **bulk** connection (`BulkHello`)
+//! and moves logs, spec chunks, artifact streams and cache transfers onto
+//! it. Each connection has its own rustls state behind its own mutex, so a
+//! bulk write that blocks on a slow reader can never hold up a pong or an
+//! offer; the control connection keeps accepting bulk messages as a
+//! fallback when the second connection cannot be established.
+//!
 //! Full duplex on one TLS connection: the rustls state sits behind a mutex
 //! that is held only while bytes move between it and a buffer, never across
 //! a socket call. One thread reads the socket; any thread may send. An offer
 //! therefore reaches a worker the moment it is placed, not at its next beat.
 
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
-    sync::{Arc, Mutex},
-    time::Duration,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc::{self, Receiver as Channel, RecvTimeoutError, Sender as ChannelSender},
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use rustls::{ClientConnection, ServerConnection, pki_types::ServerName};
 use sentinel_auth::secret::{Digest, Secret};
+use sentinel_cache::remote::{Chunk, End, Grant, Need, Push, Refusal, Refused, Serving, Upload};
 use sentinel_core::{
     AttemptId, Event, FailureClass, Fence, JobId, Outcome, RepoId, RunId, TenantId, UnixMillis,
     WorkerId,
@@ -33,7 +51,7 @@ use sentinel_protocol::{
         MAX_ARTIFACT_PATH_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_LIST_ITEMS, MAX_LOG_FRAME_BYTES,
     },
     logs::{Frame, MAX_GAPS, Stream},
-    negotiate::{Hello, Negotiated, Rejected},
+    negotiate::{Hello, Negotiated, PROFILE_MIN, Profile, Rejected},
     summary::MAX_SUMMARY_BYTES,
 };
 use serde::{Deserialize, Serialize};
@@ -51,6 +69,49 @@ const TLS_READ_BYTES: usize = 16 * 1024 + 512;
 /// [`MAX_SPEC_BYTES`]; a spec is bounded by the pipeline file it came from.
 pub const SPEC_CHUNK_BYTES: usize = 48 * 1024;
 pub const MAX_SPEC_BYTES: usize = MAX_API_BODY_BYTES;
+/// One cache chunk on the wire. The frame cap is
+/// [`MAX_CONTROL_MESSAGE_BYTES`], so a chunk's payload has to leave room for
+/// its envelope; the link refuses anything larger as `TooLarge` rather than
+/// splitting it, because a chunk's running digest cannot be recomputed for a
+/// split piece.
+pub const MAX_CACHE_CHUNK_BYTES: usize = 48 * 1024;
+/// Cache downloads one session streams at a time; beyond this a need is
+/// refused `Busy` instead of spawning another transfer thread.
+const MAX_CACHE_TRANSFERS: usize = 4;
+/// Control beats between transport telemetry refreshes.
+const TRANSPORT_BEATS: u64 = 12;
+
+/// How the worker reached the controller (Q07). `Unknown` is the honest
+/// answer when nothing measured the path — no helper running, or one that has
+/// not reported — never a guess that a relay is in use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Path {
+    #[default]
+    Unknown,
+    /// A direct TCP/TLS path to the controller.
+    Direct,
+    /// Through the Tailcat helper (NAT-traversing, possibly DERP-relayed).
+    Relay,
+}
+
+/// What the worker's process can say about its transport (Q07). Assembled by
+/// the worker's process layer when a helper probe exists; every field that
+/// nothing measured stays absent, never a zero claim: `path` is `Unknown`,
+/// `rtt_ns`/`helper_version` are `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportStats {
+    pub path: Path,
+    /// Round-trip time of the control session (a Ping/Pong pair), nanoseconds;
+    /// `None` before the first beat completes.
+    pub rtt_ns: Option<u64>,
+    /// Control sessions this worker has opened since process start.
+    pub reconnects: u64,
+    /// The Tailcat helper's version when one is running; `None` without one.
+    pub helper_version: Option<String>,
+    /// Bytes written to / read from the control connection over this session.
+    pub bytes_out: u64,
+    pub bytes_in: u64,
+}
 
 /// What a worker has, as it measures at each hello.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +217,34 @@ pub enum ClientMessage {
         reason: u8,
     },
     Bye,
+    /// Protocol 7. The scheduling profile, sent immediately after `Welcome`
+    /// when the session negotiated protocol 7: what the worker offers the
+    /// scheduler beyond raw CPU and memory. Appended last: postcard encodes
+    /// enum variants positionally, so every older variant keeps its index.
+    Profile(Profile),
+    /// Protocol 7. Opens the second connection of this session: this socket
+    /// carries the bulk traffic (logs, spec chunks, artifacts, cache
+    /// transfers) while the control connection keeps heartbeats, offers and
+    /// reports. `worker` must name a live control session presenting the
+    /// same certificate; the controller closes the connection otherwise.
+    BulkHello {
+        worker: [u8; 16],
+    },
+    /// Protocol 7 (Q07). How the worker reached the controller.
+    Transport(TransportStats),
+    /// Protocol 7 (Q08). The worker needs a cache object; answered by
+    /// `CacheGrant`, `CacheChunk`s and `CacheEnd`, or by `CacheRefused`.
+    /// Resuming an interrupted transfer is the same need with a non-zero
+    /// `offset` (and the matching `have` digest), never a separate message.
+    CacheNeed(Need),
+    /// Protocol 7 (Q08). The worker offers an object it holds so the
+    /// controller can keep it for the fleet; answered by `CacheGrant`
+    /// (stream it), `CacheEnd` (already stored) or `CacheRefused`.
+    CacheOffer(Upload),
+    /// Protocol 7 (Q08). One pushed chunk of an open offer.
+    CachePush(Push),
+    /// Protocol 7 (Q08). The offer's stream is complete.
+    CachePushEnd(End),
 }
 
 /// A worker's state event on the wire; mirrors the worker-raised half of
@@ -293,6 +382,20 @@ pub enum ServerMessage {
     /// workers get `Context` and default to the pull-request scope.
     /// Appended last: postcard encodes enum variants positionally.
     Context2(WireContext2),
+    /// Protocol 7 (Q08). The accepted start of a cache transfer: the offset
+    /// the stream resumes from and the whole object's digest. For a
+    /// `CacheOffer` the controller already stores, there is no grant: it
+    /// answers `CacheEnd` with no bytes.
+    CacheGrant(Grant),
+    /// Protocol 7 (Q08). One chunk of a granted transfer, in order, with the
+    /// running digest of the stream through it.
+    CacheChunk(Chunk),
+    /// Protocol 7 (Q08). Terminal both ways: the fetch is complete, or an
+    /// offer was stored. Appended last: postcard encodes variants positionally.
+    CacheEnd(End),
+    /// Protocol 7 (Q08). The transfer is refused; `code` is the cache
+    /// owner's stable refusal code.
+    CacheRefused(Refused),
 }
 
 /// What the controller did with a log frame.
@@ -859,6 +962,38 @@ pub trait SessionHandler: Send + Sync {
     ) -> ArtifactCode {
         ArtifactCode::Stale
     }
+    /// Protocol 7. The scheduling profile the worker reported immediately
+    /// after `Welcome`, with the capacity it sent in its hello (reported
+    /// together so disk and CPU/RAM land in one write). Recording it is what
+    /// lets placement see the worker's disk, labels, host and availability;
+    /// `Err` ends the session, because a worker whose profile cannot be
+    /// recorded must not keep taking work against stale placement data. The
+    /// default accepts and records nothing.
+    fn profiled(
+        &self,
+        _worker: WorkerId,
+        _profile: &Profile,
+        _capacity: Capacity,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Protocol 7 (Q07). The worker's latest transport telemetry.
+    fn transport(&self, _worker: WorkerId, _stats: &TransportStats) {}
+    /// Protocol 7 (Q08). Authorizes a cache download. `Some(root)` means the
+    /// fence and cache scope checked out and the session may serve the need
+    /// from the controller's store under `root`; `None` refuses. The
+    /// authorization rule is the fenced attempt: it must be held by the
+    /// worker, and the need's tenant, repo and trust class must equal the
+    /// attempt's. The default refuses.
+    fn cache_need(&self, _worker: WorkerId, _need: &Need) -> Option<PathBuf> {
+        None
+    }
+    /// Protocol 7 (Q08). Authorizes an upload the same way. `Some(root)`
+    /// seeds the object under `root` and the session holds the receiving
+    /// state for the offer's push frames; `None` refuses.
+    fn cache_offer(&self, _worker: WorkerId, _upload: &Upload) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// The rustls state and the socket it writes to. The lock is held only while
@@ -866,6 +1001,19 @@ pub trait SessionHandler: Send + Sync {
 struct Shared {
     conn: Mutex<rustls::Connection>,
     sock: TcpStream,
+    /// Frame bytes written to / socket bytes read from this connection. What
+    /// Q07 telemetry reports is measured here, never estimated.
+    out: AtomicU64,
+    in_: AtomicU64,
+}
+
+impl Shared {
+    fn bytes(&self) -> (u64, u64) {
+        (
+            self.out.load(Ordering::Relaxed),
+            self.in_.load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// The sending half: cheap to clone, usable from any thread.
@@ -888,7 +1036,17 @@ impl Sender {
         while conn.wants_write() {
             conn.write_tls(&mut sock)?;
         }
+        // Counted only once the bytes are out: a frame that failed to write
+        // never inflates the throughput figure.
+        self.0
+            .out
+            .fetch_add(bytes.len() as u64 + 4, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// (bytes written, socket bytes read) on this connection.
+    pub fn bytes(&self) -> (u64, u64) {
+        self.0.bytes()
     }
 
     /// Tear the transport down from any thread; the reading side then fails
@@ -999,6 +1157,7 @@ impl Receiver {
             };
             let mut conn = self.shared.conn.lock().unwrap_or_else(|p| p.into_inner());
             let mut slice = &self.tls[..n];
+            self.shared.in_.fetch_add(n as u64, Ordering::Relaxed);
             while !slice.is_empty() {
                 if conn.read_tls(&mut slice)? == 0 {
                     // rustls' buffer is full: decrypt to make room.
@@ -1026,6 +1185,8 @@ fn split(conn: rustls::Connection, sock: TcpStream) -> Result<(Sender, Receiver)
     let shared = Arc::new(Shared {
         conn: Mutex::new(conn),
         sock,
+        out: AtomicU64::new(0),
+        in_: AtomicU64::new(0),
     });
     Ok((
         Sender(Arc::clone(&shared)),
@@ -1039,22 +1200,288 @@ fn split(conn: rustls::Connection, sock: TcpStream) -> Result<(Sender, Receiver)
     ))
 }
 
+/// One answer to an in-flight cache transfer, as it arrived.
+enum CacheAnswer {
+    Grant(Grant),
+    Chunk(Chunk),
+    End(End),
+    Refused(Refused),
+}
+
+/// Routes cache answers from whichever thread reads the session to the call
+/// waiting on that attempt: a transfer is synchronous — the caller sends the
+/// need and blocks — but the frames arrive on the session reader, so the two
+/// meet here. An answer for an attempt nobody waits on is dropped: the
+/// worker's call has already given up (its deadline passed), and the
+/// controller's stale stream is bounded by that same attempt.
+#[derive(Default)]
+pub struct CacheRouter {
+    waiting: Mutex<HashMap<AttemptId, ChannelSender<CacheAnswer>>>,
+}
+
+impl CacheRouter {
+    /// Claim `attempt` for one transfer. A second concurrent transfer for the
+    /// same attempt is refused `Busy`: the controller tracks one serving per
+    /// attempt.
+    fn register(&self, attempt: AttemptId) -> std::result::Result<Channel<CacheAnswer>, Refusal> {
+        let (tx, rx) = mpsc::channel();
+        let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
+        if waiting.insert(attempt, tx).is_some() {
+            return Err(Refusal::Busy);
+        }
+        Ok(rx)
+    }
+
+    fn unregister(&self, attempt: AttemptId) {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&attempt);
+    }
+
+    /// Hand an answer to the transfer waiting for it, if any.
+    fn route(&self, attempt: AttemptId, answer: CacheAnswer) {
+        if let Some(waiting) = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&attempt)
+        {
+            // The receiver may have given up between the lookup and the send;
+            // a closed channel is not an error here.
+            let _ = waiting.send(answer);
+        }
+    }
+}
+
+/// The worker's [`sentinel_cache::remote::Remote`] over the link (Q08):
+/// requests go out on the bulk connection when one is attached and on the
+/// control connection otherwise, and the session reader routes the answers
+/// back to the call that is waiting for them. Cheap to clone a reference to;
+/// the executor gets it from [`Reporter::remote_cache`].
+pub struct LinkRemote {
+    control: Sender,
+    bulk: Mutex<Option<Sender>>,
+    router: Arc<CacheRouter>,
+}
+
+impl LinkRemote {
+    fn send(&self, message: &ClientMessage) -> Result<()> {
+        let bulk = self
+            .bulk
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        match bulk {
+            Some(bulk) => bulk.send(message),
+            None => self.control.send(message),
+        }
+    }
+
+    /// The bulk connection is up: bulk-class traffic moves to it.
+    fn attach_bulk(&self, bulk: Sender) {
+        *self.bulk.lock().unwrap_or_else(|p| p.into_inner()) = Some(bulk);
+    }
+
+    /// The bulk connection ended: the control connection takes the traffic
+    /// back until a new one is up.
+    fn detach_bulk(&self) {
+        self.bulk.lock().unwrap_or_else(|p| p.into_inner()).take();
+    }
+
+    /// Route one received cache answer to its waiting transfer.
+    fn answer(&self, attempt: AttemptId, answer: CacheAnswer) {
+        self.router.route(attempt, answer);
+    }
+}
+
+impl sentinel_cache::remote::Remote for LinkRemote {
+    fn fetch(
+        &self,
+        need: &Need,
+        deadline: Instant,
+        sink: &mut dyn sentinel_cache::remote::Sink,
+    ) -> std::result::Result<(), Refusal> {
+        let attempt = AttemptId::from_bytes(need.attempt).map_err(|_| Refusal::Denied)?;
+        let answers = self.router.register(attempt)?;
+        // Deregister on every exit, including a sink's early stop.
+        let _claim = Claim {
+            router: &self.router,
+            attempt,
+        };
+        self.send(&ClientMessage::CacheNeed(need.clone()))
+            .map_err(|_| Refusal::Aborted)?;
+        let mut planned = false;
+        loop {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                return Err(Refusal::Aborted);
+            }
+            match answers.recv_timeout(wait) {
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                    return Err(Refusal::Aborted);
+                }
+                Ok(CacheAnswer::Refused(refused)) => {
+                    return Err(Refusal::from_code(refused.code).unwrap_or(Refusal::Denied));
+                }
+                Ok(CacheAnswer::Grant(grant)) => {
+                    if planned {
+                        return Err(Refusal::Store);
+                    }
+                    planned = true;
+                    sink.plan(&grant)?;
+                }
+                Ok(CacheAnswer::Chunk(chunk)) => {
+                    if !planned {
+                        return Err(Refusal::Store);
+                    }
+                    sink.chunk(&chunk)?;
+                }
+                // The end marker is terminal; a stream without a plan never
+                // opened, so it is a protocol violation, not a completion.
+                Ok(CacheAnswer::End(_)) if planned => return Ok(()),
+                Ok(CacheAnswer::End(_)) => return Err(Refusal::Store),
+            }
+        }
+    }
+
+    fn offer(
+        &self,
+        upload: &Upload,
+        deadline: Instant,
+        source: &mut dyn Read,
+    ) -> std::result::Result<(), Refusal> {
+        let attempt = AttemptId::from_bytes(upload.attempt).map_err(|_| Refusal::Denied)?;
+        let answers = self.router.register(attempt)?;
+        let _claim = Claim {
+            router: &self.router,
+            attempt,
+        };
+        self.send(&ClientMessage::CacheOffer(upload.clone()))
+            .map_err(|_| Refusal::Aborted)?;
+        // The controller either grants a stream (it does not store this
+        // digest yet), answers `CacheEnd` (it already stores it) or refuses.
+        let start = match wait_answer(&answers, deadline)? {
+            CacheAnswer::Refused(refused) => {
+                return Err(Refusal::from_code(refused.code).unwrap_or(Refusal::Denied));
+            }
+            CacheAnswer::End(_) => return Ok(()),
+            CacheAnswer::Grant(grant) => grant,
+            CacheAnswer::Chunk(_) => return Err(Refusal::Store),
+        };
+        let mut offset = 0u64;
+        // A granted offset is where the controller wants the stream to start;
+        // today it is always 0, but skipping is cheap and keeps the contract.
+        let mut skip = start.offset;
+        let mut buffer = vec![0u8; MAX_CACHE_CHUNK_BYTES];
+        let mut sent = 0u64;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(Refusal::Aborted);
+            }
+            let read = source
+                .read(&mut buffer)
+                .map_err(|_| Refusal::Aborted)?;
+            if read == 0 {
+                break;
+            }
+            let mut piece = &buffer[..read];
+            if skip > 0 {
+                let drop = skip.min(piece.len() as u64) as usize;
+                skip -= drop as u64;
+                piece = &piece[drop..];
+            }
+            if piece.is_empty() {
+                continue;
+            }
+            self.send(&ClientMessage::CachePush(Push {
+                attempt: upload.attempt,
+                offset,
+                bytes: piece.to_vec(),
+            }))
+            .map_err(|_| Refusal::Aborted)?;
+            offset += piece.len() as u64;
+            sent += piece.len() as u64;
+            if sent > upload.total {
+                return Err(Refusal::Aborted);
+            }
+        }
+        if sent != upload.total {
+            // The source ended before the declared length: never claim a
+            // complete stream the bytes do not back.
+            return Err(Refusal::Aborted);
+        }
+        self.send(&ClientMessage::CachePushEnd(End {
+            attempt: upload.attempt,
+            digest: upload.digest,
+        }))
+        .map_err(|_| Refusal::Aborted)?;
+        match wait_answer(&answers, deadline)? {
+            CacheAnswer::End(_) => Ok(()),
+            CacheAnswer::Refused(refused) => {
+                Err(Refusal::from_code(refused.code).unwrap_or(Refusal::Denied))
+            }
+            CacheAnswer::Grant(_) | CacheAnswer::Chunk(_) => Err(Refusal::Store),
+        }
+    }
+}
+
+/// Answers one transfer waits for, bounded by `deadline`.
+fn wait_answer(
+    answers: &Channel<CacheAnswer>,
+    deadline: Instant,
+) -> std::result::Result<CacheAnswer, Refusal> {
+    let wait = deadline.saturating_duration_since(Instant::now());
+    if wait.is_zero() {
+        return Err(Refusal::Aborted);
+    }
+    match answers.recv_timeout(wait) {
+        Ok(answer) => Ok(answer),
+        Err(_) => Err(Refusal::Aborted),
+    }
+}
+
+/// Removes a transfer's claim when it ends, however it ends.
+struct Claim<'a> {
+    router: &'a CacheRouter,
+    attempt: AttemptId,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.router.unregister(self.attempt);
+    }
+}
+
 /// One accepted, authenticated worker session on the controller.
 pub struct WorkerSession {
     rx: Receiver,
     tx: Sender,
     pub admitted: Admitted,
     pub fingerprint: Digest,
+    /// The capacity the hello reported, kept so the protocol-7 profile is
+    /// recorded together with it, not after a second read.
+    capacity: Capacity,
+    profiled: bool,
 }
 
-/// Complete the TLS handshake on an accepted socket, read the hello, ask the
-/// admission policy, and answer. Returns the live session or the reason it
-/// was refused (after telling the worker so).
+/// One accepted connection, before it is clear which half of a session it
+/// carries: the control connection opens with `Hello`, the bulk connection
+/// with `BulkHello`.
+pub enum Accepted {
+    Control(WorkerSession),
+    /// A second connection of a session whose control half must be live:
+    /// the caller checks that `fingerprint` matches, and only then serves it.
+    Bulk(BulkSession),
+}
+
+/// Complete the TLS handshake on an accepted socket, read the first message,
+/// and answer on the control connection (which runs the admission policy).
 pub fn accept(
     socket: TcpStream,
     config: Arc<rustls::ServerConfig>,
     admission: &dyn Admission,
-) -> Result<WorkerSession> {
+) -> Result<Accepted> {
     socket.set_read_timeout(Some(HEARTBEAT_DEADLINE))?;
     socket.set_nodelay(true)?;
     let mut conn = ServerConnection::new(config).map_err(|e| Error::Tls(e.to_string()))?;
@@ -1070,48 +1497,97 @@ pub fn accept(
         .ok_or(Error::Protocol("no client certificate"))?;
     let (tx, mut rx) = split(rustls::Connection::Server(conn), socket)?;
 
-    let ClientMessage::Hello {
-        hello,
-        worker,
-        name,
-        enrollment,
-        capacity,
-    } = rx.recv(HEARTBEAT_DEADLINE)?
-    else {
-        return Err(Error::Protocol("expected hello"));
-    };
-    let worker = WorkerId::from_bytes(worker).map_err(|_| Error::Protocol("worker id"))?;
-    let secret = match enrollment.as_deref() {
-        Some(text) => {
-            Some(sentinel_auth::token::parse(text).ok_or(Error::Protocol("enrollment secret"))?)
+    match rx.recv::<ClientMessage>(HEARTBEAT_DEADLINE)? {
+        ClientMessage::Hello {
+            hello,
+            worker,
+            name,
+            enrollment,
+            capacity,
+        } => {
+            let worker = WorkerId::from_bytes(worker).map_err(|_| Error::Protocol("worker id"))?;
+            let secret = match enrollment.as_deref() {
+                Some(text) => {
+                    Some(sentinel_auth::token::parse(text).ok_or(Error::Protocol("enrollment secret"))?)
+                }
+                None => None,
+            };
+            match admission.admit(
+                &fingerprint,
+                worker,
+                &name,
+                &hello,
+                secret.as_ref(),
+                capacity,
+            ) {
+                Ok(admitted) => {
+                    tx.send(&ServerMessage::Welcome {
+                        worker: *admitted.worker.as_bytes(),
+                        negotiated: admitted.negotiated,
+                        heartbeat_interval_ms: HEARTBEAT_INTERVAL.as_millis() as u32,
+                    })?;
+                    Ok(Accepted::Control(WorkerSession {
+                        rx,
+                        tx,
+                        admitted,
+                        fingerprint,
+                        capacity,
+                        profiled: false,
+                    }))
+                }
+                Err(rejection) => {
+                    let _ = tx.send(&ServerMessage::Reject(rejection));
+                    Err(Error::Rejected(rejection))
+                }
+            }
         }
-        None => None,
-    };
-    match admission.admit(
-        &fingerprint,
-        worker,
-        &name,
-        &hello,
-        secret.as_ref(),
-        capacity,
-    ) {
-        Ok(admitted) => {
-            tx.send(&ServerMessage::Welcome {
-                worker: *admitted.worker.as_bytes(),
-                negotiated: admitted.negotiated,
-                heartbeat_interval_ms: HEARTBEAT_INTERVAL.as_millis() as u32,
-            })?;
-            Ok(WorkerSession {
+        ClientMessage::BulkHello { worker } => {
+            let worker = WorkerId::from_bytes(worker).map_err(|_| Error::Protocol("worker id"))?;
+            Ok(Accepted::Bulk(BulkSession {
                 rx,
                 tx,
-                admitted,
+                worker,
                 fingerprint,
-            })
+            }))
         }
-        Err(rejection) => {
-            let _ = tx.send(&ServerMessage::Reject(rejection));
-            Err(Error::Rejected(rejection))
-        }
+        _ => Err(Error::Protocol("expected hello")),
+    }
+}
+
+/// The bulk half of a protocol-7 session: the worker's second connection,
+/// carrying logs, spec chunks, artifacts and cache transfers. It is admitted
+/// only when a live control session with the same certificate exists; the
+/// controller checks that before calling [`BulkSession::serve`].
+pub struct BulkSession {
+    rx: Receiver,
+    tx: Sender,
+    pub worker: WorkerId,
+    pub fingerprint: Digest,
+}
+
+impl BulkSession {
+    /// The half the controller pushes bulk answers through.
+    pub fn sender(&self) -> Sender {
+        self.tx.clone()
+    }
+
+    /// Serve bulk messages until the worker says goodbye, stops answering or
+    /// breaks protocol. `protocol` is the control session's negotiated
+    /// version: the bulk connection carries no negotiation of its own.
+    pub fn serve(&mut self, handler: &dyn SessionHandler, protocol: u16) -> Result<()> {
+        // Bulk connections carry no negotiation and cannot report a profile;
+        // the capacity is only ever read by the control connection.
+        let mut profiled = true;
+        serve_connection(
+            handler,
+            self.worker,
+            protocol,
+            false,
+            &mut profiled,
+            Capacity::default(),
+            &mut self.rx,
+            &self.tx,
+        )
     }
 }
 
@@ -1122,268 +1598,490 @@ impl WorkerSession {
     }
 
     /// Serve heartbeats and offer answers until the worker says goodbye,
-    /// stops answering, or breaks protocol.
+    /// stops answering, or breaks protocol. Bulk-class messages are accepted
+    /// here too: a protocol-7 worker whose second connection cannot be
+    /// established falls back to this one.
     pub fn serve(&mut self, handler: &dyn SessionHandler) -> Result<()> {
         let worker = self.admitted.worker;
-        // In-flight artifact per attempt (protocol 4): set when a begin is
-        // granted, cleared by every verdict. Names the verdict a mid-flight
-        // failure answers with and orders begin/file/data/end.
-        let mut artifacts: std::collections::HashMap<AttemptId, String> =
-            std::collections::HashMap::new();
-        loop {
-            match self.rx.recv::<ClientMessage>(HEARTBEAT_DEADLINE)? {
-                ClientMessage::Ping { seq, held } => {
-                    if held.len() > MAX_LIST_ITEMS {
-                        return Err(Error::Protocol("held list"));
-                    }
-                    let held = ids(&held)?;
-                    let beat = handler.ping(worker, &held)?;
-                    self.tx.send(&ServerMessage::Pong {
-                        seq,
-                        lease_until_ms: beat.lease_until.0,
-                        stop: beat.stop.iter().map(|a| *a.as_bytes()).collect(),
-                        cancel: beat.cancel.iter().map(|a| *a.as_bytes()).collect(),
-                    })?;
+        let protocol = self.admitted.negotiated.protocol.0;
+        serve_connection(
+            handler,
+            worker,
+            protocol,
+            true,
+            &mut self.profiled,
+            self.capacity,
+            &mut self.rx,
+            &self.tx,
+        )
+    }
+}
+
+/// Serve one connection's inbound messages until `Bye`, a protocol violation
+/// or loss. `control` marks the control connection: it carries heartbeats,
+/// offer answers and reports, and accepts bulk-class messages as the fallback
+/// path. A bulk connection carries the bulk classes only and refuses
+/// control-class messages, so a misrouted offer can never surface as a
+/// silently dropped heartbeat.
+#[allow(clippy::too_many_arguments)]
+fn serve_connection(
+    handler: &dyn SessionHandler,
+    worker: WorkerId,
+    protocol: u16,
+    control: bool,
+    profiled: &mut bool,
+    capacity: Capacity,
+    rx: &mut Receiver,
+    tx: &Sender,
+) -> Result<()> {
+    // In-flight artifact per attempt (protocol 4): set when a begin is
+    // granted, cleared by every verdict. Names the verdict a mid-flight
+    // failure answers with and orders begin/file/data/end.
+    let mut artifacts: HashMap<AttemptId, String> = HashMap::new();
+    // In-flight upload per attempt (protocol 7): the receiving state a
+    // `CacheOffer` opened, fed by its `CachePush` frames until `CachePushEnd`.
+    let mut uploads: HashMap<AttemptId, sentinel_cache::remote::Receiving> = HashMap::new();
+    // Downloads this connection is streaming right now, bounded so a worker
+    // cannot make the controller spawn threads without limit.
+    let transfers = Arc::new(AtomicUsize::new(0));
+    loop {
+        match rx.recv::<ClientMessage>(HEARTBEAT_DEADLINE)? {
+            ClientMessage::Ping { seq, held } => {
+                if !control {
+                    return Err(Error::Protocol("control message on bulk"));
                 }
-                ClientMessage::Ack { attempt, fence } => {
-                    let attempt =
-                        AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    handler.acknowledged(worker, attempt, Fence(fence));
+                if held.len() > MAX_LIST_ITEMS {
+                    return Err(Error::Protocol("held list"));
                 }
-                ClientMessage::Decline { attempt, fence } => {
-                    let attempt =
-                        AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    handler.declined(worker, attempt, Fence(fence));
+                let held = ids(&held)?;
+                let beat = handler.ping(worker, &held)?;
+                tx.send(&ServerMessage::Pong {
+                    seq,
+                    lease_until_ms: beat.lease_until.0,
+                    stop: beat.stop.iter().map(|a| *a.as_bytes()).collect(),
+                    cancel: beat.cancel.iter().map(|a| *a.as_bytes()).collect(),
+                })?;
+            }
+            ClientMessage::Ack { attempt, fence } => {
+                if !control {
+                    return Err(Error::Protocol("control message on bulk"));
                 }
-                ClientMessage::Report {
-                    attempt,
-                    fence,
-                    event,
-                    summary,
-                } => {
-                    let attempt =
-                        AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    if summary
-                        .as_ref()
-                        .is_some_and(|s| s.len() > MAX_SUMMARY_BYTES)
-                    {
-                        return Err(Error::Protocol("summary size"));
-                    }
-                    handler.reported(worker, attempt, Fence(fence), event.to_event()?, summary);
+                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                handler.acknowledged(worker, attempt, Fence(fence));
+            }
+            ClientMessage::Decline { attempt, fence } => {
+                if !control {
+                    return Err(Error::Protocol("control message on bulk"));
                 }
-                ClientMessage::NeedSpec { attempt } => {
-                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    if handler.spec_requested(
-                        worker,
-                        id,
-                        self.tx.clone(),
-                        self.admitted.negotiated.protocol.0,
-                    ) {
-                        continue;
-                    }
-                    // The synchronous fallback (a handler that resolves inline)
-                    // still owes the protocol gate.
-                    if self.admitted.negotiated.protocol.0 < 3 {
-                        self.tx.send(&ServerMessage::NoSpec { attempt })?;
-                        continue;
-                    }
-                    match handler.spec(worker, id) {
-                        Some((context, bytes)) if bytes.len() <= MAX_SPEC_BYTES => {
-                            self.tx.send(&context_message(
-                                self.admitted.negotiated.protocol.0,
-                                &context,
-                                id,
-                            ))?;
-                            if let Some(access) = context.source {
-                                self.tx.send(&ServerMessage::Source { attempt, access })?;
-                            }
-                            let chunks = bytes.chunks(SPEC_CHUNK_BYTES);
-                            let count = chunks.len().max(1);
-                            if bytes.is_empty() {
-                                self.tx.send(&ServerMessage::Spec {
-                                    attempt,
-                                    seq: 0,
-                                    last: true,
-                                    bytes: Vec::new(),
-                                })?;
-                            }
-                            for (seq, chunk) in chunks.enumerate() {
-                                self.tx.send(&ServerMessage::Spec {
-                                    attempt,
-                                    seq: seq as u32,
-                                    last: seq + 1 == count,
-                                    bytes: chunk.to_vec(),
-                                })?;
-                            }
+                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                handler.declined(worker, attempt, Fence(fence));
+            }
+            ClientMessage::Report {
+                attempt,
+                fence,
+                event,
+                summary,
+            } => {
+                if !control {
+                    return Err(Error::Protocol("control message on bulk"));
+                }
+                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                if summary
+                    .as_ref()
+                    .is_some_and(|s| s.len() > MAX_SUMMARY_BYTES)
+                {
+                    return Err(Error::Protocol("summary size"));
+                }
+                handler.reported(worker, attempt, Fence(fence), event.to_event()?, summary);
+            }
+            ClientMessage::NeedSpec { attempt } => {
+                let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                if handler.spec_requested(worker, id, tx.clone(), protocol) {
+                    continue;
+                }
+                // The synchronous fallback (a handler that resolves inline)
+                // still owes the protocol gate.
+                if protocol < 3 {
+                    tx.send(&ServerMessage::NoSpec { attempt })?;
+                    continue;
+                }
+                match handler.spec(worker, id) {
+                    Some((context, bytes)) if bytes.len() <= MAX_SPEC_BYTES => {
+                        tx.send(&context_message(protocol, &context, id))?;
+                        if let Some(access) = context.source {
+                            tx.send(&ServerMessage::Source { attempt, access })?;
                         }
-                        _ => self.tx.send(&ServerMessage::NoSpec { attempt })?,
+                        let chunks = bytes.chunks(SPEC_CHUNK_BYTES);
+                        let count = chunks.len().max(1);
+                        if bytes.is_empty() {
+                            tx.send(&ServerMessage::Spec {
+                                attempt,
+                                seq: 0,
+                                last: true,
+                                bytes: Vec::new(),
+                            })?;
+                        }
+                        for (seq, chunk) in chunks.enumerate() {
+                            tx.send(&ServerMessage::Spec {
+                                attempt,
+                                seq: seq as u32,
+                                last: seq + 1 == count,
+                                bytes: chunk.to_vec(),
+                            })?;
+                        }
                     }
+                    _ => tx.send(&ServerMessage::NoSpec { attempt })?,
                 }
-                ClientMessage::Log {
-                    attempt,
+            }
+            ClientMessage::Log {
+                attempt,
+                seq,
+                step,
+                stream,
+                bytes,
+            } => {
+                let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                if bytes.len() > MAX_LOG_FRAME_BYTES {
+                    return Err(Error::Protocol("log frame size"));
+                }
+                let stream = Stream::from_code(stream).ok_or(Error::Protocol("stream"))?;
+                let frame = Frame {
                     seq,
                     step,
                     stream,
                     bytes,
-                } => {
-                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    if bytes.len() > MAX_LOG_FRAME_BYTES {
-                        return Err(Error::Protocol("log frame size"));
+                };
+                match handler.log(worker, id, frame) {
+                    LogVerdict::Acked(through) => {
+                        tx.send(&ServerMessage::LogAck { attempt, through })?;
                     }
-                    let stream = Stream::from_code(stream).ok_or(Error::Protocol("stream"))?;
-                    let frame = Frame {
-                        seq,
-                        step,
-                        stream,
-                        bytes,
-                    };
-                    match handler.log(worker, id, frame) {
-                        LogVerdict::Acked(through) => {
-                            self.tx.send(&ServerMessage::LogAck { attempt, through })?;
-                        }
-                        LogVerdict::Refused => {
-                            self.tx.send(&ServerMessage::LogRefused { attempt })?;
-                        }
+                    LogVerdict::Refused => {
+                        tx.send(&ServerMessage::LogRefused { attempt })?;
                     }
                 }
-                ClientMessage::LogEnd {
-                    attempt,
-                    last_seq,
-                    gaps,
-                } => {
-                    if gaps.len() > MAX_GAPS {
-                        return Err(Error::Protocol("gap list"));
+            }
+            ClientMessage::LogEnd {
+                attempt,
+                last_seq,
+                gaps,
+            } => {
+                if gaps.len() > MAX_GAPS {
+                    return Err(Error::Protocol("gap list"));
+                }
+                let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                match handler.log_end(worker, id, last_seq, &gaps) {
+                    // Protocol 5 names the durable-end boundary;
+                    // earlier versions sent nothing here.
+                    LogVerdict::Acked(_) if protocol >= 5 => {
+                        tx.send(&ServerMessage::LogEndAck { attempt })?;
                     }
-                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    match handler.log_end(worker, id, last_seq, &gaps) {
-                        // Protocol 5 names the durable-end boundary;
-                        // earlier versions sent nothing here.
-                        LogVerdict::Acked(_) if self.admitted.negotiated.protocol.0 >= 5 => {
-                            self.tx.send(&ServerMessage::LogEndAck { attempt })?;
-                        }
-                        LogVerdict::Acked(_) => {}
-                        LogVerdict::Refused => {
-                            self.tx.send(&ServerMessage::LogRefused { attempt })?;
-                        }
+                    LogVerdict::Acked(_) => {}
+                    LogVerdict::Refused => {
+                        tx.send(&ServerMessage::LogRefused { attempt })?;
                     }
                 }
-                ClientMessage::Abandon { attempt, fence } => {
-                    let attempt =
-                        AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    handler.abandoned(worker, attempt, Fence(fence));
+            }
+            ClientMessage::Abandon { attempt, fence } => {
+                if !control {
+                    return Err(Error::Protocol("control message on bulk"));
                 }
-                ClientMessage::ArtifactBegin { attempt, name } => {
-                    if self.admitted.negotiated.protocol.0 < 4 {
-                        return Err(Error::Protocol("artifact needs protocol 4"));
-                    }
-                    if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
-                        return Err(Error::Protocol("artifact name"));
-                    }
-                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    if artifacts.contains_key(&id) {
-                        return Err(Error::Protocol("artifact in flight"));
-                    }
-                    match handler.artifact_begin(worker, id, &name) {
-                        ArtifactReply::Grant => {
-                            artifacts.insert(id, name.clone());
-                            self.tx
-                                .send(&ServerMessage::ArtifactGrant { attempt, name })?;
-                        }
-                        ArtifactReply::Verdict(code) => {
-                            self.tx.send(&ServerMessage::ArtifactVerdict {
-                                attempt,
-                                name,
-                                code: code.to_u8(),
-                            })?;
-                        }
-                    }
+                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                handler.abandoned(worker, attempt, Fence(fence));
+            }
+            ClientMessage::ArtifactBegin { attempt, name } => {
+                if protocol < 4 {
+                    return Err(Error::Protocol("artifact needs protocol 4"));
                 }
-                ClientMessage::ArtifactFile {
-                    attempt,
-                    path,
-                    len,
-                    mode,
-                } => {
-                    if path.is_empty()
-                        || path.len() > MAX_ARTIFACT_PATH_BYTES
-                        || len > MAX_ARTIFACT_BYTES
-                    {
-                        return Err(Error::Protocol("artifact file"));
+                if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
+                    return Err(Error::Protocol("artifact name"));
+                }
+                let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                if artifacts.contains_key(&id) {
+                    return Err(Error::Protocol("artifact in flight"));
+                }
+                match handler.artifact_begin(worker, id, &name) {
+                    ArtifactReply::Grant => {
+                        artifacts.insert(id, name.clone());
+                        tx.send(&ServerMessage::ArtifactGrant { attempt, name })?;
                     }
-                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    let name = artifacts
-                        .get(&id)
-                        .cloned()
-                        .ok_or(Error::Protocol("artifact file without begin"))?;
-                    if let Some(code) = handler.artifact_file(worker, id, &path, len, mode) {
-                        artifacts.remove(&id);
-                        self.tx.send(&ServerMessage::ArtifactVerdict {
+                    ArtifactReply::Verdict(code) => {
+                        tx.send(&ServerMessage::ArtifactVerdict {
                             attempt,
                             name,
                             code: code.to_u8(),
                         })?;
                     }
                 }
-                ClientMessage::ArtifactData {
-                    attempt,
-                    seq,
-                    bytes,
-                } => {
-                    if bytes.len() > MAX_ARTIFACT_CHUNK_BYTES {
-                        return Err(Error::Protocol("artifact chunk"));
-                    }
-                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    let name = artifacts
-                        .get(&id)
-                        .cloned()
-                        .ok_or(Error::Protocol("artifact data without begin"))?;
-                    if let Some(code) = handler.artifact_data(worker, id, seq, &bytes) {
-                        artifacts.remove(&id);
-                        self.tx.send(&ServerMessage::ArtifactVerdict {
-                            attempt,
-                            name,
-                            code: code.to_u8(),
-                        })?;
-                    }
+            }
+            ClientMessage::ArtifactFile {
+                attempt,
+                path,
+                len,
+                mode,
+            } => {
+                if path.is_empty()
+                    || path.len() > MAX_ARTIFACT_PATH_BYTES
+                    || len > MAX_ARTIFACT_BYTES
+                {
+                    return Err(Error::Protocol("artifact file"));
                 }
-                ClientMessage::ArtifactEnd { attempt, name } => {
-                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    if artifacts.get(&id) != Some(&name) {
-                        return Err(Error::Protocol("artifact end without begin"));
-                    }
+                let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                let name = artifacts
+                    .get(&id)
+                    .cloned()
+                    .ok_or(Error::Protocol("artifact file without begin"))?;
+                if let Some(code) = handler.artifact_file(worker, id, &path, len, mode) {
                     artifacts.remove(&id);
-                    let code = handler.artifact_end(worker, id, &name);
-                    self.tx.send(&ServerMessage::ArtifactVerdict {
+                    tx.send(&ServerMessage::ArtifactVerdict {
                         attempt,
                         name,
                         code: code.to_u8(),
                     })?;
                 }
-                ClientMessage::ArtifactAbsent {
+            }
+            ClientMessage::ArtifactData {
+                attempt,
+                seq,
+                bytes,
+            } => {
+                if bytes.len() > MAX_ARTIFACT_CHUNK_BYTES {
+                    return Err(Error::Protocol("artifact chunk"));
+                }
+                let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                let name = artifacts
+                    .get(&id)
+                    .cloned()
+                    .ok_or(Error::Protocol("artifact data without begin"))?;
+                if let Some(code) = handler.artifact_data(worker, id, seq, &bytes) {
+                    artifacts.remove(&id);
+                    tx.send(&ServerMessage::ArtifactVerdict {
+                        attempt,
+                        name,
+                        code: code.to_u8(),
+                    })?;
+                }
+            }
+            ClientMessage::ArtifactEnd { attempt, name } => {
+                let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                if artifacts.get(&id) != Some(&name) {
+                    return Err(Error::Protocol("artifact end without begin"));
+                }
+                artifacts.remove(&id);
+                let code = handler.artifact_end(worker, id, &name);
+                tx.send(&ServerMessage::ArtifactVerdict {
                     attempt,
                     name,
-                    reason,
-                } => {
-                    if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
-                        return Err(Error::Protocol("artifact name"));
-                    }
-                    let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                    if let Some(open) = artifacts.get(&id)
-                        && open != &name
-                    {
-                        return Err(Error::Protocol("artifact absent of another"));
-                    }
-                    artifacts.remove(&id);
-                    let code = handler.artifact_absent(worker, id, &name, reason);
-                    self.tx.send(&ServerMessage::ArtifactVerdict {
-                        attempt,
-                        name,
-                        code: code.to_u8(),
-                    })?;
-                }
-                ClientMessage::Bye => return Ok(()),
-                ClientMessage::Hello { .. } => return Err(Error::Protocol("second hello")),
+                    code: code.to_u8(),
+                })?;
             }
+            ClientMessage::ArtifactAbsent {
+                attempt,
+                name,
+                reason,
+            } => {
+                if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
+                    return Err(Error::Protocol("artifact name"));
+                }
+                let id = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+                if let Some(open) = artifacts.get(&id)
+                    && open != &name
+                {
+                    return Err(Error::Protocol("artifact absent of another"));
+                }
+                artifacts.remove(&id);
+                let code = handler.artifact_absent(worker, id, &name, reason);
+                tx.send(&ServerMessage::ArtifactVerdict {
+                    attempt,
+                    name,
+                    code: code.to_u8(),
+                })?;
+            }
+            ClientMessage::Profile(profile) => {
+                if !control {
+                    return Err(Error::Protocol("control message on bulk"));
+                }
+                if protocol < PROFILE_MIN.0 {
+                    return Err(Error::Protocol("profile needs protocol 7"));
+                }
+                if *profiled {
+                    return Err(Error::Protocol("second profile"));
+                }
+                if let Some(what) = profile.invalid() {
+                    return Err(Error::Protocol(what));
+                }
+                handler.profiled(worker, &profile, capacity)?;
+                *profiled = true;
+            }
+            ClientMessage::Transport(stats) => {
+                if !control {
+                    return Err(Error::Protocol("control message on bulk"));
+                }
+                if protocol < PROFILE_MIN.0 {
+                    return Err(Error::Protocol("transport needs protocol 7"));
+                }
+                handler.transport(worker, &stats);
+            }
+            ClientMessage::BulkHello { .. } => {
+                return Err(Error::Protocol(if control {
+                    "bulk hello on control"
+                } else {
+                    "second bulk hello"
+                }));
+            }
+            ClientMessage::CacheNeed(need) => {
+                if protocol < PROFILE_MIN.0 {
+                    return Err(Error::Protocol("cache needs protocol 7"));
+                }
+                let attempt = need.attempt;
+                match handler.cache_need(worker, &need) {
+                    None => send_cache_refused(tx, attempt, Refusal::Denied)?,
+                    Some(root) => {
+                        if transfers.load(Ordering::Acquire) >= MAX_CACHE_TRANSFERS {
+                            send_cache_refused(tx, attempt, Refusal::Busy)?;
+                        } else {
+                            transfers.fetch_add(1, Ordering::AcqRel);
+                            let sender = tx.clone();
+                            let counter = Arc::clone(&transfers);
+                            let spawned = thread::Builder::new()
+                                .name("sentinel-cache-serve".into())
+                                .spawn(move || {
+                                    let _permit = TransferPermit(counter);
+                                    let _ = serve_cache_need(&root, &need, &sender);
+                                });
+                            if spawned.is_err() {
+                                transfers.fetch_sub(1, Ordering::AcqRel);
+                                send_cache_refused(tx, attempt, Refusal::Store)?;
+                            }
+                        }
+                    }
+                }
+            }
+            ClientMessage::CacheOffer(upload) => {
+                if protocol < PROFILE_MIN.0 {
+                    return Err(Error::Protocol("cache needs protocol 7"));
+                }
+                let attempt = upload.attempt;
+                match handler.cache_offer(worker, &upload) {
+                    None => send_cache_refused(tx, attempt, Refusal::Denied)?,
+                    Some(root) => match sentinel_cache::remote::Receiving::begin(&root, &upload) {
+                        // Already stored: no grant, no bytes, done.
+                        Ok(None) => {
+                            tx.send(&ServerMessage::CacheEnd(End {
+                                attempt,
+                                digest: upload.digest,
+                            }))?;
+                        }
+                        Ok(Some(receiving)) => {
+                            tx.send(&ServerMessage::CacheGrant(receiving.grant(&upload)))?;
+                            uploads.insert(attempt_id(attempt)?, receiving);
+                        }
+                        Err(code) => send_cache_refused(tx, attempt, code)?,
+                    },
+                }
+            }
+            ClientMessage::CachePush(push) => {
+                if protocol < PROFILE_MIN.0 {
+                    return Err(Error::Protocol("cache needs protocol 7"));
+                }
+                let attempt = push.attempt;
+                let Some(id) = well_formed_attempt(&attempt) else {
+                    send_cache_refused(tx, attempt, Refusal::Store)?;
+                    continue;
+                };
+                let pushed = match uploads.get_mut(&id) {
+                    Some(receiving) => Some(receiving.push(push.offset, &push.bytes)),
+                    None => None,
+                };
+                match pushed {
+                    Some(Ok(())) => {}
+                    Some(Err(code)) => {
+                        uploads.remove(&id);
+                        send_cache_refused(tx, attempt, code)?;
+                    }
+                    None => send_cache_refused(tx, attempt, Refusal::Store)?,
+                }
+            }
+            ClientMessage::CachePushEnd(end) => {
+                if protocol < PROFILE_MIN.0 {
+                    return Err(Error::Protocol("cache needs protocol 7"));
+                }
+                let attempt = end.attempt;
+                let digest = end.digest;
+                let Some(id) = well_formed_attempt(&attempt) else {
+                    send_cache_refused(tx, attempt, Refusal::Store)?;
+                    continue;
+                };
+                let Some(mut receiving) = uploads.remove(&id) else {
+                    send_cache_refused(tx, attempt, Refusal::Store)?;
+                    continue;
+                };
+                match receiving.end(digest) {
+                    Ok(()) => {
+                        tx.send(&ServerMessage::CacheEnd(End { attempt, digest }))?;
+                    }
+                    Err(code) => send_cache_refused(tx, attempt, code)?,
+                }
+            }
+            ClientMessage::Bye => return Ok(()),
+            ClientMessage::Hello { .. } => return Err(Error::Protocol("second hello")),
+        }
+    }
+}
+
+/// The attempt's id when the bytes are well-formed; `None` means a cache
+/// frame named an id that cannot exist, which is answered `Store` rather
+/// than tearing the session down.
+fn well_formed_attempt(raw: &[u8; 16]) -> Option<AttemptId> {
+    AttemptId::from_bytes(*raw).ok()
+}
+
+fn attempt_id(raw: [u8; 16]) -> Result<AttemptId> {
+    AttemptId::from_bytes(raw).map_err(|_| Error::Protocol("id"))
+}
+
+fn send_cache_refused(sender: &Sender, attempt: [u8; 16], code: Refusal) -> Result<()> {
+    sender.send(&ServerMessage::CacheRefused(Refused {
+        attempt,
+        code: code.code(),
+    }))
+}
+
+/// Counts one download this connection is streaming, released on every exit.
+struct TransferPermit(Arc<AtomicUsize>);
+
+impl Drop for TransferPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Stream one authorized download (Q08) off the session thread: grant,
+/// ordered chunks, end. The chunk size is checked here because the frame cap
+/// is the link's, and a running digest cannot be recomputed for a split
+/// piece.
+fn serve_cache_need(root: &std::path::Path, need: &Need, sender: &Sender) -> Result<()> {
+    let mut serving = match Serving::open(root, need) {
+        Ok(serving) => serving,
+        Err(code) => return send_cache_refused(sender, need.attempt, code),
+    };
+    let plan = serving.plan();
+    let digest = plan.digest;
+    sender.send(&ServerMessage::CacheGrant(plan))?;
+    loop {
+        match serving.next() {
+            Ok(Some(chunk)) => {
+                if chunk.bytes.len() > MAX_CACHE_CHUNK_BYTES {
+                    return send_cache_refused(sender, need.attempt, Refusal::TooLarge);
+                }
+                sender.send(&ServerMessage::CacheChunk(chunk))?;
+            }
+            Ok(None) => {
+                return sender.send(&ServerMessage::CacheEnd(End {
+                    attempt: need.attempt,
+                    digest,
+                }));
+            }
+            Err(code) => return send_cache_refused(sender, need.attempt, code),
         }
     }
 }
@@ -1407,6 +2105,18 @@ pub struct Link {
     pub negotiated: Negotiated,
     interval: Duration,
     seq: u64,
+    /// Where the bulk connection dials back to, and with which identity.
+    addr: SocketAddr,
+    client: Arc<rustls::ClientConfig>,
+    /// The session's remote side: the live bulk attachment and the cache
+    /// transfer router. Shared with the reader threads.
+    remote: Arc<LinkRemote>,
+    /// Process telemetry to refresh on the control connection (Q07).
+    transport: Option<TransportStats>,
+    beats: u64,
+    /// Whether [`Reporter::remote_cache`] hands the executor a handle (Q08):
+    /// off by configuration, every remote lookup is a local miss.
+    remote_cache: bool,
 }
 
 impl std::fmt::Debug for Link {
@@ -1435,8 +2145,8 @@ pub fn connect(
     socket.set_nodelay(true)?;
     // The name is irrelevant with a pinned fingerprint but rustls needs one.
     let server_name = ServerName::try_from("sentinel").expect("static name");
-    let mut conn =
-        ClientConnection::new(config, server_name).map_err(|e| Error::Tls(e.to_string()))?;
+    let mut conn = ClientConnection::new(Arc::clone(&config), server_name)
+        .map_err(|e| Error::Tls(e.to_string()))?;
     let mut sock = &socket;
     while conn.is_handshaking() {
         conn.complete_io(&mut sock)?;
@@ -1457,11 +2167,21 @@ pub fn connect(
             heartbeat_interval_ms,
         } => Ok(Link {
             rx,
-            tx,
+            tx: tx.clone(),
             worker: WorkerId::from_bytes(worker).map_err(|_| Error::Protocol("worker id"))?,
             negotiated,
             interval: Duration::from_millis(u64::from(heartbeat_interval_ms)),
             seq: 0,
+            addr,
+            client: config,
+            remote: Arc::new(LinkRemote {
+                control: tx,
+                bulk: Mutex::new(None),
+                router: Arc::new(CacheRouter::default()),
+            }),
+            transport: None,
+            beats: 0,
+            remote_cache: true,
         }),
         ServerMessage::Reject(why) => Err(Error::Rejected(why)),
         ServerMessage::Pong { .. }
@@ -1475,24 +2195,59 @@ pub fn connect(
         | ServerMessage::LogRefused { .. }
         | ServerMessage::LogEndAck { .. }
         | ServerMessage::ArtifactGrant { .. }
-        | ServerMessage::ArtifactVerdict { .. } => Err(Error::Protocol("message before welcome")),
+        | ServerMessage::ArtifactVerdict { .. }
+        | ServerMessage::CacheGrant(_)
+        | ServerMessage::CacheChunk(_)
+        | ServerMessage::CacheEnd(_)
+        | ServerMessage::CacheRefused(_) => Err(Error::Protocol("message before welcome")),
     }
 }
 
 /// The executor's way to speak on the session from its own threads: state
-/// events under the attempt's fence, and spec requests. Sending fails once
-/// the session is gone; the executor keeps the event and resends it when it
-/// is attached to the next session.
+/// events under the attempt's fence, spec requests, log frames and artifact
+/// publication. Sending fails once the session is gone; the executor keeps
+/// the event and resends it when it is attached to the next session.
+///
+/// From protocol 7 the bulk-class messages (spec requests, logs, artifacts)
+/// prefer the bulk connection and fall back to the control one when no bulk
+/// connection is up; reports and abandons always go control, because their
+/// latency is what keeps a lease alive.
 #[derive(Clone)]
 pub struct Reporter {
-    tx: Sender,
+    control: Sender,
+    /// Protocol 7: the session's remote side, which owns the live bulk
+    /// attachment. `None` below protocol 7, where everything is control.
+    bulk: Option<Arc<LinkRemote>>,
+    /// Whether the remote cache is exposed to the executor at all (Q08):
+    /// protocol 7 and not disabled by configuration.
+    remote_cache: bool,
     protocol: u16,
 }
 
 impl Reporter {
+    fn bulk_class(&self, message: &ClientMessage) -> Result<()> {
+        match &self.bulk {
+            Some(remote) => remote.send(message),
+            None => self.control.send(message),
+        }
+    }
+
+    /// Protocol 7 (Q08). The session's remote cache: fetch and offer objects
+    /// over the link. `None` below protocol 7 or when the operator disabled
+    /// remote cache in this process's configuration; the executor must then
+    /// treat every remote lookup as a local miss, never as a failure.
+    pub fn remote_cache(&self) -> Option<Arc<dyn sentinel_cache::remote::Remote>> {
+        if !self.remote_cache {
+            return None;
+        }
+        self.bulk
+            .as_ref()
+            .map(|remote| Arc::clone(remote) as Arc<dyn sentinel_cache::remote::Remote>)
+    }
+
     pub fn report(&self, attempt: AttemptId, fence: Fence, event: Event) -> Result<()> {
         let event = WireEvent::from_event(event).ok_or(Error::Protocol("not a worker event"))?;
-        self.tx.send(&ClientMessage::Report {
+        self.control.send(&ClientMessage::Report {
             attempt: *attempt.as_bytes(),
             fence: fence.0,
             event,
@@ -1512,7 +2267,7 @@ impl Reporter {
         if summary.len() > MAX_SUMMARY_BYTES {
             return Err(Error::Protocol("summary size"));
         }
-        self.tx.send(&ClientMessage::Report {
+        self.control.send(&ClientMessage::Report {
             attempt: *attempt.as_bytes(),
             fence: fence.0,
             event,
@@ -1521,7 +2276,7 @@ impl Reporter {
     }
 
     pub fn need_spec(&self, attempt: AttemptId) -> Result<()> {
-        self.tx.send(&ClientMessage::NeedSpec {
+        self.bulk_class(&ClientMessage::NeedSpec {
             attempt: *attempt.as_bytes(),
         })
     }
@@ -1532,7 +2287,7 @@ impl Reporter {
         if frame.bytes.len() > MAX_LOG_FRAME_BYTES {
             return Err(Error::Protocol("log frame size"));
         }
-        self.tx.send(&ClientMessage::Log {
+        self.bulk_class(&ClientMessage::Log {
             attempt: *attempt.as_bytes(),
             seq: frame.seq,
             step: frame.step,
@@ -1549,14 +2304,14 @@ impl Reporter {
 
     /// The attempt was in this worker's leftovers after a restart.
     pub fn abandon(&self, attempt: AttemptId, fence: Fence) -> Result<()> {
-        self.tx.send(&ClientMessage::Abandon {
+        self.control.send(&ClientMessage::Abandon {
             attempt: *attempt.as_bytes(),
             fence: fence.0,
         })
     }
 
     pub fn log_end(&self, attempt: AttemptId, last_seq: u64, gaps: &[(u64, u64)]) -> Result<()> {
-        self.tx.send(&ClientMessage::LogEnd {
+        self.bulk_class(&ClientMessage::LogEnd {
             attempt: *attempt.as_bytes(),
             last_seq,
             gaps: gaps.to_vec(),
@@ -1578,7 +2333,7 @@ impl Reporter {
         if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_BYTES {
             return Err(Error::Protocol("artifact name"));
         }
-        self.tx.send(&ClientMessage::ArtifactBegin {
+        self.bulk_class(&ClientMessage::ArtifactBegin {
             attempt: *attempt.as_bytes(),
             name: name.to_string(),
         })
@@ -1590,7 +2345,7 @@ impl Reporter {
         if path.is_empty() || path.len() > MAX_ARTIFACT_PATH_BYTES || len > MAX_ARTIFACT_BYTES {
             return Err(Error::Protocol("artifact file"));
         }
-        self.tx.send(&ClientMessage::ArtifactFile {
+        self.bulk_class(&ClientMessage::ArtifactFile {
             attempt: *attempt.as_bytes(),
             path: path.to_string(),
             len,
@@ -1603,7 +2358,7 @@ impl Reporter {
         if bytes.len() > MAX_ARTIFACT_CHUNK_BYTES {
             return Err(Error::Protocol("artifact chunk"));
         }
-        self.tx.send(&ClientMessage::ArtifactData {
+        self.bulk_class(&ClientMessage::ArtifactData {
             attempt: *attempt.as_bytes(),
             seq,
             bytes: bytes.to_vec(),
@@ -1612,7 +2367,7 @@ impl Reporter {
 
     /// The artifact's file set is complete; the verdict is terminal.
     pub fn artifact_end(&self, attempt: AttemptId, name: &str) -> Result<()> {
-        self.tx.send(&ClientMessage::ArtifactEnd {
+        self.bulk_class(&ClientMessage::ArtifactEnd {
             attempt: *attempt.as_bytes(),
             name: name.to_string(),
         })
@@ -1624,7 +2379,7 @@ impl Reporter {
         if self.protocol < 4 {
             return Err(Error::Protocol("artifact needs protocol 4"));
         }
-        self.tx.send(&ClientMessage::ArtifactAbsent {
+        self.bulk_class(&ClientMessage::ArtifactAbsent {
             attempt: *attempt.as_bytes(),
             name: name.to_string(),
             reason,
@@ -1676,6 +2431,57 @@ impl Link {
         self.interval
     }
 
+    /// Protocol 7: report the scheduling profile, immediately after
+    /// `Welcome`. A no-op on an older session: the controller negotiated
+    /// what it can decode, and a lower version means the extras do not
+    /// travel. Refuses a profile outside its bounds rather than truncating.
+    pub fn send_profile(&mut self, profile: &Profile) -> Result<()> {
+        if self.negotiated.protocol.0 < PROFILE_MIN.0 {
+            return Ok(());
+        }
+        if let Some(what) = profile.invalid() {
+            return Err(Error::Protocol(what));
+        }
+        self.tx.send(&ClientMessage::Profile(profile.clone()))
+    }
+
+    /// Protocol 7 (Q07): report transport telemetry and keep refreshing it
+    /// (round-trip time and byte counters) every `TRANSPORT_BEATS` beats. A
+    /// no-op on an older session.
+    pub fn report_transport(&mut self, stats: &TransportStats) -> Result<()> {
+        if self.negotiated.protocol.0 < PROFILE_MIN.0 {
+            return Ok(());
+        }
+        self.transport = Some(stats.clone());
+        self.tx.send(&ClientMessage::Transport(stats.clone()))
+    }
+
+    /// Frame bytes written to / socket bytes read from the control
+    /// connection (Q07).
+    pub fn bytes(&self) -> (u64, u64) {
+        self.tx.bytes()
+    }
+
+    /// Whether this session exposes the remote cache to the executor (Q08).
+    /// Disabled, [`Reporter::remote_cache`] answers `None` and the executor
+    /// treats every remote lookup as a local miss — the link still carries
+    /// whatever the other side asks for, since that is their decision.
+    pub fn set_remote_cache(&mut self, enabled: bool) {
+        self.remote_cache = enabled;
+    }
+
+    /// Protocol 7: how the bulk connection is dialled, or `None` below it.
+    /// Detached from the control `Link` so the bulk thread can redial on its
+    /// own after its connection dies.
+    pub fn bulk_dialer(&self) -> Option<BulkDialer> {
+        (self.negotiated.protocol.0 >= PROFILE_MIN.0).then(|| BulkDialer {
+            addr: self.addr,
+            client: Arc::clone(&self.client),
+            worker: self.worker,
+            remote: Arc::clone(&self.remote),
+        })
+    }
+
     fn ping(&mut self, executor: &dyn Executor) -> Result<()> {
         self.seq += 1;
         let held: Vec<[u8; 16]> = executor
@@ -1690,11 +2496,30 @@ impl Link {
         })
     }
 
+    /// Refresh the telemetry a completed beat makes measurable: the
+    /// round-trip time of the ping/pong pair and the connection's byte
+    /// counters, resent every `TRANSPORT_BEATS` beats.
+    fn beat_recorded(&mut self, rtt: Duration) -> Result<()> {
+        self.beats += 1;
+        let Some(stats) = self.transport.as_mut() else {
+            return Ok(());
+        };
+        stats.rtt_ns = Some(rtt.as_nanos().min(u64::MAX as u128) as u64);
+        let (out, bytes_in) = self.tx.bytes();
+        stats.bytes_out = out;
+        stats.bytes_in = bytes_in;
+        if self.beats % TRANSPORT_BEATS == 0 {
+            self.tx.send(&ClientMessage::Transport(stats.clone()))?;
+        }
+        Ok(())
+    }
+
     /// One beat: send a ping and wait for its pong within the deadline.
     /// Offers arriving in between are answered through `executor`.
     pub fn beat(&mut self, executor: &dyn Executor) -> Result<()> {
         self.ping(executor)?;
-        let deadline = std::time::Instant::now() + HEARTBEAT_DEADLINE;
+        let sent = std::time::Instant::now();
+        let deadline = sent + HEARTBEAT_DEADLINE;
         let mut state = Inbound::default();
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -1702,6 +2527,7 @@ impl Link {
                 None => return Err(Error::Lost),
                 Some(message) => {
                     if self.handle(message, executor, &mut state)? {
+                        self.beat_recorded(sent.elapsed())?;
                         return Ok(());
                     }
                 }
@@ -1709,14 +2535,15 @@ impl Link {
         }
     }
 
-    /// Handle one message; true when it was the awaited pong.
+    /// Handle one message on the control connection; true when it was the
+    /// awaited pong. Bulk-class messages are accepted here as the fallback
+    /// path when the worker has no second connection up.
     fn handle(
         &mut self,
         message: ServerMessage,
         executor: &dyn Executor,
         state: &mut Inbound,
     ) -> Result<bool> {
-        let seen = &mut state.seen;
         match message {
             ServerMessage::Pong {
                 seq,
@@ -1740,6 +2567,7 @@ impl Link {
                 let offer = Offer::from_wire(wire)?;
                 // Dedup within the session: a repeated offer of an attempt
                 // already taken is re-acknowledged, never re-executed.
+                let seen = &mut state.seen;
                 let take = if seen.insert(offer.attempt) {
                     executor.offered(&offer)
                 } else {
@@ -1756,93 +2584,12 @@ impl Link {
                 }
                 Ok(false)
             }
-            ServerMessage::Spec {
-                attempt,
-                seq,
-                last,
-                bytes,
-            } => {
-                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                let buffer = state.specs.entry(attempt).or_default();
-                if seq as usize != buffer.1 || buffer.0.len() + bytes.len() > MAX_SPEC_BYTES {
-                    return Err(Error::Protocol("spec chunk"));
-                }
-                buffer.0.extend_from_slice(&bytes);
-                buffer.1 += 1;
-                if last {
-                    let (bytes, _) = state.specs.remove(&attempt).expect("just inserted");
-                    let context = state
-                        .contexts
-                        .remove(&attempt)
-                        .ok_or(Error::Protocol("spec without context"))?;
-                    executor.spec(attempt, context, bytes);
-                }
-                Ok(false)
-            }
-            ServerMessage::Context(wire) => {
-                let (attempt, context) = JobContext::from_wire(wire)?;
-                state.contexts.insert(attempt, context);
-                Ok(false)
-            }
-            // Protocol 6 shape: carries the tenant and the cache trust
-            // class; same in-flight bookkeeping as `Context`.
-            ServerMessage::Context2(wire) => {
-                let (attempt, context) = JobContext::from_wire2(wire)?;
-                state.contexts.insert(attempt, context);
-                Ok(false)
-            }
-            ServerMessage::Source { attempt, access } => {
-                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                if !access.validate(UnixMillis::now().0) {
-                    return Err(Error::Protocol("source access"));
-                }
-                let context = state
-                    .contexts
-                    .get_mut(&attempt)
-                    .ok_or(Error::Protocol("source without context"))?;
-                if context.source.replace(access).is_some() {
-                    return Err(Error::Protocol("duplicate source"));
-                }
-                Ok(false)
-            }
-            ServerMessage::LogAck { attempt, through } => {
-                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                executor.log_acked(attempt, through);
-                Ok(false)
-            }
-            ServerMessage::LogRefused { attempt } => {
-                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                executor.log_refused(attempt);
-                Ok(false)
-            }
-            ServerMessage::LogEndAck { attempt } => {
-                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                executor.log_ended(attempt);
-                Ok(false)
-            }
-            ServerMessage::ArtifactGrant { attempt, name } => {
-                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                executor.artifact_granted(attempt, &name);
-                Ok(false)
-            }
-            ServerMessage::ArtifactVerdict {
-                attempt,
-                name,
-                code,
-            } => {
-                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                executor.artifact_verdict(attempt, &name, ArtifactCode::from_u8(code));
-                Ok(false)
-            }
-            ServerMessage::NoSpec { attempt } => {
-                let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                state.specs.remove(&attempt);
-                state.contexts.remove(&attempt);
-                executor.no_spec(attempt);
-                Ok(false)
-            }
             ServerMessage::Welcome { .. } | ServerMessage::Reject(_) => {
                 Err(Error::Protocol("unexpected message"))
+            }
+            bulk => {
+                handle_bulk_message(bulk, executor, state, &self.remote)?;
+                Ok(false)
             }
         }
     }
@@ -1858,7 +2605,9 @@ impl Link {
     /// offers answered the moment they arrive.
     pub fn run(&mut self, executor: &dyn Executor, mut until: impl FnMut() -> bool) -> Result<()> {
         executor.attached(Reporter {
-            tx: self.tx.clone(),
+            control: self.tx.clone(),
+            bulk: (self.negotiated.protocol.0 >= PROFILE_MIN.0).then(|| Arc::clone(&self.remote)),
+            remote_cache: self.remote_cache && self.negotiated.protocol.0 >= PROFILE_MIN.0,
             protocol: self.negotiated.protocol.0,
         });
         let outcome = self.serve(executor, &mut until);
@@ -1889,6 +2638,10 @@ impl Link {
             if let Some(message) = self.rx.recv_timeout::<ServerMessage>(wait)?
                 && self.handle(message, executor, &mut state)?
             {
+                let rtt = awaiting.map_or(HEARTBEAT_INTERVAL, |since| {
+                    std::time::Instant::now().duration_since(since)
+                });
+                self.beat_recorded(rtt)?;
                 awaiting = None;
                 // Forget answered attempts the executor no longer holds.
                 let held = executor.held();
@@ -1899,12 +2652,240 @@ impl Link {
     }
 }
 
+/// Handle one bulk-class answer on either connection (the bulk one normally,
+/// the control one as a fallback) and hand cache answers to the transfer
+/// waiting for them.
+fn handle_bulk_message(
+    message: ServerMessage,
+    executor: &dyn Executor,
+    state: &mut Inbound,
+    remote: &LinkRemote,
+) -> Result<()> {
+    match message {
+        ServerMessage::Spec {
+            attempt,
+            seq,
+            last,
+            bytes,
+        } => {
+            let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+            let buffer = state.specs.entry(attempt).or_default();
+            if seq as usize != buffer.1 || buffer.0.len() + bytes.len() > MAX_SPEC_BYTES {
+                return Err(Error::Protocol("spec chunk"));
+            }
+            buffer.0.extend_from_slice(&bytes);
+            buffer.1 += 1;
+            if last {
+                let (bytes, _) = state.specs.remove(&attempt).expect("just inserted");
+                let context = state
+                    .contexts
+                    .remove(&attempt)
+                    .ok_or(Error::Protocol("spec without context"))?;
+                executor.spec(attempt, context, bytes);
+            }
+        }
+        ServerMessage::Context(wire) => {
+            let (attempt, context) = JobContext::from_wire(wire)?;
+            state.contexts.insert(attempt, context);
+        }
+        // Protocol 6 shape: carries the tenant and the cache trust
+        // class; same in-flight bookkeeping as `Context`.
+        ServerMessage::Context2(wire) => {
+            let (attempt, context) = JobContext::from_wire2(wire)?;
+            state.contexts.insert(attempt, context);
+        }
+        ServerMessage::Source { attempt, access } => {
+            let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+            if !access.validate(UnixMillis::now().0) {
+                return Err(Error::Protocol("source access"));
+            }
+            let context = state
+                .contexts
+                .get_mut(&attempt)
+                .ok_or(Error::Protocol("source without context"))?;
+            if context.source.replace(access).is_some() {
+                return Err(Error::Protocol("duplicate source"));
+            }
+        }
+        ServerMessage::LogAck { attempt, through } => {
+            let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+            executor.log_acked(attempt, through);
+        }
+        ServerMessage::LogRefused { attempt } => {
+            let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+            executor.log_refused(attempt);
+        }
+        ServerMessage::LogEndAck { attempt } => {
+            let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+            executor.log_ended(attempt);
+        }
+        ServerMessage::ArtifactGrant { attempt, name } => {
+            let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+            executor.artifact_granted(attempt, &name);
+        }
+        ServerMessage::ArtifactVerdict {
+            attempt,
+            name,
+            code,
+        } => {
+            let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+            executor.artifact_verdict(attempt, &name, ArtifactCode::from_u8(code));
+        }
+        ServerMessage::NoSpec { attempt } => {
+            let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+            state.specs.remove(&attempt);
+            state.contexts.remove(&attempt);
+            executor.no_spec(attempt);
+        }
+        ServerMessage::CacheGrant(grant) => {
+            let attempt =
+                AttemptId::from_bytes(grant.attempt).map_err(|_| Error::Protocol("id"))?;
+            remote.answer(attempt, CacheAnswer::Grant(grant));
+        }
+        ServerMessage::CacheChunk(chunk) => {
+            let attempt =
+                AttemptId::from_bytes(chunk.attempt).map_err(|_| Error::Protocol("id"))?;
+            remote.answer(attempt, CacheAnswer::Chunk(chunk));
+        }
+        ServerMessage::CacheEnd(end) => {
+            let attempt = AttemptId::from_bytes(end.attempt).map_err(|_| Error::Protocol("id"))?;
+            remote.answer(attempt, CacheAnswer::End(end));
+        }
+        ServerMessage::CacheRefused(refused) => {
+            let attempt =
+                AttemptId::from_bytes(refused.attempt).map_err(|_| Error::Protocol("id"))?;
+            remote.answer(attempt, CacheAnswer::Refused(refused));
+        }
+        ServerMessage::Welcome { .. }
+        | ServerMessage::Reject(_)
+        | ServerMessage::Pong { .. }
+        | ServerMessage::Offer(_) => return Err(Error::Protocol("control message on bulk")),
+    }
+    Ok(())
+}
+
+/// How long a bulk reader waits for the next frame before checking whether
+/// the session ended; bulk has no heartbeat of its own, the control
+/// connection is the liveness signal.
+const BULK_POLL: Duration = Duration::from_millis(500);
+
+/// How the bulk connection is dialled: the session's address, identity and
+/// remote state, detached from the control `Link` so the bulk thread can
+/// redial after its connection dies.
+#[derive(Clone)]
+pub struct BulkDialer {
+    addr: SocketAddr,
+    client: Arc<rustls::ClientConfig>,
+    worker: WorkerId,
+    remote: Arc<LinkRemote>,
+}
+
+impl BulkDialer {
+    /// Dial the second connection and announce it with `BulkHello`. The
+    /// controller attaches it to the live control session with the same
+    /// certificate; no answer is sent — the bulk path is usable as soon as
+    /// this returns.
+    pub fn open(&self) -> Result<BulkLink> {
+        let socket = TcpStream::connect_timeout(&self.addr, HEARTBEAT_DEADLINE)?;
+        socket.set_read_timeout(Some(HEARTBEAT_DEADLINE))?;
+        socket.set_nodelay(true)?;
+        let server_name = ServerName::try_from("sentinel").expect("static name");
+        let mut conn = ClientConnection::new(Arc::clone(&self.client), server_name)
+            .map_err(|e| Error::Tls(e.to_string()))?;
+        let mut sock = &socket;
+        while conn.is_handshaking() {
+            conn.complete_io(&mut sock)?;
+        }
+        let (tx, rx) = split(rustls::Connection::Client(conn), socket)?;
+        tx.send(&ClientMessage::BulkHello {
+            worker: *self.worker.as_bytes(),
+        })?;
+        // Bulk-class sends move here now; the control connection stays the
+        // fallback until this connection ends.
+        self.remote.attach_bulk(tx.clone());
+        Ok(BulkLink {
+            rx,
+            tx,
+            worker: self.worker,
+            remote: Arc::clone(&self.remote),
+        })
+    }
+}
+
+/// The worker's bulk connection: anyone may send on it, exactly one thread
+/// reads it, and the cache router is fed from that read.
+pub struct BulkLink {
+    rx: Receiver,
+    tx: Sender,
+    worker: WorkerId,
+    remote: Arc<LinkRemote>,
+}
+
+impl BulkLink {
+    pub fn sender(&self) -> Sender {
+        self.tx.clone()
+    }
+
+    pub fn worker(&self) -> WorkerId {
+        self.worker
+    }
+
+    /// End the connection from here; the reader fails out of its read.
+    pub fn close(&self) {
+        self.tx.close();
+    }
+
+    /// Serve the controller's bulk answers until `until` returns true, the
+    /// connection is lost, or the peer breaks protocol. Detaches the bulk
+    /// attachment on the way out, so senders fall back to the control
+    /// connection instead of writing into a dead socket.
+    pub fn run(&mut self, executor: &dyn Executor, mut until: impl FnMut() -> bool) -> Result<()> {
+        let mut state = Inbound::default();
+        let outcome = loop {
+            if until() {
+                break Ok(());
+            }
+            match self.rx.recv_timeout::<ServerMessage>(BULK_POLL) {
+                Ok(None) => continue,
+                Ok(Some(message)) => {
+                    if let Err(error) = handle_bulk_message(message, executor, &mut state, &self.remote)
+                    {
+                        break Err(error);
+                    }
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        self.remote.detach_bulk();
+        outcome
+    }
+}
+
 /// Per-session inbound state: offers already answered, specs in flight.
 #[derive(Default)]
 struct Inbound {
     seen: std::collections::HashSet<AttemptId>,
     specs: std::collections::HashMap<AttemptId, (Vec<u8>, usize)>,
     contexts: std::collections::HashMap<AttemptId, JobContext>,
+}
+
+/// The machine identity a worker reports in its protocol-7 profile: 16 bytes
+/// derived from the host's machine id, so sibling worker processes on one
+/// host agree on it — a host-level failure or drain can then be told apart
+/// from one process's. All zero when the host has no readable machine id:
+/// an unknown host, never a shared one.
+pub fn host_id() -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let text = text.trim();
+            if !text.is_empty() {
+                out.copy_from_slice(&blake3::hash(text.as_bytes()).as_bytes()[..16]);
+                return out;
+            }
+        }
+    }
+    out
 }
 
 /// Bind a listener for tests and the controller alike.

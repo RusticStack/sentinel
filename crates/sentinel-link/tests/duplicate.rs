@@ -127,7 +127,11 @@ fn a_repeated_offer_is_acknowledged_twice_and_executed_once() {
         let (controller, offer) = (Arc::clone(&controller), offer.clone());
         thread::spawn(move || {
             let (socket, _) = listener.accept().unwrap();
-            let mut s = session::accept(socket, config, &*controller).unwrap();
+            let session::Accepted::Control(mut s) =
+                session::accept(socket, config, &*controller).unwrap()
+            else {
+                panic!("the control hello must be admitted");
+            };
             let sender = s.sender();
             // The same offer, twice, then serve until the worker says goodbye.
             session::offer(&sender, &offer).unwrap();

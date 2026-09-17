@@ -359,6 +359,8 @@ impl WorkerProcess {
                 h
             },
             capacity: CAPACITY,
+            profile: sentinel_protocol::negotiate::Profile::default(),
+            transport: sentinel_link::session::TransportStats::default(),
         };
         let (grip, log) = (Arc::clone(&handle), Arc::clone(&events));
         let thread = thread::spawn(move || {

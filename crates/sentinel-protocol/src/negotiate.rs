@@ -15,9 +15,23 @@ pub struct ProtocolVersion(pub u16);
 /// `ArtifactGrant`/`ArtifactVerdict` answers). Protocol 5 adds `LogEndAck`:
 /// the controller answers `LogEnd` once the end marker is durable, and the
 /// worker drops its spool only then. Protocol 6 adds `Context2`, the job
-/// context carrying the tenant and the cache trust class.
+/// context carrying the tenant and the cache trust class. Protocol 7 adds
+/// the scheduling `Profile`, the second bulk connection (`BulkHello`), the
+/// transport telemetry (`Transport`) and the remote-cache transfer messages;
+/// see `Profile` for why the extras are a message rather than new `Hello`
+/// fields.
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(6);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(7);
+
+/// First protocol whose sessions carry the `Profile`, the bulk connection
+/// and the remote-cache messages. The worker sends the profile immediately
+/// after `Welcome` when the negotiated version is at least this.
+pub const PROFILE_MIN: ProtocolVersion = ProtocolVersion(7);
+
+/// Scheduling labels one worker may advertise. Bounded like every wire
+/// list: a profile that exceeds a bound is a protocol error, never a silent
+/// truncation.
+pub const MAX_PROFILE_LABELS: usize = 16;
 
 /// Capabilities are a bit set: cheap to store, compare and intersect, and
 /// unknown bits from a newer worker are ignored rather than rejected.
@@ -81,6 +95,16 @@ impl Arch {
 
 /// First message on a worker session. Bounded: every field is fixed-size or
 /// capped by `limits::MAX_NAME_BYTES`.
+///
+/// Protocol 7's scheduling extras (labels, host, disk, availability) are
+/// deliberately **not** fields here. Postcard is not self-describing: a
+/// struct decodes exactly the field list its reader knows, so a trailing
+/// field added to `Hello` would make every older worker undecodable, and a
+/// `#[serde(default)]` field never fires because the reader hits the end of
+/// the frame instead of an end-of-sequence. The extras therefore travel in
+/// `ClientMessage::Profile`, sent immediately after `Welcome` once the
+/// session negotiated protocol 7 or later — append-only exactly like every
+/// other wire addition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub protocol_min: ProtocolVersion,
@@ -89,6 +113,65 @@ pub struct Hello {
     pub arch: Arch,
     /// Worker software version string for diagnostics only; never a compatibility input.
     pub software: String,
+}
+
+/// What a worker offers the scheduler beyond raw CPU and memory (protocol 7):
+/// the labels it selects work by, the machine identity it shares with sibling
+/// worker processes, the scratch disk it can give jobs, and the images and
+/// cache state it already holds. Every field is what the worker measured at
+/// this hello; a worker that cannot measure one reports the default, never a
+/// guess.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Profile {
+    /// Scheduling labels, at most [`MAX_PROFILE_LABELS`], each at most
+    /// `limits::MAX_NAME_BYTES`. A job that selects labels a worker did not
+    /// report never places there.
+    pub labels: Vec<String>,
+    /// The machine hosting this worker, so a host-level failure or drain can
+    /// be told apart from one process's; all zero when the worker does not
+    /// report one (then it is treated as unknown, never as a shared host).
+    pub host_id: [u8; 16],
+    /// Free scratch disk the worker can give jobs, in bytes. Zero means "not
+    /// reported": jobs that require scratch disk never place on it.
+    pub disk_bytes: u64,
+    pub availability: Availability,
+}
+
+impl Profile {
+    /// The first bounded field that is out of range, if any. A profile that
+    /// exceeds a bound is a protocol error, never a silent truncation.
+    pub fn invalid(&self) -> Option<&'static str> {
+        if self.labels.len() > MAX_PROFILE_LABELS {
+            return Some("labels");
+        }
+        if self
+            .labels
+            .iter()
+            .any(|label| label.is_empty() || label.len() > crate::limits::MAX_NAME_BYTES)
+        {
+            return Some("label");
+        }
+        if self.availability.images.len() > crate::limits::MAX_LIST_ITEMS {
+            return Some("images");
+        }
+        None
+    }
+}
+
+/// What the worker's runtime already holds, as it measures at this hello.
+/// `images` names the first 8 bytes of each resident image digest — enough to
+/// tell "this worker would not need to pull it again" without shipping a
+/// digest per image.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Availability {
+    pub images: Vec<[u8; 8]>,
+    /// Local cache bytes the worker can serve without fetching them.
+    pub cache_bytes: u64,
+    /// The worker's last measured CPU load, in nanoseconds of busy time over
+    /// its measurement window; zero means "not measured", never "idle".
+    pub load_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,7 +280,7 @@ mod tests {
     #[test]
     fn version_mismatch_says_who_must_upgrade() {
         assert_eq!(
-            negotiate(&hello(7, 8, Capabilities::REQUIRED)),
+            negotiate(&hello(8, 9, Capabilities::REQUIRED)),
             Err(Rejected::UnsupportedVersion {
                 supported_min: SUPPORTED_MIN,
                 supported_max: SUPPORTED_MAX,
@@ -228,6 +311,43 @@ mod tests {
                 missing: Capabilities::CGROUP_MEMORY.union(Capabilities::CGROUP_PIDS)
             })
         );
+    }
+
+    #[test]
+    fn profile_bounds_are_checked() {
+        let mut profile = Profile::default();
+        assert_eq!(profile.invalid(), None);
+        profile.labels = vec!["linux".to_string(); MAX_PROFILE_LABELS + 1];
+        assert_eq!(profile.invalid(), Some("labels"));
+        profile.labels = vec!["bad\nlabel".to_string()];
+        assert_eq!(profile.invalid(), Some("label"));
+        profile.labels = vec!["ok".to_string()];
+        assert_eq!(profile.invalid(), None);
+        profile.availability.images = vec![[0u8; 8]; crate::limits::MAX_LIST_ITEMS + 1];
+        assert_eq!(profile.invalid(), Some("images"));
+    }
+
+    #[test]
+    fn profile_round_trips_and_absent_fields_default() {
+        let profile = Profile {
+            labels: vec!["linux".to_string(), "gpu".to_string()],
+            host_id: [7u8; 16],
+            disk_bytes: 1 << 30,
+            availability: Availability {
+                images: vec![[1, 2, 3, 4, 5, 6, 7, 8]],
+                cache_bytes: 1024,
+                load_ns: 5,
+            },
+        };
+        // The wire form is postcard; the shape is also a JSON contract, where
+        // `serde(default)` lets a shorter document decode to the defaults.
+        let bytes = postcard::to_allocvec(&profile).unwrap();
+        assert_eq!(postcard::from_bytes::<Profile>(&bytes).unwrap(), profile);
+        let sparse: Profile = serde_json::from_str(r#"{"labels":["linux"]}"#).unwrap();
+        assert_eq!(sparse.labels, vec!["linux".to_string()]);
+        assert_eq!(sparse.host_id, [0u8; 16]);
+        assert_eq!(sparse.disk_bytes, 0);
+        assert_eq!(sparse.availability, Availability::default());
     }
 
     #[test]

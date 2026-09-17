@@ -12,11 +12,19 @@
 //! that name, which brings in the store) that listens, admits, places work
 //! and pushes fenced offers; and a `worker` loop that reconnects with
 //! back-off, answers offers and renews its leases on every heartbeat.
+//!
+//! Protocol 7 splits an established session in two: the control connection
+//! keeps heartbeats, offers and reports, and a second bulk connection (same
+//! identity, opened with `BulkHello`) carries logs, spec chunks, artifacts
+//! and cache transfers, each behind its own lock. The optional `tailcat`
+//! module runs the pinned helper for the Q06 transport; without it the link
+//! uses direct TLS exactly as before.
 
 #[cfg(feature = "controller")]
 pub mod controller;
 pub mod identity;
 pub mod session;
+pub mod tailcat;
 pub mod tls;
 pub mod worker;
 

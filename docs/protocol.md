@@ -58,12 +58,14 @@ Enforced from declared lengths before any body is read; exceeding one is `payloa
 | Agent diagnostic text | default 8 KiB, ceiling 64 KiB |
 | Names and labels | 128 bytes |
 | Items in any list field | 64 |
+| Worker labels per profile | 16 |
+| One cache chunk payload | 48 KiB (must fit a control frame whole) |
 
 Invariants between limits are compile-time assertions. Raise a limit only with a measured need and a note here.
 
 ## Worker negotiation
 
-A session opens with `Hello { protocol_min, protocol_max, capabilities, arch, software }`. The controller supports protocol versions in an inclusive range (currently 1 to 1) and answers with the highest version both sides share and the worker's capability bits it recognises. Capabilities are a `u64` bit set so storing, comparing and intersecting is one instruction; bits the controller does not know are masked, never rejected, so newer workers stay compatible.
+A session opens with `Hello { protocol_min, protocol_max, capabilities, arch, software }`. The controller supports protocol versions in an inclusive range (currently 1 to 7) and answers with the highest version both sides share and the worker's capability bits it recognises. Capabilities are a `u64` bit set so storing, comparing and intersecting is one instruction; bits the controller does not know are masked, never rejected, so newer workers stay compatible.
 
 | Bit | Capability |
 |---|---|
@@ -76,10 +78,38 @@ A session opens with `Hello { protocol_min, protocol_max, capabilities, arch, so
 
 Bits 0 to 3 are required (the set the F07 probe proved enforceable); a hello without them is rejected. Rejections are typed and final for that hello: `unsupported_version` names the supported range and whether the worker is the side that must upgrade, `missing_capabilities` names the missing bits, `invalid_range` flags `protocol_min > protocol_max`. A worker must not retry an unchanged rejected hello. `software` is a diagnostic string only and never a compatibility input.
 
+## Protocol 7 additions
+
+Protocol 7 is additive: every pre-existing message keeps its shape and enum
+index, and a worker and controller that negotiate 6 exchange exactly what
+they did before.
+
+| Message | Direction | Purpose |
+|---|---|---|
+| `Profile` | worker → controller | The scheduling profile (labels ≤ 16, `host_id`, `disk_bytes`, `availability { images, cache_bytes, load_ns }`), sent immediately after `Welcome` when the session negotiated 7 |
+| `BulkHello { worker }` | worker → controller | Opens the second (bulk) connection of a session; attached only when a live control session presents the same certificate |
+| `Transport` | worker → controller | Q07 telemetry: path, RTT, reconnects, helper version, byte counters; sent after `Profile` and refreshed every 12 beats |
+| `CacheNeed(Need)`, `CacheOffer(Upload)`, `CachePush(Push)`, `CachePushEnd(End)` | worker → controller | Q08 remote-cache fetch (with resume offset and prefix digest) and offer/push |
+| `CacheGrant(Grant)`, `CacheChunk(Chunk)`, `CacheEnd(End)`, `CacheRefused(Refused)` | controller → worker | Q08 transfer answers; `End` is terminal both ways |
+
+The profile is a message rather than new `Hello` fields because postcard is
+not self-describing: a struct decodes exactly the field list its reader
+knows, so a trailing `Hello` field would make an older worker's hello
+undecodable, and `#[serde(default)]` never fires because the reader hits the
+end of the frame instead of an end-of-sequence. Additive *variants* are safe;
+additive struct fields are not. The same rule is why `Context2` stayed a new
+variant at protocol 6.
+
+Bulk classes (logs, specs, artifacts, cache) travel on the worker's second
+connection when it is up and are still accepted on the control connection as
+a fallback; control classes (heartbeat, offers, reports) are refused there.
+Each connection has its own rustls state behind its own lock, so bulk traffic
+cannot delay a beat. See [worker link](worker-link.md#control-and-bulk-protocol-7-q05).
+
 ## Versioning policy
 
 The protocol version bumps on any incompatible change to messages, framing or semantics. Adding optional fields does not bump it. Error schema, cursor version byte and protocol version are independent so each can move alone. The JSON shapes of `ApiError`, `Hello` and `Rejected` are pinned by tests.
 
 ## Verification
 
-Thirteen unit tests: error wire shape and foreign-schema rejection, status and retry mapping, idempotency key bounds and size, fingerprint stability, decision table, cursor round trip with tenant binding and malformed/uppercase/version/kind rejection, sequence saturation, page-size clamping, declared-length checks, version selection with unknown-bit masking, mismatch direction, missing-capability naming, and `Hello`/`Rejected` JSON stability. All pass on Windows and Linux.
+Unit tests: error wire shape and foreign-schema rejection, status and retry mapping, idempotency key bounds and size, fingerprint stability, decision table, cursor round trip with tenant binding and malformed/uppercase/version/kind rejection, sequence saturation, page-size clamping, declared-length checks, version selection with unknown-bit masking, mismatch direction, missing-capability naming, and `Hello`/`Rejected` JSON stability, plus the protocol-7 profile's bounds (`Profile::invalid`) and its postcard round trip (with `serde(default)` on the JSON shape). All pass on Windows and Linux.

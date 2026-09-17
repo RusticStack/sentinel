@@ -266,6 +266,8 @@ impl WorkerProcess {
             name: "builder-1".into(),
             hello: hello(protocol),
             capacity: CAPACITY,
+            profile: sentinel_protocol::negotiate::Profile::default(),
+            transport: sentinel_link::session::TransportStats::default(),
         };
         let grip = Arc::clone(&handle);
         let running = Arc::clone(&executor);

@@ -27,12 +27,13 @@ use std::{
 };
 
 use sentinel_auth::secret::{Digest, Secret};
+use sentinel_cache::remote::{Need, Upload};
 use sentinel_core::{
     AttemptId, Event, Fence, JobId, PoolId, RunId, TenantId, UnixMillis, WorkerId,
 };
 use sentinel_protocol::limits::{MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES, MAX_RUN_ARTIFACT_BYTES};
 use sentinel_protocol::logs::Frame;
-use sentinel_protocol::negotiate::Hello;
+use sentinel_protocol::negotiate::{Hello, Profile, PROFILE_MIN};
 use sentinel_store::{
     Store, artifacts, dispatch,
     logs::LogStore,
@@ -44,8 +45,8 @@ use crate::{
     Error, Result,
     identity::Identity,
     session::{
-        self, Admission, Admitted, ArtifactCode, ArtifactReply, Beat, Capacity, JobContext,
-        LogVerdict, Offer, Rejection, Sender, SessionHandler,
+        self, Accepted, Admission, Admitted, ArtifactCode, ArtifactReply, Beat, BulkSession,
+        Capacity, JobContext, LogVerdict, Offer, Rejection, Sender, SessionHandler, TransportStats,
     },
     tls,
 };
@@ -87,6 +88,11 @@ pub struct Stats {
     pub abandoned: AtomicU64,
     /// Artifacts committed through the object store (protocol 4).
     pub artifacts: AtomicU64,
+    /// Protocol-7 bulk connections attached to a live control session.
+    pub bulk_attached: AtomicU64,
+    /// Protocol-7 bulk connections refused: no live control session with
+    /// that certificate.
+    pub bulk_refused: AtomicU64,
 }
 
 struct Peer {
@@ -95,6 +101,14 @@ struct Peer {
     generation: u64,
     /// When liveness was last written, so a beat costs a write once a minute.
     seen_recorded_ms: AtomicI64,
+    /// The certificate this session presented; a bulk connection may only
+    /// attach to it from the same fingerprint.
+    fingerprint: Digest,
+    /// The session's negotiated protocol: bulk traffic and the profile are
+    /// gated on it.
+    protocol: u16,
+    /// The latest transport telemetry the worker reported (Q07).
+    transport: Mutex<Option<TransportStats>>,
     /// Attempts verified as held by this worker for log frames, mapped to
     /// their (run, job) so the store path costs one read per attempt
     /// rather than one per frame.
@@ -151,6 +165,9 @@ struct Inner {
     /// Storage maintenance policy and when it last ran (D06).
     storage: Mutex<Option<StoragePolicy>>,
     last_storage: AtomicI64,
+    /// Where the controller keeps remote cache objects (Q08); `None` answers
+    /// every cache need as a miss.
+    remote_cache: Mutex<Option<std::path::PathBuf>>,
     config: Arc<rustls::ServerConfig>,
     fleet: Mutex<HashMap<WorkerId, Arc<Peer>>>,
     generation: AtomicU64,
@@ -203,7 +220,11 @@ impl Inner {
     fn serve(self: &Arc<Self>, socket: TcpStream) {
         let outcome = session::accept(socket, Arc::clone(&self.config), &**self);
         let mut session = match outcome {
-            Ok(session) => session,
+            Ok(Accepted::Control(session)) => session,
+            Ok(Accepted::Bulk(bulk)) => {
+                self.serve_bulk(bulk);
+                return;
+            }
             Err(_) => {
                 self.stats.rejected.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -217,6 +238,9 @@ impl Inner {
             pool,
             generation,
             seen_recorded_ms: AtomicI64::new(0),
+            fingerprint: session.fingerprint,
+            protocol: session.admitted.negotiated.protocol.0,
+            transport: Mutex::new(None),
             logging: Mutex::new(HashMap::new()),
         });
         self.register(worker, peer);
@@ -226,6 +250,23 @@ impl Inner {
         self.stats.sessions_ended.fetch_add(1, Ordering::Relaxed);
         // Its unacknowledged offers lapse in the sweep; acknowledged leases
         // run to expiry (W06), so a brief reconnect keeps its work.
+    }
+
+    /// Attach and serve a bulk connection: only the same certificate that
+    /// holds the live control session may open one, and it carries no
+    /// negotiation of its own — it serves the version that session agreed.
+    fn serve_bulk(self: &Arc<Self>, mut bulk: BulkSession) {
+        let Some(peer) = self.peer(bulk.worker) else {
+            self.stats.bulk_refused.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if !sentinel_auth::secret::digest_eq(&peer.fingerprint, &bulk.fingerprint) {
+            self.stats.bulk_refused.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.stats.bulk_attached.fetch_add(1, Ordering::Relaxed);
+        let _ = bulk.serve(&**self, peer.protocol);
+        self.stats.sessions_ended.fetch_add(1, Ordering::Relaxed);
     }
 
     /// One dispatch pass: storage maintenance when due, sweep lapsed
@@ -513,15 +554,23 @@ impl Admission for Inner {
         capacity: Capacity,
     ) -> std::result::Result<Admitted, Rejection> {
         let negotiated = sentinel_protocol::negotiate::negotiate(hello).map_err(Rejection::from)?;
+        // The disk half of the capacity only arrives with the protocol-7
+        // profile, after the welcome. Defer the capacity write entirely for
+        // such a session so placement never sees a disk of zero for a worker
+        // that is about to report one.
+        let deferred = negotiated.protocol.0 >= PROFILE_MIN.0;
         let capacity = dispatch::Capacity {
             cpu_millis: i64::try_from(capacity.cpu_millis).map_err(|_| Rejection::Capacity)?,
             memory_bytes: i64::try_from(capacity.memory_bytes).map_err(|_| Rejection::Capacity)?,
+            disk_bytes: 0,
         };
         match self.store.read(|c| workers::authenticate(c, fingerprint)) {
             Ok(known) => {
                 let id = known.id;
-                self.write(move |tx| dispatch::report_capacity(tx, id, capacity))
-                    .map_err(|_| Rejection::Unavailable)?;
+                if !deferred {
+                    self.write(move |tx| dispatch::report_capacity(tx, id, capacity))
+                        .map_err(|_| Rejection::Unavailable)?;
+                }
                 return Ok(Admitted {
                     worker: known.id,
                     pool: known.pool,
@@ -547,6 +596,7 @@ impl Admission for Inner {
             *fingerprint,
             name.to_owned(),
         );
+        let immediate_capacity = (!deferred).then_some(capacity);
         self.store
             .writer()
             .write(move |tx| {
@@ -561,7 +611,9 @@ impl Admission for Inner {
                     },
                     UnixMillis::now(),
                 )?;
-                dispatch::report_capacity(tx, enrolled.id, capacity)?;
+                if let Some(capacity) = immediate_capacity {
+                    dispatch::report_capacity(tx, enrolled.id, capacity)?;
+                }
                 Ok(Admitted {
                     worker: enrolled.id,
                     pool: enrolled.pool,
@@ -759,6 +811,108 @@ impl SessionHandler for Inner {
     /// round trips and credential minting happen outside the session thread.
     fn spec(&self, _worker: WorkerId, _attempt: AttemptId) -> Option<(JobContext, Vec<u8>)> {
         None
+    }
+
+    /// Protocol 7. Records the profile and, in the same transaction, the
+    /// capacity with the disk the profile carries — the hello's own capacity
+    /// write was deferred for exactly this one, so placement never sees a
+    /// disk of zero for a worker that reports one. Values the worker did not
+    /// measure (zero on the wire) are reported absent, so a column keeps its
+    /// last known value instead of being overwritten with a zero claim.
+    fn profiled(&self, worker: WorkerId, profile: &Profile, capacity: Capacity) -> Result<()> {
+        let capacity = dispatch::Capacity {
+            cpu_millis: i64::try_from(capacity.cpu_millis)
+                .map_err(|_| Error::Protocol("capacity"))?,
+            memory_bytes: i64::try_from(capacity.memory_bytes)
+                .map_err(|_| Error::Protocol("capacity"))?,
+            disk_bytes: i64::try_from(profile.disk_bytes)
+                .map_err(|_| Error::Protocol("profile disk"))?,
+        };
+        let labels = profile.labels.clone();
+        let images = profile.availability.images.clone();
+        let host_id = (profile.host_id != [0u8; 16]).then_some(profile.host_id);
+        let cache_bytes = (profile.availability.cache_bytes != 0)
+            .then(|| i64::try_from(profile.availability.cache_bytes).unwrap_or(i64::MAX));
+        let load_ns = (profile.availability.load_ns != 0)
+            .then(|| i64::try_from(profile.availability.load_ns).unwrap_or(i64::MAX));
+        self.write(move |tx| {
+            dispatch::report_capacity(tx, worker, capacity)?;
+            dispatch::report_profile(
+                tx,
+                worker,
+                &dispatch::ReportedProfile {
+                    labels: &labels,
+                    host_id,
+                    avail_images: &images,
+                    cache_bytes,
+                    load_ns,
+                },
+            )
+        })
+        .map_err(|_| Error::Internal("profile write"))
+    }
+
+    /// Protocol 7 (Q07). The worker's latest transport telemetry, kept on
+    /// its session for operators and diagnostics.
+    fn transport(&self, worker: WorkerId, stats: &TransportStats) {
+        if let Some(peer) = self.peer(worker) {
+            *peer.transport.lock().unwrap_or_else(|p| p.into_inner()) = Some(stats.clone());
+        }
+    }
+
+    /// Protocol 7 (Q08). Authorizes a download: the fenced attempt must be
+    /// held by the worker, and the need's tenant, repo and trust class must
+    /// equal the attempt's — the worker never names a boundary it does not
+    /// hold. The controller's remote-cache root is returned to serve from;
+    /// without one, every need is a miss.
+    fn cache_need(&self, worker: WorkerId, need: &Need) -> Option<std::path::PathBuf> {
+        let root = self
+            .remote_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()?;
+        let attempt = AttemptId::from_bytes(need.attempt).ok()?;
+        let authorized = self
+            .store
+            .read(|c| {
+                let tx = c.unchecked_transaction()?;
+                if !dispatch::is_held(&tx, worker, attempt)? {
+                    return Err(sentinel_store::Error::NotFound);
+                }
+                dispatch::job_context(&tx, worker, attempt)
+            })
+            .is_ok_and(|context| {
+                *context.tenant.as_bytes() == need.tenant
+                    && *context.repo.as_bytes() == need.repo
+                    && context.trust.to_u8() == need.trust
+            });
+        authorized.then_some(root)
+    }
+
+    /// Protocol 7 (Q08). Authorizes an upload under the same rule as a
+    /// download before any bytes are staged.
+    fn cache_offer(&self, worker: WorkerId, upload: &Upload) -> Option<std::path::PathBuf> {
+        let root = self
+            .remote_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()?;
+        let attempt = AttemptId::from_bytes(upload.attempt).ok()?;
+        let authorized = self
+            .store
+            .read(|c| {
+                let tx = c.unchecked_transaction()?;
+                if !dispatch::is_held(&tx, worker, attempt)? {
+                    return Err(sentinel_store::Error::NotFound);
+                }
+                dispatch::job_context(&tx, worker, attempt)
+            })
+            .is_ok_and(|context| {
+                *context.tenant.as_bytes() == upload.tenant
+                    && *context.repo.as_bytes() == upload.repo
+                    && context.trust.to_u8() == upload.trust
+            });
+        authorized.then_some(root)
     }
 
     fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict {
@@ -1337,6 +1491,17 @@ impl Controller {
     pub fn set_storage_policy(&self, policy: StoragePolicy) {
         *self.inner.storage.lock().unwrap_or_else(|p| p.into_inner()) = Some(policy);
     }
+
+    /// Where the controller keeps remote cache objects (Q08), normally
+    /// `<data_dir>/remote-cache`. Unset answers every cache need as a miss;
+    /// the directory itself is created lazily by the first upload.
+    pub fn set_remote_cache(&self, root: std::path::PathBuf) {
+        *self
+            .inner
+            .remote_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(root);
+    }
     /// Bind `listen`, present `identity`, and start serving workers of
     /// `store`. Returns once the socket is bound; workers may connect.
     pub fn start(
@@ -1371,6 +1536,7 @@ impl Controller {
             artifacts: Mutex::new(ArtifactState::default()),
             storage: Mutex::new(None),
             last_storage: AtomicI64::new(0),
+            remote_cache: Mutex::new(None),
             config,
             fleet: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(1),
@@ -1520,6 +1686,23 @@ impl Handle {
             .keys()
             .copied()
             .collect()
+    }
+
+    /// The latest transport telemetry the worker reported (Q07): direct or
+    /// relayed path, round-trip time, reconnects, helper version and byte
+    /// counters. `None` until a protocol-7 worker reports one.
+    pub fn transport(&self, worker: WorkerId) -> Option<TransportStats> {
+        let peer = self
+            .0
+            .fleet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&worker)
+            .cloned()?;
+        peer.transport
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Close a worker's session from the controller's side. Its leases stay

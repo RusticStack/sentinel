@@ -3,7 +3,11 @@ use std::{
     io::Read,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -69,12 +73,66 @@ struct FileConfig {
     enrollment_file: Option<PathBuf>,
     cpu_millis: Option<u64>,
     memory_bytes: Option<u64>,
+    // Worker: what the scheduler may select this machine by (Q01) and the
+    // scratch disk it offers jobs. Labels default to none; disk defaults to
+    // the free space of the data directory at start.
+    labels: Option<Vec<String>>,
+    disk_bytes: Option<u64>,
     // Worker: keep per-repository object mirrors under the data directory
     // (default on; `false` checks out every attempt directly).
     git_mirrors: Option<bool>,
     // Server: disk admission watermarks, quotas and retention (D06).
     storage: Option<StorageFile>,
+    // Q06: the optional pinned Tailcat helper, for either role.
+    tailcat: Option<TailcatFile>,
+    // Q08: whether this process participates in remote cache hydration.
+    remote_cache: Option<RemoteCacheFile>,
+    // Worker: the controller's `tc…` address, printed at `tailcat_listening`
+    // (Q06). Required to dial a controller through the helper.
+    tailcat_address: Option<String>,
 }
+
+/// The `[tailcat]` section (Q06), resolved into the helper's own
+/// `sentinel_link::tailcat::TailcatConfig` in the role that runs it. Kept as
+/// a plain mirror here so the portable CLI build — which links no link crate
+/// — can still validate the section.
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TailcatFile {
+    enabled: Option<bool>,
+    binary: Option<PathBuf>,
+    sha256: Option<String>,
+    derpmap_url: Option<String>,
+    region: Option<String>,
+    listen_port: Option<u16>,
+}
+
+/// The `[remote_cache]` section (Q08): whether this process participates in
+/// remote cache hydration. The controller holds objects workers offer so
+/// another worker can hydrate them; the worker fetches and offers. Local
+/// cache hits never traverse the link either way.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteCacheFile {
+    enabled: Option<bool>,
+}
+
+impl RemoteCacheFile {
+    fn on(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+}
+
+/// One scheduling label: bounded like a name, no control characters.
+fn valid_label(label: &str) -> bool {
+    !label.is_empty() && label.len() <= 128 && !label.chars().any(char::is_control)
+}
+
+/// Labels one worker may advertise; mirrors
+/// `sentinel_protocol::negotiate::MAX_PROFILE_LABELS`, kept local so the
+/// portable CLI build (which links no protocol crate) validates the same
+/// bound.
+const MAX_LABELS: usize = 16;
 
 /// The `[storage]` section: all fields optional, resolved to defaults.
 #[derive(Default, Deserialize)]
@@ -152,12 +210,26 @@ struct WorkerLink {
     cpu_millis: Option<u64>,
     memory_bytes: Option<u64>,
     git_mirrors: bool,
+    /// Scheduling labels this machine selects work by (protocol 7).
+    labels: Vec<String>,
+    /// Scratch disk offered to jobs; `None` measures free space at start.
+    disk_bytes: Option<u64>,
+    /// The helper to run, when the worker dials through Tailcat.
+    tailcat: Option<TailcatFile>,
+    /// The controller's `tc…` address the helper carries.
+    tailcat_address: Option<String>,
+    /// Whether this worker exposes the remote cache to its executor (Q08).
+    remote_cache: bool,
 }
 
 enum Role {
     Server {
         listen: SocketAddr,
         api_listen: SocketAddr,
+        /// The helper the server runs for its link port (Q06), when enabled.
+        tailcat: Option<TailcatFile>,
+        /// Whether the controller serves remote cache objects (Q08).
+        remote_cache: bool,
     },
     Worker(Option<WorkerLink>),
 }
@@ -251,9 +323,12 @@ impl Config {
                 || file.cpu_millis.is_some()
                 || file.memory_bytes.is_some()
                 || file.git_mirrors.is_some()
+                || file.labels.is_some()
+                || file.disk_bytes.is_some()
+                || file.tailcat_address.is_some()
             {
                 return Err(Error::config(
-                    "controller, controller_fingerprint, worker_name, enrollment_file, cpu_millis, memory_bytes and git_mirrors apply to the worker role only",
+                    "controller, controller_fingerprint, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, disk_bytes and tailcat_address apply to the worker role only",
                 ));
             }
             let listen = file
@@ -272,7 +347,24 @@ impl Config {
                 .map_err(|_| {
                     Error::config("api_listen must be an IP address and port, as in 127.0.0.1:7080")
                 })?;
-            Role::Server { listen, api_listen }
+            if let Some(tailcat) = &file.tailcat
+                && tailcat.enabled == Some(true)
+                && tailcat.listen_port.unwrap_or(listen.port()) != listen.port()
+            {
+                return Err(Error::config(
+                    "tailcat.listen_port must match listen: the helper carries exactly the link port",
+                ));
+            }
+            Role::Server {
+                listen,
+                api_listen,
+                tailcat: file.tailcat,
+                remote_cache: file
+                    .remote_cache
+                    .as_ref()
+                    .map(RemoteCacheFile::on)
+                    .unwrap_or(true),
+            }
         } else {
             if file.listen.is_some() || file.api_listen.is_some() {
                 return Err(Error::config(
@@ -286,6 +378,11 @@ impl Config {
                         || file.cpu_millis.is_some()
                         || file.memory_bytes.is_some()
                         || file.git_mirrors.is_some()
+                        || file.labels.is_some()
+                        || file.disk_bytes.is_some()
+                        || file.tailcat.is_some()
+                        || file.tailcat_address.is_some()
+                        || file.remote_cache.is_some()
                     {
                         return Err(Error::config(
                             "worker link settings need controller and controller_fingerprint",
@@ -320,6 +417,29 @@ impl Config {
                             "cpu_millis and memory_bytes must be positive when set",
                         ));
                     }
+                    let labels = file.labels.unwrap_or_default();
+                    if labels.len() > MAX_LABELS || !labels.iter().all(|label| valid_label(label)) {
+                        return Err(Error::config(
+                            "labels must be at most 16 entries of 1-128 bytes without control characters",
+                        ));
+                    }
+                    if file.disk_bytes == Some(0) {
+                        return Err(Error::config("disk_bytes must be positive when set"));
+                    }
+                    let tailcat_on = file
+                        .tailcat
+                        .as_ref()
+                        .is_some_and(|tailcat| tailcat.enabled == Some(true));
+                    if file.tailcat_address.is_some() && !tailcat_on {
+                        return Err(Error::config(
+                            "tailcat_address needs [tailcat] enabled = true; without the helper the worker dials the controller directly",
+                        ));
+                    }
+                    if tailcat_on && file.tailcat_address.is_none() {
+                        return Err(Error::config(
+                            "tailcat_address is required when [tailcat] is enabled: it is the controller's tc… address printed at tailcat_listening",
+                        ));
+                    }
                     Some(WorkerLink {
                         controller,
                         fingerprint,
@@ -328,6 +448,15 @@ impl Config {
                         cpu_millis: file.cpu_millis,
                         memory_bytes: file.memory_bytes,
                         git_mirrors: file.git_mirrors.unwrap_or(true),
+                        labels,
+                        disk_bytes: file.disk_bytes,
+                        tailcat: file.tailcat,
+                        tailcat_address: file.tailcat_address,
+                        remote_cache: file
+                            .remote_cache
+                            .as_ref()
+                            .map(RemoteCacheFile::on)
+                            .unwrap_or(true),
                     })
                 }
                 _ => {
@@ -362,8 +491,15 @@ impl Config {
 
     fn describe(&self) -> String {
         match &self.role {
-            Role::Server { listen, api_listen } => {
-                format!("listen={listen} api_listen={api_listen}")
+            Role::Server {
+                listen,
+                api_listen,
+                remote_cache,
+                ..
+            } => {
+                format!(
+                    "listen={listen} api_listen={api_listen} remote_cache={remote_cache}"
+                )
             }
             Role::Worker(None) => "controller=none (idle)".to_owned(),
             Role::Worker(Some(link)) => format!(
@@ -537,12 +673,105 @@ enum Running {
         checks: Option<Box<sentinel_checks::Lane>>,
         /// The lifecycle reconcile lane draining `github_refresh`.
         reconcile: Option<Box<sentinel_checks::Reconcile>>,
+        /// The Q06 helper carrying the link port; absent with direct TLS.
+        tailcat: Option<Arc<sentinel_link::tailcat::Server>>,
+        /// Stops the allow-list refresher before the helper is dropped.
+        tailcat_stop: Option<Arc<AtomicBool>>,
     },
     #[cfg(feature = "worker")]
     Worker {
         handle: Arc<sentinel_link::worker::Handle>,
         thread: std::thread::JoinHandle<()>,
+        /// The Q06 helper the worker dials through; absent with direct TLS.
+        tailcat: Option<sentinel_link::tailcat::Forward>,
     },
+}
+
+/// Q06 for the server: run the helper that carries the link port, log its
+/// `tc…` address once (the operator hands that exact string to workers as
+/// `tailcat_address`), and keep the admitted node keys current from
+/// `<data_dir>/tailcat-allow`. `None` means direct TLS, unchanged.
+#[cfg(feature = "server")]
+fn start_tailcat(
+    config: &Config,
+    file: Option<&TailcatFile>,
+    listen: SocketAddr,
+) -> Result<(Option<Arc<sentinel_link::tailcat::Server>>, Option<Arc<AtomicBool>>), Error> {
+    let Some(file) = file else {
+        return Ok((None, None));
+    };
+    if file.enabled != Some(true) {
+        return Ok((None, None));
+    }
+    let binary = file
+        .binary
+        .clone()
+        .ok_or_else(|| Error::config("tailcat.binary is required when tailcat is enabled"))?;
+    let helper = sentinel_link::tailcat::TailcatConfig {
+        enabled: true,
+        binary,
+        sha256: file
+            .sha256
+            .clone()
+            .unwrap_or_else(|| sentinel_link::tailcat::PINNED_SHA256.to_owned()),
+        derpmap_url: file.derpmap_url.clone(),
+        region: file.region.clone(),
+        listen_port: file.listen_port.unwrap_or(listen.port()),
+    };
+    let keys = sentinel_link::tailcat::allow_list(&config.data_dir)
+        .map_err(|error| Error::runtime(format!("cannot read the tailcat allow list: {error}")))?;
+    let server = sentinel_link::tailcat::start_server(&helper, &config.data_dir, &keys)
+        .map_err(|error| Error::runtime(format!("cannot start the tailcat helper: {error}")))?;
+    match server.wait_ready(Duration::from_secs(60)) {
+        // The address is a credential: only this operator-facing line ever
+        // carries it, and never a Debug-formatted field.
+        Some(address) => tracing::info!(event = "tailcat_listening", address = address.expose()),
+        None => tracing::warn!(
+            event = "tailcat_not_ready",
+            "the helper did not report an address within 60s; workers cannot dial it yet"
+        ),
+    }
+    // The allow list is an operator file; re-read it on a slow tick so a
+    // newly admitted worker key takes effect without a restart.
+    let server = Arc::new(server);
+    let stop = Arc::new(AtomicBool::new(false));
+    let refresher = {
+        let stop = Arc::clone(&stop);
+        let server = Arc::clone(&server);
+        let data_dir = config.data_dir.clone();
+        std::thread::Builder::new()
+            .name("sentinel-tailcat-allow".into())
+            .spawn(move || {
+                let mut warned = false;
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_secs(10));
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    match sentinel_link::tailcat::allow_list(&data_dir) {
+                        Ok(keys) => {
+                            warned = false;
+                            server.set_allow(&keys);
+                        }
+                        // Never pass an empty list: one typo must not restart
+                        // the helper with no ACL. Keep the last good one.
+                        Err(_) if !warned => {
+                            warned = true;
+                            tracing::warn!(
+                                event = "tailcat_allow_unreadable",
+                                "keeping the last good node-key list"
+                            );
+                        }
+                        Err(_) => {}
+                    }
+                }
+            })
+            .map_err(|error| {
+                Error::runtime(format!("cannot start the tailcat allow-list thread: {error}"))
+            })?
+    };
+    drop(refresher);
+    Ok((Some(server), Some(stop)))
 }
 
 #[cfg(feature = "server")]
@@ -550,6 +779,8 @@ fn start_server(
     config: &Config,
     listen: SocketAddr,
     api_listen: SocketAddr,
+    tailcat: Option<&TailcatFile>,
+    remote_cache: bool,
 ) -> Result<Running, Error> {
     let path = config.data_dir.join(sentinel_store::METADATA_FILE);
     let store =
@@ -623,6 +854,20 @@ fn start_server(
         log_retention_ms: config.storage.log_retention_ms,
         interval_ms: config.storage.sweep_interval_ms,
     });
+    // Remote cache (Q08): the controller holds objects workers offer, so a
+    // second worker can hydrate them without the WAN. The directory is
+    // created here for operators; uploads create it lazily anyway.
+    if remote_cache {
+        let root = config.data_dir.join("remote-cache");
+        fs::create_dir_all(&root).map_err(|error| {
+            Error::runtime(format!(
+                "cannot create the remote cache directory {}: {error}",
+                root.display()
+            ))
+        })?;
+        controller.set_remote_cache(root);
+    }
+    let (tailcat, tailcat_stop) = start_tailcat(config, tailcat, listen)?;
     controller.set_source_destinations(
         crate::source_admin::load_destinations(&config.data_dir)
             .map_err(|_| Error::runtime("cannot load source destination policy"))?,
@@ -823,6 +1068,8 @@ fn start_server(
         poll: Box::new(poll),
         checks,
         reconcile,
+        tailcat,
+        tailcat_stop,
     })
 }
 
@@ -954,6 +1201,157 @@ mod worker_role {
         }
     }
 
+    /// Free bytes on the filesystem holding `path`, or 0 when the platform
+    /// cannot say — reported as "not measured", never as "full".
+    #[cfg(target_os = "linux")]
+    fn disk_free(path: &Path) -> u64 {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return 0;
+        };
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `cpath` is a valid NUL-terminated path and `stat` is a
+        // writable, properly aligned statvfs.
+        if unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) } != 0 {
+            return 0;
+        }
+        (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn disk_free(_path: &Path) -> u64 {
+        0
+    }
+
+    /// The scratch disk this worker offers jobs: the operator's `disk_bytes`,
+    /// or the data directory's free space less a reserve of one eighth
+    /// (clamped to 512 MiB–2 GiB) for logs, metadata and artifacts. Zero
+    /// means the platform could not measure it, and jobs that require disk
+    /// then never place here.
+    fn profile_disk(link: &WorkerLink, data_dir: &Path) -> u64 {
+        match link.disk_bytes {
+            Some(bytes) => bytes,
+            None => {
+                let free = disk_free(data_dir);
+                let reserve = (free / 8).clamp(512 << 20, 2 << 30);
+                free.saturating_sub(reserve)
+            }
+        }
+    }
+
+    /// CPU busy time in nanoseconds over a short window: the worker's load
+    /// input to placement (Q03). 0 when unmeasurable (not Linux, or
+    /// /proc/stat unreadable), never a claim of idleness.
+    #[cfg(target_os = "linux")]
+    fn load_ns() -> u64 {
+        const WINDOW: Duration = Duration::from_millis(100);
+        // USER_HZ is 100 on every Linux the executor supports, so one
+        // /proc/stat tick is 10 ms.
+        const TICK_NS: u64 = 10_000_000;
+        fn busy_ticks() -> Option<u64> {
+            let text = fs::read_to_string("/proc/stat").ok()?;
+            let values: Vec<u64> = text
+                .lines()
+                .next()?
+                .strip_prefix("cpu")?
+                .split_whitespace()
+                .filter_map(|value| value.parse().ok())
+                .collect();
+            // user nice system idle iowait irq softirq steal …
+            if values.len() < 8 {
+                return None;
+            }
+            Some(values[0] + values[1] + values[2] + values[5] + values[6] + values[7])
+        }
+        let Some(first) = busy_ticks() else {
+            return 0;
+        };
+        std::thread::sleep(WINDOW);
+        let Some(second) = busy_ticks() else {
+            return 0;
+        };
+        second.saturating_sub(first).saturating_mul(TICK_NS)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn load_ns() -> u64 {
+        0
+    }
+
+    /// The protocol-7 profile: what the scheduler may select this machine by
+    /// and what it can offer jobs. Image and cache inventory travel in the
+    /// attempt summaries (K08), not here, so `images`/`cache_bytes` stay
+    /// unreported (empty/zero) rather than guessed.
+    fn profile(link: &WorkerLink, data_dir: &Path) -> sentinel_protocol::negotiate::Profile {
+        sentinel_protocol::negotiate::Profile {
+            labels: link.labels.clone(),
+            host_id: sentinel_link::session::host_id(),
+            disk_bytes: profile_disk(link, data_dir),
+            availability: sentinel_protocol::negotiate::Availability {
+                images: Vec::new(),
+                cache_bytes: 0,
+                load_ns: load_ns(),
+            },
+        }
+    }
+
+    /// Q06: run the helper the worker dials through, when it is enabled.
+    /// Returns the address the link must dial, the transport telemetry the
+    /// helper already measured, and the helper itself to shut down later.
+    fn tailcat(
+        link: &WorkerLink,
+        data_dir: &Path,
+    ) -> Result<
+        (
+            SocketAddr,
+            sentinel_link::session::TransportStats,
+            Option<sentinel_link::tailcat::Forward>,
+        ),
+        Error,
+    > {
+        let mut stats = sentinel_link::session::TransportStats::default();
+        let Some(file) = &link.tailcat else {
+            return Ok((link.controller, stats, None));
+        };
+        if file.enabled != Some(true) {
+            return Ok((link.controller, stats, None));
+        }
+        let binary = file
+            .binary
+            .clone()
+            .ok_or_else(|| Error::config("tailcat.binary is required when tailcat is enabled"))?;
+        let address_text = link
+            .tailcat_address
+            .as_deref()
+            .ok_or_else(|| Error::config("tailcat_address is required when tailcat is enabled"))?;
+        let address = sentinel_link::tailcat::Address::parse(address_text)
+            .map_err(|error| Error::config(format!("tailcat_address: {error}")))?;
+        let config = sentinel_link::tailcat::TailcatConfig {
+            enabled: true,
+            binary,
+            sha256: file
+                .sha256
+                .clone()
+                .unwrap_or_else(|| sentinel_link::tailcat::PINNED_SHA256.to_owned()),
+            derpmap_url: file.derpmap_url.clone(),
+            region: file.region.clone(),
+            listen_port: file.listen_port.unwrap_or(7443),
+        };
+        let forward = sentinel_link::tailcat::start_forward(&config, data_dir, &address)
+            .map_err(|error| Error::runtime(format!("cannot start the tailcat helper: {error}")))?;
+        stats.helper_version = forward.telemetry().version;
+        // The helper's health probe is a measured round trip (ping plus a
+        // connect through the forward); it seeds the telemetry until the
+        // first control beat measures the session's own.
+        if let Ok(rtt) = forward.probe() {
+            stats.rtt_ns = Some(rtt.as_nanos().min(u64::MAX as u128) as u64);
+        }
+        // The worker dials the helper's loopback forward; the helper carries
+        // exactly the link port.
+        let local = SocketAddr::from(([127, 0, 0, 1], forward.local_addr().port()));
+        Ok((local, stats, Some(forward)))
+    }
+
     /// The worker's generated identifier, fixed on first start.
     fn worker_id(data_dir: &Path) -> Result<sentinel_core::WorkerId, Error> {
         let path = data_dir.join("worker.id");
@@ -990,6 +1388,10 @@ mod worker_role {
             None => None,
         };
         let capacity = capacity(link);
+        let profile = profile(link, &config.data_dir);
+        // The helper, when enabled, is up before the first dial: the link
+        // then reaches the controller at its loopback forward.
+        let (controller, transport, forward) = tailcat(link, &config.data_dir)?;
         // The reflink bit is the cache root's own probe answer, so the
         // advertised capability and the backend restore uses never disagree.
         let mut capabilities = sentinel_protocol::negotiate::Capabilities::REQUIRED;
@@ -997,7 +1399,7 @@ mod worker_role {
             capabilities = capabilities.union(sentinel_protocol::negotiate::Capabilities::REFLINK);
         }
         let settings = sentinel_link::worker::Config {
-            controller: link.controller,
+            controller,
             server: sentinel_auth::secret::Digest(link.fingerprint),
             worker,
             name: link.name.clone(),
@@ -1013,14 +1415,20 @@ mod worker_role {
                 software: format!("sentinel {}", env!("CARGO_PKG_VERSION")),
             },
             capacity,
+            profile,
+            transport,
+            remote_cache: link.remote_cache,
         };
         tracing::info!(
             event = "link_configured",
-            controller = %link.controller,
+            controller = %controller,
             worker = %worker,
             cpu_millis = capacity.cpu_millis,
             memory_bytes = capacity.memory_bytes,
-            enrolling = enrollment.is_some()
+            labels = settings.profile.labels.len(),
+            disk_bytes = settings.profile.disk_bytes,
+            enrolling = enrollment.is_some(),
+            tailcat = forward.is_some()
         );
         let handle = Arc::new(sentinel_link::worker::Handle::new());
         let grip = Arc::clone(&handle);
@@ -1064,7 +1472,11 @@ mod worker_role {
                 })
             })
             .map_err(|error| Error::runtime(format!("cannot start the link thread: {error}")))?;
-        Ok(Running::Worker { handle, thread })
+        Ok(Running::Worker {
+            handle,
+            thread,
+            tailcat: forward,
+        })
     }
 }
 
@@ -1088,7 +1500,18 @@ fn initialize_and_wait(
             .map_err(|error| Error::runtime(format!("cannot initialize data_dir: {error}")))?;
         match &config.role {
             #[cfg(feature = "server")]
-            Role::Server { listen, api_listen } => start_server(config, *listen, *api_listen),
+            Role::Server {
+                listen,
+                api_listen,
+                tailcat,
+                remote_cache,
+            } => start_server(
+                config,
+                *listen,
+                *api_listen,
+                tailcat.as_ref(),
+                *remote_cache,
+            ),
             #[cfg(feature = "worker")]
             Role::Worker(Some(link)) => worker_role::start(config, link),
             #[allow(unreachable_patterns)]
@@ -1120,8 +1543,14 @@ fn initialize_and_wait(
             poll,
             checks,
             reconcile,
+            tailcat,
+            tailcat_stop,
         } => {
             api.shutdown();
+            if let Some(stop) = tailcat_stop {
+                stop.store(true, Ordering::Release);
+            }
+            drop(tailcat);
             drop(reconcile);
             drop(checks);
             drop(poll);
@@ -1143,9 +1572,16 @@ fn initialize_and_wait(
             }
         }
         #[cfg(feature = "worker")]
-        Running::Worker { handle, thread } => {
+        Running::Worker {
+            handle,
+            thread,
+            tailcat,
+        } => {
             handle.stop();
             let joined = thread.join().is_ok();
+            if let Some(forward) = tailcat {
+                forward.shutdown();
+            }
             tracing::info!(event = "link_stopped", joined);
             Ok(())
         }
