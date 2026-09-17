@@ -231,6 +231,16 @@ pub struct Stats {
     pub copied_bytes: u64,
     /// The backend the clone used.
     pub reflink: bool,
+    /// Remote hydration's wall time (Q08); `None` when no transfer ran —
+    /// a local hit never networks, so the duration stays absent.
+    pub remote_ns: Option<u64>,
+    /// Payload bytes the remote transfer delivered this attempt (a count,
+    /// `0` when none ran) — never the prefix a resumed transfer did not
+    /// re-send.
+    pub remote_bytes: u64,
+    /// The offset a resumed transfer started from; `None` for a cold
+    /// transfer and for no transfer at all.
+    pub remote_from: Option<u64>,
     /// The commit's wall time; `None` while no publish ran — an unworthy
     /// verdict or a finalization that never reached it.
     pub commit_ns: Option<u64>,

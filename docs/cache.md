@@ -1,6 +1,6 @@
 # Worker-local cache: classes, scopes, manifests and restore (K01+K02)
 
-Sentinel keeps its caches on the worker that runs the job: no network fetch on a warm hit, no shared mutable volume between tenants. This document is the metadata contract — which cache classes exist, what boundary a generation is sealed under, how a job receives its private writable view, and the vocabulary a lookup answers with. Publication, garbage collection and remote hydration are later tasks (K03+); everything here is what they share: paths, formats and reasons.
+Sentinel keeps its caches on the worker that runs the job: no network fetch on a warm hit, no shared mutable volume between tenants. This document is the metadata contract — which cache classes exist, what boundary a generation is sealed under, how a job receives its private writable view, and the vocabulary a lookup answers with. Publication, garbage collection, compiler persistence and remote hydration each have their own section below; everything here is what they share: paths, formats and reasons.
 
 ## Why three classes
 
@@ -134,6 +134,28 @@ Per entry, in order: sweep expired lease markers; remove stale `writing/` trees 
 
 Every stat is counted — entries seen, active and expired leases, removed staging, generations, freed bytes, stale pointers, failures, truncation — and reported once as `cache_swept` when the pass did work. A quiet pass stays quiet.
 
+## Remote hydration (Q08)
+
+A worker's warm path stays local: **a local hit never traverses the controller or the WAN**. Remote hydration is a miss path only — `restore::restore_remote` consults the transport exclusively in the branch where the local lookup answered a `Miss`, and never for `invalid` (a declared path that cannot serve wants no bytes at all). What a hydration installs becomes a normal local generation, so the next compatible attempt hits it locally.
+
+**The bundle.** One sealed generation travels as a canonical byte stream: a 40-byte head (12-byte magic `snc.cache.b1`, format `1`, three reserved zero bytes, then `manifest_len`, `files_len` and `payload_len` as big-endian `u64`), the exact `manifest` bytes, the exact `files` bytes, then every payload file concatenated in listing order (`payload/…` sorted by path). The stream's BLAKE3 digest is the bundle id: content addressing, store dedup and resume validation in one value. Every chunk carries the running BLAKE3 of the prefix it extends, so corruption is caught at the chunk that caused it; the whole-stream digest is checked again before anything is installed.
+
+**Messages.** Protocol 7, over the bulk transport — the control stream never carries cache bytes. A fetch is `CacheNeed { attempt, tenant, repo, class, trust, os, arch, toolchain, name, key, offset, have }` (`key` is the entry key; `offset`/`have` are the resume request, the empty digest at offset 0) answered by `CacheGrant { total, offset, prefix, digest }`, then ordered `CacheChunk { offset, bytes, prefix }` frames, then the terminal `CacheEnd { digest }`. An offer is `CacheOffer { …, total, digest }` answered by a grant (or `CacheEnd` when the store already holds that digest), then `CachePush { offset, bytes }` frames, then `CachePushEnd { digest }`. Refusals are `CacheRefused { attempt, code }` with a stable code: `no_bundle` (1), `denied` (2, not held or tenant/repo/trust mismatch), `wrong_scope` (3), `busy` (4), `too_large` (5), `store` (6). `aborted` (7) is worker-internal and never sent. A serve hands the link one chunk per frame — 48 KiB, because a chunk's running digest cannot be re-derived from split pieces — and a receiver accepts up to 1 MiB, so a wider framing needs no store change. Bundles are capped at 64 GiB.
+
+**Authorization.** A request or offer is fenced by the attempt it names: the controller resolves it through `dispatch::attempt_scope` and requires the worker to hold it and the message's tenant, repo and trust to equal the job context's — the same trust boundary the manifest enforces again on arrival. A refusal is `denied`; nothing about the store's contents crosses it.
+
+**Resume.** A hydration transfers into `<entry>/writing/remote.part` under the entry's single-writer marker (`writing/.lock`) and a lease — a live publisher is a skip, and GC can never take the entry mid-transfer. The worker hashes the partial prefix it already holds and asks to continue from it; the controller serves from that offset only when its bundle really extends the prefix, otherwise it answers offset 0 and the worker truncates. Bytes already on disk are never re-sent and never spliced: a prefix that does not match is dropped (`corrupt` — the partial can never verify) while a transfer cut short by the network or the budget keeps its partial for the next attempt. A completed partial is deleted; a stale one is reaped with the rest of `writing/`.
+
+**The restore-cost bound.** A hydration may spend at most `min(5 s, job timeout / 4)` (`remote::BUDGET_MAX`, the job's own allowance read from its spec). The deadline bounds the whole transfer, and once at least 250 ms of it has been measured the worker extrapolates the measured rate: when the estimated remaining transfer no longer fits the budget that is left, it stops. An aborted transfer is `Miss::Unavailable` on the entry — a rebuild, never a wait — and keeps its partial for a later attempt. A stalling link cannot outlive the deadline.
+
+**Install and promotion.** The received stream is decoded into a staging generation under `writing/`: the manifest must decode, be sealed and pass the *same* `Manifest::compatible` boundary check the local lookup runs (wrong tenant, repo, class, trust, platform, toolchain, name, key or compat is the same typed miss a local generation would answer); the `files` blob's digest must match the manifest's pin; every payload file is written and re-hashed against the listing entry that names it, with modes applied. Then the targets are materialized through the same `restore::materialize` a local hit uses — reflink or bounded copy — and the generation is promoted with the same two renames a publication uses: the directory lands inside the entry, then `current` is swapped atomically. Until that swap, nothing of the transfer is visible to a reader; a bundle that fails any check never serves, and no partial of it survives.
+
+**Offers.** After a verdict's terminal report has left — never before, and never on its critical path — the worker may offer each generation it sealed to the controller: hash the generation, offer the metadata, stream the canonical bytes. The whole offer is bounded by `OFFER_BUDGET` (30 s) and the attempt's cancel flag; a refusal, a lost session or a passed deadline simply drops it. The controller's store mirrors the worker layout under `<data_dir>/remote-cache`: `<repo>/<class>/<trust>/<platform>/<toolchain16>/<name>/<entry>/<bundle-id>.bundle`, with `current` naming the bundle id a fetch is served. An incoming offer stages under the same `writing/` marker, verifies the whole stream by hashing what landed, and promotes by rename plus the `current` swap — an offer of a digest already stored is answered as stored and changes nothing.
+
+**What is never served.** Corrupt content (a chunk that fails its running digest, a stream that fails its digest, a listing that disagrees with the manifest) and wrong-scope content (any boundary or compat mismatch) are typed misses, and a hydration neither materializes nor promotes them.
+
+**Measured.** A hydrated restore records three facts on its `Stats`: `remote_ns`, the transfer's wall time (a duration, absent when no transfer ran — a local hit leaves it `None`); `remote_bytes`, the bytes actually delivered (a count, `0` when none, never counting a resumed prefix); and `remote_from`, the offset a resume began at (absent for a cold transfer and for no transfer at all).
+
 ## Compiler state (K06)
 
 A `class: compiler` entry is a stable toolchain namespace whose tool owns per-input invalidation: Sentinel pins *where* compiler state lives and guarantees a writable view on every attempt, while the compiler (ccache, sccache, rustc's incremental store, go's build cache) decides per input what is still fresh. That split is what lets compiler state persist across small source and lockfile edits — a complete source hash in the outer key would destroy reuse that the tool's own content keys already express inside the namespace.
@@ -216,6 +238,17 @@ proves:
   barrier with a deliberately slow stage, exactly one writer stages at a
   time — the loser skips, staging never interleaves, `current` never
   double-promotes.
+- **Remote hydration** —
+  `tests/remote.rs` drives the real miss path against an in-memory
+  controller implementing the link's `Remote` seam: a cold transfer
+  serves the job, installs a generation the store then serves locally,
+  and a later attempt's transport is never called; an interrupted
+  transfer resumes exactly at the offset it stopped — no prefix is
+  re-sent and the partial is gone once it completes; a corrupted chunk
+  and a bundle sealed for another trust are typed misses (`corrupt`,
+  `wrong_trust`) that materialize nothing, leave no `current` and drop
+  the partial; and a controller without the bundle leaves the local miss,
+  partial and pointer untouched.
 
 Cases not re-covered here because an earlier task's test already proves
 them: lease staleness and `writing/` reap boundaries (`tests/gc.rs`),
@@ -226,4 +259,4 @@ reports its skip rather than passing silently; on hosts without
 
 ## Versioned surface
 
-The manifest and `files` blob formats are versioned contracts under [compatibility](compatibility.md); the miss-reason strings are the report vocabulary and change only there too. The pipeline-facing half — `cache.class`, its default, and the compiled digest — is schema 1 behavior documented in [pipeline schema](pipeline-schema.md).
+The manifest and `files` blob formats are versioned contracts under [compatibility](compatibility.md); the miss-reason strings are the report vocabulary and change only there too. The remote bundle stream (`remote::STREAM_MAGIC`, format `1`) is a versioned transfer contract in the same sense. The pipeline-facing half — `cache.class`, its default, and the compiled digest — is schema 1 behavior documented in [pipeline schema](pipeline-schema.md).

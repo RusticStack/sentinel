@@ -13,8 +13,8 @@
 //!
 //! Everything here is metadata. Corruption, incompatibility and truncation
 //! are `Miss` values, never build failures. Clone backends, publication
-//! leases and garbage collection are K02/K03; this crate owns what they
-//! share: paths, formats and reasons.
+//! leases, garbage collection and remote hydration (Q08, [`remote`]) build
+//! on what this crate owns: paths, formats and reasons.
 
 pub mod attach;
 pub mod clone;
@@ -23,6 +23,7 @@ pub mod lease;
 pub mod manifest;
 pub mod outcome;
 pub mod publish;
+pub mod remote;
 pub mod restore;
 pub mod scope;
 

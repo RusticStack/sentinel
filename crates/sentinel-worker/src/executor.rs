@@ -645,6 +645,16 @@ impl Report for Inner {
             stats: *stats,
         });
     }
+    /// Q08: the session's remote-cache transport, when the link offers
+    /// one. It is session state, not attempt state — a reconnect that
+    /// replaces the reporter replaces this handle with it, and an
+    /// attempt holding the old one simply drops its offers.
+    fn remote(&self) -> Option<std::sync::Arc<dyn sentinel_cache::remote::Remote>> {
+        self.state()
+            .reporter
+            .as_ref()
+            .and_then(Reporter::remote_cache)
+    }
 }
 
 impl artifacts::Sink for Inner {

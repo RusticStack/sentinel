@@ -53,7 +53,9 @@ pub(crate) const MAX_WALK_DEPTH: usize = 64;
 /// Stream block for hashing and copying; hashing rides the copy pass.
 const COPY_BYTES: usize = 1 << 20;
 /// Staging for the `current` swap: `current.tmp` then a rename.
-const CURRENT_TMP: &str = "current.tmp";
+/// `pub(crate)` for the remote path: a hydrated generation is promoted by
+/// the same two renames a publication uses.
+pub(crate) const CURRENT_TMP: &str = "current.tmp";
 
 /// What a commit did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -646,7 +648,8 @@ fn copy_hashed(from: &Path, to: &Path) -> std::io::Result<([u8; 32], u64)> {
 
 /// Write a small file durably enough to be renamed over: contents are
 /// flushed to the device before the caller links the name into place.
-fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// `pub(crate)` for the remote path's `current` swap.
+pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = fs::File::create(path)?;
     file.write_all(bytes)?;
     file.sync_data()
@@ -654,20 +657,21 @@ fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// fsync a directory so a rename inside it is durable. No-op off unix —
 /// directory fsync is not part of the portable surface (the same reading
-/// the object store makes).
+/// the object store makes). `pub(crate)` for the remote path.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
 /// Stamp a staged payload file with the mode the manifest records for it,
 /// minus the bits restore never applies (clone::mode_of keeps 0o777).
-/// No-op off unix, where mode is not tracked.
-fn stamp_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+/// No-op off unix, where mode is not tracked. `pub(crate)` for the remote
+/// path's staged payload.
+pub(crate) fn stamp_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

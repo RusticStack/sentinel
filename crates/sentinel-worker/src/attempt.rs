@@ -95,6 +95,12 @@ pub trait Report: Send + Sync {
         _stats: &sentinel_cache::Stats,
     ) {
     }
+    /// The session's remote-cache transport (Q08), when the link offers
+    /// one: a local miss may hydrate through it and a sealed generation
+    /// may be offered back. `None` — the default — leaves both off.
+    fn remote(&self) -> Option<Arc<dyn sentinel_cache::remote::Remote>> {
+        None
+    }
 }
 
 /// One cache's publication outcome, reported once per attempted entry.
@@ -166,8 +172,12 @@ pub fn run(
     cancel: &Cancel,
 ) -> (Verdict, AttemptSummary) {
     report.event(job.attempt, job.fence, Event::PreparationStarted);
+    // Q08: the session's remote transport, when it has one. Resolved once
+    // per attempt: hydration during preparation, offers after the
+    // verdict both go through it.
+    let remote = report.remote();
     let mut summary = AttemptSummary::default();
-    let prepared = prepare(root, job, cancel, &mut summary);
+    let prepared = prepare(root, job, cancel, &mut summary, remote.as_deref());
     // K08: a nominal hit that paid rebuild-scale restore cost is a
     // diagnostic on the attempt, never its verdict — flagged once per
     // entry now that preparation has filled `job.caches`.
@@ -176,6 +186,7 @@ pub fn run(
             report.costly_hit(job.attempt, &attached.name, costly, &attached.stats);
         }
     }
+    let mut sealed: Vec<SealedCache> = Vec::new();
     let verdict = match prepared {
         // A cancel that lands while preparing is a cancel, whatever step of
         // the preparation it interrupted. The log — empty or not — is closed
@@ -224,7 +235,7 @@ pub fn run(
                 matches!(verdict, Verdict::Passed),
                 sink,
             );
-            finalize(root, job, &verdict, report, workspace, container, cancel);
+            sealed = finalize(root, job, &verdict, report, workspace, container, cancel);
             // The log is part of finalization: the attempt is not done until
             // what it printed is durable on the controller, or the wait ran
             // out and the failure is on record.
@@ -264,6 +275,11 @@ pub fn run(
         Ok(bytes) => report.finish(job.attempt, job.fence, event, bytes),
         Err(_) => report.event(job.attempt, job.fence, event),
     }
+    // Q08: a sealed generation may be offered to the controller — but
+    // only now, after the terminal report already left. The offer is
+    // bounded background work; whether it lands can never change what
+    // this attempt reported.
+    offer_caches(root, job, &sealed, remote.as_deref(), cancel);
     (verdict, summary)
 }
 
@@ -272,6 +288,7 @@ fn prepare(
     job: &mut Job,
     cancel: &Cancel,
     summary: &mut AttemptSummary,
+    remote: Option<&dyn sentinel_cache::remote::Remote>,
 ) -> Result<(Workspace, Container)> {
     let compiled = job
         .spec
@@ -359,7 +376,7 @@ fn prepare(
         // directories a job always sees. Never fatal: a cache-path error
         // is an explainable miss recorded on the entry. Absolute declared
         // paths reach the container through the collected bind mounts.
-        let mounts = restore_caches(root, job, &declared, workspace.path(), &image);
+        let mounts = restore_caches(root, job, &declared, workspace.path(), &image, remote);
         let started = Instant::now();
         let container = Container::start(
             job.worker,
@@ -421,17 +438,35 @@ fn join_checkout(co: &mut Option<CheckoutThread>, summary: &mut AttemptSummary) 
 /// Never fails the attempt: any error on the cache path is an explainable
 /// miss recorded on the entry, and the declared paths stay writable
 /// directories either way. `image` is the pinned `name@digest` — the
-/// toolchain descriptor every scope is built under.
+/// toolchain descriptor every scope is built under. `remote` is the
+/// session's transport (Q08): when present, a local miss may hydrate
+/// through the controller under `min(5 s, job timeout / 4)`.
 fn restore_caches(
     root: &Path,
     job: &mut Job,
     declared: &[sentinel_pipeline::schema::Cache],
     workspace: &Path,
     image: &str,
+    remote: Option<&dyn sentinel_cache::remote::Remote>,
 ) -> Vec<podman::Mount> {
     if declared.is_empty() {
         return Vec::new();
     }
+    // The hydration budget comes from the job's own wall-time allowance,
+    // never from anything the worker invents: a quarter of the job's
+    // timeout, capped at five seconds (remote::BUDGET_MAX).
+    let job_timeout = job
+        .spec
+        .pipeline
+        .jobs
+        .get(job.job_index)
+        .map(|j| Duration::from_secs(j.spec.timeout_secs.max(1)))
+        .unwrap_or(Duration::ZERO);
+    let remote = remote.map(|source| sentinel_cache::remote::Policy {
+        source,
+        attempt: *job.attempt.as_bytes(),
+        job_timeout,
+    });
     let context = WorkerContext::new(&job.context, &job.spec, workspace);
     let cache_root = root.join(sentinel_cache::attach::ROOT_DIR);
     let env = sentinel_cache::restore::Context {
@@ -474,8 +509,8 @@ fn restore_caches(
                 .key
                 .render(&context, sentinel_cache::attach::MAX_KEY_BYTES)
                 .ok();
-            Some(sentinel_cache::restore::restore(
-                &env, decl, key, scope, &owner,
+            Some(sentinel_cache::restore::restore_remote(
+                &env, decl, key, scope, &owner, remote,
             ))
         })
         .collect();
@@ -780,15 +815,22 @@ fn cache_record(attached: &sentinel_cache::attach::Attached) -> CacheRecord {
 /// whole batch is bounded by `CACHE_PUBLISH_TIMEOUT`, each entry's outcome
 /// is reported as a `CacheNote` and stamped on the carrier's stats (K08)
 /// for the summary's per-entry record, and nothing here changes what the
-/// attempt reported.
-fn publish_caches(root: &Path, job: &mut Job, report: &dyn Report, cancel: &Cancel) {
+/// attempt reported. The returned list names the generations this attempt
+/// sealed — what a later offer (Q08) may send to the controller.
+fn publish_caches(
+    root: &Path,
+    job: &mut Job,
+    report: &dyn Report,
+    cancel: &Cancel,
+) -> Vec<SealedCache> {
+    let mut sealed = Vec::new();
     if job.caches.is_empty() {
-        return;
+        return sealed;
     }
     let cache_root = root.join(sentinel_cache::CACHE_DIR);
     let deadline = Instant::now() + sentinel_cache::publish::CACHE_PUBLISH_TIMEOUT;
     let canceled = || cancel.load(Ordering::Acquire);
-    for attached in &mut job.caches {
+    for (index, attached) in job.caches.iter_mut().enumerate() {
         let started = Instant::now();
         let committed = sentinel_cache::publish::commit(
             &cache_root,
@@ -811,6 +853,10 @@ fn publish_caches(root: &Path, job: &mut Job, report: &dyn Report, cancel: &Canc
                 attached.stats.committed = Some(sentinel_cache::Committed::Sealed {
                     staged_bytes: bytes,
                     reused_bytes,
+                });
+                sealed.push(SealedCache {
+                    index,
+                    generation: generation.clone(),
                 });
                 CacheOutcome::Sealed {
                     generation,
@@ -835,6 +881,7 @@ fn publish_caches(root: &Path, job: &mut Job, report: &dyn Report, cancel: &Canc
             },
         );
     }
+    sealed
 }
 
 fn finalize(
@@ -845,18 +892,66 @@ fn finalize(
     workspace: Workspace,
     container: Container,
     cancel: &Cancel,
-) {
+) -> Vec<SealedCache> {
     // Cache publication is finalization work: it reads the job's writable
     // views, so it must precede the teardown — and a verdict that never ran
     // the job's commands leaves nothing worth keeping.
-    if cache_worthy(verdict) {
-        publish_caches(root, job, report, cancel);
-    }
+    let sealed = if cache_worthy(verdict) {
+        publish_caches(root, job, report, cancel)
+    } else {
+        Vec::new()
+    };
     // Both run even when one fails: a container that will not stop must not
     // keep a workspace alive, and vice versa. The failure is a reconciliation
     // matter for W07, which lists what this worker still owns.
     let _ = container.destroy();
     let _ = workspace.destroy();
+    sealed
+}
+
+/// One generation this attempt sealed: the carrier it belongs to (by
+/// position, the same order `job.caches` is in) and the directory name
+/// under its entry.
+struct SealedCache {
+    index: usize,
+    generation: String,
+}
+
+/// Offer every sealed generation to the controller (Q08), one bounded
+/// transfer each, long after the terminal report already left. An offer
+/// never changes a verdict: a refusal, a session that went away, or a
+/// deadline that passed simply drops it — the local copy is already the
+/// job's own.
+fn offer_caches(
+    root: &Path,
+    job: &Job,
+    sealed: &[SealedCache],
+    remote: Option<&dyn sentinel_cache::remote::Remote>,
+    cancel: &Cancel,
+) {
+    let Some(source) = remote else {
+        return;
+    };
+    if sealed.is_empty() {
+        return;
+    }
+    let cache_root = root.join(sentinel_cache::CACHE_DIR);
+    let deadline = Instant::now() + sentinel_cache::remote::OFFER_BUDGET;
+    let canceled = || cancel.load(Ordering::Acquire);
+    for entry in sealed {
+        let Some(attached) = job.caches.get(entry.index) else {
+            continue;
+        };
+        let _ = sentinel_cache::remote::offer_generation(
+            &cache_root,
+            attached,
+            &entry.generation,
+            *job.attempt.as_bytes(),
+            source,
+            deadline,
+            &canceled,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -963,7 +1058,7 @@ mod tests {
         let mut job = job(spec());
         let declared = job.spec.pipeline.jobs[0].spec.cache.clone();
         let image = format!("example.test/i@{}", job.digest);
-        let mounts = restore_caches(&root, &mut job, &declared, &ws, &image);
+        let mounts = restore_caches(&root, &mut job, &declared, &ws, &image, None);
 
         assert_eq!(job.caches.len(), 1);
         let attached = &job.caches[0];
@@ -1003,11 +1098,13 @@ mod tests {
         assert!(!record.costly_hit);
     }
 
-    /// A report sink that records the diagnostics `run` emits.
+    /// A report sink that records the diagnostics `run` emits, and hands
+    /// out whatever remote transport a test installed on it (Q08).
     #[derive(Default)]
     struct Notes {
         cache_notes: Mutex<Vec<CacheNote>>,
         costly: Mutex<Vec<(String, sentinel_cache::Costly)>>,
+        remote: Mutex<Option<Arc<dyn sentinel_cache::remote::Remote>>>,
     }
     impl Report for Notes {
         fn event(&self, _: AttemptId, _: Fence, _: Event) {}
@@ -1024,6 +1121,44 @@ mod tests {
         ) {
             self.costly.lock().unwrap().push((name.to_owned(), costly));
         }
+        fn remote(&self) -> Option<Arc<dyn sentinel_cache::remote::Remote>> {
+            self.remote.lock().unwrap().clone()
+        }
+    }
+
+    /// A transport that records every offer it stores; a fetch always
+    /// misses, which is all the offer path needs of it.
+    #[derive(Default)]
+    struct Recorder {
+        offered: Mutex<Vec<(String, u64)>>,
+    }
+    impl sentinel_cache::remote::Remote for Recorder {
+        fn fetch(
+            &self,
+            _: &sentinel_cache::remote::Need,
+            _: Instant,
+            _: &mut dyn sentinel_cache::remote::Sink,
+        ) -> Result<(), sentinel_cache::remote::Refusal> {
+            Err(sentinel_cache::remote::Refusal::NoBundle)
+        }
+        fn offer(
+            &self,
+            upload: &sentinel_cache::remote::Upload,
+            _: Instant,
+            source: &mut dyn std::io::Read,
+        ) -> Result<(), sentinel_cache::remote::Refusal> {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            source
+                .read_to_end(&mut bytes)
+                .map_err(|_| sentinel_cache::remote::Refusal::Store)?;
+            assert_eq!(bytes.len() as u64, upload.total);
+            self.offered
+                .lock()
+                .unwrap()
+                .push((upload.key.clone(), bytes.len() as u64));
+            Ok(())
+        }
     }
 
     /// A job that wrote into its view publishes; the commit's cost and
@@ -1037,12 +1172,15 @@ mod tests {
         let mut job = job(spec());
         let declared = job.spec.pipeline.jobs[0].spec.cache.clone();
         let image = format!("example.test/i@{}", job.digest);
-        restore_caches(&root, &mut job, &declared, &ws, &image);
+        restore_caches(&root, &mut job, &declared, &ws, &image, None);
         // The job's own work: one new file in the declared path's view.
         fs::write(ws.join("vendor/lib"), b"new").unwrap();
         let notes = Notes::default();
         let flag: Cancel = Arc::new(AtomicBool::new(false));
-        publish_caches(&root, &mut job, &notes, &flag);
+        let sealed = publish_caches(&root, &mut job, &notes, &flag);
+        assert_eq!(sealed.len(), 1, "one sealed generation is one offer");
+        assert_eq!(sealed[0].index, 0);
+        assert!(sealed[0].generation.starts_with("gen-"));
 
         let attached = &job.caches[0];
         assert!(attached.stats.commit_ns.is_some());
@@ -1067,6 +1205,63 @@ mod tests {
         ));
     }
 
+    /// A sealed generation is offered through the session's transport —
+    /// and only there: with no transport the same publish stands, and a
+    /// refused offer leaves the local generation and every stat exactly
+    /// as they were.
+    #[test]
+    fn a_sealed_generation_is_offered_only_when_a_transport_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, ws) = (temp.path().join("worker"), temp.path().join("ws"));
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("f.lock"), b"locked").unwrap();
+        let mut job = job(spec());
+        let declared = job.spec.pipeline.jobs[0].spec.cache.clone();
+        let image = format!("example.test/i@{}", job.digest);
+        restore_caches(&root, &mut job, &declared, &ws, &image, None);
+        fs::write(ws.join("vendor/lib"), b"new").unwrap();
+        let notes = Notes::default();
+        let flag: Cancel = Arc::new(AtomicBool::new(false));
+        let sealed = publish_caches(&root, &mut job, &notes, &flag);
+        let generation = sealed[0].generation.clone();
+
+        // No transport: an offer is impossible and nothing pretends
+        // otherwise.
+        offer_caches(&root, &job, &sealed, None, &flag);
+        assert!(job.caches[0].stats.committed.is_some());
+
+        // With one: the canonical stream is read whole and the key the
+        // controller receives is the entry's own.
+        let recorder = Arc::new(Recorder::default());
+        let transport: &dyn sentinel_cache::remote::Remote = recorder.as_ref();
+        offer_caches(&root, &job, &sealed, Some(transport), &flag);
+        let offered = recorder.offered.lock().unwrap();
+        assert_eq!(offered.len(), 1);
+        assert!(offered[0].0.starts_with("deps-"), "{}", offered[0].0);
+        let offered_len = offered[0].1;
+        drop(offered);
+
+        // The stream is exactly the sealed generation: head, manifest,
+        // listing and payload — and the generation is still there after.
+        let attached = &job.caches[0];
+        let gen_dir = attached
+            .scope
+            .entry_dir(
+                &root.join(sentinel_cache::CACHE_DIR),
+                sentinel_cache::attach::entry_key(attached.scope.class, &attached.key),
+            )
+            .join(&generation);
+        let expected = 40
+            + fs::read(gen_dir.join(sentinel_cache::scope::MANIFEST_NAME))
+                .unwrap()
+                .len() as u64
+            + fs::read(gen_dir.join(sentinel_cache::scope::FILES_NAME))
+                .unwrap()
+                .len() as u64
+            + 3;
+        assert_eq!(offered_len, expected);
+    }
+
     /// The record's flag is the carrier's rule: a reflink-root hit that
     /// copied every byte reads `costly_hit` — the notice goes through
     /// `report.costly_hit` the same way.
@@ -1079,7 +1274,7 @@ mod tests {
         let mut job = job(spec());
         let declared = job.spec.pipeline.jobs[0].spec.cache.clone();
         let image = format!("example.test/i@{}", job.digest);
-        restore_caches(&root, &mut job, &declared, &ws, &image);
+        restore_caches(&root, &mut job, &declared, &ws, &image, None);
         // Shape the carrier the way a reflink root that refused every
         // file leaves it: a hit whose copy covered all bytes.
         let attached = &mut job.caches[0];
@@ -1213,7 +1408,7 @@ mod tests {
         // `cc-normal-<h2>` — same stem, small lockfile edit.
         seal_compiler(&root, &job, &ws, &declared[0], &[("obj/a.o", b"object")]);
 
-        let mounts = restore_caches(&root, &mut job, &declared, &ws, &image);
+        let mounts = restore_caches(&root, &mut job, &declared, &ws, &image, None);
 
         assert_eq!(job.caches.len(), 1);
         let attached = &job.caches[0];

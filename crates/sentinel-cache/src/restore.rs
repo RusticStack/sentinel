@@ -84,6 +84,23 @@ pub fn restore(
     scope: Scope,
     owner: &str,
 ) -> Attached {
+    restore_remote(env, decl, key, scope, owner, None)
+}
+
+/// [`restore`] with the remote path (Q08, [`crate::remote`]) available
+/// for a local miss. A local hit never consults `remote`: hydration is
+/// strictly a miss path. When a transfer was attempted and did not
+/// serve, the miss is the transfer's own — `unavailable` for a bounded
+/// transfer that failed or ran out of budget, or the reason the received
+/// bundle failed the same lookup the local store answers.
+pub fn restore_remote(
+    env: &Context<'_>,
+    decl: &Cache,
+    key: Option<String>,
+    scope: Scope,
+    owner: &str,
+    remote: Option<crate::remote::Policy<'_>>,
+) -> Attached {
     let key = key.unwrap_or_default();
     let compat = attach::declared_compat(decl, &key, scope.platform);
     let mut attached = Attached {
@@ -126,9 +143,28 @@ pub fn restore(
     };
     attached.stats.lookup_ns = Some(ns(started));
     let (name, gen_dir, hit) = match found {
+        // A local hit never touches the network: the miss path below is
+        // the only place remote hydration is consulted (Q08).
         Ok((name, dir, Outcome::Hit(hit))) => (name, dir, hit),
         Ok((_, _, Outcome::Miss(miss))) | Err(miss) => {
             attached.outcome = Outcome::Miss(miss);
+            // Targets were resolved usable above (an unusable one already
+            // returned `invalid`), so any miss here may hydrate: a local
+            // generation that is absent, broken or semantically invalid
+            // says nothing about what the controller holds.
+            if let Some(policy) = remote {
+                match crate::remote::hydrate(env, &mut attached, owner, policy) {
+                    crate::remote::Hydro::Served(hydrated) => {
+                        attached.outcome = Outcome::Hit(Box::new(hydrated.hit));
+                        attached.generation = Some(hydrated.generation);
+                        attached.lease = Some(hydrated.lease);
+                    }
+                    crate::remote::Hydro::Nothing => {}
+                    crate::remote::Hydro::Refused(miss) => {
+                        attached.outcome = Outcome::Miss(miss)
+                    }
+                }
+            }
             return attached;
         }
     };
@@ -214,7 +250,7 @@ fn gen_name_shape(name: &str) -> bool {
 /// manifest — the anchor that lets materialization skip per-file hashing
 /// — then decode. A manifest without its listing, an oversize one or a
 /// digest mismatch is a `Corrupt` generation.
-fn files_blob(gen_dir: &Path, manifest: &manifest::Manifest) -> Result<FilesBlob, Miss> {
+pub(crate) fn files_blob(gen_dir: &Path, manifest: &manifest::Manifest) -> Result<FilesBlob, Miss> {
     let file = fs::File::open(gen_dir.join(scope::FILES_NAME)).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => Miss::Corrupt,
         _ => Miss::Unavailable,
@@ -306,7 +342,11 @@ fn check_payload_tree(src: &Path, listed: &HashMap<&str, &FileEntry>) -> Result<
 /// (docs/cache.md). `Ok` carries the verified listing so the caller can
 /// run the bounded first-touch sample after it has stamped `clone_ns` —
 /// the sample's cost must not land inside the clone's wall time (K08).
-fn materialize(
+///
+/// `pub(crate)` for the remote path (Q08): a hydrated generation is
+/// materialized by this exact code, so a served clone and a hydrated one
+/// can never differ in their checks.
+pub(crate) fn materialize(
     gen_dir: &Path,
     manifest: &manifest::Manifest,
     targets: &[Target],
@@ -366,7 +406,7 @@ fn materialize(
 /// real, so it is measured separately rather than folded into `clone_ns`.
 /// `None` when the listing held no file to sample; a file that will not
 /// open is simply not measured, never a miss.
-fn first_touch(blob: &FilesBlob, targets: &[Target]) -> Option<u64> {
+pub(crate) fn first_touch(blob: &FilesBlob, targets: &[Target]) -> Option<u64> {
     if blob.entries.is_empty() {
         return None;
     }
