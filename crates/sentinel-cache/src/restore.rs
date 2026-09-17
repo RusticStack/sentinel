@@ -23,6 +23,7 @@
 //! a link inside the workspace is the checkout's data, not a path.
 
 use std::{
+    collections::HashMap,
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -35,8 +36,9 @@ use crate::{
     attach::{self, Attached, Stats, Target, entry_key},
     clone::{self, Backend},
     lease::{self, Lease},
-    manifest::{self, FilesBlob, Request},
+    manifest::{self, FileEntry, FilesBlob, Request},
     outcome::{Miss, Outcome},
+    publish::MAX_WALK_DEPTH,
     scope::{self, Scope},
 };
 
@@ -229,11 +231,6 @@ fn files_blob(gen_dir: &Path, manifest: &manifest::Manifest) -> Result<FilesBlob
     FilesBlob::decode(&raw)
 }
 
-/// The `<i>` in a `payload/<i>/<relpath>` listing entry.
-fn payload_index(path: &str) -> Option<usize> {
-    payload_parts(path).map(|(index, _)| index)
-}
-
 /// `payload/<i>/<rel>` → `(i, rel)` — the listing's own shape, which
 /// materialization validated before this is ever asked.
 fn payload_parts(path: &str) -> Option<(usize, &str)> {
@@ -245,13 +242,70 @@ fn payload_parts(path: &str) -> Option<(usize, &str)> {
     Some((index.parse().ok()?, rel))
 }
 
+/// Walk a generation's `payload/<i>` tree and require it to be exactly
+/// the sealed listing for that index: every non-directory entry a listed
+/// regular file at its listed size, and all of them present. A planted
+/// file, a symlink where a file was listed or a missing listed file is a
+/// generation that drifted from what its manifest pinned — `Corrupt`,
+/// never served. Bounded like the writer's own walk: deeper than
+/// [`MAX_WALK_DEPTH`] cannot be sealed content.
+fn check_payload_tree(src: &Path, listed: &HashMap<&str, &FileEntry>) -> Result<(), Miss> {
+    // `(dir, rel)` — `rel` is the listing's suffix form: `sub/dir/file`.
+    let mut stack = vec![(src.to_path_buf(), String::new(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((dir, rel, depth)) = stack.pop() {
+        if depth >= MAX_WALK_DEPTH {
+            return Err(Miss::Corrupt);
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Miss::Corrupt),
+            Err(_) => return Err(Miss::Unavailable),
+        };
+        for child in entries {
+            let child = child.map_err(|_| Miss::Unavailable)?;
+            let meta = child.metadata().map_err(|e| match e.kind() {
+                io::ErrorKind::NotFound => Miss::Corrupt,
+                _ => Miss::Unavailable,
+            })?;
+            let Some(name) = child.file_name().to_str().map(str::to_owned) else {
+                // An unencodable name can never be listed — planted.
+                return Err(Miss::Corrupt);
+            };
+            let rel = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if meta.is_dir() {
+                stack.push((child.path(), rel, depth + 1));
+            } else if meta.is_file() {
+                match listed.get(rel.as_str()) {
+                    Some(entry) if entry.size == meta.len() => seen += 1,
+                    _ => return Err(Miss::Corrupt),
+                }
+            } else {
+                // A symlink or special file can never be listed — planted.
+                return Err(Miss::Corrupt);
+            }
+        }
+    }
+    if seen != listed.len() {
+        // A listed file the tree does not hold — the other hole.
+        return Err(Miss::Corrupt);
+    }
+    Ok(())
+}
+
 /// Clone every `payload/<i>` to its target. The listing is re-validated
 /// here — `decode` already checked each path is relative, and a clone
-/// input is checked twice rather than trusted once. Payload bytes are
-/// not re-hashed: that would defeat the reflink path (docs/cache.md).
-/// `Ok` carries the verified listing so the caller can run the bounded
-/// first-touch sample after it has stamped `clone_ns` — the sample's cost
-/// must not land inside the clone's wall time (K08).
+/// input is checked twice rather than trusted once — and the tree must
+/// match it exactly: the listing is the payload's whole authority, so a
+/// planted or missing file is `Corrupt`, never served (K09). Payload
+/// bytes are not re-hashed: that would defeat the reflink path
+/// (docs/cache.md). `Ok` carries the verified listing so the caller can
+/// run the bounded first-touch sample after it has stamped `clone_ns` —
+/// the sample's cost must not land inside the clone's wall time (K08).
 fn materialize(
     gen_dir: &Path,
     manifest: &manifest::Manifest,
@@ -260,12 +314,18 @@ fn materialize(
     stats: &mut Stats,
 ) -> Result<FilesBlob, Miss> {
     let blob = files_blob(gen_dir, manifest)?;
+    // Per-index `rel → entry` maps: what the payload trees must hold.
+    let mut listed: Vec<HashMap<&str, &FileEntry>> =
+        targets.iter().map(|_| HashMap::new()).collect();
     for entry in &blob.entries {
         let ok = valid_relative_path(&entry.path)
-            && payload_index(&entry.path).is_some_and(|i| i < targets.len());
+            && payload_parts(&entry.path).is_some_and(|(i, rel)| {
+                i < targets.len() && listed[i].insert(rel, entry).is_none()
+            });
         if !ok {
             // The verified listing names a file outside the payload
-            // layout: the generation cannot serve.
+            // layout — or the same payload path twice: the generation
+            // cannot serve.
             return Err(Miss::Invalid);
         }
     }
@@ -273,6 +333,7 @@ fn materialize(
         let src = gen_dir.join("payload").join(index.to_string());
         match fs::symlink_metadata(&src) {
             Ok(meta) if meta.is_dir() => {
+                check_payload_tree(&src, &listed[index])?;
                 let cloned =
                     clone::tree(&src, &target.dir, backend).map_err(|e| match e.kind() {
                         // A payload the listing names but the tree does
@@ -288,11 +349,7 @@ fn materialize(
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 // No payload for this declared path: honest only when the
                 // listing agrees there was nothing to carry.
-                if blob
-                    .entries
-                    .iter()
-                    .any(|e| payload_index(&e.path) == Some(index))
-                {
+                if !listed[index].is_empty() {
                     return Err(Miss::Corrupt);
                 }
             }

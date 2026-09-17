@@ -47,7 +47,9 @@ pub const CACHE_PUBLISH_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 const CHECK_EVERY: u32 = 256;
 /// The deepest a payload walk descends — the `hash_files` traversal bound,
 /// so publish never wanders deeper than the resolver would have hashed.
-const MAX_WALK_DEPTH: usize = 64;
+/// `pub(crate)` for restore: a sealed generation can never hold a tree
+/// deeper than a writer could stage, so the read side shares the bound.
+pub(crate) const MAX_WALK_DEPTH: usize = 64;
 /// Stream block for hashing and copying; hashing rides the copy pass.
 const COPY_BYTES: usize = 1 << 20;
 /// Staging for the `current` swap: `current.tmp` then a rename.
