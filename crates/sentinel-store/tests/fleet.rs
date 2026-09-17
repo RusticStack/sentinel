@@ -7,8 +7,7 @@
 
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
-    Event, JobId, JobState, Outcome, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId,
-    WorkerId,
+    Event, JobId, JobState, Outcome, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Namespace, Permissions as P, Principal},
 };
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
@@ -83,6 +82,7 @@ fn fixture() -> Fixture {
 /// A second organization with its own repository, admitted to the same pool.
 fn other_tenant(f: &Fixture, slug: &str) -> (TenantId, RepoId) {
     let (root, tenant, repo, pool) = (f.root, TenantId::new(), RepoId::new(), f.pool);
+    let slug = slug.to_owned();
     f.store
         .writer()
         .write(move |tx| {
@@ -90,7 +90,7 @@ fn other_tenant(f: &Fixture, slug: &str) -> (TenantId, RepoId) {
                 tx,
                 Principal::new(root, P::ALL, None, None),
                 tenant,
-                Namespace::parse(slug).unwrap(),
+                Namespace::parse(&slug).unwrap(),
                 NamespaceKind::Organization,
                 NOW,
             )?;
@@ -315,16 +315,7 @@ jobs:
 #[test]
 fn unsatisfiable_jobs_name_the_constraint_that_blocks_them() {
     let f = fixture();
-    let w = worker(
-        &f,
-        f.pool,
-        8_000,
-        16 << 30,
-        20 << 30,
-        &["linux"],
-        None,
-        &[],
-    );
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &["linux"], None, &[]);
     let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
     let (run_id, all) = run(
         &f,
@@ -398,30 +389,21 @@ jobs:
 fn the_fair_queue_serves_the_tenant_time_favours() {
     let f = fixture();
     let (other, other_repo) = other_tenant(&f, "beta");
-    let w = worker(
-        &f,
-        f.pool,
-        8_000,
-        16 << 30,
-        20 << 30,
-        &[],
-        None,
-        &[],
-    );
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
     let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
     let backlog = "schema: 1
 on: [push]
 jobs:
   a:
     image: alpine:3
-    resources: { cpu: 1, memory: 1GiB }
+    resources: { cpu: 1, memory: 1GiB, disk: 1GiB }
     steps: [{ id: s, run: 'true' }]
   b:
     image: alpine:3
-    resources: { cpu: 1, memory: 1GiB }
+    resources: { cpu: 1, memory: 1GiB, disk: 1GiB }
     steps: [{ id: s, run: 'true' }]
 ";
-    let (_, mine) = run(&f, tenant, repo, backlog, at(2_000));
+    let (mine, _) = run(&f, tenant, repo, backlog, at(2_000));
     let (_, theirs) = run(
         &f,
         other,
@@ -448,20 +430,29 @@ jobs:
 #[test]
 fn a_waiting_large_job_keeps_its_path() {
     let f = fixture();
-    let w = worker(
-        &f,
-        f.pool,
-        8_000,
-        16 << 30,
-        20 << 30,
-        &[],
-        None,
-        &[],
-    );
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
     let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
-    let (_, first) = run(&f, tenant, repo, single_job(2, "2GiB", "2GiB").as_str(), at(2_000));
-    let (_, large) = run(&f, tenant, repo, single_job(8, "8GiB", "8GiB").as_str(), at(2_100));
-    let (_, small) = run(&f, tenant, repo, single_job(1, "1GiB", "1GiB").as_str(), at(2_200));
+    let (_, first) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(2, "2GiB", "2GiB").as_str(),
+        at(2_000),
+    );
+    let (_, large) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(8, "8GiB", "8GiB").as_str(),
+        at(2_100),
+    );
+    let (_, small) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(1, "1GiB", "1GiB").as_str(),
+        at(2_200),
+    );
     // The oldest job of the repository runs; the large job behind it does
     // not reserve capacity that is already spent.
     let offer = place(&f, w, pool, at(2_300)).unwrap();
@@ -480,16 +471,7 @@ fn a_waiting_large_job_keeps_its_path() {
 #[test]
 fn pull_request_feedback_keeps_a_quarter_of_the_host() {
     let f = fixture();
-    let w = worker(
-        &f,
-        f.pool,
-        8_000,
-        16 << 30,
-        20 << 30,
-        &[],
-        None,
-        &[],
-    );
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
     let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
     // A long manual job first, then the pull request's job behind it.
     let (_, manual) = run(
@@ -499,7 +481,13 @@ fn pull_request_feedback_keeps_a_quarter_of_the_host() {
         single_job(7, "7GiB", "7GiB").as_str(),
         at(2_000),
     );
-    let (pr, pr_jobs) = run(&f, tenant, repo, single_job(4, "4GiB", "4GiB").as_str(), at(2_100));
+    let (pr, pr_jobs) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(4, "4GiB", "4GiB").as_str(),
+        at(2_100),
+    );
     record_event(&f, tenant, repo, pr, "pull_request");
     // Placing the manual job would leave less than a quarter of the host
     // free, so it is held while the pull request's job — which fits — is
@@ -556,18 +544,15 @@ jobs:
 #[test]
 fn drain_stops_new_offers_until_undrained() {
     let f = fixture();
-    let w = worker(
-        &f,
-        f.pool,
-        8_000,
-        16 << 30,
-        20 << 30,
-        &[],
-        None,
-        &[],
-    );
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
     let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
-    let (_, ids) = run(&f, tenant, repo, single_job(1, "1GiB", "1GiB").as_str(), at(2_000));
+    let (_, ids) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(1, "1GiB", "1GiB").as_str(),
+        at(2_000),
+    );
     f.store
         .writer()
         .write(move |tx| workers::drain(tx, Authority::HostLocal, w, at(2_100)))
@@ -589,11 +574,14 @@ fn drain_stops_new_offers_until_undrained() {
         .writer()
         .write(move |tx| workers::undrain(tx, Authority::HostLocal, w))
         .unwrap();
+    f.store
+        .writer()
+        .write(move |tx| workers::revoke(tx, Authority::HostLocal, w, at(2_500)))
+        .unwrap();
     assert!(matches!(
-        f.store.writer().write(move |tx| {
-            workers::revoke(tx, Authority::HostLocal, w, at(2_500))?;
-            workers::drain(tx, Authority::HostLocal, w, at(2_500))
-        }),
+        f.store
+            .writer()
+            .write(move |tx| workers::drain(tx, Authority::HostLocal, w, at(2_500))),
         Err(Error::NotFound)
     ));
     assert!(matches!(
@@ -611,8 +599,20 @@ fn a_warm_worker_is_waited_for_only_inside_the_bound() {
     let cold = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
     let warm = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[key]);
     let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
-    let (_, filler) = run(&f, tenant, repo, single_job(1, "1GiB", "1GiB").as_str(), at(2_000));
-    let (_, target) = run(&f, tenant, repo, single_job(4, "4GiB", "4GiB").as_str(), at(2_100));
+    let (_, filler) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(1, "1GiB", "1GiB").as_str(),
+        at(2_000),
+    );
+    let (_, target) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(4, "4GiB", "4GiB").as_str(),
+        at(2_100),
+    );
     // The warm worker is busy but will free inside the locality window.
     let held = place(&f, warm, pool, at(2_200)).unwrap();
     assert_eq!(held.job, filler[0]);
@@ -626,16 +626,7 @@ fn a_warm_worker_is_waited_for_only_inside_the_bound() {
 #[test]
 fn a_new_run_supersedes_the_live_run_it_replaces() {
     let f = fixture();
-    let w = worker(
-        &f,
-        f.pool,
-        8_000,
-        16 << 30,
-        20 << 30,
-        &[],
-        None,
-        &[],
-    );
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
     let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
     let deploy = "schema: 1
 on: [push]

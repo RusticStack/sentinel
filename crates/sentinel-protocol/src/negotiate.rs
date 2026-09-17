@@ -145,11 +145,11 @@ impl Profile {
         if self.labels.len() > MAX_PROFILE_LABELS {
             return Some("labels");
         }
-        if self
-            .labels
-            .iter()
-            .any(|label| label.is_empty() || label.len() > crate::limits::MAX_NAME_BYTES)
-        {
+        if self.labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > crate::limits::MAX_NAME_BYTES
+                || label.as_bytes().iter().any(|b| *b == b'\n' || *b == b'\r')
+        }) {
             return Some("label");
         }
         if self.availability.images.len() > crate::limits::MAX_LIST_ITEMS {

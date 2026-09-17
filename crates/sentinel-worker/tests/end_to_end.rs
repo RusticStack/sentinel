@@ -192,6 +192,7 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
             },
             profile: sentinel_protocol::negotiate::Profile::default(),
             transport: sentinel_link::session::TransportStats::default(),
+            remote_cache: false,
         };
         let identity = Identity::generate("worker").unwrap();
         identity.save(&worker_cert, &worker_key).unwrap();
@@ -668,6 +669,7 @@ jobs:
             },
             profile: sentinel_protocol::negotiate::Profile::default(),
             transport: sentinel_link::session::TransportStats::default(),
+            remote_cache: false,
         };
         let identity = Identity::load(&worker_cert, &worker_key).unwrap();
         thread::spawn(move || worker::run(config, identity, None, &executor, &handle, &|_| {}))

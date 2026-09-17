@@ -969,12 +969,7 @@ pub trait SessionHandler: Send + Sync {
     /// `Err` ends the session, because a worker whose profile cannot be
     /// recorded must not keep taking work against stale placement data. The
     /// default accepts and records nothing.
-    fn profiled(
-        &self,
-        _worker: WorkerId,
-        _profile: &Profile,
-        _capacity: Capacity,
-    ) -> Result<()> {
+    fn profiled(&self, _worker: WorkerId, _profile: &Profile, _capacity: Capacity) -> Result<()> {
         Ok(())
     }
     /// Protocol 7 (Q07). The worker's latest transport telemetry.
@@ -1204,7 +1199,7 @@ fn split(conn: rustls::Connection, sock: TcpStream) -> Result<(Sender, Receiver)
 enum CacheAnswer {
     Grant(Grant),
     Chunk(Chunk),
-    End(End),
+    End,
     Refused(Refused),
 }
 
@@ -1267,11 +1262,7 @@ pub struct LinkRemote {
 
 impl LinkRemote {
     fn send(&self, message: &ClientMessage) -> Result<()> {
-        let bulk = self
-            .bulk
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let bulk = self.bulk.lock().unwrap_or_else(|p| p.into_inner()).clone();
         match bulk {
             Some(bulk) => bulk.send(message),
             None => self.control.send(message),
@@ -1339,8 +1330,8 @@ impl sentinel_cache::remote::Remote for LinkRemote {
                 }
                 // The end marker is terminal; a stream without a plan never
                 // opened, so it is a protocol violation, not a completion.
-                Ok(CacheAnswer::End(_)) if planned => return Ok(()),
-                Ok(CacheAnswer::End(_)) => return Err(Refusal::Store),
+                Ok(CacheAnswer::End) if planned => return Ok(()),
+                Ok(CacheAnswer::End) => return Err(Refusal::Store),
             }
         }
     }
@@ -1365,7 +1356,7 @@ impl sentinel_cache::remote::Remote for LinkRemote {
             CacheAnswer::Refused(refused) => {
                 return Err(Refusal::from_code(refused.code).unwrap_or(Refusal::Denied));
             }
-            CacheAnswer::End(_) => return Ok(()),
+            CacheAnswer::End => return Ok(()),
             CacheAnswer::Grant(grant) => grant,
             CacheAnswer::Chunk(_) => return Err(Refusal::Store),
         };
@@ -1379,9 +1370,7 @@ impl sentinel_cache::remote::Remote for LinkRemote {
             if Instant::now() >= deadline {
                 return Err(Refusal::Aborted);
             }
-            let read = source
-                .read(&mut buffer)
-                .map_err(|_| Refusal::Aborted)?;
+            let read = source.read(&mut buffer).map_err(|_| Refusal::Aborted)?;
             if read == 0 {
                 break;
             }
@@ -1417,7 +1406,7 @@ impl sentinel_cache::remote::Remote for LinkRemote {
         }))
         .map_err(|_| Refusal::Aborted)?;
         match wait_answer(&answers, deadline)? {
-            CacheAnswer::End(_) => Ok(()),
+            CacheAnswer::End => Ok(()),
             CacheAnswer::Refused(refused) => {
                 Err(Refusal::from_code(refused.code).unwrap_or(Refusal::Denied))
             }
@@ -1507,9 +1496,10 @@ pub fn accept(
         } => {
             let worker = WorkerId::from_bytes(worker).map_err(|_| Error::Protocol("worker id"))?;
             let secret = match enrollment.as_deref() {
-                Some(text) => {
-                    Some(sentinel_auth::token::parse(text).ok_or(Error::Protocol("enrollment secret"))?)
-                }
+                Some(text) => Some(
+                    sentinel_auth::token::parse(text)
+                        .ok_or(Error::Protocol("enrollment secret"))?,
+                ),
                 None => None,
             };
             match admission.admit(
@@ -2068,7 +2058,7 @@ fn serve_cache_need(root: &std::path::Path, need: &Need, sender: &Sender) -> Res
     let digest = plan.digest;
     sender.send(&ServerMessage::CacheGrant(plan))?;
     loop {
-        match serving.next() {
+        match serving.next_chunk() {
             Ok(Some(chunk)) => {
                 if chunk.bytes.len() > MAX_CACHE_CHUNK_BYTES {
                     return send_cache_refused(sender, need.attempt, Refusal::TooLarge);
@@ -2508,7 +2498,7 @@ impl Link {
         let (out, bytes_in) = self.tx.bytes();
         stats.bytes_out = out;
         stats.bytes_in = bytes_in;
-        if self.beats % TRANSPORT_BEATS == 0 {
+        if self.beats.is_multiple_of(TRANSPORT_BEATS) {
             self.tx.send(&ClientMessage::Transport(stats.clone()))?;
         }
         Ok(())
@@ -2749,7 +2739,7 @@ fn handle_bulk_message(
         }
         ServerMessage::CacheEnd(end) => {
             let attempt = AttemptId::from_bytes(end.attempt).map_err(|_| Error::Protocol("id"))?;
-            remote.answer(attempt, CacheAnswer::End(end));
+            remote.answer(attempt, CacheAnswer::End);
         }
         ServerMessage::CacheRefused(refused) => {
             let attempt =
@@ -2848,7 +2838,8 @@ impl BulkLink {
             match self.rx.recv_timeout::<ServerMessage>(BULK_POLL) {
                 Ok(None) => continue,
                 Ok(Some(message)) => {
-                    if let Err(error) = handle_bulk_message(message, executor, &mut state, &self.remote)
+                    if let Err(error) =
+                        handle_bulk_message(message, executor, &mut state, &self.remote)
                     {
                         break Err(error);
                     }

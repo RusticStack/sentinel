@@ -45,9 +45,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     attach::{self, Attached},
     lease::{self, Lease},
-    manifest::{
-        FileEntry, FilesBlob, Manifest, Request, MAX_FILES_BLOB_BYTES, MAX_MANIFEST_BYTES,
-    },
+    manifest::{FileEntry, FilesBlob, MAX_FILES_BLOB_BYTES, MAX_MANIFEST_BYTES, Manifest, Request},
     outcome::{Hit, Miss},
     publish,
     restore::{self, Context},
@@ -117,7 +115,10 @@ pub fn platform_of(os: u8, arch: u8) -> Option<Platform> {
         ARCH_AARCH64 => Arch::Aarch64,
         _ => return None,
     };
-    Some(Platform { os: Os::Linux, arch })
+    Some(Platform {
+        os: Os::Linux,
+        arch,
+    })
 }
 
 /// A hydration request, worker → controller: which entry, from where.
@@ -337,8 +338,12 @@ pub trait Remote: Send + Sync {
     /// The implementation sends `CacheOffer`, pushes the stream in `Push`
     /// chunks from the granted offset, ends with `CachePushEnd`, and
     /// answers once the controller stored it (or refused).
-    fn offer(&self, upload: &Upload, deadline: Instant, source: &mut dyn Read)
-    -> Result<(), Refusal>;
+    fn offer(
+        &self,
+        upload: &Upload,
+        deadline: Instant,
+        source: &mut dyn Read,
+    ) -> Result<(), Refusal>;
 }
 
 /// The receiving half of one fetch. Both calls run on the fetch's thread,
@@ -460,8 +465,10 @@ pub(crate) fn hydrate(
     match fetched {
         Ok(()) => {}
         // The controller had nothing (or refused the request itself): the
-        // local lookup's own reason is the honest answer.
+        // local lookup's own reason is the honest answer. Drop any empty
+        // staging file so a miss does not leave a resume trap.
         Err(Refusal::NoBundle) | Err(Refusal::Denied) | Err(Refusal::Busy) => {
+            let _ = fs::remove_file(&part);
             return Hydro::Nothing;
         }
         // A transfer whose bytes cannot be the promised stream is dropped
@@ -482,8 +489,8 @@ pub(crate) fn hydrate(
         let _ = fs::remove_file(&part);
         return Hydro::Refused(Miss::Corrupt);
     };
-    let complete = sink.offset == grant.total
-        && sink.hasher.clone().finalize().as_bytes() == &grant.digest;
+    let complete =
+        sink.offset == grant.total && sink.hasher.clone().finalize().as_bytes() == &grant.digest;
     drop(sink);
     if !complete {
         // The bytes on disk are not the stream that was promised; a
@@ -606,7 +613,9 @@ impl Sink for Partial {
         if grant.offset < self.offset {
             // Its bundle differs from the prefix on disk: truncate to the
             // granted point and rebuild the running digest.
-            self.file.set_len(grant.offset).map_err(|_| Refusal::Store)?;
+            self.file
+                .set_len(grant.offset)
+                .map_err(|_| Refusal::Store)?;
             self.hasher = hash_prefix(&mut self.file, grant.offset).map_err(|_| Refusal::Store)?;
             self.offset = grant.offset;
         }
@@ -706,7 +715,8 @@ fn install(
         return Err(Miss::Corrupt);
     }
     let mut manifest_raw = vec![0u8; manifest_len as usize];
-    file.read_exact(&mut manifest_raw).map_err(|_| Miss::Corrupt)?;
+    file.read_exact(&mut manifest_raw)
+        .map_err(|_| Miss::Corrupt)?;
     let manifest = Manifest::decode(&manifest_raw)?;
     if !manifest.sealed() {
         return Err(Miss::Unsealed);
@@ -748,8 +758,13 @@ fn install(
     // clone into the job's private view — the materialization a local hit
     // gets, from the generation this install just built.
     attached.stats.reflink = env.backend == crate::clone::Backend::Reflink;
-    let blob = match restore::materialize(&staging, &manifest, &attached.targets, env.backend, &mut attached.stats)
-    {
+    let blob = match restore::materialize(
+        &staging,
+        &manifest,
+        &attached.targets,
+        env.backend,
+        &mut attached.stats,
+    ) {
         Ok(blob) => blob,
         Err(miss) => {
             let _ = fs::remove_dir_all(&staging);
@@ -802,10 +817,10 @@ fn stage_payload(
         let mut size = entry.size;
         while size > 0 {
             let want = size.min(buf.len() as u64) as usize;
-            file.read_exact(&mut buf[..want]).map_err(|_| Miss::Corrupt)?;
+            file.read_exact(&mut buf[..want])
+                .map_err(|_| Miss::Corrupt)?;
             hasher.update(&buf[..want]);
-            out.write_all(&buf[..want])
-                .map_err(|_| Miss::Unavailable)?;
+            out.write_all(&buf[..want]).map_err(|_| Miss::Unavailable)?;
             size -= want as u64;
         }
         if hasher.finalize().as_bytes() != &entry.digest {
@@ -878,9 +893,10 @@ pub fn offer_generation(
     if !generation.starts_with("gen-") || generation.contains(['/', '\\']) {
         return Err(Refusal::Store);
     }
-    let entry = attached
-        .scope
-        .entry_dir(cache_root, attach::entry_key(attached.scope.class, &attached.key));
+    let entry = attached.scope.entry_dir(
+        cache_root,
+        attach::entry_key(attached.scope.class, &attached.key),
+    );
     let generation_dir = entry.join(generation);
     let (total, digest) = stream_digest(&generation_dir, deadline, cancel).map_err(|miss| {
         if miss == Miss::Unavailable {
@@ -928,7 +944,8 @@ fn stream_digest(
         if cancel() || Instant::now() >= deadline {
             return Err(Miss::Unavailable);
         }
-        let mut file = fs::File::open(generation_dir.join(&entry.path)).map_err(|_| Miss::Corrupt)?;
+        let mut file =
+            fs::File::open(generation_dir.join(&entry.path)).map_err(|_| Miss::Corrupt)?;
         let mut left = entry.size;
         while left > 0 {
             if cancel() || Instant::now() >= deadline {
@@ -1172,8 +1189,16 @@ impl Entry {
         let repo = RepoId::from_bytes(self.repo).map_err(|_| Refusal::WrongScope)?;
         let class = Class::from_u8(self.class).ok_or(Refusal::WrongScope)?;
         let trust = Trust::from_u8(self.trust).ok_or(Refusal::WrongScope)?;
-        let scope = Scope::new(tenant, repo, class, trust, platform, self.toolchain, &self.name)
-            .map_err(|_| Refusal::WrongScope)?;
+        let scope = Scope::new(
+            tenant,
+            repo,
+            class,
+            trust,
+            platform,
+            self.toolchain,
+            &self.name,
+        )
+        .map_err(|_| Refusal::WrongScope)?;
         Ok(scope.entry_dir(root, &self.key))
     }
 }
@@ -1251,14 +1276,16 @@ impl Serving {
     /// The next ordered chunk; `None` means the stream through
     /// `plan().digest` is complete and the caller sends the terminal
     /// [`End`].
-    pub fn next(&mut self) -> Result<Option<Chunk>, Refusal> {
+    pub fn next_chunk(&mut self) -> Result<Option<Chunk>, Refusal> {
         if self.offset >= self.plan.total {
             return Ok(None);
         }
         let read = {
             let remaining = usize::try_from(self.plan.total - self.offset).unwrap_or(usize::MAX);
             let want = self.buf.len().min(remaining);
-            self.file.read(&mut self.buf[..want]).map_err(|_| Refusal::Store)?
+            self.file
+                .read(&mut self.buf[..want])
+                .map_err(|_| Refusal::Store)?
         };
         if read == 0 {
             // The file is shorter than the plan: a store that lost bytes

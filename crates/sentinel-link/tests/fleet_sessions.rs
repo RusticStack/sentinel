@@ -31,9 +31,7 @@ use sentinel_link::{
     tls,
 };
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
-use sentinel_protocol::negotiate::{
-    Arch, Capabilities, Hello, Profile, ProtocolVersion,
-};
+use sentinel_protocol::negotiate::{Arch, Capabilities, Hello, Profile, ProtocolVersion};
 use sentinel_store::{
     Durability, Store,
     auth::{self, Authority, NamespaceKind, provisioning},
@@ -46,6 +44,8 @@ const SESSIONS: usize = 100;
 /// Each session takes exactly two quarter-core jobs: the burst is sized so
 /// a hundred healthy sessions all receive work and none is oversubscribed.
 const JOBS: usize = 200;
+const JOBS_PER_RUN: usize = 50;
+const RUNS: usize = JOBS / JOBS_PER_RUN;
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -54,7 +54,11 @@ const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 fn profile(index: usize) -> Profile {
     let mut host_id = [0u8; 16];
     host_id[..4].copy_from_slice(&(index as u32).to_be_bytes());
-    Profile { host_id, disk_bytes: 64 << 30, ..Profile::default() }
+    Profile {
+        host_id,
+        disk_bytes: 64 << 30,
+        ..Profile::default()
+    }
 }
 
 fn hello() -> Hello {
@@ -76,7 +80,7 @@ fn capacity() -> Capacity {
 
 fn jobs_yaml() -> String {
     let mut yaml = String::from("schema: 1\non: [push]\njobs:\n");
-    for i in 0..JOBS {
+    for i in 0..JOBS_PER_RUN {
         yaml.push_str(&format!(
             "  j{i:03}:\n    image: alpine:3\n    resources: {{ cpu: \"0.25\", memory: 128MiB, disk: 1GiB }}\n    steps: [{{ id: s, run: 'true' }}]\n"
         ));
@@ -162,19 +166,13 @@ impl Deployment {
         self.store
             .writer()
             .write(move |tx| {
-                workers::issue_enrollment(
-                    tx,
-                    Authority::HostLocal,
-                    pool,
-                    60_000,
-                    UnixMillis::now(),
-                )
+                workers::issue_enrollment(tx, Authority::HostLocal, pool, 60_000, UnixMillis::now())
             })
             .unwrap()
             .secret
     }
 
-    /// Create one run with every image resolved and wake the dispatcher.
+    /// Create the burst: several runs because a pipeline is capped at 64 jobs.
     fn run(&self) -> Vec<JobId> {
         let (tenant, repo) = (self.tenant, self.repo);
         let spec = RunSpec::new(
@@ -186,10 +184,14 @@ impl Deployment {
             .store
             .writer()
             .write(move |tx| {
-                let ids =
-                    runs::create_run(tx, tenant, repo, RunId::new(), &spec, UnixMillis::now())?;
-                for job in &ids {
-                    runs::resolve_image(tx, tenant, *job, DIGEST, "linux/amd64")?;
+                let mut ids = Vec::with_capacity(JOBS);
+                for _ in 0..RUNS {
+                    let run_ids =
+                        runs::create_run(tx, tenant, repo, RunId::new(), &spec, UnixMillis::now())?;
+                    for job in &run_ids {
+                        runs::resolve_image(tx, tenant, *job, DIGEST, "linux/amd64")?;
+                    }
+                    ids.extend(run_ids);
                 }
                 Ok(ids)
             })
@@ -255,7 +257,7 @@ fn eventually(what: &str, within: Duration, mut predicate: impl FnMut() -> bool)
 
 #[test]
 fn one_hundred_sessions_connect_and_take_their_share_of_the_burst() {
-    let d = deployment();
+    let mut d = deployment();
     let stop = Arc::new(AtomicBool::new(false));
     let enrollments: Vec<Secret> = (0..SESSIONS).map(|_| d.enrollment()).collect();
     let mut sims: Vec<Arc<Sim>> = Vec::with_capacity(SESSIONS);
@@ -284,19 +286,24 @@ fn one_hundred_sessions_connect_and_take_their_share_of_the_burst() {
             )?;
             // Protocol 7: the profile carries what a hello cannot.
             link.send_profile(&profile(index))?;
-            link.run(&sim, || stop.load(Ordering::Relaxed))
+            link.run(&*sim, || stop.load(Ordering::Relaxed))
         }));
     }
 
-    eventually("one hundred admitted sessions", Duration::from_secs(30), || {
-        d.controller().connected().len() == SESSIONS
-    });
+    eventually(
+        "one hundred admitted sessions",
+        Duration::from_secs(30),
+        || d.controller().connected().len() == SESSIONS,
+    );
     assert!(
         connected_at.elapsed() < Duration::from_secs(30),
         "a hundred handshakes took {:?}",
         connected_at.elapsed()
     );
-    assert_eq!(d.controller().stats().admitted.load(Ordering::SeqCst), SESSIONS as u64);
+    assert_eq!(
+        d.controller().stats().admitted.load(Ordering::SeqCst),
+        SESSIONS as u64
+    );
     assert_eq!(d.controller().stats().rejected.load(Ordering::SeqCst), 0);
     let mut live = d.controller().connected();
     live.sort();
@@ -311,7 +318,10 @@ fn one_hundred_sessions_connect_and_take_their_share_of_the_burst() {
     eventually("every job acknowledged", Duration::from_secs(30), || {
         d.controller().stats().acknowledged.load(Ordering::SeqCst) == JOBS as u64
     });
-    assert_eq!(d.controller().stats().offers.load(Ordering::SeqCst), JOBS as u64);
+    assert_eq!(
+        d.controller().stats().offers.load(Ordering::SeqCst),
+        JOBS as u64
+    );
     for sim in &sims {
         assert_eq!(sim.jobs.lock().unwrap().len(), 2);
         assert_eq!(sim.held.lock().unwrap().len(), 2);
@@ -335,11 +345,15 @@ fn one_hundred_sessions_connect_and_take_their_share_of_the_burst() {
         .iter()
         .map(|s| s.renewed.load(Ordering::SeqCst))
         .collect();
-    eventually("a fresh heartbeat on every session", Duration::from_secs(15), || {
-        sims.iter()
-            .zip(&renewals)
-            .all(|(sim, before)| sim.renewed.load(Ordering::SeqCst) > *before)
-    });
+    eventually(
+        "a fresh heartbeat on every session",
+        Duration::from_secs(15),
+        || {
+            sims.iter()
+                .zip(&renewals)
+                .all(|(sim, before)| sim.renewed.load(Ordering::SeqCst) > *before)
+        },
+    );
 
     // A clean stop closes every session and leaves an empty fleet.
     stop.store(true, Ordering::Relaxed);
@@ -355,5 +369,10 @@ fn one_hundred_sessions_connect_and_take_their_share_of_the_burst() {
         d.controller().stats().sessions_ended.load(Ordering::SeqCst),
         SESSIONS as u64
     );
-    assert!(d.controller.take().unwrap().shutdown(Duration::from_secs(10)));
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(10))
+    );
 }

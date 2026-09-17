@@ -295,13 +295,7 @@ pub struct Telemetry {
 /// the fleet changes. Returns as soon as supervision runs — the address
 /// arrives asynchronously, so [`Server::wait_ready`] is the way to obtain it.
 pub fn start_server(config: &TailcatConfig, data_dir: &Path, allow: &[NodeKey]) -> Result<Server> {
-    let shared = prepare(
-        config,
-        data_dir,
-        Role::Controller,
-        normalize(allow),
-        None,
-    )?;
+    let shared = prepare(config, data_dir, Role::Controller, normalize(allow), None)?;
     Ok(Server {
         run: Runner::spawn(shared, None),
     })
@@ -586,25 +580,24 @@ impl TailcatConfig {
         let digest = parse_hex(&self.sha256).ok_or_else(|| {
             Error::Unavailable("tailcat.sha256 must be 64 hexadecimal characters".to_owned())
         })?;
-        if let Some(url) = &self.derpmap_url {
-            if !url.starts_with("https://")
+        if let Some(url) = &self.derpmap_url
+            && (!url.starts_with("https://")
                 || url.len() > 512
                 || url
                     .chars()
-                    .any(|character| character.is_whitespace() || character.is_control())
-            {
-                return Err(Error::Unavailable(
-                    "tailcat.derpmap_url must be an https URL of at most 512 characters".to_owned(),
-                ));
-            }
+                    .any(|character| character.is_whitespace() || character.is_control()))
+        {
+            return Err(Error::Unavailable(
+                "tailcat.derpmap_url must be an https URL of at most 512 characters".to_owned(),
+            ));
         }
         if let Some(region) = &self.region {
             let shaped = !region.is_empty()
                 && region.len() <= 64
                 && !region.starts_with('-')
-                && region.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-                });
+                && region
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
             if !shaped {
                 return Err(Error::Unavailable(
                     "tailcat.region must be 1-64 characters of letters, digits, '.', '_' or '-'"
@@ -874,7 +867,9 @@ fn run_child(shared: &Arc<Shared>) -> Result<()> {
         .spawn()
         .map_err(|error| Error::Spawn(error.to_string()))?;
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        return Err(Error::Spawn("the helper's output was not captured".to_owned()));
+        return Err(Error::Spawn(
+            "the helper's output was not captured".to_owned(),
+        ));
     };
     let pid = child.id();
     {
@@ -1007,9 +1002,10 @@ fn probe_once(shared: &Shared) -> Result<Duration> {
 }
 
 fn probe_tunnel(shared: &Shared) -> Result<()> {
-    let controller = shared.controller.as_ref().ok_or_else(|| {
-        Error::Unavailable("this role does not probe the tunnel".to_owned())
-    })?;
+    let controller = shared
+        .controller
+        .as_ref()
+        .ok_or_else(|| Error::Unavailable("this role does not probe the tunnel".to_owned()))?;
     let mut args = vec![
         "ping".to_owned(),
         format!("--timeout={}s", PING_TIMEOUT.as_secs()),
@@ -1043,13 +1039,19 @@ fn probe_tunnel(shared: &Shared) -> Result<()> {
 
 /// Runs a bounded helper invocation and captures its output. A stop request
 /// ends the wait at once, so shutting down never waits out a helper timeout.
-fn output_within(mut command: Command, within: Duration, stop: &dyn Fn() -> bool) -> Result<Captured> {
+fn output_within(
+    mut command: Command,
+    within: Duration,
+    stop: &dyn Fn() -> bool,
+) -> Result<Captured> {
     let mut child = command
         .spawn()
         .map_err(|error| Error::Spawn(error.to_string()))?;
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
     let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
-        return Err(Error::Spawn("the helper's output was not captured".to_owned()));
+        return Err(Error::Spawn(
+            "the helper's output was not captured".to_owned(),
+        ));
     };
     let (stdout, stderr) = (drain(stdout), drain(stderr));
     let deadline = Instant::now() + within;
@@ -1135,10 +1137,10 @@ fn find_nodekey(text: &str) -> Option<NodeKey> {
     while let Some(index) = rest.find(prefix) {
         let candidate = &rest[index..];
         let end = candidate.len().min(prefix.len() + 64);
-        if let Some(window) = candidate.get(..end) {
-            if let Some(key) = NodeKey::parse(window) {
-                return Some(key);
-            }
+        if let Some(window) = candidate.get(..end)
+            && let Some(key) = NodeKey::parse(window)
+        {
+            return Some(key);
         }
         rest = &rest[index + prefix.len()..];
     }
@@ -1162,7 +1164,11 @@ fn version_of(network: &Network) -> Option<String> {
         .filter(|character| character.is_ascii_graphic() || *character == ' ')
         .take(80)
         .collect();
-    if printed.is_empty() { None } else { Some(printed) }
+    if printed.is_empty() {
+        None
+    } else {
+        Some(printed)
+    }
 }
 
 fn read_key(path: &Path) -> Result<Option<NodeKey>> {
@@ -1191,9 +1197,9 @@ fn record_key(path: &Path, key: &NodeKey) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path).map_err(|error| {
-        Error::Unavailable(format!("cannot record the nodekey: {error}"))
-    })?;
+    let mut file = options
+        .open(path)
+        .map_err(|error| Error::Unavailable(format!("cannot record the nodekey: {error}")))?;
     file.write_all(key.expose().as_bytes())
         .and_then(|()| file.write_all(b"\n"))
         .map_err(|error| Error::Unavailable(format!("cannot record the nodekey: {error}")))?;
@@ -1245,7 +1251,9 @@ fn tighten(path: &Path, depth: u32) -> Result<()> {
     }
     if kind.is_dir() {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
-            Error::Unavailable(format!("cannot restrict the tailcat key directory: {error}"))
+            Error::Unavailable(format!(
+                "cannot restrict the tailcat key directory: {error}"
+            ))
         })?;
         let entries = fs::read_dir(path).map_err(|error| {
             Error::Unavailable(format!("cannot list the tailcat key directory: {error}"))
@@ -1281,15 +1289,14 @@ fn tighten_file(_path: &Path) -> Result<()> {
 
 /// SHA-256 of the helper, streamed and compared before it may run.
 fn verify(binary: &Path, expected: &[u8; 32]) -> Result<()> {
-    let mut file = fs::File::open(binary).map_err(|error| {
-        Error::Unavailable(format!("cannot read tailcat.binary: {error}"))
-    })?;
+    let mut file = fs::File::open(binary)
+        .map_err(|error| Error::Unavailable(format!("cannot read tailcat.binary: {error}")))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buffer).map_err(|error| {
-            Error::Unavailable(format!("cannot read tailcat.binary: {error}"))
-        })?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| Error::Unavailable(format!("cannot read tailcat.binary: {error}")))?;
         if read == 0 {
             break;
         }
@@ -1327,7 +1334,7 @@ fn refuses(arg: &str) -> Option<&'static str> {
             return Some(word);
         }
     }
-    for piece in bare.split(|character: char| matches!(character, '=' | ':' | ',' | '/')) {
+    for piece in bare.split(['=', ':', ',', '/']) {
         if let Some(word) = FORBIDDEN
             .iter()
             .copied()

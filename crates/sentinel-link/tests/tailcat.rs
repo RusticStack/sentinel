@@ -104,7 +104,8 @@ fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-const SERVE_FOREVER: &str = "  serve) printf 'listening on tcabcdefghijklmnopqrstuvwxyz0123\\n'; exec sleep 3600 ;;\n";
+const SERVE_FOREVER: &str =
+    "  serve) printf 'listening on tcabcdefghijklmnopqrstuvwxyz0123\\n'; exec sleep 3600 ;;\n";
 
 #[test]
 fn a_helper_that_is_not_the_pinned_build_is_never_executed() {
@@ -113,7 +114,10 @@ fn a_helper_that_is_not_the_pinned_build_is_never_executed() {
     config.sha256 = tailcat::PINNED_SHA256.to_owned();
     let error = tailcat::start_server(&config, fake.path(), &[]).unwrap_err();
     assert!(matches!(&error, Error::Checksum { .. }), "{error:?}");
-    assert!(!fake.log.exists(), "nothing may run before the digest matches");
+    assert!(
+        !fake.log.exists(),
+        "nothing may run before the digest matches"
+    );
 }
 
 #[test]
@@ -147,9 +151,12 @@ fn serve_carries_the_link_port_and_only_the_allowed_node_keys() {
     let config = fake.config(7443);
     let first = key(KEY);
     let second = key(OTHER);
-    let server =
-        tailcat::start_server(&config, fake.path(), &[second.clone(), first.clone(), first.clone()])
-            .unwrap();
+    let server = tailcat::start_server(
+        &config,
+        fake.path(),
+        &[second.clone(), first.clone(), first.clone()],
+    )
+    .unwrap();
     let address = server.wait_ready(Duration::from_secs(10)).unwrap();
     assert_eq!(address.expose(), ADDRESS);
     assert_eq!(server.port(), 7443);
@@ -198,9 +205,8 @@ fn forward_binds_loopback_and_health_needs_the_tunnel() {
     let port = listener.local_addr().unwrap().port();
     let controller = Address::parse(ADDRESS).unwrap();
 
-    let healthy = Fake::write(
-        "  forward) printf 'forwarding\\n'; exec sleep 3600 ;;\n  ping) exit 0 ;;\n",
-    );
+    let healthy =
+        Fake::write("  forward) printf 'forwarding\\n'; exec sleep 3600 ;;\n  ping) exit 0 ;;\n");
     let config = healthy.config(port);
     let forward = tailcat::start_forward(&config, healthy.path(), &controller).unwrap();
     assert_eq!(
@@ -221,9 +227,8 @@ fn forward_binds_loopback_and_health_needs_the_tunnel() {
 
     // The same shape, but ping cannot reach the controller: not healthy, and
     // the failure is visible in telemetry rather than swallowed.
-    let broken = Fake::write(
-        "  forward) printf 'forwarding\\n'; exec sleep 3600 ;;\n  ping) exit 1 ;;\n",
-    );
+    let broken =
+        Fake::write("  forward) printf 'forwarding\\n'; exec sleep 3600 ;;\n  ping) exit 1 ;;\n");
     let config = broken.config(port);
     let forward = tailcat::start_forward(&config, broken.path(), &controller).unwrap();
     let error = forward.probe().unwrap_err();
@@ -235,7 +240,9 @@ fn forward_binds_loopback_and_health_needs_the_tunnel() {
 
 #[test]
 fn a_dead_helper_is_replaced_and_a_stalled_tunnel_is_not_trusted() {
-    let dying = Fake::write("  serve) printf 'listening on tcabcdefghijklmnopqrstuvwxyz0123\\n'; sleep 0.3; exit 7 ;;\n");
+    let dying = Fake::write(
+        "  serve) printf 'listening on tcabcdefghijklmnopqrstuvwxyz0123\\n'; sleep 0.3; exit 7 ;;\n",
+    );
     let config = dying.config(7443);
     let server = tailcat::start_server(&config, dying.path(), &[]).unwrap();
     wait_until("the dead helper to be replaced", || {
@@ -249,9 +256,8 @@ fn a_dead_helper_is_replaced_and_a_stalled_tunnel_is_not_trusted() {
     // too: an open loopback port is not health.
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
-    let stalled = Fake::write(
-        "  forward) printf 'forwarding\\n'; exec sleep 3600 ;;\n  ping) exit 1 ;;\n",
-    );
+    let stalled =
+        Fake::write("  forward) printf 'forwarding\\n'; exec sleep 3600 ;;\n  ping) exit 1 ;;\n");
     let config = stalled.config(port);
     let controller = Address::parse(ADDRESS).unwrap();
     let forward = tailcat::start_forward_every(

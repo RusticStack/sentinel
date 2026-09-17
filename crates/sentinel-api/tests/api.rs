@@ -1877,7 +1877,8 @@ fn artifact_routes_are_authorized_and_scoped() {
                 worker,
                 Capacity {
                     cpu_millis: 4_000,
-                    memory_bytes: 8 << 30, disk_bytes: 0
+                    memory_bytes: 8 << 30,
+                    disk_bytes: 0,
                 },
             )
         })

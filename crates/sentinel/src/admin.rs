@@ -1041,14 +1041,7 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
                 })?;
             // Attempts the worker already holds keep running: draining is
             // about what it is offered next, not what it is doing.
-            eprintln!(
-                "{} {id}",
-                if drain {
-                    "draining"
-                } else {
-                    "undrained"
-                }
-            );
+            eprintln!("{} {id}", if drain { "draining" } else { "undrained" });
         }
         WorkerCommand::Revoke { data, id } => {
             let store = open(data, true)?;

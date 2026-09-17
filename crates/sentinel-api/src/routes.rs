@@ -8,7 +8,8 @@ use std::{io::Read, io::Seek, io::SeekFrom, sync::Arc};
 use crate::http::{Header, Request, Response, StatusCode};
 use sentinel_auth::cookie;
 use sentinel_core::{
-    ArtifactId, AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis, UploadId, WorkerId,
+    ArtifactId, AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis, UploadId,
+    WorkerId,
     auth::{Permissions, Principal},
 };
 use sentinel_intake::ingest;

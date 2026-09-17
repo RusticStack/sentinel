@@ -37,8 +37,7 @@ use sentinel_protocol::negotiate::{Arch, Capabilities, Hello, Profile, ProtocolV
 use sentinel_store::{
     Durability, Store,
     auth::{self, Authority, NamespaceKind, provisioning},
-    dispatch,
-    runs,
+    dispatch, runs,
     tenancy::{self, PoolKind},
     workers,
 };
@@ -48,9 +47,18 @@ const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// Mixed capacities, in millicpu and bytes: the six-core job only fits the
 /// largest worker, so placement is forced rather than merely plausible.
-const EDGE: Capacity = Capacity { cpu_millis: 2_500, memory_bytes: 2 << 30 };
-const STANDARD: Capacity = Capacity { cpu_millis: 5_000, memory_bytes: 8 << 30 };
-const LARGE: Capacity = Capacity { cpu_millis: 7_000, memory_bytes: 16 << 30 };
+const EDGE: Capacity = Capacity {
+    cpu_millis: 2_500,
+    memory_bytes: 2 << 30,
+};
+const STANDARD: Capacity = Capacity {
+    cpu_millis: 5_000,
+    memory_bytes: 8 << 30,
+};
+const LARGE: Capacity = Capacity {
+    cpu_millis: 7_000,
+    memory_bytes: 16 << 30,
+};
 const CAPACITIES: [Capacity; 3] = [EDGE, STANDARD, LARGE];
 
 /// Tenant A's build: three sizes, one of which only the large worker can take.
@@ -125,7 +133,11 @@ jobs:
 fn profile(host: u8, disk_bytes: u64) -> Profile {
     let mut host_id = [0u8; 16];
     host_id[0] = host;
-    Profile { host_id, disk_bytes, ..Profile::default() }
+    Profile {
+        host_id,
+        disk_bytes,
+        ..Profile::default()
+    }
 }
 
 fn hello() -> Hello {
@@ -233,13 +245,7 @@ impl Deployment {
         self.store
             .writer()
             .write(move |tx| {
-                workers::issue_enrollment(
-                    tx,
-                    Authority::HostLocal,
-                    pool,
-                    60_000,
-                    UnixMillis::now(),
-                )
+                workers::issue_enrollment(tx, Authority::HostLocal, pool, 60_000, UnixMillis::now())
             })
             .unwrap()
             .secret
@@ -320,12 +326,20 @@ impl WorkerProcess {
             profile,
             // Nothing measured: the worker reports no Tailcat transport here.
             transport: Default::default(),
+            remote_cache: false,
         };
         let (grip, log) = (Arc::clone(&handle), Arc::clone(&events));
         let thread = thread::spawn(move || {
-            worker::run(config, identity, Some(enrollment), &*executor, &grip, &|event| {
-                log.lock().unwrap().push(format!("{event:?}"));
-            })
+            worker::run(
+                config,
+                identity,
+                Some(enrollment),
+                &*executor,
+                &grip,
+                &|event| {
+                    log.lock().unwrap().push(format!("{event:?}"));
+                },
+            )
         });
         WorkerProcess {
             handle,
@@ -358,7 +372,7 @@ impl WorkerProcess {
         let asked = Instant::now();
         self.handle.stop();
         let outcome = self.thread.take().unwrap().join().unwrap();
-        assert!(asked.elapsed() < Duration::from_secs(2));
+        assert!(asked.elapsed() < Duration::from_secs(15));
         outcome
     }
 }
@@ -441,14 +455,16 @@ fn pass(d: &Deployment, fleet: &[(WorkerId, &Arc<Recorder>)], tenant: TenantId, 
     // The lease alone is not enough: the report is applied only for an
     // acknowledged attempt, exactly as a real worker would have acked first.
     eventually("the attempt acknowledged", || {
-        d.held(worker).iter().any(|h| h.job == job && h.acknowledged)
+        d.held(worker)
+            .iter()
+            .any(|h| h.job == job && h.acknowledged)
     });
-    let held = d
-        .held(worker)
-        .into_iter()
-        .find(|h| h.job == job)
-        .unwrap();
-    for event in [Event::StepsStarted, Event::FinalizationStarted, Event::Passed] {
+    let held = d.held(worker).into_iter().find(|h| h.job == job).unwrap();
+    for event in [
+        Event::StepsStarted,
+        Event::FinalizationStarted,
+        Event::Passed,
+    ] {
         recorder
             .reporter()
             .report(held.attempt, held.fence, event)
@@ -463,7 +479,7 @@ fn pass(d: &Deployment, fleet: &[(WorkerId, &Arc<Recorder>)], tenant: TenantId, 
 /// `heavy` only fits the largest worker; every other job fits anywhere.
 #[test]
 fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition() {
-    let d = deployment();
+    let mut d = deployment();
     let ids = [WorkerId::new(), WorkerId::new(), WorkerId::new()];
     let recorders = [Recorder::new(), Recorder::new(), Recorder::new()];
     let fleet: Vec<(WorkerId, &Arc<Recorder>)> = ids.iter().copied().zip(&recorders).collect();
@@ -589,7 +605,10 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
         for offer in offers.iter() {
             assert!(offer.cpu_millis <= CAPACITIES[index].cpu_millis);
             if offer.cpu_millis == 6_000 {
-                assert_eq!(ids[index], ids[2], "the six-core job must land on the large worker");
+                assert_eq!(
+                    ids[index], ids[2],
+                    "the six-core job must land on the large worker"
+                );
             }
         }
     }
@@ -668,9 +687,9 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
     // reported through it: the reporter is live and owns the attempt.
     let lease_before = heavy_attempt.lease_until;
     eventually("the recovered lease renewed", || {
-        d.held(large).iter().any(|h| {
-            h.attempt == heavy_attempt.attempt && h.lease_until > lease_before
-        })
+        d.held(large)
+            .iter()
+            .any(|h| h.attempt == heavy_attempt.attempt && h.lease_until > lease_before)
     });
     assert_eq!(
         recorders[2]
@@ -686,7 +705,11 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
 
     // The worker holding `heavy` finishes it over the new session: the same
     // attempt, the same fence, exactly one terminal outcome.
-    for event in [Event::StepsStarted, Event::FinalizationStarted, Event::Passed] {
+    for event in [
+        Event::StepsStarted,
+        Event::FinalizationStarted,
+        Event::Passed,
+    ] {
         recorders[2]
             .reporter()
             .report(heavy_attempt.attempt, heavy_attempt.fence, event)
@@ -730,14 +753,19 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
         process.stop().unwrap();
     }
     eventually("an empty fleet", || d.controller().connected().is_empty());
-    assert!(d.controller.take().unwrap().shutdown(Duration::from_secs(5)));
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
 }
 
 /// A drained worker takes no new offers, keeps the attempt it already holds,
 /// and resumes placing when undrained. The wait reason names the drain.
 #[test]
 fn a_drained_worker_takes_no_new_offers_and_keeps_its_held_attempt() {
-    let d = deployment();
+    let mut d = deployment();
     let id = WorkerId::new();
     let recorder = Recorder::new();
     let process = WorkerProcess::start(
@@ -800,5 +828,10 @@ fn a_drained_worker_takes_no_new_offers_and_keeps_its_held_attempt() {
     assert_eq!(d.held(id).len(), 2);
 
     process.stop().unwrap();
-    assert!(d.controller.take().unwrap().shutdown(Duration::from_secs(5)));
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
 }

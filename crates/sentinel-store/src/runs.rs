@@ -15,9 +15,9 @@ use sentinel_pipeline::{
 };
 
 use crate::{
-    Error, Result, dispatch,
+    Error, Result,
     codec::{TERMINAL_BASE, decode_state, encode_state},
-    jobs,
+    dispatch, jobs,
     provenance::{self, EventFacts},
 };
 

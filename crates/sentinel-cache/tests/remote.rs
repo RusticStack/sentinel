@@ -80,7 +80,12 @@ fn entry_of(root: &Path, scope: &Scope) -> PathBuf {
 
 /// Build one sealed generation directly on disk — the same shape publish
 /// writes — and return its directory name.
-fn seal_generation(root: &Path, scope: &Scope, files: &[(&str, &[u8])], generation: &str) -> String {
+fn seal_generation(
+    root: &Path,
+    scope: &Scope,
+    files: &[(&str, &[u8])],
+    generation: &str,
+) -> String {
     let entry = entry_of(root, scope);
     let dir = entry.join(generation);
     fs::create_dir_all(&dir).unwrap();
@@ -162,7 +167,11 @@ struct Fake {
 impl Fake {
     fn stored(&self, scope: &Scope) -> Option<Vec<u8>> {
         let id = entry_id(*scope.repo.as_bytes(), &scope.name, KEY);
-        self.bundles.lock().unwrap_or_else(|p| p.into_inner()).get(&id).cloned()
+        self.bundles
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&id)
+            .cloned()
     }
 
     /// Re-key a stored bundle under another entry — how a wrong-scope
@@ -176,7 +185,10 @@ impl Fake {
     }
 
     fn transfer(&self, offset: u64, served: u64) {
-        self.transfers.lock().unwrap_or_else(|p| p.into_inner()).push((offset, served));
+        self.transfers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((offset, served));
     }
 }
 
@@ -184,7 +196,13 @@ impl Remote for Fake {
     fn fetch(&self, need: &Need, _deadline: Instant, sink: &mut dyn Sink) -> Result<(), Refusal> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
         let id = entry_id(need.repo, &need.name, &need.key);
-        let Some(stream) = self.bundles.lock().unwrap_or_else(|p| p.into_inner()).get(&id).cloned() else {
+        let Some(stream) = self
+            .bundles
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&id)
+            .cloned()
+        else {
             return Err(Refusal::NoBundle);
         };
         let total = stream.len() as u64;
@@ -207,17 +225,21 @@ impl Remote for Fake {
         while pos < stream.len() {
             let end = (pos + CHUNK).min(stream.len());
             let mut bytes = stream[pos..end].to_vec();
-            if let Some(at) = self.corrupt.lock().unwrap_or_else(|p| p.into_inner()).take()
+            if let Some(at) = self
+                .corrupt
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
                 && at < bytes.len()
             {
                 bytes[at] ^= 0xff;
             }
-            let stop = self
-                .interrupt
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_some_and(|limit| served + bytes.len() as u64 > limit);
+            let stop = {
+                let guard = self.interrupt.lock().unwrap_or_else(|p| p.into_inner());
+                guard.is_some_and(|limit| served + bytes.len() as u64 > limit)
+            };
             if stop {
+                *self.interrupt.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 self.transfer(offset, served);
                 return Err(Refusal::Store);
             }
@@ -238,17 +260,26 @@ impl Remote for Fake {
         Ok(())
     }
 
-    fn offer(&self, upload: &Upload, _deadline: Instant, source: &mut dyn Read)
-    -> Result<(), Refusal> {
+    fn offer(
+        &self,
+        upload: &Upload,
+        _deadline: Instant,
+        source: &mut dyn Read,
+    ) -> Result<(), Refusal> {
         self.offers.fetch_add(1, Ordering::SeqCst);
         let mut stream = Vec::new();
-        source.read_to_end(&mut stream).map_err(|_| Refusal::Store)?;
+        source
+            .read_to_end(&mut stream)
+            .map_err(|_| Refusal::Store)?;
         if stream.len() as u64 != upload.total || blake3::hash(&stream).as_bytes() != &upload.digest
         {
             return Err(Refusal::Store);
         }
         let id = entry_id(upload.repo, &upload.name, &upload.key);
-        self.bundles.lock().unwrap_or_else(|p| p.into_inner()).insert(id, stream);
+        self.bundles
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, stream);
         Ok(())
     }
 }
@@ -281,12 +312,7 @@ fn offer(fake: &Fake, root: &Path, scope: &Scope, generation: &str) -> [u8; 32] 
     .expect("offer")
 }
 
-fn hydrate(
-    root: &Path,
-    ws: &Path,
-    scope: &Scope,
-    source: &dyn Remote,
-) -> Attached {
+fn hydrate(root: &Path, ws: &Path, scope: &Scope, source: &dyn Remote) -> Attached {
     fs::create_dir_all(ws).unwrap();
     restore::restore_remote(
         &env(root, ws),
@@ -327,7 +353,10 @@ fn cold_hydration_serves_the_job_and_installs_a_local_copy() {
     // The name is this worker's own: the sealed time from the manifest
     // plus a fresh random tail, exactly as a publication derives it.
     assert!(installed.starts_with("gen-1500000-"), "{installed}");
-    assert_eq!(cold.stats.remote_from, None, "a cold transfer resumes nothing");
+    assert_eq!(
+        cold.stats.remote_from, None,
+        "a cold transfer resumes nothing"
+    );
     assert!(cold.stats.remote_ns.is_some());
     assert!(cold.stats.remote_bytes > 0);
     assert!(cold.lease.is_some(), "the promoted generation stays pinned");
@@ -357,7 +386,11 @@ fn cold_hydration_serves_the_job_and_installs_a_local_copy() {
 
     // A later attempt hits locally: the transport is never consulted.
     let warm = hydrate(&root_b, &ws2, &scope, &NeverCalled);
-    assert!(matches!(warm.outcome, Outcome::Hit(_)), "{:?}", warm.outcome);
+    assert!(
+        matches!(warm.outcome, Outcome::Hit(_)),
+        "{:?}",
+        warm.outcome
+    );
     assert_eq!(fs::read(ws2.join("vendor/lib")).unwrap(), b"payload-one");
     assert_eq!(fake.fetches.load(Ordering::SeqCst), 1);
     assert_eq!(fake.offers.load(Ordering::SeqCst), 1);
@@ -397,7 +430,12 @@ fn an_interrupted_transfer_resumes_from_its_partial() {
     // of the payload, so the partial is a real stream prefix.
     *fake.interrupt.lock().unwrap_or_else(|p| p.into_inner()) = Some(16 * 1024);
     let cut = hydrate(&root_b, &ws, &scope, &fake);
-    assert_eq!(cut.outcome, Outcome::Miss(Miss::Unavailable), "{:?}", cut.outcome);
+    assert_eq!(
+        cut.outcome,
+        Outcome::Miss(Miss::Unavailable),
+        "{:?}",
+        cut.outcome
+    );
 
     // The partial survived, shorter than the whole stream.
     let part = entry_of(&root_b, &scope)
@@ -410,12 +448,23 @@ fn an_interrupted_transfer_resumes_from_its_partial() {
     // Second attempt resumes exactly where the first stopped: nothing
     // before that offset is sent again.
     let resumed = hydrate(&root_b, &ws, &scope, &fake);
-    assert!(matches!(resumed.outcome, Outcome::Hit(_)), "{:?}", resumed.outcome);
+    assert!(
+        matches!(resumed.outcome, Outcome::Hit(_)),
+        "{:?}",
+        resumed.outcome
+    );
     assert_eq!(resumed.stats.remote_from, Some(partial));
-    let transfers = fake.transfers.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let transfers = fake
+        .transfers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
     assert_eq!(transfers.len(), 2);
     assert_eq!(transfers[0].1, partial, "the cut left exactly this prefix");
-    assert_eq!(transfers[1].0, partial, "the resume starts where it stopped");
+    assert_eq!(
+        transfers[1].0, partial,
+        "the resume starts where it stopped"
+    );
     assert_eq!(
         transfers[1].1,
         total - partial,
@@ -446,17 +495,19 @@ fn a_corrupt_chunk_is_a_miss_and_never_serves() {
     // at that chunk.
     *fake.corrupt.lock().unwrap_or_else(|p| p.into_inner()) = Some(10);
     let refused = hydrate(&root_b, &ws, &scope, &fake);
-    assert_eq!(refused.outcome, Outcome::Miss(Miss::Corrupt), "{:?}", refused.outcome);
+    assert_eq!(
+        refused.outcome,
+        Outcome::Miss(Miss::Corrupt),
+        "{:?}",
+        refused.outcome
+    );
 
     // Nothing of the transfer is visible: no view, no pointer, and the
     // partial that can never verify was dropped rather than kept.
     assert!(!ws.join("vendor/blob").exists());
     let entry = entry_of(&root_b, &scope);
     assert!(!entry.join(scope::CURRENT_NAME).exists());
-    assert!(!entry
-        .join(scope::WRITING_NAME)
-        .join("remote.part")
-        .exists());
+    assert!(!entry.join(scope::WRITING_NAME).join("remote.part").exists());
     assert!(fake.fetches.load(Ordering::SeqCst) >= 1);
 }
 
@@ -485,14 +536,16 @@ fn a_bundle_sealed_for_another_scope_never_serves() {
     fake.move_bundle(&foreign, &scope);
 
     let refused = hydrate(&root_b, &ws, &scope, &fake);
-    assert_eq!(refused.outcome, Outcome::Miss(Miss::WrongTrust), "{:?}", refused.outcome);
+    assert_eq!(
+        refused.outcome,
+        Outcome::Miss(Miss::WrongTrust),
+        "{:?}",
+        refused.outcome
+    );
     assert!(!ws.join("vendor/blob").exists());
     let entry = entry_of(&root_b, &scope);
     assert!(!entry.join(scope::CURRENT_NAME).exists());
-    assert!(!entry
-        .join(scope::WRITING_NAME)
-        .join("remote.part")
-        .exists());
+    assert!(!entry.join(scope::WRITING_NAME).join("remote.part").exists());
 }
 
 #[test]
@@ -503,22 +556,31 @@ fn a_controller_without_the_bundle_leaves_the_local_miss() {
     let scope = test_scope(Trust::Protected);
     fs::create_dir_all(&root_b).unwrap();
 
+    let other = test_scope(Trust::Protected);
     let generation = seal_generation(
         &root_a,
-        &scope,
+        &other,
         &[("blob", b"somewhere else")],
         "gen-1500000-0000abd1",
     );
-    let other = test_scope(Trust::Protected);
     let fake = Fake::default();
     // Offered under a *different* repo, so this entry has no bundle.
     offer(&fake, &root_a, &other, &generation);
-
     let missed = hydrate(&root_b, &ws, &scope, &fake);
-    assert_eq!(missed.outcome, Outcome::Miss(Miss::Absent), "{:?}", missed.outcome);
-    assert!(ws.join("vendor").is_dir(), "the declared path stays writable");
-    assert!(!entry_of(&root_b, &scope)
-        .join(scope::WRITING_NAME)
-        .join("remote.part")
-        .exists());
+    assert_eq!(
+        missed.outcome,
+        Outcome::Miss(Miss::Absent),
+        "{:?}",
+        missed.outcome
+    );
+    assert!(
+        ws.join("vendor").is_dir(),
+        "the declared path stays writable"
+    );
+    assert!(
+        !entry_of(&root_b, &scope)
+            .join(scope::WRITING_NAME)
+            .join("remote.part")
+            .exists()
+    );
 }

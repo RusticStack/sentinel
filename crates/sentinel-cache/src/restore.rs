@@ -160,9 +160,7 @@ pub fn restore_remote(
                         attached.lease = Some(hydrated.lease);
                     }
                     crate::remote::Hydro::Nothing => {}
-                    crate::remote::Hydro::Refused(miss) => {
-                        attached.outcome = Outcome::Miss(miss)
-                    }
+                    crate::remote::Hydro::Refused(miss) => attached.outcome = Outcome::Miss(miss),
                 }
             }
             return attached;

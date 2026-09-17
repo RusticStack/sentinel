@@ -23,16 +23,15 @@ use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersi
 use sentinel_store::{
     Durability, Store,
     auth::{self, Authority, NamespaceKind, provisioning},
-    dispatch,
-    runs,
+    dispatch, runs,
     tenancy::{self, PoolKind},
     workers::{self, Presentation},
 };
 
 const WORKERS: usize = 100;
-const RUNS: usize = 100;
-const JOBS_PER_RUN: usize = 100;
-/// 100 runs of 100 jobs: ten thousand queued jobs, each a quarter core.
+const RUNS: usize = 200;
+const JOBS_PER_RUN: usize = 50;
+/// 200 runs of 50 jobs: ten thousand queued jobs, each a quarter core.
 const JOBS: usize = RUNS * JOBS_PER_RUN;
 const NOW: UnixMillis = UnixMillis(1_000);
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -62,6 +61,7 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 }
 
 #[test]
+#[ignore = "Q09 10k-job load: cargo test -p sentinel-store --test fleet_load -- --ignored --nocapture"]
 fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();

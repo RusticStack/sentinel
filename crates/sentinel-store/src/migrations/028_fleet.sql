@@ -41,6 +41,9 @@ ALTER TABLE attempts ADD COLUMN disk_bytes INTEGER NOT NULL DEFAULT 0 CHECK(disk
 -- Per-run fair queueing inside a tenant: the oldest unplaced job of a run is
 -- found without scanning the run's whole ready set.
 CREATE INDEX jobs_fair ON jobs(tenant_id, run_id, created_seq) WHERE state_code = 1;
+CREATE INDEX jobs_ready_tenant ON jobs(tenant_id, priority, queued_ms, created_seq) WHERE state_code = 1;
+CREATE INDEX jobs_ready_large ON jobs(cpu_millis) WHERE state_code = 1 AND cpu_millis >= 8000;
+CREATE INDEX attempts_held_by_tenant ON attempts(tenant_id) WHERE released_ms IS NULL;
 -- Workers of a host, for host-scoped drain and failure sweeps.
 CREATE INDEX workers_host ON workers(host_id) WHERE host_id IS NOT NULL;
 -- Who holds an exclusion group, for admission of a job that asks for one.

@@ -213,7 +213,8 @@ fn frame(seq: u64) -> Frame {
 
 const CAP: Capacity = Capacity {
     cpu_millis: 4_000,
-    memory_bytes: 8 << 30, disk_bytes: 0
+    memory_bytes: 8 << 30,
+    disk_bytes: 0,
 };
 
 const ONE_JOB: &str = "schema: 1

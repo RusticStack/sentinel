@@ -326,7 +326,9 @@ pub fn undrain(tx: &Transaction<'_>, authority: Authority, worker: WorkerId) -> 
         [worker.as_bytes()],
     )?;
     let known: bool = tx
-        .prepare_cached("SELECT EXISTS(SELECT 1 FROM workers WHERE id = ?1 AND revoked_ms IS NULL)")?
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM workers WHERE id = ?1 AND revoked_ms IS NULL)",
+        )?
         .query_row([worker.as_bytes()], |r| r.get(0))?;
     if changed == 0 && !known {
         return Err(Error::NotFound);

@@ -33,7 +33,7 @@ use sentinel_core::{
 };
 use sentinel_protocol::limits::{MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES, MAX_RUN_ARTIFACT_BYTES};
 use sentinel_protocol::logs::Frame;
-use sentinel_protocol::negotiate::{Hello, Profile, PROFILE_MIN};
+use sentinel_protocol::negotiate::{Hello, PROFILE_MIN, Profile};
 use sentinel_store::{
     Store, artifacts, dispatch,
     logs::LogStore,

@@ -361,6 +361,7 @@ impl WorkerProcess {
             capacity: CAPACITY,
             profile: sentinel_protocol::negotiate::Profile::default(),
             transport: sentinel_link::session::TransportStats::default(),
+            remote_cache: false,
         };
         let (grip, log) = (Arc::clone(&handle), Arc::clone(&events));
         let thread = thread::spawn(move || {
@@ -468,7 +469,8 @@ fn a_worker_enrolls_once_heartbeats_reconnects_and_is_refused_after_revocation()
             .unwrap(),
         dispatch::Capacity {
             cpu_millis: 4_000,
-            memory_bytes: 8 << 30, disk_bytes: 0
+            memory_bytes: 8 << 30,
+            disk_bytes: 0
         }
     );
     eventually("fleet registration", || {

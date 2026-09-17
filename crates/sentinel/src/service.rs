@@ -497,9 +497,7 @@ impl Config {
                 remote_cache,
                 ..
             } => {
-                format!(
-                    "listen={listen} api_listen={api_listen} remote_cache={remote_cache}"
-                )
+                format!("listen={listen} api_listen={api_listen} remote_cache={remote_cache}")
             }
             Role::Worker(None) => "controller=none (idle)".to_owned(),
             Role::Worker(Some(link)) => format!(
@@ -696,7 +694,13 @@ fn start_tailcat(
     config: &Config,
     file: Option<&TailcatFile>,
     listen: SocketAddr,
-) -> Result<(Option<Arc<sentinel_link::tailcat::Server>>, Option<Arc<AtomicBool>>), Error> {
+) -> Result<
+    (
+        Option<Arc<sentinel_link::tailcat::Server>>,
+        Option<Arc<AtomicBool>>,
+    ),
+    Error,
+> {
     let Some(file) = file else {
         return Ok((None, None));
     };
@@ -767,7 +771,9 @@ fn start_tailcat(
                 }
             })
             .map_err(|error| {
-                Error::runtime(format!("cannot start the tailcat allow-list thread: {error}"))
+                Error::runtime(format!(
+                    "cannot start the tailcat allow-list thread: {error}"
+                ))
             })?
     };
     drop(refresher);

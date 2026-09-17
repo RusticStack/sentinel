@@ -289,6 +289,7 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
             },
             profile: sentinel_protocol::negotiate::Profile::default(),
             transport: sentinel_link::session::TransportStats::default(),
+            remote_cache: false,
         };
         thread::spawn(move || {
             worker::run(
