@@ -6,3 +6,18 @@ log_level = "info"
 listen = "127.0.0.1:7443"
 # Where the API and the page answer. Loopback; put TLS in front to expose it.
 api_listen = "127.0.0.1:7080"
+
+# Optional NAT-traversing transport (Q06): the pinned Tailcat helper serves
+# only the link port above, to workers admitted by node key. Sentinel still
+# authenticates every worker itself; with enabled = false (or no section) the
+# link uses direct TLS and nothing below runs. The helper prints the `tc…`
+# address workers enroll with; treat it as a credential.
+# [tailcat]
+# enabled = true
+# binary = "/usr/local/bin/tailcat"
+# sha256 = "d46582137d21f03d15345e2be425d6317d49e5b8c8bb4f6fc56037f4c08cce73"  # pinned v0.6.0
+# derpmap_url = "https://derp.example.com/derp.json"  # operator-owned DERP map
+# region = "derp.example.com"     # region name in that map; omit to fix a region
+# listen_port = 7443              # the link port the helper serves; match `listen`
+# Worker node keys are admitted in <data_dir>/tailcat-allow, one `nodekey:…` per
+# line, owner-only. The helper is restarted when that list changes.

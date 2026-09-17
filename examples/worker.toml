@@ -9,3 +9,19 @@ log_level = "info"
 # worker_name = "builder-1"
 # enrollment_file = "/etc/sentinel/enrollment"
 # git_mirrors = true               # per-repository object mirrors under <data_dir>/mirrors (default on)
+
+# Optional NAT-traversing transport (Q06): the pinned helper forwards the
+# controller's Tailcat address to loopback, so `controller` becomes
+# "127.0.0.1:<listen_port>" — the two go together. With enabled = false (or no
+# section) the link uses direct TLS and nothing below runs. The address is the
+# `tc…` the controller logged at `tailcat_listening` (a credential); this
+# worker's own node key persists under <data_dir>/tailcat, and its `nodekey:…`
+# is what the controller's tailcat-allow list admits for the first forward.
+# tailcat_address = "tc<address>"  # the controller's Tailcat address
+# [tailcat]
+# enabled = true
+# binary = "/usr/local/bin/tailcat"
+# sha256 = "d46582137d21f03d15345e2be425d6317d49e5b8c8bb4f6fc56037f4c08cce73"  # pinned v0.6.0
+# derpmap_url = "https://derp.example.com/derp.json"  # operator-owned DERP map
+# region = "derp.example.com"      # region name in that map; optional
+# listen_port = 7443               # loopback port this worker binds

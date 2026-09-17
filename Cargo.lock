@@ -1300,6 +1300,7 @@ dependencies = [
  "sentinel-protocol",
  "sentinel-store",
  "serde",
+ "sha2",
  "tempfile",
 ]
 
