@@ -58,6 +58,42 @@ Interpretation, limited to what was measured:
 - Podman writes about 512 blocks per run even for a no-op; storage/cgroup churn is a candidate for later optimization, after profiling.
 - The WSL2 kernel and the `/ is not a shared mount` warning make this a **development reference, not a production qualification**. Repeat the same commands on a dedicated Linux host and append the record before treating any number as a target.
 
+## K09 before/after: the cache path's own cost
+
+Record: [`bench/k09-before-after.jsonl`](../bench/k09-before-after.jsonl) (first line carries host/kernel/filesystem provenance), driven by [`bench/k09-before-after.sh`](../bench/k09-before-after.sh). Every number is a real attempt through the worker's own path — fresh workspace, pinned local checkout, digest-pinned image, cache restore, rootless Podman steps, publication — not the `bench-noop` process-spawn floor.
+
+| Item | Value |
+|---|---|
+| Host | `DOOMBRINGER`, Intel Core i7-13700KF, 24 logical CPUs |
+| Environment | Ubuntu 24.04.4 LTS on WSL2, kernel `6.18.33.2-microsoft-standard-WSL2` |
+| Filesystem | ext4 workdir `/srv/k09` (native Linux disk, not `/mnt/d`) |
+| Runtime | Podman 4.9.3, rootless as `sentinelbench` |
+| Image | `docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662` |
+
+**No-op job** — one `true` step; `bare` has no `cache:` block, `cache-cold` is the first run on an empty store (`absent → sealed`), `cache-warm` the steady state (`hit → unchanged`), two declared entries: a workspace path and an absolute mount path.
+
+| Case | n | checkout | steps | finalize | total median | total p95 |
+|---|---|---|---|---|---|---|
+| noop-bare | 7 | 83.0 ms | 121.1 ms | 261.8 ms | 465.7 ms | 488.1 ms |
+| noop-cache-cold | 1 | 82.5 ms | 100.7 ms | 298.3 ms | 481.5 ms | – |
+| noop-cache-warm | 7 | 82.8 ms | 121.3 ms | 265.8 ms | 470.9 ms | 503.8 ms |
+
+The warm cache path is inside noise of the bare job: lookup + clone + `unchanged` commit-skip for two entries cost ≈5 ms inside `finalize` (per-entry `lookup_ns`/`clone_ns`/`commit_ns` are on each record). The cold seal of the same two tiny entries costs ≈20–40 ms once.
+
+**Incremental build** — the custom-tool recipe's `deps`/`build`/`test` steps on a fresh small source edit each sample: `nocache` runs the same steps with no `cache:` block (stores move under the workspace), `cold` wipes the store every run (`absent → sealed` ×3 entries), `warm` is primed at the base commit then runs sequential edits — `deps.txt` never changes, so all three keys hit; the compile step prints `reused main.c` / `built lib.c` every run, and `cc` seals a new accumulating generation (`reused_bytes` grows across the samples).
+
+| Case | n | checkout | steps | finalize | total median | total p95 |
+|---|---|---|---|---|---|---|
+| incremental-nocache | 7 | 82.6 ms | 423.1 ms | 282.4 ms | 788.3 ms | 822.5 ms |
+| incremental-cold | 7 | 82.5 ms | 442.6 ms | 312.3 ms | 854.6 ms | 905.9 ms |
+| incremental-warm | 7 | 82.5 ms | 422.3 ms | 274.2 ms | 778.8 ms | 833.0 ms |
+
+Interpretation, limited to what was measured:
+
+- On this fixture the warm-vs-nocache wall-clock delta is inside noise — the per-input build is a `cp`, so reuse saves ~1 ms. What the records do prove is the *mechanism*: every warm run hits all three entries, rebuilds exactly the changed input, and re-seals the compiler namespace. For a real wall-clock delta the K07 record on the same host is the honest citation: `rust` cold 843.7 ms steps vs warm 321.5 ms vs small-edit 441.8 ms ([`bench/k07-recipes.jsonl`](../bench/k07-recipes.jsonl)).
+- The cold cache path is *slower* than no cache by ≈66 ms median — the cost of sealing three generations inside `finalize`. That is the honest price of publication on a job that does real work; it is paid once per generation, not per file restored.
+- Same caveat as the F05 baseline: a WSL2 development host, reference numbers only.
+
 ## Reproducing
 
 1. Prepare rootless Podman for a non-root user per [Development](development.md#linux-executor-work-f05f07-and-w03-onward) and pull the image by digest.

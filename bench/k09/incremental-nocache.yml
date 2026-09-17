@@ -1,0 +1,26 @@
+# K09 incremental-build baseline: the custom-tool recipe's exact steps —
+# fetch-deps plus the content-keyed fakecc build — with no `cache:` block.
+# The tool-store and object dirs move under the workspace (the container
+# root is read-only; only the workspace and declared cache paths are
+# writable), so every run fetches all packages and rebuilds both inputs
+# into a fresh tree. Compared against the same edit under a cold and a
+# warm cache (fixtures/recipes/custom-tool.yml) it shows the delta the
+# cache buys real build work, and the delta it costs.
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/library/busybox:1.36
+    resources: { cpu: 1, memory: 128MiB }
+    timeout: 5m
+    steps:
+      - id: deps
+        run: sh tools/fetch-deps.sh deps.txt .store/pkgs vendor
+      - id: build
+        run: sh tools/fakecc.sh .cc src/main.c src/lib.c
+      - id: test
+        run: |
+          test -f vendor/liba/lib.txt
+          test -f vendor/libb/lib.txt
+          ls .cc/main.c.*.o >/dev/null
+          ls .cc/lib.c.*.o >/dev/null

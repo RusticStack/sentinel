@@ -152,6 +152,78 @@ A `class: compiler` entry is a stable toolchain namespace whose tool owns per-in
 
 [recipes](recipes.md) publishes nine tested pipelines — a custom compiler tool, Go, Rust, npm, pnpm, Bun, Python, Maven and Gradle — showing how each toolchain's stores map onto these classes, which environment variables wire the mounts, how lockfile and toolchain changes move through the key and scope, and the measured cold/warm/small-edit/changed-dependency/changed-toolchain behavior.
 
+## Verification (K09)
+
+The adversarial pass over the guarantees above lives in
+`crates/sentinel-cache/tests/k09.rs` (store level, threaded, both OSes)
+and `crates/sentinel-worker/tests/k09.rs` (executor level, gated on
+`SENTINEL_PODMAN_TESTS` like the rest of the suite). What each case
+proves:
+
+- **Concurrent clone/write isolation** —
+  `concurrent_clones_during_republishing_are_never_torn`: eight readers
+  loop `restore` on one entry while a writer republishes it and
+  `gc::sweep` runs under a deliberately tiny budget. Every cloned view
+  must read as exactly one generation's bytes (each generation's payload
+  carries its own marker), the only answers are `hit` or a typed miss
+  (`absent`, `corrupt`, `unavailable`), and afterward every surviving
+  generation is re-verified — manifest, listing digest and every listed
+  file's own digest. A sealed generation is never mutated; a reader is
+  never torn.
+- **Canceled writers** —
+  `a_writer_canceled_mid_stage_promotes_nothing_and_the_store_recovers`:
+  the cancel trips on the first poll after `writing/gen-*` exists — inside
+  materialization, not the walk. Nothing promotes, `current` does not
+  move, no staged tree survives; a dead writer's remains are reaped once
+  provably old (and a still-warm one is never reaped), and the next
+  publish seals cleanly.
+- **Eviction during active use** —
+  `eviction_during_active_use_never_undercuts_a_lease`: under a forcing
+  budget the leased entry keeps both generations while the unleashed
+  sibling loses its spare; once the pin drops, the next sweep takes it.
+  The mid-clone pin itself is `tests/gc.rs::a_reader_mid_clone_keeps_its_generation_through_budget_eviction`.
+- **Tampered state** —
+  `tampered_state_is_a_typed_miss_and_republish_heals`: a rewritten
+  `files` blob, a flipped manifest byte, a garbage `current`, a payload
+  file the listing never recorded, a listed file deleted, and a listed
+  file swapped for a symlink are each a typed miss — never a panic,
+  never a wrong serve — and a republish heals the entry. This case found
+  a real defect: restore trusted the tree to be the listing, so planted
+  or missing payload files served silently. `restore::materialize` now
+  verifies each `payload/<i>` tree is exactly the sealed listing
+  (`check_payload_tree`, bounded by the publish walk's depth bound)
+  before cloning — the listing is the payload's whole authority.
+- **Trust change** —
+  `protected_state_never_serves_or_writes_pull_request` plus the
+  executor-level `a_pull_request_attempt_never_touches_protected_state`:
+  protected bytes answer `absent` through the scope path and
+  `wrong_trust` through a directory moved across; a pull-request attempt
+  seals only `pull_request` state and leaves the protected entry
+  byte-identical; a wrong-trust commit is refused before a directory
+  exists (also `tests/publish.rs`).
+- **Disk pressure** —
+  `a_full_filesystem_fails_the_publish_cleanly` (linux-only, gated on
+  `SENTINEL_MOUNT_TESTS=1` as a mount-capable account): a real `ENOSPC`
+  mid-publish on an 8 MiB tmpfs — no promotion, `current` untouched,
+  staging removed, and a clean seal once space returns. Its executor
+  half is `sentinel-worker/tests/k09.rs::a_failing_publish_is_a_note_never_the_verdict`:
+  a publication that cannot take the write lock still passes the job —
+  the failure lands as a cache note and `publish: "failed"` on the
+  summary record, never the verdict.
+- **Concurrent writers on one entry** —
+  `parallel_writers_are_serialized_and_never_double_promote`: a held
+  `writing/.lock` makes every commit `busy`; raced for real behind a
+  barrier with a deliberately slow stage, exactly one writer stages at a
+  time — the loser skips, staging never interleaves, `current` never
+  double-promotes.
+
+Cases not re-covered here because an earlier task's test already proves
+them: lease staleness and `writing/` reap boundaries (`tests/gc.rs`),
+walk-phase cancellation and trust-mismatch refusal (`tests/publish.rs`),
+malformed compiler manifests (`tests/compiler.rs`). The mount-gated case
+reports its skip rather than passing silently; on hosts without
+`mount(2)` it is the one case left to a staging host's run.
+
 ## Versioned surface
 
 The manifest and `files` blob formats are versioned contracts under [compatibility](compatibility.md); the miss-reason strings are the report vocabulary and change only there too. The pipeline-facing half — `cache.class`, its default, and the compiled digest — is schema 1 behavior documented in [pipeline schema](pipeline-schema.md).

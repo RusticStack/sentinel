@@ -1,0 +1,26 @@
+# K09 no-op with caches declared: identical work to noop-bare.yml, plus
+# one dependencies entry (a workspace path) and one compiler entry (an
+# absolute path — the bind-mount route), so the record carries both
+# mapping costs. The step seeds each path only when empty, so the first
+# run is a cold `absent → sealed` and every later run a warm
+# `hit → unchanged` — the steady state this case measures.
+schema: 1
+on: [push]
+jobs:
+  build:
+    image: docker.io/library/busybox:1.36
+    resources: { cpu: 1, memory: 128MiB }
+    timeout: 5m
+    cache:
+      - name: deps
+        key: k09-noop-deps
+        paths: [vendor]
+      - name: cc
+        class: compiler
+        key: k09-noop-cc
+        paths: [/cc]
+    steps:
+      - id: noop
+        run: |
+          test -f vendor/seed || echo seed > vendor/seed
+          test -f /cc/seed || echo seed > /cc/seed
