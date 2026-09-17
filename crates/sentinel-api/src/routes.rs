@@ -8,7 +8,7 @@ use std::{io::Read, io::Seek, io::SeekFrom, sync::Arc};
 use crate::http::{Header, Request, Response, StatusCode};
 use sentinel_auth::cookie;
 use sentinel_core::{
-    ArtifactId, AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis, UploadId,
+    ArtifactId, AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis, UploadId, WorkerId,
     auth::{Permissions, Principal},
 };
 use sentinel_intake::ingest;
@@ -445,6 +445,36 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
                 })).collect::<Vec<_>>()
             }))
         }
+        ("GET", ["api", "v1", "queue"]) => {
+            let who = identify(state, request, false)?;
+            let slug = query_param(query, "tenant")
+                .ok_or_else(|| err(ErrorCode::InvalidRequest, "tenant query parameter required"))?
+                .to_owned();
+            let limit = page_size(query_param(query, "limit").and_then(|v| v.parse().ok()));
+            // Placement is decided per transaction against the live session
+            // set, so the explanation must use the same set.
+            let connected = state.controller.connected();
+            let rows = state
+                .store
+                .read(|c| {
+                    let tenant = lookup::tenant_by_slug(c, &slug)?;
+                    authz::require_tenant_member(c, who.principal, tenant, false)?;
+                    dispatch::list_queue(c, tenant, &connected)
+                })
+                .map_err(store_error)?;
+            let shown = rows.len().min(limit);
+            ok(json!({
+                "jobs": rows.iter().take(shown).map(queued_json).collect::<Vec<_>>(),
+                "total": rows.len(),
+                "truncated": rows.len() > shown,
+            }))
+        }
+        ("POST", ["api", "v1", "workers", worker, "drain"]) => {
+            worker_drain(state, request, worker, true)
+        }
+        ("POST", ["api", "v1", "workers", worker, "undrain"]) => {
+            worker_drain(state, request, worker, false)
+        }
         ("POST", ["api", "v1", "tenants", slug, "uploads"]) => upload_begin(state, request, slug),
         ("GET", ["api", "v1", "uploads", upload]) => upload_status(state, request, upload),
         ("PUT", ["api", "v1", "uploads", upload]) => upload_chunk(state, request, upload, query),
@@ -693,6 +723,99 @@ fn logout(state: &State, request: &mut Request) -> Route {
         json!({ "ok": true }),
         vec![header("set-cookie", &cookie::clear(cookie::SESSION_COOKIE))],
     ))
+}
+
+/// Drain or undrain one worker: it keeps the attempts it already holds, takes
+/// no new offers, and stays visible in its pool, so the work it would have
+/// taken is explained by `GET /queue` rather than disappearing. Platform
+/// administration, like everything else that changes a pool's capacity, and
+/// checked against the live platform-admin rows rather than the credential's
+/// expired claims.
+fn worker_drain(state: &State, request: &mut Request, worker: &str, drain: bool) -> Route {
+    let who = identify(state, request, true)?;
+    let worker: WorkerId = id(worker, "worker")?;
+    let authority = Authority::credential(who.principal);
+    state
+        .store
+        .read(move |c| authority.require_platform(c))
+        .map_err(store_error)?;
+    let now = UnixMillis::now();
+    state
+        .store
+        .writer()
+        .write(move |tx| {
+            if drain {
+                workers::drain(tx, authority, worker, now)
+            } else {
+                workers::undrain(tx, authority, worker)
+            }
+        })
+        .map_err(store_error)?;
+    // Placement is decided per transaction from the worker's stored drain
+    // state, so a change to it is what the dispatcher's next pass must see.
+    state.controller.wake();
+    ok(json!({ "worker": worker.to_string(), "draining": drain }))
+}
+
+/// One waiting job as the API explains it: how long it has been waiting and
+/// what it is waiting for. A queued job and a job blocked on its dependencies
+/// are the same question to a person staring at a stuck pipeline.
+fn queued_json(row: &dispatch::QueuedJob) -> Value {
+    json!({
+        "job": row.job.to_string(),
+        "run": row.run.to_string(),
+        "repo": row.repo.to_string(),
+        "age_ms": row.age_ms,
+        "reason": wait_reason_json(row.reason),
+    })
+}
+
+/// The scheduler's reason as a code plus whatever says what is missing. The
+/// enum belongs to the store, which gains reasons as placement learns new
+/// ones, so a reason this build does not name still reports its own name and
+/// numbers instead of an "unknown" the client cannot act on.
+fn wait_reason_json(reason: dispatch::WaitReason) -> Value {
+    match reason {
+        dispatch::WaitReason::Dependency => json!({ "code": "dependency" }),
+        dispatch::WaitReason::Policy(what) => json!({ "code": "policy", "detail": what }),
+        dispatch::WaitReason::NoMatchingWorker {
+            cpu_short,
+            memory_short,
+        } => json!({
+            "code": "no_matching_worker",
+            "cpu_short": cpu_short,
+            "memory_short": memory_short,
+        }),
+        dispatch::WaitReason::WorkerOffline => json!({ "code": "worker_offline" }),
+        dispatch::WaitReason::Capacity => json!({ "code": "capacity" }),
+        other => {
+            let text = format!("{other:?}");
+            match text.split_once(' ') {
+                Some((name, fields)) => json!({
+                    "code": reason_code(name),
+                    "detail": fields.trim_matches(|c| c == '{' || c == '}' || c == ' '),
+                }),
+                None => json!({ "code": reason_code(&text) }),
+            }
+        }
+    }
+}
+
+/// `DiskShort` -> `disk_short`: the variant's own name in the shape the rest
+/// of the API writes enum values in.
+fn reason_code(variant: &str) -> String {
+    let mut out = String::with_capacity(variant.len() + 4);
+    for (index, ch) in variant.char_indices() {
+        if ch.is_ascii_uppercase() {
+            if index != 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]

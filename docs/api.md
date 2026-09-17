@@ -40,6 +40,9 @@ All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](p
 | `GET /runs/{id}/artifacts` | `read` | every artifact row of the run: name, job, attempt, `captured`/`absent`/`failed`, entries, bytes, retention and creation ([storage](storage.md#artifact-records-d03)) |
 | `GET /runs/{id}/artifacts/{arf}` | `read` | one row plus, when captured, its immutable manifest: version, digest, payload length and each entry's path/digest/len/mode; entry bytes download via `GET /tenants/{slug}/objects/{digest}` |
 | `GET /workers?tenant=slug` | member | the pools the tenant may use and their workers, each with `connected` from the live fleet |
+| `GET /queue?tenant=slug&limit` | member | the tenant's waiting jobs, oldest first, each with its `run`, `repo`, `age_ms` and the `reason` it is not running: `dependency`, `policy` (with its detail), `no_matching_worker` (with `cpu_short`/`memory_short`), `worker_offline`, `capacity`, and the fleet constraints `disk_short`, `arch_mismatch`, `label_missing`, `drain`, `concurrency_limit`, `fairness_hold` and `locality_wait`. Bounded to `limit` (default 100, max 500), with `total` as the number of waiting jobs the listing returned and `truncated` marking a response this route cut short, so a ten-thousand-job queue is never a ten-thousand-job document |
+| `POST /workers/{wrk}/drain` | platform admin | the worker keeps the attempts it already holds and takes no new offers → `{worker, draining:true}`; work it could have taken stays queued with reason `drain` |
+| `POST /workers/{wrk}/undrain` | platform admin | the worker is offered work again → `{worker, draining:false}` |
 | `POST /tenants/{slug}/uploads` `{len, digest?, ttl_ms?}` | member (operator+) | open a resumable upload session → `201` `{upload, received, ranges, expires_ms}` ([storage](storage.md#resumable-uploads-reads-and-materialization-d02)); `quota_exceeded` when the tenant's budget cannot take the declared length, `storage_full` below the disk watermarks |
 | `GET /uploads/{upl}` | member (operator+) | the durable resume state: held byte ranges and expiry |
 | `PUT /uploads/{upl}?offset=N` | member (operator+) | one chunk, raw body ≤ 8 MiB; re-sent ranges merge, so retries are safe |
@@ -64,9 +67,14 @@ sentinel api --token-file ~/.sentinel/token logs att_… --follow
 sentinel api --token-file ~/.sentinel/token cancel --run run_…
 sentinel api --token-file ~/.sentinel/token rerun job_…
 sentinel api --token-file ~/.sentinel/token workers --tenant acme --json
+sentinel api --token-file ~/.sentinel/token queue --tenant acme --limit 50
+sentinel api --token-file ~/.sentinel/token drain wrk_…
+sentinel api --token-file ~/.sentinel/token undrain wrk_…
 ```
 
 `--json` prints the server's document; text output is for people. Exit codes: 0 success, 1 remote or transport fault, 2 usage, 3 `unauthenticated`/`forbidden`, 4 `not_found`. `--token-file` keeps the secret out of the process list; `--token` and `SENTINEL_TOKEN` exist for tooling that already protects its environment.
+
+Draining needs a platform-admin credential on the API; on the controller's own host the same change is `sentinel admin worker drain --id wrk_… --data-dir …` (and `undrain`), which acts on the store directly like the rest of `sentinel admin`.
 
 ## The page
 

@@ -20,7 +20,7 @@ pub enum Command {
     Pipeline(PipelineArgs),
     /// Host-local administration of local login, on the controller's own host
     Admin(AdminArgs),
-    /// Talk to a controller's API with a credential: dispatch, status, logs, cancel, rerun, workers
+    /// Talk to a controller's API with a credential: dispatch, status, logs, cancel, rerun, workers, queue, drain
     Api(ApiArgs),
 }
 
@@ -109,6 +109,24 @@ pub enum ApiCommand {
         #[arg(long)]
         tenant: String,
     },
+    /// Queued and blocked jobs of a tenant, oldest first, each with its age and why it is waiting
+    Queue {
+        #[arg(long)]
+        tenant: String,
+        /// How many waiting jobs to show; the response still reports the total
+        #[arg(long, default_value_t = 100)]
+        limit: u16,
+    },
+    /// Stop one worker taking new attempts; it finishes the attempts it already holds
+    Drain {
+        #[arg(value_name = "WORKER")]
+        worker: String,
+    },
+    /// Offer a drained worker work again
+    Undrain {
+        #[arg(value_name = "WORKER")]
+        worker: String,
+    },
 }
 
 /// Authorized by access to the controller's data directory, not by a session.
@@ -177,7 +195,7 @@ pub enum AdminCommand {
     Tenant(TenantArgs),
     /// Register worker pools and grant shared ones to tenants
     Pool(PoolArgs),
-    /// Enroll, list and revoke workers
+    /// Enroll, list, drain and revoke workers
     Worker(WorkerArgs),
     /// Record cancellation for a job or a whole run; running attempts are told on their next heartbeat
     Cancel {
@@ -360,6 +378,22 @@ pub enum WorkerCommand {
         data: DataDir,
         #[arg(long)]
         pool: String,
+    },
+    /// Keep this worker's attempts running but stop offering it new ones
+    Drain {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `wrk_` identifier the worker generated
+        #[arg(long)]
+        id: String,
+    },
+    /// Offer this worker work again
+    Undrain {
+        #[command(flatten)]
+        data: DataDir,
+        /// The `wrk_` identifier the worker generated
+        #[arg(long)]
+        id: String,
     },
     /// Revoke a worker; its session is refused at its next authentication
     Revoke {

@@ -323,6 +323,59 @@ pub fn run(args: ApiArgs) -> Result<(), Error> {
             }
             out(view.clone(), text);
         }
+        ApiCommand::Queue { tenant, limit } => {
+            let view = client.expect(
+                "GET",
+                &format!("/api/v1/queue?tenant={tenant}&limit={limit}"),
+                None,
+                None,
+            )?;
+            let mut text = String::new();
+            for job in view["jobs"].as_array().into_iter().flatten() {
+                text.push_str(&format!(
+                    "{} {:<12} {:>7} {}{}\n",
+                    job["job"].as_str().unwrap_or(""),
+                    job["repo"].as_str().unwrap_or(""),
+                    age_text(job["age_ms"].as_u64().unwrap_or(0)),
+                    job["reason"]["code"].as_str().unwrap_or(""),
+                    job["reason"]["detail"]
+                        .as_str()
+                        .map(|detail| format!(" ({detail})"))
+                        .unwrap_or_default(),
+                ));
+            }
+            if view["truncated"] == true {
+                text.push_str(&format!(
+                    "{} of {} waiting jobs shown; raise --limit for the rest\n",
+                    view["jobs"].as_array().map_or(0, Vec::len),
+                    view["total"].as_u64().unwrap_or(0),
+                ));
+            }
+            out(view.clone(), text);
+        }
+        ApiCommand::Drain { worker } | ApiCommand::Undrain { worker } => {
+            let drain = matches!(args.command, ApiCommand::Drain { .. });
+            let result = client.expect(
+                "POST",
+                &format!(
+                    "/api/v1/workers/{worker}/{}",
+                    if drain { "drain" } else { "undrain" }
+                ),
+                Some(&json!({})),
+                None,
+            )?;
+            out(
+                result.clone(),
+                format!(
+                    "{worker}: {}\n",
+                    if drain {
+                        "takes no new attempts"
+                    } else {
+                        "takes work again"
+                    }
+                ),
+            );
+        }
     }
     Ok(())
 }
@@ -342,4 +395,14 @@ fn jobs_text(run: &Value) -> String {
         ));
     }
     text
+}
+
+/// A waiting age as a person reads it: seconds, then minutes, then hours.
+fn age_text(age_ms: u64) -> String {
+    let secs = age_ms / 1000;
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m{}s", secs / 60, secs % 60),
+        _ => format!("{}h{}m", secs / 3600, (secs % 3600) / 60),
+    }
 }

@@ -1020,6 +1020,36 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
                 );
             }
         }
+        WorkerCommand::Drain { data, id } | WorkerCommand::Undrain { data, id } => {
+            let store = open(data, true)?;
+            let drain = matches!(args.command, WorkerCommand::Drain { .. });
+            let id: WorkerId = id
+                .parse()
+                .map_err(|_| fail("expected a wrk_ worker identifier"))?;
+            store
+                .writer()
+                .write(move |tx| {
+                    if drain {
+                        workers::drain(tx, Authority::HostLocal, id, now)
+                    } else {
+                        workers::undrain(tx, Authority::HostLocal, id)
+                    }
+                })
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound => fail("no live worker with that identifier"),
+                    other => fail(format!("cannot change the drain state: {other}")),
+                })?;
+            // Attempts the worker already holds keep running: draining is
+            // about what it is offered next, not what it is doing.
+            eprintln!(
+                "{} {id}",
+                if drain {
+                    "draining"
+                } else {
+                    "undrained"
+                }
+            );
+        }
         WorkerCommand::Revoke { data, id } => {
             let store = open(data, true)?;
             let id: WorkerId = id
