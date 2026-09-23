@@ -125,7 +125,7 @@ fn create(state: &State, request: &mut Request, slug: &str) -> Route {
         .store
         .writer()
         .write(move |tx| {
-            let tenant = lookup::tenant_by_slug(tx, &slug)?;
+            let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
             authz::create_service_account(
                 tx,
                 principal,
@@ -167,7 +167,7 @@ fn allow(state: &State, request: &mut Request, slug: &str, account: &str, repo: 
         .store
         .writer()
         .write(move |tx| {
-            let tenant = lookup::tenant_by_slug(tx, &slug)?;
+            let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
             let repo = lookup::repo_by_name(tx, tenant, &name)?;
             service::allow_repo(tx, principal, tenant, account, repo, permissions)
         })
@@ -194,7 +194,7 @@ fn issue(state: &State, request: &mut Request, slug: &str, account: &str) -> Rou
         .store
         .writer()
         .write(move |tx| {
-            let tenant = lookup::tenant_by_slug(tx, &slug)?;
+            let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
             let repo = repo
                 .map(|name| lookup::repo_by_name(tx, tenant, &name))
                 .transpose()?;
@@ -218,7 +218,7 @@ fn list(state: &State, request: &mut Request, slug: &str, account: &str) -> Rout
     let records = state
         .store
         .read(|c| {
-            let tenant = lookup::tenant_by_slug(c, slug)?;
+            let tenant = authz::member_tenant_by_slug(c, who.principal, slug)?;
             service::service_grants(c, who.principal, tenant, account)
         })
         .map_err(store_error)?;

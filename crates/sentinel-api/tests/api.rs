@@ -52,6 +52,10 @@ struct Deployment {
 }
 
 fn deployment() -> Deployment {
+    deployment_with(local_auth::Policy::default())
+}
+
+fn deployment_with(sessions: local_auth::Policy) -> Deployment {
     let dir = tempfile::tempdir().unwrap();
     let store =
         Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
@@ -226,7 +230,7 @@ fn deployment() -> Deployment {
         logs: Arc::clone(&logs),
         objects,
         controller: controller.handle(),
-        sessions: local_auth::Policy::default(),
+        sessions,
         github_webhook_secret: Some(Arc::from(WEBHOOK_SECRET)),
         intake: None,
         public_url: None,
@@ -2008,4 +2012,186 @@ fn artifact_routes_are_authorized_and_scoped() {
         &[],
     );
     assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+}
+
+/// A raw `POST /api/v1/login`: (status, set-cookie, body).
+fn raw_login(
+    d: &Deployment,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> (u16, Option<String>, String) {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let mut request = agent.post(&format!("{}/api/v1/login", d.base));
+    for (k, v) in headers {
+        request = request.header(*k, *v);
+    }
+    let response = request.send(body.as_bytes()).unwrap();
+    let status = response.status().as_u16();
+    let cookie = response
+        .headers()
+        .get("set-cookie")
+        .map(|v| v.to_str().unwrap().to_owned());
+    (
+        status,
+        cookie,
+        response.into_body().read_to_string().unwrap(),
+    )
+}
+
+/// Login CSRF: the body a cross-site `enctype="text/plain"` form produces
+/// (`name=value`, shaped to parse as JSON) mints no session.
+#[test]
+fn login_refuses_a_text_plain_body() {
+    let d = deployment();
+    let forged = r#"{"username":"root","password":"correct horse battery=staple"}"#;
+    let (status, cookie, body) = raw_login(&d, forged, &[("content-type", "text/plain")]);
+    assert_eq!(status, 400, "{body}");
+    assert!(cookie.is_none());
+    // Without any content type, too.
+    let (status, cookie, _) = raw_login(&d, forged, &[]);
+    assert_eq!(status, 400);
+    assert!(cookie.is_none());
+}
+
+#[test]
+fn login_refuses_a_foreign_origin() {
+    let d = deployment();
+    let good = r#"{"username":"root","password":"correct horse battery staple"}"#;
+    let (status, cookie, _) = raw_login(
+        &d,
+        good,
+        &[
+            ("content-type", "application/json"),
+            ("origin", "https://attacker.example"),
+        ],
+    );
+    assert_eq!(status, 403);
+    assert!(cookie.is_none());
+    // The deployment's own origin, or none (a non-browser client), signs in.
+    let own = d.base.clone();
+    let (status, cookie, _) = raw_login(
+        &d,
+        good,
+        &[
+            ("content-type", "application/json; charset=utf-8"),
+            ("origin", &own),
+        ],
+    );
+    assert_eq!(status, 200);
+    assert!(cookie.is_some());
+    let (status, _, _) = raw_login(&d, good, &[("content-type", "application/json")]);
+    assert_eq!(status, 200);
+}
+
+/// P03-7 / P02-9: an existing tenant the caller has no part in lists as the
+/// same `not_found` as a tenant that does not exist, never as an empty page.
+#[test]
+fn a_foreign_tenant_slug_lists_as_not_found() {
+    let d = deployment();
+    let (member, globex) = (UserId::new(), TenantId::new());
+    let root = d.root;
+    let now = UnixMillis::now();
+    let tenant = d.tenant;
+    d.store
+        .writer()
+        .write(move |tx| {
+            let admin = Principal::new(root, P::ALL, None, None);
+            provisioning::insert_human(tx, member, "Member", false, now)?;
+            auth::create_namespace(
+                tx,
+                admin,
+                globex,
+                Namespace::parse("globex").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )?;
+            auth::set_membership(tx, admin, tenant, member, sentinel_core::auth::Role::Reader)
+        })
+        .unwrap();
+    let granted = tokens::provision(
+        &d.store,
+        Grant {
+            user: member,
+            name: "member",
+            permissions: P::REPOSITORY,
+            tenant: None,
+            repo: None,
+            lifetime_ms: 60_000,
+        },
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let auth = format!("Bearer {}", sentinel_auth::token::format(&granted.secret));
+    let (own, _) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/repos",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(own, 200);
+    let foreign = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/globex/repos",
+        None,
+        Some(&auth),
+        &[],
+    );
+    let missing = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/nowhere/repos",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(foreign.0, 404, "{}", foreign.1);
+    assert_eq!(foreign, missing);
+}
+
+/// P03-5: using a session slides its idle deadline, so an active session
+/// outlives the idle window it started with; the cookie lives as long as
+/// the session's absolute bound.
+#[test]
+fn an_active_session_outlives_its_first_idle_deadline() {
+    let policy = local_auth::Policy {
+        idle_ms: 6_000,
+        refresh_after_ms: 1_000,
+        ..local_auth::Policy::default()
+    };
+    let d = deployment_with(policy);
+    // The session's clock starts when the login request arrives, before the
+    // (slow, in a debug build) password hash: time everything from here.
+    let start = std::time::Instant::now();
+    let at = |ms: u64| {
+        let due = start + Duration::from_millis(ms);
+        thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
+    };
+    let (status, cookie, _) = raw_login(
+        &d,
+        r#"{"username":"root","password":"correct horse battery staple"}"#,
+        &[("content-type", "application/json")],
+    );
+    assert_eq!(status, 200);
+    let cookie = cookie.unwrap();
+    let max_age = format!("Max-Age={}", policy.absolute_ms / 1000);
+    assert!(cookie.contains(&max_age), "{cookie}");
+    let cookie = cookie.split(';').next().unwrap().to_owned();
+    let me = || call(&d, "GET", "/api/v1/me", None, None, &[("cookie", &cookie)]).0;
+    // Used at 4 s: the idle deadline slides to about 10 s.
+    at(4_000);
+    assert_eq!(me(), 200);
+    // Past the first idle deadline (6 s after sign-in), still signed in;
+    // this use slides it to about 14 s.
+    at(8_000);
+    assert_eq!(me(), 200);
+    // Idle for a whole window: gone.
+    at(14_700);
+    assert_eq!(me(), 401);
 }

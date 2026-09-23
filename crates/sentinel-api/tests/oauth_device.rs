@@ -717,3 +717,68 @@ fn five_wrong_user_codes_lock_the_account_out_for_a_while() {
     );
     assert_no_device_code(&[&posted, &locked, &locked_post], &s.device_code);
 }
+
+/// P09-1: narrowing an approval to a tenant or repository the account has
+/// no part in answers exactly as narrowing to one that does not exist, and
+/// each such answer counts toward the wrong-code lockout.
+#[test]
+fn foreign_and_missing_narrowings_are_indistinguishable_and_limited() {
+    let d = deployment();
+    // An organization root does not belong to, with a repository.
+    let (globex, secret) = (TenantId::new(), RepoId::new());
+    let root = d.root;
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            let admin = Principal::new(root, P::ALL, None, None);
+            auth::create_namespace(
+                tx,
+                admin,
+                globex,
+                Namespace::parse("globex").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )?;
+            auth::create_repo(tx, admin, globex, secret, "secret", now)
+        })
+        .unwrap();
+    let s = started(&d);
+    let cookie = sign_in(&d);
+    let (_, token) = approval_page(&d, &cookie, &s.user_code);
+    let attempt = |terms: &str| {
+        decide(
+            &d,
+            &cookie,
+            &format!(
+                "user_code={}&form_token={token}&action=approve&scope_runs%3Aread=1&{terms}",
+                s.user_code
+            ),
+        )
+    };
+    let foreign = attempt("tenant=globex");
+    let missing = attempt("tenant=nowhere");
+    assert_eq!(foreign.status, 403);
+    assert_eq!(
+        (foreign.status, html(&foreign)),
+        (missing.status, html(&missing))
+    );
+    let foreign_repo = attempt("tenant=globex&repo=secret");
+    let missing_repo = attempt("tenant=acme&repo=nothing");
+    assert_eq!(
+        (foreign_repo.status, html(&foreign_repo)),
+        (missing.status, html(&missing))
+    );
+    assert_eq!(
+        (missing_repo.status, html(&missing_repo)),
+        (missing.status, html(&missing))
+    );
+    // Four refusals so far; the fifth locks the account out of the page.
+    assert_eq!(attempt("tenant=elsewhere").status, 403);
+    assert_eq!(attempt("tenant=acme").status, 429);
+    // Nothing was spent: the request is still pending.
+    assert_eq!(
+        oauth_error(&poll(&d, &s.device_code)),
+        "authorization_pending"
+    );
+}

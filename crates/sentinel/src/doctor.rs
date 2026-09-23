@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use crate::{
     auth_cmd,
     client::{ClientArgs, Error, Exit, emit, normalize_server},
-    keystore::{Backend, file, key},
+    keystore::{Backend, file},
     profile::{self, Config, Credentials, Profile, now_ms},
 };
 
@@ -471,7 +471,7 @@ fn credential_store(
             "the file store ({})",
             file::path(config.dir(), name).display()
         ),
-        Backend::Os => format!("the OS store (key {})", key(&entry.issuer, name)),
+        Backend::Os => format!("the OS store (key {})", entry.os_key(name)),
     };
     match config.read_credentials(name, entry) {
         Ok(Some(stored)) => {

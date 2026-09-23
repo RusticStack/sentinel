@@ -331,7 +331,9 @@ fn parse_access(text: &str) -> Result<Vec<&'static str>, client::Error> {
 /// 1 h..90 d bounds; this only refuses what is not a duration.
 fn parse_duration(text: &str) -> Result<i64, client::Error> {
     let bad = || client::Error::usage(format!("invalid duration {text:?}; use e.g. 30d, 12h, 90m"));
-    let split = text.len().checked_sub(1).ok_or_else(bad)?;
+    // The unit is the last character, which need not be one byte: split on
+    // its boundary, never inside it.
+    let split = text.char_indices().last().ok_or_else(bad)?.0;
     let (number, unit) = text.split_at(split);
     let unit_ms: i64 = match unit {
         "s" => 1_000,
@@ -409,6 +411,9 @@ mod tests {
             "1w",
             "1.5d",
             "99999999999999999d",
+            "5é",
+            "é",
+            "5日",
         ] {
             assert!(parse_duration(bad).is_err(), "{bad}");
         }

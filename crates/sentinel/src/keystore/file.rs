@@ -5,8 +5,11 @@
 //! command that fixes it. Files are replaced atomically (write a sibling,
 //! `fsync`, rename), so a reader never sees half a credential and a crash
 //! never loses a rotated refresh token that was reported written. On
-//! Windows the configuration directory inherits the per-user ACL of
-//! `%APPDATA%`.
+//! Windows a directory Sentinel creates, and the `credentials` directory on
+//! every credential write, get a protected DACL granting only the current
+//! user and SYSTEM (inherited by the files inside), so the store is
+//! owner-only wherever `SENTINEL_CONFIG_DIR` points — not only under the
+//! per-user `%APPDATA%`.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -45,7 +48,13 @@ pub fn read(dir: &Path, profile: &str) -> Result<Option<Vec<u8>>, Error> {
 
 pub fn write(dir: &Path, profile: &str, blob: &[u8]) -> Result<(), Error> {
     ensure_private_dir(dir)?;
-    ensure_private_dir(&credentials_dir(dir))?;
+    let creds = credentials_dir(dir);
+    ensure_private_dir(&creds)?;
+    // A directory made by an older Sentinel, or by someone else, is brought
+    // to owner-only before a refresh token goes into it (Unix refuses a
+    // loose one in `ensure_private_dir` instead).
+    #[cfg(windows)]
+    acl::owner_only(&creds).map_err(|e| io_error("restrict access to", &creds, &e))?;
     write_private(&path(dir, profile), blob)
 }
 
@@ -101,7 +110,10 @@ pub fn ensure_private_dir(path: &Path) -> Result<(), Error> {
             std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
             builder
                 .create(path)
-                .map_err(|e| io_error("create", path, &e))
+                .map_err(|e| io_error("create", path, &e))?;
+            #[cfg(windows)]
+            acl::owner_only(path).map_err(|e| io_error("restrict access to", path, &e))?;
+            Ok(())
         }
         Err(e) => Err(io_error("read", path, &e)),
     }
@@ -199,4 +211,129 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<(), Error> {
 
 fn io_error(what: &str, path: &Path, error: &io::Error) -> Error {
     Error::usage(format!("cannot {what} {}: {error}", path.display()))
+}
+
+/// Owner-only access on Windows: a protected DACL (no inherited entries)
+/// granting full control to the current user and to SYSTEM, inherited by
+/// everything created inside. The equivalent of `chmod 700`.
+#[cfg(windows)]
+mod acl {
+    use std::{ffi::c_void, io, iter, os::windows::ffi::OsStrExt, path::Path, ptr};
+
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_SUCCESS, GENERIC_ALL, HANDLE, LocalFree},
+        Security::{
+            ACL,
+            Authorization::{
+                EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS,
+                SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
+                TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_TYPE, TRUSTEE_W,
+            },
+            CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetTokenInformation,
+            PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_MAX_SID_SIZE,
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY, TOKEN_USER, TokenUser,
+            WinLocalSystemSid,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    fn entry(sid: *mut c_void, kind: TRUSTEE_TYPE) -> EXPLICIT_ACCESS_W {
+        EXPLICIT_ACCESS_W {
+            grfAccessPermissions: GENERIC_ALL,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: kind,
+                ptstrName: sid.cast(),
+            },
+        }
+    }
+
+    pub(super) fn owner_only(path: &Path) -> io::Result<()> {
+        let mut token: HANDLE = ptr::null_mut();
+        // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no
+        // closing; `token` is a valid out-pointer for the opened handle.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // TOKEN_USER plus the SID it points at: at most 16 + 68 bytes. u64
+        // storage keeps the pointer inside TOKEN_USER aligned.
+        let mut user = [0u64; 16];
+        let mut len = 0u32;
+        // SAFETY: `token` is the live token handle opened above; `user` is
+        // writable and 8-aligned for its whole byte length, which is passed.
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                user.as_mut_ptr().cast(),
+                size_of_val(&user) as u32,
+                &mut len,
+            )
+        };
+        let error = io::Error::last_os_error();
+        // SAFETY: `token` was opened above and is closed exactly once.
+        unsafe { CloseHandle(token) };
+        if ok == 0 {
+            return Err(error);
+        }
+        // SAFETY: on success the buffer starts with a TOKEN_USER whose SID
+        // pointer refers into the same buffer, which outlives its uses below.
+        let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let mut system = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut system_len = SECURITY_MAX_SID_SIZE;
+        // SAFETY: `system` is writable for `system_len` bytes, the maximum
+        // size of any SID; no domain SID is needed for LocalSystem.
+        let ok = unsafe {
+            CreateWellKnownSid(
+                WinLocalSystemSid,
+                ptr::null_mut(),
+                system.as_mut_ptr().cast(),
+                &mut system_len,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let entries = [
+            entry(user_sid, TRUSTEE_IS_USER),
+            entry(system.as_mut_ptr().cast(), TRUSTEE_IS_WELL_KNOWN_GROUP),
+        ];
+        let mut acl: *mut ACL = ptr::null_mut();
+        // SAFETY: `entries` and the SIDs they point at live across the call;
+        // `acl` receives a LocalAlloc'd ACL owned by this function.
+        let code = unsafe { SetEntriesInAclW(2, entries.as_ptr(), ptr::null(), &mut acl) };
+        if code != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect();
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path alive for the call
+        // and `acl` a valid ACL from SetEntriesInAclW; owner, group and SACL
+        // are not being set, so their null pointers are not read.
+        let code = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                acl,
+                ptr::null(),
+            )
+        };
+        // SAFETY: `acl` was allocated by SetEntriesInAclW (LocalAlloc) and
+        // is freed exactly once, after its last use.
+        unsafe { LocalFree(acl.cast()) };
+        if code != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        Ok(())
+    }
 }

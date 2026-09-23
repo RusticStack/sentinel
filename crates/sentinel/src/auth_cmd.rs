@@ -490,7 +490,8 @@ fn save_login(
         }
         let _ = config.delete_credentials(name, old);
     }
-    let store = config.store_credentials(name, server, keystore::preferred()?, &credentials)?;
+    let (store, key) =
+        config.store_credentials(name, server, keystore::preferred()?, &credentials)?;
     let username = me["username"].as_str().map(str::to_owned);
     let entry = Profile {
         server: server.clone(),
@@ -504,6 +505,7 @@ fn save_login(
             .filter(|p| p.server == *server)
             .and_then(|p| p.tenant),
         store,
+        key,
         created_ms: sent,
     };
     config.update(|profiles| {

@@ -374,7 +374,7 @@ fn rejection_ends_access_and_keeps_the_identity_claimed() {
 
     f.store
         .writer()
-        .write(move |tx| registration::reject(tx, Authority::credential(admin), user, at(22)))
+        .write(move |tx| registration::reject(tx, stepped(admin), user, at(22)))
         .unwrap();
     // The live session stops working, and the password no longer signs in.
     assert!(matches!(
@@ -834,4 +834,158 @@ fn admission_decisions_are_audited_and_spent_invitations_are_purged() {
         f.apply_local("second", Some(&live.secret)),
         Admission::Admitted(_)
     ));
+}
+
+/// A tenant admin (not the root) who mints an admin invitation into `acme`,
+/// plus that invitation. Returns (admin user, their principal, invitation).
+fn delegated_invitation(f: &Fixture) -> (UserId, Principal, registration::Invitation) {
+    let invitation = f.invite(Terms {
+        tenant: Some(f.tenant),
+        role: Some(Role::TenantAdmin),
+        ..Terms::default()
+    });
+    let dev = admitted(f.apply_local("dev", Some(&invitation.secret)));
+    let theirs = Principal::new(dev, P::REPOSITORY.union(P::TENANT_ADMIN), None, None);
+    let tenant = f.tenant;
+    let backdoor = f
+        .store
+        .writer()
+        .write(move |tx| {
+            registration::invite(
+                tx,
+                Authority::credential(theirs),
+                Terms {
+                    tenant: Some(tenant),
+                    role: Some(Role::TenantAdmin),
+                    ..Terms::default()
+                },
+                at(11),
+            )
+        })
+        .unwrap();
+    (dev, theirs, backdoor)
+}
+
+fn redeems(f: &Fixture, username: &'static str, invitation: &registration::Invitation) -> bool {
+    match f.apply_local(username, Some(&invitation.secret)) {
+        Admission::Admitted(_) => true,
+        Admission::Refused(Refusal::InvitationUnusable) => false,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn an_invitation_dies_with_its_inviters_membership() {
+    let f = fixture();
+    let (dev, _, backdoor) = delegated_invitation(&f);
+    let (admin, tenant) = (f.admin, f.tenant);
+    f.store
+        .writer()
+        .write(move |tx| auth::remove_membership(tx, admin, tenant, dev, at(12)))
+        .unwrap();
+    assert!(!redeems(&f, "mallory", &backdoor));
+}
+
+#[test]
+fn an_invitation_dies_with_its_inviters_suspension() {
+    let f = fixture();
+    let (dev, _, backdoor) = delegated_invitation(&f);
+    let admin = f.admin;
+    f.store
+        .writer()
+        .write(move |tx| local_auth::set_active(tx, stepped(admin), dev, false, at(12)))
+        .unwrap();
+    assert!(!redeems(&f, "mallory", &backdoor));
+    // Reactivated and still an admin: the invitation works again, because
+    // what it delegates is live authority, not a record of the past.
+    f.store
+        .writer()
+        .write(move |tx| local_auth::set_active(tx, stepped(admin), dev, true, at(13)))
+        .unwrap();
+    assert!(redeems(&f, "mallory", &backdoor));
+}
+
+#[test]
+fn an_invitation_dies_with_its_inviters_downgrade_to_reader() {
+    let f = fixture();
+    let (dev, _, backdoor) = delegated_invitation(&f);
+    let (admin, tenant) = (f.admin, f.tenant);
+    f.store
+        .writer()
+        .write(move |tx| auth::set_membership(tx, admin, tenant, dev, Role::Reader))
+        .unwrap();
+    assert!(!redeems(&f, "mallory", &backdoor));
+    // An invitation the inviter could still make stays good.
+    let still_admin = fixture();
+    let (_, _, kept) = delegated_invitation(&still_admin);
+    assert!(redeems(&still_admin, "friend", &kept));
+}
+
+#[test]
+fn a_tenantless_invitation_dies_with_super_admin_demotion() {
+    let f = fixture();
+    // A second super admin mints a deployment-wide invitation, then loses
+    // platform administration.
+    let invitation = f.invite(Terms::default());
+    let other = admitted(f.apply_local("other-admin", Some(&invitation.secret)));
+    f.store
+        .writer()
+        .write(move |tx| local_auth::set_super_admin(tx, Authority::HostLocal, other, true, at(11)))
+        .unwrap();
+    let theirs = Principal::new(other, P::ALL, None, None);
+    let minted = f
+        .store
+        .writer()
+        .write(move |tx| {
+            registration::invite(tx, Authority::credential(theirs), Terms::default(), at(12))
+        })
+        .unwrap();
+    f.store
+        .writer()
+        .write(move |tx| {
+            local_auth::set_super_admin(tx, Authority::HostLocal, other, false, at(13))
+        })
+        .unwrap();
+    assert!(!redeems(&f, "mallory", &minted));
+    // A host-local invitation has no inviter to lose authority.
+    let host = f
+        .store
+        .writer()
+        .write(move |tx| registration::invite(tx, Authority::HostLocal, Terms::default(), at(14)))
+        .unwrap();
+    assert!(redeems(&f, "operator", &host));
+}
+
+/// Rejecting an approved account takes it away for good, so it needs the
+/// same step-up as suspending it; a pending application does not.
+#[test]
+fn rejecting_an_approved_account_needs_step_up() {
+    let f = fixture();
+    let invitation = f.invite(Terms::default());
+    let member = admitted(f.apply_local("member", Some(&invitation.secret)));
+    let admin = f.admin;
+    let refused = f
+        .store
+        .writer()
+        .write(move |tx| registration::reject(tx, Authority::credential(admin), member, at(20)));
+    assert!(matches!(refused, Err(Error::StepUpRequired)), "{refused:?}");
+    // Still active and able to sign in.
+    assert!(matches!(
+        local_auth::login(&f.store, "member", PASSWORD, Policy::default(), at(21)).unwrap(),
+        Login::Accepted(_)
+    ));
+    f.store
+        .writer()
+        .write(move |tx| registration::reject(tx, stepped(admin), member, at(22)))
+        .unwrap();
+
+    f.set_registration(Registration::ApprovalRequired);
+    let pending = match f.apply_local("applicant", None) {
+        Admission::Pending(user) => user,
+        other => panic!("expected pending, got {other:?}"),
+    };
+    f.store
+        .writer()
+        .write(move |tx| registration::reject(tx, Authority::credential(admin), pending, at(23)))
+        .unwrap();
 }

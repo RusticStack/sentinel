@@ -768,6 +768,12 @@ impl Request<'_> {
         &self.headers
     }
 
+    /// The connected peer's address. A `getpeername` per call, so only the
+    /// few routes that key admission by client ask for it.
+    pub(crate) fn peer(&self) -> Option<std::net::IpAddr> {
+        self.writer.peer_addr().ok().map(|addr| addr.ip())
+    }
+
     pub(crate) fn body_length(&self) -> Option<usize> {
         self.length
             .map(|n| usize::try_from(n).unwrap_or(usize::MAX))

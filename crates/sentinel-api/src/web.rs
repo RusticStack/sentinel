@@ -46,11 +46,14 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 let csrf = null, following = null;
+// Served only at the mount point ("/" here, "/sentinel/" behind a proxy
+// for a path-carrying public_url), so that is the prefix every call needs.
+const root = location.pathname.replace(/\/+$/, "");
 const api = async (method, path, body) => {
   const headers = { "accept": "application/json" };
   if (body !== undefined) headers["content-type"] = "application/json";
   if (csrf && method !== "GET") headers["x-sentinel-csrf"] = csrf;
-  const r = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: "same-origin" });
+  const r = await fetch(root + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: "same-origin" });
   const text = await r.text();
   const data = text ? JSON.parse(text) : null;
   if (!r.ok) throw new Error(data && data.message ? `${data.code}: ${data.message}` : `${r.status}`);

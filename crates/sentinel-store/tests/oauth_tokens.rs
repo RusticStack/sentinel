@@ -467,6 +467,23 @@ fn a_lost_response_recovers_once_and_the_abandoned_successor_is_a_replay() {
     ));
 }
 
+/// "Once" is once: a third presentation of the same token inside the window
+/// — someone else holding a copy of it — is a replay, not another recovery
+/// that would supersede the legitimate holder's successor again.
+#[test]
+fn a_lost_response_is_not_recovered_a_second_time() {
+    let (_dir, store, i) = fixture();
+    let first = issue(&store, login_grant(i.dev, Scopes::CLI_DEFAULT));
+    let _lost = refresh(&store, &first.refresh, None, at(1_000)).unwrap();
+    let recovered = refresh(&store, &first.refresh, None, at(2_000)).unwrap();
+    assert!(matches!(
+        refresh(&store, &first.refresh, None, at(3_000)),
+        Err(RefreshError::Replay)
+    ));
+    assert!(revoked(&store, first.grant, i.dev));
+    assert!(authenticate(&store, &recovered.access, at(3_001)).is_err());
+}
+
 #[test]
 fn a_replay_after_grace_or_after_the_successor_was_used_revokes_and_audits() {
     let (_dir, store, i) = fixture();

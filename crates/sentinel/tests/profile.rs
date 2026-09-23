@@ -268,6 +268,7 @@ fn seed(config: &Config, name: &str, server: &str, creds: &Credentials) -> Profi
         scopes: "runs:read runs:write".into(),
         tenant: None,
         store: Backend::File,
+        key: None,
         created_ms: now_ms(),
     };
     config.write_credentials(name, &entry, creds).unwrap();
@@ -558,6 +559,39 @@ fn a_refused_refresh_is_exit_3_with_the_login_command() {
     seed(&config, "gone", &closed, &credentials(1, 0));
     let handle = config.handle(Some("gone")).unwrap().unwrap();
     assert_eq!(handle.access_token(&agent()).unwrap_err().exit, Exit::Busy);
+}
+
+/// P09-2: a refresh that meets a busy authorization server retries once
+/// after the server's `retry-after`, instead of failing the command.
+#[test]
+fn a_busy_token_endpoint_is_retried_once() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let server = oauth_server(move |_| {
+        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            (503, r#"{"error":"temporarily_unavailable"}"#.into())
+        } else {
+            (200, tokens_json(2, "grt_seeded"))
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(&dir);
+    seed(&config, "ci", &server.url, &credentials(1, 0));
+    let handle = config.handle(Some("ci")).unwrap().unwrap();
+    assert_eq!(handle.access_token(&agent()).unwrap(), token("sntl_at_", 2));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // Still busy the second time: exit 6, after exactly one retry.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let busy = oauth_server(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        (503, r#"{"error":"temporarily_unavailable"}"#.into())
+    });
+    seed(&config, "busy", &busy.url, &credentials(1, 0));
+    let handle = config.handle(Some("busy")).unwrap().unwrap();
+    assert_eq!(handle.access_token(&agent()).unwrap_err().exit, Exit::Busy);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 /// Send one raw request to the listener and return the status line.
@@ -972,6 +1006,41 @@ fn grant_file_import_spends_the_provisioned_token_and_stores_the_successor() {
     assert_eq!(server.requests("/oauth/token").len(), before);
 }
 
+/// A profile may be called `profiles`: signing in holds the profile's lock
+/// while it updates `profiles.json`, whose own lock must be a different file.
+#[test]
+fn a_profile_named_profiles_signs_in_without_waiting_on_itself() {
+    let server = oauth_server(|_| (200, tokens_json(81, "grt_profiles")));
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("cfg");
+    let started = Instant::now();
+    let mut child = sentinel(&cfg)
+        .args([
+            "auth",
+            "login",
+            "--grant-file",
+            "-",
+            "--profile",
+            "profiles",
+            "--server",
+            &server.url,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{}", token("sntl_rt_", 80)).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(started.elapsed() < profile::LOCK_DEADLINE);
+    let config = Config::at(&cfg).unwrap();
+    assert_eq!(
+        config.load().unwrap().profiles["profiles"].grant,
+        "grt_profiles"
+    );
+}
+
 #[test]
 fn logout_revokes_then_deletes_and_offline_still_deletes_with_exit_1() {
     let server = oauth_server(|_| oauth_error("invalid_grant"));
@@ -1110,6 +1179,52 @@ fn context_use_sets_the_profile_default_tenant() {
     assert_eq!(output.status.code(), Some(2));
 }
 
+/// P09-10: outside `%APPDATA%` the file store must still be owner-only. A
+/// directory under the temporary directory inherits a broad ACL; after a
+/// credential write the `credentials` directory and its file grant only
+/// this user and SYSTEM, with inheritance cut.
+#[cfg(windows)]
+#[test]
+fn windows_file_store_is_owner_only_wherever_it_lives() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(&dir);
+    seed(
+        &config,
+        "default",
+        "http://127.0.0.1:1",
+        &credentials(1, 600_000),
+    );
+    let user = std::env::var("USERNAME").unwrap().to_ascii_lowercase();
+    for path in [
+        config.dir().join("credentials"),
+        config.dir().join("credentials").join("default.json"),
+    ] {
+        let listing = Command::new("icacls").arg(&path).output().unwrap();
+        assert!(listing.status.success());
+        let text = String::from_utf8_lossy(&listing.stdout).to_ascii_lowercase();
+        let grants: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains(":("))
+            .map(|l| {
+                l.trim_start_matches(&*path.to_string_lossy().to_ascii_lowercase())
+                    .trim()
+            })
+            .collect();
+        // Only this user and SYSTEM (icacls may list each twice: the
+        // object's own entry and the inheritable one).
+        let system = r"nt authority\system:";
+        let own = format!(r"\{user}:");
+        assert!(
+            grants
+                .iter()
+                .all(|g| g.starts_with(system) || g.contains(&own)),
+            "{text}"
+        );
+        assert!(grants.iter().any(|g| g.contains(&own)), "{text}");
+        assert!(grants.iter().any(|g| g.starts_with(system)), "{text}");
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_credential_manager_stores_reads_and_deletes() {
@@ -1150,10 +1265,16 @@ fn windows_credential_manager_stores_reads_and_deletes() {
     let dir = tempfile::tempdir().unwrap();
     let config = config(&dir);
     let creds = credentials(1, 600_000);
-    let store = config
+    let (store, os_key) = config
         .store_credentials("default", &issuer, Backend::Os, &creds)
         .unwrap();
     assert_eq!(store, Backend::Os);
+    let _scoped = Cleanup(os_key.clone().into_iter().collect());
+    assert!(
+        os_key
+            .as_deref()
+            .is_some_and(|k| k.starts_with(&keystore::key(&issuer, "default")))
+    );
     let entry = Profile {
         server: issuer.clone(),
         issuer: issuer.clone(),
@@ -1164,6 +1285,7 @@ fn windows_credential_manager_stores_reads_and_deletes() {
         scopes: "runs:read".into(),
         tenant: None,
         store,
+        key: os_key,
         created_ms: 0,
     };
     assert_eq!(
@@ -1171,6 +1293,44 @@ fn windows_credential_manager_stores_reads_and_deletes() {
         Some(creds)
     );
     assert!(!config.dir().join("credentials").exists());
+
+    // A second configuration directory with the same profile for the same
+    // server holds its own credential: signing in there neither replaces
+    // nor deletes this one (each directory has its own refresh lock).
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = self::config(&other_dir);
+    let other_creds = credentials(2, 600_000);
+    let (_, other_key) = other
+        .store_credentials("default", &issuer, Backend::Os, &other_creds)
+        .unwrap();
+    let _other_scoped = Cleanup(other_key.clone().into_iter().collect());
+    assert_ne!(other_key, entry.key);
+    let other_entry = Profile {
+        key: other_key,
+        ..entry.clone()
+    };
+    assert_eq!(
+        config
+            .read_credentials("default", &entry)
+            .unwrap()
+            .map(|c| c.refresh),
+        Some(credentials(1, 600_000).refresh)
+    );
+    assert_eq!(
+        other
+            .read_credentials("default", &other_entry)
+            .unwrap()
+            .map(|c| c.refresh),
+        Some(other_creds.refresh.clone())
+    );
+    other.delete_credentials("default", &other_entry).unwrap();
+    assert!(
+        config
+            .read_credentials("default", &entry)
+            .unwrap()
+            .is_some()
+    );
+
     config.delete_credentials("default", &entry).unwrap();
     assert_eq!(config.read_credentials("default", &entry).unwrap(), None);
 }

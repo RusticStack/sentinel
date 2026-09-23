@@ -3,8 +3,10 @@
 //! chosen by platform or `SENTINEL_CREDENTIAL_STORE=file|os`.
 //!
 //! A stored credential is one opaque blob per profile (the JSON
-//! [`crate::profile::Credentials`]). The OS stores key it by
-//! [`key`] (`sentinel:{issuer}:{profile}`); the file store by profile name,
+//! [`crate::profile::Credentials`]). The OS stores key it by the key the
+//! profile recorded at sign-in ([`scoped_key`],
+//! `sentinel:{issuer}:{profile}:{directory digest}`; profiles from before
+//! that use [`key`]); the file store by profile name,
 //! `credentials/<profile>.json`. Only the backend a profile recorded at
 //! sign-in is ever read, so a profile never silently changes stores.
 
@@ -61,21 +63,35 @@ pub fn preferred() -> Result<Backend, Error> {
     }
 }
 
-/// The OS-store key of a profile's credential.
+/// The OS-store key of a profile signed in before keys named their
+/// configuration directory. The OS store is per user, so two configuration
+/// directories share this key; profiles that recorded no key keep using it.
 pub fn key(issuer: &str, profile: &str) -> String {
     format!("sentinel:{issuer}:{profile}")
+}
+
+/// The OS-store key for a new sign-in: the legacy key plus 16 hex digits of
+/// BLAKE3 over the configuration directory's canonical path. Two
+/// configuration directories (a CI runner's, a project's, a test's) then
+/// hold independent credentials, matching their independent refresh locks
+/// (`locks/<profile>.lock` lives in the directory). The key is recorded in
+/// the profile at sign-in, so later spellings of the path do not matter.
+pub fn scoped_key(dir: &Path, issuer: &str, profile: &str) -> String {
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let digest = blake3::hash(canonical.as_os_str().as_encoded_bytes()).to_hex();
+    format!("sentinel:{issuer}:{profile}:{}", &digest[..16])
 }
 
 /// Read a profile's credential blob; `Ok(None)` when none is stored.
 pub fn read(
     backend: Backend,
     dir: &Path,
-    issuer: &str,
+    os_key: &str,
     profile: &str,
 ) -> Result<Option<Vec<u8>>, Error> {
     match backend {
         Backend::File => file::read(dir, profile),
-        Backend::Os => os::read(&key(issuer, profile)).map_err(|e| os_error("read", &e)),
+        Backend::Os => os::read(os_key).map_err(|e| os_error("read", &e)),
     }
 }
 
@@ -83,21 +99,21 @@ pub fn read(
 pub fn write(
     backend: Backend,
     dir: &Path,
-    issuer: &str,
+    os_key: &str,
     profile: &str,
     blob: &[u8],
 ) -> Result<(), Error> {
     match backend {
         Backend::File => file::write(dir, profile, blob),
-        Backend::Os => os::write(&key(issuer, profile), blob).map_err(|e| os_error("write", &e)),
+        Backend::Os => os::write(os_key, blob).map_err(|e| os_error("write", &e)),
     }
 }
 
 /// Remove a profile's credential; absent is success.
-pub fn delete(backend: Backend, dir: &Path, issuer: &str, profile: &str) -> Result<(), Error> {
+pub fn delete(backend: Backend, dir: &Path, os_key: &str, profile: &str) -> Result<(), Error> {
     match backend {
         Backend::File => file::delete(dir, profile),
-        Backend::Os => os::delete(&key(issuer, profile)).map_err(|e| os_error("delete", &e)),
+        Backend::Os => os::delete(os_key).map_err(|e| os_error("delete", &e)),
     }
 }
 

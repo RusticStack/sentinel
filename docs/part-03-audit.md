@@ -25,7 +25,7 @@ Audited 2026-09-14 after `e1218fd`, by re-reading every trust-boundary module in
 ## Accepted deviations, recorded rather than fixed
 
 - **Audit timestamps use the wall clock**, not the operation's `now`. Operations take `now` for determinism in tests; audit rows are provenance and record when the row was written. In production both are the same clock. Not changed, because it would touch every entry point for no security gain.
-- **`approve`/`reject` need platform administration but not step-up.** They admit or refuse *new* accounts under a policy that itself needed step-up to set; treating every approval as privileged would push administrators toward long step-up windows. Recorded as a policy choice.
+- **`approve`, and `reject` of a pending application, need platform administration but not step-up.** They admit or refuse *new* accounts under a policy that itself needed step-up to set; treating every approval as privileged would push administrators toward long step-up windows. Recorded as a policy choice. *Corrected by the Parts 03/09 re-audit:* the code did not enforce the "new accounts" premise — `reject` also deactivated approved, active accounts (super admins included), permanently and without step-up. `reject` now reads the account's status in its transaction and requires step-up, as `set_active` does, when the account was approved ([step-up](step-up.md)).
 - **A GitHub-only super admin must enroll TOTP before any privileged change**, because the password proof requires a local credential. Enrollment itself needs only a session, so there is no lockout: sign in, enroll, step up. Documented in [step-up](step-up.md).
 - **`Registration::Closed` refuses outstanding invitations.** Closed means closed; invitations expire on their own. Documented in [admission](admission.md); a one-line change if the deployment wants invitations to survive closing.
 - **Sessions issued before migration 9 have no `ses_` name** and cannot be revoked individually — only by logout-all. They expire within seven days regardless.
@@ -33,8 +33,8 @@ Audited 2026-09-14 after `e1218fd`, by re-reading every trust-boundary module in
 ## Still open in Part 03
 
 - ~~**A07**~~ — done after this audit: [tenancy](tenancy.md) flips `tenants.active`, revokes scoped credentials and invitations, cancels live jobs and moves an authorization epoch that streams re-check.
-- ~~**A08**~~ — done: `crates/sentinel-store/tests/cross_tenant.rs` is the consolidated sweep. Downloads are not yet covered because no object storage exists (D01–D02); the suite is to be extended as storage and MCP are connected.
-- **No HTTP routes exist (W08).** Every contract above is verified at the library boundary and, for GitHub, against a loopback provider. The cookie, CSRF, state and bearer policies are the bytes the routes must use; they are not yet used by a route.
+- ~~**A08**~~ — done: `crates/sentinel-store/tests/cross_tenant.rs` is the consolidated sweep. Cross-tenant coverage of downloads and OAuth landed with those features, but in `crates/sentinel-api/tests/api.rs` and `crates/sentinel-store/tests/oauth_*.rs` rather than in the sweep; the sweep itself gained slug and name resolution (`slugs_and_names_resolve_only_for_members`) in the Parts 03/09 re-audit.
+- ~~**No HTTP routes exist (W08).**~~ Superseded: `sentinel-api` now serves login, logout, the session CSRF check and the OAuth pages with exactly these cookie, CSRF, state and bearer policies. The re-audit added login-CSRF refusal and wired the sliding idle deadline into the API ([local authentication](local-authentication.md)).
 - **Rate limiting of `login` is per-account lockout only.** Password spraying across many usernames is audited (`LoginRejected` with no subject) but not throttled; that needs a request-level limiter in the server, not the store.
 
 See [TODO.md](../TODO.md) for the commands and results behind each claim.

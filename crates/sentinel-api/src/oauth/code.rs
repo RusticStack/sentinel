@@ -71,7 +71,7 @@ fn show(state: &State, request: &Request, query: &str) -> Reply {
         message.push_str("Sign in to continue to ");
         message.push_str(&params.client.name);
         message.push('.');
-        return html::sign_in_page("Sign in to Sentinel", &message);
+        return html::sign_in_page(&state.oauth.login_url, "Sign in to Sentinel", &message);
     };
     if let Err(reply) = eligible(state, &params, &who) {
         return reply;
@@ -137,7 +137,10 @@ fn approve(state: &State, form: &Form, params: &Params<'_>, who: &Identity) -> R
         (None, _) => None,
         (Some(_), None) => return again("Choose a tenant to limit access to one repository."),
         (Some(name), Some(tenant)) => {
-            match state.store.read(|c| codes::repo_named(c, tenant, name)) {
+            match state
+                .store
+                .read(|c| codes::repo_named(c, who.user, tenant, name))
+            {
                 Ok(repo) => Some(repo),
                 Err(sentinel_store::Error::NotFound) => {
                     return again("That tenant has no repository of that name.");

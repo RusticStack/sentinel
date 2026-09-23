@@ -486,6 +486,86 @@ pub fn get_namespace(
     })
 }
 
+/// Resolve a tenant slug for a client route, answering `NotFound` alike for
+/// an absent tenant, a suspended one, and one the caller has no live
+/// relationship with, so a slug in a URL never confirms that a namespace
+/// exists. Unlike [`get_namespace`] it also admits a credential narrowed to
+/// one repository of that tenant, whose routes still narrow further.
+///
+/// One key probe on `tenants(slug)` plus key joins; it replaces the
+/// host-local [`crate::lookup::tenant_by_slug`] at no extra cost.
+pub fn member_tenant_by_slug(
+    conn: &Connection,
+    principal: Principal,
+    slug: &str,
+) -> Result<TenantId> {
+    if principal.permissions == Permissions::NONE {
+        return Err(Error::NotFound);
+    }
+    let bytes: [u8; 16] = conn
+        .prepare_cached(
+            "SELECT t.id FROM tenants t JOIN users u ON u.id = ?1
+        LEFT JOIN memberships m ON m.tenant_id = t.id AND m.user_id = u.id
+        WHERE t.slug = ?2 AND t.active = 1 AND u.active = 1
+        AND (?3 IS NULL OR t.id = ?3)
+        AND (?4 IS NULL OR EXISTS(SELECT 1 FROM repos r WHERE r.id = ?4 AND r.tenant_id = t.id))
+        AND (u.kind = 0 OR u.service_tenant_id = t.id)
+        AND (m.user_id IS NOT NULL OR (u.kind = 0 AND u.super_admin = 1 AND ?5))",
+        )?
+        .query_row(
+            params![
+                principal.user.as_bytes(),
+                slug,
+                principal.tenant.as_ref().map(TenantId::as_bytes),
+                principal.repo.as_ref().map(RepoId::as_bytes),
+                principal.permissions.contains(Permissions::PLATFORM_ADMIN)
+            ],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    TenantId::from_bytes(bytes).map_err(|_| Error::Corrupt("tenant_id"))
+}
+
+/// Resolve the tenant (by slug) and, optionally, a repository (by name)
+/// that a person may narrow an OAuth grant to: an active tenant they are a
+/// member of, and a repository of it they can see (tenant admins see every
+/// repository; other members the ones granted to them). Anything else —
+/// absent, suspended, foreign, or invisible — is the same `NotFound`, so
+/// the consent and device pages cannot be used to learn which names exist
+/// elsewhere. One statement.
+pub fn narrowing_by_name(
+    conn: &Connection,
+    user: UserId,
+    slug: &str,
+    repo: Option<&str>,
+) -> Result<(TenantId, Option<RepoId>)> {
+    let (tenant, found) = conn
+        .prepare_cached(
+            "SELECT t.id, r.id FROM tenants t
+        JOIN memberships m ON m.tenant_id = t.id AND m.user_id = ?1
+        JOIN users u ON u.id = m.user_id AND u.active = 1 AND u.kind = 0
+        LEFT JOIN repos r ON ?3 IS NOT NULL AND r.tenant_id = t.id AND r.name = ?3
+            AND (m.role = 3 OR EXISTS(SELECT 1 FROM repo_grants g
+                WHERE g.tenant_id = t.id AND g.user_id = m.user_id AND g.repo_id = r.id))
+        WHERE t.slug = ?2 AND t.active = 1",
+        )?
+        .query_row(params![user.as_bytes(), slug, repo], |r| {
+            Ok((r.get::<_, [u8; 16]>(0)?, r.get::<_, Option<[u8; 16]>>(1)?))
+        })
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?;
+    match (repo, found) {
+        (None, _) => Ok((tenant, None)),
+        (Some(_), None) => Err(Error::NotFound),
+        (Some(_), Some(bytes)) => Ok((
+            tenant,
+            Some(RepoId::from_bytes(bytes).map_err(|_| Error::Corrupt("repo_id"))?),
+        )),
+    }
+}
+
 /// Set or change a member's role. A downgrade takes effect on the next query;
 /// the tenant's authorization epoch moves so anything long-lived re-checks.
 pub fn set_membership(

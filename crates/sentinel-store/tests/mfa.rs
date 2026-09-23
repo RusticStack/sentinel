@@ -790,3 +790,193 @@ fn linking_an_identity_and_provisioning_a_password_are_authentication_changes() 
     });
     assert!(matches!(refused, Err(Error::StepUpRequired)));
 }
+
+/// A fresh password session at `now`: (cookie, session).
+fn sign_in(f: &Fixture, now: UnixMillis) -> (Secret, Session) {
+    let cookie =
+        match local_auth::login(&f.store, "root", PASSWORD, Policy::default(), now).unwrap() {
+            local_auth::Login::Accepted(issued) => issued.session,
+            _ => panic!("login"),
+        };
+    let session = f
+        .store
+        .read(|c| local_auth::authenticate(c, &cookie, now))
+        .unwrap();
+    (cookie, session)
+}
+
+/// Six-digit codes that are wrong for `seed` at `now`.
+fn wrong_codes(seed: &Seed, now: UnixMillis, n: usize) -> Vec<String> {
+    let seconds = now.0 as u64 / 1000;
+    (0..1_000_000u32)
+        .map(|n| format!("{n:06}"))
+        .filter(|code| sentinel_auth::mfa::check(seed, code, seconds).is_none())
+        .take(n)
+        .collect()
+}
+
+/// Spend `guesses` wrong codes, signing in again whenever a session is
+/// revoked for its own failures — what someone holding the password does.
+fn guess(f: &Fixture, seed: &Seed, now: UnixMillis, guesses: usize) {
+    let mut current = sign_in(f, now);
+    for code in wrong_codes(seed, now, guesses) {
+        if f.store
+            .read(|c| local_auth::authenticate(c, &current.0, now))
+            .is_err()
+        {
+            current = sign_in(f, now);
+        }
+        assert!(
+            !mfa::step_up(
+                &f.store,
+                &f.key,
+                &current.0,
+                &current.1,
+                Proof::Totp(&code),
+                now
+            )
+            .unwrap()
+        );
+    }
+}
+
+fn factor_locked(f: &Fixture, now: UnixMillis) -> bool {
+    f.store
+        .read(|c| {
+            c.query_row(
+                "SELECT locked_until_ms > ?2 FROM mfa_totp WHERE user_id = ?1",
+                rusqlite::params![f.root.as_bytes(), now.0],
+                |r| r.get(0),
+            )
+            .map_err(Error::from)
+        })
+        .unwrap()
+}
+
+#[test]
+fn step_up_failures_accumulate_across_sessions() {
+    let f = fixture();
+    let (seed, _) = f.enroll(at(T0 + 10));
+    let now = at(T0 + 120_000);
+    // One short of the account limit, spread over fresh sign-ins.
+    guess(&f, &seed, now, mfa::MAX_FACTOR_FAILURES as usize - 1);
+    assert!(!factor_locked(&f, now));
+    let (cookie, session) = sign_in(&f, now);
+    let last = wrong_codes(&seed, now, 1).remove(0);
+    assert!(!mfa::step_up(&f.store, &f.key, &cookie, &session, Proof::Totp(&last), now).unwrap());
+    // The limit locks the factor and revokes every session of the account.
+    assert!(factor_locked(&f, now));
+    assert!(
+        f.store
+            .read(|c| local_auth::authenticate(c, &cookie, now))
+            .is_err()
+    );
+    assert!(
+        f.store
+            .read(|c| local_auth::authenticate(c, &f.cookie, now))
+            .is_err()
+    );
+    let audit = f
+        .store
+        .read(|c| local_auth::recent_audit(c, 5))
+        .unwrap()
+        .into_iter()
+        .find(|r| r.event == Event::SessionRevoked)
+        .expect("the lockout is audited");
+    assert_eq!(audit.detail.as_deref(), Some("second factor locked"));
+}
+
+#[test]
+fn an_account_lockout_refuses_even_a_correct_code_until_it_expires() {
+    let f = fixture();
+    let (seed, recovery) = f.enroll(at(T0 + 10));
+    let now = at(T0 + 120_000);
+    guess(&f, &seed, now, mfa::MAX_FACTOR_FAILURES as usize);
+    assert!(factor_locked(&f, now));
+    // A new sign-in, a correct code, and a recovery code: all refused, and
+    // the recovery code is not spent.
+    let during = at(now.0 + 60_000);
+    let (cookie, session) = sign_in(&f, during);
+    let good = f.code_for(&seed, during);
+    assert!(
+        !mfa::step_up(
+            &f.store,
+            &f.key,
+            &cookie,
+            &session,
+            Proof::Totp(&good),
+            during
+        )
+        .unwrap()
+    );
+    let (cookie, session) = sign_in(&f, during);
+    assert!(
+        !mfa::step_up(
+            &f.store,
+            &f.key,
+            &cookie,
+            &session,
+            Proof::Recovery(&recovery[0]),
+            during
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        f.store
+            .read(|c| mfa::recovery_codes_remaining(c, f.root))
+            .unwrap(),
+        recovery.len()
+    );
+    // After the window a correct code works, and it resets the count.
+    let after = at(now.0 + mfa::FACTOR_LOCKOUT_MS + 30_000);
+    let (cookie, session) = sign_in(&f, after);
+    let good = f.code_for(&seed, after);
+    assert!(
+        mfa::step_up(
+            &f.store,
+            &f.key,
+            &cookie,
+            &session,
+            Proof::Totp(&good),
+            after
+        )
+        .unwrap()
+    );
+    let failures: i64 = f
+        .store
+        .read(|c| {
+            c.query_row(
+                "SELECT failures FROM mfa_totp WHERE user_id = ?1",
+                [f.root.as_bytes()],
+                |r| r.get(0),
+            )
+            .map_err(Error::from)
+        })
+        .unwrap();
+    assert_eq!(failures, 0);
+}
+
+#[test]
+fn host_local_recovery_clears_the_step_up_lockout() {
+    let f = fixture();
+    let (seed, _) = f.enroll(at(T0 + 10));
+    let now = at(T0 + 120_000);
+    guess(&f, &seed, now, mfa::MAX_FACTOR_FAILURES as usize);
+    assert!(factor_locked(&f, now));
+    local_auth::recover(&f.store, "root", PASSWORD, at(now.0 + 1)).unwrap();
+    assert!(!factor_locked(&f, at(now.0 + 1)));
+    let later = at(now.0 + 30_000);
+    let (cookie, session) = sign_in(&f, later);
+    let good = f.code_for(&seed, later);
+    assert!(
+        mfa::step_up(
+            &f.store,
+            &f.key,
+            &cookie,
+            &session,
+            Proof::Totp(&good),
+            later
+        )
+        .unwrap()
+    );
+}

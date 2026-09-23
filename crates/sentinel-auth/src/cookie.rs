@@ -1,8 +1,9 @@
 //! Browser session transport policy: cookie attributes and CSRF checking.
 //!
-//! No HTTP server exists yet (W08/Part 12). These are the exact bytes and the
-//! exact decision the eventual handlers must use, so the policy is written and
-//! tested once instead of being reinvented per route.
+//! These are the exact bytes and the exact decision every `sentinel-api`
+//! handler uses (login, logout, session mutations, and the OAuth consent and
+//! device forms), so the policy is written and tested once instead of being
+//! reinvented per route.
 
 use crate::secret::{Digest, Secret, digest_eq};
 

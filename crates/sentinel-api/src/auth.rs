@@ -20,7 +20,7 @@ use sentinel_core::{
     auth::{Audience, Permissions, Principal, Scopes},
 };
 use sentinel_protocol::error::{ApiError, ErrorCode};
-use sentinel_store::{Store, local_auth, tokens};
+use sentinel_store::{Error as StoreError, Store, local_auth, tokens};
 
 /// How the caller proved who they are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +55,25 @@ pub enum Refusal {
     Unauthenticated,
     /// A session mutation without its CSRF header.
     Csrf,
+    /// The store was too busy to check the credential (every reader taken,
+    /// or the writer's queue full). Says nothing about the credential, so
+    /// it must never look like `Unauthenticated`: an OAuth client answers a
+    /// `401` by spending its refresh token.
+    Busy,
+    /// The store failed while checking the credential.
+    Fault,
+}
+
+/// A store error while checking a credential. Only "no such live
+/// credential" is an authentication answer.
+fn refused(e: StoreError) -> Refusal {
+    match e {
+        StoreError::NotFound => Refusal::Unauthenticated,
+        StoreError::Overloaded | StoreError::WriterUnavailable | StoreError::WriteAmbiguous => {
+            Refusal::Busy
+        }
+        _ => Refusal::Fault,
+    }
 }
 
 /// Resolve the request's credential. `authorization` and `cookie` are the
@@ -62,8 +81,14 @@ pub enum Refusal {
 /// a session. An `Authorization` header that is present but not a Sentinel
 /// bearer (a refresh token, a code, a GitHub token) is refused by its shape
 /// before any lookup, and never falls back to the cookie.
+///
+/// A session whose idle window is at least `sessions.refresh_after_ms`
+/// spent slides its idle deadline (never past the absolute one): one write
+/// per session per refresh interval, best effort — a refresh the writer
+/// cannot take now does not fail the request it rides on.
 pub fn identify(
     store: &Store,
+    sessions: local_auth::Policy,
     authorization: Option<&str>,
     cookie_header: Option<&str>,
     csrf: Option<&str>,
@@ -75,7 +100,7 @@ pub fn identify(
             Bearer::Credential(secret) => {
                 let authenticated = store
                     .read(|c| tokens::authenticate(c, &secret, now))
-                    .map_err(|_| Refusal::Unauthenticated)?;
+                    .map_err(refused)?;
                 if authenticated.record_use_due(now) {
                     let _ = tokens::record_use(store, authenticated.token, now);
                 }
@@ -96,7 +121,7 @@ pub fn identify(
                     .read(|c| {
                         sentinel_store::oauth::authenticate_access(c, &secret, Audience::Api, now)
                     })
-                    .map_err(|_| Refusal::Unauthenticated)?;
+                    .map_err(refused)?;
                 let principal = authenticated.principal;
                 Ok(Identity {
                     principal,
@@ -116,9 +141,12 @@ pub fn identify(
         cookie::read(cookie::SESSION_COOKIE, header).ok_or(Refusal::Unauthenticated)?;
     let session = store
         .read(|c| local_auth::authenticate(c, &secret, now))
-        .map_err(|_| Refusal::Unauthenticated)?;
+        .map_err(refused)?;
     if mutation && !cookie::csrf_accepted(&session.csrf, csrf) {
         return Err(Refusal::Csrf);
+    }
+    if local_auth::refresh_due(&session, sessions, now) {
+        let _ = local_auth::refresh(store, &secret, sessions, now);
     }
     let principal = session.principal();
     Ok(Identity {
