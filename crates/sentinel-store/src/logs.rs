@@ -38,9 +38,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
@@ -74,6 +75,22 @@ const CODEC_ZLIB: u8 = 1;
 
 const END_MAGIC: &[u8; 4] = b"SNLE";
 const END_FORMAT: u16 = 1;
+
+/// The persisted hole list of a live log: `SNLH` | format u16 | count u32 |
+/// `(from u64, to u64)` per hole, replaced atomically on every change.
+const HOLES_MAGIC: &[u8; 4] = b"SNLH";
+const HOLES_FORMAT: u16 = 1;
+/// Distinct holes one live log may track; a stream fragmenting past this is
+/// refused rather than growing the list (and its sidecar) without bound.
+pub const MAX_HOLES: usize = 4096;
+
+/// Writers held at once before the least recently used idle one closes.
+pub const MAX_OPEN_WRITERS: usize = 1024;
+/// A writer unused this long is closed by the maintenance pass
+/// ([`LogStore::close_idle`]); the next frame reopens it from disk.
+pub const WRITER_IDLE: Duration = Duration::from_secs(600);
+/// Attempt directories one retention pass examines at most.
+const SWEEP_BUDGET: u32 = 4096;
 
 /// One sparse index entry. A checkpoint describes the frame that caused
 /// it (`line`/`bytes` are cumulative *including* that frame); a seal
@@ -142,8 +159,10 @@ struct Open {
     /// Highest stored sequence.
     last_seq: u64,
     /// Ranges below `last_seq` that were never stored, sorted and
-    /// disjoint; fills shrink it.
+    /// disjoint; fills shrink it. Mirrored in the `holes` sidecar.
     holes: Vec<(u64, u64)>,
+    /// `holes` changed and the sidecar does not have it yet.
+    holes_dirty: bool,
     /// Stored record bytes across all segments: the size cap.
     len: u64,
     /// Stored newline count across all segments.
@@ -197,11 +216,32 @@ impl Compressor {
     }
 }
 
-/// Append and read attempt logs. Cheap to share: one mutex over the open
-/// writers, one directory per attempt, one compressor thread.
+/// One attempt's writer slot. The map lock only finds the slot; the frame's
+/// write and `fdatasync` happen under the slot's own lock, so attempts never
+/// wait on each other's flushes. `None` until first use (and after a failed
+/// open), so opening an attempt — a bounded decode — also runs outside the
+/// map lock.
+struct Slot {
+    open: Mutex<Option<Open>>,
+    /// Store-clock milliseconds of the last use; the idle sweep reads it
+    /// without taking `open`.
+    touched: AtomicU64,
+}
+
+/// Append and read attempt logs. Cheap to share: a short map lock to find
+/// an attempt's writer, a lock per writer for its I/O, one directory per
+/// attempt, one compressor thread.
 pub struct LogStore {
     dir: PathBuf,
-    open: Mutex<HashMap<AttemptId, Open>>,
+    open: Mutex<HashMap<AttemptId, Arc<Slot>>>,
+    /// The store clock `Slot::touched` counts from.
+    epoch: Instant,
+    /// Writers held at once; past it the least recently used idle one
+    /// closes. Two descriptors and one frame of scratch each.
+    max_open: usize,
+    /// Bumped after every stored frame and finish; `wait=1` log polls park
+    /// on it instead of re-reading on a timer.
+    changes: Arc<LogChanges>,
     compressor: Arc<Compressor>,
     worker: Mutex<Option<JoinHandle<()>>>,
     /// Disk admission (D06); unset admits every append as before.
@@ -209,6 +249,63 @@ pub struct LogStore {
     /// Stored bytes one attempt's log may occupy — `MAX_LOG_BYTES`
     /// normally, lower under `open_with_limit`.
     max_bytes: u64,
+    /// Where the bounded retention sweep resumes: the last run directory
+    /// it finished.
+    sweep_cursor: Mutex<Option<String>>,
+}
+
+/// The log-append notifier: a generation bumped after every durable append
+/// or finish, and a parking place for long polls. Same no-lost-wakeup
+/// discipline as the store's commit notifier: a waiter registers before it
+/// reads the generation under the lock; the bumper reads `waiters` after
+/// bumping and notifies under the lock. The append path pays one atomic
+/// add and one load; the lock only while someone is parked.
+#[derive(Debug, Default)]
+pub struct LogChanges {
+    generation: AtomicU64,
+    waiters: AtomicUsize,
+    lock: Mutex<()>,
+    cv: Condvar,
+}
+
+impl LogChanges {
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Park until the generation differs from `seen` or `deadline` passes;
+    /// returns the generation then.
+    pub fn wait_past(&self, seen: u64, deadline: Instant) -> u64 {
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        let mut guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let generation = loop {
+            let now = self.generation.load(Ordering::SeqCst);
+            if now != seen {
+                break now;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break now;
+            }
+            guard = self
+                .cv
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        };
+        drop(guard);
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+        generation
+    }
+
+    #[inline]
+    fn bump(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if self.waiters.load(Ordering::SeqCst) != 0 {
+            let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            self.cv.notify_all();
+        }
+    }
 }
 
 /// What appending a frame did.
@@ -244,13 +341,25 @@ impl LogStore {
         let store = LogStore {
             dir,
             open: Mutex::new(HashMap::new()),
+            epoch: Instant::now(),
+            max_open: MAX_OPEN_WRITERS,
+            changes: Arc::new(LogChanges::default()),
             compressor,
             worker: Mutex::new(Some(worker)),
             admission: OnceLock::new(),
             max_bytes,
+            sweep_cursor: Mutex::new(None),
         };
         store.sweep();
         Ok(store)
+    }
+
+    /// Hold at most `max` writers open at once (at least one); the default
+    /// is [`MAX_OPEN_WRITERS`].
+    #[must_use]
+    pub fn with_max_open(mut self, max: usize) -> LogStore {
+        self.max_open = max.max(1);
+        self
     }
 
     /// Install the disk admission gate; appends refuse once free space
@@ -259,10 +368,93 @@ impl LogStore {
         let _ = self.admission.set(admission);
     }
 
+    /// The append notifier long polls park on.
+    pub fn changes(&self) -> &LogChanges {
+        &self.changes
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// Writers held open right now.
+    pub fn open_writers(&self) -> usize {
+        self.open.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// Close writers unused for `idle`: attempts whose worker was lost,
+    /// whose lease lapsed or whose flush timed out never send `LogEnd`, and
+    /// their writers must not hold descriptors and scratch for the life of
+    /// the process — or keep their logs out of retention. A later frame or
+    /// end reopens the log from disk, which folds its state back exactly.
+    /// A writer some request is using right now is never closed. Returns how
+    /// many closed.
+    pub fn close_idle(&self, idle: Duration) -> usize {
+        let cutoff = self.now_ms().saturating_sub(idle.as_millis() as u64);
+        let mut map = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        let before = map.len();
+        // Only the map holds an idle slot's Arc: nobody can be inside it,
+        // and nobody can clone it without this lock.
+        map.retain(|_, slot| {
+            Arc::strong_count(slot) > 1 || slot.touched.load(Ordering::Relaxed) > cutoff
+        });
+        before - map.len()
+    }
+
+    /// The attempt's slot, created on first use. At the cap, the least
+    /// recently used slot nobody is using closes first — so descriptors and
+    /// memory stay bounded however many attempts never finish.
+    fn slot(&self, attempt: AttemptId) -> Arc<Slot> {
+        let now = self.now_ms();
+        let mut map = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(slot) = map.get(&attempt) {
+            slot.touched.store(now, Ordering::Relaxed);
+            return Arc::clone(slot);
+        }
+        if map.len() >= self.max_open {
+            let lru = map
+                .iter()
+                .filter(|(_, s)| Arc::strong_count(s) == 1)
+                .min_by_key(|(_, s)| s.touched.load(Ordering::Relaxed))
+                .map(|(id, _)| *id);
+            if let Some(id) = lru {
+                map.remove(&id);
+            }
+        }
+        let slot = Arc::new(Slot {
+            open: Mutex::new(None),
+            touched: AtomicU64::new(now),
+        });
+        map.insert(attempt, Arc::clone(&slot));
+        slot
+    }
+
+    /// Run `f` on the attempt's writer, opening (or reopening after a
+    /// restart or an idle close) it from disk first. Only this attempt's
+    /// lock is held while `f` does its I/O.
+    fn with_writer<T>(
+        &self,
+        run: RunId,
+        job: JobId,
+        attempt: AttemptId,
+        f: impl FnOnce(&mut Open) -> Result<T>,
+    ) -> Result<T> {
+        let slot = self.slot(attempt);
+        let mut guard = slot.open.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.is_none() {
+            *guard = Some(self.open_attempt(run, job, attempt)?);
+        }
+        f(guard.as_mut().expect("opened above"))
+    }
+
     /// Remove attempt directories and legacy flat logs whose newest byte is
     /// older than `now - retention_ms`. Open writers are never touched; the
-    /// deletion is of durable evidence only. Returns directories/files
-    /// removed, at most `limit`.
+    /// deletion is of durable evidence only. One pass removes at most
+    /// `limit` and looks at run directories in name order until it has
+    /// examined [`SWEEP_BUDGET`] attempt directories, then the next pass
+    /// resumes after the last run it finished — so a pass is bounded
+    /// however many logs are retained. An attempt's age costs one directory
+    /// listing and at most three `stat`s (`end`, `index`, newest segment).
     pub fn sweep_expired(&self, now: UnixMillis, retention_ms: i64, limit: u32) -> Result<u32> {
         if retention_ms <= 0 || limit == 0 {
             return Ok(0);
@@ -275,74 +467,64 @@ impl LogStore {
             .keys()
             .copied()
             .collect();
-        let newest_ms = |dir: &Path| -> i64 {
-            fs::read_dir(dir).map_or(0, |entries| {
-                entries
-                    .flatten()
-                    .filter_map(|e| {
-                        e.metadata()
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_millis() as i64)
-                    })
-                    .max()
-                    .unwrap_or(0)
-            })
+        let resume = self
+            .sweep_cursor
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let mut runs: Vec<(String, PathBuf)> = match fs::read_dir(&self.dir) {
+            Ok(read) => read
+                .flatten()
+                .filter_map(|e| Some((e.file_name().into_string().ok()?, e.path())))
+                .filter(|(name, _)| resume.as_ref().is_none_or(|r| name > r))
+                .collect(),
+            Err(_) => return Ok(0),
         };
+        runs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let mut swept = 0u32;
-        let Ok(runs) = fs::read_dir(&self.dir) else {
-            return Ok(0);
-        };
-        'runs: for run in runs.flatten() {
-            let run_path = run.path();
+        let mut seen = 0u32;
+        let mut stopped = None;
+        for (name, run_path) in runs {
             if run_path.is_file() {
                 // Legacy flat log: `logs/<attempt>.log` from before D04.
+                seen += 1;
                 if run_path.extension().is_some_and(|e| e == "log")
-                    && fs::metadata(&run_path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .is_some_and(|age| (age.as_millis() as i64) < cutoff)
+                    && mtime_ms(&run_path).is_some_and(|ms| ms < cutoff)
                     && fs::remove_file(&run_path).is_ok()
                 {
                     swept += 1;
-                    if swept >= limit {
-                        break;
-                    }
                 }
-                continue;
-            }
-            let Ok(jobs) = fs::read_dir(&run_path) else {
-                continue;
-            };
-            for job in jobs.flatten() {
-                let Ok(attempts) = fs::read_dir(job.path()) else {
-                    continue;
-                };
-                for attempt in attempts.flatten() {
-                    let dir = attempt.path();
-                    if !dir.is_dir() {
+            } else if let Ok(jobs) = fs::read_dir(&run_path) {
+                for job in jobs.flatten() {
+                    let Ok(attempts) = fs::read_dir(job.path()) else {
                         continue;
-                    }
-                    if let Ok(id) = attempt.file_name().to_string_lossy().parse::<AttemptId>()
-                        && held.contains(&id)
-                    {
-                        continue;
-                    }
-                    if newest_ms(&dir) < cutoff && fs::remove_dir_all(&dir).is_ok() {
-                        swept += 1;
-                        // Prune the emptied job/run parents.
-                        let _ = fs::remove_dir(job.path());
-                        if swept >= limit {
-                            break 'runs;
+                    };
+                    for attempt in attempts.flatten() {
+                        let dir = attempt.path();
+                        if !dir.is_dir() {
+                            continue;
+                        }
+                        seen += 1;
+                        if let Ok(id) = attempt.file_name().to_string_lossy().parse::<AttemptId>()
+                            && held.contains(&id)
+                        {
+                            continue;
+                        }
+                        if newest_ms(&dir) < cutoff && fs::remove_dir_all(&dir).is_ok() {
+                            swept += 1;
                         }
                     }
+                    // Prune an emptied job directory; a live one refuses.
+                    let _ = fs::remove_dir(job.path());
                 }
-                let _ = fs::remove_dir(job.path());
+                let _ = fs::remove_dir(&run_path);
             }
-            let _ = fs::remove_dir(&run_path);
+            if swept >= limit || seen >= SWEEP_BUDGET {
+                stopped = Some(name);
+                break;
+            }
         }
+        *self.sweep_cursor.lock().unwrap_or_else(|p| p.into_inner()) = stopped;
         Ok(swept)
     }
 
@@ -359,11 +541,16 @@ impl LogStore {
     /// is answered by the marker file itself. A rename the writer has not yet
     /// synced still answers `false`: the marker is not yet the durable truth.
     pub fn has_end(&self, run: RunId, job: JobId, attempt: AttemptId) -> bool {
+        let slot = self
+            .open
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&attempt)
+            .cloned();
+        if let Some(slot) = slot
+            && let Some(w) = slot.open.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
         {
-            let open = self.open.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(w) = open.get(&attempt) {
-                return w.ended.is_some();
-            }
+            return w.ended.is_some();
         }
         end_marker(&self.attempt_dir(run, job, attempt)).is_some()
     }
@@ -411,23 +598,9 @@ impl LogStore {
         }
     }
 
-    /// Open (or reopen after a restart) the attempt's writer, folding the
-    /// segments the index does not cover back into memory.
-    fn writer<'a>(
-        &self,
-        open: &'a mut HashMap<AttemptId, Open>,
-        run: RunId,
-        job: JobId,
-        attempt: AttemptId,
-    ) -> Result<&'a mut Open> {
-        match open.entry(attempt) {
-            std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
-            std::collections::hash_map::Entry::Vacant(v) => {
-                Ok(v.insert(self.open_attempt(run, job, attempt)?))
-            }
-        }
-    }
-
+    /// Open (or reopen after a restart or an idle close) the attempt's
+    /// writer, folding the segments the index does not cover back into
+    /// memory and the persisted holes of the ones it does.
     fn open_attempt(&self, run: RunId, job: JobId, attempt: AttemptId) -> Result<Open> {
         let dir = self.attempt_dir(run, job, attempt);
         fs::create_dir_all(&dir)?;
@@ -456,6 +629,7 @@ impl LogStore {
             index_len: 0,
             last_seq: 0,
             holes: Vec::new(),
+            holes_dirty: false,
             len: 0,
             lines: 0,
             step: 0,
@@ -474,6 +648,11 @@ impl LogStore {
             }
             return Ok(w);
         }
+        // Holes are known only from jumps; those inside sealed segments are
+        // not re-decoded, so the persisted list is their record. Holes of
+        // the uncovered segments are re-derived below either way.
+        let persisted = read_holes(&w.dir);
+        w.holes.clone_from(&persisted);
         // Durable base: totals through the last seal record. Entries past
         // it are provisional and regenerated from the segments they name.
         let index_bytes = fs::read(&index_path).unwrap_or_default();
@@ -581,6 +760,10 @@ impl LogStore {
                 }
             }
         }
+        // Holes re-derived from uncovered segments reach the sidecar at the
+        // latest with the seal that covers them.
+        w.holes.retain(|(from, _)| *from <= w.last_seq);
+        w.holes_dirty = w.holes != persisted;
         if let Some(last) = w.ended {
             // The stream carries the end record but the marker never
             // landed: repair it so completeness is one file read.
@@ -602,7 +785,10 @@ impl LogStore {
     }
 
     /// Append one frame: synced, then acknowledged. A jump records a hole;
-    /// a frame landing in a hole is stored as a fill.
+    /// a frame landing in a hole is stored as a fill. Either change to the
+    /// hole list is persisted (the `holes` sidecar) before the frame is
+    /// acknowledged, so a restart cannot forget a hole whose frames sit in
+    /// a sealed segment.
     pub fn append(
         &self,
         run: RunId,
@@ -610,11 +796,21 @@ impl LogStore {
         attempt: AttemptId,
         frame: &Frame,
     ) -> Result<Appended> {
-        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
-        let w = self.writer(&mut open, run, job, attempt)?;
+        let appended = self.with_writer(run, job, attempt, |w| self.append_to(w, frame))?;
+        if matches!(appended, Appended::Stored { .. }) {
+            self.changes.bump();
+        }
+        Ok(appended)
+    }
+
+    fn append_to(&self, w: &mut Open, frame: &Frame) -> Result<Appended> {
         if w.ended.is_some() {
             return Err(Error::Conflict);
         }
+        // A hole change whose sidecar write failed is persisted before
+        // anything is acknowledged again — a resend of that very frame
+        // would otherwise be acked as a duplicate over a forgettable hole.
+        persist_holes(w)?;
         if frame.seq <= w.last_seq && !in_hole(&w.holes, frame.seq) {
             return Ok(Appended::Duplicate {
                 through: w.last_seq,
@@ -628,8 +824,8 @@ impl LogStore {
         {
             return Err(Error::StorageFull);
         }
-        if frame.seq > w.last_seq + 1 {
-            add_hole(&mut w.holes, w.last_seq + 1, frame.seq - 1);
+        if frame.seq > w.last_seq + 1 && w.holes.len() >= MAX_HOLES {
+            return Err(Error::InvalidInput("log holes"));
         }
         w.scratch.clear();
         Record::Frame(frame.clone())
@@ -665,7 +861,14 @@ impl LogStore {
             // A fill: stored but never indexed — index entries must stay
             // in sequence order for the tail seek.
             fill_hole(&mut w.holes, frame.seq);
+            w.holes_dirty = true;
         } else {
+            // The hole opens only once the frame past it is durable: a
+            // failed write leaves neither.
+            if frame.seq > w.last_seq + 1 {
+                add_hole(&mut w.holes, w.last_seq + 1, frame.seq - 1);
+                w.holes_dirty = true;
+            }
             w.last_seq = frame.seq;
             w.step = frame.step;
             w.since_index += 1;
@@ -675,6 +878,7 @@ impl LogStore {
                 w.seg_checkpointed = true;
             }
         }
+        persist_holes(w)?;
         Ok(Appended::Stored {
             through: w.last_seq,
         })
@@ -683,6 +887,9 @@ impl LogStore {
     /// Close the active segment: seal record into the index, fsync, and
     /// queue the segment for compression.
     fn seal(&self, w: &mut Open) -> Result<()> {
+        // The seal record makes the segment "covered": its holes must be in
+        // the sidecar before reopen stops re-deriving them.
+        persist_holes(w)?;
         let mut entry = Vec::with_capacity(INDEX_ENTRY_BYTES);
         seal_entry(w, w.seg, &mut entry);
         index_write(w, &entry)?;
@@ -709,44 +916,54 @@ impl LogStore {
         last_seq: u64,
         gaps: &[(u64, u64)],
     ) -> Result<()> {
-        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
-        let w = self.writer(&mut open, run, job, attempt)?;
-        if let Some(ended) = w.ended {
-            return if ended == last_seq {
-                Ok(())
-            } else {
-                Err(Error::Conflict)
-            };
+        let fresh = self.with_writer(run, job, attempt, |w| {
+            if let Some(ended) = w.ended {
+                return if ended == last_seq {
+                    Ok(false)
+                } else {
+                    Err(Error::Conflict)
+                };
+            }
+            if last_seq < w.last_seq {
+                return Err(Error::Conflict);
+            }
+            let merged = merged_gaps(w, last_seq, gaps);
+            w.scratch.clear();
+            Record::End {
+                last_seq,
+                gaps: gaps.to_vec(),
+            }
+            .encode(&mut w.scratch)
+            .map_err(|_| Error::InvalidInput("log end"))?;
+            if w.file.is_none() {
+                w.file = Some(
+                    OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(false)
+                        .open(seg_path(&w.dir, w.seg, false))?,
+                );
+            }
+            w.file
+                .as_mut()
+                .expect("opened above")
+                .write_all(&w.scratch)?;
+            w.file.as_mut().expect("opened above").sync_data()?;
+            self.seal(w)?;
+            write_end_marker(&w.dir, last_seq, &merged)?;
+            w.ended = Some(last_seq);
+            Ok(true)
+        })?;
+        // A finished log needs no writer: its descriptors and scratch go
+        // now. Anyone still holding the slot sees `ended`; a later open
+        // reads the marker.
+        self.open
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&attempt);
+        if fresh {
+            self.changes.bump();
         }
-        if last_seq < w.last_seq {
-            return Err(Error::Conflict);
-        }
-        let merged = merged_gaps(w, last_seq, gaps);
-        w.scratch.clear();
-        Record::End {
-            last_seq,
-            gaps: gaps.to_vec(),
-        }
-        .encode(&mut w.scratch)
-        .map_err(|_| Error::InvalidInput("log end"))?;
-        if w.file.is_none() {
-            w.file = Some(
-                OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(seg_path(&w.dir, w.seg, false))?,
-            );
-        }
-        w.file
-            .as_mut()
-            .expect("opened above")
-            .write_all(&w.scratch)?;
-        w.file.as_mut().expect("opened above").sync_data()?;
-        self.seal(w)?;
-        write_end_marker(&w.dir, last_seq, &merged)?;
-        w.ended = Some(last_seq);
-        open.remove(&attempt);
         Ok(())
     }
 
@@ -765,6 +982,34 @@ impl LogStore {
         read_dir(&self.attempt_dir(run, job, attempt), after, limit, step)
     }
 
+    /// [`LogStore::tail`] under a [`Page`] ([`read_page`]).
+    pub fn tail_page(
+        &self,
+        run: RunId,
+        job: JobId,
+        attempt: AttemptId,
+        after: u64,
+        page: Page,
+        step: Option<u32>,
+    ) -> Result<Tail> {
+        read_page(&self.attempt_dir(run, job, attempt), after, page, step)
+    }
+
+    /// The attempt's stored frontier as its live writer knows it — no
+    /// I/O: `None` when this process holds no writer for it. A long poll
+    /// compares it across wakes so appends to *other* attempts cost it
+    /// nothing.
+    pub fn frontier(&self, attempt: AttemptId) -> Option<(u64, bool)> {
+        let slot = self
+            .open
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&attempt)
+            .cloned()?;
+        let guard = slot.open.lock().unwrap_or_else(|p| p.into_inner());
+        guard.as_ref().map(|w| (w.last_seq, w.ended.is_some()))
+    }
+
     /// Pre-D04 flat logs (`<logs>/<attempt>.log`), kept readable. The read
     /// streams in bounded chunks like a segmented log; the step filter
     /// applies during the scan so foreign frames never eat the limit.
@@ -776,6 +1021,19 @@ impl LogStore {
         step: Option<u32>,
     ) -> Result<Tail> {
         read_tail(&self.dir.join(format!("{attempt}.log")), after, limit, step)
+    }
+
+    /// [`LogStore::tail_legacy`] with a returned-bytes bound: frames stop
+    /// collecting at `page.bytes` (with `next_after`) while the scan still
+    /// streams to the end marker for completeness.
+    pub fn tail_legacy_page(
+        &self,
+        attempt: AttemptId,
+        after: u64,
+        page: Page,
+        step: Option<u32>,
+    ) -> Result<Tail> {
+        read_tail_page(&self.dir.join(format!("{attempt}.log")), after, page, step)
     }
 
     /// Find a literal byte string in an attempt's log (O05): frames with
@@ -1298,7 +1556,47 @@ pub struct Tail {
     pub frames: Vec<Frame>,
     pub complete: bool,
     pub gaps: Vec<(u64, u64)>,
+    /// Set when a [`Page`] bound cut the read before the end of what is
+    /// stored: the next read's `after`. `None` means the read reached the
+    /// end (of the log, or of what is stored so far).
+    pub next_after: Option<u64>,
+    /// With a step filter: the log has moved on to a later step, so no new
+    /// frame of this step will arrive — a long poll has nothing to wait for.
+    pub step_done: bool,
 }
+
+/// The bounds of one tail read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Page {
+    /// Frames returned at most.
+    pub limit: usize,
+    /// Payload bytes returned at most (the first frame always fits).
+    pub bytes: u64,
+    /// Payload bytes decoded past `after` at most, filtered-out frames
+    /// included.
+    pub scan: u64,
+}
+
+impl Page {
+    /// Only a frame count: the unbounded reader's shape.
+    #[must_use]
+    pub const fn frames(limit: usize) -> Page {
+        Page {
+            limit,
+            bytes: u64::MAX,
+            scan: u64::MAX,
+        }
+    }
+}
+
+/// Payload bytes one API log page returns at most. JSON escaping can grow
+/// a byte to six (``), so a page stays under ~6 MiB on the wire —
+/// inside common client body limits (the CLI's is 10 MiB).
+pub const PAGE_BYTES: u64 = 1 << 20;
+/// Payload bytes one API log page decodes past `after` at most: a step
+/// filter over a long log answers with `next_after` instead of decoding to
+/// the end in one request.
+pub const PAGE_SCAN_BYTES: u64 = 16 << 20;
 
 fn seg_path(dir: &Path, seg: u32, compressed: bool) -> PathBuf {
     if compressed {
@@ -1334,6 +1632,30 @@ fn segs(dir: &Path) -> Result<BTreeMap<u32, bool>> {
         }
     }
     Ok(out)
+}
+
+/// A file's mtime in Unix milliseconds.
+fn mtime_ms(path: &Path) -> Option<i64> {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+}
+
+/// When an attempt directory last changed: the newest of its `end` marker,
+/// its `index` and its highest segment — every write lands in one of those
+/// (older segments are sealed and only ever renamed to their `.z` twin).
+fn newest_ms(dir: &Path) -> i64 {
+    let top = segs(dir)
+        .ok()
+        .and_then(|segs| segs.iter().next_back().map(|(n, z)| seg_path(dir, *n, *z)));
+    [Some(dir.join("end")), Some(dir.join("index")), top]
+        .into_iter()
+        .flatten()
+        .filter_map(|p| mtime_ms(&p))
+        .max()
+        .unwrap_or(0)
 }
 
 fn sweep_tmp(dir: &Path) {
@@ -1396,6 +1718,58 @@ fn write_end_marker(dir: &Path, last_seq: u64, gaps: &[(u64, u64)]) -> Result<()
     }
     fs::rename(&tmp, dir.join("end"))?;
     sync_dir(dir)
+}
+
+/// Land the hole list if it changed: tmp, fsync, rename, directory
+/// fsync — complete or absent, like the end marker. Rare: only jumps and
+/// fills change it.
+fn persist_holes(w: &mut Open) -> Result<()> {
+    if !w.holes_dirty {
+        return Ok(());
+    }
+    let mut bytes = Vec::with_capacity(10 + w.holes.len() * 16);
+    bytes.extend_from_slice(HOLES_MAGIC);
+    bytes.extend_from_slice(&HOLES_FORMAT.to_le_bytes());
+    bytes.extend_from_slice(&(w.holes.len() as u32).to_le_bytes());
+    for (from, to) in &w.holes {
+        bytes.extend_from_slice(&from.to_le_bytes());
+        bytes.extend_from_slice(&to.to_le_bytes());
+    }
+    let tmp = w.dir.join("holes.tmp");
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_data()?;
+    }
+    fs::rename(&tmp, w.dir.join("holes"))?;
+    sync_dir(&w.dir)?;
+    w.holes_dirty = false;
+    Ok(())
+}
+
+/// The persisted hole list; absent or undecodable reads as none (a log
+/// written before the sidecar existed re-derives what it can).
+fn read_holes(dir: &Path) -> Vec<(u64, u64)> {
+    let Ok(bytes) = fs::read(dir.join("holes")) else {
+        return Vec::new();
+    };
+    if bytes.len() < 10
+        || bytes[..4] != *HOLES_MAGIC
+        || u16::from_le_bytes([bytes[4], bytes[5]]) != HOLES_FORMAT
+    {
+        return Vec::new();
+    }
+    let count = u32::from_le_bytes(bytes[6..10].try_into().expect("4")) as usize;
+    if count > MAX_HOLES || bytes.len() != 10 + count * 16 {
+        return Vec::new();
+    }
+    let mut holes = Vec::with_capacity(count);
+    for pair in bytes[10..].chunks_exact(16) {
+        let from = u64::from_le_bytes(pair[..8].try_into().expect("8"));
+        let to = u64::from_le_bytes(pair[8..].try_into().expect("8"));
+        add_hole(&mut holes, from, to);
+    }
+    holes
 }
 
 /// Index file → entries, validated against magic and format. A torn tail
@@ -1682,8 +2056,18 @@ fn compress(path: &Path) -> Result<()> {
 }
 
 /// Read an attempt directory: frames with `seq > after` (filtered to
-/// `step` when given), completeness, and the gap list.
+/// `step` when given), completeness, and the gap list. Unbounded but for
+/// `limit`; the API reads through [`read_page`].
 pub fn read_dir(dir: &Path, after: u64, limit: usize, step: Option<u32>) -> Result<Tail> {
+    read_page(dir, after, Page::frames(limit), step)
+}
+
+/// [`read_dir`] under a [`Page`]: at most `limit` frames and `bytes` of
+/// their payload (the first frame always fits, so every page progresses),
+/// and at most `scan` bytes of payload decoded past `after` — a step filter
+/// over a long log stops there too instead of decoding to the end. A page
+/// cut by any bound carries [`Tail::next_after`].
+pub fn read_page(dir: &Path, after: u64, page: Page, step: Option<u32>) -> Result<Tail> {
     let segs = segs(dir)?;
     let marker = end_marker(dir);
     if segs.is_empty() && marker.is_none() {
@@ -1692,36 +2076,26 @@ pub fn read_dir(dir: &Path, after: u64, limit: usize, step: Option<u32>) -> Resu
     let index_bytes = fs::read(dir.join("index")).unwrap_or_default();
     let entries = read_index(&index_bytes).unwrap_or_default();
     // Seek ([`seek_start`]). Fills always carry a sequence below every
-    // later checkpoint, so no earlier segment can hold a frame past `after`.
-    let mut start = seek_start(&entries, after, false);
-    if let Some(want) = step {
-        // A step's first frame is always checkpointed: the wanted frames
-        // continue the step run spanning `after`, or start at the next
-        // checkpoint of that step. Take the earlier candidate so neither
-        // is missed.
-        for entry in entries.iter().rev() {
-            if entry.step == want && entry.seq <= after {
-                start = start.min(entry.seg);
-                break;
-            }
-        }
-        for entry in &entries {
-            if entry.step == want && entry.seq > after {
-                start = start.min(entry.seg);
-                break;
-            }
-        }
-    }
+    // later checkpoint and land in a segment at or after the one holding
+    // the frontier they fill under, so no earlier segment can hold a frame
+    // past `after` — a step filter needs no earlier start either.
+    let start = seek_start(&entries, after, false);
     let mut tail = Tail {
         frames: Vec::new(),
         complete: marker.is_some(),
         gaps: Vec::new(),
+        next_after: None,
+        step_done: step.is_some_and(|want| step_moved_on(&entries, want)),
     };
     // Decode-observed holes are only reliable when every earlier segment
     // was decoded: a fill arriving before a mid-stream start makes a jump
     // whose "missing" frames sit in the segments the seek skipped.
     let from_start = start == segs.keys().next().copied().unwrap_or(0);
     let mut prev_seq = 0u64;
+    // The highest sequence past `after` this page consumed (returned or
+    // passed over by the filter): where a cut page resumes.
+    let mut consumed = after;
+    let (mut taken, mut scanned) = (0u64, 0u64);
     'decode: for (n, compressed) in segs.range(start..) {
         let mut decoder = match seg_decoder(dir, *n, *compressed) {
             Ok(decoder) => decoder,
@@ -1748,14 +2122,25 @@ pub fn read_dir(dir: &Path, after: u64, limit: usize, step: Option<u32>) -> Resu
                         }
                     }
                     prev_seq = prev_seq.max(frame.seq);
-                    if frame.seq > after
-                        && step.is_none_or(|s| frame.step == s)
-                        && tail.frames.len() < limit
-                    {
-                        tail.frames.push(frame);
+                    if frame.seq <= after {
+                        continue;
                     }
-                    if tail.frames.len() >= limit {
+                    let len = frame.bytes.len() as u64;
+                    let wanted = step.is_none_or(|s| frame.step == s);
+                    // Every bound is checked between frames and needs some
+                    // progress first, so a page is never empty for a bound.
+                    let full = wanted
+                        && (tail.frames.len() >= page.limit
+                            || (!tail.frames.is_empty() && taken.saturating_add(len) > page.bytes));
+                    if full || (consumed > after && scanned.saturating_add(len) > page.scan) {
+                        tail.next_after = Some(consumed);
                         break 'decode;
+                    }
+                    scanned += len;
+                    consumed = consumed.max(frame.seq);
+                    if wanted {
+                        taken += len;
+                        tail.frames.push(frame);
                     }
                 }
                 Record::End { last_seq, gaps } => {
@@ -1769,16 +2154,39 @@ pub fn read_dir(dir: &Path, after: u64, limit: usize, step: Option<u32>) -> Resu
             }
         }
     }
-    if let Some((_, gaps)) = marker {
-        merge_holes(&mut tail.gaps, &gaps);
+    match marker {
+        Some((_, gaps)) => merge_holes(&mut tail.gaps, &gaps),
+        // A live log: the holes its writer has persisted so far, including
+        // those inside segments this page did not decode.
+        None => merge_holes(&mut tail.gaps, &read_holes(dir)),
     }
     Ok(tail)
+}
+
+/// Whether the log has moved past step `want`: some checkpoint names a
+/// later step after the last checkpoint of `want` (none at all when the step
+/// never ran). Steps run in order and every step change is checkpointed, so
+/// a finished step gets no new frames — only a resent fill could still land.
+fn step_moved_on(entries: &[Entry], want: u32) -> bool {
+    let last_want = entries
+        .iter()
+        .filter(|e| e.step == want)
+        .map(|e| e.seq)
+        .max()
+        .unwrap_or(0);
+    entries.iter().any(|e| e.step > want && e.seq > last_want)
 }
 
 /// The W05 flat-file reader, kept for logs written before D04 and for
 /// spool-shaped fixtures. Bounded however long the file: frames collect to
 /// `limit` while the scan keeps streaming to the end marker.
 pub fn read_tail(path: &Path, after: u64, limit: usize, step: Option<u32>) -> Result<Tail> {
+    read_tail_page(path, after, Page::frames(limit), step)
+}
+
+/// [`read_tail`] under a page's frame and byte bounds (a flat file is read
+/// from its start either way, so `scan` does not apply).
+pub fn read_tail_page(path: &Path, after: u64, page: Page, step: Option<u32>) -> Result<Tail> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::NotFound),
@@ -1788,18 +2196,33 @@ pub fn read_tail(path: &Path, after: u64, limit: usize, step: Option<u32>) -> Re
         frames: Vec::new(),
         complete: false,
         gaps: Vec::new(),
+        next_after: None,
+        step_done: false,
     };
     let mut decoder = Decoder {
         reader: Box::new(file),
         buf: Vec::new(),
         complete: 0,
     };
+    let mut taken = 0u64;
     while let Some(record) = decoder.next()? {
         match record {
             Record::Frame(f) => {
-                if f.seq > after && step.is_none_or(|s| f.step == s) && tail.frames.len() < limit {
-                    tail.frames.push(f);
+                if f.seq <= after || !step.is_none_or(|s| f.step == s) {
+                    continue;
                 }
+                if tail.next_after.is_some() {
+                    continue;
+                }
+                let len = f.bytes.len() as u64;
+                if tail.frames.len() >= page.limit
+                    || (!tail.frames.is_empty() && taken.saturating_add(len) > page.bytes)
+                {
+                    tail.next_after = Some(tail.frames.last().map_or(after, |l| l.seq));
+                    continue;
+                }
+                taken += len;
+                tail.frames.push(f);
             }
             Record::End { gaps, .. } => {
                 tail.complete = true;

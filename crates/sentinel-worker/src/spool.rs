@@ -7,7 +7,12 @@
 //! the cursor (W07). The spool is bounded: past `MAX_SPOOL_BYTES` the step
 //! fails as `Publication` rather than filling the disk, and what could not
 //! be written is declared as a gap in the end marker, never dropped in
-//! silence. Reading it back is bounded too — scans stream in `SCAN_CHUNK`
+//! silence — across a worker restart too: a gap between stored frames is
+//! re-derived from the file, and a refused *tail* is kept in `spent` (the
+//! sequence high-water, written atomically when such a gap opens and before
+//! the end is declared), so a reopened spool never re-numbers a sequence
+//! that could have reached the controller and never closes a log as
+//! complete over lost output. Reading it back is bounded too — scans stream in `SCAN_CHUNK`
 //! windows and sends read only what `limit` frames can occupy, so a
 //! `MAX_SPOOL_BYTES` spool never becomes `MAX_SPOOL_BYTES` of RAM.
 
@@ -88,6 +93,27 @@ pub struct Spool {
     send_offset: u64,
     /// Ranges refused for size, declared at the end.
     gaps: Vec<(u64, u64)>,
+    /// The highest sequence actually written to `frames`.
+    last_stored: u64,
+    /// `next_seq` as `spent` last recorded it (0: never written).
+    persisted_next: u64,
+    /// The last sequence refused in this process (0: none yet).
+    last_refused: u64,
+}
+
+/// Write `spent` (the next unspent sequence) atomically: tmp, fsync,
+/// rename, directory fsync.
+fn write_spent(dir: &Path, next_seq: u64) -> Result<()> {
+    let tmp = dir.join("spent.tmp");
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(format!("{next_seq}\n").as_bytes())?;
+        file.sync_data()?;
+    }
+    fs::rename(&tmp, dir.join("spent"))?;
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 impl Spool {
@@ -113,9 +139,15 @@ impl Spool {
             .open(dir.join("frames"))?;
         frames.seek(SeekFrom::Start(0))?;
         let mut last = 0u64;
+        // Sequences skipped between stored frames were refused or failed:
+        // the file itself says so, whatever memory was lost.
+        let mut gaps: Vec<(u64, u64)> = Vec::new();
         let (at, end) = scan(&mut frames, |record, _| {
             if let Record::Frame(f) = record {
-                last = f.seq;
+                if f.seq > last + 1 {
+                    gaps.push((last + 1, f.seq - 1));
+                }
+                last = last.max(f.seq);
             }
             true
         })?;
@@ -124,19 +156,34 @@ impl Spool {
         }
         frames.set_len(at)?;
         frames.seek(SeekFrom::End(0))?;
-        let acked = fs::read_to_string(dir.join("cursor"))
+        let acked: u64 = fs::read_to_string(dir.join("cursor"))
             .ok()
             .and_then(|t| t.trim().parse().ok())
             .unwrap_or(0);
+        let spent: u64 = fs::read_to_string(dir.join("spent"))
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0);
+        let _ = fs::remove_file(dir.join("spent.tmp"));
+        // Acknowledged frames the controller holds are never gaps, even if
+        // an unsynced tail of them was lost here; what `spent` covers past
+        // both was refused and is declared.
+        let delivered = last.max(acked);
+        if spent > delivered + 1 {
+            gaps.push((delivered + 1, spent - 1));
+        }
         let mut spool = Spool {
             dir,
             frames,
             len: at,
             max,
-            next_seq: last + 1,
+            next_seq: (delivered + 1).max(spent),
             acked,
             send_offset: 0,
-            gaps: Vec::new(),
+            gaps,
+            last_stored: last,
+            persisted_next: spent,
+            last_refused: 0,
         };
         spool.rewind(acked)?;
         Ok(spool)
@@ -207,25 +254,50 @@ impl Spool {
             .map_err(|_| Error::Workspace("log frame".into()))?;
         self.next_seq += 1;
         if self.len + encoded.len() as u64 > self.max {
-            self.declared_gap(frame.seq);
+            self.declared_gap(frame.seq)?;
             return Ok(None);
         }
         self.frames.seek(SeekFrom::End(0))?;
         if let Err(e) = self.frames.write_all(&encoded) {
             let _ = self.frames.set_len(self.len);
-            self.declared_gap(frame.seq);
+            let _ = self.declared_gap(frame.seq);
             return Err(e.into());
         }
         self.len += encoded.len() as u64;
+        self.last_stored = frame.seq;
         Ok(Some(frame))
     }
 
     /// One sequence the spool could not hold, merged into the range list.
-    fn declared_gap(&mut self, seq: u64) {
+    /// A refusal *opening* a run (the sequence before it was not refused by
+    /// this process) is recorded in `spent` at once — one small synced
+    /// write per run, not per refused frame; a reopened spool then declares
+    /// at least its first sequence, and the rest of a contiguous run (never
+    /// sent anywhere) through `persist_end`.
+    fn declared_gap(&mut self, seq: u64) -> Result<()> {
         match self.gaps.last_mut() {
             Some((_, to)) if *to + 1 == seq => *to = seq,
             _ => self.gaps.push((seq, seq)),
         }
+        let opens = self.last_refused == 0 || self.last_refused + 1 != seq;
+        self.last_refused = seq;
+        if opens && self.persisted_next <= seq {
+            write_spent(&self.dir, seq + 1)?;
+            self.persisted_next = seq + 1;
+        }
+        Ok(())
+    }
+
+    /// Before the end is declared: make the exact sequence high-water
+    /// durable when a refused tail extends past what `spent` holds, so a
+    /// restart re-declares the same `last_seq` and gaps the controller may
+    /// already have.
+    pub fn persist_end(&mut self) -> Result<()> {
+        if self.next_seq > self.persisted_next.max(self.last_stored + 1) {
+            write_spent(&self.dir, self.next_seq)?;
+            self.persisted_next = self.next_seq;
+        }
+        Ok(())
     }
 
     /// Make everything appended so far durable.
@@ -379,7 +451,12 @@ mod tests {
         // marker both tell the truth about what the spool holds.
         assert_eq!(spool.last_seq(), 4);
         assert_eq!(spool.unacked(0, 10).unwrap().len(), 2);
+        // Declared before the end: a restart re-declares exactly this.
+        spool.persist_end().unwrap();
+        drop(spool);
         let mut reopened = Spool::open_with_limit(temp.path(), attempt, 59).unwrap();
+        assert_eq!(reopened.last_seq(), 4);
+        assert_eq!(reopened.gaps(), &[(3, 4)]);
         assert_eq!(
             reopened
                 .send_next(10)
@@ -390,11 +467,38 @@ mod tests {
             vec![1, 2]
         );
         // And a refused tail still cannot wedge later small writes once
-        // space frees: the cap is on stored bytes, not on the sequence.
+        // space frees: the cap is on stored bytes, not on the sequence —
+        // and a spent sequence is never numbered again.
+        drop(reopened);
         let mut spool = Spool::open_with_limit(temp.path(), attempt, 59).unwrap();
         assert!(spool.append(0, Stream::Stdout, b"ee").unwrap().is_none());
+        drop(spool);
         let mut spool = Spool::open_with_limit(temp.path(), attempt, 60).unwrap();
-        assert!(spool.append(0, Stream::Stdout, b"ee").unwrap().is_some());
+        let stored = spool.append(0, Stream::Stdout, b"ee").unwrap().unwrap();
+        assert!(
+            stored.seq >= 6,
+            "re-numbered a spent sequence: {}",
+            stored.seq
+        );
+        assert_eq!(spool.gaps().first(), Some(&(3, 5)));
+    }
+
+    #[test]
+    fn a_crash_after_a_refused_tail_still_declares_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt = AttemptId::new();
+        let mut spool = Spool::open_with_limit(temp.path(), attempt, 59).unwrap();
+        assert!(spool.append(0, Stream::Stdout, b"aa").unwrap().is_some());
+        assert!(spool.append(0, Stream::Stdout, b"bb").unwrap().is_some());
+        assert!(spool.append(0, Stream::Stdout, b"cc").unwrap().is_none());
+        assert!(spool.append(0, Stream::Stdout, b"dd").unwrap().is_none());
+        spool.sync().unwrap();
+        // Crash: no `persist_end`. The opened gap was recorded when it opened.
+        drop(spool);
+        let spool = Spool::open_with_limit(temp.path(), attempt, 59).unwrap();
+        assert!(spool.last_seq() >= 3, "the refused tail vanished");
+        assert_eq!(spool.gaps().first().map(|g| g.0), Some(3));
+        assert_eq!(spool.gaps().last().map(|g| g.1), Some(spool.last_seq()));
     }
 
     #[test]
