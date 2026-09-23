@@ -823,6 +823,27 @@ pub fn place(
     lease_ms: i64,
     now: UnixMillis,
 ) -> Result<Option<Offer>> {
+    place_in_fleet(tx, worker, pool, None, lease_ms, now)
+}
+
+/// [`place`], told what the rest of the connected fleet can hold.
+/// `elsewhere` is, per resource, the most any *other* connected worker of
+/// the pool reports (disk: `i64::MAX` when one reports none, since disk is
+/// then not part of its admission). A ready job that exceeds `elsewhere` in
+/// any resource can run on no other connected worker, so this worker offers
+/// it first, ahead of the fair order: spending the room on work a smaller
+/// worker could take would strand it until this worker's work finishes (Q10).
+/// Only the order changes; every hold still applies, and a job that does not
+/// fit the free capacity now is not reserved for (that is Q02's large-job
+/// path). `None` is plain [`place`].
+pub fn place_in_fleet(
+    tx: &Transaction<'_>,
+    worker: WorkerId,
+    pool: PoolId,
+    elsewhere: Option<Capacity>,
+    lease_ms: i64,
+    now: UnixMillis,
+) -> Result<Option<Offer>> {
     let Some((_, facts)) = worker_facts(tx, worker)? else {
         return Ok(None);
     };
@@ -836,9 +857,21 @@ pub fn place(
     if facts.disk_reported && free.disk_bytes <= 0 {
         return Ok(None);
     }
-    let candidates = candidates(tx, pool, &facts, free)?;
+    let mut candidates = candidates(tx, pool, &facts, free)?;
     if candidates.is_empty() {
         return Ok(None);
+    }
+    if let Some(elsewhere) = elsewhere {
+        let shared = |pick: &Pick| {
+            pick.cpu_millis <= elsewhere.cpu_millis
+                && pick.memory_bytes <= elsewhere.memory_bytes
+                && pick.disk_bytes <= elsewhere.disk_bytes
+        };
+        // A homogeneous fleet has no exclusive work: one scan, no reorder.
+        // Otherwise a stable sort keeps the fair order within each half.
+        if !candidates.iter().all(shared) {
+            candidates.sort_by_key(|pick| shared(pick));
+        }
     }
     let fairness = waiting_fairness(tx, worker, pool, &facts)?;
     let mut locality: Option<Vec<LocalityWorker>> = None;

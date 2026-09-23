@@ -1587,6 +1587,11 @@ impl WorkerSession {
         self.tx.clone()
     }
 
+    /// The capacity the worker reported in its hello.
+    pub fn capacity(&self) -> Capacity {
+        self.capacity
+    }
+
     /// Serve heartbeats and offer answers until the worker says goodbye,
     /// stops answering, or breaks protocol. Bulk-class messages are accepted
     /// here too: a protocol-7 worker whose second connection cannot be
