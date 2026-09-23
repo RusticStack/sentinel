@@ -132,14 +132,17 @@ pub fn leftovers(root: &Path) -> Result<Vec<Marker>> {
 /// Settle the disk and the runtime: remove every container this worker
 /// owns, destroy every workspace, and return the attempts that still have
 /// to be abandoned to the controller (their spools are kept for delivery).
+///
+/// Reaping is not best-effort: if the runtime cannot list what this worker
+/// owns, or a container of it cannot be removed, recovery fails and the
+/// executor does not start. Abandoning attempts whose containers may still
+/// be running would let unobserved steps go on after the controller
+/// recorded them reconciled.
 pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover>)> {
     let mut done = Recovered::default();
-    if let Ok(owned) = podman::owned(worker) {
-        for (_, name) in owned {
-            if podman::remove_named(&name).is_ok() {
-                done.containers_removed += 1;
-            }
-        }
+    for (_, name) in podman::owned(worker)? {
+        podman::remove_named(&name)?;
+        done.containers_removed += 1;
     }
     for attempt in workspace::Workspace::leftovers(root)? {
         let path = root

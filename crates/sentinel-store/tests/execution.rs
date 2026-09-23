@@ -343,8 +343,16 @@ fn the_spec_is_served_only_after_the_acknowledgement() {
     );
     ack(&f, w, &offer, at(2_200));
     assert_eq!(gate(&f), dispatch::SpecGate::Ready);
-    assert!(f.store.read(|c| dispatch::spec_bytes(c, w, attempt)).is_ok());
-    assert!(f.store.read(|c| dispatch::job_context(c, w, attempt)).is_ok());
+    assert!(
+        f.store
+            .read(|c| dispatch::spec_bytes(c, w, attempt))
+            .is_ok()
+    );
+    assert!(
+        f.store
+            .read(|c| dispatch::job_context(c, w, attempt))
+            .is_ok()
+    );
     let tenant = f.tenant;
     f.store
         .writer()
@@ -370,10 +378,7 @@ fn expiry_rechecks_the_lease_in_its_write() {
     ack(&f, w, &offer, at(2_200));
     let attempt = offer.attempt;
     let late = at(2_100 + dispatch::DEFAULT_LEASE_MS + 1);
-    let due = f
-        .store
-        .read(|c| dispatch::expired_scoped(c, late))
-        .unwrap();
+    let due = f.store.read(|c| dispatch::expired_scoped(c, late)).unwrap();
     assert_eq!(due.len(), 1);
     assert_eq!((due[0].0, due[0].2), (attempt, offer.job));
     // The worker reconnects just at its deadline and renews.

@@ -31,7 +31,9 @@ use crate::{
 
 /// How long a lease lasts without renewal. Renewal rides on the heartbeat
 /// (every 5 s), so a worker misses several beats before its lease lapses.
-pub const DEFAULT_LEASE_MS: i64 = 30_000;
+/// The worker protocol's constant: the worker measures the same duration
+/// from its own heartbeat, never by comparing wall clocks.
+pub const DEFAULT_LEASE_MS: i64 = sentinel_protocol::limits::LEASE_MS;
 /// How long an offer waits for its acknowledgement before it lapses and the
 /// job returns to the queue.
 pub const OFFER_ACK_MS: i64 = 5_000;
@@ -1427,8 +1429,7 @@ pub fn cancel_run(
 ) -> Result<usize> {
     let mut count = 0;
     for (job, state) in runs::run_jobs(tx, tenant, run)? {
-        if !state.is_terminal() && cancel_one(tx, tenant, job, now)? != Cancelled::AlreadyTerminal
-        {
+        if !state.is_terminal() && cancel_one(tx, tenant, job, now)? != Cancelled::AlreadyTerminal {
             count += 1;
         }
     }

@@ -98,7 +98,7 @@ fn the_pull_overlaps_the_checkout() {
     let seen = Arc::new(Mutex::new(Seen::default()));
     let images = Images::with_download({
         let (seen, workspace) = (Arc::clone(&seen), workspace.clone());
-        move |image, _| {
+        move |image, _, _| {
             {
                 let mut seen = seen.lock().unwrap();
                 seen.image = image.to_owned();

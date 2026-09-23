@@ -156,18 +156,26 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
     let notices = Arc::new(Mutex::new(Vec::<String>::new()));
     let log = Arc::clone(&notices);
     let worker_id = WorkerId::new();
+    // The value a secret binding would inject (S05) is registered for each
+    // attempt as it starts — per attempt, before its first step — so it
+    // never reaches that attempt's log.
+    let registrar: Arc<std::sync::OnceLock<Executor>> = Arc::new(std::sync::OnceLock::new());
+    let hook = Arc::clone(&registrar);
     let executor = Executor::start(
         worker_dir.clone(),
         worker_id,
         move |notice: Notice| {
+            if let Notice::Started(attempt) = &notice
+                && let Some(executor) = hook.get()
+            {
+                assert!(executor.register_secret(*attempt, b"hunter2-super-secret"));
+            }
             log.lock().unwrap().push(format!("{notice:?}"));
         },
         true,
     )
     .unwrap();
-    // The value a secret binding would inject (S05); registered before any
-    // attempt starts, it never reaches a log.
-    executor.register_secret(b"hunter2-super-secret");
+    let _ = registrar.set(executor.clone());
     // Cancelled steps get two seconds between TERM and the forced stop.
     executor.set_cancel_grace(Duration::from_secs(2));
     let handle = Arc::new(Handle::new());

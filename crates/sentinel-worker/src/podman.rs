@@ -4,9 +4,11 @@
 //! `--cpus`, `--memory` with swap capped at the same value, `--pids-limit`,
 //! `--network none`, a read-only root filesystem with a tmpfs `/tmp`, every
 //! capability dropped, `no-new-privileges`, and the user namespace rootless
-//! Podman gives (uid 0 inside is the worker user outside). The workspace is
-//! the only writable bind mount. There is no Docker socket, no privileged
-//! flag and nothing a pipeline can set to loosen any of this.
+//! Podman gives (uid 0 inside is the worker user outside). The writable bind
+//! mounts are the workspace and the attempt's private cache views (K02) —
+//! nothing shared, nothing of the host beyond them. There is no Docker
+//! socket, no privileged flag and nothing a pipeline can set to loosen any
+//! of this.
 //!
 //! Ownership is tracked by labels: every container is `sentinel-<attempt>`
 //! and carries `io.sentinel.worker` and `io.sentinel.attempt`, so what this
@@ -106,8 +108,12 @@ pub fn probe() -> Result<Runtime> {
 /// Make `image` (a `name@sha256:…` reference) available locally.
 /// `Ok(true)` means the store already held it — the `image exists` fast
 /// path, nothing downloaded — and `Ok(false)` means `podman pull` fetched
-/// it (K08's `image_present` signal).
-pub fn pull(image: &str, timeout: Duration) -> Result<bool> {
+/// it (K08's `image_present` signal). `cancel` kills a pull under way.
+pub fn pull(
+    image: &str,
+    timeout: Duration,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<bool> {
     if !image.contains("@sha256:") {
         return Err(Error::Preparation("image is not pinned by digest".into()));
     }
@@ -124,7 +130,7 @@ pub fn pull(image: &str, timeout: Duration) -> Result<bool> {
     }
     let mut cmd = podman();
     cmd.args(["pull", "-q", "--", image]);
-    let output = process::run(cmd, deadline(timeout), "podman pull")?;
+    let output = process::run_canceled(cmd, deadline(timeout), "podman pull", None, Some(cancel))?;
     if output.success() {
         Ok(false)
     } else {
@@ -209,16 +215,39 @@ fn inspect_named(name: &str) -> Result<(Option<i32>, Option<std::path::PathBuf>)
     Ok((pid, cgroup))
 }
 
-/// Host pids of every process in the container's cgroup except its init.
+/// Host pids of every process in the container's cgroup — and in every
+/// cgroup nested under it, where a runtime may place the exec'd step —
+/// except its init. The walk is bounded in depth and in directories.
 fn step_pids(cgroup: &std::path::Path, init: Option<i32>) -> Vec<i32> {
-    std::fs::read_to_string(cgroup.join("cgroup.procs"))
-        .map(|text| {
-            text.lines()
-                .filter_map(|l| l.trim().parse::<i32>().ok())
-                .filter(|pid| Some(*pid) != init)
-                .collect()
-        })
-        .unwrap_or_default()
+    const MAX_DEPTH: usize = 8;
+    const MAX_CGROUPS: usize = 256;
+    let mut pids = Vec::new();
+    let mut pending = vec![(cgroup.to_path_buf(), 0usize)];
+    let mut seen = 0;
+    while let Some((dir, depth)) = pending.pop() {
+        seen += 1;
+        if let Ok(text) = std::fs::read_to_string(dir.join("cgroup.procs")) {
+            pids.extend(
+                text.lines()
+                    .filter_map(|l| l.trim().parse::<i32>().ok())
+                    .filter(|pid| Some(*pid) != init),
+            );
+        }
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if seen + pending.len() >= MAX_CGROUPS {
+                    break;
+                }
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    pending.push((entry.path(), depth + 1));
+                }
+            }
+        }
+    }
+    pids
 }
 
 /// Graceful then forced termination of a container by name (W06): `SIGTERM`
@@ -416,7 +445,9 @@ impl Container {
                 stderr: output.stderr,
             }),
             Err(Error::Timeout(_)) => {
-                self.stop(Duration::ZERO)?;
+                // The step is over either way; a stop that fails here is
+                // settled by the teardown's forced removal.
+                let _ = self.stop(Duration::ZERO);
                 Ok(Exit {
                     code: None,
                     signal: None,
@@ -464,13 +495,21 @@ impl Container {
     }
 
     /// `podman stop`: TERM to the container's processes, KILL after `grace`.
+    /// A stop the runtime refused or that timed out is an error.
     pub fn stop(&self, grace: Duration) -> Result<()> {
         let mut cmd = podman();
         cmd.args(["stop", "-t"])
             .arg(grace.as_secs().to_string())
             .args(["--", &self.name]);
-        let _ = process::run(cmd, deadline(grace + STOP_TIMEOUT), "podman stop")?;
-        Ok(())
+        let output = process::run(cmd, deadline(grace + STOP_TIMEOUT), "podman stop")?;
+        if output.success() {
+            Ok(())
+        } else {
+            Err(Error::Runtime(format!(
+                "container stop: {}",
+                output.stderr_excerpt()
+            )))
+        }
     }
 
     fn remove(&self) -> Result<()> {
@@ -487,10 +526,14 @@ impl Container {
         }
     }
 
-    /// Stop and remove. Nothing of the attempt survives in the runtime.
+    /// Stop and remove. Nothing of the attempt survives in the runtime:
+    /// the removal (`rm -f`, which kills what is left) runs even when the
+    /// graceful stop failed or timed out, and the first failure is what is
+    /// returned.
     pub fn destroy(self) -> Result<()> {
-        self.stop(Duration::from_secs(2))?;
-        self.remove()
+        let stopped = self.stop(Duration::from_secs(2));
+        let removed = self.remove();
+        removed.and(stopped)
     }
 
     pub fn attempt(&self) -> AttemptId {

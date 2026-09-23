@@ -4,14 +4,17 @@
 //!
 //! Output goes to disk first and to the link second, so a slow or absent
 //! controller costs disk, never memory, and a worker restart resumes from
-//! the cursor (W07). The spool is bounded: past `MAX_SPOOL_BYTES` the step
-//! fails as `Publication` rather than filling the disk, and what could not
-//! be written is declared as a gap in the end marker, never dropped in
-//! silence. Reading it back is bounded too — scans stream in `SCAN_CHUNK`
+//! the cursor (W07). The spool is bounded: past `MAX_SPOOL_BYTES` further
+//! output is not written, and what could not be written is declared as a
+//! gap in the end marker, never dropped in silence — the highest declared
+//! sequence is kept in a small `declared` file so the gaps survive a
+//! restart. Reading it back is bounded too — scans stream in `SCAN_CHUNK`
 //! windows and sends read only what `limit` frames can occupy, so a
-//! `MAX_SPOOL_BYTES` spool never becomes `MAX_SPOOL_BYTES` of RAM.
+//! `MAX_SPOOL_BYTES` spool never becomes `MAX_SPOOL_BYTES` of RAM — and a
+//! frame sent the moment it is written is sent from memory, never read back.
 
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -19,8 +22,8 @@ use std::{
 
 use sentinel_core::AttemptId;
 use sentinel_protocol::{
-    limits::MAX_LOG_FRAME_BYTES,
-    logs::{FRAME_HEADER_BYTES, Frame, Record, RecordError, Stream},
+    limits::{MAX_LOG_FRAME_BYTES, MAX_UNACKED_LOG_FRAMES},
+    logs::{FRAME_HEADER_BYTES, Frame, Record, RecordError, Stream, encode_frame},
 };
 
 use crate::{Error, Result};
@@ -86,8 +89,20 @@ pub struct Spool {
     /// Byte offset of the next frame to send, so sending is one sequential
     /// read of the file however large the log grows.
     send_offset: u64,
-    /// Ranges refused for size, declared at the end.
+    /// Ranges never stored (the size cap, a failed write), declared at the
+    /// end.
     gaps: Vec<(u64, u64)>,
+    /// `(seq, byte offset just after it)` of frames sent since the last
+    /// rewind, oldest first: an acknowledgement turns into the offset a
+    /// rewind resumes from without scanning the file. Bounded by the send
+    /// window.
+    marks: VecDeque<(u64, u64)>,
+    /// Byte offset just after the acknowledged frame, when known.
+    acked_offset: Option<u64>,
+    /// The highest declared-gap sequence already on disk in `declared`.
+    declared_synced: u64,
+    /// Encode scratch, reused by every append.
+    scratch: Vec<u8>,
 }
 
 impl Spool {
@@ -113,8 +128,14 @@ impl Spool {
             .open(dir.join("frames"))?;
         frames.seek(SeekFrom::Start(0))?;
         let mut last = 0u64;
+        // Sequences skipped between stored frames were declared gaps (the
+        // cap, a failed write): recover them from the jumps themselves.
+        let mut gaps: Vec<(u64, u64)> = Vec::new();
         let (at, end) = scan(&mut frames, |record, _| {
             if let Record::Frame(f) = record {
+                if f.seq > last + 1 {
+                    gaps.push((last + 1, f.seq - 1));
+                }
                 last = f.seq;
             }
             true
@@ -124,19 +145,35 @@ impl Spool {
         }
         frames.set_len(at)?;
         frames.seek(SeekFrom::End(0))?;
-        let acked = fs::read_to_string(dir.join("cursor"))
-            .ok()
-            .and_then(|t| t.trim().parse().ok())
-            .unwrap_or(0);
+        let read_seq = |name: &str| -> u64 {
+            fs::read_to_string(dir.join(name))
+                .ok()
+                .and_then(|t| t.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        let acked = read_seq("cursor");
+        // Declared past the last stored frame: a refused tail that must
+        // still be declared at the end, however the process ended.
+        let declared = read_seq("declared");
+        if declared > last {
+            gaps.push((last + 1, declared));
+        }
         let mut spool = Spool {
             dir,
             frames,
             len: at,
             max,
-            next_seq: last + 1,
+            // Never reuse a sequence the controller may already hold: one it
+            // acknowledged (the frame can be gone from an unsynced tail) or
+            // one declared missing.
+            next_seq: last.max(acked).max(declared) + 1,
             acked,
             send_offset: 0,
-            gaps: Vec::new(),
+            gaps,
+            marks: VecDeque::new(),
+            acked_offset: None,
+            declared_synced: declared,
+            scratch: Vec::new(),
         };
         spool.rewind(acked)?;
         Ok(spool)
@@ -144,7 +181,19 @@ impl Spool {
 
     /// Position the send cursor just after `after`: a resend after a lost
     /// session starts from the last acknowledgement.
+    ///
+    /// Rewinding to the acknowledgement — every reattach, every lost bulk
+    /// connection — uses the offset the acknowledgement already named, so
+    /// the pipe lock is not held across a scan of a large spool; only an
+    /// offset nothing recorded (a reopen, an arbitrary point) is scanned.
     pub fn rewind(&mut self, after: u64) -> Result<()> {
+        self.marks.clear();
+        if after == self.acked
+            && let Some(offset) = self.acked_offset
+        {
+            self.send_offset = offset;
+            return Ok(());
+        }
         self.frames.seek(SeekFrom::Start(0))?;
         let mut at = self.len;
         scan(&mut self.frames, |record, offset| {
@@ -157,8 +206,34 @@ impl Spool {
             true
         })?;
         self.send_offset = at;
+        if after == self.acked {
+            self.acked_offset = Some(at);
+        }
         self.frames.seek(SeekFrom::End(0))?;
         Ok(())
+    }
+
+    /// Whether everything written has been handed to the link: the next
+    /// frame appended may then be sent straight from memory.
+    pub fn caught_up(&self) -> bool {
+        self.send_offset == self.len
+    }
+
+    /// The frame just appended (`seq`) was sent from memory: the send
+    /// cursor moves past it without reading it back.
+    pub fn sent_tail(&mut self, seq: u64) {
+        self.send_offset = self.len;
+        self.mark(seq, self.len);
+    }
+
+    fn mark(&mut self, seq: u64, end: u64) {
+        if self.marks.len() >= 4 * MAX_UNACKED_LOG_FRAMES {
+            // Far more than the window can have in flight: acks stopped
+            // matching sends. Forget the hints; a rewind scans instead.
+            self.marks.clear();
+            self.acked_offset = None;
+        }
+        self.marks.push_back((seq, end));
     }
 
     /// The next `limit` frames from the send cursor, advancing it. The
@@ -179,6 +254,8 @@ impl Spool {
             match Record::decode(&bytes[at..]) {
                 Ok((Record::Frame(f), used)) => {
                     at += used;
+                    let end = self.send_offset + at as u64;
+                    self.mark(f.seq, end);
                     out.push(f);
                 }
                 Ok((_, used)) => at += used,
@@ -189,47 +266,59 @@ impl Spool {
         Ok(out)
     }
 
-    /// Append one chunk of one stream as the next frame. Returns the frame
-    /// as written, or `None` when the spool is full (recorded as a gap).
-    /// A write that fails also declares the sequence — it is spent either
-    /// way — and cuts the torn tail so later appends stay decodable.
-    pub fn append(&mut self, step: u32, stream: Stream, bytes: &[u8]) -> Result<Option<Frame>> {
+    /// Append one chunk of one stream as the next frame, encoded straight
+    /// from the borrowed bytes into a reused buffer. Returns its sequence,
+    /// or `None` when the spool is full (recorded as a gap). A write that
+    /// fails also declares the sequence — it is spent either way — and cuts
+    /// the torn tail so later appends stay decodable.
+    pub fn append(&mut self, step: u32, stream: Stream, bytes: &[u8]) -> Result<Option<u64>> {
         debug_assert!(bytes.len() <= MAX_LOG_FRAME_BYTES);
-        let frame = Frame {
-            seq: self.next_seq,
-            step,
-            stream,
-            bytes: bytes.to_vec(),
-        };
-        let mut encoded = Vec::with_capacity(bytes.len() + 32);
-        Record::Frame(frame.clone())
-            .encode(&mut encoded)
+        let seq = self.next_seq;
+        self.scratch.clear();
+        encode_frame(seq, step, stream, bytes, &mut self.scratch)
             .map_err(|_| Error::Workspace("log frame".into()))?;
         self.next_seq += 1;
-        if self.len + encoded.len() as u64 > self.max {
-            self.declared_gap(frame.seq);
+        let encoded = self.scratch.len() as u64;
+        if self.len + encoded > self.max {
+            self.declared_gap(seq)?;
             return Ok(None);
         }
         self.frames.seek(SeekFrom::End(0))?;
-        if let Err(e) = self.frames.write_all(&encoded) {
+        if let Err(e) = self.frames.write_all(&self.scratch) {
             let _ = self.frames.set_len(self.len);
-            self.declared_gap(frame.seq);
+            let _ = self.declared_gap(seq);
             return Err(e.into());
         }
-        self.len += encoded.len() as u64;
-        Ok(Some(frame))
+        self.len += encoded;
+        Ok(Some(seq))
     }
 
     /// One sequence the spool could not hold, merged into the range list.
-    fn declared_gap(&mut self, seq: u64) {
+    /// A new range is recorded on disk at once (the next sync covers its
+    /// growth), so a restart still declares what was never stored.
+    fn declared_gap(&mut self, seq: u64) -> Result<()> {
         match self.gaps.last_mut() {
             Some((_, to)) if *to + 1 == seq => *to = seq,
-            _ => self.gaps.push((seq, seq)),
+            _ => {
+                self.gaps.push((seq, seq));
+                self.persist_declared()?;
+            }
         }
+        Ok(())
     }
 
-    /// Make everything appended so far durable.
+    fn persist_declared(&mut self) -> Result<()> {
+        let through = self.gaps.last().map_or(0, |g| g.1);
+        if through > self.declared_synced {
+            fs::write(self.dir.join("declared"), format!("{through}\n"))?;
+            self.declared_synced = through;
+        }
+        Ok(())
+    }
+
+    /// Make everything appended (and every gap declared) so far durable.
     pub fn sync(&mut self) -> Result<()> {
+        self.persist_declared()?;
         Ok(self.frames.sync_data()?)
     }
 
@@ -239,6 +328,19 @@ impl Spool {
         if seq <= self.acked {
             return Ok(());
         }
+        let mut end = None;
+        while let Some(&(sent, after)) = self.marks.front() {
+            if sent > seq {
+                break;
+            }
+            end = Some(after);
+            self.marks.pop_front();
+        }
+        // Sequences up to `seq` with no frame of their own (declared gaps)
+        // sit at no offset: the last marked frame's end is where the next
+        // unacknowledged frame begins. No mark at all: unknown, and the
+        // next rewind scans.
+        self.acked_offset = end;
         self.acked = seq;
         fs::write(self.dir.join("cursor"), format!("{seq}\n"))?;
         Ok(())
@@ -316,8 +418,8 @@ mod tests {
         let attempt = AttemptId::new();
         let mut spool = Spool::open(temp.path(), attempt).unwrap();
         for i in 0..5u8 {
-            let frame = spool.append(0, Stream::Stdout, &[i]).unwrap().unwrap();
-            assert_eq!(frame.seq, u64::from(i) + 1);
+            let seq = spool.append(0, Stream::Stdout, &[i]).unwrap().unwrap();
+            assert_eq!(seq, u64::from(i) + 1);
         }
         spool.sync().unwrap();
         spool.acknowledged(2).unwrap();
@@ -349,10 +451,7 @@ mod tests {
         let batch = spool.send_next(2).unwrap();
         assert_eq!(batch.iter().map(|f| f.seq).collect::<Vec<_>>(), vec![3, 4]);
         // Continues the sequence after the reopen; the cursor sees it too.
-        assert_eq!(
-            spool.append(1, Stream::Stderr, b"x").unwrap().unwrap().seq,
-            6
-        );
+        assert_eq!(spool.append(1, Stream::Stderr, b"x").unwrap().unwrap(), 6);
         let rest = spool.send_next(10).unwrap();
         assert_eq!(rest.iter().map(|f| f.seq).collect::<Vec<_>>(), vec![5, 6]);
         assert!(spool.send_next(10).unwrap().is_empty());
@@ -379,7 +478,14 @@ mod tests {
         // marker both tell the truth about what the spool holds.
         assert_eq!(spool.last_seq(), 4);
         assert_eq!(spool.unacked(0, 10).unwrap().len(), 2);
+        // A range's growth is durable with the next sync, like the frames.
+        spool.sync().unwrap();
+        drop(spool);
+        // P04-22: a restart keeps the declared tail — a truncated log is
+        // never delivered as complete — and never reuses its sequences.
         let mut reopened = Spool::open_with_limit(temp.path(), attempt, 59).unwrap();
+        assert_eq!(reopened.gaps(), &[(3, 4)]);
+        assert_eq!(reopened.last_seq(), 4);
         assert_eq!(
             reopened
                 .send_next(10)
@@ -389,12 +495,65 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
+        drop(reopened);
         // And a refused tail still cannot wedge later small writes once
-        // space frees: the cap is on stored bytes, not on the sequence.
+        // space frees: the cap is on stored bytes, not on the sequence;
+        // the gap stays declared between the stored frames.
         let mut spool = Spool::open_with_limit(temp.path(), attempt, 59).unwrap();
         assert!(spool.append(0, Stream::Stdout, b"ee").unwrap().is_none());
+        spool.sync().unwrap();
+        drop(spool);
         let mut spool = Spool::open_with_limit(temp.path(), attempt, 60).unwrap();
-        assert!(spool.append(0, Stream::Stdout, b"ee").unwrap().is_some());
+        assert_eq!(spool.append(0, Stream::Stdout, b"ee").unwrap(), Some(6));
+        spool.sync().unwrap();
+        drop(spool);
+        let reopened = Spool::open_with_limit(temp.path(), attempt, 60).unwrap();
+        assert_eq!(reopened.gaps(), &[(3, 5)]);
+        assert_eq!(reopened.last_seq(), 6);
+    }
+
+    /// A frame the controller acknowledged may be gone from an unsynced
+    /// tail after a crash; its sequence is never handed out again (the
+    /// controller would take the new frame for a duplicate and drop it).
+    #[test]
+    fn a_reopened_spool_never_reuses_an_acknowledged_sequence() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt = AttemptId::new();
+        let mut spool = Spool::open(temp.path(), attempt).unwrap();
+        spool.append(0, Stream::Stdout, b"one").unwrap();
+        spool.acknowledged(3).unwrap();
+        drop(spool);
+        let mut spool = Spool::open(temp.path(), attempt).unwrap();
+        assert_eq!(spool.append(0, Stream::Stdout, b"next").unwrap(), Some(4));
+    }
+
+    /// Rewinding to the acknowledgement uses the offset the ack named; the
+    /// direct-send path moves the cursor without a read.
+    #[test]
+    fn rewinds_to_the_acknowledgement_resume_at_the_recorded_offset() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt = AttemptId::new();
+        let mut spool = Spool::open(temp.path(), attempt).unwrap();
+        for i in 0..4u8 {
+            assert!(spool.caught_up());
+            let seq = spool.append(0, Stream::Stdout, &[i]).unwrap().unwrap();
+            spool.sent_tail(seq);
+        }
+        spool.acknowledged(2).unwrap();
+        spool.rewind(2).unwrap();
+        assert_eq!(
+            spool
+                .send_next(10)
+                .unwrap()
+                .iter()
+                .map(|f| f.seq)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        spool.acknowledged(4).unwrap();
+        spool.rewind(4).unwrap();
+        assert!(spool.send_next(10).unwrap().is_empty());
+        assert!(spool.caught_up());
     }
 
     #[test]

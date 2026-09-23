@@ -29,7 +29,104 @@ pub const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub const MAX_PATH_BYTES: usize = 1024;
 /// Bytes of diagnostics kept per stream (payload reads are explicitly capped).
 const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
+/// Longest a helper wait sleeps before looking at its cancel flag and
+/// output caps again. The child's own exit wakes it at once (a pidfd on
+/// Linux); only where that is unavailable is this a polling interval.
+const CHECK: Duration = Duration::from_millis(50);
+/// The fallback polling interval where no pidfd can be opened.
 const POLL: Duration = Duration::from_millis(20);
+
+thread_local! {
+    /// The cancel flag of the work this thread is doing, if any (see
+    /// [`cancel_scope`]).
+    static CANCEL: std::cell::RefCell<Option<Arc<AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with every Git helper it starts on this thread tied to `cancel`:
+/// once the flag is set, the running helper's whole process group is killed
+/// at its next check (at most [`CHECK`] later) and the call fails, instead
+/// of a fetch running on to its deadline after the work was cancelled.
+pub fn cancel_scope<T>(cancel: Arc<AtomicBool>, f: impl FnOnce() -> T) -> T {
+    let previous = CANCEL.with(|slot| slot.borrow_mut().replace(cancel));
+    let out = f();
+    CANCEL.with(|slot| *slot.borrow_mut() = previous);
+    out
+}
+
+fn canceled() -> bool {
+    CANCEL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    })
+}
+
+/// A handle that becomes readable when the child exits, so waiting costs
+/// no polling; `None` where the kernel has no pidfd (then [`wait_step`]
+/// polls).
+pub struct ExitWatch(#[cfg(target_os = "linux")] Option<std::os::fd::OwnedFd>);
+
+impl ExitWatch {
+    pub fn of(child: &Child) -> ExitWatch {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::FromRawFd;
+            // SAFETY: pidfd_open on our own, not yet reaped child: the pid
+            // cannot have been recycled. A negative answer (no pidfd
+            // support) is simply not used.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
+            ExitWatch((fd >= 0).then(|| {
+                // SAFETY: `fd` is a fresh descriptor this call owns alone.
+                unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) }
+            }))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = child;
+            ExitWatch()
+        }
+    }
+
+    /// Block until the child may have exited or `wait` passed.
+    fn park(&self, wait: Duration) {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.0 {
+            use std::os::fd::AsRawFd;
+            let mut poll = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = wait.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+            // SAFETY: one valid pollfd on the stack for the duration of the
+            // call; an interrupted poll simply returns early.
+            unsafe {
+                libc::poll(&mut poll, 1, ms);
+            }
+            return;
+        }
+        thread::sleep(wait.min(POLL));
+    }
+}
+
+/// Wait for `child` until it exits or `until` passes, returning early —
+/// with `None` — at least every [`CHECK`] so the caller can look at its
+/// cancel flag and caps. The exit itself wakes the wait at once.
+pub fn wait_step(
+    child: &mut Child,
+    watch: &ExitWatch,
+    until: Instant,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(Some(status));
+    }
+    let now = Instant::now();
+    if now < until {
+        watch.park((until - now).min(CHECK));
+    }
+    child.try_wait()
+}
 
 /// Monotonic nanoseconds since `started`, saturated at `u64::MAX`.
 pub(crate) fn elapsed_ns(started: Instant) -> u64 {
@@ -188,8 +285,9 @@ fn run_capped(
         },
     );
     let stderr = drain(child.stderr.take().expect("piped"), Capture::Tail);
+    let watch = ExitWatch::of(&child);
     let status = loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = wait_step(&mut child, &watch, deadline)? {
             break status;
         }
         if overflow
@@ -201,13 +299,18 @@ fn run_capped(
             let _ = stderr.join();
             return Err(Error::TooLarge(what));
         }
+        if canceled() {
+            kill_group(&mut child);
+            let _ = stdout.join();
+            let _ = stderr.join();
+            return Err(Error::Preparation(format!("{what} canceled")));
+        }
         if Instant::now() >= deadline {
             kill_group(&mut child);
             let _ = stdout.join();
             let _ = stderr.join();
             return Err(Error::Timeout(what));
         }
-        thread::sleep(POLL);
     };
     Ok(Output {
         code: status.code(),

@@ -2295,6 +2295,9 @@ pub struct Link {
     /// Process telemetry to refresh on the control connection (Q07).
     transport: Option<TransportStats>,
     beats: u64,
+    /// When the last heartbeat left: what the lease the pong renews is
+    /// measured from, monotonically.
+    ping_sent: Instant,
     /// Whether [`Reporter::remote_cache`] hands the executor a handle (Q08):
     /// off by configuration, every remote lookup is a local miss.
     remote_cache: bool,
@@ -2368,6 +2371,7 @@ pub fn connect(
             }),
             transport: None,
             beats: 0,
+            ping_sent: Instant::now(),
             remote_cache: true,
         }),
         ServerMessage::Reject(why) => Err(Error::Rejected(why)),
@@ -2627,6 +2631,14 @@ pub trait Executor: Send + Sync {
     fn held(&self) -> Vec<AttemptId>;
     /// The controller renewed every held lease to this deadline.
     fn renewed(&self, until: UnixMillis);
+    /// The same renewal with the monotonic instant the answered heartbeat
+    /// left this worker. The renewal happened after that instant, so the
+    /// lease lasts at least `LEASE_MS` from it on this machine's own clock —
+    /// the deadline an executor should act on, with no wall-clock
+    /// comparison between two hosts. The default forwards to `renewed`.
+    fn renewed_at(&self, until: UnixMillis, _sent: Instant) {
+        self.renewed(until);
+    }
     /// A session is live: reports and spec requests go through `reporter`
     /// until `detached`. Pending reports from a lost session are resent here.
     fn attached(&self, reporter: Reporter);
@@ -2721,6 +2733,8 @@ impl Link {
             .take(MAX_LIST_ITEMS)
             .map(|a| *a.as_bytes())
             .collect();
+        // Taken before the send: the renewal cannot precede it.
+        self.ping_sent = Instant::now();
         self.tx.send(&ClientMessage::Ping {
             seq: self.seq,
             held,
@@ -2785,7 +2799,7 @@ impl Link {
                 if seq != self.seq {
                     return Err(Error::Protocol("pong sequence"));
                 }
-                executor.renewed(UnixMillis(lease_until_ms));
+                executor.renewed_at(UnixMillis(lease_until_ms), self.ping_sent);
                 for attempt in ids(&stop)? {
                     executor.stop(attempt);
                 }

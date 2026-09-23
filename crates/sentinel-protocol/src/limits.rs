@@ -15,6 +15,13 @@ pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 << 10;
 pub const MAX_LOG_FRAME_BYTES: usize = 32 << 10;
 /// Log frames a worker may send before an acknowledgement.
 pub const MAX_UNACKED_LOG_FRAMES: usize = 256;
+/// How long a lease lasts from the renewal that granted it, in
+/// milliseconds. Part of the worker protocol: the controller renews to
+/// `now + LEASE_MS` on every heartbeat, and the worker measures its own
+/// deadline as this duration from the moment it sent that heartbeat — on
+/// its monotonic clock, so the two hosts' wall clocks never meet. Lowering
+/// it is a protocol change (an older worker would act too late).
+pub const LEASE_MS: i64 = 30_000;
 /// Items returned by any list endpoint; the default page is smaller.
 pub const MAX_PAGE_ITEMS: usize = 500;
 pub const DEFAULT_PAGE_ITEMS: usize = 100;
