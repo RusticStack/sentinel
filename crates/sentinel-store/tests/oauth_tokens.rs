@@ -441,23 +441,28 @@ fn a_lost_response_recovers_once_and_the_abandoned_successor_is_a_replay() {
     let first = issue(&store, login_grant(i.dev, Scopes::CLI_DEFAULT));
     // The response carrying `lost` never reached the client.
     let lost = refresh(&store, &first.refresh, None, at(1_000)).unwrap();
-    let recovered = refresh(&store, &first.refresh, None, at(1_000 + ROTATION_GRACE_MS)).unwrap();
+    // Recovery at the last instant of the grace window; everything after it
+    // happens later still, as a real client's clock would run (P09-18).
+    let t = 1_000 + ROTATION_GRACE_MS;
+    let recovered = refresh(&store, &first.refresh, None, at(t)).unwrap();
     assert_eq!(recovered.grant, first.grant);
-    assert!(authenticate(&store, &recovered.access, at(2_000)).is_ok());
+    assert!(authenticate(&store, &recovered.access, at(t + 1)).is_ok());
     // The abandoned successor's access token is gone with it.
-    assert!(authenticate(&store, &lost.access, at(2_000)).is_err());
+    assert!(authenticate(&store, &lost.access, at(t + 1)).is_err());
     // The recovered token keeps rotating normally.
-    let next = refresh(&store, &recovered.refresh, None, at(3_000)).unwrap();
+    let next = refresh(&store, &recovered.refresh, None, at(t + 1_000)).unwrap();
+    assert_eq!(next.refresh_expires, at(t + 1_000 + oauth::REFRESH_IDLE_MS));
+    assert!(authenticate(&store, &next.access, at(t + 1_001)).is_ok());
     assert!(!revoked(&store, first.grant, i.dev));
     // Presenting the superseded successor is a replay: the grant goes.
     assert!(matches!(
-        refresh(&store, &lost.refresh, None, at(4_000)),
+        refresh(&store, &lost.refresh, None, at(t + 2_000)),
         Err(RefreshError::Replay)
     ));
     assert!(revoked(&store, first.grant, i.dev));
-    assert!(authenticate(&store, &next.access, at(4_001)).is_err());
+    assert!(authenticate(&store, &next.access, at(t + 2_001)).is_err());
     assert!(matches!(
-        refresh(&store, &next.refresh, None, at(4_002)),
+        refresh(&store, &next.refresh, None, at(t + 2_002)),
         Err(RefreshError::Invalid)
     ));
 }
