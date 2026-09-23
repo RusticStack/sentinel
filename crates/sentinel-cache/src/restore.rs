@@ -224,6 +224,8 @@ pub fn restore_remote(
             // K08: the first-touch sample is timed separately — cold-extent
             // read cost is not the clone's wall time.
             attached.stats.first_touch_ns = first_touch(&blob, &attached.targets);
+            // The entry was used: reclamation evicts least recently used.
+            crate::gc::touch(&entry_dir);
             attached.generation = Some(name);
             attached.lease = Some(lease);
             attached.outcome = Outcome::Hit(hit);

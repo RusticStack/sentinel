@@ -527,9 +527,10 @@ fn eviction_during_active_use_never_undercuts_a_lease() {
     assert!(held.outcome.is_hit());
     assert!(held.lease.is_some(), "a hit pins the entry for the attempt");
 
-    // Total is 2×(500+600) = 2200; the budget demands 1200 back. The
-    // pinned entry's spare is untouchable; the sibling's goes.
-    let stats = gc::sweep(&root, 1_000, gc::DEFAULT_PASS_WORK);
+    // Total is 2×(500+600) = 2200; the budget demands 500 back. The
+    // pinned entry's spare is untouchable; the sibling's goes (and it is
+    // enough — currents go only when spares cannot close the gap).
+    let stats = gc::sweep(&root, 1_700, gc::DEFAULT_PASS_WORK);
     assert_eq!(stats.leases_active, 1);
     assert_eq!(
         gens(&entry1).len(),
@@ -558,10 +559,10 @@ fn eviction_during_active_use_never_undercuts_a_lease() {
     // Dropping the carriers releases both pins; the next sweep may take it.
     drop(held);
     drop(again);
-    let stats = gc::sweep(&root, 1_000, gc::DEFAULT_PASS_WORK);
+    let stats = gc::sweep(&root, 1_200, gc::DEFAULT_PASS_WORK);
     assert_eq!(gens(&entry1).len(), 1, "unpinned, the spare goes");
     assert_eq!(stats.generations_removed, 1);
-    // `current` is never a candidate either way.
+    // The spares closed the gap, so both currents stay.
     assert!(entry1.join(current_gen(&entry1).unwrap()).is_dir());
     assert!(entry2.join(current_gen(&entry2).unwrap()).is_dir());
 }
