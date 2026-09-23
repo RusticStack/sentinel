@@ -808,7 +808,9 @@ pub struct Offer {
     pub lease_until: UnixMillis,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
-    /// `name@sha256:…` as resolved on the run; what the worker pulls.
+    /// The `sha256:…` digest resolved on the run — the digest alone: the
+    /// worker pulls `<spec image name>@<digest>` once the spec arrives, so
+    /// no pull can start from the offer itself.
     pub image_digest: String,
     pub image_platform: String,
     /// Position of the job in the run's compiled spec.
