@@ -568,7 +568,7 @@ pub fn run(role: &str, args: ServiceArgs) -> Result<(), Error> {
     let config = Config::load(role, &args, &io, &cpu)?;
     let configuration_ns = elapsed_ns(configuration_started);
     if args.check {
-        println!(
+        sentinel::outln!(
             "{role} configuration valid; data_dir={}; log_format={:?}; log_level={:?}; {}",
             config.data_dir.display(),
             config.log_format,
@@ -806,20 +806,26 @@ fn start_tailcat(
     Ok(Some(TailcatServer { server, stop }))
 }
 
-/// How often expired credentials are purged: sessions, API credentials,
-/// external sign-in state and OAuth rows. Validation never depends on it —
-/// every check tests expiry and revocation itself — so this only bounds
+/// How often expired rows are purged: sessions, API credentials, external
+/// sign-in state, OAuth rows and idempotency records. Validation never
+/// depends on it — every check tests expiry and revocation itself, and an
+/// expired idempotency record already executes afresh — so this only bounds
 /// table growth.
 #[cfg(feature = "server")]
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(600);
-/// Rows each purge removes per category per tick; a backlog drains over
+/// The next tick's delay while some purge still had a full batch to take:
+/// a backlog drains a batch per kind per second, releasing the writer
+/// between batches, instead of one batch per ten minutes.
+#[cfg(feature = "server")]
+const BACKLOG_INTERVAL: Duration = Duration::from_secs(1);
+/// Rows each purge removes per kind per tick; a backlog drains over
 /// several ticks instead of holding the writer.
 #[cfg(feature = "server")]
 const PURGE_BATCH: u32 = 1000;
 
-/// The credential maintenance tick: one thread that sleeps on a channel and
-/// runs the bounded purges every [`MAINTENANCE_INTERVAL`]. Dropping the
-/// sender wakes and ends it at once.
+/// The maintenance tick: one thread that sleeps on a channel and runs the
+/// bounded purges every [`MAINTENANCE_INTERVAL`] (or [`BACKLOG_INTERVAL`]
+/// while a backlog remains). Dropping the sender wakes and ends it at once.
 #[cfg(feature = "server")]
 struct Maintenance {
     stop: mpsc::SyncSender<()>,
@@ -835,10 +841,13 @@ impl Maintenance {
             .name("sentinel-maintenance".into())
             .spawn(move || {
                 tracing::dispatcher::with_default(&dispatch, || {
-                    while let Err(mpsc::RecvTimeoutError::Timeout) =
-                        wake.recv_timeout(MAINTENANCE_INTERVAL)
-                    {
-                        purge_credentials(&store);
+                    let mut interval = MAINTENANCE_INTERVAL;
+                    while let Err(mpsc::RecvTimeoutError::Timeout) = wake.recv_timeout(interval) {
+                        interval = if purge_expired(&store, PURGE_BATCH) {
+                            BACKLOG_INTERVAL
+                        } else {
+                            MAINTENANCE_INTERVAL
+                        };
                     }
                 });
             })?;
@@ -857,24 +866,32 @@ impl Maintenance {
 type Purge =
     fn(&sentinel_store::Store, sentinel_core::UnixMillis, u32) -> sentinel_store::Result<usize>;
 
+/// One tick: at most `batch` rows of each kind. Returns whether any kind
+/// filled its batch, i.e. may have more to purge.
 #[cfg(feature = "server")]
-fn purge_credentials(store: &sentinel_store::Store) {
+fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
     let now = sentinel_core::UnixMillis::now();
-    let purges: [(&str, Purge); 4] = [
+    let purges: [(&str, Purge); 5] = [
         ("oauth", sentinel_store::oauth::purge_expired),
         ("api_tokens", sentinel_store::tokens::purge_expired),
         ("sessions", sentinel_store::local_auth::purge_expired),
         ("sign_in", sentinel_store::sign_in::purge_expired),
+        ("idempotency", sentinel_store::idempotency::purge_expired),
     ];
+    let mut backlog = false;
     for (kind, purge) in purges {
-        match purge(store, now, PURGE_BATCH) {
+        match purge(store, now, batch) {
             Ok(0) => {}
-            Ok(removed) => tracing::info!(event = "credentials_purged", kind, removed),
+            Ok(removed) => {
+                backlog |= removed >= batch as usize;
+                tracing::info!(event = "expired_rows_purged", kind, removed);
+            }
             Err(error) => {
-                tracing::warn!(event = "credentials_purge_failed", kind, error = %error);
+                tracing::warn!(event = "expired_rows_purge_failed", kind, error = %error);
             }
         }
     }
+    backlog
 }
 
 #[cfg(feature = "server")]
@@ -1467,12 +1484,14 @@ mod worker_role {
     /// The worker's generated identifier, fixed on first start.
     fn worker_id(data_dir: &Path) -> Result<sentinel_core::WorkerId, Error> {
         let path = data_dir.join("worker.id");
-        match fs::read_to_string(&path) {
+        match sentinel::bounded::text(&path, 4 << 10) {
             Ok(text) => text
                 .trim()
                 .parse()
                 .map_err(|_| Error::runtime("worker.id is not a wrk_ identifier")),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(sentinel::bounded::ReadError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
                 let id = sentinel_core::WorkerId::new();
                 fs::write(&path, format!("{id}\n"))
                     .map_err(|error| Error::runtime(format!("cannot save worker.id: {error}")))?;
@@ -1486,11 +1505,15 @@ mod worker_role {
         let identity = identity(&config.data_dir, "worker")?;
         let worker = worker_id(&config.data_dir)?;
         let enrollment = match &link.enrollment_file {
-            Some(path) => match fs::read_to_string(path) {
+            Some(path) => match sentinel::bounded::text(path, 4 << 10) {
                 Ok(text) => Some(sentinel_auth::token::parse(text.trim()).ok_or_else(|| {
                     Error::runtime("enrollment_file does not hold an enrollment secret")
                 })?),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(sentinel::bounded::ReadError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    None
+                }
                 Err(error) => {
                     return Err(Error::runtime(format!(
                         "cannot read enrollment_file: {error}"
@@ -1712,6 +1735,48 @@ mod tests {
             Ok(s) => s,
             Err(_) => panic!("storage config must resolve"),
         }
+    }
+
+    #[test]
+    fn the_maintenance_tick_purges_idempotency_records_a_batch_at_a_time() {
+        // P02-2: the tick used to leave every idempotency record forever.
+        let dir = tempfile::tempdir().unwrap();
+        let store = sentinel_store::Store::open(
+            dir.path().join("m.sqlite"),
+            sentinel_store::Durability::Normal,
+        )
+        .unwrap();
+        let tenant = sentinel_core::TenantId::new();
+        let now = sentinel_core::UnixMillis::now().0;
+        store
+            .writer()
+            .write(move |tx| {
+                sentinel_store::jobs::insert_tenant(tx, tenant, "acme", sentinel_core::UnixMillis(1))?;
+                for (key, created) in [("a", 0), ("b", 0), ("c", 0), ("live", now)] {
+                    tx.execute(
+                        "INSERT INTO idempotency_keys(tenant_id, principal, route, key, fingerprint, created_ms)
+                         VALUES (?1, 'p', 'r', ?2, zeroblob(16), ?3)",
+                        (tenant.as_bytes().as_slice(), key, created),
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let keys = || -> Vec<String> {
+            store
+                .read(|c| {
+                    let mut stmt = c.prepare("SELECT key FROM idempotency_keys ORDER BY key")?;
+                    let keys = stmt
+                        .query_map([], |r| r.get(0))?
+                        .collect::<Result<_, _>>()?;
+                    Ok(keys)
+                })
+                .unwrap()
+        };
+        assert!(purge_expired(&store, 2), "a full batch means a backlog");
+        assert_eq!(keys().len(), 2, "one tick removes at most one batch");
+        assert!(!purge_expired(&store, 2));
+        assert_eq!(keys(), ["live"]);
     }
 
     #[test]
