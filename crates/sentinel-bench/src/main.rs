@@ -176,6 +176,9 @@ fn run(cli: Cli) -> Result<(), String> {
         return Err("samples must be at least 1".into());
     }
     let argv = workload_argv(&cli)?;
+    // Provenance first: a record without its source revision cannot be
+    // attributed, so none is written (and nothing is measured) without it.
+    let source = source_revision()?;
     let image = match cli.runtime {
         Runtime::Podman => cli.image.clone().map(inspect_image),
         Runtime::Direct => None,
@@ -208,12 +211,11 @@ fn run(cli: Cli) -> Result<(), String> {
             cpus: cli.cpus,
             memory: cli.memory,
         },
-        source: Source {
-            git_commit: command_line(&["git", "rev-parse", "HEAD"]),
-            git_dirty: command_line(&["git", "status", "--porcelain"]).map(|s| !s.is_empty()),
-        },
+        source,
         tools: Tools {
-            rustc: command_line(&["rustc", "--version"]),
+            rustc: Some(env!("SENTINEL_BENCH_RUSTC"))
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned),
             podman: (cli.runtime == Runtime::Podman)
                 .then(|| command_line(&["podman", "--version"]))
                 .flatten(),
@@ -349,6 +351,26 @@ fn summarize(samples: &[Sample]) -> Summary {
         p95_ns: nearest_rank(0.95),
         max_ns: sorted[sorted.len() - 1],
     }
+}
+
+/// The commit and dirty state of the checkout this runner was built from,
+/// asked of `git` there rather than in the working directory, so a runner
+/// started elsewhere (as the F05 baseline was) still names its source.
+fn source_revision() -> Result<Source, String> {
+    let dir = env!("CARGO_MANIFEST_DIR");
+    let git_commit = command_line(&["git", "-C", dir, "rev-parse", "HEAD"]).ok_or_else(|| {
+        format!(
+            "cannot read the source commit of {dir} with git; no record written \
+             (run the runner built from a checkout; a checkout owned by another user \
+             needs `git config --global --add safe.directory {dir}`)"
+        )
+    })?;
+    let git_dirty =
+        command_line(&["git", "-C", dir, "status", "--porcelain"]).map(|s| !s.is_empty());
+    Ok(Source {
+        git_commit: Some(git_commit),
+        git_dirty,
+    })
 }
 
 fn command_line(argv: &[&str]) -> Option<String> {
