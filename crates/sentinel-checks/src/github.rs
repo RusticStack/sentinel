@@ -129,7 +129,9 @@ impl GithubChecks {
             conclusion,
             title: publication.title.clone(),
             summary: publication.summary.clone(),
-            external_id: publication.external_id.clone(),
+            // The identity the run was created with; a create below replaces
+            // it with its own generation's.
+            external_id: publication.created_identity(),
             details_url: self.details_url(publication.run),
             completed_at: (status == api::Status::Completed).then(|| api::timestamp(now.0)),
         })
@@ -207,7 +209,7 @@ impl crate::lane::Publisher for GithubChecks {
             Ok(token) => token,
             Err(outcome) => return outcome,
         };
-        let check = match self.check(publication, now) {
+        let mut check = match self.check(publication, now) {
             Ok(check) => check,
             Err(outcome) => return outcome,
         };
@@ -227,7 +229,8 @@ impl crate::lane::Publisher for GithubChecks {
                     repo: &name,
                     head_sha: &publication.head_sha,
                     name: &publication.name,
-                    external_id: &publication.external_id,
+                    external_id: &check.external_id,
+                    any_status: publication.create_seq.is_some(),
                 },
             ) {
                 Ok(found) => found.map(|found| found.check_run_id),
@@ -252,14 +255,17 @@ impl crate::lane::Publisher for GithubChecks {
                     .writer()
                     .write(move |tx| checks::create_started(tx, id, seq, UnixMillis::now()))
                 {
-                    Ok(()) => api::create(
-                        &self.client,
-                        self.app.endpoint(),
-                        &token,
-                        &owner,
-                        &name,
-                        &check,
-                    ),
+                    Ok(()) => {
+                        check.external_id = checks::create_identity(&publication.external_id, seq);
+                        api::create(
+                            &self.client,
+                            self.app.endpoint(),
+                            &token,
+                            &owner,
+                            &name,
+                            &check,
+                        )
+                    }
                     // The generation moved while the lane held the row: re-read.
                     Err(StoreError::Conflict) => {
                         return Publish::Retry {

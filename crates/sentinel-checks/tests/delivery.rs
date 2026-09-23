@@ -287,6 +287,8 @@ fn serve(mut stream: TcpStream, data: &Arc<Mutex<Data>>) {
             data.lock().unwrap().existing.push(serde_json::json!({
                 "id": reply.body["id"],
                 "external_id": request["external_id"],
+                // Listed with the status it was created with, as GitHub does.
+                "status": request["status"],
             }));
             return;
         }
@@ -394,9 +396,24 @@ fn default_reply(data: &mut Data, method: &str, path: &str) -> Reply {
         };
     }
     if method == "GET" && path.contains("/check-runs") {
+        // Paged like GitHub: `per_page` (default 30) and 1-based `page`.
+        let param = |name: &str| {
+            path.split(['?', '&'])
+                .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+                .and_then(|v| v.parse::<usize>().ok())
+        };
+        let per_page = param("per_page").unwrap_or(30);
+        let page = param("page").unwrap_or(1).max(1);
+        let listed: Vec<serde_json::Value> = data
+            .existing
+            .iter()
+            .skip((page - 1) * per_page)
+            .take(per_page)
+            .cloned()
+            .collect();
         return Reply {
             status: 200,
-            body: serde_json::json!({"total_count": data.existing.len(), "check_runs": data.existing}),
+            body: serde_json::json!({"total_count": data.existing.len(), "check_runs": listed}),
             headers: Vec::new(),
             lost: false,
         };
@@ -678,9 +695,13 @@ fn a_run_publishes_a_stable_aggregate_and_per_job_checks() {
         .unwrap();
     assert_eq!(aggregate.body["status"], "queued");
     assert_eq!(aggregate.body["head_sha"], SHA_B);
-    assert_eq!(
-        aggregate.body["external_id"],
-        format!("sentinel:{run}:aggregate")
+    // The create carries its generation: every create names exactly one run.
+    assert!(
+        aggregate.body["external_id"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("sentinel:{run}:aggregate:")),
+        "{aggregate:?}"
     );
     assert_eq!(
         aggregate.body["details_url"],
@@ -705,7 +726,13 @@ fn a_run_publishes_a_stable_aggregate_and_per_job_checks() {
         .iter()
         .find(|r| r.body["name"] == "sentinel / build")
         .unwrap();
-    assert_eq!(job.body["external_id"], format!("sentinel:{run}:{build}"));
+    assert!(
+        job.body["external_id"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("sentinel:{run}:{build}:")),
+        "{job:?}"
+    );
     // One repository token for both publications.
     assert_eq!(posts(&records, "/access_tokens").len(), 1);
 
@@ -780,17 +807,20 @@ fn an_ambiguous_create_is_adopted_instead_of_duplicated() {
     // The durable mark of an earlier create whose answer was lost: only a
     // marked publication owes the adoption lookup before creating again.
     let (tenant, run_id, scope) = (f.tenant, run, build.to_string());
-    f.store
+    let seq = f
+        .store
         .writer()
         .write(move |tx| {
             let row = checks::of_run(tx, tenant, run_id)?
                 .into_iter()
                 .find(|row| row.scope == scope)
                 .expect("the job's publication");
-            checks::create_started(tx, row.id, row.seq, UnixMillis::now())
+            checks::create_started(tx, row.id, row.seq, UnixMillis::now())?;
+            Ok(row.seq)
         })
         .unwrap();
-    f.stub.adopt(777, &external);
+    // GitHub lists the run under the identity that create carried.
+    f.stub.adopt(777, &checks::create_identity(&external, seq));
     let lane = start_lane(&f, publisher(&f));
     let records = f
         .stub
@@ -821,6 +851,60 @@ fn an_ambiguous_create_is_adopted_instead_of_duplicated() {
         "the patch carried the suite"
     );
     assert_eq!(row.published_seq, row.seq);
+    drop(lane);
+}
+
+#[test]
+fn adoption_finds_its_run_past_a_large_first_page() {
+    // A commit with many reruns: the listing is larger than one bounded
+    // answer used to accept, and our run is on the second page.
+    let mut f = fixture(None);
+    let (run, build) = event_run(&mut f);
+    let external = format!("sentinel:{run}:{build}");
+    let (tenant, run_id, scope) = (f.tenant, run, build.to_string());
+    let seq = f
+        .store
+        .writer()
+        .write(move |tx| {
+            let row = checks::of_run(tx, tenant, run_id)?
+                .into_iter()
+                .find(|row| row.scope == scope)
+                .expect("the job's publication");
+            checks::create_started(tx, row.id, row.seq, UnixMillis::now())?;
+            Ok(row.seq)
+        })
+        .unwrap();
+    {
+        let padding = "x".repeat(1024);
+        let mut data = f.stub.data.lock().unwrap();
+        for id in 0..120 {
+            data.existing.push(serde_json::json!({
+                "id": 10_000 + id,
+                "external_id": format!("{external}:old{id}"),
+                "status": "completed",
+                "output": {"summary": padding},
+            }));
+        }
+    }
+    f.stub.adopt(999, &checks::create_identity(&external, seq));
+    let lane = start_lane(&f, publisher(&f));
+    f.stub
+        .wait("the adopted update and the aggregate", |records| {
+            records
+                .iter()
+                .any(|r| r.method == "PATCH" && r.path.contains("/check-runs/999"))
+                && !posts(records, "/check-runs").is_empty()
+        });
+    wait_settled_run(&f, run, "the adopted check");
+    let records = f.stub.records();
+    assert!(
+        records
+            .iter()
+            .any(|r| r.method == "GET" && r.path.contains("page=2")),
+        "the second page was read: {records:#?}"
+    );
+    // Only the aggregate (which had no run) was created.
+    assert_eq!(posts(&records, "/check-runs").len(), 1, "{records:#?}");
     drop(lane);
 }
 
@@ -1122,7 +1206,7 @@ fn a_settled_delivery_publishes_a_completed_check() {
     assert_eq!(created[0].body["head_sha"], merge);
     assert_eq!(
         created[0].body["external_id"],
-        format!("sentinel:dlv:{accepted}")
+        format!("sentinel:dlv:{accepted}:1")
     );
     assert!(
         created[0].body["output"]["summary"]
@@ -1139,6 +1223,61 @@ fn a_settled_delivery_publishes_a_completed_check() {
     assert_eq!(row.published_seq, row.seq);
     drop(lane);
     let _ = tenant;
+}
+
+#[test]
+fn a_lost_answer_to_a_completed_create_is_adopted_not_duplicated() {
+    // A settled delivery's aggregate is created already `completed`. Its
+    // create lands but the answer is lost: the retry must adopt that
+    // completed run (it carries this create's own identity) rather than
+    // skip it and POST a second `sentinel / ci`.
+    let f = fixture(None);
+    let repo = f.repo;
+    let sha = "c".repeat(40);
+    let accepted = f
+        .store
+        .writer()
+        .write(move |tx| {
+            let accepted = intake::accept(
+                tx,
+                repo,
+                &NewDelivery {
+                    provider: "generic",
+                    external_id: "lost-completed",
+                    event: "ref_update",
+                    ref_name: REF,
+                    old_sha: SHA_A,
+                    new_sha: &sha,
+                },
+                None,
+                UnixMillis::now(),
+            )?;
+            intake::settle(
+                tx,
+                accepted.id(),
+                intake::Resolution::Failed("no_pipeline"),
+                UnixMillis::now(),
+            )?;
+            Ok(accepted.id())
+        })
+        .unwrap();
+    f.stub.script_lost("POST", "/check-runs", 888);
+    let lane = start_lane(&f, publisher(&f));
+    wait_settled_delivery(&f, accepted, "the adopted completed check");
+    let records = f.stub.records();
+    assert_eq!(
+        posts(&records, "/check-runs").len(),
+        1,
+        "exactly one create: {records:#?}"
+    );
+    let row = f
+        .store
+        .read(|c| checks::of_delivery(c, accepted))
+        .unwrap()
+        .expect("a delivery publication");
+    assert_eq!(row.check_run_id, Some(888), "{row:?}");
+    assert_eq!(row.published_seq, row.seq, "{row:?}");
+    drop(lane);
 }
 
 /// One process-level smoke check: the lane's thread must stop promptly.
