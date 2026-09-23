@@ -560,19 +560,20 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
             // Placement is decided per transaction against the live session
             // set, so the explanation must use the same set.
             let connected = state.controller.connected();
-            let rows = state
+            // The limit goes into the query: only the jobs shown are read and
+            // explained, and `total` is an index count (P08-8).
+            let page = state
                 .store
                 .read(|c| {
                     let tenant = lookup::tenant_by_slug(c, &slug)?;
                     authz::require_tenant_member(c, who.principal, tenant, false)?;
-                    dispatch::list_queue(c, tenant, &connected)
+                    dispatch::list_queue(c, tenant, &connected, limit)
                 })
                 .map_err(store_error)?;
-            let shown = rows.len().min(limit);
             ok(json!({
-                "jobs": rows.iter().take(shown).map(queued_json).collect::<Vec<_>>(),
-                "total": rows.len(),
-                "truncated": rows.len() > shown,
+                "jobs": page.jobs.iter().map(queued_json).collect::<Vec<_>>(),
+                "total": page.total,
+                "truncated": page.total > page.jobs.len(),
             }))
         }
         ("POST", ["api", "v1", "workers", worker, "drain"]) => {
@@ -895,6 +896,7 @@ fn wait_reason_json(reason: dispatch::WaitReason) -> Value {
         }),
         dispatch::WaitReason::WorkerOffline => json!({ "code": "worker_offline" }),
         dispatch::WaitReason::Capacity => json!({ "code": "capacity" }),
+        dispatch::WaitReason::Ready => json!({ "code": "ready" }),
         other => {
             let text = format!("{other:?}");
             match text.split_once(' ') {

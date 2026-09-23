@@ -1356,6 +1356,7 @@ dependencies = [
  "serde",
  "sha2",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

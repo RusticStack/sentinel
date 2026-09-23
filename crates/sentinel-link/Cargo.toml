@@ -11,7 +11,7 @@ publish.workspace = true
 [features]
 default = []
 # The controller's side: listener, admission, fleet and dispatcher over the store.
-controller = ["dep:sentinel-store", "dep:sentinel-github", "dep:sentinel-pipeline", "dep:sentinel-intake"]
+controller = ["dep:sentinel-store", "dep:sentinel-github", "dep:sentinel-pipeline", "dep:sentinel-intake", "dep:tracing"]
 
 [dependencies]
 blake3 = "1.8"
@@ -30,6 +30,8 @@ sentinel-intake = { path = "../sentinel-intake", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 # The Tailcat helper is pinned by SHA-256 and hashed before every execution.
 sha2 = { version = "0.11", default-features = false }
+# The controller's rate-limited dispatch warnings (error kind only, no payload).
+tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
 sentinel-link = { path = ".", features = ["controller"] }
