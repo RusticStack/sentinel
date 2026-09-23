@@ -777,4 +777,191 @@ mod linux {
         assert!(listed.contains(id.trim()), "{listed}");
         assert!(listed.contains("builder-1"));
     }
+
+    /// O07 against the real binary pair: `sentinel server` with a
+    /// bootstrapped password account, and `sentinel auth login --device`
+    /// approved on the server's `/device` page with a password session.
+    /// Afterwards `auth status` verifies the grant, `doctor` passes every
+    /// check, and no output carries token material.
+    #[test]
+    fn a_device_login_against_a_running_server_process() {
+        if !cfg!(feature = "server") {
+            return;
+        }
+        const PASSWORD: &str = "correct horse battery staple";
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("controller");
+        fs::create_dir_all(&data).unwrap();
+        let mut bootstrap = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+            .args(["admin", "bootstrap", "--username", "root", "--data-dir"])
+            .arg(&data)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(bootstrap.stdin.as_mut().unwrap(), PASSWORD.as_bytes()).unwrap();
+        let done = bootstrap.wait_with_output().unwrap();
+        assert!(
+            done.status.success(),
+            "{}",
+            String::from_utf8_lossy(&done.stderr)
+        );
+        let config = temp.path().join("server.toml");
+        fs::write(
+            &config,
+            "listen = '127.0.0.1:0'\napi_listen = '127.0.0.1:0'",
+        )
+        .unwrap();
+        let mut server = Logged::spawn(&[
+            "server",
+            "--config",
+            config.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+        ]);
+        let api = server.event("api_listening");
+        let base = format!("http://{}", api["fields"]["addr"].as_str().unwrap());
+
+        let profiles = temp.path().join("cli-config");
+        let cli = |args: &[&str]| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sentinel"));
+            command
+                .env("SENTINEL_CONFIG_DIR", &profiles)
+                .env("SENTINEL_CREDENTIAL_STORE", "file")
+                .env_remove("SENTINEL_TOKEN")
+                .env_remove("SENTINEL_SERVER")
+                .env_remove("SENTINEL_PROFILE")
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command
+        };
+        let no_tokens = |text: &str| {
+            for kind in ["sntl_at_", "sntl_rt_", "sntl_ac_", "sntl_dc_"] {
+                assert!(!text.contains(kind), "{text}");
+            }
+        };
+        let mut login = cli(&["auth", "login", "--device", "--server", &base])
+            .spawn()
+            .unwrap();
+        let stderr = login.stderr.take().unwrap();
+        let (sender, lines) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut all = String::new();
+            for line in BufReader::new(stderr).lines() {
+                let line = line.unwrap();
+                all.push_str(&line);
+                all.push('\n');
+                let _ = sender.send(line);
+            }
+            all
+        });
+        let user_code = loop {
+            let line = lines
+                .recv_timeout(Duration::from_secs(15))
+                .expect("the user code line");
+            if let Some(rest) = line.split("enter the code ").nth(1) {
+                break rest.split_whitespace().next().unwrap().replace('-', "");
+            }
+        };
+        // The person approves in a browser: a password session, then the page.
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .max_redirects(0)
+                .build(),
+        );
+        let signed_in = agent
+            .post(&format!("{base}/api/v1/login"))
+            .header("content-type", "application/json")
+            .send(
+                serde_json::json!({ "username": "root", "password": PASSWORD })
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(signed_in.status().as_u16(), 200);
+        let cookie = signed_in.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let page = agent
+            .get(&format!("{base}/device?user_code={user_code}"))
+            .header("cookie", &cookie)
+            .call()
+            .unwrap()
+            .into_body()
+            .read_to_string()
+            .unwrap();
+        no_tokens(&page);
+        let at = page.find("name=\"form_token\" value=\"").expect("form") + 25;
+        let form_token = &page[at..at + 64];
+        let mut form = format!("user_code={user_code}&form_token={form_token}&action=approve");
+        for scope in [
+            "runs%3Aread",
+            "runs%3Awrite",
+            "logs%3Aread",
+            "artifacts%3Aread",
+            "cache%3Aread",
+        ] {
+            form.push_str(&format!("&scope_{scope}=1"));
+        }
+        let approved = agent
+            .post(&format!("{base}/device"))
+            .header("cookie", &cookie)
+            .header("origin", &base)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .send(form.as_bytes())
+            .unwrap();
+        assert_eq!(approved.status().as_u16(), 200);
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = login.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "the device login did not finish");
+            thread::sleep(Duration::from_millis(50));
+        };
+        let said = reader.join().unwrap();
+        assert!(status.success(), "{said}");
+        assert!(said.contains("Signed in to"), "{said}");
+        no_tokens(&said);
+
+        let out = cli(&["auth", "status", "--json"]).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            (doc["verified"].as_bool(), doc["username"].as_str()),
+            (Some(true), Some("root"))
+        );
+        let out = cli(&["doctor", "--json"]).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["checks"].as_array().unwrap().len(), 7);
+        for text in [&out.stdout, &out.stderr] {
+            no_tokens(&String::from_utf8_lossy(text));
+        }
+        let out = cli(&["auth", "logout"]).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        server.terminate();
+    }
 }

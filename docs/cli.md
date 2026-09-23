@@ -64,7 +64,7 @@ Implemented in `crates/sentinel/src/{auth_cmd.rs, profile.rs, keystore/, loopbac
 **Every sign-in starts from the server's metadata** (`/.well-known/oauth-authorization-server`). Its `issuer` must equal the normalized `--server` exactly, and every endpoint it names must be on the issuer's origin; otherwise login stops (issuer mismatch exits 2, a foreign endpoint 1) before anything is sent. `--server` defaults to `SENTINEL_SERVER`, then to the profile's existing server. Scopes default to `runs:read runs:write logs:read artifacts:read cache:read`; each `--scope` name must be one the server offers. A successful login writes the profile, makes it `current`, and — when it replaced an older grant of the same profile — revokes that grant (best effort, 5 s bound).
 
 - **Browser.** A listener on `127.0.0.1:0` receives the redirect (`http://127.0.0.1:{port}/callback`). The URL — with `state` (32 random bytes, hex), an S256 `code_challenge`, `scope` and `resource={issuer}/api/v1` — is always printed on stderr and, unless `--no-browser`, handed to `rundll32 url.dll,FileProtocolHandler` (Windows), `open` (macOS) or `xdg-open` as one argv element with no shell. The listener waits at most 5 minutes, reads at most 8 KiB of each request head, answers any other path `404` and keeps waiting; the first `/callback` decides: `state` must match (constant time) and `iss` must equal the issuer (RFC 9207), else the login stops with exit 3. The browser only ever sees a static "you can close this window" page. The code is exchanged with the verifier at the token endpoint.
-- **Device.** The verification URI and user code are printed on stderr (the device code never is); polling honours `interval`, adds 5 s on `slow_down`, continues on `authorization_pending`, and stops with exit 3 on `access_denied`, `expired_token` or when `expires_in` passes. Ctrl-C ends the process; nothing has been written by then.
+- **Device.** The verification URI and user code are printed on stderr (the device code never is); polling honours `interval`, adds 5 s on `slow_down`, continues on `authorization_pending`, and stops with exit 3 on `access_denied`, `expired_token` or when `expires_in` passes. Ctrl-C ends the process with the platform's default signal behaviour — no handler is installed — and nothing has been written by then; the pending request simply expires on the server after 10 minutes.
 - **Grant import.** `--grant-file` reads a `sntl_rt_` refresh token (at most 4 KiB, from a file or stdin with `-`) and spends it at once: the provisioned text is dead afterwards and only its stored successor works, so the file can be deleted. `--scope` and `--device` do not combine with it.
 
 After tokens arrive, `GET /api/v1/me` names the account (a failure here revokes the new grant and nothing is stored). Then, under the profile lock, the credential is stored first and the profile that points at it second. stderr reports `Signed in to {server} as {user} (profile p, grant grt_…)`; stdout stays empty.
@@ -203,11 +203,11 @@ Every command below takes the [shared client flags](#the-shared-client). `--tena
 
 **`artifact download`** looks the entry up in the artifact's manifest, streams the object into `FILE.sentinel-part` beside `FILE` while hashing it (BLAKE3, the object store's digest) and counting bytes, and renames it over `FILE` only when the declared length, the byte count and the digest all match; any mismatch removes the partial file, leaves `FILE` untouched and exits 1. An entry the manifest does not list exits 4.
 
-**`log search`** follows the server's bounded scans: each request reads at most 4 MiB of log, so a 256 MiB log is at most 64 short requests, resumed at `next_after`. A literal split across two frames is not found; text mode says on stderr when the log is still being written (later lines were not searched) or when `--limit` cut the matches.
+**`log search`** follows the server's bounded scans: each request reads at most 4 MiB of log, so a 256 MiB log is at most 64 short requests, resumed at `next_after`. A literal split across two frames of the same step and stream is found (reported with the later frame), except across a request that resumes exactly at a sealed segment boundary; text mode says on stderr when the log is still being written (later lines were not searched) or when `--limit` cut the matches.
 
 **`cache`** reports per-attempt records only (K08 `cache:` entries of that attempt); there is no tenant-wide cache browser.
 
-`sentinel pipeline validate|explain` stay offline; `explain --json` prints `sentinel.explain/1`, and in that mode a failure is one `sentinel.error/1` line on stderr (`invalid_pipeline`, or `client_usage` for an unreadable file) with stdout empty, like the networked commands.
+`sentinel pipeline validate|explain` stay offline and take `--output text|json` (`--json` is `--output json`; there is no list to stream, so no `ndjson`). In JSON mode `explain` prints `sentinel.explain/1` and `validate` prints `{"file", "valid": true, "jobs"}` (text `validate` prints nothing on success), each as one line; a failure is one `sentinel.error/1` line on stderr (`invalid_pipeline`, or `client_usage` for an unreadable file) with stdout empty, like the networked commands.
 
 ## Legacy `sentinel api`
 
@@ -233,8 +233,49 @@ No command prints token material except the one that issues it (`service-account
 
 ## Doctor
 
-_Placeholder: Unit F documents `sentinel doctor` and `sentinel.doctor/1` here._
+`sentinel doctor [--profile P] [--server URL] [--json | --output text|json|ndjson]` diagnoses how this machine signs in, in `crates/sentinel/src/doctor.rs`. It runs seven checks in order; each failure names the exact command or change that fixes it, and no output ever holds token material.
+
+| Check | Passes when | A failure's fix |
+|---|---|---|
+| `config_dir` | the configuration directory can be located, is outside every Git work tree, and it, `credentials/` and `profiles.json` are owner-only (Unix) — a directory that does not exist yet passes | `SENTINEL_CONFIG_DIR=…` outside the repository, or the `chmod`/`chown` the refusal names |
+| `profile` | `--profile`, `SENTINEL_PROFILE` or the current profile exists, and a `--server`/`SENTINEL_SERVER` is that profile's server (checked before any request) | `sentinel auth login --server URL [--profile P]`, or drop the foreign `--server` |
+| `health` | `GET {server}/api/v1/health` answers `{ok: true}` within 10 s | start the controller / check the network; `sentinel auth login --server NEW_URL --profile P` if it moved |
+| `issuer` | the metadata's `issuer` equals the server and the issuer the profile recorded | set the controller's `public_url`, then `sentinel auth login --server PUBLIC_URL --profile P` |
+| `credential_store` | the stored credential is readable from the store the profile records and the sign-in has not expired | `sentinel auth login …`; for an OS store failure, `SENTINEL_CREDENTIAL_STORE=file sentinel auth login …` |
+| `access_token` | `GET /api/v1/me` accepts the profile's access token (refreshed first when it is about to lapse, once more after a `401`) | `sentinel auth login --server S --profile P` |
+| `refresh` | a forced refresh under the profile lock rotates the refresh token | `sentinel auth login --server S --profile P`, or retry when the controller answers |
+
+A check that cannot run because an earlier one failed is reported as skipped (`ok: false`, `"skipped": true`) with that failure's fix: the network checks need `health`, the token checks need `health`, `issuer` and `credential_store`; the local `credential_store` check always runs. The refresh check really spends the stored refresh token once — exactly what any command does when its access token runs low — so the profile continues with the successor.
+
+`--json` (and `--output ndjson`, as one line) prints `sentinel.doctor/1` on stdout, whether or not the checks passed:
+
+```json
+{ "schema": "sentinel.doctor/1", "profile": "default", "server": "https://ci.example.com", "ok": false,
+  "checks": [
+    { "name": "config_dir", "ok": true, "detail": "/home/alice/.config/sentinel (owner-only, outside any Git work tree)", "fix": null },
+    { "name": "health", "ok": false, "detail": "cannot reach https://ci.example.com: …",
+      "fix": "start the controller or check the network; it must answer GET https://ci.example.com/api/v1/health (…)" },
+    { "name": "issuer", "ok": false, "detail": "not checked: the health check failed", "fix": "…", "skipped": true } ] }
+```
+
+Text mode prints one `ok`/`FAIL`/`skip` line per check and a `fix:` line under each failure. **Exit:** 0 when every check passed; otherwise the exit of the first failed check from the [table](#exit-codes) — 2 for the configuration directory, an unknown profile, a server/profile mismatch or an issuer mismatch; 3 when no profile is configured, no credential is stored, the sign-in expired or the server refuses the grant; 6 when the controller or its token endpoint cannot be reached; 1 for an answer that is not Sentinel's — after the report, with one `sentinel.error/1` line on stderr in the JSON modes (`error: doctor: the … check failed; fix: …` in text).
+
+**Actionable failures elsewhere.** The shared client names the next step in its messages: a missing scope (`403` with `details.scope`) becomes `forbidden: the sign-in of profile P lacks the logs:read scope; sign in again asking for it: sentinel auth login --server S --profile P --scope "…"` with the profile's scopes plus the missing ones; a transport failure suggests `sentinel doctor`; a server/profile mismatch lists its three ways out; an answer that is not JSON names the server that sent it.
 
 ## Verification
 
-`crates/sentinel/tests/client.rs` (portable, a fake HTTP server on loopback): each `sentinel.error/1` code and a proxy's non-JSON answer map to their exit; busy answers are retried three times before exit 6; an unreachable controller exits 6; `--json` failures are one error document on stderr with stdout empty; a malformed credential is exit 2 with nothing sent; a static credential needs a Sentinel shape and a loopback-or-https server, and connecting sends nothing. The server/profile mismatch (exit 2 with zero connections) needs real profiles and is covered once they exist (O07). `crates/sentinel/tests/cli.rs` (Linux) runs the legacy commands against a real `sentinel server`.
+`crates/sentinel/tests/client.rs` (portable, a fake HTTP server on loopback): each `sentinel.error/1` code and a proxy's non-JSON answer map to their exit; busy answers are retried three times before exit 6; an unreachable controller exits 6; `--json` failures are one error document on stderr with stdout empty; a malformed credential is exit 2 with nothing sent; a static credential needs a Sentinel shape and a loopback-or-https server, and connecting sends nothing. `crates/sentinel/tests/oauth_e2e.rs` (O07, portable — Windows natively and Linux) runs the real binary against an in-process controller with a temporary `SENTINEL_CONFIG_DIR` and the file store, and scans every stdout and stderr for token material (`sntl_…` followed by 16 or more hex digits, or any `sntl_dc_`):
+
+- browser login with `--no-browser` (the test reads the URL from stderr, consents with a password session and follows the `303` to the CLI's loopback listener), then `auth status --json` and `run list`;
+- device login approved on `/device`;
+- untrusted redirects (no `location`), `plain` PKCE, a foreign `resource`, a wrong verifier (which spends the code), a refresh token as bearer and an access token as refresh token are refused, and the CLI refuses a callback with the wrong `state` or `iss` (exit 3, nothing saved, no grant created);
+- four CLI processes on a nearly expired profile all succeed with exactly one successor refresh token and the grant intact;
+- a lost refresh response recovers inside the 60 s grace window, and the same token after the window (a store call with the clock 61 s ahead, since the server's clock cannot be moved) is replay that revokes the grant; a superseded or twice-used token revokes at once over HTTP;
+- removed membership exits 3 or 4, suspension exits 3 with `not signed in to S (profile P); run: sentinel auth login --server S --profile P`;
+- `--server B` or `SENTINEL_SERVER=B` with profile A (for `run list`, `auth status` and `doctor`) exits 2 and B's listener sees zero connections; a server whose metadata names another issuer is refused at login;
+- logout revokes on the server (old access token `401`, refresh token `invalid_grant`, local credential gone, later commands exit 3 with the login hint), and offline logout deletes locally and exits 1;
+- a service grant imported with `--grant-file` runs commands with stdin closed;
+- a missing scope names the login that asks for it;
+- `doctor`: all seven checks pass for a working profile (and rotate the refresh token once), a removed credential exits 3, a stopped controller exits 6 with local checks still run, no profile exits 3, and a configuration directory inside a Git work tree exits 2 without creating anything.
+
+`crates/sentinel/tests/cli.rs` (Linux, `--features server`) runs the legacy commands against a real `sentinel server` process, and one real-server `auth login --device` approved on that server's `/device` page, followed by `auth status`, `doctor` (all checks pass) and `auth logout`. Opening a real browser is not automated anywhere; the browser flow is exercised through `--no-browser`.

@@ -595,7 +595,7 @@ fn run_status(args: &StatusArgs) -> Result<(), Error> {
     let mut narrowing = Value::Null;
     let mut failure = None;
     if !args.offline && signed_in {
-        match verify(&config, &name) {
+        match verify(&config, &name, &profile::agent()) {
             Ok(me) => {
                 verified = true;
                 narrowing = json!({ "tenant": me["tenant"], "repo": me["repo"] });
@@ -696,17 +696,16 @@ fn run_status(args: &StatusArgs) -> Result<(), Error> {
 }
 
 /// `GET /api/v1/me` through the profile, refreshing once on `401`.
-fn verify(config: &Config, name: &str) -> Result<Value, Error> {
+pub(crate) fn verify(config: &Config, name: &str, agent: &ureq::Agent) -> Result<Value, Error> {
     let handle = config
         .handle(Some(name))?
         .ok_or_else(|| Error::usage("no profile"))?;
-    let agent = profile::agent();
-    let mut token = handle.access_token(&agent)?;
+    let mut token = handle.access_token(agent)?;
     for attempt in 0..2 {
-        let (status, me) = whoami(&agent, handle.server(), &token)?;
+        let (status, me) = whoami(agent, handle.server(), &token)?;
         match status {
             200 => return Ok(me),
-            401 if attempt == 0 => token = handle.force_refresh(&agent, &token)?,
+            401 if attempt == 0 => token = handle.force_refresh(agent, &token)?,
             401 | 403 => break,
             status => {
                 return Err(Error::remote(format!(

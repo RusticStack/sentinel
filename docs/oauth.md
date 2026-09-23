@@ -158,19 +158,21 @@ pub fn purge_expired(store: &Store, now: UnixMillis, limit: u32) -> Result<usize
 // audit: crate::local_auth::audit(tx, Event::…, actor, subject, host_local, detail) — events 48–55
 ```
 
-Stub signatures the owning units implement (bodies currently `Err(Error::InvalidInput("not implemented"))`):
+The flow modules implement these (O01, O03, O06; nothing is a stub any more):
 
 ```rust
-// oauth/code.rs (B)
+// oauth/code.rs — see "Authorization code flow (O01)" for the extra consent helpers
 pub struct ConsentChoice { pub tenant: TenantId, pub slug: String, pub role: Role }
-pub fn consent_choices(conn: &Connection, user: UserId) -> Result<Vec<ConsentChoice>>
+pub fn consent_choices(conn: &Connection, user: UserId) -> Result<Vec<ConsentChoice>>   // at most MAX_CONSENT_CHOICES
+pub fn repo_named(conn: &Connection, tenant: TenantId, name: &str) -> Result<RepoId>
 pub struct Approval<'a> { pub client_id: &'a str, pub redirect_uri: &'a str, pub code_challenge: &'a str,
   pub user: UserId, pub scopes: Scopes, pub tenant: Option<TenantId>, pub repo: Option<RepoId>, pub audience: Audience }
 pub fn approve(store: &Store, a: &Approval<'_>, now: UnixMillis) -> Result<Secret>
+pub fn deny(store: &Store, client_id: &str, user: UserId) -> Result<()>
 #[derive(Debug)] pub enum CodeError { Invalid, Replay, Store(Error) }
 pub fn exchange(store: &Store, client_id: &str, code: &Secret, redirect_uri: &str, verifier: &str, now: UnixMillis)
   -> std::result::Result<Minted, CodeError>
-// oauth/device.rs (C)
+// oauth/device.rs
 #[derive(Debug)] pub struct DeviceStart { pub device: Secret, pub user_code: String, pub expires: UnixMillis, pub interval_ms: i64 }
 pub fn begin(store: &Store, client_id: &str, scopes: Scopes, audience: Audience, now: UnixMillis) -> Result<DeviceStart>
 pub struct DeviceView { pub client_name: String, pub scopes: Scopes, pub expires: UnixMillis }
@@ -179,10 +181,12 @@ pub fn view(conn: &Connection, user_code: &str, now: UnixMillis) -> Result<Devic
 pub fn decide(store: &Store, user_code: &str, user: UserId, d: Decision, now: UnixMillis) -> Result<()>
 #[derive(Debug)] pub enum Poll { Pending, Denied, Expired, Issued(Minted) }
 pub fn poll(store: &Store, client_id: &str, device: &Secret, now: UnixMillis) -> Result<Poll>
-// oauth/service.rs (C)
+// oauth/service.rs
 pub fn issue_service_grant(tx: &Transaction<'_>, principal: Principal, tenant: TenantId, account: UserId, name: &str,
   scopes: Scopes, repo: Option<RepoId>, lifetime_ms: i64, now: UnixMillis) -> Result<(GrantId, Secret, UnixMillis)>
 pub fn service_grants(conn: &Connection, principal: Principal, tenant: TenantId, account: UserId) -> Result<Vec<GrantRecord>>
+pub fn allow_repo(tx: &Transaction<'_>, principal: Principal, tenant: TenantId, account: UserId, repo: RepoId,
+  permissions: Permissions) -> Result<()>
 ```
 
 Migration 30 details the flows rely on: `oauth_device_codes.status` moves only 0→1|2 and 1→3, the approver may narrow `scopes` once in the 0→1 update, and `user_id`/`tenant_id`/`repo_id`/`decided_ms` are written once; `oauth_codes.consumed_ms` and `grant_id` are set once; the partial index `oauth_device_pending(expires_ms) WHERE status = 0` serves the pending cap; `oauth_codes_by_grant` and `oauth_device_by_grant` index the grant links.
@@ -202,11 +206,11 @@ RFC 8628, for a CLI on a machine without a browser (`sentinel auth login --devic
 | `access_denied` | denied on the page, or approved by an account that can no longer hold a grant |
 | `expired_token` | undecided or unredeemed after 10 minutes |
 | `200` token response | approved: the grant (kind device, the approved terms, 90 days), its first pair and the redemption are one writer transaction |
-| `invalid_grant` | unknown, malformed or another client's device code, or one already redeemed — so a request yields tokens exactly once |
+| `invalid_grant` | unknown, malformed or another client's device code, or one already redeemed — so a request yields tokens exactly once. A second redemption does **not** revoke the grant the first one produced (unlike a replayed authorization code): the device code only ever travelled between the server and the polling client, and a client that lost the first answer simply signs in again |
 
 The pacing is in memory (`OAuthState::device_polls`, digest → last poll and interval). Only requests the store confirmed as pending are remembered, so unknown codes cannot grow it; it holds at most `MAX_PENDING_DEVICE` entries, dropping ones idle for a whole request life when full. A final answer forgets the entry; a controller restart forgets them all, which only resets intervals to 5 s.
 
-**Approval page.** `GET /device` without a session shows the embedded password sign-in (a bearer credential or access token is not a session). With one, it asks for the user code (typed case-insensitively, dash and spaces ignored), then shows the client's name, the issuer, the signed-in username, the code for comparison, the time left and one checkbox per requested scope (`tenant:admin` and `platform:admin` flagged), plus optional tenant slug and repository name fields. `POST /device` carries `user_code`, `action=approve|deny`, the ticked `scope_{name}` fields, `tenant`, `repo` and a `form_token` keyed to the session's CSRF digest (`cookie::form_token`); a missing or foreign token is `403`, and so is an `Origin` header other than the issuer's. Approval may only narrow: at least one requested scope, `platform:admin` only for a super admin, the tenant an active membership of the approver, the repository one of that tenant. Only an active person decides — pending, rejected and suspended accounts and service principals are refused — and the grant's insert trigger re-checks the approver at redemption, so an account suspended between approval and polling redeems nothing (`access_denied`) and the request is spent. Decisions are audited (`OAuthDeviceApproved` 53, `OAuthDeviceDenied` 54, then `OAuthGrantIssued` with detail `device`).
+**Approval page.** `GET /device` without a session shows the embedded password sign-in (a bearer credential or access token is not a session). With one, it asks for the user code (typed case-insensitively, dash and spaces ignored), then shows the client's name, the issuer, the signed-in username, the code for comparison, the time left and one checkbox per requested scope (`tenant:admin` and `platform:admin` flagged), plus optional tenant slug and repository name fields. These are plain text fields, not a selector like the consent page's (the page never lists the approver's tenants or repositories); what is typed is resolved server-side against the approver's live memberships, and an unknown or foreign name is refused (`403`) without spending the request. `POST /device` carries `user_code`, `action=approve|deny`, the ticked `scope_{name}` fields, `tenant`, `repo` and a `form_token` keyed to the session's CSRF digest (`cookie::form_token`); a missing or foreign token is `403`, and so is an `Origin` header other than the issuer's. Approval may only narrow: at least one requested scope, `platform:admin` only for a super admin, the tenant an active membership of the approver, the repository one of that tenant. Only an active person decides — pending, rejected and suspended accounts and service principals are refused — and the grant's insert trigger re-checks the approver at redemption, so an account suspended between approval and polling redeems nothing (`access_denied`) and the request is spent. Decisions are audited (`OAuthDeviceApproved` 53, `OAuthDeviceDenied` 54, then `OAuthGrantIssued` with detail `device`).
 
 **Guessing.** A user code is 8 symbols of 20 (about 34.6 bits) and lives 10 minutes. Every wrong or malformed code an account enters on the page, by `GET` or `POST`, counts; after five within ten minutes (`OAuthState::user_code_failures`) the page answers `429` for that account until the window ends, even for a correct code. No page — entry, approval, result, error or sign-in — ever contains the device code.
 
@@ -238,10 +242,10 @@ pub(crate) fn store_failure(sentinel_store::Error) -> Reply      // busy -> temp
 pub(crate) fn token_reply(&Minted, now: UnixMillis) -> Reply     // TokenResponse + no-cache headers
 pub(crate) fn admit(state) -> Result<(), Reply>                  // the shared unauthenticated bucket
 pub(crate) fn session(state, &Request) -> Option<Identity>       // a session cookie identity, never a bearer
-// oauth/html.rs: SECURITY_HEADERS; escape_into(&mut String, &str); escape(&str) -> String;
+// oauth/html.rs: SECURITY_HEADERS; escape_into(&mut String, &str);
 //   document(title, body) -> String; page(status, title, body) -> Reply; error_page(status, message) -> Reply;
 //   redirect(location) -> Reply /* 303, empty body */; SIGN_IN: &str; sign_in_page(title, message) -> Reply
-// stubs the router calls (bodies answer "not available yet"):
+// the flow entry points the router calls:
 // code.rs:    pub(crate) fn authorize(state: &State, request: &mut Request, method: &str, query: &str) -> Route
 //             pub(crate) fn token(state: &State, client: &Client, form: &Form) -> Reply
 // device.rs:  pub(crate) fn authorization(state: &State, request: &mut Request) -> Route
@@ -289,3 +293,15 @@ Tests: `crates/sentinel-store/tests/oauth_device.rs` and `oauth_service.rs` (sto
 ## Tests and harness
 
 `crates/sentinel-store/tests/oauth_tokens.rs` (store), `crates/sentinel-api/tests/oauth_core.rs` (HTTP) and the unit tests in `sentinel-core::auth`, `sentinel-auth::oauth`/`cookie`, `sentinel-protocol::oauth` and `sentinel-store::oauth` (query plans). `oauth_core.rs` holds the harness the other OAuth suites copy: `deployment()` (a bootstrapped super admin `root` with password `PASSWORD` administering tenant `acme` with repository `app`, an operator `dev` with read and run on it, an `sntl_` credential for root, a real server on `127.0.0.1:0` whose issuer is its base URL), `send(d, method, path, Body::{None, Json, Form}, headers) -> Reply { status, headers, body }` (redirects are returned, not followed), `get`, `grant(d, user, scopes) -> Minted` (`issue_grant_trusted`) and `bearer(&access)`.
+
+## End-to-end verification (O07) and known limits
+
+`crates/sentinel/tests/oauth_e2e.rs` drives the real CLI binary through every flow above against an in-process controller: browser login (consent with a password session, the `303` followed to the CLI's loopback listener), device login, the refusals, concurrent refresh, lost-response recovery and replay, cascading revocation, server/profile confusion, logout, service-grant import and `sentinel doctor`, scanning every output for token material ([CLI](cli.md#verification) lists each case). On Linux, `crates/sentinel/tests/cli.rs` adds a device login against a real `sentinel server` process.
+
+Known limits, deliberately not hidden:
+
+- **Signing in needs a local password or an existing session.** The consent and device pages embed only the password sign-in (`/api/v1/login`); GitHub web sign-in is not routed through them, so an account that exists only through GitHub cannot complete an OAuth login yet. Tracked as a follow-up in [TODO](../TODO.md).
+- **One profile, one machine.** Two machines sharing one profile's credential present the same refresh token twice, which is replay and revokes the grant; the lock only serializes processes on one machine.
+- **Narrowing granularity.** A grant narrows to at most one tenant and one repository (the `Principal` shape).
+- **Open consent pages end with the process.** The form key is per process, so a controller restart invalidates consent and device pages that are already open; reloading them works.
+- **Credential stores.** Linux has no Secret Service backend (the owner-only file store is used); the macOS Keychain backend and the macOS build are unverified for lack of macOS hardware.

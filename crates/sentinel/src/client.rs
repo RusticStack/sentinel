@@ -385,9 +385,10 @@ impl Client {
             && normalize_server(explicit)? != base
         {
             return Err(Error::usage(format!(
-                "--server/SENTINEL_SERVER {explicit} does not match profile {} ({base}); \
-                 use --profile for another controller",
-                handle.name()
+                "--server/SENTINEL_SERVER {explicit} does not match profile {name} ({base}); nothing was sent. \
+                 Drop --server (or unset SENTINEL_SERVER) to use {base}, pick that controller's profile with \
+                 --profile NAME, or sign in to it: sentinel auth login --server {explicit} --profile NAME",
+                name = handle.name()
             )));
         }
         Ok(Client {
@@ -486,7 +487,12 @@ impl Client {
         if text.is_empty() {
             return Ok(Value::Null);
         }
-        serde_json::from_str(&text).map_err(|_| Error::remote("the server did not answer JSON"))
+        serde_json::from_str(&text).map_err(|_| {
+            Error::remote(format!(
+                "{} did not answer JSON; is it a Sentinel controller (and not a proxy's page)?",
+                self.base
+            ))
+        })
     }
 
     /// Turn a non-success answer into an [`Error`].
@@ -498,10 +504,10 @@ impl Client {
                 let code = api["code"].as_str().unwrap_or("error").to_owned();
                 let message = api["message"].as_str().unwrap_or("").to_owned();
                 let exit = Exit::for_code(&code);
-                let message = if exit == Exit::Auth && code == "unauthenticated" {
-                    self.not_signed_in(&message)
-                } else {
-                    format!("{code}: {message}")
+                let message = match code.as_str() {
+                    "unauthenticated" => self.not_signed_in(&message),
+                    "forbidden" => self.forbidden(&message, api["details"]["scope"].as_str()),
+                    _ => format!("{code}: {message}"),
                 };
                 Error {
                     message,
@@ -521,6 +527,37 @@ impl Client {
                 profile = handle.name()
             ),
             Credential::Static(_) => format!("unauthenticated: {message}"),
+        }
+    }
+
+    /// A refusal, with what to do: a missing scope names the sign-in that
+    /// asks for it; anything else is the account's own permission.
+    fn forbidden(&self, message: &str, scope: Option<&str>) -> String {
+        match (scope, &self.credential) {
+            (Some(scope), Credential::Profile(handle)) => {
+                let mut granted: Vec<&str> =
+                    handle.profile().scopes.split_ascii_whitespace().collect();
+                for name in scope.split_ascii_whitespace() {
+                    if !granted.contains(&name) {
+                        granted.push(name);
+                    }
+                }
+                format!(
+                    "forbidden: the sign-in of profile {profile} lacks the {scope} scope; sign in again asking for it: \
+                     sentinel auth login --server {server} --profile {profile} --scope \"{scopes}\"",
+                    profile = handle.name(),
+                    server = self.base,
+                    scopes = granted.join(" ")
+                )
+            }
+            (Some(scope), Credential::Static(_)) => {
+                format!(
+                    "forbidden: this credential lacks the {scope} scope; use one that carries it"
+                )
+            }
+            (None, _) => format!(
+                "forbidden: {message} (the account lacks the permission; ask a tenant administrator)"
+            ),
         }
     }
 
@@ -620,7 +657,14 @@ impl Client {
     }
 
     fn transport(&self, error: ureq::Error) -> Error {
-        Error::new(Exit::Busy, format!("cannot reach {}: {error}", self.base))
+        Error::new(
+            Exit::Busy,
+            format!(
+                "cannot reach {}: {error}; check that the controller is running \
+                 (sentinel doctor diagnoses the profile)",
+                self.base
+            ),
+        )
     }
 }
 
