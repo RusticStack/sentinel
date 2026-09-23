@@ -1,6 +1,6 @@
 # Sentinel — implementation plan
 
-Status: design and acceptance criteria; runtime/measurement foundations, core/store/protocol contracts, pipeline compilation and A01 durable authorization are implemented. Job execution is not implemented yet. See the [Parts 01–02 audit](docs/parts-01-02-audit.md) for outstanding gates.
+Status: design and acceptance criteria. Parts 01–09 of the [backlog](TODO.md) are implemented — foundations, contracts, identity and authorization, durable execution, sources and GitHub feedback, storage, caches, fleet scheduling, and the OAuth server with the developer CLI; secret management (Part 10) and later parts are not. See [TODO](TODO.md) for per-task evidence and the [Parts 01–02 audit](docs/parts-01-02-audit.md) for outstanding gates.
 Reviewed: 2026-09-14. Repository: `RusticStack/sentinel`.
 
 Development tracker: [TODO.md](TODO.md) splits this design into actionable parts, dependencies, first-slice work, and verification gates. Implementation progress is recorded there.

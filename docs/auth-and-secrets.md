@@ -1,6 +1,6 @@
 # OAuth, CLI/MCP access, and secret management
 
-Status: OAuth/secrets implementation contract; A01's [durable identity/authorization layer](authorization.md) exists, but there is no running login/token service yet. This extends the multi-tenant roles/registration policy in [plan.md](../plan.md). Built for humans and coding agents to use the same scoped operations with little repeated setup.
+Status: OAuth/secrets implementation contract. The CLI half of the OAuth design is implemented (Part 09): the integrated authorization server with authorization code + PKCE, device authorization, rotating refresh tokens and service-account grants ([OAuth](oauth.md)), and CLI sign-in with profiles and OS/owner-only credential storage ([CLI](cli.md)). Remote MCP OAuth (§3, Part 11) and secret management (Part 10) are not implemented yet, and the consent and device pages sign in with a local password only (GitHub web sign-in there is a follow-up). This extends the multi-tenant roles/registration policy in [plan.md](../plan.md). Built for humans and coding agents to use the same scoped operations with little repeated setup.
 
 ## 1. Identities and tokens
 
