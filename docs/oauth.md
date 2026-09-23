@@ -164,7 +164,28 @@ Migration 30 details the flows rely on: `oauth_device_codes.status` moves only 0
 
 ## Device authorization (O03)
 
-_Placeholder: Unit C documents `/oauth/device_authorization`, polling and `/device` here._
+RFC 8628, for a CLI on a machine without a browser (`sentinel auth login --device`). The device code goes only to the polling client; a person approves on `/device` in a browser where they are signed in.
+
+**Request.** `POST /oauth/device_authorization` with `client_id` (the client must be device-capable, else `unauthorized_client`), optional `scope` (default `Scopes::CLI_DEFAULT` ∩ the client's ceiling; unknown or beyond the ceiling is `invalid_scope`) and optional `resource` (`invalid_target` unless `{issuer}/api/v1`). It shares the unauthenticated bucket. The answer is `DeviceAuthorization`: `device_code` (`sntl_dc_…`), `user_code` `XXXX-XXXX`, `verification_uri` `{issuer}/device`, `verification_uri_complete` `{issuer}/device?user_code=XXXXXXXX`, `expires_in: 600`, `interval: 5`. The deployment holds at most `MAX_PENDING_DEVICE` (1024) unexpired pending requests; beyond it the answer is `429 slow_down` with `retry-after: 5`. The count walks the partial index of pending rows and stops at the cap; expired requests stop counting without a purge.
+
+**Polling.** `POST /oauth/token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `client_id` and `device_code`. Each poll is one primary-key read; only the poll that finds an approved request writes. Answers (400 unless issued):
+
+| Answer | When |
+|---|---|
+| `authorization_pending` | nobody has decided yet |
+| `slow_down` | this device polled sooner than its current interval; the interval grows by 5 s (`SLOW_DOWN_STEP_MS`) each time, up to the request's life |
+| `access_denied` | denied on the page, or approved by an account that can no longer hold a grant |
+| `expired_token` | undecided or unredeemed after 10 minutes |
+| `200` token response | approved: the grant (kind device, the approved terms, 90 days), its first pair and the redemption are one writer transaction |
+| `invalid_grant` | unknown, malformed or another client's device code, or one already redeemed — so a request yields tokens exactly once |
+
+The pacing is in memory (`OAuthState::device_polls`, digest → last poll and interval). Only requests the store confirmed as pending are remembered, so unknown codes cannot grow it; it holds at most `MAX_PENDING_DEVICE` entries, dropping ones idle for a whole request life when full. A final answer forgets the entry; a controller restart forgets them all, which only resets intervals to 5 s.
+
+**Approval page.** `GET /device` without a session shows the embedded password sign-in (a bearer credential or access token is not a session). With one, it asks for the user code (typed case-insensitively, dash and spaces ignored), then shows the client's name, the issuer, the signed-in username, the code for comparison, the time left and one checkbox per requested scope (`tenant:admin` and `platform:admin` flagged), plus optional tenant slug and repository name fields. `POST /device` carries `user_code`, `action=approve|deny`, the ticked `scope_{name}` fields, `tenant`, `repo` and a `form_token` keyed to the session's CSRF digest (`cookie::form_token`); a missing or foreign token is `403`, and so is an `Origin` header other than the issuer's. Approval may only narrow: at least one requested scope, `platform:admin` only for a super admin, the tenant an active membership of the approver, the repository one of that tenant. Only an active person decides — pending, rejected and suspended accounts and service principals are refused — and the grant's insert trigger re-checks the approver at redemption, so an account suspended between approval and polling redeems nothing (`access_denied`) and the request is spent. Decisions are audited (`OAuthDeviceApproved` 53, `OAuthDeviceDenied` 54, then `OAuthGrantIssued` with detail `device`).
+
+**Guessing.** A user code is 8 symbols of 20 (about 34.6 bits) and lives 10 minutes. Every wrong or malformed code an account enters on the page, by `GET` or `POST`, counts; after five within ten minutes (`OAuthState::user_code_failures`) the page answers `429` for that account until the window ends, even for a correct code. No page — entry, approval, result, error or sign-in — ever contains the device code.
+
+Store API (`sentinel_store::oauth::device`): `begin` (`NotFound` unknown client, `Forbidden` not device-capable, `InvalidInput("scope")`, `QuotaExceeded` at the cap), `view` (pending and unexpired only), `decide` (`NotFound` for no pending request with that code, `Forbidden`/`InvalidInput` per the rules above; nothing is spent by a refused decision), `poll` (`Pending`, `Denied`, `Expired`, `Issued(Minted)`; `NotFound` as `invalid_grant`). A query-plan test keeps the cap count, the user-code lookup and the poll on indexes.
 
 ## HTTP plumbing (`sentinel-api`, crate-private)
 
@@ -210,7 +231,35 @@ The token endpoint has already checked `grant_type`, `client_id` (unknown is `in
 
 ## Service-account grants (O06)
 
-_Placeholder: Unit C documents service accounts, their grants and `sentinel service-account` here._
+A service account is a service principal (`users.kind = 1`) confined to its home tenant; it never signs in. An administrator of that tenant (a platform administrator also qualifies) gives it repository access and issues it **service grants**: named refresh-token grants of kind 3 for the `sentinel-cli` client, narrowed to the home tenant and optionally one of its repositories. The agent imports the refresh token (`sentinel auth login --grant-file`, [CLI](cli.md)) and from then on refreshes like any login.
+
+Routes (JSON, `sentinel.error/1`; every one needs the `tenant:admin` scope and, in the store, live administration of the tenant — members get `403`, unknown accounts or repositories `404`):
+
+| Route | Body | Answer |
+|---|---|---|
+| `POST /api/v1/tenants/{slug}/service-accounts` | `{name, role?: "reader"\|"operator"}` (default operator) | `201 {user, name, role}` |
+| `PUT /api/v1/tenants/{slug}/service-accounts/{usr}/repos/{name}` | `{access: ["read", "run"]}` (`[]` withdraws) | `200 {user, repo, access}` |
+| `POST /api/v1/tenants/{slug}/service-accounts/{usr}/grants` | `{name, scope, repo?, expires_in_ms?}` | `201 {grant, refresh_token, expires_ms, scope}` |
+| `GET /api/v1/tenants/{slug}/service-accounts/{usr}/grants` | | `200 {grants: [...]}` |
+
+Issuance rules: `scope` is space-separated scope names, non-empty, never `tenant:admin` or `platform:admin` (`400`; the insert trigger refuses them too); the lifetime defaults to 30 days (`SERVICE_DEFAULT_MS`) within 1 hour..90 days (`SERVICE_MIN_MS`..`SERVICE_MAX_MS`, else `400`); `repo` must be a repository of the tenant; the account must be an active service principal of the tenant. One writer transaction writes the grant (`created_by` = the administrator, audited `ServiceGrantIssued` 55) and a single refresh token of generation 1 whose idle expiry is the grant's own — no access token is minted, since the holder refreshes first. The refresh token appears exactly once, in the `201`; only its digest is stored, and nothing lists or re-reveals it. A service grant's repository access remains the live `repo_grants` check: the grant is a ceiling, `PUT …/repos/{name}` is the authority.
+
+Listing is metadata only, newest first, at most 100, revoked grants included: `{id, user, client_id, kind: "service", scope, tenant, repo, name, created_ms, expires_ms, last_used_ms, revoked}`.
+
+Grants of any kind:
+
+| Route | Who | Answer |
+|---|---|---|
+| `GET /api/v1/grants` | any authenticated caller | `200 {grants: [...]}`: the caller's own grants, same metadata shape |
+| `DELETE /api/v1/grants/{grt}` | the grant's owner, an administrator of a service grant's home tenant, or a platform administrator | `200 {grant, revoked: true}` (reason 7, audited); anyone else `404`; revoking a revoked grant is `200` |
+
+After revocation the grant's access tokens are `401` and its refresh tokens `invalid_grant`. Tenant suspension revokes every service grant of the tenant (reason 6).
+
+Store API (`sentinel_store::oauth::service`): `issue_service_grant(tx, principal, tenant, account, name, scopes, repo, lifetime_ms, now) -> (GrantId, Secret, UnixMillis)` (`Forbidden` not an administrator; `NotFound` account or repository; `InvalidInput` scope, lifetime or name), `service_grants(conn, principal, tenant, account)` (`Forbidden`, `NotFound`), and `allow_repo(tx, principal, tenant, account, repo, permissions)`, which confines `auth::set_repo_grant` to a service principal and repository of that tenant. Revocation is `oauth::revoke_grant`.
+
+The CLI is `sentinel service-account create|allow|grant|grants|revoke` ([CLI](cli.md#service-accounts)).
+
+Tests: `crates/sentinel-store/tests/oauth_device.rs` and `oauth_service.rs` (store rules), `crates/sentinel-api/tests/oauth_device.rs` and `oauth_service.rs` (HTTP, including the end-to-end create → allow → grant → refresh → read runs → revoke → `invalid_grant`), `crates/sentinel/tests/service_accounts.rs` (the CLI binary against an in-process controller), and unit tests for the poll pacing and the CLI's argument checks.
 
 ## Tests and harness
 
