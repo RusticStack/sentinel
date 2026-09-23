@@ -18,6 +18,7 @@
 
 pub mod attach;
 pub mod clone;
+mod confined;
 pub mod gc;
 pub mod lease;
 pub mod manifest;

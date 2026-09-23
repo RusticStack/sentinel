@@ -8,8 +8,20 @@
 //! Trust scope is authorization: a publish writes only into the
 //! attachment's own scope directory, and `commit` refuses an attachment
 //! whose scope trust is not the job's. There is no cross-trust promotion
-//! in v1 — a pull-request publish can only ever produce `pull_request`
-//! entries.
+//! — an untrusted publish can only ever produce entries of its own class.
+//!
+//! The job's views are read confined (`confined`): every declared target
+//! is resolved beneath the worker-owned workspace anchor without following
+//! a symlink at any component, and every file is reopened by descriptor
+//! with `O_NOFOLLOW` — a job cannot redirect publication at host files by
+//! planting or racing a link (P07-1). An entry whose restore was refused
+//! (`invalid`) or whose key never rendered publishes nothing.
+//!
+//! Publication is bounded in bytes as well as files: a generation over
+//! [`MAX_GENERATION_BYTES`] of logical payload is refused before a byte is
+//! staged, a filesystem without room for the copy plus a reserve is
+//! refused the same way, and a sparse file is copied hole-for-hole so a
+//! mostly-empty file never amplifies into dense writes (P07-5).
 //!
 //! Incremental reuse rides the source generation the job cloned from: a
 //! file whose digest matches the source's listing is staged by hardlink
@@ -19,7 +31,7 @@
 use std::{
     collections::HashMap,
     fs,
-    io::{ErrorKind, Read, Write},
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -29,19 +41,32 @@ use sentinel_pipeline::schema::valid_relative_path;
 use sentinel_protocol::cache::Trust;
 
 use crate::{
-    attach::{Attached, entry_key},
+    attach::{Attached, Target, entry_key},
+    confined::{Base, Kind, Meta, Node},
     lease::{LeaseError, WriteLock, rand_u32},
     manifest::{
         FileEntry, FilesBlob, MAX_FILE_ENTRIES, MAX_FILES_BLOB_BYTES, Manifest, read_files,
     },
+    outcome::{Miss, Outcome},
     scope,
 };
 
 /// The deadline finalization gives the whole publish batch
-/// (docs/cache.md). Publication is off the required path: a job's verdict
-/// never waits on its cache, so the bound is minutes, not the job's own
-/// budget.
+/// (docs/cache.md). The verdict's outcome never depends on it; its report
+/// waits for it, so the bound is minutes, not the job's own budget.
 pub const CACHE_PUBLISH_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+
+/// The most logical payload one generation may carry: a quarter of the
+/// store's byte budget (`gc::DEFAULT_BUDGET_BYTES`). Checked against the
+/// planned sizes before anything is staged, so neither an honest cache
+/// far over budget nor a sparse file claiming terabytes can drive the
+/// worker's disk (P07-5).
+pub const MAX_GENERATION_BYTES: u64 = crate::gc::DEFAULT_BUDGET_BYTES / 4;
+
+/// Free space a publish always leaves on the store's filesystem beyond
+/// what its copy needs — 5 % of the filesystem, at most this much:
+/// concurrent attempts, log spools and mirrors share the disk.
+pub const FREE_SPACE_RESERVE: u64 = 1 << 30;
 
 /// Cancel and deadline are polled every this many walked or staged files.
 const CHECK_EVERY: u32 = 256;
@@ -50,8 +75,13 @@ const CHECK_EVERY: u32 = 256;
 /// `pub(crate)` for restore: a sealed generation can never hold a tree
 /// deeper than a writer could stage, so the read side shares the bound.
 pub(crate) const MAX_WALK_DEPTH: usize = 64;
-/// Stream block for hashing and copying; hashing rides the copy pass.
+/// Stream block for hashing and copying; hashing rides the copy pass. One
+/// buffer per commit, allocated on first use.
 const COPY_BYTES: usize = 1 << 20;
+/// Copied files whose durability is settled one by one; past this many a
+/// commit flushes the store's filesystem once instead (`syncfs`), so a
+/// 100k-file generation pays one barrier, not 100k.
+const SYNC_FDS: usize = 64;
 /// Staging for the `current` swap: `current.tmp` then a rename.
 /// `pub(crate)` for the remote path: a hydrated generation is promoted by
 /// the same two renames a publication uses.
@@ -72,7 +102,7 @@ pub enum Published {
         /// (hardlinked and verified) instead of copied from the job.
         reused_bytes: u64,
         /// Entries the walk saw but did not stage: non-regular files,
-        /// unencodable paths, files that vanished mid-publish.
+        /// symlinks, unencodable paths, files that vanished mid-publish.
         skipped: u64,
     },
     /// Nothing was committed; the reason is stable vocabulary for logs.
@@ -91,6 +121,10 @@ pub enum SkipReason {
     /// The staged listing is identical to the source generation's — the
     /// bytes are already published under an older generation.
     Unchanged,
+    /// Restore refused the entry (`invalid`: a declared path that cannot
+    /// serve, or a key that never rendered) — nothing it left behind is
+    /// worth sealing, and a refused path is never walked.
+    Refused,
 }
 
 impl SkipReason {
@@ -101,6 +135,7 @@ impl SkipReason {
             Self::Canceled => "canceled",
             Self::Empty => "empty",
             Self::Unchanged => "unchanged",
+            Self::Refused => "refused",
         }
     }
 }
@@ -114,8 +149,12 @@ pub enum PublishError {
     TrustMismatch,
     /// The caller's deadline passed mid-commit; staging was removed.
     TimedOut,
-    /// The generation would exceed the `files` blob's bounds.
+    /// The generation would exceed the `files` blob's bounds or
+    /// [`MAX_GENERATION_BYTES`]; refused before staging.
     TooLarge,
+    /// The store's filesystem has no room for the copy plus
+    /// [`FREE_SPACE_RESERVE`]; refused before staging.
+    NoSpace,
     /// The staging lock could not be taken for a reason other than a live
     /// writer (which is `Skipped(Busy)` instead).
     Lock(LeaseError),
@@ -127,7 +166,8 @@ impl std::fmt::Display for PublishError {
         match self {
             Self::TrustMismatch => f.write_str("scope trust is not the job's"),
             Self::TimedOut => f.write_str("publish exceeded its deadline"),
-            Self::TooLarge => f.write_str("generation exceeds the files blob bounds"),
+            Self::TooLarge => f.write_str("generation exceeds the publish bounds"),
+            Self::NoSpace => f.write_str("not enough free space for the generation"),
             Self::Lock(e) => write!(f, "write lock: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
         }
@@ -185,6 +225,12 @@ pub fn commit(
     if attached.scope.trust != trust {
         return Err(PublishError::TrustMismatch);
     }
+    // What restore refused is never walked: a declared path that could not
+    // be resolved safely, or a key that never rendered (an entry named for
+    // `""` could never serve — `Manifest::validate` refuses an empty key).
+    if attached.key.is_empty() || attached.outcome == Outcome::Miss(Miss::Invalid) {
+        return Ok(Published::Skipped(SkipReason::Refused));
+    }
     if cancel() || Instant::now() >= deadline {
         return Ok(Published::Skipped(SkipReason::Canceled));
     }
@@ -225,13 +271,17 @@ pub fn commit(
 
 /// One file seen in a target, decided but not yet staged.
 struct Planned {
-    /// The job's file on disk.
-    job: PathBuf,
+    /// Which confined base the file is reopened beneath (`Plan::bases`).
+    base: usize,
+    /// The file's path beneath that base, `/`-separated.
+    rel: String,
     /// The `payload/<i>/<rel>` path — both the `files` entry name and the
     /// path inside the generation.
     entry: String,
     size: u64,
     mode: u32,
+    /// Holes carry most of the file: copy it hole-for-hole.
+    sparse: bool,
     /// The job file's digest, computed only when the source generation
     /// lists this path at the same size — the reuse proof, `Some` only
     /// then. The staged copy carries its own digest either way.
@@ -243,12 +293,20 @@ struct Plan<'a> {
     /// `payload/…` → the source generation's listing entry.
     listed: HashMap<&'a str, &'a FileEntry>,
     planned: Vec<Planned>,
+    /// The confined directories planned files are reopened beneath: one
+    /// per directory target, or the workspace anchor for a file target.
+    bases: Vec<Base>,
+    /// Logical payload bytes planned so far — the [`MAX_GENERATION_BYTES`]
+    /// bound.
+    bytes: u64,
     /// Non-regular, unencodable or vanished entries, for diagnostics.
     skipped: u64,
     /// Walked or staged files since the last cancel/deadline poll.
     since_check: u32,
     /// Every planned file already matches the source listing.
     unchanged: bool,
+    /// The one copy/hash block this commit uses, allocated on first use.
+    buf: Vec<u8>,
 }
 
 impl Plan<'_> {
@@ -271,6 +329,28 @@ impl Plan<'_> {
             self.check(deadline, cancel)?;
         }
         Ok(())
+    }
+
+    fn buf(&mut self) -> &mut [u8] {
+        if self.buf.len() < COPY_BYTES {
+            self.buf.resize(COPY_BYTES, 0);
+        }
+        &mut self.buf
+    }
+
+    /// Bytes the copy will actually write: everything not provably
+    /// reusable from the source generation.
+    fn copy_bytes(&self) -> u64 {
+        self.planned
+            .iter()
+            .filter(|p| {
+                !matches!(
+                    (p.digest, self.listed.get(p.entry.as_str())),
+                    (Some(d), Some(l)) if l.digest == d && l.mode == p.mode
+                )
+            })
+            .map(|p| p.size)
+            .sum()
     }
 }
 
@@ -308,12 +388,15 @@ fn stage(
     let mut plan = Plan {
         listed,
         planned: Vec::new(),
+        bases: Vec::with_capacity(attached.targets.len()),
+        bytes: 0,
         skipped: 0,
         since_check: 0,
         unchanged: true,
+        buf: Vec::new(),
     };
     for (index, target) in attached.targets.iter().enumerate() {
-        plan_target(&mut plan, index, &target.dir, deadline, cancel)?;
+        plan_target(&mut plan, index, target, deadline, cancel)?;
     }
     if plan.planned.is_empty() {
         return Ok(Published::Skipped(SkipReason::Empty));
@@ -329,6 +412,14 @@ fn stage(
         return Ok(Published::Skipped(SkipReason::Unchanged));
     }
     plan.check(deadline, cancel)?;
+    // Room for what will be copied, plus the reserve every other user of
+    // the disk keeps — checked before a byte lands, never discovered by an
+    // ENOSPC halfway through.
+    if let Some((free, total)) = free_bytes(entry)
+        && free < plan.copy_bytes().saturating_add(reserve(total))
+    {
+        return Err(PublishError::NoSpace.into());
+    }
     fs::create_dir_all(staging)?;
     let (entries, bytes, reused_bytes) = materialize(
         &mut plan,
@@ -376,41 +467,86 @@ fn stage(
     })
 }
 
-/// Walk one declared path into the plan. A missing target contributes
-/// nothing; a symlinked or special target root is skipped, never
-/// followed.
+/// `rel`'s components joined by `/` — the form a confined reopen takes.
+fn slash_path(rel: &Path) -> Option<String> {
+    let mut out = String::new();
+    for comp in rel.iter() {
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(comp.to_str()?);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Walk one declared path into the plan, confined beneath the target's
+/// anchor. A missing target contributes nothing; a target that is — or
+/// sits beneath — a symlink or special entry is skipped, never followed.
 fn plan_target(
     plan: &mut Plan<'_>,
     index: usize,
-    dir: &Path,
+    target: &Target,
     deadline: Instant,
     cancel: &dyn Fn() -> bool,
 ) -> Result<(), Stop> {
     let prefix = format!("payload/{index}");
-    let meta = match fs::symlink_metadata(dir) {
-        Ok(meta) => meta,
-        // A path the job never made contributes no files.
+    let Some(rel) = target
+        .dir
+        .strip_prefix(&target.root)
+        .ok()
+        .and_then(slash_path)
+    else {
+        // A target that is not strictly beneath its anchor has no confined
+        // form; it is never read.
+        plan.skipped += 1;
+        return Ok(());
+    };
+    let anchor = match Base::anchor(&target.root) {
+        Ok(anchor) => anchor,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    if meta.is_dir() {
-        let mut rel = String::new();
-        plan.walk(dir, &prefix, &mut rel, 0, deadline, cancel)
-    } else if meta.is_file() {
-        // A declared path that is itself a file stages as `payload/<i>`.
-        plan.plan_file(dir.to_path_buf(), prefix, &meta, deadline, cancel)
-    } else {
-        plan.skipped += 1;
-        Ok(())
+    match anchor.resolve(Path::new(&rel))? {
+        // A path the job never made contributes no files.
+        Node::Missing => Ok(()),
+        Node::Dir(dir) => {
+            let base = plan.bases.len();
+            let mut walked = String::new();
+            let out = plan.walk(&dir, base, &prefix, &mut walked, 0, deadline, cancel);
+            plan.bases.push(dir);
+            out
+        }
+        Node::File(meta) => {
+            // A declared path that is itself a file stages as `payload/<i>`,
+            // reopened beneath the anchor by its own relative path.
+            let base = plan.bases.len();
+            let out = plan.plan_file(
+                base,
+                rel.clone(),
+                prefix,
+                meta,
+                || anchor.open(&rel),
+                deadline,
+                cancel,
+            );
+            plan.bases.push(anchor);
+            out
+        }
+        Node::Other => {
+            plan.skipped += 1;
+            Ok(())
+        }
     }
 }
 
 impl Plan<'_> {
-    /// Recursive walk of one target directory; depth is capped and every
-    /// entry is classified without following links.
+    /// Recursive walk of one target directory, descriptor by descriptor;
+    /// depth is capped and every entry is classified without following.
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         &mut self,
-        dir: &Path,
+        dir: &Base,
+        base: usize,
         prefix: &str,
         rel: &mut String,
         depth: usize,
@@ -421,59 +557,60 @@ impl Plan<'_> {
             self.skipped += 1;
             return Ok(());
         }
-        let mut children: Vec<fs::DirEntry> = match fs::read_dir(dir) {
-            Ok(read) => read.collect::<Result<_, _>>()?,
-            // A directory can vanish under a still-running container.
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        // Sorted so the listing — and so the sealed digest — never depends
-        // on filesystem order.
-        children.sort_by_key(|e| e.file_name());
-        for child in children {
+        // Sorted by the listing so the sealed digest never depends on
+        // filesystem order.
+        let children = dir.entries()?;
+        for (name, kind) in children {
             self.tick(deadline, cancel)?;
-            let kind = match child.file_type() {
-                Ok(kind) => kind,
-                Err(e) if e.kind() == ErrorKind::NotFound => {
-                    self.skipped += 1;
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            };
-            let Some(name) = child.file_name().to_str().map(str::to_owned) else {
+            let Some(text) = name.to_str() else {
                 // Names the `files` blob can never encode are skipped,
                 // never mangled.
                 self.skipped += 1;
                 continue;
             };
-            if kind.is_dir() {
-                let saved = rel.len();
-                if !rel.is_empty() {
-                    rel.push('/');
-                }
-                rel.push_str(&name);
-                self.walk(&child.path(), prefix, rel, depth + 1, deadline, cancel)?;
-                rel.truncate(saved);
-            } else if kind.is_file() {
-                let entry = if rel.is_empty() {
-                    format!("{prefix}/{name}")
-                } else {
-                    format!("{prefix}/{rel}/{name}")
-                };
-                let meta = match child.metadata() {
-                    Ok(meta) => meta,
-                    Err(e) if e.kind() == ErrorKind::NotFound => {
-                        self.skipped += 1;
-                        continue;
+            let saved = rel.len();
+            if !rel.is_empty() {
+                rel.push('/');
+            }
+            rel.push_str(text);
+            let out = match kind {
+                Kind::Dir => match dir.dir(&name)? {
+                    Some(child) => {
+                        self.walk(&child, base, prefix, rel, depth + 1, deadline, cancel)
                     }
-                    Err(e) => return Err(e.into()),
-                };
-                self.plan_file(child.path(), entry, &meta, deadline, cancel)?;
-            } else {
+                    // Replaced since the listing: not followed, counted.
+                    None => {
+                        self.skipped += 1;
+                        Ok(())
+                    }
+                },
+                Kind::File => match dir.stat(&name)? {
+                    Some(meta) => {
+                        let entry = format!("{prefix}/{rel}");
+                        self.plan_file(
+                            base,
+                            rel.clone(),
+                            entry,
+                            meta,
+                            || dir.open_child(&name),
+                            deadline,
+                            cancel,
+                        )
+                    }
+                    None => {
+                        self.skipped += 1;
+                        Ok(())
+                    }
+                },
                 // Symlinks and special files are never followed and never
                 // encoded: counted, then passed over.
-                self.skipped += 1;
-            }
+                Kind::Other => {
+                    self.skipped += 1;
+                    Ok(())
+                }
+            };
+            rel.truncate(saved);
+            out?;
         }
         Ok(())
     }
@@ -481,11 +618,14 @@ impl Plan<'_> {
     /// Decide one file's place in the listing: hash it only when the
     /// source generation lists the same path at the same size — the
     /// digest is the reuse proof and the unchanged check at once.
+    #[allow(clippy::too_many_arguments)]
     fn plan_file(
         &mut self,
-        job: PathBuf,
+        base: usize,
+        rel: String,
         entry: String,
-        meta: &fs::Metadata,
+        meta: Meta,
+        open: impl FnOnce() -> std::io::Result<Option<(fs::File, Meta)>>,
         deadline: Instant,
         cancel: &dyn Fn() -> bool,
     ) -> Result<(), Stop> {
@@ -496,16 +636,23 @@ impl Plan<'_> {
             self.skipped += 1;
             return Ok(());
         }
-        let size = meta.len();
-        let mode = file_mode(meta);
-        let digest = match self.listed.get(entry.as_str()) {
-            Some(listed) if listed.size == size => match hash_file(&job) {
-                Ok(digest) => Some(digest),
-                Err(e) if e.kind() == ErrorKind::NotFound => {
+        let size = meta.size;
+        self.bytes = self.bytes.saturating_add(size);
+        if self.bytes > MAX_GENERATION_BYTES {
+            return Err(PublishError::TooLarge.into());
+        }
+        let mode = meta.mode;
+        let listed_size = self.listed.get(entry.as_str()).map(|l| l.size);
+        let digest = match listed_size {
+            Some(listed) if listed == size => match open()? {
+                Some((mut file, opened)) if opened.size == size => {
+                    Some(hash_reader(&mut file, size, self.buf())?)
+                }
+                // Vanished or changed shape since the listing.
+                _ => {
                     self.skipped += 1;
                     return Ok(());
                 }
-                Err(e) => return Err(e.into()),
             },
             _ => None,
         };
@@ -519,13 +666,56 @@ impl Plan<'_> {
             self.unchanged = false;
         }
         self.planned.push(Planned {
-            job,
+            base,
+            rel,
             entry,
             size,
             mode,
+            sparse: meta.sparse(),
             digest,
         });
         self.tick(deadline, cancel)
+    }
+}
+
+/// Settles the durability of the files a commit copied before its listing
+/// and manifest are written: up to [`SYNC_FDS`] copies are `fdatasync`ed
+/// individually; past that one `syncfs` of the store covers them all.
+struct Durability {
+    pending: Vec<fs::File>,
+    whole_fs: bool,
+}
+
+impl Durability {
+    fn staged(&mut self, file: fs::File) -> std::io::Result<()> {
+        if cfg!(not(target_os = "linux")) {
+            // No `syncfs` to fall back on: settle each file now.
+            return file.sync_data();
+        }
+        if self.whole_fs {
+            return Ok(());
+        }
+        if self.pending.len() < SYNC_FDS {
+            self.pending.push(file);
+        } else {
+            self.pending.clear();
+            self.whole_fs = true;
+        }
+        Ok(())
+    }
+
+    fn settle(self, staging: &Path) -> std::io::Result<()> {
+        if self.whole_fs {
+            #[cfg(target_os = "linux")]
+            rustix::fs::syncfs(fs::File::open(staging)?)?;
+            #[cfg(not(target_os = "linux"))]
+            let _ = staging;
+            return Ok(());
+        }
+        for file in self.pending {
+            file.sync_data()?;
+        }
+        Ok(())
     }
 }
 
@@ -546,14 +736,24 @@ fn materialize(
     let mut entries = Vec::with_capacity(planned.len());
     let mut bytes = 0u64;
     let mut reused = 0u64;
+    let mut durability = Durability {
+        pending: Vec::new(),
+        whole_fs: false,
+    };
+    // Planned files arrive in walk order, so siblings share a parent: the
+    // directory is created once per run of them, not once per file.
+    let mut made: Option<PathBuf> = None;
     for planned in planned {
         plan.tick(deadline, cancel)?;
         let dst = staging.join(&planned.entry);
-        if let Some(parent) = dst.parent() {
+        if let Some(parent) = dst.parent()
+            && made.as_deref() != Some(parent)
+        {
             fs::create_dir_all(parent)?;
+            made = Some(parent.to_path_buf());
         }
         let listed = plan.listed.get(planned.entry.as_str()).copied();
-        let mut digest = None;
+        let mut staged: Option<([u8; 32], u64, u32)> = None;
         if let (Some(source_dir), Some(proof), Some(listed)) = (source_dir, planned.digest, listed)
             && proof == listed.digest
             && listed.mode == planned.mode
@@ -564,9 +764,11 @@ fn materialize(
             // fails the check and the job's file is copied instead —
             // after the link is removed, so the copy never truncates the
             // source's inode.
-            match hash_file(&dst) {
-                Ok(staged) if staged == proof => {
-                    digest = Some(proof);
+            let verified = fs::File::open(&dst)
+                .and_then(|mut f| hash_reader(&mut f, planned.size, plan.buf()));
+            match verified {
+                Ok(digest) if digest == proof => {
+                    staged = Some((proof, planned.size, planned.mode));
                     reused += planned.size;
                 }
                 _ => {
@@ -574,30 +776,30 @@ fn materialize(
                 }
             }
         }
-        let (digest, size) = match digest {
-            Some(digest) => (digest, planned.size),
-            // Size and digest recorded are always of the bytes actually
-            // staged: hashing rides the copy, so a file rewritten
-            // mid-publish can never produce a listing its generation does
-            // not satisfy.
-            None => match copy_hashed(&planned.job, &dst) {
-                Ok(staged) => {
-                    // The payload file itself must carry the recorded
-                    // mode: restore re-applies the staged file's own
-                    // permission bits (clone::file), so a File::create
-                    // default would leak 0666&umask in place of an
-                    // executable's 0755. Hardlinked entries are not
-                    // stamped — they share the source generation's inode,
-                    // which already carries that mode.
-                    stamp_mode(&dst, planned.mode)?;
-                    staged
+        let (digest, size, mode) = match staged {
+            Some(staged) => staged,
+            // Size, digest and mode recorded are always of the bytes
+            // actually staged from the descriptor actually opened: a file
+            // rewritten mid-publish can never produce a listing its
+            // generation does not satisfy, and a file swapped for a
+            // symlink is never opened at all.
+            None => match plan.bases[planned.base].open(&planned.rel)? {
+                Some((file, opened)) => {
+                    let sparse = planned.sparse || opened.sparse();
+                    let (digest, written, out) =
+                        copy_hashed(file, &dst, planned.size, sparse, plan.buf())?;
+                    // The payload file carries the recorded mode: restore
+                    // re-applies the staged file's own permission bits
+                    // (clone::file). Hardlinked entries share the source
+                    // generation's inode, which already carries it.
+                    stamp_file_mode(&out, opened.mode)?;
+                    durability.staged(out)?;
+                    (digest, written, opened.mode)
                 }
-                Err(e) if e.kind() == ErrorKind::NotFound => {
-                    let _ = fs::remove_file(&dst);
+                None => {
                     plan.skipped += 1;
                     continue;
                 }
-                Err(e) => return Err(e.into()),
             },
         };
         bytes += size;
@@ -605,45 +807,94 @@ fn materialize(
             path: planned.entry,
             size,
             digest,
-            mode: planned.mode,
+            mode,
         });
     }
+    durability.settle(staging)?;
     Ok((entries, bytes, reused))
 }
 
-/// BLAKE3 of one file's content, read in bounded blocks.
-fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
-    let mut file = fs::File::open(path)?;
+/// BLAKE3 of at most `limit` bytes of `reader`, through the caller's block.
+fn hash_reader(reader: &mut impl Read, limit: u64, buf: &mut [u8]) -> std::io::Result<[u8; 32]> {
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; COPY_BYTES];
-    loop {
-        let read = file.read(&mut buf)?;
-        if read == 0 {
-            return Ok(*hasher.finalize().as_bytes());
-        }
-        hasher.update(&buf[..read]);
-    }
-}
-
-/// Copy `from` to `to`, hashing the bytes as they are written; returns
-/// the size and digest of exactly what landed.
-fn copy_hashed(from: &Path, to: &Path) -> std::io::Result<([u8; 32], u64)> {
-    let mut input = fs::File::open(from)?;
-    let mut output = fs::File::create(to)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; COPY_BYTES];
-    let mut written = 0u64;
-    loop {
-        let read = input.read(&mut buf)?;
+    let mut left = limit;
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        let read = match reader.read(&mut buf[..want]) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            other => other?,
+        };
         if read == 0 {
             break;
         }
         hasher.update(&buf[..read]);
-        output.write_all(&buf[..read])?;
+        left -= read as u64;
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// Copy at most `limit` bytes of `input` to a new file at `to`, hashing
+/// them as they land; returns the digest and length of exactly what was
+/// staged, and the open output for the durability pass. A sparse input is
+/// copied hole-for-hole: an all-zero block becomes a seek, never a write.
+fn copy_hashed(
+    input: fs::File,
+    to: &Path,
+    limit: u64,
+    sparse: bool,
+    buf: &mut [u8],
+) -> std::io::Result<([u8; 32], u64, fs::File)> {
+    let mut input = input.take(limit);
+    let mut output = fs::File::create(to)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut written = 0u64;
+    loop {
+        let read = match input.read(buf) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            other => other?,
+        };
+        if read == 0 {
+            break;
+        }
+        let block = &buf[..read];
+        hasher.update(block);
+        if sparse && block.iter().all(|b| *b == 0) {
+            output.seek(SeekFrom::Current(read as i64))?;
+        } else {
+            output.write_all(block)?;
+        }
         written += read as u64;
     }
-    output.sync_data()?;
-    Ok((*hasher.finalize().as_bytes(), written))
+    if sparse {
+        // A trailing hole is a length, not bytes.
+        output.set_len(written)?;
+    }
+    Ok((*hasher.finalize().as_bytes(), written, output))
+}
+
+/// What a publish leaves free on a filesystem of `total` bytes: 5 % of
+/// it, at most [`FREE_SPACE_RESERVE`].
+fn reserve(total: u64) -> u64 {
+    (total / 20).min(FREE_SPACE_RESERVE)
+}
+
+/// `(free, total)` bytes of `path`'s filesystem, free as an unprivileged
+/// writer sees it; `None` where the platform cannot say (the check is
+/// then skipped).
+fn free_bytes(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let st = rustix::fs::statvfs(path).ok()?;
+        Some((
+            st.f_bavail.saturating_mul(st.f_frsize),
+            st.f_blocks.saturating_mul(st.f_frsize),
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// Write a small file durably enough to be renamed over: contents are
@@ -684,9 +935,24 @@ pub(crate) fn stamp_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     }
 }
 
+/// [`stamp_mode`] on an open file: no second path lookup.
+fn stamp_file_mode(file: &fs::File, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(mode & 0o777))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, mode);
+        Ok(())
+    }
+}
+
 /// The permission bits worth keeping — the exec bit on tools. Off unix a
 /// read-only file reads as `0o444`, anything else `0o644`.
-fn file_mode(meta: &fs::Metadata) -> u32 {
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn file_mode(meta: &fs::Metadata) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

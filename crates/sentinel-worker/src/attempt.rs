@@ -893,18 +893,26 @@ fn finalize(
     container: Container,
     cancel: &Cancel,
 ) -> Vec<SealedCache> {
+    // The container goes first (P07-1): once it is stopped and removed no
+    // job process — the keepalive, or anything a step left running — can
+    // rewrite, swap or re-link the writable views while publication reads
+    // them. The views themselves live in the workspace (and its private
+    // `.sentinel-cache/` directory), which outlives the container.
+    // Publication then walks them confined beneath the workspace anyway, so
+    // a container that would not stop cannot redirect it either.
+    let _ = container.destroy();
     // Cache publication is finalization work: it reads the job's writable
-    // views, so it must precede the teardown — and a verdict that never ran
-    // the job's commands leaves nothing worth keeping.
+    // views, so it must precede the workspace's teardown — and a verdict
+    // that never ran the job's commands leaves nothing worth keeping.
     let sealed = if cache_worthy(verdict) {
         publish_caches(root, job, report, cancel)
     } else {
         Vec::new()
     };
-    // Both run even when one fails: a container that will not stop must not
-    // keep a workspace alive, and vice versa. The failure is a reconciliation
-    // matter for W07, which lists what this worker still owns.
-    let _ = container.destroy();
+    // Runs even when the container would not stop: a container that will
+    // not stop must not keep a workspace alive. The failure is a
+    // reconciliation matter for W07, which lists what this worker still
+    // owns.
     let _ = workspace.destroy();
     sealed
 }

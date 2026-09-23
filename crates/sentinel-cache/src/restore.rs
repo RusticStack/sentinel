@@ -9,14 +9,17 @@
 //!    derived through `attach`'s shared functions so publish (K03)
 //!    derives the same entry.
 //! 2. `entry/current` names the live generation — a bounded read whose
-//!    content is the `gen-*` directory name.
+//!    content is the `gen-*` directory name. An entry that has one is
+//!    pinned (`Lease::acquire`) and the pointer read again under the pin,
+//!    so GC can never take the generation between lookup and clone.
 //! 3. `manifest::lookup` answers hit or the explainable miss.
-//! 4. On a hit the entry is pinned (`Lease::acquire`, so GC can never
-//!    take the generation mid-clone), the `files` blob's digest is
-//!    verified against the manifest — the trust anchor for the whole
-//!    payload — and each `payload/<i>` is cloned to its target.
+//! 4. On a hit the `files` blob's digest is verified against the manifest
+//!    — the trust anchor for the whole payload — every `payload/<i>` tree
+//!    is checked against the listing, and only then is each cloned to its
+//!    target.
 //! 5. On a miss the declared paths still exist as empty writable
-//!    directories: a job always sees writable cache paths.
+//!    directories: a job always sees writable cache paths — a clone that
+//!    failed part-way empties them again.
 //!
 //! Nothing here fails an attempt: a filesystem or lease error is an
 //! explainable `Miss`, and target resolution never follows a symlink —
@@ -132,21 +135,57 @@ pub fn restore_remote(
     let entry_dir = attached
         .scope
         .entry_dir(env.cache_root, entry_key(decl.class, &attached.key));
+    // An entry with no `current` is the common miss and takes no pin. One
+    // that has one is pinned *before* its pointer is trusted (P07-8): the
+    // pointer is read again under the lease, so the generation it names
+    // cannot be reclaimed between the read and the clone — a sweep that
+    // raced the first read is an ordinary miss, never a `corrupt` one.
     let started = Instant::now();
-    let found = {
-        let want = Request {
-            scope: &attached.scope,
-            key: &attached.key,
-            compat: &attached.compat,
-        };
-        current(&entry_dir).map(|(name, dir)| (name, dir.clone(), manifest::lookup(&dir, &want)))
+    let probe = current(&entry_dir);
+    let mut lookup_ns = ns(started);
+    let lease = match probe {
+        Ok(_) => {
+            let waited = Instant::now();
+            let pinned = Lease::acquire(&entry_dir, owner, lease::DEFAULT_TTL);
+            attached.stats.lock_wait_ns = Some(ns(waited));
+            match pinned {
+                Ok(lease) => Some(lease),
+                Err(_) => {
+                    // The wait was measured either way; the lease is the
+                    // part that never happened.
+                    attached.stats.lookup_ns = Some(lookup_ns);
+                    attached.outcome = Outcome::Miss(Miss::Unavailable);
+                    return attached;
+                }
+            }
+        }
+        Err(_) => None,
     };
-    attached.stats.lookup_ns = Some(ns(started));
-    let (name, gen_dir, hit) = match found {
+    let started = Instant::now();
+    let found = match probe {
+        Err(miss) => Err(miss),
+        Ok(_) => {
+            let want = Request {
+                scope: &attached.scope,
+                key: &attached.key,
+                compat: &attached.compat,
+            };
+            current(&entry_dir)
+                .map(|(name, dir)| (name, dir.clone(), manifest::lookup(&dir, &want)))
+        }
+    };
+    lookup_ns += ns(started);
+    attached.stats.lookup_ns = Some(lookup_ns);
+    let (name, gen_dir, hit, lease) = match (found, lease) {
         // A local hit never touches the network: the miss path below is
         // the only place remote hydration is consulted (Q08).
-        Ok((name, dir, Outcome::Hit(hit))) => (name, dir, hit),
-        Ok((_, _, Outcome::Miss(miss))) | Err(miss) => {
+        (Ok((name, dir, Outcome::Hit(hit))), Some(lease)) => (name, dir, hit, lease),
+        // A hit is only ever read under a pin; without one it cannot serve.
+        (Ok((_, _, Outcome::Hit(_))), None) => {
+            attached.outcome = Outcome::Miss(Miss::Unavailable);
+            return attached;
+        }
+        (Ok((_, _, Outcome::Miss(miss))), _) | (Err(miss), _) => {
             attached.outcome = Outcome::Miss(miss);
             // Targets were resolved usable above (an unusable one already
             // returned `invalid`), so any miss here may hydrate: a local
@@ -167,22 +206,10 @@ pub fn restore_remote(
         }
     };
 
-    // A hit pins the entry for the attempt's run: the generation — and
-    // later this writer's staging — stays unreachable to GC while the
-    // job reads and rewrites its view.
-    let started = Instant::now();
-    let lease = match Lease::acquire(&entry_dir, owner, lease::DEFAULT_TTL) {
-        Ok(lease) => lease,
-        Err(_) => {
-            // The wait was measured either way; the lease is the part
-            // that never happened.
-            attached.stats.lock_wait_ns = Some(ns(started));
-            attached.outcome = Outcome::Miss(Miss::Unavailable);
-            return attached;
-        }
-    };
-    attached.stats.lock_wait_ns = Some(ns(started));
-
+    // The pin taken above stays for the attempt's run (renewed while this
+    // process holds it — `lease`): the generation — and later this
+    // writer's staging — stays unreachable to GC while the job reads and
+    // rewrites its view.
     let started = Instant::now();
     attached.stats.reflink = env.backend == Backend::Reflink;
     match materialize(
@@ -202,7 +229,16 @@ pub fn restore_remote(
             attached.outcome = Outcome::Hit(hit);
         }
         // The dropped `lease` releases the pin; the entry answers the miss.
-        Err(miss) => attached.outcome = Outcome::Miss(miss),
+        // A generation that is gone although pinned was reclaimed before
+        // the pin landed — a transient `unavailable`, not tampering.
+        Err(miss) => {
+            let miss = if miss == Miss::Corrupt && !gen_dir.is_dir() {
+                Miss::Unavailable
+            } else {
+                miss
+            };
+            attached.outcome = Outcome::Miss(miss);
+        }
     }
     attached
 }
@@ -287,6 +323,9 @@ fn check_payload_tree(src: &Path, listed: &HashMap<&str, &FileEntry>) -> Result<
     // `(dir, rel)` — `rel` is the listing's suffix form: `sub/dir/file`.
     let mut stack = vec![(src.to_path_buf(), String::new(), 0usize)];
     let mut seen = 0usize;
+    // One scratch name per walk: a file's listing key is built in place,
+    // never allocated per file.
+    let mut key = String::new();
     while let Some((dir, rel, depth)) = stack.pop() {
         if depth >= MAX_WALK_DEPTH {
             return Err(Miss::Corrupt);
@@ -302,19 +341,21 @@ fn check_payload_tree(src: &Path, listed: &HashMap<&str, &FileEntry>) -> Result<
                 io::ErrorKind::NotFound => Miss::Corrupt,
                 _ => Miss::Unavailable,
             })?;
-            let Some(name) = child.file_name().to_str().map(str::to_owned) else {
+            let file_name = child.file_name();
+            let Some(name) = file_name.to_str() else {
                 // An unencodable name can never be listed — planted.
                 return Err(Miss::Corrupt);
             };
-            let rel = if rel.is_empty() {
-                name
-            } else {
-                format!("{rel}/{name}")
-            };
+            key.clear();
+            if !rel.is_empty() {
+                key.push_str(&rel);
+                key.push('/');
+            }
+            key.push_str(name);
             if meta.is_dir() {
-                stack.push((child.path(), rel, depth + 1));
+                stack.push((child.path(), key.clone(), depth + 1));
             } else if meta.is_file() {
-                match listed.get(rel.as_str()) {
+                match listed.get(key.as_str()) {
                     Some(entry) if entry.size == meta.len() => seen += 1,
                     _ => return Err(Miss::Corrupt),
                 }
@@ -367,31 +408,54 @@ pub(crate) fn materialize(
             return Err(Miss::Invalid);
         }
     }
-    for (index, target) in targets.iter().enumerate() {
+    // Every payload tree is checked against its listing before any is
+    // cloned (P07-8): a generation broken at index 1 must not leave index
+    // 0's bytes in the job's view under a "miss".
+    let mut sources = Vec::with_capacity(targets.len());
+    for (index, listed) in listed.iter().enumerate() {
         let src = gen_dir.join("payload").join(index.to_string());
         match fs::symlink_metadata(&src) {
             Ok(meta) if meta.is_dir() => {
-                check_payload_tree(&src, &listed[index])?;
-                let cloned =
-                    clone::tree(&src, &target.dir, backend).map_err(|e| match e.kind() {
-                        // A payload the listing names but the tree does
-                        // not hold is a broken generation, not a hiccup.
-                        io::ErrorKind::NotFound => Miss::Corrupt,
-                        _ => Miss::Unavailable,
-                    })?;
-                stats.files += cloned.files;
-                stats.bytes += cloned.bytes;
-                stats.copied_bytes += cloned.copied_bytes;
+                check_payload_tree(&src, listed)?;
+                sources.push(Some(src));
             }
             Ok(_) => return Err(Miss::Corrupt),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 // No payload for this declared path: honest only when the
                 // listing agrees there was nothing to carry.
-                if !listed[index].is_empty() {
+                if !listed.is_empty() {
                     return Err(Miss::Corrupt);
                 }
+                sources.push(None);
             }
             Err(_) => return Err(Miss::Unavailable),
+        }
+    }
+    for (src, target) in sources.iter().zip(targets) {
+        let Some(src) = src else {
+            continue;
+        };
+        match clone::tree(src, &target.dir, backend) {
+            Ok(cloned) => {
+                stats.files += cloned.files;
+                stats.bytes += cloned.bytes;
+                stats.copied_bytes += cloned.copied_bytes;
+            }
+            Err(e) => {
+                // A clone that stopped halfway — a full disk, an I/O error —
+                // leaves the miss contract intact: every target is an empty
+                // writable directory again, never a partial materialization
+                // an installer could mistake for a finished one.
+                for target in targets {
+                    let _ = clone::empty(&target.dir);
+                }
+                return Err(match e.kind() {
+                    // A payload the listing names but the tree does not
+                    // hold is a broken generation, not a hiccup.
+                    io::ErrorKind::NotFound => Miss::Corrupt,
+                    _ => Miss::Unavailable,
+                });
+            }
         }
     }
     Ok(blob)
@@ -446,10 +510,16 @@ pub(crate) fn first_touch(blob: &FilesBlob, targets: &[Target]) -> Option<u64> {
 fn target(env: &Context<'_>, name: &str, index: usize, declared: &str) -> (Target, Option<Miss>) {
     // Re-check the schema's rule rather than trust it: a path that is not
     // a normalised relative or `/`-absolute path is refused, not guessed.
-    if !valid_cache_path(declared) {
+    // An absolute path reaches the container as a bind-mount spec, where
+    // `:` separates fields and `,` options: such a path could only ever
+    // fail `podman create` — and so the attempt — so it is refused here as
+    // the explainable miss a cache-path error must be (P07-16).
+    let unmountable = declared.starts_with('/') && declared.contains([':', ',']);
+    if !valid_cache_path(declared) || unmountable {
         return (
             Target {
                 declared: declared.to_owned(),
+                root: env.workspace.to_path_buf(),
                 dir: env.workspace.to_path_buf(),
                 container: declared.to_owned(),
                 mount: false,
@@ -490,15 +560,32 @@ fn target(env: &Context<'_>, name: &str, index: usize, declared: &str) -> (Targe
     let (rel, refused) = rel;
     let target = Target {
         declared: declared.to_owned(),
+        root: env.workspace.to_path_buf(),
         dir,
         container,
         mount,
     };
     if refused {
-        return (target, Some(Miss::Invalid));
+        return (
+            Target {
+                mount: false,
+                ..target
+            },
+            Some(Miss::Invalid),
+        );
     }
-    let miss = create_under(env.workspace, &rel).err();
-    (target, miss)
+    match create_under(env.workspace, &rel) {
+        Ok(()) => (target, None),
+        // A directory that could not be made is never bound into the
+        // container: a mount of a missing host path would fail the start.
+        Err(miss) => (
+            Target {
+                mount: false,
+                ..target
+            },
+            Some(miss),
+        ),
+    }
 }
 
 /// Create `root/rel` as a real directory, never resolving through
@@ -976,6 +1063,60 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    /// P07-8: a generation broken at a later index is a miss that leaves
+    /// *every* target empty — index 0 is never cloned first — and the
+    /// pin is released with the miss.
+    #[test]
+    fn a_failed_materialization_leaves_empty_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, ws) = (temp.path().join("cache"), temp.path().join("ws"));
+        fs::create_dir(&ws).unwrap();
+        let s = scope();
+        let d = decl(&["one", "two"]);
+        let compat = attach::declared_compat(&d, KEY, s.platform);
+        let (_, gdir) = seal(
+            &root,
+            &Seal::at(
+                &s,
+                KEY,
+                &compat,
+                &[&[("lib.so", &[1u8; 4096])], &[("x", b"x")]],
+            ),
+        );
+        // A listed file of payload/1 is gone.
+        fs::remove_file(gdir.join("payload/1/x")).unwrap();
+        let a = restore_one(&root, &ws, &d, s);
+        assert_eq!(miss(&a), Miss::Corrupt);
+        assert!(a.lease.is_none(), "the pin is dropped with the miss");
+        for target in &a.targets {
+            assert!(target.dir.is_dir(), "the target is still writable");
+            assert_eq!(
+                fs::read_dir(&target.dir).unwrap().count(),
+                0,
+                "no partial payload in {}",
+                target.declared
+            );
+        }
+    }
+
+    /// P07-16: an absolute path the bind-mount spec cannot carry is an
+    /// explainable `invalid` miss, and it is never offered as a mount.
+    #[test]
+    fn an_unmountable_absolute_path_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, ws) = (temp.path().join("cache"), temp.path().join("ws"));
+        fs::create_dir(&ws).unwrap();
+        for path in ["/opt/a:b", "/opt/a,b"] {
+            let a = restore_one(&root, &ws, &decl(&[path]), scope());
+            assert_eq!(miss(&a), Miss::Invalid, "{path}");
+            assert!(!a.targets[0].mount, "{path} is never bound in");
+        }
+        // A refused path under the workspace mount is not a mount either.
+        let a = restore_one(&root, &ws, &decl(&["/workspace/evil"]), scope());
+        assert_eq!(miss(&a), Miss::Invalid);
+        assert!(!a.targets[0].mount);
     }
 
     #[test]

@@ -90,6 +90,7 @@ fn decl(paths: &[&str]) -> Cache {
 fn target(dir: PathBuf) -> Target {
     Target {
         declared: dir.to_string_lossy().into_owned(),
+        root: dir.parent().unwrap().to_path_buf(),
         dir,
         container: "/workspace/view".to_owned(),
         mount: false,
@@ -287,14 +288,21 @@ fn concurrent_clones_during_republishing_are_never_torn() {
                     match &a.outcome {
                         Outcome::Hit(_) => {
                             let name = a.generation.as_ref().unwrap();
-                            let want = markers
-                                .lock()
-                                .unwrap()
-                                .get(name)
-                                .unwrap_or_else(|| {
-                                    panic!("reader-{r} cloned {name}, never sealed by the writer")
-                                })
-                                .clone();
+                            // The writer records a generation's marker right
+                            // after its commit returns — a reader can resolve
+                            // the promoted `current` first, so it waits a
+                            // bounded moment for the record.
+                            let waited = std::time::Instant::now();
+                            let want = loop {
+                                if let Some(m) = markers.lock().unwrap().get(name) {
+                                    break m.clone();
+                                }
+                                assert!(
+                                    waited.elapsed() < Duration::from_secs(10),
+                                    "reader-{r} cloned {name}, never sealed by the writer"
+                                );
+                                thread::sleep(Duration::from_millis(1));
+                            };
                             for rel in &names {
                                 assert_eq!(
                                     fs::read(ws.join("view").join(rel)).unwrap(),
@@ -1031,8 +1039,11 @@ fn a_full_filesystem_fails_the_publish_cleanly() {
     let mut b = attached(scope, &d, vec![target(big)]);
     b.generation = Some(gen_a.clone());
     let out = commit(&root, &b, 2_000);
+    // The free-space check refuses before staging (`NoSpace`); a
+    // filesystem that fills between the check and the copy still fails
+    // cleanly with the real `ENOSPC` (`Io`).
     assert!(
-        matches!(out, Err(PublishError::Io(_))),
+        matches!(out, Err(PublishError::NoSpace | PublishError::Io(_))),
         "a full filesystem must fail the publish, got {out:?}"
     );
     // Nothing promoted: `current` still names the seed generation, no new

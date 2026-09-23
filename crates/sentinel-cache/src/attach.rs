@@ -195,6 +195,11 @@ impl Attached {
 pub struct Target {
     /// The declared path exactly as written.
     pub declared: String,
+    /// The worker-owned directory `dir` lies beneath — the attempt's
+    /// workspace. Publication opens this anchor itself and resolves `dir`
+    /// beneath it without following a symlink at any component (P07-1):
+    /// everything below the anchor is content a job could rewrite.
+    pub root: PathBuf,
     /// The host directory holding the job's writable view. Relative
     /// declared paths materialize inside the workspace (the existing
     /// mount carries them); absolute ones get a private directory plus

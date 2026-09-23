@@ -6,11 +6,12 @@
 //! into the store: `tree` materializes a private copy the attempt owns.
 //! On a reflink-capable filesystem each file is an extent share — cost per
 //! file, not per byte — and anywhere else the same tree is produced by a
-//! bounded read/write copy. Symlinks are recreated verbatim, never
-//! followed — a link inside a generation is data, not a path — and
-//! anything that is not a directory, regular file or symlink is skipped
-//! and counted. Hardlinks are never created: a shared inode would let one
-//! job's write corrupt the generation for every other.
+//! bounded read/write copy. A sealed payload never holds a symlink —
+//! publication does not encode them and restore refuses a tree that has
+//! one — but `tree` itself recreates any it meets verbatim, never
+//! following it, and anything that is not a directory, regular file or
+//! symlink is skipped and counted. Hardlinks are never created: a shared
+//! inode would let one job's write corrupt the generation for every other.
 
 use std::{
     collections::BTreeMap,
@@ -223,6 +224,16 @@ fn ensure_dir(dst: &Path) -> io::Result<()> {
     }
     fs::create_dir(dst)?;
     set_mode(dst, 0o755)
+}
+
+/// Empty `dir` in place — every entry below it removed, never followed —
+/// leaving the directory itself. What a failed materialization answers
+/// with: the miss contract's empty writable target.
+pub(crate) fn empty(dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        clear(&entry?.path())?;
+    }
+    Ok(())
 }
 
 /// The generation claims this slot: whatever the checkout left there goes
