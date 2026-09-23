@@ -1245,9 +1245,10 @@ fn run_wait(state: &State, request: &Request, run: &str, query: &str) -> Route {
     }))
 }
 
-/// `GET /attempts/{att}/logs/search?q=…&after&limit`: a bounded literal
-/// scan ([`sentinel_store::logs::LogStore::search`]). `q` is
-/// percent-decoded (`+` is a space), 1..=256 bytes.
+/// `GET /attempts/{att}/logs/search?q=…&after&limit&carry`: a bounded
+/// literal scan ([`sentinel_store::logs::LogStore::search`]). `q` is
+/// percent-decoded (`+` is a space), 1..=256 bytes; `carry` is the previous
+/// page's `next_carry`, which keeps a literal split across the cut found.
 fn log_search(state: &State, request: &Request, attempt: &str, query: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::LOGS_READ)?;
@@ -1276,12 +1277,15 @@ fn log_search(state: &State, request: &Request, attempt: &str, query: &str) -> R
             .map_err(|_| err(ErrorCode::InvalidRequest, "malformed after"))?,
     };
     let limit = page_size(query_param(query, "limit").and_then(|v| v.parse().ok()));
+    // The previous page's `next_carry`: opaque, hex, checked by the store.
+    let carry = query_param(query, "carry");
     let (run, job) = attempt_log(state, who.principal, attempt)?;
     let search = logs::SearchQuery {
         needle: needle.as_bytes(),
         after,
         limit,
         budget: logs::SEARCH_SCAN_BYTES,
+        carry,
     };
     let found = state
         .logs
@@ -1300,6 +1304,7 @@ fn log_search(state: &State, request: &Request, attempt: &str, query: &str) -> R
             "text": String::from_utf8_lossy(&m.text),
         })).collect::<Vec<_>>(),
         "next_after": found.next_after,
+        "next_carry": found.carry,
         "complete": found.complete,
     }))
 }

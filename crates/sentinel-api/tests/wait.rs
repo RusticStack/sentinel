@@ -503,6 +503,90 @@ fn log_search_finds_literals_across_segments_within_the_byte_bound() {
 }
 
 #[test]
+fn log_search_pages_find_a_literal_split_across_a_sealed_segment_once() {
+    let d = deployment();
+    let (run, job) = dispatch(&d);
+    let (_, attempt, _) = lease(&d, job);
+    // Records of exactly 32 KiB: segment 0 holds frames 1..=128, and the
+    // 4 MiB scan bound stops the first request at the same frame.
+    let payload = (32 << 10) - sentinel_protocol::logs::FRAME_HEADER_BYTES;
+    let frame = |tail: &str, head: &str| {
+        let mut text = head.to_owned();
+        while text.len() + tail.len() < payload {
+            let line = (payload - tail.len() - text.len()).min(100);
+            text.push_str(&"q".repeat(line - 1));
+            text.push('\n');
+        }
+        text.push_str(tail);
+        text.into_bytes()
+    };
+    for seq in 1..=200u64 {
+        let bytes = match seq {
+            128 => frame("error: nee", ""),
+            129 => frame("", "dle across the seal\n"),
+            _ => frame("", ""),
+        };
+        d.logs
+            .append(
+                run,
+                job,
+                attempt,
+                &Frame {
+                    seq,
+                    step: 0,
+                    stream: Stream::Stdout,
+                    bytes,
+                },
+            )
+            .unwrap();
+    }
+    d.logs.finish(run, job, attempt, 200, &[]).unwrap();
+    let search = |query: &str| {
+        get(
+            &d,
+            &format!("/api/v1/attempts/{attempt}/logs/search?q=needle&{query}"),
+        )
+    };
+    let (status, first) = search("");
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(first["matches"], json!([]));
+    assert_eq!(first["next_after"], 128, "stopped at the sealed boundary");
+    let carry = first["next_carry"]
+        .as_str()
+        .expect("a carry with next_after");
+    // Resuming with the carry finds the split exactly once and completes.
+    let (_, second) = search(&format!("after=128&carry={carry}"));
+    assert_eq!(
+        second["matches"],
+        json!([{"seq": 129, "step": 0, "stream": "stdout", "text": "needle across the seal"}])
+    );
+    assert_eq!(
+        (
+            &second["next_after"],
+            &second["next_carry"],
+            &second["complete"]
+        ),
+        (&Value::Null, &Value::Null, &json!(true))
+    );
+    // One request covering both sides reports it the same, once.
+    let (_, whole) = search("after=100");
+    assert_eq!(whole["matches"], second["matches"]);
+    // A carry is bound to its `after` and needle.
+    for query in [
+        format!("after=127&carry={carry}"),
+        "after=128&carry=zz".to_owned(),
+        "after=128&carry=".to_owned(),
+    ] {
+        let (status, body) = search(&query);
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("invalid_request")),
+            "{query}"
+        );
+    }
+}
+
+#[test]
 fn an_attempt_summary_needs_cache_read_and_reports_cache_records() {
     let d = deployment();
     let (_, job) = dispatch(&d);

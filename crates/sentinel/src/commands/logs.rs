@@ -120,10 +120,14 @@ pub(super) fn search(
     let mut list = List::new(output);
     let mut shown = 0usize;
     let mut after = 0u64;
+    // The server's scan state at `after` (hex), so a literal split across
+    // two requests is still found, once.
+    let mut carry = String::new();
     let (next, complete) = loop {
         let size = (cap - shown).min(PAGE);
+        let resume = if carry.is_empty() { "" } else { "&carry=" };
         let page = client.get(&format!(
-            "/api/v1/attempts/{attempt}/logs/search?q={query}&after={after}&limit={size}"
+            "/api/v1/attempts/{attempt}/logs/search?q={query}&after={after}&limit={size}{resume}{carry}"
         ))?;
         for m in page["matches"].as_array().into_iter().flatten() {
             if shown >= cap {
@@ -143,7 +147,16 @@ pub(super) fn search(
         }
         let complete = page["complete"] == true;
         match page["next_after"].as_u64() {
-            Some(next) if shown < cap => after = next,
+            Some(next) if shown < cap => {
+                after = next;
+                carry.clear();
+                // Hex from the server; anything else is dropped, not sent.
+                if let Some(text) = page["next_carry"].as_str()
+                    && text.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    carry.push_str(text);
+                }
+            }
             Some(next) => break (Some(next.max(after)), complete),
             None => break (None, complete),
         }
