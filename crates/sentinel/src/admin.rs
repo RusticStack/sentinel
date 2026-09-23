@@ -250,7 +250,9 @@ fn lifetime_ms(text: &str) -> Result<i64, Error> {
 /// Parse `<whole number><d|h|m|s>` with an explicit ceiling. No calendar
 /// arithmetic, no fractional units, no unbounded retention.
 pub(crate) fn duration_ms(text: &str, max_ms: i64) -> Result<i64, Error> {
-    let (digits, unit) = text.split_at(text.len().saturating_sub(1));
+    // Split before the last *character*: a multibyte unit must be refused,
+    // not panic on a byte offset inside it.
+    let (digits, unit) = text.split_at(text.char_indices().last().map_or(0, |(at, _)| at));
     let scale = match unit {
         "d" => DAY_MS,
         "h" => 60 * 60 * 1000,
@@ -1387,5 +1389,20 @@ const fn event_name(event: Event) -> &'static str {
         Event::OAuthDeviceDenied => "oauth-device-denied",
         Event::ServiceGrantIssued => "service-grant-issued",
         Event::ServiceAccountCreated => "service-account-created",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_need_a_unit_and_never_split_a_character() {
+        assert_eq!(duration_ms("7d", 30 * DAY_MS).ok(), Some(7 * DAY_MS));
+        assert_eq!(duration_ms("90s", DAY_MS).ok(), Some(90_000));
+        // Byte `len - 1` falls inside the multibyte unit.
+        for bad in ["30д", "é", "", "d", "0d", "1.5d"] {
+            assert!(duration_ms(bad, 30 * DAY_MS).is_err(), "{bad}");
+        }
     }
 }
