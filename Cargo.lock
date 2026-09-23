@@ -1340,6 +1340,7 @@ name = "sentinel-link"
 version = "0.1.0-dev"
 dependencies = [
  "blake3",
+ "libc",
  "postcard",
  "rcgen",
  "rustls",

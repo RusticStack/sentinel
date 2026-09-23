@@ -409,3 +409,15 @@ fn parse_arch(text: &str) -> Option<Arch> {
         _ => None,
     }
 }
+
+/// Whether a worker has been revoked. An unknown worker is not revoked: it
+/// may simply not have enrolled yet. One primary-key probe; read-only, for
+/// callers that tie another credential to a worker (the controller's Tailcat
+/// allow list) and must withdraw it when the worker is revoked.
+pub fn revoked(conn: &Connection, worker: WorkerId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT revoked_ms IS NOT NULL FROM workers WHERE id = ?1")?
+        .query_row([worker.as_bytes()], |row| row.get::<_, bool>(0))
+        .optional()?
+        .unwrap_or(false))
+}

@@ -2,34 +2,44 @@
 //! exactly one endpoint — this deployment's Sentinel link port.
 //!
 //! Tailcat's upstream is Go, so the adapter is a **pinned helper process**, not
-//! a reimplementation: the executable is hashed against [`PINNED_SHA256`]
+//! a reimplementation: the executable is verified against [`PINNED_SHA256`]
 //! before *every* execution, and a mismatch refuses to run it rather than
-//! running something else. The helper carries only the link port — the server
-//! side `serve`s that one port, the worker side `forward`s it to loopback —
-//! never a mesh-wide `serve all`, an exit node, or a shell/file mode.
+//! running something else. On Linux the file is opened once without following
+//! a symlink, checked for a trustworthy owner and mode, hashed from that open
+//! descriptor and executed through the same descriptor, so what runs is what
+//! was hashed; an unchanged file (same device, inode, size, mtime and ctime)
+//! is not re-hashed. The helper carries only the link port — the server side
+//! `serve`s that one port, the worker side `forward`s it to loopback — never a
+//! mesh-wide `serve all`, an exit node, or a shell/file mode. It runs with an
+//! empty environment apart from `HOME` (its key directory) and the operator's
+//! TLS trust overrides, and on Linux it dies with the thread that started it.
 //!
 //! Identities are keys on disk, not accounts: [`ensure_key`] creates the
 //! helper's key under `<data_dir>/tailcat` (owner-only, persisted across
 //! restarts so the address is stable) and records the `nodekey:` the helper
-//! prints, which is what the controller's allow list and the enrollment
-//! handshake exchange. Key material and `tc…` addresses are credentials:
-//! [`NodeKey`] and [`Address`] redact themselves in `Debug`/`Display`, so a
-//! diagnostic that prints them cannot leak them; `expose` is the deliberate,
-//! operator-facing accessor.
+//! prints, which is what the controller's allow list names. Key material and
+//! `tc…` addresses are credentials: [`NodeKey`] and [`Address`] redact
+//! themselves in `Debug`/`Display`, so a diagnostic that prints them cannot
+//! leak them; `expose` is the deliberate accessor for argv and owner-only
+//! files.
 //!
 //! Supervision is own-process, not library: [`start_server`] and
 //! [`start_forward`] spawn a thread that starts the helper, restarts it when
 //! it dies (or exits after failing to connect), and takes it down on
-//! [`Server::shutdown`] / [`Forward::shutdown`]. A worker also re-proves the
-//! tunnel on an interval — `tailcat ping` plus a connect through the forward —
-//! and replaces a helper whose connect path stopped working; an open loopback
-//! port by itself is not health. When `tailcat.enabled` is false (or the
-//! section is absent) none of this runs and the link uses direct TLS.
+//! [`Server::shutdown`] / [`Forward::shutdown`]. A controller with no admitted
+//! worker still runs its helper, with `--allow=none`: it has an address to
+//! hand out and admits nobody — an empty allow list never means "any peer".
+//! A worker re-proves mesh reachability on an interval with `tailcat ping`
+//! (which also measures the direct/relay path) and replaces a helper that
+//! stopped reaching the controller; the data path's health is the Sentinel
+//! session running over the forward, which the process layer watches. When
+//! `tailcat.enabled` is false (or the section is absent) none of this runs and
+//! the link uses direct TLS.
 
 use std::{
     fmt, fs, io,
     io::{BufRead, BufReader, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpStream},
+    net::{Ipv4Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -40,8 +50,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use sentinel_core::WorkerId;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+use crate::session::Path as Route;
 
 /// The upstream helper version this adapter is written against.
 pub const PINNED_VERSION: &str = "0.6.0";
@@ -51,10 +64,17 @@ pub const PINNED_VERSION: &str = "0.6.0";
 pub const PINNED_SHA256: &str = "d46582137d21f03d15345e2be425d6317d49e5b8c8bb4f6fc56037f4c08cce73";
 /// The link port a helper carries when the configuration says nothing else.
 pub const DEFAULT_LINK_PORT: u16 = 7443;
-/// The file under the data directory listing the worker node keys the
-/// controller's helper accepts, one `nodekey:…` per line (`#` comments and
-/// blank lines allowed). Absent means no worker is allowed over Tailcat yet.
+/// The file under the data directory listing the workers the controller's
+/// helper admits, one `nodekey:<64 hex> wrk_<id>` per line (`#` comments and
+/// blank lines allowed): the worker's Tailcat node key and the Sentinel worker
+/// it belongs to, so revoking the worker also closes its tunnel. A bare key
+/// with no worker id is refused. An absent or empty file admits no worker —
+/// the helper then serves with `--allow=none`, never with no `--allow` at all
+/// (which upstream treats as "any peer").
 pub const ALLOW_LIST_FILE: &str = "tailcat-allow";
+/// Under the key directory: the controller's own `tc…` address, written
+/// owner-only once the helper reports it, for the operator to hand to workers.
+pub const ADDRESS_FILE: &str = "address";
 
 /// Keys and the helper's own state live here, under the data directory.
 const KEY_DIR: &str = "tailcat";
@@ -69,9 +89,9 @@ const PROBE_EVERY: Duration = Duration::from_secs(30);
 /// Reconnect back-off bounds for helper restarts.
 const RESTART_MIN: Duration = Duration::from_secs(1);
 const RESTART_MAX: Duration = Duration::from_secs(30);
-/// `ping` and the loopback connect are both bounded.
+/// `ping` is bounded by its own flag, and its process by that plus a margin.
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const PING_MARGIN: Duration = Duration::from_secs(5);
 const GENKEY_TIMEOUT: Duration = Duration::from_secs(30);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a supervising thread looks at its stop flag while reading output.
@@ -85,8 +105,13 @@ const ALLOW_LIST_CAP: u64 = 64 * 1024;
 
 /// Argument words that would widen the helper past "carry this one link port":
 /// mesh-wide serving, an exit node, a shell, its file transfer mode, or peer
-/// authentication turned off. Refused wherever they appear in an argument.
+/// authentication turned off. Refused as a mode, a flag name, or any piece of
+/// a flag's value — except an `https://` URL, whose path segments are data.
 const FORBIDDEN: [&str; 5] = ["all", "exit-node", "ssh", "files", "no-auth-ssh"];
+/// The environment a helper may inherit besides `HOME`: the operator's TLS
+/// trust overrides, which a self-hosted DERP map or relay behind a private CA
+/// needs. Nothing else in Sentinel's environment reaches the helper.
+const INHERITED_ENV: [&str; 2] = ["SSL_CERT_FILE", "SSL_CERT_DIR"];
 
 /// Which side of the link a helper serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,8 +312,26 @@ pub struct Telemetry {
     pub version: Option<String>,
     /// The address the server's helper advertises, once it has one.
     pub address: Option<Address>,
+    /// How the worker's last successful probe reached the controller, as
+    /// `tailcat ping` reported it: `Relay` for a pong via DERP, `Direct` for a
+    /// pong from an `ip:port`. `Unknown` before a probe measured it, after a
+    /// failed probe, and always on the controller.
+    pub path: Route,
+    /// The round trip `tailcat ping` itself reported on that probe; absent
+    /// whenever `path` is `Unknown` or the pong carried no latency.
+    pub ping_rtt: Option<Duration>,
     /// The most recent failure; cleared when the helper is ready again.
     pub problem: Option<Error>,
+}
+
+/// One line of the controller's allow list: a worker's Tailcat node key and
+/// the Sentinel worker it was issued to. The worker id is what that worker
+/// records in `<data_dir>/worker.id`; the controller drops the key once that
+/// worker is revoked.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Admission {
+    pub key: NodeKey,
+    pub worker: WorkerId,
 }
 
 /// Starts the controller's helper: `serve` exactly the link port, `--allow`
@@ -347,11 +390,30 @@ pub fn ensure_key(config: &TailcatConfig, data_dir: &Path, role: Role) -> Result
     ensure(&network, role)
 }
 
-/// Reads the controller's allow list: one worker node key per line, `#`
-/// comments and blank lines allowed. A missing file is an empty list (no
-/// worker may use Tailcat yet), not an error; a malformed line names its line
-/// number and nothing else.
-pub fn allow_list(data_dir: &Path) -> Result<Vec<NodeKey>> {
+/// Where [`ensure_key`] records this role's node key: the worker's is
+/// `<data_dir>/tailcat/client-default.nodekey`, the line an operator copies
+/// into the controller's allow list (with the worker's id).
+#[must_use]
+pub fn nodekey_file(data_dir: &Path, role: Role) -> PathBuf {
+    data_dir
+        .join(KEY_DIR)
+        .join(format!("{}.nodekey", key_name(role)))
+}
+
+fn key_name(role: Role) -> &'static str {
+    match role {
+        Role::Controller => KEY_NAME,
+        Role::Worker => "client-default",
+    }
+}
+
+/// Reads the controller's allow list: one `nodekey:<64 hex> wrk_<id>` per
+/// line, `#` comments and blank lines allowed. A missing file is an empty list
+/// (no worker may use Tailcat), not an error. A malformed line — including a
+/// bare key without its worker, or one key named for two different workers —
+/// fails the whole read and names its line number and nothing else, so the
+/// caller keeps its last good list rather than guessing.
+pub fn allow_list(data_dir: &Path) -> Result<Vec<Admission>> {
     let path = data_dir.join(ALLOW_LIST_FILE);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -384,23 +446,43 @@ pub fn allow_list(data_dir: &Path) -> Result<Vec<NodeKey>> {
     let text = fs::read_to_string(&path).map_err(|error| {
         Error::Unavailable(format!("cannot read the tailcat allow list: {error}"))
     })?;
-    let mut keys = Vec::new();
+    let mut admitted = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let key = NodeKey::parse(line).ok_or_else(|| {
+        let malformed = || {
             Error::Unavailable(format!(
-                "tailcat allow list line {} is not a nodekey",
+                "tailcat allow list line {} is not 'nodekey:<64 hex> wrk_<worker id>'",
                 index + 1
             ))
-        })?;
-        keys.push(key);
+        };
+        let mut fields = line.split_whitespace();
+        let (Some(key), Some(worker), None) = (fields.next(), fields.next(), fields.next()) else {
+            return Err(malformed());
+        };
+        let key = NodeKey::parse(key).ok_or_else(malformed)?;
+        let worker = worker.parse::<WorkerId>().map_err(|_| malformed())?;
+        admitted.push((Admission { key, worker }, index + 1));
     }
-    keys.sort();
-    keys.dedup();
-    Ok(keys)
+    admitted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    admitted.dedup_by(|a, b| a.0 == b.0);
+    // One tunnel identity belongs to one worker: a key named for two workers
+    // would survive revoking either, so it is refused, not guessed at.
+    if let Some(pair) = admitted
+        .windows(2)
+        .find(|pair| pair[0].0.key == pair[1].0.key)
+    {
+        return Err(Error::Unavailable(format!(
+            "tailcat allow list line {} names a nodekey already listed for another worker",
+            pair[0].1.max(pair[1].1)
+        )));
+    }
+    Ok(admitted
+        .into_iter()
+        .map(|(admission, _)| admission)
+        .collect())
 }
 
 /// The controller's supervised helper.
@@ -415,8 +497,9 @@ impl Server {
         self.run.state().address.clone()
     }
 
-    /// Waits for the advertised address, bounded. The caller logs it (as a
-    /// credential) for enrollment.
+    /// Waits for the advertised address, bounded. The supervisor has written
+    /// it to [`Server::address_file`] by then; it is a credential, so callers
+    /// log that path, never the address.
     pub fn wait_ready(&self, within: Duration) -> Result<Address> {
         let deadline = Instant::now() + within;
         loop {
@@ -441,9 +524,18 @@ impl Server {
         self.run.shared.port
     }
 
+    /// The owner-only file (`<data_dir>/tailcat/address`) holding the
+    /// address once the helper reported it, replaced atomically.
+    #[must_use]
+    pub fn address_file(&self) -> PathBuf {
+        self.run.shared.network.keydir.join(ADDRESS_FILE)
+    }
+
     /// Replaces the allow list. When the set actually changes the helper is
-    /// restarted with the wider (or narrower) list — existing tunnels are
-    /// briefly interrupted and the link reconnects on its own.
+    /// restarted at once with the wider (or narrower) list — existing tunnels
+    /// are briefly interrupted and the link reconnects on its own. An empty
+    /// list restarts it with `--allow=none`: every tunnel closes and no peer
+    /// is admitted until a key is listed again.
     pub fn set_allow(&self, allow: &[NodeKey]) {
         let wanted = normalize(allow);
         {
@@ -453,7 +545,7 @@ impl Server {
             }
             *current = wanted;
         }
-        self.run.shared.kill();
+        self.run.shared.replace();
     }
 
     /// A snapshot for diagnostics.
@@ -495,16 +587,19 @@ impl Forward {
         SocketAddr::from((Ipv4Addr::LOCALHOST, self.run.shared.port))
     }
 
-    /// Proves the tunnel: a bounded `ping` of the controller's address, then a
-    /// connect through the forward. Returns the round trip; a listening
-    /// loopback port alone is not health.
-    pub fn probe(&self) -> Result<Duration> {
+    /// Proves the controller is reachable over the mesh: a bounded `tailcat
+    /// ping` of its address, which also reports whether the pong came direct
+    /// or via DERP. Sends nothing through the forward — the Sentinel session
+    /// carried by the forward is the data path's own health, so a probe never
+    /// puts a stray connection on the controller's link listener.
+    pub fn probe(&self) -> Result<Measured> {
         probe_once(&self.run.shared)
     }
 
-    /// Replaces the helper process now; supervision starts the next one.
+    /// Replaces the helper process now; supervision starts the next one at
+    /// once, without back-off (this is a decision, not a failure).
     pub fn restart(&self) {
-        self.run.shared.kill();
+        self.run.shared.replace();
     }
 
     /// A snapshot for diagnostics.
@@ -534,6 +629,16 @@ impl fmt::Debug for Forward {
     }
 }
 
+/// What one successful probe measured, both straight from `tailcat ping`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Measured {
+    /// `Relay` for a pong via DERP, `Direct` for one from an `ip:port`,
+    /// `Unknown` when the helper's output said neither.
+    pub path: Route,
+    /// The latency the pong reported, when it printed one.
+    pub rtt: Option<Duration>,
+}
+
 /// A validated helper location: what every execution needs.
 struct Network {
     binary: PathBuf,
@@ -541,6 +646,21 @@ struct Network {
     keydir: PathBuf,
     derpmap: Option<String>,
     region: Option<String>,
+    /// The file identity last hashed and found to match the pin; an
+    /// unchanged file is not hashed again.
+    verified: Mutex<Option<Stamp>>,
+}
+
+/// What identifies one version of the helper file: any write, rename-over or
+/// `touch` changes at least one field (`ctime` cannot be set by a writer).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct Stamp {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
 }
 
 impl TailcatConfig {
@@ -570,14 +690,6 @@ impl TailcatConfig {
         {
             return Err(Error::Unavailable(
                 "tailcat.binary must not contain '..'".to_owned(),
-            ));
-        }
-        let metadata = fs::metadata(&self.binary).map_err(|error| {
-            Error::Unavailable(format!("cannot inspect tailcat.binary: {error}"))
-        })?;
-        if !metadata.is_file() {
-            return Err(Error::Unavailable(
-                "tailcat.binary is not a regular file".to_owned(),
             ));
         }
         let digest = parse_hex(&self.sha256).ok_or_else(|| {
@@ -615,31 +727,176 @@ impl TailcatConfig {
         }
         let keydir = data_dir.join(KEY_DIR);
         prepare_keydir(&keydir)?;
-        Ok(Network {
+        let network = Network {
             binary: self.binary.clone(),
             digest,
             keydir,
             derpmap: self.derpmap_url.clone(),
             region: self.region.clone(),
-        })
+            verified: Mutex::new(None),
+        };
+        // Fail at start, not at the first spawn: a missing or wrong helper is
+        // a configuration error.
+        network.open_verified()?;
+        Ok(network)
     }
 }
 
 impl Network {
-    /// Verifies the pin and builds a helper invocation. Every execution goes
-    /// through here, so nothing unverified ever runs.
-    fn command(&self, args: &[String]) -> Result<Command> {
-        verify(&self.binary, &self.digest)?;
+    /// Verifies the pin and starts one helper invocation. Every execution
+    /// goes through here, so nothing unverified ever runs.
+    ///
+    /// On Linux the child executes `/proc/self/fd/<n>` — the very descriptor
+    /// that was checked and hashed — so replacing the file between the check
+    /// and the exec cannot run anything else. The descriptor is close-on-exec
+    /// in this process; only the forked child clears that flag, just before
+    /// it executes, so no other child ever inherits it.
+    fn spawn(&self, args: &[String]) -> Result<Child> {
         check_argv(args)?;
+        let binary = self.open_verified()?;
+        #[cfg(target_os = "linux")]
+        let mut command = {
+            use std::os::{fd::AsRawFd, unix::process::CommandExt};
+            let fd = binary.as_raw_fd();
+            let mut command = Command::new(format!("/proc/self/fd/{fd}"));
+            command.arg0("tailcat");
+            let parent = std::process::id();
+            // SAFETY: the closure runs in the forked child before exec, so it
+            // may only make async-signal-safe calls: `getppid`, `prctl` and
+            // `fcntl` are, and it allocates nothing, takes no lock and touches
+            // only `fd` and `parent` (integers copied in). `io::Error` values
+            // built from a raw OS code do not allocate.
+            unsafe {
+                command.pre_exec(move || {
+                    // Die with the thread that started us: a SIGKILLed
+                    // Sentinel must not leave a helper holding the tunnel.
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    // The parent may have died before the prctl took effect.
+                    if libc::getppid() as u32 != parent {
+                        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                    }
+                    // Keep the verified descriptor open across this exec: a
+                    // `#!` helper's interpreter reopens it by the same path.
+                    if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command
+        };
+        #[cfg(not(target_os = "linux"))]
         let mut command = Command::new(&self.binary);
         command
+            .env_clear()
             .env("HOME", &self.keydir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .args(args);
-        Ok(command)
+        for name in INHERITED_ENV {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        let child = command
+            .spawn()
+            .map_err(|error| Error::Spawn(error.to_string()))?;
+        // The child has exec'd (or failed to); the descriptor has done its job.
+        drop(binary);
+        Ok(child)
     }
+
+    /// Opens the helper and proves it is the pinned build: owner and mode
+    /// first (a file someone else can rewrite is not trusted however it
+    /// hashes), then the digest — read from this same open file, and skipped
+    /// when the file's identity is the one already found to match.
+    fn open_verified(&self) -> Result<fs::File> {
+        let file = open_helper(&self.binary)?;
+        let metadata = file.metadata().map_err(|error| {
+            Error::Unavailable(format!("cannot inspect tailcat.binary: {error}"))
+        })?;
+        if !metadata.is_file() {
+            return Err(Error::Unavailable(
+                "tailcat.binary is not a regular file".to_owned(),
+            ));
+        }
+        trusted_owner(&metadata)?;
+        let stamp = stamp(&metadata);
+        let mut verified = self.verified.lock().expect("tailcat verified");
+        if stamp.is_some() && *verified == stamp {
+            return Ok(file);
+        }
+        *verified = None;
+        verify(&file, &self.digest)?;
+        *verified = stamp;
+        drop(verified);
+        Ok(file)
+    }
+}
+
+/// Opens the helper read-only without following a final symlink (the target
+/// of a link can be swapped by whoever owns the link's directory entry).
+#[cfg(unix)]
+fn open_helper(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| Error::Unavailable(format!("cannot open tailcat.binary: {error}")))
+}
+
+#[cfg(not(unix))]
+fn open_helper(path: &Path) -> Result<fs::File> {
+    fs::File::open(path)
+        .map_err(|error| Error::Unavailable(format!("cannot open tailcat.binary: {error}")))
+}
+
+/// Only this user or root may be able to change the helper: a file owned by
+/// anyone else, or writable by group or others, is refused.
+#[cfg(unix)]
+fn trusted_owner(metadata: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if metadata.uid() != me && metadata.uid() != 0 {
+        return Err(Error::Unavailable(
+            "tailcat.binary is owned by another user; it must be owned by root or by this user"
+                .to_owned(),
+        ));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(Error::Unavailable(
+            "tailcat.binary is writable by group or others".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn trusted_owner(_metadata: &fs::Metadata) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stamp(metadata: &fs::Metadata) -> Option<Stamp> {
+    use std::os::unix::fs::MetadataExt;
+    Some(Stamp {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        size: metadata.size(),
+        mtime: (metadata.mtime(), metadata.mtime_nsec()),
+        ctime: (metadata.ctime(), metadata.ctime_nsec()),
+    })
+}
+
+/// Without an inode identity the file is hashed on every execution.
+#[cfg(not(unix))]
+fn stamp(_metadata: &fs::Metadata) -> Option<Stamp> {
+    None
 }
 
 /// One supervisor: what it shares with its threads, and the threads.
@@ -693,6 +950,10 @@ impl Runner {
 /// killing the process is atomic, so a stopping supervisor cannot be missed.
 struct Stop {
     stopped: bool,
+    /// The live child was killed on purpose (a new allow list, a failed
+    /// probe, an explicit restart): its successor starts at once, and its
+    /// death is not recorded as a helper failure.
+    replacing: bool,
     child: Option<Child>,
 }
 
@@ -733,12 +994,30 @@ impl Shared {
         self.wake.notify_all();
     }
 
-    /// Kill the current child without stopping: supervision starts another.
+    /// Kill the current child because it failed (it never became ready):
+    /// supervision starts another after its back-off.
     fn kill(&self) {
         let mut stop = self.stop.lock().expect("tailcat stop");
         if let Some(child) = stop.child.as_mut() {
             let _ = child.kill();
         }
+    }
+
+    /// Kill the current child on purpose: supervision starts its successor
+    /// at once. Also wakes a supervisor waiting out a back-off, so a new
+    /// allow list never waits behind an earlier failure.
+    fn replace(&self) {
+        let mut stop = self.stop.lock().expect("tailcat stop");
+        stop.replacing = true;
+        if let Some(child) = stop.child.as_mut() {
+            let _ = child.kill();
+        }
+        self.wake.notify_all();
+    }
+
+    /// Whether the last child was replaced on purpose; clears the mark.
+    fn take_replacing(&self) -> bool {
+        std::mem::take(&mut self.stop.lock().expect("tailcat stop").replacing)
     }
 
     fn fail(&self, problem: Error) {
@@ -752,9 +1031,17 @@ impl Shared {
         match self.role {
             Role::Controller => {
                 args.push("serve".to_owned());
-                for key in self.allow.lock().expect("tailcat allow").iter() {
-                    args.push(format!("--allow={key}"));
+                // Upstream reads one `--allow` (a repeated flag keeps only
+                // the last), takes a comma-separated list, and treats an
+                // absent or empty one as "every peer". An empty list is
+                // therefore the explicit `none`, never an omitted flag.
+                let allow = self.allow.lock().expect("tailcat allow");
+                if allow.is_empty() {
+                    args.push("--allow=none".to_owned());
+                } else {
+                    args.push(format!("--allow={}", allow.join(",")));
                 }
+                drop(allow);
                 if let Some(url) = &self.network.derpmap {
                     args.push(format!("--derpmap-url={url}"));
                 }
@@ -777,8 +1064,8 @@ impl Shared {
         args
     }
 
-    /// One line of helper output. Never stored verbatim: only the address, and
-    /// only in its redacting form.
+    /// One line of helper output. Never stored verbatim: only the address, in
+    /// its redacting form and in the owner-only address file.
     fn observe(&self, line: &str) {
         match self.role {
             Role::Controller => {
@@ -788,16 +1075,26 @@ impl Shared {
                 let Some(address) = line.split_whitespace().rev().find_map(Address::parse) else {
                     return;
                 };
+                let changed =
+                    self.state.lock().expect("tailcat state").address.as_ref() != Some(&address);
+                // Written before the address is published in telemetry, so a
+                // caller that saw `wait_ready` succeed finds the file.
+                let recorded = if changed {
+                    record_address(&self.network.keydir, &address)
+                } else {
+                    Ok(())
+                };
                 let mut state = self.state.lock().expect("tailcat state");
                 state.address = Some(address);
                 state.ready = true;
-                state.problem = None;
+                state.problem = recorded.err();
             }
             Role::Worker => {
+                // A bound listener is not a tunnel: it counts as ready only
+                // while no probe has failed, and only a probe clears one.
                 if contains_ascii_ci(line, "forwarding") {
                     let mut state = self.state.lock().expect("tailcat state");
-                    state.ready = true;
-                    state.problem = None;
+                    state.ready = state.problem.is_none();
                 }
             }
         }
@@ -827,6 +1124,7 @@ fn prepare(
         }),
         stop: Mutex::new(Stop {
             stopped: false,
+            replacing: false,
             child: None,
         }),
         wake: Condvar::new(),
@@ -834,7 +1132,10 @@ fn prepare(
 }
 
 /// One helper's lifetime, restarted until stopped: a death (or an exit after a
-/// failed connect) is a restart with bounded back-off, not a give-up.
+/// failed connect) is a restart with bounded back-off, not a give-up. The
+/// back-off doubles only across consecutive failures — a helper that became
+/// ready, or ran past [`READY_DEADLINE`], resets it — and a child killed on
+/// purpose is replaced at once, without a back-off or a recorded problem.
 fn supervise(shared: Arc<Shared>) {
     let mut backoff = RESTART_MIN;
     let mut restarted = false;
@@ -847,32 +1148,52 @@ fn supervise(shared: Arc<Shared>) {
             state.restarts += 1;
         }
         restarted = true;
-        match run_child(&shared) {
-            Ok(()) => backoff = RESTART_MIN,
+        let (outcome, healthy) = run_child(&shared);
+        if shared.take_replacing() {
+            continue;
+        }
+        if healthy {
+            backoff = RESTART_MIN;
+        }
+        let wait = match outcome {
+            Ok(()) => RESTART_MIN,
             Err(problem) => {
                 if !shared.stopped() {
                     shared.fail(problem);
                 }
+                let wait = backoff;
                 backoff = (backoff * 2).min(RESTART_MAX);
+                wait
             }
-        }
-        if !shared.wait(backoff) {
+        };
+        if !shared.wait(wait) {
             return;
         }
     }
 }
 
 /// Spawns the helper once, follows its output until it ends, and reaps it.
-fn run_child(shared: &Arc<Shared>) -> Result<()> {
+/// The flag says whether this child counted as healthy: it reported
+/// readiness, or it stayed up past [`READY_DEADLINE`].
+fn run_child(shared: &Arc<Shared>) -> (Result<()>, bool) {
+    // A replacement asked for from here on applies to this child: the mark is
+    // cleared before the argv is built, so a newer allow list that arrives
+    // before the child is registered kills it straight away.
+    shared.take_replacing();
     let args = shared.args();
-    let mut command = shared.network.command(&args)?;
-    let mut child = command
-        .spawn()
-        .map_err(|error| Error::Spawn(error.to_string()))?;
+    let mut child = match shared.network.spawn(&args) {
+        Ok(child) => child,
+        Err(error) => return (Err(error), false),
+    };
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        return Err(Error::Spawn(
-            "the helper's output was not captured".to_owned(),
-        ));
+        let _ = child.kill();
+        let _ = child.wait();
+        return (
+            Err(Error::Spawn(
+                "the helper's output was not captured".to_owned(),
+            )),
+            false,
+        );
     };
     let pid = child.id();
     {
@@ -880,7 +1201,14 @@ fn run_child(shared: &Arc<Shared>) -> Result<()> {
         state.pid = Some(pid);
         state.ready = false;
     }
-    shared.stop.lock().expect("tailcat stop").child = Some(child);
+    {
+        let mut stop = shared.stop.lock().expect("tailcat stop");
+        if stop.replacing {
+            let _ = child.kill();
+        }
+        stop.child = Some(child);
+    }
+    let mut became_ready = false;
 
     let (lines, received) = mpsc::channel::<String>();
     let readers = [pump(stdout, lines.clone()), pump(stderr, lines)];
@@ -892,13 +1220,17 @@ fn run_child(shared: &Arc<Shared>) -> Result<()> {
             break;
         }
         match received.recv_timeout(POLL) {
-            Ok(line) => shared.observe(&line),
+            Ok(line) => {
+                shared.observe(&line);
+                became_ready |= shared.state.lock().expect("tailcat state").ready;
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if exited(shared) {
                     break;
                 }
                 let late = !expired && started.elapsed() >= READY_DEADLINE;
                 let ready = shared.state.lock().expect("tailcat state").ready;
+                became_ready |= ready;
                 if late && !ready {
                     expired = true;
                     shared.fail(Error::Timeout("the helper never reported readiness"));
@@ -934,13 +1266,19 @@ fn run_child(shared: &Arc<Shared>) -> Result<()> {
         let mut state = shared.state.lock().expect("tailcat state");
         state.pid = None;
         state.ready = false;
+        state.path = Route::Unknown;
+        state.ping_rtt = None;
     }
-    match status {
+    let healthy = became_ready || (!expired && started.elapsed() >= READY_DEADLINE);
+    let outcome = match status {
+        // The readiness deadline killed it: that, not the kill, is the problem.
+        _ if expired => Err(Error::Timeout("the helper never reported readiness")),
         None => Ok(()),
         Some(Ok(status)) if status.success() => Ok(()),
         Some(Ok(status)) => Err(Error::Exited(status.code())),
         Some(Err(error)) => Err(Error::Spawn(error.to_string())),
-    }
+    };
+    (outcome, healthy)
 }
 
 /// Whether the helper has ended. `try_wait` reaps it, and the teardown's
@@ -976,35 +1314,40 @@ fn pump<R: Read + Send + 'static>(pipe: R, lines: mpsc::Sender<String>) -> threa
     })
 }
 
-/// Re-proves a worker's tunnel on an interval; a helper whose connect path
-/// stopped working is replaced rather than trusted because its port is bound.
+/// Re-proves a worker's mesh path on an interval; a helper that can no longer
+/// reach the controller is replaced rather than trusted because its port is
+/// bound. The probe's own problem stays recorded; the replacement is not a
+/// second failure and does not wait out a back-off.
 fn watch_tunnel(shared: Arc<Shared>, every: Duration) {
     while shared.wait(every) {
-        if probe_once(&shared).is_err() {
-            shared.kill();
+        if probe_once(&shared).is_err() && !shared.stopped() {
+            shared.replace();
         }
     }
 }
 
-/// `ping` the controller, then connect through the forward. Both bounded.
-fn probe_once(shared: &Shared) -> Result<Duration> {
-    let started = Instant::now();
+/// `ping` the controller, bounded, and record what it measured.
+fn probe_once(shared: &Shared) -> Result<Measured> {
     let outcome = probe_tunnel(shared);
     let mut state = shared.state.lock().expect("tailcat state");
     match &outcome {
-        Ok(_) => {
+        Ok(measured) => {
             state.ready = true;
             state.problem = None;
+            state.path = measured.path;
+            state.ping_rtt = measured.rtt;
         }
         Err(problem) => {
             state.ready = false;
             state.problem = Some(problem.clone());
+            state.path = Route::Unknown;
+            state.ping_rtt = None;
         }
     }
-    outcome.map(|()| started.elapsed())
+    outcome
 }
 
-fn probe_tunnel(shared: &Shared) -> Result<()> {
+fn probe_tunnel(shared: &Shared) -> Result<Measured> {
     let controller = shared
         .controller
         .as_ref()
@@ -1018,8 +1361,8 @@ fn probe_tunnel(shared: &Shared) -> Result<()> {
     }
     args.push(controller.expose().to_owned());
     let captured = output_within(
-        shared.network.command(&args)?,
-        PING_TIMEOUT + CONNECT_TIMEOUT,
+        shared.network.spawn(&args)?,
+        PING_TIMEOUT + PING_MARGIN,
         &|| shared.stopped(),
     )?;
     if !captured.status.success() {
@@ -1030,28 +1373,63 @@ fn probe_tunnel(shared: &Shared) -> Result<()> {
     if shared.stopped() {
         return Err(Error::Unavailable("the helper was stopped".to_owned()));
     }
-    let local = SocketAddr::from((Ipv4Addr::LOCALHOST, shared.port));
-    let mut stream = TcpStream::connect_timeout(&local, CONNECT_TIMEOUT).map_err(|error| {
-        Error::Unavailable(format!("the forward does not answer on loopback: {error}"))
-    })?;
-    // A byte at the TLS listener is not a message; it is proof the forward
-    // carries data. The session over the same forward is the real health.
-    let _ = stream.write_all(&[0]);
-    Ok(())
+    Ok(measure_pong(&captured.stdout)
+        .or_else(|| measure_pong(&captured.stderr))
+        .unwrap_or(Measured {
+            path: Route::Unknown,
+            rtt: None,
+        }))
+}
+
+/// Reads the last `pong in <latency> via <DERP(region)|ip:port>` line from
+/// `tailcat ping` output (already capped at [`OUTPUT_CAP`]). Nothing of the
+/// text is kept: only the path class and the latency number.
+fn measure_pong(output: &[u8]) -> Option<Measured> {
+    let text = std::str::from_utf8(output).ok()?;
+    text.lines().rev().find_map(|line| {
+        let rest = line.trim().strip_prefix("pong in ")?;
+        let (latency, via) = rest.split_once(" via ")?;
+        let via = via.trim();
+        let path = if via.starts_with("DERP") {
+            Route::Relay
+        } else if via.parse::<SocketAddr>().is_ok() {
+            Route::Direct
+        } else {
+            return None;
+        };
+        Some(Measured {
+            path,
+            rtt: parse_latency(latency.trim()),
+        })
+    })
+}
+
+/// Go's `time.Duration` text for sub-minute values: `740µs`, `42.1ms`,
+/// `1.2s`, `900ns`. Anything else is not a measurement.
+fn parse_latency(text: &str) -> Option<Duration> {
+    let split = text.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
+    let (number, unit) = text.split_at(split);
+    let scale: f64 = match unit {
+        "ns" => 1.0,
+        "µs" | "us" | "μs" => 1e3,
+        "ms" => 1e6,
+        "s" => 1e9,
+        _ => return None,
+    };
+    let value: f64 = number.parse().ok()?;
+    let nanos = value * scale;
+    (0.0..3.6e12)
+        .contains(&nanos)
+        .then(|| Duration::from_nanos(nanos as u64))
 }
 
 /// Runs a bounded helper invocation and captures its output. A stop request
 /// ends the wait at once, so shutting down never waits out a helper timeout.
-fn output_within(
-    mut command: Command,
-    within: Duration,
-    stop: &dyn Fn() -> bool,
-) -> Result<Captured> {
-    let mut child = command
-        .spawn()
-        .map_err(|error| Error::Spawn(error.to_string()))?;
+fn output_within(mut child: Child, within: Duration, stop: &dyn Fn() -> bool) -> Result<Captured> {
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
     let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(Error::Spawn(
             "the helper's output was not captured".to_owned(),
         ));
@@ -1100,10 +1478,7 @@ fn drain<R: Read + Send + 'static>(pipe: R) -> thread::JoinHandle<Vec<u8>> {
 /// The helper's own naming rule applies: a server key is `default`, a client
 /// key is `client-default` — `genkey --client --key=default` is refused.
 fn ensure(network: &Network, role: Role) -> Result<NodeKey> {
-    let name = match role {
-        Role::Controller => KEY_NAME,
-        Role::Worker => "client-default",
-    };
+    let name = key_name(role);
     let record = network.keydir.join(format!("{name}.nodekey"));
     if let Some(key) = read_key(&record)? {
         return Ok(key);
@@ -1122,7 +1497,7 @@ fn ensure(network: &Network, role: Role) -> Result<NodeKey> {
     if let Some(url) = &network.derpmap {
         args.push(format!("--derpmap-url={url}"));
     }
-    let captured = output_within(network.command(&args)?, GENKEY_TIMEOUT, &|| false)?;
+    let captured = output_within(network.spawn(&args)?, GENKEY_TIMEOUT, &|| false)?;
     if !captured.status.success() {
         return Err(Error::Unavailable(format!(
             "genkey did not create a key ({})",
@@ -1131,11 +1506,30 @@ fn ensure(network: &Network, role: Role) -> Result<NodeKey> {
     }
     let mut text = String::from_utf8_lossy(&captured.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&captured.stderr));
-    let key = find_nodekey(&text)
-        .ok_or_else(|| Error::Unavailable("genkey printed no nodekey".to_owned()))?;
+    let key = match role {
+        // A client key's genkey prints its public key.
+        Role::Worker => find_nodekey(&text),
+        // A server key's genkey prints its address instead; the public key
+        // inside it is what `tailcat parse` reports as `ServerPublic`.
+        Role::Controller => match text.split_whitespace().find_map(Address::parse) {
+            Some(address) => server_public(network, &address)?,
+            None => None,
+        },
+    }
+    .ok_or_else(|| Error::Unavailable("genkey printed no nodekey".to_owned()))?;
     tighten(&network.keydir, 0)?;
     record_key(&record, &key)?;
     Ok(key)
+}
+
+/// The server's public key, decoded from its own address by `tailcat parse`.
+fn server_public(network: &Network, address: &Address) -> Result<Option<NodeKey>> {
+    let args = ["parse".to_owned(), address.expose().to_owned()];
+    let captured = output_within(network.spawn(&args)?, VERSION_TIMEOUT, &|| false)?;
+    if !captured.status.success() {
+        return Ok(None);
+    }
+    Ok(find_nodekey(&String::from_utf8_lossy(&captured.stdout)))
 }
 
 /// The node key is 64 hex characters after the prefix; nothing else in the
@@ -1158,7 +1552,7 @@ fn find_nodekey(text: &str) -> Option<NodeKey> {
 
 fn version_of(network: &Network) -> Option<String> {
     let captured = output_within(
-        network.command(&["--version".to_owned()]).ok()?,
+        network.spawn(&["--version".to_owned()]).ok()?,
         VERSION_TIMEOUT,
         &|| false,
     )
@@ -1296,10 +1690,35 @@ fn tighten_file(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// SHA-256 of the helper, streamed and compared before it may run.
-fn verify(binary: &Path, expected: &[u8; 32]) -> Result<()> {
-    let mut file = fs::File::open(binary)
-        .map_err(|error| Error::Unavailable(format!("cannot read tailcat.binary: {error}")))?;
+/// Replaces `<keydir>/address` atomically with the controller's address,
+/// owner-only from creation: a temporary file opened `0600` is written,
+/// synced and renamed over the old one.
+fn record_address(keydir: &Path, address: &Address) -> Result<()> {
+    let target = keydir.join(ADDRESS_FILE);
+    let staging = keydir.join(".address.tmp");
+    let failed = |error: io::Error| {
+        Error::Unavailable(format!("cannot record the tailcat address: {error}"))
+    };
+    let _ = fs::remove_file(&staging);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&staging).map_err(failed)?;
+    file.write_all(address.expose().as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all())
+        .map_err(failed)?;
+    drop(file);
+    fs::rename(&staging, &target).map_err(failed)
+}
+
+/// SHA-256 of the helper, streamed from the open file and compared before it
+/// may run.
+fn verify(mut file: &fs::File, expected: &[u8; 32]) -> Result<()> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
@@ -1331,28 +1750,32 @@ fn check_argv(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The forbidden word an argument names, if any: as a flag name
+/// (`--files=…`), a mode or service (`all`, `80,ssh`), or a piece of a flag's
+/// value (`--serve=all`). An `https://` value is a URL — the DERP map — and
+/// its path segments (`/files/`, `/all/`) are data, not modes.
 fn refuses(arg: &str) -> Option<&'static str> {
-    let bare = arg.trim_start_matches('-');
-    let head = bare.split('=').next().unwrap_or(bare);
-    for whole in [arg, bare, head] {
-        if let Some(word) = FORBIDDEN
-            .iter()
-            .copied()
-            .find(|word| whole.eq_ignore_ascii_case(word))
-        {
-            return Some(word);
-        }
-    }
-    for piece in bare.split(['=', ':', ',', '/']) {
-        if let Some(word) = FORBIDDEN
+    let forbidden = |piece: &str| {
+        FORBIDDEN
             .iter()
             .copied()
             .find(|word| piece.eq_ignore_ascii_case(word))
-        {
-            return Some(word);
-        }
+    };
+    let bare = arg.trim_start_matches('-');
+    let (name, value) = match bare.split_once('=') {
+        Some((name, value)) if bare.len() != arg.len() => (Some(name), value),
+        _ => (None, bare),
+    };
+    if let Some(word) = name.and_then(forbidden) {
+        return Some(word);
     }
-    None
+    if value
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    {
+        return None;
+    }
+    forbidden(value).or_else(|| value.split(['=', ':', ',', '/']).find_map(forbidden))
 }
 
 fn normalize(allow: &[NodeKey]) -> Vec<String> {
@@ -1443,6 +1866,47 @@ mod tests {
             assert_eq!(refuses(&format!("--mode={banned}")), Some(banned));
         }
         assert!(check_argv(&["serve".to_owned(), "all".to_owned()]).is_err());
+        for banned in [
+            "80,all",
+            "--serve=7443,files",
+            "--files=/pub:rw",
+            "7443,no-auth-ssh",
+        ] {
+            assert!(refuses(banned).is_some(), "{banned}");
+        }
+    }
+
+    #[test]
+    fn a_derp_map_url_is_data_not_a_mode() {
+        for url in [
+            "--derpmap-url=https://derp.example.com/files/derp.json",
+            "--derpmap-url=https://example.com/all/map.json",
+            "--derpmap-url=HTTPS://example.com/ssh/exit-node.json",
+        ] {
+            assert_eq!(refuses(url), None, "{url}");
+        }
+        // The flag name is still checked, and a non-URL value still is too.
+        assert_eq!(refuses("--files=https://example.com/x"), Some("files"));
+        assert_eq!(refuses("--derpmap-url=http://x/all"), Some("all"));
+    }
+
+    #[test]
+    fn the_ping_path_and_latency_come_from_the_pong_line_only() {
+        let relayed = measure_pong(b"pinging...\npong in 42.1ms via DERP(sfo)\n").unwrap();
+        assert_eq!(relayed.path, Route::Relay);
+        assert_eq!(relayed.rtt, Some(Duration::from_micros(42_100)));
+        let direct = measure_pong("pong in 740\u{b5}s via 172.17.0.1:51223\n".as_bytes()).unwrap();
+        assert_eq!(direct.path, Route::Direct);
+        assert_eq!(direct.rtt, Some(Duration::from_micros(740)));
+        let v6 = measure_pong(b"pong in 1.2s via [2001:db8::1]:41641").unwrap();
+        assert_eq!(v6.path, Route::Direct);
+        assert_eq!(v6.rtt, Some(Duration::from_millis(1200)));
+        // The last pong wins; a pong without a readable latency keeps the path.
+        let last = measure_pong(b"pong in 9ms via DERP(fra)\npong in soon via 10.0.0.1:1\n");
+        assert_eq!(last.unwrap().path, Route::Direct);
+        assert_eq!(last.unwrap().rtt, None);
+        assert!(measure_pong(b"ping: context deadline exceeded\n").is_none());
+        assert!(measure_pong(b"pong in 1ms via somewhere\n").is_none());
     }
 
     #[test]

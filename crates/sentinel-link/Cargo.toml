@@ -33,6 +33,12 @@ sha2 = { version = "0.11", default-features = false }
 # The controller's rate-limited dispatch warnings (error kind only, no payload).
 tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
 
+# The helper is opened without following symlinks, checked by owner and mode,
+# and (on Linux) executed through the verified descriptor and tied to its
+# parent's lifetime.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 sentinel-link = { path = ".", features = ["controller"] }
 sentinel-pipeline = { path = "../sentinel-pipeline" }
