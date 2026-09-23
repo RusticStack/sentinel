@@ -8,7 +8,10 @@ use sentinel_store::logs::LogStore;
 #[test]
 #[ignore]
 fn concurrent_append_throughput() {
-    let attempts: usize = std::env::var("TPUT_ATTEMPTS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let attempts: usize = std::env::var("TPUT_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
     let frames: u64 = 250;
     let temp = tempfile::tempdir().unwrap();
     let logs = Arc::new(LogStore::open(temp.path().join("logs")).unwrap());
@@ -24,7 +27,12 @@ fn concurrent_append_throughput() {
                         run,
                         job,
                         attempt,
-                        &Frame { seq, step: 0, stream: Stream::Stdout, bytes: vec![b'x'; 512] },
+                        &Frame {
+                            seq,
+                            step: 0,
+                            stream: Stream::Stdout,
+                            bytes: vec![b'x'; 512],
+                        },
                     )
                     .unwrap();
                 }
