@@ -105,7 +105,34 @@ In text mode a failure is `error: <message>` on stderr. In JSON and NDJSON modes
 
 ## Commands
 
-_Placeholder: Unit E documents the O05 command surface here._
+Every command below takes the [shared client flags](#the-shared-client). `--tenant SLUG` defaults to the profile's context (`sentinel context use`); with a static credential and no context it is required (exit 2 names it). Identifiers, slugs and names that go into a request path must be `[A-Za-z0-9._-]`; anything else is refused locally (exit 2) rather than escaped into a different request.
+
+| Command | Route | Prints |
+|---|---|---|
+| `sentinel run dispatch [--tenant] --repo NAME --pipeline FILE --source URL --sha SHA [--ref] [--idempotency-key]` | `POST /tenants/{slug}/repos/{name}/runs` | the new run and its jobs; a retried dispatch with the same key is the same run |
+| `sentinel run status RUN`, `sentinel status RUN` | `GET /runs/{id}` | the run and its jobs |
+| `sentinel run list [--tenant] --repo NAME [--limit N \| --all] [--before RUN]` | `GET …/runs?limit&before` | runs newest first ([paging](#output)) |
+| `sentinel run cancel RUN` | `POST /runs/{id}/cancel` | how many jobs were cancelled |
+| `sentinel run wait RUN [--timeout DUR]`, `sentinel wait RUN [--timeout DUR]` | `GET /runs/{id}/wait` | progress, then the final run; exit 0 passed (or skipped), 8 finished otherwise, 7 deadline |
+| `sentinel job cancel JOB`, `sentinel job rerun JOB` | `POST /jobs/{id}/cancel\|rerun` | the cancel outcome, or the rerun job's state |
+| `sentinel log show ATTEMPT [--follow] [--step N]` | `GET /attempts/{id}/logs` | the log as the job wrote it; `--follow` waits until it is complete |
+| `sentinel log search ATTEMPT --text TEXT [--limit N]` | `GET /attempts/{id}/logs/search` | matching lines (`seq`, step, stream, text), default 100, at most 10,000 |
+| `sentinel workers list [--tenant]` | `GET /workers?tenant` | pools and their workers with connection state |
+| `sentinel workers drain\|undrain WORKER` | `POST /workers/{id}/drain\|undrain` | the new drain state (platform admin) |
+| `sentinel queue [--tenant] [--limit N]` | `GET /queue?tenant&limit` | waiting jobs, oldest first, with age and reason; the total when cut (`--limit` 1–500, default 100) |
+| `sentinel artifact list RUN`, `sentinel artifact show RUN ARTIFACT` | `GET /runs/{id}/artifacts[/{arf}]` | artifact rows; one row with its manifest entries |
+| `sentinel artifact download RUN ARTIFACT --path ENTRY --out FILE [--tenant]` | the manifest, then `GET /tenants/{slug}/objects/{digest}` | the entry's bytes in `FILE`, verified |
+| `sentinel cache show ATTEMPT` | `GET /attempts/{id}/summary` | the attempt's cache records (hit or miss reason, files, bytes, publish verdict, costly hits), or that it has not reported yet |
+
+**`wait`** is a loop of long polls, not a stream: each request parks on the server for at most 25 s (or what is left of `--timeout`: `90s`, `500ms`, `10m`, `2h`; default no deadline) and returns as soon as anything a status reader can see changes, so an idle wait costs one request per 25 s and a change is seen within milliseconds. The server parks at most four subscribers at once; when all are taken the poll is `rate_limited`, and `wait` (like `log show --follow`) sleeps the server's `retry_after_ms` plus up to half of it again of jitter and polls again, so a crowd of waiters does not return in lockstep and is never reported as exit 6. Text prints `RUN STATE (done/total jobs finished)` per change and the job table at the end; NDJSON prints each `{version, changed, finished, run}` answer that changed something; JSON prints the final run once. A run that finished without passing exits 8 with its state on stderr; the deadline exits 7.
+
+**`artifact download`** looks the entry up in the artifact's manifest, streams the object into `FILE.sentinel-part` beside `FILE` while hashing it (BLAKE3, the object store's digest) and counting bytes, and renames it over `FILE` only when the declared length, the byte count and the digest all match; any mismatch removes the partial file, leaves `FILE` untouched and exits 1. An entry the manifest does not list exits 4.
+
+**`log search`** follows the server's bounded scans: each request reads at most 4 MiB of log, so a 256 MiB log is at most 64 short requests, resumed at `next_after`. A literal split across two frames is not found; text mode says on stderr when the log is still being written (later lines were not searched) or when `--limit` cut the matches.
+
+**`cache`** reports per-attempt records only (K08 `cache:` entries of that attempt); there is no tenant-wide cache browser.
+
+`sentinel pipeline validate|explain` stay offline; `explain --json` prints `sentinel.explain/1`, and in that mode a failure is one `sentinel.error/1` line on stderr (`invalid_pipeline`, or `client_usage` for an unreadable file) with stdout empty, like the networked commands.
 
 ## Legacy `sentinel api`
 
@@ -113,7 +140,17 @@ The W08 commands keep their flags and output (`me`, `run`, `status`, `runs`, `ca
 
 ## Output
 
-_Placeholder: Unit E documents text, JSON and NDJSON output, pagination and `--all` here._
+`--output text|json|ndjson` (`--json` is `--output json`) chooses one of three shapes; stdout carries only results and stderr only notes and failures, in every mode.
+
+| Mode | One object (`status`, `artifact show`, `cache show`, …) | A list (`run list`, `log show`, `log search`, `artifact list`, `workers list`, `queue`) |
+|---|---|---|
+| `text` | lines for people; not a contract | one line (or block) per item as each page arrives; notes such as `more runs: continue with --before run_…` on stderr |
+| `json` | the server's document, pretty-printed | one document once the listing ends: `{"runs": [...], "next": …}`, `{"frames": [...], "attempt", "complete", "gaps", "next_after"}`, `{"matches": [...], "attempt", "next_after", "complete"}`, `{"artifacts": [...]}`, `{"pools": [...]}`, `{"jobs": [...], "total", "truncated"}` |
+| `ndjson` | the document as one compact line | one compact line per item, printed as each page arrives, nothing else |
+
+**Paging.** A listing prints at most `--limit N` items (default 20 for `run list`) or, with `--all`, every item up to a hard cap of **10,000**; it asks the server for pages of at most 500 and prints each page before asking for the next, so memory stays one page in text and NDJSON modes (JSON collects the listing it prints, bounded by the same cap). `--before CURSOR` starts after an item — for `run list` the `next` a previous listing returned, which JSON carries as `"next"` and text names on stderr whenever items remain; the cursor is a run id, so pages stay stable while new runs arrive. `log show --output json` stops at 10,000 frames with `complete:false` and `next_after`; `log show --output ndjson` and text stream the whole log.
+
+Exit codes and failure output are the same in every mode ([exit codes](#exit-codes), [failure output](#failure-output)).
 
 ## Security notes
 

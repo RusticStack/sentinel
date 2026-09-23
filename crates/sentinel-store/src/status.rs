@@ -141,15 +141,63 @@ pub fn recent_runs(
     repo: RepoId,
     limit: u16,
 ) -> Result<Vec<RunSummary>> {
+    runs_page(conn, tenant, repo, None, limit).map(|page| page.runs)
+}
+
+/// One page of a repository's runs, newest first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunPage {
+    pub runs: Vec<RunSummary>,
+    /// The cursor for the next page — the last listed run — when more runs
+    /// exist past this page; `None` on the last page.
+    pub next: Option<RunId>,
+}
+
+/// Keyset pagination over `runs_by_repo`, newest first: at most `limit`
+/// runs strictly older than `before` in `(created_ms, id)` order, so pages
+/// stay stable when runs share a millisecond and when new runs arrive
+/// between requests. `before` must be a run of this repository, else
+/// `NotFound` (a foreign run's timestamp is not revealed). One row past
+/// the page is read to tell whether a next page exists, so the last page
+/// never needs an empty follow-up request.
+pub fn runs_page(
+    conn: &Connection,
+    tenant: TenantId,
+    repo: RepoId,
+    before: Option<RunId>,
+    limit: u16,
+) -> Result<RunPage> {
     if !(1..=500).contains(&limit) {
         return Err(Error::InvalidInput("page size"));
     }
-    let mut stmt = conn.prepare_cached(
-        "SELECT id, source_sha, created_ms FROM runs WHERE tenant_id = ?1 AND repo_id = ?2
-         ORDER BY created_ms DESC, id DESC LIMIT ?3",
-    )?;
+    // The cursor as a key: (created_ms, id). Without one, a key above every
+    // real run keeps one statement (and one plan) for both cases.
+    let (cursor_ms, cursor_id): (i64, [u8; 16]) = match before {
+        None => (i64::MAX, [0xff; 16]),
+        Some(run) => {
+            let created: i64 = conn
+                .prepare_cached(
+                    "SELECT created_ms FROM runs WHERE id = ?1 AND tenant_id = ?2 AND repo_id = ?3",
+                )?
+                .query_row(
+                    params![run.as_bytes(), tenant.as_bytes(), repo.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or(Error::NotFound)?;
+            (created, *run.as_bytes())
+        }
+    };
+    let fetch = i64::from(limit) + 1;
+    let mut stmt = conn.prepare_cached(PAGE_SQL)?;
     let rows = stmt.query_map(
-        params![tenant.as_bytes(), repo.as_bytes(), i64::from(limit)],
+        params![
+            tenant.as_bytes(),
+            repo.as_bytes(),
+            cursor_ms,
+            &cursor_id[..],
+            fetch
+        ],
         |r| {
             Ok((
                 r.get::<_, [u8; 16]>(0)?,
@@ -158,23 +206,27 @@ pub fn recent_runs(
             ))
         },
     )?;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(usize::from(limit).min(64));
     for row in rows {
         out.push(row?);
     }
-    // One grouped scan for every listed run's job states — the `IN`
-    // subquery is the same selection, materialized once — rather than a
+    let more = out.len() > usize::from(limit);
+    out.truncate(usize::from(limit));
+    // One grouped read for every listed run's job states — the `IN`
+    // subquery is the same page, materialized once — rather than a
     // `run_state` query per row.
     let mut states: std::collections::HashMap<[u8; 16], Vec<JobState>> =
         std::collections::HashMap::with_capacity(out.len());
     if !out.is_empty() {
-        let mut jobs = conn.prepare_cached(
-            "SELECT run_id, state_code FROM jobs WHERE tenant_id = ?1 AND run_id IN (
-                 SELECT id FROM runs WHERE tenant_id = ?1 AND repo_id = ?2
-                 ORDER BY created_ms DESC, id DESC LIMIT ?3)",
-        )?;
+        let mut jobs = conn.prepare_cached(PAGE_JOBS_SQL)?;
         let rows = jobs.query_map(
-            params![tenant.as_bytes(), repo.as_bytes(), i64::from(limit)],
+            params![
+                tenant.as_bytes(),
+                repo.as_bytes(),
+                cursor_ms,
+                &cursor_id[..],
+                i64::from(limit)
+            ],
             |r| Ok((r.get::<_, [u8; 16]>(0)?, r.get::<_, i64>(1)?)),
         )?;
         for row in rows {
@@ -185,7 +237,8 @@ pub fn recent_runs(
                 .push(decode_state(code).ok_or(Error::Corrupt("state_code"))?);
         }
     }
-    out.into_iter()
+    let runs = out
+        .into_iter()
         .map(|(id, sha, created)| {
             Ok(RunSummary {
                 id: RunId::from_bytes(id).map_err(|_| Error::Corrupt("run_id"))?,
@@ -194,5 +247,89 @@ pub fn recent_runs(
                 state: aggregate(states.get(&id).into_iter().flatten().copied()),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let next = if more {
+        runs.last().map(|r| r.id)
+    } else {
+        None
+    };
+    Ok(RunPage { runs, next })
+}
+
+/// A page of runs: a range on `runs_by_repo`, whose trailing primary key
+/// makes the index `(tenant_id, repo_id, created_ms, id)`.
+pub const PAGE_SQL: &str = "SELECT id, source_sha, created_ms FROM runs
+     WHERE tenant_id = ?1 AND repo_id = ?2 AND (created_ms, id) < (?3, ?4)
+     ORDER BY created_ms DESC, id DESC LIMIT ?5";
+
+/// The job states of the same page.
+pub const PAGE_JOBS_SQL: &str = "SELECT run_id, state_code FROM jobs WHERE run_id IN (
+     SELECT id FROM runs
+     WHERE tenant_id = ?1 AND repo_id = ?2 AND (created_ms, id) < (?3, ?4)
+     ORDER BY created_ms DESC, id DESC LIMIT ?5)";
+
+/// A run's change version for long polls: 64-bit FNV-1a over the run's
+/// cancel flag and, for every job in compiled order, its id, state code,
+/// fence, cancel flag and newest attempt's log state. Any state change a
+/// status reader can see changes it (with FNV's collision odds). Computed
+/// straight off the rows — no allocation — so a parked poll can re-check
+/// cheaply after every commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunVersion {
+    pub version: u64,
+    /// Every job is terminal: nothing about the run will change by itself.
+    pub finished: bool,
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[inline]
+fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// See [`RunVersion`]. `NotFound` for a run outside `tenant`.
+pub fn run_version(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunVersion> {
+    let cancel: i64 = conn
+        .prepare_cached("SELECT cancel_requested FROM runs WHERE id = ?1 AND tenant_id = ?2")?
+        .query_row(params![run.as_bytes(), tenant.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    let mut hash = fnv(FNV_OFFSET, &cancel.to_le_bytes());
+    let mut finished = true;
+    let mut any = false;
+    let mut stmt = conn.prepare_cached(
+        "SELECT j.id, j.state_code, j.fence, j.cancel_requested,
+                (SELECT a.log_state FROM attempts a WHERE a.job_id = j.id
+                 ORDER BY a.fence DESC LIMIT 1)
+         FROM jobs j WHERE j.run_id = ?1 AND j.tenant_id = ?2 ORDER BY j.spec_index",
+    )?;
+    let mut rows = stmt.query(params![run.as_bytes(), tenant.as_bytes()])?;
+    while let Some(row) = rows.next()? {
+        let id: [u8; 16] = row.get(0)?;
+        let code: i64 = row.get(1)?;
+        let fence: i64 = row.get(2)?;
+        let job_cancel: i64 = row.get(3)?;
+        // Absent (no attempt yet) hashes apart from every stored code.
+        let log_state: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(-1);
+        hash = fnv(hash, &id);
+        hash = fnv(hash, &code.to_le_bytes());
+        hash = fnv(hash, &fence.to_le_bytes());
+        hash = fnv(hash, &job_cancel.to_le_bytes());
+        hash = fnv(hash, &log_state.to_le_bytes());
+        any = true;
+        finished &= matches!(
+            decode_state(code).ok_or(Error::Corrupt("state_code"))?,
+            JobState::Terminal(_)
+        );
+    }
+    Ok(RunVersion {
+        version: hash,
+        finished: finished && any,
+    })
 }
