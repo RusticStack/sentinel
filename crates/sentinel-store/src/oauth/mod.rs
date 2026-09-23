@@ -16,8 +16,11 @@
 //! in [`crate::auth`], exactly as for sessions and API credentials.
 //!
 //! Refresh tokens rotate on every use ([`refresh`]). A lost response is
-//! recovered once within [`ROTATION_GRACE_MS`]; every other reuse is a replay
-//! and revokes the whole grant.
+//! recovered once within [`ROTATION_GRACE_MS`]: presenting a just-rotated
+//! token again supersedes its one unused successor and mints another, and
+//! only while that successor is its only child. Every other reuse — a third
+//! presentation, one after the successor was used, one after the window —
+//! is a replay and revokes the whole grant.
 //!
 //! The authorization-code ([`code`]), device ([`device`]) and service-grant
 //! ([`service`]) flows build on [`insert_grant`] and [`mint`] in this module.
@@ -633,15 +636,18 @@ fn rotate(
             None
         }
         Some(at) if !superseded && now.0.saturating_sub(at) <= ROTATION_GRACE_MS => {
-            let children: Vec<(i64, Option<i64>)> = tx
-                .prepare_cached(
-                    "SELECT generation, rotated_ms FROM oauth_refresh_tokens
-                     WHERE grant_id = ?1 AND parent = ?2 AND superseded = 0",
-                )?
-                .query_map(params![grant, generation], |r| Ok((r.get(0)?, r.get(1)?)))?
+            // Recovery happens once: the presented token must have exactly
+            // one child, never used and never superseded. A superseded
+            // sibling means it was already recovered, so this is a replay.
+            let children: Vec<(i64, Option<i64>, bool)> = tx
+                .prepare_cached(RECOVERY_CHILDREN)?
+                .query_map(params![grant, generation], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
+                .take(2)
                 .collect::<std::result::Result<_, _>>()?;
             match children.as_slice() {
-                [(child, None)] => Some(*child),
+                [(child, None, false)] => Some(*child),
                 _ => return replay(tx, terms.id, user_of(user)?, now),
             }
         }
@@ -680,6 +686,10 @@ fn rotate(
         .execute(params![grant, now.0])?;
     Ok(Refreshed::Minted(minted))
 }
+
+/// Every child of one generation, superseded or not (see [`rotate`]).
+const RECOVERY_CHILDREN: &str = "SELECT generation, rotated_ms, superseded
+     FROM oauth_refresh_tokens WHERE grant_id = ?1 AND parent = ?2";
 
 fn replay(
     tx: &Transaction<'_>,
@@ -812,8 +822,10 @@ pub fn revoke_grant(
 }
 
 /// Revoke every live grant of an account with `reason` (see [`reason`]).
-/// Called beside session and API-credential revocation on suspension,
-/// rejection, password change and recovery.
+/// Called beside session revocation on suspension, rejection, password
+/// change and recovery; suspension and rejection also revoke the account's
+/// API credentials, while a password change and recovery leave them live
+/// (they do not depend on the password; see local-authentication.md).
 pub fn revoke_all_for_user(
     tx: &Transaction<'_>,
     user: UserId,
@@ -1080,8 +1092,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::migrate(&mut conn).unwrap();
         for sql in [
-            "SELECT generation, rotated_ms FROM oauth_refresh_tokens
-             WHERE grant_id = ?1 AND parent = ?2 AND superseded = 0",
+            super::RECOVERY_CHILDREN,
             "SELECT MAX(generation) + 1 FROM oauth_refresh_tokens WHERE grant_id = ?1",
             "UPDATE oauth_grants SET revoked_ms = ?2 WHERE user_id = ?1 AND revoked_ms IS NULL",
             "UPDATE oauth_grants SET revoked_ms = ?2 WHERE tenant_id = ?1 AND revoked_ms IS NULL",

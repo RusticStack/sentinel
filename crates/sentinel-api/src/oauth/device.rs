@@ -34,7 +34,7 @@ use crate::{
     routes::{self, Reply, Route},
 };
 
-pub(crate) use page_impl::page;
+pub(crate) use page_impl::{WrongCodes, page};
 
 /// `POST /oauth/device_authorization` (RFC 8628 §3.1): a public client asks
 /// for a device code and a user code. `scope` defaults to the CLI default
@@ -45,7 +45,7 @@ pub(crate) fn authorization(state: &State, request: &mut Request) -> Route {
 }
 
 fn authorize(state: &State, request: &mut Request) -> Reply {
-    if let Err(reply) = super::admit(state) {
+    if let Err(reply) = super::admit(state, request, super::Budget::Device) {
         return reply;
     }
     let form = match super::read_form(request) {

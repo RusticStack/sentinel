@@ -440,26 +440,45 @@ fn a_lost_response_recovers_once_and_the_abandoned_successor_is_a_replay() {
     let (_dir, store, i) = fixture();
     let first = issue(&store, login_grant(i.dev, Scopes::CLI_DEFAULT));
     // The response carrying `lost` never reached the client.
+    // Times only move forward, as they would for a real client.
     let lost = refresh(&store, &first.refresh, None, at(1_000)).unwrap();
-    let recovered = refresh(&store, &first.refresh, None, at(1_000 + ROTATION_GRACE_MS)).unwrap();
+    let t = 1_000 + ROTATION_GRACE_MS;
+    let recovered = refresh(&store, &first.refresh, None, at(t)).unwrap();
     assert_eq!(recovered.grant, first.grant);
-    assert!(authenticate(&store, &recovered.access, at(2_000)).is_ok());
+    assert!(authenticate(&store, &recovered.access, at(t + 1)).is_ok());
     // The abandoned successor's access token is gone with it.
-    assert!(authenticate(&store, &lost.access, at(2_000)).is_err());
+    assert!(authenticate(&store, &lost.access, at(t + 1)).is_err());
     // The recovered token keeps rotating normally.
-    let next = refresh(&store, &recovered.refresh, None, at(3_000)).unwrap();
+    let next = refresh(&store, &recovered.refresh, None, at(t + 2)).unwrap();
     assert!(!revoked(&store, first.grant, i.dev));
     // Presenting the superseded successor is a replay: the grant goes.
     assert!(matches!(
-        refresh(&store, &lost.refresh, None, at(4_000)),
+        refresh(&store, &lost.refresh, None, at(t + 3)),
         Err(RefreshError::Replay)
     ));
     assert!(revoked(&store, first.grant, i.dev));
-    assert!(authenticate(&store, &next.access, at(4_001)).is_err());
+    assert!(authenticate(&store, &next.access, at(t + 4)).is_err());
     assert!(matches!(
-        refresh(&store, &next.refresh, None, at(4_002)),
+        refresh(&store, &next.refresh, None, at(t + 5)),
         Err(RefreshError::Invalid)
     ));
+}
+
+/// "Once" is once: a third presentation of the same token inside the window
+/// — someone else holding a copy of it — is a replay, not another recovery
+/// that would supersede the legitimate holder's successor again.
+#[test]
+fn a_lost_response_is_not_recovered_a_second_time() {
+    let (_dir, store, i) = fixture();
+    let first = issue(&store, login_grant(i.dev, Scopes::CLI_DEFAULT));
+    let _lost = refresh(&store, &first.refresh, None, at(1_000)).unwrap();
+    let recovered = refresh(&store, &first.refresh, None, at(2_000)).unwrap();
+    assert!(matches!(
+        refresh(&store, &first.refresh, None, at(3_000)),
+        Err(RefreshError::Replay)
+    ));
+    assert!(revoked(&store, first.grant, i.dev));
+    assert!(authenticate(&store, &recovered.access, at(3_001)).is_err());
 }
 
 #[test]

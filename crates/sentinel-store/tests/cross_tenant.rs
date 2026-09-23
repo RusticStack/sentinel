@@ -664,3 +664,102 @@ fn everything_above_survives_a_reopen() {
     ));
     assert!(store.read(|c| tenancy::epoch(c, acme)).unwrap() >= 1);
 }
+
+/// P03-7 / P09-1: resolving a tenant slug (and a repository name) for a
+/// client never tells a non-member whether the tenant exists. A foreign,
+/// a suspended and a missing slug are the same `NotFound`, for principals,
+/// narrowed credentials and the OAuth narrowing alike.
+#[test]
+fn slugs_and_names_resolve_only_for_members() {
+    let w = world();
+    let sam = principal(w.sam);
+    // sam belongs to globex only.
+    assert_eq!(
+        w.store
+            .read(|c| auth::member_tenant_by_slug(c, sam, "globex"))
+            .unwrap(),
+        w.globex
+    );
+    for slug in ["acme", "dev", "no-such-tenant"] {
+        assert!(matches!(
+            w.store.read(|c| auth::member_tenant_by_slug(c, sam, slug)),
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            w.store
+                .read(|c| auth::narrowing_by_name(c, w.sam, slug, None)),
+            Err(Error::NotFound)
+        ));
+    }
+    // A repository name only inside a tenant the account can see into.
+    assert!(matches!(
+        w.store
+            .read(|c| auth::narrowing_by_name(c, w.sam, "acme", Some("app"))),
+        Err(Error::NotFound)
+    ));
+    assert_eq!(
+        w.store
+            .read(|c| auth::narrowing_by_name(c, w.sam, "globex", Some("app")))
+            .unwrap(),
+        (w.globex, Some(w.globex_repo))
+    );
+    assert!(matches!(
+        w.store
+            .read(|c| auth::narrowing_by_name(c, w.sam, "globex", Some("missing"))),
+        Err(Error::NotFound)
+    ));
+    // dev is only a globex reader with no grant: globex's repository is
+    // invisible to them, though the tenant itself resolves.
+    assert!(
+        w.store
+            .read(|c| auth::narrowing_by_name(c, w.dev, "globex", None))
+            .is_ok()
+    );
+    assert!(matches!(
+        w.store
+            .read(|c| auth::narrowing_by_name(c, w.dev, "globex", Some("app"))),
+        Err(Error::NotFound)
+    ));
+    // A credential narrowed to acme resolves acme only; the service account
+    // resolves its home tenant only; a platform credential sees any active
+    // tenant, and a suspended one is gone for everybody.
+    let narrowed = Principal::new(w.dev, P::ALL, Some(w.acme), None);
+    assert!(
+        w.store
+            .read(|c| auth::member_tenant_by_slug(c, narrowed, "acme"))
+            .is_ok()
+    );
+    assert!(matches!(
+        w.store
+            .read(|c| auth::member_tenant_by_slug(c, narrowed, "globex")),
+        Err(Error::NotFound)
+    ));
+    let bot = principal(w.bot);
+    assert!(
+        w.store
+            .read(|c| auth::member_tenant_by_slug(c, bot, "acme"))
+            .is_ok()
+    );
+    assert!(matches!(
+        w.store
+            .read(|c| auth::member_tenant_by_slug(c, bot, "globex")),
+        Err(Error::NotFound)
+    ));
+    let root = principal(w.root);
+    assert!(
+        w.store
+            .read(|c| auth::member_tenant_by_slug(c, root, "acme"))
+            .is_ok()
+    );
+    let root_id = w.root;
+    let globex = w.globex;
+    w.store
+        .writer()
+        .write(move |tx| tenancy::suspend(tx, stepped(root_id), globex, T).map(|_| ()))
+        .unwrap();
+    assert!(matches!(
+        w.store
+            .read(|c| auth::member_tenant_by_slug(c, sam, "globex")),
+        Err(Error::NotFound)
+    ));
+}

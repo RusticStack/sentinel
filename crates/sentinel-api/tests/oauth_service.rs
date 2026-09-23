@@ -526,3 +526,69 @@ fn grant_terms_are_validated() {
     );
     assert_eq!(bounds.status, 201, "{}", bounds.body);
 }
+
+/// A tenant the caller has no part in is the same `not_found` as one that
+/// does not exist, on every service-account route (P02-9: routes resolve
+/// slugs through the membership-checked lookup).
+#[test]
+fn a_foreign_tenant_is_not_found_like_a_missing_one() {
+    let d = deployment();
+    let (globex, root) = (TenantId::new(), d.root);
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::create_namespace(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                globex,
+                Namespace::parse("globex").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )
+        })
+        .unwrap();
+    let dev = tokens::provision(
+        &d.store,
+        Grant::new(d.dev, "dev", P::REPOSITORY.union(P::TENANT_ADMIN)),
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let dev = format!("Bearer {}", sentinel_auth::token::format(&dev.secret));
+    let account = UserId::new();
+    for (method, suffix, body) in [
+        ("POST", String::new(), json!({"name": "x"})),
+        (
+            "PUT",
+            format!("/{account}/repos/app"),
+            json!({"access": ["read"]}),
+        ),
+        (
+            "POST",
+            format!("/{account}/grants"),
+            json!({"name": "ci", "scope": "runs:read"}),
+        ),
+        ("GET", format!("/{account}/grants"), Value::Null),
+    ] {
+        let foreign = call(
+            &d,
+            method,
+            &format!("/api/v1/tenants/globex/service-accounts{suffix}"),
+            &body,
+            &dev,
+        );
+        let missing = call(
+            &d,
+            method,
+            &format!("/api/v1/tenants/nowhere/service-accounts{suffix}"),
+            &body,
+            &dev,
+        );
+        assert_eq!(foreign.status, 404, "{method} {suffix}: {}", foreign.body);
+        assert_eq!(
+            (foreign.status, &foreign.body),
+            (missing.status, &missing.body),
+            "{method} {suffix}"
+        );
+    }
+}

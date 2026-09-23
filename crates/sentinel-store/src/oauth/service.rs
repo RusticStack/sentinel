@@ -126,7 +126,9 @@ pub fn issue_service_grant(
 }
 
 /// A service principal's grants as metadata (never a token or a digest),
-/// newest first, at most 100, revoked ones included. `Forbidden` unless
+/// newest first, at most 100; a revoked grant is included until
+/// [`super::purge_expired`] deletes it (the next maintenance tick, at most
+/// about ten minutes, with no retention). `Forbidden` unless
 /// `principal` administers `tenant`; `NotFound` unless `account` is a
 /// service principal of it.
 pub fn service_grants(

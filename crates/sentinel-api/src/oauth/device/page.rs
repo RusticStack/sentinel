@@ -7,7 +7,11 @@
 //! session's CSRF digest, and an `Origin` header, when sent, must be the
 //! issuer's. Five wrong user codes per account within ten minutes lock the
 //! account out of the page for the rest of that window, so a code cannot be
-//! guessed from a session. The device code never appears here.
+//! guessed from a session. Approval terms the account cannot grant — a
+//! tenant or repository that is absent, foreign or not visible to it, or a
+//! scope beyond it — get one identical refusal and count toward the same
+//! limit, so the form is not a way to learn what exists elsewhere. The
+//! device code never appears here.
 
 use std::{
     fmt::Write as _,
@@ -18,7 +22,7 @@ use sentinel_auth::{cookie, oauth as forms, secret::Digest};
 use sentinel_core::{RepoId, TenantId, UnixMillis, UserId, auth::Scopes};
 use sentinel_protocol::limits::MAX_OAUTH_FORM_BYTES;
 use sentinel_store::{
-    Error as StoreError, local_auth, lookup,
+    Error as StoreError, auth as authz, local_auth,
     oauth::device::{self, Decision, DeviceView},
 };
 
@@ -36,13 +40,82 @@ const TITLE: &str = "Connect a device";
 const MAX_WRONG_CODES: u8 = 5;
 /// The window those are counted in.
 const WRONG_CODE_WINDOW: Duration = Duration::from_secs(10 * 60);
-/// Accounts tracked before stale windows are dropped.
+/// Accounts tracked at once. A hard bound: past it, an untracked account is
+/// treated as locked out until a window ends and makes room (fail closed),
+/// because evicting a live count would hand its owner fresh guesses.
 const MAX_TRACKED: usize = 4096;
+/// Least time between two sweeps of a full map for ended windows, so a full
+/// map costs one bounded scan per interval rather than one per request.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Wrong user codes (and refused approval terms) per account in the current
+/// window, bounded by [`MAX_TRACKED`] entries.
+pub(crate) struct WrongCodes {
+    counts: std::collections::HashMap<UserId, (u8, Instant)>,
+    /// When the map was last swept; `None` before the first sweep.
+    swept: Option<Instant>,
+}
+
+impl WrongCodes {
+    pub(crate) fn new() -> Self {
+        Self {
+            counts: std::collections::HashMap::new(),
+            swept: None,
+        }
+    }
+
+    /// When full, drop the windows that have ended — at most once per
+    /// [`SWEEP_INTERVAL`]. `true` when `user` has no entry and there is
+    /// still no room for one.
+    fn full_for(&mut self, user: &UserId, now: Instant) -> bool {
+        if self.counts.len() < MAX_TRACKED || self.counts.contains_key(user) {
+            return false;
+        }
+        if self
+            .swept
+            .is_none_or(|at| now.saturating_duration_since(at) >= SWEEP_INTERVAL)
+        {
+            self.swept = Some(now);
+            self.counts
+                .retain(|_, (_, start)| now.saturating_duration_since(*start) < WRONG_CODE_WINDOW);
+        }
+        self.counts.len() >= MAX_TRACKED
+    }
+
+    /// Whether the account may not try a code now.
+    fn locked(&mut self, user: UserId, now: Instant) -> bool {
+        if self.full_for(&user, now) {
+            return true;
+        }
+        self.counts.get(&user).is_some_and(|(count, start)| {
+            *count >= MAX_WRONG_CODES && now.saturating_duration_since(*start) < WRONG_CODE_WINDOW
+        })
+    }
+
+    /// Count one wrong code; nothing is stored when the map has no room,
+    /// and [`WrongCodes::locked`] then refuses the account anyway.
+    fn record(&mut self, user: UserId, now: Instant) {
+        if self.full_for(&user, now) {
+            return;
+        }
+        let entry = self.counts.entry(user).or_insert((0, now));
+        if now.saturating_duration_since(entry.1) >= WRONG_CODE_WINDOW {
+            *entry = (0, now);
+        }
+        entry.0 = entry.0.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.counts.len()
+    }
+}
 
 /// `GET`/`POST /device`.
 pub(crate) fn page(state: &State, request: &mut Request, method: &str, query: &str) -> Route {
     let Some((who, csrf)) = session(state, request).and_then(|who| Some((who, who.csrf?))) else {
         return Ok(html::sign_in_page(
+            &state.oauth.login_url,
             TITLE,
             "Sign in to connect a device to your account.",
         ));
@@ -61,27 +134,17 @@ fn locked(state: &State, user: UserId, now: Instant) -> bool {
         .user_code_failures
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .get(&user)
-        .is_some_and(|(count, start)| {
-            *count >= MAX_WRONG_CODES && now.saturating_duration_since(*start) < WRONG_CODE_WINDOW
-        })
+        .locked(user, now)
 }
 
-/// Count one wrong code for the account.
+/// Count one wrong code (or refused approval terms) for the account.
 fn wrong_code(state: &State, user: UserId, now: Instant) {
-    let mut failures = state
+    state
         .oauth
         .user_code_failures
         .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    if failures.len() >= MAX_TRACKED && !failures.contains_key(&user) {
-        failures.retain(|_, (_, start)| now.saturating_duration_since(*start) < WRONG_CODE_WINDOW);
-    }
-    let entry = failures.entry(user).or_insert((0, now));
-    if now.saturating_duration_since(entry.1) >= WRONG_CODE_WINDOW {
-        *entry = (0, now);
-    }
-    entry.0 = entry.0.saturating_add(1);
+        .unwrap_or_else(|p| p.into_inner())
+        .record(user, now);
 }
 
 fn lockout() -> Reply {
@@ -92,16 +155,17 @@ fn lockout() -> Reply {
 }
 
 /// The user-code entry form, with an optional message.
-fn entry(status: u16, message: Option<&str>) -> Reply {
+fn entry(state: &State, status: u16, message: Option<&str>) -> Reply {
     let mut body = String::with_capacity(512);
     if let Some(message) = message {
         body.push_str("<p class=\"warn\">");
         html::escape_into(&mut body, message);
         body.push_str("</p>\n");
     }
+    body.push_str("<p>Enter the code your device shows.</p>\n<form method=\"get\" action=\"");
+    html::escape_into(&mut body, &state.oauth.device_url);
     body.push_str(
-        "<p>Enter the code your device shows.</p>\n\
-         <form method=\"get\" action=\"/device\">\n\
+        "\">\n\
          <input name=\"user_code\" placeholder=\"XXXX-XXXX\" autocomplete=\"off\" \
          autocapitalize=\"characters\" spellcheck=\"false\" maxlength=\"16\" required autofocus>\n\
          <button>Continue</button>\n</form>",
@@ -115,7 +179,7 @@ fn show(state: &State, who: &Identity, csrf: &Digest, query: &str) -> Reply {
         .map(|(_, value)| value)
         .filter(|value| !value.is_empty())
     else {
-        return entry(200, None);
+        return entry(state, 200, None);
     };
     let clock = Instant::now();
     if locked(state, who.user, clock) {
@@ -123,7 +187,7 @@ fn show(state: &State, who: &Identity, csrf: &Digest, query: &str) -> Reply {
     }
     let Some(code) = forms::normalize_user_code(&typed) else {
         wrong_code(state, who.user, clock);
-        return entry(400, Some("That is not a device code."));
+        return entry(state, 400, Some("That is not a device code."));
     };
     let now = UnixMillis::now();
     let found = state.store.read(|c| {
@@ -135,6 +199,7 @@ fn show(state: &State, who: &Identity, csrf: &Digest, query: &str) -> Reply {
         Err(StoreError::NotFound) => {
             wrong_code(state, who.user, clock);
             entry(
+                state,
                 404,
                 Some("No pending request has that code. Check it, or start again on the device."),
             )
@@ -171,7 +236,9 @@ fn approval(
         "</code>. The request expires in {minutes} minute{}.</p>",
         if minutes == 1 { "" } else { "s" }
     );
-    body.push_str("\n<form method=\"post\" action=\"/device\">\n<input type=\"hidden\" name=\"user_code\" value=\"");
+    body.push_str("\n<form method=\"post\" action=\"");
+    html::escape_into(&mut body, &state.oauth.device_url);
+    body.push_str("\">\n<input type=\"hidden\" name=\"user_code\" value=\"");
     body.push_str(code);
     body.push_str("\">\n<input type=\"hidden\" name=\"form_token\" value=\"");
     body.push_str(&cookie::form_token(&state.oauth.form_key, csrf));
@@ -234,14 +301,18 @@ fn submit(state: &State, request: &mut Request, who: &Identity, csrf: &Digest) -
     }
     let Some(code) = form.get("user_code").and_then(forms::normalize_user_code) else {
         wrong_code(state, who.user, clock);
-        return entry(400, Some("That is not a device code."));
+        return entry(state, 400, Some("That is not a device code."));
     };
     let decision = match form.get("action") {
         Some("deny") => Decision::Deny,
         Some("approve") => {
-            let (tenant, repo) = match narrowing(state, &form) {
+            let (tenant, repo) = match narrowing(state, who.user, &form) {
                 Ok(narrowing) => narrowing,
-                Err(reply) => return reply,
+                Err(Narrowing::Refused) => {
+                    wrong_code(state, who.user, clock);
+                    return refused_terms();
+                }
+                Err(Narrowing::Page(reply)) => return reply,
             };
             Decision::Approve {
                 scopes: ticked(&form),
@@ -267,15 +338,15 @@ fn submit(state: &State, request: &mut Request, who: &Identity, csrf: &Digest) -
         Err(StoreError::NotFound) => {
             wrong_code(state, who.user, clock);
             entry(
+                state,
                 404,
                 Some("No pending request has that code. Check it, or start again on the device."),
             )
         }
-        Err(StoreError::Forbidden) => html::error_page(
-            403,
-            "Your account cannot approve this request with those terms: check the tenant, \
-             the repository and the administrative scopes.",
-        ),
+        Err(StoreError::Forbidden) => {
+            wrong_code(state, who.user, clock);
+            refused_terms()
+        }
         Err(StoreError::InvalidInput(_)) => html::error_page(
             400,
             "Allow at least one of the requested scopes, and name a tenant with a repository.",
@@ -284,30 +355,95 @@ fn submit(state: &State, request: &mut Request, who: &Identity, csrf: &Digest) -
     }
 }
 
-/// The optional tenant (by slug) and repository (by name) narrowing. The
-/// store re-checks membership and ownership when recording the decision.
-fn narrowing(state: &State, form: &Form) -> Result<(Option<TenantId>, Option<RepoId>), Reply> {
+/// The one answer to every approval the account cannot make: a tenant or
+/// repository that does not exist, one it has no part in, or a scope beyond
+/// it. The same bytes for each, so the form reveals nothing about other
+/// tenants; each counts toward the wrong-code lockout, so it cannot be used
+/// to probe at speed either.
+fn refused_terms() -> Reply {
+    html::error_page(
+        403,
+        "Your account cannot approve this request with those terms: check the tenant, \
+         the repository and the administrative scopes.",
+    )
+}
+
+/// Why a narrowing produced no terms.
+enum Narrowing {
+    /// Not a tenant or repository this account may narrow to.
+    Refused,
+    /// A malformed form or a busy store: its own page.
+    Page(Reply),
+}
+
+/// The optional tenant (by slug) and repository (by name) narrowing,
+/// resolved only among the account's own memberships (see
+/// `sentinel_store::auth::narrowing_by_name`). The store re-checks
+/// membership and ownership when recording the decision.
+fn narrowing(
+    state: &State,
+    user: UserId,
+    form: &Form,
+) -> Result<(Option<TenantId>, Option<RepoId>), Narrowing> {
     let (slug, name) = (form.get("tenant"), form.get("repo"));
     let Some(slug) = slug else {
         return if name.is_some() {
-            Err(html::error_page(400, "A repository needs its tenant."))
+            Err(Narrowing::Page(html::error_page(
+                400,
+                "A repository needs its tenant.",
+            )))
         } else {
             Ok((None, None))
         };
     };
-    state
+    match state
         .store
-        .read(|c| {
-            let tenant = lookup::tenant_by_slug(c, slug)?;
-            let repo = name
-                .map(|name| lookup::repo_by_name(c, tenant, name))
-                .transpose()?;
-            Ok((Some(tenant), repo))
-        })
-        .map_err(|e| match e {
-            StoreError::NotFound => {
-                html::error_page(403, "No such tenant or repository for your account.")
-            }
-            _ => html::error_page(503, "The server is busy. Try again."),
-        })
+        .read(|c| authz::narrowing_by_name(c, user, slug, name))
+    {
+        Ok((tenant, repo)) => Ok((Some(tenant), repo)),
+        Err(StoreError::NotFound) => Err(Narrowing::Refused),
+        Err(_) => Err(Narrowing::Page(html::error_page(
+            503,
+            "The server is busy. Try again.",
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// More accounts than the bound, all inside one window: the map never
+    /// grows past it, and an account it has no room for is refused rather
+    /// than left uncounted.
+    #[test]
+    fn the_wrong_code_map_is_bounded_and_fails_closed() {
+        let mut codes = WrongCodes::new();
+        let start = Instant::now();
+        for _ in 0..MAX_TRACKED {
+            codes.record(UserId::new(), start);
+        }
+        assert_eq!(codes.len(), MAX_TRACKED);
+        let late = UserId::new();
+        assert!(codes.locked(late, start));
+        codes.record(late, start + Duration::from_secs(2));
+        assert_eq!(codes.len(), MAX_TRACKED);
+        // Once those windows end, one sweep makes room again.
+        let later = start + WRONG_CODE_WINDOW + Duration::from_secs(1);
+        assert!(!codes.locked(late, later));
+        codes.record(late, later);
+        assert_eq!(codes.len(), 1);
+    }
+
+    #[test]
+    fn five_wrong_codes_lock_an_account_for_its_window() {
+        let mut codes = WrongCodes::new();
+        let (user, start) = (UserId::new(), Instant::now());
+        for _ in 0..MAX_WRONG_CODES {
+            assert!(!codes.locked(user, start));
+            codes.record(user, start);
+        }
+        assert!(codes.locked(user, start));
+        assert!(!codes.locked(user, start + WRONG_CODE_WINDOW));
+    }
 }

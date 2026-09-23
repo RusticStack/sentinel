@@ -60,6 +60,21 @@ impl Drop for Deployment {
 }
 
 pub fn deployment() -> Deployment {
+    deployment_under(None)
+}
+
+/// A deployment whose `public_url` carries `path` (`/sentinel`), reached
+/// directly (the tests play both a stripping and a forwarding proxy).
+pub fn deployment_under(path: Option<&str>) -> Deployment {
+    let (listen, public_url): (std::net::SocketAddr, Option<String>) = match path {
+        None => ("127.0.0.1:0".parse().unwrap(), None),
+        Some(path) => {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = probe.local_addr().unwrap();
+            drop(probe);
+            (addr, Some(format!("http://{addr}{path}")))
+        }
+    };
     let dir = tempfile::tempdir().unwrap();
     let store =
         Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
@@ -98,7 +113,7 @@ pub fn deployment() -> Deployment {
     )
     .unwrap();
     let server = sentinel_api::Server::start(sentinel_api::Config {
-        listen: "127.0.0.1:0".parse().unwrap(),
+        listen,
         store: Arc::clone(&store),
         logs,
         objects,
@@ -106,11 +121,11 @@ pub fn deployment() -> Deployment {
         sessions: local_auth::Policy::default(),
         github_webhook_secret: None,
         intake: None,
-        public_url: None,
+        public_url: public_url.clone(),
     })
     .unwrap();
     let base = format!("http://{}", server.local_addr());
-    assert_eq!(server.issuer(), base);
+    assert_eq!(server.issuer(), public_url.as_deref().unwrap_or(&base));
     Deployment {
         _dir: dir,
         store,
@@ -844,4 +859,188 @@ fn oauth_pages_carry_the_security_headers() {
     assert_eq!(page.header("cache-control"), Some("no-store"));
     let csp = page.header("content-security-policy").unwrap();
     assert!(csp.contains("frame-ancestors 'none'") && !csp.contains("form-action"));
+}
+
+/// P09-2: one client flooding revocation (or device authorization) takes
+/// its own budget, not everyone's; another client's refresh still goes
+/// through. Loopback is a proxy address, so `X-Forwarded-For` names the
+/// client here as a reverse proxy would.
+#[test]
+fn a_flooding_client_cannot_stop_another_clients_refresh() {
+    let d = deployment();
+    let minted = grant(&d, d.dev, Scopes::CLI_DEFAULT);
+    let flood = format!("client_id={CLI_CLIENT_ID}&token=garbage");
+    let mut refused = 0;
+    for _ in 0..120 {
+        let reply = send(
+            &d,
+            "POST",
+            "/oauth/revoke",
+            Body::Form(&flood),
+            &[("x-forwarded-for", "198.51.100.1")],
+        );
+        if reply.status == 503 {
+            assert_eq!(reply.body["error"], "temporarily_unavailable");
+            refused += 1;
+        }
+    }
+    assert!(refused > 0, "the flooding client was never limited");
+    let device_flood = format!("client_id={CLI_CLIENT_ID}");
+    for _ in 0..40 {
+        send(
+            &d,
+            "POST",
+            "/oauth/device_authorization",
+            Body::Form(&device_flood),
+            &[("x-forwarded-for", "198.51.100.1")],
+        );
+    }
+    let refreshed = send(
+        &d,
+        "POST",
+        "/oauth/token",
+        Body::Form(&refresh_form(&minted.refresh)),
+        &[("x-forwarded-for", "203.0.113.7")],
+    );
+    assert_eq!(refreshed.status, 200, "{}", refreshed.body);
+    // And another client can still start a device login.
+    let device = send(
+        &d,
+        "POST",
+        "/oauth/device_authorization",
+        Body::Form(&device_flood),
+        &[("x-forwarded-for", "203.0.113.8")],
+    );
+    assert_eq!(device.status, 200, "{}", device.body);
+}
+
+/// P09-3: a store too busy to check a credential is `rate_limited`, never
+/// `401` — a `401` would make an OAuth client spend its refresh token.
+#[test]
+fn a_busy_store_is_rate_limited_not_unauthenticated() {
+    let d = deployment();
+    let minted = grant(&d, d.dev, Scopes::CLI_DEFAULT);
+    let auth = bearer(&minted.access);
+    assert_eq!(get(&d, "/api/v1/me", &auth).status, 200);
+    // Hold every reader for longer than read admission waits.
+    let (hold, held) = (
+        std::sync::Arc::new(std::sync::Barrier::new(sentinel_store::READER_LIMIT + 1)),
+        std::time::Duration::from_millis(sentinel_store::READ_ADMISSION.as_millis() as u64 + 2_000),
+    );
+    let holders: Vec<_> = (0..sentinel_store::READER_LIMIT)
+        .map(|_| {
+            let (store, hold) = (
+                std::sync::Arc::clone(&d.store),
+                std::sync::Arc::clone(&hold),
+            );
+            std::thread::spawn(move || {
+                store
+                    .read(|_| {
+                        hold.wait();
+                        std::thread::sleep(held);
+                        Ok(())
+                    })
+                    .unwrap();
+            })
+        })
+        .collect();
+    hold.wait();
+    let busy = get(&d, "/api/v1/me", &auth);
+    assert_ne!(busy.status, 401, "{}", busy.body);
+    assert_eq!(busy.status, 429, "{}", busy.body);
+    assert_eq!(busy.body["code"], "rate_limited");
+    assert!(busy.header("www-authenticate").is_none());
+    for holder in holders {
+        holder.join().unwrap();
+    }
+    assert_eq!(get(&d, "/api/v1/me", &auth).status, 200);
+}
+
+/// P09-4: with a path-carrying `public_url`, every URL handed out stays
+/// inside the issuer, the RFC 8414 / 9728 well-known locations answer, and
+/// a proxy that forwards the prefix unstripped still reaches the routes.
+#[test]
+fn a_path_issuer_keeps_every_url_inside_its_mount() {
+    let d = deployment_under(Some("/sentinel"));
+    let issuer = format!("{}/sentinel", d.base);
+    for path in [
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/oauth-authorization-server/sentinel",
+        "/sentinel/.well-known/oauth-authorization-server",
+    ] {
+        let reply = send(&d, "GET", path, Body::None, &[]);
+        assert_eq!(reply.status, 200, "{path}");
+        let metadata: Metadata = serde_json::from_value(reply.body).unwrap();
+        assert_eq!(metadata.issuer, issuer, "{path}");
+        assert_eq!(
+            metadata.device_authorization_endpoint,
+            format!("{issuer}/oauth/device_authorization")
+        );
+    }
+    for path in [
+        "/.well-known/oauth-protected-resource/api/v1",
+        "/.well-known/oauth-protected-resource/sentinel/api/v1",
+    ] {
+        let reply = send(&d, "GET", path, Body::None, &[]);
+        assert_eq!(reply.status, 200, "{path}");
+        assert_eq!(reply.body["resource"], format!("{issuer}/api/v1"));
+    }
+    // The challenge names the RFC 9728 location of the resource.
+    let anonymous = send(&d, "GET", "/sentinel/api/v1/me", Body::None, &[]);
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(
+        anonymous.header("www-authenticate"),
+        Some(
+            format!(
+                "Bearer realm=\"sentinel\", resource_metadata=\"{}/.well-known/oauth-protected-resource/sentinel/api/v1\"",
+                d.base
+            )
+            .as_str()
+        )
+    );
+    // The sign-in and the device forms post inside the mount.
+    for path in ["/device", "/sentinel/device"] {
+        let page = send(&d, "GET", path, Body::None, &[]);
+        assert_eq!(page.status, 200, "{path}");
+        let text = page.body.as_str().unwrap();
+        assert!(
+            text.contains(&format!("fetch(\"{issuer}/api/v1/login\"")),
+            "{text}"
+        );
+        assert!(!text.contains("fetch(\"/api"), "{text}");
+    }
+    let cookie = {
+        let reply = send(
+            &d,
+            "POST",
+            "/sentinel/api/v1/login",
+            Body::Json(&json!({"username": "root", "password": PASSWORD})),
+            &[],
+        );
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        reply
+            .header("set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let entry = send(&d, "GET", "/device", Body::None, &[("cookie", &cookie)]);
+    assert!(
+        entry
+            .body
+            .as_str()
+            .unwrap()
+            .contains(&format!("action=\"{issuer}/device\""))
+    );
+    // A foreign well-known path is still nothing.
+    let other = send(
+        &d,
+        "GET",
+        "/.well-known/oauth-authorization-server/other",
+        Body::None,
+        &[],
+    );
+    assert_eq!(other.status, 404);
 }

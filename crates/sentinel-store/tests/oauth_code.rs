@@ -143,12 +143,37 @@ fn consent_offers_the_accounts_active_memberships() {
     );
     assert_eq!(
         store
-            .read(|c| code::repo_named(c, i.tenant, "app"))
+            .read(|c| code::repo_named(c, i.dev, i.tenant, "app"))
             .unwrap(),
         i.repo
     );
     assert!(matches!(
-        store.read(|c| code::repo_named(c, i.tenant, "missing")),
+        store.read(|c| code::repo_named(c, i.dev, i.tenant, "missing")),
+        Err(Error::NotFound)
+    ));
+}
+
+/// The consent page's repository lookup never tells a person whether a
+/// name exists in a tenant they do not belong to, nor in their own tenant
+/// when the repository is not theirs to see.
+#[test]
+fn consent_repository_lookup_hides_what_the_account_cannot_see() {
+    let (_dir, store, i) = fixture();
+    let foreign_existing = store.read(|c| code::repo_named(c, i.dev, i.other, "app"));
+    let foreign_missing = store.read(|c| code::repo_named(c, i.dev, i.other, "missing"));
+    assert!(matches!(foreign_existing, Err(Error::NotFound)));
+    assert!(matches!(foreign_missing, Err(Error::NotFound)));
+    // An ungranted repository of dev's own tenant is invisible to an operator.
+    let hidden = RepoId::new();
+    store
+        .writer()
+        .write(move |tx| {
+            let root = Principal::new(i.root, P::ALL, None, None);
+            auth::create_repo(tx, root, i.tenant, hidden, "private", NOW)
+        })
+        .unwrap();
+    assert!(matches!(
+        store.read(|c| code::repo_named(c, i.dev, i.tenant, "private")),
         Err(Error::NotFound)
     ));
 }

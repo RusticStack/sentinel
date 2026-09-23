@@ -88,21 +88,23 @@ pub(crate) fn store_error(e: StoreError) -> ApiError {
 pub(crate) fn handle(state: &State, request: &mut Request) {
     let method = request.method().to_owned();
     let url = request.url().to_owned();
-    let (path, query) = match url.split_once('?') {
+    let (full_path, query) = match url.split_once('?') {
         Some((p, q)) => (p.to_owned(), q.to_owned()),
         None => (url.clone(), String::new()),
     };
+    // A proxy that forwards a path-carrying issuer's paths unstripped.
+    let path = state.oauth.local_path(&full_path);
     if method == "GET" && path == "/" {
         let response = Response::from_string(web::INDEX_HTML)
             .with_header(header("content-type", "text/html; charset=utf-8"));
         let _ = request.respond(response);
         return;
     }
-    let outcome = route(state, request, &method, &path, &query);
+    let outcome = route(state, request, &method, path, &query);
     let reply = match outcome {
         Ok(reply) => reply,
         Err(error) => {
-            let headers = challenge(state, request, &path, &error);
+            let headers = challenge(state, request, path, &error);
             Reply::Json(error.http_status(), json!(error), headers)
         }
     };
@@ -163,9 +165,8 @@ fn challenge(state: &State, request: &Request, path: &str, error: &ApiError) -> 
     match error.code {
         ErrorCode::Unauthenticated => {
             let mut value = format!(
-                "Bearer realm=\"sentinel\", resource_metadata=\"{}{}\"",
-                state.oauth.issuer,
-                sentinel_protocol::oauth::PROTECTED_RESOURCE_PATH
+                "Bearer realm=\"sentinel\", resource_metadata=\"{}\"",
+                state.oauth.resource_metadata
             );
             if header_value(request, "authorization").is_some() {
                 value.push_str(", error=\"invalid_token\"");
@@ -241,6 +242,7 @@ pub(crate) fn identify(
 ) -> Result<Identity, ApiError> {
     auth::identify(
         &state.store,
+        state.sessions,
         header_value(request, "authorization"),
         header_value(request, "cookie"),
         header_value(request, cookie::CSRF_HEADER),
@@ -253,6 +255,11 @@ pub(crate) fn identify(
             "sign in or present a credential",
         ),
         Refusal::Csrf => err(ErrorCode::Forbidden, "missing or wrong CSRF header"),
+        // Never `401`: the credential was not judged, and an OAuth client
+        // answers `401` by spending its refresh token.
+        Refusal::Busy => err(ErrorCode::RateLimited, "controller busy; retry")
+            .with_detail("retry_after_ms", 1000),
+        Refusal::Fault => err(ErrorCode::Internal, "controller fault"),
     })
 }
 
@@ -307,7 +314,9 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
             let repos = state
                 .store
                 .read(|c| {
-                    let tenant = lookup::tenant_by_slug(c, &slug)?;
+                    // Membership-checked, so a foreign tenant is the same
+                    // `not_found` as an absent one, never an empty list.
+                    let tenant = authz::member_tenant_by_slug(c, who.principal, &slug)?;
                     authz::list_repos(c, who.principal, tenant, None, 100)
                 })
                 .map_err(store_error)?;
@@ -779,6 +788,28 @@ struct LoginBody {
 }
 
 fn login(state: &State, request: &mut Request) -> Route {
+    // Login CSRF: a cross-site form can post `text/plain` (whose body can be
+    // shaped to parse as JSON) but not `application/json` without a CORS
+    // preflight this server never grants; and a browser's `Origin`, when
+    // sent, must be this deployment's.
+    let json_body = header_value(request, "content-type").is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case(JSON))
+    });
+    if !json_body {
+        return Err(err(
+            ErrorCode::InvalidRequest,
+            "sign-in takes an application/json body",
+        ));
+    }
+    if header_value(request, "origin").is_some_and(|origin| origin != state.oauth.origin) {
+        return Err(err(
+            ErrorCode::Forbidden,
+            "sign-in from another site is refused",
+        ));
+    }
     let bytes = body(request)?;
     let creds: LoginBody = parse(&bytes)?;
     let outcome = local_auth::login(

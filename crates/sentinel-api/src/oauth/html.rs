@@ -92,11 +92,13 @@ pub(crate) fn redirect(location: &str) -> Reply {
     )
 }
 
-/// The embedded sign-in form: a password login through `POST /api/v1/login`
-/// (which sets the session cookie), then a reload of the same page so the
-/// request is re-evaluated with the session. Nothing about the pending
-/// request is stored; the URL carries it.
-pub(crate) const SIGN_IN: &str = r#"<form id="sentinel-sign-in">
+/// The embedded sign-in form: a password login through `POST
+/// {issuer}/api/v1/login` (which sets the session cookie), then a reload of
+/// the same page so the request is re-evaluated with the session. Nothing
+/// about the pending request is stored; the URL carries it. The login URL
+/// comes from the issuer, so a path-carrying `public_url` posts inside its
+/// own mount rather than at the host's root.
+const SIGN_IN_HEAD: &str = r#"<form id="sentinel-sign-in">
   <input id="sentinel-username" placeholder="username" autocomplete="username" required>
   <input id="sentinel-password" type="password" placeholder="password" autocomplete="current-password" required>
   <button>Sign in</button>
@@ -108,7 +110,9 @@ document.getElementById("sentinel-sign-in").onsubmit = async (event) => {
   const status = document.getElementById("sentinel-sign-in-status");
   status.textContent = "";
   try {
-    const response = await fetch("/api/v1/login", {
+    const response = await fetch("#;
+
+const SIGN_IN_TAIL: &str = r#", {
       method: "POST",
       credentials: "same-origin",
       headers: { "content-type": "application/json", "accept": "application/json" },
@@ -123,13 +127,36 @@ document.getElementById("sentinel-sign-in").onsubmit = async (event) => {
 };
 </script>"#;
 
-/// A page asking the visitor to sign in first, with `message` explaining why.
-pub(crate) fn sign_in_page(title: &str, message: &str) -> Reply {
-    let mut body = String::from("<p>");
+/// A page asking the visitor to sign in first, with `message` explaining
+/// why; the form posts to `login_url` (`OAuthState::login_url`).
+pub(crate) fn sign_in_page(login_url: &str, title: &str, message: &str) -> Reply {
+    let mut body = String::with_capacity(SIGN_IN_HEAD.len() + SIGN_IN_TAIL.len() + 256);
+    body.push_str("<p>");
     escape_into(&mut body, message);
     body.push_str("</p>\n");
-    body.push_str(SIGN_IN);
+    body.push_str(SIGN_IN_HEAD);
+    script_string_into(&mut body, login_url);
+    body.push_str(SIGN_IN_TAIL);
     page(200, title, &body)
+}
+
+/// Append `text` as a double-quoted JavaScript string literal that is also
+/// safe inside a `<script>` element: quotes, backslashes, `<`, `>` and `&`
+/// and every control character are escaped.
+fn script_string_into(out: &mut String, text: &str) {
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' | '\\' | '<' | '>' | '&' | '\'' | '\u{2028}' | '\u{2029}' => {
+                let _ = std::fmt::Write::write_fmt(out, format_args!("\\u{:04x}", ch as u32));
+            }
+            c if c.is_control() => {
+                let _ = std::fmt::Write::write_fmt(out, format_args!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 #[cfg(test)]
@@ -152,6 +179,20 @@ mod tests {
         let doc = document("<script>", "<p>ok</p>");
         assert!(doc.contains("<title>&lt;script&gt;</title>"));
         assert!(!doc.contains("<title><script>"));
+    }
+
+    #[test]
+    fn the_sign_in_posts_inside_the_issuer_and_cannot_break_out_of_its_script() {
+        let Reply::Html(_, page, _) =
+            sign_in_page("https://ci.example/sentinel/api/v1/login", "Sign in", "why")
+        else {
+            panic!("not a page");
+        };
+        assert!(page.contains(r#"fetch("https://ci.example/sentinel/api/v1/login", {"#));
+        let mut out = String::new();
+        script_string_into(&mut out, "a\"</script>\\\n");
+        let expected = ["\"a", "0022", "003c/script", "003e", "005c", "000a\""].join("\\u");
+        assert_eq!(out, expected);
     }
 
     #[test]

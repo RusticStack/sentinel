@@ -1,10 +1,18 @@
-//! Host-local name resolution for the administration command.
+//! Unauthorized name resolution: "which row does this name mean".
 //!
 //! Trusted controller internals, like [`crate::auth::provisioning`]: these
-//! functions answer "which row does this operator-typed name mean" and perform
-//! no authorization. Their only caller is a process that can already open the
-//! database file. No route may expose them — an authorized client resolves
-//! names through [`crate::auth`], which checks live membership.
+//! functions perform no authorization. The host-local administration command
+//! uses them freely, because it can already open the database file.
+//!
+//! A client route may use one only as the first half of an authorization
+//! decision taken in the same snapshot, where the second half answers
+//! `NotFound` for a denied row exactly as for an absent one (for example
+//! `repo_by_name` followed by [`crate::auth::require_repo`]). Nothing a
+//! route returns may depend on the lookup alone: a route that would answer
+//! differently for "exists but not yours" and "does not exist" must resolve
+//! through [`crate::auth`] instead ([`crate::auth::member_tenant_by_slug`],
+//! [`crate::auth::narrowing_by_name`]), which checks live membership in the
+//! resolving statement.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sentinel_core::{RepoId, TenantId, UserId};

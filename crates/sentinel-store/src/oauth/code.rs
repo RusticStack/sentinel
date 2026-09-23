@@ -39,15 +39,17 @@ pub struct ConsentChoice {
     pub role: Role,
 }
 
+/// The consent page's tenant choices.
+const CONSENT_CHOICES: &str = "SELECT m.tenant_id, t.slug, m.role FROM memberships m
+     JOIN tenants t ON t.id = m.tenant_id
+     WHERE m.user_id = ?1 AND t.active = 1
+     ORDER BY t.slug LIMIT ?2";
+
 /// The account's memberships of active tenants, by slug, at most
-/// [`MAX_CONSENT_CHOICES`]. One index range on `memberships_by_user`.
+/// [`MAX_CONSENT_CHOICES`]. One index range on `memberships_by_user`; the
+/// slug order is a sort over that one account's memberships, not a table.
 pub fn consent_choices(conn: &Connection, user: UserId) -> Result<Vec<ConsentChoice>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT m.tenant_id, t.slug, m.role FROM memberships m
-         JOIN tenants t ON t.id = m.tenant_id
-         WHERE m.user_id = ?1 AND t.active = 1
-         ORDER BY t.slug LIMIT ?2",
-    )?;
+    let mut stmt = conn.prepare_cached(CONSENT_CHOICES)?;
     let rows = stmt.query_map(params![user.as_bytes(), MAX_CONSENT_CHOICES], |r| {
         Ok((
             r.get::<_, [u8; 16]>(0)?,
@@ -72,13 +74,26 @@ pub fn consent_choices(conn: &Connection, user: UserId) -> Result<Vec<ConsentCho
     Ok(out)
 }
 
-/// The repository `name` of `tenant`, for narrowing a grant on the consent
-/// page. `NotFound` when the tenant has no such repository. A key probe on
-/// `UNIQUE(tenant_id, name)`; [`approve`] re-checks ownership anyway.
-pub fn repo_named(conn: &Connection, tenant: TenantId, name: &str) -> Result<RepoId> {
+/// Resolves a repository name for [`repo_named`]: only in an active tenant
+/// the account is a member of, and only a repository it can see (a tenant
+/// admin sees all of them, another member the ones granted to it).
+const REPO_NAMED: &str = "SELECT r.id FROM repos r
+     JOIN tenants t ON t.id = r.tenant_id AND t.active = 1
+     JOIN memberships m ON m.tenant_id = r.tenant_id AND m.user_id = ?3
+     WHERE r.tenant_id = ?1 AND r.name = ?2
+     AND (m.role = 3 OR EXISTS(SELECT 1 FROM repo_grants g
+         WHERE g.tenant_id = r.tenant_id AND g.user_id = m.user_id AND g.repo_id = r.id))";
+
+/// The repository `name` of `tenant`, for narrowing `user`'s grant on the
+/// consent page. `NotFound` alike when the tenant has no such repository,
+/// when `user` is not a member of the tenant, and when `user` cannot see
+/// the repository, so the page never reveals what another tenant holds.
+/// Key probes on `UNIQUE(tenant_id, name)` and the membership key;
+/// [`approve`] re-checks ownership anyway.
+pub fn repo_named(conn: &Connection, user: UserId, tenant: TenantId, name: &str) -> Result<RepoId> {
     let bytes = conn
-        .prepare_cached("SELECT id FROM repos WHERE tenant_id = ?1 AND name = ?2")?
-        .query_row(params![tenant.as_bytes(), name], |r| {
+        .prepare_cached(REPO_NAMED)?
+        .query_row(params![tenant.as_bytes(), name, user.as_bytes()], |r| {
             r.get::<_, [u8; 16]>(0)
         })
         .optional()?
@@ -408,7 +423,7 @@ mod tests {
     }
 
     /// Approval, consumption and the consent/replay lookups are key searches,
-    /// never scans or sorts over a table.
+    /// never table scans.
     #[test]
     fn code_statements_are_key_searches() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -417,10 +432,10 @@ mod tests {
             super::APPROVAL_TERMS,
             super::CONSUME,
             "SELECT user_id, grant_id FROM oauth_codes WHERE code_digest = ?1",
-            "SELECT id FROM repos WHERE tenant_id = ?1 AND name = ?2",
-            "SELECT m.tenant_id, t.slug, m.role FROM memberships m
-             JOIN tenants t ON t.id = m.tenant_id
-             WHERE m.user_id = ?1 AND t.active = 1",
+            super::REPO_NAMED,
+            // The statement that runs, ORDER BY and LIMIT included: its sort
+            // is over one account's memberships, found by index search.
+            super::CONSENT_CHOICES,
         ] {
             let plans = plans(&conn, sql);
             assert!(
