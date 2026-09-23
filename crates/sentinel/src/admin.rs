@@ -1386,5 +1386,6 @@ const fn event_name(event: Event) -> &'static str {
         Event::OAuthDeviceApproved => "oauth-device-approved",
         Event::OAuthDeviceDenied => "oauth-device-denied",
         Event::ServiceGrantIssued => "service-grant-issued",
+        Event::ServiceAccountCreated => "service-account-created",
     }
 }

@@ -13,7 +13,7 @@ use crate::client::{self, Client, Error, Exit, Output};
 
 pub(super) fn list(client: &Client, output: Output, run: &str) -> Result<(), Error> {
     let run = segment("run", run)?;
-    let view = client.get(&format!("/api/v1/runs/{run}/artifacts"))?;
+    let mut view = client.get(&format!("/api/v1/runs/{run}/artifacts"))?;
     let mut list = List::new(output);
     for artifact in view["artifacts"].as_array().into_iter().flatten() {
         list.item(artifact.clone(), || {
@@ -28,7 +28,11 @@ pub(super) fn list(client: &Client, output: Output, run: &str) -> Result<(), Err
             )
         });
     }
-    list.finish("artifacts", Map::new());
+    let mut extra = Map::new();
+    if let Some(tenant) = view.get_mut("tenant") {
+        extra.insert("tenant".to_owned(), tenant.take());
+    }
+    list.finish("artifacts", extra);
     Ok(())
 }
 
@@ -77,10 +81,16 @@ pub(super) fn download(
     out: &Path,
     tenant_flag: Option<String>,
 ) -> Result<(), Error> {
-    let slug = tenant(client, tenant_flag)?;
     let run = segment("run", run)?;
     let artifact = segment("artifact", artifact)?;
     let view = client.get(&format!("/api/v1/runs/{run}/artifacts/{artifact}"))?;
+    // The answer names the run's tenant; `--tenant` or the profile context
+    // only matter for a server that does not.
+    let slug = match (tenant_flag, view["tenant"].as_str()) {
+        (Some(flag), _) => tenant(client, Some(flag))?,
+        (None, Some(owner)) => segment("tenant", owner)?.to_owned(),
+        (None, None) => tenant(client, None)?,
+    };
     let entry = view["manifest"]["entries"]
         .as_array()
         .into_iter()

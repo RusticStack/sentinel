@@ -391,6 +391,23 @@ fn an_artifact_entry_downloads_with_its_length_and_digest_checked() {
         .collect();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], artifact.to_string());
+    // The answers name the owning tenant, so a download needs no --tenant
+    // (this CLI has neither the flag nor a profile context below).
+    let out = cli(&d, &["artifact", "list", &run.to_string(), "--json"]);
+    let listed: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(listed["tenant"], "acme");
+    let out = cli(
+        &d,
+        &[
+            "artifact",
+            "show",
+            &run.to_string(),
+            &artifact.to_string(),
+            "--json",
+        ],
+    );
+    let shown: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(shown["tenant"], "acme");
     let target = d.dir.path().join("report.bin");
     let out = cli(
         &d,
@@ -403,8 +420,6 @@ fn an_artifact_entry_downloads_with_its_length_and_digest_checked() {
             "out/report.bin",
             "--out",
             target.to_str().unwrap(),
-            "--tenant",
-            "acme",
             "--json",
         ],
     );
@@ -518,6 +533,42 @@ fn pipeline_explain_json_failures_are_one_error_document_on_stderr() {
         .unwrap();
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let _: Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    // `--output json` is the same mode, for validate as well as explain.
+    let pipeline = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_sentinel"))
+            .arg("pipeline")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = pipeline(&["explain", "--output", "json", good.to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let explained: Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(explained["schema"], "sentinel.explain/1");
+    let out = pipeline(&["validate", "--output", "json", good.to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let valid: Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(
+        (valid["valid"].as_bool(), valid["jobs"].as_u64()),
+        (Some(true), Some(1))
+    );
+    let out = pipeline(&["validate", "--output", "json", bad.to_str().unwrap()]);
+    assert_eq!(code(&out), 1);
+    assert!(stdout(&out).is_empty());
+    let error: Value = serde_json::from_str(stderr(&out).trim()).unwrap();
+    assert_eq!(error["code"], "invalid_pipeline");
+    // Text validate prints nothing on success; ndjson is not an offline mode.
+    let out = pipeline(&["validate", good.to_str().unwrap()]);
+    assert_eq!((code(&out), stdout(&out).as_str()), (0, ""));
+    assert_eq!(
+        code(&pipeline(&[
+            "validate",
+            "--output",
+            "ndjson",
+            good.to_str().unwrap()
+        ])),
+        2
+    );
 }
 
 fn plain_get(url: &str, token: &str) -> (u16, Value) {

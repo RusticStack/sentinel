@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use sentinel::{LogFormat, LogLevel};
 
 #[derive(Parser)]
@@ -780,18 +780,49 @@ pub struct PipelineArgs {
 
 #[derive(Subcommand)]
 pub enum PipelineCommand {
-    /// Load, decode and compile the file; print nothing on success
+    /// Load, decode and compile the file; print nothing on success (text)
     Validate {
         /// Path to the pipeline file
         file: PathBuf,
+        #[command(flatten)]
+        output: PipelineOutputArgs,
     },
     /// Show jobs, order, budgets, required grants and unresolved runtime inputs
     Explain {
         file: PathBuf,
-        /// Machine-readable output (`sentinel.explain/1`)
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        output: PipelineOutputArgs,
     },
+}
+
+/// The offline commands' output: text, or one JSON document (there is no
+/// list to stream, so `ndjson` is not offered).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum PipelineOutput {
+    #[default]
+    Text,
+    Json,
+}
+
+#[derive(Args)]
+pub struct PipelineOutputArgs {
+    /// text or json (`explain` json is `sentinel.explain/1`)
+    #[arg(long, value_enum, default_value = "text")]
+    pub output: PipelineOutput,
+    /// Same as --output json
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl PipelineOutputArgs {
+    /// The effective mode (`--json` wins).
+    pub fn mode(&self) -> sentinel::client::Output {
+        if self.json || self.output == PipelineOutput::Json {
+            sentinel::client::Output::Json
+        } else {
+            sentinel::client::Output::Text
+        }
+    }
 }
 
 #[derive(Args)]

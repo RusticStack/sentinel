@@ -409,15 +409,17 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
             let who = identify(state, request, false)?;
             auth::require_scope(&who, Scopes::ARTIFACTS_READ)?;
             let run: RunId = id(run, "run")?;
-            let rows = state
+            let (slug, rows) = state
                 .store
                 .read(|c| {
                     let repo = lookup::run_repo(c, run)?;
-                    let tenant = authz::require_repo(c, who.principal, repo, Permissions::READ)?;
-                    artifacts::for_run(c, tenant, run)
+                    let (tenant, slug) =
+                        authz::require_repo_slug(c, who.principal, repo, Permissions::READ)?;
+                    Ok((slug, artifacts::for_run(c, tenant, run)?))
                 })
                 .map_err(store_error)?;
             ok(json!({
+                "tenant": slug,
                 "artifacts": rows.iter().map(artifact_json).collect::<Vec<_>>()
             }))
         }
@@ -425,11 +427,12 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
             let who = identify(state, request, false)?;
             auth::require_scope(&who, Scopes::ARTIFACTS_READ)?;
             let (run, art): (RunId, ArtifactId) = (id(run, "run")?, id(art, "artifact")?);
-            let (row, manifest) = state
+            let (slug, row, manifest) = state
                 .store
                 .read(|c| {
                     let repo = lookup::run_repo(c, run)?;
-                    let tenant = authz::require_repo(c, who.principal, repo, Permissions::READ)?;
+                    let (tenant, slug) =
+                        authz::require_repo_slug(c, who.principal, repo, Permissions::READ)?;
                     let row = artifacts::get(c, tenant, run, art)?;
                     let manifest = match row.manifest_version {
                         Some(version) => Some(state.objects.manifest(
@@ -441,10 +444,11 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
                         )?),
                         None => None,
                     };
-                    Ok((row, manifest))
+                    Ok((slug, row, manifest))
                 })
                 .map_err(store_error)?;
             let mut body = artifact_json(&row);
+            body["tenant"] = Value::String(slug);
             if let Some(manifest) = manifest {
                 body["manifest"] = json!({
                     "version": manifest.version,
@@ -1301,7 +1305,7 @@ fn log_search(state: &State, request: &Request, attempt: &str, query: &str) -> R
 }
 
 /// Longest `q` a log search accepts, in bytes.
-const MAX_SEARCH_TEXT: usize = 256;
+const MAX_SEARCH_TEXT: usize = logs::MAX_NEEDLE;
 
 fn stream_name(stream: sentinel_protocol::logs::Stream) -> &'static str {
     match stream {

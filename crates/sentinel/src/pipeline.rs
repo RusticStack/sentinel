@@ -6,9 +6,8 @@
 //! mode a success is one document on stdout — `sentinel.explain/1` for
 //! `explain`, `{"file", "valid": true, "jobs"}` for `validate` — and a
 //! failure is one `sentinel.error/1` line on stderr (`invalid_pipeline` or
-//! `client_usage` for an unreadable file) with stdout left empty. `explain
-//! --json` selects it today; [`run_with`] takes the mode so a shared
-//! `--output` flag only has to pass it through.
+//! `client_usage` for an unreadable file) with stdout left empty. Both
+//! commands take `--output text|json` (`--json` is `--output json`).
 use std::{path::Path, process::ExitCode};
 
 use sentinel::client::Output;
@@ -19,10 +18,8 @@ use crate::cli::{PipelineArgs, PipelineCommand};
 
 pub fn run(args: PipelineArgs) -> ExitCode {
     match args.command {
-        PipelineCommand::Validate { file } => run_with(&file, false, Output::Text),
-        PipelineCommand::Explain { file, json } => {
-            run_with(&file, true, if json { Output::Json } else { Output::Text })
-        }
+        PipelineCommand::Validate { file, output } => run_with(&file, false, output.mode()),
+        PipelineCommand::Explain { file, output } => run_with(&file, true, output.mode()),
     }
 }
 

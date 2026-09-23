@@ -116,6 +116,7 @@ pub enum Event {
     OAuthDeviceApproved = 53,
     OAuthDeviceDenied = 54,
     ServiceGrantIssued = 55,
+    ServiceAccountCreated = 56,
 }
 
 impl Event {
@@ -176,6 +177,7 @@ impl Event {
             53 => Event::OAuthDeviceApproved,
             54 => Event::OAuthDeviceDenied,
             55 => Event::ServiceGrantIssued,
+            56 => Event::ServiceAccountCreated,
             _ => return None,
         })
     }

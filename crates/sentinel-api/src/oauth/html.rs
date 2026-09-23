@@ -35,14 +35,6 @@ pub(crate) fn escape_into(out: &mut String, text: &str) {
     }
 }
 
-/// `text` escaped as a new string.
-#[allow(dead_code)] // used by the consent and device pages (O01, O03)
-pub(crate) fn escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 8);
-    escape_into(&mut out, text);
-    out
-}
-
 const HEAD: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -92,7 +84,6 @@ pub(crate) fn error_page(status: u16, message: &str) -> Reply {
 }
 
 /// `303 See Other` to `location`, with an empty body.
-#[allow(dead_code)] // used by the consent page (O01)
 pub(crate) fn redirect(location: &str) -> Reply {
     Reply::Html(
         303,
@@ -105,7 +96,6 @@ pub(crate) fn redirect(location: &str) -> Reply {
 /// (which sets the session cookie), then a reload of the same page so the
 /// request is re-evaluated with the session. Nothing about the pending
 /// request is stored; the URL carries it.
-#[allow(dead_code)] // embedded by the consent and device pages (O01, O03)
 pub(crate) const SIGN_IN: &str = r#"<form id="sentinel-sign-in">
   <input id="sentinel-username" placeholder="username" autocomplete="username" required>
   <input id="sentinel-password" type="password" placeholder="password" autocomplete="current-password" required>
@@ -134,7 +124,6 @@ document.getElementById("sentinel-sign-in").onsubmit = async (event) => {
 </script>"#;
 
 /// A page asking the visitor to sign in first, with `message` explaining why.
-#[allow(dead_code)] // used by the consent and device pages (O01, O03)
 pub(crate) fn sign_in_page(title: &str, message: &str) -> Reply {
     let mut body = String::from("<p>");
     escape_into(&mut body, message);
@@ -146,6 +135,12 @@ pub(crate) fn sign_in_page(title: &str, message: &str) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn escape(text: &str) -> String {
+        let mut out = String::new();
+        escape_into(&mut out, text);
+        out
+    }
 
     #[test]
     fn escaping_covers_every_metacharacter() {

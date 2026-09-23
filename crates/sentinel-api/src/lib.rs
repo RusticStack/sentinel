@@ -71,7 +71,6 @@ pub(crate) struct State {
     pub transfers: AtomicUsize,
     /// Long-poll subscribers currently parked (run waits and `wait=1` log
     /// polls), bounded so they cannot take every handler permit.
-    #[allow(dead_code)] // read by the O05 long-poll routes
     pub subscribers: AtomicUsize,
     /// Set by `Server::shutdown`; the `wait=1` log poll checks it so a
     /// stop does not ride out the full poll interval.

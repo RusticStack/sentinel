@@ -782,8 +782,14 @@ impl LogStore {
     /// sequence greater than `after`, scanned in stored order with one
     /// precompiled `memmem` finder and no per-frame allocation beyond the
     /// decode, until `limit` matching lines or `budget` payload bytes. See
-    /// [`Search`] for how a scan resumes. A match must lie inside one frame:
-    /// a string split across two frames is not found.
+    /// [`Search`] for how a scan resumes. A literal split across two
+    /// consecutive frames of the same step and stream is found too (the
+    /// scanner carries the unfinished last line of each stream, at most
+    /// `needle.len() - 1` bytes plus context, across frames and across a
+    /// resume); it is reported with the later frame's `seq`. The one miss:
+    /// a request resuming exactly at the end of a sealed segment starts in
+    /// the next segment, so nothing seeds the carry (re-reading a whole
+    /// segment for that is not worth it).
     pub fn search(
         &self,
         run: RunId,
@@ -834,6 +840,13 @@ impl LogStore {
 pub const SEARCH_SCAN_BYTES: u64 = 4 << 20;
 /// A match's reported text: its line, cut to this many bytes around it.
 pub const MATCH_TEXT_BYTES: usize = 512;
+/// Longest needle whose split across two frames is still found; the API
+/// accepts no longer one. A longer needle matches within one frame only.
+pub const MAX_NEEDLE: usize = 256;
+/// Context kept before a split match, as a match inside one frame gets.
+const LEAD: usize = MATCH_TEXT_BYTES / 4;
+/// The carried tail of one stream: a split needle's first part plus its lead.
+const CARRY_BYTES: usize = MAX_NEEDLE - 1 + LEAD;
 
 /// A bounded literal search: frames past `after`, at most `limit` matching
 /// lines and `budget` scanned payload bytes (normally [`SEARCH_SCAN_BYTES`]).
@@ -868,33 +881,80 @@ pub struct Search {
     pub complete: bool,
 }
 
+/// The unfinished last line of the latest frame of one stream (its last
+/// `CARRY_BYTES` at most), so a needle split across two frames of the same
+/// step and stream is still found. Fixed-size: no allocation per frame.
+struct Carry {
+    step: u32,
+    len: usize,
+    /// The carried line already produced a match (one report per line).
+    reported: bool,
+    buf: [u8; CARRY_BYTES],
+}
+
+impl Carry {
+    const EMPTY: Carry = Carry {
+        step: 0,
+        len: 0,
+        reported: false,
+        buf: [0; CARRY_BYTES],
+    };
+
+    /// Continue the carried line with `bytes`, which hold no newline.
+    fn extend(&mut self, bytes: &[u8]) {
+        if bytes.len() >= CARRY_BYTES {
+            self.buf
+                .copy_from_slice(&bytes[bytes.len() - CARRY_BYTES..]);
+            self.len = CARRY_BYTES;
+            return;
+        }
+        let keep = self.len.min(CARRY_BYTES - bytes.len());
+        self.buf.copy_within(self.len - keep..self.len, 0);
+        self.buf[keep..keep + bytes.len()].copy_from_slice(bytes);
+        self.len = keep + bytes.len();
+    }
+}
+
 /// The per-request scan state: the finder is built once per request.
 struct Scanner<'n> {
     finder: memchr::memmem::Finder<'n>,
+    needle: usize,
     after: u64,
     limit: usize,
     budget: u64,
     scanned: u64,
     out: Search,
+    /// Indexed by stream (stdout, stderr).
+    carry: [Carry; 2],
 }
 
 impl<'n> Scanner<'n> {
     fn new(query: SearchQuery<'n>) -> Scanner<'n> {
         Scanner {
             finder: memchr::memmem::Finder::new(query.needle),
+            needle: query.needle.len(),
             after: query.after,
             limit: query.limit,
             budget: query.budget,
             scanned: 0,
             out: Search::default(),
+            carry: [Carry::EMPTY, Carry::EMPTY],
         }
+    }
+
+    /// Whether a needle can be split across frames and still be found.
+    const fn carries(&self) -> bool {
+        self.needle >= 2 && self.needle <= MAX_NEEDLE
     }
 
     /// Scan one decoded frame; `false` once the request's bound is reached
     /// (with `next_after` set). The limit is checked between frames, so one
-    /// frame's matching lines are never split across responses.
+    /// frame's matching lines are never split across responses. Frames at
+    /// or before `after` are not scanned but still update the carry, so a
+    /// resumed request finds a needle split across its first frame.
     fn frame(&mut self, frame: &Frame) -> bool {
         if frame.seq <= self.after {
+            self.remember(frame, false);
             return true;
         }
         if self.out.matches.len() >= self.limit || self.scanned >= self.budget {
@@ -902,32 +962,105 @@ impl<'n> Scanner<'n> {
             return false;
         }
         let bytes = &frame.bytes[..];
-        let mut from = 0;
-        while let Some(at) = self.finder.find(&bytes[from..]) {
+        let mut from = self.across(frame);
+        // Whether the frame's last (unfinished) line has been reported.
+        let mut tail_reported = from > bytes.len();
+        while from < bytes.len()
+            && let Some(at) = self.finder.find(&bytes[from..])
+        {
             let at = from + at;
             let line_start = memchr::memrchr(b'\n', &bytes[..at]).map_or(0, |i| i + 1);
             let line_end = memchr::memchr(b'\n', &bytes[at..]).map_or(bytes.len(), |i| at + i);
-            let start = line_start.max(at.saturating_sub(MATCH_TEXT_BYTES / 4));
-            let mut end = line_end.min(start + MATCH_TEXT_BYTES);
-            if end > start && bytes[end - 1] == b'\r' {
-                end -= 1;
-            }
+            let start = line_start.max(at.saturating_sub(LEAD));
+            let end = trim_cr(bytes, start, line_end.min(start + MATCH_TEXT_BYTES));
             self.out.matches.push(Match {
                 seq: frame.seq,
                 step: frame.step,
                 stream: frame.stream,
                 text: bytes[start..end].to_vec(),
             });
+            tail_reported = line_end == bytes.len();
             // One report per line; the next match starts past it.
             from = line_end + 1;
-            if from >= bytes.len() {
-                break;
-            }
         }
+        self.remember(frame, tail_reported);
         self.scanned += bytes.len() as u64;
         // Resume after this frame, whatever stops the scan next.
         self.after = frame.seq;
         true
+    }
+
+    /// A match that starts in the stream's carried line and ends in this
+    /// frame: report it and return where the in-frame scan continues (past
+    /// the line it ends on, so beyond the frame when that line is
+    /// unfinished), or 0 when there is none.
+    fn across(&mut self, frame: &Frame) -> usize {
+        let n = self.needle;
+        let carry = &self.carry[frame.stream as usize - 1];
+        if !self.carries() || carry.len == 0 || carry.step != frame.step || carry.reported {
+            return 0;
+        }
+        let bytes = &frame.bytes[..];
+        // Only the frame's first line continues the carried one.
+        let first_line = memchr::memchr(b'\n', bytes).unwrap_or(bytes.len());
+        let tail = carry.len.min(n - 1);
+        let head = first_line.min(n - 1);
+        let mut window = [0u8; 2 * (MAX_NEEDLE - 1)];
+        window[..tail].copy_from_slice(&carry.buf[carry.len - tail..carry.len]);
+        window[tail..tail + head].copy_from_slice(&bytes[..head]);
+        // Each side is shorter than the needle, so any match in the window
+        // crosses the frame boundary.
+        let Some(at) = self.finder.find(&window[..tail + head]) else {
+            return 0;
+        };
+        let at = carry.len - tail + at;
+        let mut text = Vec::with_capacity(MATCH_TEXT_BYTES);
+        text.extend_from_slice(&carry.buf[at.saturating_sub(LEAD)..carry.len]);
+        let room = MATCH_TEXT_BYTES.saturating_sub(text.len());
+        let end = trim_cr(bytes, 0, first_line.min(room));
+        text.extend_from_slice(&bytes[..end]);
+        self.out.matches.push(Match {
+            seq: frame.seq,
+            step: frame.step,
+            stream: frame.stream,
+            text,
+        });
+        first_line + 1
+    }
+
+    /// Keep the frame's unfinished last line as its stream's carry.
+    fn remember(&mut self, frame: &Frame, tail_reported: bool) {
+        if !self.carries() {
+            return;
+        }
+        let carry = &mut self.carry[frame.stream as usize - 1];
+        let bytes = &frame.bytes[..];
+        match memchr::memrchr(b'\n', bytes) {
+            Some(nl) => {
+                carry.len = 0;
+                carry.reported = tail_reported;
+                carry.extend(&bytes[nl + 1..]);
+            }
+            None if carry.step != frame.step => {
+                carry.len = 0;
+                carry.reported = tail_reported;
+                carry.extend(bytes);
+            }
+            None => {
+                carry.reported |= tail_reported;
+                carry.extend(bytes);
+            }
+        }
+        carry.step = frame.step;
+    }
+}
+
+/// `end`, moved back over a `\r` that ends the line.
+fn trim_cr(bytes: &[u8], start: usize, end: usize) -> usize {
+    if end > start && bytes[end - 1] == b'\r' {
+        end - 1
+    } else {
+        end
     }
 }
 

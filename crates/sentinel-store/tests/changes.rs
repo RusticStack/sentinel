@@ -434,3 +434,77 @@ fn log_search_finds_literals_across_segments_within_its_byte_bound() {
         Err(sentinel_store::Error::NotFound)
     ));
 }
+
+#[test]
+fn log_search_finds_a_literal_split_across_two_frames_of_one_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(dir.path().join("logs")).unwrap();
+    let (run, job, attempt) = (RunId::new(), JobId::new(), AttemptId::new());
+    // (step, stream, bytes): "needle" split "nee|dle" across stdout frames
+    // with a stderr frame in between; a split across a step change; a
+    // split spanning three frames; and a line matched in its first frame
+    // that must not be reported again when its continuation arrives.
+    let frames: [(u32, Stream, &[u8]); 10] = [
+        (0, Stream::Stdout, b"first line\nerror: nee"),
+        (0, Stream::Stderr, b"noise\n"),
+        (0, Stream::Stdout, b"dle here\r\nclean\n"),
+        (0, Stream::Stdout, b"tail ne"),
+        (1, Stream::Stdout, b"edle in a new step\n"),
+        (1, Stream::Stdout, b"n"),
+        (1, Stream::Stdout, b"ee"),
+        (1, Stream::Stdout, b"dle three\n"),
+        (1, Stream::Stderr, b"a needle, then nee"),
+        (1, Stream::Stderr, b"dle again on that line\n"),
+    ];
+    for (i, (step, stream, bytes)) in frames.iter().enumerate() {
+        logs.append(
+            run,
+            job,
+            attempt,
+            &Frame {
+                seq: i as u64 + 1,
+                step: *step,
+                stream: *stream,
+                bytes: bytes.to_vec(),
+            },
+        )
+        .unwrap();
+    }
+    let search = |after| {
+        logs.search(
+            run,
+            job,
+            attempt,
+            SearchQuery {
+                needle: b"needle",
+                after,
+                limit: 100,
+                budget: u64::MAX,
+            },
+        )
+        .unwrap()
+    };
+    let found: Vec<(u64, u32, Stream, String)> = search(0)
+        .matches
+        .into_iter()
+        .map(|m| (m.seq, m.step, m.stream, String::from_utf8(m.text).unwrap()))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (3, 0, Stream::Stdout, "error: needle here".to_owned()),
+            (8, 1, Stream::Stdout, "needle three".to_owned()),
+            (9, 1, Stream::Stderr, "a needle, then nee".to_owned()),
+        ]
+    );
+    // A request resuming between the halves still finds the split: the
+    // frames before `after` are decoded anyway and seed the carry.
+    let resumed = search(2);
+    assert_eq!(resumed.matches[0].seq, 3);
+    assert_eq!(resumed.matches[0].text, b"error: needle here");
+    // Resuming after the second of three pieces: both skipped pieces seed it.
+    let resumed = search(7);
+    let seqs: Vec<u64> = resumed.matches.iter().map(|m| m.seq).collect();
+    assert_eq!(seqs, [8, 9]);
+    assert_eq!(resumed.matches[0].text, b"needle three");
+}

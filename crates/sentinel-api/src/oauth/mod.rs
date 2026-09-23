@@ -82,21 +82,17 @@ pub(crate) struct OAuthState {
     /// The issuer: `public_url`, or `http://{bound address}`.
     pub issuer: String,
     /// `scheme://host[:port]` of the issuer, for `Origin` checks.
-    #[allow(dead_code)] // read by the consent and device pages (O01, O03)
     pub origin: String,
     /// `{issuer}/api/v1`, the `resource` of `Audience::Api`.
     pub api_resource: String,
     /// Keys consent and device-approval form tokens; random per process.
-    #[allow(dead_code)] // read by the consent and device pages (O01, O03)
     pub form_key: [u8; 32],
     /// Shared by every unauthenticated OAuth POST.
     pub unauth: Mutex<TokenBucket>,
     /// Device-code digest -> (last poll, current interval in ms), bounded by
     /// `sentinel_store::oauth::MAX_PENDING_DEVICE`.
-    #[allow(dead_code)] // read by the device grant (O03)
     pub device_polls: Mutex<HashMap<[u8; 32], (Instant, u32)>>,
     /// Wrong user codes per account: (count, window start).
-    #[allow(dead_code)] // read by the device page (O03)
     pub user_code_failures: Mutex<HashMap<UserId, (u8, Instant)>>,
 }
 
@@ -297,7 +293,6 @@ pub(crate) fn read_form(request: &mut Request) -> Result<Form, Reply> {
 
 /// The session behind a browser page request, if any. Bearer credentials
 /// never drive consent or device approval.
-#[allow(dead_code)] // used by the consent and device pages (O01, O03)
 pub(crate) fn session(state: &State, request: &Request) -> Option<Identity> {
     routes::identify(state, request, false)
         .ok()

@@ -407,3 +407,34 @@ fn repository_access_is_allowed_only_within_the_tenant() {
             .is_err()
     );
 }
+
+#[test]
+fn creating_a_service_account_is_audited_and_needs_an_administrator() {
+    let (_dir, store, i) = fixture();
+    let audit = store.read(|c| local_auth::recent_audit(c, 3)).unwrap();
+    // Newest first: the repository grant, then the two creations.
+    assert_eq!(audit[0].event, Event::GrantChanged);
+    for (row, account) in audit[1..].iter().zip([i.foreign_bot, i.bot]) {
+        assert_eq!(row.event, Event::ServiceAccountCreated);
+        assert_eq!(row.actor, Some(i.root));
+        assert_eq!(row.subject, Some(account));
+    }
+    let refused = store.writer().write(move |tx| {
+        auth::create_service_account(
+            tx,
+            person(i.dev, false),
+            i.tenant,
+            UserId::new(),
+            "rogue",
+            Role::Reader,
+            NOW,
+        )
+    });
+    assert!(matches!(refused, Err(Error::Forbidden)));
+    let after = store.read(|c| local_auth::recent_audit(c, 1)).unwrap();
+    assert_eq!(
+        after[0].event,
+        Event::GrantChanged,
+        "a refusal writes nothing"
+    );
+}

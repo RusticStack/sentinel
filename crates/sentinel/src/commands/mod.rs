@@ -234,7 +234,7 @@ pub enum ArtifactCommand {
         /// Where to write it; replaced only once the bytes verify
         #[arg(long, value_name = "FILE")]
         out: std::path::PathBuf,
-        /// Tenant slug that owns the run (default: the profile's context)
+        /// Tenant slug that owns the run (default: the one the server names)
         #[arg(long, value_name = "SLUG")]
         tenant: Option<String>,
     },

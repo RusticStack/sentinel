@@ -28,7 +28,12 @@ All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](p
 | `POST /login` `{username,password}` | none | — | password login → `Set-Cookie` session, body `{user, csrf}`; every non-accepted outcome is one `unauthenticated` |
 | `POST /logout` | session + CSRF | — | ends the session, clears the cookie |
 | `GET /me` | any | — | who the credential is and how: `user`, `username` (local login name or `null`), `via` (`bearer`, `session`, `oauth`), `super_admin`, `tenant`/`repo` narrowing, `scopes` (names), and for an OAuth token its `grant` and `expires_ms` |
-| OAuth: `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/api/v1`, `/oauth/*`, `/device`, `/api/v1/grants…`, `/api/v1/tenants/{slug}/service-accounts…` | see [OAuth](oauth.md) | see [OAuth](oauth.md) | the authorization server, grant listing/revocation and service accounts ([OAuth](oauth.md)) |
+| `GET /grants` | any | — | the caller's own OAuth grants as metadata (`{grants:[{id, user, client_id, kind, scope, tenant, repo, name, created_ms, expires_ms, last_used_ms, revoked}]}`, newest first, at most 100); never a token ([OAuth](oauth.md#service-account-grants-o06)) |
+| `DELETE /grants/{grt}` | owner, the home tenant's admin for a service grant, or platform admin | — | revoke the grant (reason 7, audited) → `{grant, revoked:true}`; anyone else `not_found`; its access tokens are then `401` and refresh tokens `invalid_grant` |
+| `POST /tenants/{slug}/service-accounts` `{name, role?}` | tenant admin | `tenant:admin` | create a service principal confined to the tenant (role `reader` or `operator`, default operator) → `201 {user, name, role}`; audited `ServiceAccountCreated` |
+| `PUT /tenants/{slug}/service-accounts/{usr}/repos/{name}` `{access:["read","run"]}` | tenant admin | `tenant:admin` | set the account's access to one repository of the tenant (`[]` withdraws) → `{user, repo, access}` |
+| `POST /tenants/{slug}/service-accounts/{usr}/grants` `{name, scope, repo?, expires_in_ms?}` | tenant admin | `tenant:admin` | issue a service grant (1 h..90 d, default 30 d; never `tenant:admin`/`platform:admin`) → `201 {grant, refresh_token, expires_ms, scope}`; the `sntl_rt_` token is shown this once |
+| `GET /tenants/{slug}/service-accounts/{usr}/grants` | tenant admin | `tenant:admin` | the account's grants as metadata, revoked ones included |
 | `POST /hooks/github` | App webhook signature | — | GitHub webhooks ([intake](intake.md)): raw-body HMAC-SHA256, delivery dedup, `push` and `pull_request` intake, `ping` probe. `not_found` until `<data_dir>/github-webhook.json` exists |
 | `POST /intake/{repo}` | repository hook secret | — | generic ref updates ([intake](intake.md)): bounded JSON, dedup, durable acceptance → `202` with the delivery id |
 | `GET /tenants/{slug}/repos` | member | `runs:read` | repositories visible to the caller |
@@ -40,10 +45,10 @@ All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](p
 | `POST /jobs/{id}/cancel` | `run` | `runs:write` | `cancel` → `terminal`, `requested` or `alreadyterminal` |
 | `POST /jobs/{id}/rerun` | `run` | `runs:write` | a new attempt of a finished job; `conflict` for a running or cancelled one |
 | `GET /attempts/{id}/logs?after&limit&wait=1&step` | `read` | `logs:read` | frames after a sequence from the segmented store the controller writes ([logs](logs.md)); `step` serves one step only; `wait=1` parks up to 25 s for more, holding one of the four subscriber slots it shares with run waits (a fifth parked poll is `rate_limited` with `details.retry_after_ms`; a poll with frames to return never parks); `complete` and `gaps` say when the log is closed; pre-D04 flat logs still read |
-| `GET /attempts/{id}/logs/search?q&after&limit` | `read` | `logs:read` | bounded literal search (O05): `q` is 1–256 bytes, percent-decoded (`+` is a space), matched byte for byte with `memmem` inside each frame (a string split across two frames is not found). Frames past `after` are scanned in stored order, at most 4 MiB of payload and `limit` matching lines (default 100, max 500; checked between frames) per request → `{attempt, matches:[{seq, step, stream, text}], next_after, complete}`; `text` is the matching line, at most 512 bytes around the match. `next_after` is where the next request resumes when a bound stopped this one; `complete` means the log is finished and was scanned to its end |
+| `GET /attempts/{id}/logs/search?q&after&limit` | `read` | `logs:read` | bounded literal search (O05): `q` is 1–256 bytes, percent-decoded (`+` is a space), matched byte for byte with `memmem`; a string split across consecutive frames of the same step and stream is found too (the scan carries each stream's unfinished last line) and reported with the later frame's `seq`, except when a request resumes exactly where a sealed log segment ends. Frames past `after` are scanned in stored order, at most 4 MiB of payload and `limit` matching lines (default 100, max 500; checked between frames) per request → `{attempt, matches:[{seq, step, stream, text}], next_after, complete}`; `text` is the matching line, at most 512 bytes around the match. `next_after` is where the next request resumes when a bound stopped this one; `complete` means the log is finished and was scanned to its end |
 | `GET /attempts/{id}/summary` | `read` | `cache:read` | the attempt's cache records (K08) from its terminal summary → `{attempt, present:true, image_present, caches:[{name, class, outcome, lookup_ns, lock_wait_ns, clone_ns, first_touch_ns, files, bytes, copied_bytes, reflink, commit_ns, staged_bytes, reused_bytes, dirty_bytes, publish, costly_hit}]}`, or `{attempt, present:false}` before the attempt reported |
-| `GET /runs/{id}/artifacts` | `read` | `artifacts:read` | every artifact row of the run: name, job, attempt, `captured`/`absent`/`failed`, entries, bytes, retention and creation ([storage](storage.md#artifact-records-d03)) |
-| `GET /runs/{id}/artifacts/{arf}` | `read` | `artifacts:read` | one row plus, when captured, its immutable manifest: version, digest, payload length and each entry's path/digest/len/mode; entry bytes download via `GET /tenants/{slug}/objects/{digest}` |
+| `GET /runs/{id}/artifacts` | `read` | `artifacts:read` | `{tenant, artifacts}`: the owning tenant's slug (for the objects route) and every artifact row of the run: name, job, attempt, `captured`/`absent`/`failed`, entries, bytes, retention and creation ([storage](storage.md#artifact-records-d03)) |
+| `GET /runs/{id}/artifacts/{arf}` | `read` | `artifacts:read` | one row with the owning `tenant` slug plus, when captured, its immutable manifest: version, digest, payload length and each entry's path/digest/len/mode; entry bytes download via `GET /tenants/{slug}/objects/{digest}` |
 | `GET /workers?tenant=slug` | member | `runs:read` | the pools the tenant may use and their workers, each with `connected` from the live fleet |
 | `GET /queue?tenant=slug&limit` | member | `runs:read` | the tenant's waiting jobs, oldest first, each with its `run`, `repo`, `age_ms` and the `reason` it is not running: `dependency`, `policy` (with its detail), `no_matching_worker` (with `cpu_short`/`memory_short`), `worker_offline`, `capacity`, and the fleet constraints `disk_short`, `arch_mismatch`, `label_missing`, `drain`, `concurrency_limit`, `fairness_hold` and `locality_wait`. Bounded to `limit` (default 100, max 500), with `total` as the number of waiting jobs the listing returned and `truncated` marking a response this route cut short, so a ten-thousand-job queue is never a ten-thousand-job document |
 | `POST /workers/{wrk}/drain` | platform admin | `platform:admin` | the worker keeps the attempts it already holds and takes no new offers → `{worker, draining:true}`; work it could have taken stays queued with reason `drain` |
@@ -54,6 +59,18 @@ All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](p
 | `POST /uploads/{upl}/commit` | member (operator+) | `runs:write` | tile check + digest verification → publish the object → `{digest}`; repeating returns the same digest |
 | `DELETE /uploads/{upl}` | member (operator+) | `runs:write` | abort and drop the staged bytes |
 | `GET /tenants/{slug}/objects/{digest}` | member | `artifacts:read` | stream a committed object; `Range: bytes=a-b`/`a-`/`-n` → `206` with `Content-Range`; invalid ranges are `invalid_request`. At most four transfer bodies are in flight at once — the next is `rate_limited` |
+
+The OAuth authorization server's endpoints are at the deployment's root, not under `/api/v1`, and answer the RFC 6749 error shape `{error, error_description}` instead of `sentinel.error/1` ([OAuth](oauth.md)):
+
+| Route | Auth | Does |
+|---|---|---|
+| `GET /.well-known/oauth-authorization-server` | none | RFC 8414 metadata: the issuer, the endpoints below, grant types, `S256`, the scopes |
+| `GET /.well-known/oauth-protected-resource/api/v1` | none | RFC 9728: `resource` `{issuer}/api/v1`, its authorization server and scopes |
+| `GET, POST /oauth/authorize` | session cookie (else the embedded password sign-in) | authorization code + PKCE consent (O01); approve or deny → `303` to the loopback redirect with `code`/`error`, `state`, `iss` |
+| `POST /oauth/token` | public client (`client_id`) | `authorization_code`, `refresh_token` (rotation with a 60 s lost-response grace, replay revokes the grant) and `urn:ietf:params:oauth:grant-type:device_code` grants → `TokenResponse`; `cache-control: no-store` |
+| `POST /oauth/revoke` | public client | RFC 7009: either token kind revokes its whole grant; always `200` |
+| `POST /oauth/device_authorization` | public client | RFC 8628 device request → `{device_code, user_code, verification_uri, verification_uri_complete, expires_in, interval}`; `429 slow_down` at 1024 pending |
+| `GET, POST /device` | session cookie (else the embedded password sign-in) | enter a user code, then approve (narrowing scopes, tenant, repository) or deny; five wrong codes in ten minutes lock the account out of the page for the rest of the window |
 
 The first page (`GET /`) is a single static document; it accepts a
 `#/runs/<run id>` fragment and opens that run, which is what a check's
@@ -91,8 +108,8 @@ GitHub Checks (G03–G06) are the other way runs *finish* externally; webhook
 intake and the resolution lane exist ([intake](intake.md)), while the
 policy-selected pipeline resolution and run creation are G03. MCP is the
 M-tasks over these same routes. TLS in the server itself is deliberately
-absent. Pagination cursors exist in the protocol and are not yet used by
-`runs` (a limit suffices for the first page). Step-up over the API (second
+absent. The run list pages with a `before` keyset cursor (O05); the
+protocol's opaque cursors are not used by any route yet. Step-up over the API (second
 factor for privileged mutations) arrives with the routes that need it.
 
 ## Verification

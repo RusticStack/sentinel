@@ -66,6 +66,36 @@ pub fn require_repo(
     TenantId::from_bytes(bytes).map_err(|_| Error::Corrupt("tenant_id"))
 }
 
+/// [`require_repo`] that also returns the owning tenant's slug. The same
+/// statement already joins `tenants` for its liveness predicate, so the slug
+/// is one more projected column, not another lookup.
+pub fn require_repo_slug(
+    conn: &Connection,
+    principal: Principal,
+    repo: RepoId,
+    required: Permissions,
+) -> Result<(TenantId, String)> {
+    repo_scope(principal, required)?;
+    let (bytes, slug) = conn
+        .prepare_cached(repo_query!("r.tenant_id, t.slug", "AND r.id = ?5"))?
+        .query_row(
+            params![
+                principal.user.as_bytes(),
+                required.bits(),
+                principal.tenant.as_ref().map(TenantId::as_bytes),
+                principal.repo.as_ref().map(RepoId::as_bytes),
+                repo.as_bytes()
+            ],
+            |row| Ok((row.get::<_, [u8; 16]>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    Ok((
+        TenantId::from_bytes(bytes).map_err(|_| Error::Corrupt("tenant_id"))?,
+        slug,
+    ))
+}
+
 /// Client dispatch entry point: derive the tenant from the authorized repository
 /// in this writer transaction. A client cannot supply a different run owner.
 pub fn create_run(
@@ -654,7 +684,14 @@ pub fn create_service_account(
         "INSERT INTO memberships(tenant_id, user_id, role) VALUES (?1, ?2, ?3)",
         params![tenant.as_bytes(), user.as_bytes(), role as u8],
     )?;
-    Ok(())
+    crate::local_auth::audit(
+        tx,
+        crate::local_auth::Event::ServiceAccountCreated,
+        Some(principal.user),
+        Some(user),
+        false,
+        None,
+    )
 }
 
 fn bounded_text(value: &str, max: usize, field: &'static str) -> Result<()> {
