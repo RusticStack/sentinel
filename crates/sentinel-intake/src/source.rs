@@ -35,6 +35,20 @@ impl std::fmt::Display for Error {
     }
 }
 
+/// A store answer while issuing access: the binding's own refusal (revoked,
+/// changed, not found, undecodable) is permanent; a busy reader or writer is
+/// a fault worth retrying, never a reason to fail the work it would serve.
+fn refusal_or_fault(error: StoreError, why: &'static str) -> Error {
+    match error {
+        StoreError::NotFound
+        | StoreError::Forbidden
+        | StoreError::Conflict
+        | StoreError::Corrupt(_)
+        | StoreError::InvalidInput(_) => Error::Refused(why),
+        _ => Error::Unavailable(why),
+    }
+}
+
 /// What a repository's binding authorizes right now: its terms, and the forge
 /// installation association when there is one. `None` means the repository
 /// has no binding at all (the explicit manual mode).
@@ -91,7 +105,7 @@ pub fn issue(
         let key = key.ok_or(Error::Refused("source_unavailable"))?;
         return store
             .read(move |conn| sources::issue(conn, binding.tenant, binding.repo, key, now))
-            .map_err(|_| Error::Refused("source_unavailable"));
+            .map_err(|e| refusal_or_fault(e, "source_unavailable"));
     };
     let app = app.ok_or(Error::Refused("github_unconfigured"))?;
     let token = app
@@ -118,7 +132,7 @@ pub fn issue(
             }
             Ok(())
         })
-        .map_err(|_| Error::Refused("source_changed"))?;
+        .map_err(|e| refusal_or_fault(e, "source_changed"))?;
     Ok(Access {
         binding: binding.metadata.binding.clone(),
         version,

@@ -247,6 +247,36 @@ pub enum ClientMessage {
     CachePushEnd(End),
 }
 
+/// `ClientMessage::Log` from borrowed parts: the same postcard bytes (variant
+/// index, then the fields in order; a byte slice encodes exactly like a
+/// `Vec<u8>`), without copying a log frame into an owned message first.
+struct LogRef<'a> {
+    attempt: &'a [u8; 16],
+    seq: u64,
+    step: u32,
+    stream: u8,
+    bytes: &'a [u8],
+}
+
+/// `ClientMessage::Log`'s position in the enum; asserted by a test.
+const LOG_VARIANT: u32 = 6;
+
+impl Serialize for LogRef<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStructVariant;
+        let mut s = serializer.serialize_struct_variant("ClientMessage", LOG_VARIANT, "Log", 5)?;
+        s.serialize_field("attempt", self.attempt)?;
+        s.serialize_field("seq", &self.seq)?;
+        s.serialize_field("step", &self.step)?;
+        s.serialize_field("stream", &self.stream)?;
+        s.serialize_field("bytes", self.bytes)?;
+        s.end()
+    }
+}
+
 /// A worker's state event on the wire; mirrors the worker-raised half of
 /// `sentinel_core::Event` with the failure class as its stored code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,7 +433,15 @@ pub enum ServerMessage {
 pub enum LogVerdict {
     /// Stored and synced through this sequence.
     Acked(u64),
+    /// Permanently refused: the attempt is not this worker's, its log has
+    /// already ended, or the size cap is reached. `LogRefused` goes out
+    /// and the worker stops sending.
     Refused,
+    /// A transient controller fault (a store read or write, log I/O):
+    /// nothing is answered and the connection that carried the frame is
+    /// closed, so the worker rewinds to its last acknowledgement and
+    /// resends — a fault never becomes a permanent refusal.
+    Retry,
 }
 
 /// A file's permission bits inside an artifact manifest; only the low mode
@@ -1015,28 +1053,75 @@ impl Shared {
 #[derive(Clone)]
 pub struct Sender(Arc<Shared>);
 
+thread_local! {
+    /// Encode scratch, reused by every send on this thread: a frame costs
+    /// no allocation once the buffer has grown to the largest one sent.
+    static ENCODE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl Sender {
     /// Encode, encrypt and write one frame. Holds the connection lock across
     /// the socket write so frames from different threads never interleave.
+    /// A write that fails — including one that ran into the socket's write
+    /// timeout because the peer stopped reading — leaves the TLS stream in
+    /// an unknown state, so the connection is torn down: the reader fails
+    /// out, the session ends, and nothing waits on a dead peer forever.
     pub(crate) fn send<M: Serialize>(&self, message: &M) -> Result<()> {
-        let bytes = postcard::to_allocvec(message).map_err(|_| Error::Protocol("encode"))?;
-        if bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
-            return Err(Error::Protocol("frame too large"));
-        }
+        ENCODE.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            scratch.extend_from_slice(&[0; 4]);
+            let mut buffer = std::mem::take(&mut *scratch);
+            let encoded = postcard::to_extend(message, buffer);
+            buffer = match encoded {
+                Ok(buffer) => buffer,
+                Err(_) => return Err(Error::Protocol("encode")),
+            };
+            let len = buffer.len() - 4;
+            let outcome = if len > MAX_CONTROL_MESSAGE_BYTES {
+                Err(Error::Protocol("frame too large"))
+            } else {
+                buffer[..4].copy_from_slice(&(len as u32).to_be_bytes());
+                self.write_frame(&buffer)
+            };
+            *scratch = buffer;
+            outcome
+        })
+    }
+
+    fn write_frame(&self, frame: &[u8]) -> Result<()> {
         let mut conn = self.0.conn.lock().unwrap_or_else(|p| p.into_inner());
-        conn.writer()
-            .write_all(&(bytes.len() as u32).to_be_bytes())?;
-        conn.writer().write_all(&bytes)?;
-        let mut sock = &self.0.sock;
-        while conn.wants_write() {
-            conn.write_tls(&mut sock)?;
+        let written = (|| -> Result<()> {
+            conn.writer().write_all(frame)?;
+            let mut sock = &self.0.sock;
+            while conn.wants_write() {
+                conn.write_tls(&mut sock)?;
+            }
+            Ok(())
+        })();
+        drop(conn);
+        match written {
+            Ok(()) => {
+                // Counted only once the bytes are out: a frame that failed
+                // to write never inflates the throughput figure.
+                self.0.out.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                self.close();
+                Err(match error {
+                    Error::Io(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        Error::Lost
+                    }
+                    error => error,
+                })
+            }
         }
-        // Counted only once the bytes are out: a frame that failed to write
-        // never inflates the throughput figure.
-        self.0
-            .out
-            .fetch_add(bytes.len() as u64 + 4, Ordering::Relaxed);
-        Ok(())
     }
 
     /// (bytes written, socket bytes read) on this connection.
@@ -1110,17 +1195,24 @@ impl Receiver {
     }
 
     /// Wait up to `timeout` for the next frame. `Ok(None)` is the timeout;
-    /// `Lost` is the peer going away.
+    /// `Lost` is the peer going away. The bound is on the whole frame, not
+    /// on each read: a peer dripping one byte just inside the socket's read
+    /// timeout still runs out after at most twice `timeout` (the check runs
+    /// between reads, so no per-read timer syscall is spent on it).
     pub(crate) fn recv_timeout<M: for<'de> Deserialize<'de>>(
         &mut self,
         timeout: Duration,
     ) -> Result<Option<M>> {
+        let started = Instant::now();
         loop {
             if let Some(message) = self.take_frame()? {
                 return Ok(Some(message));
             }
             if self.drain_plaintext()? {
                 continue;
+            }
+            if started.elapsed() >= timeout {
+                return Ok(None);
             }
             if self.timeout != Some(timeout) {
                 self.sock
@@ -1256,28 +1348,59 @@ impl CacheRouter {
 /// the executor gets it from [`Reporter::remote_cache`].
 pub struct LinkRemote {
     control: Sender,
-    bulk: Mutex<Option<Sender>>,
+    bulk: Mutex<BulkSlot>,
     router: Arc<CacheRouter>,
 }
 
+/// The live bulk attachment and the route history it has been through.
+#[derive(Default)]
+struct BulkSlot {
+    sender: Option<Sender>,
+    route: Route,
+}
+
+/// Which route a bulk-class send took, as counts of bulk attachments and
+/// detachments over the session. A sender that finds `detached` moved since
+/// its last send knows frames it handed to the dead connection may never
+/// have arrived and must rewind before anything else goes out; `attached`
+/// moving means later frames may overtake ones still in flight on control.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Route {
+    pub attached: u64,
+    pub detached: u64,
+}
+
 impl LinkRemote {
-    fn send(&self, message: &ClientMessage) -> Result<()> {
-        let bulk = self.bulk.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    fn send(&self, message: &impl Serialize) -> Result<Route> {
+        let (bulk, route) = {
+            let slot = self.bulk.lock().unwrap_or_else(|p| p.into_inner());
+            (slot.sender.clone(), slot.route)
+        };
         match bulk {
-            Some(bulk) => bulk.send(message),
-            None => self.control.send(message),
+            Some(bulk) => bulk.send(message)?,
+            None => self.control.send(message)?,
         }
+        Ok(route)
+    }
+
+    fn route(&self) -> Route {
+        self.bulk.lock().unwrap_or_else(|p| p.into_inner()).route
     }
 
     /// The bulk connection is up: bulk-class traffic moves to it.
     fn attach_bulk(&self, bulk: Sender) {
-        *self.bulk.lock().unwrap_or_else(|p| p.into_inner()) = Some(bulk);
+        let mut slot = self.bulk.lock().unwrap_or_else(|p| p.into_inner());
+        slot.sender = Some(bulk);
+        slot.route.attached += 1;
     }
 
     /// The bulk connection ended: the control connection takes the traffic
     /// back until a new one is up.
     fn detach_bulk(&self) {
-        self.bulk.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let mut slot = self.bulk.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.sender.take().is_some() {
+            slot.route.detached += 1;
+        }
     }
 
     /// Route one received cache answer to its waiting transfer.
@@ -1464,29 +1587,72 @@ pub enum Accepted {
     Bulk(BulkSession),
 }
 
+/// How long an accepted connection may take to finish its TLS handshake and
+/// send its first message, all told. Before that the peer has proved
+/// nothing, so it must not hold a session slot for longer.
+pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Drive a TLS handshake to completion, bounded in absolute time: every
+/// read or write waits at most `deadline`, and the loop gives up once the
+/// whole handshake has taken that long.
+fn handshake(conn: &mut rustls::Connection, socket: &TcpStream, deadline: Duration) -> Result<()> {
+    let started = Instant::now();
+    let mut sock = socket;
+    while conn.is_handshaking() {
+        if started.elapsed() >= deadline {
+            return Err(Error::Lost);
+        }
+        conn.complete_io(&mut sock)?;
+    }
+    Ok(())
+}
+
+/// Socket options every link connection carries: no Nagle delay, and a
+/// write timeout so a peer that stops reading cannot block a sender (and
+/// with it the connection lock and its reader) forever.
+fn configure(socket: &TcpStream, read: Duration) -> Result<()> {
+    socket.set_read_timeout(Some(read))?;
+    socket.set_write_timeout(Some(HEARTBEAT_DEADLINE))?;
+    socket.set_nodelay(true)?;
+    Ok(())
+}
+
 /// Complete the TLS handshake on an accepted socket, read the first message,
-/// and answer on the control connection (which runs the admission policy).
+/// and answer on the control connection (which runs the admission policy),
+/// all within [`HANDSHAKE_DEADLINE`].
 pub fn accept(
     socket: TcpStream,
     config: Arc<rustls::ServerConfig>,
     admission: &dyn Admission,
 ) -> Result<Accepted> {
-    socket.set_read_timeout(Some(HEARTBEAT_DEADLINE))?;
-    socket.set_nodelay(true)?;
-    let mut conn = ServerConnection::new(config).map_err(|e| Error::Tls(e.to_string()))?;
-    let mut sock = &socket;
+    accept_within(socket, config, admission, HANDSHAKE_DEADLINE)
+}
+
+/// [`accept`] under a caller-chosen handshake-plus-hello deadline.
+pub fn accept_within(
+    socket: TcpStream,
+    config: Arc<rustls::ServerConfig>,
+    admission: &dyn Admission,
+    deadline: Duration,
+) -> Result<Accepted> {
+    let started = Instant::now();
+    configure(&socket, deadline.min(HEARTBEAT_DEADLINE))?;
+    let mut conn = rustls::Connection::Server(
+        ServerConnection::new(config).map_err(|e| Error::Tls(e.to_string()))?,
+    );
     // Drive the handshake so the peer certificate is available.
-    while conn.is_handshaking() {
-        conn.complete_io(&mut sock)?;
-    }
+    handshake(&mut conn, &socket, deadline)?;
     let fingerprint = conn
         .peer_certificates()
         .and_then(|certs| certs.first())
         .map(fingerprint_of)
         .ok_or(Error::Protocol("no client certificate"))?;
-    let (tx, mut rx) = split(rustls::Connection::Server(conn), socket)?;
-
-    match rx.recv::<ClientMessage>(HEARTBEAT_DEADLINE)? {
+    let (tx, mut rx) = split(conn, socket)?;
+    let remaining = deadline.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(Error::Lost);
+    }
+    match rx.recv::<ClientMessage>(remaining)? {
         ClientMessage::Hello {
             hello,
             worker,
@@ -1561,10 +1727,19 @@ impl BulkSession {
         self.tx.clone()
     }
 
-    /// Serve bulk messages until the worker says goodbye, stops answering or
-    /// breaks protocol. `protocol` is the control session's negotiated
-    /// version: the bulk connection carries no negotiation of its own.
-    pub fn serve(&mut self, handler: &dyn SessionHandler, protocol: u16) -> Result<()> {
+    /// Serve bulk messages until the worker says goodbye, breaks protocol,
+    /// or `alive` says its control session is gone. `protocol` is the
+    /// control session's negotiated version: the bulk connection carries no
+    /// negotiation of its own. Bulk has no heartbeat — the control session
+    /// is the liveness signal — so an idle bulk connection is kept for as
+    /// long as its control session lives rather than torn down and redialled
+    /// every heartbeat deadline.
+    pub fn serve(
+        &mut self,
+        handler: &dyn SessionHandler,
+        protocol: u16,
+        alive: &dyn Fn() -> bool,
+    ) -> Result<()> {
         // Bulk connections carry no negotiation and cannot report a profile;
         // the capacity is only ever read by the control connection.
         let mut profiled = true;
@@ -1572,7 +1747,7 @@ impl BulkSession {
             handler,
             self.worker,
             protocol,
-            false,
+            Some(alive),
             &mut profiled,
             Capacity::default(),
             &mut self.rx,
@@ -1603,7 +1778,7 @@ impl WorkerSession {
             handler,
             worker,
             protocol,
-            true,
+            None,
             &mut self.profiled,
             self.capacity,
             &mut self.rx,
@@ -1613,22 +1788,25 @@ impl WorkerSession {
 }
 
 /// Serve one connection's inbound messages until `Bye`, a protocol violation
-/// or loss. `control` marks the control connection: it carries heartbeats,
-/// offer answers and reports, and accepts bulk-class messages as the fallback
-/// path. A bulk connection carries the bulk classes only and refuses
+/// or loss. `bulk` is `None` on the control connection: it carries
+/// heartbeats, offer answers and reports, accepts bulk-class messages as the
+/// fallback path, and is lost after a heartbeat deadline of silence. A bulk
+/// connection (`Some(alive)`) carries the bulk classes only and refuses
 /// control-class messages, so a misrouted offer can never surface as a
-/// silently dropped heartbeat.
+/// silently dropped heartbeat; its silence is fine for as long as `alive`
+/// says the control session is.
 #[allow(clippy::too_many_arguments)]
 fn serve_connection(
     handler: &dyn SessionHandler,
     worker: WorkerId,
     protocol: u16,
-    control: bool,
+    bulk: Option<&dyn Fn() -> bool>,
     profiled: &mut bool,
     capacity: Capacity,
     rx: &mut Receiver,
     tx: &Sender,
 ) -> Result<()> {
+    let control = bulk.is_none();
     // In-flight artifact per attempt (protocol 4): set when a begin is
     // granted, cleared by every verdict. Names the verdict a mid-flight
     // failure answers with and orders begin/file/data/end.
@@ -1640,7 +1818,13 @@ fn serve_connection(
     // cannot make the controller spawn threads without limit.
     let transfers = Arc::new(AtomicUsize::new(0));
     loop {
-        match rx.recv::<ClientMessage>(HEARTBEAT_DEADLINE)? {
+        let Some(message) = rx.recv_timeout::<ClientMessage>(HEARTBEAT_DEADLINE)? else {
+            if bulk.is_some_and(|alive| alive()) {
+                continue;
+            }
+            return Err(Error::Lost);
+        };
+        match message {
             ClientMessage::Ping { seq, held } => {
                 if !control {
                     return Err(Error::Protocol("control message on bulk"));
@@ -1753,6 +1937,7 @@ fn serve_connection(
                     LogVerdict::Refused => {
                         tx.send(&ServerMessage::LogRefused { attempt })?;
                     }
+                    LogVerdict::Retry => return Err(Error::Internal("log store")),
                 }
             }
             ClientMessage::LogEnd {
@@ -1774,6 +1959,7 @@ fn serve_connection(
                     LogVerdict::Refused => {
                         tx.send(&ServerMessage::LogRefused { attempt })?;
                     }
+                    LogVerdict::Retry => return Err(Error::Internal("log store")),
                 }
             }
             ClientMessage::Abandon { attempt, fence } => {
@@ -2136,18 +2322,17 @@ pub fn connect(
     capacity: Capacity,
 ) -> Result<Link> {
     let socket = TcpStream::connect_timeout(&addr, HEARTBEAT_DEADLINE)?;
-    socket.set_read_timeout(Some(HEARTBEAT_DEADLINE))?;
-    socket.set_nodelay(true)?;
+    configure(&socket, HEARTBEAT_DEADLINE)?;
     // The name is irrelevant with a pinned fingerprint but rustls needs one.
     let server_name = ServerName::try_from("sentinel").expect("static name");
-    let mut conn = ClientConnection::new(Arc::clone(&config), server_name)
-        .map_err(|e| Error::Tls(e.to_string()))?;
-    let mut sock = &socket;
-    while conn.is_handshaking() {
-        conn.complete_io(&mut sock)?;
-    }
-    let (tx, mut rx) = split(rustls::Connection::Client(conn), socket)?;
+    let mut conn = rustls::Connection::Client(
+        ClientConnection::new(Arc::clone(&config), server_name)
+            .map_err(|e| Error::Tls(e.to_string()))?,
+    );
+    handshake(&mut conn, &socket, HEARTBEAT_DEADLINE)?;
+    let (tx, mut rx) = split(conn, socket)?;
     let enrollment = enrollment.map(sentinel_auth::token::format);
+    let range = hello.protocol_min.0..=hello.protocol_max.0;
     tx.send(&ClientMessage::Hello {
         hello,
         worker: *worker.as_bytes(),
@@ -2156,6 +2341,13 @@ pub fn connect(
         capacity,
     })?;
     match rx.recv::<ServerMessage>(HEARTBEAT_DEADLINE)? {
+        // A welcome at a version this worker did not offer is one it cannot
+        // speak: refuse it here rather than fail on the first frame.
+        ServerMessage::Welcome { negotiated, .. } if !range.contains(&negotiated.protocol.0) => {
+            Err(Error::Protocol(
+                "negotiated version outside the hello's range",
+            ))
+        }
         ServerMessage::Welcome {
             worker,
             negotiated,
@@ -2171,7 +2363,7 @@ pub fn connect(
             client: config,
             remote: Arc::new(LinkRemote {
                 control: tx,
-                bulk: Mutex::new(None),
+                bulk: Mutex::new(BulkSlot::default()),
                 router: Arc::new(CacheRouter::default()),
             }),
             transport: None,
@@ -2221,10 +2413,20 @@ pub struct Reporter {
 
 impl Reporter {
     fn bulk_class(&self, message: &ClientMessage) -> Result<()> {
+        self.bulk_routed(message).map(|_| ())
+    }
+
+    fn bulk_routed(&self, message: &impl Serialize) -> Result<Route> {
         match &self.bulk {
             Some(remote) => remote.send(message),
-            None => self.control.send(message),
+            None => self.control.send(message).map(|()| Route::default()),
         }
+    }
+
+    /// The route bulk-class sends take now. Constant below protocol 7,
+    /// where everything is control.
+    pub fn route(&self) -> Route {
+        self.bulk.as_ref().map(|r| r.route()).unwrap_or_default()
     }
 
     /// Protocol 7 (Q08). The session's remote cache: fetch and offer objects
@@ -2279,15 +2481,42 @@ impl Reporter {
     /// One frame from the spool. The executor keeps at most
     /// `MAX_UNACKED_LOG_FRAMES` in flight per attempt.
     pub fn log(&self, attempt: AttemptId, frame: &Frame) -> Result<()> {
-        if frame.bytes.len() > MAX_LOG_FRAME_BYTES {
+        self.log_frame(attempt, frame.seq, frame.step, frame.stream, &frame.bytes)
+            .map(|_| ())
+    }
+
+    /// [`Reporter::log`] from borrowed parts, encoded straight into the
+    /// frame buffer (no owned copy of the bytes), returning the route the
+    /// frame took so the log pipe can tell when frames may have been lost
+    /// with a bulk connection.
+    pub fn log_frame(
+        &self,
+        attempt: AttemptId,
+        seq: u64,
+        step: u32,
+        stream: Stream,
+        bytes: &[u8],
+    ) -> Result<Route> {
+        if bytes.len() > MAX_LOG_FRAME_BYTES {
             return Err(Error::Protocol("log frame size"));
         }
-        self.bulk_class(&ClientMessage::Log {
+        self.bulk_routed(&LogRef {
+            attempt: attempt.as_bytes(),
+            seq,
+            step,
+            stream: stream as u8,
+            bytes,
+        })
+    }
+
+    /// Hand back an attempt this worker acknowledged but never started (its
+    /// run spec never arrived, or was refused): the controller requeues it,
+    /// or settles it canceled when that is desired. Control class: it
+    /// decides a lease.
+    pub fn decline(&self, attempt: AttemptId, fence: Fence) -> Result<()> {
+        self.control.send(&ClientMessage::Decline {
             attempt: *attempt.as_bytes(),
-            seq: frame.seq,
-            step: frame.step,
-            stream: frame.stream as u8,
-            bytes: frame.bytes.clone(),
+            fence: fence.0,
         })
     }
 
@@ -2405,8 +2634,15 @@ pub trait Executor: Send + Sync {
     /// The run spec asked for with `Reporter::need_spec`, whole, with the
     /// job context that precedes it.
     fn spec(&self, attempt: AttemptId, context: JobContext, bytes: Vec<u8>);
-    /// The controller has no spec for the attempt: it is not held here.
+    /// The controller will not serve the attempt's spec: it is not held
+    /// here, it was settled canceled, or its source or spec was refused for
+    /// good. A transient controller fault is never answered this way — the
+    /// request is queued or simply unanswered, and the executor asks again.
     fn no_spec(&self, attempt: AttemptId);
+    /// The bulk connection ended: frames handed to it may never have
+    /// arrived. Log senders rewind to their last acknowledgement before
+    /// anything else goes out on the fallback route.
+    fn bulk_detached(&self) {}
     /// Frames through `through` are durable on the controller.
     fn log_acked(&self, attempt: AttemptId, through: u64);
     /// The controller stores no more frames of this attempt.
@@ -2782,16 +3018,14 @@ impl BulkDialer {
     /// this returns.
     pub fn open(&self) -> Result<BulkLink> {
         let socket = TcpStream::connect_timeout(&self.addr, HEARTBEAT_DEADLINE)?;
-        socket.set_read_timeout(Some(HEARTBEAT_DEADLINE))?;
-        socket.set_nodelay(true)?;
+        configure(&socket, HEARTBEAT_DEADLINE)?;
         let server_name = ServerName::try_from("sentinel").expect("static name");
-        let mut conn = ClientConnection::new(Arc::clone(&self.client), server_name)
-            .map_err(|e| Error::Tls(e.to_string()))?;
-        let mut sock = &socket;
-        while conn.is_handshaking() {
-            conn.complete_io(&mut sock)?;
-        }
-        let (tx, rx) = split(rustls::Connection::Client(conn), socket)?;
+        let mut conn = rustls::Connection::Client(
+            ClientConnection::new(Arc::clone(&self.client), server_name)
+                .map_err(|e| Error::Tls(e.to_string()))?,
+        );
+        handshake(&mut conn, &socket, HEARTBEAT_DEADLINE)?;
+        let (tx, rx) = split(conn, socket)?;
         tx.send(&ClientMessage::BulkHello {
             worker: *self.worker.as_bytes(),
         })?;
@@ -2853,6 +3087,7 @@ impl BulkLink {
             }
         };
         self.remote.detach_bulk();
+        executor.bulk_detached();
         outcome
     }
 }
@@ -2892,6 +3127,90 @@ pub fn listen(addr: SocketAddr) -> Result<TcpListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The borrowed log frame is byte-for-byte the owned message: the
+    /// variant index and field order of `ClientMessage::Log` are the wire.
+    #[test]
+    fn a_borrowed_log_frame_encodes_exactly_like_the_owned_message() {
+        let attempt = AttemptId::new();
+        let bytes = vec![7u8; 300];
+        let owned = postcard::to_allocvec(&ClientMessage::Log {
+            attempt: *attempt.as_bytes(),
+            seq: 1 << 40,
+            step: 3,
+            stream: Stream::Stderr as u8,
+            bytes: bytes.clone(),
+        })
+        .unwrap();
+        let borrowed = postcard::to_allocvec(&LogRef {
+            attempt: attempt.as_bytes(),
+            seq: 1 << 40,
+            step: 3,
+            stream: Stream::Stderr as u8,
+            bytes: &bytes,
+        })
+        .unwrap();
+        assert_eq!(owned, borrowed);
+        assert!(matches!(
+            postcard::from_bytes::<ClientMessage>(&borrowed).unwrap(),
+            ClientMessage::Log { seq, .. } if seq == 1 << 40
+        ));
+    }
+
+    /// P04-17: a peer that stops reading cannot hold a sender forever. The
+    /// write times out, the send fails and the connection is torn down so
+    /// its reader ends too.
+    #[test]
+    fn a_send_to_a_peer_that_never_reads_fails_within_the_write_timeout() {
+        let server_identity = crate::identity::Identity::generate("controller").unwrap();
+        let pin = server_identity.fingerprint();
+        let server = crate::tls::server_config(server_identity).unwrap();
+        let client =
+            crate::tls::client_config(crate::identity::Identity::generate("worker").unwrap(), pin)
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The client completes the handshake and then never reads again.
+        let peer = thread::spawn(move || {
+            let socket = TcpStream::connect(addr).unwrap();
+            let mut conn = rustls::Connection::Client(
+                ClientConnection::new(client, ServerName::try_from("sentinel").unwrap()).unwrap(),
+            );
+            handshake(&mut conn, &socket, HEARTBEAT_DEADLINE).unwrap();
+            thread::sleep(Duration::from_secs(10));
+            drop(socket);
+        });
+        let (socket, _) = listener.accept().unwrap();
+        let mut conn = rustls::Connection::Server(ServerConnection::new(server).unwrap());
+        handshake(&mut conn, &socket, HEARTBEAT_DEADLINE).unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let (tx, _rx) = split(conn, socket).unwrap();
+        let started = Instant::now();
+        let big = vec![0u8; 48 * 1024];
+        let failed = loop {
+            if let Err(error) = tx.send(&ServerMessage::Spec {
+                attempt: [1; 16],
+                seq: 0,
+                last: false,
+                bytes: big.clone(),
+            }) {
+                break error;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "never blocked");
+        };
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(matches!(failed, Error::Lost | Error::Io(_)), "{failed}");
+        // Torn down: the next send fails at once rather than blocking.
+        let again = Instant::now();
+        assert!(
+            tx.send(&ServerMessage::NoSpec { attempt: [1; 16] })
+                .is_err()
+        );
+        assert!(again.elapsed() < Duration::from_millis(150));
+        drop(peer);
+    }
 
     fn context(tenant: Option<TenantId>, trust: Trust) -> JobContext {
         JobContext {

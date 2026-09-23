@@ -223,7 +223,11 @@ fn stalled_bulk_never_holds_up_the_control_beat() {
             while !drain.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(20));
             }
-            let _ = bulk.serve(&*handler, sentinel_protocol::negotiate::SUPPORTED_MAX.0);
+            let _ = bulk.serve(
+                &*handler,
+                sentinel_protocol::negotiate::SUPPORTED_MAX.0,
+                &|| !serving.is_finished(),
+            );
             let _ = serving.join();
         })
     };
