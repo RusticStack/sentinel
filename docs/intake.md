@@ -122,11 +122,21 @@ cron/systemd timer. It never resolves a pipeline and never waits for CI:
 - each `git push` line (`<old> <new> <ref>`) becomes one spooled file named by
   its delivery ID, written before the first attempt, so a retry is deduplicated
   by the controller and a replayed push cannot become a second run;
-- a bounded `curl` (10 s, two retries) delivers it; on failure the event stays
-  in the spool and the push's stderr says so;
-- `--flush` retries spooled events, files permanent refusals (4xx) under
-  `failed/` with the HTTP status, counts attempts and moves an event to
-  `failed/` after `SENTINEL_FLUSH_ATTEMPTS`;
+- delivery IDs sort by creation time (seconds, nanoseconds where `date`
+  has `%N`, the hook's own sequence within one push, then randomness) and
+  the hook globs in byte order, so the spool is always delivered **oldest
+  first**: the hook spools the push's events behind anything already waiting
+  and delivers the whole spool in order, and a transient failure stops the
+  pass rather than letting newer events overtake it;
+- a bounded `curl` (10 s, two retries) delivers each event; on failure the
+  event stays in the spool and the push's stderr says so. The hook secret
+  reaches curl as a config line on its standard input, never in its
+  arguments, so it does not show in `ps` or `/proc/<pid>/cmdline`;
+- `429` (the admission bound, a full writer queue, an ambiguous write) and
+  `408` are the controller asking for a retry: the event stays spooled;
+- `--flush` retries spooled events in the same order, files permanent
+  refusals (other 4xx) under `failed/` with the HTTP status, counts attempts
+  and moves an event to `failed/` after `SENTINEL_FLUSH_ATTEMPTS`;
 - a full spool (`SENTINEL_SPOOL_MAX`) refuses new events loudly instead of
   growing without bound.
 
@@ -176,9 +186,12 @@ unchanged:
   its commit for checkout exactly as a hook-reported tag does.
 
 The cursor and the deliveries it produced commit in one transaction, and a
-transition's delivery ID is the digest of `(ref, old, new)`: a crash
-mid-flight replays the advertisement, and the replay is a no-op wherever the
-delivery already landed. Nothing is acknowledged from memory.
+transition's delivery ID is the digest of `(ref, old, new)` **and the cursor
+state it moves** (the delivery that last moved the cursor, and when; the
+admission time for a ref with no cursor): replaying an advertisement against
+the same cursor is a no-op, while a legitimate repeat of a transition —
+`A→B`, force-reverted `B→A`, re-pushed `A→B` — is a new delivery and is
+built again. Nothing is acknowledged from memory.
 
 **Budgets.** Each `ls-remote` runs under the same discipline as every Git
 call — no prompts, no host configuration, a process group with a deadline
@@ -190,9 +203,16 @@ no fan-out per ref — so a slow or hostile remote consumes only its own
 schedule. Intervals run 10 s–24 h; a stable per-repository jitter of up to a
 quarter of the interval, derived from the repository ID, keeps same-interval
 repositories from synchronizing, including after a restart, since the
-schedule is durable. A failed poll records `failures` and `last_error` and
-backs off exponentially from the interval to a 15-minute ceiling; the next
-success clears it.
+schedule is durable. A failed poll records `failures` and `last_error` (at
+most 256 bytes, cut on a character boundary) and backs off exponentially
+from the interval to a 15-minute ceiling; the next success clears it. The
+same back-off parks a repository whose tenant is suspended
+(`tenant_suspended`), whose installation no longer grants access
+(`access_removed`) or whose remote the destination policy no longer approves
+(`destination_refused`) — its configuration is kept for when that changes —
+and a repository whose poll hits a store fault. No repository can stay first
+in every pass: a pass never fails on one configuration, and a panic in a
+pass costs a back-off, not the thread.
 
 **Lifecycle.** `admin source show` reports the configuration and schedule;
 `admin source poll --repo rep_… --disable` removes it. Rebinding (a possibly
@@ -214,7 +234,14 @@ independently of the intake lane.
 
 The lane is one thread in the controller. It drains due deliveries in batches
 of 64, woken immediately by an accepted delivery and otherwise by a 250 ms
-tick; store failures back off from 1 s to 30 s.
+tick. An idle tick is two index-backed reads (the `deliveries_open` index,
+migration 34) and no write: the writer — and the commit that wakes every
+parked run watch — is taken only when a pending delivery is due. Faults are
+isolated per delivery: one whose resolution hits a store fault is parked
+under its own retry schedule (`retried:store_fault`, same attempt budget) and
+the pass continues, so one delivery can never hold every other tenant's work
+behind it. Only a store that cannot even record that backs the lane off,
+from 1 s to 30 s.
 
 **Phase one, validation**, runs inside one writer transaction against the
 binding **as it is now**:
@@ -223,7 +250,8 @@ binding **as it is now**:
 |---|---|
 | `ready` | The binding is active, the ref is allowed and the revision is not a deletion. |
 | `ignored:ref_deleted` | A deletion or an event with no ref: understood, deliberately not a trigger. |
-| `failed:binding_revoked` | The binding was revoked (or the tenant suspended) between acceptance and resolution. |
+| `failed:binding_revoked` | The binding was revoked between acceptance and resolution. |
+| `failed:tenant_suspended` | The repository's tenant was suspended. A store fault while checking is retried, never read as a suspension. |
 | `failed:ref_not_allowed` | The binding no longer allows this ref. |
 
 **Phase two, dispatch**, takes each ready delivery through bounded remote work
@@ -244,7 +272,9 @@ The compiled `on:` policy decides whether the event is one this pipeline wants
 |---|---|
 | `dispatched:<run>` | One immutable run was created from the compiled pipeline at the exact revision. |
 | `ignored:duplicate` | This ref transition was already dispatched. |
-| `ignored:superseded` | The newest dispatched transition of this ref starts where this one ended: the repository moved past it. |
+| `ignored:superseded` | The repository already moved past this push: the newest dispatched transition starts where it ended, or (for a branch) its revision is in the newest dispatched revision's history. |
+| `failed:tenant_suspended`, `failed:binding_revoked`, `failed:access_removed` | The binding authorizes nothing any more: the tenant is suspended, the binding revoked (including a `repository` rename revoking an App binding), or the App installation suspended, deleted or without the permissions it needs. |
+| `failed:destination_refused` | The deployment's `source-destinations.json` no longer approves the binding's remote; nothing was fetched. |
 | `ignored:no_trigger` | The pipeline at that revision does not declare this event or ref. |
 | `ignored:fork_pr`, `ignored:merge_unavailable` | Pull-request trust refusals (above). |
 | `failed:no_pipeline` | The bound pipeline path does not exist at the revision. |
@@ -253,15 +283,32 @@ The compiled `on:` policy decides whether the event is one this pipeline wants
 | `failed:no_forge_association`, `failed:pr_metadata` | A pull request arrived without the association or terms that prove it. |
 | `failed:source_unavailable` | No usable credential exists for the binding. |
 | `retried:source_unreachable`, `retried:github_unavailable` | A transient fetch or provider fault; the delivery stays open and the same attempt budget applies. |
+| `retried:source_changed`, `retried:store_unavailable`, `retried:store_fault` | The binding was rotated or changed between lookup and issuance, or the store was busy or faulted; the next attempt looks the binding up again. |
 | `retried:merge_pending` | The pull request's merge ref is absent or still names a merge for an older head; GitHub may simply not have recomputed it yet, so the delivery stays open under the same budget. |
 | `failed:resolution_attempts` | Repeated transient faults spent the attempt budget. |
 
 Duplicate and reordered events are compared per stream: the newest dispatched
 delivery for the same repository, ref and event class (ref updates and pull
-requests are separate streams even when they share a base branch). An
-identical transition is a duplicate; a transition whose new revision is the
-newest one's starting point is superseded; anything else — including a forced
-rewind to an earlier commit — is a distinct transition and runs.
+requests are separate streams even when they share a base branch). Arrival
+order is not push order — a relay replays its spool, GitHub documents
+out-of-order delivery — so the rule is anchored on what was dispatched and on
+commit history:
+
+1. an identical transition is a duplicate;
+2. a transition starting where the newest one ended continues the stream and
+   runs — including a forced rewind and a repeat of an earlier transition;
+3. a transition ending where the newest one began is superseded;
+4. any other branch push is superseded when its revision is an ancestor of
+   the newest dispatched revision. Resolution proves it through Git with only
+   commits fetched (`--filter=tree:0`, at most 1024 generations back); a tip
+   the remote no longer has, or an ancestor outside the window, proves
+   nothing and the push runs.
+
+So pushes `A→B`, `B→C`, `C→D` arriving as `C→D`, `A→B`, `B→C` build `D`
+only; neither stale push dispatches, and under `cancel_in_progress` neither
+can cancel the tip's run. The in-order case never touches Git for this (rule
+2). Tags and pull requests stop at rule 3: a retagged tag is not history, and
+one base branch's stream holds unrelated pull requests.
 
 Every dispatched run records immutable provenance (`run_provenance`, migration
 19): the trigger kind, the delivery and provider, the ref transition, the
@@ -283,14 +330,21 @@ a new event is `429 rate_limited` (a duplicate is still acknowledged).
 Retention is the operator's: `admin intake list --repo rep_… [--state …]`
 shows the newest deliveries, and `admin intake purge --older-than 7d` deletes
 settled rows that produced nothing, in bounded batches: never an open one, and
-never one a run's provenance depends on.
+never one a run's provenance depends on. The same command retires GitHub
+control-event receipts (`github_events`) by age under the same batch bound
+(`receipts_purged` in its output), but never one younger than 30 days: a
+receipt is what makes a replayed signed control event — a `repository`
+rename that revokes a binding, say — a recorded no-op, and GitHub redelivers
+for days. GitHub signatures carry no timestamp, so a push whose delivery
+record was purged can be replayed; it is then judged by the ordering rule
+above, which supersedes a push the branch already moved past.
 
 ## Configuration
 
 | File | Purpose |
 |---|---|
 | `<data_dir>/github-webhook.json` | `{"secret": "…"}` (16–256 printable ASCII), owner-only. Enables the GitHub route. |
-| `<data_dir>/source-destinations.json` | the deployment's approved authorities ([sources](sources.md)); intake refuses a repository whose binding is outside it by construction |
+| `<data_dir>/source-destinations.json` | the deployment's approved authorities ([sources](sources.md)), read at start; resolution settles `failed:destination_refused` and polling backs off for a binding outside it, before anything is fetched |
 | `<data_dir>/master.key` | seals source credentials ([sources](sources.md)); intake tokens are digests and need no key |
 | `<data_dir>/intake-work/` | per-delivery scratch repositories for phase two; discarded and recreated on start |
 | `<data_dir>/poll-work/` | per-repository scratch for poll credential helpers; discarded and recreated on start |
@@ -323,6 +377,19 @@ never one a run's provenance depends on.
   dispatching at the tested merge through a stubbed App token flow, fork and
   unmergeable refusals, a generic binding refusing PR metadata, and a revoked
   binding.
+- `crates/sentinel-intake/tests/dispatch.rs` also: non-adjacent out-of-order
+  pushes superseded through Git ancestry with `cancel_in_progress` never
+  cancelling the tip, and a forced rewind still running.
+- `crates/sentinel-intake/tests/isolation.rs`: a suspended tenant, suspended
+  installation or revoked App binding settling its own delivery while another
+  tenant's dispatches; a store fault parking one delivery; the destination
+  policy refusing before any fetch or listing; a rotation racing issuance
+  retried; an idle lane taking no writes; a suspended tenant's poll backing
+  off without blocking others; a multibyte failure reason bounded without
+  killing the poll lane.
+- `crates/sentinel-git/tests/ancestry.rs` (Unix, needs `git`): the ancestry
+  window, force-pushed tips, and unauthenticated fetches refusing `ssh`,
+  `git://` and plain `http://`.
 - `crates/sentinel-intake/tests/flow.rs`: both ingest paths over a real store,
   including signature/tamper refusals, pull-request terms, and lane resolution
   on a wake and on the idle tick.
@@ -346,7 +413,9 @@ never one a run's provenance depends on.
 - `crates/sentinel-intake/tests/relay.rs` (Linux, needs `git`, `sh`, `curl`): a
   real push through the example hook — delivery, spooling across a dead
   controller, stable IDs through `--flush`, permanent refusals under `failed/`,
-  a full spool, and an unencodable ref refused without a spool write.
+  `429`/`408` kept spooled, spooled pushes delivered oldest first (also ahead
+  of a live push), the secret never in curl's arguments, a full spool, and an
+  unencodable ref refused without a spool write.
 - `crates/sentinel/tests/intake_e2e.rs` (Linux, `server`): the real binaries —
   the server loads its webhook secret and destinations, accepts and
   deduplicates a ref update, validates the binding, resolves the pipeline from

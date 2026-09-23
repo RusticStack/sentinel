@@ -66,9 +66,14 @@ a public URL; the first page serves that hash route (and re-opens the run after
 sign-in). A check that belongs to no run — a refused event — has no link, and a
 deployment without `public_url` publishes checks without one.
 
-Each check carries `external_id = sentinel:<run id>:<aggregate|job id>` (or
-`sentinel:dlv:<delivery id>`), which is what rerequests resolve back to a run,
-and what reconciles a create GitHub accepted that we never recorded. The
+Each check row has a stable id `sentinel:<run id>:<aggregate|job id>` (or
+`sentinel:dlv:<delivery id>`), and every create sends it suffixed with the
+generation that performed the create — `sentinel:<run id>:<scope>:<seq>`,
+recorded as `create_seq` (migration 34) — so each create names exactly one
+GitHub run. Updates keep sending the identity the run was created with. That
+identity is what rerequests resolve back to a run (a bare legacy id still
+matches rows created before migration 34), and what reconciles a create
+GitHub accepted that we never recorded. The
 forge's suite handle (`check_suite.id`) is stored beside the check-run handle
 so a suite rerequest can find every publication of a run.
 
@@ -118,11 +123,18 @@ A create is ambiguous by nature: the request can land while its answer never
 does. The durable answer to that is `create_started_ms`, written **before** the
 create request goes out. A first attempt skips the lookup entirely — no mark
 means no remote run can exist that we started — and a retry after a lost
-answer finds the mark, asks GitHub for a run on that commit carrying our
-`external_id`, and adopts it instead of creating a second. Adoption only ever
-takes a **live** run: GitHub treats a completed check run as immutable — a
-PATCH reopening it is answered `200` and silently changes nothing — so a
-completed run is passed by, never adopted. A crash between the
+answer finds the mark, asks GitHub for a run on that commit carrying the
+outstanding create's identity, and adopts it instead of creating a second —
+**whatever its status**. Many first creates are already `completed` (a
+settled delivery's aggregate, a job that finished before its first
+publication); because the identity carries the create's generation, an exact
+match can only be the run that create made, never an older generation's
+terminal run, so adopting it is safe and a lost answer never produces a
+duplicate. A row created before migration 34 keeps the old rule for its
+bare id: only a live run is adopted. The lookup is paged (100 runs a page,
+at most ten pages, each answer bounded to 1 MiB), so a commit with many
+reruns neither overflows one bounded answer nor hides the run past the first
+page. A crash between the
 mark and the request costs one harmless lookup; a crash after the request is
 what the mark exists for. An update is idempotent, so an ambiguous *update*
 needs no mark: the next attempt updates the same run again.
@@ -130,8 +142,9 @@ needs no mark: the next attempt updates the same run again.
 A completed remote run being immutable shapes new generations too: when a
 desired generation follows a publication whose last delivered status was
 `completed` — a rerun, a rerequest, a retried check — the stored
-`check_run_id` is cleared on the upsert, so the publisher *creates* a fresh
-check run instead of PATCHing a dead one. The run's in-progress phase is then
+`check_run_id` is cleared on the upsert — together with the create mark —
+so the publisher *creates* a fresh check run, under the new generation's
+identity, instead of PATCHing or adopting a dead one. The run's in-progress phase is then
 visible on GitHub, which a reopened-then-ignored update never was.
 
 A late completion from a superseded attempt cannot reach GitHub at all: the
@@ -225,7 +238,9 @@ holds at most 1024 repository tokens, evicting the earliest expiry at capacity.
   lane): creation with `details_url` and one cached token, updates ending in
   the right conclusions, adoption after an ambiguous create, a create whose
   remote effect landed while its answer was dropped — reconciled by external
-  ID with the durable `create_started` mark — a rate-limit
+  ID with the durable `create_started` mark — a lost answer to a create made
+  already `completed` adopted with exactly one POST, adoption past a first
+  page larger than 64 KiB, a rate-limit
   pause and successful retry for both 403 and 429, a 401 token refresh, a permanent 422 refusal
   (recorded and not retried), a revoked binding refusing without a request, a
   settled delivery's completed check, and a prompt lane stop.
