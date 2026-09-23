@@ -358,6 +358,7 @@ fn log_search_finds_literals_across_segments_within_its_byte_bound() {
         after,
         limit,
         budget,
+        carry: None,
     };
     // One request under a 1 MiB budget stops early and says where to resume.
     let first = logs
@@ -425,6 +426,7 @@ fn log_search_finds_literals_across_segments_within_its_byte_bound() {
                 after: 0,
                 limit: 10,
                 budget: u64::MAX,
+                carry: None,
             },
         )
         .unwrap();
@@ -480,6 +482,7 @@ fn log_search_finds_a_literal_split_across_two_frames_of_one_stream() {
                 after,
                 limit: 100,
                 budget: u64::MAX,
+                carry: None,
             },
         )
         .unwrap()
@@ -492,7 +495,7 @@ fn log_search_finds_a_literal_split_across_two_frames_of_one_stream() {
     assert_eq!(
         found,
         vec![
-            (3, 0, Stream::Stdout, "error: needle here".to_owned()),
+            (3, 0, Stream::Stdout, "needle here".to_owned()),
             (8, 1, Stream::Stdout, "needle three".to_owned()),
             (9, 1, Stream::Stderr, "a needle, then nee".to_owned()),
         ]
@@ -501,7 +504,7 @@ fn log_search_finds_a_literal_split_across_two_frames_of_one_stream() {
     // frames before `after` are decoded anyway and seed the carry.
     let resumed = search(2);
     assert_eq!(resumed.matches[0].seq, 3);
-    assert_eq!(resumed.matches[0].text, b"error: needle here");
+    assert_eq!(resumed.matches[0].text, b"needle here");
     // Resuming after the second of three pieces: both skipped pieces seed it.
     let resumed = search(7);
     let seqs: Vec<u64> = resumed.matches.iter().map(|m| m.seq).collect();

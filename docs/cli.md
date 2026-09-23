@@ -203,7 +203,7 @@ Every command below takes the [shared client flags](#the-shared-client). `--tena
 
 **`artifact download`** looks the entry up in the artifact's manifest, streams the object into `FILE.sentinel-part` beside `FILE` while hashing it (BLAKE3, the object store's digest) and counting bytes, and renames it over `FILE` only when the declared length, the byte count and the digest all match; any mismatch removes the partial file, leaves `FILE` untouched and exits 1. An entry the manifest does not list exits 4.
 
-**`log search`** follows the server's bounded scans: each request reads at most 4 MiB of log, so a 256 MiB log is at most 64 short requests, resumed at `next_after`. A literal split across two frames of the same step and stream is found (reported with the later frame), except across a request that resumes exactly at a sealed segment boundary; text mode says on stderr when the log is still being written (later lines were not searched) or when `--limit` cut the matches.
+**`log search`** follows the server's bounded scans: each request reads at most 4 MiB of log, so a 256 MiB log is at most 64 short requests, resumed at `next_after` with the server's `next_carry`. A literal split across frames of the same step and stream is found exactly once (reported with the frame it ends in), including across a sealed segment and across the cut between two requests; text mode says on stderr when the log is still being written (later lines were not searched) or when `--limit` cut the matches.
 
 **`cache`** reports per-attempt records only (K08 `cache:` entries of that attempt); there is no tenant-wide cache browser.
 
