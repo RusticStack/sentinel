@@ -32,6 +32,18 @@
 //!
 //! Reads are verified: [`Objects::read`] streams the object while rehashing
 //! and compares the committed digest and length before reporting success.
+//!
+//! **Who may delete a file.** A content-addressed file has no single owner
+//! once deduplication is involved, so the decision is never made from the
+//! filesystem alone. Every path that could remove an object's bytes — a
+//! discarded stage, reclamation, the orphan sweep — goes through
+//! [`Objects::discard`] or [`Objects::unlink`], which run inside a writer
+//! transaction and remove a file only when (a) no live stage or reader pins
+//! its `(tenant, digest)` and (b) no committed row names it. A stage takes
+//! its pin under the same lock, in the same step as its "does the file
+//! exist" decision, and holds it until the stage is dropped — after its
+//! commit, which also runs on the writer. So between a dedup decision and
+//! the row that publishes it, nothing can take the bytes away.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -127,17 +139,34 @@ pub struct Expect {
     pub digest: Option<Digest>,
 }
 
+/// Live holds on `(tenant, digest)`: readers streaming an object and stages
+/// whose file is not yet (or not only) published. A pinned file is never
+/// unlinked; see the module docs.
+type Pins = Arc<Mutex<HashMap<(TenantId, Digest), u64>>>;
+
+fn lock_pins(pins: &Pins) -> std::sync::MutexGuard<'_, HashMap<(TenantId, Digest), u64>> {
+    pins.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn unpin(pins: &mut HashMap<(TenantId, Digest), u64>, key: (TenantId, Digest)) {
+    if let Some(count) = pins.get_mut(&key) {
+        *count -= 1;
+        if *count == 0 {
+            pins.remove(&key);
+        }
+    }
+}
+
 /// A staged object: fully written, hashed, synced and renamed into its
 /// final path, but not yet referenced. [`Objects::commit`] publishes it;
-/// [`Staged::discard`] removes it when the commit is abandoned.
+/// [`Objects::discard`] removes it when the commit is abandoned. Holding a
+/// `Staged` pins its file: nothing unlinks it until the stage is dropped.
 pub struct Staged {
     tenant: TenantId,
     digest: Digest,
     len: u64,
-    path: PathBuf,
-    /// This stage created the final-path file; a dedup hit did not, so
-    /// `discard` must not remove what a concurrent commit may own.
-    created: bool,
+    /// The pin taken with the dedup decision; released on drop.
+    pin: Option<Pins>,
     /// Bytes admitted while the file sat uncommitted. Released when the
     /// stage leaves scope — commit, discard or drop — since the probe then
     /// accounts the bytes itself (or they are gone).
@@ -148,6 +177,9 @@ impl Drop for Staged {
     fn drop(&mut self) {
         if let Some((admission, bytes)) = self.charge.take() {
             admission.release(self.tenant, bytes);
+        }
+        if let Some(pins) = self.pin.take() {
+            unpin(&mut lock_pins(&pins), (self.tenant, self.digest));
         }
     }
 }
@@ -209,13 +241,180 @@ impl Staged {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
-    /// Remove the staged file — only when this stage created it. A dedup
-    /// hit shares its path with an earlier stage or committed object, so
-    /// removing it could delete live content.
-    pub fn discard(self) {
-        if self.created {
-            let _ = fs::remove_file(&self.path);
+}
+
+/// A file a committed transaction released — a reclaimed object, a retired
+/// manifest version — or one the orphan sweep found without a row. It is
+/// unlinked only through [`Objects::unlink`], on the writer, after the
+/// ownership re-check, so a commit that adopted the same path in between
+/// keeps its bytes.
+#[derive(Debug)]
+pub struct Doomed {
+    path: PathBuf,
+    owner: Owner,
+    /// Found by the orphan sweep: the file must still be older than
+    /// [`FILE_ORPHAN_GRACE_MS`] when the unlink runs.
+    aged: bool,
+}
+
+#[derive(Debug)]
+enum Owner {
+    Object(TenantId, Digest),
+    Manifest {
+        tenant: TenantId,
+        kind: Kind,
+        name: Vec<u8>,
+        version: u64,
+    },
+    /// A manifest file the sweep found: its path carries the name only as
+    /// a hash, so the re-check matches rows of that version by hash.
+    ManifestFile {
+        tenant: TenantId,
+        kind: Kind,
+        name_hash: String,
+        version: u64,
+    },
+    /// No row can ever name it: `tmp/` leftovers and malformed names.
+    Stray,
+}
+
+/// One orphan-sweep pass's accumulator.
+struct Walk {
+    found: Vec<Doomed>,
+    seen: u32,
+    limit: usize,
+    budget: u32,
+}
+
+impl Walk {
+    fn full(&self) -> bool {
+        self.found.len() >= self.limit || self.seen >= self.budget
+    }
+    /// A file no row can own: collected once past the grace.
+    fn stray(&mut self, path: PathBuf) {
+        if older_than_grace(&path) {
+            self.found.push(Doomed {
+                path,
+                owner: Owner::Stray,
+                aged: true,
+            });
         }
+    }
+}
+
+/// A directory's entries by name, sorted — the orphan sweep's resumable
+/// order. Unreadable directories and non-UTF-8 names yield nothing.
+fn sorted_entries(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(read) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, PathBuf)> = read
+        .flatten()
+        .filter_map(|e| Some((e.file_name().into_string().ok()?, e.path())))
+        .collect();
+    out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// `manifests/<tenant>/<kind>/<name-hash>/<version>` back to its owner key;
+/// anything off that layout is a stray.
+fn manifest_owner(tenant: TenantId, path: &Path) -> Owner {
+    let parse = || -> Option<Owner> {
+        let version = path.file_name()?.to_str()?.parse::<u64>().ok()?;
+        let hash_dir = path.parent()?;
+        let name_hash = hash_dir.file_name()?.to_str()?.to_owned();
+        let kind = hash_dir
+            .parent()?
+            .file_name()?
+            .to_str()?
+            .parse::<u8>()
+            .ok()?;
+        Some(Owner::ManifestFile {
+            tenant,
+            kind: Kind::from_code(kind).ok()?,
+            name_hash,
+            version,
+        })
+    };
+    parse().unwrap_or(Owner::Stray)
+}
+
+/// Reclamation candidates, oldest first, from the trigger-kept
+/// `object_unreferenced` set (migration 32) through its age index; the
+/// edge probe is a belt to that set's braces.
+#[doc(hidden)]
+pub const RECLAIM_CANDIDATES: &str = "SELECT u.tenant_id, u.digest, o.len
+     FROM object_unreferenced u
+     JOIN objects o ON o.tenant_id = u.tenant_id AND o.digest = u.digest
+     WHERE u.created_ms <= ?1
+       AND NOT EXISTS(SELECT 1 FROM manifest_refs r
+                      WHERE r.tenant_id = u.tenant_id AND r.digest = u.digest)
+       AND NOT EXISTS(SELECT 1 FROM object_leases l
+                      WHERE l.tenant_id = u.tenant_id AND l.digest = u.digest
+                        AND l.until_ms > ?2)
+       AND NOT EXISTS(SELECT 1 FROM manifests m
+                      WHERE m.tenant_id = u.tenant_id AND m.refs_indexed = 0)
+     ORDER BY u.created_ms
+     LIMIT ?3";
+
+impl Doomed {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// An upload touched past its expiry, or ready for its next phase. The
+/// expired answer lets the caller retire the session in its **own**
+/// transaction and then report the refusal — retiring inside the failing
+/// request's transaction would roll back with it.
+#[derive(Debug)]
+pub enum Touch<T> {
+    Ready(T),
+    Expired,
+}
+
+/// A chunk whose bytes are durable in the staging file but not yet recorded
+/// in the upload row ([`Objects::write_chunk`] → [`Objects::record_chunk`]).
+/// Dropping it unrecorded returns its admission charge.
+pub struct ChunkWritten {
+    tenant: TenantId,
+    id: UploadId,
+    start: u64,
+    end: u64,
+    /// Bytes admitted for this chunk; what the record step does not keep
+    /// is returned.
+    admitted: u64,
+    admission: Option<Arc<Admission>>,
+}
+
+impl Drop for ChunkWritten {
+    fn drop(&mut self) {
+        if let Some(a) = self.admission.take()
+            && self.admitted > 0
+        {
+            a.release_upload_delta(self.id, self.admitted);
+        }
+    }
+}
+
+/// A seal whose hashing and file work is done outside the writer
+/// ([`Objects::prepare_seal`]); [`Objects::finish_seal`] commits it.
+pub struct SealPlan {
+    tenant: TenantId,
+    id: UploadId,
+    digest: Digest,
+    len: u64,
+    /// Pins the object path from the rename (or dedup decision) to commit.
+    staged: Option<Staged>,
+    /// The object already existed: the staging file goes once the row lands.
+    dedup: bool,
+    /// Already committed by an earlier seal: its digest is the answer.
+    done: bool,
+}
+
+impl SealPlan {
+    pub fn digest(&self) -> Digest {
+        self.digest
     }
 }
 
@@ -305,13 +504,23 @@ pub const MAX_LEASE_TTL_MS: i64 = 30 * 24 * 3_600_000;
 /// never holds the writer through a whole-store walk.
 const RECLAIM_BATCH: i64 = 256;
 
-/// What one [`Objects::reclaim`] pass removed: rows deleted and the file
-/// paths the caller unlinks once the transaction commits.
+/// Largest object one resumable upload may declare, whatever the quota: the
+/// same ceiling a single artifact entry has
+/// ([`sentinel_protocol::limits::MAX_ARTIFACT_BYTES`]). With the default
+/// quota of 0 (unlimited) this is the bound on one session's staging file.
+pub const MAX_UPLOAD_BYTES: u64 = sentinel_protocol::limits::MAX_ARTIFACT_BYTES;
+/// Upload file I/O serializes per upload on one of this many stripes: a
+/// chunk write and a seal's hash of the same upload never interleave,
+/// different uploads rarely contend, and the lock set stays fixed-size.
+const UPLOAD_STRIPES: usize = 64;
+
+/// What one [`Objects::reclaim`] pass removed: rows deleted and the files
+/// the caller hands to [`Objects::unlink`] once the transaction commits.
 #[derive(Debug, Default)]
 pub struct Reclaimed {
     pub objects: u32,
     pub bytes: u64,
-    pub paths: Vec<PathBuf>,
+    pub doomed: Vec<Doomed>,
 }
 
 /// The object and manifest tree under one data directory. Filesystem work
@@ -322,9 +531,13 @@ pub struct Objects {
     /// tenant's subtree needs one fsync chain, not one per object.
     durable_dirs: Mutex<HashSet<PathBuf>>,
     tmp_seq: AtomicU64,
-    /// Live readers per (tenant, digest). Reclamation must never unlink a
-    /// file a reader is streaming; [`Objects::reader_active`] is how GC asks.
-    readers: std::sync::Arc<Mutex<HashMap<(TenantId, Digest), u64>>>,
+    /// Live readers and stages per (tenant, digest). Nothing unlinks a
+    /// pinned file; see the module docs.
+    pins: Pins,
+    /// Per-upload file I/O locks, striped by upload id.
+    upload_io: [Mutex<()>; UPLOAD_STRIPES],
+    /// Where the bounded orphan sweep resumes: the last shard it finished.
+    sweep_cursor: Mutex<Option<String>>,
     /// Disk admission; unset admits everything (tests and hosts without
     /// watermarks behave exactly as before D06).
     admission: OnceLock<Arc<Admission>>,
@@ -346,7 +559,9 @@ impl Objects {
             root,
             durable_dirs: Mutex::new(HashSet::new()),
             tmp_seq: AtomicU64::new(0),
-            readers: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            pins: Arc::new(Mutex::new(HashMap::new())),
+            upload_io: std::array::from_fn(|_| Mutex::new(())),
+            sweep_cursor: Mutex::new(None),
             admission: OnceLock::new(),
             default_quota: AtomicU64::new(0),
         })
@@ -557,7 +772,8 @@ impl Objects {
     ///
     /// `limit` bounds the staged bytes; over it the temp file is removed and
     /// nothing is staged. Deduplication is automatic: a second `stage` of
-    /// the same content lands on the same path, and `commit` is a no-op.
+    /// the same content lands on the same path, skips the fsync, and
+    /// `commit` is a no-op.
     pub fn stage(
         &self,
         tenant: TenantId,
@@ -569,32 +785,29 @@ impl Objects {
         let mut charged = 0u64;
         let tmp = self.tmp();
         let outcome = (|| -> Result<Staged> {
-            let (digest, len) = {
-                let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
-                let mut hasher = blake3::Hasher::new();
-                let mut buf = vec![0u8; CHUNK];
-                let mut len = 0u64;
-                loop {
-                    let got = reader.read(&mut buf)?;
-                    if got == 0 {
-                        break;
-                    }
-                    len += got as u64;
-                    if len > limit {
-                        return Err(Error::InvalidInput("object size"));
-                    }
-                    // Admit before the bytes land so a refused stage leaves
-                    // nothing but the temp file it already wrote.
-                    if let Some(a) = &admission {
-                        a.admit(tenant, got as u64)?;
-                        charged += got as u64;
-                    }
-                    hasher.update(&buf[..got]);
-                    file.write_all(&buf[..got])?;
+            let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+            let mut hasher = blake3::Hasher::new();
+            let mut buf = vec![0u8; CHUNK];
+            let mut len = 0u64;
+            loop {
+                let got = reader.read(&mut buf)?;
+                if got == 0 {
+                    break;
                 }
-                file.sync_data()?;
-                (Digest(*hasher.finalize().as_bytes()), len)
-            };
+                len += got as u64;
+                if len > limit {
+                    return Err(Error::InvalidInput("object size"));
+                }
+                // Admit before the bytes land so a refused stage leaves
+                // nothing but the temp file it already wrote.
+                if let Some(a) = &admission {
+                    a.admit(tenant, got as u64)?;
+                    charged += got as u64;
+                }
+                hasher.update(&buf[..got]);
+                file.write_all(&buf[..got])?;
+            }
+            let digest = Digest(*hasher.finalize().as_bytes());
             if let Some(declared) = expect.len
                 && declared != len
             {
@@ -605,28 +818,7 @@ impl Objects {
             {
                 return Err(Error::InvalidInput("object digest"));
             }
-            let path = self.object_path(tenant, &digest);
-            self.ensure_dir(path.parent().expect("object path has a parent"))?;
-            let created = if !path.exists() {
-                fs::rename(&tmp, &path)?;
-                if let Some(dir) = path.parent() {
-                    sync_dir(dir)?;
-                }
-                true
-            } else {
-                // Same tenant, same digest: the committed bytes are
-                // identical, so the duplicate stage is redundant work.
-                let _ = fs::remove_file(&tmp);
-                false
-            };
-            Ok(Staged {
-                tenant,
-                digest,
-                len,
-                path,
-                created,
-                charge: None,
-            })
+            self.place(tenant, digest, len, file, &tmp)
         })();
         match outcome {
             Ok(mut staged) => {
@@ -641,6 +833,49 @@ impl Objects {
                 Err(e)
             }
         }
+    }
+
+    /// The durable half shared by [`Objects::stage`] and
+    /// [`Objects::stage_seal`]: pin the digest and take the dedup decision
+    /// under the pin lock — the same lock every unlink takes — then, only
+    /// when this stage supplies the bytes, `fdatasync`, rename into place
+    /// and fsync the directory. A dedup hit drops its temp copy and skips
+    /// the flush: the file it adopts is already durable and now pinned.
+    fn place(
+        &self,
+        tenant: TenantId,
+        digest: Digest,
+        len: u64,
+        file: File,
+        tmp: &Path,
+    ) -> Result<Staged> {
+        let path = self.object_path(tenant, &digest);
+        let dir = path.parent().expect("object path has a parent");
+        self.ensure_dir(dir)?;
+        let exists = {
+            let mut pins = lock_pins(&self.pins);
+            let exists = path.exists();
+            *pins.entry((tenant, digest)).or_insert(0) += 1;
+            exists
+        };
+        // From here the pin is the stage's; an error below drops it.
+        let staged = Staged {
+            tenant,
+            digest,
+            len,
+            pin: Some(Arc::clone(&self.pins)),
+            charge: None,
+        };
+        if exists {
+            drop(file);
+            let _ = fs::remove_file(tmp);
+        } else {
+            file.sync_data()?;
+            drop(file);
+            fs::rename(tmp, &path)?;
+            sync_dir(dir)?;
+        }
+        Ok(staged)
     }
 
     /// Open a staged write under `tmp/` for a body that arrives in pieces —
@@ -694,30 +929,24 @@ impl Objects {
         if staging.written != expected {
             return Err(Error::InvalidInput("object length"));
         }
-        staging.file.sync_data()?;
         let digest = Digest(*staging.hasher.finalize().as_bytes());
-        let path = self.object_path(tenant, &digest);
-        self.ensure_dir(path.parent().expect("object path has a parent"))?;
-        let created = if !path.exists() {
-            fs::rename(&staging.tmp, &path)?;
-            if let Some(dir) = path.parent() {
-                sync_dir(dir)?;
-            }
-            true
-        } else {
-            false
-        };
         // `into_parts` consumes without the Drop removal firing; the
-        // admission charge moves into the `Staged` it becomes.
-        let (_, _, charge) = staging.into_parts();
-        Ok(Staged {
-            tenant,
-            digest,
-            len: expected,
-            path,
-            created,
-            charge,
-        })
+        // admission charge moves into the `Staged` it becomes, and a
+        // failure below removes the temp file and returns the charge here.
+        let (file, tmp, charge) = staging.into_parts();
+        match self.place(tenant, digest, expected, file, &tmp) {
+            Ok(mut staged) => {
+                staged.charge = charge;
+                Ok(staged)
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                if let Some((admission, bytes)) = charge {
+                    admission.release(tenant, bytes);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Publish a staged object: the reference commit. Idempotent — a second
@@ -747,6 +976,116 @@ impl Objects {
             }
         }
         Ok(changed == 1)
+    }
+
+    /// Abandon a stage whose commit will not happen. Runs on the writer
+    /// (`tx` is only read): the stage's pin is released and its file is
+    /// removed only when no other stage or reader still pins it and no
+    /// committed row names it — a dedup hit of the same bytes, committed or
+    /// still in flight, keeps them. Returns whether the file was removed.
+    pub fn discard(&self, tx: &Transaction<'_>, mut staged: Staged) -> Result<bool> {
+        let key = (staged.tenant, staged.digest);
+        let path = self.object_path(key.0, &key.1);
+        let mut pins = lock_pins(&self.pins);
+        if staged.pin.take().is_some() {
+            unpin(&mut pins, key);
+        }
+        let removed = self.remove_unowned(tx, &pins, &Owner::Object(key.0, key.1), &path, false);
+        drop(pins);
+        drop(staged);
+        removed
+    }
+
+    /// Unlink files a committed transaction released or the orphan sweep
+    /// found, re-checking each one on the writer immediately before removal:
+    /// a pinned object, a path a row names again (a commit adopted it since),
+    /// or — for a sweep find — a file younger than the grace is kept.
+    /// Returns how many were removed.
+    pub fn unlink(&self, tx: &Transaction<'_>, doomed: &[Doomed]) -> Result<u32> {
+        let mut removed = 0u32;
+        let pins = lock_pins(&self.pins);
+        for d in doomed {
+            if self.remove_unowned(tx, &pins, &d.owner, &d.path, d.aged)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// The single "may this file go" decision. Callers hold the pin lock,
+    /// so no stage can adopt the path between the check and the removal.
+    fn remove_unowned(
+        &self,
+        tx: &Connection,
+        pins: &HashMap<(TenantId, Digest), u64>,
+        owner: &Owner,
+        path: &Path,
+        aged: bool,
+    ) -> Result<bool> {
+        let owned = match owner {
+            Owner::Object(tenant, digest) => {
+                pins.contains_key(&(*tenant, *digest))
+                    || tx
+                        .prepare_cached(
+                            "SELECT EXISTS(SELECT 1 FROM objects
+                             WHERE tenant_id = ?1 AND digest = ?2)",
+                        )?
+                        .query_row(
+                            params![tenant.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+                            |r| r.get::<_, bool>(0),
+                        )?
+            }
+            Owner::Manifest {
+                tenant,
+                kind,
+                name,
+                version,
+            } => tx
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM manifests
+                     WHERE tenant_id = ?1 AND kind = ?2 AND name = ?3 AND version = ?4)",
+                )?
+                .query_row(
+                    params![
+                        tenant.as_bytes().as_slice(),
+                        kind.code() as i64,
+                        name.as_slice(),
+                        *version as i64
+                    ],
+                    |r| r.get::<_, bool>(0),
+                )?,
+            Owner::ManifestFile {
+                tenant,
+                kind,
+                name_hash,
+                version,
+            } => {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT name FROM manifests
+                     WHERE tenant_id = ?1 AND kind = ?2 AND version = ?3",
+                )?;
+                let mut rows = stmt.query(params![
+                    tenant.as_bytes().as_slice(),
+                    kind.code() as i64,
+                    *version as i64
+                ])?;
+                let mut named = false;
+                while let Some(row) = rows.next()? {
+                    if blake3::hash(&row.get::<_, Vec<u8>>(0)?).to_hex().as_str() == name_hash {
+                        named = true;
+                        break;
+                    }
+                }
+                named
+            }
+            Owner::Stray => false,
+        };
+        if owned || (aged && !older_than_grace(path)) {
+            return Ok(false);
+        }
+        // A file that will not go (gone already, or refused) stays for the
+        // next pass; the decision above is the only thing that must hold.
+        Ok(fs::remove_file(path).is_ok())
     }
 
     /// Committed metadata for an object; `NotFound` covers foreign tenants.
@@ -1206,26 +1545,22 @@ impl Objects {
             std::io::ErrorKind::NotFound => Error::Corrupt("object missing"),
             _ => Error::Io(e),
         })?;
-        let mut readers = self.readers.lock().unwrap_or_else(|p| p.into_inner());
-        *readers.entry((tenant, digest)).or_insert(0) += 1;
+        *lock_pins(&self.pins).entry((tenant, digest)).or_insert(0) += 1;
         Ok((
             Reader {
                 file,
                 key: (tenant, digest),
-                readers: std::sync::Arc::clone(&self.readers),
+                pins: Arc::clone(&self.pins),
             },
             meta.len,
         ))
     }
 
-    /// Whether any reader currently holds this object. Reclamation checks
-    /// this before unlinking; the check and the unlink are the GC stage's
-    /// responsibility to serialize.
+    /// Whether a reader or an uncommitted stage currently pins this object.
+    /// Reclamation skips pinned candidates; [`Objects::unlink`] re-checks
+    /// under the same lock the pin is taken with.
     pub fn reader_active(&self, tenant: TenantId, digest: Digest) -> bool {
-        self.readers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key(&(tenant, digest))
+        lock_pins(&self.pins).contains_key(&(tenant, digest))
     }
 
     /// Begin a resumable upload: the row and a staging file sized to the
@@ -1242,6 +1577,9 @@ impl Objects {
     ) -> Result<UploadId> {
         if ttl_ms <= 0 || ttl_ms > MAX_UPLOAD_TTL_MS {
             return Err(Error::InvalidInput("upload ttl"));
+        }
+        if declared_len > MAX_UPLOAD_BYTES {
+            return Err(Error::InvalidInput("upload length"));
         }
         // The declared length is reserved in `tenant_usage` the moment the
         // row inserts, so the projected total is what the tenant will owe.
@@ -1317,10 +1655,104 @@ impl Objects {
         })
     }
 
-    /// Write one chunk at `offset` into the staging file, then record the
-    /// range — bytes before bookkeeping, so a crash can never claim bytes it
-    /// does not have. Re-sending an identical range is idempotent (the
-    /// ranges merge; `received` counts bytes once).
+    /// The stripe lock serializing one upload's file I/O.
+    fn upload_lock(&self, id: UploadId) -> std::sync::MutexGuard<'_, ()> {
+        let bytes = id.as_bytes();
+        let stripe =
+            (u64::from_le_bytes(bytes[8..16].try_into().expect("8")) as usize) % UPLOAD_STRIPES;
+        self.upload_io[stripe]
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Chunk phase one, **outside the writer**: check the session on any
+    /// connection, admit the bytes this chunk newly covers, then write and
+    /// `fdatasync` them at `offset` under the upload's I/O lock. Bytes land
+    /// before bookkeeping, so a crash can never claim bytes it does not
+    /// have; [`Objects::record_chunk`] is the writer's short second phase.
+    pub fn write_chunk(
+        &self,
+        conn: &Connection,
+        tenant: TenantId,
+        id: UploadId,
+        offset: u64,
+        bytes: &[u8],
+        now: UnixMillis,
+    ) -> Result<Touch<ChunkWritten>> {
+        let row = upload_row(conn, tenant, id)?.ok_or(Error::NotFound)?;
+        if row.state != UploadState::Open {
+            return Err(Error::Conflict);
+        }
+        if row.expires_ms <= now.0 {
+            return Ok(Touch::Expired);
+        }
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .filter(|end| *end <= row.declared_len)
+            .ok_or(Error::InvalidInput("chunk range"))?;
+        // Admit only the bytes this chunk adds against the snapshot; the
+        // record step returns whatever a concurrent chunk covered first.
+        let mut ranges = row.ranges;
+        ranges_insert(&mut ranges, offset, end)?;
+        let received: u64 = ranges.iter().map(|(s, e)| e - s).sum();
+        let admitted = received - row.received;
+        let admission = self.admission.get().cloned();
+        if let Some(a) = &admission {
+            a.admit_untracked(id, admitted)?;
+        }
+        let chunk = ChunkWritten {
+            tenant,
+            id,
+            start: offset,
+            end,
+            admitted,
+            admission,
+        };
+        {
+            let _io = self.upload_lock(id);
+            let mut file = OpenOptions::new().write(true).open(self.upload_path(id))?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(bytes)?;
+            file.sync_data()?;
+        }
+        Ok(Touch::Ready(chunk))
+    }
+
+    /// Chunk phase two, **on the writer**: merge the durable range into the
+    /// row. Re-checks that the session is still open; re-sending an
+    /// identical range is idempotent (`received` counts bytes once).
+    pub fn record_chunk(&self, tx: &Transaction<'_>, mut chunk: ChunkWritten) -> Result<u64> {
+        let row = upload_row(tx, chunk.tenant, chunk.id)?.ok_or(Error::NotFound)?;
+        if row.state != UploadState::Open {
+            return Err(Error::Conflict);
+        }
+        let mut ranges = row.ranges;
+        ranges_insert(&mut ranges, chunk.start, chunk.end)?;
+        let received: u64 = ranges.iter().map(|(s, e)| e - s).sum();
+        tx.execute(
+            "UPDATE uploads SET ranges = ?2, received = ?3 WHERE id = ?1 AND state_code = 0",
+            params![
+                chunk.id.as_bytes().as_slice(),
+                encode_ranges(&ranges),
+                received as i64
+            ],
+        )?;
+        // Keep exactly what this chunk added; the rest (a concurrent chunk
+        // got there first) goes back now. The kept part is the upload's
+        // until it seals or aborts.
+        let delta = received - row.received;
+        if let Some(a) = chunk.admission.take() {
+            let excess = chunk.admitted.saturating_sub(delta);
+            if excess > 0 {
+                a.release_upload_delta(chunk.id, excess);
+            }
+        }
+        Ok(received)
+    }
+
+    /// Both chunk phases on one connection — host-local tools and tests. An
+    /// expired session is refused without being retired: the caller's
+    /// transaction would roll the retirement back with the refusal.
     pub fn put_chunk(
         &self,
         tx: &Transaction<'_>,
@@ -1330,99 +1762,84 @@ impl Objects {
         bytes: &[u8],
         now: UnixMillis,
     ) -> Result<u64> {
-        let row = upload_row(tx, tenant, id)?.ok_or(Error::NotFound)?;
-        if row.state != UploadState::Open {
-            return Err(Error::Conflict);
+        match self.write_chunk(tx, tenant, id, offset, bytes, now)? {
+            Touch::Ready(chunk) => self.record_chunk(tx, chunk),
+            Touch::Expired => Err(Error::InvalidInput("upload expired")),
         }
-        if row.expires_ms <= now.0 {
-            // Touching an expired session retires it: the row can no longer
-            // be resumed and the staged bytes become recoverable garbage.
-            tx.execute(
-                "UPDATE uploads SET state_code = 2 WHERE id = ?1 AND state_code = 0",
-                params![id.as_bytes().as_slice()],
-            )?;
-            if let Some(a) = self.admission.get() {
-                a.release_upload(id);
-            }
-            let _ = fs::remove_file(self.upload_path(id));
-            return Err(Error::InvalidInput("upload expired"));
-        }
-        let end = offset
-            .checked_add(bytes.len() as u64)
-            .filter(|end| *end <= row.declared_len)
-            .ok_or(Error::InvalidInput("chunk range"))?;
-        // Admit only the bytes this chunk actually adds — resent ranges
-        // merge to a zero delta and stay free.
-        let mut ranges = row.ranges.clone();
-        ranges_insert(&mut ranges, offset, end)?;
-        let received: u64 = ranges.iter().map(|(s, e)| e - s).sum();
-        let delta = received - row.received;
-        if let Some(a) = self.admission.get() {
-            a.admit_untracked(id, delta)?;
-        }
-        let landed = (|| -> Result<()> {
-            let mut file = OpenOptions::new().write(true).open(self.upload_path(id))?;
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(bytes)?;
-            file.sync_data()?;
-            tx.execute(
-                "UPDATE uploads SET ranges = ?2, received = ?3 WHERE id = ?1 AND state_code = 0",
-                params![
-                    id.as_bytes().as_slice(),
-                    encode_ranges(&ranges),
-                    received as i64
-                ],
-            )?;
-            Ok(())
-        })();
-        if landed.is_err()
-            && let Some(a) = self.admission.get()
-        {
-            // The ranges row never recorded them, so a retry charges the
-            // same delta again — return this one rather than double-count.
-            a.release_upload_delta(id, delta);
-        }
-        landed?;
-        Ok(received)
     }
 
-    /// Finish the upload: the ranges must tile the declared length, the
-    /// content must match the declared digest when one was given, then the
-    /// file is renamed into `objects/` and the reference committed — all
-    /// inside the caller's transaction. Sealing twice answers the same
-    /// digest; sealing an aborted upload is a conflict. An expired session
-    /// is retired rather than published.
-    pub fn seal_upload(
+    /// Retire an open session found past its expiry, in its own
+    /// transaction: the row becomes aborted and its reservation leaves
+    /// `tenant_usage`. Returns whether it was open; after the commit the
+    /// caller drops the staging file and charge with
+    /// [`Objects::drop_upload`].
+    pub fn retire_expired(
         &self,
         tx: &Transaction<'_>,
         tenant: TenantId,
         id: UploadId,
         now: UnixMillis,
-    ) -> Result<Digest> {
-        let row = upload_row(tx, tenant, id)?.ok_or(Error::NotFound)?;
+    ) -> Result<bool> {
+        Ok(tx.execute(
+            "UPDATE uploads SET state_code = 2
+             WHERE id = ?1 AND tenant_id = ?2 AND state_code = 0 AND expires_ms <= ?3",
+            params![
+                id.as_bytes().as_slice(),
+                tenant.as_bytes().as_slice(),
+                now.0
+            ],
+        )? == 1)
+    }
+
+    /// After a retirement committed: the staging file and the admission
+    /// charge go.
+    pub fn drop_upload(&self, id: UploadId) {
+        if let Some(a) = self.admission.get() {
+            a.release_upload(id);
+        }
+        let _ = fs::remove_file(self.upload_path(id));
+    }
+
+    /// Seal phase one, **outside the writer**: the ranges must tile the
+    /// declared length; the staging file is hashed under the upload's I/O
+    /// lock (a concurrent re-sent chunk cannot change bytes after they are
+    /// hashed) and checked against the declared digest; then the object
+    /// path is pinned and — unless identical bytes are already there — the
+    /// file is renamed into place and its directory synced. The writer's
+    /// [`Objects::finish_seal`] only flips the row and inserts the object.
+    pub fn prepare_seal(
+        &self,
+        conn: &Connection,
+        tenant: TenantId,
+        id: UploadId,
+        now: UnixMillis,
+    ) -> Result<Touch<SealPlan>> {
+        let row = upload_row(conn, tenant, id)?.ok_or(Error::NotFound)?;
         if row.state == UploadState::Committed {
-            return row.object_digest.ok_or(Error::Corrupt("upload digest"));
+            let digest = row.object_digest.ok_or(Error::Corrupt("upload digest"))?;
+            return Ok(Touch::Ready(SealPlan {
+                tenant,
+                id,
+                digest,
+                len: row.declared_len,
+                staged: None,
+                dedup: false,
+                done: true,
+            }));
         }
         if row.state == UploadState::Aborted {
             return Err(Error::Conflict);
         }
         if row.expires_ms <= now.0 {
-            tx.execute(
-                "UPDATE uploads SET state_code = 2 WHERE id = ?1 AND state_code = 0",
-                params![id.as_bytes().as_slice()],
-            )?;
-            if let Some(a) = self.admission.get() {
-                a.release_upload(id);
-            }
-            let _ = fs::remove_file(self.upload_path(id));
-            return Err(Error::InvalidInput("upload expired"));
+            return Ok(Touch::Expired);
         }
-        let path = self.upload_path(id);
         let complete = row.ranges.as_slice() == [(0, row.declared_len)]
             || row.declared_len == 0 && row.ranges.is_empty();
         if !complete {
             return Err(Error::InvalidInput("upload incomplete"));
         }
+        let path = self.upload_path(id);
+        let _io = self.upload_lock(id);
         // A previous seal may have renamed into objects/ and then lost its
         // transaction: the staging file is gone but the upload row stayed
         // open. Recover through the declared digest rather than wedging —
@@ -1455,41 +1872,93 @@ impl Objects {
             return Err(Error::InvalidInput("upload digest"));
         }
         let object = self.object_path(tenant, &digest);
-        self.ensure_dir(object.parent().expect("object path has a parent"))?;
-        let created = if object.exists() {
-            let _ = fs::remove_file(&path);
-            false
-        } else if recovered {
-            return Err(Error::Corrupt("upload file"));
-        } else {
-            fs::rename(&path, &object)?;
-            if let Some(dir) = object.parent() {
-                sync_dir(dir)?;
-            }
-            true
+        let dir = object.parent().expect("object path has a parent");
+        self.ensure_dir(dir)?;
+        let exists = {
+            let mut pins = lock_pins(&self.pins);
+            let exists = object.exists();
+            *pins.entry((tenant, digest)).or_insert(0) += 1;
+            exists
         };
+        let staged = Staged {
+            tenant,
+            digest,
+            len: row.declared_len,
+            pin: Some(Arc::clone(&self.pins)),
+            charge: None,
+        };
+        if !exists {
+            if recovered {
+                return Err(Error::Corrupt("upload file"));
+            }
+            // Every chunk was synced when it landed; only the rename and
+            // its directory entry are new.
+            fs::rename(&path, &object)?;
+            sync_dir(dir)?;
+        }
+        Ok(Touch::Ready(SealPlan {
+            tenant,
+            id,
+            digest,
+            len: row.declared_len,
+            staged: Some(staged),
+            dedup: exists && !recovered,
+            done: false,
+        }))
+    }
+
+    /// Seal phase two, **on the writer**: re-check the session, close it and
+    /// commit the object row. Sealing twice answers the same digest;
+    /// sealing an aborted upload is a conflict.
+    pub fn finish_seal(&self, tx: &Transaction<'_>, plan: SealPlan) -> Result<Digest> {
+        if plan.done {
+            return Ok(plan.digest);
+        }
+        let row = upload_row(tx, plan.tenant, plan.id)?.ok_or(Error::NotFound)?;
+        match row.state {
+            UploadState::Committed => {
+                return row.object_digest.ok_or(Error::Corrupt("upload digest"));
+            }
+            UploadState::Aborted => return Err(Error::Conflict),
+            UploadState::Open => {}
+        }
         // Close the upload first: its declared-length reservation leaves
         // `tenant_usage` as the object row's length enters it, so the seal
         // is net-zero against the tenant's quota rather than double-counted.
         tx.execute(
             "UPDATE uploads SET state_code = 1, object_digest = ?2 WHERE id = ?1",
-            params![id.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+            params![
+                plan.id.as_bytes().as_slice(),
+                plan.digest.as_bytes().as_slice()
+            ],
         )?;
-        self.commit(
-            tx,
-            &Staged {
-                tenant,
-                digest,
-                len: row.declared_len,
-                path: object,
-                created,
-                charge: None,
-            },
-        )?;
-        if let Some(a) = self.admission.get() {
-            a.release_upload(id);
+        let staged = plan.staged.as_ref().ok_or(Error::Corrupt("upload seal"))?;
+        debug_assert_eq!(staged.len, plan.len);
+        self.commit(tx, staged)?;
+        if plan.dedup {
+            // Identical bytes were already published; the staging copy is
+            // redundant. A rolled-back commit leaves the row open with the
+            // declared digest to recover through, as for a lost rename.
+            let _ = fs::remove_file(self.upload_path(plan.id));
         }
-        Ok(digest)
+        if let Some(a) = self.admission.get() {
+            a.release_upload(plan.id);
+        }
+        Ok(plan.digest)
+    }
+
+    /// Both seal phases on one connection — host-local tools and tests.
+    pub fn seal_upload(
+        &self,
+        tx: &Transaction<'_>,
+        tenant: TenantId,
+        id: UploadId,
+        now: UnixMillis,
+    ) -> Result<Digest> {
+        match self.prepare_seal(tx, tenant, id, now)? {
+            Touch::Ready(plan) => self.finish_seal(tx, plan),
+            Touch::Expired => Err(Error::InvalidInput("upload expired")),
+        }
     }
 
     /// Give up on an open upload and remove its staging file. A committed
@@ -1601,9 +2070,9 @@ impl Objects {
     }
 
     /// Delete one manifest version's row; its `manifest_refs` edges cascade.
-    /// Returns the file path for the caller to unlink once the transaction
-    /// commits — a crash between commit and unlink leaves an orphan the
-    /// file sweep later collects.
+    /// Returns the file for the caller to hand to [`Objects::unlink`] once
+    /// the transaction commits — a crash between commit and unlink leaves an
+    /// orphan the file sweep later collects.
     pub fn retire_manifest(
         &self,
         tx: &Transaction<'_>,
@@ -1611,7 +2080,7 @@ impl Objects {
         kind: Kind,
         name: &str,
         version: u64,
-    ) -> Result<Option<PathBuf>> {
+    ) -> Result<Option<Doomed>> {
         let deleted = tx.execute(
             "DELETE FROM manifests
              WHERE tenant_id = ?1 AND kind = ?2 AND name = ?3 AND version = ?4",
@@ -1622,33 +2091,30 @@ impl Objects {
                 version as i64
             ],
         )?;
-        Ok((deleted == 1).then(|| self.manifest_path(tenant, kind, name.as_bytes(), version)))
+        Ok((deleted == 1).then(|| Doomed {
+            path: self.manifest_path(tenant, kind, name.as_bytes(), version),
+            owner: Owner::Manifest {
+                tenant,
+                kind,
+                name: name.as_bytes().to_vec(),
+                version,
+            },
+            aged: false,
+        }))
     }
 
     /// Collect reclaimable objects: committed past `UNREFERENCED_GRACE_MS`,
     /// not referenced by any indexed manifest, not leased, not still
     /// decodable through an unindexed manifest (a tenant with any
-    /// `refs_indexed = 0` row is skipped entirely), and not being streamed
-    /// by a live reader. Rows are deleted in this transaction; the caller
-    /// unlinks the returned paths after commit.
+    /// `refs_indexed = 0` row is skipped entirely), and not pinned by a live
+    /// reader or stage. Candidates come from `object_unreferenced`, which
+    /// triggers keep, oldest first — the pass never walks referenced
+    /// objects. Rows are deleted in this transaction; the caller hands the
+    /// returned files to [`Objects::unlink`] after commit.
     pub fn reclaim(&self, tx: &Transaction<'_>, now: UnixMillis, limit: i64) -> Result<Reclaimed> {
         let cutoff = now.0 - UNREFERENCED_GRACE_MS;
         let candidates: Vec<(Vec<u8>, Vec<u8>, i64)> = tx
-            .prepare(
-                "SELECT o.tenant_id, o.digest, o.len FROM objects o
-                 WHERE o.created_ms <= ?1
-                   AND NOT EXISTS(SELECT 1 FROM manifest_refs r
-                                  WHERE r.tenant_id = o.tenant_id
-                                    AND r.digest = o.digest)
-                   AND NOT EXISTS(SELECT 1 FROM object_leases l
-                                  WHERE l.tenant_id = o.tenant_id
-                                    AND l.digest = o.digest
-                                    AND l.until_ms > ?2)
-                   AND NOT EXISTS(SELECT 1 FROM manifests m
-                                  WHERE m.tenant_id = o.tenant_id
-                                    AND m.refs_indexed = 0)
-                 LIMIT ?3",
-            )?
+            .prepare_cached(RECLAIM_CANDIDATES)?
             .query_map(params![cutoff, now.0, limit.min(RECLAIM_BATCH)], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?
@@ -1669,136 +2135,223 @@ impl Objects {
             )?;
             reclaimed.objects += 1;
             reclaimed.bytes += len as u64;
-            reclaimed.paths.push(self.object_path(tenant, &digest));
+            reclaimed.doomed.push(Doomed {
+                path: self.object_path(tenant, &digest),
+                owner: Owner::Object(tenant, digest),
+                aged: false,
+            });
         }
         Ok(reclaimed)
     }
 
-    /// Sweep files with no row: objects or manifests a commit orphaned, and
-    /// `tmp/` leftovers a restart's `recover` never saw. Only files whose
-    /// mtime is older than `FILE_ORPHAN_GRACE_MS` go — an in-flight commit's
-    /// just-renamed file is younger than its row insert by milliseconds.
-    /// Returns the number unlinked, at most `limit`.
-    pub fn sweep_orphans(&self, conn: &Connection, limit: u32) -> Result<u32> {
-        let cutoff = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as i64)
-            - FILE_ORPHAN_GRACE_MS;
-        let mut swept = 0u32;
-        let gone = |path: &Path, swept: &mut u32, limit: u32| -> bool {
-            if *swept >= limit {
-                return false;
-            }
-            let old = fs::metadata(path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                .is_some_and(|age| (age.as_millis() as i64) < cutoff);
-            if old && fs::remove_file(path).is_ok() {
-                *swept += 1;
-            }
-            true
+    /// One bounded pass of the orphan sweep, **outside the writer**: files
+    /// with no row — objects or manifests a commit orphaned, `tmp/`
+    /// leftovers a restart's `recover` never saw — whose mtime is older
+    /// than `FILE_ORPHAN_GRACE_MS`. The walk goes shard by shard (a
+    /// tenant's manifests, one object prefix directory of a tenant, `tmp/`)
+    /// in name order and stops after the shard that takes it past `budget`
+    /// directory entries or `limit` finds; the next pass resumes after it.
+    /// Returns the finds, for [`Objects::unlink`] on the writer, and whether
+    /// the pass reached the end of the tree (the next one starts over).
+    /// Memory is one shard: a tenant's manifest paths or one prefix
+    /// directory's names.
+    pub fn orphans(
+        &self,
+        conn: &Connection,
+        limit: u32,
+        budget: u32,
+    ) -> Result<(Vec<Doomed>, bool)> {
+        let resume = self
+            .sweep_cursor
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let mut walk = Walk {
+            found: Vec::new(),
+            seen: 0,
+            limit: limit as usize,
+            budget,
         };
-        // Committed manifest files: the path set is small enough to hold.
-        let mut manifests = HashSet::new();
-        let mut rows = conn.prepare("SELECT tenant_id, kind, name, version FROM manifests")?;
-        let mut query = rows.query([])?;
-        while let Some(row) = query.next()? {
-            manifests.insert(self.manifest_path(
-                tenant_from(row.get::<_, Vec<u8>>(0)?)?,
-                Kind::from_code(row.get::<_, i64>(1)? as u8)?,
-                &row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, i64>(3)? as u64,
-            ));
-        }
-        drop(query);
-        drop(rows);
-        let root = self.manifests_root();
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else {
+        let stopped = self.walk_shards(conn, resume.as_deref(), &mut walk)?;
+        let done = stopped.is_none();
+        *self.sweep_cursor.lock().unwrap_or_else(|p| p.into_inner()) = stopped;
+        Ok((walk.found, done))
+    }
+
+    /// Walk shards after `resume` until the walk is full; `Some(shard)` is
+    /// where it stopped, `None` means the tree ended.
+    fn walk_shards(
+        &self,
+        conn: &Connection,
+        resume: Option<&str>,
+        walk: &mut Walk,
+    ) -> Result<Option<String>> {
+        // Shard keys sort in walk order: "m/<tenant>", "o/<tenant>/<xx>", "t".
+        let after = |key: &str| resume.is_none_or(|r| key > r);
+        for (name, path) in sorted_entries(&self.manifests_root()) {
+            let key = format!("m/{name}");
+            if !after(&key) {
                 continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                    stack.push(path);
-                } else if !manifests.contains(&path) && !gone(&path, &mut swept, limit) {
-                    return Ok(swept);
-                }
+            }
+            walk.seen += 1;
+            match name.parse::<TenantId>() {
+                Ok(tenant) if path.is_dir() => self.manifest_shard(conn, tenant, &path, walk)?,
+                _ => walk.stray(path),
+            }
+            if walk.full() {
+                return Ok(Some(key));
             }
         }
-        // Object files check their row directly — one prepared statement,
-        // no whole-table materialization.
-        let mut has_row = conn
-            .prepare("SELECT EXISTS(SELECT 1 FROM objects WHERE tenant_id = ?1 AND digest = ?2)")?;
-        let objects = self.objects_root();
-        let Ok(tenants) = fs::read_dir(&objects) else {
-            return Ok(swept);
-        };
-        for tenant_dir in tenants.flatten() {
-            let Ok(tenant) = tenant_dir.file_name().to_string_lossy().parse::<TenantId>() else {
-                if tenant_dir.path().is_file() && !gone(&tenant_dir.path(), &mut swept, limit) {
-                    return Ok(swept);
+        let mut has_row = conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM objects WHERE tenant_id = ?1 AND digest = ?2)",
+        )?;
+        for (name, tenant_path) in sorted_entries(&self.objects_root()) {
+            let tenant_key = format!("o/{name}");
+            // Every prefix key of this tenant sorts after `tenant_key/`.
+            if resume.is_some_and(|r| format!("{tenant_key}/~").as_str() <= r) {
+                continue;
+            }
+            let Ok(tenant) = name.parse::<TenantId>() else {
+                walk.seen += 1;
+                walk.stray(tenant_path);
+                continue;
+            };
+            let resuming_inside = resume.is_some_and(|r| r.starts_with(&tenant_key));
+            for (prefix, prefix_path) in sorted_entries(&tenant_path) {
+                let key = format!("{tenant_key}/{prefix}");
+                if !after(&key) {
+                    continue;
                 }
-                continue;
-            };
-            let Ok(prefixes) = fs::read_dir(tenant_dir.path()) else {
-                continue;
-            };
-            for prefix in prefixes.flatten() {
-                if prefix.file_type().is_ok_and(|t| t.is_file()) {
-                    // Stray file directly under objects/<tenant>/ — no row
+                walk.seen += 1;
+                if !prefix_path.is_dir() {
+                    // A stray file directly under objects/<tenant>/: no row
                     // can own a path outside the prefix layout.
-                    if !gone(&prefix.path(), &mut swept, limit) {
-                        return Ok(swept);
+                    if !resuming_inside {
+                        walk.stray(prefix_path);
                     }
                     continue;
                 }
-                let Ok(entries) = fs::read_dir(prefix.path()) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                for (file, path) in sorted_entries(&prefix_path) {
+                    walk.seen += 1;
+                    let digest = match Digest::parse(&file) {
+                        Ok(digest) if file.starts_with(prefix.as_str()) => digest,
+                        _ => {
+                            walk.stray(path);
+                            continue;
+                        }
+                    };
+                    if self.reader_active(tenant, digest) {
                         continue;
                     }
-                    let Ok(digest) = Digest::parse(&entry.file_name().to_string_lossy()) else {
-                        if !gone(&path, &mut swept, limit) {
-                            return Ok(swept);
-                        }
-                        continue;
-                    };
                     let committed = has_row
                         .query_row(
                             params![tenant.as_bytes().as_slice(), digest.as_bytes().as_slice()],
                             |r| r.get::<_, bool>(0),
                         )
                         .unwrap_or(true);
-                    if !committed && !gone(&path, &mut swept, limit) {
-                        return Ok(swept);
+                    if !committed && older_than_grace(&path) {
+                        walk.found.push(Doomed {
+                            path,
+                            owner: Owner::Object(tenant, digest),
+                            aged: true,
+                        });
                     }
                 }
-            }
-        }
-        // `tmp/` leftovers: no row can ever claim them — the grace alone
-        // decides (a live stage's file is always fresh).
-        let tmp = self.root.join(TMP_DIR);
-        if let Ok(entries) = fs::read_dir(&tmp) {
-            for entry in entries.flatten() {
-                if entry.file_type().is_ok_and(|t| t.is_file())
-                    && !gone(&entry.path(), &mut swept, limit)
-                {
-                    return Ok(swept);
+                if walk.full() {
+                    return Ok(Some(key));
                 }
             }
         }
-        Ok(swept)
+        if after("t") {
+            // `tmp/` leftovers: no row can ever claim them — the grace alone
+            // decides (a live stage's file is always fresh).
+            for (_, path) in sorted_entries(&self.root.join(TMP_DIR)) {
+                walk.seen += 1;
+                if path.is_file() {
+                    walk.stray(path);
+                }
+                if walk.found.len() >= walk.limit {
+                    return Ok(Some("t".into()));
+                }
+            }
+        }
+        Ok(None)
     }
-    /// are re-validated, every ancestor under `dest` is checked for symlinks
-    /// and the file itself is created `O_EXCL`-style (existing targets are
-    /// refused), so a prepared directory cannot redirect the extract outside
-    /// itself. Content is verified while streaming.
+
+    /// One tenant's manifest files against its committed rows: memory is
+    /// that tenant's path set, never the whole table.
+    fn manifest_shard(
+        &self,
+        conn: &Connection,
+        tenant: TenantId,
+        dir: &Path,
+        walk: &mut Walk,
+    ) -> Result<()> {
+        let mut committed = HashSet::new();
+        let mut rows =
+            conn.prepare_cached("SELECT kind, name, version FROM manifests WHERE tenant_id = ?1")?;
+        let mut query = rows.query([tenant.as_bytes().as_slice()])?;
+        while let Some(row) = query.next()? {
+            committed.insert(self.manifest_path(
+                tenant,
+                Kind::from_code(row.get::<_, i64>(0)? as u8)?,
+                &row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)? as u64,
+            ));
+        }
+        drop(query);
+        drop(rows);
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                walk.seen += 1;
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push(path);
+                } else if !committed.contains(&path) && older_than_grace(&path) {
+                    let owner = manifest_owner(tenant, &path);
+                    walk.found.push(Doomed {
+                        path,
+                        owner,
+                        aged: true,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Sweep the whole tree for orphans and unlink them, on one connection —
+    /// host-local tools and tests. The controller runs the bounded
+    /// [`Objects::orphans`] pass per maintenance tick instead.
+    pub fn sweep_orphans(&self, conn: &mut Connection, limit: u32) -> Result<u32> {
+        *self.sweep_cursor.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let mut removed = 0u32;
+        while removed < limit {
+            let (doomed, done) = self.orphans(conn, limit - removed, u32::MAX)?;
+            let tx = conn.transaction()?;
+            removed += self.unlink(&tx, &doomed)?;
+            tx.commit()?;
+            if done || doomed.is_empty() {
+                break;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Extract a manifest version under `dest` for host-local use. Entry
+    /// paths are re-validated, every existing ancestor under `dest` is
+    /// checked for symlinks and the file itself is created `O_EXCL`-style
+    /// (existing targets are refused), so a directory prepared in advance
+    /// cannot redirect the extract outside itself. The checks are
+    /// path-based, not descriptor-relative: they do not hold against a
+    /// directory an adversary changes *while* the extract runs — `dest`
+    /// must not be writable by anyone the caller does not trust. Content is
+    /// verified while streaming. No controller path calls this; a caller
+    /// that extracts into shared space needs an `openat` walk first.
     pub fn materialize(
         &self,
         conn: &Connection,
@@ -1858,7 +2411,7 @@ impl Objects {
 pub struct Reader {
     file: File,
     key: (TenantId, Digest),
-    readers: std::sync::Arc<Mutex<HashMap<(TenantId, Digest), u64>>>,
+    pins: Pins,
 }
 
 impl Read for Reader {
@@ -1875,13 +2428,7 @@ impl Seek for Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        let mut readers = self.readers.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(count) = readers.get_mut(&self.key) {
-            *count -= 1;
-            if *count == 0 {
-                readers.remove(&self.key);
-            }
-        }
+        unpin(&mut lock_pins(&self.pins), self.key);
     }
 }
 
@@ -2027,6 +2574,20 @@ pub(crate) fn tenant_from(bytes: Vec<u8>) -> Result<TenantId> {
         <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| Error::Corrupt("tenant id"))?,
     )
     .map_err(|_| Error::Corrupt("tenant id"))
+}
+
+/// Whether `path`'s mtime is older than [`FILE_ORPHAN_GRACE_MS`]; an
+/// unreadable file is not.
+fn older_than_grace(path: &Path) -> bool {
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+        - FILE_ORPHAN_GRACE_MS;
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|age| (age.as_millis() as i64) < cutoff)
 }
 
 /// fsync a directory so a rename inside it is durable. No-op off unix:

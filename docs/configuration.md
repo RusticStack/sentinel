@@ -73,9 +73,9 @@ enabled = true                     # default; the controller holds offered objec
 reserve_bytes = 1073741824         # held back for metadata and log evidence (≥ 64 MiB, default 1 GiB)
 low_watermark_bytes = 2147483648   # discretionary writes refuse below free-reserve under this (default 2 GiB)
 high_watermark_bytes = 4294967296  # …and admit again above this (≥ low, default 4 GiB)
-tenant_quota_bytes = 0             # default committed-bytes cap per tenant; 0 = unlimited (default)
+tenant_quota_bytes = 0             # default committed-bytes cap per tenant; 0 = unlimited (default; one upload still declares at most 4 GiB)
 log_retention_secs = 1209600       # finished attempt logs kept this long (1 h .. 1 yr, default 14 d)
-sweep_interval_secs = 300          # the maintenance pass rides the dispatch loop at most this often (5..86400)
+sweep_interval_secs = 300          # the maintenance pass runs on its own thread at most this often (5..86400)
 ```
 
 The three common fields are optional in the file; `listen`, `api_listen`, `public_url` and `[storage]` are refused for the worker and the worker keys (`labels`, `disk_bytes`, `tailcat_address`) for the server; `[tailcat]` is accepted by both roles; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
