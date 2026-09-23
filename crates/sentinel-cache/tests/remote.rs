@@ -137,7 +137,7 @@ fn policy<'a>(source: &'a dyn Remote) -> remote::Policy<'a> {
     remote::Policy {
         source,
         attempt: *AttemptId::new().as_bytes(),
-        job_timeout: Duration::from_secs(120),
+        deadline: remote::Policy::deadline_for(Duration::from_secs(120)),
     }
 }
 
@@ -158,6 +158,8 @@ struct Fake {
     interrupt: Mutex<Option<u64>>,
     /// Flip one byte in the next chunk at this offset within the chunk.
     corrupt: Mutex<Option<usize>>,
+    /// Answer the next fetch `busy` before serving anything.
+    busy: Mutex<bool>,
     fetches: AtomicUsize,
     offers: AtomicUsize,
     /// Per fetch: the offset served from and the bytes served.
@@ -195,6 +197,9 @@ impl Fake {
 impl Remote for Fake {
     fn fetch(&self, need: &Need, _deadline: Instant, sink: &mut dyn Sink) -> Result<(), Refusal> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
+        if std::mem::take(&mut *self.busy.lock().unwrap_or_else(|p| p.into_inner())) {
+            return Err(Refusal::Busy);
+        }
         let id = entry_id(need.repo, &need.name, &need.key);
         let Some(stream) = self
             .bundles
@@ -583,4 +588,213 @@ fn a_controller_without_the_bundle_leaves_the_local_miss() {
             .join("remote.part")
             .exists()
     );
+}
+
+/// P08-C7: a transfer refused for now (`busy`) keeps the valid partial an
+/// earlier attempt left; the next attempt resumes it.
+#[test]
+fn a_busy_answer_keeps_a_valid_partial() {
+    let temp = tempfile::tempdir().unwrap();
+    let (root_a, root_b) = (temp.path().join("a"), temp.path().join("b"));
+    let ws = temp.path().join("ws");
+    let scope = test_scope(Trust::Protected);
+    fs::create_dir_all(&root_b).unwrap();
+    let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 249) as u8).collect();
+    let generation = seal_generation(
+        &root_a,
+        &scope,
+        &[("blob", payload.as_slice())],
+        "gen-1500000-0000abd2",
+    );
+    let fake = Fake::default();
+    offer(&fake, &root_a, &scope, &generation);
+    *fake.interrupt.lock().unwrap() = Some(16 * 1024);
+    let _ = hydrate(&root_b, &ws, &scope, &fake);
+    let part = entry_of(&root_b, &scope)
+        .join(scope::WRITING_NAME)
+        .join("remote.part");
+    let partial = fs::metadata(&part).unwrap().len();
+    assert!(partial > 0);
+    *fake.busy.lock().unwrap() = true;
+    let busy = hydrate(&root_b, &ws, &scope, &fake);
+    assert_eq!(busy.outcome, Outcome::Miss(Miss::Absent));
+    assert_eq!(fs::metadata(&part).unwrap().len(), partial, "kept whole");
+    let resumed = hydrate(&root_b, &ws, &scope, &fake);
+    assert!(resumed.outcome.is_hit(), "{:?}", resumed.outcome);
+    assert_eq!(resumed.stats.remote_from, Some(partial));
+}
+
+/// P08-C6: hydrations share the job's one deadline — a policy whose
+/// deadline already passed never reaches the transport, so N caches can
+/// never cost N budgets.
+#[test]
+fn a_spent_job_deadline_never_networks() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = temp.path().join("ws");
+    let scope = test_scope(Trust::Protected);
+    fs::create_dir_all(&ws).unwrap();
+    let spent = remote::Policy {
+        source: &NeverCalled,
+        attempt: *AttemptId::new().as_bytes(),
+        deadline: Instant::now(),
+    };
+    let missed = restore::restore_remote(
+        &env(&temp.path().join("cache"), &ws),
+        &decl(&["vendor"]),
+        Some(KEY.to_owned()),
+        scope,
+        "attempt-1",
+        Some(spent),
+    );
+    assert_eq!(missed.outcome, Outcome::Miss(Miss::Absent));
+    assert_eq!(
+        remote::Policy::budget(Duration::from_secs(8)),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        remote::Policy::budget(Duration::from_secs(3600)),
+        remote::BUDGET_MAX
+    );
+}
+
+// ——— the controller-side store (P08-C4/C5/C8) ———
+
+fn upload_for(scope: &Scope, stream: &[u8]) -> Upload {
+    Upload::of(
+        *AttemptId::new().as_bytes(),
+        scope,
+        KEY,
+        stream.len() as u64,
+        *blake3::hash(stream).as_bytes(),
+    )
+}
+
+/// Receive `stream` into the controller store exactly as a session does.
+fn receive(store: &Path, scope: &Scope, stream: &[u8]) {
+    let upload = upload_for(scope, stream);
+    let mut receiving = remote::Receiving::begin(store, &upload)
+        .unwrap()
+        .expect("not stored yet");
+    for (i, piece) in stream.chunks(1000).enumerate() {
+        receiving.push((i * 1000) as u64, piece).unwrap();
+    }
+    receiving.end(upload.digest).unwrap();
+}
+
+fn bundles(entry: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(entry)
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".bundle"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// P08-C4: a second generation supersedes the first — the entry keeps one
+/// bundle — and the store sweep removes stale upload staging and evicts
+/// whole entries least recently served first under its budget.
+#[test]
+fn the_controller_store_keeps_one_bundle_per_entry_and_a_byte_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("remote-cache");
+    let scope = test_scope(Trust::Protected);
+    let entry = entry_of(&store, &scope);
+    receive(&store, &scope, &[1u8; 3000]);
+    receive(&store, &scope, &[2u8; 3000]);
+    assert_eq!(bundles(&entry).len(), 1, "the superseded bundle is gone");
+    let served = remote::Serving::open(&store, &Need::of([9; 16], &scope, KEY, 0, [0; 32]))
+        .unwrap()
+        .plan();
+    assert_eq!(served.digest, *blake3::hash(&[2u8; 3000]).as_bytes());
+
+    // A second entry, served more recently than the first.
+    let other = test_scope(Trust::Protected);
+    receive(&store, &other, &[3u8; 5000]);
+    let past = std::time::SystemTime::now() - Duration::from_secs(3600);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(entry.join(scope::CURRENT_NAME))
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    // An abandoned upload's staging from long ago.
+    fs::create_dir_all(entry.join(scope::WRITING_NAME)).unwrap();
+    let stale = entry.join(scope::WRITING_NAME).join("dead.part");
+    fs::write(&stale, b"half").unwrap();
+
+    let later = UnixMillis::now().0 + remote::STALE_UPLOAD.as_millis() as i64 + 1000;
+    let swept = remote::sweep_store(&store, 6000, 1000, later);
+    assert_eq!(swept.parts_removed, 1);
+    assert!(!stale.exists());
+    assert_eq!(swept.entries_evicted, 1, "{swept:?}");
+    assert!(!entry.exists(), "the least recently served entry went");
+    assert!(entry_of(&store, &other).exists());
+    assert_eq!(swept.bytes, 5000);
+}
+
+/// P08-C5: an upload abandoned mid-stream removes its staging file and
+/// releases the entry, so the next offer is not `busy`.
+#[test]
+fn an_abandoned_upload_leaves_nothing_behind() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("remote-cache");
+    let scope = test_scope(Trust::Protected);
+    let stream = vec![4u8; 4000];
+    let upload = upload_for(&scope, &stream);
+    let mut receiving = remote::Receiving::begin(&store, &upload).unwrap().unwrap();
+    receiving.push(0, &stream[..1000]).unwrap();
+    let writing = entry_of(&store, &scope).join(scope::WRITING_NAME);
+    assert!(fs::read_dir(&writing).unwrap().count() > 0);
+    drop(receiving);
+    assert!(
+        fs::read_dir(&writing)
+            .map(|d| d.count() == 0)
+            .unwrap_or(true),
+        "no staging file or lock survives"
+    );
+    receive(&store, &scope, &stream);
+    assert_eq!(bundles(&entry_of(&store, &scope)).len(), 1);
+}
+
+/// P08-C8: an upload is verified as it lands — a stream whose bytes do not
+/// hash to the offered digest is refused at its end without a re-read, and
+/// a serve reproduces the stored stream through one reused chunk buffer,
+/// resuming only from a proven prefix.
+#[test]
+fn uploads_verify_as_they_land_and_serves_resume_only_proven_prefixes() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("remote-cache");
+    let scope = test_scope(Trust::Protected);
+    let stream: Vec<u8> = (0..200_000u32).map(|i| (i % 253) as u8).collect();
+    let upload = upload_for(&scope, &stream);
+    let mut lying = remote::Receiving::begin(&store, &upload).unwrap().unwrap();
+    let mut forged = stream.clone();
+    forged[100] ^= 1;
+    lying.push(0, &forged[..100_000]).unwrap();
+    lying.push(100_000, &forged[100_000..]).unwrap();
+    assert_eq!(lying.end(upload.digest), Err(Refusal::Store));
+    drop(lying);
+    assert!(bundles(&entry_of(&store, &scope)).is_empty());
+
+    receive(&store, &scope, &stream);
+    let have = *blake3::hash(&stream[..70_000]).as_bytes();
+    for (offset, have, want_from) in [(70_000, have, 70_000), (70_000, [0; 32], 0)] {
+        let mut serving =
+            remote::Serving::open(&store, &Need::of([9; 16], &scope, KEY, offset, have)).unwrap();
+        assert_eq!(serving.plan().offset, want_from);
+        let mut chunk = Chunk {
+            attempt: [0; 16],
+            offset: 0,
+            bytes: Vec::new(),
+            prefix: [0; 32],
+        };
+        let mut got = stream[..want_from as usize].to_vec();
+        while serving.next_chunk_into(&mut chunk).unwrap() {
+            assert_eq!(chunk.offset, got.len() as u64);
+            got.extend_from_slice(&chunk.bytes);
+            assert_eq!(chunk.prefix, *blake3::hash(&got).as_bytes());
+        }
+        assert_eq!(got, stream);
+    }
 }

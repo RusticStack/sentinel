@@ -84,6 +84,19 @@ const RATE_SAMPLE: Duration = Duration::from_millis(250);
 /// The partial a hydration resumes: one file per entry's staging area,
 /// written and resumed only under `writing/.lock`.
 const PART_NAME: &str = "remote.part";
+/// The longest prefix a serve hashes to prove a resume point; beyond it
+/// the transfer restarts cold. A hydration budget of at most 5 s never
+/// leaves a partial anywhere near this.
+pub const MAX_RESUME_HASH: u64 = 1 << 30;
+/// The controller store's byte budget (`sweep_store`): past it, whole
+/// entries go least recently served first.
+pub const STORE_BUDGET_BYTES: u64 = 50 << 30;
+/// An upload staging file (`writing/*.part`) untouched this long belongs
+/// to a transfer that ended without its end; the sweep removes it.
+pub const STALE_UPLOAD: Duration = Duration::from_secs(60 * 60);
+/// Free space an upload always leaves on the store's filesystem: 5 % of
+/// it, at most this much.
+pub const STORE_FREE_RESERVE: u64 = 1 << 30;
 
 /// `os` wire code for the only executor OS. The code, not the enum, is
 /// the wire form: a newer OS can only arrive as a value this build
@@ -356,30 +369,32 @@ pub trait Sink {
     fn chunk(&mut self, chunk: &Chunk) -> Result<(), Refusal>;
 }
 
-/// What one restore may spend on remote hydration, and who the transfer
-/// is fenced by. Present only when the worker's link offers a remote
-/// source; then a local miss may hydrate.
+/// What one attempt's restores may spend on remote hydration, and who the
+/// transfers are fenced by. Present only when the worker's link offers a
+/// remote source; then a local miss may hydrate.
 #[derive(Clone, Copy)]
 pub struct Policy<'a> {
     pub source: &'a dyn Remote,
     /// The attempt the request is authorized under — the id the
-    /// controller fences against (`dispatch::attempt_scope`).
+    /// controller fences against (`dispatch::cache_scope`).
     pub attempt: [u8; 16],
-    /// The job's own wall-time allowance: hydration may spend at most a
-    /// quarter of it, capped at [`BUDGET_MAX`].
-    pub job_timeout: Duration,
+    /// When every hydration of this attempt must be done — resuming,
+    /// transferring and installing alike (P08-C6). One deadline per job,
+    /// fixed before its first restore ([`Policy::deadline_for`]), so N
+    /// caches share one budget instead of each taking their own.
+    pub deadline: Instant,
 }
 
 impl Policy<'_> {
-    /// `min(BUDGET_MAX, job_timeout / 4)` — the deadline the whole
-    /// transfer runs under, fixed when hydration starts.
-    pub fn budget(&self) -> Duration {
-        let quarter = self.job_timeout / 4;
-        if quarter < BUDGET_MAX {
-            quarter
-        } else {
-            BUDGET_MAX
-        }
+    /// `min(BUDGET_MAX, job_timeout / 4)` — the whole job's hydration
+    /// allowance.
+    pub fn budget(job_timeout: Duration) -> Duration {
+        (job_timeout / 4).min(BUDGET_MAX)
+    }
+
+    /// The job-level deadline a policy carries: now plus [`Policy::budget`].
+    pub fn deadline_for(job_timeout: Duration) -> Instant {
+        Instant::now() + Self::budget(job_timeout)
     }
 }
 
@@ -420,8 +435,11 @@ pub(crate) fn hydrate(
     owner: &str,
     policy: Policy<'_>,
 ) -> Hydro {
-    let budget = policy.budget();
-    if budget.is_zero() {
+    // The clock is the job's: it started before the first restore and
+    // covers resuming the partial, the transfer and the install alike.
+    let deadline = policy.deadline;
+    let started = Instant::now();
+    if started >= deadline {
         return Hydro::Nothing;
     }
     let entry_key = attach::entry_key(attached.scope.class, &attached.key);
@@ -437,13 +455,11 @@ pub(crate) fn hydrate(
         return Hydro::Nothing;
     };
     let part = entry.join(scope::WRITING_NAME).join(PART_NAME);
-    let Ok((file, offset, hasher)) = open_partial(&part) else {
+    let Ok((file, offset, hasher)) = open_partial(&part, deadline) else {
+        // Unreadable, or the resume hash itself ran out of budget: the
+        // partial is kept for an attempt with more time.
         return Hydro::Nothing;
     };
-
-    let started = Instant::now();
-    let deadline = started + budget;
-    attached.stats.remote_from = (offset > 0).then_some(offset);
     let have = *hasher.clone().finalize().as_bytes();
     let need = Need::of(policy.attempt, &attached.scope, entry_key, offset, have);
     let mut sink = Partial {
@@ -460,15 +476,27 @@ pub(crate) fn hydrate(
     let fetched = policy.source.fetch(&need, deadline, &mut sink);
     attached.stats.remote_ns = Some(ns(started));
     attached.stats.remote_bytes = sink.received;
+    // Where the transfer really resumed: the controller's granted offset,
+    // not the one this side asked for (P08-C7).
+    attached.stats.remote_from = sink.grant.map(|g| g.offset).filter(|o| *o > 0);
     let halt = sink.halt;
 
     match fetched {
         Ok(()) => {}
-        // The controller had nothing (or refused the request itself): the
-        // local lookup's own reason is the honest answer. Drop any empty
-        // staging file so a miss does not leave a resume trap.
-        Err(Refusal::NoBundle) | Err(Refusal::Denied) | Err(Refusal::Busy) => {
+        // The controller has no bundle for the entry: whatever partial was
+        // here can never complete, so it goes (an empty one is no resume
+        // point either).
+        Err(Refusal::NoBundle) => {
             let _ = fs::remove_file(&part);
+            return Hydro::Nothing;
+        }
+        // Refused for now (`denied`, `busy`): the local lookup's own reason
+        // is the honest answer, and a valid partial stays for later (P08-C7).
+        Err(Refusal::Denied) | Err(Refusal::Busy) => {
+            drop(sink);
+            if fs::metadata(&part).is_ok_and(|m| m.len() == 0) {
+                let _ = fs::remove_file(&part);
+            }
             return Hydro::Nothing;
         }
         // A transfer whose bytes cannot be the promised stream is dropped
@@ -499,6 +527,12 @@ pub(crate) fn hydrate(
         return Hydro::Refused(Miss::Corrupt);
     }
 
+    if Instant::now() >= deadline {
+        // Complete but out of time to install: the verified stream stays
+        // as the partial, and the next attempt installs it without a byte
+        // on the wire.
+        return Hydro::Refused(TRANSFER_MISS);
+    }
     match install(env, &entry, &part, attached) {
         Ok(installed) => {
             // Promotion is best-effort: the served bytes are already
@@ -532,7 +566,7 @@ fn empty_digest() -> [u8; 32] {
 /// there, their length and their running digest. A partial that cannot be
 /// read as a stream prefix is dropped, never trusted: a cold start is
 /// always safe, a guessed resume is not.
-fn open_partial(path: &Path) -> io::Result<(fs::File, u64, blake3::Hasher)> {
+fn open_partial(path: &Path, deadline: Instant) -> io::Result<(fs::File, u64, blake3::Hasher)> {
     let mut file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -547,18 +581,29 @@ fn open_partial(path: &Path) -> io::Result<(fs::File, u64, blake3::Hasher)> {
     if len == 0 {
         return Ok((file, 0, blake3::Hasher::new()));
     }
-    let hasher = hash_prefix(&mut file, len)?;
+    let hasher = hash_prefix(&mut file, len, Some(deadline))?;
     Ok((file, len, hasher))
 }
 
 /// Hash `len` bytes from the start, leaving the cursor at `len` — the
-/// running state a resume continues from.
-fn hash_prefix(file: &mut fs::File, len: u64) -> io::Result<blake3::Hasher> {
+/// running state a resume continues from. Past `deadline` it stops with
+/// `TimedOut`: resuming a large partial is part of the restore's budget.
+fn hash_prefix(
+    file: &mut fs::File,
+    len: u64,
+    deadline: Option<Instant>,
+) -> io::Result<blake3::Hasher> {
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; BLOCK_BYTES];
     let mut left = len;
     while left > 0 {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "resume hash out of budget",
+            ));
+        }
         let want = left.min(buf.len() as u64) as usize;
         let read = file.read(&mut buf[..want])?;
         if read == 0 {
@@ -616,7 +661,8 @@ impl Sink for Partial {
             self.file
                 .set_len(grant.offset)
                 .map_err(|_| Refusal::Store)?;
-            self.hasher = hash_prefix(&mut self.file, grant.offset).map_err(|_| Refusal::Store)?;
+            self.hasher = hash_prefix(&mut self.file, grant.offset, Some(self.deadline))
+                .map_err(|_| Refusal::Store)?;
             self.offset = grant.offset;
         }
         if self.hasher.clone().finalize().as_bytes() != &grant.prefix {
@@ -664,11 +710,14 @@ impl Sink for Partial {
         // stalls before the first sample.
         let elapsed = now.duration_since(self.started).as_nanos();
         if elapsed >= RATE_SAMPLE.as_nanos() && self.received > 0 {
-            let ns_per_byte = elapsed / u128::from(self.received);
-            let remaining = u128::from(self.total - self.offset);
-            let estimate = remaining.saturating_mul(ns_per_byte);
+            // `remaining / rate > left`, i.e. `remaining * elapsed >
+            // left * received`, in `u128` — never an integer ns-per-byte
+            // that truncates to zero on a fast link (P08-C7). The install
+            // re-reads and writes the whole bundle once more, so its cost
+            // is estimated at the measured rate too (P08-C6).
+            let remaining = u128::from(self.total - self.offset) + u128::from(self.total);
             let left = self.deadline.saturating_duration_since(now).as_nanos();
-            if estimate > left {
+            if remaining.saturating_mul(elapsed) > left.saturating_mul(u128::from(self.received)) {
                 self.halt = Some(Halt::Budget);
                 return Err(Refusal::Aborted);
             }
@@ -1222,7 +1271,6 @@ pub struct Serving {
     plan: Grant,
     hasher: blake3::Hasher,
     offset: u64,
-    buf: Vec<u8>,
 }
 
 impl Serving {
@@ -1238,12 +1286,15 @@ impl Serving {
         }
         // The resume request: serve from the worker's prefix only when the
         // stored bundle really extends it; otherwise restart cold, which
-        // is always correct.
+        // is always correct. Proving a prefix costs a hash of it, so a
+        // claimed prefix past `MAX_RESUME_HASH` is not proven at all — a
+        // cold restart — and a worker's `have` can never make the
+        // controller hash gigabytes per request (P08-C8).
         let requested = need.offset.min(total);
-        let (offset, prefix, hasher) = if requested == 0 {
+        let (offset, prefix, hasher) = if requested == 0 || requested > MAX_RESUME_HASH {
             (0, empty_digest(), blake3::Hasher::new())
         } else {
-            let hasher = hash_prefix(&mut file, requested).map_err(|_| Refusal::Store)?;
+            let hasher = hash_prefix(&mut file, requested, None).map_err(|_| Refusal::Store)?;
             let prefix = *hasher.clone().finalize().as_bytes();
             if prefix == need.have {
                 (requested, prefix, hasher)
@@ -1253,6 +1304,8 @@ impl Serving {
         };
         file.seek(SeekFrom::Start(offset))
             .map_err(|_| Refusal::Store)?;
+        // A serve is a use: the store's budget evicts least recently served.
+        crate::gc::touch(&entry);
         Ok(Serving {
             file,
             plan: Grant {
@@ -1264,7 +1317,6 @@ impl Serving {
             },
             hasher,
             offset,
-            buf: vec![0u8; CHUNK_BYTES],
         })
     }
 
@@ -1277,30 +1329,43 @@ impl Serving {
     /// `plan().digest` is complete and the caller sends the terminal
     /// [`End`].
     pub fn next_chunk(&mut self) -> Result<Option<Chunk>, Refusal> {
+        let mut chunk = Chunk {
+            attempt: self.plan.attempt,
+            offset: 0,
+            bytes: Vec::new(),
+            prefix: [0; 32],
+        };
+        Ok(self.next_chunk_into(&mut chunk)?.then_some(chunk))
+    }
+
+    /// [`Serving::next_chunk`] into a caller-held chunk, reusing its byte
+    /// buffer — a serve loop allocates one buffer per transfer, not one
+    /// per 48 KiB frame (P08-C8). `false` means the stream is complete.
+    pub fn next_chunk_into(&mut self, chunk: &mut Chunk) -> Result<bool, Refusal> {
         if self.offset >= self.plan.total {
-            return Ok(None);
+            return Ok(false);
         }
-        let read = {
-            let remaining = usize::try_from(self.plan.total - self.offset).unwrap_or(usize::MAX);
-            let want = self.buf.len().min(remaining);
-            self.file
-                .read(&mut self.buf[..want])
-                .map_err(|_| Refusal::Store)?
+        let remaining = usize::try_from(self.plan.total - self.offset).unwrap_or(usize::MAX);
+        let want = CHUNK_BYTES.min(remaining);
+        chunk.bytes.resize(want, 0);
+        let read = loop {
+            match self.file.read(&mut chunk.bytes[..want]) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                other => break other.map_err(|_| Refusal::Store)?,
+            }
         };
         if read == 0 {
             // The file is shorter than the plan: a store that lost bytes
             // mid-serve must fail loudly, never end a stream short.
             return Err(Refusal::Store);
         }
-        let offset = self.offset;
-        self.hasher.update(&self.buf[..read]);
+        chunk.bytes.truncate(read);
+        chunk.attempt = self.plan.attempt;
+        chunk.offset = self.offset;
+        self.hasher.update(&chunk.bytes);
         self.offset += read as u64;
-        Ok(Some(Chunk {
-            attempt: self.plan.attempt,
-            offset,
-            bytes: self.buf[..read].to_vec(),
-            prefix: *self.hasher.clone().finalize().as_bytes(),
-        }))
+        chunk.prefix = *self.hasher.clone().finalize().as_bytes();
+        Ok(true)
     }
 }
 
@@ -1316,6 +1381,22 @@ pub struct Receiving {
     id: [u8; 32],
     total: u64,
     offset: u64,
+    /// The running digest of every accepted byte: the stream is verified
+    /// as it lands, never re-read at the end on the session's thread.
+    hasher: blake3::Hasher,
+    /// Promoted: the staging file is now the bundle and must survive.
+    done: bool,
+}
+
+impl Drop for Receiving {
+    /// An upload abandoned mid-stream — a refused chunk, a cancel, an idle
+    /// or lost session — takes its staging file with it (P08-C5); the lock
+    /// goes with `_lock`.
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = fs::remove_file(&self.part);
+        }
+    }
 }
 
 impl Receiving {
@@ -1329,6 +1410,17 @@ impl Receiving {
         }
         if bundle_path(&entry, &upload.digest).is_file() {
             return Ok(None);
+        }
+        // The store shares its disk with SQLite and the object store: an
+        // upload that would not leave the reserve free is refused up front
+        // (P08-C4), never discovered as ENOSPC halfway through.
+        if let Some((free, total)) = store_space(store_root)
+            && free
+                < upload
+                    .total
+                    .saturating_add((total / 20).min(STORE_FREE_RESERVE))
+        {
+            return Err(Refusal::TooLarge);
         }
         let Some(lock) =
             lease::WriteLock::acquire(&entry, "remote-offer").map_err(|_| Refusal::Store)?
@@ -1356,6 +1448,8 @@ impl Receiving {
             id: upload.digest,
             total: upload.total,
             offset: 0,
+            hasher: blake3::Hasher::new(),
+            done: false,
         }))
     }
 
@@ -1384,33 +1478,195 @@ impl Receiving {
             return Err(Refusal::Store);
         }
         self.file.write_all(bytes).map_err(|_| Refusal::Store)?;
+        self.hasher.update(bytes);
         self.offset = next;
         Ok(())
     }
 
     /// Verify the completed stream, promote it into the entry and make it
-    /// `current`. Until this returns `Ok`, nothing of the transfer is
-    /// visible to a serve.
+    /// `current`, then drop the bundle it superseded (P08-C4): an entry
+    /// keeps one bundle. Until this returns `Ok`, nothing of the transfer
+    /// is visible to a serve; a failed end removes the staging file.
     pub fn end(&mut self, digest: [u8; 32]) -> Result<(), Refusal> {
-        if digest != self.id || self.offset != self.total {
-            let _ = fs::remove_file(&self.part);
-            return Err(Refusal::Store);
-        }
-        // Hash what actually landed, not what was sent.
-        let mut landed = self.file.try_clone().map_err(|_| Refusal::Store)?;
-        let hasher = hash_prefix(&mut landed, self.total).map_err(|_| Refusal::Store)?;
-        if hasher.finalize().as_bytes() != &self.id {
-            let _ = fs::remove_file(&self.part);
+        if digest != self.id
+            || self.offset != self.total
+            || self.hasher.finalize().as_bytes() != &self.id
+        {
             return Err(Refusal::Store);
         }
         self.file.sync_all().map_err(|_| Refusal::Store)?;
+        let previous = read_current(&self.entry).filter(|id| *id != self.id);
         fs::rename(&self.part, bundle_path(&self.entry, &self.id)).map_err(|_| Refusal::Store)?;
+        self.done = true;
         publish::sync_dir(&self.entry).map_err(|_| Refusal::Store)?;
         let tmp = self.entry.join(publish::CURRENT_TMP);
         publish::write_synced(&tmp, hex32(&self.id).as_bytes()).map_err(|_| Refusal::Store)?;
         fs::rename(&tmp, self.entry.join(scope::CURRENT_NAME)).map_err(|_| Refusal::Store)?;
         publish::sync_dir(&self.entry).map_err(|_| Refusal::Store)?;
+        // Unlinking is safe for a serve already reading it: an open file
+        // outlives its name on unix.
+        if let Some(previous) = previous {
+            let _ = fs::remove_file(bundle_path(&self.entry, &previous));
+        }
         Ok(())
+    }
+}
+
+/// `(free, total)` bytes of the store's filesystem; `None` where the
+/// platform cannot say (the admission check is then skipped).
+fn store_space(root: &Path) -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let st = rustix::fs::statvfs(root).ok()?;
+        Some((
+            st.f_bavail.saturating_mul(st.f_frsize),
+            st.f_blocks.saturating_mul(st.f_frsize),
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        None
+    }
+}
+
+/// What one [`sweep_store`] pass did to the controller's store.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StoreSweep {
+    /// Entry directories visited.
+    pub entries: u64,
+    /// Bytes of the `current` bundles kept, after the pass.
+    pub bytes: u64,
+    /// Superseded (non-`current`) bundles removed.
+    pub bundles_removed: u64,
+    /// Abandoned upload staging files removed.
+    pub parts_removed: u64,
+    /// Whole entries evicted under the budget, least recently served first.
+    pub entries_evicted: u64,
+    pub bytes_freed: u64,
+    pub errors: u64,
+}
+
+/// One reclamation pass over the controller's remote-cache store (P08-C4):
+/// an entry keeps only its `current` bundle, upload staging older than
+/// [`STALE_UPLOAD`] goes, and while the kept bundles exceed
+/// `budget_bytes` whole entries are evicted least recently served first
+/// (`current`'s mtime — every serve touches it). An entry whose upload is
+/// live (its `writing/.lock`) is never touched. `max_entries` bounds the
+/// walk.
+pub fn sweep_store(root: &Path, budget_bytes: u64, max_entries: u64, now_ms: i64) -> StoreSweep {
+    let mut out = StoreSweep::default();
+    let mut kept: Vec<(i64, u64, PathBuf)> = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0u32)];
+    while let Some((dir, depth)) = stack.pop() {
+        if out.entries >= max_entries {
+            break;
+        }
+        if depth == 7 {
+            out.entries += 1;
+            if lease::writing_lock_live(&dir, now_ms) {
+                continue;
+            }
+            if let Some(entry) = sweep_entry(&dir, now_ms, &mut out) {
+                kept.push(entry);
+            }
+            continue;
+        }
+        let Ok(children) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for child in children.flatten() {
+            if child.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push((child.path(), depth + 1));
+            }
+        }
+    }
+    let mut total: u64 = kept.iter().map(|(_, bytes, _)| bytes).sum();
+    if total > budget_bytes {
+        kept.sort_unstable_by_key(|(used, _, _)| *used);
+        for (_, bytes, entry) in kept {
+            if total <= budget_bytes {
+                break;
+            }
+            if lease::writing_lock_live(&entry, now_ms) {
+                continue;
+            }
+            match fs::remove_dir_all(&entry) {
+                Ok(()) => {
+                    out.entries_evicted += 1;
+                    out.bytes_freed += bytes;
+                    total -= bytes;
+                }
+                Err(_) => out.errors += 1,
+            }
+        }
+    }
+    out.bytes = total;
+    out
+}
+
+/// One store entry: stale staging and superseded bundles go; returns the
+/// entry's last use, `current` bundle size and path when it still serves.
+fn sweep_entry(entry: &Path, now_ms: i64, out: &mut StoreSweep) -> Option<(i64, u64, PathBuf)> {
+    let stale_ms = STALE_UPLOAD.as_millis() as i64;
+    let mtime_ms = |m: &fs::Metadata| {
+        m.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as i64)
+    };
+    if let Ok(parts) = fs::read_dir(entry.join(scope::WRITING_NAME)) {
+        for part in parts.flatten() {
+            let name = part.file_name();
+            let is_part = name.to_str().is_some_and(|n| n.ends_with(".part"));
+            if is_part
+                && part
+                    .metadata()
+                    .is_ok_and(|m| mtime_ms(&m) + stale_ms <= now_ms)
+            {
+                match fs::remove_file(part.path()) {
+                    Ok(()) => out.parts_removed += 1,
+                    Err(_) => out.errors += 1,
+                }
+            }
+        }
+    }
+    let current = read_current(entry);
+    let mut kept = None;
+    for child in fs::read_dir(entry).ok()?.flatten() {
+        let name = child.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".bundle"))
+            .and_then(unhex32)
+        else {
+            continue;
+        };
+        let Ok(meta) = child.metadata() else {
+            continue;
+        };
+        if Some(id) == current {
+            kept = Some(meta.len());
+            continue;
+        }
+        match fs::remove_file(child.path()) {
+            Ok(()) => {
+                out.bundles_removed += 1;
+                out.bytes_freed += meta.len();
+            }
+            Err(_) => out.errors += 1,
+        }
+    }
+    let used = fs::metadata(entry.join(scope::CURRENT_NAME))
+        .map(|m| mtime_ms(&m))
+        .unwrap_or(0);
+    match kept {
+        Some(bytes) => Some((used, bytes, entry.to_path_buf())),
+        None => {
+            // Nothing serves from here: an empty shell goes.
+            let _ = fs::remove_dir_all(entry);
+            None
+        }
     }
 }
 

@@ -30,8 +30,8 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc::{self, Receiver as Channel, RecvTimeoutError, Sender as ChannelSender},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc::{self, Receiver as Channel, RecvTimeoutError},
     },
     thread,
     time::{Duration, Instant},
@@ -51,7 +51,7 @@ use sentinel_protocol::{
         MAX_ARTIFACT_PATH_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_LIST_ITEMS, MAX_LOG_FRAME_BYTES,
     },
     logs::{Frame, MAX_GAPS, Stream},
-    negotiate::{Hello, Negotiated, PROFILE_MIN, Profile, Rejected},
+    negotiate::{CACHE_CANCEL_MIN, Hello, Negotiated, PROFILE_MIN, Profile, Rejected},
     summary::MAX_SUMMARY_BYTES,
 };
 use serde::{Deserialize, Serialize};
@@ -76,8 +76,13 @@ pub const MAX_SPEC_BYTES: usize = MAX_API_BODY_BYTES;
 /// split piece.
 pub const MAX_CACHE_CHUNK_BYTES: usize = 48 * 1024;
 /// Cache downloads one session streams at a time; beyond this a need is
-/// refused `Busy` instead of spawning another transfer thread.
+/// refused `Busy` instead of spawning another transfer thread. Uploads one
+/// connection holds open are bounded the same way.
 const MAX_CACHE_TRANSFERS: usize = 4;
+/// An upload that has not moved for this long is dropped with its staging
+/// file and entry lock (P08-C5): a worker that went quiet mid-offer never
+/// pins an entry for the life of its connection.
+const UPLOAD_IDLE: Duration = Duration::from_secs(60);
 /// Control beats between transport telemetry refreshes.
 const TRANSPORT_BEATS: u64 = 12;
 
@@ -245,6 +250,14 @@ pub enum ClientMessage {
     CachePush(Push),
     /// Protocol 7 (Q08). The offer's stream is complete.
     CachePushEnd(End),
+    /// Protocol 8 (P08-C2). The worker abandoned the attempt's transfer —
+    /// a fetch past its budget or a failed offer: the controller stops the
+    /// serve (answering `CacheRefused` with `aborted` as its terminal) or
+    /// drops the upload's staging. Appended last: postcard encodes variants
+    /// positionally.
+    CacheCancel {
+        attempt: [u8; 16],
+    },
 }
 
 /// A worker's state event on the wire; mirrors the worker-raised half of
@@ -1158,10 +1171,25 @@ impl Receiver {
             let mut slice = &self.tls[..n];
             self.shared.in_.fetch_add(n as u64, Ordering::Relaxed);
             while !slice.is_empty() {
-                if conn.read_tls(&mut slice)? == 0 {
-                    // rustls' buffer is full: decrypt to make room.
+                let stalled = match conn.read_tls(&mut slice) {
+                    Ok(0) => true,
+                    Ok(_) => false,
+                    // "message buffer full": rustls holds as much undecrypted
+                    // or unread plaintext as it will take.
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => true,
+                    Err(e) => return Err(e.into()),
+                };
+                if stalled {
+                    // Decrypt, then move the plaintext out so rustls has room
+                    // for the rest of this read: a burst of full frames (a
+                    // cache push stream) must never overflow its buffer.
                     conn.process_new_packets()
                         .map_err(|e| Error::Tls(e.to_string()))?;
+                    let before = self.plain.len();
+                    move_plaintext(&mut conn, &mut self.plain)?;
+                    if self.plain.len() == before && conn.read_tls(&mut slice).is_err() {
+                        return Err(Error::Protocol("tls buffer"));
+                    }
                 }
             }
             conn.process_new_packets()
@@ -1176,6 +1204,30 @@ impl Receiver {
     /// Wait for the next frame; the peer is `Lost` after `deadline`.
     pub(crate) fn recv<M: for<'de> Deserialize<'de>>(&mut self, deadline: Duration) -> Result<M> {
         self.recv_timeout(deadline)?.ok_or(Error::Lost)
+    }
+}
+
+/// Move whatever plaintext rustls has decrypted into `plain`. A clean close
+/// is left for the next `drain_plaintext` to report.
+fn move_plaintext(conn: &mut rustls::Connection, plain: &mut Vec<u8>) -> Result<()> {
+    loop {
+        let start = plain.len();
+        plain.resize(start + TLS_READ_BYTES, 0);
+        match conn.reader().read(&mut plain[start..]) {
+            Ok(0) => {
+                plain.truncate(start);
+                return Ok(());
+            }
+            Ok(n) => plain.truncate(start + n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                plain.truncate(start);
+                return Ok(());
+            }
+            Err(e) => {
+                plain.truncate(start);
+                return Err(e.into());
+            }
+        }
     }
 }
 
@@ -1207,48 +1259,91 @@ enum CacheAnswer {
     Refused(Refused),
 }
 
+impl CacheAnswer {
+    /// `CacheEnd` and `CacheRefused` close a transfer; nothing of it
+    /// follows them.
+    fn terminal(&self) -> bool {
+        matches!(self, Self::End | Self::Refused(_))
+    }
+}
+
+/// Answers one transfer may have queued before its caller reads them; a
+/// transfer whose caller falls further behind (disk or hashing slower than
+/// the link) is abandoned rather than buffered without bound (P08-C9).
+const ANSWER_QUEUE: usize = 64;
+
+/// One attempt's place in the router.
+enum Slot {
+    /// A caller is waiting on these answers.
+    Live(mpsc::SyncSender<CacheAnswer>),
+    /// The caller gave up before the transfer's terminal answer: what the
+    /// controller still sends for it is swallowed here until that terminal
+    /// arrives, and a new transfer of the attempt is `busy` meanwhile — the
+    /// stale tail can never be routed into it (P08-C3).
+    Draining,
+}
+
 /// Routes cache answers from whichever thread reads the session to the call
 /// waiting on that attempt: a transfer is synchronous — the caller sends the
 /// need and blocks — but the frames arrive on the session reader, so the two
-/// meet here. An answer for an attempt nobody waits on is dropped: the
-/// worker's call has already given up (its deadline passed), and the
-/// controller's stale stream is bounded by that same attempt.
+/// meet here. The reader never blocks on a slow caller: a full queue
+/// abandons that transfer.
 #[derive(Default)]
 pub struct CacheRouter {
-    waiting: Mutex<HashMap<AttemptId, ChannelSender<CacheAnswer>>>,
+    waiting: Mutex<HashMap<AttemptId, Slot>>,
 }
 
 impl CacheRouter {
     /// Claim `attempt` for one transfer. A second concurrent transfer for the
-    /// same attempt is refused `Busy`: the controller tracks one serving per
-    /// attempt.
+    /// same attempt — or one while an abandoned transfer still drains — is
+    /// refused `Busy`: the wire routes by attempt alone.
     fn register(&self, attempt: AttemptId) -> std::result::Result<Channel<CacheAnswer>, Refusal> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(ANSWER_QUEUE);
         let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
-        if waiting.insert(attempt, tx).is_some() {
+        if waiting.contains_key(&attempt) {
             return Err(Refusal::Busy);
         }
+        waiting.insert(attempt, Slot::Live(tx));
         Ok(rx)
     }
 
-    fn unregister(&self, attempt: AttemptId) {
-        self.waiting
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&attempt);
+    /// The caller is done: a transfer that saw its terminal answer frees the
+    /// attempt, one that did not leaves it draining.
+    fn finish(&self, attempt: AttemptId, terminal: bool) {
+        let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
+        if terminal {
+            waiting.remove(&attempt);
+        } else if let Some(slot) = waiting.get_mut(&attempt) {
+            *slot = Slot::Draining;
+        }
     }
 
     /// Hand an answer to the transfer waiting for it, if any.
     fn route(&self, attempt: AttemptId, answer: CacheAnswer) {
-        if let Some(waiting) = self
-            .waiting
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&attempt)
-        {
-            // The receiver may have given up between the lookup and the send;
-            // a closed channel is not an error here.
-            let _ = waiting.send(answer);
+        let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
+        let terminal = answer.terminal();
+        let drop_slot = match waiting.get_mut(&attempt) {
+            None => false,
+            Some(Slot::Draining) => terminal,
+            Some(Slot::Live(tx)) => match tx.try_send(answer) {
+                Ok(()) => false,
+                // The caller is too far behind: dropping the sender ends its
+                // wait (disconnected), and the rest of the stream drains.
+                Err(mpsc::TrySendError::Full(_)) => {
+                    waiting.insert(attempt, Slot::Draining);
+                    false
+                }
+                // The caller already left; a terminal closes the attempt.
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    if !terminal {
+                        waiting.insert(attempt, Slot::Draining);
+                    }
+                    terminal
+                }
+            },
+        };
+        if drop_slot {
+            waiting.remove(&attempt);
         }
     }
 }
@@ -1262,9 +1357,25 @@ pub struct LinkRemote {
     control: Sender,
     bulk: Mutex<Option<Sender>>,
     router: Arc<CacheRouter>,
+    /// The negotiated protocol: from 8 an abandoned transfer is cancelled
+    /// on the controller (`CacheCancel`).
+    protocol: u16,
 }
 
 impl LinkRemote {
+    /// Tell the controller this worker abandoned the attempt's transfer
+    /// (P08-C2): a serve stops at its next chunk instead of streaming the
+    /// rest of the bundle into a dropped channel, and an upload releases its
+    /// staging and lock. Best effort, protocol 8 only; the draining slot
+    /// swallows whatever is already in flight.
+    fn cancel(&self, attempt: AttemptId) {
+        if self.protocol >= CACHE_CANCEL_MIN.0 {
+            let _ = self.send(&ClientMessage::CacheCancel {
+                attempt: *attempt.as_bytes(),
+            });
+        }
+    }
+
     fn send(&self, message: &ClientMessage) -> Result<()> {
         let bulk = self.bulk.lock().unwrap_or_else(|p| p.into_inner()).clone();
         match bulk {
@@ -1299,10 +1410,13 @@ impl sentinel_cache::remote::Remote for LinkRemote {
     ) -> std::result::Result<(), Refusal> {
         let attempt = AttemptId::from_bytes(need.attempt).map_err(|_| Refusal::Denied)?;
         let answers = self.router.register(attempt)?;
-        // Deregister on every exit, including a sink's early stop.
-        let _claim = Claim {
-            router: &self.router,
+        // Deregister on every exit, including a sink's early stop — and on
+        // an exit before the terminal answer, cancel on the controller and
+        // leave the attempt draining.
+        let mut claim = Claim {
+            remote: self,
             attempt,
+            terminal: false,
         };
         self.send(&ClientMessage::CacheNeed(need.clone()))
             .map_err(|_| Refusal::Aborted)?;
@@ -1317,6 +1431,7 @@ impl sentinel_cache::remote::Remote for LinkRemote {
                     return Err(Refusal::Aborted);
                 }
                 Ok(CacheAnswer::Refused(refused)) => {
+                    claim.terminal = true;
                     return Err(Refusal::from_code(refused.code).unwrap_or(Refusal::Denied));
                 }
                 Ok(CacheAnswer::Grant(grant)) => {
@@ -1334,8 +1449,10 @@ impl sentinel_cache::remote::Remote for LinkRemote {
                 }
                 // The end marker is terminal; a stream without a plan never
                 // opened, so it is a protocol violation, not a completion.
-                Ok(CacheAnswer::End) if planned => return Ok(()),
-                Ok(CacheAnswer::End) => return Err(Refusal::Store),
+                Ok(CacheAnswer::End) => {
+                    claim.terminal = true;
+                    return if planned { Ok(()) } else { Err(Refusal::Store) };
+                }
             }
         }
     }
@@ -1348,9 +1465,10 @@ impl sentinel_cache::remote::Remote for LinkRemote {
     ) -> std::result::Result<(), Refusal> {
         let attempt = AttemptId::from_bytes(upload.attempt).map_err(|_| Refusal::Denied)?;
         let answers = self.router.register(attempt)?;
-        let _claim = Claim {
-            router: &self.router,
+        let mut claim = Claim {
+            remote: self,
             attempt,
+            terminal: false,
         };
         self.send(&ClientMessage::CacheOffer(upload.clone()))
             .map_err(|_| Refusal::Aborted)?;
@@ -1358,9 +1476,13 @@ impl sentinel_cache::remote::Remote for LinkRemote {
         // digest yet), answers `CacheEnd` (it already stores it) or refuses.
         let start = match wait_answer(&answers, deadline)? {
             CacheAnswer::Refused(refused) => {
+                claim.terminal = true;
                 return Err(Refusal::from_code(refused.code).unwrap_or(Refusal::Denied));
             }
-            CacheAnswer::End => return Ok(()),
+            CacheAnswer::End => {
+                claim.terminal = true;
+                return Ok(());
+            }
             CacheAnswer::Grant(grant) => grant,
             CacheAnswer::Chunk(_) => return Err(Refusal::Store),
         };
@@ -1409,7 +1531,9 @@ impl sentinel_cache::remote::Remote for LinkRemote {
             digest: upload.digest,
         }))
         .map_err(|_| Refusal::Aborted)?;
-        match wait_answer(&answers, deadline)? {
+        let answer = wait_answer(&answers, deadline)?;
+        claim.terminal = answer.terminal();
+        match answer {
             CacheAnswer::End => Ok(()),
             CacheAnswer::Refused(refused) => {
                 Err(Refusal::from_code(refused.code).unwrap_or(Refusal::Denied))
@@ -1434,15 +1558,21 @@ fn wait_answer(
     }
 }
 
-/// Removes a transfer's claim when it ends, however it ends.
+/// Settles a transfer's claim when it ends, however it ends: a transfer
+/// that saw its terminal answer frees the attempt; one that did not is
+/// cancelled on the controller and left draining.
 struct Claim<'a> {
-    router: &'a CacheRouter,
+    remote: &'a LinkRemote,
     attempt: AttemptId,
+    terminal: bool,
 }
 
 impl Drop for Claim<'_> {
     fn drop(&mut self) {
-        self.router.unregister(self.attempt);
+        if !self.terminal {
+            self.remote.cancel(self.attempt);
+        }
+        self.remote.router.finish(self.attempt, self.terminal);
     }
 }
 
@@ -1633,13 +1763,24 @@ fn serve_connection(
     // failure answers with and orders begin/file/data/end.
     let mut artifacts: HashMap<AttemptId, String> = HashMap::new();
     // In-flight upload per attempt (protocol 7): the receiving state a
-    // `CacheOffer` opened, fed by its `CachePush` frames until `CachePushEnd`.
-    let mut uploads: HashMap<AttemptId, sentinel_cache::remote::Receiving> = HashMap::new();
+    // `CacheOffer` opened, fed by its `CachePush` frames until `CachePushEnd`,
+    // with the time it last moved. Bounded per connection, and one idle
+    // past `UPLOAD_IDLE` is dropped — its staging file and entry lock with
+    // it (P08-C5).
+    let mut uploads: HashMap<AttemptId, (sentinel_cache::remote::Receiving, Instant)> =
+        HashMap::new();
     // Downloads this connection is streaming right now, bounded so a worker
     // cannot make the controller spawn threads without limit.
     let transfers = Arc::new(AtomicUsize::new(0));
+    // The cancel flag of each download in flight (protocol 8, P08-C2).
+    let serving: Arc<Mutex<HashMap<AttemptId, Arc<AtomicBool>>>> = Arc::default();
     loop {
-        match rx.recv::<ClientMessage>(HEARTBEAT_DEADLINE)? {
+        let message = rx.recv::<ClientMessage>(HEARTBEAT_DEADLINE)?;
+        if !uploads.is_empty() {
+            let now = Instant::now();
+            uploads.retain(|_, (_, moved)| now.duration_since(*moved) < UPLOAD_IDLE);
+        }
+        match message {
             ClientMessage::Ping { seq, held } => {
                 if !control {
                     return Err(Error::Protocol("control message on bulk"));
@@ -1897,7 +2038,9 @@ fn serve_connection(
                 if protocol < PROFILE_MIN.0 {
                     return Err(Error::Protocol("profile needs protocol 7"));
                 }
-                if *profiled {
+                // From protocol 8 a later profile is an availability refresh
+                // (P07-6): the worker re-reports what it holds as it changes.
+                if *profiled && protocol < CACHE_CANCEL_MIN.0 {
                     return Err(Error::Protocol("second profile"));
                 }
                 if let Some(what) = profile.invalid() {
@@ -1933,17 +2076,33 @@ fn serve_connection(
                         if transfers.load(Ordering::Acquire) >= MAX_CACHE_TRANSFERS {
                             send_cache_refused(tx, attempt, Refusal::Busy)?;
                         } else {
+                            let id = attempt_id(attempt)?;
+                            let cancel = Arc::new(AtomicBool::new(false));
+                            serving
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(id, Arc::clone(&cancel));
                             transfers.fetch_add(1, Ordering::AcqRel);
                             let sender = tx.clone();
                             let counter = Arc::clone(&transfers);
+                            let registry = Arc::clone(&serving);
                             let spawned = thread::Builder::new()
                                 .name("sentinel-cache-serve".into())
                                 .spawn(move || {
                                     let _permit = TransferPermit(counter);
-                                    let _ = serve_cache_need(&root, &need, &sender);
+                                    let _ = serve_cache_need(&root, &need, &sender, &cancel);
+                                    let mut live =
+                                        registry.lock().unwrap_or_else(|p| p.into_inner());
+                                    if live.get(&id).is_some_and(|c| Arc::ptr_eq(c, &cancel)) {
+                                        live.remove(&id);
+                                    }
                                 });
                             if spawned.is_err() {
                                 transfers.fetch_sub(1, Ordering::AcqRel);
+                                serving
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .remove(&id);
                                 send_cache_refused(tx, attempt, Refusal::Store)?;
                             }
                         }
@@ -1955,6 +2114,13 @@ fn serve_connection(
                     return Err(Error::Protocol("cache needs protocol 7"));
                 }
                 let attempt = upload.attempt;
+                let id = attempt_id(attempt)?;
+                if uploads.contains_key(&id) || uploads.len() >= MAX_CACHE_TRANSFERS {
+                    // One upload per attempt, a few per connection: an
+                    // abandoned one cannot pin more than its share.
+                    send_cache_refused(tx, attempt, Refusal::Busy)?;
+                    continue;
+                }
                 match handler.cache_offer(worker, &upload) {
                     None => send_cache_refused(tx, attempt, Refusal::Denied)?,
                     Some(root) => match sentinel_cache::remote::Receiving::begin(&root, &upload) {
@@ -1967,7 +2133,7 @@ fn serve_connection(
                         }
                         Ok(Some(receiving)) => {
                             tx.send(&ServerMessage::CacheGrant(receiving.grant(&upload)))?;
-                            uploads.insert(attempt_id(attempt)?, receiving);
+                            uploads.insert(id, (receiving, Instant::now()));
                         }
                         Err(code) => send_cache_refused(tx, attempt, code)?,
                     },
@@ -1983,16 +2149,17 @@ fn serve_connection(
                     continue;
                 };
                 let pushed = match uploads.get_mut(&id) {
-                    Some(receiving) => Some(receiving.push(push.offset, &push.bytes)),
+                    Some((receiving, moved)) => {
+                        *moved = Instant::now();
+                        Some(receiving.push(push.offset, &push.bytes))
+                    }
                     None => None,
                 };
-                match pushed {
-                    Some(Ok(())) => {}
-                    Some(Err(code)) => {
-                        uploads.remove(&id);
-                        send_cache_refused(tx, attempt, code)?;
-                    }
-                    None => send_cache_refused(tx, attempt, Refusal::Store)?,
+                // A push for an upload already failed, cancelled or reaped
+                // is dropped: its refusal was sent once, never per frame.
+                if let Some(Err(code)) = pushed {
+                    uploads.remove(&id);
+                    send_cache_refused(tx, attempt, code)?;
                 }
             }
             ClientMessage::CachePushEnd(end) => {
@@ -2005,7 +2172,7 @@ fn serve_connection(
                     send_cache_refused(tx, attempt, Refusal::Store)?;
                     continue;
                 };
-                let Some(mut receiving) = uploads.remove(&id) else {
+                let Some((mut receiving, _)) = uploads.remove(&id) else {
                     send_cache_refused(tx, attempt, Refusal::Store)?;
                     continue;
                 };
@@ -2014,6 +2181,23 @@ fn serve_connection(
                         tx.send(&ServerMessage::CacheEnd(End { attempt, digest }))?;
                     }
                     Err(code) => send_cache_refused(tx, attempt, code)?,
+                }
+            }
+            ClientMessage::CacheCancel { attempt } => {
+                if protocol < CACHE_CANCEL_MIN.0 {
+                    return Err(Error::Protocol("cache cancel needs protocol 8"));
+                }
+                let Some(id) = well_formed_attempt(&attempt) else {
+                    continue;
+                };
+                // A download stops at its next chunk and sends its own
+                // terminal; an upload is dropped here — staging and lock
+                // with it — and answered once.
+                if let Some(flag) = serving.lock().unwrap_or_else(|p| p.into_inner()).get(&id) {
+                    flag.store(true, Ordering::Release);
+                }
+                if uploads.remove(&id).is_some() {
+                    send_cache_refused(tx, attempt, Refusal::Aborted)?;
                 }
             }
             ClientMessage::Bye => return Ok(()),
@@ -2050,10 +2234,17 @@ impl Drop for TransferPermit {
 }
 
 /// Stream one authorized download (Q08) off the session thread: grant,
-/// ordered chunks, end. The chunk size is checked here because the frame cap
-/// is the link's, and a running digest cannot be recomputed for a split
-/// piece.
-fn serve_cache_need(root: &std::path::Path, need: &Need, sender: &Sender) -> Result<()> {
+/// ordered chunks, end — or, once the worker cancelled it (protocol 8),
+/// `CacheRefused` with `aborted` as the terminal at the next chunk. One
+/// chunk buffer serves the whole transfer. The chunk size is checked here
+/// because the frame cap is the link's, and a running digest cannot be
+/// recomputed for a split piece.
+fn serve_cache_need(
+    root: &std::path::Path,
+    need: &Need,
+    sender: &Sender,
+    cancel: &AtomicBool,
+) -> Result<()> {
     let mut serving = match Serving::open(root, need) {
         Ok(serving) => serving,
         Err(code) => return send_cache_refused(sender, need.attempt, code),
@@ -2061,15 +2252,27 @@ fn serve_cache_need(root: &std::path::Path, need: &Need, sender: &Sender) -> Res
     let plan = serving.plan();
     let digest = plan.digest;
     sender.send(&ServerMessage::CacheGrant(plan))?;
+    let mut message = ServerMessage::CacheChunk(Chunk {
+        attempt: need.attempt,
+        offset: 0,
+        bytes: Vec::with_capacity(MAX_CACHE_CHUNK_BYTES),
+        prefix: [0; 32],
+    });
     loop {
-        match serving.next_chunk() {
-            Ok(Some(chunk)) => {
+        if cancel.load(Ordering::Acquire) {
+            return send_cache_refused(sender, need.attempt, Refusal::Aborted);
+        }
+        let ServerMessage::CacheChunk(chunk) = &mut message else {
+            return send_cache_refused(sender, need.attempt, Refusal::Store);
+        };
+        match serving.next_chunk_into(chunk) {
+            Ok(true) => {
                 if chunk.bytes.len() > MAX_CACHE_CHUNK_BYTES {
                     return send_cache_refused(sender, need.attempt, Refusal::TooLarge);
                 }
-                sender.send(&ServerMessage::CacheChunk(chunk))?;
+                sender.send(&message)?;
             }
-            Ok(None) => {
+            Ok(false) => {
                 return sender.send(&ServerMessage::CacheEnd(End {
                     attempt: need.attempt,
                     digest,
@@ -2111,6 +2314,11 @@ pub struct Link {
     /// Whether [`Reporter::remote_cache`] hands the executor a handle (Q08):
     /// off by configuration, every remote lookup is a local miss.
     remote_cache: bool,
+    /// The profile this session reported last (protocol 7), the base a
+    /// protocol-8 availability refresh amends.
+    profile: Option<Profile>,
+    /// The executor's availability version that profile carried.
+    availability_sent: u64,
 }
 
 impl std::fmt::Debug for Link {
@@ -2172,10 +2380,13 @@ pub fn connect(
                 control: tx,
                 bulk: Mutex::new(None),
                 router: Arc::new(CacheRouter::default()),
+                protocol: negotiated.protocol.0,
             }),
             transport: None,
             beats: 0,
             remote_cache: true,
+            profile: None,
+            availability_sent: 0,
         }),
         ServerMessage::Reject(why) => Err(Error::Rejected(why)),
         ServerMessage::Pong { .. }
@@ -2418,6 +2629,14 @@ pub trait Executor: Send + Sync {
     fn artifact_granted(&self, _attempt: AttemptId, _name: &str) {}
     /// The artifact's terminal answer; the publication is over either way.
     fn artifact_verdict(&self, _attempt: AttemptId, _name: &str, _code: ArtifactCode) {}
+    /// K08/P07-6: what this worker holds right now for placement — resident
+    /// image keys and cache bytes — with a version that moves whenever it
+    /// changes. The session reports it in the profile it opens with and,
+    /// from protocol 8, refreshes the profile when the version moves.
+    /// `None` (the default) reports nothing measured.
+    fn availability(&self) -> Option<(u64, sentinel_protocol::negotiate::Availability)> {
+        None
+    }
 }
 
 impl Link {
@@ -2436,7 +2655,42 @@ impl Link {
         if let Some(what) = profile.invalid() {
             return Err(Error::Protocol(what));
         }
-        self.tx.send(&ClientMessage::Profile(profile.clone()))
+        self.tx.send(&ClientMessage::Profile(profile.clone()))?;
+        self.profile = Some(profile.clone());
+        Ok(())
+    }
+
+    /// The availability version the opening profile already carried; a
+    /// later refresh is sent only once the executor's version moves.
+    pub fn set_availability_sent(&mut self, version: u64) {
+        self.availability_sent = version;
+    }
+
+    /// Protocol 8 (P07-6): resend the profile when the executor's
+    /// availability changed since it was last reported — at most once per
+    /// heartbeat, and only when something moved.
+    fn refresh_profile(&mut self, executor: &dyn Executor) -> Result<()> {
+        if self.negotiated.protocol.0 < CACHE_CANCEL_MIN.0 {
+            return Ok(());
+        }
+        let Some((version, availability)) = executor.availability() else {
+            return Ok(());
+        };
+        if version == self.availability_sent {
+            return Ok(());
+        }
+        let Some(mut profile) = self.profile.clone() else {
+            return Ok(());
+        };
+        profile.availability.images = availability.images;
+        profile.availability.cache_bytes = availability.cache_bytes;
+        if profile.invalid().is_some() {
+            return Ok(());
+        }
+        self.tx.send(&ClientMessage::Profile(profile.clone()))?;
+        self.profile = Some(profile);
+        self.availability_sent = version;
+        Ok(())
     }
 
     /// Protocol 7 (Q07): report transport telemetry and keep refreshing it
@@ -2477,6 +2731,7 @@ impl Link {
     }
 
     fn ping(&mut self, executor: &dyn Executor) -> Result<()> {
+        self.refresh_profile(executor)?;
         self.seq += 1;
         let held: Vec<[u8; 16]> = executor
             .held()

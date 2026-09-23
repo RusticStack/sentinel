@@ -462,10 +462,13 @@ fn restore_caches(
         .get(job.job_index)
         .map(|j| Duration::from_secs(j.spec.timeout_secs.max(1)))
         .unwrap_or(Duration::ZERO);
+    // One hydration deadline for the whole job, fixed before its first
+    // restore: N declared caches share the budget rather than each taking
+    // their own (P08-C6).
     let remote = remote.map(|source| sentinel_cache::remote::Policy {
         source,
         attempt: *job.attempt.as_bytes(),
-        job_timeout,
+        deadline: sentinel_cache::remote::Policy::deadline_for(job_timeout),
     });
     let context = WorkerContext::new(&job.context, &job.spec, workspace);
     let cache_root = root.join(sentinel_cache::attach::ROOT_DIR);

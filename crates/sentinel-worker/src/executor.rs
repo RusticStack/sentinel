@@ -240,6 +240,8 @@ pub struct Inner {
     /// The cache store's payload bytes as the last pass estimated them —
     /// the availability the link reports to placement (K08).
     cache_bytes: std::sync::atomic::AtomicU64,
+    /// Moves whenever `cache_bytes` changes.
+    cache_version: std::sync::atomic::AtomicU64,
     notify: Box<dyn Fn(Notice) + Send + Sync>,
     recovered: Recovered,
 }
@@ -294,6 +296,7 @@ impl Executor {
             notify: Box::new(notify),
             gc_lock: Mutex::new(sentinel_cache::gc::Cursor::default()),
             cache_bytes: std::sync::atomic::AtomicU64::new(0),
+            cache_version: std::sync::atomic::AtomicU64::new(0),
             recovered,
         }));
         // One bounded reclamation pass at start: what a dead process left —
@@ -525,8 +528,14 @@ impl Inner {
             &mut cursor,
         );
         drop(cursor);
-        self.cache_bytes
-            .store(stats.estimated_bytes, std::sync::atomic::Ordering::Relaxed);
+        if self
+            .cache_bytes
+            .swap(stats.estimated_bytes, std::sync::atomic::Ordering::Relaxed)
+            != stats.estimated_bytes
+        {
+            self.cache_version
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         (self.notify)(Notice::Availability(Availability {
             images_held: self.images.held(),
             images_in_flight: self.images.in_flight(),
@@ -796,6 +805,28 @@ impl artifacts::Sink for Inner {
 }
 
 impl LinkExecutor for Executor {
+    /// P07-6: the image keys the local store is known to hold (newest
+    /// first, bounded by the wire's list limit) and the cache store's bytes
+    /// as the last sweep estimated them. Both come from state the worker
+    /// already keeps — no store scan, no podman call; the version moves
+    /// when either changes, so the link resends only then.
+    fn availability(&self) -> Option<(u64, sentinel_protocol::negotiate::Availability)> {
+        let version = self.images.version().wrapping_add(
+            self.cache_version
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        Some((
+            version,
+            sentinel_protocol::negotiate::Availability {
+                images: self
+                    .images
+                    .held_keys(sentinel_protocol::limits::MAX_LIST_ITEMS),
+                cache_bytes: self.cache_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                load_ns: 0,
+            },
+        ))
+    }
+
     fn offered(&self, offer: &Offer) -> bool {
         let mut state = self.state();
         if state.live.len() + state.awaiting.len() >= MAX_LIST_ITEMS || state.reporter.is_none() {

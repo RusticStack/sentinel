@@ -97,6 +97,10 @@ pub struct Stats {
     /// attempt this worker does not own (or released too long ago), or a
     /// boundary that is not the job's.
     pub cache_denied: AtomicU64,
+    /// Bytes the remote-cache store's reclamation removed, in total.
+    pub remote_cache_freed: AtomicU64,
+    /// The remote-cache store's kept bytes after its last sweep.
+    pub remote_cache_bytes: AtomicU64,
 }
 
 struct Peer {
@@ -436,6 +440,9 @@ impl Inner {
         }
     }
 }
+
+/// How often the controller's remote-cache store is reclaimed.
+pub const REMOTE_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// How long after its release an attempt may still offer what it sealed
 /// (P07-7): the worker's offer budget plus slack for publication and the
@@ -1511,14 +1518,56 @@ impl Controller {
     }
 
     /// Where the controller keeps remote cache objects (Q08), normally
-    /// `<data_dir>/remote-cache`. Unset answers every cache need as a miss;
-    /// the directory itself is created lazily by the first upload.
+    /// `<data_dir>/remote-cache`. Unset answers every cache need `denied`;
+    /// the directory itself is created lazily by the first upload. Setting
+    /// it starts the store's reclamation (P08-C4): one bounded
+    /// `remote::sweep_store` pass now and every [`REMOTE_SWEEP_INTERVAL`] —
+    /// one bundle per entry, abandoned uploads removed, and the store held
+    /// to `remote::STORE_BUDGET_BYTES`, least recently served first.
     pub fn set_remote_cache(&self, root: std::path::PathBuf) {
-        *self
+        let first = self
             .inner
             .remote_cache
             .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(root);
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(root)
+            .is_none();
+        if !first {
+            return;
+        }
+        let watched = Arc::downgrade(&self.inner);
+        let _ = thread::Builder::new()
+            .name("sentinel-remote-cache-gc".into())
+            .spawn(move || {
+                loop {
+                    let Some(inner) = watched.upgrade() else {
+                        return;
+                    };
+                    let root = inner
+                        .remote_cache
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    if let Some(root) = root {
+                        let swept = sentinel_cache::remote::sweep_store(
+                            &root,
+                            sentinel_cache::remote::STORE_BUDGET_BYTES,
+                            sentinel_cache::gc::DEFAULT_PASS_WORK,
+                            UnixMillis::now().0,
+                        );
+                        inner
+                            .stats
+                            .remote_cache_freed
+                            .fetch_add(swept.bytes_freed, Ordering::Relaxed);
+                        inner
+                            .stats
+                            .remote_cache_bytes
+                            .store(swept.bytes, Ordering::Relaxed);
+                    }
+                    drop(inner);
+                    thread::sleep(REMOTE_SWEEP_INTERVAL);
+                }
+            });
     }
     /// Bind `listen`, present `identity`, and start serving workers of
     /// `store`. Returns once the socket is bound; workers may connect.
