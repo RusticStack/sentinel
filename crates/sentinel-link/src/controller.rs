@@ -130,6 +130,16 @@ pub struct Stats {
     /// Spec requests handed back to the queue: offers declined and
     /// acknowledged attempts whose spec never reached their worker.
     pub handed_back: AtomicU64,
+    /// Placement transactions (or the reads that precede them) the store
+    /// failed. Each failure is also logged, by error kind only, at most once
+    /// a minute (P08-15): a fleet that stops placing leaves evidence.
+    pub placement_errors: AtomicU64,
+    /// Expiry, queue-timeout, offer-lapse and revocation sweeps the store
+    /// failed, counted and logged the same way. A sweep that found its row
+    /// already moved (renewed, acknowledged, released) is not a failure.
+    pub sweep_errors: AtomicU64,
+    /// Live sessions closed because their worker was revoked (P08-7).
+    pub revoked_sessions: AtomicU64,
 }
 
 struct Peer {
@@ -143,6 +153,12 @@ struct Peer {
     /// The scratch disk its protocol-7 profile reported; 0 until then (or
     /// for protocol 6), which is not a disk constraint.
     disk_bytes: AtomicI64,
+    /// The measured load its protocol-7 profile reported: CPU busy
+    /// nanoseconds over the worker's sampling window, across all cores; 0
+    /// when unmeasured. Read by the dispatch sweep's ranking (Q03).
+    load_ns: AtomicI64,
+    /// Warm cache bytes its profile reported; 0 when unmeasured.
+    cache_bytes: AtomicI64,
     /// When liveness was last written, so a beat costs a write once a minute.
     seen_recorded_ms: AtomicI64,
     /// The certificate this session presented; a bulk connection may only
@@ -344,6 +360,53 @@ struct Inner {
     max_pending: AtomicUsize,
     handshake_ms: AtomicU64,
     stats: Stats,
+    /// The revocation fingerprint (`dispatch::revocations`) the dispatcher
+    /// last acted on; `(-1, -1)` until the first pass, which always checks.
+    revocations: Mutex<(i64, i64)>,
+    /// When a placement or sweep failure was last logged, for the
+    /// once-a-minute limit.
+    warned: [AtomicI64; 2],
+}
+
+/// Placement and sweep failures are logged at most this often per kind.
+const WARN_INTERVAL_MS: i64 = 60_000;
+
+/// What the dispatch sweep ranks a connected worker by, lowest first: the
+/// share of its reported CPU its held attempts already take (least committed
+/// first, so a burst spreads instead of filling whichever worker comes
+/// first), then its measured load per reported millicore (the host's own
+/// busy time — work that is not ours counts too), then more warm cache
+/// first, then the smaller worker (best fit: the large worker's room stays
+/// for the jobs only it can run, Q10), then its id for a total order.
+fn rank(size: Ranked, held_millis: i64) -> (i64, i64, i64, i64, i64) {
+    let cpu = size.cpu_millis.max(1);
+    (
+        held_millis.saturating_mul(1_000) / cpu,
+        size.load_ns / cpu,
+        size.cache_bytes.saturating_neg(),
+        size.cpu_millis,
+        size.memory_bytes,
+    )
+}
+
+/// What [`rank`] reads of a worker.
+#[derive(Clone, Copy, Debug)]
+struct Ranked {
+    cpu_millis: i64,
+    memory_bytes: i64,
+    load_ns: i64,
+    cache_bytes: i64,
+}
+
+impl Peer {
+    fn ranked(&self) -> Ranked {
+        Ranked {
+            cpu_millis: self.cpu_millis,
+            memory_bytes: self.memory_bytes,
+            load_ns: self.load_ns.load(Ordering::Relaxed),
+            cache_bytes: self.cache_bytes.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Per pool, the largest and second-largest of each resource among the
@@ -501,6 +564,8 @@ impl Inner {
             cpu_millis: i64::try_from(capacity.cpu_millis).unwrap_or(i64::MAX),
             memory_bytes: i64::try_from(capacity.memory_bytes).unwrap_or(i64::MAX),
             disk_bytes: AtomicI64::new(0),
+            load_ns: AtomicI64::new(0),
+            cache_bytes: AtomicI64::new(0),
             seen_recorded_ms: AtomicI64::new(0),
             fingerprint: session.fingerprint,
             protocol: session.admitted.negotiated.protocol.0,
@@ -558,90 +623,296 @@ impl Inner {
         self.stats.sessions_ended.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One dispatch pass: sweep expired leases and lapsed offers (one
-    /// batched transaction each, every lease re-checked inside it), then
-    /// fill every connected worker until nothing fits — one transaction per
-    /// worker per pass, so a failing one never holds up the rest. Storage
-    /// maintenance runs on its own thread ([`Inner::maintenance_loop`]),
-    /// never here.
+    /// A write whose store error the caller needs (to tell a benign "the row
+    /// already moved" from a failure).
+    fn write_store<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&sentinel_store::Transaction<'_>) -> sentinel_store::Result<T> + Send + 'static,
+    ) -> sentinel_store::Result<T> {
+        self.store.writer().write(f)
+    }
+
+    /// Count a failed placement or sweep and log its kind, at most once a
+    /// minute per class. The error's kind is the variant name only: no SQL,
+    /// path or row value reaches the log.
+    fn failed(&self, placement: bool, what: &'static str, error: &sentinel_store::Error) {
+        let (counter, slot) = if placement {
+            (&self.stats.placement_errors, &self.warned[0])
+        } else {
+            (&self.stats.sweep_errors, &self.warned[1])
+        };
+        let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = UnixMillis::now().0;
+        let last = slot.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= WARN_INTERVAL_MS
+            && slot
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                event = if placement {
+                    "dispatch_placement_failed"
+                } else {
+                    "dispatch_sweep_failed"
+                },
+                stage = what,
+                kind = error.kind(),
+                total,
+                "the dispatcher's store work failed; counted, retried next pass"
+            );
+        }
+    }
+
+    /// Whether a sweep's error only says the row moved first (renewed,
+    /// acknowledged, released): the sweep's work is already done or moot.
+    fn benign(error: &sentinel_store::Error) -> bool {
+        matches!(
+            error,
+            sentinel_store::Error::Conflict | sentinel_store::Error::NotFound
+        )
+    }
+
+    /// One dispatch pass: sweep expired leases, queue timeouts and lapsed
+    /// offers (one batched transaction each, every row re-checked inside it
+    /// under its own savepoint), apply revocations, then place work in
+    /// rounds ([`Inner::placement_pass`]). Storage maintenance runs on its
+    /// own thread ([`Inner::maintenance_loop`]), never here. A sweep row
+    /// that moved first (renewed, acknowledged, released) is skipped; any
+    /// other store failure is counted and logged (P08-15).
     fn dispatch_pass(&self) {
         let now = UnixMillis::now();
         // Leases that ran out and attempts that outran their job's timeout
         // by the grace: infra-failed, capacity back, never replayed. One
         // write for the whole batch, each lease re-checked inside it; the
         // log-end answer is read here, so the writer never waits on log I/O.
-        if let Ok(due) = self.store.read(|c| dispatch::expired_scoped(c, now))
-            && !due.is_empty()
-        {
-            let ends: Vec<(AttemptId, bool)> = due
-                .iter()
-                .map(|&(attempt, run, job)| (attempt, self.logs.has_end(run, job, attempt)))
-                .collect();
-            if let Ok(count) = self.write(move |tx| dispatch::expire_batch(tx, &ends, now)) {
-                self.stats
-                    .expired
-                    .fetch_add(count as u64, Ordering::Relaxed);
-                for (attempt, _, _) in due {
-                    self.logs.forget(attempt);
+        match self.store.read(|c| dispatch::expired_scoped(c, now)) {
+            Ok(due) if !due.is_empty() => {
+                let ends: Vec<(AttemptId, bool)> = due
+                    .iter()
+                    .map(|&(attempt, run, job)| (attempt, self.logs.has_end(run, job, attempt)))
+                    .collect();
+                match self.write_store(move |tx| dispatch::expire_batch(tx, &ends, now)) {
+                    Ok(swept) => {
+                        self.stats
+                            .expired
+                            .fetch_add(swept.done as u64, Ordering::Relaxed);
+                        self.swept("expire", swept);
+                        for (attempt, _, _) in due {
+                            self.logs.forget(attempt);
+                        }
+                    }
+                    Err(e) => self.failed(false, "expire", &e),
                 }
             }
+            Ok(_) => {}
+            Err(e) => self.failed(false, "expire", &e),
         }
-        if let Ok(count) = self.write(move |tx| dispatch::sweep_queue_timeouts(tx, now)) {
+        match self.write_store(move |tx| dispatch::sweep_queue_timeouts(tx, now)) {
+            Ok(count) => {
+                self.stats
+                    .queue_timeouts
+                    .fetch_add(count as u64, Ordering::Relaxed);
+            }
+            Err(e) => self.failed(false, "queue_timeout", &e),
+        }
+        match self.write_store(move |tx| dispatch::lapse_due(tx, now)) {
+            Ok(swept) => {
+                self.stats
+                    .lapsed
+                    .fetch_add(swept.done as u64, Ordering::Relaxed);
+                self.swept("lapse", swept);
+            }
+            Err(e) => self.failed(false, "lapse", &e),
+        }
+        self.revocation_pass(now);
+        self.placement_pass();
+    }
+
+    /// Count a batched sweep's failed rows: each is a sweep error, logged
+    /// (by its first error's kind) under the same once-a-minute limit.
+    fn swept(&self, what: &'static str, swept: dispatch::Swept) {
+        if let Some(error) = &swept.error {
             self.stats
-                .queue_timeouts
-                .fetch_add(count as u64, Ordering::Relaxed);
+                .sweep_errors
+                .fetch_add(swept.failed as u64 - 1, Ordering::Relaxed);
+            self.failed(false, what, error);
         }
-        if let Ok(count) = self.write(move |tx| dispatch::lapse_due(tx, now)) {
-            self.stats.lapsed.fetch_add(count as u64, Ordering::Relaxed);
-        }
-        // Below the low watermark, no new work is placed: a job that cannot
-        // store its output must not consume capacity discovering that.
-        let admit_work = self.objects.admission().is_none_or(|a| a.is_open());
-        let mut peers: Vec<(WorkerId, Arc<Peer>)> = if !admit_work {
-            Vec::new()
-        } else {
-            self.fleet
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .iter()
-                .map(|(w, p)| (*w, Arc::clone(p)))
-                .collect()
+    }
+
+    /// A revocation is written by the host-local admin command, another
+    /// process that cannot signal this one. Each pass compares one indexed
+    /// fingerprint of the revoked set; when it moved, every connected
+    /// session of a revoked worker is closed and everything a revoked worker
+    /// holds is fenced — acknowledged attempts `Reconciled`, offers lapsed —
+    /// within one reconciliation interval of the revocation (P08-7). The
+    /// store already refuses such a worker's acknowledgements, renewals,
+    /// reports, logs, publications and cache transfers from the moment the
+    /// row says revoked.
+    fn revocation_pass(&self, now: UnixMillis) {
+        let stamp = match self.store.read(dispatch::revocations) {
+            Ok(stamp) => stamp,
+            Err(e) => return self.failed(false, "revocation", &e),
         };
-        // Smallest worker first (best fit), never the map's arbitrary order:
-        // small work lands on small workers before a large worker is asked,
-        // so the large worker's room is still there for the jobs only it
-        // can run (Q10).
-        peers.sort_unstable_by_key(|(worker, p)| (p.cpu_millis, p.memory_bytes, *worker));
-        let reach = Reach::of(peers.iter().map(|(_, p)| (p.pool, p.size())));
-        for (index, (worker, peer)) in peers.iter().enumerate() {
-            let (worker, pool) = (*worker, peer.pool);
-            // What the rest of the pool can hold: a job beyond it is offered
-            // here first, whatever order the sweep reached this worker in.
-            let elsewhere = reach.elsewhere(index, pool);
-            // All of this worker's placements in one transaction: `place`
-            // sees the leases it just wrote, and the commits collapse to
-            // one writer round trip per worker per wake.
-            let now = UnixMillis::now();
-            let placed = self.write(move |tx| {
-                let mut placed = Vec::new();
-                for _ in 0..dispatch::MAX_HELD_ATTEMPTS {
-                    match dispatch::place_in_fleet(
-                        tx,
-                        worker,
-                        pool,
-                        elsewhere,
-                        dispatch::DEFAULT_LEASE_MS,
-                        now,
-                    )? {
-                        Some(offer) => placed.push(offer),
-                        None => break,
+        if *self.revocations.lock().unwrap_or_else(|p| p.into_inner()) == stamp {
+            return;
+        }
+        let connected: Vec<WorkerId> = self
+            .fleet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        match self
+            .store
+            .read(move |c| dispatch::revoked_among(c, &connected))
+        {
+            Ok(revoked) => {
+                for worker in revoked {
+                    if let Some(peer) = self.peer(worker) {
+                        peer.sender.close();
+                        self.stats.revoked_sessions.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Ok(placed)
+            }
+            Err(e) => return self.failed(false, "revocation", &e),
+        }
+        // One sweep batch per transaction until nothing is left; bounded,
+        // and an unfinished sweep leaves the fingerprint unrecorded so the
+        // next pass continues it.
+        for _ in 0..16 {
+            let logs = Arc::clone(&self.logs);
+            match self.write_store(move |tx| dispatch::reconcile_revoked(tx, now, Some(&logs))) {
+                Ok(0) => {
+                    *self.revocations.lock().unwrap_or_else(|p| p.into_inner()) = stamp;
+                    return;
+                }
+                Ok(settled) => {
+                    self.stats
+                        .abandoned
+                        .fetch_add(settled as u64, Ordering::Relaxed);
+                }
+                Err(e) => return self.failed(false, "revocation", &e),
+            }
+        }
+    }
+
+    /// Place work in rounds. A round ranks the connected workers (see
+    /// [`rank`]) and offers each one job, all in one writer transaction; a
+    /// worker with nothing to take leaves the pass, and rounds repeat until
+    /// none is left or each worker holds [`dispatch::MAX_HELD_ATTEMPTS`].
+    /// A burst therefore spreads over the fleet by commitment and measured
+    /// load instead of filling whichever worker comes first (Q03, P08-6),
+    /// and the writer sees one round trip per round rather than one per
+    /// worker. Nothing is read or written when no job is ready at all
+    /// (P08-14).
+    fn placement_pass(&self) {
+        // Below the low watermark, no new work is placed: a job that cannot
+        // store its output must not consume capacity discovering that.
+        if !self.objects.admission().is_none_or(|a| a.is_open()) {
+            return;
+        }
+        let mut peers: Vec<(WorkerId, Arc<Peer>)> = self
+            .fleet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(w, p)| (*w, Arc::clone(p)))
+            .collect();
+        if peers.is_empty() {
+            return;
+        }
+        match self.store.read(dispatch::any_ready) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => return self.failed(true, "ready", &e),
+        }
+        let mut held = match self.store.read(dispatch::held_by_worker) {
+            Ok(held) => held,
+            Err(e) => return self.failed(true, "held", &e),
+        };
+        // A stable index per worker for `Reach`; the order is the Q10 best
+        // fit, which is also `rank`'s tie-break.
+        peers.sort_unstable_by_key(|(worker, p)| (p.cpu_millis, p.memory_bytes, *worker));
+        let reach = Reach::of(peers.iter().map(|(_, p)| (p.pool, p.size())));
+        let mut active: Vec<usize> = (0..peers.len()).collect();
+        for _ in 0..dispatch::MAX_HELD_ATTEMPTS {
+            if active.is_empty() {
+                return;
+            }
+            active.sort_by_cached_key(|&i| {
+                let (worker, peer) = &peers[i];
+                (
+                    rank(peer.ranked(), held.get(worker).copied().unwrap_or(0)),
+                    *worker,
+                )
             });
-            let Ok(placed) = placed else { continue };
-            let mut unsent = placed.into_iter();
-            while let Some(placed) = unsent.next() {
+            let round: Vec<(usize, WorkerId, PoolId, Option<dispatch::Capacity>)> = active
+                .iter()
+                .map(|&i| {
+                    (
+                        i,
+                        peers[i].0,
+                        peers[i].1.pool,
+                        reach.elsewhere(i, peers[i].1.pool),
+                    )
+                })
+                .collect();
+            let now = UnixMillis::now();
+            let placed: Vec<(usize, Option<dispatch::Offer>)> = {
+                let batch = round.clone();
+                match self.write_store(move |tx| {
+                    let mut placed = Vec::with_capacity(batch.len());
+                    for (i, worker, pool, elsewhere) in batch {
+                        let offer = dispatch::place_in_fleet(
+                            tx,
+                            worker,
+                            pool,
+                            elsewhere,
+                            dispatch::DEFAULT_LEASE_MS,
+                            now,
+                        )?;
+                        placed.push((i, offer));
+                    }
+                    Ok(placed)
+                }) {
+                    Ok(placed) => placed,
+                    Err(e) => {
+                        // One worker's failure must not stall the fleet:
+                        // retry the round a worker per transaction, and a
+                        // worker that still fails leaves this pass.
+                        self.failed(true, "round", &e);
+                        round
+                            .into_iter()
+                            .map(|(i, worker, pool, elsewhere)| {
+                                let offer = self
+                                    .write_store(move |tx| {
+                                        dispatch::place_in_fleet(
+                                            tx,
+                                            worker,
+                                            pool,
+                                            elsewhere,
+                                            dispatch::DEFAULT_LEASE_MS,
+                                            now,
+                                        )
+                                    })
+                                    .unwrap_or_else(|e| {
+                                        self.failed(true, "place", &e);
+                                        None
+                                    });
+                                (i, offer)
+                            })
+                            .collect()
+                    }
+                }
+            };
+            let mut done: Vec<usize> = Vec::new();
+            for (i, offer) in placed {
+                let Some(placed) = offer else {
+                    done.push(i);
+                    continue;
+                };
+                let (worker, peer) = &peers[i];
                 let offer = Offer {
                     attempt: placed.attempt,
                     tenant: placed.tenant,
@@ -656,22 +927,24 @@ impl Inner {
                     job_index: placed.job_index,
                 };
                 if session::offer(&peer.sender, &offer).is_err() {
-                    // The session is gone: give this attempt and every
-                    // placement never sent back at once rather than letting
-                    // the ack timeout find them.
-                    let mut attempts = vec![offer.attempt];
-                    attempts.extend(unsent.by_ref().map(|p| p.attempt));
-                    let _ = self.write(move |tx| {
-                        for attempt in attempts {
-                            dispatch::lapse(tx, attempt, UnixMillis::now())?;
-                        }
-                        Ok(())
-                    });
+                    // The session is gone: give the attempt back at once
+                    // rather than letting the ack timeout find it.
+                    let attempt = offer.attempt;
+                    match self
+                        .write_store(move |tx| dispatch::lapse(tx, attempt, UnixMillis::now()))
+                    {
+                        Ok(()) => {}
+                        Err(e) if Self::benign(&e) => {}
+                        Err(e) => self.failed(false, "lapse", &e),
+                    }
                     peer.sender.close();
-                    break;
+                    done.push(i);
+                    continue;
                 }
                 self.stats.offers.fetch_add(1, Ordering::Relaxed);
+                *held.entry(*worker).or_insert(0) += placed.cpu_millis;
             }
+            active.retain(|i| !done.contains(i));
         }
     }
 
@@ -1420,15 +1693,18 @@ impl SessionHandler for Inner {
         };
         let labels = profile.labels.clone();
         let images = profile.availability.images.clone();
-        if let Some(peer) = self.peer(worker) {
-            peer.disk_bytes
-                .store(capacity.disk_bytes, Ordering::Relaxed);
-        }
         let host_id = (profile.host_id != [0u8; 16]).then_some(profile.host_id);
         let cache_bytes = (profile.availability.cache_bytes != 0)
             .then(|| i64::try_from(profile.availability.cache_bytes).unwrap_or(i64::MAX));
         let load_ns = (profile.availability.load_ns != 0)
             .then(|| i64::try_from(profile.availability.load_ns).unwrap_or(i64::MAX));
+        if let Some(peer) = self.peer(worker) {
+            peer.disk_bytes
+                .store(capacity.disk_bytes, Ordering::Relaxed);
+            peer.load_ns.store(load_ns.unwrap_or(0), Ordering::Relaxed);
+            peer.cache_bytes
+                .store(cache_bytes.unwrap_or(0), Ordering::Relaxed);
+        }
         self.write(move |tx| {
             dispatch::report_capacity(tx, worker, capacity)?;
             dispatch::report_profile(
@@ -2213,6 +2489,8 @@ impl Controller {
             max_pending: AtomicUsize::new(MAX_PENDING),
             handshake_ms: AtomicU64::new(session::HANDSHAKE_DEADLINE.as_millis() as u64),
             stats: Stats::default(),
+            revocations: Mutex::new((-1, -1)),
+            warned: [AtomicI64::new(i64::MIN), AtomicI64::new(i64::MIN)],
         });
         let _ = inner.me.set(Arc::downgrade(&inner));
         let acceptor = {
@@ -2458,6 +2736,34 @@ mod tests {
         // Another pool's worker is never "elsewhere", and a lone worker has
         // nothing to prefer.
         assert_eq!(reach.elsewhere(2, other), None);
+    }
+
+    fn ranked(cpu_millis: i64, load_ns: i64, cache_bytes: i64) -> Ranked {
+        Ranked {
+            cpu_millis,
+            memory_bytes: 8 << 30,
+            load_ns,
+            cache_bytes,
+        }
+    }
+
+    /// Q03's ranking, in its order of precedence: commitment, then measured
+    /// load per core, then warm cache, then the smaller worker.
+    #[test]
+    fn the_sweep_ranks_workers_by_commitment_then_load_then_cache_then_size() {
+        let idle = ranked(8_000, 0, 0);
+        // A quarter committed ranks behind idle, whatever else it has.
+        assert!(rank(idle, 0) < rank(ranked(8_000, 0, 1 << 40), 2_000));
+        // Commitment is a share of the worker: 2 cores of 16 beat 2 of 8.
+        assert!(rank(ranked(16_000, 0, 0), 2_000) < rank(ranked(8_000, 0, 0), 2_000));
+        // Equal commitment: the host that measured less busy time per core.
+        assert!(rank(ranked(8_000, 10_000_000, 0), 0) < rank(ranked(8_000, 400_000_000, 0), 0));
+        // Load is per core: the same busy time on twice the cores is lighter.
+        assert!(rank(ranked(16_000, 200_000_000, 0), 0) < rank(ranked(8_000, 200_000_000, 0), 0));
+        // Equal load: more warm cache first.
+        assert!(rank(ranked(8_000, 0, 1 << 30), 0) < rank(idle, 0));
+        // Everything equal: the smaller worker (Q10's best fit).
+        assert!(rank(ranked(2_500, 0, 0), 0) < rank(idle, 0));
     }
 
     /// P04-4: a burst of spec requests past the resolver bound is queued and

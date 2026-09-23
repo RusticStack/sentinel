@@ -523,6 +523,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
                         "arch": format!("{:?}", w.negotiated.arch).to_lowercase(),
                         "connected": connected.contains(&w.id),
                         "last_seen_ms": w.last_seen.map(|t| t.0),
+                        "transport": state.controller.transport(w.id).map(|t| transport_json(&t)),
                     })).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>()
             }))
@@ -537,19 +538,20 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
             // Placement is decided per transaction against the live session
             // set, so the explanation must use the same set.
             let connected = state.controller.connected();
-            let rows = state
+            // The limit goes into the query: only the jobs shown are read and
+            // explained, and `total` is an index count (P08-8).
+            let page = state
                 .store
                 .read(|c| {
                     let tenant = lookup::tenant_by_slug(c, &slug)?;
                     authz::require_tenant_member(c, who.principal, tenant, false)?;
-                    dispatch::list_queue(c, tenant, &connected)
+                    dispatch::list_queue(c, tenant, &connected, limit)
                 })
                 .map_err(store_error)?;
-            let shown = rows.len().min(limit);
             ok(json!({
-                "jobs": rows.iter().take(shown).map(queued_json).collect::<Vec<_>>(),
-                "total": rows.len(),
-                "truncated": rows.len() > shown,
+                "jobs": page.jobs.iter().map(queued_json).collect::<Vec<_>>(),
+                "total": page.total,
+                "truncated": page.total > page.jobs.len(),
             }))
         }
         ("POST", ["api", "v1", "workers", worker, "drain"]) => {
@@ -863,6 +865,30 @@ fn worker_drain(state: &State, request: &mut Request, worker: &str, drain: bool)
     ok(json!({ "worker": worker.to_string(), "draining": drain }))
 }
 
+/// A connected worker's transport telemetry (Q07), as it last reported it.
+/// Unmeasured fields are absent, never zero: `path` is `unknown` until a
+/// probe measured it, `rtt_ns` and `helper_version` are left out until set.
+/// Nothing here is a credential: no address or key is ever reported.
+fn transport_json(t: &sentinel_link::session::TransportStats) -> Value {
+    let mut out = json!({
+        "path": match t.path {
+            sentinel_link::session::Path::Unknown => "unknown",
+            sentinel_link::session::Path::Direct => "direct",
+            sentinel_link::session::Path::Relay => "relay",
+        },
+        "reconnects": t.reconnects,
+        "bytes_in": t.bytes_in,
+        "bytes_out": t.bytes_out,
+    });
+    if let Some(rtt) = t.rtt_ns {
+        out["rtt_ns"] = json!(rtt);
+    }
+    if let Some(version) = &t.helper_version {
+        out["helper_version"] = json!(version);
+    }
+    out
+}
+
 /// One waiting job as the API explains it: how long it has been waiting and
 /// what it is waiting for. A queued job and a job blocked on its dependencies
 /// are the same question to a person staring at a stuck pipeline.
@@ -894,6 +920,7 @@ fn wait_reason_json(reason: dispatch::WaitReason) -> Value {
         }),
         dispatch::WaitReason::WorkerOffline => json!({ "code": "worker_offline" }),
         dispatch::WaitReason::Capacity => json!({ "code": "capacity" }),
+        dispatch::WaitReason::Ready => json!({ "code": "ready" }),
         other => {
             let text = format!("{other:?}");
             match text.split_once(' ') {
@@ -1852,6 +1879,34 @@ mod tests {
                 .as_ref()
                 .and_then(|d| d.get("retry_with_idempotency_key")),
             Some(&Value::Bool(true))
+        );
+    }
+
+    /// What a worker never measured stays out of the answer (AGENTS.md:
+    /// unmeasured is absent, never zero).
+    #[test]
+    fn transport_telemetry_leaves_unmeasured_fields_out() {
+        use sentinel_link::session::{Path, TransportStats};
+        let bare = transport_json(&TransportStats::default());
+        assert_eq!(bare["path"], "unknown");
+        assert!(bare.get("rtt_ns").is_none() && bare.get("helper_version").is_none());
+        let measured = transport_json(&TransportStats {
+            path: Path::Relay,
+            rtt_ns: Some(12_000_000),
+            reconnects: 2,
+            helper_version: Some("tailcat 0.6.0".into()),
+            bytes_out: 10,
+            bytes_in: 20,
+        });
+        assert_eq!(measured["path"], "relay");
+        assert_eq!(measured["rtt_ns"], 12_000_000);
+        assert_eq!(measured["helper_version"], "tailcat 0.6.0");
+        assert_eq!(
+            (
+                measured["reconnects"].as_u64(),
+                measured["bytes_in"].as_u64()
+            ),
+            (Some(2), Some(20))
         );
     }
 }

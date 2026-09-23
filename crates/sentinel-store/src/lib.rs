@@ -129,6 +129,34 @@ impl fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+
+impl Error {
+    /// The variant's name and nothing else: safe to log, because it carries
+    /// no payload — no SQL text, no path, no value from a row.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Sqlite(_) => "sqlite",
+            Self::Conflict => "conflict",
+            Self::NotFound => "not_found",
+            Self::Forbidden => "forbidden",
+            Self::StepUpRequired => "step_up_required",
+            Self::InvalidInput(_) => "invalid_input",
+            Self::Transition(_) => "transition",
+            Self::Corrupt(_) => "corrupt",
+            Self::Spec(_) => "spec",
+            Self::WriterUnavailable => "writer_unavailable",
+            Self::WriteAmbiguous => "write_ambiguous",
+            Self::WriterPanicked => "writer_panicked",
+            Self::Overloaded => "overloaded",
+            Self::AlreadyOwned => "already_owned",
+            Self::Unresolved => "unresolved",
+            Self::StorageFull => "storage_full",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::Io(_) => "io",
+        }
+    }
+}
+
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
         Self::Sqlite(e)
@@ -167,6 +195,30 @@ fn configure(conn: &Connection, durability: Durability) -> Result<()> {
         "PRAGMA journal_mode=WAL; PRAGMA synchronous={sync}; PRAGMA foreign_keys=ON;
          PRAGMA temp_store=MEMORY;"
     ))?;
+    register_functions(conn)
+}
+
+/// Register the SQL functions placement's statements call. Every connection
+/// the store opens has them; a connection opened elsewhere (a test's
+/// in-memory schema) must call this before preparing a placement query.
+///
+/// `sentinel_labels_subset(job, worker)`: whether every label in the job's
+/// encoded label blob is in the worker's — the same sorted,
+/// newline-separated encoding [`dispatch::encode_labels`] writes, compared by
+/// one merge walk over the borrowed blobs, no allocation. Deterministic, so
+/// SQLite may evaluate it once per distinct argument pair.
+pub fn register_functions(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "sentinel_labels_subset",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let job = ctx.get_raw(0).as_blob_or_null()?.unwrap_or_default();
+            let worker = ctx.get_raw(1).as_blob_or_null()?.unwrap_or_default();
+            Ok(dispatch::labels_subset(job, worker))
+        },
+    )?;
     Ok(())
 }
 

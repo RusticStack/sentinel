@@ -381,16 +381,19 @@ fn expiry_rechecks_the_lease_in_its_write() {
     let due = f.store.read(|c| dispatch::expired_scoped(c, late)).unwrap();
     assert_eq!(due.len(), 1);
     assert_eq!((due[0].0, due[0].2), (attempt, offer.job));
-    // The worker reconnects just at its deadline and renews.
+    // The worker renews at its deadline; that write commits only after the
+    // sweep's read (a renewal of an already-passed lease is refused, P08-13).
+    let deadline = at(late.0 - 1);
     f.store
         .writer()
-        .write(move |tx| dispatch::renew(tx, w, &[attempt], dispatch::DEFAULT_LEASE_MS, late))
+        .write(move |tx| dispatch::renew(tx, w, &[attempt], dispatch::DEFAULT_LEASE_MS, deadline))
         .unwrap();
     assert_eq!(
         f.store
             .writer()
             .write(move |tx| dispatch::expire_batch(tx, &[(attempt, false)], late))
-            .unwrap(),
+            .unwrap()
+            .done,
         0
     );
     assert_eq!(state(&f, offer.job), JobState::Leased);
@@ -400,7 +403,8 @@ fn expiry_rechecks_the_lease_in_its_write() {
         f.store
             .writer()
             .write(move |tx| dispatch::expire_batch(tx, &[(attempt, true)], later))
-            .unwrap(),
+            .unwrap()
+            .done,
         1
     );
     assert_eq!(

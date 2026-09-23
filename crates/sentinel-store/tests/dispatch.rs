@@ -1029,7 +1029,10 @@ jobs:
             dispatch::acknowledge(tx, w, aa, af, at(2_200))?;
             dispatch::acknowledge(tx, gone, ca, cf, at(2_200))?;
             dispatch::acknowledge(tx, w, da, df, at(2_200))?;
-            dispatch::renew(tx, w, &[da], dispatch::DEFAULT_LEASE_MS, at(40_000))?;
+            // Renewed just before its lease (to 32 100) ran out, so it outlives
+            // both restarts below; a renewal after the deadline would be
+            // refused, and the lease would expire.
+            dispatch::renew(tx, w, &[da], dispatch::DEFAULT_LEASE_MS, at(32_000))?;
             workers::revoke(tx, Authority::HostLocal, gone, at(2_300))
         })
         .unwrap();

@@ -79,8 +79,8 @@ pub fn insert_job(
     created_seq: i64,
 ) -> Result<()> {
     let n = tx.execute(
-        "INSERT INTO jobs(id, tenant_id, run_id, name, state_code, priority, created_seq)
-         SELECT ?1, ?2, id, ?4, ?5, ?6, ?7 FROM runs WHERE id = ?3 AND tenant_id = ?2",
+        "INSERT INTO jobs(id, tenant_id, run_id, name, state_code, priority, created_seq, repo_id)
+         SELECT ?1, ?2, id, ?4, ?5, ?6, ?7, repo_id FROM runs WHERE id = ?3 AND tenant_id = ?2",
         params![
             id.as_bytes(),
             tenant.as_bytes(),
@@ -283,20 +283,55 @@ pub fn lease(
     lease_until: UnixMillis,
     now: UnixMillis,
 ) -> Result<(AttemptId, Fence)> {
-    let (resolved, cpu_millis, memory_bytes, disk_bytes): (bool, i64, i64, i64) = tx
+    let (resolved, reservation): (bool, Reservation) = tx
         .prepare_cached(
             "SELECT image_digest IS NOT NULL AND image_platform IS NOT NULL, cpu_millis,
-                    memory_bytes, disk_bytes
+                    memory_bytes, disk_bytes, repo_id
              FROM jobs WHERE id = ?1 AND tenant_id = ?2",
         )?
         .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            Ok((
+                r.get(0)?,
+                Reservation {
+                    cpu_millis: r.get(1)?,
+                    memory_bytes: r.get(2)?,
+                    disk_bytes: r.get(3)?,
+                    repo: r.get(4)?,
+                },
+            ))
         })
         .optional()?
         .ok_or(Error::NotFound)?;
     if !resolved {
         return Err(Error::Unresolved);
     }
+    lease_reserved(tx, tenant, job, worker, &reservation, lease_until, now)
+}
+
+/// What an attempt reserves, as placement already read it from the job row.
+#[derive(Clone, Copy, Debug)]
+pub struct Reservation {
+    pub cpu_millis: i64,
+    pub memory_bytes: i64,
+    pub disk_bytes: i64,
+    /// The job's repository (`jobs.repo_id`), kept on the attempt so held
+    /// resources per repository are an index-only sum.
+    pub repo: Option<[u8; 16]>,
+}
+
+/// [`lease`] for a caller that read the job's resources and proved its image
+/// resolved in the same transaction — placement's candidate scan — so neither
+/// is read again. The state machine still decides the edge, and the fence is
+/// the job's current one plus one.
+pub fn lease_reserved(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    job: JobId,
+    worker: WorkerId,
+    reservation: &Reservation,
+    lease_until: UnixMillis,
+    now: UnixMillis,
+) -> Result<(AttemptId, Fence)> {
     let row = read_job(tx, tenant, job)?;
     let fence = row.fence.next();
     transition(
@@ -308,23 +343,24 @@ pub fn lease(
         now,
     )?;
     let attempt = AttemptId::new();
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO attempts(id, tenant_id, job_id, fence, worker_id, lease_until_ms,
-                              cpu_millis, memory_bytes, disk_bytes, offered_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            attempt.as_bytes(),
-            tenant.as_bytes(),
-            job.as_bytes(),
-            fence.0 as i64,
-            worker.as_bytes(),
-            lease_until.0,
-            cpu_millis,
-            memory_bytes,
-            disk_bytes,
-            now.0
-        ],
-    )?;
+                              cpu_millis, memory_bytes, disk_bytes, offered_ms, repo_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )?
+    .execute(params![
+        attempt.as_bytes(),
+        tenant.as_bytes(),
+        job.as_bytes(),
+        fence.0 as i64,
+        worker.as_bytes(),
+        lease_until.0,
+        reservation.cpu_millis,
+        reservation.memory_bytes,
+        reservation.disk_bytes,
+        now.0,
+        reservation.repo.as_ref().map(|r| r.as_slice()),
+    ])?;
     Ok((attempt, fence))
 }
 

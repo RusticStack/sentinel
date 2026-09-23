@@ -25,7 +25,7 @@ use sentinel_protocol::negotiate::{Hello, PROFILE_MIN, Profile};
 use crate::{
     Error, Result,
     identity::Identity,
-    session::{self, Capacity, Executor, Link, Sender, TransportStats},
+    session::{self, Capacity, Executor, Link, Sender, TransportSource, TransportStats},
     tls,
 };
 
@@ -39,6 +39,9 @@ pub struct Handle {
     /// Control sessions opened since process start; what Q07 telemetry
     /// reports reconnects from, measured, never estimated.
     sessions: std::sync::atomic::AtomicU64,
+    /// The process's live transport measurements (Q07), when it has any;
+    /// without one every session reports [`Config::transport`].
+    transport: Mutex<Option<TransportSource>>,
 }
 
 impl Handle {
@@ -60,6 +63,21 @@ impl Handle {
     /// Control sessions this worker has opened (0 before the first).
     pub fn sessions(&self) -> u64 {
         self.sessions.load(Ordering::Acquire)
+    }
+
+    /// Report transport telemetry from `source` (the Tailcat helper's latest
+    /// probe) instead of the fixed [`Config::transport`]: read at every
+    /// session start, and at every telemetry resend within a session, so a
+    /// path the helper re-measured reaches the controller (Q07).
+    pub fn set_transport_source(&self, source: TransportSource) {
+        *self.transport.lock().unwrap_or_else(|p| p.into_inner()) = Some(source);
+    }
+
+    fn transport_source(&self) -> Option<TransportSource> {
+        self.transport
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 }
 
@@ -158,7 +176,14 @@ pub fn session(
             link.set_availability_sent(version);
         }
         link.send_profile(&profile)?;
-        let mut transport = config.transport.clone();
+        let source = handle.transport_source();
+        let mut transport = match &source {
+            Some(source) => source(),
+            None => config.transport.clone(),
+        };
+        if let Some(source) = source {
+            link.set_transport_source(source);
+        }
         transport.reconnects = handle.sessions().saturating_sub(1);
         link.report_transport(&transport)?;
     }
@@ -179,7 +204,11 @@ pub fn session(
     let outcome = std::thread::scope(|scope| {
         if let (Some(dialer), Some(bulk)) = (dialer, bulk) {
             let gate = Arc::clone(&stop_bulk);
-            scope.spawn(move || serve_bulk(&dialer, bulk, executor, &gate));
+            // Its own jitter stream: bulk redials of a fleet must not align
+            // with each other or with the control reconnects.
+            let seed = 0xD1B5_4A32_D192_ED03
+                ^ u64::from_le_bytes(config.worker.as_bytes()[8..].try_into().expect("8 bytes"));
+            scope.spawn(move || serve_bulk(&dialer, bulk, executor, &gate, seed));
         }
         let outcome = link.run(executor, || handle.stopped());
         stop_bulk.store(true, Ordering::Release);
@@ -193,14 +222,39 @@ pub fn session(
     outcome
 }
 
+/// Sleep up to `wait`, returning early (with `false`) once `stop` is set.
+/// Checked every [`STOP_POLL`], so whoever waits on this thread — the
+/// control session's teardown joins it — waits at most that long for a stop,
+/// never the whole back-off.
+fn wait_unless_stopped(stop: &AtomicBool, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(STOP_POLL.min(left));
+    }
+}
+
+/// How often a back-off wait looks at its stop flag.
+const STOP_POLL: Duration = Duration::from_millis(50);
+
 /// Serve the bulk half of a session on its own thread: the first connection
-/// is already open, and a lost one is redialled with doubling back-off until
-/// the control session ends.
+/// is already open, and a lost one is redialled with doubling, jittered
+/// back-off until the control session ends. The back-off wait watches the
+/// stop flag: the control session joins this thread before it returns, so an
+/// uninterruptible sleep here would hold a reconnect for up to
+/// [`BACKOFF_MAX`] — longer than a lease (P08-11).
 fn serve_bulk(
     dialer: &session::BulkDialer,
     first: session::BulkLink,
     executor: &dyn Executor,
     stop: &AtomicBool,
+    mut seed: u64,
 ) {
     let mut backoff = BACKOFF_MIN;
     let mut next = Some(first);
@@ -211,10 +265,9 @@ fn serve_bulk(
         if let Some(mut bulk) = next.take() {
             let _ = bulk.run(executor, || stop.load(Ordering::Acquire));
         }
-        if stop.load(Ordering::Acquire) {
+        if !wait_unless_stopped(stop, jitter(backoff, &mut seed)) {
             return;
         }
-        std::thread::sleep(backoff);
         backoff = (backoff * 2).min(BACKOFF_MAX);
         match dialer.open() {
             Ok(bulk) => {
@@ -282,9 +335,8 @@ pub fn run(
         }
         let wait = jitter(backoff, &mut seed);
         on_event(Event::Backoff(wait));
-        let deadline = Instant::now() + wait;
-        while Instant::now() < deadline && !handle.stopped() {
-            std::thread::sleep(Duration::from_millis(50).min(deadline - Instant::now()));
+        if !wait_unless_stopped(&handle.stop, wait) {
+            break;
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }

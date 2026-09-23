@@ -118,6 +118,12 @@ pub struct TransportStats {
     pub bytes_in: u64,
 }
 
+/// A live source of the process's transport measurements (Q07): the worker
+/// process hands one to the link so each session starts from — and each
+/// telemetry resend refreshes — what the Tailcat helper last measured,
+/// rather than what it measured once at process start.
+pub type TransportSource = Arc<dyn Fn() -> TransportStats + Send + Sync>;
+
 /// What a worker has, as it measures at each hello.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capacity {
@@ -2501,6 +2507,10 @@ pub struct Link {
     remote: Arc<LinkRemote>,
     /// Process telemetry to refresh on the control connection (Q07).
     transport: Option<TransportStats>,
+    /// Where the process's own transport measurements come from (the Tailcat
+    /// helper's latest probe): read at every telemetry resend, so a path
+    /// that changed mid-session (direct to relayed, say) is reported.
+    transport_source: Option<TransportSource>,
     beats: u64,
     /// When the last heartbeat left: what the lease the pong renews is
     /// measured from, monotonically.
@@ -2583,6 +2593,7 @@ pub fn connect(
                 protocol: negotiated.protocol.0,
             }),
             transport: None,
+            transport_source: None,
             beats: 0,
             ping_sent: Instant::now(),
             remote_cache: true,
@@ -2957,6 +2968,12 @@ impl Link {
         self.tx.send(&ClientMessage::Transport(stats.clone()))
     }
 
+    /// Protocol 7 (Q07): where refreshed path telemetry comes from; read
+    /// each time the telemetry is resent.
+    pub fn set_transport_source(&mut self, source: TransportSource) {
+        self.transport_source = Some(source);
+    }
+
     /// Frame bytes written to / socket bytes read from the control
     /// connection (Q07).
     pub fn bytes(&self) -> (u64, u64) {
@@ -3013,6 +3030,14 @@ impl Link {
         stats.bytes_out = out;
         stats.bytes_in = bytes_in;
         if self.beats.is_multiple_of(TRANSPORT_BEATS) {
+            // What the process measured about the path since: the helper's
+            // latest probe. Round-trip time stays this session's own beat,
+            // the better measure of the link actually in use.
+            if let Some(source) = &self.transport_source {
+                let fresh = source();
+                stats.path = fresh.path;
+                stats.helper_version = fresh.helper_version;
+            }
             self.tx.send(&ClientMessage::Transport(stats.clone()))?;
         }
         Ok(())

@@ -434,3 +434,102 @@ fn session_error_is_printable() {
     let error: Error = Error::Protocol("priority");
     assert!(format!("{error}").contains("priority"));
 }
+
+/// P08-11: the control session joins its bulk thread before it returns, and
+/// the bulk thread's redial back-off (doubling towards 30 s) used to be one
+/// uninterruptible sleep. With the bulk dial failing, a lost control session
+/// could not even begin reconnecting until that sleep ended — longer than a
+/// lease once the back-off saturated. The wait now watches the stop flag:
+/// the session returns promptly whatever the back-off.
+#[test]
+fn a_failing_bulk_redial_never_delays_the_control_teardown() {
+    let (listener, server, client) = deployment();
+    let addr = listener.local_addr().unwrap();
+    let handler = Arc::new(Counting::default());
+    let dials = Arc::new(AtomicU64::new(0));
+    let (control_tx, control_rx) = std::sync::mpsc::channel();
+    let controller = {
+        let handler = Arc::clone(&handler);
+        let dials = Arc::clone(&dials);
+        thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let Accepted::Control(mut control) =
+                session::accept(socket, server.clone(), &AnyAdmission).unwrap()
+            else {
+                panic!("control hello expected");
+            };
+            control_tx.send(control.sender()).unwrap();
+            thread::spawn(move || {
+                let _ = control.serve(&*handler);
+            });
+            // The first bulk connection is attached, then dropped; every
+            // redial after it is accepted at TCP and closed before TLS, so
+            // the worker's bulk thread keeps backing off.
+            let (socket, _) = listener.accept().unwrap();
+            let first = session::accept(socket, server, &AnyAdmission).unwrap();
+            dials.fetch_add(1, Ordering::AcqRel);
+            drop(first);
+            for socket in listener.incoming() {
+                let Ok(socket) = socket else { return };
+                dials.fetch_add(1, Ordering::AcqRel);
+                drop(socket);
+            }
+        })
+    };
+
+    let worker_id = WorkerId::new();
+    let config = sentinel_link::worker::Config {
+        controller: addr,
+        server: sentinel_auth::secret::Digest([0; 32]),
+        worker: worker_id,
+        name: "bulk-backoff".into(),
+        hello: hello(),
+        capacity: capacity(),
+        profile: Profile::default(),
+        transport: Default::default(),
+        remote_cache: false,
+    };
+    let executor = Arc::new(TestExecutor::default());
+    let handle = Arc::new(sentinel_link::worker::Handle::new());
+    let worker = {
+        let executor = Arc::clone(&executor);
+        let handle = Arc::clone(&handle);
+        thread::spawn(move || {
+            let welcomed = AtomicBool::new(false);
+            let outcome = sentinel_link::worker::session(
+                &config,
+                client,
+                None,
+                &*executor,
+                &handle,
+                &welcomed,
+                &|_| {},
+            );
+            (outcome, Instant::now())
+        })
+    };
+    let control = control_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    // The first bulk connection, then two failed redials: the bulk thread is
+    // now inside its third back-off, 4 s ± 25 %.
+    assert!(
+        wait_until(
+            || dials.load(Ordering::Acquire) >= 3,
+            Duration::from_secs(15)
+        ),
+        "the bulk connection must be redialled after it drops"
+    );
+    thread::sleep(Duration::from_millis(300));
+    let closed = Instant::now();
+    control.close();
+    let (outcome, returned) = worker.join().unwrap();
+    assert!(outcome.is_err(), "a lost control session is an error");
+    let teardown = returned.duration_since(closed);
+    assert!(
+        teardown < Duration::from_millis(1_500),
+        "the session returned {teardown:?} after the control connection closed"
+    );
+    handle.stop();
+    // Unblock the fake controller's accept loop.
+    let _ = std::net::TcpStream::connect(addr);
+    drop(controller);
+}

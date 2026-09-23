@@ -3,11 +3,7 @@ use std::{
     io::Read,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
@@ -89,7 +85,7 @@ struct FileConfig {
     tailcat: Option<TailcatFile>,
     // Q08: whether this process participates in remote cache hydration.
     remote_cache: Option<RemoteCacheFile>,
-    // Worker: the controller's `tc…` address, printed at `tailcat_listening`
+    // Worker: the controller's `tc…` address, as written to its `<data_dir>/tailcat/address`
     // (Q06). Required to dial a controller through the helper.
     tailcat_address: Option<String>,
 }
@@ -452,7 +448,7 @@ impl Config {
                     }
                     if tailcat_on && file.tailcat_address.is_none() {
                         return Err(Error::config(
-                            "tailcat_address is required when [tailcat] is enabled: it is the controller's tc… address printed at tailcat_listening",
+                            "tailcat_address is required when [tailcat] is enabled: it is the controller's tc… address from its <data_dir>/tailcat/address file",
                         ));
                     }
                     Some(WorkerLink {
@@ -703,24 +699,65 @@ enum Running {
         handle: Arc<sentinel_link::worker::Handle>,
         thread: std::thread::JoinHandle<()>,
         /// The Q06 helper the worker dials through; absent with direct TLS.
-        tailcat: Option<sentinel_link::tailcat::Forward>,
+        /// Shared with the link thread, which replaces it when sessions over
+        /// it keep failing.
+        tailcat: Option<Arc<sentinel_link::tailcat::Forward>>,
     },
 }
 
-/// Q06 for the server: run the helper that carries the link port, log its
-/// `tc…` address once (the operator hands that exact string to workers as
-/// `tailcat_address`), and keep the admitted node keys current from
-/// `<data_dir>/tailcat-allow`. `None` means direct TLS, unchanged.
+/// Q06 for the server: run the helper that carries the link port, keep its
+/// `tc…` address in the owner-only `<data_dir>/tailcat/address` (the operator
+/// hands that exact string to workers as `tailcat_address`; the log names only
+/// the file), and keep the admitted node keys current from
+/// `<data_dir>/tailcat-allow` minus every key whose worker is revoked. `None`
+/// means direct TLS, unchanged.
 #[cfg(feature = "server")]
 struct TailcatServer {
     server: Arc<sentinel_link::tailcat::Server>,
-    /// Stops the allow-list refresher before the helper is dropped.
-    stop: Arc<AtomicBool>,
+    /// Dropping it wakes and ends the allow-list refresher at once.
+    stop: mpsc::SyncSender<()>,
+    /// The refresher holds a store handle; it is joined before the store
+    /// drains.
+    refresher: std::thread::JoinHandle<()>,
+}
+
+#[cfg(feature = "server")]
+impl TailcatServer {
+    fn shutdown(self) {
+        drop(self.stop);
+        let _ = self.refresher.join();
+        self.server.shutdown();
+    }
+}
+
+/// How often the allow list and the workers it names are re-read: a
+/// revoked worker's tunnel closes within one tick.
+#[cfg(feature = "server")]
+const TAILCAT_ALLOW_REFRESH: Duration = Duration::from_secs(10);
+
+/// The keys the helper may admit: every listed key whose worker is not
+/// revoked. A worker the store does not know yet stays admitted — it has to
+/// reach the controller over the tunnel to enroll at all.
+#[cfg(feature = "server")]
+fn admitted_keys(
+    store: &sentinel_store::Store,
+    listed: &[sentinel_link::tailcat::Admission],
+) -> sentinel_store::Result<Vec<sentinel_link::tailcat::NodeKey>> {
+    store.read(|conn| {
+        let mut keys = Vec::with_capacity(listed.len());
+        for admission in listed {
+            if !sentinel_store::workers::revoked(conn, admission.worker)? {
+                keys.push(admission.key.clone());
+            }
+        }
+        Ok(keys)
+    })
 }
 
 #[cfg(feature = "server")]
 fn start_tailcat(
     config: &Config,
+    store: &Arc<sentinel_store::Store>,
     file: Option<&TailcatFile>,
     listen: SocketAddr,
 ) -> Result<Option<TailcatServer>, Error> {
@@ -745,56 +782,82 @@ fn start_tailcat(
         region: file.region.clone(),
         listen_port: file.listen_port.unwrap_or(listen.port()),
     };
-    let keys = sentinel_link::tailcat::allow_list(&config.data_dir)
+    let mut listed = sentinel_link::tailcat::allow_list(&config.data_dir)
         .map_err(|error| Error::runtime(format!("cannot read the tailcat allow list: {error}")))?;
+    let keys = admitted_keys(store, &listed).map_err(|error| {
+        Error::runtime(format!(
+            "cannot check the tailcat allow list's workers: {error}"
+        ))
+    })?;
     let server = sentinel_link::tailcat::start_server(&helper, &config.data_dir, &keys)
         .map_err(|error| Error::runtime(format!("cannot start the tailcat helper: {error}")))?;
     match server.wait_ready(Duration::from_secs(60)) {
-        // The address is a credential: only this operator-facing line ever
-        // carries it, and never a Debug-formatted field.
-        Ok(address) => {
-            tracing::info!(event = "tailcat_listening", address = address.expose())
-        }
+        // The address is a credential: it lives in an owner-only file, and
+        // the log names only that file.
+        Ok(_) => tracing::info!(
+            event = "tailcat_listening",
+            address_file = %server.address_file().display(),
+            admitted = keys.len()
+        ),
         Err(problem) => tracing::warn!(
             event = "tailcat_not_ready",
             problem = %problem,
             "the helper did not report an address within 60s; workers cannot dial it yet"
         ),
     }
-    // The allow list is an operator file; re-read it on a slow tick so a
-    // newly admitted worker key takes effect without a restart.
+    // The allow list is an operator file and revocation is a store fact;
+    // both are re-read on a slow tick, so a newly admitted key takes effect
+    // and a revoked worker's tunnel closes without a restart.
     let server = Arc::new(server);
-    let stop = Arc::new(AtomicBool::new(false));
+    let (stop, wake) = mpsc::sync_channel::<()>(0);
     let refresher = {
-        let stop = Arc::clone(&stop);
         let server = Arc::clone(&server);
+        let store = Arc::clone(store);
         let data_dir = config.data_dir.clone();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         std::thread::Builder::new()
             .name("sentinel-tailcat-allow".into())
             .spawn(move || {
-                let mut warned = false;
-                while !stop.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_secs(10));
-                    if stop.load(Ordering::Acquire) {
-                        return;
-                    }
-                    match sentinel_link::tailcat::allow_list(&data_dir) {
-                        Ok(keys) => {
-                            warned = false;
-                            server.set_allow(&keys);
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let (mut file_warned, mut store_warned) = (false, false);
+                    while let Err(mpsc::RecvTimeoutError::Timeout) =
+                        wake.recv_timeout(TAILCAT_ALLOW_REFRESH)
+                    {
+                        match sentinel_link::tailcat::allow_list(&data_dir) {
+                            // An empty or absent file is a decision: it
+                            // closes every tunnel (`--allow=none`).
+                            Ok(read) => {
+                                file_warned = false;
+                                listed = read;
+                            }
+                            // An unreadable or malformed file is not: keep the
+                            // last good list, still filtered by revocation.
+                            Err(_) if !file_warned => {
+                                file_warned = true;
+                                tracing::warn!(
+                                    event = "tailcat_allow_unreadable",
+                                    "keeping the last good node-key list"
+                                );
+                            }
+                            Err(_) => {}
                         }
-                        // Never pass an empty list: one typo must not restart
-                        // the helper with no ACL. Keep the last good one.
-                        Err(_) if !warned => {
-                            warned = true;
-                            tracing::warn!(
-                                event = "tailcat_allow_unreadable",
-                                "keeping the last good node-key list"
-                            );
+                        match admitted_keys(&store, &listed) {
+                            Ok(keys) => {
+                                store_warned = false;
+                                server.set_allow(&keys);
+                            }
+                            Err(error) if !store_warned => {
+                                store_warned = true;
+                                tracing::warn!(
+                                    event = "tailcat_allow_unchecked",
+                                    error = %error,
+                                    "keeping the admitted node keys until the store answers"
+                                );
+                            }
+                            Err(_) => {}
                         }
-                        Err(_) => {}
                     }
-                }
+                });
             })
             .map_err(|error| {
                 Error::runtime(format!(
@@ -802,8 +865,11 @@ fn start_tailcat(
                 ))
             })?
     };
-    drop(refresher);
-    Ok(Some(TailcatServer { server, stop }))
+    Ok(Some(TailcatServer {
+        server,
+        stop,
+        refresher,
+    }))
 }
 
 /// How often expired rows are purged: sessions, API credentials, external
@@ -988,7 +1054,7 @@ fn start_server(
         })?;
         controller.set_remote_cache(root);
     }
-    let tailcat = start_tailcat(config, tailcat, listen)?;
+    let tailcat = start_tailcat(config, &store, tailcat, listen)?;
     // One destination policy for every controller-side fetch: worker spec
     // delivery, intake resolution and ref polling all recheck it.
     let destinations = crate::source_admin::load_destinations(&config.data_dir)
@@ -1475,18 +1541,64 @@ mod worker_role {
         };
         let forward = sentinel_link::tailcat::start_forward(&config, data_dir, &address)
             .map_err(|error| Error::runtime(format!("cannot start the tailcat helper: {error}")))?;
-        stats.path = sentinel_link::session::Path::Relay;
         stats.helper_version = forward.telemetry().version;
-        // The helper's health probe is a measured round trip (ping plus a
-        // connect through the forward); it seeds the telemetry until the
-        // first control beat measures the session's own.
-        if let Ok(rtt) = forward.probe() {
-            stats.rtt_ns = Some(rtt.as_nanos().min(u64::MAX as u128) as u64);
+        // The path is what `tailcat ping` reported — a pong via DERP or from
+        // an ip:port — and stays Unknown when no probe measured it. The seed
+        // RTT is the latency the pong itself reported, never the wall time
+        // of the ping process; the first control beat replaces it.
+        stats.path = sentinel_link::session::Path::Unknown;
+        if let Ok(measured) = forward.probe() {
+            stats.path = measured.path;
+            stats.rtt_ns = measured
+                .rtt
+                .map(|rtt| rtt.as_nanos().min(u128::from(u64::MAX)) as u64);
         }
+        tracing::info!(
+            event = "tailcat_forwarding",
+            nodekey_file = %sentinel_link::tailcat::nodekey_file(
+                data_dir,
+                sentinel_link::tailcat::Role::Worker
+            )
+            .display(),
+            path = ?stats.path
+        );
         // The worker dials the helper's loopback forward; the helper carries
         // exactly the link port.
         let local = SocketAddr::from(([127, 0, 0, 1], forward.local_addr().port()));
         Ok((local, stats, Some(forward)))
+    }
+
+    /// Control sessions in a row that may fail over a running helper before
+    /// the helper is replaced. The session is the data path's health: `ping`
+    /// proves the mesh, only a session proves the forward carries the link.
+    pub(super) const TUNNEL_SESSION_FAILURES: u32 = 3;
+
+    /// Counts consecutive failed control sessions (a failed dial included);
+    /// any welcomed session resets it.
+    #[derive(Default)]
+    pub(super) struct TunnelWatch {
+        failures: std::sync::atomic::AtomicU32,
+    }
+
+    impl TunnelWatch {
+        pub(super) fn connected(&self) {
+            self.failures.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        /// Records a lost or refused session; `true` means replace the helper
+        /// now (and the count starts over for its successor).
+        pub(super) fn lost(&self) -> bool {
+            let failures = self
+                .failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if failures >= TUNNEL_SESSION_FAILURES {
+                self.failures.store(0, std::sync::atomic::Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        }
     }
 
     /// The worker's generated identifier, fixed on first start.
@@ -1535,6 +1647,7 @@ mod worker_role {
         // The helper, when enabled, is up before the first dial: the link
         // then reaches the controller at its loopback forward.
         let (controller, transport, forward) = tailcat(link, &config.data_dir)?;
+        let forward = forward.map(Arc::new);
         // The reflink bit is the cache root's own probe answer, so the
         // advertised capability and the backend restore uses never disagree.
         let mut capabilities = sentinel_protocol::negotiate::Capabilities::REQUIRED;
@@ -1574,11 +1687,30 @@ mod worker_role {
             tailcat = forward.is_some()
         );
         let handle = Arc::new(sentinel_link::worker::Handle::new());
+        // Q07: with a helper, every session starts from — and every
+        // telemetry resend refreshes — the path and latency the helper's
+        // latest probe measured, not the probe at process start.
+        if let Some(forward) = &forward {
+            let forward = Arc::clone(forward);
+            handle.set_transport_source(Arc::new(move || {
+                let measured = forward.telemetry();
+                sentinel_link::session::TransportStats {
+                    path: measured.path,
+                    rtt_ns: measured
+                        .ping_rtt
+                        .map(|rtt| rtt.as_nanos().min(u128::from(u64::MAX)) as u64),
+                    helper_version: measured.version,
+                    ..sentinel_link::session::TransportStats::default()
+                }
+            }));
+        }
         let grip = Arc::clone(&handle);
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
         let enrollment_file = link.enrollment_file.clone();
         let executor = executor(&config.data_dir, worker, link.git_mirrors);
+        let tunnel = forward.clone();
+        let watch = TunnelWatch::default();
         let thread = std::thread::Builder::new()
             .name("sentinel-worker-link".into())
             .spawn(move || {
@@ -1598,10 +1730,19 @@ mod worker_role {
                                         // confusion at the next start.
                                         let _ = fs::remove_file(path);
                                     }
+                                    watch.connected();
                                     tracing::info!(event = "link_connected", worker = %worker, enrolled);
                                 }
                                 sentinel_link::worker::Event::Disconnected(error) => {
                                     tracing::warn!(event = "link_lost", error = %error);
+                                    if let Some(forward) = &tunnel && watch.lost() {
+                                        tracing::warn!(
+                                            event = "tailcat_replaced",
+                                            sessions_failed = TUNNEL_SESSION_FAILURES,
+                                            "no control session over the forward; replacing the helper"
+                                        );
+                                        forward.restart();
+                                    }
                                 }
                                 sentinel_link::worker::Event::Backoff(wait) => {
                                     tracing::info!(event = "link_backoff", wait_ms = wait.as_millis() as u64);
@@ -1694,8 +1835,7 @@ fn initialize_and_wait(
             api.shutdown();
             maintenance.stop();
             if let Some(tailcat) = tailcat {
-                tailcat.stop.store(true, Ordering::Release);
-                tailcat.server.shutdown();
+                tailcat.shutdown();
             }
             drop(reconcile);
             drop(checks);
@@ -1734,9 +1874,112 @@ fn initialize_and_wait(
     }
 }
 
+#[cfg(all(test, feature = "worker"))]
+mod worker_tests {
+    use super::worker_role::{TUNNEL_SESSION_FAILURES, TunnelWatch};
+
+    #[test]
+    fn the_helper_is_replaced_only_after_consecutive_failed_sessions() {
+        let watch = TunnelWatch::default();
+        for _ in 1..TUNNEL_SESSION_FAILURES {
+            assert!(!watch.lost());
+        }
+        // A welcomed session in between proves the forward carries the link.
+        watch.connected();
+        for _ in 1..TUNNEL_SESSION_FAILURES {
+            assert!(!watch.lost());
+        }
+        assert!(
+            watch.lost(),
+            "the third failure in a row replaces the helper"
+        );
+        // Its successor gets the full allowance again.
+        for _ in 1..TUNNEL_SESSION_FAILURES {
+            assert!(!watch.lost());
+        }
+        assert!(watch.lost());
+    }
+}
+
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_revoked_worker_loses_its_tailcat_key_and_an_unenrolled_one_keeps_it() {
+        use sentinel_auth::secret::Secret;
+        use sentinel_core::{PoolId, UnixMillis, WorkerId};
+        use sentinel_link::tailcat::{Admission, NodeKey};
+        use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
+        use sentinel_store::{auth::Authority, tenancy, workers};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = sentinel_store::Store::open(
+            dir.path().join("metadata.sqlite"),
+            sentinel_store::Durability::Normal,
+        )
+        .unwrap();
+        let now = UnixMillis(1_000);
+        let (pool, enrolled, pending) = (PoolId::new(), WorkerId::new(), WorkerId::new());
+        store
+            .writer()
+            .write(move |tx| {
+                tenancy::create_pool(
+                    tx,
+                    Authority::HostLocal,
+                    pool,
+                    "builders",
+                    tenancy::PoolKind::Shared,
+                    now,
+                )?;
+                let issued =
+                    workers::issue_enrollment(tx, Authority::HostLocal, pool, 60_000, now)?;
+                let mut text = String::new();
+                issued.secret.expose(&mut text);
+                workers::enroll(
+                    tx,
+                    &Secret::parse(&text).unwrap(),
+                    workers::Presentation {
+                        worker: enrolled,
+                        fingerprint: Secret::generate().digest(),
+                        name: "w",
+                        negotiated: Negotiated {
+                            protocol: ProtocolVersion(7),
+                            capabilities: Capabilities::REQUIRED,
+                            arch: Arch::X86_64,
+                        },
+                    },
+                    now,
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        let key =
+            |digit: char| NodeKey::parse(&format!("nodekey:{}", digit.to_string().repeat(64)));
+        let listed = [
+            Admission {
+                key: key('a').unwrap(),
+                worker: enrolled,
+            },
+            Admission {
+                key: key('b').unwrap(),
+                worker: pending,
+            },
+        ];
+        assert_eq!(
+            admitted_keys(&store, &listed).unwrap(),
+            vec![key('a').unwrap(), key('b').unwrap()]
+        );
+        store
+            .writer()
+            .write(move |tx| workers::revoke(tx, Authority::HostLocal, enrolled, UnixMillis(2_000)))
+            .unwrap();
+        assert_eq!(
+            admitted_keys(&store, &listed).unwrap(),
+            vec![key('b').unwrap()],
+            "revoking the worker withdraws its tunnel key"
+        );
+    }
 
     fn resolve_ok(file: StorageFile) -> Storage {
         match file.resolve() {

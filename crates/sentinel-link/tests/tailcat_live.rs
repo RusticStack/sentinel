@@ -1,33 +1,58 @@
 //! Q07 live evidence: the pinned helper over a real NAT boundary.
 //!
-//! These tests need the real `tailcat` binary and rootless Podman; they are
-//! `#[ignore]`d by default and run on a Linux host with:
+//! These tests need the real `tailcat` binary, Podman and the tools named
+//! below; they are `#[ignore]`d by default and run on a Linux host with:
 //!
 //! ```sh
 //! SENTINEL_TAILCAT_LIVE=/root/tailcat/tailcat \
-//!   cargo test -p sentinel-link --test tailcat_live -- --ignored --nocapture
+//!   cargo test -p sentinel-link --all-features --test tailcat_live -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! The server side runs inside a Podman container, so the helper crosses a
-//! real NAT boundary (slirp4netns) instead of a loopback shortcut: the
-//! container serves the link port plus a `nc` echo, and the worker's forward
-//! on loopback is the only listener on that port on the host — a byte that
-//! comes back went through the tunnel. What stays unproven here is recorded,
-//! not faked: a self-hosted DERP map and forced relay-only operation need an
-//! operator's relay infrastructure (see docs/worker-link.md).
+//! With the gate unset every test skips; with it set, a missing prerequisite
+//! fails the test rather than passing it vacuously. The Podman in use here is
+//! **rootful** (the tests run as root, the relay test drops UDP with
+//! `iptables` on the default `10.88.0.0/16` bridge and the self-hosted relay
+//! binds that bridge's gateway): the helper crosses a real network-namespace
+//! and NAT boundary, but rootless Podman / slirp4netns is not what is proven.
+//!
+//! One side of each tunnel runs in a container, so the link port on the host
+//! and in the container are different sockets: a byte that comes back went
+//! through the tunnel. The controller side is Sentinel's own supervisor
+//! ([`tailcat::start_server`], `set_allow`, the address file) wherever the
+//! test is about admission; the older tests keep a raw `tailcat serve` in the
+//! container to prove the worker's forward across the NAT boundary.
+//!
+//! The self-hosted relay test additionally needs `derper` (Tailscale's DERP
+//! server, e.g. `go install tailscale.com/cmd/derper@v1.86.2`), `openssl` and
+//! `python3`, and TLS trust for its throwaway CA — the helper trusts it only
+//! through `SSL_CERT_FILE`, one of the two trust overrides Sentinel passes on.
+//! The runner provides a copy of the system roots; the test appends its CA:
+//!
+//! ```sh
+//! cp /etc/ssl/certs/ca-certificates.crt /tmp/tailcat-live-ca.pem
+//! SENTINEL_TAILCAT_DERPER=/root/derper-bin/derper \
+//! SENTINEL_TAILCAT_DERP_CA=/tmp/tailcat-live-ca.pem SSL_CERT_FILE=/tmp/tailcat-live-ca.pem \
+//!   (plus the command above; PATH must include /usr/sbin for podman and iptables)
+//! ```
 
 #![cfg(target_os = "linux")]
 
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-use sentinel_link::tailcat::{
-    self, Address, NodeKey, PINNED_SHA256, PINNED_VERSION, Role, TailcatConfig,
+use sentinel_link::{
+    session::Path as Route,
+    tailcat::{self, Address, NodeKey, PINNED_SHA256, PINNED_VERSION, Role, TailcatConfig},
 };
 use sha2::{Digest, Sha256};
 
@@ -42,12 +67,19 @@ const PROBLEM: Duration = Duration::from_secs(45);
 /// keeps that block from overlapping another test's tunnel.
 static LIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The pinned helper, or `None` when the live gate is not set. A binary that
-/// is not the pinned build fails the test rather than running: that is the
-/// same refusal the supervisor applies.
-fn live_binary() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var("SENTINEL_TAILCAT_LIVE").ok()?);
-    let digest = Sha256::digest(&std::fs::read(&path).ok()?)
+/// The pinned helper, copied into a directory this user owns (Sentinel
+/// refuses a helper another user can rewrite), or `None` when the live gate
+/// is not set. A binary that is not the pinned build fails the test.
+struct Helper {
+    _dir: tempfile::TempDir,
+    binary: PathBuf,
+}
+
+fn live_binary() -> Option<Helper> {
+    let path = PathBuf::from(std::env::var_os("SENTINEL_TAILCAT_LIVE")?);
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("SENTINEL_TAILCAT_LIVE is set but unreadable: {error}"));
+    let digest = Sha256::digest(&bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
@@ -55,17 +87,35 @@ fn live_binary() -> Option<PathBuf> {
         digest, PINNED_SHA256,
         "SENTINEL_TAILCAT_LIVE is not the pinned {PINNED_VERSION} build"
     );
-    Some(path)
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let binary = dir.path().join("tailcat");
+    std::fs::write(&binary, bytes).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    Some(Helper { _dir: dir, binary })
 }
 
-fn podman() -> Option<()> {
-    let ok = Command::new("podman")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    ok.then_some(())
+/// The gate, plus every named tool: missing any of them with the gate set is
+/// a failure, never a pass.
+fn gate(tools: &[&str]) -> Option<Helper> {
+    let Some(helper) = live_binary() else {
+        eprintln!("SENTINEL_TAILCAT_LIVE unset; skipping live tailcat test");
+        return None;
+    };
+    for tool in tools {
+        // Only whether it runs at all: exit codes of `--version` vary.
+        let found = Command::new(tool)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok();
+        assert!(
+            found,
+            "SENTINEL_TAILCAT_LIVE is set but {tool} is unavailable"
+        );
+    }
+    Some(helper)
 }
 
 /// A free loopback port, raced the way tests always race it.
@@ -77,8 +127,7 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn config(binary: &Path, data_dir: &Path, port: u16) -> TailcatConfig {
-    let _ = data_dir;
+fn config(binary: &Path, port: u16) -> TailcatConfig {
     TailcatConfig {
         enabled: true,
         binary: binary.to_path_buf(),
@@ -111,8 +160,9 @@ struct Server {
 
 impl Server {
     /// `allow` is the worker node key the helper accepts; `None` serves any
-    /// peer (tailcat's default), `Some(key)` passes `--allow=<key>`. The key
-    /// exists after the first start, so a restart reuses the same identity.
+    /// peer (upstream's default when `--allow` is absent — which is why
+    /// Sentinel's own supervisor never omits it), `Some(key)` passes
+    /// `--allow=<key>`.
     fn start(binary: &Path, name: &str, port: u16, allow: Option<&NodeKey>, keys: &Path) -> Self {
         let bind = binary.parent().unwrap();
         let allow_arg = allow
@@ -126,7 +176,8 @@ impl Server {
              fi; \
              HOME=/home /tc/tailcat serve {allow_arg} {port}"
         );
-        let status = Command::new("podman")
+        remove_container(name);
+        let output = Command::new("podman")
             .args([
                 "run",
                 "-d",
@@ -141,11 +192,13 @@ impl Server {
                 "-c",
                 &script,
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success(), "podman run failed for {name}");
+        assert!(
+            output.status.success(),
+            "podman run failed for {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let mut server = Self {
             name: name.to_owned(),
             address: Address::parse("tcplaceholderplaceholder").unwrap(),
@@ -192,11 +245,7 @@ impl Server {
     }
 
     fn stop(&self) {
-        let _ = Command::new("podman")
-            .args(["rm", "-f", &self.name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        remove_container(&self.name);
     }
 }
 
@@ -204,6 +253,14 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn remove_container(name: &str) {
+    let _ = Command::new("podman")
+        .args(["rm", "-f", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// A byte string through the worker's loopback forward and back. Nothing on
@@ -225,21 +282,152 @@ fn echo(port: u16, payload: &[u8]) -> Vec<u8> {
     reply
 }
 
+/// The controller-side link port on the host: an echo that answers once per
+/// connection and closes, so a container client sees its bytes come back
+/// only through the tunnel the controller's helper serves.
+struct HostEcho {
+    stop: Arc<AtomicBool>,
+}
+
+impl HostEcho {
+    fn start(port: u16) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !flag.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                        let mut buffer = [0u8; 256];
+                        if let Ok(read) = stream.read(&mut buffer) {
+                            let _ = stream.write_all(&buffer[..read]);
+                        }
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        });
+        Self { stop }
+    }
+}
+
+impl Drop for HostEcho {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+/// A worker in a container: the pinned helper `forward`s the controller's
+/// address to the container's own loopback, with a key the host generated
+/// through [`tailcat::ensure_key`] (so its node key is known up front).
+struct ContainerWorker {
+    name: String,
+    port: u16,
+}
+
+impl ContainerWorker {
+    fn start(
+        binary: &Path,
+        name: &str,
+        keys: &Path,
+        controller: &Address,
+        port: u16,
+        extra: &[String],
+    ) -> Self {
+        remove_container(name);
+        let mut args = vec![
+            "run".to_owned(),
+            "-d".to_owned(),
+            "--name".to_owned(),
+            name.to_owned(),
+            "-v".to_owned(),
+            format!("{}:/tc:ro", binary.parent().unwrap().display()),
+            "-v".to_owned(),
+            format!("{}:/home", keys.display()),
+            "-e".to_owned(),
+            "HOME=/home".to_owned(),
+        ];
+        args.extend(extra.iter().cloned());
+        args.extend([
+            "alpine:3".to_owned(),
+            "/tc/tailcat".to_owned(),
+            "forward".to_owned(),
+            "--bind=127.0.0.1".to_owned(),
+        ]);
+        if let Some(url) = extra
+            .iter()
+            .find_map(|arg| arg.strip_prefix("TAILCAT_DERPMAP_URL="))
+        {
+            args.push(format!("--derpmap-url={url}"));
+        }
+        args.push(controller.expose().to_owned());
+        args.push(format!("{port}:{port}"));
+        let output = Command::new("podman").args(&args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "podman run failed for {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Self {
+            name: name.to_owned(),
+            port,
+        }
+    }
+
+    /// Sends `payload` to the container's forward and returns what came back
+    /// (empty when the tunnel refused or dropped it).
+    fn echo(&self, payload: &str) -> String {
+        let output = Command::new("podman")
+            .args([
+                "exec",
+                &self.name,
+                "sh",
+                "-c",
+                &format!("printf '{payload}' | nc -w 5 127.0.0.1 {}", self.port),
+            ])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn ping(&self, controller: &Address, derpmap: Option<&str>) -> String {
+        let mut args = vec![
+            "exec".to_owned(),
+            self.name.clone(),
+            "/tc/tailcat".to_owned(),
+            "ping".to_owned(),
+            "--timeout=15s".to_owned(),
+        ];
+        if let Some(url) = derpmap {
+            args.push(format!("--derpmap-url={url}"));
+        }
+        args.push(controller.expose().to_owned());
+        let output = Command::new("podman").args(&args).output().unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr)
+    }
+}
+
+impl Drop for ContainerWorker {
+    fn drop(&mut self) {
+        remove_container(&self.name);
+    }
+}
+
 #[test]
 #[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman"]
 fn the_helper_carries_the_link_port_and_reports_telemetry() {
-    let _serial = LIVE.lock().expect("live serial");
-    let Some(binary) = live_binary() else {
-        eprintln!("SENTINEL_TAILCAT_LIVE unset; skipping live tailcat test");
+    let _serial = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(helper) = gate(&["podman"]) else {
         return;
     };
-    if podman().is_none() {
-        eprintln!("podman unavailable; skipping live tailcat test");
-        return;
-    }
+    let binary = &helper.binary;
     let data_dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    let config = config(&binary, data_dir.path(), port);
+    let config = config(binary, port);
 
     // The worker's identity persists: the same node key comes back after a
     // second ensure, which is what makes the address stable across restarts.
@@ -248,10 +436,14 @@ fn the_helper_carries_the_link_port_and_reports_telemetry() {
         key,
         tailcat::ensure_key(&config, data_dir.path(), Role::Worker).unwrap()
     );
+    // …and it is on disk where the operator copies it from.
+    let recorded =
+        std::fs::read_to_string(tailcat::nodekey_file(data_dir.path(), Role::Worker)).unwrap();
+    assert_eq!(recorded.trim(), key.expose());
 
     let server_keys = tempfile::tempdir().unwrap();
     let server = Server::start(
-        &binary,
+        binary,
         "sentinel-live-serve",
         port,
         Some(&key),
@@ -271,8 +463,12 @@ fn the_helper_carries_the_link_port_and_reports_telemetry() {
             .is_some_and(|v| v.contains(PINNED_VERSION)),
         "helper version missing from telemetry: {telemetry:?}"
     );
-    let rtt = forward.probe().expect("the tunnel does not answer a probe");
+    // The path and latency are what `tailcat ping` measured, never a guess.
+    let measured = forward.probe().expect("the tunnel does not answer a probe");
+    assert_ne!(measured.path, Route::Unknown, "{measured:?}");
+    let rtt = measured.rtt.expect("the pong reported no latency");
     assert!(rtt < Duration::from_secs(10), "probe rtt {rtt:?}");
+    eprintln!("live probe: path {:?}, rtt {rtt:?}", measured.path);
 
     // The link port is carried end to end: a byte written to the loopback
     // forward comes back from the container's echo through the tunnel.
@@ -293,23 +489,19 @@ fn the_helper_carries_the_link_port_and_reports_telemetry() {
 #[test]
 #[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman"]
 fn a_revoked_peer_loses_the_tunnel_and_a_new_endpoint_is_dialed() {
-    let _serial = LIVE.lock().expect("live serial");
-    let Some(binary) = live_binary() else {
-        eprintln!("SENTINEL_TAILCAT_LIVE unset; skipping live tailcat test");
+    let _serial = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(helper) = gate(&["podman"]) else {
         return;
     };
-    if podman().is_none() {
-        eprintln!("podman unavailable; skipping live tailcat test");
-        return;
-    }
+    let binary = &helper.binary;
     let data_dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    let config = config(&binary, data_dir.path(), port);
+    let config = config(binary, port);
     let key = tailcat::ensure_key(&config, data_dir.path(), Role::Worker).unwrap();
 
     let server_keys = tempfile::tempdir().unwrap();
     let server = Server::start(
-        &binary,
+        binary,
         "sentinel-live-revoke",
         port,
         Some(&key),
@@ -326,7 +518,7 @@ fn a_revoked_peer_loses_the_tunnel_and_a_new_endpoint_is_dialed() {
     // a rejection — not an endpoint that moved.
     let before = server.address.expose().to_owned();
     let other = NodeKey::parse(&format!("nodekey:{}", "ab".repeat(32))).unwrap();
-    let server = server.restart_with(&binary, port, Some(&other), server_keys.path());
+    let server = server.restart_with(binary, port, Some(&other), server_keys.path());
     assert_eq!(
         before,
         server.address.expose(),
@@ -343,7 +535,7 @@ fn a_revoked_peer_loses_the_tunnel_and_a_new_endpoint_is_dialed() {
     // serves the same port, and a fresh forward dials it.
     let endpoint_keys = tempfile::tempdir().unwrap();
     let server_b = Server::start(
-        &binary,
+        binary,
         "sentinel-live-endpoint",
         port,
         Some(&key),
@@ -360,16 +552,15 @@ fn a_revoked_peer_loses_the_tunnel_and_a_new_endpoint_is_dialed() {
 }
 
 #[test]
-#[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman"]
+#[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat>"]
 fn a_dead_address_fails_fast_and_stays_supervised() {
-    let _serial = LIVE.lock().expect("live serial");
-    let Some(binary) = live_binary() else {
-        eprintln!("SENTINEL_TAILCAT_LIVE unset; skipping live tailcat test");
+    let _serial = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(helper) = gate(&[]) else {
         return;
     };
     let data_dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    let config = config(&binary, data_dir.path(), port);
+    let config = config(&helper.binary, port);
     let _key = tailcat::ensure_key(&config, data_dir.path(), Role::Worker).unwrap();
 
     // A well-formed address that no peer serves: the NAT path cannot be
@@ -382,7 +573,61 @@ fn a_dead_address_fails_fast_and_stays_supervised() {
         forward.telemetry().problem.is_some()
     });
     assert!(forward.probe().is_err());
+    assert_eq!(forward.telemetry().path, Route::Unknown);
     forward.shutdown();
+}
+
+#[test]
+#[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman"]
+fn the_controller_supervisor_admits_only_listed_workers() {
+    let _serial = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(helper) = gate(&["podman"]) else {
+        return;
+    };
+    let binary = &helper.binary;
+    let port = free_port();
+    let _echo = HostEcho::start(port);
+
+    // The worker's key, generated through Sentinel and handed to the
+    // container as its helper's HOME.
+    let worker_dir = tempfile::tempdir().unwrap();
+    let key = tailcat::ensure_key(&config(binary, port), worker_dir.path(), Role::Worker).unwrap();
+
+    // Sentinel's controller supervisor with nobody admitted: it still has an
+    // address (in its owner-only file) and admits no peer.
+    let controller_dir = tempfile::tempdir().unwrap();
+    let server = tailcat::start_server(&config(binary, port), controller_dir.path(), &[]).unwrap();
+    let address = server.wait_ready(READY).unwrap();
+    let file = std::fs::read_to_string(server.address_file()).unwrap();
+    assert_eq!(file.trim(), address.expose());
+
+    let worker = ContainerWorker::start(
+        binary,
+        "sentinel-live-admission",
+        &worker_dir.path().join("tailcat"),
+        &address,
+        port,
+        &[],
+    );
+    std::thread::sleep(Duration::from_secs(8));
+    assert_eq!(
+        worker.echo("refused"),
+        "",
+        "an empty allow list must admit no peer"
+    );
+
+    // Admitted: the same container's bytes now come back through the tunnel.
+    server.set_allow(std::slice::from_ref(&key));
+    wait_until("the admitted worker's echo", READY, || {
+        worker.echo("admitted") == "admitted"
+    });
+
+    // Emptied again (the worker was revoked): the tunnel closes.
+    server.set_allow(&[]);
+    wait_until("the revoked worker's tunnel to close", PROBLEM, || {
+        worker.echo("revoked").is_empty()
+    });
+    server.shutdown();
 }
 
 /// Outbound UDP to the container subnet blocked for the scope of the guard:
@@ -392,7 +637,7 @@ fn a_dead_address_fails_fast_and_stays_supervised() {
 struct UdpBlock;
 
 impl UdpBlock {
-    fn engage() -> Option<Self> {
+    fn engage() -> Self {
         let engaged = Command::new("iptables")
             .args([
                 "-I",
@@ -406,7 +651,8 @@ impl UdpBlock {
             ])
             .status()
             .is_ok_and(|status| status.success());
-        engaged.then_some(Self)
+        assert!(engaged, "SENTINEL_TAILCAT_LIVE is set but iptables failed");
+        Self
     }
 }
 
@@ -430,52 +676,264 @@ impl Drop for UdpBlock {
 #[test]
 #[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman + iptables"]
 fn relay_only_paths_report_derp() {
-    let _serial = LIVE.lock().expect("live serial");
-    let Some(binary) = live_binary() else {
-        eprintln!("SENTINEL_TAILCAT_LIVE unset; skipping live tailcat test");
+    let _serial = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(helper) = gate(&["podman", "iptables"]) else {
         return;
     };
-    if podman().is_none() {
-        eprintln!("podman unavailable; skipping live tailcat test");
-        return;
-    }
+    let binary = &helper.binary;
     let data_dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    let config = config(&binary, data_dir.path(), port);
+    let config = config(binary, port);
     let key = tailcat::ensure_key(&config, data_dir.path(), Role::Worker).unwrap();
     let server_keys = tempfile::tempdir().unwrap();
     let server = Server::start(
-        &binary,
+        binary,
         "sentinel-live-relay",
         port,
         Some(&key),
         server_keys.path(),
     );
 
-    let Some(_block) = UdpBlock::engage() else {
-        eprintln!("iptables unavailable; skipping relay-only assertion");
-        server.stop();
-        return;
-    };
+    let _block = UdpBlock::engage();
 
-    // With UDP dropped the direct path cannot form: every pong must arrive
-    // via a DERP relay, and the forward still carries the link port.
-    let output = Command::new(&binary)
-        .env("HOME", data_dir.path().join("tailcat"))
-        .args(["ping", "--timeout=20s", server.address.expose()])
-        .output()
-        .unwrap();
-    let text = String::from_utf8_lossy(&output.stdout).into_owned()
-        + &String::from_utf8_lossy(&output.stderr);
-    assert!(
-        text.contains("via DERP"),
-        "expected a DERP-relayed pong, got: {text}"
-    );
-
+    // With UDP dropped the direct path cannot form: the supervisor's own
+    // probe must measure a relayed path, and the forward still carries the
+    // link port.
     let forward =
         tailcat::start_forward_every(&config, data_dir.path(), &server.address, PROBE_EVERY)
             .unwrap();
     wait_until("the relayed tunnel", READY, || forward.telemetry().ready);
+    let measured = forward.probe().expect("the relayed tunnel does not answer");
+    assert_eq!(measured.path, Route::Relay, "{measured:?}");
     assert_eq!(echo(port, b"relay-only"), b"relay-only");
     forward.shutdown();
+}
+
+/// A throwaway CA and a leaf for `ip`, written with `openssl`.
+fn issue_certs(dir: &Path, ip: &str, ca_out: &Path) -> (PathBuf, PathBuf) {
+    let run = |args: &[&str]| {
+        let status = Command::new("openssl")
+            .args(args)
+            .current_dir(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "openssl {args:?} failed");
+    };
+    let ec = [
+        "-newkey",
+        "ec",
+        "-pkeyopt",
+        "ec_paramgen_curve:prime256v1",
+        "-nodes",
+    ];
+    let mut ca = vec!["req", "-x509"];
+    ca.extend(ec);
+    ca.extend([
+        "-days",
+        "1",
+        "-subj",
+        "/CN=sentinel-live-ca",
+        "-keyout",
+        "ca.key",
+        "-out",
+        "ca.pem",
+    ]);
+    run(&ca);
+    let certs = dir.join("certs");
+    std::fs::create_dir_all(&certs).unwrap();
+    let (crt, key) = (
+        certs.join(format!("{ip}.crt")),
+        certs.join(format!("{ip}.key")),
+    );
+    let mut leaf = vec!["req"];
+    leaf.extend(ec);
+    let subject = format!("/CN={ip}");
+    let key_text = key.display().to_string();
+    leaf.extend(["-subj", &subject, "-keyout", &key_text, "-out", "leaf.csr"]);
+    run(&leaf);
+    std::fs::write(dir.join("ext.cnf"), format!("subjectAltName=IP:{ip}\n")).unwrap();
+    let crt_text = crt.display().to_string();
+    run(&[
+        "x509",
+        "-req",
+        "-in",
+        "leaf.csr",
+        "-CA",
+        "ca.pem",
+        "-CAkey",
+        "ca.key",
+        "-CAcreateserial",
+        "-days",
+        "1",
+        "-extfile",
+        "ext.cnf",
+        "-out",
+        &crt_text,
+    ]);
+    // Appended to the runner's bundle (a copy of the system roots), so the
+    // tests that use the public relays keep working in the same run.
+    let ca = std::fs::read(dir.join("ca.pem")).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(ca_out)
+        .and_then(|mut bundle| bundle.write_all(&ca))
+        .expect("SENTINEL_TAILCAT_DERP_CA must be an existing, writable bundle");
+    (crt, key)
+}
+
+/// Kills a background process on drop.
+struct Background(Child);
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+#[ignore = "live helper: SENTINEL_TAILCAT_LIVE + SENTINEL_TAILCAT_DERPER + SENTINEL_TAILCAT_DERP_CA=SSL_CERT_FILE"]
+fn a_self_hosted_derp_relay_carries_the_link() {
+    let _serial = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(helper) = gate(&["podman", "openssl", "python3", "iptables"]) else {
+        return;
+    };
+    let derper = PathBuf::from(
+        std::env::var_os("SENTINEL_TAILCAT_DERPER")
+            .expect("SENTINEL_TAILCAT_LIVE is set but SENTINEL_TAILCAT_DERPER is not"),
+    );
+    let ca_path = PathBuf::from(
+        std::env::var_os("SENTINEL_TAILCAT_DERP_CA")
+            .expect("SENTINEL_TAILCAT_LIVE is set but SENTINEL_TAILCAT_DERP_CA is not"),
+    );
+    assert_eq!(
+        std::env::var_os("SSL_CERT_FILE")
+            .map(PathBuf::from)
+            .as_ref(),
+        Some(&ca_path),
+        "SSL_CERT_FILE must name SENTINEL_TAILCAT_DERP_CA: it is how the helper trusts the relay"
+    );
+    let binary = &helper.binary;
+    let port = free_port();
+    let _echo = HostEcho::start(port);
+
+    assert!(derper.is_file(), "SENTINEL_TAILCAT_DERPER is not a file");
+    // The relay lives on the Podman bridge's gateway, which both the host and
+    // the container reach. The bridge exists once a container runs.
+    let worker_dir = tempfile::tempdir().unwrap();
+    let placeholder = "sentinel-live-derp-bridge";
+    remove_container(placeholder);
+    assert!(
+        Command::new("podman")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                placeholder,
+                "alpine:3",
+                "sleep",
+                "600"
+            ])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let gateway = String::from_utf8(
+        Command::new("podman")
+            .args([
+                "network",
+                "inspect",
+                "podman",
+                "--format",
+                "{{range .Subnets}}{{.Gateway}}{{end}}",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    assert!(gateway.parse::<std::net::Ipv4Addr>().is_ok(), "{gateway}");
+
+    let relay_dir = tempfile::tempdir().unwrap();
+    let (crt, _key) = issue_certs(relay_dir.path(), &gateway, &ca_path);
+    let (derp_port, map_port) = (free_port(), free_port());
+    let map = format!(
+        "{{\"Regions\":{{\"900\":{{\"RegionID\":900,\"RegionCode\":\"local\",\"RegionName\":\"Local\",\"Nodes\":[{{\"Name\":\"900a\",\"RegionID\":900,\"HostName\":\"{gateway}\",\"IPv4\":\"{gateway}\",\"DERPPort\":{derp_port},\"STUNPort\":-1}}]}}}}}}"
+    );
+    std::fs::write(relay_dir.path().join("map.json"), map).unwrap();
+    let _derper = Background(
+        Command::new(&derper)
+            .args([
+                &format!("--hostname={gateway}"),
+                "--certmode=manual",
+                &format!("--certdir={}", crt.parent().unwrap().display()),
+                &format!("-a={gateway}:{derp_port}"),
+                "--stun=false",
+                "--http-port=-1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let server_py = format!(
+        "import http.server, ssl, os\nos.chdir({dir:?})\nsrv = http.server.HTTPServer(({gateway:?}, {map_port}), http.server.SimpleHTTPRequestHandler)\nctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\nctx.load_cert_chain({crt:?}, {key:?})\nsrv.socket = ctx.wrap_socket(srv.socket, server_side=True)\nsrv.serve_forever()\n",
+        dir = relay_dir.path().display().to_string(),
+        crt = crt.display().to_string(),
+        key = crt.with_extension("key").display().to_string(),
+    );
+    let _map_server = Background(
+        Command::new("python3")
+            .args(["-c", &server_py])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let url = format!("https://{gateway}:{map_port}/map.json");
+    std::thread::sleep(Duration::from_secs(2));
+
+    let mut relayed = config(binary, port);
+    relayed.derpmap_url = Some(url.clone());
+    let key = tailcat::ensure_key(&relayed, worker_dir.path(), Role::Worker).unwrap();
+    let controller_dir = tempfile::tempdir().unwrap();
+    let server =
+        tailcat::start_server(&relayed, controller_dir.path(), std::slice::from_ref(&key)).unwrap();
+    let address = server.wait_ready(READY).unwrap();
+
+    // Direct UDP between the container and the host is dropped, so the only
+    // way through is the self-hosted relay — the only region in the map.
+    let _block = UdpBlock::engage();
+    let worker = ContainerWorker::start(
+        binary,
+        "sentinel-live-derp",
+        &worker_dir.path().join("tailcat"),
+        &address,
+        port,
+        &[
+            "-v".to_owned(),
+            format!("{}:/ca.pem:ro", ca_path.display()),
+            "-e".to_owned(),
+            "SSL_CERT_FILE=/ca.pem".to_owned(),
+            "-e".to_owned(),
+            format!("TAILCAT_DERPMAP_URL={url}"),
+        ],
+    );
+    wait_until("an echo through the self-hosted relay", READY, || {
+        worker.echo("self-hosted") == "self-hosted"
+    });
+    let ping = worker.ping(&address, Some(&url));
+    assert!(ping.contains("via DERP(local)"), "{ping}");
+    eprintln!(
+        "self-hosted relay ping: {}",
+        ping.lines().last().unwrap_or("")
+    );
+    server.shutdown();
+    drop(worker);
+    remove_container(placeholder);
 }

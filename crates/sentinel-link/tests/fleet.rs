@@ -837,3 +837,267 @@ fn a_drained_worker_takes_no_new_offers_and_keeps_its_held_attempt() {
             .shutdown(Duration::from_secs(5))
     );
 }
+
+/// Start `n` identical protocol-7 workers, each its own host, and wait until
+/// all are connected with their profiles recorded.
+fn identical_fleet(
+    d: &Deployment,
+    n: usize,
+) -> (Vec<WorkerId>, Vec<Arc<Recorder>>, Vec<WorkerProcess>) {
+    let ids: Vec<WorkerId> = (0..n).map(|_| WorkerId::new()).collect();
+    let recorders: Vec<Arc<Recorder>> = (0..n).map(|_| Recorder::new()).collect();
+    let processes: Vec<WorkerProcess> = ids
+        .iter()
+        .zip(&recorders)
+        .enumerate()
+        .map(|(i, (id, recorder))| {
+            WorkerProcess::start(
+                d,
+                Identity::generate(&format!("same-{i}")).unwrap(),
+                *id,
+                d.enrollment(),
+                STANDARD,
+                profile(10 + i as u8, 128 << 30),
+                Arc::clone(recorder),
+            )
+        })
+        .collect();
+    for process in &processes {
+        process.wait_for("Connected", 1);
+    }
+    eventually("the fleet", || d.controller().connected().len() == n);
+    for worker in ids.iter().copied() {
+        eventually("the reported disk", || {
+            d.store
+                .read(move |c| dispatch::free_capacity(c, worker))
+                .unwrap()
+                .disk_bytes
+                >= 64 << 30
+        });
+    }
+    (ids, recorders, processes)
+}
+
+/// P08-6: the sweep used to fill one worker to capacity before asking the
+/// next, so a burst of three quarter-core jobs landed on whichever idle
+/// worker came first while two identical peers idled. Placement now goes in
+/// rounds ranked by commitment and measured load: each worker gets one.
+#[test]
+fn a_burst_spreads_over_identical_workers() {
+    let mut d = deployment();
+    let (_, recorders, processes) = identical_fleet(&d, 3);
+    let burst = d.runs(vec![(d.tenant_a, d.repo_a, noise_of(3))]);
+    d.controller().wake();
+    eventually("the burst leased", || {
+        burst[0]
+            .iter()
+            .all(|job| d.state(d.tenant_a, *job) == JobState::Leased)
+    });
+    // A job is leased when its offer is written; the worker records the
+    // offer only when it arrives. Wait for all three to arrive, then judge
+    // where they went.
+    eventually("every offer delivered", || {
+        recorders
+            .iter()
+            .map(|r| r.offers.lock().unwrap().len())
+            .sum::<usize>()
+            >= 3
+    });
+    let per_worker: Vec<usize> = recorders
+        .iter()
+        .map(|r| r.offers.lock().unwrap().len())
+        .collect();
+    assert_eq!(per_worker, vec![1, 1, 1], "offers per worker");
+    for process in processes {
+        process.stop().unwrap();
+    }
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
+}
+
+/// P08-7: revocation is written by another process (the host-local admin
+/// command); the controller notices within a reconciliation pass, closes the
+/// revoked worker's live session, and fences what it held — the
+/// acknowledged attempt ends `Reconciled` rather than renewing forever — and
+/// the worker cannot come back.
+#[test]
+fn revoking_a_connected_worker_ends_its_session_and_fences_its_work() {
+    let mut d = deployment();
+    let (ids, recorders, mut processes) = identical_fleet(&d, 1);
+    let worker = ids[0];
+    let job = d.runs(vec![(d.tenant_a, d.repo_a, one_job())])[0][0];
+    d.controller().wake();
+    eventually("the job acknowledged", || {
+        d.held(worker)
+            .iter()
+            .any(|h| h.job == job && h.acknowledged)
+    });
+    let revoked_at = Instant::now();
+    d.store
+        .writer()
+        .write(move |tx| workers::revoke(tx, Authority::HostLocal, worker, UnixMillis::now()))
+        .unwrap();
+    eventually("the attempt fenced", || {
+        d.state(d.tenant_a, job) == JobState::Terminal(Outcome::InfraFailed)
+    });
+    eventually("the session closed", || {
+        !d.controller().connected().contains(&worker)
+    });
+    assert!(
+        revoked_at.elapsed() < RECONCILE_INTERVAL * 3,
+        "revocation took {:?} to take effect",
+        revoked_at.elapsed()
+    );
+    assert_eq!(
+        d.controller()
+            .stats()
+            .revoked_sessions
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        d.store
+            .read(|c| sentinel_store::jobs::get_job(c, d.tenant_a, job))
+            .unwrap()
+            .failure_class,
+        Some(sentinel_core::FailureClass::Reconciled)
+    );
+    assert!(d.held(worker).is_empty());
+    // The worker is refused on reconnect: its loop ends with the rejection.
+    let process = processes.pop().unwrap();
+    let outcome = process.stop();
+    assert!(
+        matches!(outcome, Err(Error::Rejected(_)) | Ok(())),
+        "{outcome:?}"
+    );
+    drop(recorders);
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
+}
+
+/// `n` quarter-core jobs of one run.
+fn noise_of(n: usize) -> String {
+    let mut yaml = String::from("schema: 1\non: [push]\njobs:\n");
+    for i in 0..n {
+        yaml.push_str(&format!(
+            "  n{i}:\n    image: alpine:3\n    resources: {{ cpu: \"0.25\", memory: 128MiB, disk: 1GiB }}\n    steps: [{{ id: s, run: 'true' }}]\n"
+        ));
+    }
+    yaml
+}
+
+/// P08-15: a store error in placement used to be dropped silently, so a
+/// fleet that stopped placing left no evidence. Break the schema under a
+/// running controller: the failure is counted (and logged by kind), the
+/// loop keeps running, and nothing is offered.
+#[test]
+fn a_failing_placement_is_counted_not_swallowed() {
+    let mut d = deployment();
+    let (_, recorders, processes) = identical_fleet(&d, 1);
+    d.store
+        .writer()
+        .raw(|c| {
+            c.execute_batch("ALTER TABLE jobs RENAME COLUMN pull_request TO pull_request_gone")?;
+            Ok(())
+        })
+        .unwrap();
+    d.runs(vec![(d.tenant_a, d.repo_a, one_job())]);
+    d.controller().wake();
+    eventually("the placement failure counted", || {
+        d.controller()
+            .stats()
+            .placement_errors
+            .load(Ordering::SeqCst)
+            > 0
+    });
+    assert!(recorders[0].offers.lock().unwrap().is_empty());
+    for process in processes {
+        process.stop().unwrap();
+    }
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
+}
+
+/// T2 (Q07): transport telemetry used to be measured once at process start
+/// and replayed on every session. With a live source on the worker handle
+/// (the Tailcat helper's latest probe), each session reports what the helper
+/// last measured — here a relayed path, then, after the helper re-measures
+/// and the session reconnects, a direct one — and the controller exposes it
+/// per worker.
+#[test]
+fn each_session_reports_the_helpers_latest_transport_measurement() {
+    use sentinel_link::session::{Path, TransportStats};
+    let mut d = deployment();
+    let id = WorkerId::new();
+    let measured = Arc::new(Mutex::new(Path::Relay));
+    let handle = Arc::new(worker::Handle::new());
+    {
+        let measured = Arc::clone(&measured);
+        handle.set_transport_source(Arc::new(move || TransportStats {
+            path: *measured.lock().unwrap(),
+            rtt_ns: Some(5_000_000),
+            helper_version: Some("tailcat 0.6.0".into()),
+            ..TransportStats::default()
+        }));
+    }
+    let config = worker::Config {
+        controller: d.controller().local_addr(),
+        server: d.controller().fingerprint(),
+        worker: id,
+        name: "measured".into(),
+        hello: hello(),
+        capacity: STANDARD,
+        profile: profile(40, 128 << 30),
+        // What a process without a live source would send: never used here.
+        transport: TransportStats::default(),
+        remote_cache: false,
+    };
+    let (enrollment, recorder, grip) = (d.enrollment(), Recorder::new(), Arc::clone(&handle));
+    let identity = Identity::generate("measured").unwrap();
+    let thread = thread::spawn(move || {
+        worker::run(
+            config,
+            identity,
+            Some(enrollment),
+            &*recorder,
+            &grip,
+            &|_| {},
+        )
+    });
+    let link = d.controller().handle();
+    eventually("the relayed path reported", || {
+        link.transport(id).is_some_and(|t| t.path == Path::Relay)
+    });
+    let first = link.transport(id).unwrap();
+    assert_eq!(first.helper_version.as_deref(), Some("tailcat 0.6.0"));
+    assert_eq!(first.reconnects, 0);
+
+    // The helper re-measures a direct path; the next session reports it.
+    *measured.lock().unwrap() = Path::Direct;
+    assert!(link.disconnect(id));
+    eventually("the re-measured path reported", || {
+        link.transport(id)
+            .is_some_and(|t| t.path == Path::Direct && t.reconnects == 1)
+    });
+
+    handle.stop();
+    thread.join().unwrap().unwrap();
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
+}

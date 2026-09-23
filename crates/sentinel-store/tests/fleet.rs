@@ -368,19 +368,33 @@ jobs:
     );
     // The queue listing names the same reasons, oldest first, and the one
     // job that fits still places: a hard constraint is per job.
-    let queue = f
+    let page = f
         .store
-        .read(move |c| dispatch::list_queue(c, tenant, &[w]))
+        .read(move |c| dispatch::list_queue(c, tenant, &[w], 100))
         .unwrap();
+    assert_eq!(page.total, 5);
+    let queue = page.jobs;
     assert_eq!(queue.len(), 5);
     // Compiled order is alphabetical: arm, fits, gpu, huge, scratch.
     assert_eq!(queue[0].job, arm);
     assert_eq!(queue[0].reason, WaitReason::ArchMismatch);
     assert_eq!(queue[1].job, fits);
-    assert_eq!(queue[1].reason, WaitReason::Capacity);
+    // The idle connected worker has the room and nothing holds the job: it
+    // is not waiting for capacity, it is next.
+    assert_eq!(queue[1].reason, WaitReason::Ready);
     assert_eq!(queue[3].job, huge);
     assert_eq!(queue[4].job, scratch);
     assert!(queue.iter().all(|entry| entry.age_ms > 0));
+    // A bounded page is the oldest `limit` jobs, and says how many wait.
+    let two = f
+        .store
+        .read(move |c| dispatch::list_queue(c, tenant, &[w], 2))
+        .unwrap();
+    assert_eq!(two.total, 5);
+    assert_eq!(
+        two.jobs.iter().map(|j| j.job).collect::<Vec<_>>(),
+        vec![arm, fits]
+    );
     let offer = place(&f, w, pool, at(2_100)).unwrap();
     assert_eq!(offer.job, fits);
 }
@@ -599,11 +613,20 @@ fn a_warm_worker_is_waited_for_only_inside_the_bound() {
     let cold = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
     let warm = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[key]);
     let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    // A short job: the warm worker is certain to free inside the window.
     let (_, filler) = run(
         &f,
         tenant,
         repo,
-        single_job(1, "1GiB", "1GiB").as_str(),
+        "schema: 1
+on: [push]
+jobs:
+  one:
+    image: alpine:3
+    timeout: 20s
+    resources: { cpu: 1, memory: 1GiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+",
         at(2_000),
     );
     let (_, target) = run(
@@ -760,4 +783,491 @@ fn a_job_only_the_largest_worker_fits_is_not_stranded_by_small_work() {
         let used: i64 = offers.iter().map(|o| o.cpu_millis).sum();
         assert!(used <= room.cpu_millis);
     }
+}
+
+/// Place on `w` with plain `place` until nothing more fits (bounded).
+fn fill_all(f: &Fixture, w: WorkerId, pool: PoolId, now: UnixMillis) -> Vec<dispatch::Offer> {
+    let mut out = Vec::new();
+    while let Some(offer) = place(f, w, pool, now) {
+        out.push(offer);
+        assert!(
+            out.len() <= dispatch::MAX_HELD_ATTEMPTS,
+            "runaway placement"
+        );
+    }
+    out
+}
+
+/// `n` jobs of `cpu` cores each, with an optional extra job-level line.
+fn n_jobs(n: usize, cpu: &str, extra: &str) -> String {
+    let mut yaml = String::from("schema: 1\non: [push]\njobs:\n");
+    for i in 0..n {
+        yaml.push_str(&format!(
+            "  j{i:03}:\n    image: alpine:3\n{extra}    resources: {{ cpu: \"{cpu}\", memory: 128MiB, disk: 1GiB }}\n    steps: [{{ id: s, run: 'true' }}]\n"
+        ));
+    }
+    yaml
+}
+
+/// A tenant with its own dedicated pool (no grant to the fixture's pool).
+fn isolated_tenant(f: &Fixture, slug: &str) -> (TenantId, RepoId, PoolId) {
+    let (root, tenant, repo, pool) = (f.root, TenantId::new(), RepoId::new(), PoolId::new());
+    let slug = slug.to_owned();
+    f.store
+        .writer()
+        .write(move |tx| {
+            auth::create_namespace(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                Namespace::parse(&slug).unwrap(),
+                NamespaceKind::Organization,
+                NOW,
+            )?;
+            jobs::insert_repo(tx, tenant, repo, "app", NOW)?;
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                pool,
+                "private",
+                PoolKind::Dedicated(tenant),
+                NOW,
+            )
+        })
+        .unwrap();
+    (tenant, repo, pool)
+}
+
+const SERIAL: &str = "schema: 1
+on: [push]
+concurrency: { group: serial }
+jobs:
+  a:
+    image: alpine:3
+    resources: { cpu: 1, memory: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+";
+
+/// P08-1: two queued runs of a serializing group used to exclude each other
+/// (each saw the other's live job) and neither ever placed. The older run
+/// goes first; the newer waits with `ConcurrencyLimit` exactly as long as the
+/// older is live, then goes.
+#[test]
+fn two_queued_runs_of_a_serial_group_both_run_in_order() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (_, earlier) = run(&f, tenant, repo, SERIAL, at(2_300));
+    let (_, later) = run(&f, tenant, repo, SERIAL, at(2_400));
+    assert_eq!(reason(&f, earlier[0], &[w]), WaitReason::Ready);
+    assert_eq!(reason(&f, later[0], &[w]), WaitReason::ConcurrencyLimit);
+    let first = place(&f, w, pool, at(2_500)).expect("the older run places");
+    assert_eq!(first.job, earlier[0]);
+    // While the older run executes, the newer one waits, with its reason.
+    assert_eq!(place(&f, w, pool, at(2_600)), None);
+    assert_eq!(reason(&f, later[0], &[w]), WaitReason::ConcurrencyLimit);
+    finish(&f, w, &first, at(2_700));
+    let second = place(&f, w, pool, at(3_000)).expect("then the newer run places");
+    assert_eq!(second.job, later[0]);
+}
+
+/// P08-1: a group is a (tenant, repository, key) lock, as documented — a
+/// sibling repository's run of the same group name does not wait.
+#[test]
+fn a_concurrency_group_is_held_per_repository() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let sibling = RepoId::new();
+    f.store
+        .writer()
+        .write(move |tx| jobs::insert_repo(tx, tenant, sibling, "lib", NOW))
+        .unwrap();
+    let (_, mine) = run(&f, tenant, repo, SERIAL, at(2_300));
+    let (_, theirs) = run(&f, tenant, sibling, SERIAL, at(2_400));
+    let placed: Vec<JobId> = fill_all(&f, w, pool, at(2_500))
+        .iter()
+        .map(|o| o.job)
+        .collect();
+    assert_eq!(placed.len(), 2, "{placed:?}");
+    assert!(placed.contains(&mine[0]) && placed.contains(&theirs[0]));
+}
+
+/// P08-1: two `cancel_in_progress` runs created in the same millisecond used
+/// to survive together (a strict `<` cancelled neither); exactly one does.
+#[test]
+fn same_millisecond_superseding_runs_leave_exactly_one() {
+    let f = fixture();
+    let (tenant, repo) = (f.tenant, f.repo);
+    let deploy = "schema: 1
+on: [push]
+concurrency: { group: deploy, cancel_in_progress: true }
+jobs:
+  a:
+    image: alpine:3
+    steps: [{ id: s, run: 'true' }]
+";
+    let (_, first) = run(&f, tenant, repo, deploy, at(2_000));
+    let (_, second) = run(&f, tenant, repo, deploy, at(2_000));
+    assert_eq!(
+        state(&f, first[0]),
+        JobState::Terminal(Outcome::Canceled),
+        "the run applied first is superseded"
+    );
+    assert_eq!(state(&f, second[0]), JobState::Queued);
+}
+
+/// P08-2: a large job waiting in another tenant's dedicated pool used to hold
+/// half of this pool's worker idle.
+#[test]
+fn a_large_job_in_another_pool_reserves_nothing_here() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 16_000, 64 << 30, 100 << 30, &[], None, &[]);
+    let (y, y_repo, _) = isolated_tenant(&f, "other");
+    run(&f, y, y_repo, &single_job(8, "8GiB", "8GiB"), at(2_000));
+    run(&f, f.tenant, f.repo, &n_jobs(16, "1", ""), at(2_100));
+    assert_eq!(fill_all(&f, w, f.pool, at(2_200)).len(), 16);
+}
+
+/// P08-2: an 8-core job no worker here can ever run (arm64 on an x86_64
+/// fleet) used to reserve its path for up to the six-hour queue timeout.
+#[test]
+fn an_unrunnable_large_job_reserves_nothing() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 16_000, 64 << 30, 100 << 30, &[], None, &[]);
+    run(
+        &f,
+        f.tenant,
+        f.repo,
+        &n_jobs(1, "8", "    runs_on: { arch: arm64 }\n"),
+        at(2_000),
+    );
+    run(&f, f.tenant, f.repo, &n_jobs(16, "1", ""), at(2_100));
+    assert_eq!(fill_all(&f, w, f.pool, at(2_200)).len(), 16);
+}
+
+/// P08-2: a pull-request job this worker cannot run (it needs a label the
+/// worker lacks) used to keep a quarter of the host idle anyway.
+#[test]
+fn an_unrunnable_pull_request_job_reserves_nothing() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], None, &[]);
+    let (pr, _) = run(
+        &f,
+        f.tenant,
+        f.repo,
+        &n_jobs(1, "1", "    runs_on: { labels: [gpu] }\n"),
+        at(2_000),
+    );
+    record_event(&f, f.tenant, f.repo, pr, "pull_request");
+    run(&f, f.tenant, f.repo, &n_jobs(8, "1", ""), at(2_100));
+    assert_eq!(fill_all(&f, w, f.pool, at(2_200)).len(), 8);
+}
+
+/// P08-3: the pull-request reserve summed every identity on the host, so two
+/// identities reserved half the machine instead of a quarter.
+#[test]
+fn the_pull_request_reserve_counts_the_host_once() {
+    let f = fixture();
+    let w1 = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], Some(HOST), &[]);
+    let _w2 = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], Some(HOST), &[]);
+    run(&f, f.tenant, f.repo, &n_jobs(8, "1", ""), at(2_000));
+    let (pr, _) = run(&f, f.tenant, f.repo, &n_jobs(1, "1", ""), at(2_100));
+    record_event(&f, f.tenant, f.repo, pr, "pull_request");
+    let placed = fill_all(&f, w1, f.pool, at(2_200));
+    let before_pr = placed.iter().take_while(|o| o.run != pr).count();
+    // A quarter of one 8-core host (2 cores) stays free for the PR job.
+    assert_eq!(before_pr, 6, "{} placed in all", placed.len());
+    assert!(placed.iter().any(|o| o.run == pr));
+}
+
+/// P08-4: labels were filtered after a per-tenant `LIMIT 32`, so forty `gpu`
+/// jobs hid a plain job from an idle worker and the explanation said
+/// `Capacity`. Labels are now part of the candidate scan.
+#[test]
+fn label_mismatched_jobs_never_hide_a_fitting_one() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], None, &[]);
+    run(
+        &f,
+        f.tenant,
+        f.repo,
+        &n_jobs(40, "0.25", "    runs_on: { labels: [gpu] }\n"),
+        at(2_000),
+    );
+    let (_, plain) = run(&f, f.tenant, f.repo, &n_jobs(1, "0.25", ""), at(2_100));
+    assert_eq!(reason(&f, plain[0], &[w]), WaitReason::Ready);
+    let offer = place(&f, w, f.pool, at(2_200)).expect("the plain job places");
+    assert_eq!(offer.job, plain[0]);
+}
+
+/// P08-4: the same head-of-line hiding for jobs held for locality: forty
+/// jobs wait for a warm worker, and a job no worker has warm is still found
+/// behind them by paging past the held rows.
+#[test]
+fn locality_held_jobs_never_hide_a_placeable_one() {
+    let f = fixture();
+    let key = [0xaa_u8; 8];
+    let cold = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], None, &[]);
+    let _warm = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], None, &[key]);
+    let (tenant, repo) = (f.tenant, f.repo);
+    run(&f, tenant, repo, &n_jobs(40, "0.25", ""), at(2_000));
+    // A different image: nobody has it warm, so nothing holds it.
+    let spec = spec(&n_jobs(1, "0.25", ""));
+    let other = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let fresh = f
+        .store
+        .writer()
+        .write(move |tx| {
+            let ids = runs::create_run(tx, tenant, repo, RunId::new(), &spec, at(2_100))?;
+            runs::resolve_image(tx, tenant, ids[0], other, "linux/amd64")?;
+            Ok(ids[0])
+        })
+        .unwrap();
+    let offer = place(&f, cold, f.pool, at(2_200)).expect("the fresh-image job places");
+    assert_eq!(offer.job, fresh);
+}
+
+/// P08-5: repository fairness inside a tenant. Repository A queued twenty
+/// jobs before repository B's one; B's job is placed second, not
+/// twenty-first.
+#[test]
+fn a_repository_backlog_does_not_starve_its_siblings() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 64_000, 64 << 30, 100 << 30, &[], None, &[]);
+    let (tenant, repo) = (f.tenant, f.repo);
+    let sibling = RepoId::new();
+    f.store
+        .writer()
+        .write(move |tx| jobs::insert_repo(tx, tenant, sibling, "lib", NOW))
+        .unwrap();
+    run(&f, tenant, repo, &n_jobs(20, "1", ""), at(2_000));
+    let (_, theirs) = run(&f, tenant, sibling, &n_jobs(1, "1", ""), at(2_500));
+    let first = place(&f, w, f.pool, at(3_000)).unwrap();
+    let second = place(&f, w, f.pool, at(3_000)).unwrap();
+    assert_ne!(first.job, theirs[0], "the oldest head goes first");
+    assert_eq!(second.job, theirs[0], "then the idle repository");
+}
+
+/// Q09's noisy tenant, with demand above capacity so the decision is
+/// observable: tenant A queues forty jobs first, tenant B four; a worker
+/// with room for eight gives B its four within the first eight.
+#[test]
+fn a_noisy_tenant_does_not_crowd_out_a_quiet_one() {
+    let f = fixture();
+    let (quiet, quiet_repo) = other_tenant(&f, "quiet");
+    let w = worker(&f, f.pool, 8_000, 64 << 30, 100 << 30, &[], None, &[]);
+    run(&f, f.tenant, f.repo, &n_jobs(40, "1", ""), at(2_000));
+    run(&f, quiet, quiet_repo, &n_jobs(4, "1", ""), at(2_500));
+    let placed = fill_all(&f, w, f.pool, at(3_000));
+    assert_eq!(placed.len(), 8);
+    assert_eq!(placed.iter().filter(|o| o.tenant == quiet).count(), 4);
+}
+
+/// P08-6: expected completion, not the lease. A warm worker running a job
+/// whose timeout reaches past the locality window is not about to free —
+/// renewal keeps its lease inside the window forever — so a cold worker
+/// takes the job at once.
+#[test]
+fn a_busy_warm_worker_with_long_work_does_not_hold_a_cold_job() {
+    let f = fixture();
+    let key = [0xaa_u8; 8];
+    let cold = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let warm = worker(&f, f.pool, 4_000, 16 << 30, 20 << 30, &[], None, &[key]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    // An hour-long job (the default timeout) fills the warm worker.
+    let (_, long) = run(&f, tenant, repo, &single_job(4, "4GiB", "4GiB"), at(2_000));
+    assert_eq!(place(&f, warm, pool, at(2_100)).unwrap().job, long[0]);
+    let (_, target) = run(&f, tenant, repo, &single_job(4, "4GiB", "4GiB"), at(2_200));
+    assert_eq!(reason(&f, target[0], &[cold, warm]), WaitReason::Ready);
+    assert_eq!(place(&f, cold, pool, at(2_300)).unwrap().job, target[0]);
+}
+
+/// P08-7: revocation fences the live session's attempts at once. The
+/// revoked worker can no longer acknowledge, renew, report or publish, and
+/// the dispatcher's sweep settles what it held: the acknowledged attempt
+/// `Reconciled` (never replayed), the unacknowledged offer back to the queue.
+#[test]
+fn a_revoked_worker_holds_nothing_and_its_attempts_are_settled() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    run(&f, tenant, repo, &n_jobs(2, "1", ""), at(2_000));
+    let acked = place(&f, w, pool, at(2_100)).unwrap();
+    let offered = place(&f, w, pool, at(2_100)).unwrap();
+    let (aa, af, oa, of) = (acked.attempt, acked.fence, offered.attempt, offered.fence);
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::acknowledge(tx, w, aa, af, at(2_200))?;
+            dispatch::report(
+                tx,
+                w,
+                aa,
+                af,
+                Event::PreparationStarted,
+                None,
+                at(2_250),
+                None,
+            )?;
+            workers::revoke(tx, Authority::HostLocal, w, at(2_300))
+        })
+        .unwrap();
+    let store = &f.store;
+    assert!(!store.read(|c| dispatch::is_held(c, w, aa)).unwrap());
+    assert!(matches!(
+        store.writer().write(move |tx| dispatch::renew(
+            tx,
+            w,
+            &[aa],
+            dispatch::DEFAULT_LEASE_MS,
+            at(2_400)
+        )),
+        Err(Error::Forbidden)
+    ));
+    assert!(matches!(
+        store
+            .writer()
+            .write(move |tx| dispatch::acknowledge(tx, w, oa, of, at(2_400))),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        store.writer().write(move |tx| dispatch::report(
+            tx,
+            w,
+            aa,
+            af,
+            Event::StepsStarted,
+            None,
+            at(2_400),
+            None
+        )),
+        Err(Error::NotFound)
+    ));
+    assert!(store.read(|c| dispatch::attempt_scope(c, w, aa)).is_err());
+    let settled = store
+        .writer()
+        .write(|tx| dispatch::reconcile_revoked(tx, at(2_500), None))
+        .unwrap();
+    assert_eq!(settled, 2);
+    assert_eq!(
+        state(&f, acked.job),
+        JobState::Terminal(Outcome::InfraFailed)
+    );
+    assert_eq!(state(&f, offered.job), JobState::Queued);
+    // Nothing is left to settle.
+    assert_eq!(
+        store
+            .writer()
+            .write(|tx| dispatch::reconcile_revoked(tx, at(2_600), None))
+            .unwrap(),
+        0
+    );
+}
+
+/// P08-7 across the Part 04 paths: a revoked worker is served no run spec
+/// (which carries source access), cannot hand an acknowledged attempt back,
+/// and names no remote-cache boundary — each refused like a stranger's.
+#[test]
+fn a_revoked_worker_gets_no_spec_hand_back_or_cache_boundary() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    run(&f, tenant, repo, &n_jobs(1, "1", ""), at(2_000));
+    let offer = place(&f, w, pool, at(2_100)).unwrap();
+    let (a, fence) = (offer.attempt, offer.fence);
+    f.store
+        .writer()
+        .write(move |tx| dispatch::acknowledge(tx, w, a, fence, at(2_200)).map(|_| ()))
+        .unwrap();
+    let store = &f.store;
+    // Held and acknowledged: every path answers before the revocation.
+    assert_eq!(
+        store.read(|c| dispatch::spec_gate(c, w, a)).unwrap(),
+        dispatch::SpecGate::Ready
+    );
+    assert!(store.read(|c| dispatch::spec_bytes(c, w, a)).is_ok());
+    assert!(store.read(|c| dispatch::job_context(c, w, a)).is_ok());
+    assert!(store.read(|c| dispatch::cache_scope(c, w, a, None)).is_ok());
+    store
+        .writer()
+        .write(move |tx| workers::revoke(tx, Authority::HostLocal, w, at(2_300)))
+        .unwrap();
+    assert_eq!(
+        store.read(|c| dispatch::spec_gate(c, w, a)).unwrap(),
+        dispatch::SpecGate::NotHeld
+    );
+    assert!(matches!(
+        store.read(|c| dispatch::spec_bytes(c, w, a)),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        store.read(|c| dispatch::job_context(c, w, a)),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        store.read(|c| dispatch::cache_scope(c, w, a, Some(at(0)))),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        store
+            .writer()
+            .write(move |tx| dispatch::decline(tx, w, a, fence, at(2_400))),
+        Err(Error::NotFound)
+    ));
+    // The hand-back changed nothing; the revocation sweep settles it.
+    assert_eq!(state(&f, offer.job), JobState::Leased);
+    assert_eq!(
+        store
+            .writer()
+            .write(|tx| dispatch::reconcile_revoked(tx, at(2_500), None))
+            .unwrap(),
+        1
+    );
+}
+
+/// P08-13: a lease that has passed cannot be renewed back to life, and an
+/// attempt renewed between the sweep's read and its write is not expired.
+#[test]
+fn a_passed_lease_stays_expired_and_a_renewed_one_is_not_expired() {
+    let f = fixture();
+    let w = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    run(&f, tenant, repo, &n_jobs(2, "1", ""), at(2_000));
+    let a = place(&f, w, pool, at(2_100)).unwrap();
+    let b = place(&f, w, pool, at(2_100)).unwrap();
+    let (aa, af, ba, bf) = (a.attempt, a.fence, b.attempt, b.fence);
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::acknowledge(tx, w, aa, af, at(2_200))?;
+            dispatch::acknowledge(tx, w, ba, bf, at(2_200)).map(|_| ())
+        })
+        .unwrap();
+    let lapsed = at(2_100 + dispatch::DEFAULT_LEASE_MS + 1);
+    // `a`'s lease passed: a late beat does not resurrect it.
+    let (_, stop) = f
+        .store
+        .writer()
+        .write(move |tx| dispatch::renew(tx, w, &[aa], dispatch::DEFAULT_LEASE_MS, lapsed))
+        .unwrap();
+    assert_eq!(stop, vec![aa]);
+    // `b` is renewed in time, then an expiry decided from an older snapshot
+    // arrives: it is refused, and `b` keeps running.
+    f.store
+        .writer()
+        .write(move |tx| dispatch::renew(tx, w, &[ba], dispatch::DEFAULT_LEASE_MS, at(20_000)))
+        .unwrap();
+    assert!(matches!(
+        f.store
+            .writer()
+            .write(move |tx| dispatch::expire(tx, ba, lapsed, None)),
+        Err(Error::Conflict)
+    ));
+    assert_eq!(state(&f, b.job), JobState::Leased);
+    f.store
+        .writer()
+        .write(move |tx| dispatch::expire(tx, aa, lapsed, None))
+        .unwrap();
+    assert_eq!(state(&f, a.job), JobState::Terminal(Outcome::InfraFailed));
 }
