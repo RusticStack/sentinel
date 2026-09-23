@@ -619,3 +619,166 @@ fn an_authorized_checkout_still_enforces_the_access() {
         .unwrap_err();
     assert!(matches!(error, Error::Preparation(_)));
 }
+
+/// P07-17: a mirror serves only the remote that filled it — the same
+/// repository id checked out from another remote gets a rebuilt, empty
+/// store, never the first remote's objects.
+#[test]
+fn a_mirror_serves_only_the_remote_that_filled_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let victim = repository(temp.path());
+    let other = repository(temp.path());
+    // A commit only the first remote has.
+    fs::write(victim.path.join("secret.txt"), "victim only\n").unwrap();
+    git(&victim.path, &["add", "."]);
+    git(&victim.path, &["commit", "-qm", "victim"]);
+    let private = git(&victim.path, &["rev-parse", "HEAD"]);
+    let mirrors = Mirrors::open(&temp.path().join("mirrors")).unwrap();
+    let repo_id = RepoId::new();
+    let timeout = Duration::from_secs(60);
+    mirrors
+        .checkout(
+            &work(temp.path(), "victim"),
+            &repo_id,
+            &source(&victim, &private, None),
+            None,
+            "att_victim",
+            timeout,
+        )
+        .unwrap();
+    let mirror = mirrors.path(&repo_id);
+    assert!(git_ok(&mirror, &["cat-file", "-e", &private]));
+    mirrors
+        .checkout(
+            &work(temp.path(), "other"),
+            &repo_id,
+            &source(&other, &other.first, None),
+            None,
+            "att_other",
+            timeout,
+        )
+        .unwrap();
+    assert!(
+        !git_ok(&mirror, &["cat-file", "-e", &private]),
+        "the first remote's objects are gone with its store"
+    );
+}
+
+/// P07-19: store damage a bare-repository check cannot see — the pinned
+/// commit's object gone from under a ref — is rebuilt and served, not a
+/// permanent preparation failure.
+#[test]
+fn damage_under_a_ref_tip_is_rebuilt_not_a_permanent_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = repository(temp.path());
+    let mirrors = Mirrors::open(&temp.path().join("mirrors")).unwrap();
+    let repo_id = RepoId::new();
+    let timeout = Duration::from_secs(60);
+    let src = source(&repo, &repo.first, None);
+    mirrors
+        .checkout(
+            &work(temp.path(), "a"),
+            &repo_id,
+            &src,
+            None,
+            "att_a",
+            timeout,
+        )
+        .unwrap();
+    let mirror = mirrors.path(&repo_id);
+    // Every object file of the store goes: the pin ref now names nothing.
+    let objects = mirror.join("objects");
+    for entry in fs::read_dir(&objects).unwrap().flatten() {
+        let name = entry.file_name();
+        let name = name.to_str().unwrap();
+        if name.len() == 2 || name == "pack" {
+            fs::remove_dir_all(entry.path()).unwrap();
+        }
+    }
+    fs::create_dir(objects.join("pack")).unwrap();
+    let out = mirrors
+        .checkout(
+            &work(temp.path(), "b"),
+            &repo_id,
+            &src,
+            None,
+            "att_b",
+            timeout,
+        )
+        .unwrap();
+    assert_eq!(out.sha, repo.first);
+}
+
+/// P07-23: a crashed attempt's leftover lease temp file does not block the
+/// same attempt id's next lease.
+#[test]
+fn a_leftover_lease_temp_file_does_not_block_a_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = repository(temp.path());
+    let mirrors = Mirrors::open(&temp.path().join("mirrors")).unwrap();
+    let repo_id = RepoId::new();
+    let leases = temp.path().join(format!("mirrors/{repo_id}.leases"));
+    fs::create_dir_all(&leases).unwrap();
+    fs::write(leases.join(".att_retry.tmp"), b"torn").unwrap();
+    mirrors
+        .checkout(
+            &work(temp.path(), "retry"),
+            &repo_id,
+            &source(&repo, &repo.first, None),
+            None,
+            "att_retry",
+            Duration::from_secs(60),
+        )
+        .unwrap();
+}
+
+/// P07-22: the sweep bounds mirror disk — a killed fetch's stale `tmp_*`
+/// goes, and over the budget the least recently written mirror goes; a
+/// mirror whose writer lock is held is never touched.
+#[test]
+fn the_sweep_bounds_mirror_disk() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = repository(temp.path());
+    let mirrors = Mirrors::open(&temp.path().join("mirrors")).unwrap();
+    let (old, new) = (RepoId::new(), RepoId::new());
+    for (id, name) in [(old, "old"), (new, "new")] {
+        mirrors
+            .checkout(
+                &work(temp.path(), name),
+                &id,
+                &source(&repo, &repo.first, None),
+                None,
+                &format!("att_{name}"),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+    }
+    // `old` was written an hour earlier; a dead fetch left a temp pack.
+    let lock = temp.path().join(format!("mirrors/{old}.lock"));
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&lock)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    let tmp = mirrors.path(&new).join("objects/pack/tmp_pack_dead");
+    fs::write(&tmp, b"partial").unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200))
+        .unwrap();
+    let one = {
+        let s = mirrors.sweep(u64::MAX);
+        assert_eq!(s.removed, 0);
+        assert_eq!(s.tmp_removed, 1);
+        s.bytes / 2
+    };
+    assert!(!tmp.exists());
+    let swept = mirrors.sweep(one + one / 2);
+    assert_eq!(swept.removed, 1, "{swept:?}");
+    assert!(!mirrors.path(&old).exists(), "least recently written goes");
+    assert!(mirrors.path(&new).exists());
+    assert!(lock.exists(), "the lock file itself stays");
+}

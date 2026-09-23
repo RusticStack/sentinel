@@ -259,7 +259,10 @@ pub fn run(
     let event = match &verdict {
         Verdict::Passed => Event::Passed,
         Verdict::Failed(class, why) => {
-            summary.detail = why.chars().take(500).collect();
+            // The failure reason leads; a mirror fallback reason recorded
+            // during preparation stays after it rather than being lost
+            // (P07-24), both inside the same 500-character bound.
+            summary.detail = failure_detail(why, &summary.detail);
             Event::Failed(*class)
         }
     };
@@ -281,6 +284,19 @@ pub fn run(
     // this attempt reported.
     offer_caches(root, job, &sealed, remote.as_deref(), cancel);
     (verdict, summary)
+}
+
+/// The summary's `detail` for a failed attempt: the failure reason, then
+/// any checkout fallback reason preparation recorded, within 500 chars.
+fn failure_detail(why: &str, fallback: &str) -> String {
+    if fallback.is_empty() {
+        why.chars().take(500).collect()
+    } else {
+        format!("{why} (checkout fell back: {fallback})")
+            .chars()
+            .take(500)
+            .collect()
+    }
 }
 
 fn prepare(
@@ -975,6 +991,22 @@ mod tests {
     use sentinel_protocol::cache::Trust;
 
     use super::*;
+
+    /// P07-24: a failed attempt keeps the mirror fallback reason next to
+    /// its own, bounded.
+    #[test]
+    fn a_failure_keeps_the_checkout_fallback_reason() {
+        assert_eq!(
+            failure_detail("step 0 exited with 1", ""),
+            "step 0 exited with 1"
+        );
+        let detail = failure_detail("step 0 exited with 1", "git mirror: lock wait");
+        assert_eq!(
+            detail,
+            "step 0 exited with 1 (checkout fell back: git mirror: lock wait)"
+        );
+        assert_eq!(failure_detail(&"x".repeat(600), "y").chars().count(), 500);
+    }
 
     #[test]
     fn publication_follows_whether_the_commands_ran() {

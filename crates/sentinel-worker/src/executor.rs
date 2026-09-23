@@ -528,6 +528,11 @@ impl Inner {
             &mut cursor,
         );
         drop(cursor);
+        // The mirrors share the pass's cadence: bounded, and skipped for
+        // any mirror a checkout holds (P07-22).
+        if let Some(mirrors) = &self.mirrors {
+            let _ = mirrors.sweep(crate::checkout::MIRRORS_BUDGET_BYTES);
+        }
         if self
             .cache_bytes
             .swap(stats.estimated_bytes, std::sync::atomic::Ordering::Relaxed)

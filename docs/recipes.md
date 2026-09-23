@@ -118,3 +118,13 @@ Records carry `"status": "measured"` with the attempt's own timings, or
 `"status": "blocked"` with the provisioning/runtime reason — see the
 header of the script for the environment contract (rootless Podman on
 Linux/WSL2; provisioning may use the network, measured steps cannot).
+
+## Symlinks are not cached
+
+A cache payload carries regular files and directories only: publication skips every symlink (it is counted in the commit's `skipped`, never followed), because a link's target is a path the next job's view could not trust. Tools that build their installed state out of links therefore restore *incomplete*, not broken silently — the recipes above rebuild what the links provided:
+
+- **Python** — a venv's `bin/python` is a link to the interpreter; the recipe recreates the venv when it is missing (`test -x .venv/bin/python || python -m venv .venv`) before installing.
+- **npm / Bun** — `node_modules/.bin` shims are links; the install step (`npm ci --prefer-offline`, `bun install`) recreates them from the restored packages.
+- **pnpm** — the default isolated linker is built from links into the store; the recipe forces `node-linker=hoisted` so the restored tree is plain files. With the isolated linker the cache still serves the content-addressed store (`downloads`), just not the linked `node_modules`.
+
+A cache whose value is mostly links belongs in a `downloads` store the tool re-links itself.

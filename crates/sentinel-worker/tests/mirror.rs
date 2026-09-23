@@ -64,9 +64,9 @@ fn a_mirrored_checkout_reports_its_route_and_separate_phases() {
     let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
     let source =
         PinnedSource::new(repo.to_str().unwrap(), &first, Some("refs/heads/main")).unwrap();
-    let out = checkout::checkout_mirrored(
+    let out = checkout::through_mirror(
         ws.path(),
-        Some(&mirrors),
+        &mirrors,
         &repo_id,
         &source,
         None,
@@ -112,9 +112,9 @@ fn a_mirror_that_cannot_serve_falls_back_with_the_reason_on_record() {
     let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
     let source = PinnedSource::new(repo.to_str().unwrap(), &first, None).unwrap();
     let started = Instant::now();
-    let out = checkout::checkout_mirrored(
+    let out = checkout::through_mirror(
         ws.path(),
-        Some(&mirrors),
+        &mirrors,
         &repo_id,
         &source,
         None,
@@ -173,9 +173,9 @@ fn an_absent_commit_is_a_preparation_failure_not_a_fallback() {
     let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
     let missing = "0123456789abcdef0123456789abcdef01234567";
     let source = PinnedSource::new(repo.to_str().unwrap(), missing, None).unwrap();
-    let error = checkout::checkout_mirrored(
+    let error = checkout::through_mirror(
         ws.path(),
-        Some(&mirrors),
+        &mirrors,
         &RepoId::new(),
         &source,
         None,
@@ -186,5 +186,75 @@ fn an_absent_commit_is_a_preparation_failure_not_a_fallback() {
     // The remote's answer propagates as the preparation failure it is;
     // falling back would only re-ask the same question.
     assert!(matches!(error, Error::Preparation(_)), "{error:?}");
+    ws.destroy().unwrap();
+}
+
+/// P07-17: a manual run names its own remote — here a local path, which
+/// could as well be another repository's mirror — so it never goes through
+/// (or fills) a mirror: the route is direct and no store is created.
+#[test]
+fn a_manual_run_never_reads_or_feeds_a_mirror() {
+    let temp = tempfile::tempdir().unwrap();
+    let (repo, first, _) = repository(temp.path());
+    let mirrors = Mirrors::open(&temp.path().join("mirrors")).unwrap();
+    let repo_id = RepoId::new();
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    let source = PinnedSource::new(repo.to_str().unwrap(), &first, None).unwrap();
+    let out = checkout::checkout_mirrored(
+        ws.path(),
+        Some(&mirrors),
+        &repo_id,
+        &source,
+        None,
+        "att_manual",
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    assert_eq!(out.route, CheckoutRoute::Direct);
+    assert!(!mirrors.path(&repo_id).exists(), "no mirror was built");
+    assert_eq!(out.checkout.sha, first);
+    ws.destroy().unwrap();
+}
+
+/// P07-18: when the mirror cannot serve, the direct fallback runs within
+/// what is left of the one deadline — never a fresh one.
+#[test]
+fn a_fallback_spends_the_remaining_deadline_not_a_new_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let (repo, first, _) = repository(temp.path());
+    let mirrors = Mirrors::open(&temp.path().join("mirrors")).unwrap();
+    let repo_id = RepoId::new();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(temp.path().join(format!("mirrors/{repo_id}.lock")))
+        .unwrap();
+    // SAFETY: flock on the test's own fd, released when `lock` closes.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let ws = Workspace::create(temp.path(), AttemptId::new()).unwrap();
+    let source = PinnedSource::new(repo.to_str().unwrap(), &first, None).unwrap();
+    let started = Instant::now();
+    let out = checkout::through_mirror(
+        ws.path(),
+        &mirrors,
+        &repo_id,
+        &source,
+        None,
+        "att_budget",
+        Duration::from_secs(6),
+    )
+    .unwrap();
+    assert_eq!(out.route, CheckoutRoute::MirrorFallback);
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "lock wait plus fallback stayed inside the one 6 s deadline: {:?}",
+        started.elapsed()
+    );
+    drop(lock);
     ws.destroy().unwrap();
 }
