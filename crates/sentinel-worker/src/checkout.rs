@@ -25,7 +25,7 @@ use sentinel_protocol::summary::CheckoutRoute;
 
 use crate::{Error, Result};
 
-pub use sentinel_git::mirror::{MIRRORS_DIR, Mirrors};
+pub use sentinel_git::mirror::{MIRRORS_BUDGET_BYTES, MIRRORS_DIR, Mirrors};
 pub use sentinel_git::{CHECKOUT_TIMEOUT, Checkout, Credential};
 
 /// What a checkout produced and how. `route` is the truth about where the
@@ -100,18 +100,49 @@ pub fn checkout_mirrored(
     lease: &str,
     timeout: Duration,
 ) -> Result<Outcome> {
-    let Some(mirrors) = mirrors else {
-        return direct(workspace, source, access, timeout).map(|checkout| Outcome {
+    // A mirror serves only the bound repository whose binding filled it
+    // (P07-17): a manual run names its own remote — possibly a local path
+    // to another repository's store — so it never reads or feeds a mirror.
+    match (mirrors, access) {
+        (Some(mirrors), Some(access)) => through_mirror(
+            workspace,
+            mirrors,
+            repo,
+            source,
+            Some(access),
+            lease,
+            timeout,
+        ),
+        _ => direct(workspace, source, access, timeout).map(|checkout| Outcome {
             checkout,
             route: CheckoutRoute::Direct,
             fallback_reason: None,
-        });
-    };
+        }),
+    }
+}
+
+/// The mirror route with its fallback: the mirror gets half of `timeout`
+/// when it runs into trouble, and a failure that is about the mirror — lock
+/// wait, IO, a damaged store, or its share of the deadline spent (a cold
+/// full-history fetch of a large repository) — falls back to the depth-1
+/// direct fetch within what is *left* of `timeout`, never a fresh one
+/// (P07-18). `access: None` is the manual mirror mode, which the worker
+/// never uses ([`checkout_mirrored`]); tests exercise the routing with it.
+#[doc(hidden)]
+pub fn through_mirror(
+    workspace: &Path,
+    mirrors: &Mirrors,
+    repo: &RepoId,
+    source: &PinnedSource,
+    access: Option<&Access>,
+    lease: &str,
+    timeout: Duration,
+) -> Result<Outcome> {
+    let deadline = std::time::Instant::now() + timeout;
+    let share = timeout / 2;
     let attempted = match access {
-        Some(access) => {
-            mirrors.checkout_authorized(workspace, repo, source, access, lease, timeout)
-        }
-        None => mirrors.checkout(workspace, repo, source, None, lease, timeout),
+        Some(access) => mirrors.checkout_authorized(workspace, repo, source, access, lease, share),
+        None => mirrors.checkout(workspace, repo, source, None, lease, share),
     };
     match attempted {
         Ok(checkout) => Ok(Outcome {
@@ -119,12 +150,20 @@ pub fn checkout_mirrored(
             route: CheckoutRoute::Mirror,
             fallback_reason: None,
         }),
-        Err(e @ (sentinel_git::Error::Mirror(_) | sentinel_git::Error::Io(_))) => {
+        Err(
+            e @ (sentinel_git::Error::Mirror(_)
+            | sentinel_git::Error::Io(_)
+            | sentinel_git::Error::Timeout(_)),
+        ) => {
             let reason: String = e.to_string().chars().take(300).collect();
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(map(e));
+            }
             // The mirror may have half-materialized the workspace; the
             // direct path requires it empty.
             clear(workspace)?;
-            let checkout = direct(workspace, source, access, timeout)?;
+            let checkout = direct(workspace, source, access, left)?;
             Ok(Outcome {
                 checkout,
                 route: CheckoutRoute::MirrorFallback,

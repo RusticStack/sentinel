@@ -259,7 +259,10 @@ pub fn run(
     let event = match &verdict {
         Verdict::Passed => Event::Passed,
         Verdict::Failed(class, why) => {
-            summary.detail = why.chars().take(500).collect();
+            // The failure reason leads; a mirror fallback reason recorded
+            // during preparation stays after it rather than being lost
+            // (P07-24), both inside the same 500-character bound.
+            summary.detail = failure_detail(why, &summary.detail);
             Event::Failed(*class)
         }
     };
@@ -281,6 +284,19 @@ pub fn run(
     // this attempt reported.
     offer_caches(root, job, &sealed, remote.as_deref(), cancel);
     (verdict, summary)
+}
+
+/// The summary's `detail` for a failed attempt: the failure reason, then
+/// any checkout fallback reason preparation recorded, within 500 chars.
+fn failure_detail(why: &str, fallback: &str) -> String {
+    if fallback.is_empty() {
+        why.chars().take(500).collect()
+    } else {
+        format!("{why} (checkout fell back: {fallback})")
+            .chars()
+            .take(500)
+            .collect()
+    }
 }
 
 fn prepare(
@@ -462,10 +478,13 @@ fn restore_caches(
         .get(job.job_index)
         .map(|j| Duration::from_secs(j.spec.timeout_secs.max(1)))
         .unwrap_or(Duration::ZERO);
+    // One hydration deadline for the whole job, fixed before its first
+    // restore: N declared caches share the budget rather than each taking
+    // their own (P08-C6).
     let remote = remote.map(|source| sentinel_cache::remote::Policy {
         source,
         attempt: *job.attempt.as_bytes(),
-        job_timeout,
+        deadline: sentinel_cache::remote::Policy::deadline_for(job_timeout),
     });
     let context = WorkerContext::new(&job.context, &job.spec, workspace);
     let cache_root = root.join(sentinel_cache::attach::ROOT_DIR);
@@ -811,7 +830,7 @@ fn cache_record(attached: &sentinel_cache::attach::Attached) -> CacheRecord {
 }
 
 /// Commit each attached cache under its own scope, while the workspace's
-/// writable views still exist. Publication is off the verdict's path: the
+/// writable views still exist. The verdict never depends on publication (its report waits for it): the
 /// whole batch is bounded by `CACHE_PUBLISH_TIMEOUT`, each entry's outcome
 /// is reported as a `CacheNote` and stamped on the carrier's stats (K08)
 /// for the summary's per-entry record, and nothing here changes what the
@@ -893,18 +912,26 @@ fn finalize(
     container: Container,
     cancel: &Cancel,
 ) -> Vec<SealedCache> {
+    // The container goes first (P07-1): once it is stopped and removed no
+    // job process — the keepalive, or anything a step left running — can
+    // rewrite, swap or re-link the writable views while publication reads
+    // them. The views themselves live in the workspace (and its private
+    // `.sentinel-cache/` directory), which outlives the container.
+    // Publication then walks them confined beneath the workspace anyway, so
+    // a container that would not stop cannot redirect it either.
+    let _ = container.destroy();
     // Cache publication is finalization work: it reads the job's writable
-    // views, so it must precede the teardown — and a verdict that never ran
-    // the job's commands leaves nothing worth keeping.
+    // views, so it must precede the workspace's teardown — and a verdict
+    // that never ran the job's commands leaves nothing worth keeping.
     let sealed = if cache_worthy(verdict) {
         publish_caches(root, job, report, cancel)
     } else {
         Vec::new()
     };
-    // Both run even when one fails: a container that will not stop must not
-    // keep a workspace alive, and vice versa. The failure is a reconciliation
-    // matter for W07, which lists what this worker still owns.
-    let _ = container.destroy();
+    // Runs even when the container would not stop: a container that will
+    // not stop must not keep a workspace alive. The failure is a
+    // reconciliation matter for W07, which lists what this worker still
+    // owns.
     let _ = workspace.destroy();
     sealed
 }
@@ -964,6 +991,22 @@ mod tests {
     use sentinel_protocol::cache::Trust;
 
     use super::*;
+
+    /// P07-24: a failed attempt keeps the mirror fallback reason next to
+    /// its own, bounded.
+    #[test]
+    fn a_failure_keeps_the_checkout_fallback_reason() {
+        assert_eq!(
+            failure_detail("step 0 exited with 1", ""),
+            "step 0 exited with 1"
+        );
+        let detail = failure_detail("step 0 exited with 1", "git mirror: lock wait");
+        assert_eq!(
+            detail,
+            "step 0 exited with 1 (checkout fell back: git mirror: lock wait)"
+        );
+        assert_eq!(failure_detail(&"x".repeat(600), "y").chars().count(), 500);
+    }
 
     #[test]
     fn publication_follows_whether_the_commands_ran() {

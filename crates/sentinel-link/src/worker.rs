@@ -146,7 +146,16 @@ pub fn session(
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     link.set_remote_cache(config.remote_cache);
     if link.negotiated.protocol.0 >= PROFILE_MIN.0 {
-        link.send_profile(&config.profile)?;
+        // The profile opens with what the executor holds right now (P07-6):
+        // resident images and cache bytes, measured, never the configured
+        // placeholder.
+        let mut profile = config.profile.clone();
+        if let Some((version, availability)) = executor.availability() {
+            profile.availability.images = availability.images;
+            profile.availability.cache_bytes = availability.cache_bytes;
+            link.set_availability_sent(version);
+        }
+        link.send_profile(&profile)?;
         let mut transport = config.transport.clone();
         transport.reconnects = handle.sessions().saturating_sub(1);
         link.report_transport(&transport)?;

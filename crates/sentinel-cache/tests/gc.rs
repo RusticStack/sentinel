@@ -219,24 +219,116 @@ fn over_budget_evicts_oldest_first_across_entries() {
     make_gen(&e2, &s2, "vendor-bb", "gen-400-00000004", 600);
     set_current(&e2, "gen-400-00000004");
 
-    // Total 2400; budget 1100 → both spares evicted, oldest first.
-    let stats = sweep_at(&root, 1100, gc::DEFAULT_PASS_WORK, now_ms());
+    // Total 2400; budget 1200 → both spares evicted, oldest first, and
+    // the two currents fit.
+    let stats = sweep_at(&root, 1200, gc::DEFAULT_PASS_WORK, now_ms());
     assert_eq!(gens(&e1), ["gen-300-00000003".to_owned()]);
     assert_eq!(gens(&e2), ["gen-400-00000004".to_owned()]);
     assert_eq!(stats.generations_removed, 2);
     assert_eq!(stats.bytes_freed, 1200);
 
-    // And with a tighter budget the same pass shape holds: the spare is
-    // still evictable, but currents are never candidates — so a store can
-    // stay over budget rather than lose what `current` names.
+    // With a tighter budget the spares go first, then whole entries least
+    // recently used first (P07-3): e2 was last used before e1, so it goes
+    // and e1's current — enough to fit 700 bytes — stays.
     make_gen(&e1, &s1, "deps-aa", "gen-500-00000005", 600);
     set_current(&e1, "gen-500-00000005");
-    let stats = sweep_at(&root, 1, gc::DEFAULT_PASS_WORK, now_ms());
+    age_current(&e2, 3_600_000);
+    let stats = sweep_at(&root, 700, gc::DEFAULT_PASS_WORK, now_ms());
     assert_eq!(gens(&e1), ["gen-500-00000005".to_owned()]);
-    assert_eq!(gens(&e2), ["gen-400-00000004".to_owned()]);
-    // Only e1's evictable spare went; both currents stayed even though the
-    // store is still far over budget.
-    assert_eq!(stats.generations_removed, 1);
+    assert!(!e2.exists(), "the least recently used entry went whole");
+    assert_eq!(stats.entries_removed, 1);
+    assert_eq!(stats.generations_removed, 2);
+    assert_eq!(stats.estimated_bytes, 600);
+}
+
+/// Move `current`'s mtime `ms` into the past: its last use.
+fn age_current(entry: &Path, ms: u64) {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(entry.join(scope::CURRENT_NAME))
+        .unwrap();
+    file.set_modified(std::time::SystemTime::now() - Duration::from_millis(ms))
+        .unwrap();
+}
+
+/// P07-3: the currents of stale keys are reclaimable — twenty entries
+/// over a tiny budget all go, and an entry idle past `IDLE_TTL` goes
+/// whole even under budget; a pinned one never does.
+#[test]
+fn budget_evicts_idle_currents_lru_and_ttl_removes_idle_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cache");
+    let scope = test_scope("deps");
+    let mut entries = Vec::new();
+    for i in 0..20 {
+        let key = format!("deps-{i:04}");
+        let e = entry(&root, &scope, &key);
+        make_gen(&e, &scope, &key, "gen-100-00000001", 64 << 10);
+        set_current(&e, "gen-100-00000001");
+        age_current(&e, (20 - i) * 1000);
+        entries.push(e);
+    }
+    let pin = Lease::acquire(&entries[0], "reader-1", lease::DEFAULT_TTL).unwrap();
+    let stats = sweep_at(&root, 1, gc::DEFAULT_PASS_WORK, now_ms());
+    assert_eq!(stats.entries_removed, 19, "every unpinned current went");
+    assert_eq!(stats.bytes_freed, 19 * (64 << 10));
+    assert!(entries[0].exists(), "a leased current survives the budget");
+    drop(pin);
+
+    // Idle past the TTL: removed although the store is under budget, and
+    // the empty scope directories go with it.
+    age_current(&entries[0], gc::IDLE_TTL.as_millis() as u64 + 1000);
+    let stats = sweep_at(
+        &root,
+        gc::DEFAULT_BUDGET_BYTES,
+        gc::DEFAULT_PASS_WORK,
+        now_ms(),
+    );
+    assert_eq!(stats.entries_removed, 1);
+    assert!(!entries[0].exists());
+    assert_eq!(
+        fs::read_dir(&root).unwrap().count(),
+        0,
+        "no empty scope directories linger"
+    );
+}
+
+/// P07-4: with a cursor, passes truncated by the work bound resume where
+/// the previous one stopped — together they visit every entry — and each
+/// truncated pass still enforces the budget.
+#[test]
+fn truncated_passes_cover_every_entry_and_still_enforce_the_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cache");
+    let scope = test_scope("deps");
+    for i in 0..20 {
+        let key = format!("deps-{i:04}");
+        let e = entry(&root, &scope, &key);
+        make_gen(&e, &scope, &key, "gen-100-00000001", 10);
+        set_current(&e, "gen-100-00000001");
+    }
+    let mut cursor = gc::Cursor::default();
+    let mut seen = 0;
+    let mut passes = 0;
+    loop {
+        let stats = gc::resume_at(&root, gc::DEFAULT_BUDGET_BYTES, 40, now_ms(), &mut cursor);
+        seen += stats.entries_seen;
+        passes += 1;
+        assert!(passes < 50, "the passes never finished a cycle");
+        if !stats.truncated {
+            break;
+        }
+    }
+    assert!(passes > 1, "the bound must have truncated at least once");
+    assert!(seen >= 20, "successive passes covered every entry: {seen}");
+    // The full cycle measured 200 bytes; a truncated pass over budget
+    // evicts from what it saw even though it saw only part of the tree.
+    let stats = gc::resume_at(&root, 150, 40, now_ms(), &mut cursor);
+    assert!(stats.truncated);
+    assert!(
+        stats.entries_removed > 0,
+        "budget enforced despite truncation"
+    );
 }
 
 #[test]
@@ -360,8 +452,10 @@ fn a_reader_mid_clone_keeps_its_generation_through_budget_eviction() {
     assert_eq!(gens(&entry).len(), 2);
     pin.release().unwrap();
 
-    // After release, the same pass may evict it.
+    // After release, the same pass may evict it — and, still over the
+    // budget, the whole entry with its current.
     let stats = sweep_at(&root, 10, gc::DEFAULT_PASS_WORK, now_ms());
-    assert_eq!(stats.generations_removed, 1);
-    assert_eq!(gens(&entry), ["gen-200-00000002".to_owned()]);
+    assert_eq!(stats.generations_removed, 2);
+    assert_eq!(stats.entries_removed, 1);
+    assert!(!entry.exists());
 }

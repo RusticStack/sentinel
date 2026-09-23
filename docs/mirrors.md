@@ -1,6 +1,6 @@
 # Worker-local Git mirrors (K04)
 
-A worker keeps one **bare mirror per repository binding** under
+A worker keeps one **bare mirror per repository binding** — mirrors serve bound repositories only; a manual run names its own remote (possibly a local path) and always checks out direct, so it can never read another repository's store or feed its own objects into one — under
 `<data_dir>/mirrors/<rep_id>/`, keyed by the dispatched `RepoId` — never by
 remote URL, so a renamed remote cannot collide two tenants' stores. Attempts
 share it under a writer lock plus reader leases, and each worktree is
@@ -20,7 +20,8 @@ separately as `checkout_materialize_ns`; the mirror update is
     <rep_id>/            bare repository (HEAD, objects/, refs/)
     <rep_id>.lock        flock'd writer lock (content is operator provenance)
     <rep_id>.leases/     reader leases, one file per materializing attempt
-    <rep_id>.suspect     mark left by a failed materialization → rebuild
+    <rep_id>.suspect     mark left by store damage → rebuild
+    <rep_id>/sentinel-remote  the remote that filled the store; another remote → rebuild
     <rep_id>.askpass/    credential helper, only for the fetch in flight
 ```
 
@@ -40,12 +41,13 @@ shallow, and `gc.auto`/`maintenance.auto` are forced off so pruning only
 ever happens through the lease-checked path described below. A `file://`
 remote accepts a raw commit id as a want; a real server that refuses an
 unadvertised SHA gets the event-ref want instead — the commit usually rides
-its history — with the SHA alone as the last resort. A mirror fetch with
-no source access (the manual mode) runs under the same unauthenticated
-transport discipline as a direct one — only `https` or a local path, no
-redirects, no credential helper, never `ssh` ([sources](sources.md)); the
-controller refuses a client-named local path, so local remotes reach a
-mirror only from worker-local tooling and tests. Credentials reuse the
+its history — with the SHA alone as the last resort. Those narrower wants
+are tried only when the server refused a want; an authentication, network
+or store failure is not asked twice more. Manual runs never read or feed a
+mirror (they check out direct); any mirror fetch without source access
+still runs under the same unauthenticated transport discipline as a direct
+one — only `https` or a local path, no redirects, no credential helper,
+never `ssh` ([sources](sources.md)). Credentials reuse the
 direct checkout's discipline exactly: the same askpass/`GIT_SSH` files,
 owner-only, removed when the fetch returns (a crashed fetch's helper is
 dropped by recovery on restart, and by the next writer's `ensure`).
@@ -68,12 +70,15 @@ never to select the checked-out revision.
 ## Reader-safe GC
 
 Materialization creates a lease: `<rep_id>.leases/<attempt>` holding an
-expiry timestamp, published by rename while the writer lock is still held,
-removed when the copy finishes. `git gc --prune=now` runs only under the
+expiry timestamp — the reader's own deadline plus a minute, never a fixed
+guess — published by rename (from a temp file a crashed publisher's leftover
+cannot block) while the writer lock is still held, removed when the copy
+finishes. `git gc --prune=now` runs only under the
 writer lock, only when the store crossed a trigger (more than 16 packs or
 4096 loose objects — a cache, not an archive), and only with **no live
 lease**: expired leases are swept by that check, so a crashed attempt holds
-GC off for at most the 20-minute TTL. Fetches never delete objects, so a
+GC off until its declared expiry (an unreadable record: at most the
+20-minute TTL). Fetches never delete objects, so a
 reader's copy only ever sees a superset of the verified store.
 
 ## Private materialization
@@ -86,7 +91,9 @@ copy is a **reflink** (`FICLONE`: shared extents, separate inode), probed
 once at worker start; elsewhere it is a plain byte copy. `tmp_*` files and
 `info/alternates` are never copied. After `checkout --detach <sha>`, `HEAD`
 is verified against the pin. A materialization failure marks the mirror
-`suspect`, so the next writer rebuilds before serving it again.
+`suspect` only when the store itself is damaged (the health probe below
+fails): a deadline, a full workspace or a checkout error on a healthy store
+never forces a full refetch.
 
 ## Failure policy
 
@@ -101,9 +108,23 @@ Mirror failures split in two:
   only re-ask the same question.
 - **`Error::Timeout`** — the deadline is spent either way.
 
-A mirror that does not look like a bare store, or that Git itself refuses
-after a fetch error, is rebuilt once under the lock (after any live readers
-drain) and retried once; still broken reports `Mirror` and falls back.
+A mirror that does not look like a bare store, or that fails the health
+probe after a fetch or verify error — Git must accept it as a bare
+repository *and* every ref tip must still read as an object (`rev-list
+--no-walk --all`), which catches a corrupt or truncated pack under a tip —
+is rebuilt once under the lock (after any live readers drain) and retried
+once; still broken reports `Mirror` and falls back. The fallback runs within
+what is left of the checkout's one deadline: the mirror gets half of it,
+and a mirror that ran out of its half (a cold full-history fetch of a large
+repository) falls back too.
+
+**Disk bound.** After every attempt (with the cache sweep) `Mirrors::sweep`
+removes `tmp_*` leftovers of killed fetches older than an hour, removes
+mirrors no writer touched for 14 days, and while the rest exceed 50 GiB
+removes the least recently written — each under that mirror's writer lock
+(taken without waiting) and with no live reader lease; the lock file stays.
+`tmp_*` leftovers also count toward the GC trigger. The fallback reason of
+a failed attempt is kept in `detail` after the failure reason.
 A mirror root that cannot be opened at worker start logs
 `mirrors_unavailable` once and every checkout runs direct for the life of
 the process.

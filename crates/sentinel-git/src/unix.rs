@@ -286,7 +286,14 @@ fn fetch(
         return Err(Error::Preparation("repository looks like an option".into()));
     }
     let mut fetch = git(work);
-    let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
+    let mut secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
+    // A manual credential a server echoes back is redacted like a bound
+    // one (P07-25): no error excerpt may carry either.
+    if let Some(credential) = credential
+        && !credential.secret.is_empty()
+    {
+        secrets.push(credential.secret.clone());
+    }
     transport(&mut fetch, private);
     fetch.args([
         "fetch",

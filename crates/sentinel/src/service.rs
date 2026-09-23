@@ -1407,9 +1407,10 @@ mod worker_role {
     }
 
     /// The protocol-7 profile: what the scheduler may select this machine by
-    /// and what it can offer jobs. Image and cache inventory travel in the
-    /// attempt summaries (K08), not here, so `images`/`cache_bytes` stay
-    /// unreported (empty/zero) rather than guessed.
+    /// and what it can offer jobs. `images`/`cache_bytes` start empty here
+    /// and are filled per session from the executor's own record (P07-6,
+    /// `Executor::availability`): the held image keys and the cache store's
+    /// estimated bytes, refreshed from protocol 8 whenever they change.
     fn profile(link: &WorkerLink, data_dir: &Path) -> sentinel_protocol::negotiate::Profile {
         sentinel_protocol::negotiate::Profile {
             labels: link.labels.clone(),

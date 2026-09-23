@@ -77,6 +77,19 @@ pub const GC_MAX_LOOSE: usize = 4096;
 const MAX_OBJECT_FILES: u64 = 2_000_000;
 /// Poll interval for the lock and for lease drains.
 const WAIT_POLL: Duration = Duration::from_millis(25);
+/// A reader lease outlives its reader's own deadline by this much, so a
+/// lease can never lapse while its materialization is still allowed to run.
+const LEASE_MARGIN: Duration = Duration::from_secs(60);
+/// The remote a mirror was built from, recorded inside it: a mirror serves
+/// only the binding that filled it (P07-17).
+const REMOTE_FILE: &str = "sentinel-remote";
+/// Default budget for all mirrors together (`Mirrors::sweep`).
+pub const MIRRORS_BUDGET_BYTES: u64 = 50 << 30;
+/// A mirror no writer touched for this long is removed by the sweep.
+pub const MIRROR_IDLE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// Git's in-flight names (`tmp_*`) older than this belong to a killed
+/// fetch; the sweep removes them.
+const STALE_TMP: Duration = Duration::from_secs(60 * 60);
 
 /// Handle over `<data_dir>/mirrors`, created once per worker process: the
 /// reflink capability of the filesystem is probed here, not per attempt.
@@ -232,9 +245,15 @@ impl Mirrors {
         let lock_deadline = Instant::now() + LOCK_WAIT.min(timeout);
         let lock = Self::lock(&self.root.join(format!("{repo}.lock")), lock_deadline)?;
         let fetch_started = Instant::now();
-        self.ensure(&dir, &suspect, &leases, deadline)?;
+        self.ensure(&dir, &suspect, &leases, &source.repo, deadline)?;
         let private = access.map(|a| Private::install(&dir, a)).transpose()?;
-        let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
+        let mut secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
+        // A manual credential is redacted like a bound one (P07-25).
+        if let Some(credential) = credential
+            && !credential.secret.is_empty()
+        {
+            secrets.push(credential.secret.clone());
+        }
         let ctx = Ctx {
             private: private.as_ref(),
             credential,
@@ -255,7 +274,7 @@ impl Mirrors {
         self.gc_if_due(&dir, &leases, deadline)?;
         // The reader lease is created while still holding the write lock:
         // a GC that follows can never miss it.
-        let lease = self.lease(&leases, lease_name)?;
+        let lease = self.lease(&leases, lease_name, deadline)?;
         let fetch_ns = elapsed_ns(fetch_started);
         drop(lock);
 
@@ -270,9 +289,23 @@ impl Mirrors {
                 materialize_ns: elapsed_ns(materialize_started),
             }),
             Err(e) => {
-                // The copied store verified nothing: mark the mirror so the
-                // next writer rebuilds it rather than serving it again.
-                let _ = fs::write(&suspect, b"materialization failed\n");
+                // Only damage to the store itself marks it for a rebuild
+                // (P07-21): a deadline, a full workspace or a checkout error
+                // on a healthy store says nothing about the mirror, and a
+                // rebuild would refetch the whole history for nothing.
+                let damaged = !matches!(e, Error::Timeout(_) | Error::TooLarge(_))
+                    && !self.healthy(&dir, Instant::now() + Duration::from_secs(30));
+                let e = if damaged {
+                    match fs::write(&suspect, b"materialization failed\n") {
+                        Ok(()) => e,
+                        Err(mark) => Error::Mirror(format!(
+                            "{e}; the store could not be marked for a rebuild: {}",
+                            mark.kind()
+                        )),
+                    }
+                } else {
+                    e
+                };
                 Err(match e {
                     Error::Mirror(_) | Error::Timeout(_) => e,
                     Error::Preparation(what) => Error::Mirror(what),
@@ -335,19 +368,37 @@ impl Mirrors {
     fn healthy(&self, dir: &Path, deadline: Instant) -> bool {
         let mut probe = git(dir);
         probe.args(["rev-parse", "--is-bare-repository"]);
-        match step(probe, deadline, "git rev-parse", &[]) {
+        let bare = match step(probe, deadline, "git rev-parse", &[]) {
             Ok(output) => trim(&output.stdout) == "true",
             Err(_) => false,
-        }
+        };
+        // Every ref tip must still read as an object (P07-19): a corrupt or
+        // truncated pack under a tip is store damage — rebuilt once — not
+        // the remote's answer. One object read per ref, no history walk.
+        let mut tips = git(dir);
+        tips.args(["rev-list", "--no-walk", "--all", "--quiet"]);
+        bare && step(tips, deadline, "git rev-list", &[]).is_ok()
     }
 
     /// Bring the mirror up: a missing or damaged store is rebuilt (after
     /// any live readers drain, bounded by `deadline`); a `suspect` mark from
     /// a failed materialization forces the same. Also drops a credential
     /// helper directory a crashed fetch may have left behind.
-    fn ensure(&self, dir: &Path, suspect: &Path, leases: &Path, deadline: Instant) -> Result<()> {
-        if suspect.exists() || !Self::looks_bare(dir) {
+    fn ensure(
+        &self,
+        dir: &Path,
+        suspect: &Path,
+        leases: &Path,
+        remote: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        // A mirror serves only the remote that filled it (P07-17): a binding
+        // that now names another remote starts from an empty store, so no
+        // object of the old one can reach a workspace of the new one.
+        let recorded = fs::read_to_string(dir.join(REMOTE_FILE)).ok();
+        if suspect.exists() || !Self::looks_bare(dir) || recorded.as_deref() != Some(remote) {
             self.rebuild(dir, suspect, leases, deadline)?;
+            fs::write(dir.join(REMOTE_FILE), remote)?;
         }
         let _ = fs::remove_dir_all(dir.with_extension("askpass"));
         Ok(())
@@ -437,6 +488,10 @@ impl Mirrors {
         match self.fetch(dir, &source.repo, &wants, ctx) {
             Ok(()) => return self.verify(dir, &source.sha, ctx.deadline),
             Err(e) if event_ref.is_none() => return Err(e),
+            // Narrower wants help only when the server refused one of the
+            // wants themselves (P07-26); an authentication, network or
+            // store failure would only be asked twice more.
+            Err(e) if !want_refused(&e) => return Err(e),
             Err(_) => {}
         }
         if let Some(r) = event_ref
@@ -536,15 +591,18 @@ impl Mirrors {
         Ok(())
     }
 
-    /// `(pack files, loose objects)` in the mirror's object store; transient
-    /// `tmp_*` names are not counted.
+    /// `(pack files, loose objects)` in the mirror's object store; `tmp_*`
+    /// leftovers count too — only GC or the sweep ever reclaims them.
     fn object_stats(objects: &Path) -> Result<(usize, u64)> {
         let mut packs = 0usize;
         let mut loose = 0u64;
         let pack_dir = objects.join("pack");
         if let Ok(entries) = fs::read_dir(&pack_dir) {
             for entry in entries.flatten() {
-                if entry.file_name().as_bytes().ends_with(b".pack") {
+                // A killed fetch's `tmp_pack_*` counts like a pack: it is
+                // disk the next GC reclaims (P07-22).
+                let name = entry.file_name();
+                if name.as_bytes().ends_with(b".pack") || name.as_bytes().starts_with(b"tmp_") {
                     packs += 1;
                 }
             }
@@ -557,9 +615,7 @@ impl Mirrors {
                 && entry.file_type().is_ok_and(|t| t.is_dir())
             {
                 for inner in fs::read_dir(entry.path())?.flatten() {
-                    if inner.file_type().is_ok_and(|t| t.is_file())
-                        && !inner.file_name().as_bytes().starts_with(b"tmp_")
-                    {
+                    if inner.file_type().is_ok_and(|t| t.is_file()) {
                         loose += 1;
                     }
                 }
@@ -580,17 +636,32 @@ impl Mirrors {
         let mut live = false;
         for entry in entries.flatten() {
             let path = entry.path();
-            let expired = fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| text.trim().parse::<i64>().ok())
-                .is_some_and(|expiry| now_ms >= expiry);
-            if expired {
+            // A `.<name>.tmp` is a lease being published — which happens only
+            // under the writer lock every caller here holds: any one seen is
+            // a crashed publisher's, never a reader.
+            if entry.file_name().as_bytes().starts_with(b".") {
                 let _ = fs::remove_file(&path);
                 continue;
             }
-            // Unparseable content means a lease mid-publish or a stale
-            // record: trust its age — older than a lease can live is stale,
-            // younger is conservatively a live reader.
+            let declared = fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| text.trim().parse::<i64>().ok());
+            match declared {
+                Some(expiry) if now_ms >= expiry => {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+                // A declared expiry is the reader's own deadline plus a
+                // margin (P07-23): it holds however long that is.
+                Some(_) => {
+                    live = true;
+                    continue;
+                }
+                None => {}
+            }
+            // Unparseable content is a stale record: trust its age — older
+            // than a lease can live is stale, younger is conservatively a
+            // live reader.
             let stale = entry
                 .metadata()
                 .ok()
@@ -609,7 +680,7 @@ impl Mirrors {
     /// Publish a reader lease for `name` (the attempt id): expiry timestamp
     /// inside, written to a temp file then renamed so a sweeper never reads
     /// a torn record. Runs under the write lock.
-    fn lease(&self, leases: &Path, name: &str) -> Result<Lease> {
+    fn lease(&self, leases: &Path, name: &str, deadline: Instant) -> Result<Lease> {
         if name.is_empty()
             || name.len() > 128
             || !name
@@ -619,11 +690,17 @@ impl Mirrors {
             return Err(Error::Preparation("lease name is not usable".into()));
         }
         fs::create_dir_all(leases)?;
-        let expiry = UnixMillis::now().0 + LEASE_TTL.as_millis() as i64;
+        // The lease lasts as long as its reader may run, plus a margin — the
+        // reader's own deadline, never a fixed wall-clock guess (P07-23).
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let expiry = UnixMillis::now().0 + (remaining + LEASE_MARGIN).as_millis() as i64;
         let tmp = leases.join(format!(".{name}.tmp"));
+        // Truncating, not `create_new`: a crashed attempt's leftover temp
+        // file must not block the same attempt id's next lease.
         OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(true)
             .open(&tmp)?
             .write_all(format!("{expiry}\n").as_bytes())?;
         let path = leases.join(name);
@@ -759,6 +836,166 @@ impl Mirrors {
     }
 }
 
+/// Whether a failed fetch is the server refusing one of the wants — an
+/// unadvertised SHA, or a ref that is gone — the only failures a narrower
+/// want can get past (P07-26).
+fn want_refused(error: &Error) -> bool {
+    let Error::Preparation(text) = error else {
+        return false;
+    };
+    let text = text.to_ascii_lowercase();
+    [
+        "not our ref",
+        "unadvertised object",
+        "no such remote ref",
+        "couldn't find remote ref",
+        "not a valid object",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+/// What one [`Mirrors::sweep`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MirrorSweep {
+    /// Mirrors seen.
+    pub mirrors: u64,
+    /// Bytes the kept mirrors hold after the pass.
+    pub bytes: u64,
+    /// Mirrors removed — idle past [`MIRROR_IDLE`] or over the budget.
+    pub removed: u64,
+    /// Stale `tmp_*` files of killed fetches removed.
+    pub tmp_removed: u64,
+    pub bytes_freed: u64,
+}
+
+impl Mirrors {
+    /// Bound the mirrors' disk (P07-22): stale `tmp_*` leftovers of killed
+    /// fetches go, a mirror no writer touched for [`MIRROR_IDLE`] goes, and
+    /// while the rest exceed `budget_bytes` the least recently written
+    /// mirrors go. Every removal happens under that mirror's writer lock
+    /// (taken without waiting — a busy mirror is skipped) and with no live
+    /// reader lease; the lock file itself stays, so a writer that opened it
+    /// can never lock a stale inode.
+    pub fn sweep(&self, budget_bytes: u64) -> MirrorSweep {
+        let mut out = MirrorSweep::default();
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return out;
+        };
+        let now = std::time::SystemTime::now();
+        let mut kept: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) || !Self::looks_bare(&path) {
+                continue;
+            }
+            out.mirrors += 1;
+            let Some(guard) = self.try_lock(&path) else {
+                continue;
+            };
+            let used = guard.metadata().and_then(|m| m.modified()).unwrap_or(now);
+            let leases = path.with_extension("leases");
+            let idle = now.duration_since(used).is_ok_and(|age| age > MIRROR_IDLE);
+            if idle && !Self::leases_live(&leases).unwrap_or(true) {
+                let bytes = tree_bytes(&path);
+                if fs::remove_dir_all(&path).is_ok() {
+                    out.removed += 1;
+                    out.bytes_freed += bytes;
+                }
+                continue;
+            }
+            out.tmp_removed += remove_stale_tmp(&path.join("objects"), now);
+            kept.push((used, tree_bytes(&path), path));
+        }
+        let mut total: u64 = kept.iter().map(|(_, bytes, _)| bytes).sum();
+        kept.sort_by_key(|(used, _, _)| *used);
+        for (_, bytes, path) in kept {
+            if total <= budget_bytes {
+                break;
+            }
+            let Some(_guard) = self.try_lock(&path) else {
+                continue;
+            };
+            if Self::leases_live(&path.with_extension("leases")).unwrap_or(true) {
+                continue;
+            }
+            if fs::remove_dir_all(&path).is_ok() {
+                out.removed += 1;
+                out.bytes_freed += bytes;
+                total -= bytes;
+            }
+        }
+        out.bytes = total;
+        out
+    }
+
+    /// The mirror's writer lock without waiting; `None` when a writer holds
+    /// it or it cannot be opened.
+    fn try_lock(&self, mirror: &Path) -> Option<File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(mirror.with_extension("lock"))
+            .ok()?;
+        // SAFETY: flock on our own open fd; released when `file` closes.
+        (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0)
+            .then_some(file)
+    }
+}
+
+/// Bytes of every regular file under `dir`, never following links.
+fn tree_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(entry.path()),
+                Ok(t) if t.is_file() => {
+                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+                _ => {}
+            }
+        }
+    }
+    total
+}
+
+/// Remove `tmp_*` files under an object store older than [`STALE_TMP`].
+fn remove_stale_tmp(objects: &Path, now: std::time::SystemTime) -> u64 {
+    let mut removed = 0;
+    let mut stack = vec![objects.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                stack.push(entry.path());
+            } else if entry.file_name().as_bytes().starts_with(b"tmp_")
+                && entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| now.duration_since(t).ok())
+                    .is_some_and(|age| age > STALE_TMP)
+                && fs::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 /// Does `root`'s filesystem support `FICLONE`? One real clone of a probe
 /// pair — created, exercised and removed here — settles it for the process.
 fn reflink_supported(root: &Path) -> Result<bool> {
@@ -784,4 +1021,33 @@ fn reflink_supported(root: &Path) -> Result<bool> {
         return Ok(false);
     }
     Ok(to.metadata().map(|m| m.len() == 8).unwrap_or(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P07-26: only a server refusing a want earns the narrower retries;
+    /// an authentication, network or local failure is final.
+    #[test]
+    fn only_a_refused_want_is_retried_narrower() {
+        for refused in [
+            "git fetch: fatal: remote error: upload-pack: not our ref 0123",
+            "git fetch: error: Server does not allow request for unadvertised object 0123",
+            "git fetch: fatal: couldn't find remote ref refs/heads/gone",
+        ] {
+            assert!(
+                want_refused(&Error::Preparation(refused.into())),
+                "{refused}"
+            );
+        }
+        for final_answer in [
+            "git fetch: fatal: Authentication failed for 'https://forge.example/r.git/'",
+            "git fetch: fatal: unable to access: Could not resolve host",
+        ] {
+            assert!(!want_refused(&Error::Preparation(final_answer.into())));
+        }
+        assert!(!want_refused(&Error::Timeout("git fetch")));
+        assert!(!want_refused(&Error::Mirror("not our ref".into())));
+    }
 }

@@ -21,9 +21,16 @@ pub struct ProtocolVersion(pub u16);
 /// the scheduling `Profile`, the second bulk connection (`BulkHello`), the
 /// transport telemetry (`Transport`) and the remote-cache transfer messages;
 /// see `Profile` for why the extras are a message rather than new `Hello`
-/// fields.
+/// fields. Protocol 8 adds the third cache trust class (`Trust::Unprotected`
+/// in `Context2`), `CacheCancel` for an abandoned transfer, and allows a
+/// later `Profile` on the same session as an availability refresh.
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(7);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(8);
+
+/// First protocol that can carry `Trust::Unprotected`, `CacheCancel` and a
+/// refreshed `Profile`. An older session is sent `PullRequest` for an
+/// unprotected job — the scope that can never touch protected state.
+pub const CACHE_CANCEL_MIN: ProtocolVersion = ProtocolVersion(8);
 
 /// First protocol whose sessions carry the `Profile`, the bulk connection
 /// and the remote-cache messages. The worker sends the profile immediately
@@ -283,7 +290,7 @@ mod tests {
     #[test]
     fn version_mismatch_says_who_must_upgrade() {
         assert_eq!(
-            negotiate(&hello(8, 9, Capabilities::REQUIRED)),
+            negotiate(&hello(9, 10, Capabilities::REQUIRED)),
             Err(Rejected::UnsupportedVersion {
                 supported_min: SUPPORTED_MIN,
                 supported_max: SUPPORTED_MAX,

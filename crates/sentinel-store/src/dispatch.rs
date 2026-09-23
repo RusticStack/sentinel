@@ -1566,9 +1566,8 @@ pub fn attempt_summary(
 /// run, repository and job, the event that triggered it, the dependency
 /// outcomes by name, and whether cancellation is desired. `tenant` and
 /// `trust` are the cache boundary (protocol 6): the tenant the run belongs
-/// to and the trust class derived here, once, from the recorded event —
-/// `pull_request` scopes to pull-request state, everything else to
-/// protected (docs/cache.md).
+/// to and the trust class derived here, once, from the recorded provenance
+/// and the repository's binding (`provenance::cache_trust`, docs/cache.md).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobContext {
     /// The tenant the run belongs to; every cache scope is under it.
@@ -1581,10 +1580,10 @@ pub struct JobContext {
     pub sha: String,
     /// The event facts recorded as the run's provenance.
     pub event: crate::provenance::EventFacts,
-    /// `sentinel_protocol::cache::Trust::of_event` applied to `event.name`:
-    /// exactly `pull_request` is pull-request trust, every other event —
-    /// or none recorded — is protected. Derived here so no consumer can
-    /// pick a different rule.
+    /// `provenance::cache_trust`: protected only for a verified push/tag
+    /// to a ref the binding names exactly, pull-request for PR runs,
+    /// unprotected otherwise. Derived here so no consumer can pick a
+    /// different rule.
     pub trust: sentinel_protocol::cache::Trust,
     pub cancelled: bool,
     /// `(dependency job name, outcome)` for every `needs` entry.
@@ -1659,15 +1658,16 @@ pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> R
         needs.push((upstream.name.clone(), outcome));
     }
     let event = crate::provenance::event_facts(conn, run)?;
+    let repo = RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?;
     Ok(JobContext {
         tenant,
         run,
-        repo: RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?,
+        repo,
         repo_name,
         job: JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?,
         job_name,
         sha,
-        trust: sentinel_protocol::cache::Trust::of_event(&event.name),
+        trust: crate::provenance::cache_trust(conn, run, repo)?,
         event,
         cancelled: cancel != 0,
         needs,
@@ -1724,6 +1724,46 @@ pub fn attempt_scope(
         )
         .map_err(|_| Error::Corrupt("job_id"))?,
         u32::try_from(index).map_err(|_| Error::Corrupt("spec_index"))?,
+    ))
+}
+
+/// The cache boundary of an attempt `worker` owns — its tenant, repository
+/// and trust class — for remote-cache authorization (Q08). A fetch passes
+/// `released_since: None`: the attempt must still be held. An offer passes
+/// the oldest release it accepts: a worker offers what it sealed only after
+/// its terminal report released the attempt (P07-7), so a recently
+/// released attempt of the same worker still names its boundary.
+/// `NotFound` for a foreign, unknown or long-released attempt. One indexed
+/// row plus the trust probe — none of `job_context`'s spec work.
+pub fn cache_scope(
+    conn: &Connection,
+    worker: WorkerId,
+    attempt: AttemptId,
+    released_since: Option<UnixMillis>,
+) -> Result<(TenantId, RepoId, sentinel_protocol::cache::Trust)> {
+    let row: Option<([u8; 16], [u8; 16], [u8; 16])> = conn
+        .prepare_cached(
+            "SELECT j.tenant_id, j.run_id, r.repo_id
+             FROM attempts a JOIN jobs j ON j.id = a.job_id JOIN runs r ON r.id = j.run_id
+             WHERE a.id = ?1 AND a.worker_id = ?2
+               AND (a.released_ms IS NULL OR (?3 IS NOT NULL AND a.released_ms >= ?3))",
+        )?
+        .query_row(
+            params![
+                attempt.as_bytes(),
+                worker.as_bytes(),
+                released_since.map(|t| t.0)
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let (tenant, run, repo) = row.ok_or(Error::NotFound)?;
+    let run = RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?;
+    let repo = RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?;
+    Ok((
+        TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?,
+        repo,
+        crate::provenance::cache_trust(conn, run, repo)?,
     ))
 }
 

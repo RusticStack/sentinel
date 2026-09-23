@@ -7,11 +7,19 @@
 //! lease expires on its own — collection treats a lease as active while
 //! `min(declared expiry, mtime + MAX_TTL)` is in the future, so a torn
 //! write reads as fresh, never as collectible, until it is provably stale.
+//!
+//! A lease lives exactly as long as its holder does (P07-13): every held
+//! lease is registered with this process's keeper, which renews each one
+//! to its own TTL every [`RENEW_EVERY`] — so an attempt that runs for
+//! hours keeps its pin, while a process that dies stops renewing and its
+//! markers age out within the TTL.
 
 use std::{
+    collections::HashMap,
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
@@ -59,6 +67,52 @@ fn valid_owner(owner: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// How often the keeper renews every lease this process holds. A quarter
+/// of the default pin: a renewal can be late by a whole period and the
+/// lease is still live.
+pub const RENEW_EVERY: Duration = Duration::from_secs(DEFAULT_TTL.as_secs() / 4);
+
+/// The leases this process holds: marker path → (owner, ttl).
+fn held() -> &'static Mutex<HashMap<PathBuf, (String, Duration)>> {
+    static HELD: OnceLock<Mutex<HashMap<PathBuf, (String, Duration)>>> = OnceLock::new();
+    HELD.get_or_init(|| {
+        // One keeper thread per process, started with the first lease.
+        let _ = std::thread::Builder::new()
+            .name("sentinel-cache-leases".into())
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(RENEW_EVERY);
+                    renew_held();
+                }
+            });
+        Mutex::new(HashMap::new())
+    })
+}
+
+/// Renew every lease this process holds, each to its own TTL; returns
+/// how many markers were rewritten. The keeper calls this every
+/// [`RENEW_EVERY`]; tests call it directly. A marker that is already gone
+/// (released, or reaped after an outage) is never recreated.
+#[doc(hidden)]
+pub fn renew_held() -> usize {
+    let held = held().lock().unwrap_or_else(|p| p.into_inner());
+    held.iter()
+        .filter(|(file, (owner, ttl))| rewrite(file, owner, *ttl).is_ok())
+        .count()
+}
+
+/// Rewrite an existing marker's body — and so its mtime — with a fresh
+/// expiry. `create(false)`: renewal never resurrects a removed lease.
+fn rewrite(file: &Path, owner: &str, ttl: Duration) -> std::io::Result<()> {
+    use std::io::Write;
+    let expires = unix_ms() + ttl.min(MAX_TTL).as_millis() as i64;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(file)?;
+    f.write_all(format!("{expires} {owner}").as_bytes())
+}
+
 /// A held pin on `entry`. Dropping it removes the marker; a process that
 /// dies first leaves it to expire.
 pub struct Lease {
@@ -87,6 +141,10 @@ impl Lease {
                     use std::io::Write;
                     f.write_all(format!("{expires} {owner}").as_bytes())?;
                     f.sync_data()?;
+                    held()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(file.clone(), (owner.to_owned(), ttl));
                     return Ok(Lease {
                         file,
                         owner: owner.to_owned(),
@@ -102,11 +160,18 @@ impl Lease {
         )))
     }
 
-    /// Extend the pin; a failed renew keeps the old expiry — callers that
-    /// still need the pin must re-acquire rather than assume it.
+    /// Extend the pin now, and have the keeper keep extending it to `ttl`;
+    /// a failed renew keeps the old expiry — callers that still need the
+    /// pin must re-acquire rather than assume it.
     pub fn renew(&self, ttl: Duration) -> Result<(), LeaseError> {
-        let expires = unix_ms() + ttl.min(MAX_TTL).as_millis() as i64;
-        fs::write(&self.file, format!("{expires} {}", self.owner))?;
+        rewrite(&self.file, &self.owner, ttl)?;
+        if let Some(slot) = held()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(&self.file)
+        {
+            slot.1 = ttl;
+        }
         Ok(())
     }
 
@@ -117,13 +182,24 @@ impl Lease {
 
     /// Release early. A failed remove is safe: the lease still expires.
     pub fn release(self) -> Result<(), LeaseError> {
+        forget(&self.file);
         fs::remove_file(&self.file)?;
         Ok(())
     }
 }
 
+/// Stop renewing a marker: deregistered first, so the keeper can never
+/// rewrite a lease whose holder has let go.
+fn forget(file: &Path) {
+    held()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(file);
+}
+
 impl Drop for Lease {
     fn drop(&mut self) {
+        forget(&self.file);
         let _ = fs::remove_file(&self.file);
     }
 }
@@ -169,8 +245,26 @@ impl WriteLock {
                     if live(&file, unix_ms()) {
                         return Ok(None);
                     }
-                    // A dead writer's marker: reap and retry.
-                    let _ = fs::remove_file(&file);
+                    // A dead writer's marker: reap and retry. Reaping is a
+                    // rename, and what was moved is judged again (P07-14):
+                    // when two writers race to reap the same dead marker,
+                    // the slower one moves the faster one's *fresh* marker
+                    // — it finds it live, puts it back and answers busy,
+                    // instead of deleting it and staging alongside.
+                    let dead = dir.join(format!("{WRITE_LOCK_NAME}.{:08x}.dead", rand_u32()));
+                    match fs::rename(&file, &dead) {
+                        Ok(()) => {
+                            if live(&dead, unix_ms()) {
+                                let _ = fs::hard_link(&dead, &file);
+                                let _ = fs::remove_file(&dead);
+                                return Ok(None);
+                            }
+                            let _ = fs::remove_file(&dead);
+                        }
+                        // Another reaper moved it first; the retry decides.
+                        Err(e) if e.kind() == ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
                 Err(e) if e.kind() == ErrorKind::NotFound => {
                     // `writing/` is not there yet (or was removed under
@@ -338,6 +432,46 @@ mod tests {
         // Not a parseable lease, but just written: conservative-live.
         fs::write(lease_dir.join("torn"), b"\xff\xfe").unwrap();
         assert_eq!(sweep(entry).unwrap().active, 1);
+    }
+
+    /// P07-13: a held lease is renewed to its own TTL for as long as it is
+    /// held, and a released one is never resurrected by the keeper.
+    #[test]
+    fn a_held_lease_is_renewed_and_a_released_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path();
+        let lease = Lease::acquire(entry, "attempt-1", Duration::from_millis(50)).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        // Past its TTL: a sweep now would take it — unless renewed.
+        assert!(!live(lease.path(), unix_ms()));
+        assert!(renew_held() >= 1);
+        lease.renew(DEFAULT_TTL).unwrap();
+        assert_eq!(sweep(entry).unwrap().active, 1, "renewed, still pinning");
+        let file = lease.path().to_path_buf();
+        drop(lease);
+        renew_held();
+        assert!(
+            !file.exists(),
+            "the keeper never recreates a released lease"
+        );
+    }
+
+    /// P07-14: a reaper that moves a marker which turned out to be live
+    /// puts it back and answers busy — it never deletes a fresh claim.
+    #[test]
+    fn a_racing_reaper_never_deletes_a_fresh_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path();
+        let held = WriteLock::acquire(entry, "writer-b").unwrap().unwrap();
+        // Writer C judged an older marker stale and now tries to take the
+        // slot: the marker it finds is B's fresh one.
+        assert!(WriteLock::acquire(entry, "writer-c").unwrap().is_none());
+        assert!(held.path().is_file(), "B's claim survives");
+        let leftovers: Vec<_> = fs::read_dir(entry.join(WRITING_NAME))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "no reaped copies linger: {leftovers:?}");
     }
 
     #[test]

@@ -93,7 +93,7 @@ Optional on-disk controller state configures sources ([sources](sources.md)), ev
 
 - `<data_dir>/source-destinations.json` — a JSON array of at most 128 approved authorities (`https://host[:port]`, `ssh://user@host[:port]`). A source binding whose remote is not exactly one of them is refused. Absent means no binding can be created.
 - `<data_dir>/github-app.json` — `{"app_id": 1234, "private_key_file": "/absolute/owner-only.pem"}` for the GitHub App association, plus two optional fields: `public_url`, the deployment-facing base URL used for a check's `details_url` ([checks](checks.md)), and `api_url`, another GitHub API endpoint (Enterprise, or a loopback stub). The PEM must be a regular file, not group- or world-readable, at most 16 KiB, PKCS#1 or unencrypted PKCS#8. The App key is never stored in the database.
-- `<data_dir>/remote-cache/` — the controller's remote cache store (Q08): objects workers offered so another worker can hydrate them without the WAN. Created at server start; with the directory absent every cache need is refused `NoBundle`. The API also sets it through `Controller::set_remote_cache`.
+- `<data_dir>/remote-cache/` — the controller's remote cache store (Q08): objects workers offered so another worker can hydrate them without the WAN. Created at server start; without a configured store every cache need and offer is refused `denied`; the store is reclaimed every 10 minutes to one bundle per entry and a 50 GiB budget ([cache](cache.md)). The API also sets it through `Controller::set_remote_cache`.
 - `<data_dir>/github-webhook.json` — `{"secret": "…"}` for GitHub webhook signature verification; the secret is 16–256 printable ASCII bytes and the file must be owner-only. Without it the GitHub intake route does not exist.
 
 Source credentials themselves are sealed with `<data_dir>/master.key` (`admin key create`), the same key-outside-database file second factors use. Repository hook secrets are digests and need no key. Resolution also uses `<data_dir>/intake-work/` as per-delivery scratch space for the repository fetches it makes; it is emptied at startup and never reused.
@@ -117,7 +117,7 @@ Keys live under `<data_dir>/tailcat` (owner-only) and persist across restarts, s
 
 ### Remote cache
 
-`[remote_cache] enabled = true` (the default) is what makes the two Q08 halves line up: the controller keeps objects workers offer under `<data_dir>/remote-cache`, and a worker fetches, offers and resumes objects over its bulk connection. Set it to `false` on either side to make every remote lookup a local miss — a worker then never asks and never offers, and a controller without the section serves nothing (`NoBundle`). A local cache hit never touches the link in any configuration.
+`[remote_cache] enabled = true` (the default) is what makes the two Q08 halves line up: the controller keeps objects workers offer under `<data_dir>/remote-cache`, and a worker fetches, offers and resumes objects over its bulk connection. Set it to `false` on either side to make every remote lookup a local miss — a worker then never asks and never offers, and a controller without the section serves nothing (`denied`). A local cache hit never touches the link in any configuration.
 
 With the helper enabled, the worker's `Transport` telemetry carries the helper's version and the control session's measured round-trip time; the direct/relay distinction stays `Unknown` unless a probe can actually tell, never guessed.
 

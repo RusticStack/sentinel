@@ -1262,6 +1262,7 @@ dependencies = [
  "blake3",
  "libc",
  "postcard",
+ "rustix",
  "sentinel-core",
  "sentinel-pipeline",
  "sentinel-protocol",

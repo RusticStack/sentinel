@@ -92,6 +92,9 @@ struct State {
     held: HashSet<Box<str>>,
     /// The `held` digests oldest-first, for eviction past [`MAX_HELD`].
     order: VecDeque<Box<str>>,
+    /// Moves every time `held` gains a digest: the placement feed resends
+    /// only when it changed.
+    version: u64,
 }
 
 struct Inner {
@@ -126,6 +129,7 @@ impl Images {
                     pulling: HashMap::new(),
                     held: HashSet::new(),
                     order: VecDeque::new(),
+                    version: 0,
                 }),
                 download: Arc::new(download),
             }),
@@ -232,6 +236,33 @@ impl Images {
         held
     }
 
+    /// Moves every time the held record gains a digest.
+    pub fn version(&self) -> u64 {
+        self.state().version
+    }
+
+    /// The newest `max` held digests as placement keys — the first 8 bytes
+    /// of each `sha256:` digest, what the profile's `Availability::images`
+    /// carries (K08, P07-6). A digest that is not `sha256:<hex>` has no key.
+    pub fn held_keys(&self, max: usize) -> Vec<[u8; 8]> {
+        let state = self.state();
+        state
+            .order
+            .iter()
+            .rev()
+            .filter_map(|digest| {
+                let hex = digest.strip_prefix("sha256:")?.as_bytes();
+                let mut key = [0u8; 8];
+                for (i, slot) in key.iter_mut().enumerate() {
+                    let pair = std::str::from_utf8(hex.get(i * 2..i * 2 + 2)?).ok()?;
+                    *slot = u8::from_str_radix(pair, 16).ok()?;
+                }
+                Some(key)
+            })
+            .take(max)
+            .collect()
+    }
+
     /// Pulls in flight right now; never more than the attempt bound.
     pub fn in_flight(&self) -> usize {
         self.state().pulling.len()
@@ -255,6 +286,7 @@ impl Images {
         let digest: Box<str> = digest.into();
         state.order.push_back(digest.clone());
         state.held.insert(digest);
+        state.version += 1;
     }
 
     fn state(&self) -> MutexGuard<'_, State> {

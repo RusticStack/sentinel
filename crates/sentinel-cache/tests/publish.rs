@@ -49,6 +49,7 @@ fn compat() -> Compat {
 fn target(dir: PathBuf) -> Target {
     Target {
         declared: dir.to_string_lossy().into_owned(),
+        root: dir.parent().unwrap().to_path_buf(),
         dir,
         container: "/workspace/cache".to_owned(),
         mount: false,
@@ -577,4 +578,260 @@ fn sealed_payload_files_carry_the_recorded_mode() {
         0o755,
         "the staged payload file itself carries the recorded mode"
     );
+}
+
+// ——— P07-1 / P07-5 / P07-9: confined, bounded, refusal-aware publish ———
+
+/// A restore-shaped carrier over a real workspace: the targets are what
+/// `restore` resolved (anchored at the workspace), so publish sees exactly
+/// what finalization hands it.
+#[cfg(unix)]
+fn restored(root: &Path, ws: &Path, paths: &[&str], key: &str) -> Attached {
+    let decl = sentinel_pipeline::schema::Cache {
+        name: "deps".into(),
+        class: Class::Dependencies,
+        key: sentinel_pipeline::expr::Template::parse(key).unwrap(),
+        paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+    };
+    let env = sentinel_cache::restore::Context {
+        cache_root: root,
+        workspace: ws,
+        workspace_mount: "/workspace",
+        backend: sentinel_cache::clone::Backend::Copy,
+    };
+    sentinel_cache::restore::restore(
+        &env,
+        &decl,
+        Some(key.to_owned()),
+        test_scope(Trust::PullRequest),
+        "attempt-1",
+    )
+}
+
+/// Every payload path a sealed generation lists, in listing order.
+#[cfg(unix)]
+fn listed(root: &Path, a: &Attached, generation: &str) -> Vec<String> {
+    let (_, blob) = sealed(&entry_of(root, a), generation);
+    blob.entries.into_iter().map(|e| e.path).collect()
+}
+
+/// P07-1: a job that swaps an intermediate component of a declared path
+/// for a symlink to a host directory must not seal that directory — for a
+/// relative declaration and for an absolute one (whose private view lives
+/// under `.sentinel-cache/` inside the workspace).
+#[cfg(unix)]
+#[test]
+fn publish_refuses_a_symlinked_intermediate_component() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cache");
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    // Host files the job must never read: the worker's key, another
+    // tenant's cache — anything the worker account can open.
+    let host = tmp.path().join("host");
+    put(&host, "b/worker.key", b"PRIVATE KEY MATERIAL");
+    put(&host, "1/stolen", b"PRIVATE KEY MATERIAL");
+
+    let a = restored(&root, &ws, &["a/b", "/opt/tool"], "deps-p071");
+    assert_eq!(a.outcome, Outcome::Miss(Miss::Absent));
+    put(&ws, "a/b/honest", b"job output");
+    // The job replaces `a` (above the declared `a/b`) and the private
+    // `.sentinel-cache/deps` (above `/opt/tool`'s view) with links out.
+    fs::remove_dir_all(ws.join("a")).unwrap();
+    symlink(&host, ws.join("a")).unwrap();
+    let private = ws.join(sentinel_cache::attach::PRIVATE_DIR).join("deps");
+    fs::remove_dir_all(&private).unwrap();
+    symlink(&host, &private).unwrap();
+
+    let out = commit(&root, &a, 1_000).unwrap();
+    assert_eq!(
+        out,
+        Published::Skipped(SkipReason::Empty),
+        "nothing beneath a planted link may be walked"
+    );
+    // And no generation holding host bytes exists anywhere.
+    assert!(current_gen(&entry_of(&root, &a)).is_none());
+}
+
+/// P07-1/P07-9: a symlink the checkout itself carries above a declared
+/// path makes restore refuse the entry (`invalid`); publication of a
+/// refused entry is a `refused` skip — the path is never walked.
+#[cfg(unix)]
+#[test]
+fn publish_skips_an_entry_restore_refused() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cache");
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let host = tmp.path().join("host");
+    put(&host, "sub/secret", b"host bytes");
+    symlink(&host, ws.join("link")).unwrap();
+    let a = restored(&root, &ws, &["link/sub"], "deps-p079");
+    assert_eq!(a.outcome, Outcome::Miss(Miss::Invalid));
+    assert_eq!(
+        commit(&root, &a, 1_000).unwrap(),
+        Published::Skipped(SkipReason::Refused)
+    );
+    assert!(!entry_of(&root, &a).exists(), "nothing was created");
+}
+
+/// P07-9: an entry whose key never rendered (`""`) could never serve — it
+/// publishes nothing instead of a permanent unservable `current`; neither
+/// does an entry restore answered `invalid`.
+#[test]
+fn an_unrendered_key_publishes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cache");
+    let view = tmp.path().join("view");
+    put(&view, "f", b"bytes");
+    let mut a = attached(test_scope(Trust::Protected), vec![target(view)]);
+    a.key = String::new();
+    assert_eq!(
+        commit(&root, &a, 1_000).unwrap(),
+        Published::Skipped(SkipReason::Refused)
+    );
+    a.key = "deps-deadbeef".into();
+    a.outcome = Outcome::Miss(Miss::Invalid);
+    assert_eq!(
+        commit(&root, &a, 1_000).unwrap(),
+        Published::Skipped(SkipReason::Refused)
+    );
+    assert_eq!(SkipReason::Refused.as_str(), "refused");
+}
+
+/// P07-1: a file swapped for a symlink between the plan and the copy is
+/// never opened — the stage reopens every file beneath its confined base
+/// with `O_NOFOLLOW`, so the swap stages nothing of the link's target.
+#[cfg(unix)]
+#[test]
+fn publish_opens_files_nofollow() {
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::AtomicBool;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cache");
+    let view = tmp.path().join("view");
+    put(&view, "keep", b"kept bytes");
+    put(&view, "swap", b"planned bytes");
+    let secret = tmp.path().join("secret");
+    fs::write(&secret, b"PRIVATE KEY MATERIAL").unwrap();
+    let a = attached(test_scope(Trust::Protected), vec![target(view.clone())]);
+    // The commit polls `cancel` once before planning and once between the
+    // plan and the stage: the second poll is where the job's swap lands.
+    let calls = AtomicU32::new(0);
+    let swapped = AtomicBool::new(false);
+    let cancel = || {
+        if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            fs::remove_file(view.join("swap")).unwrap();
+            symlink(&secret, view.join("swap")).unwrap();
+            swapped.store(true, Ordering::SeqCst);
+        }
+        false
+    };
+    let out = sentinel_cache::publish::commit(
+        &root,
+        &a,
+        Trust::Protected,
+        UnixMillis(1_000),
+        deadline(),
+        &cancel,
+    )
+    .unwrap();
+    assert!(swapped.load(Ordering::SeqCst), "the swap ran mid-commit");
+    let Published::Sealed {
+        generation,
+        skipped,
+        ..
+    } = out
+    else {
+        panic!("expected sealed, got {out:?}")
+    };
+    assert_eq!(skipped, 1, "the swapped entry is counted, not staged");
+    assert_eq!(listed(&root, &a, &generation), ["payload/0/keep"]);
+}
+
+/// P07-5: a generation whose logical payload exceeds the per-generation
+/// cap is refused before a byte is staged — a sparse file claiming
+/// terabytes costs a stat, not a copy.
+#[cfg(target_os = "linux")]
+#[test]
+fn publish_refuses_a_generation_over_the_byte_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cache");
+    let view = tmp.path().join("view");
+    put(&view, "small", b"ok");
+    let huge = fs::File::create(view.join("huge")).unwrap();
+    huge.set_len(sentinel_cache::publish::MAX_GENERATION_BYTES + 1)
+        .unwrap();
+    let a = attached(test_scope(Trust::Protected), vec![target(view)]);
+    let started = Instant::now();
+    let out = commit(&root, &a, 1_000);
+    assert!(
+        matches!(out, Err(PublishError::TooLarge)),
+        "over the cap must be refused, got {out:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "refused at plan time, never after reading the file"
+    );
+    let entry = entry_of(&root, &a);
+    assert!(current_gen(&entry).is_none());
+    assert!(
+        fs::read_dir(entry.join(scope::WRITING_NAME))
+            .map(|d| d.count() == 0)
+            .unwrap_or(true),
+        "no staging survives"
+    );
+}
+
+/// P07-5: a sparse file within the cap is staged hole-for-hole: the sealed
+/// copy allocates about what the source allocates, not its logical size,
+/// and its recorded digest is still of the full logical content.
+#[cfg(target_os = "linux")]
+#[test]
+fn sparse_file_does_not_amplify() {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("cache");
+    let view = tmp.path().join("view");
+    fs::create_dir_all(&view).unwrap();
+    const LOGICAL: u64 = 256 << 20;
+    let mut file = fs::File::create(view.join("sparse")).unwrap();
+    file.write_all(b"head").unwrap();
+    file.seek(SeekFrom::Start(LOGICAL - 4)).unwrap();
+    file.write_all(b"tail").unwrap();
+    drop(file);
+    let source = fs::metadata(view.join("sparse")).unwrap();
+    if source.blocks() * 512 * 2 >= LOGICAL {
+        eprintln!("skipped: this filesystem does not keep holes");
+        return;
+    }
+    let a = attached(test_scope(Trust::Protected), vec![target(view.clone())]);
+    let Published::Sealed { generation, .. } = commit(&root, &a, 1_000).unwrap() else {
+        panic!("expected sealed")
+    };
+    let staged = entry_of(&root, &a)
+        .join(&generation)
+        .join("payload/0/sparse");
+    let meta = fs::metadata(&staged).unwrap();
+    assert_eq!(meta.len(), LOGICAL);
+    assert!(
+        meta.blocks() * 512 < 16 << 20,
+        "the staged copy allocated {} bytes for a 256 MiB mostly-hole file",
+        meta.blocks() * 512
+    );
+    let (_, blob) = sealed(&entry_of(&root, &a), &generation);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"head");
+    let zeros = vec![0u8; 1 << 20];
+    let mut left = LOGICAL - 8;
+    while left > 0 {
+        let n = left.min(zeros.len() as u64) as usize;
+        hasher.update(&zeros[..n]);
+        left -= n as u64;
+    }
+    hasher.update(b"tail");
+    assert_eq!(blob.entries[0].digest, *hasher.finalize().as_bytes());
 }

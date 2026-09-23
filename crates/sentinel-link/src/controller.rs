@@ -97,6 +97,14 @@ pub struct Stats {
     /// Protocol-7 bulk connections refused: no live control session with
     /// that certificate.
     pub bulk_refused: AtomicU64,
+    /// Remote-cache needs and offers refused `denied`: no remote store, an
+    /// attempt this worker does not own (or released too long ago), or a
+    /// boundary that is not the job's.
+    pub cache_denied: AtomicU64,
+    /// Bytes the remote-cache store's reclamation removed, in total.
+    pub remote_cache_freed: AtomicU64,
+    /// The remote-cache store's kept bytes after its last sweep.
+    pub remote_cache_bytes: AtomicU64,
 }
 
 struct Peer {
@@ -585,7 +593,50 @@ impl Inner {
     }
 }
 
+/// How often the controller's remote-cache store is reclaimed.
+pub const REMOTE_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// How long after its release an attempt may still offer what it sealed
+/// (P07-7): the worker's offer budget plus slack for publication and the
+/// terminal report's round trip.
+pub const OFFER_WINDOW_MS: i64 = 10 * 60 * 1000;
+
 impl Inner {
+    /// Protocol 7 (Q08). The shared remote-cache gate: `attempt` is owned
+    /// by `worker` (held, or released since `released_since` for an offer)
+    /// and the transfer names exactly the job's tenant and repository and a
+    /// trust class the job's admits. `Some(root)` to serve from; a refusal
+    /// is counted in `cache_denied`.
+    fn cache_authorize(
+        &self,
+        worker: WorkerId,
+        attempt: [u8; 16],
+        (tenant, repo, trust): ([u8; 16], [u8; 16], u8),
+        released_since: Option<UnixMillis>,
+    ) -> Option<std::path::PathBuf> {
+        let root = self
+            .remote_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let authorized = root.is_some()
+            && AttemptId::from_bytes(attempt).is_ok_and(|attempt| {
+                self.store
+                    .read(|c| dispatch::cache_scope(c, worker, attempt, released_since))
+                    .is_ok_and(|(job_tenant, job_repo, job_trust)| {
+                        *job_tenant.as_bytes() == tenant
+                            && *job_repo.as_bytes() == repo
+                            && sentinel_protocol::cache::Trust::from_u8(trust)
+                                .is_some_and(|t| job_trust.admits(t))
+                    })
+            });
+        if !authorized {
+            self.stats.cache_denied.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        root
+    }
+
     fn peer(&self, worker: WorkerId) -> Option<Arc<Peer>> {
         self.fleet
             .lock()
@@ -1063,53 +1114,27 @@ impl SessionHandler for Inner {
     /// hold. The controller's remote-cache root is returned to serve from;
     /// without one, every need is a miss.
     fn cache_need(&self, worker: WorkerId, need: &Need) -> Option<std::path::PathBuf> {
-        let root = self
-            .remote_cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()?;
-        let attempt = AttemptId::from_bytes(need.attempt).ok()?;
-        let authorized = self
-            .store
-            .read(|c| {
-                let tx = c.unchecked_transaction()?;
-                if !dispatch::is_held(&tx, worker, attempt)? {
-                    return Err(sentinel_store::Error::NotFound);
-                }
-                dispatch::job_context(&tx, worker, attempt)
-            })
-            .is_ok_and(|context| {
-                *context.tenant.as_bytes() == need.tenant
-                    && *context.repo.as_bytes() == need.repo
-                    && context.trust.to_u8() == need.trust
-            });
-        authorized.then_some(root)
+        self.cache_authorize(
+            worker,
+            need.attempt,
+            (need.tenant, need.repo, need.trust),
+            None,
+        )
     }
 
-    /// Protocol 7 (Q08). Authorizes an upload under the same rule as a
-    /// download before any bytes are staged.
+    /// Protocol 7 (Q08). Authorizes an upload under the same boundary rule
+    /// as a download before any bytes are staged — except that the attempt
+    /// may already be released: a worker offers what it sealed only after
+    /// its terminal report (P07-7), so the same worker's attempt released
+    /// within [`OFFER_WINDOW_MS`] still names its boundary.
     fn cache_offer(&self, worker: WorkerId, upload: &Upload) -> Option<std::path::PathBuf> {
-        let root = self
-            .remote_cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()?;
-        let attempt = AttemptId::from_bytes(upload.attempt).ok()?;
-        let authorized = self
-            .store
-            .read(|c| {
-                let tx = c.unchecked_transaction()?;
-                if !dispatch::is_held(&tx, worker, attempt)? {
-                    return Err(sentinel_store::Error::NotFound);
-                }
-                dispatch::job_context(&tx, worker, attempt)
-            })
-            .is_ok_and(|context| {
-                *context.tenant.as_bytes() == upload.tenant
-                    && *context.repo.as_bytes() == upload.repo
-                    && context.trust.to_u8() == upload.trust
-            });
-        authorized.then_some(root)
+        let since = UnixMillis(UnixMillis::now().0 - OFFER_WINDOW_MS);
+        self.cache_authorize(
+            worker,
+            upload.attempt,
+            (upload.tenant, upload.repo, upload.trust),
+            Some(since),
+        )
     }
 
     fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict {
@@ -1672,14 +1697,56 @@ impl Controller {
     }
 
     /// Where the controller keeps remote cache objects (Q08), normally
-    /// `<data_dir>/remote-cache`. Unset answers every cache need as a miss;
-    /// the directory itself is created lazily by the first upload.
+    /// `<data_dir>/remote-cache`. Unset answers every cache need `denied`;
+    /// the directory itself is created lazily by the first upload. Setting
+    /// it starts the store's reclamation (P08-C4): one bounded
+    /// `remote::sweep_store` pass now and every [`REMOTE_SWEEP_INTERVAL`] —
+    /// one bundle per entry, abandoned uploads removed, and the store held
+    /// to `remote::STORE_BUDGET_BYTES`, least recently served first.
     pub fn set_remote_cache(&self, root: std::path::PathBuf) {
-        *self
+        let first = self
             .inner
             .remote_cache
             .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(root);
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(root)
+            .is_none();
+        if !first {
+            return;
+        }
+        let watched = Arc::downgrade(&self.inner);
+        let _ = thread::Builder::new()
+            .name("sentinel-remote-cache-gc".into())
+            .spawn(move || {
+                loop {
+                    let Some(inner) = watched.upgrade() else {
+                        return;
+                    };
+                    let root = inner
+                        .remote_cache
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    if let Some(root) = root {
+                        let swept = sentinel_cache::remote::sweep_store(
+                            &root,
+                            sentinel_cache::remote::STORE_BUDGET_BYTES,
+                            sentinel_cache::gc::DEFAULT_PASS_WORK,
+                            UnixMillis::now().0,
+                        );
+                        inner
+                            .stats
+                            .remote_cache_freed
+                            .fetch_add(swept.bytes_freed, Ordering::Relaxed);
+                        inner
+                            .stats
+                            .remote_cache_bytes
+                            .store(swept.bytes, Ordering::Relaxed);
+                    }
+                    drop(inner);
+                    thread::sleep(REMOTE_SWEEP_INTERVAL);
+                }
+            });
     }
     /// Bind `listen`, present `identity`, and start serving workers of
     /// `store`. Returns once the socket is bound; workers may connect.

@@ -100,11 +100,12 @@ sent once per session after `Profile` and refreshed every 12 beats. The
 controller keeps the latest per session (`Handle::transport(worker)`), and a
 field nothing measured stays absent — never a zero claim.
 
-## Cache transfers (protocol 7, Q08)
+## Cache transfers (protocol 7, Q08; cancel and refresh from 8)
 
-Remote cache hydration runs entirely on the bulk connection, in both
-directions, with the cache crate owning the objects and the link owning
-framing:
+Remote cache hydration prefers the bulk connection, in both directions,
+with the cache crate owning the objects and the link owning framing; a
+worker whose bulk connection is down sends the same messages on the control
+connection (the bulk-class fallback):
 
 - `CacheNeed(Need)` asks for one object by scope (tenant/repo/class/trust/
   platform/toolchain/name/key), with `offset` and `have` so a retry resumes
@@ -113,23 +114,47 @@ framing:
 - `CacheGrant(Grant)` accepts a transfer at an offset, `CacheChunk` carries
   ordered chunks with a running digest, `CacheEnd` is terminal both ways, and
   `CacheRefused(Refused)` carries a stable refusal code.
-- Authorization is the **fenced attempt**, never the request: the controller
-  requires the attempt to be held by that worker and the need's tenant, repo
-  and trust class to equal the attempt's recorded context. A worker cannot
-  name a boundary it does not hold.
+- Protocol 8: `CacheCancel { attempt }` tells the controller the worker
+  abandoned the attempt's transfer. A serve stops at its next chunk and
+  answers `CacheRefused` with `aborted` as its terminal; an upload is dropped
+  with its staging file and entry lock and answered once. The worker keeps
+  the attempt *draining* until that terminal arrives and refuses a new
+  transfer of it (`busy`) meanwhile, so a stale tail is never routed into the
+  next stream; answers queue at most 64 deep per transfer and a caller that
+  falls behind abandons the transfer instead of buffering without bound.
+- Authorization is the **fenced attempt**, never the request
+  (`dispatch::cache_scope`): the attempt must be owned by that worker — held
+  for a fetch, or released within 10 minutes for an offer, which always
+  follows the terminal report — and the transfer's tenant and repository must
+  equal the attempt's while its trust is one the job's class admits (a
+  protocol-6/7 worker names `pull_request` for an `unprotected` job). A
+  worker cannot name a boundary it does not hold; refusals are `denied` and
+  counted (`Stats::cache_denied`).
 - The link caps one cache chunk at `MAX_CACHE_CHUNK_BYTES` (48 KiB, so the
   frame fits `MAX_CONTROL_MESSAGE_BYTES`) and refuses anything larger as
   `TooLarge` rather than splitting it: a chunk's running digest cannot be
-  recomputed for a piece.
+  recomputed for a piece. The receiver moves decrypted plaintext out of
+  rustls whenever its buffer fills, so a burst of full frames never
+  overflows it.
 - Downloads are streamed off the session thread (at most
-  `MAX_CACHE_TRANSFERS` at a time per connection) so a large hydration never
-  stalls the reader; uploads are fed frame by frame into the cache crate's
-  receiving state, which verifies the whole stream's digest before promoting
-  it.
+  `MAX_CACHE_TRANSFERS` at a time per connection, one reused chunk buffer
+  each) so a large hydration never stalls the reader; uploads (at most
+  `MAX_CACHE_TRANSFERS` per connection, dropped after 60 s without a push)
+  are fed frame by frame into the cache crate's receiving state, which
+  hashes as bytes land and verifies the whole stream's digest before
+  promoting it.
 
 A local cache hit never touches the link. The controller serves from
-`<data_dir>/remote-cache` when it has one (`Controller::set_remote_cache`);
-without one every need is refused `NoBundle`.
+`<data_dir>/remote-cache` when it has one (`Controller::set_remote_cache`,
+which also starts that store's reclamation); without one every need is
+refused `denied`.
+
+**Profile refresh (protocol 8).** The worker opens every session with a
+`Profile` whose availability is the executor's own record — the newest
+held image keys (at most 64) and the cache store's estimated bytes — and,
+from protocol 8, sends a later `Profile` whenever that record's version
+moves (checked once per heartbeat). A protocol-7 controller accepts one
+profile per session; a protocol-8 one treats a later one as a refresh.
 
 ## Dispatch (W02)
 

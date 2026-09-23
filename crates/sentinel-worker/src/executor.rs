@@ -233,8 +233,15 @@ pub struct Inner {
     mirrors: Option<crate::checkout::Mirrors>,
     state: Mutex<State>,
     /// One cache reclamation pass at a time; a second caller skips rather
-    /// than waits, because the running pass already covers its work.
-    gc_lock: Mutex<()>,
+    /// than waits, because the running pass already covers its work. The
+    /// lock holds the resume cursor, so bounded passes cover the whole
+    /// tree across attempts (P07-4).
+    gc_lock: Mutex<sentinel_cache::gc::Cursor>,
+    /// The cache store's payload bytes as the last pass estimated them —
+    /// the availability the link reports to placement (K08).
+    cache_bytes: std::sync::atomic::AtomicU64,
+    /// Moves whenever `cache_bytes` changes.
+    cache_version: std::sync::atomic::AtomicU64,
     notify: Box<dyn Fn(Notice) + Send + Sync>,
     recovered: Recovered,
 }
@@ -287,7 +294,9 @@ impl Executor {
                 artifact_waits: HashMap::new(),
             }),
             notify: Box::new(notify),
-            gc_lock: Mutex::new(()),
+            gc_lock: Mutex::new(sentinel_cache::gc::Cursor::default()),
+            cache_bytes: std::sync::atomic::AtomicU64::new(0),
+            cache_version: std::sync::atomic::AtomicU64::new(0),
             recovered,
         }));
         // One bounded reclamation pass at start: what a dead process left —
@@ -507,22 +516,37 @@ impl Inner {
     /// rides, so the occupancy it already computed costs a second walk
     /// never.
     fn sweep_caches(&self) {
-        let _guard = match self.gc_lock.try_lock() {
+        let mut cursor = match self.gc_lock.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return,
         };
-        let stats = sentinel_cache::gc::sweep(
+        let stats = sentinel_cache::gc::resume(
             &self.root.join(sentinel_cache::CACHE_DIR),
             sentinel_cache::gc::DEFAULT_BUDGET_BYTES,
             sentinel_cache::gc::DEFAULT_PASS_WORK,
+            &mut cursor,
         );
+        drop(cursor);
+        // The mirrors share the pass's cadence: bounded, and skipped for
+        // any mirror a checkout holds (P07-22).
+        if let Some(mirrors) = &self.mirrors {
+            let _ = mirrors.sweep(crate::checkout::MIRRORS_BUDGET_BYTES);
+        }
+        if self
+            .cache_bytes
+            .swap(stats.estimated_bytes, std::sync::atomic::Ordering::Relaxed)
+            != stats.estimated_bytes
+        {
+            self.cache_version
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         (self.notify)(Notice::Availability(Availability {
             images_held: self.images.held(),
             images_in_flight: self.images.in_flight(),
             cache_entries: stats.entries_seen,
             cache_generations: stats.generations_seen,
-            cache_bytes: stats.payload_bytes.saturating_sub(stats.bytes_freed),
+            cache_bytes: stats.estimated_bytes,
             truncated: stats.truncated,
         }));
         if stats.did_work() {
@@ -786,6 +810,28 @@ impl artifacts::Sink for Inner {
 }
 
 impl LinkExecutor for Executor {
+    /// P07-6: the image keys the local store is known to hold (newest
+    /// first, bounded by the wire's list limit) and the cache store's bytes
+    /// as the last sweep estimated them. Both come from state the worker
+    /// already keeps — no store scan, no podman call; the version moves
+    /// when either changes, so the link resends only then.
+    fn availability(&self) -> Option<(u64, sentinel_protocol::negotiate::Availability)> {
+        let version = self.images.version().wrapping_add(
+            self.cache_version
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        Some((
+            version,
+            sentinel_protocol::negotiate::Availability {
+                images: self
+                    .images
+                    .held_keys(sentinel_protocol::limits::MAX_LIST_ITEMS),
+                cache_bytes: self.cache_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                load_ns: 0,
+            },
+        ))
+    }
+
     fn offered(&self, offer: &Offer) -> bool {
         let mut state = self.state();
         if state.live.len() + state.awaiting.len() >= MAX_LIST_ITEMS || state.reporter.is_none() {

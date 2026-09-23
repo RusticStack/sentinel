@@ -282,6 +282,64 @@ fn a_pull_request_attempt_never_touches_protected_state() {
     assert!(pr.join(scope::CURRENT_NAME).exists());
 }
 
+/// P07-1: publication reads the job's writable views only after the
+/// container is gone — a background process a step left running (here a
+/// loop that keeps rewriting the cache view) can no longer touch the tree
+/// the walk reads. Proven at the moment of publication: the cache note is
+/// emitted from inside the publish, and at that instant the runtime no
+/// longer knows the attempt's container.
+#[test]
+fn publish_runs_with_the_container_stopped() {
+    if !enabled() {
+        return;
+    }
+    struct Probe {
+        container_alive_at_publish: Mutex<Vec<bool>>,
+    }
+    impl Report for Probe {
+        fn event(&self, _: AttemptId, _: Fence, _: Event) {}
+        fn finish(&self, _: AttemptId, _: Fence, _: Event, _: Vec<u8>) {}
+        fn cache_note(&self, attempt: AttemptId, _: CacheNote) {
+            let alive = Command::new("podman")
+                .args(["container", "exists", &format!("sentinel-{attempt}")])
+                .status()
+                .unwrap()
+                .success();
+            self.container_alive_at_publish.lock().unwrap().push(alive);
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("origin");
+    let sha = make_repo(&repo_dir);
+    let worker_dir = temp.path().join("worker");
+    let mut job = make_job(&repo_dir, &sha, RepoId::new(), Trust::Protected);
+    // The step returns at once but leaves a writer behind in the view.
+    let yaml = PIPELINE.replace(
+        "run: 'mkdir -p vendor && echo payload > vendor/lib'",
+        "run: 'mkdir -p vendor && echo payload > vendor/lib && (while :; do date > vendor/churn; done) >/dev/null 2>&1 &'",
+    );
+    job.spec = RunSpec::new(job.spec.source.clone(), compile_str(&yaml).unwrap()).unwrap();
+    let probe = Probe {
+        container_alive_at_publish: Mutex::new(Vec::new()),
+    };
+    let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let (verdict, summary) = attempt::run(
+        &worker_dir,
+        &mut job,
+        &probe,
+        Arc::new(NoOutput),
+        &NoSink,
+        &cancel,
+    );
+    assert_eq!(verdict, Verdict::Passed);
+    assert_eq!(summary.caches[0].publish.as_deref(), Some("sealed"));
+    assert_eq!(
+        *probe.container_alive_at_publish.lock().unwrap(),
+        [false],
+        "the container must be gone before publication reads the views"
+    );
+}
+
 /// An entry tree as relpath → bytes, so "untouched" is checked, not
 /// assumed — two snapshots compare equal only when every name and byte
 /// survived.
