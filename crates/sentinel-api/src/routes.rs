@@ -546,6 +546,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
                         "arch": format!("{:?}", w.negotiated.arch).to_lowercase(),
                         "connected": connected.contains(&w.id),
                         "last_seen_ms": w.last_seen.map(|t| t.0),
+                        "transport": state.controller.transport(w.id).map(|t| transport_json(&t)),
                     })).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>()
             }))
@@ -863,6 +864,63 @@ fn worker_drain(state: &State, request: &mut Request, worker: &str, drain: bool)
     // state, so a change to it is what the dispatcher's next pass must see.
     state.controller.wake();
     ok(json!({ "worker": worker.to_string(), "draining": drain }))
+}
+
+/// A connected worker's transport telemetry (Q07), as it last reported it.
+/// Unmeasured fields are absent, never zero: `path` is `unknown` until a
+/// probe measured it, `rtt_ns` and `helper_version` are left out until set.
+/// Nothing here is a credential: no address or key is ever reported.
+fn transport_json(t: &sentinel_link::session::TransportStats) -> Value {
+    let mut out = json!({
+        "path": match t.path {
+            sentinel_link::session::Path::Unknown => "unknown",
+            sentinel_link::session::Path::Direct => "direct",
+            sentinel_link::session::Path::Relay => "relay",
+        },
+        "reconnects": t.reconnects,
+        "bytes_in": t.bytes_in,
+        "bytes_out": t.bytes_out,
+    });
+    if let Some(rtt) = t.rtt_ns {
+        out["rtt_ns"] = json!(rtt);
+    }
+    if let Some(version) = &t.helper_version {
+        out["helper_version"] = json!(version);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a worker never measured stays out of the answer (AGENTS.md:
+    /// unmeasured is absent, never zero).
+    #[test]
+    fn transport_telemetry_leaves_unmeasured_fields_out() {
+        use sentinel_link::session::{Path, TransportStats};
+        let bare = transport_json(&TransportStats::default());
+        assert_eq!(bare["path"], "unknown");
+        assert!(bare.get("rtt_ns").is_none() && bare.get("helper_version").is_none());
+        let measured = transport_json(&TransportStats {
+            path: Path::Relay,
+            rtt_ns: Some(12_000_000),
+            reconnects: 2,
+            helper_version: Some("tailcat 0.6.0".into()),
+            bytes_out: 10,
+            bytes_in: 20,
+        });
+        assert_eq!(measured["path"], "relay");
+        assert_eq!(measured["rtt_ns"], 12_000_000);
+        assert_eq!(measured["helper_version"], "tailcat 0.6.0");
+        assert_eq!(
+            (
+                measured["reconnects"].as_u64(),
+                measured["bytes_in"].as_u64()
+            ),
+            (Some(2), Some(20))
+        );
+    }
 }
 
 /// One waiting job as the API explains it: how long it has been waiting and

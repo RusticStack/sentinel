@@ -1019,3 +1019,75 @@ fn a_failing_placement_is_counted_not_swallowed() {
             .shutdown(Duration::from_secs(5))
     );
 }
+
+/// T2 (Q07): transport telemetry used to be measured once at process start
+/// and replayed on every session. With a live source on the worker handle
+/// (the Tailcat helper's latest probe), each session reports what the helper
+/// last measured — here a relayed path, then, after the helper re-measures
+/// and the session reconnects, a direct one — and the controller exposes it
+/// per worker.
+#[test]
+fn each_session_reports_the_helpers_latest_transport_measurement() {
+    use sentinel_link::session::{Path, TransportStats};
+    let mut d = deployment();
+    let id = WorkerId::new();
+    let measured = Arc::new(Mutex::new(Path::Relay));
+    let handle = Arc::new(worker::Handle::new());
+    {
+        let measured = Arc::clone(&measured);
+        handle.set_transport_source(Arc::new(move || TransportStats {
+            path: *measured.lock().unwrap(),
+            rtt_ns: Some(5_000_000),
+            helper_version: Some("tailcat 0.6.0".into()),
+            ..TransportStats::default()
+        }));
+    }
+    let config = worker::Config {
+        controller: d.controller().local_addr(),
+        server: d.controller().fingerprint(),
+        worker: id,
+        name: "measured".into(),
+        hello: hello(),
+        capacity: STANDARD,
+        profile: profile(40, 128 << 30),
+        // What a process without a live source would send: never used here.
+        transport: TransportStats::default(),
+        remote_cache: false,
+    };
+    let (enrollment, recorder, grip) = (d.enrollment(), Recorder::new(), Arc::clone(&handle));
+    let identity = Identity::generate("measured").unwrap();
+    let thread = thread::spawn(move || {
+        worker::run(
+            config,
+            identity,
+            Some(enrollment),
+            &*recorder,
+            &grip,
+            &|_| {},
+        )
+    });
+    let link = d.controller().handle();
+    eventually("the relayed path reported", || {
+        link.transport(id).is_some_and(|t| t.path == Path::Relay)
+    });
+    let first = link.transport(id).unwrap();
+    assert_eq!(first.helper_version.as_deref(), Some("tailcat 0.6.0"));
+    assert_eq!(first.reconnects, 0);
+
+    // The helper re-measures a direct path; the next session reports it.
+    *measured.lock().unwrap() = Path::Direct;
+    assert!(link.disconnect(id));
+    eventually("the re-measured path reported", || {
+        link.transport(id)
+            .is_some_and(|t| t.path == Path::Direct && t.reconnects == 1)
+    });
+
+    handle.stop();
+    thread.join().unwrap().unwrap();
+    assert!(
+        d.controller
+            .take()
+            .unwrap()
+            .shutdown(Duration::from_secs(5))
+    );
+}

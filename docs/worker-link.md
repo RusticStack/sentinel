@@ -103,9 +103,15 @@ control-session Ping/Pong pair; before the first beat, the latency that
 `tailcat ping` itself reported, else absent), `reconnects` (control sessions
 opened since process start), `helper_version` (the Tailcat helper's version, absent
 without one), and `bytes_in`/`bytes_out` (control-connection counters). It is
-sent once per session after `Profile` and refreshed every 12 beats. The
-controller keeps the latest per session (`Handle::transport(worker)`), and a
-field nothing measured stays absent — never a zero claim.
+sent once per session after `Profile` and refreshed every 12 beats. The worker
+process hands the link a live source (`worker::Handle::set_transport_source`,
+fed from the helper's `Forward::telemetry()`): each session starts from the
+path and latency the helper's **latest** probe measured, and each 12-beat
+resend refreshes the path and helper version from it (round-trip time stays the
+session's own beat), so a path that changed after process start is reported.
+The controller keeps the latest per session (`Handle::transport(worker)`) and
+`GET /api/v1/workers` shows it per connected worker as `transport` ([API](api.md));
+a field nothing measured stays absent — never a zero claim.
 
 ## Cache transfers (protocol 7, Q08)
 

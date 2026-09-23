@@ -23,7 +23,7 @@ use sentinel_protocol::negotiate::{Hello, PROFILE_MIN, Profile};
 use crate::{
     Error, Result,
     identity::Identity,
-    session::{self, Capacity, Executor, Link, Sender, TransportStats},
+    session::{self, Capacity, Executor, Link, Sender, TransportSource, TransportStats},
     tls,
 };
 
@@ -37,6 +37,9 @@ pub struct Handle {
     /// Control sessions opened since process start; what Q07 telemetry
     /// reports reconnects from, measured, never estimated.
     sessions: std::sync::atomic::AtomicU64,
+    /// The process's live transport measurements (Q07), when it has any;
+    /// without one every session reports [`Config::transport`].
+    transport: Mutex<Option<TransportSource>>,
 }
 
 impl Handle {
@@ -58,6 +61,21 @@ impl Handle {
     /// Control sessions this worker has opened (0 before the first).
     pub fn sessions(&self) -> u64 {
         self.sessions.load(Ordering::Acquire)
+    }
+
+    /// Report transport telemetry from `source` (the Tailcat helper's latest
+    /// probe) instead of the fixed [`Config::transport`]: read at every
+    /// session start, and at every telemetry resend within a session, so a
+    /// path the helper re-measured reaches the controller (Q07).
+    pub fn set_transport_source(&self, source: TransportSource) {
+        *self.transport.lock().unwrap_or_else(|p| p.into_inner()) = Some(source);
+    }
+
+    fn transport_source(&self) -> Option<TransportSource> {
+        self.transport
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 }
 
@@ -147,7 +165,14 @@ pub fn session(
     link.set_remote_cache(config.remote_cache);
     if link.negotiated.protocol.0 >= PROFILE_MIN.0 {
         link.send_profile(&config.profile)?;
-        let mut transport = config.transport.clone();
+        let source = handle.transport_source();
+        let mut transport = match &source {
+            Some(source) => source(),
+            None => config.transport.clone(),
+        };
+        if let Some(source) = source {
+            link.set_transport_source(source);
+        }
         transport.reconnects = handle.sessions().saturating_sub(1);
         link.report_transport(&transport)?;
     }

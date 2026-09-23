@@ -1656,6 +1656,23 @@ mod worker_role {
             tailcat = forward.is_some()
         );
         let handle = Arc::new(sentinel_link::worker::Handle::new());
+        // Q07: with a helper, every session starts from — and every
+        // telemetry resend refreshes — the path and latency the helper's
+        // latest probe measured, not the probe at process start.
+        if let Some(forward) = &forward {
+            let forward = Arc::clone(forward);
+            handle.set_transport_source(Arc::new(move || {
+                let measured = forward.telemetry();
+                sentinel_link::session::TransportStats {
+                    path: measured.path,
+                    rtt_ns: measured
+                        .ping_rtt
+                        .map(|rtt| rtt.as_nanos().min(u128::from(u64::MAX)) as u64),
+                    helper_version: measured.version,
+                    ..sentinel_link::session::TransportStats::default()
+                }
+            }));
+        }
         let grip = Arc::clone(&handle);
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
