@@ -1378,5 +1378,13 @@ const fn event_name(event: Event) -> &'static str {
         Event::WorkerEnrollmentRefused => "worker-enrollment-refused",
         Event::WorkerEnrolled => "worker-enrolled",
         Event::WorkerRevoked => "worker-revoked",
+        Event::OAuthGrantIssued => "oauth-grant-issued",
+        Event::OAuthGrantRevoked => "oauth-grant-revoked",
+        Event::OAuthRefreshReplay => "oauth-refresh-replay",
+        Event::OAuthCodeReplay => "oauth-code-replay",
+        Event::OAuthConsentDenied => "oauth-consent-denied",
+        Event::OAuthDeviceApproved => "oauth-device-approved",
+        Event::OAuthDeviceDenied => "oauth-device-denied",
+        Event::ServiceGrantIssued => "service-grant-issued",
     }
 }

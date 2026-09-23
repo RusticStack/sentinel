@@ -108,6 +108,14 @@ pub enum Event {
     WorkerEnrollmentRefused = 45,
     WorkerEnrolled = 46,
     WorkerRevoked = 47,
+    OAuthGrantIssued = 48,
+    OAuthGrantRevoked = 49,
+    OAuthRefreshReplay = 50,
+    OAuthCodeReplay = 51,
+    OAuthConsentDenied = 52,
+    OAuthDeviceApproved = 53,
+    OAuthDeviceDenied = 54,
+    ServiceGrantIssued = 55,
 }
 
 impl Event {
@@ -160,6 +168,14 @@ impl Event {
             45 => Event::WorkerEnrollmentRefused,
             46 => Event::WorkerEnrolled,
             47 => Event::WorkerRevoked,
+            48 => Event::OAuthGrantIssued,
+            49 => Event::OAuthGrantRevoked,
+            50 => Event::OAuthRefreshReplay,
+            51 => Event::OAuthCodeReplay,
+            52 => Event::OAuthConsentDenied,
+            53 => Event::OAuthDeviceApproved,
+            54 => Event::OAuthDeviceDenied,
+            55 => Event::ServiceGrantIssued,
             _ => return None,
         })
     }
@@ -329,6 +345,14 @@ fn bootstrap_complete(conn: &Connection) -> Result<bool> {
         )?
         .query_row([], |r| r.get(0))?;
     Ok(complete)
+}
+
+/// The local login name of an account, if it has one. One primary-key probe.
+pub fn username_of(conn: &Connection, user: UserId) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached("SELECT username FROM local_credentials WHERE user_id = ?1")?
+        .query_row([user.as_bytes()], |r| r.get(0))
+        .optional()?)
 }
 
 /// Whether the host-local bootstrap command is still available.
@@ -678,6 +702,7 @@ pub fn change_password(
             return Err(Error::Conflict);
         }
         revoke_all(tx, user, now)?;
+        crate::oauth::revoke_all_for_user(tx, user, crate::oauth::reason::ACCOUNT, now)?;
         audit(
             tx,
             Event::PasswordChanged,
@@ -713,6 +738,7 @@ pub fn recover(
             .ok_or(Error::NotFound)?;
         let user = UserId::from_bytes(user).map_err(|_| Error::Corrupt("user_id"))?;
         revoke_all(tx, user, now)?;
+        crate::oauth::revoke_all_for_user(tx, user, crate::oauth::reason::ACCOUNT, now)?;
         audit(
             tx,
             Event::PasswordRecovered,
@@ -797,6 +823,7 @@ pub fn set_active(
         // Suspension takes every credential with it, not only browser sessions.
         revoke_all(tx, target, now)?;
         crate::tokens::revoke_all_for_user(tx, target, now)?;
+        crate::oauth::revoke_all_for_user(tx, target, crate::oauth::reason::ACCOUNT, now)?;
     }
     let event = if active {
         Event::AccountActivated

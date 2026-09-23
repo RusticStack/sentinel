@@ -630,6 +630,7 @@ pub fn reject(
     // An account that was approved before may hold live credentials.
     crate::local_auth::revoke_all(tx, user, now)?;
     crate::tokens::revoke_all_for_user(tx, user, now)?;
+    crate::oauth::revoke_all_for_user(tx, user, crate::oauth::reason::ACCOUNT, now)?;
     audit(
         tx,
         Event::AccountRejected,

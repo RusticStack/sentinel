@@ -514,6 +514,7 @@ pub fn remove_membership(
          AND revoked_ms IS NULL",
         params![user.as_bytes(), tenant.as_bytes(), now.0],
     )?;
+    crate::oauth::revoke_for_membership(tx, user, tenant, now)?;
     crate::tenancy::bump_epoch(tx, tenant)?;
     crate::local_auth::audit(
         tx,

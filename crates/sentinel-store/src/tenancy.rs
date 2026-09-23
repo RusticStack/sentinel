@@ -47,7 +47,8 @@ pub(crate) fn bump_epoch(tx: &Transaction<'_>, tenant: TenantId) -> Result<()> {
 /// What suspension did, so the caller can report it truthfully.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Suspension {
-    /// Credentials scoped to the tenant, including every service account's.
+    /// Credentials scoped to the tenant, including every service account's:
+    /// API credentials and OAuth grants (O02) alike.
     pub tokens_revoked: usize,
     /// Unspent invitations into the tenant.
     pub invitations_revoked: usize,
@@ -92,6 +93,7 @@ pub fn suspend(
         )?,
         ..Suspension::default()
     };
+    done.tokens_revoked += crate::oauth::revoke_for_tenant(tx, tenant, now)?;
 
     // Every live job gets the durable cancel flag; the ones nobody owns yet are
     // finished here through the state machine, so the run aggregates honestly.
