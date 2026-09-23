@@ -274,10 +274,16 @@ pub fn apply_concurrency(
     Ok(())
 }
 
-/// Cancel every live run of the repository already holding `group`, older
-/// than this run: a group is a (tenant, repository, key) lock, never a
-/// global branch string. Workers learn through the usual cancel path — a
-/// running attempt is told on its next heartbeat, an unstarted job ends now.
+/// Cancel every live run of the repository already holding `group` that is
+/// not newer than this run: a group is a (tenant, repository, key) lock,
+/// never a global branch string. Workers learn through the usual cancel
+/// path — a running attempt is told on its next heartbeat, an unstarted job
+/// ends now.
+///
+/// "Not newer" is `created_ms <=`, not `<`: two runs created in the same
+/// millisecond must still supersede one another (the one applied later
+/// wins), or both would stay live and serialize behind each other instead
+/// of the older being cancelled.
 fn supersede(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -290,7 +296,7 @@ fn supersede(
         .prepare_cached(
             "SELECT DISTINCT r.id FROM runs r JOIN jobs j ON j.run_id = r.id
              WHERE r.tenant_id = ?1 AND r.repo_id = ?2 AND r.id <> ?3
-               AND r.created_ms < (SELECT created_ms FROM runs WHERE id = ?3)
+               AND r.created_ms <= (SELECT created_ms FROM runs WHERE id = ?3)
                AND j.concurrency_group = ?4 AND j.state_code < ?5",
         )?
         .query_map(
