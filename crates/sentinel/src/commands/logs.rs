@@ -11,9 +11,11 @@ use crate::client::{Client, Error, Output};
 /// to the stream it came from (stdout or stderr), as the job wrote them;
 /// NDJSON prints one `{seq, step, stream, text}` line per frame; JSON one
 /// `{attempt, frames, complete, gaps}` document of at most 10,000 frames
-/// (`next_after` continues a cut one). Without `--follow` the command ends
-/// at the end of what is stored; with it, it parks until the log is
-/// complete.
+/// (`next_after` continues a cut one). Pages follow the server's
+/// `next_after`: a page is bounded in bytes as well as frames (1 MiB of
+/// payload), so a log of full 32 KiB frames never produces a response the
+/// client cannot read. Without `--follow` the command ends at the end of
+/// what is stored; with it, it parks until the log is complete.
 pub(super) fn show(
     client: &Client,
     output: Output,
@@ -67,6 +69,15 @@ pub(super) fn show(
         }
         let complete = page["complete"] == true;
         let capped = output == Output::Json && shown >= MAX_ITEMS;
+        // A page the server cut (bytes, frames or a step filter's scan
+        // bound) says where the next one starts; follow it at once.
+        let more = page["next_after"].as_u64();
+        if let Some(next) = more
+            && !capped
+        {
+            after = after.max(next);
+            continue;
+        }
         if complete || capped || (!follow && frames.len() < PAGE) {
             break (complete && !capped, page["gaps"].clone());
         }
@@ -129,8 +140,13 @@ pub(super) fn search(
         let page = client.get(&format!(
             "/api/v1/attempts/{attempt}/logs/search?q={query}&after={after}&limit={size}{resume}{carry}"
         ))?;
+        // The server checks `limit` between frames, so one frame can bring
+        // several matches past the cap. Those are cut here; the resume point
+        // is then just before that frame, so a rerun from it sees them.
+        let mut cut: Option<u64> = None;
         for m in page["matches"].as_array().into_iter().flatten() {
             if shown >= cap {
+                cut = m["seq"].as_u64().map(|seq| seq.saturating_sub(1));
                 break;
             }
             shown += 1;
@@ -146,6 +162,9 @@ pub(super) fn search(
             after = m["seq"].as_u64().unwrap_or(after);
         }
         let complete = page["complete"] == true;
+        if let Some(cut) = cut {
+            break (Some(cut), false);
+        }
         match page["next_after"].as_u64() {
             Some(next) if shown < cap => {
                 after = next;

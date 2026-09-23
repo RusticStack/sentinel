@@ -31,6 +31,7 @@ struct Deployment {
     dir: tempfile::TempDir,
     store: Arc<Store>,
     objects: Arc<Objects>,
+    logs: Arc<LogStore>,
     _controller: Controller,
     server: Option<sentinel_api::Server>,
     base: String,
@@ -86,7 +87,7 @@ fn deployment() -> Deployment {
     let server = sentinel_api::Server::start(sentinel_api::Config {
         listen: "127.0.0.1:0".parse().unwrap(),
         store: Arc::clone(&store),
-        logs,
+        logs: Arc::clone(&logs),
         objects: Arc::clone(&objects),
         controller: controller.handle(),
         sessions: local_auth::Policy::default(),
@@ -100,6 +101,7 @@ fn deployment() -> Deployment {
         dir,
         store,
         objects,
+        logs,
         _controller: controller,
         server: Some(server),
         token: sentinel_auth::token::format(&granted.secret),
@@ -593,10 +595,10 @@ fn wait_rides_out_rate_limited_answers_instead_of_failing() {
     let d = deployment();
     let (busy, _) = dispatch_run(&d);
     let (run, job) = dispatch_run(&d);
-    // Four other long polls hold every subscriber slot for about 2 s.
+    // Other long polls hold every subscriber slot for about 2 s.
     let (_, answer) = plain_get(&format!("{}/api/v1/runs/{busy}/wait", d.base), &d.token);
     let version = answer["version"].as_str().unwrap().to_owned();
-    let holders: Vec<_> = (0..4)
+    let holders: Vec<_> = (0..sentinel_api::SUBSCRIBERS)
         .map(|_| {
             let url = format!(
                 "{}/api/v1/runs/{busy}/wait?since={version}&timeout_ms=2000",
@@ -625,4 +627,90 @@ fn wait_rides_out_rate_limited_answers_instead_of_failing() {
         assert_eq!(holder.join().unwrap(), 200);
     }
     assert_eq!(code(&out), 8, "finished, not busy: {}", stderr(&out));
+}
+
+/// P09-11: `log show` over a log far larger than the client's 10 MiB body
+/// limit — full 32 KiB frames — prints every frame: the server bounds each
+/// page in bytes and the CLI follows `next_after`.
+#[test]
+fn log_show_reads_a_log_of_full_frames_past_the_client_body_limit() {
+    let d = deployment();
+    let (run, job) = dispatch_run(&d);
+    let (_, attempt, _) = lease(&d, job);
+    let frames = 400u64; // 12.5 MiB of payload
+    for seq in 1..=frames {
+        let mut bytes = vec![b'q'; 32 * 1024];
+        bytes[..8].copy_from_slice(format!("{seq:07}\n").as_bytes());
+        d.logs
+            .append(
+                run,
+                job,
+                attempt,
+                &sentinel_protocol::logs::Frame {
+                    seq,
+                    step: 0,
+                    stream: sentinel_protocol::logs::Stream::Stdout,
+                    bytes,
+                },
+            )
+            .unwrap();
+    }
+    let out = cli(
+        &d,
+        &["log", "show", &attempt.to_string(), "--output", "ndjson"],
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let seqs: Vec<u64> = stdout(&out)
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["seq"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(seqs, (1..=frames).collect::<Vec<_>>());
+}
+
+/// P09-16: when the match cap falls inside one frame's matches, the resume
+/// point is before that frame, so its remaining matches are not skipped.
+#[test]
+fn log_search_cut_inside_a_frame_resumes_before_it() {
+    let d = deployment();
+    let (run, job) = dispatch_run(&d);
+    let (_, attempt, _) = lease(&d, job);
+    for (seq, text) in [(1u64, "needle a\n"), (2, "needle b\nneedle c\nneedle d\n")] {
+        d.logs
+            .append(
+                run,
+                job,
+                attempt,
+                &sentinel_protocol::logs::Frame {
+                    seq,
+                    step: 0,
+                    stream: sentinel_protocol::logs::Stream::Stdout,
+                    bytes: text.as_bytes().to_vec(),
+                },
+            )
+            .unwrap();
+    }
+    d.logs.finish(run, job, attempt, 2, &[]).unwrap();
+    let out = cli(
+        &d,
+        &[
+            "log",
+            "search",
+            &attempt.to_string(),
+            "--text",
+            "needle",
+            "--limit",
+            "2",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let answer: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(answer["matches"].as_array().unwrap().len(), 2);
+    assert_eq!(answer["complete"], false, "{answer}");
+    assert_eq!(answer["next_after"], 1, "{answer}");
 }
