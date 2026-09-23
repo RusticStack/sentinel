@@ -5,8 +5,8 @@ compile_error!(
 
 #[cfg(all(target_os = "linux", feature = "server"))]
 mod admin;
+mod api;
 mod cli;
-mod client;
 #[cfg(all(target_os = "linux", feature = "server"))]
 mod intake_admin;
 mod pipeline;
@@ -17,6 +17,7 @@ mod source_admin;
 mod service;
 
 use clap::Parser;
+use sentinel::{client, commands::Invocation};
 use std::process::ExitCode;
 
 use cli::{Cli, Command};
@@ -40,22 +41,43 @@ fn run_admin(_args: cli::AdminArgs) -> ExitCode {
     ExitCode::from(2)
 }
 
+/// A client command's outcome as the process exit: the failure is reported
+/// on stderr in the command's output mode, and its exit code is returned.
+fn finish(outcome: Result<(), client::Error>) -> ExitCode {
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            client::report(&error);
+            ExitCode::from(error.exit as u8)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let (role, args) = match cli.command {
         Command::Server(args) => ("server", args),
         Command::Worker(args) => ("worker", args),
         Command::Pipeline(args) => return pipeline::run(args),
-        Command::Api(args) => {
-            return match client::run(args) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("error: {}", error.message);
-                    ExitCode::from(error.code)
-                }
-            };
-        }
+        Command::Api(args) => return finish(api::run(args)),
         Command::Admin(args) => return run_admin(args),
+        Command::Auth(args) => return finish(sentinel::auth_cmd::run(args)),
+        Command::Context(args) => return finish(sentinel::auth_cmd::run_context(args)),
+        Command::Doctor(args) => return finish(sentinel::doctor::run(args)),
+        Command::ServiceAccount(args) => return finish(sentinel::service_accounts::run(args)),
+        Command::Run(args) => return finish(sentinel::commands::run(Invocation::Run(args))),
+        Command::Status(args) => return finish(sentinel::commands::run(Invocation::Status(args))),
+        Command::Wait(args) => return finish(sentinel::commands::run(Invocation::Wait(args))),
+        Command::Job(args) => return finish(sentinel::commands::run(Invocation::Job(args))),
+        Command::Log(args) => return finish(sentinel::commands::run(Invocation::Log(args))),
+        Command::Workers(args) => {
+            return finish(sentinel::commands::run(Invocation::Workers(args)));
+        }
+        Command::Queue(args) => return finish(sentinel::commands::run(Invocation::Queue(args))),
+        Command::Artifact(args) => {
+            return finish(sentinel::commands::run(Invocation::Artifact(args)));
+        }
+        Command::Cache(args) => return finish(sentinel::commands::run(Invocation::Cache(args))),
     };
 
     #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]

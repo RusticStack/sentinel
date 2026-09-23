@@ -10,7 +10,7 @@ use sentinel_auth::cookie;
 use sentinel_core::{
     ArtifactId, AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis, UploadId,
     WorkerId,
-    auth::{Permissions, Principal},
+    auth::{Permissions, Principal, Scopes},
 };
 use sentinel_intake::ingest;
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
@@ -33,30 +33,34 @@ use crate::{
     web,
 };
 
-/// What a route answers: a JSON body, or a bounded stream from the object
-/// store. Streams carry an explicit length so the response is never chunked.
-enum Reply {
+/// What a route answers: a JSON body, a bounded stream from the object
+/// store, or an HTML page (OAuth consent and device pages, and `303`
+/// redirects with an empty body and a `location`). Streams carry an
+/// explicit length so the response is never chunked. HTML replies always
+/// carry the page security headers ([`crate::oauth::html`]).
+pub(crate) enum Reply {
     Json(u16, Value, Vec<Header>),
     Stream(u16, Box<dyn Read + Send>, u64, Vec<Header>),
+    Html(u16, String, Vec<Header>),
 }
-type Route = Result<Reply, ApiError>;
+pub(crate) type Route = Result<Reply, ApiError>;
 
 const JSON: &str = "application/json";
 
-fn header(name: &str, value: &str) -> Header {
+pub(crate) fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static header")
 }
 
-fn ok(value: Value) -> Route {
+pub(crate) fn ok(value: Value) -> Route {
     Ok(Reply::Json(200, value, Vec::new()))
 }
 
-fn err(code: ErrorCode, message: impl Into<String>) -> ApiError {
+pub(crate) fn err(code: ErrorCode, message: impl Into<String>) -> ApiError {
     ApiError::new(code, message)
 }
 
 /// The store's refusals as the API's.
-fn store_error(e: StoreError) -> ApiError {
+pub(crate) fn store_error(e: StoreError) -> ApiError {
     match e {
         StoreError::NotFound => err(ErrorCode::NotFound, "not found"),
         StoreError::Forbidden => err(ErrorCode::Forbidden, "not permitted"),
@@ -97,7 +101,10 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
     let outcome = route(state, request, &method, &path, &query);
     let reply = match outcome {
         Ok(reply) => reply,
-        Err(error) => Reply::Json(error.http_status(), json!(error), Vec::new()),
+        Err(error) => {
+            let headers = challenge(state, request, &path, &error);
+            Reply::Json(error.http_status(), json!(error), headers)
+        }
     };
     match reply {
         Reply::Json(status, body, headers) => {
@@ -105,6 +112,18 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
                 .with_status_code(StatusCode(status))
                 .with_header(header("content-type", JSON))
                 .with_header(header("cache-control", "no-store"));
+            for h in headers {
+                response = response.with_header(h);
+            }
+            let _ = request.respond(response);
+        }
+        Reply::Html(status, body, headers) => {
+            let mut response = Response::from_string(body)
+                .with_status_code(StatusCode(status))
+                .with_header(header("content-type", "text/html; charset=utf-8"));
+            for (name, value) in crate::oauth::html::SECURITY_HEADERS {
+                response = response.with_header(header(name, value));
+            }
             for h in headers {
                 response = response.with_header(h);
             }
@@ -129,7 +148,47 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
     }
 }
 
-fn header_value<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
+/// The `WWW-Authenticate` challenge of an `/api/v1` refusal (RFC 6750 §3,
+/// RFC 9728 §5.1): every `401` names the protected-resource metadata, plus
+/// `error="invalid_token"` when a token was presented; a scope refusal
+/// names the missing scope. The GitHub and intake hooks have their own
+/// secrets and are not OAuth resources.
+fn challenge(state: &State, request: &Request, path: &str, error: &ApiError) -> Vec<Header> {
+    let Some(rest) = path.strip_prefix("/api/v1/") else {
+        return Vec::new();
+    };
+    if rest.starts_with("hooks/") || rest.starts_with("intake/") || rest == "login" {
+        return Vec::new();
+    }
+    match error.code {
+        ErrorCode::Unauthenticated => {
+            let mut value = format!(
+                "Bearer realm=\"sentinel\", resource_metadata=\"{}{}\"",
+                state.oauth.issuer,
+                sentinel_protocol::oauth::PROTECTED_RESOURCE_PATH
+            );
+            if header_value(request, "authorization").is_some() {
+                value.push_str(", error=\"invalid_token\"");
+            }
+            vec![header("www-authenticate", &value)]
+        }
+        ErrorCode::Forbidden => match error
+            .details
+            .as_ref()
+            .and_then(|d| d.get("scope"))
+            .and_then(Value::as_str)
+        {
+            Some(scope) => vec![header(
+                "www-authenticate",
+                &format!("Bearer error=\"insufficient_scope\", scope=\"{scope}\""),
+            )],
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+pub(crate) fn header_value<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
     request
         .headers()
         .iter()
@@ -138,12 +197,12 @@ fn header_value<'a>(request: &'a Request, name: &'static str) -> Option<&'a str>
 }
 
 /// Read a JSON body within the protocol limit.
-fn body(request: &mut Request) -> Result<Vec<u8>, ApiError> {
+pub(crate) fn body(request: &mut Request) -> Result<Vec<u8>, ApiError> {
     body_limit(request, MAX_API_BODY_BYTES)
 }
 
 /// Read a body within a route-specific limit, before anything is buffered.
-fn body_limit(request: &mut Request, limit: usize) -> Result<Vec<u8>, ApiError> {
+pub(crate) fn body_limit(request: &mut Request, limit: usize) -> Result<Vec<u8>, ApiError> {
     if request.body_length().is_some_and(|n| n > limit) {
         return Err(
             err(ErrorCode::PayloadTooLarge, "body too large").with_detail("limit_bytes", limit)
@@ -163,11 +222,11 @@ fn body_limit(request: &mut Request, limit: usize) -> Result<Vec<u8>, ApiError> 
     Ok(bytes)
 }
 
-fn parse<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, ApiError> {
+pub(crate) fn parse<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, ApiError> {
     serde_json::from_slice(bytes).map_err(|_| err(ErrorCode::InvalidRequest, "invalid JSON body"))
 }
 
-fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     query
         .split('&')
         .filter_map(|pair| pair.split_once('=').or(Some((pair, ""))))
@@ -175,7 +234,11 @@ fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
-fn identify(state: &State, request: &Request, mutation: bool) -> Result<Identity, ApiError> {
+pub(crate) fn identify(
+    state: &State,
+    request: &Request,
+    mutation: bool,
+) -> Result<Identity, ApiError> {
     auth::identify(
         &state.store,
         header_value(request, "authorization"),
@@ -193,7 +256,7 @@ fn identify(state: &State, request: &Request, mutation: bool) -> Result<Identity
     })
 }
 
-fn id<T: std::str::FromStr>(text: &str, what: &str) -> Result<T, ApiError> {
+pub(crate) fn id<T: std::str::FromStr>(text: &str, what: &str) -> Result<T, ApiError> {
     text.parse().map_err(|_| {
         err(
             ErrorCode::InvalidRequest,
@@ -204,6 +267,11 @@ fn id<T: std::str::FromStr>(text: &str, what: &str) -> Result<T, ApiError> {
 
 fn route(state: &State, request: &mut Request, method: &str, path: &str, query: &str) -> Route {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    // The OAuth authorization server owns `/.well-known/*`, `/oauth/*`,
+    // `/device`, `/api/v1/grants*` and `/api/v1/tenants/*/service-accounts*`.
+    if let Some(reply) = crate::oauth::route(state, request, method, &parts, query) {
+        return reply;
+    }
     match (method, parts.as_slice()) {
         ("GET", ["api", "v1", "health"]) => ok(json!({ "ok": true })),
         ("POST", ["api", "v1", "hooks", "github"]) => github_hook(state, request),
@@ -212,16 +280,29 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
         ("POST", ["api", "v1", "logout"]) => logout(state, request),
         ("GET", ["api", "v1", "me"]) => {
             let who = identify(state, request, false)?;
+            let username = state
+                .store
+                .read(|c| local_auth::username_of(c, who.user))
+                .map_err(store_error)?;
             ok(json!({
                 "user": who.user.to_string(),
+                "username": username,
                 "super_admin": who.super_admin,
-                "via": match who.via { auth::Via::Bearer => "bearer", auth::Via::Session => "session" },
+                "via": match who.via {
+                    auth::Via::Bearer => "bearer",
+                    auth::Via::Session => "session",
+                    auth::Via::OAuth => "oauth",
+                },
                 "tenant": who.principal.tenant.map(|t| t.to_string()),
                 "repo": who.principal.repo.map(|r| r.to_string()),
+                "scopes": who.scopes.names().collect::<Vec<_>>(),
+                "grant": who.grant.map(|g| g.to_string()),
+                "expires_ms": who.expires.map(|t| t.0),
             }))
         }
         ("GET", ["api", "v1", "tenants", slug, "repos"]) => {
             let who = identify(state, request, false)?;
+            auth::require_scope(&who, Scopes::RUNS_READ)?;
             let slug = (*slug).to_owned();
             let repos = state
                 .store
@@ -236,6 +317,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
         }
         ("GET", ["api", "v1", "tenants", slug, "repos", name, "runs"]) => {
             let who = identify(state, request, false)?;
+            auth::require_scope(&who, Scopes::RUNS_READ)?;
             let (slug, name) = ((*slug).to_owned(), (*name).to_owned());
             let limit = page_size(query_param(query, "limit").and_then(|v| v.parse().ok()))
                 .min(MAX_PAGE_ITEMS) as u16;
@@ -260,6 +342,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
         }
         ("GET", ["api", "v1", "runs", run]) => {
             let who = identify(state, request, false)?;
+            auth::require_scope(&who, Scopes::RUNS_READ)?;
             let run: RunId = id(run, "run")?;
             let view = state
                 .store
@@ -273,6 +356,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
         }
         ("POST", ["api", "v1", "runs", run, "cancel"]) => {
             let who = identify(state, request, true)?;
+            auth::require_scope(&who, Scopes::RUNS_WRITE)?;
             let run: RunId = id(run, "run")?;
             let tenant = authorize_run(state, who.principal, run, Permissions::RUN)?;
             let count = state
@@ -285,6 +369,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
         }
         ("POST", ["api", "v1", "jobs", job, "cancel"]) => {
             let who = identify(state, request, true)?;
+            auth::require_scope(&who, Scopes::RUNS_WRITE)?;
             let job: JobId = id(job, "job")?;
             let tenant = authorize_job(state, who.principal, job, Permissions::RUN)?;
             let outcome = state
@@ -297,6 +382,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
         }
         ("POST", ["api", "v1", "jobs", job, "rerun"]) => {
             let who = identify(state, request, true)?;
+            auth::require_scope(&who, Scopes::RUNS_WRITE)?;
             let job: JobId = id(job, "job")?;
             let tenant = authorize_job(state, who.principal, job, Permissions::RUN)?;
             let next = state
@@ -309,6 +395,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
         }
         ("GET", ["api", "v1", "runs", run, "artifacts"]) => {
             let who = identify(state, request, false)?;
+            auth::require_scope(&who, Scopes::ARTIFACTS_READ)?;
             let run: RunId = id(run, "run")?;
             let rows = state
                 .store
@@ -324,6 +411,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
         }
         ("GET", ["api", "v1", "runs", run, "artifacts", art]) => {
             let who = identify(state, request, false)?;
+            auth::require_scope(&who, Scopes::ARTIFACTS_READ)?;
             let (run, art): (RunId, ArtifactId) = (id(run, "run")?, id(art, "artifact")?);
             let (row, manifest) = state
                 .store
@@ -362,6 +450,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
         }
         ("GET", ["api", "v1", "attempts", attempt, "logs"]) => {
             let who = identify(state, request, false)?;
+            auth::require_scope(&who, Scopes::LOGS_READ)?;
             let attempt: AttemptId = id(attempt, "attempt")?;
             let (run, job) = state
                 .store
@@ -415,6 +504,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
         }
         ("GET", ["api", "v1", "workers"]) => {
             let who = identify(state, request, false)?;
+            auth::require_scope(&who, Scopes::RUNS_READ)?;
             let slug = query_param(query, "tenant")
                 .ok_or_else(|| err(ErrorCode::InvalidRequest, "tenant query parameter required"))?
                 .to_owned();
@@ -448,6 +538,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
         }
         ("GET", ["api", "v1", "queue"]) => {
             let who = identify(state, request, false)?;
+            auth::require_scope(&who, Scopes::RUNS_READ)?;
             let slug = query_param(query, "tenant")
                 .ok_or_else(|| err(ErrorCode::InvalidRequest, "tenant query parameter required"))?
                 .to_owned();
@@ -734,6 +825,7 @@ fn logout(state: &State, request: &mut Request) -> Route {
 /// expired claims.
 fn worker_drain(state: &State, request: &mut Request, worker: &str, drain: bool) -> Route {
     let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::PLATFORM_ADMIN)?;
     let worker: WorkerId = id(worker, "worker")?;
     let authority = Authority::credential(who.principal);
     state
@@ -838,6 +930,7 @@ struct DispatchBody {
 /// and wake the dispatcher. Idempotent under `Idempotency-Key`.
 fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) -> Route {
     let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::RUNS_WRITE)?;
     let key = header_value(request, "idempotency-key")
         .map(|raw| {
             IdempotencyKey::parse(raw)
@@ -1062,6 +1155,7 @@ fn upload_json(upload: UploadId, status: &sentinel_store::objects::UploadStatus)
 /// Begin a resumable upload against a tenant the caller operates in.
 fn upload_begin(state: &State, request: &mut Request, slug: &str) -> Route {
     let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::RUNS_WRITE)?;
     let body: UploadBody = parse(&body(request)?)?;
     let digest = body
         .digest
@@ -1096,6 +1190,7 @@ fn upload_begin(state: &State, request: &mut Request, slug: &str) -> Route {
 /// Where a resumable upload stands; the client's resume plan.
 fn upload_status(state: &State, request: &mut Request, upload: &str) -> Route {
     let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::RUNS_WRITE)?;
     let upload: UploadId = id(upload, "upload")?;
     let tenant = upload_tenant(state, who.principal, upload, true)?;
     let status = state
@@ -1108,6 +1203,7 @@ fn upload_status(state: &State, request: &mut Request, upload: &str) -> Route {
 /// One chunk: `PUT /api/v1/uploads/<upl>?offset=N` with a raw body.
 fn upload_chunk(state: &State, request: &mut Request, upload: &str, query: &str) -> Route {
     let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::RUNS_WRITE)?;
     let upload: UploadId = id(upload, "upload")?;
     let tenant = upload_tenant(state, who.principal, upload, true)?;
     let offset: u64 = query_param(query, "offset")
@@ -1130,6 +1226,7 @@ fn upload_chunk(state: &State, request: &mut Request, upload: &str, query: &str)
 /// Seal: the ranges must tile the declared length and match the digest.
 fn upload_commit(state: &State, request: &mut Request, upload: &str) -> Route {
     let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::RUNS_WRITE)?;
     let upload: UploadId = id(upload, "upload")?;
     let tenant = upload_tenant(state, who.principal, upload, true)?;
     let objects = Arc::clone(&state.objects);
@@ -1144,6 +1241,7 @@ fn upload_commit(state: &State, request: &mut Request, upload: &str) -> Route {
 /// Give up an open upload and drop its staged bytes.
 fn upload_abort(state: &State, request: &mut Request, upload: &str) -> Route {
     let who = identify(state, request, true)?;
+    auth::require_scope(&who, Scopes::RUNS_WRITE)?;
     let upload: UploadId = id(upload, "upload")?;
     let tenant = upload_tenant(state, who.principal, upload, true)?;
     let objects = Arc::clone(&state.objects);
@@ -1196,6 +1294,7 @@ fn byte_range(spec: &str, len: u64) -> Result<(u64, u64), ApiError> {
 /// keeps the file un-reclaimable until the response finishes.
 fn object_download(state: &State, request: &mut Request, slug: &str, digest: &str) -> Route {
     let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::ARTIFACTS_READ)?;
     let digest =
         Digest::parse(digest).map_err(|_| err(ErrorCode::InvalidRequest, "malformed digest"))?;
     let (slug, principal) = (slug.to_owned(), who.principal);

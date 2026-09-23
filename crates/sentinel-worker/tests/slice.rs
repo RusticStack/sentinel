@@ -237,6 +237,7 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
         sessions: local_auth::Policy::default(),
         github_webhook_secret: None,
         intake: None,
+        public_url: None,
     })
     .unwrap();
     let api = Api {

@@ -229,6 +229,7 @@ fn deployment() -> Deployment {
         sessions: local_auth::Policy::default(),
         github_webhook_secret: Some(Arc::from(WEBHOOK_SECRET)),
         intake: None,
+        public_url: None,
     })
     .unwrap();
     let base = format!("http://{}", server.local_addr());

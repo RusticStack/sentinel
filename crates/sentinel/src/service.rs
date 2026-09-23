@@ -66,6 +66,8 @@ struct FileConfig {
     // Server: where workers connect, and where the API answers.
     listen: Option<String>,
     api_listen: Option<String>,
+    // Server: the deployment-facing base URL, which is the OAuth issuer (O02).
+    public_url: Option<String>,
     // Worker: which controller to reach and how to trust it.
     controller: Option<String>,
     controller_fingerprint: Option<String>,
@@ -226,6 +228,8 @@ enum Role {
     Server {
         listen: SocketAddr,
         api_listen: SocketAddr,
+        /// The OAuth issuer; `None` means `http://{api_listen}`.
+        public_url: Option<String>,
         /// The helper the server runs for its link port (Q06), when enabled.
         tailcat: Option<TailcatFile>,
         /// Whether the controller serves remote cache objects (Q08).
@@ -355,9 +359,20 @@ impl Config {
                     "tailcat.listen_port must match listen: the helper carries exactly the link port",
                 ));
             }
+            let public_url = file
+                .public_url
+                .as_deref()
+                .map(|url| match sentinel::client::normalize_server(url) {
+                    Ok(normalized) if normalized == url => Ok(normalized),
+                    _ => Err(Error::config(
+                        "public_url must be an absolute URL such as https://ci.example.com: lower-case scheme and host, no trailing slash, query or fragment, and http only for a loopback host",
+                    )),
+                })
+                .transpose()?;
             Role::Server {
                 listen,
                 api_listen,
+                public_url,
                 tailcat: file.tailcat,
                 remote_cache: file
                     .remote_cache
@@ -366,9 +381,9 @@ impl Config {
                     .unwrap_or(true),
             }
         } else {
-            if file.listen.is_some() || file.api_listen.is_some() {
+            if file.listen.is_some() || file.api_listen.is_some() || file.public_url.is_some() {
                 return Err(Error::config(
-                    "listen and api_listen apply to the server role only",
+                    "listen, api_listen and public_url apply to the server role only",
                 ));
             }
             let link = match (file.controller, file.controller_fingerprint) {
@@ -495,9 +510,16 @@ impl Config {
                 listen,
                 api_listen,
                 remote_cache,
+                public_url,
                 ..
             } => {
-                format!("listen={listen} api_listen={api_listen} remote_cache={remote_cache}")
+                let mut text =
+                    format!("listen={listen} api_listen={api_listen} remote_cache={remote_cache}");
+                if let Some(url) = public_url {
+                    text.push_str(" public_url=");
+                    text.push_str(url);
+                }
+                text
             }
             Role::Worker(None) => "controller=none (idle)".to_owned(),
             Role::Worker(Some(link)) => format!(
@@ -661,6 +683,8 @@ enum Running {
     Server {
         controller: sentinel_link::controller::Controller,
         api: sentinel_api::Server,
+        /// The credential purge tick; holds a store handle until stopped.
+        maintenance: Maintenance,
         store: Arc<sentinel_store::Store>,
         /// Boxed: the enum is constructed once per process, and this keeps
         /// the variant from dominating its size.
@@ -782,11 +806,83 @@ fn start_tailcat(
     Ok(Some(TailcatServer { server, stop }))
 }
 
+/// How often expired credentials are purged: sessions, API credentials,
+/// external sign-in state and OAuth rows. Validation never depends on it —
+/// every check tests expiry and revocation itself — so this only bounds
+/// table growth.
+#[cfg(feature = "server")]
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(600);
+/// Rows each purge removes per category per tick; a backlog drains over
+/// several ticks instead of holding the writer.
+#[cfg(feature = "server")]
+const PURGE_BATCH: u32 = 1000;
+
+/// The credential maintenance tick: one thread that sleeps on a channel and
+/// runs the bounded purges every [`MAINTENANCE_INTERVAL`]. Dropping the
+/// sender wakes and ends it at once.
+#[cfg(feature = "server")]
+struct Maintenance {
+    stop: mpsc::SyncSender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[cfg(feature = "server")]
+impl Maintenance {
+    fn start(store: Arc<sentinel_store::Store>) -> std::io::Result<Maintenance> {
+        let (stop, wake) = mpsc::sync_channel::<()>(0);
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let thread = std::thread::Builder::new()
+            .name("sentinel-maintenance".into())
+            .spawn(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    while let Err(mpsc::RecvTimeoutError::Timeout) =
+                        wake.recv_timeout(MAINTENANCE_INTERVAL)
+                    {
+                        purge_credentials(&store);
+                    }
+                });
+            })?;
+        Ok(Maintenance { stop, thread })
+    }
+
+    /// Stop the tick and release its store handle before the store drains.
+    fn stop(self) {
+        drop(self.stop);
+        let _ = self.thread.join();
+    }
+}
+
+/// One bounded purge: the store, "now", and the per-call row budget.
+#[cfg(feature = "server")]
+type Purge =
+    fn(&sentinel_store::Store, sentinel_core::UnixMillis, u32) -> sentinel_store::Result<usize>;
+
+#[cfg(feature = "server")]
+fn purge_credentials(store: &sentinel_store::Store) {
+    let now = sentinel_core::UnixMillis::now();
+    let purges: [(&str, Purge); 4] = [
+        ("oauth", sentinel_store::oauth::purge_expired),
+        ("api_tokens", sentinel_store::tokens::purge_expired),
+        ("sessions", sentinel_store::local_auth::purge_expired),
+        ("sign_in", sentinel_store::sign_in::purge_expired),
+    ];
+    for (kind, purge) in purges {
+        match purge(store, now, PURGE_BATCH) {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(event = "credentials_purged", kind, removed),
+            Err(error) => {
+                tracing::warn!(event = "credentials_purge_failed", kind, error = %error);
+            }
+        }
+    }
+}
+
 #[cfg(feature = "server")]
 fn start_server(
     config: &Config,
     listen: SocketAddr,
     api_listen: SocketAddr,
+    public_url: Option<String>,
     tailcat: Option<&TailcatFile>,
     remote_cache: bool,
 ) -> Result<Running, Error> {
@@ -1065,12 +1161,16 @@ fn start_server(
         sessions: sentinel_store::local_auth::Policy::default(),
         github_webhook_secret,
         intake: Some(lane.waker()),
+        public_url,
     })
     .map_err(|error| Error::runtime(format!("cannot listen on {api_listen}: {error}")))?;
-    tracing::info!(event = "api_listening", addr = %api.local_addr());
+    tracing::info!(event = "api_listening", addr = %api.local_addr(), issuer = %api.issuer());
+    let maintenance = Maintenance::start(Arc::clone(&store))
+        .map_err(|error| Error::runtime(format!("cannot start maintenance: {error}")))?;
     Ok(Running::Server {
         controller,
         api,
+        maintenance,
         store,
         lane: Box::new(lane),
         poll: Box::new(poll),
@@ -1515,12 +1615,14 @@ fn initialize_and_wait(
             Role::Server {
                 listen,
                 api_listen,
+                public_url,
                 tailcat,
                 remote_cache,
             } => start_server(
                 config,
                 *listen,
                 *api_listen,
+                public_url.clone(),
                 tailcat.as_ref(),
                 *remote_cache,
             ),
@@ -1550,6 +1652,7 @@ fn initialize_and_wait(
         Running::Server {
             controller,
             api,
+            maintenance,
             store,
             lane,
             poll,
@@ -1558,6 +1661,7 @@ fn initialize_and_wait(
             tailcat,
         } => {
             api.shutdown();
+            maintenance.stop();
             if let Some(tailcat) = tailcat {
                 tailcat.stop.store(true, Ordering::Release);
                 tailcat.server.shutdown();

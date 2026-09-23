@@ -1,7 +1,18 @@
-//! Shared command options and Linux runtime foundations.
-//! These are internal development APIs, not a stable plugin/SDK contract.
+//! Shared command options, the portable API client and its commands, and
+//! Linux runtime foundations. These are internal development APIs, not a
+//! stable plugin/SDK contract.
 
 use clap::ValueEnum;
+
+pub mod auth_cmd;
+pub mod browser;
+pub mod client;
+pub mod commands;
+pub mod doctor;
+pub mod keystore;
+pub mod loopback;
+pub mod profile;
+pub mod service_accounts;
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 #[cfg_attr(

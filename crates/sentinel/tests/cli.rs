@@ -170,6 +170,53 @@ mod linux {
     }
 
     #[test]
+    fn public_url_is_an_exact_absolute_url_for_the_server_only() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("config.toml");
+        let data = temp.path().join("data");
+        let check = |role: &str, url: &str| {
+            fs::write(
+                &file,
+                format!("data_dir = '{}'\npublic_url = '{url}'", data.display()),
+            )
+            .unwrap();
+            invoke(&[role, "--config", file.to_str().unwrap(), "--check"])
+        };
+        if cfg!(feature = "server") {
+            for accepted in [
+                "https://ci.example.com",
+                "https://ci.example.com/sentinel",
+                "http://127.0.0.1:7080",
+            ] {
+                let output = check("server", accepted);
+                assert!(output.status.success(), "{accepted}");
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains(&format!("public_url={accepted}")),
+                    "{accepted}"
+                );
+            }
+            for refused in [
+                "https://ci.example.com/",
+                "https://CI.example.com",
+                "https://ci.example.com?x=1",
+                "http://ci.example.com",
+                "ci.example.com",
+                "https://user@ci.example.com",
+            ] {
+                assert_eq!(check("server", refused).status.code(), Some(2), "{refused}");
+            }
+        }
+        if cfg!(feature = "worker") {
+            assert_eq!(
+                check("worker", "https://ci.example.com").status.code(),
+                Some(2)
+            );
+        }
+        assert!(!data.exists());
+    }
+
+    #[test]
     fn malformed_oversized_and_missing_configuration_fail_without_echoing_input() {
         let temp = tempdir().unwrap();
         let file = temp.path().join("config.toml");

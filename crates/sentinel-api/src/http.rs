@@ -230,6 +230,8 @@ fn reason(status: u16) -> &'static str {
         202 => "Accepted",
         204 => "No Content",
         206 => "Partial Content",
+        302 => "Found",
+        303 => "See Other",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",

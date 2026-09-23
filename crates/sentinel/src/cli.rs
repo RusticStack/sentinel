@@ -22,6 +22,32 @@ pub enum Command {
     Admin(AdminArgs),
     /// Talk to a controller's API with a credential: dispatch, status, logs, cancel, rerun, workers, queue, drain
     Api(ApiArgs),
+    /// Sign in to a controller (browser or device), show the session, sign out
+    Auth(sentinel::auth_cmd::AuthArgs),
+    /// Choose or show the profile's default tenant
+    Context(sentinel::auth_cmd::ContextArgs),
+    /// Check configuration, credentials and connectivity, with a fix for each failure
+    Doctor(sentinel::doctor::DoctorArgs),
+    /// Create service accounts, allow them repositories, and issue or revoke their grants
+    ServiceAccount(sentinel::service_accounts::ServiceAccountArgs),
+    /// Dispatch, list, inspect, cancel and wait for runs
+    Run(sentinel::commands::RunArgs),
+    /// A run and its jobs
+    Status(sentinel::commands::StatusArgs),
+    /// Wait for a run to finish: exit 0 passed, 8 not passed, 7 deadline reached
+    Wait(sentinel::commands::WaitArgs),
+    /// Cancel or rerun one job
+    Job(sentinel::commands::JobArgs),
+    /// Show, follow or search an attempt's log
+    Log(sentinel::commands::LogArgs),
+    /// Pools and workers a tenant may use; drain and undrain
+    Workers(sentinel::commands::WorkersArgs),
+    /// Waiting jobs of a tenant and why each is waiting
+    Queue(sentinel::commands::QueueArgs),
+    /// List, show and download a run's artifacts
+    Artifact(sentinel::commands::ArtifactArgs),
+    /// Cache records of an attempt
+    Cache(sentinel::commands::CacheArgs),
 }
 
 /// Client options: the controller and the credential come from flags or

@@ -4,14 +4,17 @@
 //! session cookie is `__Host-`, which a browser accepts from `localhost`
 //! or over HTTPS only).
 //!
-//! Every route authenticates a bearer credential or a session cookie into
-//! a `Principal` and then authorizes through `sentinel-store::auth` — the
-//! API never reads a tenant's rows without the predicate that says the
-//! caller may. Errors are `sentinel.error/1`; mutations take an
-//! `Idempotency-Key`; bodies are bounded before they are read.
+//! Every route authenticates a bearer credential, an OAuth access token or
+//! a session cookie into a `Principal` and its scopes, then authorizes
+//! through `sentinel-store::auth` — the API never reads a tenant's rows
+//! without the predicate that says the caller may. Errors are
+//! `sentinel.error/1` under `/api/v1` and RFC 6749 under `/oauth`;
+//! mutations take an `Idempotency-Key`; bodies are bounded before they are
+//! read. The OAuth authorization server (O01–O06) lives in [`oauth`].
 
 pub mod auth;
 mod http;
+mod oauth;
 mod routes;
 mod web;
 
@@ -50,6 +53,10 @@ pub struct Config {
     pub github_webhook_secret: Option<Arc<[u8]>>,
     /// Wakes the resolution lane after an accepted delivery.
     pub intake: Option<sentinel_intake::Waker>,
+    /// The deployment-facing base URL (`https://ci.example.com`, no trailing
+    /// slash). It is the OAuth issuer; without it the issuer is
+    /// `http://{bound address}`, which is right only for direct loopback use.
+    pub public_url: Option<String>,
 }
 
 pub(crate) struct State {
@@ -62,13 +69,20 @@ pub(crate) struct State {
     pub intake: Option<sentinel_intake::Waker>,
     /// Upload/download bodies currently in flight.
     pub transfers: AtomicUsize,
+    /// Long-poll subscribers currently parked (run waits and `wait=1` log
+    /// polls), bounded so they cannot take every handler permit.
+    #[allow(dead_code)] // read by the O05 long-poll routes
+    pub subscribers: AtomicUsize,
     /// Set by `Server::shutdown`; the `wait=1` log poll checks it so a
     /// stop does not ride out the full poll interval.
     pub stop: Arc<AtomicBool>,
+    /// The OAuth authorization server's issuer, keys and in-memory limits.
+    pub oauth: oauth::OAuthState,
 }
 
 pub struct Server {
     addr: SocketAddr,
+    issuer: String,
     conns: http::Conns,
 }
 
@@ -76,6 +90,10 @@ impl Server {
     pub fn start(config: Config) -> std::io::Result<Server> {
         let listener = std::net::TcpListener::bind(config.listen)?;
         let addr = listener.local_addr()?;
+        let issuer = match config.public_url {
+            Some(url) => url.trim_end_matches('/').to_owned(),
+            None => format!("http://{addr}"),
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::new(State {
             store: config.store,
@@ -86,7 +104,9 @@ impl Server {
             github_webhook_secret: config.github_webhook_secret,
             intake: config.intake,
             transfers: AtomicUsize::new(0),
+            subscribers: AtomicUsize::new(0),
             stop: Arc::clone(&stop),
+            oauth: oauth::OAuthState::new(issuer.clone()),
         });
         let conns = http::listen(
             listener,
@@ -94,11 +114,20 @@ impl Server {
             stop,
             http::Tune::DEFAULT,
         )?;
-        Ok(Server { addr, conns })
+        Ok(Server {
+            addr,
+            issuer,
+            conns,
+        })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// The OAuth issuer this server publishes in its metadata.
+    pub fn issuer(&self) -> &str {
+        &self.issuer
     }
 
     /// Stop accepting, close live connections and wait out the readers.
