@@ -1191,37 +1191,53 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
                     move |tx| {
                         let uploads = objects.sweep_uploads(tx, now)?;
                         let leases = objects.sweep_leases(tx, now)?;
-                        let mut paths =
+                        let manifests =
                             sentinel_store::artifacts::sweep_expired(tx, &objects, now, 4096)?;
                         let indexed = objects.index_refs(tx, 4096)?;
                         let reclaimed = objects.reclaim(tx, now, 4096)?;
-                        paths.extend(reclaimed.paths);
                         Ok::<_, sentinel_store::Error>((
-                            uploads,
-                            leases,
-                            paths,
-                            indexed,
-                            reclaimed.objects,
-                            reclaimed.bytes,
+                            uploads, leases, manifests, indexed, reclaimed,
                         ))
                     }
                 })
                 .map_err(|error| fail(format!("reclaim failed: {error}")))?;
-            for path in &report.2 {
-                let _ = std::fs::remove_file(path);
+            let (uploads, leases, manifests, indexed, reclaimed) = report;
+            let manifest_files = manifests.len();
+            let (objects_reclaimed, bytes_reclaimed) = (reclaimed.objects, reclaimed.bytes);
+            // Every unlink re-checks ownership on the writer, the same path
+            // the controller's maintenance pass takes.
+            let mut doomed = manifests;
+            doomed.extend(reclaimed.doomed);
+            {
+                let objects = std::sync::Arc::clone(&objects);
+                store
+                    .writer()
+                    .write(move |tx| objects.unlink(tx, &doomed))
+                    .map_err(|error| fail(format!("unlink failed: {error}")))?;
             }
-            let orphans = store
-                .read(|conn| objects.sweep_orphans(conn, 4096))
-                .map_err(|error| fail(format!("orphan sweep failed: {error}")))?;
+            let mut orphans = 0u32;
+            loop {
+                let (found, done) = store
+                    .read(|conn| objects.orphans(conn, 4096, u32::MAX))
+                    .map_err(|error| fail(format!("orphan sweep failed: {error}")))?;
+                let objects = std::sync::Arc::clone(&objects);
+                orphans += store
+                    .writer()
+                    .write(move |tx| objects.unlink(tx, &found))
+                    .map_err(|error| fail(format!("orphan sweep failed: {error}")))?;
+                if done {
+                    break;
+                }
+            }
             sentinel::outln!(
                 "{}",
                 serde_json::json!({
-                    "expired_uploads": report.0,
-                    "expired_leases": report.1,
-                    "manifest_files_removed": report.2.len(),
-                    "manifests_indexed": report.3,
-                    "objects_reclaimed": report.4,
-                    "bytes_reclaimed": report.5,
+                    "expired_uploads": uploads,
+                    "expired_leases": leases,
+                    "manifest_files_removed": manifest_files,
+                    "manifests_indexed": indexed,
+                    "objects_reclaimed": objects_reclaimed,
+                    "bytes_reclaimed": bytes_reclaimed,
                     "orphan_files_removed": orphans,
                 })
             );

@@ -225,6 +225,9 @@ impl Output for LogPipe {
             }
             if let Some(spool) = st.spool.as_mut() {
                 let _ = spool.sync();
+                // The `last_seq` and gaps `LogEnd` declares must survive a
+                // restart unchanged, or a re-sent end would conflict.
+                let _ = spool.persist_end();
             }
             st.ended = true;
         }

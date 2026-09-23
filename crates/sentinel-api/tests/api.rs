@@ -2072,6 +2072,524 @@ fn artifact_routes_are_authorized_and_scoped() {
         &[],
     );
     assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+
+    // P06-6: the bytes follow repository authorization. The admin reads
+    // them; a tenant reader without a grant on the repository cannot — the
+    // digest answers exactly as an unknown one would — until granted.
+    let digest = entries[0]["digest"].as_str().unwrap().to_owned();
+    let object = format!("/api/v1/tenants/acme/objects/{digest}");
+    let (status, bytes, _) = raw(&d, "GET", &object, None, Some(&auth), &[]);
+    assert_eq!((status, bytes.as_slice()), (200, &b"report-bytes"[..]));
+    let reader = UserId::new();
+    let root = d.root;
+    d.store
+        .writer()
+        .write(move |tx| {
+            provisioning::insert_human(tx, reader, "Rita", false, now)?;
+            auth::set_membership(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                reader,
+                sentinel_core::auth::Role::Reader,
+            )
+        })
+        .unwrap();
+    let reader_auth = format!(
+        "Bearer {}",
+        sentinel_auth::token::format(
+            &tokens::provision(
+                &d.store,
+                Grant {
+                    user: reader,
+                    name: "rita",
+                    permissions: P::READ,
+                    tenant: None,
+                    repo: None,
+                    lifetime_ms: 60_000,
+                },
+                now,
+            )
+            .unwrap()
+            .secret
+        )
+    );
+    let unknown = format!("/api/v1/tenants/acme/objects/{}", "0".repeat(64));
+    let (status, missing, _) = raw(&d, "GET", &unknown, None, Some(&reader_auth), &[]);
+    assert_eq!(status, 404);
+    let (status, refused, _) = raw(&d, "GET", &object, None, Some(&reader_auth), &[]);
+    assert_eq!(
+        status, 404,
+        "a reader without a grant read another repo's bytes"
+    );
+    let code =
+        |body: &[u8]| serde_json::from_slice::<serde_json::Value>(body).unwrap()["code"].clone();
+    assert_eq!(code(&refused), code(&missing), "an existence oracle");
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::set_repo_grant(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                repo,
+                reader,
+                P::READ,
+            )
+        })
+        .unwrap();
+    let (status, _, _) = raw(&d, "GET", &object, None, Some(&reader_auth), &[]);
+    assert_eq!(status, 200);
+    // A super admin holding platform scope is no member of another tenant:
+    // its bytes are not the admin's to read.
+    let beta = TenantId::new();
+    let foreign = {
+        let objects = Objects::open(d._dir.path()).unwrap();
+        let staged = objects
+            .stage(beta, &b"beta bytes"[..], u64::MAX, Expect::default())
+            .unwrap();
+        let digest = staged.digest();
+        d.store
+            .writer()
+            .write(move |tx| {
+                auth::create_namespace(
+                    tx,
+                    Principal::new(root, P::ALL, None, None),
+                    beta,
+                    Namespace::parse("beta").unwrap(),
+                    NamespaceKind::Organization,
+                    now,
+                )?;
+                objects.commit(tx, &staged).map(|_| ())
+            })
+            .unwrap();
+        digest
+    };
+    let (status, _, _) = raw(
+        &d,
+        "GET",
+        &format!("/api/v1/tenants/beta/objects/{foreign}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 404, "platform scope read a tenant's bytes");
+}
+
+/// Upload `content` as root and return its digest.
+fn upload_object(d: &Deployment, auth: &str, content: &[u8]) -> String {
+    let digest = blake3::hash(content).to_hex().to_string();
+    let (status, begin) = call(
+        d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": content.len(), "digest": digest })),
+        Some(auth),
+        &[],
+    );
+    assert_eq!(status, 201, "{begin}");
+    let upload = begin["upload"].as_str().unwrap().to_owned();
+    for (i, chunk) in content.chunks(sentinel_api::MAX_UPLOAD_CHUNK).enumerate() {
+        let offset = i * sentinel_api::MAX_UPLOAD_CHUNK;
+        let (status, _, _) = raw(
+            d,
+            "PUT",
+            &format!("/api/v1/uploads/{upload}?offset={offset}"),
+            Some(chunk),
+            Some(auth),
+            &[],
+        );
+        assert_eq!(status, 200);
+    }
+    let (status, sealed) = call(
+        d,
+        "POST",
+        &format!("/api/v1/uploads/{upload}/commit"),
+        Some(&serde_json::json!({})),
+        Some(auth),
+        &[],
+    );
+    assert_eq!(status, 200, "{sealed}");
+    digest
+}
+
+/// A GET whose response is never read: once the socket buffers fill, the
+/// server's body write stalls with the request's permits held.
+fn stalled_get(d: &Deployment, path: &str, auth: &str) -> std::net::TcpStream {
+    use std::io::Write as _;
+    let addr = d.base.strip_prefix("http://").unwrap().to_owned();
+    let mut socket = std::net::TcpStream::connect(addr).unwrap();
+    write!(
+        socket,
+        "GET {path} HTTP/1.1\r\nhost: sentinel\r\nauthorization: {auth}\r\n\r\n"
+    )
+    .unwrap();
+    socket
+}
+
+/// P06-2 and P09-12: a download holds its transfer slot until its body is
+/// written, and with every transfer slot held by stalled downloads and every
+/// subscriber slot by parked waits, control requests still find a handler.
+#[test]
+fn downloads_hold_their_slot_and_control_requests_keep_handlers() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let content: Vec<u8> = (0..(24u32 << 20)).map(|i| (i % 253) as u8).collect();
+    let digest = upload_object(&d, &auth, &content);
+    let object = format!("/api/v1/tenants/acme/objects/{digest}");
+    let stalled: Vec<_> = (0..sentinel_api::TRANSFERS)
+        .map(|_| stalled_get(&d, &object, &auth))
+        .collect();
+    thread::sleep(Duration::from_millis(500));
+    let (status, body, _) = raw(&d, "GET", &object, None, Some(&auth), &[]);
+    assert_eq!(status, 429, "downloads are not bounded while they stream");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
+        "rate_limited"
+    );
+    // Park every subscriber slot too.
+    let (status, run) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&dispatch_body()),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201, "{run}");
+    let run = run["id"].as_str().unwrap().to_owned();
+    let (_, first) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run}/wait"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    let version = first["version"].as_str().unwrap().to_owned();
+    let waits: Vec<_> = (0..sentinel_api::SUBSCRIBERS)
+        .map(|_| {
+            let (base, auth, run, version) =
+                (d.base.clone(), auth.clone(), run.clone(), version.clone());
+            thread::spawn(move || {
+                let agent = ureq::Agent::new_with_config(
+                    ureq::Agent::config_builder()
+                        .http_status_as_error(false)
+                        .build(),
+                );
+                agent
+                    .get(format!(
+                        "{base}/api/v1/runs/{run}/wait?since={version}&timeout_ms=3000"
+                    ))
+                    .header("authorization", &auth)
+                    .call()
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(500));
+    // Transfers and long polls hold six of eight permits; the reserved two
+    // still answer at once.
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let (status, _) = call(&d, "GET", "/api/v1/health", None, None, &[]);
+        assert_eq!(status, 200);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "health waited {:?} behind long-held permits",
+            started.elapsed()
+        );
+    }
+    for wait in waits {
+        assert_eq!(wait.join().unwrap(), 200);
+    }
+    drop(stalled);
+    // The dead sockets fail their stalled writes and release the slots.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        let (status, bytes, _) = raw(
+            &d,
+            "GET",
+            &object,
+            None,
+            Some(&auth),
+            &[("range", "bytes=0-9")],
+        );
+        if status == 206 || std::time::Instant::now() > deadline {
+            assert!(status != 206 || bytes == content[..10]);
+            break status;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(status, 206);
+}
+
+/// P06-13: a whole-object download is rehashed while it streams; bytes that
+/// rotted on disk end the body short instead of arriving complete.
+#[test]
+fn a_rotted_object_is_never_served_whole() {
+    use std::io::Read as _;
+    let d = deployment();
+    let auth = bearer(&d);
+    let content = b"bytes that will rot on disk".repeat(1000);
+    let digest = upload_object(&d, &auth, &content);
+    let path = d
+        ._dir
+        .path()
+        .join("objects")
+        .join(d.tenant.to_string())
+        .join(&digest[..2])
+        .join(&digest);
+    let mut rotten = content.clone();
+    rotten[5000] ^= 0xff;
+    std::fs::write(&path, &rotten).unwrap();
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let response = agent
+        .get(format!("{}/api/v1/tenants/acme/objects/{digest}", d.base))
+        .header("authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let mut got = Vec::new();
+    let read = response.into_body().into_reader().read_to_end(&mut got);
+    assert!(
+        read.is_err() || got.len() < content.len(),
+        "a corrupt object arrived whole ({} bytes)",
+        got.len()
+    );
+    // A range read is not verified (documented); the route still serves it.
+    let (status, _, _) = raw(
+        &d,
+        "GET",
+        &format!("/api/v1/tenants/acme/objects/{digest}"),
+        None,
+        Some(&auth),
+        &[("range", "bytes=0-9")],
+    );
+    assert_eq!(status, 206);
+}
+
+/// P06-12: touching an expired upload retires it — durably, not inside the
+/// refused request's rolled-back transaction.
+#[test]
+fn touching_an_expired_upload_retires_it() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let (status, begin) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/uploads",
+        Some(&serde_json::json!({ "len": 8, "ttl_ms": 1 })),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201);
+    let upload = begin["upload"].as_str().unwrap().to_owned();
+    thread::sleep(Duration::from_millis(20));
+    let (status, _, _) = raw(
+        &d,
+        "PUT",
+        &format!("/api/v1/uploads/{upload}?offset=0"),
+        Some(b"abcdefgh"),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 400);
+    let (status, state) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/uploads/{upload}"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, state["state"].as_str()),
+        (200, Some("aborted")),
+        "{state}"
+    );
+    assert!(
+        !d._dir.path().join("incoming").join(&upload).exists(),
+        "the staging file outlived the retirement"
+    );
+}
+
+/// P02-3 and P09-11: the log route refuses a malformed position instead of
+/// restarting at zero, pages carry the versioned `c1` cursor bound to the
+/// tenant and attempt, and a page of full frames is bounded in bytes.
+#[test]
+fn log_pages_are_bounded_and_positions_are_validated() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let (status, run) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&dispatch_body()),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201, "{run}");
+    let run_id: RunId = run["id"].as_str().unwrap().parse().unwrap();
+    let job_id: sentinel_core::JobId = run["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
+    let attempt = attempt_for(&d, job_id);
+    let full = vec![b'z'; 32 * 1024];
+    for seq in 1..=100u64 {
+        d.logs
+            .append(
+                run_id,
+                job_id,
+                attempt,
+                &Frame {
+                    seq,
+                    step: 0,
+                    stream: Stream::Stdout,
+                    bytes: full.clone(),
+                },
+            )
+            .unwrap();
+    }
+    let logs = format!("/api/v1/attempts/{attempt}");
+    for bad in ["after=abc", "after=-1", "limit=many", "step=x"] {
+        let (status, body) = call(
+            &d,
+            "GET",
+            &format!("{logs}/logs?{bad}"),
+            None,
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("invalid_request")),
+            "{bad}: {body}"
+        );
+    }
+    for bad in [
+        "c1zz".to_owned(),
+        sentinel_protocol::cursor::Cursor {
+            tenant: TenantId::new(),
+            kind: sentinel_protocol::cursor::StreamKind::AttemptLog,
+            stream: *attempt.as_bytes(),
+            seq: sentinel_protocol::cursor::Seq(0),
+        }
+        .to_string(),
+        sentinel_protocol::cursor::Cursor {
+            tenant: d.tenant,
+            kind: sentinel_protocol::cursor::StreamKind::AttemptLog,
+            stream: *AttemptId::new().as_bytes(),
+            seq: sentinel_protocol::cursor::Seq(0),
+        }
+        .to_string(),
+    ] {
+        let (status, body) = call(
+            &d,
+            "GET",
+            &format!("{logs}/logs?cursor={bad}"),
+            None,
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("invalid_cursor")),
+            "{body}"
+        );
+    }
+    // Paging by the numeric position and by the cursor sees every frame,
+    // each page within the byte bound.
+    let mut seen = Vec::new();
+    let mut next: Option<String> = None;
+    loop {
+        let query = match &next {
+            None => "after=0".to_owned(),
+            Some(cursor) => format!("cursor={cursor}"),
+        };
+        let (status, page) = call(
+            &d,
+            "GET",
+            &format!("{logs}/logs?{query}&limit=500"),
+            None,
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(status, 200, "{page}");
+        let frames = page["frames"].as_array().unwrap();
+        let bytes: usize = frames
+            .iter()
+            .map(|f| f["text"].as_str().unwrap().len())
+            .sum();
+        assert!(
+            bytes <= sentinel_store::logs::PAGE_BYTES as usize,
+            "{bytes}"
+        );
+        seen.extend(frames.iter().map(|f| f["seq"].as_u64().unwrap()));
+        assert!(page["next"].as_str().unwrap().starts_with("c1"));
+        if page["next_after"].is_null() {
+            break;
+        }
+        next = Some(page["next"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(seen, (1..=100).collect::<Vec<_>>());
+}
+
+/// Place the job's attempt through the dispatcher's own path.
+fn attempt_for(d: &Deployment, job: sentinel_core::JobId) -> AttemptId {
+    let (tenant, now) = (d.tenant, UnixMillis::now());
+    let (pool, worker) = (PoolId::new(), WorkerId::new());
+    d.store
+        .writer()
+        .write(move |tx| {
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                pool,
+                "logs",
+                PoolKind::Dedicated(tenant),
+                now,
+            )?;
+            let issued = workers::issue_enrollment(tx, Authority::HostLocal, pool, 60_000, now)?;
+            let mut text = String::new();
+            issued.secret.expose(&mut text);
+            workers::enroll(
+                tx,
+                &sentinel_auth::secret::Secret::parse(&text).unwrap(),
+                Presentation {
+                    worker,
+                    fingerprint: sentinel_auth::secret::Secret::generate().digest(),
+                    name: "w",
+                    negotiated: Negotiated {
+                        protocol: ProtocolVersion(4),
+                        capabilities: Capabilities::REQUIRED,
+                        arch: Arch::X86_64,
+                    },
+                },
+                now,
+            )?;
+            dispatch::report_capacity(
+                tx,
+                worker,
+                Capacity {
+                    cpu_millis: 4_000,
+                    memory_bytes: 8 << 30,
+                    disk_bytes: 0,
+                },
+            )
+        })
+        .unwrap();
+    let offer = d
+        .store
+        .writer()
+        .write(move |tx| dispatch::place(tx, worker, pool, dispatch::DEFAULT_LEASE_MS, now))
+        .unwrap()
+        .expect("the queued job was placed");
+    assert_eq!(offer.job, job);
+    offer.attempt
 }
 
 /// A raw `POST /api/v1/login`: (status, set-cookie, body).

@@ -3,7 +3,13 @@
 //! for every refusal. Nothing here reads a tenant's rows without the
 //! `auth` predicate that says the caller may.
 
-use std::{io::Read, io::Seek, io::SeekFrom, sync::Arc};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use crate::http::{Header, Request, Response, StatusCode};
 use sentinel_auth::cookie;
@@ -15,20 +21,24 @@ use sentinel_core::{
 use sentinel_intake::ingest;
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
 use sentinel_protocol::{
+    cursor::{Cursor, Seq, StreamKind},
     error::{ApiError, ErrorCode},
     idempotency::{Fingerprint, IdempotencyKey},
     intake::{MAX_HOOK_BODY_BYTES, MAX_WEBHOOK_BODY_BYTES},
     limits::{MAX_API_BODY_BYTES, MAX_PAGE_ITEMS, page_size},
 };
 use sentinel_store::{
-    Error as StoreError, artifacts, auth as authz, auth::Authority, checks, dispatch, idempotency,
-    local_auth, logs, lookup, objects::Digest, provenance, runs, status, tenancy, workers,
+    Error as StoreError, artifacts, auth as authz,
+    auth::Authority,
+    checks, dispatch, idempotency, local_auth, logs, lookup,
+    objects::{Digest, Touch},
+    provenance, runs, status, tenancy, workers,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    LOG_WAIT, MAX_UPLOAD_CHUNK, State, TRANSFERS,
+    LOG_WAIT, MAX_UPLOAD_CHUNK, SUBSCRIBERS, State, TRANSFERS,
     auth::{self, Identity, Refusal},
     web,
 };
@@ -481,56 +491,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
             ok(body)
         }
         ("GET", ["api", "v1", "attempts", attempt, "logs"]) => {
-            let who = identify(state, request, false)?;
-            auth::require_scope(&who, Scopes::LOGS_READ)?;
-            let attempt: AttemptId = id(attempt, "attempt")?;
-            let (run, job) = attempt_log(state, who.principal, attempt)?;
-            let after: u64 = query_param(query, "after")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            let limit = page_size(query_param(query, "limit").and_then(|v| v.parse().ok()));
-            let step: Option<u32> = query_param(query, "step").and_then(|v| v.parse().ok());
-            let wait = query_param(query, "wait").is_some_and(|v| v == "1" || v == "true");
-            let deadline = std::time::Instant::now() + LOG_WAIT;
-            // Parking holds a handler permit: the poll takes one of the
-            // SUBSCRIBERS slots it shares with run waits before it parks.
-            let mut parked: Option<Slot<'_>> = None;
-            let tail = loop {
-                let tail = state
-                    .logs
-                    .tail(run, job, attempt, after, limit, step)
-                    .or_else(|e| match e {
-                        // A pre-D04 flat log file is the only fallback.
-                        sentinel_store::Error::NotFound => {
-                            state.logs.tail_legacy(attempt, after, limit, step)
-                        }
-                        e => Err(e),
-                    })
-                    .map_err(store_error)?;
-                if !wait || !tail.frames.is_empty() || tail.complete {
-                    break tail;
-                }
-                if std::time::Instant::now() >= deadline
-                    || state.stop.load(std::sync::atomic::Ordering::Acquire)
-                {
-                    break tail;
-                }
-                if parked.is_none() {
-                    parked = Some(subscriber(state)?);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            };
-            drop(parked);
-            ok(json!({
-                "attempt": attempt.to_string(),
-                "complete": tail.complete,
-                "gaps": tail.gaps,
-                "frames": tail.frames.iter().map(|f| json!({
-                    "seq": f.seq, "step": f.step,
-                    "stream": match f.stream { sentinel_protocol::logs::Stream::Stdout => "stdout", sentinel_protocol::logs::Stream::Stderr => "stderr" },
-                    "text": String::from_utf8_lossy(&f.bytes),
-                })).collect::<Vec<_>>(),
-            }))
+            attempt_logs(state, request, attempt, query)
         }
         ("GET", ["api", "v1", "workers"]) => {
             let who = identify(state, request, false)?;
@@ -1112,44 +1073,38 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
     }
 }
 
-/// A held upload/download slot; dropping frees it for the next request.
-/// The bound exists so bounded-heap processes never queue unbounded
-/// transfer work.
-struct Slot<'a>(&'a std::sync::atomic::AtomicUsize);
+/// A held transfer or subscriber slot; dropping frees it for the next
+/// request. It owns its counter, so a download's slot can travel with the
+/// body the connection streams after the route returned. The bounds exist
+/// so bounded-heap processes never queue unbounded transfer work and long
+/// polls and slow bodies never take the handler permits
+/// [`crate::RESERVED_HANDLERS`] keeps for everything else.
+struct Slot(Arc<AtomicUsize>);
 
-impl Drop for Slot<'_> {
+impl Drop for Slot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        self.0.fetch_sub(1, Ordering::Release);
     }
 }
 
-fn slot(state: &State) -> Result<Slot<'_>, ApiError> {
-    use std::sync::atomic::Ordering;
-    let mut held = state.transfers.load(Ordering::Acquire);
+fn take_slot(counter: &Arc<AtomicUsize>, cap: usize) -> Option<Slot> {
+    let mut held = counter.load(Ordering::Acquire);
     loop {
-        if held >= TRANSFERS {
-            return Err(err(
-                ErrorCode::RateLimited,
-                "transfer slots exhausted; retry",
-            ));
+        if held >= cap {
+            return None;
         }
-        match state.transfers.compare_exchange_weak(
-            held,
-            held + 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return Ok(Slot(&state.transfers)),
+        match counter.compare_exchange_weak(held, held + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(Slot(Arc::clone(counter))),
             Err(next) => held = next,
         }
     }
 }
 
-/// Long-poll subscribers parked at once — run waits and `wait=1` log polls
-/// together. Each holds a handler permit ([`crate::WORKERS`]) while parked,
-/// so the cap keeps half of them for everything else; beyond it a poll is
-/// `rate_limited` with `details.retry_after_ms`.
-pub(crate) const SUBSCRIBERS: usize = 4;
+fn slot(state: &State) -> Result<Slot, ApiError> {
+    take_slot(&state.transfers, TRANSFERS)
+        .ok_or_else(|| err(ErrorCode::RateLimited, "transfer slots exhausted; retry"))
+}
+
 /// What a refused subscriber is told to wait before trying again.
 const SUBSCRIBER_RETRY_MS: u64 = 1_000;
 /// The longest a run wait parks (`timeout_ms` bound and default), the same
@@ -1162,44 +1117,176 @@ const RECHECK: std::time::Duration = std::time::Duration::from_millis(10);
 /// How often a parked wait looks at the shutdown flag.
 const STOP_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
 
-fn subscriber(state: &State) -> Result<Slot<'_>, ApiError> {
-    use std::sync::atomic::Ordering;
-    let mut held = state.subscribers.load(Ordering::Acquire);
-    loop {
-        if held >= SUBSCRIBERS {
-            return Err(
-                err(ErrorCode::RateLimited, "too many parked subscribers; retry")
-                    .with_detail("retry_after_ms", SUBSCRIBER_RETRY_MS),
-            );
-        }
-        match state.subscribers.compare_exchange_weak(
-            held,
-            held + 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return Ok(Slot(&state.subscribers)),
-            Err(next) => held = next,
-        }
-    }
+fn subscriber(state: &State) -> Result<Slot, ApiError> {
+    take_slot(&state.subscribers, SUBSCRIBERS).ok_or_else(|| {
+        err(ErrorCode::RateLimited, "too many parked subscribers; retry")
+            .with_detail("retry_after_ms", SUBSCRIBER_RETRY_MS)
+    })
 }
 
-/// An attempt's run and job, after the caller's `read` on its repository.
+/// An attempt's tenant, run and job, after the caller's `read` on its
+/// repository.
 fn attempt_log(
     state: &State,
     principal: Principal,
     attempt: AttemptId,
-) -> Result<(RunId, JobId), ApiError> {
+) -> Result<(sentinel_core::TenantId, RunId, JobId), ApiError> {
     state
         .store
         .read(|c| {
             let job = lookup::attempt_job(c, attempt)?;
             let run = lookup::job_run(c, job)?;
             let repo = lookup::run_repo(c, run)?;
-            authz::require_repo(c, principal, repo, Permissions::READ)?;
-            Ok((run, job))
+            let tenant = authz::require_repo(c, principal, repo, Permissions::READ)?;
+            Ok((tenant, run, job))
         })
         .map_err(store_error)
+}
+
+/// How often a parked log poll may re-read its attempt, however fast that
+/// attempt appends.
+const LOG_RECHECK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `GET /attempts/{att}/logs?after|cursor&limit&step&wait=1`: frames past a
+/// position. `after` is a sequence number; `cursor` is the versioned
+/// tenant- and attempt-bound `c1` form of the same position (the answer's
+/// `next`). A page carries at most `limit` frames and
+/// [`logs::PAGE_BYTES`] of payload and decodes at most
+/// [`logs::PAGE_SCAN_BYTES`]; a page cut short says where to continue in
+/// `next_after`/`next`. `wait=1` parks — on the log store's append
+/// notifier, re-reading only when this attempt's stored frontier moved —
+/// until something arrives, the log completes, the step has finished, or
+/// the deadline.
+fn attempt_logs(state: &State, request: &Request, attempt: &str, query: &str) -> Route {
+    let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::LOGS_READ)?;
+    let attempt: AttemptId = id(attempt, "attempt")?;
+    let after: Option<u64> = query_param(query, "after")
+        .map(|v| {
+            v.parse()
+                .map_err(|_| err(ErrorCode::InvalidRequest, "malformed after"))
+        })
+        .transpose()?;
+    let limit = page_size(
+        query_param(query, "limit")
+            .map(|v| {
+                v.parse()
+                    .map_err(|_| err(ErrorCode::InvalidRequest, "malformed limit"))
+            })
+            .transpose()?,
+    );
+    let step: Option<u32> = query_param(query, "step")
+        .map(|v| {
+            v.parse()
+                .map_err(|_| err(ErrorCode::InvalidRequest, "malformed step"))
+        })
+        .transpose()?;
+    let wait = query_param(query, "wait").is_some_and(|v| v == "1" || v == "true");
+    let (tenant, run, job) = attempt_log(state, who.principal, attempt)?;
+    let after = match (after, query_param(query, "cursor")) {
+        (Some(_), Some(_)) => {
+            return Err(err(
+                ErrorCode::InvalidRequest,
+                "after and cursor are exclusive",
+            ));
+        }
+        (Some(after), None) => after,
+        (None, Some(text)) => {
+            // Malformed, another tenant's, another stream's: one answer.
+            let cursor = Cursor::parse(text, tenant)
+                .ok()
+                .filter(|c| c.kind == StreamKind::AttemptLog && c.stream == *attempt.as_bytes())
+                .ok_or_else(|| err(ErrorCode::InvalidCursor, "invalid cursor"))?;
+            cursor.seq.0
+        }
+        (None, None) => 0,
+    };
+    let page = logs::Page {
+        limit,
+        bytes: logs::PAGE_BYTES,
+        scan: logs::PAGE_SCAN_BYTES,
+    };
+    let read = || {
+        state
+            .logs
+            .tail_page(run, job, attempt, after, page, step)
+            .or_else(|e| match e {
+                // A pre-D04 flat log file is the only fallback.
+                StoreError::NotFound => state.logs.tail_legacy_page(attempt, after, page, step),
+                e => Err(e),
+            })
+            .map_err(store_error)
+    };
+    let changes = state.logs.changes();
+    // The generation and the frontier are taken before the read: an append
+    // landing after them moves one or both, so the park below never sleeps
+    // through a frame the read missed.
+    let mut seen = changes.generation();
+    let mut frontier = state.logs.frontier(attempt);
+    let mut tail = read()?;
+    let deadline = std::time::Instant::now() + LOG_WAIT;
+    // Parking holds a handler permit: the poll takes one of the
+    // SUBSCRIBERS slots it shares with run waits before it parks.
+    let mut parked: Option<Slot> = None;
+    let mut checked = std::time::Instant::now();
+    while wait
+        && tail.frames.is_empty()
+        && !tail.complete
+        && !tail.step_done
+        && tail.next_after.is_none()
+    {
+        if parked.is_none() {
+            parked = Some(subscriber(state)?);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline || state.stop.load(Ordering::Acquire) {
+            break;
+        }
+        let next = changes.wait_past(seen, deadline.min(now + STOP_SLICE));
+        if next == seen {
+            continue;
+        }
+        seen = next;
+        // Every append in the store wakes the poll; only this attempt's
+        // moving frontier (or its writer closing) is worth a read.
+        let moved = state.logs.frontier(attempt);
+        if moved == frontier {
+            continue;
+        }
+        let since_check = checked.elapsed();
+        if since_check < LOG_RECHECK {
+            std::thread::sleep((LOG_RECHECK - since_check).min(deadline - now));
+            seen = changes.generation();
+        }
+        frontier = state.logs.frontier(attempt);
+        tail = read()?;
+        checked = std::time::Instant::now();
+    }
+    drop(parked);
+    // Where the next page starts: past the last frame this one covered.
+    let position = tail
+        .next_after
+        .or_else(|| tail.frames.last().map(|f| f.seq))
+        .unwrap_or(after)
+        .max(after);
+    let next = Cursor {
+        tenant,
+        kind: StreamKind::AttemptLog,
+        stream: *attempt.as_bytes(),
+        seq: Seq(position),
+    };
+    ok(json!({
+        "attempt": attempt.to_string(),
+        "complete": tail.complete,
+        "gaps": tail.gaps,
+        "next_after": tail.next_after,
+        "next": next.to_string(),
+        "frames": tail.frames.iter().map(|f| json!({
+            "seq": f.seq, "step": f.step,
+            "stream": stream_name(f.stream),
+            "text": String::from_utf8_lossy(&f.bytes),
+        })).collect::<Vec<_>>(),
+    }))
 }
 
 /// `GET /runs/{run}/wait?since=<16 hex>&timeout_ms=1..25000`: answer as
@@ -1248,7 +1335,7 @@ fn run_wait(state: &State, request: &Request, run: &str, query: &str) -> Route {
     let mut seen = changes.generation();
     let mut current = version()?;
     let mut checked = std::time::Instant::now();
-    let mut parked: Option<Slot<'_>> = None;
+    let mut parked: Option<Slot> = None;
     while since == Some(current.version) && !current.finished {
         if parked.is_none() {
             parked = Some(subscriber(state)?);
@@ -1317,7 +1404,7 @@ fn log_search(state: &State, request: &Request, attempt: &str, query: &str) -> R
     let limit = page_size(query_param(query, "limit").and_then(|v| v.parse().ok()));
     // The previous page's `next_carry`: opaque, hex, checked by the store.
     let carry = query_param(query, "carry");
-    let (run, job) = attempt_log(state, who.principal, attempt)?;
+    let (_, run, job) = attempt_log(state, who.principal, attempt)?;
     let search = logs::SearchQuery {
         needle: needle.as_bytes(),
         after,
@@ -1493,7 +1580,9 @@ fn upload_status(state: &State, request: &mut Request, upload: &str) -> Route {
     ok(upload_json(upload, &status))
 }
 
-/// One chunk: `PUT /api/v1/uploads/<upl>?offset=N` with a raw body.
+/// One chunk: `PUT /api/v1/uploads/<upl>?offset=N` with a raw body. The
+/// bytes are written and synced outside the store's writer; the writer
+/// only records the range.
 fn upload_chunk(state: &State, request: &mut Request, upload: &str, query: &str) -> Route {
     let who = identify(state, request, true)?;
     auth::require_scope(&who, Scopes::RUNS_WRITE)?;
@@ -1507,26 +1596,67 @@ fn upload_chunk(state: &State, request: &mut Request, upload: &str, query: &str)
     if bytes.is_empty() {
         return Err(err(ErrorCode::InvalidRequest, "empty chunk"));
     }
+    let now = UnixMillis::now();
+    let written = state
+        .store
+        .read(|c| {
+            state
+                .objects
+                .write_chunk(c, tenant, upload, offset, &bytes, now)
+        })
+        .map_err(store_error)?;
+    let chunk = match written {
+        Touch::Ready(chunk) => chunk,
+        Touch::Expired => return Err(retire_expired(state, tenant, upload)),
+    };
     let objects = Arc::clone(&state.objects);
     let received = state
         .store
         .writer()
-        .write(move |tx| objects.put_chunk(tx, tenant, upload, offset, &bytes, UnixMillis::now()))
+        .write(move |tx| objects.record_chunk(tx, chunk))
         .map_err(store_error)?;
     ok(json!({ "upload": upload.to_string(), "received": received }))
 }
 
+/// A session touched past its expiry is retired in its own transaction —
+/// then the request is refused. Retiring inside the refused request's
+/// transaction would roll back with it.
+fn retire_expired(state: &State, tenant: sentinel_core::TenantId, upload: UploadId) -> ApiError {
+    let objects = Arc::clone(&state.objects);
+    if let Ok(true) = state
+        .store
+        .writer()
+        .write(move |tx| objects.retire_expired(tx, tenant, upload, UnixMillis::now()))
+    {
+        state.objects.drop_upload(upload);
+    }
+    err(ErrorCode::InvalidRequest, "invalid upload expired")
+}
+
 /// Seal: the ranges must tile the declared length and match the digest.
+/// Hashing and the rename run outside the writer (holding a transfer slot:
+/// a seal reads the whole object); the writer flips the row and inserts
+/// the object.
 fn upload_commit(state: &State, request: &mut Request, upload: &str) -> Route {
     let who = identify(state, request, true)?;
     auth::require_scope(&who, Scopes::RUNS_WRITE)?;
     let upload: UploadId = id(upload, "upload")?;
     let tenant = upload_tenant(state, who.principal, upload, true)?;
+    let _slot = slot(state)?;
+    let now = UnixMillis::now();
+    let prepared = state
+        .store
+        .read(|c| state.objects.prepare_seal(c, tenant, upload, now))
+        .map_err(store_error)?;
+    let plan = match prepared {
+        Touch::Ready(plan) => plan,
+        Touch::Expired => return Err(retire_expired(state, tenant, upload)),
+    };
     let objects = Arc::clone(&state.objects);
     let digest = state
         .store
         .writer()
-        .write(move |tx| objects.seal_upload(tx, tenant, upload, UnixMillis::now()))
+        .write(move |tx| objects.finish_seal(tx, plan))
         .map_err(store_error)?;
     ok(json!({ "upload": upload.to_string(), "digest": digest.to_string() }))
 }
@@ -1583,8 +1713,13 @@ fn byte_range(spec: &str, len: u64) -> Result<(u64, u64), ApiError> {
     Ok((start, end))
 }
 
-/// Stream a committed object, whole or a `Range`. The reader registration
-/// keeps the file un-reclaimable until the response finishes.
+/// Stream a committed object, whole or a `Range`. The bytes are repository
+/// evidence: the caller must be able to read an artifact that references
+/// them, or be an operator of the tenant it was uploaded to
+/// ([`authz::require_object_read`]). The reader registration keeps the file
+/// un-reclaimable and the transfer slot stays held until the body has been
+/// written. A whole-object body is rehashed while it streams and cut short
+/// before its last byte if it does not match its digest.
 fn object_download(state: &State, request: &mut Request, slug: &str, digest: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::ARTIFACTS_READ)?;
@@ -1595,18 +1730,29 @@ fn object_download(state: &State, request: &mut Request, slug: &str, digest: &st
         .store
         .read(|c| {
             let tenant = lookup::tenant_by_slug(c, &slug)?;
-            authz::require_tenant_member(c, principal, tenant, false)?;
+            authz::require_object_read(c, principal, tenant, digest.as_bytes())?;
             state.objects.open_read(c, tenant, digest)
         })
         .map_err(store_error)?;
-    let _slot = slot(state)?;
+    let slot = slot(state)?;
     let tag = digest.to_string();
     let mut headers = vec![
         header("accept-ranges", "bytes"),
         header("etag", &format!("\"{tag}\"")),
     ];
     match header_value(request, "range") {
-        None => Ok(Reply::Stream(200, Box::new(reader.take(len)), len, headers)),
+        None => Ok(Reply::Stream(
+            200,
+            Box::new(Verified {
+                inner: reader,
+                left: len,
+                hasher: blake3::Hasher::new(),
+                digest,
+                _slot: slot,
+            }),
+            len,
+            headers,
+        )),
         Some(spec) => {
             let (start, end) = byte_range(spec, len)?;
             reader
@@ -1618,11 +1764,66 @@ fn object_download(state: &State, request: &mut Request, slug: &str, digest: &st
             ));
             Ok(Reply::Stream(
                 206,
-                Box::new(reader.take(end - start)),
+                Box::new(Held {
+                    inner: reader.take(end - start),
+                    _slot: slot,
+                }),
                 end - start,
                 headers,
             ))
         }
+    }
+}
+
+/// A streamed range body that holds its transfer slot until dropped —
+/// after the connection wrote it, not when the route returned.
+struct Held<R> {
+    inner: R,
+    _slot: Slot,
+}
+
+impl<R: Read> Read for Held<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+/// A whole-object body: holds its slot like [`Held`] and rehashes as it
+/// streams. The read that would deliver the final byte first finishes the
+/// hash; on a mismatch (or a file shorter than its row) it fails instead,
+/// so a client sees a truncated body rather than complete wrong bytes.
+struct Verified {
+    inner: sentinel_store::objects::Reader,
+    left: u64,
+    hasher: blake3::Hasher,
+    digest: Digest,
+    _slot: Slot,
+}
+
+impl Read for Verified {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = buf
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let got = self.inner.read(&mut buf[..want])?;
+        if got == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "object shorter than recorded",
+            ));
+        }
+        self.hasher.update(&buf[..got]);
+        self.left -= got as u64;
+        if self.left == 0 && self.hasher.finalize().as_bytes() != self.digest.as_bytes() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "object content does not match its digest",
+            ));
+        }
+        Ok(got)
     }
 }
 

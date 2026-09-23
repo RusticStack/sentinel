@@ -820,8 +820,19 @@ impl Request<'_> {
         if self.method != "HEAD" {
             let mut data = response.data;
             let copied = match response.len {
-                Some(len) => io::copy(&mut data.by_ref().take(len), &mut writer)?,
-                None => io::copy(&mut data, &mut writer)?,
+                Some(len) => io::copy(&mut data.by_ref().take(len), &mut writer),
+                None => io::copy(&mut data, &mut writer),
+            };
+            // A body that failed mid-stream (a stall, or a download whose
+            // bytes did not verify) leaves the client short of the declared
+            // length: the connection must end, never serve another head.
+            let copied = match copied {
+                Ok(copied) => copied,
+                Err(e) => {
+                    self.close = true;
+                    let _ = self.writer.shutdown(Shutdown::Both);
+                    return Err(e);
+                }
             };
             writer.flush()?;
             // A stream that ended early desyncs the client; close rather

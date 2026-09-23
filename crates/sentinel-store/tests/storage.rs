@@ -463,10 +463,10 @@ fn tenant_usage_tracks_objects_uploads_and_reclaims() {
     tx.commit().unwrap();
     assert_eq!(reclaimed.objects, 2);
     assert_eq!(reclaimed.bytes, 117);
-    assert_eq!(reclaimed.paths.len(), 2);
-    for path in &reclaimed.paths {
-        fs::remove_file(path).unwrap();
-    }
+    assert_eq!(reclaimed.doomed.len(), 2);
+    let tx = fx.conn.transaction().unwrap();
+    assert_eq!(fx.objects.unlink(&tx, &reclaimed.doomed).unwrap(), 2);
+    tx.commit().unwrap();
     assert_eq!(fx.usage(), 0);
     assert!(matches!(
         fx.objects.meta(&fx.conn, fx.tenant, digest),
@@ -731,7 +731,7 @@ fn index_refs_backfills_edges_and_retirement_releases_them() {
             .retire_manifest(&tx, fx.tenant, Kind::Artifact, "m", version)
             .unwrap()
             .unwrap();
-        fs::remove_file(path).unwrap();
+        fs::remove_file(path.path()).unwrap();
     }
     let edges: i64 = tx
         .query_row("SELECT COUNT(*) FROM manifest_refs", [], |r| r.get(0))
@@ -789,9 +789,14 @@ fn artifact_retention_retires_the_manifest_and_frees_its_objects() {
         .write(move |tx| artifacts::sweep_expired(tx, &objects, UnixMillis::now(), 256))
         .unwrap();
     assert_eq!(paths.len(), 1);
-    for path in &paths {
-        fs::remove_file(path).unwrap();
-    }
+    let objects = Arc::clone(&f.objects);
+    assert_eq!(
+        f.store
+            .writer()
+            .write(move |tx| objects.unlink(tx, &paths))
+            .unwrap(),
+        1
+    );
     f.store
         .read(|c| {
             let artifacts: i64 = c.query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))?;
@@ -832,7 +837,7 @@ fn orphan_sweep_removes_only_unowned_files_past_the_grace() {
     fs::write(&loose, b"loose").unwrap();
     age(&loose, grace);
 
-    assert_eq!(fx.objects.sweep_orphans(&fx.conn, 256).unwrap(), 2);
+    assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 256).unwrap(), 2);
     assert!(!old_stray.exists());
     assert!(!loose.exists());
     assert!(fresh_stray.exists());
@@ -1175,4 +1180,161 @@ fn migration_27_upgrades_a_populated_database() {
     assert_eq!(owed, 70); // the deleted object left the books
     conn.execute("DELETE FROM manifests WHERE tenant_id = ?1", [&tid])
         .unwrap();
+}
+
+/// P06-9: reclamation reads its candidates through the unreferenced set's
+/// age index — it never walks the objects table — and a referenced object
+/// is not a candidate at all.
+#[test]
+fn reclaim_candidates_come_from_the_unreferenced_index() {
+    let mut fx = fixture();
+    let referenced = fx.put(b"kept by a manifest");
+    let loose = fx.put(b"referenced by nothing");
+    let tx = fx.conn.transaction().unwrap();
+    fx.objects
+        .commit_manifest(
+            &tx,
+            fx.tenant,
+            Kind::Artifact,
+            "m",
+            &[entry("a", referenced, 18)],
+        )
+        .unwrap();
+    tx.commit().unwrap();
+    let listed: Vec<Vec<u8>> = fx
+        .conn
+        .prepare("SELECT digest FROM object_unreferenced")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(listed, vec![loose.as_bytes().to_vec()]);
+    let plan: Vec<String> = fx
+        .conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            objects::RECLAIM_CANDIDATES
+        ))
+        .unwrap()
+        .query_map(rusqlite::params![0i64, 0i64, 1i64], |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        plan.iter().all(|step| !step.starts_with("SCAN")),
+        "reclaim walks a table: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("object_unreferenced_age")),
+        "{plan:?}"
+    );
+}
+
+/// P06-4: an upload's chunk writes and its seal's full-object hash run
+/// outside the single writer — other durable writes keep committing while
+/// a large seal hashes, and the writer's share of the seal is bookkeeping.
+#[test]
+fn a_large_seal_does_not_hold_the_writer() {
+    let f = store_fixture();
+    let (tenant, objects) = (f.tenant, Arc::clone(&f.objects));
+    const LEN: u64 = 64 << 20;
+    let id = {
+        let objects = Arc::clone(&objects);
+        f.store
+            .writer()
+            .write(move |tx| objects.begin_upload(tx, tenant, LEN, None, 60_000, UnixMillis::now()))
+            .unwrap()
+    };
+    let chunk = vec![7u8; 8 << 20];
+    for offset in (0..LEN).step_by(chunk.len()) {
+        let now = UnixMillis::now();
+        let written = f
+            .store
+            .read(|c| objects.write_chunk(c, tenant, id, offset, &chunk, now))
+            .unwrap();
+        let objects::Touch::Ready(written) = written else {
+            panic!("expired")
+        };
+        let objects = Arc::clone(&objects);
+        f.store
+            .writer()
+            .write(move |tx| objects.record_chunk(tx, written))
+            .unwrap();
+    }
+    let store = Arc::new(f.store);
+    let sealing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sealer = {
+        let (store, objects, sealing) = (
+            Arc::clone(&store),
+            Arc::clone(&objects),
+            Arc::clone(&sealing),
+        );
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let plan = store
+                .read(|c| objects.prepare_seal(c, tenant, id, UnixMillis::now()))
+                .unwrap();
+            let hashed = started.elapsed();
+            sealing.store(false, Ordering::Release);
+            let objects::Touch::Ready(plan) = plan else {
+                panic!("expired")
+            };
+            let digest = store
+                .writer()
+                .write(move |tx| objects.finish_seal(tx, plan))
+                .unwrap();
+            (digest, hashed)
+        })
+    };
+    let mut rounds = 0u32;
+    let mut slowest = Duration::ZERO;
+    while sealing.load(Ordering::Acquire) {
+        let at = std::time::Instant::now();
+        store
+            .writer()
+            .write(|tx| {
+                tx.execute_batch("SELECT 1")?;
+                Ok(())
+            })
+            .unwrap();
+        slowest = slowest.max(at.elapsed());
+        rounds += 1;
+    }
+    let (digest, hashed) = sealer.join().unwrap();
+    assert_eq!(
+        digest,
+        Digest::from_bytes(*blake3::hash(&vec![7u8; LEN as usize]).as_bytes())
+    );
+    // While a 64 MiB hash ran, writer round trips kept completing, each
+    // far faster than the hash itself.
+    assert!(
+        rounds >= 2,
+        "{rounds} writer round trips during a {hashed:?} seal"
+    );
+    assert!(
+        slowest < hashed,
+        "a writer round trip took {slowest:?} of a {hashed:?} seal"
+    );
+}
+
+/// P06-4: a declared length past the per-upload bound is refused at begin.
+#[test]
+fn an_upload_past_the_object_bound_is_refused_at_begin() {
+    let mut fx = fixture();
+    let tx = fx.conn.transaction().unwrap();
+    assert!(matches!(
+        fx.objects.begin_upload(
+            &tx,
+            fx.tenant,
+            objects::MAX_UPLOAD_BYTES + 1,
+            None,
+            60_000,
+            UnixMillis::now()
+        ),
+        Err(Error::InvalidInput("upload length"))
+    ));
 }

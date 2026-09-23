@@ -445,10 +445,116 @@ fn a_deduped_stage_never_deletes_the_committed_object() {
         .stage(tenant, &b"same body"[..], u64::MAX, Expect::default())
         .unwrap();
     assert_eq!(second.digest(), digest);
-    second.discard();
+    let objects = Arc::clone(&f.objects);
+    assert!(
+        !f.store
+            .writer()
+            .write(move |tx| objects.discard(tx, second))
+            .unwrap()
+    );
     let mut out = Vec::new();
     f.store
         .read(|c| f.objects.read(c, tenant, digest, &mut out))
         .unwrap();
     assert_eq!(out, b"same body");
+}
+
+/// P06-1 (a): the creator of a file discards *after* a deduper of the same
+/// bytes committed — the committed object keeps its file.
+#[test]
+fn a_creator_discarding_after_a_dedup_commit_keeps_the_object() {
+    let f = fixture();
+    let tenant = f.tenant;
+    let creator = f
+        .objects
+        .stage(tenant, &b"shared bytes"[..], u64::MAX, Expect::default())
+        .unwrap();
+    let deduper = f
+        .objects
+        .stage(tenant, &b"shared bytes"[..], u64::MAX, Expect::default())
+        .unwrap();
+    let digest = deduper.digest();
+    let objects = Arc::clone(&f.objects);
+    f.store
+        .writer()
+        .write(move |tx| objects.commit(tx, &deduper).map(|_| ()))
+        .unwrap();
+    // The creator's publication fails later in its stream.
+    let objects = Arc::clone(&f.objects);
+    let removed = f
+        .store
+        .writer()
+        .write(move |tx| objects.discard(tx, creator))
+        .unwrap();
+    assert!(!removed, "the discard removed a committed object's file");
+    let mut out = Vec::new();
+    f.store
+        .read(|c| f.objects.read(c, tenant, digest, &mut out))
+        .unwrap();
+    assert_eq!(out, b"shared bytes");
+}
+
+/// P06-1 (a), other order: the creator discards while the deduper's commit
+/// is still pending — the live stage's pin keeps the file for it.
+#[test]
+fn a_discard_before_a_pending_dedup_commit_keeps_the_file() {
+    let f = fixture();
+    let tenant = f.tenant;
+    let creator = f
+        .objects
+        .stage(tenant, &b"pending bytes"[..], u64::MAX, Expect::default())
+        .unwrap();
+    let deduper = f
+        .objects
+        .stage(tenant, &b"pending bytes"[..], u64::MAX, Expect::default())
+        .unwrap();
+    let digest = deduper.digest();
+    let objects = Arc::clone(&f.objects);
+    assert!(
+        !f.store
+            .writer()
+            .write(move |tx| objects.discard(tx, creator))
+            .unwrap()
+    );
+    let objects = Arc::clone(&f.objects);
+    f.store
+        .writer()
+        .write(move |tx| objects.commit(tx, &deduper).map(|_| ()))
+        .unwrap();
+    let mut out = Vec::new();
+    f.store
+        .read(|c| f.objects.read(c, tenant, digest, &mut out))
+        .unwrap();
+    assert_eq!(out, b"pending bytes");
+    // A lone uncommitted stage, by contrast, is removed by its discard.
+    let lone = f
+        .objects
+        .stage(tenant, &b"nobody else"[..], u64::MAX, Expect::default())
+        .unwrap();
+    let objects = Arc::clone(&f.objects);
+    assert!(
+        f.store
+            .writer()
+            .write(move |tx| objects.discard(tx, lone))
+            .unwrap()
+    );
+}
+
+/// P06-7: a deduplicated streaming seal removes its temporary copy.
+#[test]
+fn a_deduped_stage_seal_leaves_nothing_in_tmp() {
+    let f = fixture();
+    let tenant = f.tenant;
+    let mut kept = Vec::new();
+    for _ in 0..2 {
+        let mut staging = f.objects.stage_begin(tenant, 5).unwrap();
+        f.objects.stage_write(&mut staging, b"hello").unwrap();
+        kept.push(f.objects.stage_seal(tenant, staging, 5).unwrap());
+    }
+    let left: Vec<_> = std::fs::read_dir(f._dir.path().join("objects").join("tmp"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert!(left.is_empty(), "tmp leftovers: {left:?}");
 }

@@ -329,3 +329,127 @@ fn an_attempt_log_is_capped() {
     assert!(tail.complete);
     assert_eq!(tail.gaps, vec![(fits + 1, fits + 1)]);
 }
+
+/// P06-5: a hole whose neighbours sit in a sealed segment survives a
+/// restart: a later fill is stored (not acked as a duplicate), and a finish
+/// without the fill still declares it.
+#[test]
+fn a_hole_in_a_sealed_segment_survives_a_reopen() {
+    let full = "x".repeat(32 * 1024 - 18);
+    for fill in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let attempt = AttemptId::new();
+        {
+            let logs = LogStore::open(temp.path().join("logs")).unwrap();
+            logs.append(run(), job(), attempt, &frame(1, "one"))
+                .unwrap();
+            // Sequence 2 never arrives; 3..=140 seal the first segment.
+            for seq in 3..=140u64 {
+                logs.append(run(), job(), attempt, &frame(seq, &full))
+                    .unwrap();
+            }
+        }
+        let logs = LogStore::open(temp.path().join("logs")).unwrap();
+        let dir = logs.attempt_dir(run(), job(), attempt);
+        // A live mid-stream read already names the hole.
+        assert_eq!(read_dir(&dir, 139, 10, None).unwrap().gaps, vec![(2, 2)]);
+        if fill {
+            assert_eq!(
+                logs.append(run(), job(), attempt, &frame(2, "two"))
+                    .unwrap(),
+                Appended::Stored { through: 140 }
+            );
+        }
+        logs.finish(run(), job(), attempt, 140, &[]).unwrap();
+        let tail = read_dir(&dir, 139, 10, None).unwrap();
+        let whole = read_dir(&dir, 0, 1000, None).unwrap();
+        if fill {
+            assert!(tail.gaps.is_empty(), "{:?}", tail.gaps);
+            assert!(whole.frames.iter().any(|f| f.seq == 2));
+        } else {
+            assert_eq!(tail.gaps, vec![(2, 2)], "the marker lost the hole");
+        }
+    }
+}
+
+/// P06-3: writers of attempts that never finish are closed when idle and
+/// capped in number; their logs then fall under retention, and a late frame
+/// reopens the log from disk exactly.
+#[test]
+fn idle_writers_close_are_capped_and_their_logs_expire() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs"))
+        .unwrap()
+        .with_max_open(4);
+    let attempts: Vec<AttemptId> = (0..10).map(|_| AttemptId::new()).collect();
+    for attempt in &attempts {
+        logs.append(run(), job(), *attempt, &frame(1, "a")).unwrap();
+    }
+    assert_eq!(logs.open_writers(), 4, "the writer cap did not hold");
+    assert_eq!(logs.close_idle(Duration::ZERO), 4);
+    assert_eq!(logs.open_writers(), 0);
+    // A late frame reopens from disk and continues the sequence.
+    assert_eq!(
+        logs.append(run(), job(), attempts[0], &frame(2, "b"))
+            .unwrap(),
+        Appended::Stored { through: 2 }
+    );
+    logs.close_idle(Duration::ZERO);
+    // Nothing is held open any more, so retention reaches every log.
+    let now = sentinel_core::UnixMillis(sentinel_core::UnixMillis::now().0 + 10_000);
+    assert_eq!(logs.sweep_expired(now, 1, 256).unwrap(), 10);
+}
+
+/// P09-11 / P06-11: an API page is bounded in bytes and in decode work,
+/// says where to continue, and a step filter over a finished step says so.
+#[test]
+fn pages_are_bounded_and_a_finished_step_is_reported() {
+    use sentinel_store::logs::{Page, read_page};
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let attempt = AttemptId::new();
+    let full = "y".repeat(32 * 1024);
+    for seq in 1..=40u64 {
+        logs.append(run(), job(), attempt, &at_step(seq, 0, &full))
+            .unwrap();
+    }
+    for seq in 41..=80u64 {
+        logs.append(run(), job(), attempt, &at_step(seq, 1, "later\n"))
+            .unwrap();
+    }
+    let dir = logs.attempt_dir(run(), job(), attempt);
+    let page = Page {
+        limit: 500,
+        bytes: 1 << 20,
+        scan: 16 << 20,
+    };
+    let mut after = 0;
+    let mut seen = Vec::new();
+    loop {
+        let tail = read_page(&dir, after, page, None).unwrap();
+        let bytes: usize = tail.frames.iter().map(|f| f.bytes.len()).sum();
+        assert!(bytes <= 1 << 20, "a page carried {bytes} bytes");
+        seen.extend(tail.frames.iter().map(|f| f.seq));
+        match tail.next_after {
+            Some(next) => after = next,
+            None => break,
+        }
+    }
+    assert_eq!(seen, (1..=80).collect::<Vec<_>>());
+    // Step 0 is over: a poll past its last frame learns so at once.
+    let step0 = read_page(&dir, 40, page, Some(0)).unwrap();
+    assert!(step0.frames.is_empty() && step0.step_done);
+    assert!(!read_page(&dir, 79, page, Some(1)).unwrap().step_done);
+    // The scan bound cuts a filtered read that matches nothing.
+    let small = Page {
+        scan: 64 * 1024,
+        ..page
+    };
+    let cut = read_page(&dir, 0, small, Some(7)).unwrap();
+    assert!(cut.frames.is_empty());
+    assert!(
+        cut.next_after.is_some_and(|n| n < 80),
+        "{:?}",
+        cut.next_after
+    );
+}

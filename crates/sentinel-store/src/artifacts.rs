@@ -350,14 +350,15 @@ pub fn captured(
 /// Retire artifact rows whose retention deadline passed: a captured row's
 /// manifest version is deleted with it (cascading its `manifest_refs`
 /// edges, which is what later lets the objects be reclaimed), and the row
-/// itself goes. Returns the manifest file paths the caller unlinks once the
-/// transaction commits; at most `limit` rows per pass.
+/// itself goes. Returns the manifest files the caller hands to
+/// [`Objects::unlink`] once the transaction commits; at most `limit` rows
+/// per pass.
 pub fn sweep_expired(
     tx: &Transaction<'_>,
     objects: &Objects,
     now: UnixMillis,
     limit: i64,
-) -> Result<Vec<std::path::PathBuf>> {
+) -> Result<Vec<objects::Doomed>> {
     // (id, tenant_id, job_id, name, manifest_version)
     type Due = (Vec<u8>, Vec<u8>, Vec<u8>, String, Option<i64>);
     let due: Vec<Due> = tx

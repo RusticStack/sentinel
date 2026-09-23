@@ -147,8 +147,10 @@ fn a_commit_rolled_back_leaves_an_orphan_the_sweep_collects() {
     let path = fx.object_path(fx.tenant, staged.digest());
     let tx = fx.conn.transaction().unwrap();
     assert!(fx.objects.commit(&tx, &staged).unwrap());
-    // The crash lands here: file durable, transaction rolled back.
+    // The crash lands here: file durable, transaction rolled back, and
+    // the stage that pinned the file is gone with the process.
     tx.rollback().unwrap();
+    drop(staged);
     assert!(path.is_file());
 
     // Recovery reports it; it is not corrupt and no row is missing.
@@ -156,12 +158,12 @@ fn a_commit_rolled_back_leaves_an_orphan_the_sweep_collects() {
     assert_eq!(report.orphans, vec![path.clone()]);
     assert!(report.corrupt.is_empty() && report.missing.is_empty());
     // Fresh files are never swept — the grace protects an in-flight commit.
-    assert_eq!(fx.objects.sweep_orphans(&fx.conn, 64).unwrap(), 0);
+    assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 64).unwrap(), 0);
     age(
         &path,
         Duration::from_millis(objects::FILE_ORPHAN_GRACE_MS as u64 + 1_000),
     );
-    assert_eq!(fx.objects.sweep_orphans(&fx.conn, 64).unwrap(), 1);
+    assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 64).unwrap(), 1);
     assert!(!path.exists());
     // Nothing was ever owed for it.
     assert_eq!(fx.objects.usage(&fx.conn, fx.tenant).unwrap(), 0);
@@ -202,7 +204,7 @@ fn a_manifest_commit_rolled_back_leaves_an_orphan_file() {
         &path,
         Duration::from_millis(objects::FILE_ORPHAN_GRACE_MS as u64 + 1_000),
     );
-    assert_eq!(fx.objects.sweep_orphans(&fx.conn, 64).unwrap(), 1);
+    assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 64).unwrap(), 1);
     assert!(!path.exists());
     // The object the manifest named is still committed — unreferenced, but
     // inside the reclamation grace, so nothing collects it yet.
@@ -500,4 +502,88 @@ fn foreign_tenant_bytes_are_indistinguishable_from_absent() {
         .read(&fx.conn, fx.tenant, digest, &mut out)
         .unwrap();
     assert_eq!(out, b"alice's bytes");
+}
+
+/// P06-1 (b): an aged orphan adopted by a dedup stage is not swept between
+/// the stage and its commit.
+#[test]
+fn the_orphan_sweep_never_takes_a_file_a_stage_adopted() {
+    let mut fx = fixture();
+    let orphan = fx
+        .objects
+        .stage(
+            fx.tenant,
+            &b"orphaned then reused"[..],
+            u64::MAX,
+            Expect::default(),
+        )
+        .unwrap();
+    let digest = orphan.digest();
+    drop(orphan); // its commit never happened
+    let path = fx.object_path(fx.tenant, digest);
+    age(
+        &path,
+        Duration::from_millis(objects::FILE_ORPHAN_GRACE_MS as u64 + 60_000),
+    );
+    // The same content again (a rerun): dedup onto the aged file.
+    let again = fx
+        .objects
+        .stage(
+            fx.tenant,
+            &b"orphaned then reused"[..],
+            u64::MAX,
+            Expect::default(),
+        )
+        .unwrap();
+    // The maintenance pass runs between the stage and its commit.
+    assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 64).unwrap(), 0);
+    let tx = fx.conn.transaction().unwrap();
+    assert!(fx.objects.commit(&tx, &again).unwrap());
+    tx.commit().unwrap();
+    drop(again);
+    let mut out = Vec::new();
+    fx.objects
+        .read(&fx.conn, fx.tenant, digest, &mut out)
+        .unwrap();
+    assert_eq!(out, b"orphaned then reused");
+    // Committed, it stays through later sweeps too.
+    assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 64).unwrap(), 0);
+}
+
+/// P06-1 (c): reclamation commits a row delete, then the same bytes are
+/// staged again before the unlink runs — the unlink keeps the file.
+#[test]
+fn a_reclaim_unlink_spares_bytes_staged_again_meanwhile() {
+    let mut fx = fixture();
+    let digest = fx.put(fx.tenant, b"expired yesterday, built again today");
+    let later = UnixMillis(UnixMillis::now().0 + objects::UNREFERENCED_GRACE_MS + 1);
+    let tx = fx.conn.transaction().unwrap();
+    let reclaimed = fx.objects.reclaim(&tx, later, 256).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(reclaimed.objects, 1);
+    // Today's identical build streams while the unlink is still pending.
+    let again = fx
+        .objects
+        .stage(
+            fx.tenant,
+            &b"expired yesterday, built again today"[..],
+            u64::MAX,
+            Expect::default(),
+        )
+        .unwrap();
+    let tx = fx.conn.transaction().unwrap();
+    assert_eq!(fx.objects.unlink(&tx, &reclaimed.doomed).unwrap(), 0);
+    assert!(fx.objects.commit(&tx, &again).unwrap());
+    tx.commit().unwrap();
+    drop(again);
+    let mut out = Vec::new();
+    fx.objects
+        .read(&fx.conn, fx.tenant, digest, &mut out)
+        .unwrap();
+    assert_eq!(out, b"expired yesterday, built again today");
+    // After that commit a stale unlink of the same file is refused too.
+    let tx = fx.conn.transaction().unwrap();
+    assert_eq!(fx.objects.unlink(&tx, &reclaimed.doomed).unwrap(), 0);
+    tx.commit().unwrap();
+    assert!(fx.object_path(fx.tenant, digest).is_file());
 }

@@ -34,9 +34,23 @@ use sentinel_store::{Store, logs::LogStore, objects::Objects};
 pub const WORKERS: usize = 8;
 /// How long a `wait=1` log poll holds before answering with nothing new.
 pub const LOG_WAIT: Duration = Duration::from_secs(25);
-/// Upload/download bodies in flight at once (D02). Beyond this the API
-/// answers `rate_limited` rather than queue unbounded transfer work.
-pub const TRANSFERS: usize = 4;
+/// Upload/download bodies in flight at once (D02), counted until the last
+/// byte is written — a download's slot travels with its streamed body.
+/// Beyond this the API answers `rate_limited` rather than queue unbounded
+/// transfer work.
+pub const TRANSFERS: usize = 3;
+/// Long-poll subscribers parked at once — run waits and `wait=1` log polls
+/// together. Beyond it a poll is `rate_limited` with
+/// `details.retry_after_ms`.
+pub const SUBSCRIBERS: usize = 3;
+/// Handler permits neither transfers nor long polls can take: however many
+/// slow bodies and parked polls there are, this many requests — logins,
+/// token refreshes, health checks, run reads — are always served.
+pub const RESERVED_HANDLERS: usize = WORKERS - TRANSFERS - SUBSCRIBERS;
+const _: () = assert!(
+    RESERVED_HANDLERS >= 2,
+    "keep handler permits for control requests"
+);
 /// Largest single upload chunk; resume boundaries let clients pick smaller.
 pub const MAX_UPLOAD_CHUNK: usize = 8 << 20;
 
@@ -67,11 +81,12 @@ pub(crate) struct State {
     pub sessions: sentinel_store::local_auth::Policy,
     pub github_webhook_secret: Option<Arc<[u8]>>,
     pub intake: Option<sentinel_intake::Waker>,
-    /// Upload/download bodies currently in flight.
-    pub transfers: AtomicUsize,
+    /// Upload/download bodies currently in flight. Shared with the body a
+    /// download streams after its route returned.
+    pub transfers: Arc<AtomicUsize>,
     /// Long-poll subscribers currently parked (run waits and `wait=1` log
     /// polls), bounded so they cannot take every handler permit.
-    pub subscribers: AtomicUsize,
+    pub subscribers: Arc<AtomicUsize>,
     /// Set by `Server::shutdown`; the `wait=1` log poll checks it so a
     /// stop does not ride out the full poll interval.
     pub stop: Arc<AtomicBool>,
@@ -102,8 +117,8 @@ impl Server {
             sessions: config.sessions,
             github_webhook_secret: config.github_webhook_secret,
             intake: config.intake,
-            transfers: AtomicUsize::new(0),
-            subscribers: AtomicUsize::new(0),
+            transfers: Arc::new(AtomicUsize::new(0)),
+            subscribers: Arc::new(AtomicUsize::new(0)),
             stop: Arc::clone(&stop),
             oauth: oauth::OAuthState::new(issuer.clone()),
         });
