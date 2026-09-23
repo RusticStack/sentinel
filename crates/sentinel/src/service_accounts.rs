@@ -233,7 +233,7 @@ impl Request {
                     return Err(client::Error::remote("the server answered without a token"));
                 };
                 // Only the token on stdout, so `> file` captures exactly it.
-                println!("{token}");
+                crate::outln!("{token}");
                 let metadata = json!({
                     "grant": issued["grant"],
                     "account": account,

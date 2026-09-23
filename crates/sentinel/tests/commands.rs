@@ -607,6 +607,20 @@ fn wait_rides_out_rate_limited_answers_instead_of_failing() {
         })
         .collect();
     thread::sleep(Duration::from_millis(300));
+    // Every slot is taken: a parking poll now is refused, so the CLI below
+    // really meets `rate_limited` (P09-18) rather than parking at once.
+    let (_, now) = plain_get(&format!("{}/api/v1/runs/{run}/wait", d.base), &d.token);
+    let (status, refused) = plain_get(
+        &format!(
+            "{}/api/v1/runs/{run}/wait?since={}&timeout_ms=2000",
+            d.base,
+            now["version"].as_str().unwrap()
+        ),
+        &d.token,
+    );
+    assert_eq!(status, 429, "{refused}");
+    assert_eq!(refused["code"], "rate_limited");
+    assert!(refused["details"]["retry_after_ms"].as_u64().is_some());
     // The job is cancelled while the CLI's parking polls are being refused.
     let (store, tenant) = (Arc::clone(&d.store), d.tenant);
     let canceller = thread::spawn(move || {

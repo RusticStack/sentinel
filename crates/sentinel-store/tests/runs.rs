@@ -248,3 +248,33 @@ fn rerun_refuses_running_and_cancelled_jobs() {
     let row = f.store.read(|c| jobs::get_job(c, tenant, blocked)).unwrap();
     assert_eq!(row.state, JobState::Terminal(Outcome::Canceled));
 }
+
+#[test]
+fn a_stored_run_spec_cannot_be_rewritten_even_by_raw_sql() {
+    // P02-7: every attempt and rerun executes this blob; it is written once.
+    let f = fx();
+    let (tenant, repo, run) = (f.tenant, f.repo, RunId::new());
+    let s = spec();
+    let expected = s.clone();
+    f.store
+        .writer()
+        .write(move |tx| runs::create_run(tx, tenant, repo, run, &s, UnixMillis(10)))
+        .unwrap();
+    for sql in [
+        "UPDATE run_specs SET spec = x'04' WHERE run_id = ?1",
+        "UPDATE run_specs SET digest = zeroblob(16) WHERE run_id = ?1",
+        "UPDATE run_specs SET format = 3 WHERE run_id = ?1",
+        "UPDATE run_specs SET spec = spec WHERE run_id = ?1",
+    ] {
+        let raw = f.store.writer().write(move |tx| {
+            tx.execute(sql, [run.as_bytes().as_slice()])?;
+            Ok(())
+        });
+        assert!(matches!(raw, Err(Error::Sqlite(_))), "{sql}: {raw:?}");
+    }
+    let stored = f
+        .store
+        .read(|c| runs::get_run_spec(c, tenant, run))
+        .unwrap();
+    assert_eq!(stored, expected);
+}

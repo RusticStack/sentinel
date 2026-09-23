@@ -302,7 +302,8 @@ fn usage_and_authorization_failures_have_their_exit_codes() {
     assert!(admin.stdout.is_empty());
     let document: Value = serde_json::from_str(admin.stderr.trim()).unwrap();
     assert_eq!(document["code"], "invalid_request");
-    // Revoking an unknown grant is not found.
-    let unknown = cli(&d, &d.root, &["revoke", "grt_00000000000000000000000000"]);
-    assert!(unknown.code == 4 || unknown.code == 1, "{}", unknown.stderr);
+    // Revoking a well-formed but unknown grant is not found (exit 4, P09-18).
+    let missing = sentinel_core::GrantId::new().to_string();
+    let unknown = cli(&d, &d.root, &["revoke", &missing]);
+    assert_eq!(unknown.code, 4, "{}", unknown.stderr);
 }

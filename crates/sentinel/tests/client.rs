@@ -154,6 +154,7 @@ fn server_answers_become_stable_exit_codes() {
         (429, error_body("rate_limited"), 6, 3),
         (507, error_body("storage_full"), 6, 3),
         (500, error_body("internal"), 6, 3),
+        (503, error_body("outcome_unknown"), 6, 3),
         // A proxy's answer that is not sentinel.error/1, and a malformed 200.
         (502, "bad gateway".into(), 1, 3),
         (200, "not json".into(), 1, 1),
@@ -254,4 +255,84 @@ fn a_static_credential_is_checked_before_any_request() {
     let error = client.get("/api/v1/me").unwrap_err();
     assert_eq!(error.exit, Exit::NotFound);
     assert_eq!(error.api.unwrap()["code"], "not_found");
+}
+
+#[test]
+fn a_closed_stdout_ends_a_networked_command_quietly_with_exit_zero() {
+    // P09-13: `… --output ndjson | head -1` used to end in a panic (exit 101).
+    let dir = tempfile::tempdir().unwrap();
+    let token = token_file(&dir);
+    let fake = Fake::start(200, r#"{"user":"usr_x","via":"bearer"}"#);
+    for mode in [&[][..], &["--json"][..]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+            .env_remove("SENTINEL_TOKEN")
+            .env_remove("SENTINEL_SERVER")
+            .env_remove("SENTINEL_PROFILE")
+            .args(["api", "--server", &fake.url, "--token-file"])
+            .arg(&token)
+            .args(mode)
+            .arg("me")
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{mode:?}: {stderr}");
+        assert!(stderr.is_empty(), "{mode:?}: {stderr}");
+    }
+}
+
+#[test]
+fn an_unknown_write_outcome_is_repeated_only_under_its_idempotency_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = |server: &str| ClientArgs {
+        server: Some(server.to_owned()),
+        token_file: Some(token_file(&dir)),
+        ..ClientArgs::default()
+    };
+    let body = r#"{"schema":"sentinel.error/1","code":"outcome_unknown","message":"canned","retryable":false,"details":{"retry_with_idempotency_key":true}}"#;
+    // P02-1: the first write may still commit, so an unkeyed POST is sent once.
+    let fake = Fake::start(503, body);
+    let client = Client::connect(&args(&fake.url)).unwrap();
+    let error = client
+        .post("/api/v1/x", &serde_json::json!({}), None)
+        .unwrap_err();
+    assert_eq!(error.exit, Exit::Busy);
+    assert!(
+        error.message.contains("may have been applied"),
+        "{}",
+        error.message
+    );
+    assert_eq!(fake.requests(), 1);
+    // The same key makes a repeat a replay, never a second execution.
+    let keyed = Fake::start(503, body);
+    let client = Client::connect(&args(&keyed.url)).unwrap();
+    let error = client
+        .post("/api/v1/x", &serde_json::json!({}), Some("k1"))
+        .unwrap_err();
+    assert_eq!(error.api.unwrap()["code"], "outcome_unknown");
+    assert_eq!(keyed.requests(), 3);
+}
+
+#[test]
+fn a_named_server_backoff_is_left_to_the_caller() {
+    // P09-15: a subscriber refusal names its own back-off; the client must
+    // not add two lockstep retries of its own before the caller's jitter.
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::start(
+        429,
+        r#"{"schema":"sentinel.error/1","code":"rate_limited","message":"canned","retryable":true,"details":{"retry_after_ms":1000}}"#,
+    );
+    let client = Client::connect(&ClientArgs {
+        server: Some(fake.url.clone()),
+        token_file: Some(token_file(&dir)),
+        ..ClientArgs::default()
+    })
+    .unwrap();
+    let error = client.get("/api/v1/runs/x/wait").unwrap_err();
+    assert_eq!(error.exit, Exit::Busy);
+    assert_eq!(error.api.unwrap()["details"]["retry_after_ms"], 1000);
+    assert_eq!(fake.requests(), 1);
 }

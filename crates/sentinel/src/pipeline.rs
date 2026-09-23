@@ -10,6 +10,7 @@
 //! commands take `--output text|json` (`--json` is `--output json`).
 use std::{path::Path, process::ExitCode};
 
+use sentinel::bounded::{self, ReadError};
 use sentinel::client::Output;
 use sentinel_pipeline::{Explanation, compile_str, yaml::MAX_PIPELINE_FILE_BYTES};
 use serde_json::json;
@@ -40,27 +41,19 @@ pub fn run_with(file: &Path, explain: bool, output: Output) -> ExitCode {
         }
         ExitCode::from(1)
     };
-    // Bound the read before parsing so a huge file fails fast without allocation.
-    let size = match std::fs::metadata(file) {
-        Ok(m) => m.len(),
-        Err(e) => {
+    // Bound the read itself: a device, FIFO or procfs file reports length 0
+    // and a file can grow after a size check, so only the bytes read count.
+    let text = match bounded::text(file, MAX_PIPELINE_FILE_BYTES as u64) {
+        Ok(t) => t,
+        Err(ReadError::TooLarge { limit }) => {
             return fail(
-                "client_usage",
-                format!("error: cannot read {}: {e}", file.display()),
+                "invalid_pipeline",
+                format!(
+                    "error: {} exceeds the pipeline file limit of {limit} bytes",
+                    file.display()
+                ),
             );
         }
-    };
-    if size > MAX_PIPELINE_FILE_BYTES as u64 {
-        return fail(
-            "invalid_pipeline",
-            format!(
-                "error: {} is {size} bytes; the limit is {MAX_PIPELINE_FILE_BYTES}",
-                file.display()
-            ),
-        );
-    }
-    let text = match std::fs::read_to_string(file) {
-        Ok(t) => t,
         Err(e) => {
             return fail(
                 "client_usage",
@@ -75,7 +68,7 @@ pub fn run_with(file: &Path, explain: bool, output: Output) -> ExitCode {
     let document = if explain {
         let explanation = Explanation::of(&compiled);
         if output == Output::Text {
-            print!("{}", explanation.render_text());
+            sentinel::out!("{}", explanation.render_text());
             return ExitCode::SUCCESS;
         }
         match serde_json::to_value(&explanation) {
@@ -93,6 +86,6 @@ pub fn run_with(file: &Path, explain: bool, output: Output) -> ExitCode {
         })
     };
     // One compact line in both JSON modes, as `explain --json` always printed.
-    println!("{document}");
+    sentinel::outln!("{document}");
     ExitCode::SUCCESS
 }

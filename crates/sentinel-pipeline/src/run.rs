@@ -205,16 +205,22 @@ impl RunSpec {
 
     /// The byte that heads a stored spec decides which layout follows.
     /// Format 3 decodes through the shadow types below and upgrades every
-    /// cache to `Dependencies`; any other format byte, or a body its
-    /// layout cannot parse, is `Decode`. Postcard ignores trailing bytes,
-    /// so the format byte alone chooses the type — a v3 body is never fed
-    /// to the v4 layout hoping the extra field swallows leftover bytes.
+    /// cache to `Dependencies`; any other format byte, a body its layout
+    /// cannot parse, or bytes left over after it is `Decode`. The format
+    /// byte alone chooses the type — a v3 body is never fed to the v4
+    /// layout hoping the extra field swallows leftover bytes — and the
+    /// chosen layout must consume the whole body, so a corrupted or
+    /// concatenated blob is refused rather than half-read.
     pub fn decode(bytes: &[u8]) -> Result<Self, SpecError> {
+        fn whole<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, SpecError> {
+            match postcard::take_from_bytes(body) {
+                Ok((value, [])) => Ok(value),
+                _ => Err(SpecError::Decode),
+            }
+        }
         match bytes.split_first() {
-            Some((&SPEC_FORMAT, body)) => postcard::from_bytes(body).map_err(|_| SpecError::Decode),
-            Some((&SPEC_FORMAT_READ_MIN, body)) => postcard::from_bytes::<RunSpecV3>(body)
-                .map(RunSpec::from)
-                .map_err(|_| SpecError::Decode),
+            Some((&SPEC_FORMAT, body)) => whole(body),
+            Some((&SPEC_FORMAT_READ_MIN, body)) => whole::<RunSpecV3>(body).map(RunSpec::from),
             _ => Err(SpecError::Decode),
         }
     }
@@ -564,6 +570,26 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xFF;
         let _ = RunSpec::decode(&corrupt); // may decode or not; must not panic
+    }
+
+    #[test]
+    fn a_blob_with_trailing_bytes_is_not_a_spec() {
+        // P02-5: readers reject unknown bytes rather than guess
+        // (docs/compatibility.md), in both readable layouts.
+        let spec = full_spec();
+        for blob in [spec.encode().unwrap(), encode_v3(&spec)] {
+            assert!(RunSpec::decode(&blob).is_ok());
+            for tail in [&[0xAAu8][..], &[0], &blob[1..]] {
+                let longer = [blob.as_slice(), tail].concat();
+                assert_eq!(
+                    RunSpec::decode(&longer),
+                    Err(SpecError::Decode),
+                    "format {} + {} bytes",
+                    blob[0],
+                    tail.len()
+                );
+            }
+        }
     }
 
     #[test]

@@ -75,9 +75,16 @@ pub(crate) fn store_error(e: StoreError) -> ApiError {
             ErrorCode::InvalidRequest,
             "image digest and platform not resolved",
         ),
-        StoreError::WriterUnavailable | StoreError::Overloaded | StoreError::WriteAmbiguous => {
+        StoreError::WriterUnavailable | StoreError::Overloaded => {
             err(ErrorCode::RateLimited, "controller busy; retry")
         }
+        // The write is still queued or running and may yet commit: an
+        // identical unkeyed retry could apply it twice (P02-1).
+        StoreError::WriteAmbiguous => err(
+            ErrorCode::OutcomeUnknown,
+            "the write may still commit; re-read before retrying",
+        )
+        .with_detail("retry_with_idempotency_key", true),
         StoreError::StorageFull => err(ErrorCode::StorageFull, "storage below watermark; retry"),
         StoreError::QuotaExceeded => err(ErrorCode::QuotaExceeded, "tenant storage quota exceeded"),
         _ => err(ErrorCode::Internal, "controller fault"),
@@ -1585,5 +1592,34 @@ fn object_download(state: &State, request: &mut Request, slug: &str, digest: &st
                 headers,
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_write_that_may_commit_is_reported_as_outcome_unknown() {
+        // Nothing was attempted, or a read was refused: an identical retry is safe.
+        for refused in [StoreError::WriterUnavailable, StoreError::Overloaded] {
+            let e = store_error(refused);
+            assert_eq!(
+                (e.code, e.http_status(), e.retryable),
+                (ErrorCode::RateLimited, 429, true)
+            );
+        }
+        // P02-1: the write may still commit, so no blind retry is invited.
+        let e = store_error(StoreError::WriteAmbiguous);
+        assert_eq!(
+            (e.code, e.http_status(), e.retryable),
+            (ErrorCode::OutcomeUnknown, 503, false)
+        );
+        assert_eq!(
+            e.details
+                .as_ref()
+                .and_then(|d| d.get("retry_with_idempotency_key")),
+            Some(&Value::Bool(true))
+        );
     }
 }

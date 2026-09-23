@@ -5,7 +5,7 @@ use std::io::Write;
 use serde_json::{Map, Value, json};
 
 use super::{List, MAX_ITEMS, PAGE, busy_backoff, segment, text};
-use crate::client::{Client, Error, Output};
+use crate::client::{self, Client, Error, Output};
 
 /// Print an attempt's frames page by page. Text writes each frame's bytes
 /// to the stream it came from (stdout or stderr), as the job wrote them;
@@ -52,18 +52,18 @@ pub(super) fn show(
             match output {
                 Output::Text => {
                     let bytes = text(frame, "text").as_bytes();
-                    let _ = if frame["stream"] == "stderr" {
-                        std::io::stderr().write_all(bytes)
+                    if frame["stream"] == "stderr" {
+                        let _ = std::io::stderr().write_all(bytes);
                     } else {
-                        std::io::stdout().write_all(bytes)
-                    };
+                        client::stdout_bytes(bytes);
+                    }
                 }
                 _ => list.item(frame.clone(), String::new),
             }
             after = frame["seq"].as_u64().unwrap_or(after);
         }
         if output == Output::Text {
-            let _ = std::io::stdout().flush();
+            client::stdout_flush();
         }
         let complete = page["complete"] == true;
         let capped = output == Output::Json && shown >= MAX_ITEMS;

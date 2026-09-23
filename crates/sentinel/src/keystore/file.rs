@@ -10,7 +10,7 @@
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -61,7 +61,7 @@ pub fn delete(dir: &Path, profile: &str) -> Result<(), Error> {
 /// Read a private file, checking the opened file itself (no race between
 /// the check and the read). `Ok(None)` when it does not exist.
 pub fn read_private(path: &Path) -> Result<Option<Vec<u8>>, Error> {
-    let mut file = match File::open(path) {
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(io_error("read", path, &e)),
@@ -74,10 +74,16 @@ pub fn read_private(path: &Path) -> Result<Option<Vec<u8>>, Error> {
             path.display()
         )));
     }
-    let mut data = Vec::with_capacity(meta.len() as usize);
-    file.read_to_end(&mut data)
-        .map_err(|e| io_error("read", path, &e))?;
-    Ok(Some(data))
+    // The length check above is a fast refusal; the read is what is bounded,
+    // since the file can grow after `metadata`.
+    match crate::bounded::read(file, MAX_FILE) {
+        Ok(data) => Ok(Some(data)),
+        Err(crate::bounded::ReadError::Io(e)) => Err(io_error("read", path, &e)),
+        Err(_) => Err(Error::usage(format!(
+            "{} is larger than a Sentinel file can be",
+            path.display()
+        ))),
+    }
 }
 
 /// Create `path` (and missing parents) owner-only, or check an existing one.

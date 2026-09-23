@@ -38,6 +38,18 @@ pub enum ErrorCode {
     StorageFull = 11,
     /// The tenant reached its storage quota; reclaim space or raise it.
     QuotaExceeded = 12,
+    /// The controller stopped waiting for a write that is still queued or
+    /// running and may yet commit. Not retryable as is: repeating an unkeyed
+    /// mutation can apply it twice. Re-read the resource, or repeat the
+    /// request with the same `Idempotency-Key`
+    /// (`details.retry_with_idempotency_key`).
+    OutcomeUnknown = 13,
+    /// A code this build does not know, sent by a newer server. Never sent
+    /// by this build: it keeps the error document parseable across additive
+    /// codes, which the contract requires of clients. The answer's HTTP
+    /// status and `retryable` field are authoritative for it.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 impl ErrorCode {
@@ -56,6 +68,8 @@ impl ErrorCode {
             Self::Internal => "internal",
             Self::StorageFull => "storage_full",
             Self::QuotaExceeded => "quota_exceeded",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -70,9 +84,10 @@ impl ErrorCode {
             Self::IdempotencyMismatch => 422,
             Self::RateLimited => 429,
             Self::UnsupportedVersion => 426,
-            Self::Internal => 500,
+            Self::Internal | Self::Unknown => 500,
             Self::StorageFull => 507,
             Self::QuotaExceeded => 403,
+            Self::OutcomeUnknown => 503,
         }
     }
 
@@ -191,5 +206,24 @@ mod tests {
         assert!(!ErrorCode::QuotaExceeded.retryable());
         let minimal = serde_json::to_string(&ApiError::new(ErrorCode::Internal, "x")).unwrap();
         assert!(!minimal.contains("request_id"), "absent fields are omitted");
+    }
+
+    #[test]
+    fn an_ambiguous_write_is_unavailable_and_never_blindly_retryable() {
+        // P02-1: the write may still commit, so an identical unkeyed retry
+        // could apply it twice; the code must not invite one.
+        assert_eq!(ErrorCode::OutcomeUnknown.http_status(), 503);
+        assert!(!ErrorCode::OutcomeUnknown.retryable());
+        let json = serde_json::to_string(&ApiError::new(ErrorCode::OutcomeUnknown, "x")).unwrap();
+        assert!(json.contains(r#""code":"outcome_unknown","message":"x","retryable":false"#));
+    }
+
+    #[test]
+    fn an_unknown_code_from_a_newer_server_still_parses() {
+        let json = r#"{"schema":"sentinel.error/1","code":"brand_new_code","message":"m","retryable":true}"#;
+        let e: ApiError = serde_json::from_str(json).unwrap();
+        assert_eq!(e.code, ErrorCode::Unknown);
+        assert!(e.retryable, "the wire's retryable flag is kept");
+        assert!(!ErrorCode::Unknown.retryable());
     }
 }

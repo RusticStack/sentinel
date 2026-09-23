@@ -1,7 +1,25 @@
-use std::process::Command;
+use std::process::{Command, Output};
 
 fn bench() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sentinel-bench"))
+}
+
+/// Whether git can read the checkout the runner was built from. Where it
+/// cannot (for example Linux git on a worktree that Windows git created,
+/// whose `.git` names a `D:/` path), the runner must refuse to measure
+/// rather than write a record without its source.
+fn source_readable() -> bool {
+    Command::new("git")
+        .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// The refusal a runner without readable provenance gives: no record.
+fn refused_for_provenance(out: &Output) -> bool {
+    !out.status.success()
+        && out.stdout.is_empty()
+        && String::from_utf8_lossy(&out.stderr).contains("cannot read the source commit")
 }
 
 #[test]
@@ -21,6 +39,10 @@ fn direct_noop_emits_one_machine_readable_record() {
         ])
         .output()
         .unwrap();
+    if !source_readable() {
+        assert!(refused_for_provenance(&out), "{out:?}");
+        return;
+    }
     assert!(
         out.status.success(),
         "{}",
@@ -60,6 +82,44 @@ fn direct_noop_emits_one_machine_readable_record() {
 }
 
 #[test]
+fn a_record_names_its_source_and_compiler_even_outside_the_checkout() {
+    // F05: the committed baseline ran outside the checkout as a user without
+    // rustc on PATH, and its record carried neither revision.
+    // The compiler is recorded at build time, so it no longer depends on
+    // PATH at run time; the commit is asked of the build's own checkout.
+    let out = bench()
+        .current_dir(std::env::temp_dir())
+        .args([
+            "--runtime",
+            "direct",
+            "--samples",
+            "1",
+            "--warmup",
+            "0",
+            "--warm-state",
+            "warm",
+        ])
+        .output()
+        .unwrap();
+    if !source_readable() {
+        assert!(refused_for_provenance(&out), "{out:?}");
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let commit = record["source"]["git_commit"].as_str().unwrap();
+    assert_eq!(commit.len(), 40, "{commit}");
+    assert!(commit.bytes().all(|b| b.is_ascii_hexdigit()), "{commit}");
+    assert!(record["source"]["git_dirty"].is_boolean());
+    let rustc = record["tools"]["rustc"].as_str().unwrap();
+    assert!(rustc.starts_with("rustc "), "{rustc}");
+}
+
+#[test]
 fn failing_workload_writes_no_record() {
     let dir = std::env::temp_dir().join(format!("sentinel-bench-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -80,7 +140,10 @@ fn failing_workload_writes_no_record() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("status 3"));
+    assert!(
+        refused_for_provenance(&out) || String::from_utf8_lossy(&out.stderr).contains("status 3"),
+        "{out:?}"
+    );
     assert!(!output.exists(), "no partial record on failure");
     std::fs::remove_dir_all(dir).unwrap();
 }

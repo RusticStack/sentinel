@@ -140,6 +140,42 @@ fn duplicate_requests_execute_once_and_replay_the_same_run() {
 }
 
 #[test]
+fn expired_idempotency_records_are_purged_in_bounded_batches() {
+    // P02-2: every distinct key used to stay forever.
+    let dir = tempfile::tempdir().unwrap();
+    let (store, tenant, repo) = open(dir.path(), Durability::Normal);
+    for i in 0..5 {
+        dispatch(&store, tenant, repo, &format!("old-{i}"), b"a", 1_000).unwrap();
+    }
+    let live_at = 1_500 + IDEMPOTENCY_TTL_MS;
+    for i in 0..2 {
+        dispatch(&store, tenant, repo, &format!("live-{i}"), b"a", live_at).unwrap();
+    }
+    // The old records are past the TTL at `now`; the live ones are not.
+    let now = UnixMillis(2_000 + IDEMPOTENCY_TTL_MS);
+    let keys = || -> i64 {
+        store
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM idempotency_keys", [], |r| r.get(0))?))
+            .unwrap()
+    };
+    assert_eq!(idempotency::purge_expired(&store, now, 3).unwrap(), 3);
+    assert_eq!(keys(), 4, "one call removes at most its batch");
+    assert_eq!(idempotency::purge_expired(&store, now, 3).unwrap(), 2);
+    assert_eq!(idempotency::purge_expired(&store, now, 3).unwrap(), 0);
+    assert_eq!(keys(), 2);
+    // Live keys still replay their run, and the runs themselves are untouched.
+    for i in 0..2 {
+        let (_, replayed) =
+            dispatch(&store, tenant, repo, &format!("live-{i}"), b"a", now.0).unwrap();
+        assert!(replayed, "live-{i}");
+    }
+    let runs: i64 = store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(runs, 7);
+}
+
+#[test]
 fn failed_transaction_leaves_no_partial_rows() {
     let dir = tempfile::tempdir().unwrap();
     let (store, tenant, _repo) = open(dir.path(), Durability::Normal);

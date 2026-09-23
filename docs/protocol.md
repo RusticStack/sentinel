@@ -17,12 +17,15 @@ Every error response is one JSON object with `schema: "sentinel.error/1"`, a sta
 | `payload_too_large` | 413 | no | A protocol limit was exceeded; `details.limit_bytes` says which |
 | `idempotency_mismatch` | 422 | no | Same key, different body |
 | `unsupported_version` | 426 | no | Version or capability set cannot be served |
-| `rate_limited` | 429 | yes | Client rate or writer queue full; back off |
+| `rate_limited` | 429 | yes | Client rate, a full queue, or a busy writer that attempted nothing; back off. `details.retry_after_ms`, when present, is the server's own back-off |
 | `internal` | 500 | yes | Server fault; `request_id` locates the log record |
+| `outcome_unknown` | 503 | no | The controller stopped waiting for a write that is still queued or running and **may yet commit** (the store's `WriteAmbiguous`). Repeating an unkeyed mutation can apply it twice: re-read first, or repeat with the same `Idempotency-Key` (`details.retry_with_idempotency_key: true`), which replays instead of executing again |
 | `storage_full` | 507 | yes | Write refused below the disk watermarks ([storage](storage.md#disk-admission-quotas-and-reclamation-d06)); retry once the controller has headroom |
 | `quota_exceeded` | 403 | no | The tenant reached its storage quota; reclaim space or raise it |
 
 `message` and `details` never echo request payloads, secrets or parser fragments.
+
+Codes are additive, so a client meets codes newer than itself. `sentinel_protocol::ErrorCode` parses any code it does not know as `ErrorCode::Unknown` (`#[serde(other)]`; never sent by a server); for such an answer the HTTP status and the document's `retryable` field are authoritative. The CLI switches on the code string and maps unknown codes to exit 1.
 
 ## Idempotency
 
@@ -32,7 +35,7 @@ Mutations accept an `Idempotency-Key`: 1 to 64 printable ASCII bytes without spa
 |---|---|
 | none, or older than 24 hours | execute and store |
 | same fingerprint, completed | replay stored response, do not execute |
-| same fingerprint, first execution still in flight | tell the client to retry shortly |
+| same fingerprint, first execution still in flight | `outcome_unknown`; repeat with the same key (unreachable while the route records and completes the key in the mutation's own transaction, as `POST …/runs` does) |
 | different fingerprint | `idempotency_mismatch` |
 
 The fingerprint is not cryptographic: only the caller can collide it, against their own earlier request, and the scope is per authenticated principal.
@@ -40,6 +43,8 @@ The fingerprint is not cryptographic: only the caller can collide it, against th
 ## Event sequences and cursors
 
 Each event stream (run events, an attempt's log frames, a tenant's audit feed) is numbered by a dense per-stream `Seq` assigned by the writer in commit order, so resuming is one indexed range scan. A `Cursor` is an opaque fixed-size token: 42 bytes (version, tenant, stream kind, stream ID, sequence) encoded as `c1` plus 84 lowercase hex characters. Parsing takes the caller's tenant and rejects a cursor issued for another tenant; that rejection is reported to the client as `invalid_cursor`, indistinguishable from a malformed one. Pages report `next` (absent when exhausted) separately from `complete`, which tells log readers whether upstream truncation or gaps occurred.
+
+**Not yet on the wire.** The `Cursor` type is defined and tested here, but no `/api/v1` route emits or accepts one today: the log routes page by a plain frame sequence (`after=<seq>`) and the run list by the last run's ID (`before=run_…`, answered as `next`). Those parameters are route-level query syntax, not the versioned `c1` contract; a route that adopts `Cursor` will say so in [API](api.md) and [compatibility](compatibility.md).
 
 ## Size limits
 
@@ -58,6 +63,13 @@ Enforced from declared lengths before any body is read; exceeding one is `payloa
 | Agent diagnostic text | default 8 KiB, ceiling 64 KiB |
 | Names and labels | 128 bytes |
 | Items in any list field | 64 |
+| Artifact data frame payload (`ArtifactData`) | 48 KiB |
+| Files in one artifact | 4,096 |
+| One artifact's bytes | 4 GiB |
+| All artifact bytes of one run | 16 GiB |
+| Artifact name | 64 bytes |
+| Artifact file path | 1,024 bytes |
+| OAuth form body (token, revocation, device authorization, consent) | 8 KiB |
 | Worker labels per profile | 16 |
 | One cache chunk payload | 48 KiB (must fit a control frame whole) |
 
@@ -108,7 +120,7 @@ cannot delay a beat. See [worker link](worker-link.md#control-and-bulk-protocol-
 
 ## Versioning policy
 
-The protocol version bumps on any incompatible change to messages, framing or semantics. Adding optional fields does not bump it. Error schema, cursor version byte and protocol version are independent so each can move alone. The JSON shapes of `ApiError`, `Hello` and `Rejected` are pinned by tests.
+The protocol version bumps on any incompatible change to messages, framing or semantics. A new message *variant* is additive; a new or changed *struct field* — optional or not — bumps the protocol, because postcard decodes exactly the field list its reader knows and `#[serde(default)]` never fires (see [Protocol 7 additions](#protocol-7-additions)). Error schema, cursor version byte and protocol version are independent so each can move alone. The JSON shapes of `ApiError`, `Hello` and `Rejected` are pinned by tests.
 
 ## Verification
 

@@ -127,11 +127,45 @@ pub fn complete(
     Ok(())
 }
 
-/// Drop records older than the TTL; run periodically.
-pub fn expire(tx: &Transaction<'_>, now: UnixMillis) -> Result<usize> {
+/// The oldest `?2` expired records, oldest first, off `idempotency_by_age`.
+const PURGE_SQL: &str = "DELETE FROM idempotency_keys WHERE (tenant_id, principal, route, key) IN
+     (SELECT tenant_id, principal, route, key FROM idempotency_keys
+      WHERE created_ms < ?1 ORDER BY created_ms LIMIT ?2)";
+
+/// Remove at most `limit` records past the TTL, oldest first, in one write;
+/// the controller's maintenance tick calls it. An expired record is already
+/// dead to [`begin`] (it executes afresh and overwrites it), so purging only
+/// bounds the table: without it every distinct key would stay forever.
+/// Batched so a backlog drains over several writes instead of holding the
+/// writer. Returns how many were removed.
+pub fn purge_expired(store: &crate::Store, now: UnixMillis, limit: u32) -> Result<usize> {
     let cutoff = now.0 - sentinel_protocol::idempotency::IDEMPOTENCY_TTL_MS;
-    Ok(tx.execute(
-        "DELETE FROM idempotency_keys WHERE created_ms < ?1",
-        [cutoff],
-    )?)
+    store
+        .writer()
+        .write(move |tx| Ok(tx.execute(PURGE_SQL, params![cutoff, limit])?))
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    /// The purge must walk `idempotency_by_age` and probe the primary key,
+    /// never scan or sort the table it bounds.
+    #[test]
+    fn the_purge_is_an_index_range() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::migrate(&mut conn).unwrap();
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", super::PURGE_SQL))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map((0i64, 10i64), |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let plan = plan.join(" | ");
+        assert!(plan.contains("idempotency_by_age"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        assert!(!plan.contains("SCAN idempotency_keys"), "{plan}");
+    }
 }

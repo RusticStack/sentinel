@@ -5,7 +5,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire protocol version. Bump on any incompatible change to messages,
-/// framing or semantics; additive optional fields do not bump it.
+/// framing or semantics. New message variants are additive; a new or
+/// changed struct field (optional or not) bumps it, since postcard decodes
+/// exactly the fields its reader knows (see [`Hello`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct ProtocolVersion(pub u16);
@@ -93,8 +95,9 @@ impl Arch {
     }
 }
 
-/// First message on a worker session. Bounded: every field is fixed-size or
-/// capped by `limits::MAX_NAME_BYTES`.
+/// First message on a worker session. Bounded: every field is fixed-size
+/// except `software`, a diagnostic string that nothing reads and that only
+/// the 64 KiB control-frame limit bounds.
 ///
 /// Protocol 7's scheduling extras (labels, host, disk, availability) are
 /// deliberately **not** fields here. Postcard is not self-describing: a
