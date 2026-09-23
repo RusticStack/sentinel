@@ -73,6 +73,57 @@ fn pipeline_validate_reports_path_and_exit_code() {
     assert!(String::from_utf8_lossy(&missing.stderr).contains("cannot read"));
 }
 
+/// P02-4: a character device reports length 0, so only a bound on the read
+/// itself stops `/dev/zero` (valid UTF-8, no end) from exhausting memory.
+#[cfg(unix)]
+#[test]
+fn pipeline_validate_bounds_the_read_of_an_endless_device() {
+    use std::time::{Duration, Instant};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+        .args(["pipeline", "validate", "--json", "/dev/zero"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("pipeline validate /dev/zero did not stop");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let document: serde_json::Value = serde_json::from_slice(output.stderr.trim_ascii()).unwrap();
+    assert_eq!(document["code"], "invalid_pipeline", "{document}");
+}
+
+/// P09-13: a reader that has gone (`| head -1`) used to make every write
+/// panic with exit 101. Now the command stops quietly with exit 0.
+#[test]
+fn a_closed_stdout_ends_the_command_quietly_with_exit_zero() {
+    let file = fixture("valid/full.yml");
+    for args in [
+        vec!["pipeline", "explain", file.as_str()],
+        vec!["pipeline", "explain", "--json", file.as_str()],
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+            .args(&args)
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {stderr}");
+        assert!(stderr.is_empty(), "{args:?}: {stderr}");
+    }
+}
+
 #[test]
 fn pipeline_explain_lists_requirements_and_unresolved_inputs() {
     let text = invoke(&["pipeline", "explain", &fixture("valid/conditions.yml")]);

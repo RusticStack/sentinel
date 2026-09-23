@@ -4,7 +4,28 @@
 
 use clap::ValueEnum;
 
+/// `print!` to standard output through [`client::stdout_fmt`]: a closed
+/// pipe ends the command quietly with exit 0 instead of a panic.
+#[macro_export]
+macro_rules! out {
+    ($($arg:tt)*) => {
+        $crate::client::stdout_fmt(format_args!($($arg)*))
+    };
+}
+
+/// `println!` to standard output through [`client::stdout_fmt`].
+#[macro_export]
+macro_rules! outln {
+    () => {
+        $crate::client::stdout_fmt(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::client::stdout_fmt(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
 pub mod auth_cmd;
+pub mod bounded;
 pub mod browser;
 pub mod client;
 pub mod commands;

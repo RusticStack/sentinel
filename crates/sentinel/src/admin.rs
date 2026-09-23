@@ -8,7 +8,7 @@
 //! Passwords are read from standard input only. They never appear in argv, in
 //! the process list, in shell history, in diagnostics or in an error message.
 
-use std::io::{IsTerminal, Read};
+use std::io::IsTerminal;
 
 use sentinel_core::{
     InvitationId, RepoId, SessionId, TenantId, TokenId, UnixMillis, UserId, WorkerId,
@@ -48,18 +48,29 @@ pub(crate) fn fail(message: impl Into<String>) -> Error {
 /// newline so a piped file or heredoc works. Bytes are preserved otherwise: a
 /// passphrase is not trimmed, normalized or re-encoded.
 fn read_password() -> Result<Vec<u8>, Error> {
-    let mut stdin = std::io::stdin();
+    let stdin = std::io::stdin();
     if stdin.is_terminal() {
         return Err(fail(
             "read the password from standard input, for example: sentinel admin bootstrap ... < secret-file",
         ));
     }
-    let mut password = Vec::with_capacity(64);
-    stdin.read_to_end(&mut password).map_err(|error| {
-        fail(format!(
-            "cannot read the password from standard input: {error}"
-        ))
-    })?;
+    // At most the longest accepted password plus a CRLF: `< /dev/zero` or an
+    // endless pipe is refused, not buffered.
+    let limit = sentinel_auth::password::MAX_LEN as u64 + 2;
+    let mut password = match sentinel::bounded::read(stdin.lock(), limit) {
+        Ok(bytes) => bytes,
+        Err(sentinel::bounded::ReadError::TooLarge { .. }) => {
+            return Err(fail(format!(
+                "the password on standard input is longer than {} bytes",
+                sentinel_auth::password::MAX_LEN
+            )));
+        }
+        Err(error) => {
+            return Err(fail(format!(
+                "cannot read the password from standard input: {error}"
+            )));
+        }
+    };
     if password.last() == Some(&b'\n') {
         password.pop();
         if password.last() == Some(&b'\r') {
@@ -115,7 +126,7 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
                     )),
                     other => fail(format!("bootstrap failed: {other}")),
                 })?;
-            println!("super admin {username} created as {user}");
+            sentinel::outln!("super admin {username} created as {user}");
         }
         AdminCommand::Recover { data, username } => {
             let store = open(data, true)?;
@@ -132,7 +143,7 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
                         other => fail(format!("recovery failed: {other}")),
                     },
                 )?;
-            println!("password reset and sessions revoked for {user}");
+            sentinel::outln!("password reset and sessions revoked for {user}");
         }
         AdminCommand::Status { data } => {
             let store = open(data, true)?;
@@ -155,16 +166,16 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
                     ))
                 })
                 .map_err(|error| fail(format!("cannot read authentication state: {error}")))?;
-            println!("bootstrap available: {available}");
-            println!("active super admins: {admins}");
-            println!("live sessions: {sessions}");
+            sentinel::outln!("bootstrap available: {available}");
+            sentinel::outln!("active super admins: {admins}");
+            sentinel::outln!("live sessions: {sessions}");
             for record in recent {
                 let scope = if record.host_local {
                     "host-local"
                 } else {
                     "remote"
                 };
-                println!(
+                sentinel::outln!(
                     "  {} {} {scope}{}",
                     record.at.0,
                     event_name(record.event),
@@ -350,7 +361,7 @@ fn token(args: &TokenArgs, now: UnixMillis) -> Result<(), Error> {
             })?;
             // The secret is the only thing on stdout, so a redirect captures it
             // exactly; everything an operator reads goes to stderr.
-            println!("{}", sentinel_auth::token::format(&granted.secret));
+            sentinel::outln!("{}", sentinel_auth::token::format(&granted.secret));
             eprintln!(
                 "issued {} for {user}, scope {}, expires at {} (shown once)",
                 granted.id,
@@ -365,7 +376,7 @@ fn token(args: &TokenArgs, now: UnixMillis) -> Result<(), Error> {
                 .read(|conn| tokens::list(conn, Authority::HostLocal, user, 100))
                 .map_err(|error| fail(format!("cannot list credentials: {error}")))?;
             for record in records {
-                println!(
+                sentinel::outln!(
                     "{} scope={} expires={}{}{} {}",
                     record.id,
                     scope_names(record.permissions),
@@ -406,9 +417,11 @@ fn identity(args: &IdentityArgs, now: UnixMillis) -> Result<(), Error> {
                 .read(|conn| sign_in::identities(conn, Authority::HostLocal, user))
                 .map_err(|error| fail(format!("cannot list identities: {error}")))?;
             for identity in identities {
-                println!(
+                sentinel::outln!(
                     "{} subject={} linked={}",
-                    identity.provider, identity.subject, identity.linked.0
+                    identity.provider,
+                    identity.subject,
+                    identity.linked.0
                 );
             }
         }
@@ -440,12 +453,12 @@ fn policy(args: &PolicyArgs, now: UnixMillis) -> Result<(), Error> {
             let policy = store
                 .read(registration::policy)
                 .map_err(|error| fail(format!("cannot read the policy: {error}")))?;
-            println!("registration: {}", registration_name(policy.registration));
-            println!(
+            sentinel::outln!("registration: {}", registration_name(policy.registration));
+            sentinel::outln!(
                 "tenant creation: {}",
                 tenant_creation_name(policy.tenant_creation)
             );
-            println!(
+            sentinel::outln!(
                 "installation binding: {}",
                 installation_binding_name(policy.installation_binding)
             );
@@ -596,7 +609,7 @@ fn invite(args: &InviteArgs, now: UnixMillis) -> Result<(), Error> {
                 })?;
             // The secret alone on stdout, as with credentials: deliver the link
             // out of band. There is no way to show it again.
-            println!("{}", sentinel_auth::token::format(&invitation.secret));
+            sentinel::outln!("{}", sentinel_auth::token::format(&invitation.secret));
             eprintln!(
                 "issued {} expiring at {} (shown once)",
                 invitation.id, invitation.expires.0
@@ -609,7 +622,7 @@ fn invite(args: &InviteArgs, now: UnixMillis) -> Result<(), Error> {
                 .read(|conn| registration::invitations(conn, Authority::HostLocal, tenant, 100))
                 .map_err(|error| fail(format!("cannot list invitations: {error}")))?;
             for record in records {
-                println!(
+                sentinel::outln!(
                     "{} expires={}{}{}{}{}",
                     record.id,
                     record.expires.0,
@@ -652,9 +665,11 @@ fn account(args: &AccountArgs, now: UnixMillis) -> Result<(), Error> {
                 .read(|conn| registration::pending(conn, Authority::HostLocal, 100))
                 .map_err(|error| fail(format!("cannot list applications: {error}")))?;
             for application in applications {
-                println!(
+                sentinel::outln!(
                     "{} applied={} {}",
-                    application.user, application.applied.0, application.display_name
+                    application.user,
+                    application.applied.0,
+                    application.display_name
                 );
             }
         }
@@ -719,8 +734,8 @@ fn second_factor(args: &MfaArgs, now: UnixMillis) -> Result<(), Error> {
                     ))
                 })
                 .map_err(|error| fail(format!("cannot read second-factor state: {error}")))?;
-            println!("enrolled: {enrolled}");
-            println!("recovery codes remaining: {remaining}");
+            sentinel::outln!("enrolled: {enrolled}");
+            sentinel::outln!("recovery codes remaining: {remaining}");
         }
         MfaCommand::Disable { data, user } => {
             let store = open(data, true)?;
@@ -744,7 +759,7 @@ fn session(args: &SessionArgs, now: UnixMillis) -> Result<(), Error> {
                 .read(|conn| local_auth::sessions(conn, Authority::HostLocal, user, 100))
                 .map_err(|error| fail(format!("cannot list sessions: {error}")))?;
             for record in records {
-                println!(
+                sentinel::outln!(
                     "{} created={} idle_until={} until={}{}{}",
                     record
                         .id
@@ -806,7 +821,7 @@ fn tenant(args: &TenantArgs, now: UnixMillis) -> Result<(), Error> {
                     sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
                     other => fail(format!("cannot create the namespace: {other}")),
                 })?;
-            println!("{id}");
+            sentinel::outln!("{id}");
             return Ok(());
         }
         TenantCommand::Quota {
@@ -845,7 +860,7 @@ fn tenant(args: &TenantArgs, now: UnixMillis) -> Result<(), Error> {
                     let report = store
                         .read(move |conn| Ok((objects.usage(conn, id)?, objects.quota(conn, id)?)))
                         .map_err(|error| fail(format!("cannot read the quota: {error}")))?;
-                    println!(
+                    sentinel::outln!(
                         "{}",
                         serde_json::json!({
                             "tenant": id.to_string(),
@@ -911,7 +926,7 @@ fn pool(args: &PoolArgs, now: UnixMillis) -> Result<(), Error> {
                     sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
                     other => fail(format!("cannot create the pool: {other}")),
                 })?;
-            println!("{id}");
+            sentinel::outln!("{id}");
         }
         PoolCommand::Grant { data, pool, tenant } | PoolCommand::Revoke { data, pool, tenant } => {
             let store = open(data, true)?;
@@ -950,7 +965,7 @@ fn pool(args: &PoolArgs, now: UnixMillis) -> Result<(), Error> {
                 .read(|conn| tenancy::pools_for_tenant(conn, Authority::HostLocal, tenant))
                 .map_err(|error| fail(format!("cannot list pools: {error}")))?;
             for record in pools {
-                println!(
+                sentinel::outln!(
                     "{} {} {}{}",
                     record.id,
                     record.name,
@@ -991,7 +1006,7 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
                     sentinel_store::Error::NotFound => fail("that pool is not active"),
                     other => fail(format!("cannot issue the enrollment: {other}")),
                 })?;
-            println!("{}", sentinel_auth::token::format(&enrollment.secret));
+            sentinel::outln!("{}", sentinel_auth::token::format(&enrollment.secret));
             eprintln!(
                 "issued {} for pool {} expiring at {} (shown once)",
                 enrollment.id, enrollment.pool, enrollment.expires.0
@@ -1007,7 +1022,7 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
                 .read(|conn| workers::in_pool(conn, Authority::HostLocal, pool))
                 .map_err(|error| fail(format!("cannot list workers: {error}")))?;
             for w in live {
-                println!(
+                sentinel::outln!(
                     "{} {} {:?} protocol={} capabilities={:#x}{}",
                     w.id,
                     w.name,
@@ -1119,7 +1134,7 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
             let report = store
                 .read(|conn| objects.recover(conn))
                 .map_err(|error| fail(format!("recovery failed: {error}")))?;
-            println!(
+            sentinel::outln!(
                 "{}",
                 serde_json::json!({
                     "staged": report.staged,
@@ -1134,7 +1149,7 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
             let corrupt = store
                 .read(|conn| objects.verify(conn))
                 .map_err(|error| fail(format!("verification failed: {error}")))?;
-            println!(
+            sentinel::outln!(
                 "{}",
                 serde_json::json!({
                     "corrupt": corrupt
@@ -1156,7 +1171,7 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
                 .writer()
                 .write(move |tx| objects.sweep_uploads(tx, sentinel_core::UnixMillis::now()))
                 .map_err(|error| fail(format!("sweep failed: {error}")))?;
-            println!("{}", serde_json::json!({ "expired": swept }));
+            sentinel::outln!("{}", serde_json::json!({ "expired": swept }));
         }
         ObjectsCommand::Reclaim => {
             // The full maintenance pass: expired sessions and leases, expired
@@ -1196,7 +1211,7 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
             let orphans = store
                 .read(|conn| objects.sweep_orphans(conn, 4096))
                 .map_err(|error| fail(format!("orphan sweep failed: {error}")))?;
-            println!(
+            sentinel::outln!(
                 "{}",
                 serde_json::json!({
                     "expired_uploads": report.0,
@@ -1238,7 +1253,7 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
                 })
                 .map_err(|error| fail(format!("cannot read storage state: {error}")))?;
             let free = sentinel_store::space::free_bytes(&args.data.data_dir).ok();
-            println!(
+            sentinel::outln!(
                 "{}",
                 serde_json::json!({
                     "free_bytes": free,
@@ -1307,8 +1322,12 @@ fn logs(data: &DataDir, attempt: &str, follow: bool) -> Result<(), Error> {
                 sentinel_protocol::logs::Stream::Stdout => &mut stdout,
                 sentinel_protocol::logs::Stream::Stderr => &mut stderr,
             };
-            out.write_all(&frame.bytes)
-                .map_err(|error| fail(format!("cannot write: {error}")))?;
+            match out.write_all(&frame.bytes) {
+                Ok(()) => {}
+                // The reader of the pipe stopped (`| head`): end quietly.
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                Err(error) => return Err(fail(format!("cannot write: {error}"))),
+            }
             after = frame.seq;
         }
         stdout.flush().ok();

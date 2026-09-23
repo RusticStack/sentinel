@@ -204,7 +204,7 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                 .writer()
                 .write(move |tx| auth::create_repo_trusted(tx, tenant, id, &name, now))
                 .map_err(denied)?;
-            println!("{}", serde_json::json!({"repo":id.to_string()}));
+            sentinel::outln!("{}", serde_json::json!({"repo":id.to_string()}));
         }
         SourceCommand::Bind { repo: r, expected } => {
             let repo = repo(r)?;
@@ -239,7 +239,7 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                     )
                 })
                 .map_err(|e| fail(&format!("source bind refused: {e}")))?;
-            println!(
+            sentinel::outln!(
                 "{}",
                 serde_json::json!({"repo":repo.to_string(),"version":version})
             );
@@ -258,7 +258,7 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
             let polling = polling.map(|p| {
                 serde_json::json!({"interval_ms":p.interval_ms,"refs":p.refs,"next_poll_ms":p.next_poll_ms,"failures":p.failures,"last_error":p.last_error,"baselined":p.baselined})
             });
-            println!(
+            sentinel::outln!(
                 "{}",
                 serde_json::json!({"repo":repo.to_string(),"binding":m.binding,"version":m.version,"revoked":m.revoked,"hook_token_ms":hook_token.map(|t|t.0),"poll":polling,"forge":m.forge.map(|(i,r)|serde_json::json!({"installation":i.to_string(),"repository_id":r}))})
             );
@@ -270,7 +270,7 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                 .writer()
                 .write(move |tx| sources::revoke(tx, host, Some(actor), repo, expected, now))
                 .map_err(denied)?;
-            println!(
+            sentinel::outln!(
                 "{}",
                 serde_json::json!({"revoked":true,"version":expected+1})
             );
@@ -282,7 +282,7 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                     .writer()
                     .write(move |tx| intake::revoke_token(tx, host, repo, now))
                     .map_err(denied)?;
-                println!(
+                sentinel::outln!(
                     "{}",
                     serde_json::json!({"repo":repo.to_string(),"revoked":true})
                 );
@@ -293,7 +293,7 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                     .map_err(denied)?;
                 // The one presentation: only the secret reaches stdout, so a
                 // shell can redirect it without a parser in between.
-                println!("{}", intake::hook_token_text(&secret));
+                sentinel::outln!("{}", intake::hook_token_text(&secret));
             }
         }
         SourceCommand::Poll {
@@ -308,7 +308,7 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                     .writer()
                     .write(move |tx| poll::disable(tx, host, Some(actor), repo, now))
                     .map_err(denied)?;
-                println!(
+                sentinel::outln!(
                     "{}",
                     serde_json::json!({"repo":repo.to_string(),"polling":false})
                 );
@@ -333,7 +333,7 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                     .writer()
                     .write(move |tx| poll::configure(tx, host, Some(actor), repo, &spec, now))
                     .map_err(|e| fail(&format!("poll configuration refused: {e}")))?;
-                println!(
+                sentinel::outln!(
                     "{}",
                     serde_json::json!({"repo":repo.to_string(),"polling":true,"interval_ms":interval_ms,"refs":refs})
                 );
@@ -368,7 +368,7 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                     )
                 })
                 .map_err(denied)?;
-            println!(
+            sentinel::outln!(
                 "{}",
                 serde_json::json!({"installation":id.to_string(),"version":expected+1})
             );
@@ -383,7 +383,7 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                 .writer()
                 .write(move |tx| registration::bind_installation_trusted(tx, id, tenant, now))
                 .map_err(denied)?;
-            println!("{}", serde_json::json!({"bound":true}));
+            sentinel::outln!("{}", serde_json::json!({"bound":true}));
         }
         SourceCommand::RemoveInstallation { installation: i } => {
             let id = installation(i)?;
@@ -391,7 +391,7 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                 .writer()
                 .write(move |tx| sources_forge::remove(tx, id))
                 .map_err(denied)?;
-            println!("{}", serde_json::json!({"disabled":true}));
+            sentinel::outln!("{}", serde_json::json!({"disabled":true}));
         }
     }
     Ok(())

@@ -55,7 +55,7 @@ pub fn run(args: &IntakeArgs) -> Result<(), Error> {
                     })
                 })
                 .collect();
-            println!(
+            sentinel::outln!(
                 "{}",
                 json!({ "repo": repo.to_string(), "deliveries": deliveries })
             );
@@ -71,7 +71,7 @@ pub fn run(args: &IntakeArgs) -> Result<(), Error> {
                 .writer()
                 .write(move |tx| intake::purge_settled(tx, before, limit))
                 .map_err(|error| fail(format!("cannot purge deliveries: {error}")))?;
-            println!(
+            sentinel::outln!(
                 "{}",
                 json!({ "purged": purged, "older_than_ms": retention })
             );

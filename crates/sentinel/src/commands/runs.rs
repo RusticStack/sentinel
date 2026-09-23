@@ -1,7 +1,6 @@
 //! `run dispatch|status|list|cancel|wait`, `status` and `wait`.
 
 use std::{
-    fs,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -26,7 +25,7 @@ pub(super) struct Dispatch {
 pub(super) fn dispatch(client: &Client, output: Output, args: &Dispatch) -> Result<(), Error> {
     let slug = tenant(client, args.tenant.clone())?;
     let repo = segment("repository", &args.repo)?;
-    let pipeline = fs::read_to_string(&args.pipeline)
+    let pipeline = crate::bounded::text(&args.pipeline, crate::bounded::PIPELINE_BYTES)
         .map_err(|e| Error::usage(format!("cannot read the pipeline: {e}")))?;
     let body = json!({
         "pipeline": pipeline,
@@ -184,7 +183,7 @@ pub(super) fn wait(
         if answer["changed"] == true {
             match output {
                 Output::Ndjson => client::emit(output, &answer, String::new),
-                Output::Text => print!("{}", progress(&answer["run"])),
+                Output::Text => crate::out!("{}", progress(&answer["run"])),
                 Output::Json => {}
             }
         }
@@ -192,7 +191,7 @@ pub(super) fn wait(
             let view = &answer["run"];
             match output {
                 Output::Json => client::emit(output, view, String::new),
-                Output::Text => print!("{}", jobs_text(view)),
+                Output::Text => crate::out!("{}", jobs_text(view)),
                 Output::Ndjson => {}
             }
             if passed(view) {

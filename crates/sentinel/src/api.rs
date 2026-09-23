@@ -6,17 +6,16 @@
 //! access token) and the server from `--server` or `SENTINEL_SERVER`, and
 //! exit with the shared exit codes.
 
-use std::{fs, path::Path};
+use std::path::Path;
 
+use sentinel::bounded;
 use sentinel::client::{self, Client, Error, Output};
 use serde_json::{Value, json};
 
 use crate::cli::{ApiArgs, ApiCommand};
 
 fn read_token(path: &Path) -> Result<String, Error> {
-    let text = fs::read_to_string(path)
-        .map_err(|e| Error::usage(format!("cannot read the token file: {e}")))?;
-    Ok(text.trim().to_owned())
+    Ok(client::read_token_file(path)?.trim().to_owned())
 }
 
 fn connect(args: &ApiArgs) -> Result<Client, Error> {
@@ -71,7 +70,7 @@ pub fn run(args: ApiArgs) -> Result<(), Error> {
             r#ref,
             idempotency_key,
         } => {
-            let text = fs::read_to_string(pipeline)
+            let text = bounded::text(pipeline, bounded::PIPELINE_BYTES)
                 .map_err(|e| Error::usage(format!("cannot read the pipeline: {e}")))?;
             let body =
                 json!({ "pipeline": text, "source": { "repo": source, "sha": sha, "ref": r#ref } });
@@ -140,7 +139,7 @@ pub fn run(args: ApiArgs) -> Result<(), Error> {
                     u8::from(*follow)
                 ))?;
                 if json_out {
-                    println!("{}", serde_json::to_string(&page).expect("json"));
+                    sentinel::outln!("{page}");
                 } else {
                     use std::io::Write;
                     for frame in page["frames"].as_array().into_iter().flatten() {
@@ -148,10 +147,10 @@ pub fn run(args: ApiArgs) -> Result<(), Error> {
                         if frame["stream"] == "stderr" {
                             let _ = std::io::stderr().write_all(text.as_bytes());
                         } else {
-                            let _ = std::io::stdout().write_all(text.as_bytes());
+                            client::stdout_bytes(text.as_bytes());
                         }
                     }
-                    let _ = std::io::stdout().flush();
+                    client::stdout_flush();
                 }
                 if let Some(last) = page["frames"].as_array().and_then(|f| f.last()) {
                     after = last["seq"].as_u64().unwrap_or(after);

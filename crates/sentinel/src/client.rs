@@ -42,7 +42,8 @@ pub enum Exit {
     NotFound = 4,
     /// Conflict or idempotency-key mismatch.
     Conflict = 5,
-    /// Busy or rate limited after the client's retries, or unreachable.
+    /// Busy or rate limited after the client's retries, unreachable, or a
+    /// write whose outcome the controller could not confirm (`outcome_unknown`).
     Busy = 6,
     /// `wait`: the deadline passed first.
     Timeout = 7,
@@ -72,7 +73,7 @@ impl Exit {
             "unauthenticated" | "forbidden" => Exit::Auth,
             "not_found" => Exit::NotFound,
             "conflict" | "idempotency_mismatch" => Exit::Conflict,
-            "rate_limited" | "storage_full" | "internal" => Exit::Busy,
+            "rate_limited" | "storage_full" | "internal" | "outcome_unknown" => Exit::Busy,
             _ => Exit::Remote,
         }
     }
@@ -181,12 +182,53 @@ impl ClientArgs {
     }
 }
 
+/// Write to standard output; every command's stdout goes through here (or
+/// the [`crate::out!`]/[`crate::outln!`] macros), never `print!`, which
+/// panics with exit 101 when the reader has gone. A closed stdout — the
+/// reader of a pipe exited, as `| head -1` does — ends the process at once,
+/// quietly, with exit 0: the reader chose to stop, and nothing failed. Any
+/// other write failure (a full disk behind a redirect) is reported in the
+/// current mode and exits 1.
+pub fn stdout_fmt(args: fmt::Arguments<'_>) {
+    use std::io::Write;
+    if let Err(error) = std::io::stdout().lock().write_fmt(args) {
+        stdout_failed(&error);
+    }
+}
+
+/// [`stdout_fmt`] for raw bytes (log frames).
+pub fn stdout_bytes(bytes: &[u8]) {
+    use std::io::Write;
+    if let Err(error) = std::io::stdout().lock().write_all(bytes) {
+        stdout_failed(&error);
+    }
+}
+
+/// Push buffered output to the reader now (a followed log between polls).
+pub fn stdout_flush() {
+    use std::io::Write;
+    if let Err(error) = std::io::stdout().lock().flush() {
+        stdout_failed(&error);
+    }
+}
+
+#[cold]
+fn stdout_failed(error: &std::io::Error) -> ! {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(Exit::Ok as i32);
+    }
+    report(&Error::remote(format!(
+        "cannot write to standard output: {error}"
+    )));
+    std::process::exit(Exit::Remote as i32)
+}
+
 /// Print one result: text, pretty JSON, or one compact line.
 pub fn emit(output: Output, value: &Value, text: impl FnOnce() -> String) {
     match output {
-        Output::Text => print!("{}", text()),
-        Output::Json => println!("{}", serde_json::to_string_pretty(value).expect("json")),
-        Output::Ndjson => println!("{}", serde_json::to_string(value).expect("json")),
+        Output::Text => crate::out!("{}", text()),
+        Output::Json => crate::outln!("{:#}", value),
+        Output::Ndjson => crate::outln!("{value}"),
     }
 }
 
@@ -195,10 +237,8 @@ pub fn emit(output: Output, value: &Value, text: impl FnOnce() -> String) {
 /// caller with [`emit`] instead).
 pub fn emit_item(output: Output, value: &Value, text: impl FnOnce() -> String) {
     match output {
-        Output::Text => print!("{}", text()),
-        Output::Json | Output::Ndjson => {
-            println!("{}", serde_json::to_string(value).expect("json"));
-        }
+        Output::Text => crate::out!("{}", text()),
+        Output::Json | Output::Ndjson => crate::outln!("{value}"),
     }
 }
 
@@ -340,8 +380,12 @@ fn static_credential(text: &str) -> Result<String, Error> {
     Ok(text.to_owned())
 }
 
-fn read_token_file(path: &std::path::Path) -> Result<String, Error> {
-    std::fs::read_to_string(path)
+/// The most a token file may hold: a credential is under 100 bytes.
+pub const MAX_TOKEN_FILE_BYTES: u64 = 4 << 10;
+
+/// A `--token-file`, read with a bound on the bytes actually read.
+pub fn read_token_file(path: &std::path::Path) -> Result<String, Error> {
+    crate::bounded::text(path, MAX_TOKEN_FILE_BYTES)
         .map_err(|e| Error::usage(format!("cannot read the token file: {e}")))
 }
 
@@ -507,6 +551,10 @@ impl Client {
                 let message = match code.as_str() {
                     "unauthenticated" => self.not_signed_in(&message),
                     "forbidden" => self.forbidden(&message, api["details"]["scope"].as_str()),
+                    "outcome_unknown" => format!(
+                        "outcome_unknown: {message}; the change may have been applied, so check \
+                         (for example with `sentinel run list`) before repeating it"
+                    ),
                     _ => format!("{code}: {message}"),
                 };
                 Error {
@@ -570,8 +618,12 @@ impl Client {
 
     /// Send with the credential, retrying where it is safe: a profile's
     /// rejected access token is refreshed once; `rate_limited`,
-    /// `storage_full`, `internal` and transport failures are retried with
-    /// back-off for idempotent methods and keyed POSTs.
+    /// `storage_full`, `internal`, `outcome_unknown`, a proxy's 502/503/504
+    /// and transport failures are retried with back-off for idempotent
+    /// methods and keyed POSTs. A `rate_limited` answer that carries
+    /// `details.retry_after_ms` is returned at once: the server named its own
+    /// back-off, which the caller (`wait`, `log show --follow`) applies with
+    /// jitter, so the client does not add lockstep retries of its own.
     fn exchange(
         &self,
         method: &Method,
@@ -588,26 +640,35 @@ impl Client {
         loop {
             let outcome =
                 self.send_once(method, path, payload.as_deref(), idempotency, range, &token);
-            let retry_after = match &outcome {
+            let (last, retry_after) = match outcome {
                 Ok(response) if response.status().as_u16() == 401 => {
                     if let (Credential::Profile(handle), false) = (&self.credential, refreshed) {
                         refreshed = true;
                         token = handle.force_refresh(&self.agent, &token)?;
                         continue;
                     }
-                    return outcome.map_err(|e| self.transport(e));
+                    return Ok(response);
+                }
+                Ok(response) if response.status().as_u16() == 429 => {
+                    // The hint is in the error document, so read it now; it
+                    // is small and bounded by the agent's body limit.
+                    let error = self.failure(response);
+                    if server_backoff(&error).is_some() {
+                        return Err(error);
+                    }
+                    (Err(error), None)
                 }
                 Ok(response) if retryable_status(response.status().as_u16()) => {
-                    Some(retry_hint(response))
+                    let hint = retry_hint(&response);
+                    (Ok(response), hint)
                 }
-                Ok(_) => return outcome.map_err(|e| self.transport(e)),
-                Err(_) => Some(None),
+                Ok(response) => return Ok(response),
+                Err(e) => (Err(self.transport(e)), None),
             };
             if !repeatable || attempt >= ATTEMPTS {
-                return outcome.map_err(|e| self.transport(e));
+                return last;
             }
             let backoff = retry_after
-                .flatten()
                 .unwrap_or(BACKOFF * (1 << (attempt - 1)))
                 .min(MAX_BACKOFF);
             std::thread::sleep(backoff);
@@ -668,15 +729,26 @@ impl Client {
     }
 }
 
-/// Answers worth another attempt: `rate_limited` (429), `internal` (500),
+/// Answers worth another attempt on a request that is safe to repeat:
+/// `rate_limited` (429), `internal` (500), `outcome_unknown` (503, only
+/// ever repeated with the same idempotency key or on an idempotent method),
 /// `storage_full` (507), and a proxy's 502/503/504.
 fn retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504 | 507)
 }
 
-/// `retry-after` seconds or the error's `details.retry_after_ms`, when the
-/// server gave one. Reading the body is left to the final answer, so only
-/// the header is consulted here.
+/// The back-off a `rate_limited` answer names in `details.retry_after_ms`.
+fn server_backoff(error: &Error) -> Option<u64> {
+    let api = error.api.as_ref()?;
+    if api["code"] != "rate_limited" {
+        return None;
+    }
+    api["details"]["retry_after_ms"].as_u64()
+}
+
+/// A `retry-after` header in seconds, when an answer (typically a proxy's)
+/// carries one. The controller names its back-off in the error document
+/// instead, which [`server_backoff`] reads.
 fn retry_hint(response: &Response) -> Option<Duration> {
     response
         .headers()
@@ -749,6 +821,7 @@ mod tests {
             ("rate_limited", Exit::Busy),
             ("storage_full", Exit::Busy),
             ("internal", Exit::Busy),
+            ("outcome_unknown", Exit::Busy),
             ("invalid_request", Exit::Remote),
             ("quota_exceeded", Exit::Remote),
             ("something_new", Exit::Remote),
