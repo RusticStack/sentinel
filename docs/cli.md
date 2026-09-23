@@ -97,7 +97,19 @@ Every `run` returns `Result<(), client::Error>`; `main.rs` reports the error in 
 
 ## Service accounts
 
-_Placeholder: Unit C documents `sentinel service-account` here._
+For a tenant administrator (the credential needs `tenant:admin`; see [OAuth](oauth.md#service-account-grants-o06)). `--tenant SLUG` defaults to the profile's context (`sentinel context use`); without either the command exits 2 before any request. Tenant, account, repository and grant arguments must be plain path segments (`A-Z a-z 0-9 - . _ ~`), checked locally.
+
+| Command | Does |
+|---|---|
+| `sentinel service-account create --name NAME [--role reader\|operator] [--tenant SLUG]` | creates a service principal (default role operator); prints `usr_…`, name and role |
+| `sentinel service-account allow USR --repo NAME [--access read,run] [--tenant SLUG]` | sets its access to one repository (default `read,run`; `--access ""` withdraws) |
+| `sentinel service-account grant USR --name LABEL --scope "SCOPES" [--repo NAME] [--expires-in 30d] [--tenant SLUG]` | issues a service grant; `--expires-in` takes `s`, `m`, `h` or `d`, 1h..90d (server-checked), default 30d |
+| `sentinel service-account grants USR [--tenant SLUG]` | lists its grants as metadata (text: one line each; `--output ndjson`: one JSON object per grant; `--json`: the whole answer) |
+| `sentinel service-account revoke GRT` | revokes a grant (`DELETE /api/v1/grants/{grt}`) |
+
+`grant` prints **only the refresh token** (`sntl_rt_…`) and a newline on stdout, so `sentinel service-account grant … > agent.token` captures exactly it; the grant handle, scope and expiry go to stderr (one JSON line in `--json`/`--output ndjson` mode), with the import command. The token is shown this once; the server keeps only its digest. On the agent's machine, `sentinel auth login --server URL --grant-file agent.token` spends it for the agent's own profile (then delete the file).
+
+Exits follow the table above: a non-administrator is 3, an unknown account, repository or grant 4, a refused scope or lifetime (`invalid_request`) 1, a bad argument 2.
 
 ## Failure output
 
