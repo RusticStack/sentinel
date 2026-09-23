@@ -496,34 +496,56 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         (status, body["code"].as_str()),
         (400, Some("invalid_request"))
     );
+    // A credential of another, real tenant — with every permission there,
+    // so no scope check stands in for the tenant boundary — sees nothing of
+    // this one: not the run, and it cannot cancel or rerun its jobs.
+    let (root, globex) = (d.root, TenantId::new());
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::create_namespace(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                globex,
+                Namespace::parse("globex").unwrap(),
+                NamespaceKind::Organization,
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
     let outsider = tokens::provision(
         &d.store,
         Grant {
             user: d.root,
-            name: "narrow",
-            permissions: P::READ,
-            tenant: Some(TenantId::new()),
+            name: "globex-only",
+            permissions: P::ALL,
+            tenant: Some(globex),
             repo: None,
             lifetime_ms: 60_000,
         },
         UnixMillis::now(),
-    );
-    if let Ok(outsider) = outsider {
-        let narrow = format!("Bearer {}", sentinel_auth::token::format(&outsider.secret));
-        let (status, body) = call(
-            &d,
-            "GET",
-            &format!("/api/v1/runs/{run_id}"),
-            None,
-            Some(&narrow),
-            &[],
+    )
+    .expect("a credential of a real second tenant");
+    let foreign = format!("Bearer {}", sentinel_auth::token::format(&outsider.secret));
+    let build = run["jobs"][0]["id"].as_str().unwrap().to_owned();
+    for (method, path) in [
+        ("GET", format!("/api/v1/runs/{run_id}")),
+        ("POST", format!("/api/v1/jobs/{build}/cancel")),
+        ("POST", format!("/api/v1/jobs/{build}/rerun")),
+        ("POST", format!("/api/v1/runs/{run_id}/cancel")),
+    ] {
+        let body = (method == "POST").then(|| serde_json::json!({}));
+        let (status, answer) = call(&d, method, &path, body.as_ref(), Some(&foreign), &[]);
+        assert_eq!(
+            (status, answer["code"].as_str()),
+            (404, Some("not_found")),
+            "{method} {path}"
         );
-        assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
     }
 
     // Cancel the job that is running-to-be; the blocked one is skipped by
-    // the dependency decision; a rerun is refused for a cancelled job.
-    let build = run["jobs"][0]["id"].as_str().unwrap().to_owned();
+    // the dependency decision in the same step, so the run is over; a
+    // rerun is refused for a cancelled job.
     let (status, body) = call(
         &d,
         "POST",
@@ -544,6 +566,8 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     assert_eq!(status, 200);
     assert_eq!(view["jobs"][0]["state"], "canceled");
     assert_eq!(view["jobs"][0]["failure_class"], "canceled");
+    assert_eq!(view["jobs"][1]["state"], "skipped");
+    assert_eq!(view["state"], "canceled");
     // Never attempted: no log state exists to report.
     assert!(view["jobs"][0]["log_state"].is_null());
     let (status, body) = call(
@@ -563,8 +587,8 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         Some(&auth),
         &[],
     );
-    assert_eq!(status, 200);
-    assert!(body["canceled"].as_u64().unwrap() <= 1);
+    // Nothing is left to cancel: every job already ended.
+    assert_eq!((status, body["canceled"].as_u64()), (200, Some(0)));
     let (status, view) = call(
         &d,
         "GET",
@@ -647,6 +671,33 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     assert_eq!(body["frames"].as_array().unwrap().len(), 1);
     assert_eq!(body["frames"][0]["stream"], "stderr");
     assert_eq!(body["frames"][0]["text"], "warn\n");
+    // Malformed paging is refused, never read as "from the start" or
+    // "every step".
+    for query in ["after=abc", "step=x", "after=-1"] {
+        let (status, body) = call(
+            &d,
+            "GET",
+            &format!("/api/v1/attempts/{attempt}/logs?{query}"),
+            None,
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("invalid_request")),
+            "{query}"
+        );
+    }
+    // Another tenant's credential cannot read these logs.
+    let (status, body) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/attempts/{attempt}/logs"),
+        None,
+        Some(&foreign),
+        &[],
+    );
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
     // Follow: the request parks until a frame arrives.
     let logs = Arc::clone(&d.logs);
     let store = Arc::clone(&d.store);

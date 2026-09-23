@@ -469,11 +469,22 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
             auth::require_scope(&who, Scopes::LOGS_READ)?;
             let attempt: AttemptId = id(attempt, "attempt")?;
             let (run, job) = attempt_log(state, who.principal, attempt)?;
-            let after: u64 = query_param(query, "after")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
+            // Malformed input is refused, never read as "from the start" or
+            // "every step": the client would silently get the wrong frames.
+            let after: u64 = match query_param(query, "after") {
+                None => 0,
+                Some(v) => v
+                    .parse()
+                    .map_err(|_| err(ErrorCode::InvalidRequest, "malformed after"))?,
+            };
             let limit = page_size(query_param(query, "limit").and_then(|v| v.parse().ok()));
-            let step: Option<u32> = query_param(query, "step").and_then(|v| v.parse().ok());
+            let step: Option<u32> = match query_param(query, "step") {
+                None => None,
+                Some(v) => Some(
+                    v.parse()
+                        .map_err(|_| err(ErrorCode::InvalidRequest, "malformed step"))?,
+                ),
+            };
             let wait = query_param(query, "wait").is_some_and(|v| v == "1" || v == "true");
             let deadline = std::time::Instant::now() + LOG_WAIT;
             // Parking holds a handler permit: the poll takes one of the
