@@ -830,7 +830,7 @@ fn cache_record(attached: &sentinel_cache::attach::Attached) -> CacheRecord {
 }
 
 /// Commit each attached cache under its own scope, while the workspace's
-/// writable views still exist. Publication is off the verdict's path: the
+/// writable views still exist. The verdict never depends on publication (its report waits for it): the
 /// whole batch is bounded by `CACHE_PUBLISH_TIMEOUT`, each entry's outcome
 /// is reported as a `CacheNote` and stamped on the carrier's stats (K08)
 /// for the summary's per-entry record, and nothing here changes what the

@@ -258,7 +258,25 @@ proves:
   and a bundle sealed for another trust are typed misses (`corrupt`,
   `wrong_trust`) that materialize nothing, leave no `current` and drop
   the partial; and a controller without the bundle leaves the local miss,
-  partial and pointer untouched.
+  partial and pointer untouched. The in-memory controller never ran the
+  real store or link, so the cache audit added what it could not reach:
+  `tests/remote.rs` now drives the controller store itself (one bundle per
+  entry, the byte budget, abandoned uploads, verify-as-it-lands, proven
+  resume prefixes, a kept partial on `busy`, one job deadline), and
+  `sentinel-link/tests/remote_cache.rs` runs the whole path over TLS
+  against a real `Controller` — an offer after the terminal report is
+  stored and hydrates the next attempt, an abandoned fetch is cancelled and
+  the next fetch of that attempt is clean, a foreign worker's offer is
+  `denied`, and the profile carries and refreshes measured availability.
+- **Confinement and bounds (cache audit)** — `tests/publish.rs` proves a
+  symlink at any component — planted, raced between plan and copy, or
+  checked in — is never followed, a refused entry publishes nothing, the
+  byte cap refuses before staging and a sparse file stays sparse;
+  `sentinel-worker/tests/k09.rs::publish_runs_with_the_container_stopped`
+  proves the container is gone when publication reads the views;
+  `tests/gc.rs` proves currents are evicted least recently used under the
+  budget, idle entries age out, and bounded passes resume to cover the
+  whole tree while still enforcing the budget.
 
 Cases not re-covered here because an earlier task's test already proves
 them: lease staleness and `writing/` reap boundaries (`tests/gc.rs`),

@@ -78,7 +78,7 @@ Record: [`bench/k09-before-after.jsonl`](../bench/k09-before-after.jsonl) (first
 | noop-cache-cold | 1 | 82.5 ms | 100.7 ms | 298.3 ms | 481.5 ms | – |
 | noop-cache-warm | 7 | 82.8 ms | 121.3 ms | 265.8 ms | 470.9 ms | 503.8 ms |
 
-The warm cache path is inside noise of the bare job: lookup + clone + `unchanged` commit-skip for two entries cost ≈5 ms inside `finalize` (per-entry `lookup_ns`/`clone_ns`/`commit_ns` are on each record). The cold seal of the same two tiny entries costs ≈20–40 ms once.
+The warm cache path is small next to the bare job: the restore (lookup + lock + clone, 5.3 ms median, measured during preparation and so outside `total`) plus the `unchanged` commit-skip (2.7 ms inside `finalize`) for two entries — about 10.5 ms end to end, see the correction below (per-entry `lookup_ns`/`clone_ns`/`commit_ns` are on each record). The cold seal of the same two tiny entries costs ≈20–40 ms once.
 
 **Incremental build** — the custom-tool recipe's `deps`/`build`/`test` steps on a fresh small source edit each sample: `nocache` runs the same steps with no `cache:` block (stores move under the workspace), `cold` wipes the store every run (`absent → sealed` ×3 entries), `warm` is primed at the base commit then runs sequential edits — `deps.txt` never changes, so all three keys hit; the compile step prints `reused main.c` / `built lib.c` every run, and `cc` seals a new accumulating generation (`reused_bytes` grows across the samples).
 
@@ -93,6 +93,13 @@ Interpretation, limited to what was measured:
 - On this fixture the warm-vs-nocache wall-clock delta is inside noise — the per-input build is a `cp`, so reuse saves ~1 ms. What the records do prove is the *mechanism*: every warm run hits all three entries, rebuilds exactly the changed input, and re-seals the compiler namespace. For a real wall-clock delta the K07 record on the same host is the honest citation: `rust` cold 843.7 ms steps vs warm 321.5 ms vs small-edit 441.8 ms ([`bench/k07-recipes.jsonl`](../bench/k07-recipes.jsonl)).
 - The cold cache path is *slower* than no cache by ≈66 ms median — the cost of sealing three generations inside `finalize`. That is the honest price of publication on a job that does real work; it is paid once per generation, not per file restored.
 - Same caveat as the F05 baseline: a WSL2 development host, reference numbers only.
+
+**Correction (cache audit, P07 K09 evidence).** The committed record is unchanged; what the tables above claim about it is corrected here, recomputed from `bench/k09-before-after.jsonl`:
+
+- The `total` column is `checkout_ns + steps_ns + finalize_ns`. It leaves out preparation after the checkout — `image_pull_ns`, `container_start_ns` (≈200 ms median) — and with it the **cache restore**, which runs in preparation, not in `finalize`. Including checkout, image pull, container start, steps and finalize, the medians are noop-bare 728.1 ms, noop-cache-warm 732.8 ms, incremental-nocache 1032.1 ms, incremental-warm 1039.8 ms.
+- The warm path's cost is therefore not "≈5 ms inside `finalize`": the restore (per-entry `lookup_ns + lock_wait_ns + clone_ns`, summed over the two entries) is 5.34 ms median for noop-cache-warm and 7.52 ms for incremental-warm, *outside* `total`; the `unchanged` commit-skip is 2.65 ms median inside `finalize`. The honest warm-vs-bare delta of the no-op job is about 10.5 ms (5.2 ms in `total` plus the 5.3 ms restore) — still small, and still inside the run-to-run noise of the container start.
+- The p95 column is an interpolated percentile; nearest-rank over the same seven samples gives noop-bare 488.5, noop-cache-warm 508.4, incremental-nocache 828.0, incremental-cold 917.4, incremental-warm 838.9 ms.
+- The record holds 38 lines: one `meta` line and 37 attempts, one of which is the single `incremental-prime` run that seeds the warm case — 36 measured case samples plus the prime.
 
 ## Reproducing
 
