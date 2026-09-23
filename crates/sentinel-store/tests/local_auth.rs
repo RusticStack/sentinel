@@ -279,6 +279,42 @@ fn repeated_failures_lock_the_account_and_a_correct_password_cannot_unlock_it() 
     assert!(events(&store).contains(&Event::LoginLocked));
 }
 
+/// A served lockout window is over: one typo afterwards is one failure, not
+/// a fresh lockout, so one request per window cannot keep an account locked.
+#[test]
+fn a_single_failure_after_an_ended_lockout_does_not_lock_again() {
+    let (_dir, store) = store();
+    local_auth::bootstrap(&store, "root", "Root", PASSWORD, at(0)).unwrap();
+    let policy = Policy {
+        max_failures: 3,
+        lockout_ms: 60_000,
+        ..Policy::default()
+    };
+    for attempt in 0..3 {
+        local_auth::login(&store, "root", OTHER, policy, at(attempt)).unwrap();
+    }
+    // The window (until 60 002) ends; one typo, then the right password.
+    assert!(matches!(
+        local_auth::login(&store, "root", OTHER, policy, at(70_000)).unwrap(),
+        Login::Rejected
+    ));
+    assert!(matches!(
+        local_auth::login(&store, "root", PASSWORD, policy, at(70_001)).unwrap(),
+        Login::Accepted(_)
+    ));
+    // A full run of failures after an ended window still locks again.
+    for attempt in 0..3 {
+        local_auth::login(&store, "root", OTHER, policy, at(80_000 + attempt)).unwrap();
+    }
+    for attempt in 0..3 {
+        local_auth::login(&store, "root", OTHER, policy, at(200_000 + attempt)).unwrap();
+    }
+    assert!(matches!(
+        local_auth::login(&store, "root", PASSWORD, policy, at(200_010)).unwrap(),
+        Login::Locked { .. }
+    ));
+}
+
 #[test]
 fn host_local_recovery_resets_the_password_revokes_sessions_and_is_audited() {
     let (_dir, store) = store();

@@ -31,6 +31,14 @@ use crate::{
 /// guessing is not the person it was issued to.
 pub const MAX_STEP_UP_FAILURES: i64 = 5;
 
+/// Consecutive wrong second-factor proofs (TOTP or recovery code) an
+/// account may accumulate across all of its sessions before every proof is
+/// refused for [`FACTOR_LOCKOUT_MS`]. The per-session limit alone does not
+/// hold anyone who knows the password: they sign in again and keep guessing.
+pub const MAX_FACTOR_FAILURES: i64 = 10;
+/// How long an account's second factor stays refused after the limit.
+pub const FACTOR_LOCKOUT_MS: i64 = 15 * 60 * 1000;
+
 /// Context binding a sealed seed to the account it belongs to, so a seed row
 /// copied onto another account cannot be opened.
 fn context(user: UserId) -> Vec<u8> {
@@ -206,12 +214,13 @@ pub fn step_up(
                 return refuse(store, digest.0, user, now);
             };
             // RFC 6238 leaves one-use to the caller: a step already accepted is
-            // refused, so a code seen over a shoulder is worthless.
+            // refused, so a code seen over a shoulder is worthless. A locked
+            // factor accepts nothing, a correct code included.
             store.writer().write(move |tx| {
                 let fresh = tx.execute(
                     "UPDATE mfa_totp SET last_step = ?2 WHERE user_id = ?1
-                     AND (last_step IS NULL OR last_step < ?2)",
-                    params![user.as_bytes(), step as i64],
+                     AND (last_step IS NULL OR last_step < ?2) AND locked_until_ms <= ?3",
+                    params![user.as_bytes(), step as i64, now.0],
                 )?;
                 Ok(fresh == 1)
             })?
@@ -221,9 +230,12 @@ pub fn step_up(
                 return refuse(store, digest.0, user, now);
             };
             store.writer().write(move |tx| {
+                // A locked factor spends no recovery code.
                 let spent = tx.execute(
                     "UPDATE mfa_recovery_codes SET used_ms = ?3
-                     WHERE code_digest = ?1 AND user_id = ?2 AND used_ms IS NULL",
+                     WHERE code_digest = ?1 AND user_id = ?2 AND used_ms IS NULL
+                     AND NOT EXISTS(SELECT 1 FROM mfa_totp
+                         WHERE user_id = ?2 AND locked_until_ms > ?3)",
                     params![code_digest.0, user.as_bytes(), now.0],
                 )?;
                 if spent == 1 {
@@ -267,14 +279,31 @@ pub fn step_up(
     }
     store.writer().write(move |tx| {
         stamp(tx, digest.0, now)?;
+        // A proof that succeeds is what the account count was guarding.
+        tx.prepare_cached("UPDATE mfa_totp SET failures = 0 WHERE user_id = ?1 AND failures != 0")?
+            .execute([user.as_bytes()])?;
         audit(tx, Event::SteppedUp, Some(user), Some(user), false, None)
     })?;
     Ok(true)
 }
 
-/// Record a failed proof against the session that presented it. Past the
-/// limit the session is revoked outright: the cookie holder has shown they
-/// cannot prove presence, so the cookie stops proving identity too.
+/// Clear an account's second-factor lockout and count. Host-local, like
+/// password recovery (which calls it too).
+pub(crate) fn clear_factor_lockout(tx: &rusqlite::Transaction<'_>, user: UserId) -> Result<()> {
+    tx.prepare_cached(
+        "UPDATE mfa_totp SET failures = 0, locked_until_ms = 0
+         WHERE user_id = ?1 AND (failures != 0 OR locked_until_ms != 0)",
+    )?
+    .execute([user.as_bytes()])?;
+    Ok(())
+}
+
+/// Record a failed proof against the session that presented it, and against
+/// the account's second factor. Past the session limit the session is
+/// revoked outright: the cookie holder has shown they cannot prove presence,
+/// so the cookie stops proving identity too. Past the account limit the
+/// factor refuses every proof for [`FACTOR_LOCKOUT_MS`] and every session of
+/// the account is revoked, so signing in again buys no further guesses.
 fn refuse(store: &Store, digest: [u8; 32], user: UserId, now: UnixMillis) -> Result<bool> {
     store.writer().write(move |tx| {
         let failures: Option<i64> = tx
@@ -285,6 +314,39 @@ fn refuse(store: &Store, digest: [u8; 32], user: UserId, now: UnixMillis) -> Res
             .query_row([digest], |r| r.get(0))
             .optional()?;
         audit(tx, Event::StepUpFailed, Some(user), Some(user), false, None)?;
+        // The account count. While locked it stands still (the window is not
+        // extended by further tries); an ended window restarts it at this
+        // failure, as the login lockout does. No row: no factor enrolled.
+        let until = now.0.saturating_add(FACTOR_LOCKOUT_MS);
+        let locked_now: Option<bool> = tx
+            .prepare_cached(
+                "UPDATE mfa_totp SET
+                 failures = CASE WHEN locked_until_ms > ?2 THEN failures
+                     WHEN locked_until_ms != 0 THEN 1 ELSE failures + 1 END,
+                 locked_until_ms = CASE WHEN locked_until_ms > ?2 THEN locked_until_ms
+                     WHEN (CASE WHEN locked_until_ms != 0 THEN 1 ELSE failures + 1 END) >= ?3
+                         THEN ?4
+                     ELSE 0 END
+                 WHERE user_id = ?1 AND confirmed_ms IS NOT NULL
+                 RETURNING locked_until_ms = ?4",
+            )?
+            .query_row(
+                params![user.as_bytes(), now.0, MAX_FACTOR_FAILURES, until],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if locked_now == Some(true) {
+            crate::local_auth::revoke_all(tx, user, now)?;
+            audit(
+                tx,
+                Event::SessionRevoked,
+                None,
+                Some(user),
+                false,
+                Some("second factor locked"),
+            )?;
+            return Ok(false);
+        }
         if failures.is_some_and(|count| count >= MAX_STEP_UP_FAILURES) {
             tx.execute(
                 "UPDATE sessions SET revoked_ms = ?2 WHERE token_digest = ?1 AND revoked_ms IS NULL",

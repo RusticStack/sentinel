@@ -441,11 +441,23 @@ pub fn register(
         // and spending it in this transaction means a lost race creates nothing.
         let redeemed = match presented {
             Some(digest) => {
+                // An invitation delegates its creator's authority, so it is
+                // only as good as that authority is now: the creator must still
+                // be an active super admin, or still administer the tenant the
+                // invitation grants membership of. Removal, suspension,
+                // rejection and demotion therefore void every unspent
+                // invitation the creator minted, with no bookkeeping. Host-local
+                // invitations (no creator) hold the database file's authority.
                 let row: Option<Redeemable> = tx
                     .prepare_cached(
-                        "SELECT tenant_id, role, provider, subject FROM invitations
-                         WHERE token_digest = ?1 AND redeemed_ms IS NULL AND revoked_ms IS NULL
-                         AND expires_ms > ?2",
+                        "SELECT i.tenant_id, i.role, i.provider, i.subject FROM invitations i
+                         LEFT JOIN users c ON c.id = i.created_by
+                         LEFT JOIN memberships cm
+                           ON cm.tenant_id = i.tenant_id AND cm.user_id = i.created_by
+                         WHERE i.token_digest = ?1 AND i.redeemed_ms IS NULL
+                         AND i.revoked_ms IS NULL AND i.expires_ms > ?2
+                         AND (i.created_by IS NULL OR
+                              (c.active = 1 AND (c.super_admin = 1 OR cm.role = 3)))",
                     )?
                     .query_row(params![digest.0, now.0], |r| {
                         Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -613,6 +625,12 @@ pub fn approve(
 
 /// Reject an account. A rejected account is inactive and stays on record, so
 /// its username and identity remain claimed and cannot be re-applied for.
+///
+/// Refusing a pending application is platform administration. Rejecting an
+/// account that was already approved takes away a live account for good (a
+/// rejected account can be neither approved nor reactivated), so it needs the
+/// same recent step-up as deactivating one with `set_active`: an unstepped
+/// credential must not be able to do permanently what it cannot do reversibly.
 pub fn reject(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -620,6 +638,15 @@ pub fn reject(
     now: UnixMillis,
 ) -> Result<()> {
     authority.require_platform(tx)?;
+    let status: Option<i64> = tx
+        .prepare_cached("SELECT status FROM users WHERE id = ?1 AND kind = 0 AND status != 2")?
+        .query_row([user.as_bytes()], |r| r.get(0))
+        .optional()?;
+    match status {
+        None => return Err(Error::NotFound),
+        Some(0) => {}
+        Some(_) => authority.require_privileged(tx)?,
+    }
     let changed = tx.execute(
         "UPDATE users SET active = 0, status = 2 WHERE id = ?1 AND kind = 0 AND status != 2",
         [user.as_bytes()],

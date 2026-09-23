@@ -26,7 +26,7 @@ Every query re-checks membership and grants, but a long-lived subscription — a
 
 ## Membership and grant revocation
 
-`auth::set_membership`, `auth::remove_membership` and `auth::set_repo_grant` (A01) are now audited and move the epoch. A role downgrade takes effect on the next query. Removing a membership cascades its repository grants (unchanged) **and revokes the member's credentials scoped to that tenant** in the same transaction, because nothing they could reach remains; the member's credentials scoped to other tenants are untouched.
+`auth::set_membership`, `auth::remove_membership` and `auth::set_repo_grant` (A01) are now audited and move the epoch. A role downgrade takes effect on the next query. Removing a membership cascades its repository grants (unchanged) **and revokes the member's credentials scoped to that tenant** in the same transaction, because nothing they could reach remains; the member's credentials scoped to other tenants are untouched. Invitations the member minted as a tenant admin need no revocation: redemption re-checks the inviter's live authority ([admission](admission.md#invitations)), so removal, a downgrade below tenant admin, or suspension of the account voids them at once.
 
 ## Pool grants
 

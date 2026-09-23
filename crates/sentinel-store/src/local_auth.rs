@@ -466,11 +466,20 @@ pub fn login(
 
     if verdict != Verdict::Accepted {
         store.writer().write(move |tx| {
-            // Count the failure only against the record that was actually tested.
+            // Count the failure only against the record that was actually
+            // tested. A lockout window that has ended starts the count again
+            // at this failure: the window is served, not a standing debt that
+            // one typo afterwards turns into a fresh lockout.
             let locked: Option<i64> = tx
                 .prepare_cached(
-                    "UPDATE local_credentials SET failures = failures + 1,
-                     locked_until_ms = CASE WHEN failures + 1 >= ?3 THEN ?4 ELSE locked_until_ms END
+                    "UPDATE local_credentials SET
+                     failures = CASE WHEN locked_until_ms != 0 AND locked_until_ms <= ?5
+                         THEN 1 ELSE failures + 1 END,
+                     locked_until_ms = CASE
+                         WHEN (CASE WHEN locked_until_ms != 0 AND locked_until_ms <= ?5
+                               THEN 1 ELSE failures + 1 END) >= ?3 THEN ?4
+                         WHEN locked_until_ms <= ?5 THEN 0
+                         ELSE locked_until_ms END
                      WHERE user_id = ?1 AND phc = ?2 RETURNING locked_until_ms",
                 )?
                 .query_row(
@@ -478,7 +487,8 @@ pub fn login(
                         user.as_bytes(),
                         verified,
                         policy.max_failures,
-                        now.0.saturating_add(policy.lockout_ms)
+                        now.0.saturating_add(policy.lockout_ms),
+                        now.0
                     ],
                     |r| r.get(0),
                 )
@@ -565,7 +575,10 @@ pub fn issue_session(
         user,
         session,
         csrf,
-        max_age_secs: (policy.idle_ms / 1000).clamp(0, i64::from(u32::MAX)) as u32,
+        // The cookie lives as long as the session can: the idle deadline
+        // slides server-side (see `refresh`), which a fixed idle-length
+        // Max-Age would cut short. Expiry is still the server's decision.
+        max_age_secs: (policy.absolute_ms / 1000).clamp(0, i64::from(u32::MAX)) as u32,
     })
 }
 
@@ -717,8 +730,8 @@ pub fn change_password(
     })
 }
 
-/// Host-local recovery: reset a local password, clear the lockout and revoke
-/// the account's sessions. Authorized by access to the database file itself, so
+/// Host-local recovery: reset a local password, clear the login and
+/// second-factor lockouts and revoke the account's sessions and OAuth grants. Authorized by access to the database file itself, so
 /// a locked-out operator is never permanently shut out, and every use is
 /// recorded as host-local in the audit table.
 pub fn recover(
@@ -741,6 +754,9 @@ pub fn recover(
         let user = UserId::from_bytes(user).map_err(|_| Error::Corrupt("user_id"))?;
         revoke_all(tx, user, now)?;
         crate::oauth::revoke_all_for_user(tx, user, crate::oauth::reason::ACCOUNT, now)?;
+        // The operator is recovering the account: a second-factor lockout
+        // goes with the password lockout.
+        crate::mfa::clear_factor_lockout(tx, user)?;
         audit(
             tx,
             Event::PasswordRecovered,
