@@ -164,6 +164,9 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
     if !enabled() {
         return;
     }
+    // The slice dispatches from a repository on disk; a deployment refuses
+    // local manual sources (P05-10), so this process opts in explicitly.
+    sentinel_store::sources::permit_any_manual_source_for_tests();
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("origin");
     fs::create_dir(&repo).unwrap();

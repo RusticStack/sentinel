@@ -353,6 +353,66 @@ fn credentials_are_required_and_errors_are_structured() {
     assert!(page.as_str().unwrap().contains("/api/v1/login"));
 }
 
+/// Manual dispatch on a repository with no binding: the worker fetches the
+/// named remote with its own identity, so only an unauthenticated `https://`
+/// remote is admissible — never a path or `file://` URL on the worker host,
+/// never `ssh://` with the worker account's keys, never `git://` or plain
+/// `http://`.
+#[test]
+fn manual_dispatch_refuses_local_and_ambient_credential_remotes() {
+    let d = deployment();
+    let auth = bearer(&d);
+    for remote in [
+        "file:///var/lib/sentinel/worker/mirrors/rep_x",
+        "/var/lib/sentinel/worker/mirrors/rep_x",
+        "../other-attempt",
+        "ssh://git@github.com/o/r.git",
+        "git@github.com:o/r.git",
+        "git://github.com/o/r.git",
+        "http://169.254.169.254/latest",
+        "https://user:pass@github.com/o/r.git",
+        "ext::sh -c touch% /tmp/pwned",
+    ] {
+        let body = serde_json::json!({
+            "pipeline": PIPELINE,
+            "source": { "repo": remote, "sha": "0123456789abcdef0123456789abcdef01234567" }
+        });
+        let (status, answer) = call(
+            &d,
+            "POST",
+            "/api/v1/tenants/acme/repos/app/runs",
+            Some(&body),
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(
+            (status, answer["code"].as_str()),
+            (400, Some("invalid_request")),
+            "{remote}: {answer}"
+        );
+    }
+    // Nothing was created by any refusal; an https remote still dispatches.
+    let (status, _) = call(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/repos/app/runs",
+        Some(&dispatch_body()),
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 201);
+    let (status, page) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/repos/app/runs",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(page["runs"].as_array().unwrap().len(), 1, "{page}");
+}
+
 #[test]
 fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     let d = deployment();

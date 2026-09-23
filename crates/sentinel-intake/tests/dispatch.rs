@@ -101,6 +101,8 @@ impl Drop for Server {
 
 struct Fixture {
     dir: tempfile::TempDir,
+    /// The deployment's approved authorities: the loopback remote and GitHub.
+    destinations: Arc<[String]>,
     store: Arc<Store>,
     key: Arc<Key>,
     resolver: Resolver,
@@ -347,19 +349,23 @@ fn fixture() -> Fixture {
             }
         })
         .unwrap();
+    let destinations: Arc<[String]> = vec![authority(&remote), "https://github.com".into()].into();
     let resolver = Resolver::new(
         Arc::clone(&store),
         Some(Arc::clone(&key)),
         None,
+        Arc::clone(&destinations),
         Arc::new(sentinel_intake::resolve::GitFetch),
         dir.path().join("work"),
         Config {
             budget: Duration::from_secs(30),
             max_pipeline_bytes: 64 * 1024,
+            ..Config::default()
         },
     )
     .unwrap();
     Fixture {
+        destinations,
         dir,
         store,
         key,
@@ -539,6 +545,68 @@ fn a_push_resolves_through_the_policy_and_dispatches_with_exact_provenance() {
     assert_eq!(runs, 1);
 }
 
+/// Pushes `A→B`, `B→C`, `C→D` arriving as `C→D`, `A→B`, `B→C` (a relay
+/// replaying its spool, or GitHub's out-of-order delivery): only the tip is
+/// built, and the stale pushes neither dispatch nor cancel the tip's run
+/// under `cancel_in_progress`.
+#[test]
+fn out_of_order_pushes_never_dispatch_behind_or_cancel_the_tip() {
+    if !prerequisites() {
+        return;
+    }
+    let f = fixture();
+    let repo_git = Repo {
+        git: f.dir.path().join("repo"),
+    };
+    let grouped = "schema: 1\non: [push]\nconcurrency:\n  group: \"${{ repo.id }}:${{ event.key }}\"\n  cancel_in_progress: true\njobs:\n  build:\n    image: IMAGE\n    steps: [{ id: s, run: 'true' }]\n"
+        .replace("IMAGE", IMAGE);
+    let a = repo_git.rev("HEAD");
+    let b = repo_git.commit("b", &[(".sentinel.yml", &grouped)]);
+    let c = repo_git.commit("c", &[("src/lib.txt", "c\n")]);
+    let d = repo_git.commit("d", &[("src/lib.txt", "d\n")]);
+
+    let tip = f.accept_push("push-d", REF, &c, &d);
+    let _ = f.validate(tip);
+    let (outcome, _) = f.resolve(tip);
+    let Outcome::Dispatched { run: tip_run } = outcome else {
+        panic!("the tip dispatches: {outcome:?}");
+    };
+    // A→B is not adjacent to C→D: only history shows B is behind D.
+    let stale = f.accept_push("push-b", REF, &a, &b);
+    let _ = f.validate(stale);
+    let (outcome, row) = f.resolve(stale);
+    assert_eq!(outcome, Outcome::Ignored("superseded"));
+    assert_eq!(row.reason.as_deref(), Some("superseded"));
+    // B→C ends where the tip began.
+    let stale = f.accept_push("push-c", REF, &b, &c);
+    let _ = f.validate(stale);
+    let (outcome, _) = f.resolve(stale);
+    assert_eq!(outcome, Outcome::Ignored("superseded"));
+
+    let (runs, cancelled): (i64, i64) = f
+        .store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT count(*), coalesce(sum(cancel_requested), 0) FROM runs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!((runs, cancelled), (1, 0), "only the tip ran, uncancelled");
+    assert_eq!(f.spec_of(tip_run).source.sha, d);
+
+    // The stream continues normally from the tip — and a rewind to an older
+    // commit is a new transition, not a stale one.
+    let rewind = f.accept_push("push-rewind", REF, &d, &b);
+    let _ = f.validate(rewind);
+    let (outcome, _) = f.resolve(rewind);
+    assert!(
+        matches!(outcome, Outcome::Dispatched { .. }),
+        "a forced rewind runs: {outcome:?}"
+    );
+}
+
 #[test]
 fn the_policy_refuses_branches_it_does_not_declare() {
     if !prerequisites() {
@@ -666,6 +734,13 @@ impl Fetch for FakeFetch {
             bytes: self.pipeline.as_bytes().to_vec(),
         })
     }
+
+    fn is_ancestor(
+        &self,
+        _: sentinel_intake::resolve::AncestryRequest<'_>,
+    ) -> Result<bool, sentinel_git::Error> {
+        panic!("pull requests are never an ancestry question");
+    }
 }
 
 /// A fetcher whose merge ref is absent or stale: every call fails as a merge
@@ -685,6 +760,13 @@ impl Fetch for PendingMerge {
         _: sentinel_intake::resolve::MergeRequest<'_>,
     ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error> {
         Err(sentinel_git::Error::Merge)
+    }
+
+    fn is_ancestor(
+        &self,
+        _: sentinel_intake::resolve::AncestryRequest<'_>,
+    ) -> Result<bool, sentinel_git::Error> {
+        panic!("pull requests are never an ancestry question");
     }
 }
 
@@ -838,11 +920,13 @@ fn app_resolver(f: &Fixture, name: &str, fetch: Arc<dyn Fetch>) -> (Resolver, Gi
         Arc::clone(&f.store),
         None,
         Some(app),
+        Arc::clone(&f.destinations),
         fetch,
         f.dir.path().join(format!("work-{name}")),
         Config {
             budget: Duration::from_secs(5),
             max_pipeline_bytes: 64 * 1024,
+            ..Config::default()
         },
     )
     .unwrap();
@@ -1077,6 +1161,7 @@ fn a_polled_ref_observation_becomes_a_real_dispatch() {
         Arc::clone(&f.store),
         Some(Arc::clone(&f.key)),
         None,
+        Arc::clone(&f.destinations),
         Arc::new(sentinel_intake::GitLister),
         work,
         sentinel_intake::poll::Config {

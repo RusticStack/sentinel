@@ -278,9 +278,8 @@ pub fn observations(conn: &Connection, repo: RepoId) -> Result<Vec<Observation>>
 ///
 /// Every transition becomes an ordinary `poll`-provider `ref_update`
 /// delivery through `intake::accept`, and the cursor update commits in the
-/// same transaction: a crash mid-flight replays the advertisement, whose
-/// deterministic delivery ids make the retry a no-op where the delivery
-/// already landed.
+/// same transaction: a crash mid-flight loses both or neither, and a replay
+/// against the same cursor state maps to the same delivery id.
 pub fn admit(
     tx: &Transaction,
     repo: RepoId,
@@ -337,20 +336,25 @@ pub fn admit(
         if !valid_tip(tip) || !processed.insert(tip.name.as_str()) {
             continue;
         }
-        let previous: Option<(String, Option<[u8; 16]>)> = tx
+        let previous: Option<(String, Cursor)> = tx
             .prepare_cached(
-                "SELECT oid,delivery_id FROM poll_observations WHERE repo_id=?1 AND ref_name=?2",
+                "SELECT oid,delivery_id,observed_ms FROM poll_observations
+                 WHERE repo_id=?1 AND ref_name=?2",
             )?
             .query_row(params![repo.as_bytes(), tip.name.as_str()], |r| {
-                Ok((r.get(0)?, r.get(1)?))
+                Ok((r.get(0)?, Cursor(r.get(1)?, r.get(2)?)))
             })
             .optional()?;
-        let (old, kind) = match &previous {
-            Some((oid, _)) if oid == &tip.oid => continue,
-            Some((oid, _)) => (oid.clone(), &mut out.moved),
-            None => ("0".repeat(tip.oid.len()), &mut out.created),
+        let (old, cursor, kind) = match previous {
+            Some((oid, _)) if oid == tip.oid => continue,
+            Some((oid, cursor)) => (oid, cursor, &mut out.moved),
+            None => (
+                "0".repeat(tip.oid.len()),
+                Cursor(None, now.0),
+                &mut out.created,
+            ),
         };
-        let external = external_id(&tip.name, &old, &tip.oid);
+        let external = external_id(&tip.name, &old, &tip.oid, &cursor);
         match intake::accept(
             tx,
             repo,
@@ -376,16 +380,20 @@ pub fn admit(
 
     // A watched ref the remote no longer advertises is a deletion. The
     // cursor is dropped only once the deletion delivery lands.
-    let mut q = tx.prepare_cached("SELECT ref_name,oid FROM poll_observations WHERE repo_id=?1")?;
-    let cursors: Vec<(String, String)> = q
-        .query_map([repo.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?)))?
+    let mut q = tx.prepare_cached(
+        "SELECT ref_name,oid,delivery_id,observed_ms FROM poll_observations WHERE repo_id=?1",
+    )?;
+    let cursors: Vec<(String, String, Cursor)> = q
+        .query_map([repo.as_bytes()], |r| {
+            Ok((r.get(0)?, r.get(1)?, Cursor(r.get(2)?, r.get(3)?)))
+        })?
         .collect::<rusqlite::Result<_>>()?;
-    for (name, old) in cursors {
+    for (name, old, cursor) in cursors {
         if present.contains(name.as_str()) {
             continue;
         }
         let new = "0".repeat(old.len());
-        let external = external_id(&name, &old, &new);
+        let external = external_id(&name, &old, &new, &cursor);
         match intake::accept(
             tx,
             repo,
@@ -426,11 +434,30 @@ fn valid_tip(tip: &Tip) -> bool {
             .is_none_or(sentinel_protocol::intake::valid_sha)
 }
 
-/// `poll:` plus the transition's digest: the same observed change always
-/// maps to the same delivery, so a retried admission is a no-op.
-fn external_id(reference: &str, old: &str, new: &str) -> String {
-    let digest = blake3::hash(format!("{reference}\0{old}\0{new}").as_bytes());
-    format!("poll:{}", digest.to_hex())
+/// The cursor state a transition moves: the delivery that last moved it
+/// (none for a baseline) and when. A ref with no cursor uses the admission
+/// time.
+struct Cursor(Option<[u8; 16]>, i64);
+
+/// `poll:` plus the digest of the transition *and the cursor state it
+/// moves*. Replaying one advertisement against one cursor state maps to the
+/// same delivery, but a later, legitimate repeat of the same transition —
+/// `A→B`, force-reverted `B→A`, re-pushed `A→B` — moves a cursor that a
+/// different delivery set, so it is a new delivery rather than a suppressed
+/// duplicate. The cursor and the delivery commit together, so crash safety
+/// never needed the identity to ignore the cursor.
+fn external_id(reference: &str, old: &str, new: &str, cursor: &Cursor) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(reference.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(old.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(new.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(cursor.0.as_ref().map_or(&[][..], |d| &d[..]));
+    hasher.update(b"\0");
+    hasher.update(&cursor.1.to_le_bytes());
+    format!("poll:{}", hasher.finalize().to_hex())
 }
 
 fn observe(

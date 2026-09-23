@@ -693,14 +693,39 @@ pub fn last_dispatched(
 }
 
 /// Deliveries of one open state whose next attempt is due, oldest first.
+///
+/// The literal `state IN (0, 1)` term is what lets SQLite use the partial
+/// `deliveries_open` index (a bound `state = ?` alone never proves the
+/// index's predicate): the state is an index equality, the order is the
+/// index order, and the limit stops the walk — no scan, no sort, however
+/// much settled history the table holds.
 pub fn due(conn: &Connection, state: State, now: UnixMillis, limit: u16) -> Result<Vec<Delivery>> {
+    if !state.is_open() {
+        return Ok(Vec::new());
+    }
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {COLUMNS} FROM webhook_deliveries
-         WHERE state = ?1 AND (next_attempt_ms IS NULL OR next_attempt_ms <= ?2)
+         WHERE state IN (0, 1) AND state = ?1
+           AND (next_attempt_ms IS NULL OR next_attempt_ms <= ?2)
          ORDER BY received_ms, id LIMIT ?3"
     ))?;
     let rows = stmt.query_map(params![state.code(), now.0, limit], map_row)?;
     rows.map(|row| decode(row?)).collect()
+}
+
+/// Whether any delivery of one open state is due: the lanes' idle probe,
+/// one index-backed read, so an idle tick never takes the writer.
+pub fn any_due(conn: &Connection, state: State, now: UnixMillis) -> Result<bool> {
+    if !state.is_open() {
+        return Ok(false);
+    }
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM webhook_deliveries
+               WHERE state IN (0, 1) AND state = ?1
+                 AND (next_attempt_ms IS NULL OR next_attempt_ms <= ?2))",
+        )?
+        .query_row(params![state.code(), now.0], |r| r.get(0))?)
 }
 
 /// What resolution decided about one delivery.
@@ -726,8 +751,12 @@ impl Resolution {
 /// acceptance and resolution, and a delivery that cannot be fetched, or is
 /// not a trigger, must not run.
 pub fn validate(conn: &Connection, delivery: &Delivery) -> Result<Resolution> {
-    if sources::repo_tenant(conn, delivery.repo).is_err() {
-        return Ok(Resolution::Failed("tenant_suspended"));
+    // `NotFound` is the inactive tenant; any other error is a store fault
+    // and must stay one, not become a permanent verdict on the delivery.
+    match sources::repo_tenant(conn, delivery.repo) {
+        Ok(_) => {}
+        Err(Error::NotFound) => return Ok(Resolution::Failed("tenant_suspended")),
+        Err(e) => return Err(e),
     }
     let metadata = match sources::load_metadata(conn, delivery.repo) {
         Ok(metadata) => metadata,
@@ -858,6 +887,10 @@ pub fn backoff_ms(attempts: u32) -> i64 {
 
 /// One pass of the validation lane: revalidate and settle every due pending
 /// delivery. Runs inside one writer transaction; the caller bounds the batch.
+/// The rows `due` read are current — nothing else writes inside this
+/// transaction — so they are not read twice. A delivery whose validation
+/// hits a fault is given its own retry schedule and the pass continues: one
+/// unreadable binding cannot hold every later delivery behind it.
 pub fn resolve_due(
     tx: &Transaction<'_>,
     now: UnixMillis,
@@ -866,17 +899,19 @@ pub fn resolve_due(
     let due = due(tx, State::Pending, now, limit)?;
     let mut settled = Vec::with_capacity(due.len());
     for delivery in due {
-        let current = match get(tx, delivery.id) {
-            Ok(current) => current,
-            Err(Error::NotFound) => continue,
-            Err(e) => return Err(e),
-        };
-        if current.state != State::Pending {
-            continue;
+        match validate(tx, &delivery) {
+            Ok(resolution) => {
+                settle(tx, delivery.id, resolution, now)?;
+                settled.push((delivery.id, resolution));
+            }
+            Err(Error::Sqlite(e)) => return Err(Error::Sqlite(e)),
+            Err(_) => {
+                let exhausted = Resolution::Failed("resolution_attempts");
+                if retry(tx, delivery.id, now, exhausted)? == Retry::Exhausted {
+                    settled.push((delivery.id, exhausted));
+                }
+            }
         }
-        let resolution = validate(tx, &current)?;
-        settle(tx, current.id, resolution, now)?;
-        settled.push((current.id, resolution));
     }
     Ok(settled)
 }

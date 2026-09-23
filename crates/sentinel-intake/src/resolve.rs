@@ -36,6 +36,9 @@ use crate::source;
 pub struct Config {
     pub budget: Duration,
     pub max_pipeline_bytes: usize,
+    /// How many generations behind the newest dispatched tip an out-of-order
+    /// push is still recognised as stale. Only commits are fetched for it.
+    pub ancestry_depth: u32,
 }
 
 impl Default for Config {
@@ -43,6 +46,7 @@ impl Default for Config {
         Self {
             budget: Duration::from_secs(120),
             max_pipeline_bytes: sentinel_protocol::limits::MAX_PIPELINE_FILE_BYTES,
+            ancestry_depth: 1024,
         }
     }
 }
@@ -109,6 +113,18 @@ pub struct MergeRequest<'a> {
     pub budget: Duration,
 }
 
+/// One bounded ancestry question (the reordered-push rule): is `ancestor` in
+/// the history of `tip`, at most `depth` generations back?
+pub struct AncestryRequest<'a> {
+    pub work: &'a std::path::Path,
+    pub remote: &'a str,
+    pub access: Option<&'a sentinel_protocol::source::Access>,
+    pub ancestor: &'a str,
+    pub tip: &'a str,
+    pub depth: u32,
+    pub budget: Duration,
+}
+
 /// Where the pipeline file comes from. Production uses bounded Git
 /// ([`GitFetch`]); a test can supply a fake because a GitHub-App-bound remote
 /// is not reachable offline.
@@ -121,6 +137,8 @@ pub trait Fetch: Send + Sync {
         &self,
         request: MergeRequest<'_>,
     ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error>;
+    /// `Ok(false)` means "not proven" — the push is then treated as new.
+    fn is_ancestor(&self, request: AncestryRequest<'_>) -> Result<bool, sentinel_git::Error>;
 }
 
 /// The production fetcher: `sentinel-git`'s bounded file-at-revision reads.
@@ -159,12 +177,27 @@ impl Fetch for GitFetch {
             request.budget,
         )
     }
+
+    fn is_ancestor(&self, request: AncestryRequest<'_>) -> Result<bool, sentinel_git::Error> {
+        sentinel_git::is_ancestor(
+            request.work,
+            request.remote,
+            request.access,
+            request.ancestor,
+            request.tip,
+            request.depth,
+            request.budget,
+        )
+    }
 }
 
 pub struct Resolver {
     store: Arc<Store>,
     key: Option<Arc<Key>>,
     app: Option<Arc<App>>,
+    /// The deployment's approved source authorities, rechecked on every
+    /// resolution: a narrowed policy stops fetches, not just new bindings.
+    destinations: Arc<[String]>,
     fetch: Arc<dyn Fetch>,
     work_root: PathBuf,
     config: Config,
@@ -174,10 +207,12 @@ impl Resolver {
     /// Prepare a resolver whose scratch space is `work_root`. Anything a
     /// previous process left there is discarded: a half-fetched repository is
     /// never reused.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<Store>,
         key: Option<Arc<Key>>,
         app: Option<Arc<App>>,
+        destinations: Arc<[String]>,
         fetch: Arc<dyn Fetch>,
         work_root: PathBuf,
         config: Config,
@@ -192,6 +227,7 @@ impl Resolver {
             store,
             key,
             app,
+            destinations,
             fetch,
             work_root,
             config,
@@ -204,22 +240,38 @@ impl Resolver {
         if delivery.state != intake::State::Ready {
             return Ok(Outcome::Skipped);
         }
-        // What the binding authorizes right now.
-        let Some(binding) = source::lookup(&self.store, delivery.repo)? else {
-            return self.settle(
-                delivery,
-                Outcome::Failed {
-                    reason: "binding_revoked",
-                    detail: None,
-                },
-                now,
-            );
+        // What the binding authorizes right now. A binding that authorizes
+        // nothing settles this delivery with its reason; it never fails the
+        // lane's pass for everybody else.
+        let binding = match source::classify(&self.store, delivery.repo)? {
+            source::Lookup::Bound(binding) => binding,
+            source::Lookup::Unbound => {
+                return self.settle(
+                    delivery,
+                    Outcome::Failed {
+                        reason: "binding_revoked",
+                        detail: None,
+                    },
+                    now,
+                );
+            }
+            source::Lookup::Unusable(reason) => {
+                return self.settle(
+                    delivery,
+                    Outcome::Failed {
+                        reason,
+                        detail: None,
+                    },
+                    now,
+                );
+            }
         };
-        if binding.metadata.revoked {
+        // The deployment's egress policy, as it is now.
+        if !source::destination_allowed(&self.destinations, &binding.metadata.binding.remote) {
             return self.settle(
                 delivery,
                 Outcome::Failed {
-                    reason: "binding_revoked",
+                    reason: "destination_refused",
                     detail: None,
                 },
                 now,
@@ -234,25 +286,19 @@ impl Resolver {
             Err(outcome) => return self.settle(delivery, outcome, now),
         };
 
-        // Duplicate and reordered events: a transition already dispatched is
-        // acknowledged, and a predecessor of the newest dispatched transition
-        // for the same ref is superseded.
+        // Duplicate and reordered events, judged against the newest
+        // dispatched transition of the same stream (see `order`).
         let stream = plan.policy_ref.clone();
         let is_pr = plan.kind == EventKind::PullRequest;
         let (tenant, repo) = (delivery.tenant, delivery.repo);
         let previous = self
             .store
             .read(move |c| intake::last_dispatched(c, tenant, repo, &stream, is_pr))?;
-        if let Some(previous) = previous {
-            if previous.old_sha.as_deref() == delivery.old_sha.as_deref()
-                && previous.new_sha.as_deref() == delivery.new_sha.as_deref()
-            {
-                return self.settle(delivery, Outcome::Ignored("duplicate"), now);
-            }
-            if previous.old_sha.as_deref() == delivery.new_sha.as_deref() {
-                return self.settle(delivery, Outcome::Ignored("superseded"), now);
-            }
-        }
+        let prove_stale = match order(delivery, previous.as_ref(), plan.kind) {
+            Order::Settle(outcome) => return self.settle(delivery, outcome, now),
+            Order::New => None,
+            Order::Prove { tip } => Some(tip),
+        };
 
         // The only network step: mint the access (sealed credential, or App
         // token with a lifecycle recheck).
@@ -284,6 +330,47 @@ impl Resolver {
                 );
             }
         };
+
+        // An out-of-order push: the newest dispatched tip may already contain
+        // this revision, in which case the repository moved past it and a
+        // run for it would test (and, under `cancel_in_progress`, cancel the
+        // tip's run in favour of) an older commit. Only commits are fetched.
+        if let (Some(tip), Some(new_sha)) = (prove_stale, delivery.new_sha.as_deref()) {
+            let work = self.work_root.join(format!("{}-ancestry", delivery.id));
+            let _scratch = Scratch(work.clone());
+            fs::create_dir(&work)?;
+            match self.fetch.is_ancestor(AncestryRequest {
+                work: &work,
+                remote: &binding.metadata.binding.remote,
+                access: Some(&access),
+                ancestor: new_sha,
+                tip: &tip,
+                depth: self.config.ancestry_depth,
+                budget: self.config.budget,
+            }) {
+                Ok(true) => return self.settle(delivery, Outcome::Ignored("superseded"), now),
+                Ok(false) => {}
+                Err(sentinel_git::Error::UnsupportedPlatform) => {
+                    return self.settle(
+                        delivery,
+                        Outcome::Failed {
+                            reason: "source_unavailable",
+                            detail: None,
+                        },
+                        now,
+                    );
+                }
+                Err(e) => {
+                    return self.retry(
+                        delivery,
+                        "source_unreachable",
+                        Some(e.to_string()),
+                        intake::Resolution::Failed("resolution_attempts"),
+                        now,
+                    );
+                }
+            }
+        }
 
         // The pipeline file, read from the policy-selected revision; a tag
         // object is peeled to its commit. A pull request reads it at the
@@ -603,6 +690,60 @@ impl Resolver {
     }
 }
 
+/// What the ordering rule decided before any remote work.
+#[derive(Debug, PartialEq, Eq)]
+enum Order {
+    /// Nothing on record contradicts this transition: it is new work.
+    New,
+    /// Decided from stored facts alone.
+    Settle(Outcome),
+    /// A push that neither continues the newest dispatched transition nor
+    /// ends where it began: stale exactly when its revision is already in
+    /// the history of `tip`, the newest dispatched revision.
+    Prove { tip: String },
+}
+
+/// The duplicate/reordered-event rule. Arrival order is not push order — a
+/// relay replays its spool, GitHub documents out-of-order delivery — so the
+/// rule is anchored on the newest **dispatched** transition of the stream
+/// and on commit history, never on which event happened to arrive last:
+///
+/// 1. the identical transition is a duplicate;
+/// 2. a transition starting where the newest one ended continues the stream
+///    and runs — including a forced rewind and a repeat of an older
+///    transition (`A→B`, `B→A`, `A→B` builds `B` again);
+/// 3. a transition ending where the newest one began is its predecessor and
+///    is superseded;
+/// 4. any other branch push is superseded when its revision is an ancestor
+///    of the newest dispatched revision (proved through Git), so an older
+///    push can never dispatch after — or cancel the run of — the tip.
+///
+/// Tags and pull requests stop at rule 3: a retagged tag is not history,
+/// and one base branch's stream holds unrelated pull requests.
+fn order(delivery: &Delivery, previous: Option<&Delivery>, kind: EventKind) -> Order {
+    let Some(previous) = previous else {
+        return Order::New;
+    };
+    let (old, new) = (delivery.old_sha.as_deref(), delivery.new_sha.as_deref());
+    if previous.old_sha.as_deref() == old && previous.new_sha.as_deref() == new {
+        return Order::Settle(Outcome::Ignored("duplicate"));
+    }
+    if old.is_some() && old == previous.new_sha.as_deref() {
+        return Order::New;
+    }
+    if new.is_some() && new == previous.old_sha.as_deref() {
+        return Order::Settle(Outcome::Ignored("superseded"));
+    }
+    match previous.new_sha.as_deref() {
+        Some(tip) if kind == EventKind::Push && !sentinel_protocol::intake::is_zero_sha(tip) => {
+            Order::Prove {
+                tip: tip.to_owned(),
+            }
+        }
+        _ => Order::New,
+    }
+}
+
 /// Where the pipeline file is read from.
 enum Revision {
     /// The peeled event commit (push, tag).
@@ -679,5 +820,94 @@ struct Scratch(PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sentinel_core::{DeliveryId, RepoId, TenantId};
+
+    fn sha(c: char) -> String {
+        c.to_string().repeat(40)
+    }
+
+    fn transition(old: char, new: char) -> Delivery {
+        Delivery {
+            id: DeliveryId::new(),
+            tenant: TenantId::new(),
+            repo: RepoId::new(),
+            provider: "generic".into(),
+            external_id: "x".into(),
+            event: "ref_update".into(),
+            ref_name: Some("refs/heads/main".into()),
+            old_sha: Some(sha(old)),
+            new_sha: Some(sha(new)),
+            state: intake::State::Ready,
+            reason: None,
+            attempts: 0,
+            received: UnixMillis(1),
+            settled: None,
+            run: None,
+        }
+    }
+
+    #[test]
+    fn the_first_transition_of_a_stream_is_new_work() {
+        assert_eq!(
+            order(&transition('a', 'b'), None, EventKind::Push),
+            Order::New
+        );
+    }
+
+    #[test]
+    fn identical_successor_and_predecessor_transitions_are_decided_without_git() {
+        let tip = transition('c', 'd');
+        assert_eq!(
+            order(&transition('c', 'd'), Some(&tip), EventKind::Push),
+            Order::Settle(Outcome::Ignored("duplicate"))
+        );
+        assert_eq!(
+            order(&transition('d', 'e'), Some(&tip), EventKind::Push),
+            Order::New
+        );
+        assert_eq!(
+            order(&transition('b', 'c'), Some(&tip), EventKind::Push),
+            Order::Settle(Outcome::Ignored("superseded"))
+        );
+    }
+
+    #[test]
+    fn a_rewind_and_a_repeated_transition_continue_the_stream() {
+        // A→B built, then a forced rewind B→A, then A→B pushed again: each
+        // starts where the newest dispatched one ended, so each runs.
+        let built = transition('a', 'b');
+        let rewind = transition('b', 'a');
+        assert_eq!(order(&rewind, Some(&built), EventKind::Push), Order::New);
+        assert_eq!(
+            order(&transition('a', 'b'), Some(&rewind), EventKind::Push),
+            Order::New
+        );
+    }
+
+    #[test]
+    fn a_non_adjacent_push_must_be_proved_against_the_tip_and_only_for_branches() {
+        // C→D is the tip; A→B arrives late. Nothing adjacent decides it, so
+        // the tip's history does.
+        let tip = transition('c', 'd');
+        assert_eq!(
+            order(&transition('a', 'b'), Some(&tip), EventKind::Push),
+            Order::Prove { tip: sha('d') }
+        );
+        // A retagged tag and an unrelated pull request on the same base are
+        // not history questions.
+        assert_eq!(
+            order(&transition('a', 'b'), Some(&tip), EventKind::Tag),
+            Order::New
+        );
+        assert_eq!(
+            order(&transition('a', 'b'), Some(&tip), EventKind::PullRequest),
+            Order::New
+        );
     }
 }

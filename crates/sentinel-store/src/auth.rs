@@ -107,6 +107,9 @@ pub fn create_run(
     now: UnixMillis,
 ) -> Result<Vec<sentinel_core::JobId>> {
     let tenant = require_repo(tx, principal, repo, Permissions::RUN)?;
+    // Only after authorization, so an outsider learns nothing about the
+    // repository's binding from the refusal.
+    crate::sources::validate_manual(tx, repo, &spec.source)?;
     let jobs = crate::runs::create_run(tx, tenant, repo, run, spec, now)?;
     // A manual dispatch records no provenance: a group template over
     // `event.*` resolves to the manual event facts here instead of waiting

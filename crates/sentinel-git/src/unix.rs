@@ -287,9 +287,7 @@ fn fetch(
     }
     let mut fetch = git(work);
     let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
-    if let Some(private) = private {
-        private.configure(&mut fetch);
-    }
+    transport(&mut fetch, private);
     fetch.args([
         "fetch",
         "-q",
@@ -315,6 +313,35 @@ fn fetch(
     // the `Private` install for the checkout that follows.
     drop(askpass);
     fetched.map(|_| ())
+}
+
+/// The transport discipline for one fetch. An authorized fetch gets the
+/// binding's pinned trust ([`Private::configure`]). A fetch with no access —
+/// the manual mode, whose remote a client named — gets the same refusals
+/// minus the credential: no redirects, no credential helper from anywhere,
+/// and only `https` or a local path. `ssh` is refused outright there, since
+/// OpenSSH would present the worker account's own identity and
+/// configuration; `git://`, plain `http://` and remote helpers never run.
+/// Local paths stay possible here for worker-local mirrors and tests; the
+/// controller refuses them as a client-named manual source.
+pub(crate) fn transport(cmd: &mut Command, private: Option<&Private>) {
+    match private {
+        Some(private) => private.configure(cmd),
+        None => {
+            cmd.args([
+                "-c",
+                "http.followRedirects=false",
+                "-c",
+                "credential.helper=",
+                "-c",
+                "protocol.allow=never",
+                "-c",
+                "protocol.https.allow=always",
+                "-c",
+                "protocol.file.allow=always",
+            ]);
+        }
+    }
 }
 
 /// A full ref name under `refs/` — the merge ref a forge computes for a pull
@@ -540,9 +567,7 @@ pub fn file_at_merge(
         return Err(Error::Preparation("repository looks like an option".into()));
     }
     let mut fetch = git(work);
-    if let Some(private) = &private {
-        private.configure(&mut fetch);
-    }
+    transport(&mut fetch, private.as_ref());
     fetch.args([
         "fetch",
         "-q",
@@ -559,9 +584,7 @@ pub fn file_at_merge(
         for secret in &secrets {
             excerpt = excerpt.replace(secret, "[redacted]");
         }
-        // A missing ref means the forge has not computed the merge (yet);
-        // every other failure is the remote itself.
-        if excerpt.contains("remote ref") || excerpt.contains("not found") {
+        if merge_ref_missing(&excerpt) {
             return Err(Error::Merge);
         }
         return Err(Error::Preparation(format!("git fetch failed: {excerpt}")));
@@ -587,6 +610,103 @@ pub fn file_at_merge(
 
     let bytes = read_path(work, &commit, path, max_bytes, deadline, &secrets)?;
     Ok(FetchedFile { commit, bytes })
+}
+
+/// Whether a failed merge-ref fetch means the ref is absent — the forge has
+/// not computed the merge (yet), which is retryable. Every other failure is
+/// the remote itself: in particular a repository that is gone, renamed or
+/// inaccessible (`repository '…' not found`) is not a merge still pending.
+fn merge_ref_missing(excerpt: &str) -> bool {
+    excerpt.contains("couldn't find remote ref")
+}
+
+/// Whether `ancestor` is in the history of `tip` on `remote`, looking at most
+/// `depth` generations back from `tip` — the intake resolver's test for "the
+/// repository already moved past this commit". Only commits are fetched
+/// (`--filter=tree:0`, where the server supports it; otherwise the depth
+/// alone bounds the transfer), into `work`, which must be empty; nothing is
+/// ever fetched lazily afterwards.
+///
+/// The answer is conservative: `false` means "not proven", including an
+/// ancestor older than the window and a `tip` the remote no longer has
+/// (force-pushed away). A remote that cannot be reached is an error.
+pub fn is_ancestor(
+    work: &Path,
+    remote: &str,
+    access: Option<&Access>,
+    ancestor: &str,
+    tip: &str,
+    depth: u32,
+    timeout: Duration,
+) -> Result<bool> {
+    if !valid_sha(ancestor) || !valid_sha(tip) || depth == 0 {
+        return Err(Error::Preparation("ancestry request is not usable".into()));
+    }
+    if remote.starts_with('-') {
+        return Err(Error::Preparation("repository looks like an option".into()));
+    }
+    if let Some(access) = access
+        && (!access.validate(UnixMillis::now().0) || access.binding.remote != remote)
+    {
+        return Err(Error::Preparation("source access refused".into()));
+    }
+    if ancestor == tip {
+        return Ok(true);
+    }
+    let deadline = Instant::now() + timeout;
+    init(work, deadline)?;
+    let private = access.map(|a| Private::install(work, a)).transpose()?;
+    let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
+    // A filtered fetch records its remote as a promisor, which needs a name:
+    // a bare URL or path is not one. The scratch repository gets `origin`
+    // (no refspec, so only the wanted commit is fetched).
+    let mut name = git(work);
+    name.args(["config", "--local", "remote.origin.url", remote]);
+    step(name, deadline, "git config", &secrets)?;
+    let mut fetch = git(work);
+    transport(&mut fetch, private.as_ref());
+    let depth_arg = depth.to_string();
+    fetch.args([
+        "fetch",
+        "-q",
+        "--no-tags",
+        "--filter=tree:0",
+        "--depth",
+        &depth_arg,
+        "origin",
+        tip,
+    ]);
+    let output = run(fetch, deadline, "git fetch")?;
+    drop(private);
+    if !output.success() {
+        let mut excerpt = output.stderr_excerpt();
+        for secret in &secrets {
+            excerpt = excerpt.replace(secret, "[redacted]");
+        }
+        // The remote no longer has the tip: nothing can be proven about it.
+        if excerpt.contains("not our ref") || excerpt.contains("couldn't find remote ref") {
+            return Ok(false);
+        }
+        return Err(Error::Preparation(format!("git fetch failed: {excerpt}")));
+    }
+    // Walk only what was fetched: the shallow boundary ends the walk, and
+    // lazy fetching is disabled so a missing object is never requested.
+    let limit = (depth as usize).saturating_mul(8).min(1 << 16);
+    let mut walk = git(work);
+    walk.env("GIT_NO_LAZY_FETCH", "1").args([
+        "rev-list",
+        &format!("--max-count={limit}"),
+        tip,
+        "--",
+    ]);
+    let output = run_capped(walk, deadline, "git rev-list", Some(limit * 66))?;
+    if !output.success() {
+        return Err(Error::Preparation("git rev-list failed".into()));
+    }
+    Ok(output
+        .stdout
+        .split(|&b| b == b'\n')
+        .any(|line| line == ancestor.as_bytes()))
 }
 
 /// Advertise `remote`'s heads and tags without fetching anything — the ref
@@ -615,9 +735,7 @@ pub fn ls_remote(
     let private = access.map(|a| Private::install(dir, a)).transpose()?;
     let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
     let mut cmd = git(dir);
-    if let Some(private) = &private {
-        private.configure(&mut cmd);
-    }
+    transport(&mut cmd, private.as_ref());
     // `--heads --tags` keeps the advertisement to the refs a binding can
     // name; `--` keeps the remote itself unambiguous as an argument.
     cmd.args(["ls-remote", "--heads", "--tags", "--", remote]);
@@ -824,6 +942,29 @@ impl Drop for Askpass {
     fn drop(&mut self) {
         if let Some(dir) = self.path.parent() {
             let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_ref_missing;
+
+    #[test]
+    fn only_a_missing_ref_is_a_pending_merge() {
+        // What Git prints when the forge has not computed the merge ref.
+        assert!(merge_ref_missing(
+            "fatal: couldn't find remote ref refs/pull/7/merge"
+        ));
+        // A repository that is gone, renamed or inaccessible is the remote's
+        // answer, not a merge still pending.
+        for excerpt in [
+            "fatal: repository 'https://github.com/o/r.git/' not found",
+            "remote: Repository not found.",
+            "fatal: Authentication failed for 'https://github.com/o/r.git/'",
+            "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host",
+        ] {
+            assert!(!merge_ref_missing(excerpt), "{excerpt}");
         }
     }
 }

@@ -124,6 +124,7 @@ struct Inner {
     store: Arc<Store>,
     key: Option<Arc<Key>>,
     app: Option<Arc<App>>,
+    destinations: Arc<[String]>,
     lister: Arc<dyn Lister>,
     work_root: PathBuf,
     config: Config,
@@ -139,6 +140,7 @@ impl Poll {
         store: Arc<Store>,
         key: Option<Arc<Key>>,
         app: Option<Arc<App>>,
+        destinations: Arc<[String]>,
         lister: Arc<dyn Lister>,
         work_root: PathBuf,
         config: Config,
@@ -154,6 +156,7 @@ impl Poll {
             store,
             key,
             app,
+            destinations,
             lister,
             work_root,
             config,
@@ -161,7 +164,9 @@ impl Poll {
         });
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
-        let thread = thread::spawn(move || inner.run(&flag));
+        let thread = thread::Builder::new()
+            .name("sentinel-poll".into())
+            .spawn(move || inner.run(&flag))?;
         Ok(Poll {
             stop,
             thread: Some(thread),
@@ -182,7 +187,12 @@ impl Inner {
     fn run(&self, stop: &AtomicBool) {
         let mut backoff = self.config.min_backoff;
         while !stop.load(Ordering::Acquire) {
-            match self.pass() {
+            // A panic in one pass (a bug, never an input it was meant to
+            // handle) costs that pass and a back-off, not polling for every
+            // repository until the controller restarts.
+            let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.pass()))
+                .unwrap_or(Err(StoreError::WriterPanicked));
+            match pass {
                 Ok(worked) => {
                     backoff = self.config.min_backoff;
                     // More repositories may be due behind the batch cap; an
@@ -212,7 +222,9 @@ impl Inner {
     }
 
     /// Poll every repository whose schedule has come due. `true` when any
-    /// work ran.
+    /// work ran. A repository whose poll hits a store fault is rescheduled
+    /// under its own failure back-off and the pass continues, so no one
+    /// configuration can stay first in every pass and starve the rest.
     fn pass(&self) -> Result<bool, StoreError> {
         let now = UnixMillis::now();
         let due = self
@@ -220,27 +232,38 @@ impl Inner {
             .read(|conn| poll::due(conn, now, self.config.batch))?;
         let worked = !due.is_empty();
         for config in &due {
-            (self.notice)(&self.poll_one(config)?);
+            let notice = match self.poll_one(config) {
+                Ok(notice) => notice,
+                Err(error) => self.fail(config, &format!("store: {error}"))?,
+            };
+            (self.notice)(&notice);
         }
         Ok(worked)
     }
 
     fn poll_one(&self, config: &poll::Config) -> Result<Notice, StoreError> {
         let repo = config.repo;
-        // What the binding authorizes right now; a config that outlived its
-        // binding can never succeed again, so it is dropped rather than
-        // retried forever.
-        let binding = source::lookup(&self.store, repo)?;
-        let Some(binding) = binding.filter(|b| !b.metadata.revoked) else {
-            self.store
-                .writer()
-                .write(move |tx| poll::drop_config(tx, repo))?;
-            return Ok(Notice {
-                repo,
-                outcome: "unbound".into(),
-                failed: false,
-            });
+        // What the binding authorizes right now. A configuration that
+        // outlived its binding can never succeed again, so it is dropped
+        // rather than retried forever; a suspended tenant or installation
+        // may come back, so that one backs off and keeps its configuration.
+        let binding = match source::classify(&self.store, repo)? {
+            source::Lookup::Bound(binding) => binding,
+            source::Lookup::Unbound | source::Lookup::Unusable("binding_revoked") => {
+                self.store
+                    .writer()
+                    .write(move |tx| poll::drop_config(tx, repo))?;
+                return Ok(Notice {
+                    repo,
+                    outcome: "unbound".into(),
+                    failed: false,
+                });
+            }
+            source::Lookup::Unusable(reason) => return self.fail(config, reason),
         };
+        if !source::destination_allowed(&self.destinations, &binding.metadata.binding.remote) {
+            return self.fail(config, "destination_refused");
+        }
 
         let now = UnixMillis::now();
         let access = match source::issue(
@@ -328,8 +351,9 @@ impl Inner {
         let backoff = (config.interval_ms << failures.min(6) as u32)
             .min(self.config.max_failure_backoff_ms)
             .max(config.interval_ms);
-        let mut reason = reason.to_owned();
-        reason.truncate(256);
+        // Bounded on a character boundary: the reason can carry a remote's
+        // stderr, and a byte cut through a multibyte character would panic.
+        let reason = truncate_chars(reason, 256).to_owned();
         let stored = reason.clone();
         self.store.writer().write(move |tx| {
             let now = UnixMillis::now();
@@ -341,6 +365,12 @@ impl Inner {
             failed: true,
         })
     }
+}
+
+/// The longest prefix of `text` that is at most `max` bytes and ends on a
+/// character boundary.
+fn truncate_chars(text: &str, max: usize) -> &str {
+    &text[..text.floor_char_boundary(max)]
 }
 
 /// A stable per-repository offset, up to a quarter of the interval, so a

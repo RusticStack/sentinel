@@ -205,7 +205,7 @@ pub fn migrate(conn: &mut Connection) -> Result<u32> {
 type Job = Box<dyn FnOnce(&mut Connection, &Changes) + Send>;
 
 /// The commit notifier: a generation counter the writer thread bumps after
-/// every write that completed successfully, and a parking place for readers
+/// every successful write that changed at least one row, and a parking place for readers
 /// that want to know when the database may have changed (the O05 long
 /// polls). A generation says only "something committed"; the waiter
 /// re-reads whatever it cares about.
@@ -370,11 +370,14 @@ impl Writer {
     {
         let (reply, done) = mpsc::sync_channel::<Result<T>>(1);
         let job: Job = Box::new(move |conn, changes| {
+            let before = conn.total_changes();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn)))
                 .unwrap_or(Err(Error::WriterPanicked));
             // Before the reply, so a caller whose write succeeded never
-            // observes the generation that preceded it.
-            if result.is_ok() {
+            // observes the generation that preceded it. A write that changed
+            // no row is not news: bumping the generation for it would wake
+            // every change watcher to re-read what it already has.
+            if result.is_ok() && conn.total_changes() != before {
                 changes.committed();
             }
             // A caller that stopped waiting is not an error for the writer.

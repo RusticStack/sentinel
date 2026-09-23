@@ -457,3 +457,32 @@ fn a_full_delivery_queue_defers_without_advancing_the_cursor() {
     let observed = poll::observations(&f.conn, f.repo).unwrap();
     assert_eq!(observed[0].oid, a);
 }
+
+/// `A→B`, force-reverted `B→A`, re-pushed `A→B`: the third observation is
+/// the same transition as the first but a new event, so it becomes a new
+/// delivery rather than being suppressed as a duplicate of the first. The
+/// clock is fixed here on purpose — the identity must not rely on it.
+#[test]
+fn a_repeated_transition_after_a_revert_is_a_new_delivery() {
+    let mut f = fixture();
+    bind(&mut f);
+    configure(&mut f, Authority::HostLocal, &[MAIN]).unwrap();
+    let (a, b) = ("a".repeat(40), "b".repeat(40));
+    admit(&mut f, &[tip(MAIN, &a)]).unwrap();
+    for oid in [&b, &a, &b] {
+        let out = admit(&mut f, &[tip(MAIN, oid)]).unwrap().unwrap();
+        assert_eq!(out.moved, 1, "{out:?}");
+    }
+    let rows = deliveries(&f);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    let repeated = rows.iter().filter(|r| r.3 == a && r.4 == b).count();
+    assert_eq!(repeated, 2, "both A→B transitions are deliveries");
+    let mut ids: Vec<&String> = rows.iter().map(|r| &r.1).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 3);
+    // Replaying the last advertisement against the same cursor still emits
+    // nothing.
+    let out = admit(&mut f, &[tip(MAIN, &b)]).unwrap().unwrap();
+    assert_eq!(out, poll::Admitted::default());
+}

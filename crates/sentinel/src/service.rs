@@ -972,10 +972,12 @@ fn start_server(
         controller.set_remote_cache(root);
     }
     let tailcat = start_tailcat(config, tailcat, listen)?;
-    controller.set_source_destinations(
-        crate::source_admin::load_destinations(&config.data_dir)
-            .map_err(|_| Error::runtime("cannot load source destination policy"))?,
-    );
+    // One destination policy for every controller-side fetch: worker spec
+    // delivery, intake resolution and ref polling all recheck it.
+    let destinations = crate::source_admin::load_destinations(&config.data_dir)
+        .map_err(|_| Error::runtime("cannot load source destination policy"))?;
+    let intake_destinations: Arc<[String]> = destinations.clone().into();
+    controller.set_source_destinations(destinations);
     let app = crate::source_admin::load_app(&config.data_dir)
         .map_err(|_| Error::runtime("cannot load GitHub App configuration"))?;
     if let Some(app) = &app {
@@ -1002,6 +1004,7 @@ fn start_server(
         Arc::clone(&store),
         key.clone(),
         app.as_ref().map(|app| Arc::clone(&app.app)),
+        Arc::clone(&intake_destinations),
         Arc::new(sentinel_intake::resolve::GitFetch),
         config.data_dir.join("intake-work"),
         sentinel_intake::resolve::Config::default(),
@@ -1050,6 +1053,7 @@ fn start_server(
         Arc::clone(&store),
         key.clone(),
         app.as_ref().map(|app| Arc::clone(&app.app)),
+        intake_destinations,
         Arc::new(sentinel_intake::GitLister),
         config.data_dir.join("poll-work"),
         sentinel_intake::poll::Config::default(),

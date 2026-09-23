@@ -39,6 +39,35 @@ fn repo(store: &Store) -> (TenantId, RepoId) {
     (tenant, repo)
 }
 
+/// A write that changes no row is not news: the generation — which every
+/// parked run watch wakes on — stays put. A write that changes one still
+/// advances it.
+#[test]
+fn a_write_that_changes_nothing_does_not_advance_the_generation() {
+    let (_dir, store) = store();
+    let _ = repo(&store);
+    let before = store.changes().generation();
+    // The intake lane's idle validation pass used to be exactly this.
+    let settled = store
+        .writer()
+        .write(|tx| sentinel_store::intake::resolve_due(tx, UnixMillis(5), 64))
+        .unwrap();
+    assert!(settled.is_empty());
+    store
+        .writer()
+        .write(|tx| {
+            tx.execute("UPDATE tenants SET active = 1 WHERE 0", [])?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(store.changes().generation(), before);
+    store
+        .writer()
+        .write(move |tx| jobs::insert_tenant(tx, TenantId::new(), "other", UnixMillis(2)))
+        .unwrap();
+    assert_eq!(store.changes().generation(), before + 1);
+}
+
 #[test]
 fn a_parked_waiter_wakes_on_the_next_commit() {
     let (_dir, store) = store();
