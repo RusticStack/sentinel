@@ -955,6 +955,11 @@ struct Stop {
     /// death is not recorded as a helper failure.
     replacing: bool,
     child: Option<Child>,
+    /// Counts registered children, so the tunnel prober replaces only the
+    /// child it probed, never a successor that started meanwhile.
+    generation: u64,
+    /// When the live child was registered (`None` between children).
+    born: Option<Instant>,
 }
 
 struct Shared {
@@ -1008,6 +1013,27 @@ impl Shared {
     /// allow list never waits behind an earlier failure.
     fn replace(&self) {
         let mut stop = self.stop.lock().expect("tailcat stop");
+        stop.replacing = true;
+        if let Some(child) = stop.child.as_mut() {
+            let _ = child.kill();
+        }
+        self.wake.notify_all();
+    }
+
+    /// The live child's generation and registration instant, if one runs.
+    fn current_child(&self) -> Option<(u64, Instant)> {
+        let stop = self.stop.lock().expect("tailcat stop");
+        stop.born.map(|born| (stop.generation, born))
+    }
+
+    /// [`Shared::replace`], but only while `generation` is still the live
+    /// child: a probe's verdict is about the child it probed, and a
+    /// successor that started while the probe ran has not been judged.
+    fn replace_probed(&self, generation: u64) {
+        let mut stop = self.stop.lock().expect("tailcat stop");
+        if stop.generation != generation || stop.born.is_none() {
+            return;
+        }
         stop.replacing = true;
         if let Some(child) = stop.child.as_mut() {
             let _ = child.kill();
@@ -1126,6 +1152,8 @@ fn prepare(
             stopped: false,
             replacing: false,
             child: None,
+            generation: 0,
+            born: None,
         }),
         wake: Condvar::new(),
     }))
@@ -1207,6 +1235,8 @@ fn run_child(shared: &Arc<Shared>) -> (Result<()>, bool) {
             let _ = child.kill();
         }
         stop.child = Some(child);
+        stop.generation += 1;
+        stop.born = Some(Instant::now());
     }
     let mut became_ready = false;
 
@@ -1244,7 +1274,11 @@ fn run_child(shared: &Arc<Shared>) -> (Result<()>, bool) {
         }
     }
 
-    let status = shared.stop.lock().expect("tailcat stop").child.take();
+    let status = {
+        let mut stop = shared.stop.lock().expect("tailcat stop");
+        stop.born = None;
+        stop.child.take()
+    };
     // The supervisor never leaves a helper running: a stop may have arrived
     // while the child was being registered, in which case `halt` had nothing
     // to kill. Killing here (harmless once it has exited) closes that race,
@@ -1318,10 +1352,33 @@ fn pump<R: Read + Send + 'static>(pipe: R, lines: mpsc::Sender<String>) -> threa
 /// reach the controller is replaced rather than trusted because its port is
 /// bound. The probe's own problem stays recorded; the replacement is not a
 /// second failure and does not wait out a back-off.
+///
+/// The interval is a deadline, not a wait that any wake-up ends: a
+/// replacement (or a new allow list) notifies the same condition, and
+/// probing then would judge a helper that has had no time to connect,
+/// fail, and kill it again — on a slow host before it ever ran. A helper
+/// is judged only once it has lived a full interval, and a failed probe
+/// replaces only the child it probed.
 fn watch_tunnel(shared: Arc<Shared>, every: Duration) {
-    while shared.wait(every) {
+    let mut next = Instant::now() + every;
+    loop {
+        let left = next.saturating_duration_since(Instant::now());
+        if !left.is_zero() {
+            if !shared.wait(left) {
+                return;
+            }
+            continue;
+        }
+        next = Instant::now() + every;
+        let Some((generation, born)) = shared.current_child() else {
+            continue;
+        };
+        if born.elapsed() < every {
+            next = born + every;
+            continue;
+        }
         if probe_once(&shared).is_err() && !shared.stopped() {
-            shared.replace();
+            shared.replace_probed(generation);
         }
     }
 }

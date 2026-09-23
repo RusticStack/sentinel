@@ -101,8 +101,13 @@ fn key(body: &str) -> NodeKey {
     NodeKey::parse(&format!("nodekey:{body}")).unwrap()
 }
 
+/// Polls `ready` until it holds. The deadline only bounds a hang — a passing
+/// test returns the moment the condition is true — and every condition here
+/// waits on real `/bin/sh` spawns, which a host short of memory has been
+/// seen to stall for over 10 s; 60 s keeps a stalled host from reading as a
+/// supervision bug without slowing a healthy run at all.
 fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         if ready() {
             return;
@@ -283,6 +288,62 @@ fn a_dead_helper_is_replaced_and_a_stalled_tunnel_is_not_trusted() {
     assert!(forward.telemetry().restarts >= 1);
     forward.shutdown();
     assert!(forward.telemetry().pid.is_none());
+}
+
+/// A probe's verdict is about the helper it probed. Here the first helper
+/// ends on its own while its probe is still in flight, and its successor
+/// starts before that probe fails: the failure must not kill the successor,
+/// which nothing has judged yet. Marker files order the events, so no
+/// timing decides the outcome; the successor is judged only after its own
+/// full interval (5 s), well after the check below.
+#[test]
+fn a_stale_probe_never_replaces_the_successor_it_did_not_probe() {
+    let marks = tempfile::tempdir().unwrap();
+    let m = marks.path().display();
+    // Waits (bounded, 20 s) until the marker `name` exists.
+    let wait_for = |name: &str| {
+        format!(
+            "i=0; while [ ! -e \"{m}/{name}\" ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done"
+        )
+    };
+    // The first `forward` marks `a` and ends once a probe is in flight; the
+    // second marks `b` and stays up. `ping` marks `pinging` and fails only
+    // once `b` exists.
+    let body = format!(
+        concat!(
+            "  forward) if [ ! -e \"{m}/a\" ]; then : > \"{m}/a\"; {until_pinging}; exit 0; fi;",
+            " : > \"{m}/b\"; exec sleep 3600 ;;\n",
+            "  ping) : > \"{m}/pinging\"; {until_b}; exit 1 ;;\n",
+        ),
+        m = m,
+        until_pinging = wait_for("pinging"),
+        until_b = wait_for("b"),
+    );
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let fake = Fake::write(&body);
+    let config = fake.config(port);
+    let controller = Address::parse(ADDRESS).unwrap();
+    let forward =
+        tailcat::start_forward_every(&config, fake.path(), &controller, Duration::from_secs(5))
+            .unwrap();
+    // The first probe starts; the first helper then ends; its successor
+    // starts, and only then does the probe fail.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !marks.path().join("b").exists() {
+        assert!(Instant::now() < deadline, "the successor never started");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // The stale failure lands within a poll of the successor's start; give
+    // it far longer than that, yet far less than the successor's own
+    // interval.
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(
+        fake.calls("forward").len(),
+        2,
+        "the successor was replaced on its predecessor's probe"
+    );
+    forward.shutdown();
 }
 
 #[test]
