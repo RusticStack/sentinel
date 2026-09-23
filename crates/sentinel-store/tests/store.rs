@@ -360,37 +360,66 @@ fn acknowledged_writes_survive_reopen_without_checkpoint() {
 fn writer_queue_is_bounded_and_reports_back_pressure() {
     let f = fixture();
     let store = Arc::new(f.store);
-    // Block the writer, then fill the queue beyond capacity from other threads.
+    // Block the writer inside a job, and know it is running there: the
+    // queue is then empty and holds exactly WRITER_QUEUE more.
     let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+    let (running_tx, running_rx) = std::sync::mpsc::channel::<()>();
     let blocker = {
         let store = Arc::clone(&store);
         thread::spawn(move || {
             store.writer().raw(move |_| {
-                let _ = hold_rx.recv_timeout(Duration::from_secs(5));
+                running_tx.send(()).unwrap();
+                // Released when the test drops `hold_tx` (also on a panic).
+                let _ = hold_rx.recv();
                 Ok(())
             })
         })
     };
-    thread::sleep(Duration::from_millis(50));
-    let mut handles = Vec::new();
-    for _ in 0..sentinel_store::WRITER_QUEUE + 8 {
-        let store = Arc::clone(&store);
-        handles.push(thread::spawn(move || store.writer().raw(|_| Ok(()))));
+    running_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the blocking job never ran");
+    // Every submitter reports its answer as soon as it has one. While the
+    // writer is blocked an accepted job cannot answer, so the first answers
+    // are exactly the overflow — no sleep has to guess when every thread
+    // has tried to enqueue.
+    const OVERFLOW: usize = 8;
+    let (answer_tx, answers) = std::sync::mpsc::channel();
+    let handles: Vec<_> = (0..sentinel_store::WRITER_QUEUE + OVERFLOW)
+        .map(|_| {
+            let (store, answer_tx) = (Arc::clone(&store), answer_tx.clone());
+            thread::spawn(move || answer_tx.send(store.writer().raw(|_| Ok(()))).unwrap())
+        })
+        .collect();
+    drop(answer_tx);
+    // An accepted job's caller that outwaits WRITE_WAIT (a very slow host)
+    // is told `WriteAmbiguous`; that is accepted work, kept for below.
+    let mut early = Vec::new();
+    let mut rejected = 0;
+    while rejected < OVERFLOW {
+        match answers.recv_timeout(Duration::from_secs(60)) {
+            Ok(Err(Error::WriterUnavailable)) => rejected += 1,
+            Ok(Err(Error::WriteAmbiguous)) => early.push(Err(Error::WriteAmbiguous)),
+            Ok(other) => panic!("a blocked writer answered {other:?}"),
+            Err(_) => panic!("only {rejected} overflow answers"),
+        }
     }
-    thread::sleep(Duration::from_millis(200));
     drop(hold_tx);
-    blocker.join().unwrap().unwrap();
-    let rejected = handles
-        .into_iter()
-        .map(|h| h.join().unwrap())
-        .filter(|r| matches!(r, Err(Error::WriterUnavailable)))
-        .count();
+    let blocked = blocker.join().unwrap();
     assert!(
-        rejected >= 1,
-        "at least the overflow must be rejected immediately"
+        matches!(blocked, Ok(()) | Err(Error::WriteAmbiguous)),
+        "{blocked:?}"
     );
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    // Every accepted job ran once the writer was free: accepted work is
+    // never dropped. (Past WRITE_WAIT a waiter is told the outcome is
+    // ambiguous — the job still runs.)
+    let rest: Vec<_> = early.into_iter().chain(answers.iter()).collect();
+    assert_eq!(rest.len(), sentinel_store::WRITER_QUEUE);
     assert!(
-        rejected <= 8 + 1,
-        "accepted work must not be dropped: {rejected} rejected"
+        rest.iter()
+            .all(|r| matches!(r, Ok(()) | Err(Error::WriteAmbiguous))),
+        "accepted work was refused: {rest:?}"
     );
 }
