@@ -73,6 +73,44 @@ pub fn csrf_accepted(expected: &Digest, presented_header: Option<&str>) -> bool 
     digest_eq(&secret.digest(), expected)
 }
 
+/// A fresh per-process key for [`form_token`]. Restarting the process
+/// invalidates open forms, which is the intended bound on their life.
+#[must_use]
+pub fn form_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).expect("operating system entropy");
+    key
+}
+
+/// Text length of a [`form_token`]: 32 bytes as hex.
+pub const FORM_TOKEN_LEN: usize = 64;
+
+/// The anti-forgery token an HTML form (OAuth consent, device approval)
+/// carries: `BLAKE3-keyed(key, session CSRF digest)` as hex. Bound to the
+/// session that rendered the page and to the process key, so it is useless
+/// for another session and needs no stored state.
+#[must_use]
+pub fn form_token(key: &[u8; 32], csrf: &Digest) -> String {
+    let mut out = String::with_capacity(FORM_TOKEN_LEN);
+    out.push_str(blake3::keyed_hash(key, &csrf.0).to_hex().as_str());
+    out
+}
+
+/// Whether a submitted form token is the one [`form_token`] renders for this
+/// key and session. Constant time over the full length.
+#[must_use]
+pub fn form_token_accepted(key: &[u8; 32], csrf: &Digest, presented: Option<&str>) -> bool {
+    let Some(presented) = presented.filter(|p| p.len() == FORM_TOKEN_LEN) else {
+        return false;
+    };
+    let expected = blake3::keyed_hash(key, &csrf.0).to_hex();
+    let mut diff = 0u8;
+    for (a, b) in expected.as_bytes().iter().zip(presented.as_bytes()) {
+        diff |= a ^ b;
+    }
+    core::hint::black_box(diff) == 0
+}
+
 fn itoa(mut value: u32) -> String {
     if value == 0 {
         return "0".into();
@@ -150,6 +188,26 @@ mod tests {
             .is_none()
         );
         assert!(read(SESSION_COOKIE, "").is_none());
+    }
+
+    #[test]
+    fn form_tokens_bind_to_the_key_and_the_session() {
+        let (key, other_key) = ([7u8; 32], [8u8; 32]);
+        let (csrf, other_csrf) = (Secret::generate().digest(), Secret::generate().digest());
+        let token = form_token(&key, &csrf);
+        assert_eq!(token.len(), FORM_TOKEN_LEN);
+        assert!(form_token_accepted(&key, &csrf, Some(&token)));
+        assert!(!form_token_accepted(&other_key, &csrf, Some(&token)));
+        assert!(!form_token_accepted(&key, &other_csrf, Some(&token)));
+        assert!(!form_token_accepted(&key, &csrf, None));
+        assert!(!form_token_accepted(&key, &csrf, Some("")));
+        assert!(!form_token_accepted(&key, &csrf, Some(&token[..63])));
+        assert!(!form_token_accepted(
+            &key,
+            &csrf,
+            Some(&token.to_uppercase())
+        ));
+        assert_ne!(token, form_token(&other_key, &csrf));
     }
 
     #[test]

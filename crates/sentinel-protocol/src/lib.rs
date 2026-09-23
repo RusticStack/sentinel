@@ -11,6 +11,7 @@ pub mod intake;
 pub mod limits;
 pub mod logs;
 pub mod negotiate;
+pub mod oauth;
 pub mod source;
 pub mod summary;
 

@@ -171,6 +171,13 @@ identifier!(
     ArtifactId,
     "arf"
 );
+identifier!(
+    /// One OAuth grant (O02): a refresh-token family issued through the
+    /// browser or device flow, or a service-account grant. Names the record so
+    /// it can be listed and revoked; it is not a token and authenticates nothing.
+    GrantId,
+    "grt"
+);
 
 /// Step position inside its job. Steps are compiled in order and referenced by
 /// index; the human name lives in the compiled spec. `u16` bounds a job to

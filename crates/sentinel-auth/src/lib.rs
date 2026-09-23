@@ -6,6 +6,7 @@
 
 pub mod cookie;
 pub mod mfa;
+pub mod oauth;
 pub mod password;
 pub mod sealed;
 pub mod secret;

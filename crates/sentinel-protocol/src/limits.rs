@@ -35,6 +35,9 @@ pub const MAX_ARTIFACT_ENTRIES: usize = 4096;
 pub const MAX_ARTIFACT_BYTES: u64 = 4 << 30;
 /// All captured artifact bytes of one run, across jobs and attempts.
 pub const MAX_RUN_ARTIFACT_BYTES: u64 = 16 << 30;
+/// An `application/x-www-form-urlencoded` body at the OAuth token,
+/// revocation and device-authorization endpoints, and a consent form post.
+pub const MAX_OAUTH_FORM_BYTES: usize = 8 << 10;
 /// Artifact names are pipeline ids (`expect_id`), at most this long.
 pub const MAX_ARTIFACT_NAME_BYTES: usize = 64;
 /// One file path on the artifact wire; the store's entry-path bound agrees.

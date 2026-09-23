@@ -9,9 +9,9 @@ pub mod state;
 pub mod time;
 
 pub use id::{
-    ArtifactId, AttemptId, CheckId, DeliveryId, Fence, InstallationId, InvalidId, InvitationId,
-    JobId, PoolId, RepoId, RunId, SessionId, StepIndex, TenantId, TokenId, UploadId, UserId,
-    WorkerId,
+    ArtifactId, AttemptId, CheckId, DeliveryId, Fence, GrantId, InstallationId, InvalidId,
+    InvitationId, JobId, PoolId, RepoId, RunId, SessionId, StepIndex, TenantId, TokenId, UploadId,
+    UserId, WorkerId,
 };
 pub use state::{
     Actor, DependencyPolicy, Event, FailureClass, JobControl, JobState, Outcome, RunState,
