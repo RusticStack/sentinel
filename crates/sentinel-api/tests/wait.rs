@@ -328,7 +328,7 @@ fn a_wait_returns_as_soon_as_the_run_changes_and_parks_while_it_does_not() {
 }
 
 #[test]
-fn a_fifth_parked_subscriber_is_rate_limited_and_log_follows_share_the_cap() {
+fn a_parked_subscriber_past_the_cap_is_rate_limited_and_log_follows_share_it() {
     let d = deployment();
     let (run, job) = dispatch(&d);
     // An attempt with one stored frame, so a follow past it would park.
@@ -348,7 +348,7 @@ fn a_fifth_parked_subscriber_is_rate_limited_and_log_follows_share_the_cap() {
         .unwrap();
     let (_, first) = get(&d, &format!("/api/v1/runs/{run}/wait"));
     let version = version_of(&first);
-    let parked: Vec<_> = (0..4)
+    let parked: Vec<_> = (0..sentinel_api::SUBSCRIBERS)
         .map(|_| {
             let (base, auth, version) = (d.base.clone(), d.auth.clone(), version.clone());
             thread::spawn(move || {
@@ -375,7 +375,7 @@ fn a_fifth_parked_subscriber_is_rate_limited_and_log_follows_share_the_cap() {
     // A wait that would answer at once needs no slot.
     let (status, _) = get(&d, &format!("/api/v1/runs/{run}/wait"));
     assert_eq!(status, 200);
-    // A log follow that would park shares the same four slots.
+    // A log follow that would park shares the same slots.
     let (status, body) = get(
         &d,
         &format!("/api/v1/attempts/{attempt}/logs?after=1&wait=1"),

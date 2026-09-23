@@ -398,6 +398,82 @@ pub fn require_tenant_member(
     }
 }
 
+/// Object download authority (D02). Bytes are repository evidence, so a
+/// digest is readable only through something that already grants it:
+///
+/// - an **artifact**: some manifest edge to `(tenant, digest)` belongs to an
+///   artifact of a run whose repository the caller may `READ` — the same
+///   predicate as the run's artifact listing (one join from the
+///   `manifest_refs_object` index; the job id is the manifest name's
+///   prefix, `job_<uuid>/<artifact>`);
+/// - a **resumable upload** committed in the tenant, for a member at
+///   operator role or above holding `RUN` — who could have uploaded it.
+///
+/// Super admin carries no ambient data access here: platform scope is not
+/// a membership. Anything else is `NotFound`, the same as a missing digest,
+/// so the route is no existence oracle.
+pub fn require_object_read(
+    conn: &Connection,
+    principal: Principal,
+    tenant: TenantId,
+    digest: &[u8; 32],
+) -> Result<()> {
+    if principal.tenant.is_some_and(|id| id != tenant) {
+        return Err(Error::NotFound);
+    }
+    if repo_scope(principal, Permissions::READ).is_ok() {
+        let found = conn
+            .prepare_cached(repo_query!(
+                "1",
+                "JOIN manifest_refs mr ON mr.tenant_id = r.tenant_id AND mr.kind = 0
+                 JOIN jobs j ON j.id = unhex(replace(substr(CAST(mr.name AS TEXT), 5, 36), '-', ''))
+                    AND j.tenant_id = mr.tenant_id
+                 JOIN runs ru ON ru.id = j.run_id AND ru.repo_id = r.id",
+                "AND r.tenant_id = ?5 AND mr.digest = ?6 LIMIT 1"
+            ))?
+            .query_row(
+                params![
+                    principal.user.as_bytes(),
+                    Permissions::READ.bits(),
+                    principal.tenant.as_ref().map(TenantId::as_bytes),
+                    principal.repo.as_ref().map(RepoId::as_bytes),
+                    tenant.as_bytes(),
+                    digest.as_slice()
+                ],
+                |_| Ok(()),
+            )
+            .optional()?;
+        if found.is_some() {
+            return Ok(());
+        }
+    }
+    if principal.repo.is_some() || !principal.permissions.contains(Permissions::RUN) {
+        return Err(Error::NotFound);
+    }
+    let uploaded: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(
+        SELECT 1 FROM users u JOIN tenants t ON t.id = ?2
+        JOIN memberships m ON m.tenant_id = t.id AND m.user_id = u.id
+        JOIN uploads up ON up.tenant_id = t.id AND up.object_digest = ?3 AND up.state_code = 1
+        WHERE u.id = ?1 AND u.active = 1 AND t.active = 1
+        AND (u.kind = 0 OR u.service_tenant_id = t.id) AND m.role >= 2)",
+        )?
+        .query_row(
+            params![
+                principal.user.as_bytes(),
+                tenant.as_bytes(),
+                digest.as_slice()
+            ],
+            |r| r.get(0),
+        )?;
+    if uploaded {
+        Ok(())
+    } else {
+        Err(Error::NotFound)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum NamespaceKind {
     Organization,
