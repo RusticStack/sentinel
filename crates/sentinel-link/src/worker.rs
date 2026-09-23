@@ -168,7 +168,11 @@ pub fn session(
     let outcome = std::thread::scope(|scope| {
         if let (Some(dialer), Some(bulk)) = (dialer, bulk) {
             let gate = Arc::clone(&stop_bulk);
-            scope.spawn(move || serve_bulk(&dialer, bulk, executor, &gate));
+            // Its own jitter stream: bulk redials of a fleet must not align
+            // with each other or with the control reconnects.
+            let seed = 0xD1B5_4A32_D192_ED03
+                ^ u64::from_le_bytes(config.worker.as_bytes()[8..].try_into().expect("8 bytes"));
+            scope.spawn(move || serve_bulk(&dialer, bulk, executor, &gate, seed));
         }
         let outcome = link.run(executor, || handle.stopped());
         stop_bulk.store(true, Ordering::Release);
@@ -182,14 +186,39 @@ pub fn session(
     outcome
 }
 
+/// Sleep up to `wait`, returning early (with `false`) once `stop` is set.
+/// Checked every [`STOP_POLL`], so whoever waits on this thread — the
+/// control session's teardown joins it — waits at most that long for a stop,
+/// never the whole back-off.
+fn wait_unless_stopped(stop: &AtomicBool, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(STOP_POLL.min(left));
+    }
+}
+
+/// How often a back-off wait looks at its stop flag.
+const STOP_POLL: Duration = Duration::from_millis(50);
+
 /// Serve the bulk half of a session on its own thread: the first connection
-/// is already open, and a lost one is redialled with doubling back-off until
-/// the control session ends.
+/// is already open, and a lost one is redialled with doubling, jittered
+/// back-off until the control session ends. The back-off wait watches the
+/// stop flag: the control session joins this thread before it returns, so an
+/// uninterruptible sleep here would hold a reconnect for up to
+/// [`BACKOFF_MAX`] — longer than a lease (P08-11).
 fn serve_bulk(
     dialer: &session::BulkDialer,
     first: session::BulkLink,
     executor: &dyn Executor,
     stop: &AtomicBool,
+    mut seed: u64,
 ) {
     let mut backoff = BACKOFF_MIN;
     let mut next = Some(first);
@@ -200,10 +229,9 @@ fn serve_bulk(
         if let Some(mut bulk) = next.take() {
             let _ = bulk.run(executor, || stop.load(Ordering::Acquire));
         }
-        if stop.load(Ordering::Acquire) {
+        if !wait_unless_stopped(stop, jitter(backoff, &mut seed)) {
             return;
         }
-        std::thread::sleep(backoff);
         backoff = (backoff * 2).min(BACKOFF_MAX);
         match dialer.open() {
             Ok(bulk) => {
@@ -261,9 +289,8 @@ pub fn run(
         }
         let wait = jitter(backoff, &mut seed);
         on_event(Event::Backoff(wait));
-        let deadline = Instant::now() + wait;
-        while Instant::now() < deadline && !handle.stopped() {
-            std::thread::sleep(Duration::from_millis(50).min(deadline - Instant::now()));
+        if !wait_unless_stopped(&handle.stop, wait) {
+            break;
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
