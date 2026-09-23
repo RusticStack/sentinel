@@ -40,7 +40,12 @@ shallow, and `gc.auto`/`maintenance.auto` are forced off so pruning only
 ever happens through the lease-checked path described below. A `file://`
 remote accepts a raw commit id as a want; a real server that refuses an
 unadvertised SHA gets the event-ref want instead — the commit usually rides
-its history — with the SHA alone as the last resort. Credentials reuse the
+its history — with the SHA alone as the last resort. A mirror fetch with
+no source access (the manual mode) runs under the same unauthenticated
+transport discipline as a direct one — only `https` or a local path, no
+redirects, no credential helper, never `ssh` ([sources](sources.md)); the
+controller refuses a client-named local path, so local remotes reach a
+mirror only from worker-local tooling and tests. Credentials reuse the
 direct checkout's discipline exactly: the same askpass/`GIT_SSH` files,
 owner-only, removed when the fetch returns (a crashed fetch's helper is
 dropped by recovery on restart, and by the next writer's `ensure`).

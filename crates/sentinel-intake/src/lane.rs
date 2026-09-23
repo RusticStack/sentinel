@@ -206,8 +206,14 @@ fn backoff(config: &Config, failures: u32) -> Duration {
 }
 
 /// Phase one: revalidate due pending deliveries in one writer transaction.
-/// `Ok(Some(batch))` means at least one delivery settled.
+/// `Ok(Some(batch))` means at least one delivery settled. An idle tick costs
+/// one index-backed read: the writer — and the commit every change watcher
+/// wakes on — is taken only when a pending delivery is actually due.
 fn validate(store: &Store, config: &Config) -> Result<Option<Batch>, sentinel_store::Error> {
+    let now = UnixMillis::now();
+    if !store.read(move |c| intake::any_due(c, intake::State::Pending, now))? {
+        return Ok(None);
+    }
     let batch_size = config.batch;
     let settled = store
         .writer()
@@ -227,7 +233,10 @@ fn validate(store: &Store, config: &Config) -> Result<Option<Batch>, sentinel_st
 }
 
 /// Phase two: resolve ready deliveries, one bounded unit of remote work at a
-/// time. Store faults leave the delivery open for the next pass.
+/// time. Faults are isolated per delivery: one that cannot be resolved right
+/// now is parked under its own retry schedule and the pass moves on, so no
+/// single delivery can hold every other tenant's work behind it. Only a
+/// store that cannot even record that fails the pass.
 fn dispatch(
     store: &Store,
     resolver: &Resolver,
@@ -241,9 +250,10 @@ fn dispatch(
     }
     let mut batch = Batch::default();
     for delivery in ready {
-        // A store fault while resolving leaves the delivery ready for the
-        // next pass (after a backoff).
-        let outcome = resolver.resolve(&delivery, UnixMillis::now())?;
+        let outcome = match resolver.resolve(&delivery, UnixMillis::now()) {
+            Ok(outcome) => outcome,
+            Err(error) => park(store, &delivery, &error)?,
+        };
         if matches!(outcome, Outcome::Dispatched { .. })
             && let Some(wake) = wake
         {
@@ -257,4 +267,36 @@ fn dispatch(
         });
     }
     Ok(Some(batch))
+}
+
+/// Give one delivery whose resolution hit a store fault its own backoff
+/// under the shared attempt budget, so it stops being first in every pass.
+/// `Err` only when the store cannot record even that — then the lane itself
+/// backs off, since no other delivery could make progress either.
+fn park(
+    store: &Store,
+    delivery: &intake::Delivery,
+    error: &sentinel_store::Error,
+) -> Result<Outcome, sentinel_store::Error> {
+    let id = delivery.id;
+    let detail = Some(error.to_string());
+    match store.writer().write(move |tx| {
+        intake::retry(
+            tx,
+            id,
+            UnixMillis::now(),
+            intake::Resolution::Failed("resolution_attempts"),
+        )
+    }) {
+        Ok(intake::Retry::Scheduled { .. }) => Ok(Outcome::Retried {
+            reason: "store_fault",
+            detail,
+        }),
+        Ok(intake::Retry::Exhausted) => Ok(Outcome::Failed {
+            reason: "resolution_attempts",
+            detail,
+        }),
+        Err(sentinel_store::Error::Conflict) => Ok(Outcome::Skipped),
+        Err(e) => Err(e),
+    }
 }

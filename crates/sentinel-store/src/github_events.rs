@@ -126,6 +126,30 @@ pub fn accept(
     Ok((outcome, false))
 }
 
+/// Receipts younger than this are kept whatever retention an operator asks
+/// for: a receipt is what makes a replayed control event (a signed
+/// `repository` rename that revokes a binding, say) a recorded no-op, and
+/// GitHub redelivers for days, not weeks.
+pub const MIN_RECEIPT_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Delete control-event receipts older than `before` (and never younger than
+/// [`MIN_RECEIPT_RETENTION_MS`] before `now`), oldest first, at most `limit`
+/// rows. Receipts are the only unbounded table control events write.
+pub fn purge_receipts(
+    tx: &Transaction<'_>,
+    before: UnixMillis,
+    now: UnixMillis,
+    limit: u32,
+) -> Result<usize> {
+    let before = before.0.min(now.0.saturating_sub(MIN_RECEIPT_RETENTION_MS));
+    Ok(tx.execute(
+        "DELETE FROM github_events WHERE delivery IN (
+            SELECT delivery FROM github_events WHERE created_ms <= ?1
+            ORDER BY created_ms LIMIT ?2)",
+        params![before, limit],
+    )?)
+}
+
 fn rerequest(
     tx: &Transaction<'_>,
     installation: u64,
@@ -141,10 +165,12 @@ fn rerequest(
         Err(Error::NotFound) => return Ok("unbound_repository".into()),
         Err(e) => return Err(e),
     };
-    if sources_forge::grant(tx, tenant, repo).is_err() {
-        return Ok("access_removed".into());
+    match sources_forge::grant(tx, tenant, repo) {
+        Ok(_) => {}
+        Err(Error::NotFound) => return Ok("access_removed".into()),
+        Err(e) => return Err(e),
     }
-    let mut stmt=tx.prepare_cached("SELECT DISTINCT run_id FROM check_publications WHERE repo_id=?1 AND head_sha=?2 AND run_id IS NOT NULL AND ((?3 IS NOT NULL AND check_run_id=?3 AND external_id=?4) OR (?3 IS NULL AND (check_suite_id=?5 OR check_suite_id IS NULL))) LIMIT 65")?;
+    let mut stmt=tx.prepare_cached("SELECT DISTINCT run_id FROM check_publications WHERE repo_id=?1 AND head_sha=?2 AND run_id IS NOT NULL AND ((?3 IS NOT NULL AND check_run_id=?3 AND (external_id=?4 OR (create_seq IS NOT NULL AND ?4=external_id||':'||create_seq))) OR (?3 IS NULL AND (check_suite_id=?5 OR check_suite_id IS NULL))) LIMIT 65")?;
     let ids = stmt
         .query_map(
             params![

@@ -684,12 +684,17 @@ fn resources(path: &str, node: Option<&Node>, policy: &ResourcePolicy) -> Result
                     0
                 } else {
                     let padded = format!("{frac:0<3}");
-                    padded[..3].parse().map_err(|_| {
-                        err(
-                            &child,
-                            SchemaErrorKind::Invalid("at most millicore precision".into()),
-                        )
-                    })?
+                    // `get`, not indexing: a multibyte character in the
+                    // fraction must be a schema error, never a panic.
+                    padded
+                        .get(..3)
+                        .and_then(|digits| digits.parse().ok())
+                        .ok_or_else(|| {
+                            err(
+                                &child,
+                                SchemaErrorKind::Invalid("at most millicore precision".into()),
+                            )
+                        })?
                 };
                 w * 1000 + f
             }
@@ -1234,6 +1239,19 @@ mod tests {
         assert!(valid_image("rust:1-bookworm"));
         assert!(valid_image("ghcr.io/o/i@sha256:abc"));
         assert!(!valid_image("a b"));
+    }
+
+    #[test]
+    fn a_multibyte_core_fraction_is_a_schema_error_not_a_panic() {
+        let doc = |cpu: &str| {
+            format!(
+                "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    resources: {{ cpu: \"{cpu}\" }}\n    steps:\n      - id: s\n        run: echo\n"
+            )
+        };
+        // `éé0` puts byte 3 inside the second `é`.
+        assert!(crate::compile_str(&doc("1.éé")).is_err());
+        assert!(crate::compile_str(&doc("0.€")).is_err());
+        assert!(crate::compile_str(&doc("0.5")).is_ok());
     }
 
     fn cache_of(text: &str) -> std::result::Result<Cache, crate::Error> {

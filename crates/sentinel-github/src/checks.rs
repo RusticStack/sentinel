@@ -278,12 +278,27 @@ pub struct Lookup<'a> {
     pub head_sha: &'a str,
     pub name: &'a str,
     pub external_id: &'a str,
+    /// The identity names exactly one create (it carries the generation), so
+    /// a match is ours whatever its status — including a run created already
+    /// `completed`. A legacy identity shared by every generation of a row
+    /// adopts only a live run.
+    pub any_status: bool,
 }
+
+/// Runs per lookup page, pages per lookup, and the byte ceiling of one page.
+/// A check run object with its app and output is a few KiB; a page of 100 is
+/// comfortably inside 1 MiB, and ten pages cover a thousand reruns of one
+/// check on one commit.
+const FIND_PER_PAGE: usize = 100;
+const FIND_MAX_PAGES: usize = 10;
+const FIND_MAX_BODY: u64 = 1024 * 1024;
 
 /// Find a check run we already created for this commit and name, by the
 /// `external_id` we set. This is how an ambiguous create is reconciled: the
 /// request timed out, GitHub may or may not have made the run, so the retry
-/// looks before it writes.
+/// looks before it writes. The listing is paged and every page is bounded,
+/// so a commit with many reruns neither overflows one answer nor hides the
+/// run we are looking for past the first page.
 pub fn find(
     client: &Client,
     endpoint: &str,
@@ -292,41 +307,53 @@ pub fn find(
 ) -> std::result::Result<Option<Published>, Refusal> {
     let (owner, repo, head_sha) = (lookup.owner, lookup.repo, lookup.head_sha);
     let (name, external_id) = (lookup.name, lookup.external_id);
-    let url = format!(
-        "{endpoint}/repos/{owner}/{repo}/commits/{head_sha}/check-runs?filter=all&per_page=100&check_name={}",
-        percent_encode(name)
-    );
-    let reply = client
-        .send_json("GET", &url, token, None)
-        .map_err(|e| Refusal::Unavailable {
-            reason: format!("request: {e}"),
-        })?;
-    match reply.status {
-        200 => {
-            let Some(list) = reply.body["check_runs"].as_array() else {
-                return Err(Refusal::Refused {
-                    reason: "unreadable list".into(),
+    let name = percent_encode(name);
+    for page in 1..=FIND_MAX_PAGES {
+        let url = format!(
+            "{endpoint}/repos/{owner}/{repo}/commits/{head_sha}/check-runs?filter=all&per_page={FIND_PER_PAGE}&page={page}&check_name={name}"
+        );
+        let reply = client
+            .send_json_bounded("GET", &url, token, None, FIND_MAX_BODY)
+            .map_err(|e| Refusal::Unavailable {
+                reason: format!("request: {e}"),
+            })?;
+        match reply.status {
+            200 => {
+                let Some(list) = reply.body["check_runs"].as_array() else {
+                    return Err(Refusal::Refused {
+                        reason: "unreadable list".into(),
+                    });
+                };
+                if let Some(found) = select(list, external_id, lookup.any_status) {
+                    return Ok(Some(found));
+                }
+                if list.len() < FIND_PER_PAGE {
+                    return Ok(None);
+                }
+            }
+            401 => return Err(Refusal::Unauthorized),
+            403 | 429 => return Err(github_refusal(&reply)),
+            404 => return Ok(None),
+            _ => {
+                return Err(Refusal::Unavailable {
+                    reason: format!("status {}", reply.status),
                 });
-            };
-            Ok(select(list, external_id))
+            }
         }
-        401 => Err(Refusal::Unauthorized),
-        403 | 429 => Err(github_refusal(&reply)),
-        404 => Ok(None),
-        _ => Err(Refusal::Unavailable {
-            reason: format!("status {}", reply.status),
-        }),
     }
+    Ok(None)
 }
 
-/// Pick the adoptable run from a lookup list. A `completed` run is immutable
-/// on GitHub — a PATCH reopening it is silently ignored — so adopting one
-/// would doom every later update; only a live run may be adopted.
-fn select(list: &[Value], external_id: &str) -> Option<Published> {
+/// Pick the adoptable run from a lookup list. With a per-create identity
+/// the exact match is the run that create made, whatever its status. With a
+/// legacy identity a `completed` match may be an older generation's run —
+/// immutable on GitHub, where a PATCH reopening it is silently ignored — so
+/// only a live run is adopted.
+fn select(list: &[Value], external_id: &str, any_status: bool) -> Option<Published> {
     list.iter()
         .find(|run| {
             run["external_id"].as_str() == Some(external_id)
-                && run["status"].as_str() != Some("completed")
+                && (any_status || run["status"].as_str() != Some("completed"))
         })
         .and_then(|run| {
             run["id"]
@@ -482,9 +509,10 @@ mod tests {
     }
 
     #[test]
-    fn adoption_skips_completed_runs() {
-        // A completed check run is immutable: GitHub answers a reopening PATCH
-        // with 200 and keeps it completed, so adoption must pass it by.
+    fn a_legacy_identity_adopts_only_a_live_run() {
+        // A bare row identity is shared by every generation: a completed
+        // match may be an older generation's immutable run, so adoption
+        // passes it by.
         let ext = "sentinel:run_1:aggregate";
         let list = serde_json::json!([
             {"id": 7, "external_id": ext, "status": "completed",
@@ -493,15 +521,29 @@ mod tests {
              "check_suite": {"id": 91}},
             {"id": 9, "external_id": "sentinel:other", "status": "in_progress"},
         ]);
-        let found = select(list.as_array().unwrap(), ext).unwrap();
+        let found = select(list.as_array().unwrap(), ext, false).unwrap();
         assert_eq!(found.check_run_id, 8);
         assert_eq!(found.check_suite_id, Some(91));
-        // Only a completed run matches: nothing is adoptable, a fresh create
-        // is owed instead.
         let done = serde_json::json!([
             {"id": 7, "external_id": ext, "status": "completed"},
         ]);
-        assert!(select(done.as_array().unwrap(), ext).is_none());
-        assert!(select(&[], ext).is_none());
+        assert!(select(done.as_array().unwrap(), ext, false).is_none());
+        assert!(select(&[], ext, false).is_none());
+    }
+
+    #[test]
+    fn a_per_create_identity_adopts_its_run_whatever_its_status() {
+        // The create for generation 3 carried `…:3`: a completed run with
+        // exactly that identity is the one that create made.
+        let ext = "sentinel:run_1:aggregate:3";
+        let list = serde_json::json!([
+            {"id": 6, "external_id": "sentinel:run_1:aggregate:1", "status": "completed"},
+            {"id": 7, "external_id": ext, "status": "completed",
+             "check_suite": {"id": 90}},
+        ]);
+        let found = select(list.as_array().unwrap(), ext, true).unwrap();
+        assert_eq!(found.check_run_id, 7);
+        assert_eq!(found.check_suite_id, Some(90));
+        assert!(select(list.as_array().unwrap(), "sentinel:run_1:aggregate:2", true).is_none());
     }
 }

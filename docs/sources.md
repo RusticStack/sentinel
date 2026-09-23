@@ -7,6 +7,21 @@ and — optionally — the forge installation the repository belongs to. A
 repository with no binding keeps working as the explicit manual mode that
 Part 04 exercised: a dispatch names its own remote and gets no credential.
 
+The worker fetches a manual remote with its own process identity, outside
+any job container, so the remote a client may name there is narrow: an
+unauthenticated `https://host[:port]/path` in the same canonical grammar a
+binding uses. `POST …/runs` on an unbound repository answers `400
+invalid_request` ("invalid manual source remote") — after authorization, so
+an outsider learns nothing — for a local path or `file://` URL (other
+repositories, mirrors and workspaces on the worker host), `ssh://` or scp
+syntax (the worker account's own SSH identity and configuration), `git://`,
+plain `http://`, remote helpers (`ext::`) and userinfo. A bound repository's
+dispatch must name exactly its binding, as before. Independently, every Git
+fetch that carries no source access runs with `protocol.allow=never` plus
+only `https` and local paths (worker-local mirrors and tests use the
+latter), no redirects and no credential helper, so even a spec that bypassed
+the API could not reach `ssh`, `git://` or plain HTTP.
+
 ## Two transports, one authority
 
 | | Generic binding | GitHub App association |
@@ -120,6 +135,21 @@ credential or the App token exactly as above, rechecks the binding's version
 and lifecycle after any round trip, and then discards the credential with the
 resolution's scratch directory. A generic repository's events never touch the
 App, and a forge-associated one never falls back to a generic credential.
+
+Every controller-side fetch — worker spec delivery, event resolution and ref
+polling — rechecks the binding against the destination allowlist as it is
+*now*, not only at bind time: narrowing `source-destinations.json` stops
+resolution with `failed:destination_refused` and backs a poll off with the
+same reason, before any credential is minted or remote contacted. A binding
+that authorizes nothing any more — its tenant suspended, its installation
+suspended or without the permissions it needs (`access_removed`), the binding
+revoked (including a `repository` rename that revoked it) — is a typed answer
+that settles or parks that one delivery or poll; it never fails a lane's pass
+for other tenants. A credential rotation that commits between the lookup and
+the issuance is retried under a fresh lookup (`retried:source_changed`), and
+a store fault while issuing is transient (`retried:store_unavailable`);
+only a sealed credential that cannot be opened is a permanent
+`failed:source_unavailable`. Version and ciphertext are read in one statement.
 
 ## Commands
 

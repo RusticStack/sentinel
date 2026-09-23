@@ -3,10 +3,12 @@
 //! Deliveries are tenant-owned rows; the operator opening the database reads
 //! them the way they read any other record. Listing is metadata only, and
 //! purging is bounded and retention-scoped: it never touches a pending
-//! delivery, only settled ones older than the retention duration.
+//! delivery, only settled ones older than the retention duration, and it
+//! retires GitHub control-event receipts the same way (never inside their
+//! replay window).
 
 use sentinel_core::{RepoId, UnixMillis};
-use sentinel_store::{Store, intake, lookup};
+use sentinel_store::{Store, github_events, intake, lookup};
 use serde_json::json;
 
 use crate::{
@@ -67,13 +69,24 @@ pub fn run(args: &IntakeArgs) -> Result<(), Error> {
             }
             let limit = *limit;
             let before = UnixMillis(UnixMillis::now().0.saturating_sub(retention));
-            let purged = store
+            let (purged, receipts) = store
                 .writer()
-                .write(move |tx| intake::purge_settled(tx, before, limit))
+                .write(move |tx| {
+                    let purged = intake::purge_settled(tx, before, limit)?;
+                    // Control-event receipts are retired under the same
+                    // bound (never younger than their replay window).
+                    let receipts =
+                        github_events::purge_receipts(tx, before, UnixMillis::now(), limit)?;
+                    Ok((purged, receipts))
+                })
                 .map_err(|error| fail(format!("cannot purge deliveries: {error}")))?;
             sentinel::outln!(
                 "{}",
-                json!({ "purged": purged, "older_than_ms": retention })
+                json!({
+                    "purged": purged,
+                    "receipts_purged": receipts,
+                    "older_than_ms": retention
+                })
             );
         }
     }

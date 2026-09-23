@@ -414,6 +414,7 @@ mod tests {
             "5é",
             "é",
             "5日",
+            "30д",
         ] {
             assert!(parse_duration(bad).is_err(), "{bad}");
         }

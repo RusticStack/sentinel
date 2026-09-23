@@ -30,7 +30,7 @@ const MAX_BACKOFF_MS: i64 = 5 * 60 * 1000;
 
 const COLUMNS: &str = "id, tenant_id, repo_id, run_id, delivery_id, scope, name, head_sha,
     external_id, status, conclusion, title, summary, check_run_id, seq, published_seq, state, reason,
-    check_suite_id, create_started_ms";
+    check_suite_id, create_started_ms, create_seq";
 
 /// A check's desired status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,11 +171,36 @@ pub struct Publication {
     /// presence means an earlier create may have landed: a later attempt must
     /// adopt by `external_id` instead of blindly creating another check run.
     pub create_started_ms: Option<i64>,
+    /// The generation whose create is outstanding or produced the current
+    /// handle: it names the run on GitHub ([`Publication::create_identity`]).
+    /// `None` on a row created before migration 33, whose run carries the
+    /// bare `external_id`.
+    pub create_seq: Option<i64>,
     pub seq: i64,
     pub published_seq: i64,
     /// Where the outbox stands: due, delivered, or refused with `reason`.
     pub state: State,
     pub reason: Option<String>,
+}
+
+/// The `external_id` a create for generation `seq` sends: the row's stable
+/// id plus the generation, so every create names exactly one GitHub run and
+/// a lost answer can be adopted by exact match whatever status the run was
+/// created with. `parse_control` and rerequest matching accept it (it keeps
+/// the `sentinel:` prefix and stays well under 128 bytes).
+pub fn create_identity(external_id: &str, seq: i64) -> String {
+    format!("{external_id}:{seq}")
+}
+
+impl Publication {
+    /// The identity the run behind this row was (or is being) created with:
+    /// what an update keeps sending and what an adoption lookup matches.
+    pub fn created_identity(&self) -> String {
+        match self.create_seq {
+            Some(seq) => create_identity(&self.external_id, seq),
+            None => self.external_id.clone(),
+        }
+    }
 }
 
 /// What a retry did.
@@ -361,7 +386,9 @@ struct Draft<'a> {
 /// A new generation resets the cursor to pending and clears any previous
 /// refusal or retry schedule. A generation that follows a `completed` one
 /// also drops the check-run handle: the remote run is terminal and GitHub
-/// silently keeps a completed run completed, so new work needs a fresh run.
+/// silently keeps a completed run completed, so new work needs a fresh run —
+/// and the create mark goes with it, so that fresh run is created under its
+/// own identity instead of adopting the terminal one.
 fn upsert(tx: &Transaction<'_>, draft: Draft<'_>, now: UnixMillis) -> Result<()> {
     let id = CheckId::new();
     tx.execute(
@@ -373,6 +400,10 @@ fn upsert(tx: &Transaction<'_>, draft: Draft<'_>, now: UnixMillis) -> Result<()>
             title = excluded.title, summary = excluded.summary,
             check_run_id = CASE WHEN check_publications.status = 'completed'
                 THEN NULL ELSE check_publications.check_run_id END,
+            create_started_ms = CASE WHEN check_publications.status = 'completed'
+                THEN NULL ELSE check_publications.create_started_ms END,
+            create_seq = CASE WHEN check_publications.status = 'completed'
+                THEN NULL ELSE check_publications.create_seq END,
              seq = check_publications.seq + 1, state = 0, reason = NULL, attempts = 0,
             next_attempt_ms = NULL, settled_ms = NULL, updated_ms = excluded.updated_ms",
         params![
@@ -630,6 +661,15 @@ pub fn record_delivery(
             "GitHub did not compute a tested merge for this pull request",
         ),
         "binding_revoked" => ("Not run", "the source binding was revoked"),
+        "tenant_suspended" => ("Not run", "the repository's tenant is suspended"),
+        "access_removed" => (
+            "Not run",
+            "the GitHub App installation no longer grants access",
+        ),
+        "destination_refused" => (
+            "Not run",
+            "the deployment no longer approves this source's destination",
+        ),
         "ref_not_allowed" => ("Not run", "the binding does not allow this ref"),
         "no_pipeline" => (
             "Not run",
@@ -733,6 +773,7 @@ type Fields = (
     Option<String>,
     Option<i64>,
     Option<i64>,
+    Option<i64>,
 );
 
 fn decode_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Fields> {
@@ -757,6 +798,7 @@ fn decode_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Fields> {
         r.get(17)?,
         r.get(18)?,
         r.get(19)?,
+        r.get(20)?,
     ))
 }
 
@@ -782,6 +824,7 @@ fn decode(row: Fields) -> Result<Publication> {
         reason,
         check_suite_id,
         create_started_ms,
+        create_seq,
     ) = row;
     Ok(Publication {
         id: CheckId::from_bytes(id).map_err(|_| Error::Corrupt("check id"))?,
@@ -807,6 +850,7 @@ fn decode(row: Fields) -> Result<Publication> {
         check_run_id,
         check_suite_id,
         create_started_ms,
+        create_seq,
         seq,
         published_seq,
         state: State::decode(state).ok_or(Error::Corrupt("check state"))?,
@@ -817,12 +861,14 @@ fn decode(row: Fields) -> Result<Publication> {
 /// Mark, durably and before the request, that a create was attempted for this
 /// generation. A crash between GitHub accepting the create and the handle
 /// being recorded then still reconciles through the `external_id` lookup
-/// rather than creating a second check run. The marker sticks across
-/// generations: once any create may have landed, every later create looks
+/// rather than creating a second check run. The mark records the generation
+/// the create is for, which is the identity the request carries
+/// ([`create_identity`]). It sticks across generations until the row's run
+/// goes terminal: once a create may have landed, every later create looks
 /// first. `Conflict` means the generation moved — re-read and start over.
 pub fn create_started(tx: &Transaction<'_>, id: CheckId, seq: i64, now: UnixMillis) -> Result<()> {
     let changed = tx.execute(
-        "UPDATE check_publications SET create_started_ms = ?3, updated_ms = ?3
+        "UPDATE check_publications SET create_started_ms = ?3, create_seq = ?2, updated_ms = ?3
          WHERE id = ?1 AND seq = ?2",
         params![id.as_bytes(), seq, now.0],
     )?;

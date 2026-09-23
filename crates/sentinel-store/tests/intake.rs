@@ -1098,3 +1098,96 @@ fn pull_request_terms_are_stored_and_bounded() {
         "pull request terms must belong to a stored delivery"
     );
 }
+
+/// The lanes' due query and idle probe run several times a second over a
+/// table that keeps every settled delivery a run depends on: they must be
+/// index searches that stop at their limit, never a scan plus a sort.
+#[test]
+fn the_due_queries_are_index_searches_without_a_sort() {
+    let mut f = fixture();
+    // Some settled history and some open work.
+    for n in 0..20 {
+        let accepted = accept(&mut f, &format!("push-{n}"), REF, SHA_A, SHA_B);
+        if n % 2 == 0 {
+            let tx = f.conn.transaction().unwrap();
+            intake::settle(&tx, accepted.id(), Resolution::Ignored("duplicate"), NOW).unwrap();
+            tx.commit().unwrap();
+        }
+    }
+    let plan = |sql: &str| -> String {
+        let mut stmt = f
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map(rusqlite::params![0_i64, NOW.0, 64_i64], |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.join("\n")
+    };
+    for sql in [
+        "SELECT id FROM webhook_deliveries
+         WHERE state IN (0, 1) AND state = ?1
+           AND (next_attempt_ms IS NULL OR next_attempt_ms <= ?2)
+         ORDER BY received_ms, id LIMIT ?3",
+        "SELECT EXISTS(SELECT 1 FROM webhook_deliveries
+           WHERE state IN (0, 1) AND state = ?1
+             AND (next_attempt_ms IS NULL OR next_attempt_ms <= ?2)) WHERE ?3 = ?3",
+    ] {
+        let plan = plan(sql);
+        assert!(!plan.contains("SCAN webhook_deliveries"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        assert!(plan.contains("deliveries_open"), "{plan}");
+    }
+    // And the queries the lanes actually run agree with the plans above.
+    let pending = intake::due(&f.conn, State::Pending, NOW, 64).unwrap();
+    assert_eq!(pending.len(), 10);
+    assert!(pending.windows(2).all(|w| w[0].received <= w[1].received));
+    assert!(intake::any_due(&f.conn, State::Pending, NOW).unwrap());
+    assert!(!intake::any_due(&f.conn, State::Ready, NOW).unwrap());
+    assert!(
+        intake::due(&f.conn, State::Ignored, NOW, 64)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A store fault while validating one delivery is not a verdict about it:
+/// the delivery is retried under the attempt budget, never settled as
+/// `tenant_suspended`, and the rest of the pass still settles.
+#[test]
+fn a_store_fault_during_validation_retries_instead_of_suspending() {
+    let mut f = fixture();
+    let faulty = accept(&mut f, "push-1", REF, SHA_A, SHA_B).id();
+    // An unreadable tenant id: `repo_tenant` answers `Corrupt`, not
+    // `NotFound`. Rewrite both sides of the foreign key with it.
+    let mut bad = *f.tenant.as_bytes();
+    bad[6] &= 0x0f; // version nibble 0: not an id this build issues
+    f.conn
+        .execute_batch("PRAGMA foreign_keys=OFF; DROP TRIGGER repo_owner_update;")
+        .unwrap();
+    f.conn
+        .execute(
+            "UPDATE tenants SET id = ?1 WHERE id = ?2",
+            rusqlite::params![bad, f.tenant.as_bytes()],
+        )
+        .unwrap();
+    f.conn
+        .execute(
+            "UPDATE repos SET tenant_id = ?1 WHERE tenant_id = ?2",
+            rusqlite::params![bad, f.tenant.as_bytes()],
+        )
+        .unwrap();
+    f.conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    let tx = f.conn.transaction().unwrap();
+    let settled = intake::resolve_due(&tx, NOW, 64).unwrap();
+    tx.commit().unwrap();
+    assert!(settled.is_empty(), "{settled:?}");
+    let row = fetch(&f, faulty);
+    assert_eq!(row.state, State::Pending, "{row:?}");
+    assert_eq!(row.attempts, 1, "{row:?}");
+    assert!(row.reason.is_none(), "{row:?}");
+}

@@ -141,7 +141,9 @@ pub fn normalize_user_code(text: &str) -> Option<String> {
 #[must_use]
 pub fn display_user_code(canonical: &str) -> String {
     let mut out = String::with_capacity(USER_CODE_LEN + 1);
-    let (a, b) = canonical.split_at(canonical.len().min(4));
+    // A character boundary, not a byte count: a non-canonical input must
+    // never panic here.
+    let (a, b) = canonical.split_at(canonical.floor_char_boundary(4));
     out.push_str(a);
     out.push('-');
     out.push_str(b);
@@ -325,6 +327,14 @@ mod tests {
             verifier,
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM="
         ));
+    }
+
+    #[test]
+    fn displaying_a_non_canonical_code_never_splits_a_character() {
+        // Byte 4 falls inside the second `é`: the split moves to a boundary.
+        assert_eq!(display_user_code("aéé"), "aé-é");
+        assert_eq!(display_user_code("€€"), "€-€");
+        assert_eq!(display_user_code(""), "-");
     }
 
     #[test]

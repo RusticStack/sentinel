@@ -324,6 +324,93 @@ fn a_check_run_rerequest_requeues_the_terminal_run() {
     assert_eq!(again.0, "unknown_check");
 }
 
+/// A check run created under its per-create identity (`…:<generation>`)
+/// is found by a rerequest naming that identity, as GitHub echoes it.
+#[test]
+fn a_rerequest_names_the_run_by_its_create_identity() {
+    let mut f = fixture();
+    let (run, jobs) = create_run(&mut f, NOW);
+    finish(&mut f, &jobs);
+    let publication = checks::of_run(&f.conn, f.tenant, run)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.scope == jobs[0].to_string())
+        .unwrap();
+    let tx = f.conn.transaction().unwrap();
+    checks::create_started(&tx, publication.id, publication.seq, NOW).unwrap();
+    checks::published(&tx, publication.id, publication.seq, 4242, Some(9001), NOW).unwrap();
+    tx.commit().unwrap();
+    let identity = checks::create_identity(&publication.external_id, publication.seq);
+    // A foreign suffix is not ours.
+    let (outcome, _) = accept(
+        &mut f,
+        "d-foreign",
+        3,
+        &Event::Rerequest {
+            installation: INSTALLATION,
+            repository: GITHUB_REPO_ID,
+            head: SHA_B.into(),
+            check: Some((4242, format!("{}:99", publication.external_id))),
+            suite: 9001,
+        },
+    );
+    assert_eq!(outcome, "unknown_check");
+    let (outcome, _) = accept(
+        &mut f,
+        "d-identity",
+        1,
+        &Event::Rerequest {
+            installation: INSTALLATION,
+            repository: GITHUB_REPO_ID,
+            head: SHA_B.into(),
+            check: Some((4242, identity)),
+            suite: 9001,
+        },
+    );
+    assert_eq!(outcome, "rerequested");
+}
+
+/// Receipts are retired by age in bounded batches, never inside the replay
+/// window whatever retention was asked for.
+#[test]
+fn receipts_are_purged_by_age_but_never_inside_the_replay_window() {
+    let mut f = fixture();
+    let event = Event::Installation {
+        installation: INSTALLATION,
+        disable: false,
+    };
+    for n in 0..3 {
+        accept(&mut f, &format!("d-{n}"), 7, &event);
+    }
+    let receipts = |f: &Fixture| -> i64 {
+        f.conn
+            .query_row("SELECT count(*) FROM github_events", [], |r| r.get(0))
+            .unwrap()
+    };
+    // Everything is older than `before`, but still inside the window.
+    let tx = f.conn.transaction().unwrap();
+    let inside = UnixMillis(NOW.0 + 1_000);
+    assert_eq!(
+        github_events::purge_receipts(&tx, inside, inside, 100).unwrap(),
+        0
+    );
+    tx.commit().unwrap();
+    assert_eq!(receipts(&f), 3);
+    // Past the window: bounded by the batch limit, oldest first.
+    let later = UnixMillis(NOW.0 + github_events::MIN_RECEIPT_RETENTION_MS + 1);
+    let tx = f.conn.transaction().unwrap();
+    assert_eq!(
+        github_events::purge_receipts(&tx, later, later, 2).unwrap(),
+        2
+    );
+    assert_eq!(
+        github_events::purge_receipts(&tx, later, later, 2).unwrap(),
+        1
+    );
+    tx.commit().unwrap();
+    assert_eq!(receipts(&f), 0);
+}
+
 #[test]
 fn a_check_suite_rerequest_resolves_by_suite_including_legacy_rows() {
     let mut f = fixture();

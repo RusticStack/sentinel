@@ -55,7 +55,9 @@ use sentinel_protocol::source::Access;
 
 use crate::{
     Checkout, Credential, Error, Result,
-    unix::{Askpass, Private, elapsed_ns, git, init, step, trim, valid_ref_name, valid_sha},
+    unix::{
+        Askpass, Private, elapsed_ns, git, init, step, transport, trim, valid_ref_name, valid_sha,
+    },
 };
 
 /// The directory under the worker's data directory holding every mirror.
@@ -461,9 +463,7 @@ impl Mirrors {
     /// installed beside the mirror for this fetch only.
     fn fetch(&self, dir: &Path, remote: &str, wants: &[String], ctx: &Ctx<'_>) -> Result<()> {
         let mut fetch = git(dir);
-        if let Some(private) = ctx.private {
-            private.configure(&mut fetch);
-        }
+        transport(&mut fetch, ctx.private);
         fetch.args(["-c", "gc.auto=0", "-c", "maintenance.auto=0"]);
         fetch.args(["fetch", "-q", "--no-tags", "--", remote]);
         fetch.args(wants);

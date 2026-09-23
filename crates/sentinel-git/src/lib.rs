@@ -29,7 +29,7 @@ pub mod mirror;
 #[cfg(unix)]
 pub use unix::{
     CHECKOUT_TIMEOUT, Checkout, Credential, FetchedFile, MAX_PATH_BYTES, Output, checkout,
-    checkout_authorized, file_at, file_at_merge, ls_remote, run,
+    checkout_authorized, file_at, file_at_merge, is_ancestor, ls_remote, run,
 };
 
 #[cfg(not(unix))]
@@ -38,7 +38,7 @@ mod stub;
 #[cfg(not(unix))]
 pub use stub::{
     CHECKOUT_TIMEOUT, Checkout, Credential, FetchedFile, Output, checkout, checkout_authorized,
-    file_at, file_at_merge, ls_remote, run,
+    file_at, file_at_merge, is_ancestor, ls_remote, run,
 };
 
 use std::fmt;

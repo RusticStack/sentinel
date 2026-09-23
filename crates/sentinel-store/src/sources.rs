@@ -231,6 +231,48 @@ pub fn validate_source(
     }
 }
 
+/// The remote a credentialed client may name for a repository with **no**
+/// binding (the explicit manual mode). The worker fetches it with its own
+/// process identity and no delivered credential, so only an unauthenticated
+/// `https://` remote in the canonical grammar is acceptable: never a local
+/// path or `file://` URL (other repositories and workspaces on the worker
+/// host), never `ssh://` (the worker account's own SSH identity and
+/// configuration), never `git://`, plain `http://`, a remote helper or
+/// userinfo. A bound repository is judged by [`validate_source`] instead.
+pub fn manual_remote_allowed(remote: &str) -> bool {
+    (remote.starts_with("https://") && sentinel_protocol::source::remote(remote).is_some())
+        || LOCAL_MANUAL_SOURCES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static LOCAL_MANUAL_SOURCES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only escape hatch: let this *process* dispatch manual runs from any
+/// remote, including local paths. Container suites that drive a real worker
+/// against a repository on disk call it once; production code never does,
+/// and nothing can set it from outside the process.
+#[doc(hidden)]
+pub fn permit_any_manual_source_for_tests() {
+    LOCAL_MANUAL_SOURCES.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Manual-dispatch admission for a client principal: a bound repository's
+/// source must be exactly its binding ([`validate_source`]), and an unbound
+/// repository's source must pass [`manual_remote_allowed`]. Host-local
+/// callers and the event path do not come through here.
+pub fn validate_manual(
+    conn: &Connection,
+    repo: RepoId,
+    source: &sentinel_pipeline::PinnedSource,
+) -> Result<()> {
+    match load_metadata(conn, repo) {
+        Ok(_) => validate_source(conn, repo, source),
+        Err(Error::NotFound) if manual_remote_allowed(&source.repo) => Ok(()),
+        Err(Error::NotFound) => Err(Error::InvalidInput("manual source remote")),
+        Err(e) => Err(e),
+    }
+}
+
 /// Fetch authority for one acknowledged, live, preparing attempt. The worker
 /// identity comes from mutual TLS; no tenant/repository is accepted from it.
 pub fn attempt_repo(
@@ -255,17 +297,31 @@ pub fn issue(
     key: &Key,
     now: UnixMillis,
 ) -> Result<Access> {
-    let m = load_metadata(conn, repo)?;
-    if m.revoked || m.forge.is_some() {
+    // One statement: the terms, the version and the ciphertext come from the
+    // same row image, so a rotation committing mid-issue can never pair one
+    // version's terms with another version's sealed credential.
+    type Row = (Vec<u8>, i64, bool, Option<[u8; 16]>, Vec<u8>);
+    let (binding, version, revoked, installation, sealed): Row = conn
+        .prepare_cached(
+            "SELECT b.binding, b.version, b.revoked, b.installation_id, b.credential
+             FROM source_bindings b JOIN tenants t ON t.id = b.tenant_id AND t.active = 1
+             WHERE b.repo_id = ?1 AND b.tenant_id = ?2",
+        )?
+        .query_row(params![repo.as_bytes(), tenant.as_bytes()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    if revoked || installation.is_some() {
         return Err(Error::Forbidden);
     }
-    let sealed: Vec<u8> = conn.query_row("SELECT b.credential FROM source_bindings b JOIN tenants t ON t.id=b.tenant_id AND t.active=1 WHERE b.repo_id=?1 AND b.tenant_id=?2 AND b.revoked=0",params![repo.as_bytes(),tenant.as_bytes()],|r|r.get(0)).optional()?.ok_or(Error::NotFound)?;
+    let version = u64::try_from(version).map_err(|_| Error::Corrupt("source version"))?;
     let bytes = key
-        .open(&context(tenant, repo, m.version), &sealed)
+        .open(&context(tenant, repo, version), &sealed)
         .map_err(|_| Error::Corrupt("sealed source credential"))?;
     let access = Access {
-        binding: m.binding,
-        version: m.version,
+        binding: serde_json::from_slice(&binding).map_err(|_| Error::Corrupt("source binding"))?,
+        version,
         expires_ms: now.0.saturating_add(60_000),
         credential: serde_json::from_slice(&bytes)
             .map_err(|_| Error::Corrupt("source credential"))?,

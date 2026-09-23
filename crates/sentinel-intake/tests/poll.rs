@@ -89,6 +89,10 @@ impl Fetch for FakeFetch {
     ) -> Result<sentinel_git::FetchedFile, sentinel_git::Error> {
         panic!("poll deliveries are pushes, not pull requests")
     }
+    fn is_ancestor(&self, _: resolve::AncestryRequest<'_>) -> Result<bool, sentinel_git::Error> {
+        // No history is modelled: nothing is proven stale.
+        Ok(false)
+    }
 }
 
 struct Fixture {
@@ -198,6 +202,11 @@ fn config(f: &Fixture) -> Option<store_poll::Config> {
     f.store.read(|c| store_poll::of_repo(c, f.repo)).unwrap()
 }
 
+/// The deployment's approved authorities: exactly the fixture binding's.
+fn destinations() -> Arc<[String]> {
+    vec!["https://git.example:8443".to_owned()].into()
+}
+
 fn lane_config() -> poll::Config {
     poll::Config {
         idle: Duration::from_millis(10),
@@ -216,6 +225,7 @@ fn an_observed_push_becomes_a_delivery_and_dispatches_a_run() {
         Arc::clone(&f.store),
         Some(Arc::clone(&f.key)),
         None,
+        destinations(),
         Arc::clone(&lister) as Arc<dyn Lister>,
         work,
         lane_config(),
@@ -243,6 +253,7 @@ fn an_observed_push_becomes_a_delivery_and_dispatches_a_run() {
         Arc::clone(&f.store),
         Some(Arc::clone(&f.key)),
         None,
+        destinations(),
         Arc::new(FakeFetch),
         f.dir.path().join("intake-work"),
         resolve::Config::default(),
@@ -277,6 +288,7 @@ fn remote_failures_back_the_schedule_off_and_revocation_retires_it() {
         Arc::clone(&f.store),
         Some(Arc::clone(&f.key)),
         None,
+        destinations(),
         Arc::clone(&lister) as Arc<dyn Lister>,
         f.dir.path().join("poll-work"),
         lane_config(),
@@ -322,6 +334,7 @@ fn a_binding_that_vanished_mid_schedule_drops_the_configuration() {
         Arc::clone(&f.store),
         Some(Arc::clone(&f.key)),
         None,
+        destinations(),
         Arc::clone(&lister) as Arc<dyn Lister>,
         f.dir.path().join("poll-work"),
         lane_config(),

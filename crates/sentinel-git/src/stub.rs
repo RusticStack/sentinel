@@ -99,3 +99,15 @@ pub fn ls_remote(
 ) -> Result<Vec<RefTip>> {
     Err(Error::UnsupportedPlatform)
 }
+
+pub fn is_ancestor(
+    _: &Path,
+    _: &str,
+    _: Option<&Access>,
+    _: &str,
+    _: &str,
+    _: u32,
+    _: Duration,
+) -> Result<bool> {
+    Err(Error::UnsupportedPlatform)
+}
