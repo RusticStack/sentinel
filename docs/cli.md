@@ -42,11 +42,13 @@ Stable; scripts and agents switch on them (`sentinel::client::Exit`).
 | 3 | unauthenticated or forbidden, including an expired or revoked grant; the message names the login command |
 | 4 | not found |
 | 5 | conflict or idempotency-key mismatch |
-| 6 | busy (`rate_limited`, `storage_full`, `internal`) or unreachable, after the client's retries |
+| 6 | busy (`rate_limited`, `storage_full`, `internal`) or unreachable, after the client's retries; or `outcome_unknown`, a write the controller could not confirm — it may have been applied, so check before repeating it |
 | 7 | `wait`: the deadline passed first |
 | 8 | `wait`: the run finished but did not pass |
 
-Retries: a `rate_limited`, `storage_full` or `internal` answer, a proxy's 502/503/504 and a transport failure are retried up to three attempts with back-off (200 ms, 400 ms, or the server's `retry-after`, at most 2 s) when the request is safe to repeat — GET, PUT, DELETE, and a POST that carries an `Idempotency-Key`. A POST without a key is never repeated, since the outcome of a busy write can be unknown.
+Retries: a `rate_limited`, `storage_full`, `internal` or `outcome_unknown` answer, a proxy's 502/503/504 and a transport failure are retried up to three attempts with back-off (200 ms, then 400 ms, or a `retry-after` header's seconds when the answer carries one, at most 2 s) when the request is safe to repeat — GET, PUT, DELETE, and a POST that carries an `Idempotency-Key`, which the controller replays instead of executing again. A POST without a key is never repeated, since the outcome of a busy write can be unknown. The controller names its own back-off in the error document rather than a header: a `rate_limited` answer with `details.retry_after_ms` (a refused long poll) is not retried by the client at all but returned to the command, and `wait` and `log show --follow` wait that long plus jitter before polling again; any other command exits 6.
+
+A closed standard output — the reader of a pipe exited, as `sentinel run list --all --output ndjson | head -1` does — ends the command at once, quietly, with **exit 0**: nothing failed on Sentinel's side and there is no one left to tell. (It used to panic with exit 101.) Any other failure to write standard output (for example a full disk behind a redirect) is reported and exits 1. Files the CLI reads — pipelines, token and grant files, the admin password on standard input — are bounded by the bytes actually read, so a device such as `/dev/zero` or an endless pipe is refused at the limit instead of exhausting memory.
 
 ## Authentication and profiles
 
@@ -207,7 +209,7 @@ Every command below takes the [shared client flags](#the-shared-client). `--tena
 
 **`cache`** reports per-attempt records only (K08 `cache:` entries of that attempt); there is no tenant-wide cache browser.
 
-`sentinel pipeline validate|explain` stay offline and take `--output text|json` (`--json` is `--output json`; there is no list to stream, so no `ndjson`). In JSON mode `explain` prints `sentinel.explain/1` and `validate` prints `{"file", "valid": true, "jobs"}` (text `validate` prints nothing on success), each as one line; a failure is one `sentinel.error/1` line on stderr (`invalid_pipeline`, or `client_usage` for an unreadable file) with stdout empty, like the networked commands.
+`sentinel pipeline validate|explain` stay offline and take `--output text|json` (`--json` is `--output json`; there is no list to stream, so no `ndjson`). In JSON mode `explain` prints `sentinel.explain/1` and `validate` prints `{"file", "valid": true, "jobs"}` (text `validate` prints nothing on success), each as one line; a failure is one `sentinel.error/1` line on stderr (`invalid_pipeline`, including a file over the 256 KiB limit, or `client_usage` for an unreadable file) with stdout empty, like the networked commands. The limit bounds the bytes read, not a reported size, so `validate /dev/zero` fails at 256 KiB.
 
 ## Legacy `sentinel api`
 
