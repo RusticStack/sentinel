@@ -1,4 +1,5 @@
-//! W07 worker-side reconciliation without a container runtime: markers
+//! W07 worker-side reconciliation against an empty container runtime (a
+//! shim that owns nothing): markers
 //! record attempts in flight with their fence, leftover workspaces are
 //! destroyed, a spool without a marker is discarded, a spool with one is
 //! kept for delivery, and the result names what was found.
@@ -15,8 +16,32 @@ use sentinel_worker::{
     workspace::Workspace,
 };
 
+/// A `podman` on `PATH` that owns nothing: recovery now requires a runtime
+/// that answers (it refuses to guess), and these cases are about the disk.
+fn empty_runtime() {
+    use std::os::unix::fs::PermissionsExt;
+    static SHIM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    SHIM.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("podman");
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let joined = format!(
+            "{}:{}",
+            dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        // SAFETY: set once, before either test of this binary runs a
+        // helper; `OnceLock` serializes the first call.
+        unsafe {
+            std::env::set_var("PATH", joined);
+        }
+    });
+}
+
 #[test]
 fn leftovers_are_settled_on_disk_and_kept_for_the_controller() {
+    empty_runtime();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let (running, finished, unmarked) = (AttemptId::new(), AttemptId::new(), AttemptId::new());
@@ -82,6 +107,7 @@ fn leftovers_are_settled_on_disk_and_kept_for_the_controller() {
 
 #[test]
 fn a_marker_without_a_spool_reports_whether_the_end_was_delivered() {
+    empty_runtime();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let (lost, done, gone) = (AttemptId::new(), AttemptId::new(), AttemptId::new());

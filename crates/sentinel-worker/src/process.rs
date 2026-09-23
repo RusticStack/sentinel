@@ -1,13 +1,21 @@
 //! Helper processes under a deadline, in their own process group, with
 //! bounded output capture. `git` and `podman` are both run this way.
+//!
+//! Waiting costs no polling: the child's exit wakes the wait at once (a
+//! pidfd), and the wait only returns early to look at the deadline and the
+//! cancel flag. A cancel kills the whole group, so a preparation helper — a
+//! large pull, say — never runs on after the attempt was cancelled.
 
 use std::{
     io::Read,
     os::unix::process::CommandExt,
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use sentinel_protocol::logs::Stream;
@@ -23,8 +31,6 @@ pub const CHUNK_BYTES: usize = 8192;
 
 /// Bytes of each stream kept for diagnostics; older output is dropped.
 pub const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
-/// How often a running helper is checked against its deadline.
-const POLL: Duration = Duration::from_millis(20);
 
 /// What a helper produced. `code` is `None` when it died from a signal.
 #[derive(Debug)]
@@ -55,33 +61,78 @@ impl Output {
     }
 }
 
+/// The last [`OUTPUT_TAIL_BYTES`] of a stream: a fixed ring written in
+/// place, so keeping the tail of a long stream costs no memmove per chunk.
+struct Tail {
+    ring: Vec<u8>,
+    /// Where the next byte goes once the ring is full.
+    head: usize,
+}
+
+impl Tail {
+    fn new() -> Tail {
+        Tail {
+            ring: Vec::with_capacity(4096),
+            head: 0,
+        }
+    }
+
+    fn push(&mut self, mut bytes: &[u8]) {
+        if bytes.len() >= OUTPUT_TAIL_BYTES {
+            bytes = &bytes[bytes.len() - OUTPUT_TAIL_BYTES..];
+            self.ring.clear();
+            self.ring.extend_from_slice(bytes);
+            self.head = 0;
+            return;
+        }
+        let room = OUTPUT_TAIL_BYTES - self.ring.len();
+        if room > 0 {
+            let fill = room.min(bytes.len());
+            self.ring.extend_from_slice(&bytes[..fill]);
+            bytes = &bytes[fill..];
+        }
+        while !bytes.is_empty() {
+            let n = (OUTPUT_TAIL_BYTES - self.head).min(bytes.len());
+            self.ring[self.head..self.head + n].copy_from_slice(&bytes[..n]);
+            self.head = (self.head + n) % OUTPUT_TAIL_BYTES;
+            bytes = &bytes[n..];
+        }
+    }
+
+    /// The tail in order, oldest byte first.
+    fn into_bytes(mut self) -> Vec<u8> {
+        if self.ring.len() == OUTPUT_TAIL_BYTES {
+            self.ring.rotate_left(self.head);
+        }
+        self.ring
+    }
+}
+
 /// Read a stream to its end, keeping only the last [`OUTPUT_TAIL_BYTES`]
 /// and handing every chunk to the sink as it arrives.
 fn drain(
     mut stream: impl Read + Send + 'static,
     which: Stream,
     sink: Option<Sink>,
-) -> thread::JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut tail = Vec::with_capacity(4096);
-        let mut chunk = [0u8; CHUNK_BYTES];
-        loop {
-            match stream.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if let Some(sink) = &sink {
-                        sink(which, &chunk[..n]);
-                    }
-                    tail.extend_from_slice(&chunk[..n]);
-                    if tail.len() > OUTPUT_TAIL_BYTES {
-                        let excess = tail.len() - OUTPUT_TAIL_BYTES;
-                        tail.drain(..excess);
+) -> std::io::Result<thread::JoinHandle<Vec<u8>>> {
+    thread::Builder::new()
+        .name("sentinel-helper-out".into())
+        .spawn(move || {
+            let mut tail = Tail::new();
+            let mut chunk = [0u8; CHUNK_BYTES];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Some(sink) = &sink {
+                            sink(which, &chunk[..n]);
+                        }
+                        tail.push(&chunk[..n]);
                     }
                 }
             }
-        }
-        tail
-    })
+            tail.into_bytes()
+        })
 }
 
 /// Run `command` as the leader of a new process group, with stdin closed,
@@ -93,10 +144,32 @@ pub fn run(command: Command, deadline: Instant, what: &'static str) -> Result<Ou
 
 /// [`run`] with the output also streamed to `sink`.
 pub fn run_with(
+    command: Command,
+    deadline: Instant,
+    what: &'static str,
+    sink: Option<Sink>,
+) -> Result<Output> {
+    run_canceled(command, deadline, what, sink, None)
+}
+
+fn kill_group(child: &mut std::process::Child) {
+    let pgid = child.id() as libc::pid_t;
+    // SAFETY: a plain syscall on our own child's process group id; a group
+    // that already vanished makes kill fail harmlessly.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+/// [`run_with`] that also ends — killing the whole group — once `cancel`
+/// is set, with `Preparation("<what> canceled")`.
+pub fn run_canceled(
     mut command: Command,
     deadline: Instant,
     what: &'static str,
     sink: Option<Sink>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Output> {
     command
         .stdin(Stdio::null())
@@ -104,33 +177,121 @@ pub fn run_with(
         .stderr(Stdio::piped())
         .process_group(0);
     let mut child = command.spawn()?;
-    let stdout = drain(
+    let readers = drain(
         child.stdout.take().expect("piped"),
         Stream::Stdout,
         sink.clone(),
-    );
-    let stderr = drain(child.stderr.take().expect("piped"), Stream::Stderr, sink);
+    )
+    .and_then(|stdout| {
+        drain(child.stderr.take().expect("piped"), Stream::Stderr, sink).map(|e| (stdout, e))
+    });
+    let (stdout, stderr) = match readers {
+        Ok(readers) => readers,
+        Err(e) => {
+            // No thread to read its pipes: the helper must not run on
+            // unobserved.
+            kill_group(&mut child);
+            return Err(e.into());
+        }
+    };
+    let watch = sentinel_git::ExitWatch::of(&child);
     let status = loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = sentinel_git::wait_step(&mut child, &watch, deadline)? {
             break status;
         }
-        if Instant::now() >= deadline {
-            let pgid = child.id() as libc::pid_t;
-            // SAFETY: a plain syscall on our own child's process group id; a
-            // group that already vanished makes kill fail harmlessly.
-            unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
-            }
-            let _ = child.wait();
+        let canceled = cancel.is_some_and(|c| c.load(Ordering::Acquire));
+        if canceled || Instant::now() >= deadline {
+            kill_group(&mut child);
             let _ = stdout.join();
             let _ = stderr.join();
-            return Err(Error::Timeout(what));
+            return Err(if canceled {
+                Error::Preparation(format!("{what} canceled"))
+            } else {
+                Error::Timeout(what)
+            });
         }
-        thread::sleep(POLL);
     };
     Ok(Output {
         code: status.code(),
         stdout: stdout.join().unwrap_or_default(),
         stderr: stderr.join().unwrap_or_default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn the_tail_keeps_the_last_bytes_in_order() {
+        let mut tail = Tail::new();
+        let mut all = Vec::new();
+        for i in 0..40u32 {
+            let chunk: Vec<u8> = (0..5_000).map(|j| ((i * 7 + j) % 251) as u8).collect();
+            tail.push(&chunk);
+            all.extend_from_slice(&chunk);
+        }
+        assert_eq!(tail.into_bytes(), all[all.len() - OUTPUT_TAIL_BYTES..]);
+        let mut short = Tail::new();
+        short.push(b"abc");
+        short.push(b"def");
+        assert_eq!(short.into_bytes(), b"abcdef");
+    }
+
+    /// P04-16: a cancel kills a running helper's whole group at once
+    /// instead of letting it run to its deadline.
+    #[test]
+    fn a_cancel_kills_a_running_helper() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let setter = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::Release);
+        });
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let started = Instant::now();
+        let outcome = run_canceled(
+            cmd,
+            Instant::now() + Duration::from_secs(30),
+            "sleep",
+            None,
+            Some(&cancel),
+        );
+        setter.join().unwrap();
+        assert!(matches!(outcome, Err(Error::Preparation(_))));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A helper that exits is noticed at once, not at the next poll tick:
+    /// running one costs what a blocking `wait` costs, plus the reader
+    /// threads — not an extra poll interval (the old 20 ms sleep added
+    /// 10 ms on average and at least 20 ms to a helper that outlived the
+    /// first check).
+    #[test]
+    fn a_quick_helper_is_not_held_by_a_poll_interval() {
+        const N: u32 = 20;
+        let sleep = || {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 0.01"]);
+            cmd
+        };
+        let started = Instant::now();
+        for _ in 0..N {
+            assert!(sleep().status().unwrap().success());
+        }
+        let blocking = started.elapsed() / N;
+        let started = Instant::now();
+        for _ in 0..N {
+            let output = run(sleep(), Instant::now() + Duration::from_secs(10), "sleep").unwrap();
+            assert!(output.success());
+        }
+        let ours = started.elapsed() / N;
+        assert!(
+            ours < blocking + Duration::from_millis(8),
+            "{ours:?} per helper against {blocking:?} blocking"
+        );
+    }
 }

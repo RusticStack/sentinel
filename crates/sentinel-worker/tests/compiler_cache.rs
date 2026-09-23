@@ -133,7 +133,12 @@ fn a_compiler_namespace_persists_across_attempts_and_the_tool_decides_staleness(
     if !enabled() {
         return;
     }
-    podman::pull(IMAGE, Duration::from_secs(600)).unwrap();
+    podman::pull(
+        IMAGE,
+        Duration::from_secs(600),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("cache");
     let repo = RepoId::new();

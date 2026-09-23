@@ -5,7 +5,9 @@
 //! holds and keeps renewing them once the session is back; if it is not back
 //! before the lease deadline the executor stops them itself (W06 reconciles
 //! the controller's view). A typed rejection is final for this
-//! configuration — the loop returns rather than retrying an unchanged hello.
+//! configuration — the loop returns rather than retrying an unchanged hello
+//! — except `Unavailable`, the controller's "try again later", which backs
+//! off and retries like a lost connection.
 
 use std::{
     net::SocketAddr,
@@ -230,7 +232,8 @@ fn serve_bulk(
 
 /// The worker's main loop: sessions back to back with bounded back-off,
 /// until `stop` is set. Returns the reason only when it is final: a typed
-/// rejection, an identity that cannot be used, or the stop.
+/// rejection other than `Unavailable`, an identity that cannot be used, or
+/// the stop.
 pub fn run(
     config: Config,
     identity: Identity,
@@ -261,6 +264,15 @@ pub fn run(
         }
         match outcome {
             Ok(()) => return Ok(()),
+            // The controller's store was briefly unavailable (a restart
+            // herd, a full writer queue): the same hello will be accepted
+            // later, so it is retried like a lost connection — with the
+            // same jittered back-off, so a fleet does not retry in step.
+            Err(Error::Rejected(session::Rejection::Unavailable)) if !handle.stopped() => {
+                on_event(Event::Disconnected(Error::Rejected(
+                    session::Rejection::Unavailable,
+                )));
+            }
             Err(Error::Rejected(why)) => return Err(Error::Rejected(why)),
             Err(_) if handle.stopped() => return Ok(()),
             Err(error) => on_event(Event::Disconnected(error)),

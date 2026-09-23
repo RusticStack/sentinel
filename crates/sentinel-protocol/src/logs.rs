@@ -61,21 +61,34 @@ pub enum RecordError {
     Invalid,
 }
 
+/// Append one frame record to `out` straight from borrowed parts — the same
+/// bytes as `Record::Frame(..).encode`, without building an owned frame.
+pub fn encode_frame(
+    seq: u64,
+    step: u32,
+    stream: Stream,
+    bytes: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), RecordError> {
+    if bytes.len() > MAX_LOG_FRAME_BYTES {
+        return Err(RecordError::Invalid);
+    }
+    out.reserve(FRAME_HEADER_BYTES + bytes.len());
+    out.push(KIND_FRAME);
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&step.to_le_bytes());
+    out.push(stream as u8);
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
 impl Record {
     /// Append the record's bytes to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), RecordError> {
         match self {
             Record::Frame(frame) => {
-                if frame.bytes.len() > MAX_LOG_FRAME_BYTES {
-                    return Err(RecordError::Invalid);
-                }
-                out.reserve(FRAME_HEADER_BYTES + frame.bytes.len());
-                out.push(KIND_FRAME);
-                out.extend_from_slice(&frame.seq.to_le_bytes());
-                out.extend_from_slice(&frame.step.to_le_bytes());
-                out.push(frame.stream as u8);
-                out.extend_from_slice(&(frame.bytes.len() as u32).to_le_bytes());
-                out.extend_from_slice(&frame.bytes);
+                encode_frame(frame.seq, frame.step, frame.stream, &frame.bytes, out)?;
             }
             Record::End { last_seq, gaps } => {
                 if gaps.len() > MAX_GAPS {

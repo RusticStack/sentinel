@@ -31,7 +31,9 @@ use crate::{
 
 /// How long a lease lasts without renewal. Renewal rides on the heartbeat
 /// (every 5 s), so a worker misses several beats before its lease lapses.
-pub const DEFAULT_LEASE_MS: i64 = 30_000;
+/// The worker protocol's constant: the worker measures the same duration
+/// from its own heartbeat, never by comparing wall clocks.
+pub const DEFAULT_LEASE_MS: i64 = sentinel_protocol::limits::LEASE_MS;
 /// How long an offer waits for its acknowledgement before it lapses and the
 /// job returns to the queue.
 pub const OFFER_ACK_MS: i64 = 5_000;
@@ -970,6 +972,9 @@ pub fn acknowledge(
 /// The offer was declined or never acknowledged: release the reservation and
 /// return the job to the queue under its advanced fence. Only an
 /// unacknowledged, held attempt can lapse; anything else is `NotFound`.
+/// A job whose cancellation was recorded while the offer was out does not
+/// wait in the queue for a placement it can never get: it ends `canceled`
+/// in the same transaction and its dependents are decided.
 pub fn lapse(tx: &Transaction<'_>, attempt: AttemptId, now: UnixMillis) -> Result<()> {
     let row: Option<([u8; 16], [u8; 16], i64)> = tx
         .prepare_cached(
@@ -985,14 +990,114 @@ pub fn lapse(tx: &Transaction<'_>, attempt: AttemptId, now: UnixMillis) -> Resul
     };
     let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?;
     let job = JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?;
+    give_back(tx, attempt, tenant, job, Fence(fence as u64), now).map(|_| ())
+}
+
+/// Release an attempt that never started and return its job to the queue
+/// (`OfferLapsed`, fence kept advanced); with cancellation desired, straight
+/// on to `canceled` with the dependents decided. The job must still be
+/// `Leased` under `fence`: once the worker reported a phase, only a report
+/// or an expiry may settle it.
+fn give_back(
+    tx: &Transaction<'_>,
+    attempt: AttemptId,
+    tenant: TenantId,
+    job: JobId,
+    fence: Fence,
+    now: UnixMillis,
+) -> Result<JobState> {
     let current = jobs::get_job(tx, tenant, job)?;
-    if current.fence.0 != fence as u64 {
+    if current.fence != fence || current.state != JobState::Leased {
         return Err(Error::Conflict);
     }
-    jobs::transition(tx, tenant, job, Actor::Controller, Event::OfferLapsed, now)?;
+    let mut next = jobs::transition(tx, tenant, job, Actor::Controller, Event::OfferLapsed, now)?;
     tx.prepare_cached("UPDATE attempts SET released_ms = ?2 WHERE id = ?1")?
         .execute(params![attempt.as_bytes(), now.0])?;
-    Ok(())
+    if current.cancel_requested {
+        next = jobs::transition(
+            tx,
+            tenant,
+            job,
+            Actor::Controller,
+            Event::CancelBeforeStart,
+            now,
+        )?;
+        let run = run_of(tx, tenant, job)?;
+        release_dependents(tx, tenant, run, now)?;
+    }
+    Ok(next)
+}
+
+/// The worker hands an attempt back without having run it: an offer it
+/// declined, or an acknowledged attempt whose run spec never reached it
+/// (the worker never started it, so the job is still `Leased`). Fenced on
+/// the holder: another worker naming the attempt, a stale fence or an
+/// attempt that already started is refused and nothing changes. The job
+/// returns to the queue — nothing ran, so this is not an execution and not
+/// an infrastructure failure — or ends `canceled` when that is desired.
+pub fn decline(
+    tx: &Transaction<'_>,
+    worker: WorkerId,
+    attempt: AttemptId,
+    fence: Fence,
+    now: UnixMillis,
+) -> Result<JobState> {
+    let row: Option<([u8; 16], [u8; 16])> = tx
+        .prepare_cached(
+            "SELECT tenant_id, job_id FROM attempts
+             WHERE id = ?1 AND worker_id = ?2 AND fence = ?3 AND released_ms IS NULL",
+        )?
+        .query_row(
+            params![attempt.as_bytes(), worker.as_bytes(), fence.0 as i64],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((tenant, job)) = row else {
+        return Err(Error::NotFound);
+    };
+    let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?;
+    let job = JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?;
+    give_back(tx, attempt, tenant, job, fence, now)
+}
+
+/// Where an attempt's run spec stands for the worker asking for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecGate {
+    /// Held and acknowledged: the spec may be served.
+    Ready,
+    /// Held, but the acknowledgement has not committed yet. It is in flight
+    /// on the control connection, or its write failed and the offer will
+    /// lapse — either way nothing may run before it is durable.
+    Unacknowledged,
+    /// Held and acknowledged, never started, and its job has cancellation
+    /// desired: settle it `canceled` (see [`decline`]) instead of serving.
+    Canceled(Fence),
+    /// Not this worker's live attempt.
+    NotHeld,
+}
+
+/// Whether the spec of `attempt` may go to `worker` now. One indexed read.
+pub fn spec_gate(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Result<SpecGate> {
+    let row: Option<(bool, i64, bool, i64)> = conn
+        .prepare_cached(
+            "SELECT a.acked_ms IS NOT NULL, a.fence, j.cancel_requested, j.state_code
+             FROM attempts a JOIN jobs j ON j.id = a.job_id
+             WHERE a.id = ?1 AND a.worker_id = ?2 AND a.released_ms IS NULL",
+        )?
+        .query_row(params![attempt.as_bytes(), worker.as_bytes()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .optional()?;
+    Ok(match row {
+        None => SpecGate::NotHeld,
+        Some((false, _, _, _)) => SpecGate::Unacknowledged,
+        Some((true, fence, true, state))
+            if decode_state(state).ok_or(Error::Corrupt("state_code"))? == JobState::Leased =>
+        {
+            SpecGate::Canceled(Fence(fence as u64))
+        }
+        Some(_) => SpecGate::Ready,
+    })
 }
 
 /// Offers whose [`OFFER_ACK_MS`] has passed at `now` without an
@@ -1266,8 +1371,27 @@ pub enum Cancelled {
 
 /// Cancellation as durable desired state: recorded first, effective at once
 /// for an unstarted job, delivered to the owning worker for a running one.
-/// Never cleared; a cancelled job cannot be rerun.
+/// An unstarted job that ends here decides its dependents in the same
+/// transaction, exactly as any other terminal edge does — a dependent left
+/// `blocked` would hold its run open forever. Operator and API cancels never
+/// clear the flag; the one exception is a GitHub check-run rerequest, which
+/// starts a cancelled job over (see docs/checks.md).
 pub fn cancel(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    job: JobId,
+    now: UnixMillis,
+) -> Result<Cancelled> {
+    let outcome = cancel_one(tx, tenant, job, now)?;
+    if outcome == Cancelled::Terminal {
+        let run = run_of(tx, tenant, job)?;
+        release_dependents(tx, tenant, run, now)?;
+    }
+    Ok(outcome)
+}
+
+/// [`cancel`] without deciding dependents: the caller does that once.
+fn cancel_one(
     tx: &Transaction<'_>,
     tenant: TenantId,
     job: JobId,
@@ -1293,7 +1417,10 @@ pub fn cancel(
     }
 }
 
-/// Cancel every job of a run that is not terminal yet.
+/// Cancel every job of a run that is not terminal yet; returns how many
+/// were cancelled or asked to stop. Every job is cancelled before
+/// dependents are decided, once, so nothing is decided against a sibling
+/// about to be cancelled too.
 pub fn cancel_run(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -1302,11 +1429,11 @@ pub fn cancel_run(
 ) -> Result<usize> {
     let mut count = 0;
     for (job, state) in runs::run_jobs(tx, tenant, run)? {
-        if !state.is_terminal() {
-            cancel(tx, tenant, job, now)?;
+        if !state.is_terminal() && cancel_one(tx, tenant, job, now)? != Cancelled::AlreadyTerminal {
             count += 1;
         }
     }
+    release_dependents(tx, tenant, run, now)?;
     Ok(count)
 }
 
@@ -1338,31 +1465,50 @@ pub fn cancel_requested(
 /// was never acknowledged is not here — it never ran, so it lapses back to
 /// the queue through [`unacknowledged`] instead.
 pub fn expired(conn: &Connection, now: UnixMillis) -> Result<Vec<AttemptId>> {
+    Ok(expired_scoped(conn, now)?
+        .into_iter()
+        .map(|(attempt, _, _)| attempt)
+        .collect())
+}
+
+/// [`expired`] with each attempt's run and job, so a caller can learn
+/// whether its log ended before it takes the writer.
+pub fn expired_scoped(
+    conn: &Connection,
+    now: UnixMillis,
+) -> Result<Vec<(AttemptId, RunId, JobId)>> {
+    let decode = |r: &rusqlite::Row<'_>| -> rusqlite::Result<([u8; 16], [u8; 16], [u8; 16])> {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    };
+    let typed = |(a, r, j): ([u8; 16], [u8; 16], [u8; 16])| -> Result<(AttemptId, RunId, JobId)> {
+        Ok((
+            AttemptId::from_bytes(a).map_err(|_| Error::Corrupt("attempt_id"))?,
+            RunId::from_bytes(r).map_err(|_| Error::Corrupt("run_id"))?,
+            JobId::from_bytes(j).map_err(|_| Error::Corrupt("job_id"))?,
+        ))
+    };
     let mut stmt = conn.prepare_cached(
-        "SELECT a.id FROM attempts a
+        "SELECT a.id, j.run_id, j.id FROM attempts a JOIN jobs j ON j.id = a.job_id
          WHERE a.released_ms IS NULL AND a.acked_ms IS NOT NULL AND a.lease_until_ms < ?1
          ORDER BY a.lease_until_ms LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![now.0, SWEEP_BATCH as i64], |r| {
-        r.get::<_, [u8; 16]>(0)
-    })?;
-    let mut out: Vec<AttemptId> = rows
-        .map(|row| AttemptId::from_bytes(row?).map_err(|_| Error::Corrupt("attempt_id")))
-        .collect::<Result<_>>()?;
+    let mut out = Vec::new();
+    for row in stmt.query_map(params![now.0, SWEEP_BATCH as i64], decode)? {
+        out.push(typed(row?)?);
+    }
     let mut overrun = conn.prepare_cached(
-        "SELECT a.id FROM attempts a JOIN jobs j ON j.id = a.job_id
+        "SELECT a.id, j.run_id, j.id FROM attempts a JOIN jobs j ON j.id = a.job_id
          WHERE a.released_ms IS NULL AND a.acked_ms IS NOT NULL
            AND a.acked_ms + j.timeout_ms + ?2 < ?1
          LIMIT ?3",
     )?;
-    let rows = overrun.query_map(
+    for row in overrun.query_map(
         params![now.0, EXECUTION_GRACE_MS, SWEEP_BATCH as i64],
-        |r| r.get::<_, [u8; 16]>(0),
-    )?;
-    for row in rows {
-        let id = AttemptId::from_bytes(row?).map_err(|_| Error::Corrupt("attempt_id"))?;
-        if !out.contains(&id) {
-            out.push(id);
+        decode,
+    )? {
+        let row = typed(row?)?;
+        if !out.iter().any(|(a, _, _)| *a == row.0) {
+            out.push(row);
         }
     }
     Ok(out)
@@ -1371,12 +1517,30 @@ pub fn expired(conn: &Connection, now: UnixMillis) -> Result<Vec<AttemptId>> {
 /// Expire one attempt: `LeaseExpired` through the machine, capacity back,
 /// dependents decided. The job is terminal `infra_failed` — never re-queued
 /// on its own, because whether its side effects happened is unknown.
+///
+/// The lease is re-checked in this write: a renewal that committed after the
+/// sweep read the attempt as due (a worker reconnecting at its deadline)
+/// wins, and the attempt is `NotFound` here rather than failed under a
+/// worker that was just granted more time.
 pub fn expire(
     tx: &Transaction<'_>,
     attempt: AttemptId,
     now: UnixMillis,
     logs: Option<&LogStore>,
 ) -> Result<JobState> {
+    let due: bool = tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM attempts a JOIN jobs j ON j.id = a.job_id
+             WHERE a.id = ?1 AND a.released_ms IS NULL AND a.acked_ms IS NOT NULL
+               AND (a.lease_until_ms < ?2 OR a.acked_ms + j.timeout_ms + ?3 < ?2))",
+        )?
+        .query_row(
+            params![attempt.as_bytes(), now.0, EXECUTION_GRACE_MS],
+            |r| r.get(0),
+        )?;
+    if !due {
+        return Err(Error::NotFound);
+    }
     finish(
         tx,
         attempt,
@@ -1385,6 +1549,60 @@ pub fn expire(
         now,
         logs,
     )
+}
+
+/// Run `f` inside a savepoint: its writes stay when it succeeds and are
+/// undone alone when it fails, so one bad row cannot sink a batch.
+fn isolated<T>(tx: &Transaction<'_>, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    tx.execute_batch("SAVEPOINT one")?;
+    match f() {
+        Ok(value) => {
+            tx.execute_batch("RELEASE one")?;
+            Ok(value)
+        }
+        Err(e) => {
+            tx.execute_batch("ROLLBACK TO one; RELEASE one")?;
+            Err(e)
+        }
+    }
+}
+
+/// Expire every attempt in `due` (from [`expired_scoped`]) in one
+/// transaction, re-checking each lease. `ended` says, per attempt, whether
+/// its log end marker was durable when the caller looked — computed before
+/// the writer was taken, so the writer never waits on log I/O. Returns how
+/// many expired; a renewed or already-settled attempt is skipped.
+pub fn expire_batch(
+    tx: &Transaction<'_>,
+    due: &[(AttemptId, bool)],
+    now: UnixMillis,
+) -> Result<usize> {
+    let mut count = 0;
+    for &(attempt, ended) in due {
+        let expired = isolated(tx, || {
+            let state = expire(tx, attempt, now, None)?;
+            if ended {
+                log_ended(tx, attempt)?;
+            }
+            Ok(state)
+        });
+        if expired.is_ok() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Lapse every offer past its acknowledgement timeout in one transaction;
+/// returns how many lapsed. One that was acknowledged meanwhile is skipped.
+pub fn lapse_due(tx: &Transaction<'_>, now: UnixMillis) -> Result<usize> {
+    let mut count = 0;
+    for attempt in unacknowledged(tx, now)? {
+        if isolated(tx, || lapse(tx, attempt, now)).is_ok() {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// A worker found this attempt in its own leftovers after a restart and
@@ -1416,9 +1634,15 @@ pub fn abandon(
         .prepare_cached("SELECT acked_ms IS NOT NULL FROM attempts WHERE id = ?1")?
         .query_row([attempt.as_bytes()], |r| r.get(0))?;
     if !acked {
-        // Never acknowledged: it never started, so back to the queue.
+        // Never acknowledged: it never started, so back to the queue (or
+        // `canceled`, when that is desired).
+        let (tenant, job): ([u8; 16], [u8; 16]) = tx
+            .prepare_cached("SELECT tenant_id, job_id FROM attempts WHERE id = ?1")?
+            .query_row([attempt.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?)))?;
         lapse(tx, attempt, now)?;
-        return Ok(JobState::Queued);
+        let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?;
+        let job = JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?;
+        return Ok(jobs::get_job(tx, tenant, job)?.state);
     }
     finish(tx, attempt, Actor::Reconciler, Event::Reconciled, now, logs)
 }
@@ -1525,18 +1749,29 @@ pub fn report(
     now: UnixMillis,
     logs: Option<&LogStore>,
 ) -> Result<JobState> {
-    let held: bool = tx
+    let cancel_requested: Option<bool> = tx
         .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM attempts WHERE id = ?1 AND worker_id = ?2 AND fence = ?3
-                           AND acked_ms IS NOT NULL AND released_ms IS NULL)",
+            "SELECT j.cancel_requested FROM attempts a JOIN jobs j ON j.id = a.job_id
+             WHERE a.id = ?1 AND a.worker_id = ?2 AND a.fence = ?3
+               AND a.acked_ms IS NOT NULL AND a.released_ms IS NULL",
         )?
         .query_row(
             params![attempt.as_bytes(), worker.as_bytes(), fence.0 as i64],
             |r| r.get(0),
-        )?;
-    if !held {
+        )
+        .optional()?;
+    let Some(cancel_requested) = cancel_requested else {
         return Err(Error::NotFound);
-    }
+    };
+    // `canceled` is the user's verdict: a worker that ended the attempt on
+    // its own (its lease watchdog, its own shutdown) with no cancel ever
+    // requested is reporting an infrastructure event, not a cancellation.
+    let event = match event {
+        Event::Failed(FailureClass::Canceled) if !cancel_requested => {
+            Event::Failed(FailureClass::Runtime)
+        }
+        event => event,
+    };
     let next = finish(tx, attempt, Actor::Worker(fence), event, now, logs)?;
     if let Some(summary) = summary
         && next.is_terminal()
@@ -1602,7 +1837,10 @@ type ContextRow = (
     i64,
 );
 
-/// Context for an attempt the worker holds. One statement for the identity
+/// Context for an attempt the worker holds and has acknowledged — nothing
+/// that could start work leaves before the acknowledgement is durable, so
+/// an offer that lapses for a lost ack write never also runs (P04-10). One
+/// statement for the identity
 /// row, one for the run's job states; the spec (already sent to the worker)
 /// names the dependencies.
 pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Result<JobContext> {
@@ -1612,7 +1850,8 @@ pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> R
                     j.cancel_requested, j.spec_index
              FROM attempts a JOIN jobs j ON j.id = a.job_id JOIN runs r ON r.id = j.run_id
              JOIN repos p ON p.id = r.repo_id
-             WHERE a.id = ?1 AND a.worker_id = ?2 AND a.released_ms IS NULL",
+             WHERE a.id = ?1 AND a.worker_id = ?2 AND a.acked_ms IS NOT NULL
+               AND a.released_ms IS NULL",
         )?
         .query_row(params![attempt.as_bytes(), worker.as_bytes()], |r| {
             Ok((
@@ -1800,12 +2039,14 @@ pub fn attempt_log_scope(
     ))
 }
 
-/// The encoded run spec of an attempt the worker holds, exactly as stored.
+/// The encoded run spec of an attempt the worker holds and has
+/// acknowledged, exactly as stored.
 pub fn spec_bytes(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Result<Vec<u8>> {
     conn.prepare_cached(
         "SELECT s.spec FROM attempts a JOIN jobs j ON j.id = a.job_id
          JOIN run_specs s ON s.run_id = j.run_id
-         WHERE a.id = ?1 AND a.worker_id = ?2 AND a.released_ms IS NULL",
+         WHERE a.id = ?1 AND a.worker_id = ?2 AND a.acked_ms IS NOT NULL
+           AND a.released_ms IS NULL",
     )?
     .query_row(params![attempt.as_bytes(), worker.as_bytes()], |r| r.get(0))
     .optional()?

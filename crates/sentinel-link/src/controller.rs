@@ -16,7 +16,7 @@
 //! reconstructs the queue and the reservations by reading them.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Condvar, Mutex,
@@ -56,6 +56,25 @@ use crate::{
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 /// Sessions accepted at once; beyond this a connection is closed unserved.
 pub const MAX_SESSIONS: usize = 1024;
+/// Connections that have not finished their handshake and hello yet. A
+/// separate cap: peers that have proved nothing can hold at most this many
+/// slots (each for at most the handshake deadline), so three quarters of
+/// [`MAX_SESSIONS`] always stay for authenticated workers, while a fleet
+/// reconnecting at once after a controller restart still gets through.
+pub const MAX_PENDING: usize = 256;
+/// Spec resolutions running at once. Each may make GitHub round trips to
+/// mint a source token, so they run off the session threads, bounded.
+const SPEC_RESOLVERS: usize = 8;
+/// Spec requests waiting for a resolver, fleet-wide. Per worker the bound
+/// is what it may hold ([`dispatch::MAX_HELD_ATTEMPTS`]); a request past
+/// either bound is dropped unanswered and the worker asks again.
+const MAX_SPEC_QUEUE: usize = 4096;
+/// How long a resolver waits for an acknowledgement still in flight on the
+/// control connection before leaving the request unanswered.
+const SPEC_ACK_WAIT: Duration = Duration::from_millis(dispatch::OFFER_ACK_MS as u64);
+/// Tries per request against a transient fault (reader overload, a GitHub
+/// timeout) before the request is left for the worker to ask again.
+const SPEC_TRIES: u32 = 3;
 
 /// Rows one storage maintenance pass may touch.
 const STORAGE_BATCH: i64 = 256;
@@ -105,6 +124,12 @@ pub struct Stats {
     pub remote_cache_freed: AtomicU64,
     /// The remote-cache store's kept bytes after its last sweep.
     pub remote_cache_bytes: AtomicU64,
+    /// Connections closed unserved because the session or pre-admission
+    /// cap was full.
+    pub shed: AtomicU64,
+    /// Spec requests handed back to the queue: offers declined and
+    /// acknowledged attempts whose spec never reached their worker.
+    pub handed_back: AtomicU64,
 }
 
 struct Peer {
@@ -132,6 +157,9 @@ struct Peer {
     /// their (run, job) so the store path costs one read per attempt
     /// rather than one per frame.
     logging: Mutex<HashMap<AttemptId, (RunId, JobId)>>,
+    /// The protocol-7 bulk connection attached to this session, closed with
+    /// it: a bulk connection lives exactly as long as its control session.
+    bulk: Mutex<Option<Sender>>,
 }
 
 /// A file currently receiving `ArtifactData` chunks.
@@ -179,10 +207,118 @@ struct ArtifactState {
     runs: HashMap<RunId, u64>,
 }
 
+/// One worker's request for an attempt's run spec, waiting for a resolver.
+struct SpecRequest {
+    worker: WorkerId,
+    attempt: AttemptId,
+    sender: Sender,
+    protocol: u16,
+}
+
+/// The bounded spec queue (P04-4): at most [`SPEC_RESOLVERS`] resolutions
+/// run at once, the rest wait here in arrival order instead of being
+/// refused. A request already waiting or running for the same attempt is
+/// not queued twice, and a worker can have no more waiting than it may
+/// hold. Resolver threads drain the queue and exit when it is empty.
+struct SpecDesk<T> {
+    state: Mutex<DeskState<T>>,
+}
+
+struct DeskState<T> {
+    running: usize,
+    queue: VecDeque<((WorkerId, AttemptId), T)>,
+    /// Queued or being resolved.
+    pending: HashSet<(WorkerId, AttemptId)>,
+    per_worker: HashMap<WorkerId, usize>,
+}
+
+/// What [`SpecDesk::submit`] did with a request.
+#[derive(Debug, PartialEq, Eq)]
+enum Submitted {
+    /// Queued; the caller must start one more resolver thread.
+    Start,
+    /// Queued behind the running resolvers.
+    Queued,
+    /// The same attempt is already waiting or being resolved.
+    Duplicate,
+    /// Over the per-worker or fleet bound: dropped, the worker asks again.
+    Full,
+}
+
+impl<T> SpecDesk<T> {
+    fn new() -> Self {
+        SpecDesk {
+            state: Mutex::new(DeskState {
+                running: 0,
+                queue: VecDeque::new(),
+                pending: HashSet::new(),
+                per_worker: HashMap::new(),
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, DeskState<T>> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn submit(&self, key: (WorkerId, AttemptId), request: T) -> Submitted {
+        let mut state = self.lock();
+        if state.pending.contains(&key) {
+            return Submitted::Duplicate;
+        }
+        let queued = state.per_worker.get(&key.0).copied().unwrap_or(0);
+        if state.queue.len() >= MAX_SPEC_QUEUE || queued >= dispatch::MAX_HELD_ATTEMPTS {
+            return Submitted::Full;
+        }
+        state.pending.insert(key);
+        *state.per_worker.entry(key.0).or_default() += 1;
+        state.queue.push_back((key, request));
+        if state.running < SPEC_RESOLVERS {
+            state.running += 1;
+            Submitted::Start
+        } else {
+            Submitted::Queued
+        }
+    }
+
+    /// The next request for a resolver thread, after settling the one it
+    /// finished (`done`). `None` means the queue is empty and the thread
+    /// has been counted out — it must exit.
+    fn next(&self, done: Option<(WorkerId, AttemptId)>) -> Option<((WorkerId, AttemptId), T)> {
+        let mut state = self.lock();
+        if let Some(key) = done {
+            state.pending.remove(&key);
+        }
+        match state.queue.pop_front() {
+            Some((key, request)) => {
+                if let Some(n) = state.per_worker.get_mut(&key.0) {
+                    *n -= 1;
+                    if *n == 0 {
+                        state.per_worker.remove(&key.0);
+                    }
+                }
+                Some((key, request))
+            }
+            None => {
+                state.running -= 1;
+                None
+            }
+        }
+    }
+
+    /// A resolver thread could not be started: count it out. Its request
+    /// stays queued for the next thread.
+    fn not_started(&self) {
+        self.lock().running -= 1;
+    }
+}
+
 struct Inner {
+    /// This controller, for the threads it starts from a `&self` handler.
+    me: std::sync::OnceLock<std::sync::Weak<Inner>>,
     source_destinations: Mutex<Arc<Vec<String>>>,
     source_app: Mutex<Option<Arc<sentinel_github::app::App>>>,
-    source_active: Arc<AtomicUsize>,
+    specs: SpecDesk<SpecRequest>,
     source_key: Mutex<Option<Arc<sentinel_auth::sealed::Key>>>,
     store: Arc<Store>,
     logs: Arc<LogStore>,
@@ -203,6 +339,10 @@ struct Inner {
     wake: (Mutex<bool>, Condvar),
     stop: AtomicBool,
     sessions: AtomicUsize,
+    /// Connections still in their handshake or hello.
+    pending: AtomicUsize,
+    max_pending: AtomicUsize,
+    handshake_ms: AtomicU64,
     stats: Stats,
 }
 
@@ -333,7 +473,11 @@ impl Inner {
     }
 
     fn serve(self: &Arc<Self>, socket: TcpStream) {
-        let outcome = session::accept(socket, Arc::clone(&self.config), &**self);
+        let deadline = Duration::from_millis(self.handshake_ms.load(Ordering::Relaxed));
+        let outcome = session::accept_within(socket, Arc::clone(&self.config), &**self, deadline);
+        // Handshake and hello are over, one way or the other: the slot of
+        // the pre-admission cap is free again.
+        self.pending.fetch_sub(1, Ordering::AcqRel);
         let mut session = match outcome {
             Ok(Accepted::Control(session)) => session,
             Ok(Accepted::Bulk(bulk)) => {
@@ -362,11 +506,19 @@ impl Inner {
             protocol: session.admitted.negotiated.protocol.0,
             transport: Mutex::new(None),
             logging: Mutex::new(HashMap::new()),
+            bulk: Mutex::new(None),
         });
-        self.register(worker, peer);
+        self.register(worker, Arc::clone(&peer));
         self.wake();
         let _ = session.serve(&**self);
         self.unregister(worker, generation);
+        // The socket goes with the session, whatever ended it: a sender
+        // still holding it (a spec resolver, the dispatcher) fails at once
+        // instead of writing into a connection nobody reads.
+        peer.sender.close();
+        if let Some(bulk) = peer.bulk.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            bulk.close();
+        }
         self.stats.sessions_ended.fetch_add(1, Ordering::Relaxed);
         // Its unacknowledged offers lapse in the sweep; acknowledged leases
         // run to expiry (W06), so a brief reconnect keeps its work.
@@ -385,26 +537,52 @@ impl Inner {
             return;
         }
         self.stats.bulk_attached.fetch_add(1, Ordering::Relaxed);
-        let _ = bulk.serve(&**self, peer.protocol);
+        let sender = bulk.sender();
+        if let Some(previous) = peer
+            .bulk
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(sender.clone())
+        {
+            previous.close();
+        }
+        // Idle is fine for as long as the control session this connection
+        // belongs to is registered; its end closes this socket too.
+        let worker = bulk.worker;
+        let alive = || {
+            self.peer(worker)
+                .is_some_and(|live| Arc::ptr_eq(&live, &peer))
+        };
+        let _ = bulk.serve(&**self, peer.protocol, &alive);
+        sender.close();
         self.stats.sessions_ended.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One dispatch pass: sweep lapsed offers, then fill every connected
-    /// worker until nothing fits. Each placement is its own transaction, so
-    /// a failing one never holds up the rest. Storage maintenance runs on
-    /// its own thread ([`Inner::maintenance_loop`]), never here.
+    /// One dispatch pass: sweep expired leases and lapsed offers (one
+    /// batched transaction each, every lease re-checked inside it), then
+    /// fill every connected worker until nothing fits — one transaction per
+    /// worker per pass, so a failing one never holds up the rest. Storage
+    /// maintenance runs on its own thread ([`Inner::maintenance_loop`]),
+    /// never here.
     fn dispatch_pass(&self) {
         let now = UnixMillis::now();
         // Leases that ran out and attempts that outran their job's timeout
-        // by the grace: infra-failed, capacity back, never replayed.
-        if let Ok(due) = self.store.read(|c| dispatch::expired(c, now)) {
-            for attempt in due {
-                let logs = Arc::clone(&self.logs);
-                if self
-                    .write(move |tx| dispatch::expire(tx, attempt, now, Some(&logs)))
-                    .is_ok()
-                {
-                    self.stats.expired.fetch_add(1, Ordering::Relaxed);
+        // by the grace: infra-failed, capacity back, never replayed. One
+        // write for the whole batch, each lease re-checked inside it; the
+        // log-end answer is read here, so the writer never waits on log I/O.
+        if let Ok(due) = self.store.read(|c| dispatch::expired_scoped(c, now))
+            && !due.is_empty()
+        {
+            let ends: Vec<(AttemptId, bool)> = due
+                .iter()
+                .map(|&(attempt, run, job)| (attempt, self.logs.has_end(run, job, attempt)))
+                .collect();
+            if let Ok(count) = self.write(move |tx| dispatch::expire_batch(tx, &ends, now)) {
+                self.stats
+                    .expired
+                    .fetch_add(count as u64, Ordering::Relaxed);
+                for (attempt, _, _) in due {
+                    self.logs.forget(attempt);
                 }
             }
         }
@@ -413,15 +591,8 @@ impl Inner {
                 .queue_timeouts
                 .fetch_add(count as u64, Ordering::Relaxed);
         }
-        if let Ok(due) = self.store.read(|c| dispatch::unacknowledged(c, now)) {
-            for attempt in due {
-                if self
-                    .write(move |tx| dispatch::lapse(tx, attempt, now))
-                    .is_ok()
-                {
-                    self.stats.lapsed.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+        if let Ok(count) = self.write(move |tx| dispatch::lapse_due(tx, now)) {
+            self.stats.lapsed.fetch_add(count as u64, Ordering::Relaxed);
         }
         // Below the low watermark, no new work is placed: a job that cannot
         // store its output must not consume capacity discovering that.
@@ -658,28 +829,61 @@ impl Inner {
     /// resolved against the store once per attempt, then remembered on the
     /// session. A released attempt still accepts log frames and its end;
     /// the verdict is long decided and the bytes are evidence.
-    fn log_scope(&self, worker: WorkerId, attempt: AttemptId) -> Option<(RunId, JobId)> {
-        let peer = self.peer(worker)?;
+    ///
+    /// `Ok(None)` is a definite "not this worker's" (or no live session);
+    /// `Err` is a store fault, which must never be answered as a refusal.
+    fn log_scope(
+        &self,
+        worker: WorkerId,
+        attempt: AttemptId,
+    ) -> std::result::Result<Option<(RunId, JobId)>, ()> {
+        let Some(peer) = self.peer(worker) else {
+            return Ok(None);
+        };
         if let Some(scope) = peer
             .logging
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(&attempt)
         {
-            return Some(*scope);
+            return Ok(Some(*scope));
         }
-        let scope = self
-            .store
-            .read(|c| {
-                let tx = c.unchecked_transaction()?;
-                dispatch::attempt_log_scope(&tx, worker, attempt)
-            })
-            .ok()?;
+        let scope = match self.store.read(|c| {
+            let tx = c.unchecked_transaction()?;
+            dispatch::attempt_log_scope(&tx, worker, attempt)
+        }) {
+            Ok(scope) => scope,
+            Err(sentinel_store::Error::NotFound) => return Ok(None),
+            Err(_) => return Err(()),
+        };
         peer.logging
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(attempt, scope);
-        Some(scope)
+        Ok(Some(scope))
+    }
+
+    /// Whether the attempt's log end is durable, asked before a terminal
+    /// write so the writer thread never waits on the log store's I/O.
+    /// Unknown (a store fault) answers `false`: the row then says
+    /// `incomplete`, which a later `LogEnd` upgrades.
+    fn log_has_end(&self, worker: WorkerId, attempt: AttemptId) -> bool {
+        match self.log_scope(worker, attempt) {
+            Ok(Some((run, job))) => self.logs.has_end(run, job, attempt),
+            _ => false,
+        }
+    }
+
+    /// The attempt was released: its open log writer and cached scope go
+    /// with it, so neither grows with uptime (P04-23).
+    fn released(&self, worker: WorkerId, attempt: AttemptId) {
+        self.logs.forget(attempt);
+        if let Some(peer) = self.peer(worker) {
+            peer.logging
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&attempt);
+        }
     }
 
     /// Record the settled outcome of a declared artifact: `state`, the
@@ -787,6 +991,145 @@ impl Inner {
     }
 }
 
+/// Back-off between tries against a transient fault: doubling from 100 ms,
+/// with ±25 % jitter from the attempt id so concurrent resolutions do not
+/// retry in step.
+fn spec_backoff(try_no: u32, attempt: AttemptId) -> Duration {
+    let base = 100u64 << try_no.min(4);
+    let quarter = base / 4;
+    let noise = u64::from(attempt.as_bytes()[15] ^ attempt.as_bytes()[7]);
+    Duration::from_millis(base - quarter + noise % (2 * quarter + 1))
+}
+
+impl Inner {
+    /// A resolver thread: drain the spec desk, then exit.
+    fn resolve_specs(&self) {
+        let mut done = None;
+        while let Some((key, request)) = self.specs.next(done.take()) {
+            self.serve_spec(&request);
+            done = Some(key);
+        }
+    }
+
+    fn no_spec(request: &SpecRequest) {
+        let _ = request.sender.send(&session::ServerMessage::NoSpec {
+            attempt: *request.attempt.as_bytes(),
+        });
+    }
+
+    /// Where the attempt stands, with transient read faults retried. `None`
+    /// means the question stays open: leave the request unanswered.
+    fn spec_gate(&self, request: &SpecRequest) -> Option<dispatch::SpecGate> {
+        let (worker, attempt) = (request.worker, request.attempt);
+        let started = Instant::now();
+        let mut pause = Duration::from_millis(2);
+        let mut faults = 0;
+        loop {
+            match self.store.read(|c| dispatch::spec_gate(c, worker, attempt)) {
+                // The acknowledgement is on its way on the control
+                // connection (the request may have come on bulk): wait for
+                // it, briefly. Nothing is served before it is durable.
+                Ok(dispatch::SpecGate::Unacknowledged) => {
+                    if started.elapsed() >= SPEC_ACK_WAIT {
+                        return None;
+                    }
+                    thread::sleep(pause);
+                    pause = (pause * 2).min(Duration::from_millis(100));
+                }
+                Ok(gate) => return Some(gate),
+                Err(_) => {
+                    faults += 1;
+                    if faults >= SPEC_TRIES {
+                        return None;
+                    }
+                    thread::sleep(spec_backoff(faults, attempt));
+                }
+            }
+        }
+    }
+
+    /// Settle an acknowledged, unstarted attempt whose job has cancellation
+    /// desired: `canceled` now, dependents decided, and `NoSpec` so the
+    /// worker lets it go.
+    fn settle_canceled(&self, request: &SpecRequest, fence: Fence) {
+        let (worker, attempt) = (request.worker, request.attempt);
+        if self
+            .write(move |tx| dispatch::decline(tx, worker, attempt, fence, UnixMillis::now()))
+            .is_ok()
+        {
+            self.stats.handed_back.fetch_add(1, Ordering::Relaxed);
+            self.wake();
+            Self::no_spec(request);
+        }
+    }
+
+    /// Serve one spec request. A definitive answer is sent — the spec, or
+    /// `NoSpec` for an attempt that is not this worker's, was settled
+    /// canceled, or whose source or spec is refused for good. A transient
+    /// fault is retried a few times and then left unanswered: the worker
+    /// asks again, and hands the attempt back if it never gets it, so a
+    /// fault never turns into an infrastructure failure of a job that did
+    /// not run (P04-4).
+    fn serve_spec(&self, request: &SpecRequest) {
+        let (worker, attempt) = (request.worker, request.attempt);
+        match self.spec_gate(request) {
+            None => return,
+            Some(dispatch::SpecGate::NotHeld) => return Self::no_spec(request),
+            Some(dispatch::SpecGate::Canceled(fence)) => {
+                return self.settle_canceled(request, fence);
+            }
+            Some(dispatch::SpecGate::Ready | dispatch::SpecGate::Unacknowledged) => {}
+        }
+        let key = self
+            .source_key
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let app = self
+            .source_app
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let destinations = self
+            .source_destinations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        for try_no in 0..SPEC_TRIES {
+            match resolve_spec(
+                &self.store,
+                key.as_deref(),
+                app.as_ref(),
+                &destinations,
+                worker,
+                attempt,
+            ) {
+                Ok(spec) => {
+                    let _ = send_resolved(&request.sender, attempt, request.protocol, Some(spec));
+                    return;
+                }
+                Err(SpecFault::Refused) => {
+                    // A cancel that landed after the gate refuses a bound
+                    // source too: settle it as the cancel it is.
+                    match self.spec_gate(request) {
+                        Some(dispatch::SpecGate::Canceled(fence)) => {
+                            self.settle_canceled(request, fence);
+                        }
+                        None => {}
+                        Some(_) => Self::no_spec(request),
+                    }
+                    return;
+                }
+                Err(SpecFault::Transient) => {
+                    if try_no + 1 < SPEC_TRIES {
+                        thread::sleep(spec_backoff(try_no, attempt));
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Admission for Inner {
     fn admit(
         &self,
@@ -810,15 +1153,33 @@ impl Admission for Inner {
         };
         match self.store.read(|c| workers::authenticate(c, fingerprint)) {
             Ok(known) => {
+                // The architecture is part of what was enrolled; a machine
+                // presenting the key on another one is not that worker.
+                if known.negotiated.arch != negotiated.arch {
+                    return Err(Rejection::Identity);
+                }
+                // Negotiated afresh on every hello and recorded: an upgraded
+                // worker is welcomed at the newer protocol (and so sends
+                // its profile), a rolled-back one at a version it speaks.
                 let id = known.id;
-                if !deferred {
-                    self.write(move |tx| dispatch::report_capacity(tx, id, capacity))
-                        .map_err(|_| Rejection::Unavailable)?;
+                let renegotiated = (known.negotiated != negotiated).then_some(negotiated);
+                let immediate = (!deferred).then_some(capacity);
+                if renegotiated.is_some() || immediate.is_some() {
+                    self.write(move |tx| {
+                        if let Some(negotiated) = renegotiated {
+                            workers::renegotiate(tx, id, negotiated)?;
+                        }
+                        if let Some(capacity) = immediate {
+                            dispatch::report_capacity(tx, id, capacity)?;
+                        }
+                        Ok(())
+                    })
+                    .map_err(|_| Rejection::Unavailable)?;
                 }
                 return Ok(Admitted {
                     worker: known.id,
                     pool: known.pool,
-                    negotiated: known.negotiated,
+                    negotiated,
                 });
             }
             Err(sentinel_store::Error::NotFound) => {}
@@ -844,7 +1205,8 @@ impl Admission for Inner {
         self.store
             .writer()
             .write(move |tx| {
-                let enrolled = workers::enroll(
+                // A refused secret commits its audit row: `Ok(None)`.
+                let Some(enrolled) = workers::redeem(
                     tx,
                     &secret,
                     workers::Presentation {
@@ -854,15 +1216,18 @@ impl Admission for Inner {
                         negotiated,
                     },
                     UnixMillis::now(),
-                )?;
+                )?
+                else {
+                    return Ok(None);
+                };
                 if let Some(capacity) = immediate_capacity {
                     dispatch::report_capacity(tx, enrolled.id, capacity)?;
                 }
-                Ok(Admitted {
+                Ok(Some(Admitted {
                     worker: enrolled.id,
                     pool: enrolled.pool,
                     negotiated: enrolled.negotiated,
-                })
+                }))
             })
             .map_err(|e| match e {
                 sentinel_store::Error::Conflict | sentinel_store::Error::InvalidInput(_) => {
@@ -870,11 +1235,18 @@ impl Admission for Inner {
                 }
                 sentinel_store::Error::NotFound => Rejection::Enrollment,
                 _ => Rejection::Unavailable,
-            })
+            })?
+            .ok_or(Rejection::Enrollment)
     }
 }
 
 impl SessionHandler for Inner {
+    /// Queue the request on the bounded spec desk: at most
+    /// [`SPEC_RESOLVERS`] resolutions (each possibly a GitHub round trip)
+    /// run off the session threads, and the rest wait their turn instead of
+    /// being refused. A request over the bound is dropped unanswered — the
+    /// worker asks again — never answered `NoSpec`, which would end the
+    /// attempt.
     fn spec_requested(
         &self,
         worker: WorkerId,
@@ -882,64 +1254,24 @@ impl SessionHandler for Inner {
         sender: Sender,
         protocol: u16,
     ) -> bool {
-        // No unbounded queue, and no GitHub round trip on heartbeat/dispatch.
-        if self
-            .source_active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < 8).then_some(n + 1)
-            })
-            .is_err()
-        {
-            let _ = sender.send(&session::ServerMessage::NoSpec {
-                attempt: *attempt.as_bytes(),
+        let request = SpecRequest {
+            worker,
+            attempt,
+            sender,
+            protocol,
+        };
+        if self.specs.submit((worker, attempt), request) == Submitted::Start {
+            let me = self.me.get().and_then(std::sync::Weak::upgrade);
+            let spawned = me.is_some_and(|me| {
+                thread::Builder::new()
+                    .name("sentinel-source".into())
+                    .spawn(move || me.resolve_specs())
+                    .is_ok()
             });
-            return true;
-        }
-        let active = Arc::clone(&self.source_active);
-        let store = Arc::clone(&self.store);
-        let key = self
-            .source_key
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        let app = self
-            .source_app
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        let failed = sender.clone();
-        let destinations = self
-            .source_destinations
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        if thread::Builder::new()
-            .name("sentinel-source".into())
-            .spawn(move || {
-                struct Permit(Arc<AtomicUsize>);
-                impl Drop for Permit {
-                    fn drop(&mut self) {
-                        self.0.fetch_sub(1, Ordering::AcqRel);
-                    }
-                }
-                let _permit = Permit(active);
-                let spec = resolve_spec(
-                    &store,
-                    key.as_deref(),
-                    app.as_ref(),
-                    &destinations,
-                    worker,
-                    attempt,
-                )
-                .ok();
-                let _ = send_resolved(&sender, attempt, protocol, spec);
-            })
-            .is_err()
-        {
-            self.source_active.fetch_sub(1, Ordering::AcqRel);
-            let _ = failed.send(&session::ServerMessage::NoSpec {
-                attempt: *attempt.as_bytes(),
-            });
+            if !spawned {
+                // The request stays queued for the next resolver.
+                self.specs.not_started();
+            }
         }
         true
     }
@@ -1008,9 +1340,13 @@ impl SessionHandler for Inner {
         event: Event,
         summary: Option<Vec<u8>>,
     ) {
-        let logs = Arc::clone(&self.logs);
+        // Whether the log ended is asked here, before the writer is taken,
+        // so a terminal report never waits behind another attempt's log
+        // fsync on the single writer thread.
+        let ended =
+            matches!(event, Event::Passed | Event::Failed(_)) && self.log_has_end(worker, attempt);
         let finished = self.write(move |tx| {
-            dispatch::report(
+            let state = dispatch::report(
                 tx,
                 worker,
                 attempt,
@@ -1018,13 +1354,18 @@ impl SessionHandler for Inner {
                 event,
                 summary.as_deref(),
                 UnixMillis::now(),
-                Some(&logs),
-            )
+                None,
+            )?;
+            if ended && state.is_terminal() {
+                dispatch::log_ended(tx, attempt)?;
+            }
+            Ok(state)
         });
         match finished {
             Ok(state) => {
                 self.stats.reports.fetch_add(1, Ordering::Relaxed);
                 if state.is_terminal() {
+                    self.released(worker, attempt);
                     // Capacity came back and dependents may be queued.
                     self.wake();
                 }
@@ -1038,12 +1379,17 @@ impl SessionHandler for Inner {
     }
 
     fn abandoned(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {
-        let logs = Arc::clone(&self.logs);
+        let ended = self.log_has_end(worker, attempt);
         let settled = self.write(move |tx| {
-            dispatch::abandon(tx, worker, attempt, fence, UnixMillis::now(), Some(&logs))
+            let state = dispatch::abandon(tx, worker, attempt, fence, UnixMillis::now(), None)?;
+            if ended && state.is_terminal() {
+                dispatch::log_ended(tx, attempt)?;
+            }
+            Ok(state)
         });
         if settled.is_ok() {
             self.stats.abandoned.fetch_add(1, Ordering::Relaxed);
+            self.released(worker, attempt);
             self.wake();
         } else {
             self.stats.stale_reports.fetch_add(1, Ordering::Relaxed);
@@ -1137,10 +1483,19 @@ impl SessionHandler for Inner {
         )
     }
 
+    /// `Refused` only for a permanent cause — not this worker's attempt, a
+    /// log that already ended, the size cap, no disk reserve left for
+    /// evidence. A store read or log I/O fault is `Retry`: the connection
+    /// closes and the worker resends from its last acknowledgement, so a
+    /// passing job never loses its log (and its verdict) to a hiccup.
     fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict {
-        let Some((run, job)) = self.log_scope(worker, attempt) else {
-            self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
-            return LogVerdict::Refused;
+        let (run, job) = match self.log_scope(worker, attempt) {
+            Ok(Some(scope)) => scope,
+            Ok(None) => {
+                self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
+                return LogVerdict::Refused;
+            }
+            Err(()) => return LogVerdict::Retry,
         };
         match self.logs.append(run, job, attempt, &frame) {
             Ok(sentinel_store::logs::Appended::Stored { through })
@@ -1148,10 +1503,15 @@ impl SessionHandler for Inner {
                 self.stats.log_frames.fetch_add(1, Ordering::Relaxed);
                 LogVerdict::Acked(through)
             }
-            Err(_) => {
+            Err(
+                sentinel_store::Error::Conflict
+                | sentinel_store::Error::InvalidInput(_)
+                | sentinel_store::Error::StorageFull,
+            ) => {
                 self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
                 LogVerdict::Refused
             }
+            Err(_) => LogVerdict::Retry,
         }
     }
 
@@ -1162,21 +1522,25 @@ impl SessionHandler for Inner {
         last_seq: u64,
         gaps: &[(u64, u64)],
     ) -> LogVerdict {
-        let Some((run, job)) = self.log_scope(worker, attempt) else {
-            self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
-            return LogVerdict::Refused;
+        let (run, job) = match self.log_scope(worker, attempt) {
+            Ok(Some(scope)) => scope,
+            Ok(None) => {
+                self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
+                return LogVerdict::Refused;
+            }
+            Err(()) => return LogVerdict::Retry,
         };
         match self.logs.finish(run, job, attempt, last_seq, gaps) {
             Ok(()) => {
                 // The acknowledgement — and the spool it releases — waits for
                 // the row that says the end marker is durable. If the write
-                // fails the worker re-sends `LogEnd`; `finish` is idempotent.
+                // fails the connection closes and the worker re-sends
+                // `LogEnd` from its rewind; `finish` is idempotent.
                 if self
                     .write(move |tx| dispatch::log_ended(tx, attempt))
                     .is_err()
                 {
-                    self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
-                    return LogVerdict::Refused;
+                    return LogVerdict::Retry;
                 }
                 if let Some(peer) = self.peer(worker) {
                     peer.logging
@@ -1186,22 +1550,33 @@ impl SessionHandler for Inner {
                 }
                 LogVerdict::Acked(last_seq)
             }
-            Err(_) => {
+            // A different end than the one recorded, or an end before what
+            // is stored: the worker's claim cannot be accepted, ever.
+            Err(sentinel_store::Error::Conflict | sentinel_store::Error::InvalidInput(_)) => {
                 self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
                 LogVerdict::Refused
             }
+            Err(_) => LogVerdict::Retry,
         }
     }
 
-    fn declined(&self, _worker: WorkerId, attempt: AttemptId, _fence: Fence) {
-        if self
-            .write(move |tx| dispatch::lapse(tx, attempt, UnixMillis::now()))
-            .is_ok()
+    /// Fenced on the declining worker (P04-25): only the holder of the
+    /// offer, under its fence, can give it back — an unacknowledged offer,
+    /// or an acknowledged attempt it never started because the spec never
+    /// arrived (P04-4). Either goes back to the queue, or ends `canceled`.
+    fn declined(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {
+        if let Ok(state) =
+            self.write(move |tx| dispatch::decline(tx, worker, attempt, fence, UnixMillis::now()))
         {
             self.stats.lapsed.fetch_add(1, Ordering::Relaxed);
-            // Deliberately no wake: the job is queued again and the next
-            // reconciliation places it, which bounds a worker that keeps
-            // refusing to one offer per interval instead of a tight loop.
+            self.stats.handed_back.fetch_add(1, Ordering::Relaxed);
+            // Deliberately no wake for a requeue: the next reconciliation
+            // places it, which bounds a worker that keeps refusing to one
+            // offer per interval instead of a tight loop. A cancel that
+            // ended the job did free capacity and decide dependents.
+            if state.is_terminal() {
+                self.wake();
+            }
         }
     }
 
@@ -1536,7 +1911,33 @@ impl SessionHandler for Inner {
     }
 }
 
-/// A running controller: listener, fleet and dispatcher.
+/// Why a spec could not be resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpecFault {
+    /// For good: the attempt is gone, the source is not authorized or not
+    /// allowed, the stored spec does not decode.
+    Refused,
+    /// Worth another try: reader overload, a busy writer, a GitHub timeout.
+    Transient,
+}
+
+impl From<sentinel_store::Error> for SpecFault {
+    fn from(error: sentinel_store::Error) -> Self {
+        use sentinel_store::Error as E;
+        match error {
+            E::NotFound
+            | E::Forbidden
+            | E::Conflict
+            | E::Corrupt(_)
+            | E::InvalidInput(_)
+            | E::Transition(_)
+            | E::Spec(_)
+            | E::Unresolved => SpecFault::Refused,
+            _ => SpecFault::Transient,
+        }
+    }
+}
+
 fn resolve_spec(
     store: &Store,
     key: Option<&sentinel_auth::sealed::Key>,
@@ -1544,7 +1945,7 @@ fn resolve_spec(
     destinations: &[String],
     worker: WorkerId,
     attempt: AttemptId,
-) -> sentinel_store::Result<(JobContext, Vec<u8>)> {
+) -> std::result::Result<(JobContext, Vec<u8>), SpecFault> {
     use sentinel_store::{Error as StoreError, sources};
     // One read snapshot: the attempt's context and spec, the binding that
     // authorizes it, and the destination policy.
@@ -1553,6 +1954,7 @@ fn resolve_spec(
         let c = dispatch::job_context(&tx, worker, attempt)?;
         let bytes = dispatch::spec_bytes(&tx, worker, attempt)?;
         let context = JobContext {
+            // Access is minted below, outside this snapshot.
             source: None,
             run: c.run,
             repo: c.repo,
@@ -1597,7 +1999,10 @@ fn resolve_spec(
         // The only network step; a revocation that lands while a token is
         // being minted wins the race (rechecked inside `issue`).
         let access = sentinel_intake::source::issue(store, key, app, &binding, UnixMillis::now())
-            .map_err(|_| StoreError::Forbidden)?;
+            .map_err(|e| match e {
+            sentinel_intake::source::Error::Unavailable(_) => SpecFault::Transient,
+            sentinel_intake::source::Error::Refused(_) => SpecFault::Refused,
+        })?;
         // And the lease that authorized this delivery must still be live.
         let (tenant, repo) = (binding.tenant, binding.repo);
         store.read(move |conn| {
@@ -1691,6 +2096,19 @@ impl Controller {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(key);
     }
+    /// Pre-admission limits: how many connections may be in their handshake
+    /// and hello at once, and how long each may take. Defaults are
+    /// [`MAX_PENDING`] and [`session::HANDSHAKE_DEADLINE`].
+    pub fn set_admission_limits(&self, pending: usize, handshake: Duration) {
+        self.inner
+            .max_pending
+            .store(pending.max(1), Ordering::Relaxed);
+        self.inner.handshake_ms.store(
+            handshake.as_millis().clamp(1, u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
     /// Enable storage maintenance (D06). Unset keeps every byte forever.
     pub fn set_storage_policy(&self, policy: StoragePolicy) {
         *self.inner.storage.lock().unwrap_or_else(|p| p.into_inner()) = Some(policy);
@@ -1772,9 +2190,10 @@ impl Controller {
         let listener = TcpListener::bind(listen)?;
         let addr = listener.local_addr()?;
         let inner = Arc::new(Inner {
+            me: std::sync::OnceLock::new(),
             source_destinations: Mutex::new(Arc::new(Vec::new())),
             source_app: Mutex::new(None),
-            source_active: Arc::new(AtomicUsize::new(0)),
+            specs: SpecDesk::new(),
             source_key: Mutex::new(None),
             store,
             logs,
@@ -1790,8 +2209,12 @@ impl Controller {
             wake: (Mutex::new(false), Condvar::new()),
             stop: AtomicBool::new(false),
             sessions: AtomicUsize::new(0),
+            pending: AtomicUsize::new(0),
+            max_pending: AtomicUsize::new(MAX_PENDING),
+            handshake_ms: AtomicU64::new(session::HANDSHAKE_DEADLINE.as_millis() as u64),
             stats: Stats::default(),
         });
+        let _ = inner.me.set(Arc::downgrade(&inner));
         let acceptor = {
             let inner = Arc::clone(&inner);
             thread::Builder::new()
@@ -1913,11 +2336,19 @@ fn accept_loop(inner: &Arc<Inner>, listener: &TcpListener) {
             return;
         }
         let Ok(socket) = socket else { continue };
-        if inner.sessions.load(Ordering::Acquire) >= MAX_SESSIONS {
+        // Two caps: every session, and — much smaller — connections that
+        // have not authenticated yet, each also bounded by the handshake
+        // deadline. Peers that prove nothing can never hold the slots the
+        // enrolled fleet reconnects into.
+        if inner.sessions.load(Ordering::Acquire) >= MAX_SESSIONS
+            || inner.pending.load(Ordering::Acquire) >= inner.max_pending.load(Ordering::Relaxed)
+        {
+            inner.stats.shed.fetch_add(1, Ordering::Relaxed);
             drop(socket);
             continue;
         }
         inner.sessions.fetch_add(1, Ordering::AcqRel);
+        inner.pending.fetch_add(1, Ordering::AcqRel);
         let session = Arc::clone(inner);
         let spawned = thread::Builder::new()
             .name("sentinel-link-session".into())
@@ -1926,6 +2357,7 @@ fn accept_loop(inner: &Arc<Inner>, listener: &TcpListener) {
                 session.sessions.fetch_sub(1, Ordering::AcqRel);
             });
         if spawned.is_err() {
+            inner.pending.fetch_sub(1, Ordering::AcqRel);
             inner.sessions.fetch_sub(1, Ordering::AcqRel);
         }
     }
@@ -2026,6 +2458,72 @@ mod tests {
         // Another pool's worker is never "elsewhere", and a lone worker has
         // nothing to prefer.
         assert_eq!(reach.elsewhere(2, other), None);
+    }
+
+    /// P04-4: a burst of spec requests past the resolver bound is queued and
+    /// every one is served, never refused; duplicates are not queued twice,
+    /// and a worker cannot queue more than it may hold.
+    #[test]
+    fn the_spec_desk_serves_a_burst_past_its_resolver_bound_in_order() {
+        let desk = std::sync::Arc::new(SpecDesk::<usize>::new());
+        let worker = WorkerId::new();
+        let keys: Vec<(WorkerId, AttemptId)> =
+            (0..20).map(|_| (worker, AttemptId::new())).collect();
+        let mut starts = 0;
+        for (i, key) in keys.iter().enumerate() {
+            match desk.submit(*key, i) {
+                Submitted::Start => starts += 1,
+                Submitted::Queued => {}
+                other => panic!("request {i} was {other:?}"),
+            }
+        }
+        assert_eq!(starts, SPEC_RESOLVERS);
+        assert_eq!(desk.submit(keys[3], 99), Submitted::Duplicate);
+        // Resolver threads drain the queue with at most SPEC_RESOLVERS
+        // running; every request is served exactly once, in arrival order.
+        let running = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let served = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let threads: Vec<_> = (0..starts)
+            .map(|_| {
+                let (desk, running, peak, served) = (
+                    std::sync::Arc::clone(&desk),
+                    std::sync::Arc::clone(&running),
+                    std::sync::Arc::clone(&peak),
+                    std::sync::Arc::clone(&served),
+                );
+                thread::spawn(move || {
+                    let mut done = None;
+                    while let Some((key, i)) = desk.next(done.take()) {
+                        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(5));
+                        served.lock().unwrap().push(i);
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        done = Some(key);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let mut served = served.lock().unwrap().clone();
+        served.sort_unstable();
+        assert_eq!(served, (0..20).collect::<Vec<_>>());
+        assert!(peak.load(Ordering::SeqCst) <= SPEC_RESOLVERS);
+        // Drained: the same attempt may ask again, and threads were counted out.
+        assert_eq!(desk.submit(keys[3], 3), Submitted::Start);
+        // Per-worker bound: no more waiting than it may hold.
+        let desk = SpecDesk::<()>::new();
+        for _ in 0..dispatch::MAX_HELD_ATTEMPTS {
+            assert_ne!(desk.submit((worker, AttemptId::new()), ()), Submitted::Full);
+        }
+        assert_eq!(desk.submit((worker, AttemptId::new()), ()), Submitted::Full);
+        assert_ne!(
+            desk.submit((WorkerId::new(), AttemptId::new()), ()),
+            Submitted::Full
+        );
     }
 
     #[test]

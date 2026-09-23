@@ -1250,6 +1250,9 @@ mod worker_role {
                     sentinel_worker::executor::Notice::SpecRefused(attempt) => {
                         tracing::warn!(event = "attempt_spec_refused", attempt = %attempt);
                     }
+                    sentinel_worker::executor::Notice::HandedBack(attempt) => {
+                        tracing::warn!(event = "attempt_handed_back", attempt = %attempt, "the run spec never arrived; the attempt was returned to the queue unstarted");
+                    }
                     sentinel_worker::executor::Notice::Stopped(attempt) => {
                         tracing::info!(event = "attempt_stopped", attempt = %attempt);
                     }

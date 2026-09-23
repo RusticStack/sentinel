@@ -48,6 +48,14 @@ pub fn run(_: Command, _: Instant, _: &'static str) -> Result<Output> {
     Err(Error::UnsupportedPlatform)
 }
 
+/// Nothing runs here, so there is nothing to cancel: `f` runs as is.
+pub fn cancel_scope<T>(
+    _: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    f: impl FnOnce() -> T,
+) -> T {
+    f()
+}
+
 pub fn checkout(
     _: &Path,
     _: &PinnedSource,

@@ -134,6 +134,16 @@ pub enum CacheOutcome {
 pub trait Output: Send + Sync {
     fn write(&self, step: u32, stream: Stream, bytes: &[u8]);
     fn complete(&self) -> bool;
+    /// Step `step` finished: output it held back (a possible secret prefix)
+    /// is released as that step's. The default holds nothing.
+    fn step_done(&self, _step: u32) {}
+    /// `text` with the attempt's registered values redacted: every
+    /// diagnostic that leaves the attempt (the verdict detail, the stored
+    /// summary, the process log) passes through here. The default redacts
+    /// nothing.
+    fn redact(&self, text: String) -> String {
+        text
+    }
 }
 
 /// An output that discards everything, for callers without a log.
@@ -256,6 +266,16 @@ pub fn run(
             }
         }
     };
+    // A step's stderr, a helper's excerpt or a fallback reason can carry a
+    // value the job printed: redacted like its log before it becomes the
+    // verdict, the stored summary or a line in the worker's own log.
+    let verdict = match verdict {
+        Verdict::Failed(class, why) => Verdict::Failed(class, output.redact(why)),
+        passed => passed,
+    };
+    if !summary.detail.is_empty() {
+        summary.detail = output.redact(std::mem::take(&mut summary.detail));
+    }
     let event = match &verdict {
         Verdict::Passed => Event::Passed,
         Verdict::Failed(class, why) => {
@@ -332,27 +352,37 @@ fn prepare(
         // `image_pull_ns` together can exceed the preparation's. The
         // thread returns the mirror-aware outcome so the fetch and
         // materialization halves land on the summary too.
-        let mut co = Some(std::thread::spawn({
-            let path = workspace.path().to_path_buf();
-            let source = job.spec.source.clone();
-            let access = job.context.source.clone();
-            let mirrors = job.mirrors.clone();
-            let repo = job.context.repo;
-            let lease = job.attempt.to_string();
-            move || -> Result<(checkout::Outcome, Option<u64>)> {
-                let started = Instant::now();
-                let outcome = checkout::checkout_mirrored(
-                    &path,
-                    mirrors.as_ref(),
-                    &repo,
-                    &source,
-                    access.as_ref(),
-                    &lease,
-                    CHECKOUT_TIMEOUT,
-                )?;
-                Ok((outcome, ns(started)))
-            }
-        }));
+        // The Git helpers it runs are tied to the attempt's cancel flag: a
+        // cancel kills a fetch under way instead of letting it run on to
+        // the checkout deadline.
+        let spawned = std::thread::Builder::new()
+            .name(format!("sentinel-checkout-{}", job.attempt))
+            .spawn({
+                let path = workspace.path().to_path_buf();
+                let source = job.spec.source.clone();
+                let access = job.context.source.clone();
+                let mirrors = job.mirrors.clone();
+                let repo = job.context.repo;
+                let lease = job.attempt.to_string();
+                let cancel = Arc::clone(cancel);
+                move || -> Result<(checkout::Outcome, Option<u64>)> {
+                    sentinel_git::cancel_scope(cancel, || {
+                        let started = Instant::now();
+                        let outcome = checkout::checkout_mirrored(
+                            &path,
+                            mirrors.as_ref(),
+                            &repo,
+                            &source,
+                            access.as_ref(),
+                            &lease,
+                            CHECKOUT_TIMEOUT,
+                        )?;
+                        Ok((outcome, ns(started)))
+                    })
+                }
+            })
+            .map_err(|_| Error::Preparation("checkout thread could not start".into()))?;
+        let mut co = Some(spawned);
         if !job.prepare_hold.is_zero() {
             let until = Instant::now() + job.prepare_hold;
             while Instant::now() < until && !cancel.load(Ordering::Acquire) {
@@ -649,7 +679,11 @@ fn execute(
             let step_index = index as u32;
             Arc::new(move |stream, bytes: &[u8]| output.write(step_index, stream, bytes))
         };
-        let exit = match container.exec_streaming(&command, &extra, Some(sink)) {
+        let exec = container.exec_streaming(&command, &extra, Some(sink));
+        // Whatever the step printed last and the redactor held back is
+        // this step's output, released before the next one starts.
+        output.step_done(index as u32);
+        let exit = match exec {
             Ok(exit) => exit,
             Err(e) => {
                 record.outcome = StepOutcome::Runtime;

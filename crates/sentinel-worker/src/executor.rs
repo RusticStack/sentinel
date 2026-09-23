@@ -7,7 +7,15 @@
 //! queue in memory and are replayed at the next attach (a durable spool is
 //! W05). A `stop` from the controller flips the attempt's cancel flag and
 //! ends its container; it is not reported, because the controller already
-//! counts the attempt as gone.
+//! counts the attempt as gone. The lease watchdog ends every attempt the
+//! same way once the lease it measured (monotonically, from the heartbeat
+//! that renewed it) has run out, and nothing it ended is reported either.
+//!
+//! A spec that does not arrive is asked for again every [`SPEC_RETRY`]; one
+//! refused for good fails the attempt at once as `Preparation`; and an
+//! attempt that still has none after [`SPEC_DEADLINE`] is handed back — it
+//! never started, so the controller requeues it rather than recording a
+//! failure.
 
 use std::{
     collections::HashMap,
@@ -42,6 +50,9 @@ pub enum Notice {
     Started(AttemptId),
     Finished(AttemptId, Verdict),
     SpecRefused(AttemptId),
+    /// The spec never arrived within [`SPEC_DEADLINE`]: the attempt was
+    /// handed back to the controller unstarted.
+    HandedBack(AttemptId),
     Stopped(AttemptId),
     /// A cancel order was carried out; `forced` when the grace ran out.
     Canceled {
@@ -109,31 +120,51 @@ pub struct Availability {
 
 /// TERM-to-KILL grace for a cancel when the process sets none.
 pub const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(30);
-/// Subtracted from the controller's lease deadline: the worker acts before
-/// the controller could have expired it, never after.
+/// Subtracted from the lease the worker measured: it acts before the
+/// controller could have expired the attempt, never after.
 pub const LEASE_GUARD: Duration = Duration::from_secs(5);
+/// The lease a renewal grants, as the worker protocol fixes it.
+const LEASE: Duration = Duration::from_millis(sentinel_protocol::limits::LEASE_MS as u64);
 /// How often the lease watchdog looks.
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a spec request goes unanswered before it is asked again.
+pub const SPEC_RETRY: Duration = Duration::from_secs(10);
+/// How long an acknowledged attempt waits for its spec before it is handed
+/// back to the controller unstarted.
+pub const SPEC_DEADLINE: Duration = Duration::from_secs(60);
 
 struct Live {
     cancel: Cancel,
     logs: Arc<LogPipe>,
     /// A cancel order is already being carried out.
     canceling: bool,
+    /// The lease watchdog ended it: the controller has (or will have)
+    /// settled it by expiry, so nothing about it is reported.
+    lost: bool,
+}
+
+/// An offer taken and waiting for its spec.
+struct Awaiting {
+    offer: Offer,
+    /// When the spec was first asked for, and last.
+    since: Instant,
+    asked: Instant,
+    /// It is being handed back; a spec arriving now is not used.
+    declining: bool,
+    /// Values registered before the attempt started, for its redactor.
+    secrets: Vec<Vec<u8>>,
 }
 
 struct State {
     reporter: Option<Reporter>,
     /// Offers taken and waiting for their spec.
-    awaiting: HashMap<AttemptId, Offer>,
+    awaiting: HashMap<AttemptId, Awaiting>,
     live: HashMap<AttemptId, Live>,
     /// Reports that found no session, in order, with the summary of a
     /// terminal one.
     pending: Vec<(AttemptId, Fence, Event, Option<Vec<u8>>)>,
-    /// Values every new attempt's redactor starts with (S05/S06 register
-    /// per attempt; until then the operator's list applies to all).
-    secrets: Vec<Vec<u8>>,
-    /// Monotonic deadline derived from the last renewal, minus the guard.
+    /// Monotonic deadline: the lease the last renewal granted, measured
+    /// from the heartbeat that asked for it, minus the guard.
     lease_deadline: Option<Instant>,
     cancel_grace: Duration,
     prepare_hold: Duration,
@@ -285,7 +316,6 @@ impl Executor {
                 awaiting: HashMap::new(),
                 live: HashMap::new(),
                 pending: Vec::new(),
-                secrets: Vec::new(),
                 lease_deadline: None,
                 cancel_grace: DEFAULT_CANCEL_GRACE,
                 prepare_hold: Duration::ZERO,
@@ -317,6 +347,7 @@ impl Executor {
             .spawn(move || {
                 while let Some(inner) = watched.upgrade() {
                     inner.watch_lease();
+                    inner.watch_specs();
                     drop(inner);
                     thread::sleep(WATCHDOG_INTERVAL);
                 }
@@ -335,17 +366,42 @@ impl Executor {
         self.state().prepare_hold = hold;
     }
 
-    /// Register a value to redact from every attempt started from now on.
-    pub fn register_secret(&self, value: &[u8]) {
-        self.state().secrets.push(value.to_vec());
+    /// Redact `value` from `attempt`'s output — only that attempt's, from
+    /// now on, for its lifetime; it goes with the attempt. A value
+    /// registered before the attempt starts applies from its first byte.
+    /// Returns whether it was accepted: `false` for a value too short to be
+    /// a secret (`redact::MIN_SECRET_BYTES`) or an attempt not held here.
+    pub fn register_secret(&self, attempt: AttemptId, value: &[u8]) -> bool {
+        if value.len() < crate::redact::MIN_SECRET_BYTES {
+            return false;
+        }
+        let pipe = {
+            let mut state = self.state();
+            if let Some(waiting) = state.awaiting.get_mut(&attempt) {
+                waiting.secrets.push(value.to_vec());
+                return true;
+            }
+            match state.live.get(&attempt) {
+                Some(live) => Arc::clone(&live.logs),
+                None => return false,
+            }
+        };
+        pipe.register_secret(value)
     }
 
-    fn spawn(&self, offer: Offer, spec: RunSpec, context: JobContext, job_index: usize) {
+    fn spawn(
+        &self,
+        offer: Offer,
+        spec: RunSpec,
+        context: JobContext,
+        job_index: usize,
+        secrets: Vec<Vec<u8>>,
+    ) {
         let cancel: Cancel = Arc::new(AtomicBool::new(false));
         let logs = {
             let state = self.state();
             let mut redactor = Redactor::new();
-            for secret in &state.secrets {
+            for secret in &secrets {
                 redactor.register(secret);
             }
             match LogPipe::open(&self.root, offer.attempt, redactor, state.reporter.clone()) {
@@ -368,6 +424,7 @@ impl Executor {
                 cancel: Arc::clone(&cancel),
                 logs: Arc::clone(&logs),
                 canceling: false,
+                lost: false,
             },
         );
         let executor = Arc::clone(&self.0);
@@ -401,11 +458,40 @@ impl Executor {
         let spawned = thread::Builder::new()
             .name(format!("sentinel-attempt-{}", offer.attempt))
             .spawn(move || {
-                (executor.notify)(Notice::Started(job.attempt));
+                let (attempt, fence) = (job.attempt, job.fence);
+                (executor.notify)(Notice::Started(attempt));
                 let output: Arc<dyn attempt::Output> = logs;
                 let sink: &dyn artifacts::Sink = &*executor;
-                let (verdict, _) =
-                    attempt::run(&executor.root, &mut job, &*executor, output, sink, &cancel);
+                // A panic anywhere in the attempt must not leave it held,
+                // renewed and running until the controller's backstop: tear
+                // down what it may have left and report it as a runtime
+                // failure, like any other thing the runtime could not do.
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    attempt::run(&executor.root, &mut job, &*executor, output, sink, &cancel)
+                }));
+                let verdict = match ran {
+                    Ok((verdict, _)) => verdict,
+                    Err(_) => {
+                        cancel.store(true, Ordering::Release);
+                        let _ = podman::remove_named(&format!("sentinel-{attempt}"));
+                        let _ = crate::workspace::remove_tree(
+                            &executor
+                                .root
+                                .join(crate::workspace::WORKSPACES_DIR)
+                                .join(attempt.to_string()),
+                        );
+                        executor.send(
+                            attempt,
+                            fence,
+                            Event::Failed(sentinel_core::FailureClass::Runtime),
+                            None,
+                        );
+                        Verdict::Failed(
+                            sentinel_core::FailureClass::Runtime,
+                            "the attempt thread panicked".into(),
+                        )
+                    }
+                };
                 let delivered = {
                     let mut state = executor.state();
                     state.live.remove(&job.attempt);
@@ -424,7 +510,16 @@ impl Executor {
                 executor.sweep_caches();
             });
         if spawned.is_err() {
+            // Nothing ran: the marker goes, the attempt is reported as the
+            // runtime failing to start it.
             self.state().live.remove(&offer.attempt);
+            recovery::unmark(&self.root, offer.attempt);
+            self.send(
+                offer.attempt,
+                offer.fence,
+                Event::Failed(sentinel_core::FailureClass::Runtime),
+                None,
+            );
         }
     }
 }
@@ -554,10 +649,12 @@ impl Inner {
         }
     }
 
-    /// The lease watchdog: once the deadline the controller last granted
-    /// (less the guard) has passed without a renewal, no attempt here is
-    /// ours any more. End them all, forced, and report nothing — the
-    /// controller has expired them and any report would be stale.
+    /// The lease watchdog: once the lease the last renewal granted —
+    /// measured on this machine's monotonic clock from the heartbeat that
+    /// asked for it, less the guard — has run out, no attempt here is ours
+    /// any more. End them all, forced, and report nothing: the controller
+    /// settles them by expiry, and a report would be stale, or worse,
+    /// recorded as a cancel nobody asked for.
     fn watch_lease(&self) {
         let lost: Vec<(AttemptId, Cancel)> = {
             let mut state = self.state();
@@ -573,6 +670,7 @@ impl Inner {
                 .iter_mut()
                 .map(|(id, live)| {
                     live.canceling = true;
+                    live.lost = true;
                     (*id, Arc::clone(&live.cancel))
                 })
                 .collect()
@@ -584,6 +682,39 @@ impl Inner {
         (self.notify)(Notice::LeaseLost(
             lost.into_iter().map(|(a, _)| a).collect(),
         ));
+    }
+
+    /// Spec requests that went unanswered are asked again; an attempt with
+    /// no spec past [`SPEC_DEADLINE`] is handed back to the controller. It
+    /// stays held (and renewed) until the hand-back is on the wire, and a
+    /// spec that arrives meanwhile is not used.
+    fn watch_specs(&self) {
+        let (reporter, ask, give_back) = {
+            let mut state = self.state();
+            let Some(reporter) = state.reporter.clone() else {
+                return;
+            };
+            let (mut ask, mut give_back) = (Vec::new(), Vec::new());
+            for (attempt, waiting) in state.awaiting.iter_mut() {
+                if waiting.declining || waiting.since.elapsed() >= SPEC_DEADLINE {
+                    waiting.declining = true;
+                    give_back.push((*attempt, waiting.offer.fence));
+                } else if waiting.asked.elapsed() >= SPEC_RETRY {
+                    waiting.asked = Instant::now();
+                    ask.push(*attempt);
+                }
+            }
+            (reporter, ask, give_back)
+        };
+        for attempt in ask {
+            let _ = reporter.need_spec(attempt);
+        }
+        for (attempt, fence) in give_back {
+            if reporter.decline(attempt, fence).is_ok() {
+                self.state().awaiting.remove(&attempt);
+                (self.notify)(Notice::HandedBack(attempt));
+            }
+        }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -602,6 +733,11 @@ impl Inner {
 
     fn send(&self, attempt: AttemptId, fence: Fence, event: Event, summary: Option<Vec<u8>>) {
         let mut state = self.state();
+        if state.live.get(&attempt).is_some_and(|live| live.lost) {
+            // Ended by the lease watchdog: the controller settles it by
+            // expiry; nothing is reported, not even the forced verdict.
+            return;
+        }
         let sent = match (&state.reporter, &summary) {
             (Some(reporter), Some(summary)) => reporter
                 .finish(attempt, fence, event, summary.clone())
@@ -834,19 +970,40 @@ impl LinkExecutor for Executor {
 
     fn offered(&self, offer: &Offer) -> bool {
         let mut state = self.state();
+        // An attempt already taken — a repeated offer, in this session or
+        // an earlier one — is acknowledged again, never started twice.
+        if state.live.contains_key(&offer.attempt) || state.awaiting.contains_key(&offer.attempt) {
+            return true;
+        }
         if state.live.len() + state.awaiting.len() >= MAX_LIST_ITEMS || state.reporter.is_none() {
             return false;
         }
-        state.awaiting.insert(offer.attempt, offer.clone());
+        let now = Instant::now();
+        // Until the first renewal, the offer's own lease bounds the work:
+        // it was granted no earlier than it arrived.
+        if state.lease_deadline.is_none() {
+            state.lease_deadline = Some(now + LEASE.saturating_sub(LEASE_GUARD));
+        }
+        state.awaiting.insert(
+            offer.attempt,
+            Awaiting {
+                offer: offer.clone(),
+                since: now,
+                asked: now,
+                declining: false,
+                secrets: Vec::new(),
+            },
+        );
         true
     }
 
     fn accepted(&self, attempt: AttemptId) {
         let reporter = {
-            let state = self.state();
-            if !state.awaiting.contains_key(&attempt) {
+            let mut state = self.state();
+            let Some(waiting) = state.awaiting.get_mut(&attempt) else {
                 return;
-            }
+            };
+            waiting.asked = Instant::now();
             state.reporter.clone()
         };
         if let Some(reporter) = reporter {
@@ -862,9 +1019,17 @@ impl LinkExecutor for Executor {
         };
         if let Some(cancel) = live {
             cancel.store(true, Ordering::Release);
-            // End the container now, outside the lock; the attempt thread
-            // finalizes what is left and exits.
-            let _ = podman::remove_named(&format!("sentinel-{attempt}"));
+            // End the container now, off this thread — it is the session's
+            // heartbeat thread, and a removal can take seconds; the attempt
+            // thread finalizes what is left and exits.
+            let spawned = thread::Builder::new()
+                .name(format!("sentinel-stop-{attempt}"))
+                .spawn(move || {
+                    let _ = podman::remove_named(&format!("sentinel-{attempt}"));
+                });
+            if spawned.is_err() {
+                let _ = podman::remove_named(&format!("sentinel-{attempt}"));
+            }
         }
         (self.notify)(Notice::Stopped(attempt));
     }
@@ -885,13 +1050,32 @@ impl LinkExecutor for Executor {
         // still reported as canceled; then the signals, off this thread.
         cancel.store(true, Ordering::Release);
         let executor = Arc::clone(&self.0);
-        let _ = thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name(format!("sentinel-cancel-{attempt}"))
             .spawn(move || {
                 let outcome = podman::terminate_named(&format!("sentinel-{attempt}"), grace);
-                let forced = matches!(outcome, Ok(podman::Terminated::Forced));
-                (executor.notify)(Notice::Canceled { attempt, forced });
+                match outcome {
+                    Ok(podman::Terminated::Graceful | podman::Terminated::Forced) => {
+                        let forced = matches!(outcome, Ok(podman::Terminated::Forced));
+                        (executor.notify)(Notice::Canceled { attempt, forced });
+                    }
+                    // Nothing was signalled — an exec still starting, a
+                    // runtime that could not be asked — while the attempt
+                    // may still be running a step: let the cancel the next
+                    // heartbeat repeats try again rather than dropping it
+                    // for the rest of the step.
+                    Ok(podman::Terminated::Gone) | Err(_) => {
+                        if let Some(live) = executor.state().live.get_mut(&attempt) {
+                            live.canceling = false;
+                        }
+                    }
+                }
             });
+        if spawned.is_err()
+            && let Some(live) = self.state().live.get_mut(&attempt)
+        {
+            live.canceling = false;
+        }
     }
 
     fn held(&self) -> Vec<AttemptId> {
@@ -905,12 +1089,16 @@ impl LinkExecutor for Executor {
     }
 
     fn renewed(&self, until: UnixMillis) {
-        // Monotonic from here on: the wall-clock deadline the controller
-        // granted becomes an `Instant`, less the guard margin.
-        let remaining = until.0.saturating_sub(UnixMillis::now().0).max(0) as u64;
-        let deadline =
-            Instant::now() + Duration::from_millis(remaining).saturating_sub(LEASE_GUARD);
-        self.state().lease_deadline = Some(deadline);
+        self.renewed_at(until, Instant::now());
+    }
+
+    /// The controller renewed to `now + LEASE` after the heartbeat left at
+    /// `sent`, so on this machine the lease lasts at least until
+    /// `sent + LEASE`. The controller's wall-clock deadline is never
+    /// compared with this machine's clock: skew between the two hosts can
+    /// neither kill live work early nor let it run past its expiry.
+    fn renewed_at(&self, _until: UnixMillis, sent: Instant) {
+        self.state().lease_deadline = Some(sent + LEASE.saturating_sub(LEASE_GUARD));
     }
 
     fn attached(&self, reporter: Reporter) {
@@ -969,10 +1157,35 @@ impl LinkExecutor for Executor {
                 recovery::unmark(&self.root, attempt);
             }
         }
-        // Specs asked for on a lost session: ask again.
-        let awaiting: Vec<AttemptId> = self.state().awaiting.keys().copied().collect();
+        // Specs asked for on a lost session: ask again (hand-backs under
+        // way go out with the next watchdog look).
+        let awaiting: Vec<AttemptId> = {
+            let mut state = self.state();
+            let now = Instant::now();
+            state
+                .awaiting
+                .iter_mut()
+                .filter(|(_, waiting)| !waiting.declining)
+                .map(|(attempt, waiting)| {
+                    waiting.asked = now;
+                    *attempt
+                })
+                .collect()
+        };
         for attempt in awaiting {
             let _ = reporter.need_spec(attempt);
+        }
+    }
+
+    fn bulk_detached(&self) {
+        let pipes: Vec<Arc<LogPipe>> = self
+            .state()
+            .live
+            .values()
+            .map(|l| Arc::clone(&l.logs))
+            .collect();
+        for pipe in pipes {
+            pipe.resync();
         }
     }
 
@@ -1032,13 +1245,19 @@ impl LinkExecutor for Executor {
     }
 
     fn spec(&self, attempt: AttemptId, context: JobContext, bytes: Vec<u8>) {
-        let Some(offer) = self.state().awaiting.remove(&attempt) else {
-            return;
+        let waiting = {
+            let mut state = self.state();
+            // Being handed back: too late, it is no longer this worker's.
+            if state.awaiting.get(&attempt).is_none_or(|w| w.declining) {
+                return;
+            }
+            state.awaiting.remove(&attempt).expect("checked present")
         };
+        let offer = waiting.offer;
         match RunSpec::decode(&bytes) {
             Ok(spec) => {
                 let job_index = offer.job_index as usize;
-                self.spawn(offer, spec, context, job_index);
+                self.spawn(offer, spec, context, job_index, waiting.secrets);
             }
             Err(_) => {
                 self.send(
@@ -1051,8 +1270,22 @@ impl LinkExecutor for Executor {
         }
     }
 
+    /// A definitive refusal: the attempt is settled at once as the
+    /// preparation failure it is, never left for the lease to expire. When
+    /// the controller already settled it (cancelled, or not this worker's)
+    /// the report is refused as stale and changes nothing.
     fn no_spec(&self, attempt: AttemptId) {
-        self.state().awaiting.remove(&attempt);
+        let Some(waiting) = self.state().awaiting.remove(&attempt) else {
+            return;
+        };
+        if !waiting.declining {
+            self.send(
+                attempt,
+                waiting.offer.fence,
+                Event::Failed(sentinel_core::FailureClass::Preparation),
+                None,
+            );
+        }
         (self.notify)(Notice::SpecRefused(attempt));
     }
 }

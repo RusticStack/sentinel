@@ -226,7 +226,8 @@ pub struct JobControl {
     pub state: JobState,
     /// Fence of the current attempt; `NONE` until first lease.
     pub fence: Fence,
-    /// Durable desired state: once set it is never cleared. The controller
+    /// Durable desired state: once set, no cancel path clears it (a GitHub
+    /// check-run rerequest is the one deliberate reset; docs/checks.md). The controller
     /// stops new starts immediately; a running attempt is asked to stop and
     /// its worker reports `Failed(Canceled)` when done (or is killed after
     /// the grace period and reported by lease expiry).

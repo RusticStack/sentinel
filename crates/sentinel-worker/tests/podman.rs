@@ -33,9 +33,21 @@ fn a_present_image_skips_the_download() {
     if !enabled() {
         return;
     }
-    podman::pull(IMAGE, Duration::from_secs(600)).unwrap();
+    podman::pull(
+        IMAGE,
+        Duration::from_secs(600),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
     // `true` is the exists fast path's answer (K08): nothing downloaded.
-    assert!(podman::pull(IMAGE, Duration::from_millis(1)).unwrap());
+    assert!(
+        podman::pull(
+            IMAGE,
+            Duration::from_millis(1),
+            &std::sync::atomic::AtomicBool::new(false)
+        )
+        .unwrap()
+    );
 }
 
 fn sh(script: &str, timeout_secs: u64) -> StepCommand {
@@ -54,8 +66,20 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
     }
     let runtime = podman::probe().unwrap();
     assert_eq!(runtime.cgroup_version, "v2");
-    podman::pull(IMAGE, Duration::from_secs(600)).unwrap();
-    assert!(podman::pull("docker.io/library/busybox:latest", Duration::from_secs(1)).is_err());
+    podman::pull(
+        IMAGE,
+        Duration::from_secs(600),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(
+        podman::pull(
+            "docker.io/library/busybox:latest",
+            Duration::from_secs(1),
+            &std::sync::atomic::AtomicBool::new(false)
+        )
+        .is_err()
+    );
 
     let temp = tempfile::tempdir().unwrap();
     let (worker, attempt) = (WorkerId::new(), AttemptId::new());

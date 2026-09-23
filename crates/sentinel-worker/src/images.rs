@@ -21,7 +21,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -39,7 +39,7 @@ const FOLLOW_POLL: Duration = Duration::from_millis(50);
 /// What does the pulling: `podman::pull` in production, a stub in tests.
 /// The bool is the `image exists` fast path — true when the store already
 /// held the reference and nothing was downloaded.
-type Download = Arc<dyn Fn(&str, Duration) -> Result<bool> + Send + Sync>;
+type Download = Arc<dyn Fn(&str, Duration, &AtomicBool) -> Result<bool> + Send + Sync>;
 
 /// One in-flight pull: the outcome the leader publishes exactly once.
 /// `Ok` carries the leader's present/downloaded answer to every follower.
@@ -60,6 +60,9 @@ enum Shared {
     Timeout(&'static str),
     Workspace(String),
     Io(std::io::ErrorKind, String),
+    /// The leader's own attempt was cancelled and its pull killed: nothing
+    /// about the image was learned, so a follower pulls for itself.
+    Abandoned,
 }
 
 impl Shared {
@@ -80,6 +83,7 @@ impl Shared {
             Shared::Timeout(what) => Error::Timeout(what),
             Shared::Workspace(what) => Error::Workspace(what),
             Shared::Io(kind, what) => Error::Io(std::io::Error::new(kind, what)),
+            Shared::Abandoned => Error::Preparation("image pull abandoned".into()),
         }
     }
 }
@@ -121,7 +125,7 @@ impl Images {
     /// already held the image.
     #[doc(hidden)]
     pub fn with_download(
-        download: impl Fn(&str, Duration) -> Result<bool> + Send + Sync + 'static,
+        download: impl Fn(&str, Duration, &AtomicBool) -> Result<bool> + Send + Sync + 'static,
     ) -> Self {
         Images {
             inner: Arc::new(Inner {
@@ -147,7 +151,9 @@ impl Images {
     ///
     /// A follower's wait is bounded by `timeout` and ends early on
     /// `cancel`; the pull it watched may still complete for the others.
-    /// The leader is not interruptible, exactly as a lone pull is not.
+    /// The leader's pull is killed on its own attempt's `cancel`; its
+    /// followers are then told to pull for themselves, never handed a
+    /// cancellation that was not theirs.
     pub fn pull(&self, image: &str, timeout: Duration, cancel: &Cancel) -> Result<bool> {
         if cancel.load(Ordering::Acquire) {
             return Err(Error::Preparation("canceled".into()));
@@ -164,14 +170,19 @@ impl Images {
             }
         };
         if leader {
-            let outcome = (self.inner.download)(image, timeout);
+            let outcome = (self.inner.download)(image, timeout, cancel);
             if outcome.is_ok() {
                 self.record(image);
             }
+            // A pull killed because this attempt was cancelled says nothing
+            // about the image: followers are told to pull for themselves.
+            let shared = match &outcome {
+                Err(_) if cancel.load(Ordering::Acquire) => Err(Shared::Abandoned),
+                other => other.as_ref().copied().map_err(Shared::of),
+            };
             // Publish before the slot leaves the map: a caller between the
             // two still follows this pull rather than leading a second one.
-            *slot.result.lock().unwrap_or_else(|p| p.into_inner()) =
-                Some(outcome.as_ref().copied().map_err(Shared::of));
+            *slot.result.lock().unwrap_or_else(|p| p.into_inner()) = Some(shared);
             slot.done.notify_all();
             self.state().pulling.remove(image);
             return outcome;
@@ -184,6 +195,12 @@ impl Images {
                 // The lock is dropped before `record` so the slot mutex is
                 // never held across the state one.
                 drop(result);
+                if matches!(outcome, Err(Shared::Abandoned)) {
+                    // The leader was cancelled, not this attempt: lead (or
+                    // follow) a fresh pull within what is left of the wait.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    return self.pull(image, remaining, cancel);
+                }
                 if outcome.is_ok() {
                     self.record(image);
                 }
@@ -367,7 +384,7 @@ mod tests {
                 Arc::clone(&self.release),
                 self.outcome,
             );
-            Images::with_download(move |_, _| {
+            Images::with_download(move |_, _, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 let _ = entered.send(());
                 release.wait();
@@ -480,7 +497,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let images = Images::with_download({
             let calls = Arc::clone(&calls);
-            move |_, _| {
+            move |_, _, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(true)
             }
@@ -502,7 +519,7 @@ mod tests {
 
     #[test]
     fn the_held_record_is_bounded_and_evicts_the_oldest() {
-        let images = Images::with_download(|_, _| Ok(false));
+        let images = Images::with_download(|_, _, _| Ok(false));
         let flag = cancel();
         for i in 0..MAX_HELD + 1 {
             let image = format!("example.test/i@sha256:{i:064}");
