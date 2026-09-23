@@ -132,12 +132,28 @@ pub struct Presentation<'a> {
 /// Redeem an enrollment: single use, before expiry, binding the presented
 /// identity to the enrollment's pool. The worker chose its identifier and its
 /// key; the operator chose the pool; nothing else is negotiable here.
+///
+/// An unknown, spent, expired or dead-pool secret is `NotFound`. Its
+/// `WorkerEnrollmentRefused` audit row only survives when the caller commits
+/// anyway — use [`redeem`], which does, from anything that must keep it.
 pub fn enroll(
     tx: &Transaction<'_>,
     presented: &Secret,
     presentation: Presentation<'_>,
     now: UnixMillis,
 ) -> Result<Worker> {
+    redeem(tx, presented, presentation, now)?.ok_or(Error::NotFound)
+}
+
+/// [`enroll`] with the refusal as a value: `Ok(None)` means the secret was
+/// refused and the audit row is written, so a caller that commits keeps the
+/// record of the failed attempt (a rolled-back `Err` would erase it).
+pub fn redeem(
+    tx: &Transaction<'_>,
+    presented: &Secret,
+    presentation: Presentation<'_>,
+    now: UnixMillis,
+) -> Result<Option<Worker>> {
     if presentation.name.is_empty()
         || presentation.name.len() > 128
         || presentation.name.chars().any(char::is_control)
@@ -155,7 +171,7 @@ pub fn enroll(
         .optional()?;
     let Some(pool) = pool else {
         audit(tx, Event::WorkerEnrollmentRefused, None, None, false, None)?;
-        return Err(Error::NotFound);
+        return Ok(None);
     };
     let pool = PoolId::from_bytes(pool).map_err(|_| Error::Corrupt("pool id"))?;
     let inserted = tx.execute(
@@ -192,7 +208,7 @@ pub fn enroll(
         false,
         Some(presentation.name),
     )?;
-    Ok(Worker {
+    Ok(Some(Worker {
         id: presentation.worker,
         pool,
         fingerprint: presentation.fingerprint,
@@ -200,7 +216,45 @@ pub fn enroll(
         negotiated: presentation.negotiated,
         enrolled: now,
         last_seen: None,
-    })
+    }))
+}
+
+/// Record what this hello negotiated for an enrolled worker. Negotiation
+/// happens on every hello, not only at enrollment: an upgraded worker gets
+/// the newer protocol and a rolled-back one the older, never a version it
+/// cannot speak. The architecture is part of the identity — a different one
+/// is `Conflict`. Dropping below the profile protocol clears the placement
+/// facts only a profile reports (labels, warm images), so a worker that can
+/// no longer report them is not matched on stale ones.
+pub fn renegotiate(tx: &Transaction<'_>, worker: WorkerId, negotiated: Negotiated) -> Result<()> {
+    let profiled = negotiated.protocol.0 >= sentinel_protocol::negotiate::PROFILE_MIN.0;
+    let changed = tx
+        .prepare_cached(
+            "UPDATE workers SET protocol = ?2, capabilities = ?3,
+                    labels = CASE WHEN ?5 THEN labels ELSE X'' END,
+                    avail_images = CASE WHEN ?5 THEN avail_images ELSE X'' END
+             WHERE id = ?1 AND revoked_ms IS NULL AND arch = ?4",
+        )?
+        .execute(params![
+            worker.as_bytes(),
+            i64::from(negotiated.protocol.0),
+            negotiated.capabilities.0 as i64,
+            arch_name(negotiated.arch),
+            profiled
+        ])?;
+    if changed == 0 {
+        let known: bool = tx
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM workers WHERE id = ?1 AND revoked_ms IS NULL)",
+            )?
+            .query_row([worker.as_bytes()], |r| r.get(0))?;
+        return Err(if known {
+            Error::Conflict
+        } else {
+            Error::NotFound
+        });
+    }
+    Ok(())
 }
 
 /// Resolve a presented certificate fingerprint to a live worker: enrolled,

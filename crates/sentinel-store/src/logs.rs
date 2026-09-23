@@ -368,6 +368,19 @@ impl LogStore {
         end_marker(&self.attempt_dir(run, job, attempt)).is_some()
     }
 
+    /// Close the writer of an attempt that was released without its log
+    /// ending (lease expiry, abandonment, a lost worker): its file handles
+    /// and scratch go now instead of at process exit, and the log becomes
+    /// eligible for retention. A later retransmission simply reopens it
+    /// from disk. Returns whether a writer was open.
+    pub fn forget(&self, attempt: AttemptId) -> bool {
+        self.open
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&attempt)
+            .is_some()
+    }
+
     /// Recover interrupted compressions: plain segments whose successor
     /// or `.z` twin exists, or whose log ended, are sealed — queue them
     /// and drop stale compressor temporaries.
@@ -430,7 +443,20 @@ impl LogStore {
 
     fn open_attempt(&self, run: RunId, job: JobId, attempt: AttemptId) -> Result<Open> {
         let dir = self.attempt_dir(run, job, attempt);
-        fs::create_dir_all(&dir)?;
+        if !dir.is_dir() {
+            // A new attempt directory (and possibly its job and run
+            // parents): make each new entry durable before any frame in it
+            // is acknowledged.
+            fs::create_dir_all(&dir)?;
+            let mut at = dir.as_path();
+            while let Some(parent) = at.parent() {
+                sync_dir(parent)?;
+                if parent == self.dir {
+                    break;
+                }
+                at = parent;
+            }
+        }
         sweep_tmp(&dir);
         let segs = segs(&dir)?;
         for (n, compressed) in &segs {
@@ -632,9 +658,14 @@ impl LogStore {
             add_hole(&mut w.holes, w.last_seq + 1, frame.seq - 1);
         }
         w.scratch.clear();
-        Record::Frame(frame.clone())
-            .encode(&mut w.scratch)
-            .map_err(|_| Error::InvalidInput("log frame"))?;
+        sentinel_protocol::logs::encode_frame(
+            frame.seq,
+            frame.step,
+            frame.stream,
+            &frame.bytes,
+            &mut w.scratch,
+        )
+        .map_err(|_| Error::InvalidInput("log frame"))?;
         let record_len = w.scratch.len() as u64;
         if w.len + record_len > self.max_bytes {
             return Err(Error::InvalidInput("log size"));
@@ -651,6 +682,10 @@ impl LogStore {
                     .truncate(false)
                     .open(seg_path(&w.dir, w.seg, false))?,
             );
+            // The acknowledgement below promises the frame survives a power
+            // loss; a segment file whose directory entry is not durable yet
+            // could vanish with it. Once per segment.
+            sync_dir(&w.dir)?;
         }
         w.file
             .as_mut()

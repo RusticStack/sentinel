@@ -503,8 +503,17 @@ jobs:
     let (build, test) = (ids[0], ids[1]);
     let offer = place(&f, w, f.pool, at(2_100)).unwrap();
     let (attempt, fence) = (offer.attempt, offer.fence);
-    // Context before acknowledgement is refused only for a foreign worker;
-    // the held attempt answers with its identity and no dependencies.
+    // Context is refused before the acknowledgement is durable (nothing
+    // may start ahead of it) and to a foreign worker at any time; the
+    // acknowledged holder gets its identity and no dependencies.
+    assert!(matches!(
+        f.store.read(|c| dispatch::job_context(c, w, attempt)),
+        Err(Error::NotFound)
+    ));
+    f.store
+        .writer()
+        .write(move |tx| dispatch::acknowledge(tx, w, attempt, fence, at(2_150)))
+        .unwrap();
     assert!(matches!(
         f.store
             .read(|c| dispatch::job_context(c, WorkerId::new(), attempt)),
@@ -606,6 +615,10 @@ jobs:
     // The dependent's context names its dependency's outcome.
     let next = place(&f, w, f.pool, at(2_700)).unwrap();
     assert_eq!(next.job, test);
+    f.store
+        .writer()
+        .write(move |tx| dispatch::acknowledge(tx, w, next.attempt, next.fence, at(2_750)))
+        .unwrap();
     let context = f
         .store
         .read(|c| dispatch::job_context(c, w, next.attempt))
@@ -675,6 +688,10 @@ jobs:
         }
         let offer = place(&f, w, f.pool, at(2_100)).unwrap();
         assert_eq!(offer.job, ids[0]);
+        f.store
+            .writer()
+            .write(move |tx| dispatch::acknowledge(tx, w, offer.attempt, offer.fence, at(2_150)))
+            .unwrap();
         let context = f
             .store
             .read(|c| dispatch::job_context(c, w, offer.attempt))
