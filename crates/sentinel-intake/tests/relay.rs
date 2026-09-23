@@ -271,6 +271,22 @@ impl Repo {
         run(Command::new("sh").arg(&self.hook).arg("--flush"))
     }
 
+    /// Push with `dir` first on the hook's `PATH` (the hook inherits the
+    /// pusher's environment through `receive-pack`).
+    fn push_with_path_prefix(&self, dir: &Path) -> String {
+        let path = format!(
+            "{}:{}",
+            dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let (ok, stderr) = run(Command::new("git")
+            .args(["push", "origin", "main"])
+            .current_dir(&self.work)
+            .env("PATH", path));
+        assert!(ok, "push failed: {stderr}");
+        stderr
+    }
+
     fn spooled(&self) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> = fs::read_dir(&self.spool)
             .map(|entries| {
@@ -389,6 +405,142 @@ fn a_permanent_refusal_moves_the_event_to_failed_with_its_response() {
             .contains("401"),
         "the refusal status is kept beside the event"
     );
+}
+
+#[test]
+fn a_rate_limited_event_stays_spooled_for_retry() {
+    if !prerequisites() {
+        return;
+    }
+    // 429 is the controller asking for back-off (admission bound, a full
+    // writer queue, an ambiguous write): the event must survive it.
+    let stub = Stub::start(429);
+    let repo = Repo::create(&stub.url("rep_test"), None);
+    repo.commit("two");
+    let stderr = repo.push();
+    assert!(stderr.contains("spooled"), "{stderr}");
+    assert_eq!(repo.spooled().len(), 1);
+    let (ok, stderr) = repo.flush();
+    assert!(!ok, "an undelivered event is reported: {stderr}");
+    assert!(!stderr.contains("refused permanently"), "{stderr}");
+    assert_eq!(repo.spooled().len(), 1, "still spooled for the next flush");
+    assert!(
+        repo.failed().is_empty(),
+        "never filed as a permanent refusal"
+    );
+    // 408 is the same kind of answer.
+    let stub = Stub::start(408);
+    repo.write_env(&stub.url("rep_test"), None);
+    let (ok, _) = repo.flush();
+    assert!(!ok);
+    assert_eq!(repo.spooled().len(), 1);
+    assert!(repo.failed().is_empty());
+}
+
+#[test]
+fn spooled_pushes_are_delivered_oldest_first() {
+    if !prerequisites() {
+        return;
+    }
+    // Three pushes while the controller is down; the IDs sort by time, so
+    // the flush replays them in push order rather than directory order.
+    let repo = Repo::create("http://127.0.0.1:9/api/v1/intake/rep_test", None);
+    let mut pushed = Vec::new();
+    for name in ["two", "three", "four"] {
+        pushed.push(repo.commit(name));
+        repo.push();
+    }
+    let spooled = repo.spooled();
+    assert_eq!(spooled.len(), 3);
+    let stub = Stub::start(202);
+    repo.write_env(&stub.url("rep_test"), None);
+    let (ok, stderr) = repo.flush();
+    assert!(ok, "flush: {stderr}");
+    let requests = stub.wait(3, Duration::from_secs(10));
+    let delivered: Vec<String> = requests
+        .iter()
+        .map(|r| r.json()["new_sha"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(delivered, pushed, "push order, not directory order");
+    // The spool file names are what order them: sorted names are the
+    // delivered IDs in the same order.
+    let ids: Vec<String> = requests
+        .iter()
+        .map(|r| r.json()["delivery_id"].as_str().unwrap().to_owned())
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted);
+    assert!(repo.spooled().is_empty());
+}
+
+#[test]
+fn a_live_push_is_delivered_after_the_events_already_spooled() {
+    if !prerequisites() {
+        return;
+    }
+    let repo = Repo::create("http://127.0.0.1:9/api/v1/intake/rep_test", None);
+    let older = repo.commit("two");
+    repo.push();
+    assert_eq!(repo.spooled().len(), 1);
+    // The controller is back; the next push must not overtake the event it
+    // missed.
+    let stub = Stub::start(202);
+    repo.write_env(&stub.url("rep_test"), None);
+    let newer = repo.commit("three");
+    repo.push();
+    let requests = stub.wait(2, Duration::from_secs(10));
+    assert_eq!(requests[0].json()["new_sha"], older.as_str());
+    assert_eq!(requests[1].json()["new_sha"], newer.as_str());
+    assert!(repo.spooled().is_empty());
+}
+
+#[test]
+fn the_hook_secret_never_appears_in_curl_arguments() {
+    if !prerequisites() {
+        return;
+    }
+    let stub = Stub::start(202);
+    let repo = Repo::create(&stub.url("rep_test"), None);
+    // A `curl` shim first on PATH records its argv and standard input, then
+    // runs the real one with the same input.
+    let real = Command::new("sh")
+        .args(["-c", "command -v curl"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_owned();
+    let shim_dir = repo.work.parent().unwrap().join("shim");
+    fs::create_dir(&shim_dir).unwrap();
+    let argv_log = shim_dir.join("argv.log");
+    let stdin_log = shim_dir.join("stdin.log");
+    let shim = shim_dir.join("curl");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >>'{argv}'\ntee -a '{stdin}' | exec '{real}' \"$@\"\n",
+            argv = argv_log.display(),
+            stdin = stdin_log.display(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    repo.commit("two");
+    repo.push_with_path_prefix(&shim_dir);
+    let requests = stub.wait(1, Duration::from_secs(10));
+    // The controller still receives the bearer header…
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some(format!("Bearer {SECRET}").as_str())
+    );
+    // …but it travelled on curl's standard input, never its command line.
+    let argv = fs::read_to_string(&argv_log).unwrap();
+    assert!(!argv.is_empty(), "the shim ran");
+    assert!(!argv.contains(SECRET), "secret in argv: {argv}");
+    assert!(fs::read_to_string(&stdin_log).unwrap().contains(SECRET));
 }
 
 #[test]

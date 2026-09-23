@@ -13,11 +13,18 @@
 # The hook reads Git's "<old> <new> <ref>" lines and hands each one to the
 # controller's intake route. It does not resolve a pipeline and never waits
 # for a run: the controller acknowledges the delivery durably and resolves it
-# asynchronously. Each event gets a stable delivery ID, is written to the
-# spool before the first attempt, and is retried by `--flush` (cron or a
-# systemd timer) with a bounded number of attempts. A permanent refusal (4xx)
-# moves the event to `failed/` next to its response for an operator to read;
-# a full spool refuses new events loudly instead of growing without bound.
+# asynchronously. Each event gets a stable, time-ordered delivery ID and is
+# written to the spool before the first attempt; the spool is always
+# delivered oldest first — by the hook itself, and by `--flush` (cron or a
+# systemd timer) with a bounded number of attempts — so events a dead
+# controller missed reach it in push order, ahead of newer ones. A permanent
+# refusal (4xx other than 408/429) moves the event to `failed/` next to its
+# response for an operator to read; `429`/`408` are the controller asking
+# for a retry and keep the event spooled. A full spool refuses new events
+# loudly instead of growing without bound.
+#
+# The secret reaches curl on its standard input, never in its arguments, so
+# it does not show in `ps` or /proc/<pid>/cmdline on a shared Git host.
 #
 # Exit status: 0 in hook mode unless the spool is full or a spool write
 # failed; `--flush` exits 1 if anything could not be delivered. Git shows the
@@ -27,6 +34,9 @@
 # over TLS (or loopback).
 
 set -u
+# Byte order for globbing and sorting: spool names sort by creation time.
+LC_ALL=C
+export LC_ALL
 
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ -f "$DIR/sentinel-hook.env" ]; then
@@ -37,32 +47,47 @@ if [ -z "${SENTINEL_INTAKE_URL:-}" ] || [ -z "${SENTINEL_HOOK_SECRET:-}" ]; then
     echo "sentinel: set SENTINEL_INTAKE_URL and SENTINEL_HOOK_SECRET in $DIR/sentinel-hook.env" >&2
     exit 1
 fi
+case "$SENTINEL_HOOK_SECRET" in
+    *[!A-Za-z0-9_]*) echo "sentinel: SENTINEL_HOOK_SECRET is not a hook secret" >&2; exit 1 ;;
+esac
 SPOOL=${SENTINEL_SPOOL_DIR:-${GIT_DIR:-.}/sentinel-intake}
 MAX=${SENTINEL_SPOOL_MAX:-1000}
 FLUSH_ATTEMPTS=${SENTINEL_FLUSH_ATTEMPTS:-10}
 case "$MAX" in *[!0-9]*|'') echo "sentinel: SENTINEL_SPOOL_MAX must be a number" >&2; exit 1;; esac
 mkdir -p "$SPOOL/failed" || exit 1
 
-# A unique ID per event. It is stable for the life of the spooled file, so a
-# retry is deduplicated by the controller; a later event never reuses it.
+# A unique ID per event that sorts by creation time: seconds, nanoseconds
+# (zero where `date` has no %N), this hook's own sequence number for events
+# of one push, then randomness. It is stable for the life of the spooled
+# file, so a retry is deduplicated by the controller; a later event never
+# reuses it. The caller bumps SEQ: `$(new_id)` runs in a subshell.
+SEQ=0
 new_id() {
+    now=$(date +%s.%N 2>/dev/null)
+    seconds=${now%%.*}
+    nanos=${now#*.}
+    case "$seconds" in '' | *[!0-9]*) seconds=$(date +%s) ;; esac
+    case "$nanos" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;; *) nanos=000000000 ;; esac
     if command -v openssl >/dev/null 2>&1; then
-        openssl rand -hex 16
+        random=$(openssl rand -hex 8)
     else
-        printf '%s%s%s' "$(date +%s)" "$$" "$(date +%N 2>/dev/null || echo 0)"
+        random=$$
     fi
+    printf '%010d%s%04d-%s' "$seconds" "$nanos" "$SEQ" "$random"
 }
 
 # send FILE -> 0 delivered, 2 permanently refused, 1 retry later.
 send() {
-    code=$(curl -sS -o "$SPOOL/.response" -w '%{http_code}' \
-        --max-time 10 --retry 2 --retry-connrefused --retry-delay 1 \
-        -X POST -H 'content-type: application/json' \
-        -H "Authorization: Bearer $SENTINEL_HOOK_SECRET" \
-        --data-binary @"$1" "$SENTINEL_INTAKE_URL" 2>>"$SPOOL/.errors") || return 1
+    code=$(printf 'header = "Authorization: Bearer %s"\n' "$SENTINEL_HOOK_SECRET" |
+        curl -sS -K - -o "$SPOOL/.response" -w '%{http_code}' \
+            --max-time 10 --retry 2 --retry-connrefused --retry-delay 1 \
+            -X POST -H 'content-type: application/json' \
+            --data-binary @"$1" "$SENTINEL_INTAKE_URL" 2>>"$SPOOL/.errors") || return 1
     printf '%s\n' "$code" >"$SPOOL/.response.status"
     case "$code" in
         2*) return 0 ;;
+        # Back-pressure and timeouts: the controller wants this again later.
+        408 | 429) return 1 ;;
         4*) return 2 ;;
         *) return 1 ;;
     esac
@@ -74,7 +99,11 @@ pending_count() {
     echo "$#"
 }
 
-flush() {
+# Deliver the spool oldest first. A transient failure stops the pass: every
+# event behind it would only overtake it. MODE=flush counts attempts and
+# files events under failed/; MODE=hook leaves that to the next flush.
+deliver() {
+    mode=$1
     status=0
     for file in "$SPOOL"/*.json; do
         [ -e "$file" ] || continue
@@ -86,21 +115,31 @@ flush() {
                 rm -f "$file.attempts" "$file"
                 ;;
             2)
-                mv "$file" "$SPOOL/failed/$name"
-                rm -f "$file.attempts"
-                echo "sentinel: $name refused permanently; status in $SPOOL/.response.status" >&2
                 status=1
-                ;;
-            *)
-                attempts=$(cat "$file.attempts" 2>/dev/null || echo 0)
-                attempts=$((attempts + 1))
-                echo "$attempts" >"$file.attempts"
-                if [ "$attempts" -ge "$FLUSH_ATTEMPTS" ]; then
+                if [ "$mode" = flush ]; then
                     mv "$file" "$SPOOL/failed/$name"
                     rm -f "$file.attempts"
-                    echo "sentinel: $name undelivered after $attempts attempts; moved to $SPOOL/failed" >&2
+                    echo "sentinel: $name refused permanently; status in $SPOOL/.response.status" >&2
+                else
+                    echo "sentinel: $name was refused permanently; spooled for --flush to file under $SPOOL/failed; status in $SPOOL/.response.status" >&2
                 fi
+                ;;
+            *)
                 status=1
+                if [ "$mode" = flush ]; then
+                    attempts=$(cat "$file.attempts" 2>/dev/null || echo 0)
+                    attempts=$((attempts + 1))
+                    echo "$attempts" >"$file.attempts"
+                    if [ "$attempts" -ge "$FLUSH_ATTEMPTS" ]; then
+                        mv "$file" "$SPOOL/failed/$name"
+                        rm -f "$file.attempts"
+                        echo "sentinel: $name undelivered after $attempts attempts; moved to $SPOOL/failed" >&2
+                        # Filed: the next event may go now.
+                        continue
+                    fi
+                fi
+                echo "sentinel: intake did not acknowledge $name; it and $(($(pending_count) - 1)) later event(s) stay spooled in $SPOOL" >&2
+                break
                 ;;
         esac
     done
@@ -109,11 +148,11 @@ flush() {
 
 case "${1:-}" in
     --flush)
-        flush
+        deliver flush
         exit $?
         ;;
     --help | -h)
-        sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     '') ;;
@@ -124,6 +163,7 @@ case "${1:-}" in
 esac
 
 status=0
+spooled=0
 while read -r old new ref; do
     [ -n "${ref:-}" ] || continue
     case "$ref" in
@@ -139,6 +179,7 @@ while read -r old new ref; do
         status=1
         continue
     fi
+    SEQ=$((SEQ + 1))
     id=$(new_id)
     file="$SPOOL/$id.json"
     if ! printf '{"delivery_id":"%s","ref":"%s","old_sha":"%s","new_sha":"%s"}' \
@@ -147,15 +188,11 @@ while read -r old new ref; do
         status=1
         continue
     fi
-    send "$file"
-    result=$?
-    if [ "$result" -eq 0 ]; then
-        rm -f "$file"
-    else
-        echo "sentinel: intake did not acknowledge '$ref'; spooled as $id.json in $SPOOL" >&2
-        if [ "$result" -eq 2 ]; then
-            echo "sentinel: ... a permanent refusal; status in $SPOOL/.response.status" >&2
-        fi
-    fi
+    spooled=$((spooled + 1))
 done
+# This push's events join the spool behind anything older and are delivered
+# in order with it; whatever is not acknowledged stays for `--flush`.
+if [ "$spooled" -gt 0 ]; then
+    deliver hook || true
+fi
 exit $status
