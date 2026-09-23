@@ -92,7 +92,23 @@ pub struct Profile {
     pub tenant: Option<String>,
     /// Where the credential is stored.
     pub store: Backend,
+    /// The OS-store key the credential was stored under
+    /// ([`keystore::scoped_key`]). Absent for the file store, and for
+    /// profiles signed in before keys named their configuration directory,
+    /// which keep the legacy per-user [`keystore::key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub created_ms: u64,
+}
+
+impl Profile {
+    /// The OS-store key of this profile's credential.
+    pub fn os_key(&self, name: &str) -> String {
+        match &self.key {
+            Some(key) => key.clone(),
+            None => keystore::key(&self.issuer, name),
+        }
+    }
 }
 
 /// `profiles.json`.
@@ -266,7 +282,10 @@ impl Config {
         &self,
         change: impl FnOnce(&mut Profiles) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let _lock = self.lock_path("profiles")?;
+        // A name no profile can take (profile names never start with `.`):
+        // signing in holds the profile's own lock while updating, and a
+        // profile called `profiles` must not wait on itself.
+        let _lock = self.lock_path(".profiles")?;
         let mut profiles = self.load()?;
         let out = change(&mut profiles)?;
         let data = serde_json::to_vec_pretty(&profiles).expect("profiles serialize");
@@ -345,7 +364,7 @@ impl Config {
         profile: &Profile,
     ) -> Result<Option<Credentials>, Error> {
         validate_name(name)?;
-        keystore::read(profile.store, &self.dir, &profile.issuer, name)?
+        keystore::read(profile.store, &self.dir, &profile.os_key(name), name)?
             .map(|blob| Credentials::parse(&blob))
             .transpose()
     }
@@ -359,31 +378,33 @@ impl Config {
     ) -> Result<(), Error> {
         validate_name(name)?;
         let blob = serde_json::to_vec(credentials).expect("credentials serialize");
-        keystore::write(profile.store, &self.dir, &profile.issuer, name, &blob)
+        keystore::write(profile.store, &self.dir, &profile.os_key(name), name, &blob)
     }
 
     /// Store a new credential in `preferred`; when the OS store fails, fall
     /// back to the owner-only file with a notice on stderr. Returns the
-    /// backend used, for the profile to record.
+    /// backend used and, for the OS store, the key used
+    /// ([`keystore::scoped_key`]), for the profile to record.
     pub fn store_credentials(
         &self,
         name: &str,
         issuer: &str,
         preferred: Backend,
         credentials: &Credentials,
-    ) -> Result<Backend, Error> {
+    ) -> Result<(Backend, Option<String>), Error> {
         validate_name(name)?;
         let blob = serde_json::to_vec(credentials).expect("credentials serialize");
-        match keystore::write(preferred, &self.dir, issuer, name, &blob) {
-            Ok(()) => Ok(preferred),
+        let key = keystore::scoped_key(&self.dir, issuer, name);
+        match keystore::write(preferred, &self.dir, &key, name, &blob) {
+            Ok(()) => Ok((preferred, (preferred == Backend::Os).then_some(key))),
             Err(error) if preferred == Backend::Os => {
                 eprintln!(
                     "notice: {}; storing it in an owner-only file under {} instead",
                     error.message,
                     file::credentials_dir(&self.dir).display()
                 );
-                keystore::write(Backend::File, &self.dir, issuer, name, &blob)?;
-                Ok(Backend::File)
+                keystore::write(Backend::File, &self.dir, &key, name, &blob)?;
+                Ok((Backend::File, None))
             }
             Err(error) => Err(error),
         }
@@ -392,7 +413,7 @@ impl Config {
     /// Remove the stored credential of `name` (absent is fine).
     pub fn delete_credentials(&self, name: &str, profile: &Profile) -> Result<(), Error> {
         validate_name(name)?;
-        keystore::delete(profile.store, &self.dir, &profile.issuer, name)
+        keystore::delete(profile.store, &self.dir, &profile.os_key(name), name)
     }
 }
 
@@ -521,7 +542,16 @@ impl Handle {
             ("client_id", &self.0.profile.client_id),
         ]);
         let url = format!("{}{TOKEN_PATH}", self.0.profile.issuer);
-        let response = match token_call(agent, &url, &form)? {
+        let mut answer = token_call(agent, &url, &form)?;
+        // A busy authorization server spent nothing (or, if the rotation
+        // committed after all, a second presentation within the grace
+        // window recovers it once), so one retry after the server's
+        // `retry-after: 1` is safe and rides out a brief overload.
+        if matches!(&answer, Err(e) if e.error == OAuthErrorCode::TemporarilyUnavailable) {
+            std::thread::sleep(Duration::from_secs(1));
+            answer = token_call(agent, &url, &form)?;
+        }
+        let response = match answer {
             Ok(response) => response,
             Err(oauth) if oauth_exit(oauth.error) == Exit::Auth => {
                 return Err(self.not_signed_in(&format!(
