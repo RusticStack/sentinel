@@ -68,7 +68,7 @@ Each class maps to exactly one outcome, so storage can never hold a contradictor
 
 ## Cancellation
 
-Cancellation is durable desired state on the job (`cancel_requested`), set once and never cleared. If the job is `blocked` or `queued`, the controller finishes it immediately with `CancelBeforeStart`. If a worker owns it, the flag is delivered on the session; the worker terminates the process group gracefully, then forcibly after the grace period, and reports `Failed(Canceled)` with its fence. If the worker never reports, lease expiry produces `infra_failed` and the flag still prevents any rerun from starting. Superseded runs, tenant suspension and operator cancel all use this one path.
+Cancellation is durable desired state on the job (`cancel_requested`), set once and never cleared by a cancel path; the single exception is a GitHub check-run rerequest, which deliberately starts a cancelled job over and resets the flag with it ([checks](checks.md#rerequests-and-lifecycle-reconciliation-g05)). If the job is `blocked` or `queued`, the controller finishes it immediately with `CancelBeforeStart` and decides its dependents. If it is leased but never started, it ends `canceled` (`OfferLapsed` then `CancelBeforeStart`, both controller edges) the moment the offer goes back. If a worker owns it, the flag is delivered on the session; the worker terminates the process group gracefully, then forcibly after the grace period, and reports `Failed(Canceled)` with its fence. If the worker never reports, lease expiry produces `infra_failed` and the flag still prevents any rerun from starting. Superseded runs, tenant suspension and operator cancel all use this one path.
 
 ## Run aggregation and dependencies
 
