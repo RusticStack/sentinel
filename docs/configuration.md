@@ -41,6 +41,8 @@ log_level = "info"
 # server only: where workers connect (default 127.0.0.1:7443) and where the API answers (default 127.0.0.1:7080)
 listen = "0.0.0.0:7443"
 api_listen = "127.0.0.1:7080"
+# server only: the deployment-facing base URL; it is the OAuth issuer ([OAuth](oauth.md)). Absent = http://{api_listen}
+public_url = "https://ci.example.com"
 # worker only: the controller to reach and the fingerprint it logged at `link_listening`
 controller = "10.0.0.5:7443"
 controller_fingerprint = "<64 lower-case hex characters>"
@@ -76,10 +78,12 @@ log_retention_secs = 1209600       # finished attempt logs kept this long (1 h .
 sweep_interval_secs = 300          # the maintenance pass rides the dispatch loop at most this often (5..86400)
 ```
 
-The three common fields are optional in the file; `listen`, `api_listen` and `[storage]` are refused for the worker and the worker keys (`labels`, `disk_bytes`, `tailcat_address`) for the server; `[tailcat]` is accepted by both roles; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
+The three common fields are optional in the file; `listen`, `api_listen`, `public_url` and `[storage]` are refused for the worker and the worker keys (`labels`, `disk_bytes`, `tailcat_address`) for the server; `[tailcat]` is accepted by both roles; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
 
 - Server: `/var/lib/sentinel`
 - Worker: `/var/lib/sentinel-worker`
+
+`public_url` is the URL clients reach the API at, exactly: an absolute `https://` URL (plain `http://` only for a loopback host), lower-case scheme and host, no default port, no trailing slash, query or fragment; a path prefix is kept (`https://ci.example.com/sentinel`). It names the OAuth issuer, every endpoint in the authorization-server metadata and the API's `resource`, so it must be what the CLI is given as `--server`. Behind a reverse proxy set it, and forward `/.well-known/*`, `/oauth/*` and `/device` along with `/api/*`. Without it the issuer is `http://{api_listen}`, correct only for direct loopback use. The server also runs a credential maintenance tick every ten minutes that purges expired sessions, API credentials, sign-in state and OAuth rows in bounded batches; validation never depends on it.
 
 Use separate directories for the two roles. Paths must be absolute, non-root, and contain no `..` components. An existing non-directory is rejected. Existing directory contents are preserved. Data directories are trusted operator-managed paths; F02 does not provide an artifact extraction sandbox or a single-process directory lease. Ownership and access permissions follow the service account and its umask; Sentinel does not elevate privileges or change ownership.
 

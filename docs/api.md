@@ -14,41 +14,43 @@ Plain HTTP on loopback by default; TLS and exposure are a reverse proxy's job. T
 |---|---|---|
 | `Authorization: Bearer sntl_…` ([API credentials](api-credentials.md)) | `tokens::authenticate`: one digest lookup; scope is a ceiling on the account's live membership | allowed; no CSRF (nothing sends a bearer ambiently) |
 | session cookie ([local authentication](local-authentication.md)) | `local_auth::authenticate` | require the `x-sentinel-csrf` header with the session's CSRF secret, else `forbidden` |
+| `Authorization: Bearer sntl_at_…` ([OAuth](oauth.md)) | `oauth::authenticate_access`: one statement (token, grant and account by key); the grant's scopes are the ceiling | allowed; no CSRF |
 
-The credential yields a `Principal`; every route then asks the store — `auth::require_repo` for anything under a run, `auth::list_repos`, `tenancy::pools_for_tenant` and `workers::in_pool` under an `Authority` — so a resource the caller may not see is `not_found`, never revealed. A bearer credential can never step up.
+The credential yields a `Principal`; every route then asks the store — `auth::require_repo` for anything under a run, `auth::list_repos`, `tenancy::pools_for_tenant` and `workers::in_pool` under an `Authority` — so a resource the caller may not see is `not_found`, never revealed. A bearer credential can never step up. Every route also requires the **scope** in its row below: an OAuth access token carries exactly its grant's scopes, while a session or `sntl_` credential carries the scopes its permissions imply (`read` → every `:read` scope and `secrets:metadata`, `run` → `runs:write` and `cache:write`, the administrative bits one to one), so their authority is unchanged. A missing scope is `403 forbidden` with `details.scope` and `WWW-Authenticate: Bearer error="insufficient_scope", scope="…"`; every `401` from `/api/v1` carries `WWW-Authenticate: Bearer realm="sentinel", resource_metadata="{issuer}/.well-known/oauth-protected-resource/api/v1"`, plus `error="invalid_token"` when a token was presented (the login and hook routes excepted).
 
 ## Routes
 
 All under `/api/v1`, JSON in and out, errors as `sentinel.error/1` ([protocol](protocol.md)); bodies bounded at 1 MiB before they are read, with the intake routes bounding their own bodies ([intake](intake.md)).
 
-| Route | Auth | Does |
-|---|---|---|
-| `GET /health` | none | `{ok:true}` |
-| `POST /login` `{username,password}` | none | password login → `Set-Cookie` session, body `{user, csrf}`; every non-accepted outcome is one `unauthenticated` |
-| `POST /logout` | session + CSRF | ends the session, clears the cookie |
-| `GET /me` | any | who the credential is and how |
-| `POST /hooks/github` | App webhook signature | GitHub webhooks ([intake](intake.md)): raw-body HMAC-SHA256, delivery dedup, `push` and `pull_request` intake, `ping` probe. `not_found` until `<data_dir>/github-webhook.json` exists |
-| `POST /intake/{repo}` | repository hook secret | generic ref updates ([intake](intake.md)): bounded JSON, dedup, durable acceptance → `202` with the delivery id |
-| `GET /tenants/{slug}/repos` | member | repositories visible to the caller |
-| `GET /tenants/{slug}/repos/{name}/runs?limit` | `read` | newest runs first |
-| `POST /tenants/{slug}/repos/{name}/runs` `{pipeline, source:{repo,sha,ref}}` | `run` | compile, pin, create the run and its jobs, resolve every digest-pinned image, record manual provenance, wake the dispatcher → `201` run status. `Idempotency-Key` replays the same run (`200`) and refuses a different body (`idempotency_mismatch`). Every image must be pinned by digest until a resolver exists |
-| `GET /runs/{id}` | `read` | the run and its jobs: state, failure class, trigger (`push`, `tag`, `pull_request`, `manual`), cancel flag, newest attempt, `log_state` (`pending`/`incomplete`/`complete` of that attempt's durable log end, `null` until an attempt exists), fence, phase timestamps |
-| `POST /runs/{id}/cancel` | `run` | `cancel_run` ([cancellation](cancellation.md)) |
-| `POST /jobs/{id}/cancel` | `run` | `cancel` → `terminal`, `requested` or `alreadyterminal` |
-| `POST /jobs/{id}/rerun` | `run` | a new attempt of a finished job; `conflict` for a running or cancelled one |
-| `GET /attempts/{id}/logs?after&limit&wait=1&step` | `read` | frames after a sequence from the segmented store the controller writes ([logs](logs.md)); `step` serves one step only; `wait=1` parks up to 25 s for more; `complete` and `gaps` say when the log is closed; pre-D04 flat logs still read |
-| `GET /runs/{id}/artifacts` | `read` | every artifact row of the run: name, job, attempt, `captured`/`absent`/`failed`, entries, bytes, retention and creation ([storage](storage.md#artifact-records-d03)) |
-| `GET /runs/{id}/artifacts/{arf}` | `read` | one row plus, when captured, its immutable manifest: version, digest, payload length and each entry's path/digest/len/mode; entry bytes download via `GET /tenants/{slug}/objects/{digest}` |
-| `GET /workers?tenant=slug` | member | the pools the tenant may use and their workers, each with `connected` from the live fleet |
-| `GET /queue?tenant=slug&limit` | member | the tenant's waiting jobs, oldest first, each with its `run`, `repo`, `age_ms` and the `reason` it is not running: `dependency`, `policy` (with its detail), `no_matching_worker` (with `cpu_short`/`memory_short`), `worker_offline`, `capacity`, and the fleet constraints `disk_short`, `arch_mismatch`, `label_missing`, `drain`, `concurrency_limit`, `fairness_hold` and `locality_wait`. Bounded to `limit` (default 100, max 500), with `total` as the number of waiting jobs the listing returned and `truncated` marking a response this route cut short, so a ten-thousand-job queue is never a ten-thousand-job document |
-| `POST /workers/{wrk}/drain` | platform admin | the worker keeps the attempts it already holds and takes no new offers → `{worker, draining:true}`; work it could have taken stays queued with reason `drain` |
-| `POST /workers/{wrk}/undrain` | platform admin | the worker is offered work again → `{worker, draining:false}` |
-| `POST /tenants/{slug}/uploads` `{len, digest?, ttl_ms?}` | member (operator+) | open a resumable upload session → `201` `{upload, received, ranges, expires_ms}` ([storage](storage.md#resumable-uploads-reads-and-materialization-d02)); `quota_exceeded` when the tenant's budget cannot take the declared length, `storage_full` below the disk watermarks |
-| `GET /uploads/{upl}` | member (operator+) | the durable resume state: held byte ranges and expiry |
-| `PUT /uploads/{upl}?offset=N` | member (operator+) | one chunk, raw body ≤ 8 MiB; re-sent ranges merge, so retries are safe |
-| `POST /uploads/{upl}/commit` | member (operator+) | tile check + digest verification → publish the object → `{digest}`; repeating returns the same digest |
-| `DELETE /uploads/{upl}` | member (operator+) | abort and drop the staged bytes |
-| `GET /tenants/{slug}/objects/{digest}` | member | stream a committed object; `Range: bytes=a-b`/`a-`/`-n` → `206` with `Content-Range`; invalid ranges are `invalid_request`. At most four transfer bodies are in flight at once — the next is `rate_limited` |
+| Route | Auth | Scope | Does |
+|---|---|---|---|
+| `GET /health` | none | — | `{ok:true}` |
+| `POST /login` `{username,password}` | none | — | password login → `Set-Cookie` session, body `{user, csrf}`; every non-accepted outcome is one `unauthenticated` |
+| `POST /logout` | session + CSRF | — | ends the session, clears the cookie |
+| `GET /me` | any | — | who the credential is and how: `user`, `username` (local login name or `null`), `via` (`bearer`, `session`, `oauth`), `super_admin`, `tenant`/`repo` narrowing, `scopes` (names), and for an OAuth token its `grant` and `expires_ms` |
+| OAuth: `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/api/v1`, `/oauth/*`, `/device`, `/api/v1/grants…`, `/api/v1/tenants/{slug}/service-accounts…` | see [OAuth](oauth.md) | see [OAuth](oauth.md) | the authorization server, grant listing/revocation and service accounts ([OAuth](oauth.md)) |
+| `POST /hooks/github` | App webhook signature | — | GitHub webhooks ([intake](intake.md)): raw-body HMAC-SHA256, delivery dedup, `push` and `pull_request` intake, `ping` probe. `not_found` until `<data_dir>/github-webhook.json` exists |
+| `POST /intake/{repo}` | repository hook secret | — | generic ref updates ([intake](intake.md)): bounded JSON, dedup, durable acceptance → `202` with the delivery id |
+| `GET /tenants/{slug}/repos` | member | `runs:read` | repositories visible to the caller |
+| `GET /tenants/{slug}/repos/{name}/runs?limit` | `read` | `runs:read` | newest runs first |
+| `POST /tenants/{slug}/repos/{name}/runs` `{pipeline, source:{repo,sha,ref}}` | `run` | `runs:write` | compile, pin, create the run and its jobs, resolve every digest-pinned image, record manual provenance, wake the dispatcher → `201` run status. `Idempotency-Key` replays the same run (`200`) and refuses a different body (`idempotency_mismatch`). Every image must be pinned by digest until a resolver exists |
+| `GET /runs/{id}` | `read` | `runs:read` | the run and its jobs: state, failure class, trigger (`push`, `tag`, `pull_request`, `manual`), cancel flag, newest attempt, `log_state` (`pending`/`incomplete`/`complete` of that attempt's durable log end, `null` until an attempt exists), fence, phase timestamps |
+| `POST /runs/{id}/cancel` | `run` | `runs:write` | `cancel_run` ([cancellation](cancellation.md)) |
+| `POST /jobs/{id}/cancel` | `run` | `runs:write` | `cancel` → `terminal`, `requested` or `alreadyterminal` |
+| `POST /jobs/{id}/rerun` | `run` | `runs:write` | a new attempt of a finished job; `conflict` for a running or cancelled one |
+| `GET /attempts/{id}/logs?after&limit&wait=1&step` | `read` | `logs:read` | frames after a sequence from the segmented store the controller writes ([logs](logs.md)); `step` serves one step only; `wait=1` parks up to 25 s for more; `complete` and `gaps` say when the log is closed; pre-D04 flat logs still read |
+| `GET /runs/{id}/artifacts` | `read` | `artifacts:read` | every artifact row of the run: name, job, attempt, `captured`/`absent`/`failed`, entries, bytes, retention and creation ([storage](storage.md#artifact-records-d03)) |
+| `GET /runs/{id}/artifacts/{arf}` | `read` | `artifacts:read` | one row plus, when captured, its immutable manifest: version, digest, payload length and each entry's path/digest/len/mode; entry bytes download via `GET /tenants/{slug}/objects/{digest}` |
+| `GET /workers?tenant=slug` | member | `runs:read` | the pools the tenant may use and their workers, each with `connected` from the live fleet |
+| `GET /queue?tenant=slug&limit` | member | `runs:read` | the tenant's waiting jobs, oldest first, each with its `run`, `repo`, `age_ms` and the `reason` it is not running: `dependency`, `policy` (with its detail), `no_matching_worker` (with `cpu_short`/`memory_short`), `worker_offline`, `capacity`, and the fleet constraints `disk_short`, `arch_mismatch`, `label_missing`, `drain`, `concurrency_limit`, `fairness_hold` and `locality_wait`. Bounded to `limit` (default 100, max 500), with `total` as the number of waiting jobs the listing returned and `truncated` marking a response this route cut short, so a ten-thousand-job queue is never a ten-thousand-job document |
+| `POST /workers/{wrk}/drain` | platform admin | `platform:admin` | the worker keeps the attempts it already holds and takes no new offers → `{worker, draining:true}`; work it could have taken stays queued with reason `drain` |
+| `POST /workers/{wrk}/undrain` | platform admin | `platform:admin` | the worker is offered work again → `{worker, draining:false}` |
+| `POST /tenants/{slug}/uploads` `{len, digest?, ttl_ms?}` | member (operator+) | `runs:write` | open a resumable upload session → `201` `{upload, received, ranges, expires_ms}` ([storage](storage.md#resumable-uploads-reads-and-materialization-d02)); `quota_exceeded` when the tenant's budget cannot take the declared length, `storage_full` below the disk watermarks |
+| `GET /uploads/{upl}` | member (operator+) | `runs:write` | the durable resume state: held byte ranges and expiry |
+| `PUT /uploads/{upl}?offset=N` | member (operator+) | `runs:write` | one chunk, raw body ≤ 8 MiB; re-sent ranges merge, so retries are safe |
+| `POST /uploads/{upl}/commit` | member (operator+) | `runs:write` | tile check + digest verification → publish the object → `{digest}`; repeating returns the same digest |
+| `DELETE /uploads/{upl}` | member (operator+) | `runs:write` | abort and drop the staged bytes |
+| `GET /tenants/{slug}/objects/{digest}` | member | `artifacts:read` | stream a committed object; `Range: bytes=a-b`/`a-`/`-n` → `206` with `Content-Range`; invalid ranges are `invalid_request`. At most four transfer bodies are in flight at once — the next is `rate_limited` |
 
 The first page (`GET /`) is a single static document; it accepts a
 `#/runs/<run id>` fragment and opens that run, which is what a check's
@@ -72,7 +74,7 @@ sentinel api --token-file ~/.sentinel/token drain wrk_…
 sentinel api --token-file ~/.sentinel/token undrain wrk_…
 ```
 
-`--json` prints the server's document; text output is for people. Exit codes: 0 success, 1 remote or transport fault, 2 usage, 3 `unauthenticated`/`forbidden`, 4 `not_found`. `--token-file` keeps the secret out of the process list; `--token` and `SENTINEL_TOKEN` exist for tooling that already protects its environment.
+`--json` prints the server's document, and a failure as one `sentinel.error/1` line on stderr; text output is for people. `--token-file`/`--token`/`SENTINEL_TOKEN` accept an `sntl_` credential or an `sntl_at_` access token. Exit codes are the shared table in [CLI](cli.md#exit-codes): 0 success, 1 remote fault or malformed answer, 2 usage, 3 `unauthenticated`/`forbidden`, 4 `not_found`, 5 `conflict`/`idempotency_mismatch`, 6 busy or unreachable after retries. `--token-file` keeps the secret out of the process list; `--token` and `SENTINEL_TOKEN` exist for tooling that already protects its environment.
 
 Draining needs a platform-admin credential on the API; on the controller's own host the same change is `sentinel admin worker drain --id wrk_… --data-dir …` (and `undrain`), which acts on the store directly like the rest of `sentinel admin`.
 
@@ -93,5 +95,7 @@ factor for privileged mutations) arrives with the routes that need it.
 ## Verification
 
 `crates/sentinel-api/tests/api.rs`, over loopback HTTP against a controller and a store: no credential and a wrong credential are `unauthenticated` with the error schema; an unknown route is `not_found`; the page is served without a credential; an unpinned image and a malformed pipeline are `invalid_request` without echoing the input; dispatch returns the run with its jobs (`queued`, `blocked`), replays under the same idempotency key and refuses a different body; the repository's run list and the run are readable, a random run and a malformed id are refused, a credential narrowed to another tenant sees nothing; cancelling a queued job is `terminal` and marks it `canceled`, rerunning a cancelled job is `conflict`, cancelling the run ends it; an attempt's log is `not_found` before any frame, tails by sequence with stream and step, a `wait=1` request returns as soon as a frame lands and reports completion; worker status lists the tenant's pool. A password login sets a `__Host-` HttpOnly cookie and returns the CSRF secret; the cookie alone reads, a mutation without the header is `forbidden`, with it dispatch succeeds; logout kills the session.
+
+`crates/sentinel-api/tests/oauth_core.rs` covers OAuth access tokens on these routes, per-route scopes and the `WWW-Authenticate` challenges ([OAuth](oauth.md#tests-and-harness)).
 
 `crates/sentinel/tests/cli.rs` (Linux, both role features), against the real `sentinel server` with its `api_listening` address and a credential issued by `admin token issue`: a bad token file exits 2; `api me` shows the bearer identity; `api run` for a repository the account is not a member of exits 4 with `not_found`; `api workers --json` lists the pool with the enrolled worker `connected`.
