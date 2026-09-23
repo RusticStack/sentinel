@@ -669,3 +669,95 @@ jobs:
     assert_eq!(state(&f, later[0]), JobState::Queued);
     assert_eq!(reason(&f, later[0], &[w]), WaitReason::ConcurrencyLimit);
 }
+
+/// One job with fractional CPU, as the pipeline schema writes it.
+fn job_of(cpu: &str, memory: &str) -> String {
+    format!(
+        "schema: 1
+on: [push]
+jobs:
+  one:
+    image: alpine:3
+    resources: {{ cpu: \"{cpu}\", memory: {memory}, disk: 1GiB }}
+    steps: [{{ id: s, run: 'true' }}]
+"
+    )
+}
+
+/// Place on `w` until nothing more fits, told what the rest of the connected
+/// fleet can hold, as one dispatcher visit does.
+fn fill(f: &Fixture, w: WorkerId, elsewhere: Capacity, now: UnixMillis) -> Vec<dispatch::Offer> {
+    let pool = f.pool;
+    f.store
+        .writer()
+        .write(move |tx| {
+            let mut placed = Vec::new();
+            while let Some(offer) = dispatch::place_in_fleet(
+                tx,
+                w,
+                pool,
+                Some(elsewhere),
+                dispatch::DEFAULT_LEASE_MS,
+                now,
+            )? {
+                placed.push(offer);
+            }
+            Ok(placed)
+        })
+        .unwrap()
+}
+
+/// Q10: a two-tenant burst reaches a mixed fleet and the largest worker is
+/// visited first — the order a mid-sweep enqueue or any unlucky sweep order
+/// produces. The six-core job fits only that worker, and all the small work
+/// is older, so the fair order puts it first. Told what the rest of the
+/// fleet can hold, the large worker offers the job only it can run first and
+/// the small work lands on the small workers. Plain `place` (the pre-Q10
+/// behavior) spends the large worker's room on quarter-core jobs, and the
+/// six-core job then waits for capacity nothing in the burst will release.
+#[test]
+fn a_job_only_the_largest_worker_fits_is_not_stranded_by_small_work() {
+    let f = fixture();
+    let (other, other_repo) = other_tenant(&f, "beta");
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let edge = worker(&f, pool, 2_500, 2 << 30, 64 << 30, &[], None, &[]);
+    let standard = worker(&f, pool, 5_000, 8 << 30, 128 << 30, &[], None, &[]);
+    let large = worker(&f, pool, 7_000, 16 << 30, 256 << 30, &[], None, &[]);
+    for i in 0..8 {
+        run(&f, tenant, repo, &job_of("0.25", "128MiB"), at(2_000 + i));
+    }
+    run(&f, other, other_repo, &job_of("0.25", "128MiB"), at(2_010));
+    run(&f, other, other_repo, &job_of("1", "512MiB"), at(2_020));
+    run(&f, tenant, repo, &job_of("1", "512MiB"), at(2_030));
+    let heavy = run(&f, tenant, repo, &job_of("6", "2GiB"), at(2_100)).1[0];
+    let cap = |cpu_millis: i64, memory_bytes: i64, disk_bytes: i64| Capacity {
+        cpu_millis,
+        memory_bytes,
+        disk_bytes,
+    };
+    let (small, mid, big) = (
+        cap(2_500, 2 << 30, 64 << 30),
+        cap(5_000, 8 << 30, 128 << 30),
+        cap(7_000, 16 << 30, 256 << 30),
+    );
+
+    // The rest of the fleet holds at most the standard worker's resources.
+    let on_large = fill(&f, large, mid, at(3_000));
+    let on_edge = fill(&f, edge, big, at(3_000));
+    let on_standard = fill(&f, standard, big, at(3_000));
+    assert_eq!(
+        state(&f, heavy),
+        JobState::Leased,
+        "the six-core job is placed"
+    );
+    assert_eq!(on_large[0].job, heavy, "the exclusive job goes first");
+    assert_eq!(
+        on_large.len() + on_edge.len() + on_standard.len(),
+        12,
+        "every job of the burst is leased"
+    );
+    for (offers, room) in [(&on_large, big), (&on_edge, small), (&on_standard, mid)] {
+        let used: i64 = offers.iter().map(|o| o.cpu_millis).sum();
+        assert!(used <= room.cpu_millis);
+    }
+}

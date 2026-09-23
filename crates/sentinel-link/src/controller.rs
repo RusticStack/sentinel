@@ -99,6 +99,13 @@ struct Peer {
     sender: Sender,
     pool: PoolId,
     generation: u64,
+    /// The CPU and memory the hello reported: the sweep's order and what the
+    /// rest of the fleet can hold are read from here, never from the store.
+    cpu_millis: i64,
+    memory_bytes: i64,
+    /// The scratch disk its protocol-7 profile reported; 0 until then (or
+    /// for protocol 6), which is not a disk constraint.
+    disk_bytes: AtomicI64,
     /// When liveness was last written, so a beat costs a write once a minute.
     seen_recorded_ms: AtomicI64,
     /// The certificate this session presented; a bulk connection may only
@@ -177,6 +184,92 @@ struct Inner {
     stats: Stats,
 }
 
+/// Per pool, the largest and second-largest of each resource among the
+/// connected workers of one sweep, so what "every other worker" can hold is
+/// O(1) per worker instead of a scan per worker.
+struct Reach {
+    pools: Vec<PoolReach>,
+}
+
+struct PoolReach {
+    pool: PoolId,
+    workers: usize,
+    /// `(largest, index of its holder, second largest)` per resource.
+    cpu: (i64, usize, i64),
+    memory: (i64, usize, i64),
+    disk: (i64, usize, i64),
+}
+
+/// Fold one value into a `(largest, holder, second)` triple.
+fn top_two(top: &mut (i64, usize, i64), value: i64, index: usize) {
+    if value > top.0 {
+        *top = (value, index, top.0);
+    } else if value > top.2 {
+        top.2 = value;
+    }
+}
+
+/// The most any worker but `index` holds: the second largest when `index`
+/// holds the largest, the largest otherwise.
+fn other_than(top: (i64, usize, i64), index: usize) -> i64 {
+    if top.1 == index { top.2 } else { top.0 }
+}
+
+impl Peer {
+    /// What this worker holds, as the sweep compares it: a worker that never
+    /// reported disk has no disk constraint.
+    fn size(&self) -> dispatch::Capacity {
+        dispatch::Capacity {
+            cpu_millis: self.cpu_millis,
+            memory_bytes: self.memory_bytes,
+            disk_bytes: match self.disk_bytes.load(Ordering::Relaxed) {
+                0 => i64::MAX,
+                disk => disk,
+            },
+        }
+    }
+}
+
+impl Reach {
+    /// Fold the sweep's workers, in sweep order, as `(pool, size)`.
+    fn of(sizes: impl IntoIterator<Item = (PoolId, dispatch::Capacity)>) -> Reach {
+        let mut pools: Vec<PoolReach> = Vec::new();
+        for (index, (pool, size)) in sizes.into_iter().enumerate() {
+            let at = match pools.iter().position(|r| r.pool == pool) {
+                Some(at) => at,
+                None => {
+                    pools.push(PoolReach {
+                        pool,
+                        workers: 0,
+                        cpu: (i64::MIN, usize::MAX, i64::MIN),
+                        memory: (i64::MIN, usize::MAX, i64::MIN),
+                        disk: (i64::MIN, usize::MAX, i64::MIN),
+                    });
+                    pools.len() - 1
+                }
+            };
+            let r = &mut pools[at];
+            r.workers += 1;
+            top_two(&mut r.cpu, size.cpu_millis, index);
+            top_two(&mut r.memory, size.memory_bytes, index);
+            top_two(&mut r.disk, size.disk_bytes, index);
+        }
+        Reach { pools }
+    }
+
+    /// What the rest of `pool` can hold beside the `index`th worker, per
+    /// resource; `None` when it is the pool's only connected worker (nothing
+    /// to prefer).
+    fn elsewhere(&self, index: usize, pool: PoolId) -> Option<dispatch::Capacity> {
+        let r = self.pools.iter().find(|r| r.pool == pool)?;
+        (r.workers > 1).then(|| dispatch::Capacity {
+            cpu_millis: other_than(r.cpu, index),
+            memory_bytes: other_than(r.memory, index),
+            disk_bytes: other_than(r.disk, index),
+        })
+    }
+}
+
 impl Inner {
     fn wake(&self) {
         let (flag, cv) = &self.wake;
@@ -233,10 +326,15 @@ impl Inner {
         self.stats.admitted.fetch_add(1, Ordering::Relaxed);
         let Admitted { worker, pool, .. } = session.admitted;
         let generation = self.generation.fetch_add(1, Ordering::Relaxed);
+        let capacity = session.capacity();
         let peer = Arc::new(Peer {
             sender: session.sender(),
             pool,
             generation,
+            // Admission already refused a capacity that is not an i64.
+            cpu_millis: i64::try_from(capacity.cpu_millis).unwrap_or(i64::MAX),
+            memory_bytes: i64::try_from(capacity.memory_bytes).unwrap_or(i64::MAX),
+            disk_bytes: AtomicI64::new(0),
             seen_recorded_ms: AtomicI64::new(0),
             fingerprint: session.fingerprint,
             protocol: session.admitted.negotiated.protocol.0,
@@ -318,7 +416,7 @@ impl Inner {
         // Below the low watermark, no new work is placed: a job that cannot
         // store its output must not consume capacity discovering that.
         let admit_work = self.objects.admission().is_none_or(|a| a.is_open());
-        let peers: Vec<(WorkerId, Arc<Peer>)> = if !admit_work {
+        let mut peers: Vec<(WorkerId, Arc<Peer>)> = if !admit_work {
             Vec::new()
         } else {
             self.fleet
@@ -328,8 +426,17 @@ impl Inner {
                 .map(|(w, p)| (*w, Arc::clone(p)))
                 .collect()
         };
-        for (worker, peer) in peers {
-            let pool = peer.pool;
+        // Smallest worker first (best fit), never the map's arbitrary order:
+        // small work lands on small workers before a large worker is asked,
+        // so the large worker's room is still there for the jobs only it
+        // can run (Q10).
+        peers.sort_unstable_by_key(|(worker, p)| (p.cpu_millis, p.memory_bytes, *worker));
+        let reach = Reach::of(peers.iter().map(|(_, p)| (p.pool, p.size())));
+        for (index, (worker, peer)) in peers.iter().enumerate() {
+            let (worker, pool) = (*worker, peer.pool);
+            // What the rest of the pool can hold: a job beyond it is offered
+            // here first, whatever order the sweep reached this worker in.
+            let elsewhere = reach.elsewhere(index, pool);
             // All of this worker's placements in one transaction: `place`
             // sees the leases it just wrote, and the commits collapse to
             // one writer round trip per worker per wake.
@@ -337,7 +444,14 @@ impl Inner {
             let placed = self.write(move |tx| {
                 let mut placed = Vec::new();
                 for _ in 0..dispatch::MAX_HELD_ATTEMPTS {
-                    match dispatch::place(tx, worker, pool, dispatch::DEFAULT_LEASE_MS, now)? {
+                    match dispatch::place_in_fleet(
+                        tx,
+                        worker,
+                        pool,
+                        elsewhere,
+                        dispatch::DEFAULT_LEASE_MS,
+                        now,
+                    )? {
                         Some(offer) => placed.push(offer),
                         None => break,
                     }
@@ -830,6 +944,10 @@ impl SessionHandler for Inner {
         };
         let labels = profile.labels.clone();
         let images = profile.availability.images.clone();
+        if let Some(peer) = self.peer(worker) {
+            peer.disk_bytes
+                .store(capacity.disk_bytes, Ordering::Relaxed);
+        }
         let host_id = (profile.host_id != [0u8; 16]).then_some(profile.host_id);
         let cache_bytes = (profile.availability.cache_bytes != 0)
             .then(|| i64::try_from(profile.availability.cache_bytes).unwrap_or(i64::MAX));
@@ -1732,5 +1850,45 @@ impl std::fmt::Debug for Controller {
             .field("addr", &self.addr)
             .field("fingerprint", &self.fingerprint)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn size(cpu_millis: i64, memory_bytes: i64, disk_bytes: i64) -> dispatch::Capacity {
+        dispatch::Capacity {
+            cpu_millis,
+            memory_bytes,
+            disk_bytes,
+        }
+    }
+
+    #[test]
+    fn reach_is_what_every_other_worker_of_the_pool_can_hold() {
+        let (pool, other) = (PoolId::new(), PoolId::new());
+        let reach = Reach::of([
+            (pool, size(2_500, 2, 64)),
+            (pool, size(5_000, 8, i64::MAX)),
+            (other, size(64_000, 64, 64)),
+            (pool, size(7_000, 16, 256)),
+        ]);
+        // The largest worker is compared with the next largest per resource,
+        // across workers: memory and disk need not come from one machine.
+        assert_eq!(reach.elsewhere(3, pool), Some(size(5_000, 8, i64::MAX)));
+        assert_eq!(reach.elsewhere(0, pool), Some(size(7_000, 16, i64::MAX)));
+        assert_eq!(reach.elsewhere(1, pool), Some(size(7_000, 16, 256)));
+        // Another pool's worker is never "elsewhere", and a lone worker has
+        // nothing to prefer.
+        assert_eq!(reach.elsewhere(2, other), None);
+    }
+
+    #[test]
+    fn equal_largest_workers_hold_nothing_exclusive() {
+        let pool = PoolId::new();
+        let reach = Reach::of([(pool, size(7_000, 16, 256)), (pool, size(7_000, 16, 256))]);
+        assert_eq!(reach.elsewhere(0, pool), Some(size(7_000, 16, 256)));
+        assert_eq!(reach.elsewhere(1, pool), Some(size(7_000, 16, 256)));
     }
 }
