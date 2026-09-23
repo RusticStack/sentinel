@@ -777,6 +777,218 @@ impl LogStore {
     ) -> Result<Tail> {
         read_tail(&self.dir.join(format!("{attempt}.log")), after, limit, step)
     }
+
+    /// Find a literal byte string in an attempt's log (O05): frames with
+    /// sequence greater than `after`, scanned in stored order with one
+    /// precompiled `memmem` finder and no per-frame allocation beyond the
+    /// decode, until `limit` matching lines or `budget` payload bytes. See
+    /// [`Search`] for how a scan resumes. A match must lie inside one frame:
+    /// a string split across two frames is not found.
+    pub fn search(
+        &self,
+        run: RunId,
+        job: JobId,
+        attempt: AttemptId,
+        query: SearchQuery<'_>,
+    ) -> Result<Search> {
+        search_dir(
+            &self.attempt_dir(run, job, attempt),
+            &mut Scanner::new(query),
+        )
+    }
+
+    /// [`LogStore::search`] over a pre-D04 flat log.
+    pub fn search_legacy(&self, attempt: AttemptId, query: SearchQuery<'_>) -> Result<Search> {
+        let file = match File::open(self.dir.join(format!("{attempt}.log"))) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::NotFound),
+            Err(e) => return Err(e.into()),
+        };
+        let mut scanner = Scanner::new(query);
+        let mut decoder = Decoder {
+            reader: Box::new(file),
+            buf: Vec::new(),
+            complete: 0,
+        };
+        let mut ended = false;
+        while let Some(record) = decoder.next()? {
+            match record {
+                Record::Frame(frame) => {
+                    if !scanner.frame(&frame) {
+                        return Ok(scanner.out);
+                    }
+                }
+                Record::End { .. } => {
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        scanner.out.complete = ended;
+        Ok(scanner.out)
+    }
+}
+
+/// Bytes of frame payload one search request scans at most; a bigger log
+/// takes several requests, each resuming at the previous `next_after`.
+pub const SEARCH_SCAN_BYTES: u64 = 4 << 20;
+/// A match's reported text: its line, cut to this many bytes around it.
+pub const MATCH_TEXT_BYTES: usize = 512;
+
+/// A bounded literal search: frames past `after`, at most `limit` matching
+/// lines and `budget` scanned payload bytes (normally [`SEARCH_SCAN_BYTES`]).
+#[derive(Clone, Copy, Debug)]
+pub struct SearchQuery<'a> {
+    pub needle: &'a [u8],
+    pub after: u64,
+    pub limit: usize,
+    pub budget: u64,
+}
+
+/// One matching line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Match {
+    pub seq: u64,
+    pub step: u32,
+    pub stream: sentinel_protocol::logs::Stream,
+    /// The line holding the match (without its newline), at most
+    /// [`MATCH_TEXT_BYTES`] around the first match on it.
+    pub text: Vec<u8>,
+}
+
+/// What one bounded search found. `next_after` is set when the scan
+/// stopped at the match limit or the byte budget before the end of what is
+/// stored: pass it as the next request's `after`. `complete` means the log
+/// is finished and the scan reached its end, so nothing more can match.
+/// Neither set: the scan reached the end of a log still being written.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Search {
+    pub matches: Vec<Match>,
+    pub next_after: Option<u64>,
+    pub complete: bool,
+}
+
+/// The per-request scan state: the finder is built once per request.
+struct Scanner<'n> {
+    finder: memchr::memmem::Finder<'n>,
+    after: u64,
+    limit: usize,
+    budget: u64,
+    scanned: u64,
+    out: Search,
+}
+
+impl<'n> Scanner<'n> {
+    fn new(query: SearchQuery<'n>) -> Scanner<'n> {
+        Scanner {
+            finder: memchr::memmem::Finder::new(query.needle),
+            after: query.after,
+            limit: query.limit,
+            budget: query.budget,
+            scanned: 0,
+            out: Search::default(),
+        }
+    }
+
+    /// Scan one decoded frame; `false` once the request's bound is reached
+    /// (with `next_after` set). The limit is checked between frames, so one
+    /// frame's matching lines are never split across responses.
+    fn frame(&mut self, frame: &Frame) -> bool {
+        if frame.seq <= self.after {
+            return true;
+        }
+        if self.out.matches.len() >= self.limit || self.scanned >= self.budget {
+            self.out.next_after = Some(self.after);
+            return false;
+        }
+        let bytes = &frame.bytes[..];
+        let mut from = 0;
+        while let Some(at) = self.finder.find(&bytes[from..]) {
+            let at = from + at;
+            let line_start = memchr::memrchr(b'\n', &bytes[..at]).map_or(0, |i| i + 1);
+            let line_end = memchr::memchr(b'\n', &bytes[at..]).map_or(bytes.len(), |i| at + i);
+            let start = line_start.max(at.saturating_sub(MATCH_TEXT_BYTES / 4));
+            let mut end = line_end.min(start + MATCH_TEXT_BYTES);
+            if end > start && bytes[end - 1] == b'\r' {
+                end -= 1;
+            }
+            self.out.matches.push(Match {
+                seq: frame.seq,
+                step: frame.step,
+                stream: frame.stream,
+                text: bytes[start..end].to_vec(),
+            });
+            // One report per line; the next match starts past it.
+            from = line_end + 1;
+            if from >= bytes.len() {
+                break;
+            }
+        }
+        self.scanned += bytes.len() as u64;
+        // Resume after this frame, whatever stops the scan next.
+        self.after = frame.seq;
+        true
+    }
+}
+
+/// Where a scan for frames past `after` starts: the last checkpoint at or
+/// before `after` names the segment (a seal entry's coverage ends with its
+/// segment, so the next frames sit in the one after).
+fn seek_start(entries: &[Entry], after: u64) -> u32 {
+    let mut start = 0u32;
+    for entry in entries {
+        if entry.seq <= after {
+            start = if entry.kind == KIND_SEAL {
+                entry.seg.saturating_add(1)
+            } else {
+                entry.seg
+            };
+        }
+    }
+    start
+}
+
+fn search_dir(dir: &Path, scanner: &mut Scanner<'_>) -> Result<Search> {
+    let segs = segs(dir)?;
+    let marker = end_marker(dir).is_some();
+    if segs.is_empty() && !marker {
+        return Err(Error::NotFound);
+    }
+    let index_bytes = fs::read(dir.join("index")).unwrap_or_default();
+    let entries = read_index(&index_bytes).unwrap_or_default();
+    let start = seek_start(&entries, scanner.after);
+    let mut ended = marker;
+    'decode: for (n, compressed) in segs.range(start..) {
+        let mut decoder = match seg_decoder(dir, *n, *compressed) {
+            Ok(decoder) => decoder,
+            // The compressor renamed it between listing and open.
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound && !compressed => {
+                match seg_decoder(dir, *n, true) {
+                    Ok(decoder) => decoder,
+                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e),
+        };
+        while let Some(record) = decoder.next()? {
+            match record {
+                Record::Frame(frame) => {
+                    if !scanner.frame(&frame) {
+                        return Ok(std::mem::take(&mut scanner.out));
+                    }
+                }
+                Record::End { .. } => {
+                    ended = true;
+                    break 'decode;
+                }
+            }
+        }
+    }
+    let mut out = std::mem::take(&mut scanner.out);
+    out.complete = ended;
+    Ok(out)
 }
 
 impl Drop for LogStore {
@@ -1187,21 +1399,9 @@ pub fn read_dir(dir: &Path, after: u64, limit: usize, step: Option<u32>) -> Resu
     }
     let index_bytes = fs::read(dir.join("index")).unwrap_or_default();
     let entries = read_index(&index_bytes).unwrap_or_default();
-    // Seek: the last checkpoint at or before `after` names the segment to
-    // start at (a seal entry's coverage ends with its segment, so the
-    // next frames sit in the one after). Fills always carry a sequence
-    // below every later checkpoint, so no earlier segment can hold a
-    // frame past `after`.
-    let mut start = 0u32;
-    for entry in &entries {
-        if entry.seq <= after {
-            start = if entry.kind == KIND_SEAL {
-                entry.seg.saturating_add(1)
-            } else {
-                entry.seg
-            };
-        }
-    }
+    // Seek ([`seek_start`]). Fills always carry a sequence below every
+    // later checkpoint, so no earlier segment can hold a frame past `after`.
+    let mut start = seek_start(&entries, after);
     if let Some(want) = step {
         // A step's first frame is always checkpointed: the wanted frames
         // continue the step run spanning `after`, or start at the next

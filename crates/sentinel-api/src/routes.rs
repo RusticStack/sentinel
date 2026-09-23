@@ -22,7 +22,7 @@ use sentinel_protocol::{
 };
 use sentinel_store::{
     Error as StoreError, artifacts, auth as authz, auth::Authority, checks, dispatch, idempotency,
-    local_auth, lookup, objects::Digest, provenance, runs, status, tenancy, workers,
+    local_auth, logs, lookup, objects::Digest, provenance, runs, status, tenancy, workers,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -321,24 +321,36 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
             let (slug, name) = ((*slug).to_owned(), (*name).to_owned());
             let limit = page_size(query_param(query, "limit").and_then(|v| v.parse().ok()))
                 .min(MAX_PAGE_ITEMS) as u16;
-            let runs = state
+            // Keyset cursor: the last run of the previous page.
+            let before: Option<RunId> = query_param(query, "before")
+                .map(|v| id(v, "run"))
+                .transpose()?;
+            let page = state
                 .store
                 .read(|c| {
                     let tenant = lookup::tenant_by_slug(c, &slug)?;
                     let repo = lookup::repo_by_name(c, tenant, &name)?;
                     authz::require_repo(c, who.principal, repo, Permissions::READ)?;
-                    status::recent_runs(c, tenant, repo, limit)
+                    status::runs_page(c, tenant, repo, before, limit)
                 })
                 .map_err(store_error)?;
             ok(json!({
-                "runs": runs.iter().map(|r| json!({
+                "runs": page.runs.iter().map(|r| json!({
                     "id": r.id.to_string(), "sha": r.sha, "created_ms": r.created.0,
                     "state": run_state(r.state),
-                })).collect::<Vec<_>>()
+                })).collect::<Vec<_>>(),
+                "next": page.next.map(|r| r.to_string()),
             }))
         }
         ("POST", ["api", "v1", "tenants", slug, "repos", name, "runs"]) => {
             dispatch_run(state, request, slug, name)
+        }
+        ("GET", ["api", "v1", "runs", run, "wait"]) => run_wait(state, request, run, query),
+        ("GET", ["api", "v1", "attempts", attempt, "logs", "search"]) => {
+            log_search(state, request, attempt, query)
+        }
+        ("GET", ["api", "v1", "attempts", attempt, "summary"]) => {
+            attempt_summary(state, request, attempt)
         }
         ("GET", ["api", "v1", "runs", run]) => {
             let who = identify(state, request, false)?;
@@ -452,16 +464,7 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
             let who = identify(state, request, false)?;
             auth::require_scope(&who, Scopes::LOGS_READ)?;
             let attempt: AttemptId = id(attempt, "attempt")?;
-            let (run, job) = state
-                .store
-                .read(|c| {
-                    let job = lookup::attempt_job(c, attempt)?;
-                    let run = lookup::job_run(c, job)?;
-                    let repo = lookup::run_repo(c, run)?;
-                    authz::require_repo(c, who.principal, repo, Permissions::READ)?;
-                    Ok((run, job))
-                })
-                .map_err(store_error)?;
+            let (run, job) = attempt_log(state, who.principal, attempt)?;
             let after: u64 = query_param(query, "after")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
@@ -469,6 +472,9 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
             let step: Option<u32> = query_param(query, "step").and_then(|v| v.parse().ok());
             let wait = query_param(query, "wait").is_some_and(|v| v == "1" || v == "true");
             let deadline = std::time::Instant::now() + LOG_WAIT;
+            // Parking holds a handler permit: the poll takes one of the
+            // SUBSCRIBERS slots it shares with run waits before it parks.
+            let mut parked: Option<Slot<'_>> = None;
             let tail = loop {
                 let tail = state
                     .logs
@@ -489,8 +495,12 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
                 {
                     break tail;
                 }
+                if parked.is_none() {
+                    parked = Some(subscriber(state)?);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(250));
             };
+            drop(parked);
             ok(json!({
                 "attempt": attempt.to_string(),
                 "complete": tail.complete,
@@ -1091,6 +1101,242 @@ fn slot(state: &State) -> Result<Slot<'_>, ApiError> {
             Err(next) => held = next,
         }
     }
+}
+
+/// Long-poll subscribers parked at once — run waits and `wait=1` log polls
+/// together. Each holds a handler permit ([`crate::WORKERS`]) while parked,
+/// so the cap keeps half of them for everything else; beyond it a poll is
+/// `rate_limited` with `details.retry_after_ms`.
+pub(crate) const SUBSCRIBERS: usize = 4;
+/// What a refused subscriber is told to wait before trying again.
+const SUBSCRIBER_RETRY_MS: u64 = 1_000;
+/// The longest a run wait parks (`timeout_ms` bound and default), the same
+/// bound as a `wait=1` log poll.
+const MAX_WAIT_MS: u64 = LOG_WAIT.as_millis() as u64;
+/// A parked wait re-reads the run at most this often however fast commits
+/// arrive: every commit in the store bumps the notifier, so a busy
+/// controller would otherwise cost one status read per commit per waiter.
+const RECHECK: std::time::Duration = std::time::Duration::from_millis(10);
+/// How often a parked wait looks at the shutdown flag.
+const STOP_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn subscriber(state: &State) -> Result<Slot<'_>, ApiError> {
+    use std::sync::atomic::Ordering;
+    let mut held = state.subscribers.load(Ordering::Acquire);
+    loop {
+        if held >= SUBSCRIBERS {
+            return Err(
+                err(ErrorCode::RateLimited, "too many parked subscribers; retry")
+                    .with_detail("retry_after_ms", SUBSCRIBER_RETRY_MS),
+            );
+        }
+        match state.subscribers.compare_exchange_weak(
+            held,
+            held + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(Slot(&state.subscribers)),
+            Err(next) => held = next,
+        }
+    }
+}
+
+/// An attempt's run and job, after the caller's `read` on its repository.
+fn attempt_log(
+    state: &State,
+    principal: Principal,
+    attempt: AttemptId,
+) -> Result<(RunId, JobId), ApiError> {
+    state
+        .store
+        .read(|c| {
+            let job = lookup::attempt_job(c, attempt)?;
+            let run = lookup::job_run(c, job)?;
+            let repo = lookup::run_repo(c, run)?;
+            authz::require_repo(c, principal, repo, Permissions::READ)?;
+            Ok((run, job))
+        })
+        .map_err(store_error)
+}
+
+/// `GET /runs/{run}/wait?since=<16 hex>&timeout_ms=1..25000`: answer as
+/// soon as the run's version differs from `since` (at once without one) or
+/// the run is finished; otherwise park on the store's commit notifier until
+/// something commits, re-reading only the allocation-free version, until
+/// the deadline or shutdown. The answer always carries the current run.
+fn run_wait(state: &State, request: &Request, run: &str, query: &str) -> Route {
+    let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::RUNS_READ)?;
+    let run: RunId = id(run, "run")?;
+    let since = query_param(query, "since")
+        .map(|v| {
+            (v.len() == 16)
+                .then(|| u64::from_str_radix(v, 16).ok())
+                .flatten()
+                .ok_or_else(|| err(ErrorCode::InvalidRequest, "since must be 16 hex digits"))
+        })
+        .transpose()?;
+    let timeout_ms = match query_param(query, "timeout_ms") {
+        None => MAX_WAIT_MS,
+        Some(v) => v
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| (1..=MAX_WAIT_MS).contains(ms))
+            .ok_or_else(|| {
+                err(
+                    ErrorCode::InvalidRequest,
+                    format!("timeout_ms must be 1..{MAX_WAIT_MS}"),
+                )
+            })?,
+    };
+    let tenant = authorize_run(state, who.principal, run, Permissions::READ)?;
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(timeout_ms);
+    let changes = state.store.changes();
+    let version = || {
+        state
+            .store
+            .read(|c| status::run_version(c, tenant, run))
+            .map_err(store_error)
+    };
+    // The generation is read before the version: a commit landing between
+    // the two moves the generation past `seen`, so the park below returns
+    // at once instead of missing it.
+    let mut seen = changes.generation();
+    let mut current = version()?;
+    let mut checked = std::time::Instant::now();
+    let mut parked: Option<Slot<'_>> = None;
+    while since == Some(current.version) && !current.finished {
+        if parked.is_none() {
+            parked = Some(subscriber(state)?);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline || state.stop.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        let next = changes.wait_past(seen, deadline.min(now + STOP_SLICE));
+        if next == seen {
+            continue;
+        }
+        seen = next;
+        let since_check = checked.elapsed();
+        if since_check < RECHECK {
+            std::thread::sleep((RECHECK - since_check).min(deadline - now));
+            seen = changes.generation();
+        }
+        current = version()?;
+        checked = std::time::Instant::now();
+    }
+    drop(parked);
+    let view = state
+        .store
+        .read(|c| status::run(c, tenant, run))
+        .map_err(store_error)?;
+    ok(json!({
+        "version": format!("{:016x}", current.version),
+        "changed": since != Some(current.version),
+        "finished": current.finished,
+        "run": run_json(&view),
+    }))
+}
+
+/// `GET /attempts/{att}/logs/search?q=…&after&limit`: a bounded literal
+/// scan ([`sentinel_store::logs::LogStore::search`]). `q` is
+/// percent-decoded (`+` is a space), 1..=256 bytes.
+fn log_search(state: &State, request: &Request, attempt: &str, query: &str) -> Route {
+    let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::LOGS_READ)?;
+    let attempt: AttemptId = id(attempt, "attempt")?;
+    let mut needle = None;
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        if key == "q" {
+            if needle.is_some() {
+                return Err(err(ErrorCode::InvalidRequest, "q given twice"));
+            }
+            needle = Some(value);
+        }
+    }
+    let needle = needle
+        .filter(|q| (1..=MAX_SEARCH_TEXT).contains(&q.len()))
+        .ok_or_else(|| {
+            err(
+                ErrorCode::InvalidRequest,
+                format!("q must be 1..{MAX_SEARCH_TEXT} bytes"),
+            )
+        })?;
+    let after: u64 = match query_param(query, "after") {
+        None => 0,
+        Some(v) => v
+            .parse()
+            .map_err(|_| err(ErrorCode::InvalidRequest, "malformed after"))?,
+    };
+    let limit = page_size(query_param(query, "limit").and_then(|v| v.parse().ok()));
+    let (run, job) = attempt_log(state, who.principal, attempt)?;
+    let search = logs::SearchQuery {
+        needle: needle.as_bytes(),
+        after,
+        limit,
+        budget: logs::SEARCH_SCAN_BYTES,
+    };
+    let found = state
+        .logs
+        .search(run, job, attempt, search)
+        .or_else(|e| match e {
+            StoreError::NotFound => state.logs.search_legacy(attempt, search),
+            e => Err(e),
+        })
+        .map_err(store_error)?;
+    ok(json!({
+        "attempt": attempt.to_string(),
+        "matches": found.matches.iter().map(|m| json!({
+            "seq": m.seq,
+            "step": m.step,
+            "stream": stream_name(m.stream),
+            "text": String::from_utf8_lossy(&m.text),
+        })).collect::<Vec<_>>(),
+        "next_after": found.next_after,
+        "complete": found.complete,
+    }))
+}
+
+/// Longest `q` a log search accepts, in bytes.
+const MAX_SEARCH_TEXT: usize = 256;
+
+fn stream_name(stream: sentinel_protocol::logs::Stream) -> &'static str {
+    match stream {
+        sentinel_protocol::logs::Stream::Stdout => "stdout",
+        sentinel_protocol::logs::Stream::Stderr => "stderr",
+    }
+}
+
+/// `GET /attempts/{att}/summary`: the cache records (K08) the attempt's
+/// terminal report carried, or `{present:false}` before there is one.
+fn attempt_summary(state: &State, request: &Request, attempt: &str) -> Route {
+    let who = identify(state, request, false)?;
+    auth::require_scope(&who, Scopes::CACHE_READ)?;
+    let attempt: AttemptId = id(attempt, "attempt")?;
+    let bytes = state
+        .store
+        .read(|c| {
+            let job = lookup::attempt_job(c, attempt)?;
+            let run = lookup::job_run(c, job)?;
+            let repo = lookup::run_repo(c, run)?;
+            let tenant = authz::require_repo(c, who.principal, repo, Permissions::READ)?;
+            dispatch::attempt_summary(c, tenant, attempt)
+        })
+        .map_err(store_error)?;
+    let Some(bytes) = bytes else {
+        return ok(json!({ "attempt": attempt.to_string(), "present": false }));
+    };
+    let summary = sentinel_protocol::summary::AttemptSummary::decode(&bytes)
+        .map_err(|_| err(ErrorCode::Internal, "stored summary unreadable"))?;
+    ok(json!({
+        "attempt": attempt.to_string(),
+        "present": true,
+        "image_present": summary.image_present,
+        "caches": summary.caches,
+    }))
 }
 
 #[derive(Deserialize)]

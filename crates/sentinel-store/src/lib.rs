@@ -45,10 +45,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// The connection type read closures receive; re-exported for the same reason.
@@ -199,7 +200,76 @@ pub fn migrate(conn: &mut Connection) -> Result<u32> {
     Ok(current)
 }
 
-type Job = Box<dyn FnOnce(&mut Connection) + Send>;
+/// A queued write: it runs on the writer thread with the connection and the
+/// commit notifier, which it bumps once its work has committed.
+type Job = Box<dyn FnOnce(&mut Connection, &Changes) + Send>;
+
+/// The commit notifier: a generation counter the writer thread bumps after
+/// every write that completed successfully, and a parking place for readers
+/// that want to know when the database may have changed (the O05 long
+/// polls). A generation says only "something committed"; the waiter
+/// re-reads whatever it cares about.
+///
+/// Hot-path cost on the writer: one atomic add and one atomic load per
+/// commit. The lock and `notify_all` are taken only while someone is
+/// parked. No wakeup is lost: a waiter registers in `waiters` *before* it
+/// reads the generation under the lock, and the writer reads `waiters`
+/// *after* bumping the generation (all `SeqCst`), so either the writer sees
+/// the waiter and notifies under the lock, or the waiter's read already
+/// sees the new generation and never parks.
+#[derive(Debug, Default)]
+pub struct Changes {
+    generation: AtomicU64,
+    waiters: AtomicUsize,
+    lock: Mutex<()>,
+    cv: Condvar,
+}
+
+impl Changes {
+    /// The current generation. It only grows, by one per completed write.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Park until the generation differs from `seen` or `deadline` passes,
+    /// and return the generation then (equal to `seen` on timeout). Returns
+    /// at once when it already differs; spurious wakeups are absorbed here.
+    pub fn wait_past(&self, seen: u64, deadline: Instant) -> u64 {
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        let mut guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let generation = loop {
+            let now = self.generation.load(Ordering::SeqCst);
+            if now != seen {
+                break now;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break now;
+            }
+            guard = self
+                .cv
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        };
+        drop(guard);
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+        generation
+    }
+
+    /// The writer's side, once a write has committed.
+    #[inline]
+    fn committed(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if self.waiters.load(Ordering::SeqCst) != 0 {
+            // Taking the lock orders this notify after any waiter's check:
+            // a waiter is either not yet checking (and will see the new
+            // generation) or parked in `wait_timeout` (and is woken).
+            let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            self.cv.notify_all();
+        }
+    }
+}
 
 /// Readers admitted at once. Each holds a WAL snapshot and a file descriptor;
 /// beyond this many, a request waits briefly and is then shed rather than
@@ -239,6 +309,7 @@ pub struct Writer {
     sender: SyncSender<Job>,
     thread: Option<thread::JoinHandle<()>>,
     drained: Arc<(Mutex<bool>, Condvar)>,
+    changes: Arc<Changes>,
 }
 
 impl Writer {
@@ -246,11 +317,13 @@ impl Writer {
         let (sender, receiver) = mpsc::sync_channel::<Job>(capacity);
         let drained = Arc::new((Mutex::new(false), Condvar::new()));
         let signal = Arc::clone(&drained);
+        let changes = Arc::new(Changes::default());
+        let notifier = Arc::clone(&changes);
         let thread = thread::Builder::new()
             .name("sentinel-store-writer".into())
             .spawn(move || {
                 for job in receiver {
-                    job(&mut conn);
+                    job(&mut conn, &notifier);
                 }
                 let (flag, wake) = &*signal;
                 *flag.lock().unwrap_or_else(|p| p.into_inner()) = true;
@@ -261,6 +334,7 @@ impl Writer {
             sender,
             thread: Some(thread),
             drained,
+            changes,
         }
     }
 
@@ -295,9 +369,14 @@ impl Writer {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
         let (reply, done) = mpsc::sync_channel::<Result<T>>(1);
-        let job: Job = Box::new(move |conn| {
+        let job: Job = Box::new(move |conn, changes| {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn)))
                 .unwrap_or(Err(Error::WriterPanicked));
+            // Before the reply, so a caller whose write succeeded never
+            // observes the generation that preceded it.
+            if result.is_ok() {
+                changes.committed();
+            }
             // A caller that stopped waiting is not an error for the writer.
             let _ = reply.send(result);
         });
@@ -417,6 +496,11 @@ impl Store {
 
     pub fn writer(&self) -> &Writer {
         &self.writer
+    }
+
+    /// The commit notifier: bumped after every successful write.
+    pub fn changes(&self) -> &Changes {
+        &self.writer.changes
     }
 
     /// Run a read-only closure on a pooled connection using committed WAL
