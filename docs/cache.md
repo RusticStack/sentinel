@@ -22,7 +22,7 @@ cache/<repo>/<class>/<trust>/<os>-<arch>/<toolchain16>/<name>/<entry>/lease/
 ```
 
 - `<repo>` leads: repository IDs are globally unique, so two tenants can never produce the same scope directory. The tenant is still recorded in every manifest — a moved directory fails `WrongTenant`, not the path check.
-- `<class>` and `<trust>` are the enum names: `downloads`/`dependencies`/`compiler` and `protected`/`pull_request`.
+- `<class>` and `<trust>` are the enum names: `downloads`/`dependencies`/`compiler` and `protected`/`pull_request`/`unprotected`.
 - `<os>-<arch>` is one component (`linux-x86_64`); a second OS can never silently reuse a scope directory.
 - `<toolchain16>` is the first 8 bytes of the BLAKE3 digest of the toolchain descriptor — image digest, tool versions, whatever pins "the toolchain" — as 16 lowercase hex characters.
 - `<name>` is the pipeline's cache name, already `valid_id`-shaped; `Scope::new` re-checks rather than trusts.
@@ -31,12 +31,13 @@ cache/<repo>/<class>/<trust>/<os>-<arch>/<toolchain16>/<name>/<entry>/lease/
 
 ## Trust derivation
 
-`Trust` has two values with one rule (`Trust::of_event`, applied once in `dispatch::job_context` from the run's recorded provenance):
+Trust is keyed to who could have produced a run's content, not merely to its event name. `Trust` has three values with one rule (`Trust::derive`, applied once by `provenance::cache_trust` for `dispatch::job_context` and the remote-cache gate):
 
-- `pull_request` runs → `PullRequest`: content a fork can influence never writes to — or reads — protected state.
-- every other trigger, and a run with no recorded provenance (`manual`) → `Protected`.
+- `protected` — a `push` or `tag` that arrived through verified intake (a recorded webhook or ref-poll delivery, never the API) for a ref the repository's live source binding names **exactly** in `allowed_refs` (no wildcard). Name the default branch, and any release refs whose builds may seed protected state, explicitly — e.g. `allowed_refs = ["refs/heads/main", "refs/heads/*", "refs/tags/*"]` builds every branch but gives only `main` protected cache state.
+- `pull_request` — pull-request runs: content a fork can influence.
+- `unprotected` — everything else: manual API runs (the caller chose the checkout URL, SHA and possibly the whole pipeline — the repository `RUN` bit is enough), pushes and tags admitted only by a wildcard pattern (anyone with push rights to any branch), runs of an unbound or revoked repository, and runs with no recorded provenance.
 
-Workers that negotiated protocol 6 receive the tenant and trust class in `Context2`; older workers get `Context` and scope to `PullRequest` — the reading that can never touch protected state. A trust byte that does not decode is a protocol error, never a guess.
+Each class reads and writes only its own scope directory and manifests record it, so neither untrusted class can plant `node_modules`, a `.venv` or compiler output a protected build restores, and neither reads protected state. Workers that negotiated protocol 8 receive the class as is in `Context2`; a protocol 6–7 worker cannot carry `unprotected` and is sent `pull_request` for such a job (the controller's remote-cache gate accepts that downgrade for it); protocol ≤5 workers get `Context` and scope to `pull_request`. Every downgrade is toward the scope that can never touch protected state. A trust byte that does not decode is a protocol error, never a guess.
 
 ## The manifest
 
@@ -57,7 +58,7 @@ A lookup answers an `Outcome`, never an error: `Hit` (the verified manifest plus
 | `wrong_class` | sealed under a different cache class |
 | `wrong_tenant` | sealed under another tenant |
 | `wrong_repo` | sealed under another repository |
-| `wrong_trust` | sealed under the other trust class |
+| `wrong_trust` | sealed under another trust class |
 | `wrong_platform` | sealed on another `os-arch` |
 | `wrong_toolchain` | sealed under another toolchain digest |
 | `wrong_name` | names a different cache entry |
@@ -149,7 +150,7 @@ A worker's warm path stays local: **a local hit never traverses the controller o
 
 **Messages.** Protocol 7, over the bulk transport — the control stream never carries cache bytes. A fetch is `CacheNeed { attempt, tenant, repo, class, trust, os, arch, toolchain, name, key, offset, have }` (`key` is the entry key; `offset`/`have` are the resume request, the empty digest at offset 0) answered by `CacheGrant { total, offset, prefix, digest }`, then ordered `CacheChunk { offset, bytes, prefix }` frames, then the terminal `CacheEnd { digest }`. An offer is `CacheOffer { …, total, digest }` answered by a grant (or `CacheEnd` when the store already holds that digest), then `CachePush { offset, bytes }` frames, then `CachePushEnd { digest }`. Refusals are `CacheRefused { attempt, code }` with a stable code: `no_bundle` (1), `denied` (2, not held or tenant/repo/trust mismatch), `wrong_scope` (3), `busy` (4), `too_large` (5), `store` (6). `aborted` (7) is worker-internal and never sent. A serve hands the link one chunk per frame — 48 KiB, because a chunk's running digest cannot be re-derived from split pieces — and a receiver accepts up to 1 MiB, so a wider framing needs no store change. Bundles are capped at 64 GiB.
 
-**Authorization.** A request or offer is fenced by the attempt it names: the controller resolves it through `dispatch::attempt_scope` and requires the worker to hold it and the message's tenant, repo and trust to equal the job context's — the same trust boundary the manifest enforces again on arrival. A refusal is `denied`; nothing about the store's contents crosses it.
+**Authorization.** A request or offer is fenced by the attempt it names: the controller resolves it through `dispatch::cache_scope` (one indexed row plus the trust probe) and requires the attempt to be owned by that worker and the message's tenant and repo to equal the job's and its trust to be one the job's class admits (its own, or the `pull_request` a pre-8 worker was told to use for an `unprotected` job) — the same trust boundary the manifest enforces again on arrival. A fetch requires the attempt still held; an offer — sent only after the terminal report released the attempt — accepts one released by the same worker within `OFFER_WINDOW_MS` (10 minutes). A refusal is `denied` and counted (`Stats::cache_denied`); nothing about the store's contents crosses it.
 
 **Resume.** A hydration transfers into `<entry>/writing/remote.part` under the entry's single-writer marker (`writing/.lock`) and a lease — a live publisher is a skip, and GC can never take the entry mid-transfer. The worker hashes the partial prefix it already holds and asks to continue from it; the controller serves from that offset only when its bundle really extends the prefix, otherwise it answers offset 0 and the worker truncates. Bytes already on disk are never re-sent and never spliced: a prefix that does not match is dropped (`corrupt` — the partial can never verify) while a transfer cut short by the network or the budget keeps its partial for the next attempt. A completed partial is deleted; a stale one is reaped with the rest of `writing/`.
 

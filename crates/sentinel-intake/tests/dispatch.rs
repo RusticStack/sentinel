@@ -539,6 +539,64 @@ fn a_push_resolves_through_the_policy_and_dispatches_with_exact_provenance() {
     assert_eq!(runs, 1);
 }
 
+/// P07-2: a verified push is protected cache state only when the binding
+/// names its ref exactly. Admitted through the fixture's `refs/heads/*`
+/// wildcard, anyone with push rights to any branch could produce it, so it
+/// is `unprotected`; once the binding names `refs/heads/main` itself, the
+/// same run reads as `protected`. A run with no delivery (manual API
+/// dispatch) never is.
+#[test]
+fn a_push_is_protected_only_for_a_ref_the_binding_names_exactly() {
+    use sentinel_protocol::cache::Trust;
+    if !prerequisites() {
+        return;
+    }
+    let f = fixture();
+    let accepted = f.accept_push("push-trust", REF, &f.commits[0], &f.commits[1]);
+    let _ = f.validate(accepted);
+    let (outcome, _) = f.resolve(accepted);
+    let Outcome::Dispatched { run } = outcome else {
+        panic!("expected a dispatch, got {outcome:?}");
+    };
+    let repo = f.repo;
+    let trust = |store: &Store| {
+        store
+            .read(move |c| provenance::cache_trust(c, run, repo))
+            .unwrap()
+    };
+    assert_eq!(trust(&f.store), Trust::Unprotected, "wildcard-admitted");
+    let exact = serde_json::to_vec(&Binding {
+        remote: f.remote.clone(),
+        allowed_refs: vec![REF.into(), "refs/heads/*".into()],
+        pipeline_path: ".sentinel.yml".into(),
+        trust: String::new(),
+    })
+    .unwrap();
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE source_bindings SET binding = ?1 WHERE repo_id = ?2",
+                (exact, repo.as_bytes().as_slice()),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(trust(&f.store), Trust::Protected, "named exactly");
+    // A revoked binding protects nothing.
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE source_bindings SET revoked = 1 WHERE repo_id = ?1",
+                [repo.as_bytes()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(trust(&f.store), Trust::Unprotected, "revoked");
+}
+
 #[test]
 fn the_policy_refuses_branches_it_does_not_declare() {
     if !prerequisites() {

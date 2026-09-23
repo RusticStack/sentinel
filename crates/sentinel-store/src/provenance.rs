@@ -203,6 +203,49 @@ pub fn event_facts(conn: &Connection, run: RunId) -> Result<EventFacts> {
     })
 }
 
+/// The cache trust class of one run (P07-2, docs/cache.md): `Protected`
+/// only for a `push`/`tag` that arrived through verified intake (a
+/// recorded delivery — never the API) for a ref the repository's live
+/// binding names *exactly*; `PullRequest` for pull-request runs;
+/// `Unprotected` for everything else — manual runs, whose source and
+/// pipeline the caller chose, refs admitted only by a wildcard, unbound or
+/// revoked repositories, and runs without provenance.
+pub fn cache_trust(
+    conn: &Connection,
+    run: RunId,
+    repo: sentinel_core::RepoId,
+) -> Result<sentinel_protocol::cache::Trust> {
+    use sentinel_protocol::cache::Trust;
+    let row: Option<(String, bool, Option<String>)> = conn
+        .prepare_cached(
+            "SELECT trigger, delivery_id IS NOT NULL, ref_name FROM run_provenance
+             WHERE run_id = ?1",
+        )?
+        .query_row([run.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .optional()?;
+    let Some((trigger, verified, ref_name)) = row else {
+        return Ok(Trust::Unprotected);
+    };
+    let exact = match (&*trigger, verified, ref_name) {
+        ("push" | "tag", true, Some(reference)) => {
+            match crate::sources::load_metadata(conn, repo) {
+                Ok(meta) => {
+                    !meta.revoked
+                        && meta
+                            .binding
+                            .allowed_refs
+                            .iter()
+                            .any(|pattern| !pattern.contains('*') && *pattern == reference)
+                }
+                Err(crate::Error::NotFound) => false,
+                Err(e) => return Err(e),
+            }
+        }
+        _ => false,
+    };
+    Ok(Trust::derive(&trigger, verified, exact))
+}
+
 /// One run's provenance; `None` for a run created before this contract
 /// (or by a path that does not record it).
 pub fn of_run(conn: &Connection, run: RunId) -> Result<Option<RunProvenance>> {

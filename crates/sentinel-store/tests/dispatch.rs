@@ -633,14 +633,17 @@ jobs:
     image: alpine:3
     steps: [{ id: s, run: 'true' }]
 ";
-    // Exactly `pull_request` scopes a job's caches to pull-request state;
-    // every other recorded trigger — and no provenance at all, which reads
-    // back as `manual` — scopes to protected.
+    // `pull_request` scopes a job's caches to pull-request state. Protected
+    // state needs a verified delivery for a ref the binding names exactly
+    // (P07-2; `sentinel-intake/tests/dispatch.rs` covers that path), so a
+    // push recorded without a delivery, an unknown trigger and no
+    // provenance at all — the manual API — are all unprotected.
     for (trigger, trust) in [
         (Some("pull_request"), Trust::PullRequest),
-        (Some("push"), Trust::Protected),
-        (Some("merge_queue"), Trust::Protected),
-        (None, Trust::Protected),
+        (Some("push"), Trust::Unprotected),
+        (Some("manual"), Trust::Unprotected),
+        (Some("merge_queue"), Trust::Unprotected),
+        (None, Trust::Unprotected),
     ] {
         let (run_id, ids) = run(&f, yaml, at(2_000));
         if let Some(trigger) = trigger {

@@ -1253,9 +1253,10 @@ fn protocol6_context_carries_the_tenant_and_derived_cache_trust() {
     let context = context.unwrap();
     // `Context2` reached the worker: the run's tenant, and the trust class
     // the store derived from recorded provenance — this run has none, so
-    // `manual` maps to the protected scope.
+    // it is `manual` and unprotected (P07-2); a protocol-6 worker cannot
+    // carry that class and is given the pull-request scope instead.
     assert_eq!(context.tenant, Some(d.tenant));
-    assert_eq!(context.trust, Trust::Protected);
+    assert_eq!(context.trust, Trust::PullRequest);
     assert_eq!(context.event.name, "manual");
     assert_eq!(context.job, offer.job);
     process.stop().unwrap();

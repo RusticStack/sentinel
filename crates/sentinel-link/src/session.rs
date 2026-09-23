@@ -729,7 +729,11 @@ pub(crate) fn context_message(
     attempt: AttemptId,
 ) -> ServerMessage {
     if protocol >= 6 {
-        ServerMessage::Context2(context.to_wire2(attempt))
+        let mut wire = context.to_wire2(attempt);
+        // Before protocol 8 there is no `Unprotected`: such a job gets the
+        // pull-request scope, which can never touch protected state.
+        wire.trust = context.trust.for_protocol(protocol).to_u8();
+        ServerMessage::Context2(wire)
     } else {
         ServerMessage::Context(context.to_wire(attempt))
     }
@@ -2924,6 +2928,24 @@ mod tests {
         }
     }
 
+    /// P07-2: an unprotected job reaches a protocol-8 worker as itself and
+    /// an older one as the pull-request scope — never as protected.
+    #[test]
+    fn unprotected_jobs_downgrade_for_older_peers() {
+        let job = context(None, Trust::Unprotected);
+        for (protocol, want) in [
+            (8u16, Trust::Unprotected),
+            (7, Trust::PullRequest),
+            (6, Trust::PullRequest),
+        ] {
+            let ServerMessage::Context2(wire) = context_message(protocol, &job, AttemptId::new())
+            else {
+                panic!("protocol {protocol} sends Context2");
+            };
+            assert_eq!(wire.trust, want.to_u8(), "protocol {protocol}");
+        }
+    }
+
     #[test]
     fn context2_absent_tenant_stays_absent() {
         let (.., decoded) =
@@ -2936,7 +2958,7 @@ mod tests {
     #[test]
     fn context2_rejects_unknown_trust_code() {
         let attempt = AttemptId::new();
-        for bad in [2u8, 9, 255] {
+        for bad in [3u8, 9, 255] {
             let mut wire = context(Some(TenantId::new()), Trust::Protected).to_wire2(attempt);
             wire.trust = bad;
             assert!(

@@ -71,37 +71,72 @@ impl std::fmt::Display for Class {
 
 /// The trust boundary a job's cache scopes live behind.
 ///
-/// v1 derivation (`of_event`): a run recorded under the `pull_request`
-/// event is `PullRequest`; every other trigger — `push`, `tag`, `manual`,
-/// or a run with no recorded provenance — is `Protected`. Pull-request
-/// state is content a fork can influence, so it is never allowed to poison
-/// protected builds; the store computes this once from recorded provenance
-/// and every consumer uses the same rule.
+/// The derivation ([`Trust::derive`], docs/cache.md) keys trust to who could
+/// have produced the run's content, not merely to its event name: only a
+/// `push`/`tag` that arrived through verified intake for a ref the
+/// repository's binding names exactly is `Protected`; a `pull_request` run
+/// is `PullRequest`; everything else — manual API runs (caller-chosen
+/// source and pipeline), pushes to refs a wildcard admits, runs of an
+/// unbound repository, or no recorded provenance — is `Unprotected`. Each
+/// class reads and writes only its own scope, so neither untrusted class
+/// can plant state a protected build restores. The store computes this
+/// once and every consumer uses the same rule.
 ///
 /// Wire form is one byte (`to_u8`); serde/JSON uses the snake_case name.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum Trust {
-    /// Trusted events (push, tag, manual): the protected cache scope.
+    /// Verified pushes and tags to a ref the binding names exactly: the
+    /// protected cache scope.
     Protected = 0,
     /// Pull-request runs. Also the default when a wire did not carry the
     /// class — the safer reading, since it can never touch protected state.
     #[default]
     PullRequest = 1,
+    /// Runs whose content an insider chose without the protected ref's
+    /// review: manual runs, pushes to wildcard-admitted refs, unbound
+    /// repositories. Protocol 8; an older worker is sent `PullRequest`.
+    Unprotected = 2,
 }
 
 impl Trust {
     /// Every value, in wire-code order.
-    pub const ALL: [Trust; 2] = [Self::Protected, Self::PullRequest];
+    pub const ALL: [Trust; 3] = [Self::Protected, Self::PullRequest, Self::Unprotected];
 
-    /// The v1 derivation: `pull_request` runs are untrusted for cache
-    /// purposes; everything else is protected.
-    pub fn of_event(event: &str) -> Trust {
+    /// The trust class of a run. `event` is the recorded trigger;
+    /// `verified_intake` says the run came from an authenticated delivery
+    /// (a webhook or ref poll), not the API; `protected_ref` says the
+    /// repository's live binding names the run's ref exactly, without a
+    /// wildcard.
+    pub fn derive(event: &str, verified_intake: bool, protected_ref: bool) -> Trust {
         match event {
             "pull_request" => Trust::PullRequest,
-            _ => Trust::Protected,
+            "push" | "tag" if verified_intake && protected_ref => Trust::Protected,
+            _ => Trust::Unprotected,
         }
+    }
+
+    /// The class to send a peer that negotiated `protocol`: before 8 there
+    /// is no `Unprotected`, and such a job is scoped to `PullRequest` — the
+    /// class that can never touch protected state.
+    pub const fn for_protocol(self, protocol: u16) -> Trust {
+        match self {
+            Self::Unprotected if protocol < 8 => Self::PullRequest,
+            other => other,
+        }
+    }
+
+    /// Whether a transfer naming `requested` is within a job of class
+    /// `self`: the same class, or the `PullRequest` an older worker was
+    /// told to use for an unprotected job.
+    pub const fn admits(self, requested: Trust) -> bool {
+        matches!(
+            (self, requested),
+            (Self::Protected, Self::Protected)
+                | (Self::PullRequest, Self::PullRequest)
+                | (Self::Unprotected, Self::Unprotected | Self::PullRequest)
+        )
     }
 
     /// The wire code.
@@ -115,6 +150,7 @@ impl Trust {
         match code {
             0 => Some(Self::Protected),
             1 => Some(Self::PullRequest),
+            2 => Some(Self::Unprotected),
             _ => None,
         }
     }
@@ -123,6 +159,7 @@ impl Trust {
         match self {
             Self::Protected => "protected",
             Self::PullRequest => "pull_request",
+            Self::Unprotected => "unprotected",
         }
     }
     /// Parse an `as_str` name.
@@ -165,14 +202,50 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", trust.as_str()));
             assert_eq!(serde_json::from_str::<Trust>(&json).unwrap(), trust);
         }
-        assert_eq!(Trust::from_u8(2), None);
+        assert_eq!(Trust::from_u8(3), None);
         assert_eq!(Trust::of_name("protected "), None);
-        // The v1 rule: only pull_request is untrusted; everything else is
-        // protected, including events added later.
-        assert_eq!(Trust::of_event("pull_request"), Trust::PullRequest);
-        for event in ["push", "tag", "manual", "", "merge_queue"] {
-            assert_eq!(Trust::of_event(event), Trust::Protected, "{event}");
-        }
         assert_eq!(Trust::default(), Trust::PullRequest);
+    }
+
+    /// P07-2: protected state is written only by verified pushes/tags to a
+    /// ref the binding names exactly; manual runs, wildcard-admitted refs
+    /// and unknown events never are.
+    #[test]
+    fn only_verified_protected_refs_are_protected() {
+        assert_eq!(Trust::derive("push", true, true), Trust::Protected);
+        assert_eq!(Trust::derive("tag", true, true), Trust::Protected);
+        for (event, verified, exact) in [
+            ("push", true, false),
+            ("push", false, true),
+            ("tag", false, false),
+            ("manual", true, true),
+            ("manual", false, false),
+            ("", true, true),
+            ("merge_queue", true, true),
+        ] {
+            assert_eq!(
+                Trust::derive(event, verified, exact),
+                Trust::Unprotected,
+                "{event} {verified} {exact}"
+            );
+        }
+        for verified in [true, false] {
+            assert_eq!(
+                Trust::derive("pull_request", verified, true),
+                Trust::PullRequest
+            );
+        }
+    }
+
+    #[test]
+    fn older_peers_get_the_pull_request_scope_for_unprotected_jobs() {
+        assert_eq!(Trust::Unprotected.for_protocol(7), Trust::PullRequest);
+        assert_eq!(Trust::Unprotected.for_protocol(8), Trust::Unprotected);
+        assert_eq!(Trust::Protected.for_protocol(6), Trust::Protected);
+        assert!(Trust::Unprotected.admits(Trust::PullRequest));
+        assert!(!Trust::Unprotected.admits(Trust::Protected));
+        assert!(!Trust::PullRequest.admits(Trust::Unprotected));
+        assert!(!Trust::PullRequest.admits(Trust::Protected));
+        assert!(Trust::Protected.admits(Trust::Protected));
     }
 }
