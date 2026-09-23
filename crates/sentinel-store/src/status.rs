@@ -269,8 +269,9 @@ pub const PAGE_JOBS_SQL: &str = "SELECT run_id, state_code FROM jobs WHERE run_i
      ORDER BY created_ms DESC, id DESC LIMIT ?5)";
 
 /// A run's change version for long polls: 64-bit FNV-1a over the run's
-/// cancel flag and, for every job in compiled order, its id, state code,
-/// fence, cancel flag and newest attempt's log state. Any state change a
+/// cancel flag and, for every job in id order (the order `jobs_by_run` already
+/// delivers, so no sort), its id, state code, fence, cancel flag and newest
+/// attempt's log state. Any state change a
 /// status reader can see changes it (with FNV's collision odds). Computed
 /// straight off the rows — no allocation — so a parked poll can re-check
 /// cheaply after every commit.
@@ -293,6 +294,14 @@ fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+/// The per-job rows [`run_version`] hashes. `jobs` is `WITHOUT ROWID`, so
+/// `jobs_by_run(run_id)` entries carry the primary key and deliver `id`
+/// order for one run: a parked poll's re-check never builds a sort.
+pub const VERSION_JOBS_SQL: &str = "SELECT j.id, j.state_code, j.fence, j.cancel_requested,
+        (SELECT a.log_state FROM attempts a WHERE a.job_id = j.id
+         ORDER BY a.fence DESC LIMIT 1)
+     FROM jobs j WHERE j.run_id = ?1 AND j.tenant_id = ?2 ORDER BY j.id";
+
 /// See [`RunVersion`]. `NotFound` for a run outside `tenant`.
 pub fn run_version(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunVersion> {
     let cancel: i64 = conn
@@ -303,12 +312,7 @@ pub fn run_version(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Ru
     let mut hash = fnv(FNV_OFFSET, &cancel.to_le_bytes());
     let mut finished = true;
     let mut any = false;
-    let mut stmt = conn.prepare_cached(
-        "SELECT j.id, j.state_code, j.fence, j.cancel_requested,
-                (SELECT a.log_state FROM attempts a WHERE a.job_id = j.id
-                 ORDER BY a.fence DESC LIMIT 1)
-         FROM jobs j WHERE j.run_id = ?1 AND j.tenant_id = ?2 ORDER BY j.spec_index",
-    )?;
+    let mut stmt = conn.prepare_cached(VERSION_JOBS_SQL)?;
     let mut rows = stmt.query(params![run.as_bytes(), tenant.as_bytes()])?;
     while let Some(row) = rows.next()? {
         let id: [u8; 16] = row.get(0)?;

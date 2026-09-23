@@ -283,6 +283,28 @@ fn run_pages_are_index_ranges() {
 }
 
 #[test]
+fn the_run_version_recheck_reads_an_index_range_without_a_sort() {
+    // P09-17: a parked waiter re-checks up to 100 times a second under
+    // commit load; each re-check must not build a temporary B-tree.
+    let (_dir, store) = store();
+    store
+        .read(|conn| {
+            let mut stmt =
+                conn.prepare(&format!("EXPLAIN QUERY PLAN {}", status::VERSION_JOBS_SQL))?;
+            let plan: Vec<String> = stmt
+                .query_map(([0u8; 16].as_slice(), [0u8; 16].as_slice()), |r| r.get(3))?
+                .collect::<Result<_, _>>()?;
+            let plan = plan.join(" | ");
+            assert!(plan.contains("jobs_by_run"), "{plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "no sort: {plan}");
+            assert!(!plan.contains("SCAN jobs"), "{plan}");
+            assert!(!plan.contains("SCAN a"), "{plan}");
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn the_run_version_moves_with_every_visible_change() {
     let (_dir, store) = store();
     let (tenant, repo) = repo(&store);
