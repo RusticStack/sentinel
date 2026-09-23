@@ -48,8 +48,8 @@ controller = "10.0.0.5:7443"
 controller_fingerprint = "<64 lower-case hex characters>"
 worker_name = "builder-1"          # 1-128 bytes, default "worker"
 enrollment_file = "/etc/sentinel/enrollment"  # absolute; read on start, removed once spent
-cpu_millis = 8000                  # override measured capacity (default: every core)
-memory_bytes = 34359738368         # override measured capacity (default: total less a host reserve)
+cpu_millis = 8000                  # override measured capacity (default: every core); the WHOLE host's, see below
+memory_bytes = 34359738368         # override measured capacity (default: total less a host reserve); the whole host's
 git_mirrors = true                 # keep per-repository object mirrors under <data_dir>/mirrors (default on; [mirrors](mirrors.md))
 labels = ["linux", "gpu"]          # scheduling labels this worker selects work by; at most 16, each 1-128 bytes (default none)
 disk_bytes = 1073741824            # scratch disk offered to jobs; default: the data directory's free space less an eighth (clamped to 512 MiB-2 GiB)
@@ -82,6 +82,8 @@ The three common fields are optional in the file; `listen`, `api_listen`, `publi
 
 - Server: `/var/lib/sentinel`
 - Worker: `/var/lib/sentinel-worker`
+
+**Several worker identities on one machine.** The controller counts the reservations of every identity that reports the same host (`/etc/machine-id`) against each one's report, because each identity measures the same machine ([storage](storage.md#fleet-placement-q01q04)). A `cpu_millis`/`memory_bytes` override on such identities must therefore state the **whole host's** capacity, not a share of it: two identities overridden to `cpu_millis = 8000` on one 16-core host share 8,000 millicpu between them, not 16,000. An identity that reports no host id (a container without `/etc/machine-id`) is accounted alone, so several of those on one machine can oversubscribe it — give them the host's machine id, or size their overrides so their sum fits. The host id is the worker's own claim: a worker credential can make another host look busier, never its own look larger.
 
 `public_url` is the URL clients reach the API at, exactly: an absolute `https://` URL (plain `http://` only for a loopback host), lower-case scheme and host, no default port, no trailing slash, query or fragment; a path prefix is kept (`https://ci.example.com/sentinel`). It names the OAuth issuer, every endpoint in the authorization-server metadata and the API's `resource`, so it must be what the CLI is given as `--server`. Behind a reverse proxy set it, and forward `/.well-known/*`, `/oauth/*` and `/device` along with `/api/*`. Without it the issuer is `http://{api_listen}`, correct only for direct loopback use. The server also runs a credential maintenance tick every ten minutes that purges expired sessions, API credentials, sign-in state and OAuth rows in bounded batches; validation never depends on it.
 
