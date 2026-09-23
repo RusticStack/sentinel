@@ -14,9 +14,9 @@ log_level = "info"
 # controller's Tailcat address to loopback, so `controller` becomes
 # "127.0.0.1:<listen_port>" — the two go together. With enabled = false (or no
 # section) the link uses direct TLS and nothing below runs. The address is the
-# `tc…` the controller logged at `tailcat_listening` (a credential); this
-# worker's own node key persists under <data_dir>/tailcat, and its `nodekey:…`
-# is what the controller's tailcat-allow list admits for the first forward.
+# `tc…` in the controller's <data_dir>/tailcat/address (a credential); this
+# worker's node key is recorded in <data_dir>/tailcat/client-default.nodekey,
+# and the controller's tailcat-allow admits it as `nodekey:… <this worker.id>`.
 # tailcat_address = "tc<address>"  # the controller's Tailcat address
 # [tailcat]
 # enabled = true
