@@ -188,6 +188,11 @@ pub fn migrate(conn: &mut Connection) -> Result<u32> {
         if version <= current {
             continue;
         }
+        // The list is contiguous (a compile-time check in `schema`), so the
+        // next entry to apply is always the one right after the database.
+        if version != current + 1 {
+            return Err(Error::Corrupt("migration order"));
+        }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(sql)?;
         tx.execute(

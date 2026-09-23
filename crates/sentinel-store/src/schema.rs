@@ -120,4 +120,56 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (28, include_str!("migrations/028_fleet.sql")),
     (29, include_str!("migrations/029_ready_indexes.sql")),
     (30, include_str!("migrations/030_oauth.sql")),
+    (31, include_str!("migrations/037_foundation_hardening.sql")),
 ];
+
+/// Whether `versions` are exactly `1..=N` in order. `migrate` skips every
+/// entry at or below a database's version, so an entry inserted out of
+/// order, renumbered or duplicated would silently never apply to databases
+/// already past it while fresh ones get it: installations would diverge.
+pub const fn contiguous_from_one(migrations: &[(u32, &str)]) -> bool {
+    let mut i = 0;
+    while i < migrations.len() {
+        if migrations[i].0 as usize != i + 1 {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+// A build whose migration list is out of order does not compile.
+const _: () = assert!(
+    contiguous_from_one(MIGRATIONS),
+    "MIGRATIONS must be numbered 1..=N in order"
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_versions_are_strictly_ascending_and_contiguous_from_one() {
+        assert!(!MIGRATIONS.is_empty());
+        assert!(contiguous_from_one(MIGRATIONS));
+        for pair in MIGRATIONS.windows(2) {
+            assert_eq!(pair[1].0, pair[0].0 + 1, "after {}", pair[0].0);
+        }
+        // The check itself refuses every way a merge can go wrong.
+        assert!(contiguous_from_one(&[]));
+        assert!(contiguous_from_one(&[(1, ""), (2, "")]));
+        for bad in [
+            &[(2, "")][..],
+            &[(1, ""), (3, "")],
+            &[(1, ""), (1, "")],
+            &[(2, ""), (1, "")],
+            &[(1, ""), (2, ""), (2, "")],
+        ] {
+            assert!(
+                !contiguous_from_one(bad),
+                "{:?}",
+                bad.iter().map(|m| m.0).collect::<Vec<_>>()
+            );
+        }
+    }
+}
