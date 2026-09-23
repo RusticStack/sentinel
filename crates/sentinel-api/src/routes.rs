@@ -14,7 +14,7 @@ use std::{
 use crate::http::{Header, Request, Response, StatusCode};
 use sentinel_auth::cookie;
 use sentinel_core::{
-    ArtifactId, AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis, UploadId,
+    ArtifactId, AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis, UploadId, UserId,
     WorkerId,
     auth::{Permissions, Principal, Scopes},
 };
@@ -38,7 +38,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    LOG_WAIT, MAX_UPLOAD_CHUNK, SUBSCRIBERS, State, TRANSFERS,
+    LOG_WAIT, MAX_UPLOAD_CHUNK, State, TRANSFERS,
     auth::{self, Identity, Refusal},
     web,
 };
@@ -1100,7 +1100,7 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
     }
 }
 
-/// A held transfer or subscriber slot; dropping frees it for the next
+/// A held transfer slot; dropping it frees the slot for the next
 /// request. It owns its counter, so a download's slot can travel with the
 /// body the connection streams after the route returned. The bounds exist
 /// so bounded-heap processes never queue unbounded transfer work and long
@@ -1144,10 +1144,18 @@ const RECHECK: std::time::Duration = std::time::Duration::from_millis(10);
 /// How often a parked wait looks at the shutdown flag.
 const STOP_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
 
-fn subscriber(state: &State) -> Result<Slot, ApiError> {
-    take_slot(&state.subscribers, SUBSCRIBERS).ok_or_else(|| {
-        err(ErrorCode::RateLimited, "too many parked subscribers; retry")
-            .with_detail("retry_after_ms", SUBSCRIBER_RETRY_MS)
+/// A parked long poll's slot for `user`: refused `rate_limited` (with
+/// `details.retry_after_ms`) when every slot is parked or this user already
+/// holds its [`crate::SUBSCRIBERS_PER_USER`].
+fn subscriber(state: &State, user: UserId) -> Result<crate::Subscriber<'_>, ApiError> {
+    state.subscribers.take(user).map_err(|refusal| {
+        let message = match refusal {
+            crate::SubscriberRefusal::Full => "too many parked subscribers; retry",
+            crate::SubscriberRefusal::UserFull => {
+                "too many parked subscribers for this user; retry"
+            }
+        };
+        err(ErrorCode::RateLimited, message).with_detail("retry_after_ms", SUBSCRIBER_RETRY_MS)
     })
 }
 
@@ -1254,7 +1262,7 @@ fn attempt_logs(state: &State, request: &Request, attempt: &str, query: &str) ->
     let deadline = std::time::Instant::now() + LOG_WAIT;
     // Parking holds a handler permit: the poll takes one of the
     // SUBSCRIBERS slots it shares with run waits before it parks.
-    let mut parked: Option<Slot> = None;
+    let mut parked: Option<crate::Subscriber<'_>> = None;
     let mut checked = std::time::Instant::now();
     while wait
         && tail.frames.is_empty()
@@ -1263,7 +1271,7 @@ fn attempt_logs(state: &State, request: &Request, attempt: &str, query: &str) ->
         && tail.next_after.is_none()
     {
         if parked.is_none() {
-            parked = Some(subscriber(state)?);
+            parked = Some(subscriber(state, who.principal.user)?);
         }
         let now = std::time::Instant::now();
         if now >= deadline || state.stop.load(Ordering::Acquire) {
@@ -1362,10 +1370,10 @@ fn run_wait(state: &State, request: &Request, run: &str, query: &str) -> Route {
     let mut seen = changes.generation();
     let mut current = version()?;
     let mut checked = std::time::Instant::now();
-    let mut parked: Option<Slot> = None;
+    let mut parked: Option<crate::Subscriber<'_>> = None;
     while since == Some(current.version) && !current.finished {
         if parked.is_none() {
-            parked = Some(subscriber(state)?);
+            parked = Some(subscriber(state, who.principal.user)?);
         }
         let now = std::time::Instant::now();
         if now >= deadline || state.stop.load(std::sync::atomic::Ordering::Acquire) {

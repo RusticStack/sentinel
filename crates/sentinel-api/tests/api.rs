@@ -310,6 +310,30 @@ fn bearer(d: &Deployment) -> String {
     format!("Bearer {}", d.token)
 }
 
+/// Another person administering `acme` (so every repository is visible),
+/// with their own read credential: `Bearer sntl_…`.
+fn member_bearer(d: &Deployment, name: &'static str) -> String {
+    let (root, tenant) = (d.root, d.tenant);
+    let user = UserId::new();
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            provisioning::insert_human(tx, user, name, false, now)?;
+            let admin = Principal::new(root, P::ALL, None, None);
+            auth::set_membership(
+                tx,
+                admin,
+                tenant,
+                user,
+                sentinel_core::auth::Role::TenantAdmin,
+            )
+        })
+        .unwrap();
+    let granted = tokens::provision(&d.store, Grant::new(user, name, P::READ), now).unwrap();
+    format!("Bearer {}", sentinel_auth::token::format(&granted.secret))
+}
+
 const PIPELINE: &str = "schema: 1
 on: [push]
 jobs:
@@ -2317,10 +2341,17 @@ fn downloads_hold_their_slot_and_control_requests_keep_handlers() {
         &[],
     );
     let version = first["version"].as_str().unwrap().to_owned();
+    // Two users park them, each within its per-user share.
+    let other = member_bearer(&d, "other");
     let waits: Vec<_> = (0..sentinel_api::SUBSCRIBERS)
-        .map(|_| {
+        .map(|i| {
+            let who = if i < sentinel_api::SUBSCRIBERS_PER_USER {
+                &other
+            } else {
+                &auth
+            };
             let (base, auth, run, version) =
-                (d.base.clone(), auth.clone(), run.clone(), version.clone());
+                (d.base.clone(), who.clone(), run.clone(), version.clone());
             thread::spawn(move || {
                 let agent = ureq::Agent::new_with_config(
                     ureq::Agent::config_builder()

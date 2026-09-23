@@ -142,6 +142,37 @@ fn get(d: &Deployment, path: &str) -> (u16, Value) {
     call(&d.base, "GET", path, &d.auth)
 }
 
+/// A second person administering `acme` (so every repository is visible),
+/// with their own read credential: `Bearer sntl_…`.
+fn second_user(d: &Deployment, name: &'static str) -> String {
+    let (root, tenant) = (d.root, d.tenant);
+    let user = UserId::new();
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::provisioning::insert_human(tx, user, name, false, now)?;
+            let admin = Principal::new(root, P::ALL, None, None);
+            auth::set_membership(tx, admin, tenant, user, Role::TenantAdmin)
+        })
+        .unwrap();
+    let granted = tokens::provision(&d.store, Grant::new(user, name, P::READ), now).unwrap();
+    format!("Bearer {}", sentinel_auth::token::format(&granted.secret))
+}
+
+/// Park a run wait on `run` past `version` for 2.5 s as `auth`.
+fn park(d: &Deployment, run: RunId, version: &str, auth: &str) -> thread::JoinHandle<(u16, Value)> {
+    let (base, auth, version) = (d.base.clone(), auth.to_owned(), version.to_owned());
+    thread::spawn(move || {
+        call(
+            &base,
+            "GET",
+            &format!("/api/v1/runs/{run}/wait?since={version}&timeout_ms=2500"),
+            &auth,
+        )
+    })
+}
+
 const PIPELINE: &str = "schema: 1
 on: [push]
 jobs:
@@ -348,17 +379,16 @@ fn a_parked_subscriber_past_the_cap_is_rate_limited_and_log_follows_share_it() {
         .unwrap();
     let (_, first) = get(&d, &format!("/api/v1/runs/{run}/wait"));
     let version = version_of(&first);
+    // Every slot parked, by two users: the cap is global, not per user.
+    let other = second_user(&d, "other");
     let parked: Vec<_> = (0..sentinel_api::SUBSCRIBERS)
-        .map(|_| {
-            let (base, auth, version) = (d.base.clone(), d.auth.clone(), version.clone());
-            thread::spawn(move || {
-                call(
-                    &base,
-                    "GET",
-                    &format!("/api/v1/runs/{run}/wait?since={version}&timeout_ms=2500"),
-                    &auth,
-                )
-            })
+        .map(|i| {
+            let auth = if i < sentinel_api::SUBSCRIBERS_PER_USER {
+                &other
+            } else {
+                &d.auth
+            };
+            park(&d, run, &version, auth)
         })
         .collect();
     thread::sleep(Duration::from_millis(500));
@@ -395,6 +425,74 @@ fn a_parked_subscriber_past_the_cap_is_rate_limited_and_log_follows_share_it() {
         assert_eq!((status, body["changed"].as_bool()), (200, Some(false)));
     }
     // The slots came back.
+    let (status, _) = get(
+        &d,
+        &format!("/api/v1/runs/{run}/wait?since={version}&timeout_ms=50"),
+    );
+    assert_eq!(status, 200);
+}
+
+/// P09-12: one user cannot hold every parked slot. Past its share its next
+/// parking poll is refused at once, while another user's still parks; the
+/// share comes back when a poll ends.
+#[test]
+fn one_user_cannot_take_every_subscriber_slot() {
+    let d = deployment();
+    let (run, _) = dispatch(&d);
+    let (_, first) = get(&d, &format!("/api/v1/runs/{run}/wait"));
+    let version = version_of(&first);
+    // One more parking poll than the user's share, all at once: exactly one
+    // is refused, at once, and its answer proves the others are parked.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let greedy: Vec<_> = (0..=sentinel_api::SUBSCRIBERS_PER_USER)
+        .map(|_| {
+            let (base, auth, version, tx) =
+                (d.base.clone(), d.auth.clone(), version.clone(), tx.clone());
+            thread::spawn(move || {
+                let answer = call(
+                    &base,
+                    "GET",
+                    &format!("/api/v1/runs/{run}/wait?since={version}&timeout_ms=2500"),
+                    &auth,
+                );
+                tx.send(answer).unwrap();
+            })
+        })
+        .collect();
+    let (status, body) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (429, Some("rate_limited")),
+        "{body}"
+    );
+    assert_eq!(body["details"]["retry_after_ms"], 1000);
+    // Someone else still parks: the poll waits out its timeout.
+    let other = second_user(&d, "other");
+    let started = Instant::now();
+    let (status, body) = call(
+        &d.base,
+        "GET",
+        &format!("/api/v1/runs/{run}/wait?since={version}&timeout_ms=400"),
+        &other,
+    );
+    assert_eq!(
+        (status, body["changed"].as_bool()),
+        (200, Some(false)),
+        "{body}"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(400), "it parked");
+    for waiter in greedy {
+        waiter.join().unwrap();
+    }
+    for _ in 0..sentinel_api::SUBSCRIBERS_PER_USER {
+        let (status, body) = rx.recv().unwrap();
+        assert_eq!(
+            (status, body["changed"].as_bool()),
+            (200, Some(false)),
+            "{body}"
+        );
+    }
+    // The greedy user's share came back.
     let (status, _) = get(
         &d,
         &format!("/api/v1/runs/{run}/wait?since={version}&timeout_ms=50"),

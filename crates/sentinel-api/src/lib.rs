@@ -21,12 +21,13 @@ mod web;
 use std::{
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize},
     },
     time::Duration,
 };
 
+use sentinel_core::UserId;
 use sentinel_link::controller::Handle;
 use sentinel_store::{Store, logs::LogStore, objects::Objects};
 
@@ -43,6 +44,14 @@ pub const TRANSFERS: usize = 3;
 /// together. Beyond it a poll is `rate_limited` with
 /// `details.retry_after_ms`.
 pub const SUBSCRIBERS: usize = 3;
+/// Of those, how many one user (a person or a service account, whatever
+/// credential it presents) may hold at once: a single credential looping
+/// parked polls can never take every slot from everyone else (P09-12).
+pub const SUBSCRIBERS_PER_USER: usize = 2;
+const _: () = assert!(
+    SUBSCRIBERS_PER_USER >= 1 && SUBSCRIBERS_PER_USER < SUBSCRIBERS,
+    "one user must leave a subscriber slot for others"
+);
 /// Handler permits neither transfers nor long polls can take: however many
 /// slow bodies and parked polls there are, this many requests — logins,
 /// token refreshes, health checks, run reads — are always served.
@@ -85,13 +94,82 @@ pub(crate) struct State {
     /// download streams after its route returned.
     pub transfers: Arc<AtomicUsize>,
     /// Long-poll subscribers currently parked (run waits and `wait=1` log
-    /// polls), bounded so they cannot take every handler permit.
-    pub subscribers: Arc<AtomicUsize>,
+    /// polls), bounded in total so they cannot take every handler permit and
+    /// per user so one user cannot take every slot.
+    pub subscribers: Subscribers,
     /// Set by `Server::shutdown`; the `wait=1` log poll checks it so a
     /// stop does not ride out the full poll interval.
     pub stop: Arc<AtomicBool>,
     /// The OAuth authorization server's issuer, keys and in-memory limits.
     pub oauth: oauth::OAuthState,
+}
+
+/// Who holds the parked long-poll slots: at most [`SUBSCRIBERS`] in total
+/// and [`SUBSCRIBERS_PER_USER`] per user. A fixed table, never a map: with
+/// at most `SUBSCRIBERS` slots held there are at most that many distinct
+/// holders, so a take or a release is one short lock and a scan of three
+/// entries, and nothing grows with the number of users.
+#[derive(Default)]
+pub(crate) struct Subscribers {
+    held: Mutex<[(Option<UserId>, u8); SUBSCRIBERS]>,
+}
+
+/// Why a parked slot was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubscriberRefusal {
+    /// Every slot is parked.
+    Full,
+    /// This user already holds its share.
+    UserFull,
+}
+
+impl Subscribers {
+    /// Take one slot for `user`, released when the guard drops.
+    pub(crate) fn take(&self, user: UserId) -> Result<Subscriber<'_>, SubscriberRefusal> {
+        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        let total: usize = held.iter().map(|(_, n)| usize::from(*n)).sum();
+        if total >= SUBSCRIBERS {
+            return Err(SubscriberRefusal::Full);
+        }
+        let entry = match held.iter().position(|(u, _)| *u == Some(user)) {
+            Some(i) => i,
+            // Fewer than SUBSCRIBERS slots are held, so fewer holders than
+            // entries: a free entry exists.
+            None => held
+                .iter()
+                .position(|(_, n)| *n == 0)
+                .ok_or(SubscriberRefusal::Full)?,
+        };
+        let (holder, count) = &mut held[entry];
+        if usize::from(*count) >= SUBSCRIBERS_PER_USER {
+            return Err(SubscriberRefusal::UserFull);
+        }
+        *holder = Some(user);
+        *count += 1;
+        Ok(Subscriber { table: self, user })
+    }
+
+    fn release(&self, user: UserId) {
+        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((holder, count)) = held.iter_mut().find(|(u, _)| *u == Some(user)) {
+            *count -= 1;
+            if *count == 0 {
+                *holder = None;
+            }
+        }
+    }
+}
+
+/// One parked long poll's slot; dropping it frees the slot.
+pub(crate) struct Subscriber<'a> {
+    table: &'a Subscribers,
+    user: UserId,
+}
+
+impl Drop for Subscriber<'_> {
+    fn drop(&mut self) {
+        self.table.release(self.user);
+    }
 }
 
 pub struct Server {
@@ -118,7 +196,7 @@ impl Server {
             github_webhook_secret: config.github_webhook_secret,
             intake: config.intake,
             transfers: Arc::new(AtomicUsize::new(0)),
-            subscribers: Arc::new(AtomicUsize::new(0)),
+            subscribers: Subscribers::default(),
             stop: Arc::clone(&stop),
             oauth: oauth::OAuthState::new(issuer.clone()),
         });

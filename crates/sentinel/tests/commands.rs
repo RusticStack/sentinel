@@ -13,7 +13,7 @@ use std::{
 };
 
 use sentinel_core::{
-    AttemptId, Event, Fence, JobId, RepoId, RunId, TenantId, UnixMillis, WorkerId,
+    AttemptId, Event, Fence, JobId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Namespace, Permissions as P, Principal, Role},
 };
 use sentinel_link::{controller::Controller, identity::Identity};
@@ -36,6 +36,7 @@ struct Deployment {
     server: Option<sentinel_api::Server>,
     base: String,
     token: String,
+    root: UserId,
     tenant: TenantId,
     repo: RepoId,
 }
@@ -105,6 +106,7 @@ fn deployment() -> Deployment {
         _controller: controller,
         server: Some(server),
         token: sentinel_auth::token::format(&granted.secret),
+        root,
         tenant,
         repo,
     }
@@ -590,6 +592,24 @@ fn plain_get(url: &str, token: &str) -> (u16, Value) {
     (status, body)
 }
 
+/// Another person administering `acme` (so every repository is visible),
+/// with their own read credential (the raw `sntl_…` text).
+fn other_user(d: &Deployment, name: &'static str) -> String {
+    let (root, tenant) = (d.root, d.tenant);
+    let user = UserId::new();
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::provisioning::insert_human(tx, user, name, false, now)?;
+            let admin = Principal::new(root, P::ALL, None, None);
+            auth::set_membership(tx, admin, tenant, user, Role::TenantAdmin)
+        })
+        .unwrap();
+    let granted = tokens::provision(&d.store, Grant::new(user, name, P::READ), now).unwrap();
+    sentinel_auth::token::format(&granted.secret)
+}
+
 #[test]
 fn wait_rides_out_rate_limited_answers_instead_of_failing() {
     let d = deployment();
@@ -598,13 +618,15 @@ fn wait_rides_out_rate_limited_answers_instead_of_failing() {
     // Other long polls hold every subscriber slot for about 2 s.
     let (_, answer) = plain_get(&format!("{}/api/v1/runs/{busy}/wait", d.base), &d.token);
     let version = answer["version"].as_str().unwrap().to_owned();
+    // Two other users hold them, each within its per-user share (P09-12).
+    let others = [other_user(&d, "other-a"), other_user(&d, "other-b")];
     let holders: Vec<_> = (0..sentinel_api::SUBSCRIBERS)
-        .map(|_| {
+        .map(|i| {
             let url = format!(
                 "{}/api/v1/runs/{busy}/wait?since={version}&timeout_ms=2000",
                 d.base
             );
-            let token = d.token.clone();
+            let token = others[i / sentinel_api::SUBSCRIBERS_PER_USER].clone();
             thread::spawn(move || plain_get(&url, &token).0)
         })
         .collect();
