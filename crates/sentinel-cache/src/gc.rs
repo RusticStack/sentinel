@@ -549,7 +549,33 @@ impl Gc {
         if !self.tick() || !self.removable(&stale.entry) {
             return false;
         }
-        match fs::remove_dir_all(&stale.entry) {
+        // Take the entry out of the tree first, then judge it again: a pin
+        // (a reader's lease, a publisher's lease or its staging lock) taken
+        // before the rename is inside the moved directory and is seen here,
+        // and the entry goes back; one taken after it lands in a fresh entry
+        // directory the removal never touches. Readers pin before they trust
+        // `current`, so neither case can serve from a directory being removed.
+        let Some(name) = stale.entry.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        let aside = stale
+            .entry
+            .with_file_name(format!("{name}.gc-{:08x}", lease::rand_u32()));
+        match fs::rename(&stale.entry, &aside) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => return false,
+            Err(_) => {
+                self.stats.errors += 1;
+                return false;
+            }
+        }
+        if !self.removable(&aside) {
+            // Put it back; if the name was taken meanwhile the moved entry
+            // stays pinned where it is and a later pass collects it.
+            let _ = fs::rename(&aside, &stale.entry);
+            return false;
+        }
+        match fs::remove_dir_all(&aside) {
             Ok(()) => {
                 self.stats.entries_removed += 1;
                 self.stats.generations_removed += stale.generations;

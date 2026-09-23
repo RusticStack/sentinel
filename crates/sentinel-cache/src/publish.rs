@@ -43,7 +43,7 @@ use sentinel_protocol::cache::Trust;
 use crate::{
     attach::{Attached, Target, entry_key},
     confined::{Base, Kind, Meta, Node},
-    lease::{LeaseError, WriteLock, rand_u32},
+    lease::{Lease, LeaseError, WriteLock, rand_u32},
     manifest::{
         FileEntry, FilesBlob, MAX_FILE_ENTRIES, MAX_FILES_BLOB_BYTES, Manifest, read_files,
     },
@@ -242,6 +242,10 @@ pub fn commit(
     // One writer per entry: `create_new` never waits — a live marker is
     // `Busy`, and a marker older than the lease bound is a dead writer's,
     // reaped in place so a crash can never wedge the entry.
+    // The commit pins its entry like a reader does: reclamation never takes
+    // an entry — its source generation included — out from under a writer,
+    // hit or miss.
+    let _pin = Lease::acquire(&entry, "publish", crate::lease::DEFAULT_TTL)?;
     let Some(_lock) = WriteLock::acquire(&entry, "publish")? else {
         return Ok(Published::Skipped(SkipReason::Busy));
     };

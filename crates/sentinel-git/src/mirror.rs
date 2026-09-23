@@ -1022,3 +1022,32 @@ fn reflink_supported(root: &Path) -> Result<bool> {
     }
     Ok(to.metadata().map(|m| m.len() == 8).unwrap_or(false))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P07-26: only a server refusing a want earns the narrower retries;
+    /// an authentication, network or local failure is final.
+    #[test]
+    fn only_a_refused_want_is_retried_narrower() {
+        for refused in [
+            "git fetch: fatal: remote error: upload-pack: not our ref 0123",
+            "git fetch: error: Server does not allow request for unadvertised object 0123",
+            "git fetch: fatal: couldn't find remote ref refs/heads/gone",
+        ] {
+            assert!(
+                want_refused(&Error::Preparation(refused.into())),
+                "{refused}"
+            );
+        }
+        for final_answer in [
+            "git fetch: fatal: Authentication failed for 'https://forge.example/r.git/'",
+            "git fetch: fatal: unable to access: Could not resolve host",
+        ] {
+            assert!(!want_refused(&Error::Preparation(final_answer.into())));
+        }
+        assert!(!want_refused(&Error::Timeout("git fetch")));
+        assert!(!want_refused(&Error::Mirror("not our ref".into())));
+    }
+}
