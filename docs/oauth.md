@@ -74,7 +74,32 @@ The answer is `{access_token, token_type: "Bearer", expires_in, refresh_token, s
 
 ## Authorization code flow (O01)
 
-_Placeholder: Unit B documents `/oauth/authorize`, consent and the `authorization_code` grant here._
+Browser sign-in for public clients (RFC 6749 §4.1 with PKCE, RFC 8252 loopback redirects, RFC 9207 `iss`). Implemented in `sentinel-store::oauth::code` and `sentinel-api::oauth::code` (the page in `code/consent.rs`).
+
+**`GET /oauth/authorize`** takes a percent-encoded query (a repeated parameter is malformed). It is checked in this order:
+
+1. `client_id` must name an enabled client and `redirect_uri` must be one it may use: `http://127.0.0.1:PORT/callback` or `http://[::1]:PORT/callback` for the loopback CLI client (explicit port; no `localhost`, `https`, userinfo, query or fragment), or an exact registered URI. Otherwise the answer is a `400` **error page with no `location`** — an untrusted redirect is never followed.
+2. From here every refusal is a `303` to `redirect_uri` with `error`, `error_description`, `iss` (the issuer) and `state` (when one was given): `response_type` must be `code` (`unsupported_response_type`); `state` is required, 1–512 bytes; `code_challenge_method` must be `S256` (`plain` and absence are refused) and `code_challenge` a 43-character S256 challenge (`invalid_request`); `scope` defaults to `CLI_DEFAULT` ∩ the client's ceiling, and an unknown scope, an empty set or one beyond the ceiling is `invalid_scope`; `resource`, when given, must be `{issuer}/api/v1` (`invalid_target`).
+3. Without a browser session the page offers the embedded password sign-in (it posts to `/api/v1/login` and reloads the same URL); nothing is stored and no cookie is set by the authorize endpoint itself. Bearer credentials never drive consent.
+4. `platform:admin` from an account that is not a super admin is `invalid_scope`.
+5. The consent page names the client, the deployment's issuer, the signed-in account, each requested scope in plain words (a warning on `tenant:admin` and `platform:admin`) and the redirect target, and offers a tenant selector (all tenants, or one of the account's active memberships, at most 100) and an optional repository name within it.
+
+Consent is stateless: every request parameter rides in hidden fields with a form token (`cookie::form_token`, BLAKE3 keyed by a per-process key over the session's CSRF digest). **`POST /oauth/authorize`** refuses a present `Origin` other than the issuer's origin (`403` page), a missing session (`401` page) and a missing or foreign form token (`403` page) before anything else, then re-validates every parameter exactly as `GET` does. `decision=deny` audits `OAuthConsentDenied` and redirects `error=access_denied`. `decision=approve` resolves the optional tenant and repository (a repository without a tenant, or an unknown name, re-renders the page with a notice) and calls `approve`, which re-checks every term in one statement inside the writer: the account is an active human, `platform:admin` only for a super admin, the tenant an active membership, the repository owned by it, the scopes within the client's ceiling, the redirect still allowed. A refusal there redirects `access_denied` (eligibility) or `invalid_request`. Success is `303` to `redirect_uri?code=sntl_ac_…&state=…&iss=…`. Restarting the controller invalidates open consent pages (the form key is per process).
+
+**Codes** are 256-bit secrets stored as their digest with the client, the exact redirect URI, the challenge, the account, scopes, narrowing and audience; they live 60 s. **`grant_type=authorization_code`** at `/oauth/token` takes `client_id`, `code`, `redirect_uri` and `code_verifier` (a missing one is `invalid_request`). The code is consumed by the same statement that reads it (`UPDATE … RETURNING`), so only the first presentation can succeed; every failure after the lookup — expired, another client, another redirect URI, a wrong or malformed verifier, an account suspended since approval — still spends it. Success inserts a kind-1 grant (`LOGIN_GRANT_MS`, the code's terms; the grant trigger re-checks the account), mints generation 1, links the code to the grant and audits `OAuthGrantIssued`; the answer is the ordinary `TokenResponse`. Presenting a spent code again is a **replay**: the grant it produced is revoked (reason 3, so its access and refresh tokens stop working at once), `OAuthCodeReplay` is audited, and the answer is `invalid_grant` like every other failure. No separate client capability gates this grant: a client can only hold a code issued to a redirect it may use.
+
+```rust
+// sentinel_store::oauth::code (beyond the stub contract)
+pub const MAX_CONSENT_CHOICES: u32 = 100;
+pub fn consent_choices(conn: &Connection, user: UserId) -> Result<Vec<ConsentChoice>>  // active tenants, by slug
+pub fn repo_named(conn: &Connection, tenant: TenantId, name: &str) -> Result<RepoId>   // NotFound
+pub fn approve(store: &Store, a: &Approval<'_>, now: UnixMillis) -> Result<Secret>
+    // NotFound: unknown/disabled client or account; Forbidden: eligibility; InvalidInput: scope/redirect/challenge
+pub fn deny(store: &Store, client_id: &str, user: UserId) -> Result<()>               // audits OAuthConsentDenied
+pub fn exchange(store, client_id, code, redirect_uri, verifier, now) -> Result<Minted, CodeError> // Invalid | Replay | Store
+```
+
+Tests: `crates/sentinel-store/tests/oauth_code.rs` (approval and exchange mint a kind-1 grant with its narrowing; expiry; replay revokes and audits; wrong verifier, redirect or client are invalid and spend the code; tenant, repository, platform, ceiling and redirect refusals; pending and suspended accounts can neither approve nor redeem; denial audited), the query-plan unit test in `sentinel-store::oauth::code`, and `crates/sentinel-api/tests/oauth_code.rs` (a ureq "browser" with a password session: sign-in page without a cookie, error pages without `location`, error redirects with `state` and `iss`, form-token/session/`Origin` refusals, tampered hidden fields re-validated, deny, approve with tenant and repository narrowing, one exchange then `invalid_grant` and a dead access token, page security headers).
 
 ## Revocation
 
