@@ -871,6 +871,7 @@ fn start_tailcat(
     store: &Arc<sentinel_store::Store>,
     file: Option<&TailcatFile>,
     listen: SocketAddr,
+    link: sentinel_link::controller::Handle,
 ) -> Result<Option<TailcatServer>, Error> {
     let Some(helper) = helper_config(file, listen.port())? else {
         return Ok(None);
@@ -952,7 +953,20 @@ fn start_tailcat(
                         match admitted_keys(&store, &listed) {
                             Ok(keys) => {
                                 store_warned = false;
-                                server.set_allow(&keys);
+                                // A real change restarts the helper; the
+                                // sessions it carries are closed through it
+                                // first, so their workers reconnect at once
+                                // instead of at their heartbeat deadline.
+                                if let Some(handoff) = link.hand_off(&server, &keys) {
+                                    tracing::info!(
+                                        event = "tailcat_allow_changed",
+                                        admitted = keys.len(),
+                                        tunnelled = handoff.tunnelled,
+                                        closed = handoff.closed,
+                                        ended = handoff.ended,
+                                        waited_ms = handoff.waited.as_millis() as u64
+                                    );
+                                }
                             }
                             Err(error) if !store_warned => {
                                 store_warned = true;
@@ -1162,7 +1176,7 @@ fn start_server(
         })?;
         controller.set_remote_cache(root);
     }
-    let tailcat = start_tailcat(config, &store, tailcat, listen)?;
+    let tailcat = start_tailcat(config, &store, tailcat, listen, controller.handle())?;
     // One destination policy for every controller-side fetch: worker spec
     // delivery, intake resolution and ref polling all recheck it.
     let destinations = crate::source_admin::load_destinations(&config.data_dir)

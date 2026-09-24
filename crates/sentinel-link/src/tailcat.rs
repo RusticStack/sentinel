@@ -935,6 +935,37 @@ impl Server {
         helpers.main.shared.set_allow(wanted);
     }
 
+    /// [`Server::set_allow`], with a hand-off: when the list really changes,
+    /// `drain` is first given the local addresses of the connections the
+    /// running helpers carry into the link port (sorted), while those
+    /// helpers still run, and they are replaced only once it returns. A
+    /// connection counts as carried when the helper process owns its other
+    /// end, so a direct-TLS peer, even one on loopback, is never among them.
+    /// `false`, without calling `drain`, when the list is unchanged.
+    pub fn set_allow_draining(&self, allow: &[NodeKey], drain: impl FnOnce(&[SocketAddr])) -> bool {
+        let wanted = normalize(allow);
+        let helpers = self.helpers();
+        let runners = std::iter::once(&helpers.main).chain(helpers.staged.as_ref().map(|(_, r)| r));
+        let mut pids = Vec::with_capacity(2);
+        let mut changed = false;
+        for runner in runners {
+            changed |= *runner.shared.allow.lock().expect("tailcat allow") != wanted;
+            pids.extend(runner.state().pid);
+        }
+        if !changed {
+            return false;
+        }
+        let carried = carried_connections(&pids, self.port);
+        if !carried.is_empty() {
+            drain(&carried);
+        }
+        if let Some((_, runner)) = &helpers.staged {
+            runner.shared.set_allow(wanted.clone());
+        }
+        helpers.main.shared.set_allow(wanted);
+        true
+    }
+
     /// Follows the key files an operator's rotation changed (two small reads
     /// when nothing did). A staged key gets a second helper serving it beside
     /// the active one, with the same allow list — the overlap window in which
@@ -2436,6 +2467,117 @@ fn refuses(arg: &str) -> Option<&'static str> {
     forbidden(value).or_else(|| value.split(['=', ':', ',', '/']).find_map(forbidden))
 }
 
+/// The local addresses of the loopback connections into `port` whose other
+/// end the processes `pids` own: the controller's view of the sessions a
+/// helper carries. Read from `/proc` once per allow-list change: each
+/// helper's descriptors give its socket inodes, and the TCP tables map an
+/// inode to its addresses. Sorted. Unreadable entries count as not carried,
+/// so a failure here only means a session is cut as it was before.
+#[cfg(target_os = "linux")]
+fn carried_connections(pids: &[u32], port: u16) -> Vec<SocketAddr> {
+    let mut inodes = Vec::new();
+    for pid in pids {
+        let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = fs::read_link(fd.path()) else {
+                continue;
+            };
+            if let Some(inode) = target
+                .to_str()
+                .and_then(|text| text.strip_prefix("socket:["))
+                .and_then(|text| text.strip_suffix(']'))
+                .and_then(|text| text.parse::<u64>().ok())
+            {
+                inodes.push(inode);
+            }
+        }
+    }
+    let Some(pid) = pids.first() else {
+        return Vec::new();
+    };
+    if inodes.is_empty() {
+        return Vec::new();
+    }
+    inodes.sort_unstable();
+    let mut carried = Vec::new();
+    for table in ["tcp", "tcp6"] {
+        let Ok(text) = fs::read_to_string(format!("/proc/{pid}/net/{table}")) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            let mut fields = line.split_whitespace();
+            let (Some(local), Some(remote), Some(inode)) =
+                (fields.nth(1), fields.next(), fields.nth(6))
+            else {
+                continue;
+            };
+            let (Some(local), Some(remote), Ok(inode)) =
+                (proc_addr(local), proc_addr(remote), inode.parse::<u64>())
+            else {
+                continue;
+            };
+            if remote.port() == port && loopback(remote) && inodes.binary_search(&inode).is_ok() {
+                carried.push(canonical(local));
+            }
+        }
+    }
+    carried.sort_unstable();
+    carried
+}
+
+/// `addr` with an IPv4-mapped IPv6 address written as IPv4: a dual-stack
+/// listener sees an IPv4 peer as mapped, the peer's own table does not.
+#[cfg(any(target_os = "linux", feature = "controller"))]
+pub(crate) fn canonical(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(ip) => SocketAddr::from((ip, v6.port())),
+            None => addr,
+        },
+        SocketAddr::V4(_) => addr,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn carried_connections(_pids: &[u32], _port: u16) -> Vec<SocketAddr> {
+    Vec::new()
+}
+
+/// An address as `/proc/net/tcp{,6}` prints it: the IP as 32-bit words in
+/// host byte order, `:`, the port in hex.
+#[cfg(target_os = "linux")]
+fn proc_addr(text: &str) -> Option<SocketAddr> {
+    let (ip, port) = text.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let word = |index: usize| -> Option<[u8; 4]> {
+        let hex = ip.get(index * 8..index * 8 + 8)?;
+        Some(u32::from_str_radix(hex, 16).ok()?.to_ne_bytes())
+    };
+    match ip.len() {
+        8 => Some(SocketAddr::from((word(0)?, port))),
+        32 => {
+            let mut bytes = [0u8; 16];
+            for index in 0..4 {
+                bytes[index * 4..index * 4 + 4].copy_from_slice(&word(index)?);
+            }
+            Some(SocketAddr::from((std::net::Ipv6Addr::from(bytes), port)))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn loopback(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_loopback(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+        }
+    }
+}
+
 fn normalize(allow: &[NodeKey]) -> Vec<String> {
     let mut keys: Vec<String> = allow.iter().map(|key| key.expose().to_owned()).collect();
     keys.sort();
@@ -2593,5 +2735,41 @@ mod tests {
         assert!(contains_ascii_ci("Forwarding", "forwarding"));
         assert!(!contains_ascii_ci("listen", "listening"));
         assert!(!contains_ascii_ci("", "listening"));
+    }
+
+    /// The connections a process carries into the link port are the ones it
+    /// dialled there, told apart by owner: the same loopback connection is
+    /// not carried by a process that does not own its dialling end, and the
+    /// accepting end (remote port ephemeral) never is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn carried_connections_are_the_owners_dials_into_the_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dialled = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (accepted, peer) = listener.accept().unwrap();
+        assert_eq!(peer, dialled.local_addr().unwrap());
+
+        let carried = carried_connections(&[std::process::id()], port);
+        assert_eq!(carried, vec![peer]);
+        // Another process (init) owns neither end.
+        assert!(carried_connections(&[1], port).is_empty());
+        // Another port is not the link port.
+        assert!(carried_connections(&[std::process::id()], port.wrapping_add(1)).is_empty());
+        drop((dialled, accepted));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_tcp_addresses_parse_in_host_order() {
+        let v4 = proc_addr("0100007F:1F90").unwrap();
+        assert_eq!(v4, "127.0.0.1:8080".parse().unwrap());
+        let v6 = proc_addr("00000000000000000000000001000000:0050").unwrap();
+        assert_eq!(v6, "[::1]:80".parse().unwrap());
+        let mapped = proc_addr("0000000000000000FFFF00000100007F:0050").unwrap();
+        assert_eq!(canonical(mapped), "127.0.0.1:80".parse().unwrap());
+        assert!(loopback(mapped));
+        assert!(proc_addr("0100007F").is_none());
+        assert!(proc_addr("7F:0050").is_none());
     }
 }
