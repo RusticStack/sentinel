@@ -34,10 +34,17 @@ use sentinel_protocol::negotiate::{
     Arch, Capabilities, Hello, Profile, ProtocolVersion, negotiate,
 };
 
-/// 16 KiB frames: enough to fill loopback socket buffers (~1 MiB) and prove
-/// the writer blocks, small enough that drain completes in debug.
-const FLOOD_FRAMES: u64 = 256;
+/// 16 KiB frames. The flood is not a fixed size: the loopback socket buffers
+/// autotune (Linux defaults allow 4 MiB of send buffer and 32 MiB of receive
+/// buffer), so any fixed amount either fits on some kernel or wastes time on
+/// others. The flood writes until the writer blocks, whatever that takes.
 const FLOOD_BYTES: usize = 16 * 1024;
+/// The flood's counter must stand still this long, with its thread still
+/// running, before the writer counts as blocked. The flood loop never sleeps,
+/// so a writer that is not blocked moves the counter within microseconds.
+const STALL_QUIET: Duration = Duration::from_secs(1);
+/// Longer than the heartbeat interval (5 s) with slack for a loaded machine,
+/// shorter than the socket write timeout (15 s) that would end the stall.
 const PONG_WINDOW: Duration = Duration::from_secs(12);
 
 fn wait_until(mut done: impl FnMut() -> bool, limit: Duration) -> bool {
@@ -292,31 +299,67 @@ fn stalled_bulk_never_holds_up_the_control_beat() {
         .clone()
         .expect("reporter checked present");
 
-    // Flood the bulk connection; the controller is not reading, so once the
-    // socket buffers fill the writer blocks. 64 MiB cannot fit in loopback
-    // socket buffers, so completing within the window would mean the stall
-    // was not in effect.
-    let finished = Arc::new(AtomicBool::new(false));
+    // Flood the bulk connection until the controller drains it. Nothing
+    // reads it before then, so once the socket buffers are full the writer
+    // blocks inside a frame write. `sent` counts frames the socket took;
+    // `outcome` is 1 once the flood ended cleanly after the drain, 2 if a
+    // write failed.
+    let sent = Arc::new(AtomicU64::new(0));
+    let outcome = Arc::new(AtomicU64::new(0));
     let attempt = AttemptId::new();
     let flood = {
-        let finished = Arc::clone(&finished);
+        let sent = Arc::clone(&sent);
+        let outcome = Arc::clone(&outcome);
+        let drain = Arc::clone(&drain);
         thread::spawn(move || {
-            for seq in 1..=FLOOD_FRAMES {
-                if reporter.log(attempt, &log_frame(seq)).is_err() {
+            let frame = log_frame(0);
+            let mut seq = 0;
+            while !drain.load(Ordering::Acquire) {
+                seq += 1;
+                if reporter
+                    .log_frame(attempt, seq, frame.step, frame.stream, &frame.bytes)
+                    .is_err()
+                {
+                    outcome.store(2, Ordering::Release);
                     return;
                 }
+                sent.store(seq, Ordering::Release);
             }
-            finished.store(true, Ordering::Release);
+            outcome.store(1, Ordering::Release);
         })
     };
-    assert!(
-        !wait_until(|| finished.load(Ordering::Acquire), Duration::from_secs(2)),
-        "the flood must not complete while nothing reads the bulk connection"
-    );
+
+    // The stall: the counter stops while the flood is still running. This
+    // waits for the kernel's buffers to fill, however large they autotuned.
+    let stalled_at = {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut last = sent.load(Ordering::Acquire);
+        let mut since = Instant::now();
+        loop {
+            assert_eq!(
+                outcome.load(Ordering::Acquire),
+                0,
+                "the flood must still be writing while nothing reads the bulk connection"
+            );
+            let now = sent.load(Ordering::Acquire);
+            if now != last {
+                last = now;
+                since = Instant::now();
+            } else if since.elapsed() >= STALL_QUIET {
+                break last;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the bulk writer never blocked ({last} frames of {FLOOD_BYTES} bytes sent)"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert!(stalled_at > 0, "the bulk connection took no frames at all");
 
     // The whole point: a beat completes while the bulk writer is blocked.
     // The controller answers pings on the control connection only, so a
-    // second ping here cannot have come from a bulk-powered session.
+    // later ping cannot have come from a bulk-powered session.
     let pings_before = handler.pings.load(Ordering::Acquire);
     assert!(
         wait_until(
@@ -325,20 +368,43 @@ fn stalled_bulk_never_holds_up_the_control_beat() {
         ),
         "a pong must arrive while the bulk connection is stalled"
     );
-    assert!(
-        !finished.load(Ordering::Acquire),
-        "the pong must have arrived before the stalled bulk traffic moved"
+    assert_eq!(
+        (
+            sent.load(Ordering::Acquire),
+            outcome.load(Ordering::Acquire)
+        ),
+        (stalled_at, 0),
+        "the bulk writer must still have been blocked when the pong arrived"
     );
 
-    // Unblock the controller's bulk reader. Completing the flood is extra
-    // evidence, not the isolation contract: the pong above is.
+    // Unblock the controller's bulk reader: the blocked write completes and
+    // the flood ends cleanly, with every frame the socket took acknowledged.
     drain.store(true, Ordering::Release);
-    let _ = wait_until(|| finished.load(Ordering::Acquire), Duration::from_secs(5));
+    assert!(
+        wait_until(
+            || outcome.load(Ordering::Acquire) != 0,
+            Duration::from_secs(30)
+        ),
+        "the stalled bulk write must complete once the controller reads"
+    );
+    assert_eq!(
+        outcome.load(Ordering::Acquire),
+        1,
+        "the stalled bulk write must complete, not fail, once the controller reads"
+    );
+    let total = sent.load(Ordering::Acquire);
+    assert!(
+        wait_until(
+            || handler.logs.load(Ordering::Acquire) == total,
+            Duration::from_secs(30)
+        ),
+        "every flooded frame must reach the controller after the drain"
+    );
     stop.store(true, Ordering::Release);
     bulk_stop.store(true, Ordering::Release);
     closer.close();
     bulk_closer.close();
-    let _ = flood.join();
+    flood.join().unwrap();
     let _ = runner.join();
     let _ = bulk_reader.join();
     let _ = controller.join();
