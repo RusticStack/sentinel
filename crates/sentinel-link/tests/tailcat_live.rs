@@ -16,7 +16,8 @@
 //! and NAT boundary, but rootless Podman / slirp4netns is not what is proven.
 //! The allow-list hand-off test also needs `nsenter` (util-linux): it runs a
 //! worker link in a parked container's network namespace, and for its
-//! relay-only half drops UDP other than DNS there with `iptables`.
+//! relay-only half drops UDP other than DNS there with `iptables` (and, for
+//! 800 ms around some changes, everything arriving there).
 //!
 //! One side of each tunnel runs in a container, so the link port on the host
 //! and in the container are different sockets: a byte that comes back went
@@ -54,6 +55,7 @@ use std::{
 };
 
 use sentinel_link::{
+    controller::{HANDOFF_BOUND, HANDOFF_RESEND_BOUND},
     session::Path as Route,
     tailcat::{self, Address, NodeKey, PINNED_SHA256, PINNED_VERSION, Role, TailcatConfig},
 };
@@ -667,10 +669,11 @@ fn mono_ns() -> u64 {
 /// When set, this binary plays the Sentinel worker in another network
 /// namespace; the value names its working directory.
 const WORKER_ROLE: &str = "SENTINEL_TAILCAT_LIVE_WORKER";
-/// How the worker reacts to a lost session: unset is the shipped rule
-/// ([`tailcat::Forward::session_lost`]); `previous` replaces the forward
-/// after three failed sessions in a row; `keep` never replaces it. The last
-/// two are for comparison only.
+/// How the worker reacts to a lost session: unset is the shipped rule (a
+/// clean close replaces the forward after [`tailcat::CLOSE_GRACE`],
+/// anything else goes through [`tailcat::Forward::session_lost`]);
+/// `immediate` is the rule before the grace, `session_lost` for every loss,
+/// kept for comparison only.
 const WORKER_RULE: &str = "SENTINEL_TAILCAT_LIVE_WORKER_RULE";
 
 struct Idle;
@@ -708,32 +711,37 @@ fn play_worker(dir: &Path) {
     }
     let config = config(&PathBuf::from(read("binary").trim()), port);
     let forward = tailcat::start_forward(&config, &dir.join("data"), &address).unwrap();
-    let log = std::sync::Mutex::new(
+    let notes = Arc::new(Notes(std::sync::Mutex::new(
         std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .open(dir.join("events"))
             .unwrap(),
-    );
-    let note = |event: &str| {
-        let mut file = log.lock().unwrap();
-        writeln!(file, "{event} {}", mono_ns()).unwrap();
-        file.flush().unwrap();
-    };
+    )));
+    let note = |event: &str| notes.note(event);
+    // The worker link dials the forward through a slow link it controls.
+    let slow = slow_link(dir, forward.local_addr(), Arc::clone(&notes));
     let rule = std::env::var(WORKER_RULE).unwrap_or_default();
     // Presented only until the first session was welcomed.
     let secret = std::fs::read_to_string(dir.join("enrollment"))
         .ok()
         .and_then(|text| sentinel_auth::secret::Secret::parse(text.trim()));
     let settings = worker::Config {
-        controller: forward.local_addr(),
+        controller: slow,
         server: sentinel_auth::secret::Digest(fingerprint),
         worker: read("worker").trim().parse().unwrap(),
         name: "live-worker".into(),
         hello: sentinel_protocol::negotiate::Hello {
             protocol_min: sentinel_protocol::negotiate::ProtocolVersion(1),
             protocol_max: sentinel_protocol::negotiate::ProtocolVersion(3),
-            capabilities: sentinel_protocol::negotiate::Capabilities::REQUIRED,
+            // The shipped rule answers hand-offs, as `sentinel worker` says;
+            // the comparison rule stands for a worker from before that.
+            capabilities: if rule == "immediate" {
+                sentinel_protocol::negotiate::Capabilities::REQUIRED
+            } else {
+                sentinel_protocol::negotiate::Capabilities::REQUIRED
+                    .union(sentinel_protocol::negotiate::Capabilities::HANDOFF_ANSWER)
+            },
             arch: sentinel_protocol::negotiate::Arch::X86_64,
             software: "live".into(),
         },
@@ -761,6 +769,96 @@ fn play_worker(dir: &Path) {
     });
 }
 
+/// The worker's `events` file: `<event> <monotonic ns>` lines.
+struct Notes(std::sync::Mutex<std::fs::File>);
+
+impl Notes {
+    fn note(&self, event: &str) {
+        let mut file = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        writeln!(file, "{event} {}", mono_ns()).unwrap();
+        file.flush().unwrap();
+    }
+}
+
+/// Written into the worker's directory by the controller side: the next
+/// connection the worker opens is stalled (see [`slow_link`]).
+const STALL: &str = "stall";
+
+/// A slow link between the worker link and its forward, on loopback in the
+/// worker's namespace. Bytes pass as they are, and so does each end (a FIN
+/// or a reset) in either direction, the controller's close included. Only
+/// the one connection opened after the controller side wrote [`STALL`] is
+/// slowed: once the controller's first bytes (its TLS handshake flight)
+/// came back, the worker's bytes stop getting through, so the controller
+/// holds that connection in its TLS handshake, not yet a session. The
+/// worker notes `stalled` at that moment.
+fn slow_link(
+    dir: &Path,
+    upstream: std::net::SocketAddr,
+    notes: Arc<Notes>,
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = listener.local_addr().unwrap();
+    let stall = dir.join(STALL);
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(client) = client else { continue };
+            let Ok(server) = TcpStream::connect(upstream) else {
+                continue;
+            };
+            let stalled = std::fs::remove_file(&stall).is_ok();
+            let held = Arc::new(AtomicBool::new(false));
+            let _ = client.set_nodelay(true);
+            let _ = server.set_nodelay(true);
+            // Neither direction lingers past a dead tunnel forever.
+            let _ = server.set_read_timeout(Some(Duration::from_secs(120)));
+            let (Ok(client_rx), Ok(server_tx)) = (client.try_clone(), server.try_clone()) else {
+                continue;
+            };
+            let gate = Arc::clone(&held);
+            std::thread::spawn(move || {
+                pump(client_rx, server_tx, |_| !gate.load(Ordering::Acquire))
+            });
+            let notes = Arc::clone(&notes);
+            std::thread::spawn(move || {
+                pump(server, client, |_| {
+                    if stalled && !held.swap(true, Ordering::AcqRel) {
+                        notes.note("stalled");
+                    }
+                    true
+                })
+            });
+        }
+    });
+    local
+}
+
+/// Copy `from` to `to` until `from` ends, passing its end on: a FIN as a
+/// FIN, an error as a reset of both. `pass` decides, per read, whether the
+/// bytes are delivered or swallowed (a link that stopped delivering).
+fn pump(mut from: TcpStream, mut to: TcpStream, mut pass: impl FnMut(usize) -> bool) {
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => {
+                let _ = to.shutdown(std::net::Shutdown::Write);
+                return;
+            }
+            Ok(n) => {
+                if pass(n) && to.write_all(&buf[..n]).is_err() {
+                    let _ = from.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            }
+            Err(_) => {
+                let _ = to.shutdown(std::net::Shutdown::Both);
+                let _ = from.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+        }
+    }
+}
+
 /// The worker link of [`play_worker`], reacting to lost sessions by `rule`.
 fn play_link(
     settings: sentinel_link::worker::Config,
@@ -772,7 +870,6 @@ fn play_link(
     note: &(dyn Fn(&str) + Sync),
 ) {
     use sentinel_link::worker;
-    let failures = std::sync::atomic::AtomicU32::new(0);
     let _ = worker::run(
         settings,
         identity,
@@ -781,27 +878,18 @@ fn play_link(
         handle,
         &|event| match event {
             worker::Event::Connected { .. } => {
-                failures.store(0, std::sync::atomic::Ordering::Relaxed);
                 note("connected");
                 note(&format!("helper-restarts={}", forward.telemetry().restarts));
             }
-            worker::Event::Disconnected(_) => {
+            worker::Event::Disconnected(error) => {
+                let clean = matches!(error, sentinel_link::Error::Closed);
                 note("lost");
-                let replaced = if rule == "keep" {
-                    false
-                } else if rule == "previous" {
-                    // The rule `sentinel worker` used before: replace the
-                    // helper after three failed sessions in a row.
-                    let failed = failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    failed >= 3 && {
-                        failures.store(0, std::sync::atomic::Ordering::Relaxed);
-                        forward.restart();
-                        true
-                    }
-                } else {
-                    forward.session_lost()
-                };
-                if replaced {
+                note(if clean { "closed" } else { "cut" });
+                if clean && rule != "immediate" {
+                    // The shipped rule, as `sentinel worker` has it.
+                    forward.session_closed();
+                    note("replaced");
+                } else if forward.session_lost() {
                     note("replaced");
                 }
             }
@@ -888,6 +976,17 @@ const HANDOFF_TEST: &str = "an_allow_list_change_hands_tunnelled_sessions_to_the
 /// `Handle::hand_off` does it, the controller first closes that session
 /// through the old helper. The outage is from the change to the next
 /// welcomed session, on `CLOCK_MONOTONIC`.
+///
+/// On each path: cut changes (the "before" figure), then at least 60
+/// handed-off changes of a settled session (so a close lost once in 52
+/// would show), changes that meet the worker's connection still in its TLS
+/// handshake ([`slow_link`]), and changes during a moment of loss at the
+/// worker ([`NetnsLoss`]), whose close only the old helper's resend
+/// delivers. Every handed-off close must come back answered before the old
+/// helper goes. Last, a worker that behaves as one from before
+/// `HANDOFF_ANSWER` must never keep the old helper past the short bound.
+/// It takes about 55 minutes; the `SENTINEL_TAILCAT_LIVE_*` counts in
+/// [`plan`] shorten a development run.
 #[test]
 #[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman + nsenter + iptables"]
 fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
@@ -983,8 +1082,15 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
 
     // Rounds of allow-list changes, each set on a fresh worker; every change
     // widens the list, so the worker stays admitted throughout.
-    let mut change = 0u8;
-    let mut measure = |rule: &str, handoff: bool, relay: bool, count: usize| -> Vec<Round> {
+    let plan = plan();
+    let mut change = 0u16;
+    let mut next_allow = || {
+        change += 1;
+        let other =
+            NodeKey::parse(&format!("nodekey:{}", format!("{change:04x}").repeat(16))).unwrap();
+        (change, [key.clone(), other])
+    };
+    let mut measure = |rule: &str, kind: Kind, relay: bool, count: usize| -> Vec<Round> {
         let worker = NetnsWorker::start(&parked.pid, dir, rule);
         assert!(
             worker.first_after("connected", 0, READY * 2).is_some(),
@@ -992,9 +1098,8 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
         );
         let _ = std::fs::remove_file(dir.join("enrollment"));
         let label = format!(
-            "{} path, {}, worker rule {}",
+            "{} path, {kind:?}, worker rule {}",
             if relay { "relay" } else { "direct" },
-            if handoff { "handed off" } else { "cut" },
             if rule.is_empty() { "shipped" } else { rule }
         );
         // The path the worker's helper measured; a relay-only namespace must
@@ -1012,20 +1117,42 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
             assert_eq!(path.as_deref(), Some("Relay"), "{label}: not relayed");
         }
         let mut rounds = Vec::new();
-        for _ in 0..count {
+        for index in 0..count {
             // Past the settle time, as a long-running worker's helper is.
             std::thread::sleep(tailcat::SESSION_SETTLE + Duration::from_secs(1));
-            change += 1;
-            let other =
-                NodeKey::parse(&format!("nodekey:{}", format!("{change:02x}").repeat(32))).unwrap();
-            let allow = [key.clone(), other];
+            let mut first = None;
+            if kind == Kind::Stalled {
+                // A handed-off change whose redial the slow link then holds
+                // in its TLS handshake, through the restarted helper.
+                std::fs::write(dir.join(STALL), "").unwrap();
+                let at = mono_ns();
+                let handed = link
+                    .hand_off(&server, &next_allow().1)
+                    .expect("the list changed");
+                let stalled = worker
+                    .first_after("stalled", at, Duration::from_secs(60))
+                    .expect("the redial never reached the controller's handshake");
+                let lost = worker
+                    .first_after("lost", at, Duration::ZERO)
+                    .filter(|lost| *lost <= stalled)
+                    .map(|lost| Duration::from_nanos(lost - at));
+                first = Some((handed, lost, Duration::from_nanos(stalled - at)));
+            }
+            let (change, allow) = next_allow();
+            // A lossy moment: everything reaching the worker's namespace is
+            // dropped from the change on, so the close is lost in the tunnel
+            // and gets through only if the old helper resends it.
+            let loss = (kind == Kind::Lossy).then(|| NetnsLoss::engage(&parked.pid));
             let changed = mono_ns();
-            let handed = if handoff {
-                Some(link.hand_off(&server, &allow).expect("the list changed"))
-            } else {
+            let handed = if kind == Kind::Cut {
                 server.set_allow(&allow);
                 None
+            } else {
+                Some(link.hand_off(&server, &allow).expect("the list changed"))
             };
+            if let Some(loss) = loss {
+                loss.lift();
+            }
             let back = worker
                 .first_after("connected", changed, Duration::from_secs(300))
                 .expect("the worker never came back after an allow-list change");
@@ -1037,35 +1164,39 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
                 .events()
                 .into_iter()
                 .filter(|(_, at)| *at >= changed && *at <= back + 100_000_000)
-                .map(|(event, at)| format!("{event}@{:.2}s", since(at).as_secs_f64()))
+                .map(|(event, at)| format!("{event}@{:.3}s", since(at).as_secs_f64()))
                 .collect();
             let lost = worker
                 .first_after("lost", changed, Duration::ZERO)
                 .filter(|at| *at <= back)
                 .map(since);
             eprintln!(
-                "allow-list change {change} ({label}): welcomed again after {:?}; lost after {lost:?}; hand-off {handed:?}; worker events {trail:?}",
+                "allow-list change {change} ({label}, {}/{count}): welcomed again after {:?}; lost after {lost:?}; hand-off {handed:?}; before it {first:?}; worker events {trail:?}",
+                index + 1,
                 since(back)
             );
             rounds.push(Round {
                 outage: since(back),
                 lost,
                 handed,
+                first,
                 trail,
             });
         }
         rounds
     };
+    // Set here, it picks the worker's rule for a comparison run.
+    let rule = std::env::var(WORKER_RULE).unwrap_or_default();
     let mut results = Vec::new();
     for relay in [false, true] {
         let _block = relay.then(|| NetnsUdpBlock::engage(&parked.pid));
-        for (rule, handoff, rounds) in PLAN {
-            results.push((
-                relay,
-                *rule,
-                *handoff,
-                measure(rule, *handoff, relay, *rounds),
-            ));
+        for (kind, rounds) in &plan {
+            let rule = if *kind == Kind::Older {
+                "immediate"
+            } else {
+                &rule
+            };
+            results.push((relay, *kind, measure(rule, *kind, relay, *rounds)));
         }
     }
 
@@ -1103,56 +1234,166 @@ fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
     drop(parked);
     server.shutdown();
     drop(controller);
-    for (relay, rule, handoff, rounds) in &results {
+    for (relay, kind, rounds) in &results {
+        let mut outages: Vec<Duration> = rounds.iter().map(|round| round.outage).collect();
+        outages.sort_unstable();
+        // A close the worker did not see promptly: it waited for a deadline.
+        let late = rounds
+            .iter()
+            .filter(|round| !round.lost.is_some_and(|lost| lost < HANDOFF_NOTICED))
+            .count();
+        let unconfirmed = rounds
+            .iter()
+            .filter_map(|round| round.handed)
+            .filter(|handed| handed.ended < handed.closed + handed.arrivals)
+            .count();
+        let waited: Vec<Duration> = rounds
+            .iter()
+            .filter_map(|round| round.handed.map(|handed| handed.waited))
+            .collect();
         eprintln!(
-            "summary: {} path, {}, worker rule {}: outages {:?}; lost after {:?}",
+            "summary: {} path, {kind:?}: {} changes; outage min {:?}, max {:?}, sorted {outages:?}; close not seen within {HANDOFF_NOTICED:?}: {late}; closes the controller did not see answered: {unconfirmed}; hand-off waits min {:?}, max {:?}",
             if *relay { "relay" } else { "direct" },
-            if *handoff { "handed off" } else { "cut" },
-            if rule.is_empty() { "shipped" } else { rule },
-            rounds.iter().map(|round| round.outage).collect::<Vec<_>>(),
-            rounds.iter().map(|round| round.lost).collect::<Vec<_>>()
+            rounds.len(),
+            outages.first(),
+            outages.last(),
+            waited.iter().min(),
+            waited.iter().max()
         );
     }
 
-    // Handed off, the worker sees the close within a relay round trip and
-    // is welcomed again once the restarted helper answers: measured at
-    // 3.3-4.3 s direct and 3.6-4.6 s relayed (twelve changes each), where a
-    // fresh helper answered 3.2-4.3 s after its start. Cut, the same
-    // changes cost 18.0-21.0 s (heartbeat detection).
-    for (relay, _, handoff, rounds) in &results {
-        for round in rounds.iter().filter(|_| *handoff) {
-            let label = if *relay { "relay" } else { "direct" };
+    for (relay, kind, rounds) in &results {
+        let label = if *relay { "relay" } else { "direct" };
+        for round in rounds.iter().filter(|_| *kind != Kind::Cut) {
+            let handed = round.handed.expect("handed off");
+            if *kind == Kind::Stalled {
+                assert!(
+                    handed.arrivals == 1 && handed.closed == 0,
+                    "{label}: the connection in its handshake was not closed: {round:?}"
+                );
+            } else {
+                assert!(
+                    handed.closed == 1,
+                    "{label}: the tunnelled session was not closed: {round:?}"
+                );
+            }
+            if *kind == Kind::Older {
+                // Its answer may be lost with its forward, but the old
+                // helper is never kept past the short bound for it.
+                assert!(
+                    handed.waited < HANDOFF_BOUND + Duration::from_millis(250),
+                    "{label}: the hand-off waited {:?} for a worker that does not answer: {round:?}",
+                    handed.waited
+                );
+            } else {
+                // The worker's end came back before the old helper went:
+                // the close was delivered, and the controller knew it.
+                assert_eq!(
+                    handed.ended,
+                    handed.closed + handed.arrivals,
+                    "{label} {kind:?}: a close went unanswered: {round:?}"
+                );
+            }
+            let (noticed, outage) = if *kind == Kind::Lossy {
+                (HANDOFF_RESEND_BOUND, LOSSY_OUTAGE)
+            } else {
+                (HANDOFF_NOTICED, HANDOFF_OUTAGE)
+            };
             assert!(
-                round.handed.is_some_and(|handed| handed.closed == 1),
-                "{label}: the tunnelled session was not closed: {round:?}"
+                round.lost.is_some_and(|lost| lost < noticed),
+                "{label} {kind:?}: the worker did not see the close in time: {round:?}"
             );
             assert!(
-                round.lost.is_some_and(|lost| lost < HANDOFF_NOTICED),
-                "{label}: the worker did not see the close at once: {round:?}"
-            );
-            assert!(
-                round.outage < HANDOFF_OUTAGE,
-                "{label}: a handed-off change interrupted the worker for {:?} (bound {HANDOFF_OUTAGE:?}): {round:?}",
+                round.outage < outage,
+                "{label} {kind:?}: a handed-off change interrupted the worker for {:?} (bound {outage:?}): {round:?}",
                 round.outage
             );
         }
     }
 }
 
-/// A handed-off worker sees its session end within this long (measured:
-/// 1.5-4.2 ms direct, 35.3-38.4 ms relayed).
-const HANDOFF_NOTICED: Duration = Duration::from_secs(1);
+/// A handed-off worker sees its session (or its connection in the
+/// handshake) end within this long (measured over two full runs, 316
+/// changes: 1.6-26 ms direct, 34-69 ms relayed).
+const HANDOFF_NOTICED: Duration = Duration::from_millis(500);
 /// A handed-off change costs a worker less than this, from the change to
-/// the next welcomed session (measured: at most 4.60 s).
-const HANDOFF_OUTAGE: Duration = Duration::from_secs(6);
+/// the next welcomed session (measured over the same 316 changes:
+/// 3.30-4.63 s, the restarted helper's own start).
+const HANDOFF_OUTAGE: Duration = Duration::from_millis(5_500);
+/// The same through a lossy moment, whose close only the old helper's
+/// resend delivers (measured over 44 changes: 4.6-7.0 s, where a helper
+/// that went at 600 ms left the direct worker to its heartbeat deadline,
+/// 17.7-20.5 s).
+const LOSSY_OUTAGE: Duration = Duration::from_secs(9);
 
-/// (worker rule, handed off, changes) measured on each path: the cut the
-/// controller made before the hand-off, then the hand-off.
-const PLAN: &[(&str, bool, usize)] = &[("", false, 4), ("", true, 6)];
+/// How an allow-list change meets the worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Cut, as `Server::set_allow` alone does it: the "before" figure.
+    Cut,
+    /// Handed off, the worker's session settled.
+    Settled,
+    /// Handed off while the worker's connection is still in its TLS
+    /// handshake (see [`slow_link`]).
+    Stalled,
+    /// Handed off, the worker's session settled, while everything reaching
+    /// the worker is dropped for [`LOSS`] ([`NetnsLoss`]): the close is lost
+    /// in the tunnel and only the old helper can resend it.
+    Lossy,
+    /// Handed off, the worker's session settled, but the worker behaves as
+    /// one from before `HANDOFF_ANSWER`: it replaces its forward on a clean
+    /// close at once (when older than 10 s) and does not advertise the bit.
+    Older,
+}
+
+/// Handed-off changes per path with a settled session. At least 60, so a
+/// close lost once in 52 changes would show; `SENTINEL_TAILCAT_LIVE_CHANGES`
+/// overrides it for a shorter development run.
+const SETTLED_CHANGES: usize = 64;
+/// Handed-off changes per path that meet a connection in its handshake;
+/// `SENTINEL_TAILCAT_LIVE_STALLS` overrides it.
+const STALLED_CHANGES: usize = 10;
+/// Cut changes per path, for the figure the hand-off is compared with;
+/// `SENTINEL_TAILCAT_LIVE_CUTS` overrides it.
+const CUT_CHANGES: usize = 4;
+/// Handed-off changes per path that meet a lossy moment;
+/// `SENTINEL_TAILCAT_LIVE_LOSSY` overrides it.
+const LOSSY_CHANGES: usize = 6;
+/// Handed-off changes per path with a worker from before `HANDOFF_ANSWER`;
+/// `SENTINEL_TAILCAT_LIVE_OLDER` overrides it.
+const OLDER_CHANGES: usize = 10;
+
+/// What each path measures, in order.
+fn plan() -> [(Kind, usize); 5] {
+    let count = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .map_or(default, |text| text.trim().parse().unwrap())
+    };
+    [
+        (Kind::Cut, count("SENTINEL_TAILCAT_LIVE_CUTS", CUT_CHANGES)),
+        (
+            Kind::Settled,
+            count("SENTINEL_TAILCAT_LIVE_CHANGES", SETTLED_CHANGES),
+        ),
+        (
+            Kind::Stalled,
+            count("SENTINEL_TAILCAT_LIVE_STALLS", STALLED_CHANGES),
+        ),
+        (
+            Kind::Lossy,
+            count("SENTINEL_TAILCAT_LIVE_LOSSY", LOSSY_CHANGES),
+        ),
+        (
+            Kind::Older,
+            count("SENTINEL_TAILCAT_LIVE_OLDER", OLDER_CHANGES),
+        ),
+    ]
+}
 
 /// One measured allow-list change.
 #[derive(Debug)]
-// `trail` is read only through `Debug`, in failure messages.
+// `trail` and `first` are read only through `Debug`, in failure messages.
 #[allow(dead_code)]
 struct Round {
     /// From the change to the next welcomed session.
@@ -1160,6 +1401,13 @@ struct Round {
     /// From the change to the worker seeing its session end.
     lost: Option<Duration>,
     handed: Option<sentinel_link::controller::Handoff>,
+    /// For a stalled change: the change before it (its hand-off, when the
+    /// worker saw that close, and when the redial reached the handshake).
+    first: Option<(
+        sentinel_link::controller::Handoff,
+        Option<Duration>,
+        Duration,
+    )>,
     trail: Vec<String>,
 }
 
@@ -1228,6 +1476,60 @@ impl Drop for NetnsUdpBlock {
             .args(["iptables", "-D"])
             .args(Self::RULE)
             .status();
+    }
+}
+
+/// How long a [`Kind::Lossy`] change drops what reaches the worker.
+const LOSS: Duration = Duration::from_millis(800);
+
+/// Everything arriving in one network namespace other than on loopback
+/// dropped for [`LOSS`], from `engage` on; the rule is removed on its own
+/// timer (a hand-off in progress must not hold it up), and `lift` waits for
+/// that.
+struct NetnsLoss {
+    lifter: Option<std::thread::JoinHandle<()>>,
+}
+
+impl NetnsLoss {
+    const RULE: [&str; 5] = ["INPUT", "!", "-i", "lo", "-j"];
+
+    fn rule(pid: &str, op: &str) -> bool {
+        Command::new("nsenter")
+            .arg(format!("--net=/proc/{pid}/ns/net"))
+            .args(["iptables", op])
+            .args(Self::RULE)
+            .arg("DROP")
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn engage(pid: &str) -> Self {
+        assert!(
+            Self::rule(pid, "-I"),
+            "iptables failed inside the worker's namespace"
+        );
+        let pid = pid.to_owned();
+        let lifter = std::thread::spawn(move || {
+            std::thread::sleep(LOSS);
+            assert!(Self::rule(&pid, "-D"), "the loss rule could not be removed");
+        });
+        Self {
+            lifter: Some(lifter),
+        }
+    }
+
+    fn lift(mut self) {
+        if let Some(lifter) = self.lifter.take() {
+            lifter.join().unwrap();
+        }
+    }
+}
+
+impl Drop for NetnsLoss {
+    fn drop(&mut self) {
+        if let Some(lifter) = self.lifter.take() {
+            let _ = lifter.join();
+        }
     }
 }
 

@@ -963,6 +963,7 @@ fn start_tailcat(
                                         admitted = keys.len(),
                                         tunnelled = handoff.tunnelled,
                                         closed = handoff.closed,
+                                        arrivals = handoff.arrivals,
                                         ended = handoff.ended,
                                         waited_ms = handoff.waited.as_millis() as u64
                                     );
@@ -1739,7 +1740,12 @@ mod worker_role {
         let forward = forward.map(Arc::new);
         // The reflink bit is the cache root's own probe answer, so the
         // advertised capability and the backend restore uses never disagree.
-        let mut capabilities = sentinel_protocol::negotiate::Capabilities::REQUIRED;
+        // This worker answers a hand-off close before its forward goes, and
+        // replaces the forward on every clean close (below), so the
+        // controller may keep its old helper for a close it did not hear
+        // answered.
+        let mut capabilities = sentinel_protocol::negotiate::Capabilities::REQUIRED
+            .union(sentinel_protocol::negotiate::Capabilities::HANDOFF_ANSWER);
         if sentinel_worker::cache_reflink(&config.data_dir) {
             capabilities = capabilities.union(sentinel_protocol::negotiate::Capabilities::REFLINK);
         }
@@ -1831,7 +1837,18 @@ mod worker_role {
                                     // to carry a new session after the
                                     // controller's helper restarts (every
                                     // allow-list change); a fresh one does not.
-                                    if let Some(forward) = &tunnel && forward.session_lost() {
+                                    // A clean close is the controller's hand-off
+                                    // to that restart: always replaced, after the
+                                    // worker's own end had time to get through.
+                                    if let Some(forward) = &tunnel
+                                        && matches!(error, sentinel_link::Error::Closed)
+                                    {
+                                        forward.session_closed();
+                                        tracing::info!(
+                                            event = "tailcat_replaced",
+                                            "the controller handed the session off; replacing the helper"
+                                        );
+                                    } else if let Some(forward) = &tunnel && forward.session_lost() {
                                         tracing::warn!(
                                             event = "tailcat_replaced",
                                             "the control session over the forward was lost; replacing the helper"

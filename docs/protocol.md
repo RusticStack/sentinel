@@ -87,6 +87,7 @@ A session opens with `Hello { protocol_min, protocol_max, capabilities, arch, so
 | 5 | `REFLINK` on the cache volume |
 | 6 | `TAILCAT` helper available |
 | 7 | `NETWORK_NONE` supported |
+| 8 | `HANDOFF_ANSWER`: the worker answers a Tailcat hand-off close before it replaces its forward, and replaces it on every clean close ([worker link](worker-link.md)) |
 
 Bits 0 to 3 are required (the set the F07 probe proved enforceable); a hello without them is rejected. Rejections are typed and final for that hello: `unsupported_version` names the supported range and whether the worker is the side that must upgrade, `missing_capabilities` names the missing bits, `invalid_range` flags `protocol_min > protocol_max`. A worker must not retry an unchanged rejected hello. `software` is a diagnostic string only and never a compatibility input.
 

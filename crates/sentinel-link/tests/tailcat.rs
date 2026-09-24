@@ -1305,3 +1305,75 @@ fn a_hand_off_restarts_the_helper_only_on_a_change_and_spares_direct_tls() {
     server.shutdown();
     assert!(controller.shutdown(Duration::from_secs(5)));
 }
+
+/// A connection the helper carries that is not a session yet (here it has
+/// sent no TLS byte at all) is closed by the hand-off too, from its own
+/// thread: a `close_notify` alert and a FIN reach the helper's socket, and
+/// the helper closing its end in turn counts as the close delivered. The
+/// fake helper dials the link port itself, so it owns that connection the
+/// way the real one owns each tunnelled dial.
+#[test]
+fn a_hand_off_closes_a_carried_connection_still_in_its_handshake() {
+    use sentinel_link::{controller::Controller, identity::Identity};
+    use sentinel_store::{Durability, Store};
+    use std::sync::Arc;
+
+    let state = tempfile::tempdir().unwrap();
+    let store =
+        Arc::new(Store::open(state.path().join("metadata.sqlite"), Durability::Normal).unwrap());
+    let controller = Controller::start(
+        store,
+        Arc::new(sentinel_store::logs::LogStore::open(state.path().join("logs")).unwrap()),
+        Arc::new(sentinel_store::objects::Objects::open(state.path().join("objects")).unwrap()),
+        Identity::generate("controller").unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
+    let port = controller.local_addr().port();
+    let link = controller.handle();
+
+    // Each helper dials the link port, reads until the controller's end and
+    // records what came, then exits, which closes its side.
+    let received = state.path().join("received");
+    let fake = Fake::write(&format!(
+        "  serve) printf 'listening on {ADDRESS}\\n'; exec bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}; exec cat <&3 > \"$0.$$\"' {} ;;\n",
+        received.display()
+    ));
+    let server = tailcat::start_server(&fake.config(port), fake.path(), &[key(KEY)]).unwrap();
+    server.wait_ready(Duration::from_secs(10)).unwrap();
+    wait_until("the helper's pid", || server.telemetry().pid.is_some());
+    let old = server.telemetry().pid.unwrap();
+    let file = PathBuf::from(format!("{}.{old}", received.display()));
+    wait_until("the helper's dial", || file.exists());
+    // Accepted and waiting for its ClientHello.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let handoff = link.hand_off(&server, &[key(KEY), key(OTHER)]).unwrap();
+    assert_eq!(
+        (
+            handoff.tunnelled,
+            handoff.closed,
+            handoff.arrivals,
+            handoff.ended
+        ),
+        (1, 0, 1, 1),
+        "{handoff:?}"
+    );
+    // The close came before the helper was replaced, and it was a TLS
+    // close_notify alert (record type 21, level warning, description 0).
+    let bytes = fs::read(&file).unwrap();
+    assert_eq!(bytes.len(), 7, "{bytes:?}");
+    assert_eq!((bytes[0], &bytes[5..]), (21, &[1u8, 0][..]), "{bytes:?}");
+    assert_eq!(
+        controller
+            .stats()
+            .rejected
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a handed-off connection is not a rejected one"
+    );
+    wait_until("the old helper to be gone", || !alive(old));
+
+    server.shutdown();
+    assert!(controller.shutdown(Duration::from_secs(5)));
+}
