@@ -6,6 +6,8 @@ A purpose-built, fully open-source, self-hosted CI engine designed from scratch 
 
 Start development from [TODO.md](TODO.md): ordered work packages, stable task IDs, dependencies, the first runnable server/worker slice, and verification gates.
 
+**Supported platforms:** Linux runs everything (the server, the worker and the CLI); Windows runs the CLI. macOS is not supported. The [platform matrix](docs/rust-foundation.md#platform-and-feature-matrix) lists the target triples.
+
 See [Rust foundation](docs/rust-foundation.md) for the pinned toolchain, build commands, platform/feature matrix, and dependency boundaries.
 
 See [CLI and configuration](docs/configuration.md) to validate configuration, start the separate Linux processes, and shut them down.

@@ -37,12 +37,12 @@ Features select which **roles can be compiled**, not user authorization or paid 
 |---|---|---|
 | `x86_64-unknown-linux-gnu` | Linux x86_64 CLI, server, worker | default CLI; `server`, `worker`, or both |
 | `aarch64-unknown-linux-gnu` | Linux arm64 CLI, server, worker | default CLI; `server`, `worker`, or both |
-| `x86_64-apple-darwin` | macOS Intel CLI | default / no role features |
-| `aarch64-apple-darwin` | macOS Apple silicon CLI | default / no role features |
 | `x86_64-pc-windows-msvc` | Windows x86_64 CLI | default / no role features |
 | `aarch64-pc-windows-msvc` | Windows arm64 CLI | default / no role features |
 
 `server` and `worker` are additive, opt-in features. A Linux distribution can contain both; CLI-only builds carry neither. Enabling either on a non-Linux target fails compilation with an explicit diagnostic. Later role modules/dependencies must follow the same feature/platform boundary. CLI-only builds must remain free of container-execution/server dependencies.
+
+These four targets are the whole platform contract; the [README](../README.md) states it in one line. macOS was dropped by decision on 2026-09-24: there is no macOS build target, credential store or browser path. **Linux is the only supported Unix.** Code gated `cfg(unix)` is written for Linux, and Linux-specific calls sit under `cfg(target_os = "linux")` with a portable fallback, so another Unix target may still compile, but it is not built, tested or supported, and no `compile_error!` guards it.
 
 GNU Linux targets are the initial Linux contract. Musl/static distribution, additional operating systems/architectures, native installers and minimum OS/libc versions require subsequent qualification; no global linker/sysroot configuration is baked into this workspace.
 
@@ -69,7 +69,6 @@ Install only the cross-target standard libraries needed for your work; cloning t
 
 ```sh
 rustup target add --toolchain 1.97.0 x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
-rustup target add --toolchain 1.97.0 x86_64-apple-darwin aarch64-apple-darwin
 rustup target add --toolchain 1.97.0 x86_64-pc-windows-msvc aarch64-pc-windows-msvc
 ```
 
@@ -78,15 +77,13 @@ Validate the target/role combinations without requiring cross-linkers:
 ```sh
 cargo check --locked --workspace --all-targets --target x86_64-unknown-linux-gnu --features server,worker
 cargo check --locked --workspace --all-targets --target aarch64-unknown-linux-gnu --features server,worker
-cargo check --locked --workspace --all-targets --target x86_64-apple-darwin
-cargo check --locked --workspace --all-targets --target aarch64-apple-darwin
 cargo check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
 cargo check --locked --workspace --all-targets --target aarch64-pc-windows-msvc
 ```
 
-Also check `server` and `worker` individually on Linux, and verify each is rejected on macOS/Windows. `--all-targets` means package binaries/tests/examples/benches for the selected platform; it does not iterate all operating systems. `--all-features` is appropriate for Linux, but intentionally invalid on non-Linux hosts because it enables Linux-only roles.
+Also check `server` and `worker` individually on Linux, and verify each is rejected on Windows. `--all-targets` means package binaries/tests/examples/benches for the selected platform; it does not iterate all operating systems. `--all-features` is appropriate for Linux, but intentionally invalid on non-Linux hosts because it enables Linux-only roles.
 
-`cargo check` verifies Rust compilation/type checking, **not native linking or runtime behavior**. Windows MSVC builds need the appropriate Visual C++ linker/SDK; Linux builds need a compatible native/cross linker and libc; macOS binaries require an Apple SDK/toolchain. Release qualification will build/run on the actual supported systems. Container runtime conformance remains a later Linux executor task.
+`cargo check` verifies Rust compilation/type checking, **not native linking or runtime behavior**. Windows MSVC builds need the appropriate Visual C++ linker/SDK; Linux builds need a compatible native/cross linker and libc. Release qualification will build/run on the actual supported systems. Container runtime conformance remains a later Linux executor task.
 
 ## Library and dependency boundaries
 

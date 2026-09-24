@@ -1,6 +1,6 @@
-//! Credential storage for profiles (O04): Windows Credential Manager, the
-//! macOS Keychain, or an owner-only file under the configuration directory,
-//! chosen by platform or `SENTINEL_CREDENTIAL_STORE=file|os`.
+//! Credential storage for profiles (O04): Windows Credential Manager or an
+//! owner-only file under the configuration directory, chosen by platform or
+//! `SENTINEL_CREDENTIAL_STORE=file|os`.
 //!
 //! A stored credential is one opaque blob per profile (the JSON
 //! [`crate::profile::Credentials`]). The OS stores key it by the key the
@@ -17,8 +17,6 @@ use serde::{Deserialize, Serialize};
 use crate::client::Error;
 
 pub mod file;
-#[cfg(target_os = "macos")]
-pub mod macos;
 #[cfg(windows)]
 pub mod windows;
 
@@ -27,7 +25,7 @@ pub mod windows;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
-    /// Windows Credential Manager or the macOS Keychain.
+    /// Windows Credential Manager.
     Os,
     /// `credentials/<profile>.json`, owner-only.
     File,
@@ -42,9 +40,9 @@ impl Backend {
     }
 }
 
-/// Whether this build has an OS credential store (Linux Secret Service is
-/// deferred; Linux and other Unixes use the file store).
-pub const OS_AVAILABLE: bool = cfg!(any(windows, target_os = "macos"));
+/// Whether this build has an OS credential store: Windows only. Linux Secret
+/// Service is deferred, so Linux uses the file store.
+pub const OS_AVAILABLE: bool = cfg!(windows);
 
 /// The backend for a new sign-in: `SENTINEL_CREDENTIAL_STORE` when set,
 /// otherwise the OS store where one exists and the file store elsewhere.
@@ -125,30 +123,28 @@ fn os_error(what: &str, error: &std::io::Error) -> Error {
 
 /// The platform's OS store, or an `Unsupported` error where there is none.
 mod os {
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     use std::io;
 
-    #[cfg(target_os = "macos")]
-    pub(super) use super::macos::{delete, read, write};
     #[cfg(windows)]
     pub(super) use super::windows::{delete, read, write};
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     fn unsupported() -> io::Error {
         io::Error::new(
             io::ErrorKind::Unsupported,
             "no OS credential store on this platform; use SENTINEL_CREDENTIAL_STORE=file",
         )
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     pub(super) fn read(_key: &str) -> io::Result<Option<Vec<u8>>> {
         Err(unsupported())
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     pub(super) fn write(_key: &str, _blob: &[u8]) -> io::Result<()> {
         Err(unsupported())
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     pub(super) fn delete(_key: &str) -> io::Result<()> {
         Err(unsupported())
     }

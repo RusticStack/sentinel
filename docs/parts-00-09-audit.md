@@ -448,7 +448,7 @@ The audits marked these tasks Partial or Missing. Each one is met now, with the 
 Not met, stated plainly:
 
 - **K05 was Partial and is closed only by moving scope.** Bounded prefetch was never implemented; an offer carries only the digest and the reference arrives with the spec after the acknowledgement, when preparation already starts the pull. The requirement moved to B04 and tenant-scoped private-image authorization to S05; the K05 item text says so. The single-flight pulls and the pull/checkout overlap are met. **Since closed:** the B04 follow-up implements the bounded prefetch; only tenant-scoped registry authorization remains, with S05.
-- **O07 remains Blocked by: no macOS hardware or Apple toolchain.** The macOS Keychain in O04 is also unverified. Nothing in this audit changes that.
+- ~~**O07 remains Blocked by: no macOS hardware or Apple toolchain.** The macOS Keychain in O04 is also unverified.~~ No longer open: macOS was dropped by decision on 2026-09-24 ([below](#macos-dropped)), and the Keychain backend was removed.
 - ~~**P04-28's power-loss boundary is implemented but unverified.**~~ Verified by the [follow-up](#follow-up-spool-space-crash-durability-and-p04-regression-tests), which also found and fixed the durability bugs listed there.
 
 The audit notes raised three more gaps without finding IDs, and no cluster took them:
@@ -702,16 +702,7 @@ The flood now has no fixed size. It writes until the controller drains it. The s
 
 This is consistent with a damaged link output from the out-of-memory builds, which a relink replaced. It rules out a defect in the rusqlite build or the code. With no failure left to reproduce, nothing was changed.
 
-**macOS type-check recipe.** The whole-workspace check runs in WSL2 with these settings:
-
-- `CC_aarch64_apple_darwin` and `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER` point to a wrapper that drops `--target=` and runs `/opt/zig/zig cc -target aarch64-macos`.
-- `AR_aarch64_apple_darwin` runs `zig ar`.
-- `CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS=--sysroot=<dir>`, where `<dir>/lib/rustlib/aarch64-apple-darwin` links to the Windows toolchain's copy.
-
-Two pitfalls:
-
-- A plain `RUSTFLAGS` also reaches host build scripts under `clippy`, which then cannot find the host `std`.
-- `--target` must come before clippy's `--`. After it, the flag goes to `CLIPPY_ARGS` and cross-compiles every build script.
+**macOS type-check.** The last row below used a zig-based cross-check recipe for `aarch64-apple-darwin`. The recipe was retired when macOS was dropped by decision on 2026-09-24 ([below](#macos-dropped)); the row stays as a record of that run.
 
 | Where | Command | Exit | Result |
 |---|---|---|---|
@@ -728,7 +719,7 @@ Two pitfalls:
 | WSL2, root | `SENTINEL_POWER_LOSS_TESTS=1` `crash_consistency` `power_cut_on_dm_flakey` | 0 | 52 power cuts on ext4 and 52 on XFS, every promise kept (40.8 s); a second run gave the same result |
 | WSL2, rootful Podman | the live Tailcat suite as its header documents (`SENTINEL_TAILCAT_LIVE`, `SENTINEL_TAILCAT_DERPER`, `SENTINEL_TAILCAT_DERP_CA` = `SSL_CERT_FILE`, `/usr/sbin` on `PATH`, `nsenter`) | 0 | 8 passed in 517.7 s; live probe `path Direct, rtt 440µs`; self-hosted relay `pong in 350µs via DERP(local)`; allow-list outages 19.2–21.6 s (previous rule) and 20.5–20.8 s (shipped rule), 4 changes each |
 | WSL2, release | `cargo test --release -p sentinel-store --test fleet_load -- --ignored --nocapture --test-threads=1` | 0 | 2 passed; 10,000 of 10,000 jobs placed, 0 placement failures, first wave per tenant [700, 300, 300, 300], 7 waves, 107 rounds |
-| WSL2 (zig 0.16, recipe above) | `cargo check --locked --workspace --all-targets --target aarch64-apple-darwin` and `cargo clippy --locked --workspace --all-targets --target aarch64-apple-darwin -- -D warnings` | 0, 0 | clean. A type-check, not a macOS run (Blocked by: no macOS hardware) |
+| WSL2 (zig 0.16, recipe since retired) | `cargo check --locked --workspace --all-targets --target aarch64-apple-darwin` and `cargo clippy --locked --workspace --all-targets --target aarch64-apple-darwin -- -D warnings` | 0, 0 | clean. A type-check, not a macOS run (Blocked by: no macOS hardware) |
 
 **`fleet_load` timing.** The first three runs of the merged tree took 9,961, 5,601 and 10,583 ms, against 4,444–4,638 ms recorded on `93884b4`. To tell a regression from host noise, the release binary of the pre-follow-up tree (`fca2d1e`) and of the merged tree were run alternately, five times each:
 
@@ -741,8 +732,18 @@ The follow-ups did not slow placement. The slow runs were host noise. They are n
 
 Still open after this verification:
 
-- macOS hardware runs.
+- ~~macOS hardware runs.~~ No longer open: macOS was dropped by decision on 2026-09-24.
 - U07.
 - The ~20 s allow-list outage floor (heartbeat detection).
 - S05 tenant-scoped registry authorization.
 - B04, R01 and R04 as written in the tracker.
+
+## macOS dropped
+
+On 2026-09-24 the owner decided that Sentinel supports Linux (server, worker and CLI) and Windows (CLI), not macOS. The macOS items above are therefore closed by decision, not by verification:
+
+- O04's macOS Keychain backend (`keystore/macos.rs`, the `security-framework` dependency) was removed, never having run on macOS.
+- O07's "Blocked by: no macOS hardware or Apple toolchain" no longer applies. O07's text now names Linux and Windows CLI builds.
+- The `aarch64-apple-darwin` type-check rows above record runs of a target that is no longer built; the zig recipe is retired.
+- The browser opener's `open` path and the `$HOME/Library/Application Support` configuration directory are gone. On Linux the opener is `xdg-open` and the directory is `${XDG_CONFIG_HOME:-$HOME/.config}/sentinel`.
+- Linux is the only supported Unix. `cfg(unix)` code keeps compiling where it did, but other Unix targets are not built or tested ([Rust foundation](rust-foundation.md#platform-and-feature-matrix)).

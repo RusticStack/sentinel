@@ -32,17 +32,7 @@ pub(super) fn workers(
         list.item(pool.clone(), || {
             let mut out = format!("pool {} ({})\n", text(pool, "name"), text(pool, "kind"));
             for worker in pool["workers"].as_array().into_iter().flatten() {
-                out.push_str(&format!(
-                    "  {} {} {} {}\n",
-                    text(worker, "id"),
-                    text(worker, "name"),
-                    text(worker, "arch"),
-                    if worker["connected"] == true {
-                        "connected"
-                    } else {
-                        "offline"
-                    }
-                ));
+                client::push_worker_line(&mut out, worker);
             }
             out
         });

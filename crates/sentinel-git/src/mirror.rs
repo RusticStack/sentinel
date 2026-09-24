@@ -1084,7 +1084,7 @@ fn remove_stale_tmp(objects: &Path, now: std::time::SystemTime) -> u64 {
 }
 
 /// `FICLONE` `from` onto `to`: shared extents, separate inode. Linux only;
-/// on other Unix targets reflink is unsupported and callers copy bytes.
+/// elsewhere reflink is unsupported and callers copy bytes.
 fn ficlone(to: &File, from: &File) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {

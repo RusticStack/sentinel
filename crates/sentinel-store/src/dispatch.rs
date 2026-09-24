@@ -2724,7 +2724,11 @@ pub fn release_dependents(
 }
 
 /// Why a job is not running, as the plan's structured reason.
+///
+/// Non-exhaustive so the API's rendering keeps a guard arm for a reason
+/// added here before the API names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WaitReason {
     /// Blocked on a dependency that has not finished.
     Dependency,

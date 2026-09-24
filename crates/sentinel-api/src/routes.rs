@@ -902,15 +902,18 @@ fn queued_json(row: &dispatch::QueuedJob) -> Value {
     })
 }
 
-/// The scheduler's reason as a code plus whatever says what is missing. The
-/// enum belongs to the store, which gains reasons as placement learns new
-/// ones, so a reason this build does not name still reports its own name and
-/// numbers instead of an "unknown" the client cannot act on.
+/// The scheduler's reason as a code plus whatever says what is missing, each
+/// quantity as its own numeric field. Every reason the store has today is
+/// named here. The enum belongs to the store and is non-exhaustive, so a
+/// reason added there before this match names it falls to the guard, which
+/// still reports its own name and fields instead of an "unknown" the client
+/// cannot act on.
 fn wait_reason_json(reason: dispatch::WaitReason) -> Value {
+    use dispatch::WaitReason as R;
     match reason {
-        dispatch::WaitReason::Dependency => json!({ "code": "dependency" }),
-        dispatch::WaitReason::Policy(what) => json!({ "code": "policy", "detail": what }),
-        dispatch::WaitReason::NoMatchingWorker {
+        R::Dependency => json!({ "code": "dependency" }),
+        R::Policy(what) => json!({ "code": "policy", "detail": what }),
+        R::NoMatchingWorker {
             cpu_short,
             memory_short,
         } => json!({
@@ -918,19 +921,59 @@ fn wait_reason_json(reason: dispatch::WaitReason) -> Value {
             "cpu_short": cpu_short,
             "memory_short": memory_short,
         }),
-        dispatch::WaitReason::WorkerOffline => json!({ "code": "worker_offline" }),
-        dispatch::WaitReason::Capacity => json!({ "code": "capacity" }),
-        dispatch::WaitReason::Ready => json!({ "code": "ready" }),
-        other => {
-            let text = format!("{other:?}");
-            match text.split_once(' ') {
-                Some((name, fields)) => json!({
-                    "code": reason_code(name),
-                    "detail": fields.trim_matches(|c| c == '{' || c == '}' || c == ' '),
-                }),
-                None => json!({ "code": reason_code(&text) }),
+        R::DiskShort { disk_short } => json!({ "code": "disk_short", "disk_short": disk_short }),
+        R::ArchMismatch => json!({ "code": "arch_mismatch" }),
+        R::LabelMissing => json!({ "code": "label_missing" }),
+        R::ConcurrencyLimit => json!({ "code": "concurrency_limit" }),
+        R::WorkerOffline => json!({ "code": "worker_offline" }),
+        R::Capacity => json!({ "code": "capacity" }),
+        R::Drain => json!({ "code": "drain" }),
+        R::FairnessHold => json!({ "code": "fairness_hold" }),
+        R::LocalityWait => json!({ "code": "locality_wait" }),
+        R::Ready => json!({ "code": "ready" }),
+        other => debug_reason_json(&format!("{other:?}")),
+    }
+}
+
+/// The guard's rendering of a reason's `Debug` text: `Name { a: 1, b: 2 }`
+/// becomes `{"code":"name","a":1,"b":2}`, `Name(x)` puts `x` in `detail`,
+/// and `Name` is the code alone. Reasons are `Copy`, so their fields are
+/// numbers, flags or static text, which this reads back as such.
+fn debug_reason_json(text: &str) -> Value {
+    let end = text.find([' ', '(']).unwrap_or(text.len());
+    let (name, rest) = text.split_at(end);
+    let mut out = json!({ "code": reason_code(name) });
+    let rest = rest.trim();
+    if let Some(fields) = rest.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+        for field in fields.split(',') {
+            if let Some((key, value)) = field.split_once(':') {
+                out[key.trim()] = debug_value(value.trim());
             }
         }
+    } else if let Some(value) = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        out["detail"] = debug_value(value.trim());
+    }
+    out
+}
+
+/// One `Debug` field value as JSON: an integer or a flag as itself, quoted
+/// text without its quotes, anything else as written.
+fn debug_value(value: &str) -> Value {
+    if let Ok(n) = value.parse::<i64>() {
+        return json!(n);
+    }
+    if let Ok(n) = value.parse::<u64>() {
+        return json!(n);
+    }
+    match value {
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        _ => json!(
+            value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(value)
+        ),
     }
 }
 
@@ -1887,6 +1930,59 @@ mod tests {
                 .as_ref()
                 .and_then(|d| d.get("retry_with_idempotency_key")),
             Some(&Value::Bool(true))
+        );
+    }
+
+    /// Every quantity a reason carries is its own numeric field: a client
+    /// reads `disk_short` as bytes, never parses a `detail` string.
+    #[test]
+    fn queue_reasons_carry_their_quantities_as_numeric_fields() {
+        use dispatch::WaitReason as R;
+        let disk = wait_reason_json(R::DiskShort {
+            disk_short: 5_368_709_120,
+        });
+        assert_eq!(
+            disk,
+            json!({ "code": "disk_short", "disk_short": 5_368_709_120_i64 })
+        );
+        assert_eq!(
+            wait_reason_json(R::NoMatchingWorker {
+                cpu_short: 2_000,
+                memory_short: 0,
+            }),
+            json!({ "code": "no_matching_worker", "cpu_short": 2_000, "memory_short": 0 })
+        );
+        assert_eq!(
+            wait_reason_json(R::Policy("image unresolved")),
+            json!({ "code": "policy", "detail": "image unresolved" })
+        );
+        for (reason, code) in [
+            (R::ArchMismatch, "arch_mismatch"),
+            (R::LabelMissing, "label_missing"),
+            (R::ConcurrencyLimit, "concurrency_limit"),
+            (R::Drain, "drain"),
+            (R::FairnessHold, "fairness_hold"),
+            (R::LocalityWait, "locality_wait"),
+        ] {
+            assert_eq!(wait_reason_json(reason), json!({ "code": code }));
+        }
+    }
+
+    /// The guard for a reason the API does not name yet keeps its fields
+    /// structured, whether the variant has named fields, a tuple or none.
+    #[test]
+    fn an_unnamed_reason_still_reports_structured_fields() {
+        assert_eq!(
+            debug_reason_json("GpuShort { gpus: 2, vram_short: 1024, shared: false }"),
+            json!({ "code": "gpu_short", "gpus": 2, "vram_short": 1024, "shared": false })
+        );
+        assert_eq!(
+            debug_reason_json("QuotaHold(\"tenant minutes\")"),
+            json!({ "code": "quota_hold", "detail": "tenant minutes" })
+        );
+        assert_eq!(
+            debug_reason_json("MaintenanceWindow"),
+            json!({ "code": "maintenance_window" })
         );
     }
 
