@@ -184,17 +184,7 @@ pub fn run(args: ApiArgs) -> Result<(), Error> {
                     pool["kind"].as_str().unwrap_or("")
                 ));
                 for worker in pool["workers"].as_array().into_iter().flatten() {
-                    text.push_str(&format!(
-                        "  {} {} {} {}\n",
-                        worker["id"].as_str().unwrap_or(""),
-                        worker["name"].as_str().unwrap_or(""),
-                        worker["arch"].as_str().unwrap_or(""),
-                        if worker["connected"] == true {
-                            "connected"
-                        } else {
-                            "offline"
-                        }
-                    ));
+                    client::push_worker_line(&mut text, worker);
                 }
             }
             out(view.clone(), text);

@@ -194,7 +194,7 @@ Every command below takes the [shared client flags](#the-shared-client). `--tena
 | `sentinel job cancel JOB`, `sentinel job rerun JOB` | `POST /jobs/{id}/cancel\|rerun` | the cancel outcome, or the rerun job's state |
 | `sentinel log show ATTEMPT [--follow] [--step N]` | `GET /attempts/{id}/logs` | the log as the job wrote it; `--follow` waits until it is complete |
 | `sentinel log search ATTEMPT --text TEXT [--limit N]` | `GET /attempts/{id}/logs/search` | matching lines (`seq`, step, stream, text), default 100, at most 10,000 |
-| `sentinel workers list [--tenant]` | `GET /workers?tenant` | pools and their workers with connection state |
+| `sentinel workers list [--tenant]` | `GET /workers?tenant` | pools and their workers with connection state and transport: `{path} {rtt}ms`, `{path} rtt=-` when the round trip was not measured, `transport=-` when the worker never reported (`sentinel api workers` prints the same lines) |
 | `sentinel workers drain\|undrain WORKER` | `POST /workers/{id}/drain\|undrain` | the new drain state (platform admin) |
 | `sentinel queue [--tenant] [--limit N]` | `GET /queue?tenant&limit` | waiting jobs, oldest first, with age and reason; the total when cut (`--limit` 1–500, default 100) |
 | `sentinel artifact list RUN`, `sentinel artifact show RUN ARTIFACT` | `GET /runs/{id}/artifacts[/{arf}]` | artifact rows; one row with its manifest entries |

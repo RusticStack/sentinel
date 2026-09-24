@@ -242,6 +242,39 @@ pub fn emit_item(output: Output, value: &Value, text: impl FnOnce() -> String) {
     }
 }
 
+/// Append one worker of a `GET /workers` pool as a text line:
+/// `  {id} {name} {arch} connected|offline {transport}`. The transport is
+/// `{path} {rtt}ms`, with `rtt=-` for a round trip nothing measured and
+/// `transport=-` for a worker that never reported one, so an absent
+/// measurement never reads as a direct link with no latency.
+pub fn push_worker_line(out: &mut String, worker: &Value) {
+    use fmt::Write as _;
+    let str_of = |key: &str| worker[key].as_str().unwrap_or("");
+    let state = if worker["connected"] == true {
+        "connected"
+    } else {
+        "offline"
+    };
+    // Writing into a String cannot fail.
+    let _ = write!(
+        out,
+        "  {} {} {} {state} ",
+        str_of("id"),
+        str_of("name"),
+        str_of("arch")
+    );
+    let _ = match worker["transport"].as_object() {
+        Some(t) => {
+            let path = t.get("path").and_then(Value::as_str).unwrap_or("unknown");
+            match t.get("rtt_ns").and_then(Value::as_u64) {
+                Some(ns) => writeln!(out, "{path} {:.1}ms", ns as f64 / 1_000_000.0),
+                None => writeln!(out, "{path} rtt=-"),
+            }
+        }
+        None => writeln!(out, "transport=-"),
+    };
+}
+
 /// Report a failure on stderr in the current mode: `error: …` for text,
 /// one `sentinel.error/1` line for JSON and NDJSON.
 pub fn report(error: &Error) {

@@ -336,3 +336,65 @@ fn a_named_server_backoff_is_left_to_the_caller() {
     assert_eq!(error.api.unwrap()["details"]["retry_after_ms"], 1000);
     assert_eq!(fake.requests(), 1);
 }
+
+/// Both worker listings show how each worker is reached: `{path} {rtt}ms`
+/// when measured, `rtt=-` when the round trip was not, `transport=-` when
+/// the worker never reported. JSON output stays the server's document.
+#[test]
+fn worker_listings_show_each_workers_transport_and_json_stays_the_server_document() {
+    let body = r#"{"pools":[{"name":"linux","kind":"shared","workers":[
+        {"id":"wrk_a","name":"alpha","arch":"x86_64","connected":true,
+         "transport":{"path":"direct","rtt_ns":1234567,"reconnects":0,"bytes_in":1,"bytes_out":2}},
+        {"id":"wrk_b","name":"beta","arch":"aarch64","connected":true,
+         "transport":{"path":"relay","reconnects":3,"bytes_in":0,"bytes_out":0}},
+        {"id":"wrk_c","name":"gamma","arch":"x86_64","connected":false,"transport":null}]}]}"#;
+    let fake = Fake::start(200, body);
+    let dir = tempfile::tempdir().unwrap();
+    let token = token_file(&dir);
+    let token = token.to_str().unwrap();
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+            .env_remove("SENTINEL_TOKEN")
+            .env_remove("SENTINEL_SERVER")
+            .env_remove("SENTINEL_PROFILE")
+            .env("SENTINEL_CONFIG_DIR", dir.path().join("no-profiles"))
+            .args(args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {stderr}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let list = |extra: &[&str]| {
+        let mut args = vec![
+            "workers",
+            "list",
+            "--tenant",
+            "acme",
+            "--server",
+            &fake.url,
+            "--token-file",
+            token,
+        ];
+        args.extend_from_slice(extra);
+        run(&args)
+    };
+    let legacy = |extra: &[&str]| {
+        let mut args = vec!["api", "--server", &fake.url, "--token-file", token];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["workers", "--tenant", "acme"]);
+        run(&args)
+    };
+    let expected = "pool linux (shared)\n\
+                    \x20 wrk_a alpha x86_64 connected direct 1.2ms\n\
+                    \x20 wrk_b beta aarch64 connected relay rtt=-\n\
+                    \x20 wrk_c gamma x86_64 offline transport=-\n";
+    assert_eq!(list(&[]), expected);
+    assert_eq!(legacy(&[]), expected);
+
+    let server: serde_json::Value = serde_json::from_str(body).unwrap();
+    let listed: serde_json::Value = serde_json::from_str(&list(&["--output", "json"])).unwrap();
+    assert_eq!(listed["pools"], server["pools"]);
+    let raw: serde_json::Value = serde_json::from_str(&legacy(&["--json"])).unwrap();
+    assert_eq!(raw, server);
+}
