@@ -177,22 +177,61 @@ fn dispatch_run(d: &Deployment) -> (RunId, JobId) {
 }
 
 fn lease(d: &Deployment, job: JobId) -> (WorkerId, AttemptId, Fence) {
-    let (tenant, worker) = (d.tenant, WorkerId::new());
-    let (attempt, fence) = d
-        .store
+    let tenant = d.tenant;
+    d.store
         .writer()
         .write(move |tx| {
-            jobs::lease(
-                tx,
-                tenant,
-                job,
-                worker,
-                UnixMillis(i64::MAX / 2),
-                UnixMillis::now(),
-            )
+            let now = UnixMillis::now();
+            let worker = enrolled_worker(tx, tenant, now)?;
+            let (attempt, fence) =
+                jobs::lease(tx, tenant, job, worker, UnixMillis(i64::MAX / 2), now)?;
+            Ok((worker, attempt, fence))
         })
-        .unwrap();
-    (worker, attempt, fence)
+        .unwrap()
+}
+
+/// A worker the store knows: its own dedicated pool of the tenant and a
+/// host-local enrollment. Acknowledgements and reports come only from a
+/// registered, unrevoked worker (P08-7).
+fn enrolled_worker(
+    tx: &sentinel_store::Transaction<'_>,
+    tenant: TenantId,
+    now: UnixMillis,
+) -> sentinel_store::Result<WorkerId> {
+    use sentinel_protocol::negotiate::{Arch, Capabilities, Negotiated, ProtocolVersion};
+    use sentinel_store::{
+        auth::Authority,
+        tenancy::{self, PoolKind},
+        workers::{self, Presentation},
+    };
+    let (pool, worker) = (sentinel_core::PoolId::new(), WorkerId::new());
+    tenancy::create_pool(
+        tx,
+        Authority::HostLocal,
+        pool,
+        "test",
+        PoolKind::Dedicated(tenant),
+        now,
+    )?;
+    let issued = workers::issue_enrollment(tx, Authority::HostLocal, pool, 60_000, now)?;
+    let mut text = String::new();
+    issued.secret.expose(&mut text);
+    workers::enroll(
+        tx,
+        &sentinel_auth::secret::Secret::parse(&text).unwrap(),
+        Presentation {
+            worker,
+            fingerprint: sentinel_auth::secret::Secret::generate().digest(),
+            name: "w",
+            negotiated: Negotiated {
+                protocol: ProtocolVersion(4),
+                capabilities: Capabilities::REQUIRED,
+                arch: Arch::X86_64,
+            },
+        },
+        now,
+    )?;
+    Ok(worker)
 }
 
 fn pass(store: &Store, (worker, attempt, fence): (WorkerId, AttemptId, Fence)) {
@@ -302,7 +341,18 @@ fn wait_exits_zero_when_the_run_passes_eight_when_it_does_not_and_seven_at_the_d
         pass(&store, leased);
     });
     let started = Instant::now();
-    let out = cli(&d, &["wait", &run.to_string(), "--output", "ndjson"]);
+    // Bounded, so a run that never passes fails the test instead of hanging it.
+    let out = cli(
+        &d,
+        &[
+            "wait",
+            &run.to_string(),
+            "--output",
+            "ndjson",
+            "--timeout",
+            "20s",
+        ],
+    );
     worker.join().unwrap();
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(started.elapsed() >= Duration::from_millis(500));
