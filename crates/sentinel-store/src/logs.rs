@@ -1566,18 +1566,8 @@ fn search_dir(dir: &Path, scanner: &mut Scanner<'_>) -> Result<Search> {
     let start = seek_start(&entries, scanner.after, !scanner.seeded);
     let mut ended = marker;
     'decode: for (n, compressed) in segs.range(start..) {
-        let mut decoder = match seg_decoder(dir, *n, *compressed) {
-            Ok(decoder) => decoder,
-            // The compressor renamed it between listing and open.
-            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound && !compressed => {
-                match seg_decoder(dir, *n, true) {
-                    Ok(decoder) => decoder,
-                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => break,
-                    Err(e) => return Err(e),
-                }
-            }
-            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => break,
-            Err(e) => return Err(e),
+        let Some(mut decoder) = listed_seg_decoder(dir, *n, *compressed)? else {
+            break;
         };
         while let Some(record) = decoder.next()? {
             match record {
@@ -2114,6 +2104,38 @@ fn seg_decoder(dir: &Path, seg: u32, compressed: bool) -> Result<Decoder> {
     })
 }
 
+/// Open a segment [`segs`] listed, or `None` when it is gone — the reader
+/// stops there. A plain segment the compressor replaced between the
+/// listing and the open is read from its `.z` twin: the rename lands
+/// before the plain file goes. On Windows a plain file whose delete is
+/// still pending (another handle — a concurrent reader, a scanner — held
+/// it open when the compressor removed it) refuses the open with
+/// `PermissionDenied`, not `NotFound`; the twin is already there, so it
+/// is read the same way.
+fn listed_seg_decoder(dir: &Path, seg: u32, compressed: bool) -> Result<Option<Decoder>> {
+    use std::io::ErrorKind;
+    let replaced = |e: &std::io::Error| {
+        e.kind() == ErrorKind::NotFound
+            || (cfg!(windows) && e.kind() == ErrorKind::PermissionDenied)
+    };
+    match seg_decoder(dir, seg, compressed) {
+        Ok(decoder) => Ok(Some(decoder)),
+        Err(Error::Io(e)) if !compressed && replaced(&e) => match seg_decoder(dir, seg, true) {
+            Ok(decoder) => Ok(Some(decoder)),
+            Err(Error::Io(z)) if z.kind() == ErrorKind::NotFound => {
+                if e.kind() == ErrorKind::NotFound {
+                    Ok(None)
+                } else {
+                    Err(Error::Io(e))
+                }
+            }
+            Err(z) => Err(z),
+        },
+        Err(Error::Io(e)) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Compress a sealed segment in place: `seg-N` → `seg-N.z` through a
 /// temporary, fsync, rename, directory fsync, then the plain file goes.
 fn compress(path: &Path) -> Result<()> {
@@ -2186,18 +2208,8 @@ pub fn read_page(dir: &Path, after: u64, page: Page, step: Option<u32>) -> Resul
     let mut consumed = after;
     let (mut taken, mut scanned) = (0u64, 0u64);
     'decode: for (n, compressed) in segs.range(start..) {
-        let mut decoder = match seg_decoder(dir, *n, *compressed) {
-            Ok(decoder) => decoder,
-            // The compressor renamed it between listing and open.
-            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound && !compressed => {
-                match seg_decoder(dir, *n, true) {
-                    Ok(decoder) => decoder,
-                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => break,
-                    Err(e) => return Err(e),
-                }
-            }
-            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => break,
-            Err(e) => return Err(e),
+        let Some(mut decoder) = listed_seg_decoder(dir, *n, *compressed)? else {
+            break;
         };
         while let Some(record) = decoder.next()? {
             match record {
