@@ -16,11 +16,14 @@
 //!   expiry timestamp, published by rename; an expired or stale lease file
 //!   is swept, so a crashed attempt can hold GC off for at most its TTL.
 //! - **Private objects.** The worktree gets its own object files: a
-//!   reflink (`FICLONE`, copy-on-write extents) when the data directory's
-//!   filesystem supports it — probed once at [`Mirrors::open`] — else a
-//!   plain copy. Nothing in the job's `.git` shares an inode with the
-//!   mirror, so a job cannot rewrite shared objects, and no `alternates`
-//!   file ever points outside the workspace.
+//!   reflink (`FICLONE`, copy-on-write extents) of the store when the data
+//!   directory's filesystem supports it — probed once at [`Mirrors::open`]
+//!   — else a plain copy of a small store, and for a larger one a depth-1
+//!   fetch of the pinned commit out of the mirror, which writes one tree's
+//!   objects instead of the whole history (P07-20). Nothing in the job's
+//!   `.git` shares an inode with the mirror, so a job cannot rewrite
+//!   shared objects, and no `alternates` file ever points outside the
+//!   workspace.
 //!
 //! Fetches are incremental and full-history: the pinned commit itself plus
 //! the event ref the binding allows (`+ref:refs/sentinel/event`), so a later
@@ -75,6 +78,14 @@ pub const GC_MAX_PACKS: usize = 16;
 pub const GC_MAX_LOOSE: usize = 4096;
 /// A materialization copying more files than this is not copying a mirror.
 const MAX_OBJECT_FILES: u64 = 2_000_000;
+/// Without reflink, a store up to this size is byte-copied into the job;
+/// a larger one is materialized by a depth-1 fetch of the pinned commit.
+/// Measured on WSL2 ext4 with an 8 MiB tree, materialization plus the
+/// `syncfs` its write-back costs (`tests/mirror_cost.rs`): the copy wins
+/// at 9–42 MiB of store (75–132 ms against the fetch's 145–205 ms) and
+/// loses from 76 MiB (493 ms against 147 ms; 337–725 ms against 155 ms
+/// at 262 MiB), where the fetch writes 31x fewer bytes.
+const COPY_MAX_BYTES: u64 = 48 << 20;
 /// Poll interval for the lock and for lease drains.
 const WAIT_POLL: Duration = Duration::from_millis(25);
 /// A reader lease outlives its reader's own deadline by this much, so a
@@ -99,6 +110,8 @@ pub struct Mirrors {
     reflink: bool,
     gc_max_packs: usize,
     gc_max_loose: usize,
+    /// [`COPY_MAX_BYTES`] unless a test forces the fetch path.
+    copy_max: u64,
 }
 
 /// A reader lease: a file under `<repo-id>.leases/` named by the attempt,
@@ -147,7 +160,18 @@ impl Mirrors {
             reflink,
             gc_max_packs,
             gc_max_loose,
+            copy_max: COPY_MAX_BYTES,
         })
+    }
+
+    /// Materialize every checkout by the depth-1 fetch, whatever the
+    /// store's size or the filesystem — the path a large mirror takes, so
+    /// conformance tests reach it with a small one.
+    #[doc(hidden)]
+    pub fn fetch_materialization(mut self) -> Mirrors {
+        self.reflink = false;
+        self.copy_max = 0;
+        self
     }
 
     /// Whether the filesystem holding `root` performed the reflink probe.
@@ -271,7 +295,7 @@ impl Mirrors {
             Error::Preparation(what) => Error::Mirror(what),
             other => other,
         })?;
-        self.gc_if_due(&dir, &leases, deadline)?;
+        let store_bytes = self.gc_if_due(&dir, &leases, deadline)?;
         // The reader lease is created while still holding the write lock:
         // a GC that follows can never miss it.
         let lease = self.lease(&leases, lease_name, deadline)?;
@@ -280,7 +304,7 @@ impl Mirrors {
 
         // The reader phase: a private object store in the workspace.
         let materialize_started = Instant::now();
-        let materialized = self.materialize(&dir, workspace, &commit, deadline);
+        let materialized = self.materialize(&dir, workspace, &commit, store_bytes, deadline);
         drop(lease);
         match materialized {
             Ok(()) => Ok(Checkout {
@@ -566,13 +590,14 @@ impl Mirrors {
     /// GC only when the store actually crossed a trigger, and only with no
     /// live readers: expired leases are swept first, a live one skips this
     /// round — a later fetch retries.
-    fn gc_if_due(&self, dir: &Path, leases: &Path, deadline: Instant) -> Result<()> {
-        let (packs, loose) = Self::object_stats(&dir.join("objects"))?;
+    fn gc_if_due(&self, dir: &Path, leases: &Path, deadline: Instant) -> Result<u64> {
+        let objects = dir.join("objects");
+        let (packs, loose, bytes) = Self::object_stats(&objects)?;
         if packs <= self.gc_max_packs && loose <= self.gc_max_loose as u64 {
-            return Ok(());
+            return Ok(bytes);
         }
         if Self::leases_live(leases)? {
-            return Ok(());
+            return Ok(bytes);
         }
         let mut gc = git(dir);
         gc.args([
@@ -588,14 +613,19 @@ impl Mirrors {
             Error::Preparation(what) => Error::Mirror(what),
             other => other,
         })?;
-        Ok(())
+        // The store was just rewritten; its size decides how it is read.
+        Ok(Self::object_stats(&objects)?.2)
     }
 
-    /// `(pack files, loose objects)` in the mirror's object store; `tmp_*`
-    /// leftovers count too — only GC or the sweep ever reclaims them.
-    fn object_stats(objects: &Path) -> Result<(usize, u64)> {
+    /// `(pack files, loose objects, bytes)` in the mirror's object store;
+    /// `tmp_*` leftovers count too — only GC or the sweep ever reclaims
+    /// them. `bytes` is exact up to [`COPY_MAX_BYTES`] and only known to
+    /// exceed it past that: loose objects stop being statted once the
+    /// materialization choice is settled.
+    fn object_stats(objects: &Path) -> Result<(usize, u64, u64)> {
         let mut packs = 0usize;
         let mut loose = 0u64;
+        let mut bytes = 0u64;
         let pack_dir = objects.join("pack");
         if let Ok(entries) = fs::read_dir(&pack_dir) {
             for entry in entries.flatten() {
@@ -604,6 +634,9 @@ impl Mirrors {
                 let name = entry.file_name();
                 if name.as_bytes().ends_with(b".pack") || name.as_bytes().starts_with(b"tmp_") {
                     packs += 1;
+                }
+                if let Ok(meta) = entry.metadata() {
+                    bytes = bytes.saturating_add(meta.len());
                 }
             }
         }
@@ -617,11 +650,16 @@ impl Mirrors {
                 for inner in fs::read_dir(entry.path())?.flatten() {
                     if inner.file_type().is_ok_and(|t| t.is_file()) {
                         loose += 1;
+                        if bytes <= COPY_MAX_BYTES
+                            && let Ok(meta) = inner.metadata()
+                        {
+                            bytes = bytes.saturating_add(meta.len());
+                        }
                     }
                 }
             }
         }
-        Ok((packs, loose))
+        Ok((packs, loose, bytes))
     }
 
     /// Are readers holding leases? Expired and stale records are swept as a
@@ -709,25 +747,35 @@ impl Mirrors {
     }
 
     /// Populate `workspace` (empty) with `commit` out of the mirror: a
-    /// private object store — reflink when the filesystem proved capable,
-    /// a byte copy otherwise — then `checkout --detach` and a final HEAD
-    /// verification.
+    /// private object store, then `checkout --detach` and a final HEAD
+    /// verification. The store is built the cheapest measured way (P07-20):
+    ///
+    /// - reflink the whole store when the filesystem proved capable — cost
+    ///   per file, not per byte, and GC keeps the file count small;
+    /// - byte-copy it when it is at most [`COPY_MAX_BYTES`];
+    /// - otherwise fetch the pinned commit alone at depth 1, so the job's
+    ///   `.git` holds one tree instead of every revision ever fetched.
     fn materialize(
         &self,
         mirror: &Path,
         workspace: &Path,
         commit: &str,
+        store_bytes: u64,
         deadline: Instant,
     ) -> Result<()> {
         init(workspace, deadline)?;
-        let mut files = 0u64;
-        Self::copy_objects(
-            &mirror.join("objects"),
-            &workspace.join(".git/objects"),
-            self.reflink,
-            &mut files,
-            deadline,
-        )?;
+        if self.reflink || store_bytes <= self.copy_max {
+            let mut files = 0u64;
+            Self::copy_objects(
+                &mirror.join("objects"),
+                &workspace.join(".git/objects"),
+                self.reflink,
+                &mut files,
+                deadline,
+            )?;
+        } else {
+            Self::fetch_pinned(mirror, workspace, commit, deadline)?;
+        }
         let mut checkout = git(workspace);
         checkout.args([
             "-c",
@@ -749,6 +797,48 @@ impl Mirrors {
                 "materialized workspace is not the pinned revision".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Fetch exactly the pinned commit's tree out of the mirror into the
+    /// workspace (`--depth 1`, protocol v2 over a local path): Git packs
+    /// only the objects the checkout reaches, and the workspace indexes its
+    /// own pack — private inodes, no `alternates`, and bytes proportional
+    /// to the tree rather than to every revision the mirror ever fetched
+    /// (P07-20). The mirror is only read: upload-pack runs against it
+    /// under this attempt's reader lease, which keeps GC from pruning it.
+    fn fetch_pinned(
+        mirror: &Path,
+        workspace: &Path,
+        commit: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let Some(from) = mirror.to_str() else {
+            return Err(Error::Mirror("mirror path is not UTF-8".into()));
+        };
+        let mut fetch = git(workspace);
+        fetch.args([
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "protocol.version=2",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=0",
+            "fetch",
+            "-q",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--depth",
+            "1",
+            "--",
+            from,
+            commit,
+        ]);
+        step(fetch, deadline, "git fetch (mirror)", &[])?;
         Ok(())
     }
 
@@ -1027,7 +1117,14 @@ fn reflink_supported(root: &Path) -> Result<bool> {
         }
     }
     let _clean = Clean(&src, &dst);
-    let mut from = OpenOptions::new().write(true).create_new(true).open(&src)?;
+    // `FICLONE` needs its source open for reading: a write-only source is
+    // `EBADF` on every filesystem, which once made this probe answer "no
+    // reflink" even on XFS and Btrfs.
+    let mut from = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&src)?;
     from.write_all(b"sentinel")?;
     from.sync_data()?;
     let to = OpenOptions::new().write(true).create_new(true).open(&dst)?;
@@ -1040,6 +1137,20 @@ fn reflink_supported(root: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The probe answers what the filesystem does: it agrees with a clone
+    /// made the way materialization makes one (a read-only source). Before
+    /// the fix the probe's source was write-only, so it said "no" on XFS
+    /// and Btrfs too. Point `TMPDIR` at a reflink filesystem to see the
+    /// `true` side; on ext4 or tmpfs both answers are `false`.
+    #[test]
+    fn the_reflink_probe_agrees_with_a_real_clone() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::write(&src, b"sentinel").unwrap();
+        let real = Mirrors::reflink_file(&src, &dir.path().join("dst")).is_ok();
+        assert_eq!(reflink_supported(dir.path()).unwrap(), real);
+    }
 
     /// P07-26: only a server refusing a want earns the narrower retries;
     /// an authentication, network or local failure is final.

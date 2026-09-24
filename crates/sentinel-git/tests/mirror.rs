@@ -664,3 +664,72 @@ fn a_leftover_lease_temp_file_does_not_block_a_retry() {
         )
         .unwrap();
 }
+
+/// P07-20: a store too large to copy is materialized by a depth-1 fetch of
+/// the pinned commit alone. The job gets exactly that commit — here one the
+/// branch has moved past, so not an advertised tip — in its own pack: no
+/// history behind it, no `alternates`, sound with the mirror gone, and its
+/// writes never reach the mirror.
+#[test]
+fn a_large_store_is_materialized_by_fetching_the_pinned_commit_alone() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = repository(temp.path());
+    let mirrors = Mirrors::open(&temp.path().join("mirrors"))
+        .unwrap()
+        .fetch_materialization();
+    let repo_id = RepoId::new();
+    // Fill the mirror with both commits first, so the store holds history.
+    mirrors
+        .checkout(
+            &work(temp.path(), "fill"),
+            &repo_id,
+            &source(&repo, &repo.second, Some("refs/heads/main")),
+            None,
+            "att_fill",
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    let mirror = mirrors.path(&repo_id);
+    let before = manifest(&mirror.join("objects"));
+    let ws = work(temp.path(), "old");
+    let out = mirrors
+        .checkout(
+            &ws,
+            &repo_id,
+            &source(&repo, &repo.first, None),
+            None,
+            "att_old",
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert_eq!(out.sha, repo.first);
+    assert_eq!(git(&ws, &["rev-parse", "HEAD"]), repo.first);
+    assert_eq!(fs::read_to_string(ws.join("file.txt")).unwrap(), "one\n");
+    // One commit, shallow, and none of the mirror's other history.
+    assert_eq!(git(&ws, &["rev-list", "--count", "HEAD"]), "1");
+    assert!(ws.join(".git/shallow").is_file());
+    assert!(!git_ok(&ws, &["cat-file", "-e", &repo.second]));
+    assert!(!ws.join(".git/objects/info/alternates").exists());
+    // Private: sound without the mirror, and scribbling over the job's
+    // objects leaves the mirror's bytes and verdict unchanged.
+    fs::rename(&mirror, temp.path().join("mirror-away")).unwrap();
+    assert!(git_ok(&ws, &["fsck", "--strict"]));
+    fs::rename(temp.path().join("mirror-away"), &mirror).unwrap();
+    let mut stack = vec![ws.join(".git/objects")];
+    while let Some(d) = stack.pop() {
+        for entry in fs::read_dir(&d).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(entry.path());
+            } else {
+                let _ = fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o644));
+                let _ = fs::write(entry.path(), b"corrupted by the job");
+            }
+        }
+    }
+    let after = manifest(&mirror.join("objects"));
+    for (path, hash) in &before {
+        assert_eq!(after.get(path), Some(hash), "{} moved", path.display());
+    }
+    assert!(git_ok(&mirror, &["fsck", "--strict"]));
+}
