@@ -17,6 +17,8 @@
 
 pub mod app;
 pub mod checks;
+#[cfg(feature = "fake")]
+pub mod fake;
 pub mod http;
 pub mod oauth;
 pub mod webhook;

@@ -23,6 +23,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [dev-dependencies]
+sentinel-github = { path = "../sentinel-github", features = ["fake"] }
 ring = "0.17"
 tempfile = "3.20"
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }

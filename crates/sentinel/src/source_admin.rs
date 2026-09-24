@@ -145,6 +145,57 @@ pub fn load_webhook_secret(root: &Path) -> Result<Option<Arc<[u8]>>, Error> {
     Ok(Some(Arc::from(secret)))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignInConfig {
+    client_id: String,
+    client_secret_file: std::path::PathBuf,
+    /// GitHub Enterprise Server: both, or neither for github.com.
+    web_url: Option<String>,
+    api_url: Option<String>,
+}
+
+/// GitHub web sign-in (U07), when `<data_dir>/github-sign-in.json` exists:
+/// the OAuth app's client ID and an absolute path to an owner-only file
+/// holding its client secret. The secret never enters the configuration
+/// file, the database or a log line; errors name the field, not a value.
+pub fn load_sign_in(root: &Path) -> Result<Option<sentinel_api::GithubSignIn>, Error> {
+    let path = root.join("github-sign-in.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let config: SignInConfig = serde_json::from_slice(&file(&path, 4096)?)
+        .map_err(|_| fail("invalid GitHub sign-in configuration"))?;
+    if !config.client_secret_file.is_absolute() {
+        return Err(fail("GitHub sign-in client_secret_file must be absolute"));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&config.client_secret_file)
+        .map_err(|_| fail("cannot inspect the GitHub sign-in client secret file"))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        return Err(fail("GitHub sign-in client secret file must be owner-only"));
+    }
+    let client_secret = sentinel_github::oauth::read_secret(&config.client_secret_file)
+        .map_err(|_| fail("cannot read the GitHub sign-in client secret file"))?;
+    let endpoints = match (&config.web_url, &config.api_url) {
+        (None, None) => sentinel_github::oauth::Endpoints::github(),
+        (Some(web), Some(api)) => sentinel_github::oauth::Endpoints::enterprise(web, api)
+            .map_err(|_| fail("GitHub sign-in web_url and api_url must be https"))?,
+        _ => {
+            return Err(fail(
+                "GitHub sign-in web_url and api_url go together (GitHub Enterprise Server)",
+            ));
+        }
+    };
+    Ok(Some(sentinel_api::GithubSignIn {
+        client_id: config.client_id,
+        client_secret,
+        endpoints,
+    }))
+}
+
 pub fn load_destinations(root: &Path) -> Result<Vec<String>, Error> {
     let path = root.join("source-destinations.json");
     if !path.exists() {
@@ -395,4 +446,67 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn loaded(root: &Path) -> Option<sentinel_api::GithubSignIn> {
+        load_sign_in(root).unwrap_or_else(|error| panic!("{}", error.message))
+    }
+
+    fn write(path: &Path, text: &str, mode: u32) {
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn github_sign_in_reads_an_owner_only_secret_file_and_never_echoes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(loaded(dir.path()).is_none(), "absent is off");
+        let secret = dir.path().join("client-secret");
+        let config = dir.path().join("github-sign-in.json");
+        write(&secret, "s3cret-client-value\n", 0o600);
+        let body = |extra: &str| {
+            format!(
+                r#"{{"client_id":"Iv1.abc","client_secret_file":"{}"{extra}}}"#,
+                secret.display()
+            )
+        };
+        write(&config, &body(""), 0o600);
+        let sign_in = loaded(dir.path()).unwrap();
+        assert_eq!(sign_in.client_secret, "s3cret-client-value");
+        assert!(!format!("{sign_in:?}").contains("s3cret"));
+
+        write(
+            &config,
+            &body(r#","web_url":"https://gh.corp","api_url":"https://gh.corp/api/v3""#),
+            0o600,
+        );
+        assert!(loaded(dir.path()).is_some());
+        for (extra, mode) in [
+            (r#","web_url":"https://gh.corp""#, 0o600),
+            (
+                r#","web_url":"http://gh.corp","api_url":"https://gh.corp/api/v3""#,
+                0o600,
+            ),
+            (r#","client_secret":"inline""#, 0o600),
+            ("", 0o644),
+        ] {
+            write(&secret, "s3cret-client-value\n", mode);
+            write(&config, &body(extra), 0o600);
+            let error = load_sign_in(dir.path()).expect_err(extra);
+            assert!(!error.message.contains("s3cret"), "{}", error.message);
+            assert!(!error.message.contains("inline"), "{}", error.message);
+        }
+        write(&secret, "s3cret-client-value\n", 0o600);
+        write(
+            &config,
+            r#"{"client_id":"Iv1.abc","client_secret_file":"relative"}"#,
+            0o600,
+        );
+        assert!(load_sign_in(dir.path()).is_err());
+    }
 }

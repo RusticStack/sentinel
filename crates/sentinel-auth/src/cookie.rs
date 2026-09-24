@@ -14,6 +14,8 @@ pub const SESSION_COOKIE: &str = "__Host-sentinel_session";
 
 /// Carries the pending sign-in state during an external authorization round
 /// trip, so a callback must present the browser's own half of it (A04).
+/// Issued with [`issue_sign_in`], never [`issue`]: the callback arrives as a
+/// cross-site navigation from the provider, which a `Strict` cookie misses.
 pub const SIGN_IN_COOKIE: &str = "__Host-sentinel_signin";
 
 /// The header carrying the session's CSRF secret. A header cannot be set by a
@@ -24,6 +26,13 @@ pub const CSRF_HEADER: &str = "x-sentinel-csrf";
 /// arrive already authenticated, and top-level GET navigation mutates nothing.
 const ATTRIBUTES: &str = "; Path=/; Secure; HttpOnly; SameSite=Strict";
 
+/// The pending sign-in cookie's attributes. `Lax`, because the provider's
+/// redirect back is a top-level cross-site `GET` and a `Strict` cookie is not
+/// sent on it. That is the only request `Lax` adds, and the cookie grants
+/// nothing by itself: it is half of a single-use state whose other half is the
+/// callback's `state` parameter, and it never authenticates a request.
+const SIGN_IN_ATTRIBUTES: &str = "; Path=/; Secure; HttpOnly; SameSite=Lax";
+
 /// `Set-Cookie` value issuing `secret` under `name` for `max_age_secs`. The
 /// secret appears here and nowhere else; the caller must not log the result.
 pub fn issue(name: &str, secret: &Secret, max_age_secs: u32) -> String {
@@ -32,6 +41,20 @@ pub fn issue(name: &str, secret: &Secret, max_age_secs: u32) -> String {
     header.push('=');
     secret.expose(&mut header);
     header.push_str(ATTRIBUTES);
+    header.push_str("; Max-Age=");
+    header.push_str(itoa(max_age_secs).as_str());
+    header
+}
+
+/// `Set-Cookie` value issuing the pending sign-in state ([`SIGN_IN_COOKIE`])
+/// for `max_age_secs`, with `SameSite=Lax` so the provider's redirect back
+/// carries it. The caller must not log the result.
+pub fn issue_sign_in(secret: &Secret, max_age_secs: u32) -> String {
+    let mut header = String::with_capacity(SIGN_IN_COOKIE.len() + Secret::TEXT_LEN + 64);
+    header.push_str(SIGN_IN_COOKIE);
+    header.push('=');
+    secret.expose(&mut header);
+    header.push_str(SIGN_IN_ATTRIBUTES);
     header.push_str("; Max-Age=");
     header.push_str(itoa(max_age_secs).as_str());
     header
@@ -154,9 +177,24 @@ mod tests {
         }
         assert!(!header.contains("Domain="), "{header}");
         assert!(clear(SESSION_COOKIE).contains("Max-Age=0"));
-        let pending = issue(SIGN_IN_COOKIE, &secret, 600);
-        assert!(pending.starts_with(SIGN_IN_COOKIE), "{pending}");
-        assert!(pending.contains("SameSite=Strict") && pending.contains("Max-Age=600"));
+        let pending = issue_sign_in(&secret, 600);
+        assert!(
+            pending.starts_with(&format!("{SIGN_IN_COOKIE}={text};")),
+            "{pending}"
+        );
+        for attribute in [
+            "Path=/",
+            "Secure",
+            "HttpOnly",
+            "SameSite=Lax",
+            "Max-Age=600",
+        ] {
+            assert!(
+                pending.contains(attribute),
+                "{attribute} missing from {pending}"
+            );
+        }
+        assert!(!pending.contains("Domain="), "{pending}");
     }
 
     #[test]

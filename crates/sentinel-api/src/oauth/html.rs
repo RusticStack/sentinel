@@ -128,12 +128,27 @@ const SIGN_IN_TAIL: &str = r#", {
 </script>"#;
 
 /// A page asking the visitor to sign in first, with `message` explaining
-/// why; the form posts to `login_url` (`OAuthState::login_url`).
-pub(crate) fn sign_in_page(login_url: &str, title: &str, message: &str) -> Reply {
-    let mut body = String::with_capacity(SIGN_IN_HEAD.len() + SIGN_IN_TAIL.len() + 256);
+/// why; the form posts to `login_url` (`OAuthState::login_url`). With
+/// `github` (the start URL, and the issuer-relative path of this page with
+/// its query), a "Sign in with GitHub" link sits next to the form and
+/// returns the browser here, parameters intact. It is a plain `GET` link, so
+/// the page's CSP (which has no `form-action` and governs no navigation)
+/// does not stand in the way of the redirect to GitHub.
+pub(crate) fn sign_in_page(
+    login_url: &str,
+    github: Option<(&str, &str)>,
+    title: &str,
+    message: &str,
+) -> Reply {
+    let mut body = String::with_capacity(SIGN_IN_HEAD.len() + SIGN_IN_TAIL.len() + 512);
     body.push_str("<p>");
     escape_into(&mut body, message);
     body.push_str("</p>\n");
+    if let Some((start_url, here)) = github {
+        body.push_str("<p><a id=\"sentinel-github\" href=\"");
+        escape_into(&mut body, &crate::github::start_link(start_url, here));
+        body.push_str("\">Sign in with GitHub</a></p>\n");
+    }
     body.push_str(SIGN_IN_HEAD);
     script_string_into(&mut body, login_url);
     body.push_str(SIGN_IN_TAIL);
@@ -183,12 +198,30 @@ mod tests {
 
     #[test]
     fn the_sign_in_posts_inside_the_issuer_and_cannot_break_out_of_its_script() {
-        let Reply::Html(_, page, _) =
-            sign_in_page("https://ci.example/sentinel/api/v1/login", "Sign in", "why")
-        else {
+        let Reply::Html(_, page, _) = sign_in_page(
+            "https://ci.example/sentinel/api/v1/login",
+            None,
+            "Sign in",
+            "why",
+        ) else {
             panic!("not a page");
         };
         assert!(page.contains(r#"fetch("https://ci.example/sentinel/api/v1/login", {"#));
+        assert!(!page.contains("Sign in with GitHub"));
+        let Reply::Html(_, page, _) = sign_in_page(
+            "https://ci.example/sentinel/api/v1/login",
+            Some((
+                "https://ci.example/sentinel/auth/github/start",
+                "/device?a=1&b=\"",
+            )),
+            "Sign in",
+            "why",
+        ) else {
+            panic!("not a page");
+        };
+        assert!(page.contains(
+            r#"href="https://ci.example/sentinel/auth/github/start?return_to=%2Fdevice%3Fa%3D1%26b%3D%22""#
+        ));
         let mut out = String::new();
         script_string_into(&mut out, "a\"</script>\\\n");
         let expected = ["\"a", "0022", "003c/script", "003e", "005c", "000a\""].join("\\u");

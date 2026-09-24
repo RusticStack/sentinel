@@ -154,8 +154,8 @@ fn a_linked_github_account_signs_in_end_to_end() {
     let state = sign_in::begin(&f.store, PROVIDER, Some("/runs"), at(10), 60_000).unwrap();
     let mut state_text = String::new();
     state.expose(&mut state_text);
-    let set_cookie = cookie::issue(cookie::SIGN_IN_COOKIE, &state, 600);
-    assert!(set_cookie.contains("SameSite=Strict") && set_cookie.contains("HttpOnly"));
+    let set_cookie = cookie::issue_sign_in(&state, 600);
+    assert!(set_cookie.contains("SameSite=Lax") && set_cookie.contains("HttpOnly"));
     let url = f.app.authorize_url(&f.endpoints, &state_text);
     assert!(url.contains(&format!("state={state_text}")));
 

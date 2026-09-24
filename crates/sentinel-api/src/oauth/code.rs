@@ -71,7 +71,17 @@ fn show(state: &State, request: &Request, query: &str) -> Reply {
         message.push_str("Sign in to continue to ");
         message.push_str(&params.client.name);
         message.push('.');
-        return html::sign_in_page(&state.oauth.login_url, "Sign in to Sentinel", &message);
+        let here = format!("/oauth/authorize?{query}");
+        let github = state
+            .github
+            .as_ref()
+            .map(|g| (g.start_url.as_str(), here.as_str()));
+        return html::sign_in_page(
+            &state.oauth.login_url,
+            github,
+            "Sign in to Sentinel",
+            &message,
+        );
     };
     if let Err(reply) = eligible(state, &params, &who) {
         return reply;

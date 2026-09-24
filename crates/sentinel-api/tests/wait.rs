@@ -98,6 +98,7 @@ fn deployment() -> Deployment {
         github_webhook_secret: None,
         intake: None,
         public_url: None,
+        github_sign_in: None,
     })
     .unwrap();
     Deployment {

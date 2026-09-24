@@ -733,7 +733,7 @@ The follow-ups did not slow placement. The slow runs were host noise. They are n
 Still open after this verification:
 
 - ~~macOS hardware runs.~~ No longer open: macOS was dropped by decision on 2026-09-24.
-- U07.
+- U07 — closed since: GitHub web sign-in is routed through the consent, device and first pages (migration 37; [GitHub sign-in](github-sign-in.md#browser-routes-u07)).
 - The ~20 s allow-list outage floor (heartbeat detection).
 - S05 tenant-scoped registry authorization.
 - B04, R01 and R04 as written in the tracker.

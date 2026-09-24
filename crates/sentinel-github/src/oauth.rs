@@ -85,9 +85,12 @@ impl fmt::Debug for App {
 }
 
 impl App {
-    /// One exact, absolute HTTPS redirect URI: no wildcard, no query, no
-    /// fragment. GitHub compares it too, but a deployment must not be able to
-    /// register a pattern here and rely on the other side to be strict.
+    /// One exact, absolute redirect URI: no wildcard, no query, no fragment,
+    /// no userinfo. GitHub compares it too, but a deployment must not be able
+    /// to register a pattern here and rely on the other side to be strict.
+    /// HTTPS, or plain HTTP to a loopback host (`127.0.0.1`, `[::1]`,
+    /// `localhost`) for a controller used directly on this machine: that
+    /// redirect never leaves the host, and no secret travels in it.
     pub fn new(client_id: &str, client_secret: String, redirect_uri: &str) -> Result<App> {
         if client_id.is_empty()
             || client_id.len() > 128
@@ -100,9 +103,13 @@ impl App {
         if client_secret.is_empty() || client_secret.len() > 512 {
             return Err(Error::Config("client secret"));
         }
-        if !redirect_uri.starts_with("https://")
+        let loopback = ["http://127.0.0.1", "http://[::1]", "http://localhost"]
+            .iter()
+            .filter_map(|host| redirect_uri.strip_prefix(host))
+            .any(|rest| rest.starts_with([':', '/']));
+        if !(redirect_uri.starts_with("https://") || loopback)
             || redirect_uri.len() > 512
-            || redirect_uri.contains(['?', '#', '*', ' '])
+            || redirect_uri.contains(['?', '#', '*', ' ', '@'])
         {
             return Err(Error::Config("redirect uri"));
         }
@@ -120,20 +127,7 @@ impl App {
     /// trailing newline is dropped so an ordinary text file works; nothing else
     /// is trimmed, because a secret is bytes.
     pub fn load(client_id: &str, secret_path: &Path, redirect_uri: &str) -> Result<App> {
-        let metadata =
-            std::fs::metadata(secret_path).map_err(|_| Error::Config("client secret file"))?;
-        if !metadata.is_file() || metadata.len() > 4096 {
-            return Err(Error::Config("client secret file"));
-        }
-        let mut secret = std::fs::read_to_string(secret_path)
-            .map_err(|_| Error::Config("client secret file"))?;
-        if secret.ends_with('\n') {
-            secret.pop();
-            if secret.ends_with('\r') {
-                secret.pop();
-            }
-        }
-        App::new(client_id, secret, redirect_uri)
+        App::new(client_id, read_secret(secret_path)?, redirect_uri)
     }
 
     /// Where to send the browser. `state` is the caller's single-use secret; it
@@ -187,6 +181,26 @@ impl App {
         }
         Ok(LoginToken(token.to_owned()))
     }
+}
+
+/// Read an OAuth client secret from an operator-controlled file: a regular
+/// file of at most 4 KiB, with one trailing newline dropped so an ordinary
+/// text file works. Nothing else is trimmed, because a secret is bytes. The
+/// error names the file's role, never its content.
+pub fn read_secret(path: &Path) -> Result<String> {
+    let metadata = std::fs::metadata(path).map_err(|_| Error::Config("client secret file"))?;
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return Err(Error::Config("client secret file"));
+    }
+    let mut secret =
+        std::fs::read_to_string(path).map_err(|_| Error::Config("client secret file"))?;
+    if secret.ends_with('\n') {
+        secret.pop();
+        if secret.ends_with('\r') {
+            secret.pop();
+        }
+    }
+    Ok(secret)
 }
 
 /// A GitHub **user** access token. Never stored, never logged, never given to a
@@ -318,7 +332,7 @@ fn encode(value: &str) -> String {
 
 /// Decode a query value. Rejects malformed escapes and non-UTF-8 rather than
 /// substituting replacement characters.
-fn decode(value: &str) -> Result<String> {
+pub(crate) fn decode(value: &str) -> Result<String> {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
@@ -539,10 +553,33 @@ mod tests {
             ("Iv1.abc", "s3cret value", "http://ci.example/cb"),
             ("Iv1.abc", "s3cret value", "https://ci.example/cb?next=/"),
             ("Iv1.abc", "s3cret value", "https://*.example/cb"),
+            (
+                "Iv1.abc",
+                "s3cret value",
+                "http://127.0.0.1.evil.example/cb",
+            ),
+            (
+                "Iv1.abc",
+                "s3cret value",
+                "http://127.0.0.1:80@evil.example/cb",
+            ),
+            ("Iv1.abc", "s3cret value", "http://localhostile.example/cb"),
         ] {
             assert!(
                 App::new(id, secret.into(), redirect).is_err(),
                 "{id}/{redirect} accepted"
+            );
+        }
+        // A controller used directly on its own host may register a loopback
+        // callback; that redirect never leaves the machine.
+        for redirect in [
+            "http://127.0.0.1:7080/auth/github/callback",
+            "http://localhost:7080/auth/github/callback",
+            "http://[::1]:7080/auth/github/callback",
+        ] {
+            assert!(
+                App::new("Iv1.abc", "s3cret".into(), redirect).is_ok(),
+                "{redirect}"
             );
         }
         assert!(Endpoints::enterprise("http://gh.corp", "https://gh.corp/api/v3").is_err());
