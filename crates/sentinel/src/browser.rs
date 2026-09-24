@@ -5,15 +5,13 @@
 use std::process::{Command, Stdio};
 
 /// The launcher for `url`: `rundll32 url.dll,FileProtocolHandler` on
-/// Windows, `open` on macOS, `xdg-open` elsewhere. The URL is one argument
+/// Windows, `xdg-open` on Linux. The URL is one argument
 /// and no shell parses it.
 pub fn command(url: &str) -> Command {
     let mut command = if cfg!(windows) {
         let mut c = Command::new("rundll32.exe");
         c.arg("url.dll,FileProtocolHandler");
         c
-    } else if cfg!(target_os = "macos") {
-        Command::new("open")
     } else {
         Command::new("xdg-open")
     };

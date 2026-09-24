@@ -4,10 +4,9 @@
 //! and access-token refresh serialized across processes by a lock file.
 //!
 //! Configuration directory: `SENTINEL_CONFIG_DIR`, else `%APPDATA%\Sentinel`
-//! (Windows), `$HOME/Library/Application Support/Sentinel` (macOS) or
-//! `${XDG_CONFIG_HOME:-$HOME/.config}/sentinel`. A directory inside a Git
-//! work tree (any ancestor holding `.git`) is refused, so a credential can
-//! never be committed by accident.
+//! (Windows) or `${XDG_CONFIG_HOME:-$HOME/.config}/sentinel` (Linux). A
+//! directory inside a Git work tree (any ancestor holding `.git`) is
+//! refused, so a credential can never be committed by accident.
 //!
 //! Refresh: [`Handle::access_token`] answers from memory while more than 30 s
 //! of the access token remain; otherwise it takes `locks/<profile>.lock`
@@ -207,9 +206,6 @@ fn default_dir() -> Result<PathBuf, Error> {
             .join("Sentinel"));
     }
     let home = || env_path("HOME").ok_or_else(|| missing("HOME"));
-    if cfg!(target_os = "macos") {
-        return Ok(home()?.join("Library/Application Support/Sentinel"));
-    }
     match env_path("XDG_CONFIG_HOME").filter(|p| p.is_absolute()) {
         Some(base) => Ok(base.join("sentinel")),
         None => Ok(home()?.join(".config/sentinel")),

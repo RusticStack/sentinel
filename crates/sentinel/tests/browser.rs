@@ -5,8 +5,8 @@
 //! reaches a harmless stand-in instead of a browser.
 //!
 //! - **Test** (as built): copies itself into a temporary directory twice —
-//!   as a runner and under the platform opener's name (`rundll32.exe`,
-//!   `open`, `xdg-open`) — and starts the runner.
+//!   as a runner and under the platform opener's name (`rundll32.exe`
+//!   or `xdg-open`) — and starts the runner.
 //! - **Runner**: calls `sentinel::browser::open` exactly as `sentinel auth
 //!   login` does. The opener is found where the real one would be looked up
 //!   first: on Windows the launching program's own directory comes before
@@ -35,8 +35,6 @@ const LAUNCH: &str = "SENTINEL_BROWSER_TEST_LAUNCH";
 /// The launcher `browser::command` names on this platform.
 const OPENER: &str = if cfg!(windows) {
     "rundll32.exe"
-} else if cfg!(target_os = "macos") {
-    "open"
 } else {
     "xdg-open"
 };
