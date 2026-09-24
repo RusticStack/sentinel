@@ -443,7 +443,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // `libc` is a Linux-only dependency of this crate.
+    #[cfg(target_os = "linux")]
     #[test]
     fn special_files_are_skipped() {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};

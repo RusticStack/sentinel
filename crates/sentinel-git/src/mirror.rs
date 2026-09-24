@@ -824,10 +824,7 @@ impl Mirrors {
             .create_new(true)
             .mode(0o600)
             .open(dst)?;
-        // SAFETY: a plain ioctl between two files this process just opened;
-        // FICLONE takes the source descriptor as its argument.
-        if unsafe { libc::ioctl(to.as_raw_fd(), libc::FICLONE, from.as_raw_fd()) } != 0 {
-            let error = std::io::Error::last_os_error();
+        if let Err(error) = ficlone(&to, &from) {
             let _ = fs::remove_file(dst);
             return Err(error);
         }
@@ -996,6 +993,25 @@ fn remove_stale_tmp(objects: &Path, now: std::time::SystemTime) -> u64 {
     removed
 }
 
+/// `FICLONE` `from` onto `to`: shared extents, separate inode. Linux only;
+/// on other Unix targets reflink is unsupported and callers copy bytes.
+fn ficlone(to: &File, from: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a plain ioctl between two files the caller holds open;
+        // FICLONE takes the source descriptor as its argument.
+        if unsafe { libc::ioctl(to.as_raw_fd(), libc::FICLONE, from.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (to, from);
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
 /// Does `root`'s filesystem support `FICLONE`? One real clone of a probe
 /// pair — created, exercised and removed here — settles it for the process.
 fn reflink_supported(root: &Path) -> Result<bool> {
@@ -1015,9 +1031,7 @@ fn reflink_supported(root: &Path) -> Result<bool> {
     from.write_all(b"sentinel")?;
     from.sync_data()?;
     let to = OpenOptions::new().write(true).create_new(true).open(&dst)?;
-    // SAFETY: a plain ioctl between two files this process just opened;
-    // FICLONE takes the source descriptor as its argument.
-    if unsafe { libc::ioctl(to.as_raw_fd(), libc::FICLONE, from.as_raw_fd()) } != 0 {
+    if ficlone(&to, &from).is_err() {
         return Ok(false);
     }
     Ok(to.metadata().map(|m| m.len() == 8).unwrap_or(false))
