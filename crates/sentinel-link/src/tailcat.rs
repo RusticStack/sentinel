@@ -110,6 +110,10 @@ const SMALL_FILE_CAP: u64 = 256;
 const READY_DEADLINE: Duration = Duration::from_secs(60);
 /// A worker re-proves the tunnel this often.
 const PROBE_EVERY: Duration = Duration::from_secs(30);
+/// A lost session replaces a worker's helper only once the helper has run
+/// this long: well past the 1.0-1.4 s a fresh helper took to carry a session
+/// in the live suite, so a successor is never judged before it could connect.
+pub const SESSION_SETTLE: Duration = Duration::from_secs(10);
 /// Reconnect back-off bounds for helper restarts.
 const RESTART_MIN: Duration = Duration::from_secs(1);
 const RESTART_MAX: Duration = Duration::from_secs(30);
@@ -1060,6 +1064,36 @@ impl Forward {
     /// once, without back-off (this is a decision, not a failure).
     pub fn restart(&self) {
         self.run.shared.replace();
+    }
+
+    /// A Sentinel session over this forward was lost or refused (a failed
+    /// dial included). The helper is replaced at once unless it started less
+    /// than [`SESSION_SETTLE`] ago; `true` when it was.
+    ///
+    /// The controller's helper restarts on every allow-list change, and a
+    /// session it carried ends without a close reaching the worker. The same
+    /// forward then took 0.9-30.4 s after the lost session to carry a new
+    /// one (live suite, sixteen changes), where a fresh helper carried one in
+    /// 1.0-1.4 s. `tailcat ping` cannot see the difference (it is a fresh
+    /// process each time), so the lost session is the signal. A young helper
+    /// is spared so that a controller which is down does not make the worker
+    /// kill each successor before it could connect; the probe still judges
+    /// it.
+    pub fn session_lost(&self) -> bool {
+        self.session_lost_after(SESSION_SETTLE)
+    }
+
+    /// As [`Forward::session_lost`], with the settle time stated (tests use
+    /// a short one).
+    pub fn session_lost_after(&self, settle: Duration) -> bool {
+        let Some((generation, born)) = self.run.shared.current_child() else {
+            return false;
+        };
+        if born.elapsed() < settle {
+            return false;
+        }
+        self.run.shared.replace_probed(generation);
+        true
     }
 
     /// A snapshot for diagnostics.

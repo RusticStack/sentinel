@@ -1637,39 +1637,6 @@ mod worker_role {
         Ok((local, stats, Some(forward)))
     }
 
-    /// Control sessions in a row that may fail over a running helper before
-    /// the helper is replaced. The session is the data path's health: `ping`
-    /// proves the mesh, only a session proves the forward carries the link.
-    pub(super) const TUNNEL_SESSION_FAILURES: u32 = 3;
-
-    /// Counts consecutive failed control sessions (a failed dial included);
-    /// any welcomed session resets it.
-    #[derive(Default)]
-    pub(super) struct TunnelWatch {
-        failures: std::sync::atomic::AtomicU32,
-    }
-
-    impl TunnelWatch {
-        pub(super) fn connected(&self) {
-            self.failures.store(0, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        /// Records a lost or refused session; `true` means replace the helper
-        /// now (and the count starts over for its successor).
-        pub(super) fn lost(&self) -> bool {
-            let failures = self
-                .failures
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1;
-            if failures >= TUNNEL_SESSION_FAILURES {
-                self.failures.store(0, std::sync::atomic::Ordering::Relaxed);
-                true
-            } else {
-                false
-            }
-        }
-    }
-
     /// The worker's generated identifier, fixed on first start.
     fn worker_id(data_dir: &Path) -> Result<sentinel_core::WorkerId, Error> {
         let path = data_dir.join("worker.id");
@@ -1779,7 +1746,6 @@ mod worker_role {
         let enrollment_file = link.enrollment_file.clone();
         let executor = executor(&config.data_dir, worker, link.git_mirrors);
         let tunnel = forward.clone();
-        let watch = TunnelWatch::default();
         let thread = std::thread::Builder::new()
             .name("sentinel-worker-link".into())
             .spawn(move || {
@@ -1799,18 +1765,19 @@ mod worker_role {
                                         // confusion at the next start.
                                         let _ = fs::remove_file(path);
                                     }
-                                    watch.connected();
                                     tracing::info!(event = "link_connected", worker = %worker, enrolled);
                                 }
                                 sentinel_link::worker::Event::Disconnected(error) => {
                                     tracing::warn!(event = "link_lost", error = %error);
-                                    if let Some(forward) = &tunnel && watch.lost() {
+                                    // The same forward can take tens of seconds
+                                    // to carry a new session after the
+                                    // controller's helper restarts (every
+                                    // allow-list change); a fresh one does not.
+                                    if let Some(forward) = &tunnel && forward.session_lost() {
                                         tracing::warn!(
                                             event = "tailcat_replaced",
-                                            sessions_failed = TUNNEL_SESSION_FAILURES,
-                                            "no control session over the forward; replacing the helper"
+                                            "the control session over the forward was lost; replacing the helper"
                                         );
-                                        forward.restart();
                                     }
                                 }
                                 sentinel_link::worker::Event::Backoff(wait) => {
@@ -1940,33 +1907,6 @@ fn initialize_and_wait(
             tracing::info!(event = "link_stopped", joined);
             Ok(())
         }
-    }
-}
-
-#[cfg(all(test, feature = "worker"))]
-mod worker_tests {
-    use super::worker_role::{TUNNEL_SESSION_FAILURES, TunnelWatch};
-
-    #[test]
-    fn the_helper_is_replaced_only_after_consecutive_failed_sessions() {
-        let watch = TunnelWatch::default();
-        for _ in 1..TUNNEL_SESSION_FAILURES {
-            assert!(!watch.lost());
-        }
-        // A welcomed session in between proves the forward carries the link.
-        watch.connected();
-        for _ in 1..TUNNEL_SESSION_FAILURES {
-            assert!(!watch.lost());
-        }
-        assert!(
-            watch.lost(),
-            "the third failure in a row replaces the helper"
-        );
-        // Its successor gets the full allowance again.
-        for _ in 1..TUNNEL_SESSION_FAILURES {
-            assert!(!watch.lost());
-        }
-        assert!(watch.lost());
     }
 }
 

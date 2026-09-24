@@ -739,6 +739,48 @@ fn a_derp_map_url_with_mode_like_path_segments_is_accepted() {
     server.shutdown();
 }
 
+#[test]
+fn a_lost_session_replaces_a_settled_helper_at_once_and_spares_a_young_one() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let fake =
+        Fake::write("  forward) printf 'forwarding\\n'; exec sleep 3600 ;;\n  ping) exit 0 ;;\n");
+    let controller = Address::parse(ADDRESS).unwrap();
+    let forward = tailcat::start_forward_every(
+        &fake.config(port),
+        fake.path(),
+        &controller,
+        Duration::from_secs(3600),
+    )
+    .unwrap();
+    wait_until("the forward", || forward.telemetry().pid.is_some());
+    let first = forward.telemetry().pid.unwrap();
+    // Too young to judge (the shipped settle time is 10 s): a controller
+    // still coming up must not make the worker kill a successor before it
+    // could connect.
+    assert!(!forward.session_lost());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(forward.telemetry().pid, Some(first));
+    // Settled: one lost session replaces it at once, as a decision (no
+    // back-off, no recorded problem)...
+    let asked = Instant::now();
+    assert!(forward.session_lost_after(Duration::from_millis(200)));
+    wait_until("the replacement helper", || {
+        forward.telemetry().pid.is_some_and(|pid| pid != first)
+    });
+    // ...and its successor is young again.
+    assert!(!forward.session_lost());
+    assert!(
+        asked.elapsed() < Duration::from_millis(900),
+        "{:?}",
+        asked.elapsed()
+    );
+    assert!(!alive(first));
+    assert_eq!(fake.calls("forward").len(), 2);
+    assert!(forward.telemetry().problem.is_none());
+    forward.shutdown();
+}
+
 /// The address a controller's rotated key is served at.
 const ADDRESS2: &str = "tczyxwvutsrqponmlkjihgfedcba9876";
 

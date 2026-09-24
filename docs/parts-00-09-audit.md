@@ -257,7 +257,7 @@ Evidence corrections (`ac6c0b5`):
 | P08-T5 | medium | Tailcat revocation was disconnected from worker revocation. | A revoked worker kept its tunnel. | Allow-list lines are `nodekey:<hex> wrk_<id>`; revoked workers' keys are withdrawn within one 10 s tick (`d106e4b`). | `tailcat.rs` |
 | P08-T6 | medium | The Q07 live evidence proved less than claimed: vacuous passes, rootful Podman, public DERP only. | The checkpoint "self-hosted relay" was unproven. | A missing prerequisite fails when the gate is set. The controller runs through `start_server`. A local derper case was added. The suite states that it uses rootful Podman (`5471245`). | `tailcat_live.rs` (6/6 per the sub-agent) |
 | P08-T7 | medium | The helper restart back-off never reset, and intentional restarts counted as failures. | About 30 s of fleet-wide outage per allow-list change. | Back-off resets after a healthy run; deliberate restarts are immediate (`d106e4b`). | `tailcat.rs` |
-| P08-T8 | low | The health probe did not prove the tunnel carried traffic, and it sent a stray byte. | False health and spurious rejections. | The probe is `tailcat ping` only. The worker replaces the helper after 3 failed sessions in a row (`d106e4b`). | `tailcat.rs` |
+| P08-T8 | low | The health probe did not prove the tunnel carried traffic, and it sent a stray byte. | False health and spurious rejections. | The probe is `tailcat ping` only. The worker replaces the helper after 3 failed sessions in a row (`d106e4b`); the [follow-up](#follow-up-tailcat-key-rotation-and-browser-launch) replaces it on the first lost session. | `tailcat.rs` |
 | P08-T9 | low | The helper was orphaned on SIGKILL, and DERP URLs containing `/files/` or `/all/` were refused. | Leaked process; legitimate configuration refused. | `PR_SET_PDEATHSIG`; the argv check applies only to modes and flags (`d106e4b`). | `tailcat.rs` unit tests |
 | P08-C1 | high | Same as P07-7: offers were refused after the terminal report. | Q08 never filled in production. | See P07-7 (`2ead7fa`, `27d1135`); refusals are counted in `Stats::cache_denied`. | `remote_cache.rs::an_offer_after_the_terminal_report_is_stored_and_serves_the_next_attempt` |
 | P08-C2 | high | A fetch the worker abandoned was never cancelled on the controller. | Up to 64 GiB streamed for nothing, holding a transfer permit. | Protocol 8 `CacheCancel` (`27d1135`). | `remote_cache.rs` (abandon, then a clean re-fetch) |
@@ -552,7 +552,29 @@ Tests:
   - The old address stops answering.
   - Emptying the allow list refuses the rotated identity.
 
-Observed while writing the live test, and not changed here: an allow-list change restarts the controller's helper. In the first run, an established container forward did not re-handshake with the restarted helper within 60 s. The Sentinel worker recovers by replacing its helper after three failed control sessions (`tailcat_replaced`). The live test therefore replaces a container's helper after each allow-list change before judging it. How long an unreplaced forward takes to recover was not measured.
+**Allow-list change outage** (found while writing the rotation live test, then measured and fixed in `fix: replace a worker's Tailcat helper as soon as its session is lost`).
+
+Every allow-list change restarts the controller's helper. The rotation test's containers run a bare `tailcat forward` probed with short `nc` connections. Such a forward did not answer again within 300 s after each of three restarts, so that test replaces a container's helper after each change.
+
+What a real worker pays was measured separately, in `tailcat_live.rs::an_allow_list_change_interrupts_a_worker_for_one_heartbeat_deadline`. That test runs Sentinel's controller link and helper supervisor on the host, and the worker link with its own supervisor in a container's network namespace (`nsenter`). The outage is timed on `CLOCK_MONOTONIC` from the change to the next welcomed session.
+
+- **Where the time goes.** The worker notices the cut session only at the heartbeat deadline, 15.1–19.6 s after the change. The same forward then took 0.9–30.4 s more to carry a new session. A fresh helper took 1.0–1.4 s.
+- **Previous rule** (keep the forward until three sessions fail in a row), three runs:
+  - eight changes: 22.2, 23.5, 24.1, 26.1, 31.8, 32.6, 39.8 and 45.6 s;
+  - four changes: 19.4, 20.5, 20.6 and 27.4 s;
+  - four changes (the verification run): 19.3, 20.0, 20.5 and 20.8 s.
+
+  The forward was never replaced; each time the same forward recovered, only later. Four of the sixteen outages exceeded the 30 s lease length.
+- **Shipped rule** (`Forward::session_lost`: a lost session replaces a helper that has run at least 10 s). 20.56, 20.62, 20.69 and 20.74 s, then 20.53, 20.67, 20.74 and 20.89 s in the verification run. Each set ran alongside the second and third previous-rule sets. The test asserts that every change stays under 25 s (heartbeat interval plus deadline plus 5 s) and that the helper was replaced.
+- **Net effect.** The rule removes the tail (19.3–45.6 s becomes 20.5–20.9 s). It does not lower the typical cost of about 20 s, which is the heartbeat detection.
+
+Options that could not do better:
+
+- The pinned helper has no reload for `--allow`.
+- `SIGKILL`, `SIGTERM` and `SIGINT` all left a tunnelled connection open for more than 30 s. A graceful stop therefore tells the worker nothing.
+- Starting the new helper before stopping the old one does not help. The tunnelled stream lives in the old process, and the heartbeat deadline, not the new helper, sets the floor.
+
+Shortening that floor would mean changing the protocol's heartbeat constants, which this change does not do. The rule itself is also covered by the fake-helper test `sentinel-link/tests/tailcat.rs::a_lost_session_replaces_a_settled_helper_at_once_and_spares_a_young_one`. That test replaced `the_helper_is_replaced_only_after_consecutive_failed_sessions`, the `service.rs` unit test of the removed counter.
 
 **Browser launch smoke test** (O04/O07 recorded "Real browser launch not automated"). The commit is `test: launch the real browser opener against a harmless stand-in`, and production code is unchanged.
 
@@ -572,3 +594,6 @@ Verification on `close-tailcat-browser`, run one command at a time:
 | WSL2 | `cargo lint-linux` | 0 | no warnings |
 | WSL2 | `cargo test-linux --no-fail-fast` | 0 | 129 binaries: 1,031 passed, 0 failed, 12 ignored (the new live test is the 12th) |
 | WSL2, rootful Podman | the live Tailcat suite as its header documents (`SENTINEL_TAILCAT_LIVE`, `SENTINEL_TAILCAT_DERPER`, `SENTINEL_TAILCAT_DERP_CA` = `SSL_CERT_FILE`, `/usr/sbin` on `PATH`) | 0 | 7 passed in 184.6 s; live probe `path Direct, rtt 270µs`; self-hosted relay `pong in 380µs via DERP(local)` |
+| Windows, after the outage fix | `cargo fmt-check`, `cargo lint`, `cargo test-cli --no-fail-fast` | 0, 0, 0 | clean; no warnings; 129 binaries: 866 passed, 0 failed, 3 ignored |
+| WSL2, after the outage fix | `cargo lint-linux`, `cargo test-linux --no-fail-fast` | 0, 0 | no warnings; 129 binaries: 1,031 passed, 0 failed, 13 ignored (the eight live Tailcat tests among them). The first `test-linux` attempt failed to link (`Cannot allocate memory` while other builds ran) and passed on retry |
+| WSL2, rootful Podman, after the outage fix | the live Tailcat suite as above, `nsenter` on `PATH` too | 0 | 8 passed in 471.9 s; live probe `path Relay, rtt 69ms`; self-hosted relay `pong in 300µs via DERP(local)`; allow-list outages as listed above (verification run) |
