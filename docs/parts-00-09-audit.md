@@ -22,7 +22,7 @@ Seven clusters fixed the findings in parallel worktrees. Each fixer re-verified 
 | execution | `cfcba5d` | `84afa74` |
 | fleet | `cfcba5d`, which includes the Q10 fix | `5442ca7` |
 
-Four follow-up commits closed what the merges left open (see [Found during integration](#found-during-integration)).
+Ten follow-up commits closed what the merges left open or what verifying the merged tree found (see [Found during integration](#found-during-integration)).
 
 **Migrations** were renumbered into one contiguous sequence at merge time. The fix branches used 037, 031, 034, 032 and 036. The final names are:
 
@@ -118,7 +118,7 @@ Doc corrections (`cde19ef`, `b3fc93d`):
 | P04-19 | medium | The log hot path copied each byte about five times, rescanned the spool on rewind, and polled helpers every 20 ms. | Rule-one waste on the worker's throughput path. | Borrowed redaction and encoding, a reused spool scratch buffer, sending from memory when caught up, rewind by the recorded offset, a ring-buffer tail, and a pidfd wait (`4b6dd39`, `9d99000`). | `session::tests::a_borrowed_log_frame_encodes_exactly_like_the_owned_message`; `process::tests::a_quick_helper_is_not_held_by_a_poll_interval`, `the_tail_keeps_the_last_bytes_in_order` |
 | P04-20 | low | Unredacted step stderr reached the verdict, the summary and the trace log. | Secret leak. | The detail passes through `Output::redact` (`9d99000`). | `logpipe::tests::registration_is_per_attempt_and_takes_effect_while_it_runs` (redaction assertions) |
 | P04-21 | low | Longest-match redaction failed across a chunk boundary, and held-back bytes crossed steps. | A partial secret could leak; bytes were attributed to the wrong step. | Hold back while a longer secret matches; flush at each step's end (`9d99000`). | `redact::tests::the_longest_secret_wins_across_a_chunk_boundary`; `logpipe::tests::held_back_bytes_belong_to_the_step_that_printed_them` |
-| P04-22 | low | Spool size-cap gaps were lost across a worker restart. | A truncated log was recorded as complete. | Interior gaps are rederived from sequence jumps, and the tail is kept in a `declared` file (`9d99000`). Merged with storage's P06-10 in `84afa74`. | `spool::tests::a_full_spool_declares_gaps_and_the_sequences_stay_spent`, `a_reopened_spool_never_reuses_an_acknowledged_sequence` |
+| P04-22 | low | Spool size-cap gaps were lost across a worker restart. | A truncated log was recorded as complete. | Interior gaps are rederived from sequence jumps, and the tail is kept in a `declared` file (`9d99000`), made atomic and synced when merged with storage's P06-10 in `84afa74`. | `spool::tests::a_full_spool_declares_gaps_and_the_sequences_stay_spent`, `a_reopened_spool_never_reuses_an_acknowledged_sequence` |
 | P04-23 | low | Controller log writers for attempts that never ended were never evicted. | Handles and memory grew with uptime. | `LogStore::forget` runs on report, abandon and expiry (`414f3ca`, `4b6dd39`). Storage added the idle/LRU bound (P06-3). | None dedicated. Eviction is covered by `sentinel-store/tests/logs.rs::idle_writers_close_are_capped_and_their_logs_expire`. |
 | P04-24 | low | Expiry did not re-check the lease in its write. | A just-renewed attempt could still be expired. | `expire` re-checks. Sweeps run one transaction per pass with a savepoint per row (`414f3ca`, `4b6dd39`). | `execution.rs::expiry_rechecks_the_lease_in_its_write` |
 | P04-25 | low | `Decline` ignored the worker and the fence. | Any worker could lapse another worker's offer. | `dispatch::decline` matches worker and fence (`414f3ca`, `4b6dd39`). | `execution.rs::a_decline_is_fenced_and_hands_back_…` |
@@ -183,7 +183,7 @@ Doc corrections (`6599622`):
 | P06-7 | medium | A deduplicated `stage_seal` left its temp file behind and released its admission charge. | `tmp/` filled up while admission undercounted it. | The dedup branch drops the temp file and skips the fsync (`b779f33`). | `artifacts.rs::a_deduped_stage_seal_leaves_nothing_in_tmp` |
 | P06-8 | medium | Process-wide mutexes were held across fsyncs on the log and artifact paths. | Fleet log throughput was capped at one flush at a time. | Per-attempt locks; the map lock is used only for lookup (`966062d`, `b779f33`). | `tests/tput.rs` (ignored measurement harness) |
 | P06-9 | medium | The storage pass walked the whole store on the dispatch thread, and reclaim scanned without an index inside the writer. | Placement paused and the writer was held for a scan that grew with the store. | Migration `034_storage_hardening`: `object_unreferenced` with an age index. Orphan and log sweeps are bounded and resumable, and the pass runs on its own `sentinel-storage` thread (`b779f33`, `966062d`). | `storage.rs::reclaim_candidates_come_from_the_unreferenced_index` |
-| P06-10 | medium | Worker spool gaps were memory-only, and sequences were renumbered after a reopen. | Lost output was recorded as a complete log. | Gaps and the spent high-water mark are persisted (`966062d`). Merged with P04-22 in `84afa74`. | `spool::tests::a_full_spool_declares_gaps_and_the_sequences_stay_spent`, `a_crash_after_a_refused_tail_still_declares_it` |
+| P06-10 | medium | Worker spool gaps were memory-only, and sequences were renumbered after a reopen. | Lost output was recorded as a complete log. | Gaps and the refused-tail high-water mark are persisted (`966062d`, a `spent` file). The merge `84afa74` keeps one mechanism: execution's `declared` file (P04-22), now replaced atomically and synced, never declaring an acknowledged sequence, and persisted before `LogEnd`. | `spool::tests::a_full_spool_declares_gaps_and_the_sequences_stay_spent`, `a_crash_after_a_refused_tail_still_declares_it` |
 | P06-11 | medium | A `wait=1` poll with `step=` re-decoded up to 256 MiB every 250 ms. | CPU and I/O amplification from one request. | Pages decode at most 16 MiB. A finished step is answered at once. Polls park on a log-append notifier (`966062d`, `14f4cd0`). | `logs.rs::pages_are_bounded_and_a_finished_step_is_reported` |
 | P06-12 | low | Retiring an expired upload on touch was rolled back, but its file and charge were dropped anyway. | The row, file and quota were briefly inconsistent. | `Touch::Expired`; the route retires the upload in its own transaction (`b779f33`, `14f4cd0`). | `api.rs::touching_an_expired_upload_retires_it` |
 | P06-13 | low | The server did not verify digests on download. | A rotted file was served under its digest ETag. | Whole-object bodies are rehashed while streaming, and the connection is cut on mismatch. Range reads are documented as unverified (`14f4cd0`). | `api.rs::a_rotted_object_is_never_served_whole` |
@@ -327,6 +327,12 @@ These came from merging the seven branches and from the flakes seen in their ver
 | P09-12 per-user cap | Storage made the subscriber and transfer reservation real but left the optional per-principal cap out. One `runs:read` credential could still hold all three subscriber slots. | `26cc5c1`: `SUBSCRIBERS_PER_USER = 2` of 3, held in a fixed three-entry table under one short lock. | `sentinel-api/tests/wait.rs::one_user_cannot_take_every_subscriber_slot` (fails without the rule) |
 | Writer back-pressure flake | `store.rs::writer_queue_is_bounded_and_reports_back_pressure` failed intermittently in several clusters' runs. It guessed timing with two sleeps. Not a product bug. | `94711ab`: the test waits for the blocking job and the eight overflow answers; its assertions are exact. | The test itself |
 | Offer comment | The `Offer` comment said it carries `name@sha256:…`. It carries only the digest. | `eee35e9` (docs) | None |
+| Q07 throughput counted only control | The audit's Q07 note: "throughput" was the control connection's lifetime byte totals, so logs, specs and artifacts on the protocol-7 bulk connection were missing. No cluster took it. | `529d4a7`: `bytes_in`/`bytes_out` add every bulk connection of the session, keeping a lost connection's bytes across a redial; throughput is their rate between two reports. No wire change. | `session::tests::transport_bytes_count_every_bulk_connection_of_the_session` |
+| CLI and wait suites hung after P08-7 | The merged `test-cli` run stalled in `sentinel/tests/commands.rs` (as the fleet cluster's run had, which it attributed to memory pressure). The fixtures leased attempts to a worker id with no `workers` row; since P08-7 the store answers such a worker's acknowledgement and reports `NotFound`, the helper failed in its thread, and `sentinel wait` without a deadline waited forever. The product behavior is correct. | `d65e7b4`: the fixtures enroll the worker in the lease transaction; the wait carries a deadline, so a run that never passes fails instead of hanging. | `commands.rs::wait_exits_zero_when_the_run_passes_eight_when_it_does_not_and_seven_at_the_deadline`, `wait.rs::an_attempt_summary_needs_cache_read_and_reports_cache_records` |
+| Worker helper-wait timing test | `process::tests::a_quick_helper_is_not_held_by_a_poll_interval` failed in the merged `test-linux` run: two back-to-back averages drifted with the host's load (79 ms for a 10 ms child), exceeding its 8 ms margin. Test assumption, not a product bug. | `93884b4`: interleaved pairs, median paired difference, a 2 ms child the old poll would hold ~18 ms longer. | The test itself (30/30 under 6-way load) |
+| Drain test offer race | The Q10 stress (6 parallel lanes) failed `a_drained_worker_takes_no_new_offers_and_keeps_its_held_attempt` once: the same leased-before-delivered race as the burst test. | `eea1e34`: waits for the offer to arrive. | The test itself (Q10 stress 120/120 after) |
+| macOS type-check | The workspace did not type-check for `aarch64-apple-darwin`: the mirror's reflink used Linux-only `FICLONE` under `cfg(unix)`, and a cache test used the crate's Linux-only `libc` dependency. The Part 09 check had covered only the CLI package. | `ac121ad`: one `ficlone` helper, real on Linux and `Unsupported` elsewhere (other Unix targets copy bytes); the FIFO test is Linux-gated. | `cargo check` and `cargo clippy -D warnings --workspace --all-targets --target aarch64-apple-darwin` (type-check only; no macOS hardware) |
+| Mirror disk-bound test under load | `the_sweep_bounds_mirror_disk` failed once in a crate run, and 9 in 60 parallel runs even with in-process retries: a sweep skips a mirror whose lock is momentarily held (by design), and git children the suite's other tests fork hold an inherited lock descriptor until they exec, so which mirror went depended on timing. | `c8b574b`: the test runs alone in `mirror_sweep.rs`; helpers shared through `tests/support`. | `sentinel-git/tests/mirror_sweep.rs::the_sweep_bounds_mirror_disk` (60/60 under 6-way load) |
 
 ## Not a defect / kept by design
 
@@ -353,6 +359,8 @@ These came from merging the seven branches and from the flakes seen in their ver
 | K05 bounded image prefetch (P07-12) | **B04** | A K05 requirement that was never implemented. An offer carries only the image digest; the name arrives with the spec after the ack, and preparation already starts the pull then (`eee35e9`). A prefetch belongs to the measured image fast-path work. The B04 text is being extended. |
 | P07-20: mirror materialization copies the whole object store on non-reflink filesystems | **B04** | A performance item that needs before/after measurement on ext4 or overlay. It is bounded by `MAX_OBJECT_FILES`. With manual runs out of mirrors (P07-17), the exposure it widened is closed. |
 | P08-C8 remainder: hydration writes each byte three times, the offer reads the payload twice, and the bundle digest is not stored with the generation | **B04** | Throughput work on a transfer already bounded to at most 5 s per job. |
+| Worker-side spool free-space admission (noted against D06) | **R01** | D06 covers the controller's disk admission. The worker's spool is capped per attempt and a failed write is a declared gap, so the bound holds; admission by free space is retention/operations work. |
+| Tailcat node-key rotation (noted against Q06) | **R04** | Not in Q06's text; plan §5 asks for rotatable identities. Key rotation sits with the key-material operations in R04. |
 
 Items fixed without an automated regression test, with the fix report's reason:
 
@@ -397,7 +405,7 @@ The audits marked these tasks Partial or Missing. Each one is met now, with the 
 | D01 | Partial | P06-1, P06-7 |
 | D02 | Partial | P06-2, P06-4, P06-13 |
 | D04 | Partial | P06-3, P06-5. Time and line checkpoints are written but no reader seeks by them yet; this is now documented. |
-| D06 | Partial | P06-1, P06-9 |
+| D06 | Partial | P06-1, P06-9. Worker-side spool free space moved to R01. |
 | D07 | Partial | P06-5, P06-10 |
 | K03 | Partial | P07-1, P07-2, P07-3, P07-4, P07-5 |
 | K04 | Partial | P07-17, P07-18, P07-22 |
@@ -407,25 +415,25 @@ The audits marked these tasks Partial or Missing. Each one is met now, with the 
 | Q03 | Partial | P08-6 |
 | Q04 | Partial | P08-7, P08-8 |
 | Q05 | Partial | P08-11. Mid-flight revocation is reconciled in the pass (P08-7). The cache docs about the control fallback were corrected. |
-| Q06 | Partial | P08-T1, P08-T5. DERP and self-hosted relay docs (`fbf72cb`). |
-| Q07 | Partial | P08-T2, P08-T3, P08-T6 |
+| Q06 | Partial | P08-T1, P08-T5. DERP and self-hosted relay docs (`fbf72cb`). Key rotation (a plan item, not in Q06's text) moved to R04. |
+| Q07 | Partial | P08-T2, P08-T3, P08-T6; throughput counts the bulk connection (`529d4a7`) |
 | Q08 | Partial | P08-C1 to P08-C9; part of C8 is deferred to B04 as a performance item. |
 | Q09 | Partial | Load run rewritten to hold capacity and recorded in `bench/`; noisy-tenant fairness observable; P08-9 |
 | O05 | Partial | P09-11, P09-12, P09-13 |
 
 Not met, stated plainly:
 
-- **K05 remains Partial.** Bounded prefetch was never implemented and is deferred to B04. Private-image authorization is worker-wide until S05. The single-flight pulls and the pull/checkout overlap are met.
+- **K05 was Partial and is closed only by moving scope.** Bounded prefetch was never implemented; an offer carries only the digest and the reference arrives with the spec after the acknowledgement, when preparation already starts the pull. The requirement moved to B04 and tenant-scoped private-image authorization to S05; the K05 item text says so. The single-flight pulls and the pull/checkout overlap are met.
 - **O07 remains Blocked by: no macOS hardware or Apple toolchain.** The macOS Keychain in O04 is also unverified. Nothing in this audit changes that.
 - **P04-28's power-loss boundary is implemented but unverified.** Blocked by: a fault-injecting filesystem.
 
-The audit notes raised three more gaps as unmet requirements without giving them finding IDs. No fix report addresses them, so they are recorded here rather than claimed closed:
+The audit notes raised three more gaps without finding IDs, and no cluster took them:
 
-- **D06:** there is no worker-side spool reserve or free-space admission. The spool is capped per attempt at 256 MiB, but the worker has no free-space probe.
-- **Q06:** no Tailcat key rotation.
-- **Q07:** "throughput" is still the control connection's lifetime byte totals. P08-T2 fixed path and latency, not throughput.
+- **D06, worker-side spool free space.** D06 is the controller's disk admission (its reserve protects the metadata database and log evidence), and that is met. The worker's log spool is capped per attempt (256 MiB) and a failed write becomes a declared gap, but the worker has no free-space probe. Moved to **R01**, whose text now names it.
+- **Q06, Tailcat key rotation.** Q06's text does not ask for it; plan §5 asks for rotatable identities. Moved to **R04** (key material operations), whose text now names it.
+- **Q07, throughput.** Fixed in `529d4a7` (see [Found during integration](#found-during-integration)).
 
-The integrator should decide whether each one is a new task or an accepted limit. K08's costly-hit rule also remains a fixed heuristic (hit + reflink root + everything copied, or more than 5 s of lock wait plus clone). It does not compare against a measured rebuild.
+K08's costly-hit rule remains a fixed heuristic (hit + reflink root + everything copied, or more than 5 s of lock wait plus clone); it does not compare against a measured rebuild. K08's text asks to flag costly hits, which it does; comparing against a rebuild belongs with B05's cache-usefulness measurements.
 
 ## Measurements recorded by the fixes
 
@@ -460,9 +468,57 @@ These are quoted from the cluster reports. No number here was re-measured for th
     - limit 500: 4,768,443 µs before, 1,683 µs after.
   - Tailcat helper verification: 8.7 ms → 0.9 µs per execution for an unchanged 18 MB helper.
   - P08-11: control teardown took 3.68 s before the fix; the test requires under 1.5 s after.
-- **Execution (P04-19).** `process::tests::a_quick_helper_is_not_held_by_a_poll_interval` asserts that a helper costs less than a blocking `status()` plus 8 ms. Log throughput before and after was **not measured**: the ignored harness `sentinel-worker/tests/log_throughput.rs` (`ea60329`) was stopped because the host ran critically low on memory.
+- **Execution (P04-19).** `process::tests::a_quick_helper_is_not_held_by_a_poll_interval` asserts that a helper costs less than a blocking `status()` plus 8 ms. The cluster could not measure log throughput (its release build was stopped for low memory); the integrator measured it, below.
+- **Execution (P04-19), measured at integration.** `log_throughput` (`ea60329`) built in release from `cfcba5d` (the harness copied in; it uses only APIs present there) and from the merged tree `eee35e9`, run inside WSL2's own ext4 (`/root/bench`), i7-13700KF, 24 threads, alternating base and merged, five runs of `log_path_throughput` each under `timeout 300`, then three of `helper_wait_latency` each. 64 MiB in 8 KiB chunks through `LogPipe` over loopback TLS to an acknowledging stand-in:
+
+  | | base `cfcba5d` | merged |
+  |---|---|---|
+  | linked and acknowledged | runs 2 and 5: 1,075.6 ms (60 MiB/s), 1,007.4 ms (64 MiB/s); runs 1, 3, 4: **never finished** (killed at 300 s) | 1,038.3, 924.4, 1,003.3, 988.5, 993.1 ms (62–69 MiB/s) |
+  | spool only | 294.8, 291.2 ms (217, 220 MiB/s) | 314.3, 297.5, 327.9, 279.7, 285.7 ms (195–229 MiB/s) |
+  | one helper run (`exit 0` shim) | 20.41, 20.36, 20.37 ms | 369, 298, 372 µs |
+  | the same process with a blocking wait | 318, 289, 316 µs | 295, 274, 265 µs |
+
+  Throughput on this loopback harness is unchanged within noise; the fix's gain is elsewhere: the helper wait drops from about 20 ms (the old 20 ms poll) to within about 0.1 ms of a blocking wait, and the base log path **stalled in three of five runs**. In a stalled base run only the main thread and the test's wait loop remained (the TLS session threads had ended) and no further frame was acknowledged. This is consistent with the rustls "message buffer full" session drop on bursts of full frames that the cache cluster fixed in `27d1135`; it was not traced further. Raw output: the integrator's scratch `log-throughput-results.txt`.
 - **Foundation (P09-17).** No timing. The query plan lost its `USE TEMP B-TREE FOR ORDER BY` step, and the test asserts that.
 
 ## Verification evidence
 
-<!-- VERIFICATION TABLE: filled by the integrator -->
+Run sequentially, one build at a time, on the development host (i7-13700KF, 24 threads, Windows 11 and WSL2 Ubuntu 24.04, kernel 6.18.33.2). WSL2 verifies Linux process, signal and container behavior; it is not a production benchmark host. The final tree is `c8b574b` unless a row says otherwise.
+
+| Where | Command | Exit | Result |
+|---|---|---|---|
+| Windows | `cargo fmt-check` | 0 | clean |
+| Windows | `cargo lint` | 0 | no warnings |
+| Windows | `cargo test-cli --no-fail-fast` | 0 | 127 binaries: 862 passed, 0 failed, 3 ignored (the two `fleet_load` measurements and `tput`) |
+| Windows | `cargo release-cli` | 0 | built |
+| WSL2 | `cargo lint-linux` | 0 | no warnings |
+| WSL2 | `cargo test-server --no-fail-fast` | 0 | 127 binaries: 1,022 passed, 0 failed, 11 ignored |
+| WSL2 | `cargo test-linux --no-fail-fast` | 0 | 127 binaries: 1,023 passed, 0 failed, 11 ignored |
+| WSL2 | `cargo release-linux` | 0 | built |
+| WSL2, rootless Podman 4.9.3 (cgroup v2) | each Podman-gated worker binary as the non-root `sentinelbench` account: `sudo -iu sentinelbench env SENTINEL_PODMAN_TESTS=1 <target>/debug/deps/<suite>-<hash>` | 0 | `podman` 2, `end_to_end` 1, `compiler_cache` 1, `k09` 3, `slice` 1: 8 passed, 0 failed, none skipped |
+| WSL2, rootful Podman (tree `93884b4`; no link or Tailcat source changed after it) | the live Tailcat suite as its header documents: `SENTINEL_TAILCAT_LIVE=/root/tailcat/tailcat SENTINEL_TAILCAT_DERPER=… SENTINEL_TAILCAT_DERP_CA=… SSL_CERT_FILE=… cargo test -p sentinel-link --all-features --test tailcat_live -- --ignored --nocapture --test-threads=1`, `/usr/sbin` on `PATH` | 0 | 6 passed in 123 s; live probe `path Relay, rtt 67.6ms`; self-hosted relay `pong in 310µs via DERP(local)` |
+| WSL2, release (tree `93884b4`; store code unchanged since) | `SENTINEL_BENCH_OUT=… cargo test --release -p sentinel-store --test fleet_load -- --ignored --nocapture --test-threads=1`, three runs | 0 ×3 | 2 passed each; recorded in `bench/q09-fleet-load.jsonl` (below) |
+| WSL2 | Q10 stress: the prebuilt `sentinel-link` `fleet` binary (all 6 tests, the Q10 mixed-fleet test among them) in 6 parallel lanes × 10 runs | — | first batch (tree `93884b4`): 59 of 60 runs passed; the one failure was the drain test's offer race (fixed in `eea1e34`), and the Q10 test passed all 60. After the fix: two batches, 60 of 60 and 60 of 60 |
+| WSL2 (zig 0.16 as C compiler, sysroot linked to the Windows toolchain's `aarch64-apple-darwin` std) | `cargo check` and `cargo clippy --locked --workspace --all-targets --target aarch64-apple-darwin -- -D warnings` | 0 | clean after `ac121ad`; before it, 3 errors (`libc::FICLONE` twice, a Linux-only `libc` use). A type-check, not a macOS run (Blocked by: no macOS hardware) |
+
+Flaky-test fixes, re-run under load (6 parallel lanes):
+
+- `sentinel-store` `writer_queue_is_bounded_and_reports_back_pressure`: 60 of 60. The old test also passed this stress; it had failed only under full-suite load with memory pressure. The fix removes its two timing guesses.
+- `sentinel-link` Tailcat suite (17 tests): 30 of 30 full-suite runs.
+- `sentinel-worker` `a_quick_helper_is_not_held_by_a_poll_interval`: 30 of 30, with full lib-suite runs alongside.
+- `sentinel-git` `mirror` and `mirror_sweep`: 60 of 60 each. Before the split (with the test retrying skipped sweeps in-process), 51 of 60; the unchanged test failed once in a `sentinel-git`/`sentinel-cache` run.
+
+**Load run (`fleet_load`, release, three runs on `93884b4`), against the fleet cluster's recorded run on `fix-fleet`:**
+
+| | fleet report | run 1 | run 2 | run 3 |
+|---|---|---|---|---|
+| elapsed | 5,812 ms | 4,592 ms | 4,638 ms | 4,444 ms |
+| `place()` p50 / p95 / p99 / max | 272 / 545 / 728 / 1,499 µs | 249 / 475 / 543 / 814 µs | 253 / 484 / 551 / 832 µs | 250 / 482 / 559 / 803 µs |
+| queue wait p50 / p95 / p99 / max | 3,015 / 5,342 / 5,717 / 5,768 ms | 2,354 / 4,233 / 4,517 / 4,550 ms | 2,389 / 4,260 / 4,565 / 4,587 ms | 2,375 / 4,130 / 4,383 / 4,408 ms |
+| throughput | 1,720 jobs/s | 2,178 | 2,156 | 2,250 |
+| waves / rounds | 7 / 108 | 7 / 107 | 7 / 107 | 7 / 107 |
+| first wave per tenant | [700, 300, 300, 300] | same | same | same |
+| process CPU / peak RSS | 5,320 ms / 12.7 MiB | 4,780 ms / 12.8 MiB | 4,820 ms / 12.8 MiB | 4,850 ms / 12.8 MiB |
+| `list_queue` 5,000 jobs, limit 100 / 500 | 3,981 / 1,683 µs | 3,728 / 1,426 µs | 3,491 / 1,483 µs | 3,420 / 1,460 µs |
+
+All 10,000 jobs were placed with 0 placement failures in every run. The merged tree is at least as fast as the fleet branch; this is one host, three runs, and not a production benchmark.
