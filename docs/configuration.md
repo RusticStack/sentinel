@@ -14,7 +14,7 @@ cargo build --locked --release --features server,worker
 ./target/release/sentinel worker --help
 ```
 
-The role build command requires Linux. Portable CLI builds use `cargo build --locked --release` and support help/version on Linux/macOS/Windows. Requesting a role omitted from the build produces an explicit unavailable-role error. Help describes both roles even in CLI-only builds; it does not indicate role availability. No command defaults to starting a service.
+The role build command requires Linux. Portable CLI builds use `cargo build --locked --release` and support help/version on Linux and Windows. Requesting a role omitted from the build produces an explicit unavailable-role error. Help describes both roles even in CLI-only builds; it does not indicate role availability. No command defaults to starting a service.
 
 `--version` (also accepted after the subcommand) reports the package version from Cargo metadata. The current version is a development version, not a released executor.
 

@@ -27,7 +27,7 @@ The resolver opens its trusted checkout-root path once with `openat2(NO_SYMLINKS
 
 Before reading content, `O_PATH` pins and classifies the inode without opening devices/FIFOs for data I/O. Only regular inodes are reopened through the trusted host `/proc/self/fd/<fd>` entry while the descriptor is still owned. This extra open is needed to avoid a check/open race or side effects from opening a special file. Rooted directory descriptors are consumed directly by the directory iterator; enumeration uses no procfs path reconstruction.
 
-Unavailable `openat2` (Linux before 5.6 or blocked by seccomp), missing host procfs, forbidden mounts/symlinks, and access errors fail closed with no insecure fallback. The worker-side resolver returns `UnsupportedPlatform` on Windows/macOS. CLI parsing, compilation, validation and explain remain portable and do not resolve filesystem hashes.
+Unavailable `openat2` (Linux before 5.6 or blocked by seccomp), missing host procfs, forbidden mounts/symlinks, and access errors fail closed with no insecure fallback. The worker-side resolver returns `UnsupportedPlatform` off Linux (on Windows). CLI parsing, compilation, validation and explain remain portable and do not resolve filesystem hashes.
 
 Only a missing literal path is treated as a normal nonmatch; errors while opening/enumerating a directory or reopening an enumerated match invalidate the operation. Matching symlinks/special files are rejected, not followed. A symlink encountered while recursively scanning `**` therefore fails the operation, even if its contents would not have matched.
 

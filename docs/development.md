@@ -7,10 +7,10 @@ Run the commands below from the **repository root**. The shared shortcuts live i
 ### All contributors
 
 - Git and rustup. The repository pins Rust 1.97.0 and requests rustfmt/Clippy in `rust-toolchain.toml`; rustup installs missing components when a Cargo command runs.
-- A native linker/toolchain: Linux C toolchain and libc development files; macOS Xcode Command Line Tools; Windows Visual Studio Build Tools with the C++ workload and matching Windows SDK.
+- A native linker/toolchain: Linux C toolchain and libc development files; Windows Visual Studio Build Tools with the C++ workload and matching Windows SDK.
 - Network access for initial toolchain and locked dependency downloads. No GitHub App, cloud account, database service, Node/Deno process, or container engine is required for the currently implemented lifecycle tests.
 
-See [Rust foundation](rust-foundation.md) for the architecture/target matrix. Use a Linux host or Linux VM for server/worker work. Windows and macOS build the portable CLI. Linux x86_64 WSL2 is verified for the current process/signal tests; that does not qualify its filesystem or container isolation for executor benchmarks.
+See [Rust foundation](rust-foundation.md) for the architecture/target matrix. Use a Linux host or Linux VM for server/worker work. Windows builds the portable CLI; macOS is not supported ([supported platforms](../README.md)). Linux x86_64 WSL2 is verified for the current process/signal tests; that does not qualify its filesystem or container isolation for executor benchmarks.
 
 ### Linux executor work (F05/F07 and W03 onward)
 
@@ -37,7 +37,7 @@ The benchmark runner records runtime/kernel/filesystem/cgroup details automatica
 
 ## Daily checks
 
-On Linux, macOS, and Windows:
+On Linux and Windows:
 
 ```sh
 cargo fmt-check
