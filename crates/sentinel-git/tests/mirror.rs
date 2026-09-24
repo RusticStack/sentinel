@@ -20,75 +20,8 @@ use sentinel_git::{Error, mirror::Mirrors};
 use sentinel_pipeline::PinnedSource;
 use sentinel_protocol::source::{Access, Binding};
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@example.com")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
-}
-
-/// `git` in `dir` that may legitimately fail — for `cat-file -e` probes.
-fn git_ok(dir: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
-        .unwrap()
-        .status
-        .success()
-}
-
-struct Repo {
-    _dir: tempfile::TempDir,
-    path: PathBuf,
-    first: String,
-    second: String,
-}
-
-/// Two commits on `main`, one file that changes between them.
-fn repository(root: &Path) -> Repo {
-    let dir = tempfile::tempdir_in(root).unwrap();
-    let path = dir.path().join("origin");
-    fs::create_dir(&path).unwrap();
-    git(&path, &["init", "-q", "--initial-branch=main"]);
-    fs::write(path.join("file.txt"), "one\n").unwrap();
-    git(&path, &["add", "."]);
-    git(&path, &["commit", "-qm", "one"]);
-    let first = git(&path, &["rev-parse", "HEAD"]);
-    fs::write(path.join("file.txt"), "two\n").unwrap();
-    git(&path, &["commit", "-qam", "two"]);
-    let second = git(&path, &["rev-parse", "HEAD"]);
-    Repo {
-        _dir: dir,
-        path,
-        first,
-        second,
-    }
-}
-
-fn source(repo: &Repo, sha: &str, ref_name: Option<&str>) -> PinnedSource {
-    PinnedSource::new(repo.path.to_str().unwrap(), sha, ref_name).unwrap()
-}
-
-fn work(root: &Path, name: &str) -> PathBuf {
-    let dir = root.join(format!("ws-{name}"));
-    fs::create_dir(&dir).unwrap();
-    dir
-}
+mod support;
+use support::{git, git_ok, repository, source, work};
 
 /// path → content hash for every regular file under `dir`.
 fn manifest(dir: &Path) -> BTreeMap<PathBuf, u64> {
@@ -730,55 +663,4 @@ fn a_leftover_lease_temp_file_does_not_block_a_retry() {
             Duration::from_secs(60),
         )
         .unwrap();
-}
-
-/// P07-22: the sweep bounds mirror disk — a killed fetch's stale `tmp_*`
-/// goes, and over the budget the least recently written mirror goes; a
-/// mirror whose writer lock is held is never touched.
-#[test]
-fn the_sweep_bounds_mirror_disk() {
-    let temp = tempfile::tempdir().unwrap();
-    let repo = repository(temp.path());
-    let mirrors = Mirrors::open(&temp.path().join("mirrors")).unwrap();
-    let (old, new) = (RepoId::new(), RepoId::new());
-    for (id, name) in [(old, "old"), (new, "new")] {
-        mirrors
-            .checkout(
-                &work(temp.path(), name),
-                &id,
-                &source(&repo, &repo.first, None),
-                None,
-                &format!("att_{name}"),
-                Duration::from_secs(60),
-            )
-            .unwrap();
-    }
-    // `old` was written an hour earlier; a dead fetch left a temp pack.
-    let lock = temp.path().join(format!("mirrors/{old}.lock"));
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&lock)
-        .unwrap()
-        .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
-        .unwrap();
-    let tmp = mirrors.path(&new).join("objects/pack/tmp_pack_dead");
-    fs::write(&tmp, b"partial").unwrap();
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&tmp)
-        .unwrap()
-        .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200))
-        .unwrap();
-    let one = {
-        let s = mirrors.sweep(u64::MAX);
-        assert_eq!(s.removed, 0);
-        assert_eq!(s.tmp_removed, 1);
-        s.bytes / 2
-    };
-    assert!(!tmp.exists());
-    let swept = mirrors.sweep(one + one / 2);
-    assert_eq!(swept.removed, 1, "{swept:?}");
-    assert!(!mirrors.path(&old).exists(), "least recently written goes");
-    assert!(mirrors.path(&new).exists());
-    assert!(lock.exists(), "the lock file itself stays");
 }
