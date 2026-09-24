@@ -32,7 +32,7 @@ Ten follow-up commits closed what the merges left open or what verifying the mer
 4. `034_storage_hardening`
 5. `035_fleet_scheduling`
 
-A compile-time contiguity check added by P02-6 now enforces the order. The **worker protocol maximum is 8**. Only the cache cluster raised it, for `CacheCancel`, `Trust::Unprotected` and availability refreshes. The execution cluster made the lease length a protocol constant (`LEASE_MS`) without a version bump.
+A compile-time contiguity check added by P02-6 now enforces the order. The **worker protocol maximum is 8**. Only the cache cluster raised it, for `CacheCancel`, `Trust::Unprotected` and availability refreshes. The execution cluster made the lease length a protocol constant (`LEASE_MS`) without a version bump. (The B04 follow-up below later added migration **36** and raised the maximum to **9**.)
 
 The bar was the same as in the Parts 01–06 audit. An operational failure must be one of these:
 
@@ -206,7 +206,7 @@ Doc corrections: [api](api.md), [storage](storage.md), [logs](logs.md), [configu
 | P07-9 | medium | Publish ignored the restore outcome. | Unservable generations were stored, and P07-1 was widened. | `SkipReason::Refused` (`279432d`). | `publish.rs::an_unrendered_key_publishes_nothing` |
 | P07-10 | medium | Publish allocated 1 MiB and ran an fsync per file on the verdict path. | 100k-file caches cost minutes. | One buffer per commit; one `syncfs` beyond 64 files (`279432d`). | Measurement (see Measurements) |
 | P07-11 | medium | A GC walk of the whole store ran after every attempt, and every restore walked the payload twice. | Per-attempt cost grew with the store. | GC part fixed with incremental cursor passes (`7025e27`). The per-file `format!` was removed from the restore check (`279432d`). The double walk is kept (see Not a defect). | Covered by the gc and restore tests above |
-| P07-12 | medium | K05 had no bounded prefetch. Private-image authorization was worker-wide, and the `image exists` fast path served any tenant. | Tenant B could run tenant A's private image by digest. | **Deferred** (see Deferred). [Executor](executor.md) now says so (`352a5a5`, `eee35e9`). | None |
+| P07-12 | medium | K05 had no bounded prefetch. Private-image authorization was worker-wide, and the `image exists` fast path served any tenant. | Tenant B could run tenant A's private image by digest. | **Deferred** (see Deferred). [Executor](executor.md) now says so (`352a5a5`, `eee35e9`). The prefetch half is **closed** by the B04 follow-up (see [B04 follow-up](#b04-follow-up-image-prefetch-and-transfer-copies)); tenant-scoped authorization stays with S05. | Prefetch: `sentinel-worker` `prefetch::tests`, `tests/prefetch.rs`; `sentinel-link/tests/prefetch.rs`; `sentinel-store/tests/fleet.rs` |
 | P07-13 | low | The restore lease was never renewed (10 min TTL against jobs of up to 24 h). | GC could evict the source generation of a long job. | A process-wide keeper renews held leases every 2.5 min (`279432d`). | `lease::tests::a_held_lease_is_renewed_and_a_released_one_is_not` |
 | P07-14 | low | Stale write-lock reaping was racy. | Two writers could stage at once. | Rename the lock aside, then re-judge it. A residual window of three writers within microseconds is documented (`279432d`). | `lease::tests::a_racing_reaper_never_deletes_a_fresh_marker` |
 | P07-15 | low | Payloads silently dropped symlinks. | An "exact" dependency tree was not exact. | Fixed by documentation (see Not a defect) (`279432d`, `352a5a5`). | None (docs) |
@@ -214,7 +214,7 @@ Doc corrections: [api](api.md), [storage](storage.md), [logs](logs.md), [configu
 | P07-17 | high | Manual-mode mirrors accepted any remote, so a local mirror path copied another repository's objects in. | Cross-tenant disclosure of private source. | Mirrors serve only bound runs. A mirror records its remote and is rebuilt when the remote changes (`352a5a5`). | `sentinel-worker/tests/mirror.rs::a_manual_run_never_reads_or_feeds_a_mirror`; `sentinel-git/tests/mirror.rs::a_mirror_serves_only_the_remote_that_filled_it` |
 | P07-18 | medium | Mirror failure plus fallback could take twice `CHECKOUT_TIMEOUT`, and a timeout never fell back. | Large repositories failed every attempt. | The mirror gets half the deadline; the fallback uses the rest and also covers `Timeout` (`352a5a5`). | `mirror.rs::a_fallback_spends_the_remaining_deadline_not_a_new_one` |
 | P07-19 | medium | Corruption the health check missed became a permanent `Preparation` failure. | Every attempt on that worker failed. | The health probe adds `rev-list --no-walk --all` (`352a5a5`). | `sentinel-git/tests/mirror.rs::damage_under_a_ref_tip_is_rebuilt_not_a_permanent_failure` |
-| P07-20 | medium | Every attempt copied the entire mirror object store. | Rule-one waste on non-reflink filesystems. | **Deferred to B04** (see Deferred). | None |
+| P07-20 | medium | Every attempt copied the entire mirror object store. | Rule-one waste on non-reflink filesystems. | Deferred to B04, then **closed** by the B04 follow-up: a store over 48 MiB is materialized by a depth-1 fetch of the pinned commit; the reflink probe, which never succeeded, is fixed. | `sentinel-git/tests/mirror.rs::a_large_store_is_materialized_by_fetching_the_pinned_commit_alone`, `mirror::tests::the_reflink_probe_agrees_with_a_real_clone` |
 | P07-21 | medium | Any materialization failure marked the mirror suspect. | Full refetches repeated. | Suspect only when the health probe fails; a failed marker write is surfaced (`352a5a5`). | Covered by `damage_under_a_ref_tip…` and the existing rebuild test |
 | P07-22 | medium | Mirror disk use was unbounded. | The disk filled. | `Mirrors::sweep` removes stale `tmp_*` after 1 h and idle mirrors after 14 d, and enforces a 50 GiB LRU budget. Each removal runs under the mirror lock with no live lease (`352a5a5`). | `sentinel-git/tests/mirror.rs::the_sweep_bounds_mirror_disk` |
 | P07-23 | low | The mirror lease TTL was a fixed 20 min, and a crashed temp file blocked retries. | GC could undercut a long reader. | Expiry is the reader's deadline + 60 s; temp files are truncated (`352a5a5`). | `mirror.rs::a_leftover_lease_temp_file_does_not_block_a_retry` |
@@ -266,7 +266,7 @@ Evidence corrections (`ac6c0b5`):
 | P08-C5 | medium | Abandoned uploads leaked their lock, handle and `.part` file. | Other workers got `Busy`; disk leaked. | `Drop for Receiving`, at most 4 uploads per connection, a 60 s idle reap (`27d1135`). | `remote.rs::an_abandoned_upload_leaves_nothing_behind` |
 | P08-C6 | medium | The hydration deadline did not bound wall time. | N caches cost N × the budget, plus unbudgeted work. | One job-level deadline covering the resume hash, the transfer and the install (`27d1135`). | `remote.rs::a_spent_job_deadline_never_networks` |
 | P08-C7 | low | A valid partial was deleted on `Busy`/`Denied`; the rate estimate truncated to zero; `remote_from` was wrong. | Contradicted [cache](cache.md); the rate policy never aborted on fast links. | Partial kept; u128 cross-multiplication; offset taken from `grant.offset` (`27d1135`). | `remote.rs::a_busy_answer_keeps_a_valid_partial` |
-| P08-C8 | medium | Rule-one waste on the transfer path: triple writes, double reads, re-hash on the reader thread, and prefix-hash amplification. | Stalled connections; a worker could force 64 GiB hashes. | Incremental hashing in `push`, one reused buffer, resume proven only up to 1 GiB (`27d1135`). The rest is **deferred to B04**. | `remote.rs::uploads_verify_as_they_land_and_serves_resume_only_proven_prefixes` |
+| P08-C8 | medium | Rule-one waste on the transfer path: triple writes, double reads, re-hash on the reader thread, and prefix-hash amplification. | Stalled connections; a worker could force 64 GiB hashes. | Incremental hashing in `push`, one reused buffer, resume proven only up to 1 GiB (`27d1135`). The rest was deferred to B04 and is **closed** by the B04 follow-up: hydration is staged in place (written once), and a protocol-9 offer states its digest at the end (read once). | `remote.rs::uploads_verify_as_they_land_and_serves_resume_only_proven_prefixes`, `a_foreign_head_stops_the_transfer_before_its_payload`, `an_offer_to_a_protocol_9_controller_states_its_digest_at_the_end`, `the_store_takes_a_digest_at_the_end_only_when_the_bytes_prove_it`; `session::tests::a_borrowed_cache_push_encodes_exactly_like_the_owned_message` |
 | P08-C9 | low | The worker's cache answer channel was unbounded. | Unbounded memory if disk fell behind. | `sync_channel(64)` with `try_send`: a full queue abandons that transfer (`27d1135`). | Covered by `remote_cache.rs` |
 
 Evidence corrections (`6759536`, `133afca`, `fbf72cb`):
@@ -356,9 +356,9 @@ These came from merging the seven branches and from the flakes seen in their ver
 | Item | To | Reason |
 |---|---|---|
 | P07-12: tenant-scoped private-registry authorization, and the `image exists` fast path serving any tenant | **S05** | Needs per-tenant registry credentials, which arrive with per-attempt secret delivery. Registry authority stays worker-wide, and [executor](executor.md) says so. The S05 text is being extended to name this. |
-| K05 bounded image prefetch (P07-12) | **B04** | A K05 requirement that was never implemented. An offer carries only the image digest; the name arrives with the spec after the ack, and preparation already starts the pull then (`eee35e9`). A prefetch belongs to the measured image fast-path work. The B04 text is being extended. |
-| P07-20: mirror materialization copies the whole object store on non-reflink filesystems | **B04** | A performance item that needs before/after measurement on ext4 or overlay. It is bounded by `MAX_OBJECT_FILES`. With manual runs out of mirrors (P07-17), the exposure it widened is closed. |
-| P08-C8 remainder: hydration writes each byte three times, the offer reads the payload twice, and the bundle digest is not stored with the generation | **B04** | Throughput work on a transfer already bounded to at most 5 s per job. |
+| K05 bounded image prefetch (P07-12) | **B04 — closed** | A K05 requirement that was never implemented. An offer carries only the image digest; the name arrives with the spec after the ack, and preparation already starts the pull then (`eee35e9`). A prefetch belongs to the measured image fast-path work. **Closed** by the [B04 follow-up](#b04-follow-up-image-prefetch-and-transfer-copies): controller hints over protocol 9, bounded worker prefetch. |
+| P07-20: mirror materialization copies the whole object store on non-reflink filesystems | **B04 — closed** | A performance item that needs before/after measurement on ext4 or overlay. It is bounded by `MAX_OBJECT_FILES`. With manual runs out of mirrors (P07-17), the exposure it widened is closed. **Closed** by the B04 follow-up, measured. |
+| P08-C8 remainder: hydration writes each byte three times, the offer reads the payload twice, and the bundle digest is not stored with the generation | **B04 — closed** | Throughput work on a transfer already bounded to at most 5 s per job. **Closed** by the B04 follow-up, measured. The digest is not stored with the generation: a protocol-9 offer needs no digest before its bytes, so there is nothing to store; an older controller still gets the up-front hash. |
 | Worker-side spool free-space admission (noted against D06) | **R01** | D06 covers the controller's disk admission. The worker's spool is capped per attempt and a failed write is a declared gap, so the bound holds; admission by free space is retention/operations work. |
 | Tailcat node-key rotation (noted against Q06) | **R04** | Not in Q06's text; plan §5 asks for rotatable identities. Key rotation sits with the key-material operations in R04. |
 
@@ -378,6 +378,30 @@ Items fixed without an automated regression test, with the fix report's reason:
 - **P08-12:** docs only.
 - **P08-14:** no before/after behavior to assert.
 - **W09 duplicate offers on the real executor:** needs Podman-backed `Executor::start`. Link-level dedup is covered by `duplicate.rs`.
+
+## B04 follow-up: image prefetch and transfer copies
+
+The three items deferred to B04 are closed on branch `close-prefetch` (from `fca2d1e`), each measured before and after on the development host (WSL2 figures are reference only). Raw records: [`bench/b04-transfer-copies.jsonl`](../bench/b04-transfer-copies.jsonl).
+
+| Item | Change | Before | After |
+|---|---|---|---|
+| K05 bounded prefetch (P07-12) | Protocol 9 `Prefetch` hints from `dispatch::prefetch_hints` (pool access, architecture, labels, capacity, drain, not warm; at most 4 per worker, 2 workers per image, idle or underused workers only); migration 36 `jobs.image_name`; the worker's `prefetch::Prefetcher` pulls through the `Images` single-flight slot within one pull at a time, attempts first, 4 GiB per 10 minutes, a disk reserve on podman's graph root and the pull timeout, and kills a stale pull unless an attempt joined it; a stored profile wakes placement. [Executor](executor.md#the-image-pull-k05), [worker link](worker-link.md#image-prefetch-hints-protocol-9-k05). | A job a locality hold kept from an idle cold worker: offered after 30,020 / 30,027 / 30,018 ms (the hold's bound). An attempt's pull of `python:3.12-slim` (123 MB): 2,389 / 2,247 / 2,273 ms. | The same job: 5,148 / 5,042 / 5,222 ms (a fake 300 ms pull; the rest is the next heartbeat's profile refresh). The attempt's pull after a background prefetch (2.4–2.5 s): 48 / 29 / 52 ms. |
+| P07-20 | A store over 48 MiB is materialized by a depth-1 fetch of the pinned commit out of the mirror; smaller stores are still copied (measured faster there). The reflink probe opened its source write-only, which `FICLONE` refuses, so mirrors never reflinked even on XFS or Btrfs; fixed. [Mirrors](mirrors.md#private-materialization). | 262 MiB store, 8 MiB tree, ext4: 262 MiB written into each job; materialization plus `syncfs` 337–725 ms. 76 MiB store: 493 ms. | 8.5 MiB written; 142–157 ms. 76 MiB store: 145 ms. XFS reflink: 78.5 ms. |
+| P08-C8 remainder | Hydration is demultiplexed into the staging generation as it arrives (written once, the head checked before any payload lands, each file verified as it completes, resumable from the staged files); a protocol-9 offer names `DIGEST_AT_END` and states its digest in `CachePushEnd`, read once and hashed on the way out; pushes are encoded from the read buffer. [Cache](cache.md#remote-hydration-q08). | 256 MiB, ext4, byte-copy view: hydration read the payload 2× and wrote it 3×, 495.6 ms median (+`syncfs` 1,778 ms). Offer read it 2×, 216.6 ms median. | Hydration 1 read, 2 writes, 367 and 430 ms medians over two series (+`syncfs` 1,229 and 792 ms). Offer 1 read, 156.7 ms median. XFS reflink hydration: 2 writes → 1, 802 → 741 ms median. |
+
+Protocol and schema: the worker protocol maximum is now **9** (`Prefetch`, and the digest-at-end meaning of an all-zero `Upload::digest`), and the metadata schema is at migration **36**; older peers are served as before ([compatibility](compatibility.md)).
+
+Verification on the final tree, run one at a time:
+
+| Where | Command | Exit | Result |
+|---|---|---|---|
+| Windows | `cargo fmt-check` | 0 | clean |
+| Windows | `cargo lint` | 0 | no warnings |
+| Windows | `cargo test-cli --no-fail-fast` | 0 | 131 binaries: 870 passed, 0 failed, 4 ignored |
+| WSL2 | `cargo lint-linux` | 0 | no warnings |
+| WSL2 | `cargo test-linux --no-fail-fast` | 0 | 131 binaries: 1,040 passed, 0 failed, 15 ignored (the measurements `mirror_cost`, `remote_cost`, `prefetch_placement_latency` and `prefetch_saves_the_attempt_pull` among them). An earlier attempt failed to build (out of memory beside another agent's build); the next ran with one failure, `priority::stalled_bulk_never_holds_up_the_control_beat` (the flood completed within its 2 s window), which then passed 8 of 8 alone and 36 of 36 in six parallel lanes; the run above is the one after it |
+| WSL2, rootless Podman 4.9.3 as `sentinelbench` | the Podman-gated worker suites: `podman` 2, `end_to_end` 1, `compiler_cache` 1, `k09` 3, `slice` 1, `images` 2, `prefetch` 2 (real pulls from Docker Hub: a hinted image prefetched and found held; a stale `python:3.12-slim` pull killed about 0.5 s after the hint) | 0 | 12 passed, 0 failed |
+| WSL2 | stress: `sentinel-worker` `prefetch::tests` in 6 lanes × 5; `sentinel-link` `tests/prefetch.rs` in 4 lanes × 5 | 0 | 30 of 30; 20 of 20 |
 
 ## Task verdict changes
 
@@ -417,13 +441,13 @@ The audits marked these tasks Partial or Missing. Each one is met now, with the 
 | Q05 | Partial | P08-11. Mid-flight revocation is reconciled in the pass (P08-7). The cache docs about the control fallback were corrected. |
 | Q06 | Partial | P08-T1, P08-T5. DERP and self-hosted relay docs (`fbf72cb`). Key rotation (a plan item, not in Q06's text) moved to R04. |
 | Q07 | Partial | P08-T2, P08-T3, P08-T6; throughput counts the bulk connection (`529d4a7`) |
-| Q08 | Partial | P08-C1 to P08-C9; part of C8 is deferred to B04 as a performance item. |
+| Q08 | Partial | P08-C1 to P08-C9; part of C8 was deferred to B04 as a performance item and is now closed by the B04 follow-up. |
 | Q09 | Partial | Load run rewritten to hold capacity and recorded in `bench/`; noisy-tenant fairness observable; P08-9 |
 | O05 | Partial | P09-11, P09-12, P09-13 |
 
 Not met, stated plainly:
 
-- **K05 was Partial and is closed only by moving scope.** Bounded prefetch was never implemented; an offer carries only the digest and the reference arrives with the spec after the acknowledgement, when preparation already starts the pull. The requirement moved to B04 and tenant-scoped private-image authorization to S05; the K05 item text says so. The single-flight pulls and the pull/checkout overlap are met.
+- **K05 was Partial and is closed only by moving scope.** Bounded prefetch was never implemented; an offer carries only the digest and the reference arrives with the spec after the acknowledgement, when preparation already starts the pull. The requirement moved to B04 and tenant-scoped private-image authorization to S05; the K05 item text says so. The single-flight pulls and the pull/checkout overlap are met. **Since closed:** the B04 follow-up implements the bounded prefetch; only tenant-scoped registry authorization remains, with S05.
 - **O07 remains Blocked by: no macOS hardware or Apple toolchain.** The macOS Keychain in O04 is also unverified. Nothing in this audit changes that.
 - **P04-28's power-loss boundary is implemented but unverified.** Blocked by: a fault-injecting filesystem.
 
