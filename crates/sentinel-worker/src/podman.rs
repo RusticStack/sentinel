@@ -105,6 +105,40 @@ pub fn probe() -> Result<Runtime> {
     })
 }
 
+/// Where the image store keeps its layers (`GraphRoot`): the filesystem a
+/// prefetch's disk reserve is measured on.
+pub fn graph_root() -> Result<std::path::PathBuf> {
+    let mut cmd = podman();
+    cmd.args(["info", "--format", "{{.Store.GraphRoot}}"]);
+    let output = process::run(cmd, deadline(Duration::from_secs(30)), "podman info")?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let root = text.trim();
+    if !output.success() || root.is_empty() {
+        return Err(Error::Runtime(format!(
+            "podman info: {}",
+            output.stderr_excerpt()
+        )));
+    }
+    Ok(std::path::PathBuf::from(root))
+}
+
+/// Bytes `image` takes in the local store (`podman image inspect`'s
+/// `Size`), `None` when it is not there or cannot be read.
+pub fn image_bytes(image: &str) -> Option<u64> {
+    let mut cmd = podman();
+    cmd.args(["image", "inspect", "--format", "{{.Size}}", "--", image]);
+    let output = process::run(
+        cmd,
+        deadline(Duration::from_secs(30)),
+        "podman image inspect",
+    )
+    .ok()?;
+    if !output.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
 /// Make `image` (a `name@sha256:…` reference) available locally.
 /// `Ok(true)` means the store already held it — the `image exists` fast
 /// path, nothing downloaded — and `Ok(false)` means `podman pull` fetched

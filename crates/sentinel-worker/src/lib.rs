@@ -27,6 +27,8 @@ pub mod logpipe;
 #[cfg(target_os = "linux")]
 pub mod podman;
 #[cfg(target_os = "linux")]
+pub mod prefetch;
+#[cfg(target_os = "linux")]
 mod process;
 #[cfg(target_os = "linux")]
 pub mod recovery;

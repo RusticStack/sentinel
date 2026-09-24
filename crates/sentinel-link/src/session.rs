@@ -54,7 +54,8 @@ use sentinel_protocol::{
     },
     logs::{Frame, MAX_GAPS, Stream},
     negotiate::{
-        CACHE_CANCEL_MIN, DIGEST_AT_END_MIN, Hello, Negotiated, PROFILE_MIN, Profile, Rejected,
+        CACHE_CANCEL_MIN, DIGEST_AT_END_MIN, Hello, MAX_PREFETCH_IMAGES,
+        MAX_PREFETCH_REFERENCE_BYTES, Negotiated, PREFETCH_MIN, PROFILE_MIN, Profile, Rejected,
     },
     summary::MAX_SUMMARY_BYTES,
 };
@@ -494,6 +495,16 @@ pub enum ServerMessage {
     /// Protocol 7 (Q08). The transfer is refused; `code` is the cache
     /// owner's stable refusal code.
     CacheRefused(Refused),
+    /// Protocol 9 (K05). The image references (`name@sha256:…`) this
+    /// worker should pull ahead of an offer: ready jobs it could be placed
+    /// but does not hold warm. The whole wanted set, replacing the last one
+    /// — a reference that is gone from it is stale and its prefetch stops.
+    /// At most `MAX_PREFETCH_IMAGES`; sent on the control connection, and
+    /// only when the set changed. Appended last: postcard encodes variants
+    /// positionally.
+    Prefetch {
+        images: Vec<String>,
+    },
 }
 
 /// What the controller did with a log frame.
@@ -2596,6 +2607,22 @@ pub fn offer(sender: &Sender, offer: &Offer) -> Result<()> {
     sender.send(&ServerMessage::Offer(offer.to_wire()))
 }
 
+/// Push a prefetch hint (protocol 9) to a session: the whole wanted set of
+/// image references. Refused before anything is sent when it is over the
+/// wire bounds, so a caller can never make a worker drop the session.
+pub fn prefetch(sender: &Sender, images: &[String]) -> Result<()> {
+    if images.len() > MAX_PREFETCH_IMAGES
+        || images
+            .iter()
+            .any(|image| image.is_empty() || image.len() > MAX_PREFETCH_REFERENCE_BYTES)
+    {
+        return Err(Error::Protocol("prefetch hint"));
+    }
+    sender.send(&ServerMessage::Prefetch {
+        images: images.to_vec(),
+    })
+}
+
 /// The worker's end of a session.
 pub struct Link {
     rx: Receiver,
@@ -2721,7 +2748,8 @@ pub fn connect(
         | ServerMessage::CacheGrant(_)
         | ServerMessage::CacheChunk(_)
         | ServerMessage::CacheEnd(_)
-        | ServerMessage::CacheRefused(_) => Err(Error::Protocol("message before welcome")),
+        | ServerMessage::CacheRefused(_)
+        | ServerMessage::Prefetch { .. } => Err(Error::Protocol("message before welcome")),
     }
 }
 
@@ -3006,6 +3034,13 @@ pub trait Executor: Send + Sync {
     fn availability(&self) -> Option<(u64, sentinel_protocol::negotiate::Availability)> {
         None
     }
+    /// K05 (protocol 9): the controller's current prefetch hint — image
+    /// references (`name@sha256:…`) of queued work this worker could be
+    /// placed. The whole wanted set: it replaces the previous one, and a
+    /// prefetch of a reference no longer in it is stale. Bounded by the
+    /// session (`MAX_PREFETCH_IMAGES`); the executor still validates each
+    /// reference and pulls within its own bounds. The default ignores it.
+    fn prefetch(&self, _images: &[String]) {}
 }
 
 impl Link {
@@ -3219,6 +3254,23 @@ impl Link {
                 }
                 Ok(false)
             }
+            ServerMessage::Prefetch { images } => {
+                // Only a protocol-9 session agreed to hints, and a hint is
+                // bounded like every wire list: over a bound is a
+                // violation, never a truncation.
+                if self.negotiated.protocol.0 < PREFETCH_MIN.0 {
+                    return Err(Error::Protocol("prefetch needs protocol 9"));
+                }
+                if images.len() > MAX_PREFETCH_IMAGES
+                    || images
+                        .iter()
+                        .any(|image| image.is_empty() || image.len() > MAX_PREFETCH_REFERENCE_BYTES)
+                {
+                    return Err(Error::Protocol("prefetch hint"));
+                }
+                executor.prefetch(&images);
+                Ok(false)
+            }
             ServerMessage::Welcome { .. } | ServerMessage::Reject(_) => {
                 Err(Error::Protocol("unexpected message"))
             }
@@ -3394,7 +3446,8 @@ fn handle_bulk_message(
         ServerMessage::Welcome { .. }
         | ServerMessage::Reject(_)
         | ServerMessage::Pong { .. }
-        | ServerMessage::Offer(_) => return Err(Error::Protocol("control message on bulk")),
+        | ServerMessage::Offer(_)
+        | ServerMessage::Prefetch { .. } => return Err(Error::Protocol("control message on bulk")),
     }
     Ok(())
 }

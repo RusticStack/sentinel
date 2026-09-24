@@ -188,6 +188,32 @@ from protocol 8, sends a later `Profile` whenever that record's version
 moves (checked once per heartbeat). A protocol-7 controller accepts one
 profile per session; a protocol-8 one treats a later one as a refresh.
 
+## Image prefetch hints (protocol 9, K05)
+
+An offer carries only the image digest, so a worker cannot start a pull
+before it is placed. From protocol 9 the controller hints instead:
+`Prefetch { images }` on the control connection names the image references
+(`name@sha256:…`, at most `MAX_PREFETCH_IMAGES` = 8 of at most 512 bytes;
+the controller sends at most 4) the worker should pull ahead of an offer. It
+is the whole wanted set and replaces the last one; a reference that left it
+is stale and its prefetch stops. The controller computes it after each
+dispatch pass, at most every `PREFETCH_INTERVAL` (500 ms), with one store
+read (`dispatch::prefetch_hints`, see [executor](executor.md#the-image-pull-k05)
+for the eligibility rules), and sends it to a session only when its set
+changed; a new session always gets the current set, empty or not. Counted
+in `Stats::prefetch_hints`.
+
+- A worker on protocol 8 or older is never hinted: its session negotiated
+  no such message. A worker refuses a `Prefetch` below protocol 9, or one
+  over the bounds, as a protocol violation, and a `Prefetch` on the bulk
+  connection is a control-class message there.
+- The worker reports what it prefetched the same way as any pull: the held
+  set grows, the next profile refresh (checked once per heartbeat) carries
+  it, and a stored profile now wakes the dispatcher, so a worker that just
+  became warm is placed at once rather than at the next reconciliation.
+- `Executor::prefetch(&[String])` is the executor's side, a no-op by
+  default.
+
 ## Dispatch (W02)
 
 **The ready queue is the database.** A job is queued when its row says so (`jobs_ready`, the partial index on `(priority, created_seq) WHERE state_code = 1`); nothing in memory has to be rebuilt after a restart. Its resource needs (`cpu_millis`, `memory_bytes`) are copied from the compiled spec at run creation so placement never decodes a spec blob.
@@ -231,6 +257,8 @@ Lease expiry, cancellation and timeouts are in [cancellation](cancellation.md): 
 `crates/sentinel-link/tests/link.rs`, against a running `Controller` over loopback TLS: the W01 refusals as before, plus — a run enqueued while a worker is connected has both ready jobs offered within half the reconciliation interval, acknowledged and reserved, the blocked job withheld; completion queues the dependent and the wake places it; the lease deadline the worker sees moves with its beats; a decline lapses and is re-offered under fence 2 at the next reconciliation; an offer left unread lapses after the ack timeout and the late acknowledgement is stale while the fresh one lands; a worker whose controller stops reconnects with back-off to the restarted controller under the same pin, presenting no enrollment the second time; stopping a worker closes its session without waiting for a beat.
 
 `crates/sentinel-link/tests/hardening.rs` (Part 04 audit): a worker refused `Unavailable` twice backs off and connects on the third hello while any other rejection stays final; a welcome outside the hello's range is refused; a transient log fault closes the connection and is never answered `LogRefused`; an idle bulk connection outlives the heartbeat deadline and ends with its session; a worker enrolled at protocol 6 is welcomed at 7 when it offers 7 (recorded, and its profile's disk reaches placement) and at 5 when rolled back; with the pre-admission cap full a new connection is shed, a dripping handshake is cut at its absolute deadline, and an enrolled worker is then admitted. Controller unit tests drive a burst of twenty spec requests through the eight-resolver desk (all served in order, none refused, duplicates and per-worker overflow held back); session unit tests prove a borrowed log frame encodes byte-for-byte like the owned message and that a peer which never reads fails a sender within its write timeout. `crates/sentinel-store/tests/execution.rs` covers the store edges: cancel decides dependents, a cancel recorded while offered settles on lapse or decline, decline is fenced and hands back an acknowledged, unstarted attempt to the queue, specs wait for the acknowledgement, expiry re-checks the lease, a worker `canceled` without a request is recorded as a runtime failure, renegotiation is recorded, and a refused enrollment is audited.
+
+`crates/sentinel-link/tests/prefetch.rs` (K05): a protocol-9 worker that a locality hold passes over is hinted the held job's image (`alpine@sha256:…`), "pulls" it, reports it warm and is offered the job within half the hold (5.0–5.2 s in the ignored `prefetch_placement_latency` measurement, against 30.0 s for a protocol-8 worker, which is never hinted — the second test). `crates/sentinel-store/tests/fleet.rs` covers the hint's eligibility (pool access, architecture, labels, capacity, drain, a full worker) and its bounds, and the placement it pays for; `dispatch::tests::placement_statements_plan_their_indexes` pins its statement to `jobs_queued_since`.
 
 `crates/sentinel-link/tests/priority.rs` proves the protocol-7 split's one guarantee: with the bulk connection connected but stalled (its peer never reads, so the worker's bulk writes block on TCP backpressure), the next control beat still gets its `Pong` within the deadline, and the stalled bulk traffic then completes once the peer drains. It also proves the fallback: a bulk message on the control connection is served, not rejected. `a_failing_bulk_redial_never_delays_the_control_teardown` fails the bulk redials until the back-off is 4 s and closes the control connection: the session returns within 1.5 s (before the fix it waited out the sleep, 3.7 s in the failing run).
 

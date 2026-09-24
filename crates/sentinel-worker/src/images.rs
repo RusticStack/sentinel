@@ -99,6 +99,9 @@ struct State {
     /// Moves every time `held` gains a digest: the placement feed resends
     /// only when it changed.
     version: u64,
+    /// References in `pulling` whose leader is a prefetch (K05), not an
+    /// attempt: a prefetch yields to attempts' own pulls.
+    prefetching: HashSet<String>,
 }
 
 struct Inner {
@@ -134,6 +137,7 @@ impl Images {
                     held: HashSet::new(),
                     order: VecDeque::new(),
                     version: 0,
+                    prefetching: HashSet::new(),
                 }),
                 download: Arc::new(download),
             }),
@@ -170,22 +174,7 @@ impl Images {
             }
         };
         if leader {
-            let outcome = (self.inner.download)(image, timeout, cancel);
-            if outcome.is_ok() {
-                self.record(image);
-            }
-            // A pull killed because this attempt was cancelled says nothing
-            // about the image: followers are told to pull for themselves.
-            let shared = match &outcome {
-                Err(_) if cancel.load(Ordering::Acquire) => Err(Shared::Abandoned),
-                other => other.as_ref().copied().map_err(Shared::of),
-            };
-            // Publish before the slot leaves the map: a caller between the
-            // two still follows this pull rather than leading a second one.
-            *slot.result.lock().unwrap_or_else(|p| p.into_inner()) = Some(shared);
-            slot.done.notify_all();
-            self.state().pulling.remove(image);
-            return outcome;
+            return self.lead(image, &slot, timeout, cancel);
         }
         slot.waiters.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + timeout;
@@ -230,6 +219,76 @@ impl Images {
                 .unwrap_or_else(|p| p.into_inner());
             result = guard;
         }
+    }
+
+    /// Run the download for `slot` and publish its outcome to every
+    /// follower, then retire the slot.
+    fn lead(&self, image: &str, slot: &Pull, timeout: Duration, cancel: &Cancel) -> Result<bool> {
+        let outcome = (self.inner.download)(image, timeout, cancel);
+        if outcome.is_ok() {
+            self.record(image);
+        }
+        // A pull killed because its leader was cancelled says nothing about
+        // the image: followers are told to pull for themselves.
+        let shared = match &outcome {
+            Err(_) if cancel.load(Ordering::Acquire) => Err(Shared::Abandoned),
+            other => other.as_ref().copied().map_err(Shared::of),
+        };
+        // Publish before the slot leaves the map: a caller between the
+        // two still follows this pull rather than leading a second one.
+        *slot.result.lock().unwrap_or_else(|p| p.into_inner()) = Some(shared);
+        slot.done.notify_all();
+        let mut state = self.state();
+        state.pulling.remove(image);
+        state.prefetching.remove(image);
+        outcome
+    }
+
+    /// K05: lead a pull of `image` ahead of any attempt needing it, or do
+    /// nothing (`None`) when the store is known to hold its digest or a
+    /// pull of it is already in flight. An attempt that then needs the
+    /// image follows this pull like any other and shares its download;
+    /// `cancel` kills it — the prefetcher sets it only for a stale hint
+    /// with no follower, and a follower of a cancelled prefetch pulls for
+    /// itself. `image` must be a `name@sha256:…` reference.
+    pub fn prefetch(
+        &self,
+        image: &str,
+        timeout: Duration,
+        cancel: &Cancel,
+    ) -> Option<Result<bool>> {
+        let slot = {
+            let mut state = self.state();
+            let digest = image.split_once('@')?.1;
+            if state.held.contains(digest) || state.pulling.contains_key(image) {
+                return None;
+            }
+            let slot = Arc::new(Pull::default());
+            state.pulling.insert(image.to_owned(), Arc::clone(&slot));
+            state.prefetching.insert(image.to_owned());
+            slot
+        };
+        Some(self.lead(image, &slot, timeout, cancel))
+    }
+
+    /// Pulls in flight that an attempt leads — what a prefetch yields to.
+    pub fn attempt_pulls(&self) -> usize {
+        let state = self.state();
+        state
+            .pulling
+            .keys()
+            .filter(|image| !state.prefetching.contains(*image))
+            .count()
+    }
+
+    /// Attempts parked on `image`'s in-flight pull: a prefetch with a
+    /// follower is no longer only a guess, and is never cancelled as
+    /// stale.
+    pub fn followers(&self, image: &str) -> usize {
+        self.state()
+            .pulling
+            .get(image)
+            .map_or(0, |slot| slot.waiters.load(Ordering::Relaxed))
     }
 
     /// Whether `digest` — the `sha256:…` half of a pulled reference — is

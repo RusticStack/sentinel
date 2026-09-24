@@ -892,6 +892,201 @@ fn locality_hold(view: &[LocalityWorker], exclude: WorkerId, pick: &Pick, now: U
     })
 }
 
+// ——— bounded image prefetch (K05, B04) ———————————————————————————
+
+/// Image references one worker is hinted at most.
+pub const MAX_PREFETCH_HINTS: usize = 4;
+/// Workers one image is hinted to per pass: the likeliest next hosts of the
+/// job, not the whole fleet — a burst of one image never becomes a
+/// fleet-wide pull.
+pub const PREFETCH_FANOUT: usize = 2;
+/// Ready jobs a pass reads, longest-waiting first. Hints are best effort:
+/// work past them is hinted once it gets there.
+pub const PREFETCH_SCAN: usize = 256;
+
+/// Whether `name` — the repository part of a job's image reference — may
+/// travel in a hint: 1–255 bytes of the OCI reference charset. Anything
+/// else is never hinted (the job still pulls it itself when it runs).
+pub fn prefetch_name(name: &str) -> bool {
+    (1..=255).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b':'))
+        && !name.starts_with(['/', '-', ':', '.'])
+}
+
+/// A ready job as a prefetch pass sees it.
+struct PrefetchJob {
+    tenant: TenantId,
+    reference: String,
+    key: [u8; IMAGE_KEY_BYTES],
+    arch: Option<String>,
+    labels: Vec<u8>,
+    cpu_millis: i64,
+    memory_bytes: i64,
+    disk_bytes: i64,
+}
+
+/// The longest-waiting ready jobs, at most [`PREFETCH_SCAN`] read off the
+/// `jobs_queued_since` partial index — never a scan or a sort of the queue.
+const PREFETCH_HEAD_SQL: &str = "SELECT j.tenant_id, j.image_name, j.image_digest, j.arch,
+            j.labels, j.cpu_millis, j.memory_bytes, j.disk_bytes, j.priority, j.queued_ms,
+            j.created_seq
+     FROM (SELECT id FROM jobs INDEXED BY jobs_queued_since WHERE state_code = 1
+           ORDER BY queued_ms LIMIT ?1) h
+     JOIN jobs j ON j.id = h.id
+     WHERE j.cancel_requested = 0 AND j.image_name IS NOT NULL
+       AND j.image_digest IS NOT NULL AND j.image_platform IS NOT NULL";
+
+/// [`PREFETCH_HEAD_SQL`]'s rows with a hintable image, in the fair order's
+/// priority-then-age sequence (sorted here: at most [`PREFETCH_SCAN`]).
+fn prefetch_head(conn: &Connection) -> Result<Vec<PrefetchJob>> {
+    let mut stmt = conn.prepare_cached(PREFETCH_HEAD_SQL)?;
+    let rows = stmt.query_map([PREFETCH_SCAN as i64], |r| {
+        Ok((
+            r.get::<_, [u8; 16]>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Vec<u8>>(4)?,
+            (
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+            ),
+            (
+                r.get::<_, i64>(8)?,
+                r.get::<_, i64>(9)?,
+                r.get::<_, i64>(10)?,
+            ),
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (tenant, name, digest, arch, labels, (cpu_millis, memory_bytes, disk_bytes), order) =
+            row?;
+        let Some(key) = image_key(&digest) else {
+            continue;
+        };
+        if !prefetch_name(&name) {
+            continue;
+        }
+        out.push((
+            order,
+            PrefetchJob {
+                tenant: TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?,
+                reference: format!("{name}@{digest}"),
+                key,
+                arch,
+                labels,
+                cpu_millis,
+                memory_bytes,
+                disk_bytes,
+            },
+        ));
+    }
+    out.sort_unstable_by_key(|(order, _)| *order);
+    Ok(out.into_iter().map(|(_, job)| job).collect())
+}
+
+/// A07's pool access, asked once per (tenant, pool) a pass meets.
+fn pool_admits(conn: &Connection, tenant: TenantId, pool: PoolId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM tenants t
+               JOIN pools p ON p.id = ?2 AND p.active = 1
+               LEFT JOIN pool_grants g ON g.pool_id = p.id AND g.tenant_id = t.id
+               WHERE t.id = ?1 AND t.active = 1
+                 AND (p.owner_tenant_id = t.id OR g.tenant_id IS NOT NULL))",
+        )?
+        .query_row(params![tenant.as_bytes(), pool.as_bytes()], |r| r.get(0))?)
+}
+
+/// What each of `workers` should prefetch now (K05): image references of
+/// ready jobs at the head of the queue that it could run and does not hold
+/// warm, at most [`MAX_PREFETCH_HINTS`] per worker and [`PREFETCH_FANOUT`]
+/// workers per image. Every worker named gets an entry — an empty one means
+/// "nothing": a hint set replaces the last, so stale prefetches stop.
+///
+/// Only an idle or underused worker is hinted: one whose held attempts take
+/// less than its reported CPU. The job must be one the worker could be
+/// placed: its tenant may use the worker's pool (A07: tenant active, pool
+/// active, owner or granted), and its architecture, labels, CPU, memory and
+/// disk fit the worker's reported capacity — so a worker is only ever told
+/// to pull what it would pull anyway for an eligible job, under the same
+/// worker-wide registry authority (tenant-scoped registry credentials are
+/// S05). A draining or revoked worker gets nothing. Within a pool, the
+/// most idle workers are hinted first: they are the likeliest next hosts.
+///
+/// Reads only: the head of `jobs_ready` (bounded by [`PREFETCH_SCAN`]), one
+/// grouped read of held CPU, one point read per worker and one access probe
+/// per (tenant, pool) met.
+pub fn prefetch_hints(
+    conn: &Connection,
+    workers: &[WorkerId],
+) -> Result<Vec<(WorkerId, Vec<String>)>> {
+    let mut out: Vec<(WorkerId, Vec<String>)> = workers.iter().map(|w| (*w, Vec::new())).collect();
+    if workers.is_empty() || !any_ready(conn)? {
+        return Ok(out);
+    }
+    let held = held_by_worker(conn)?;
+    // (index into `out`, facts, free CPU) of every worker a hint may reach.
+    let mut eligible: Vec<(usize, WorkerFacts, i64)> = Vec::new();
+    for (index, worker) in workers.iter().enumerate() {
+        let Some((_, facts)) = worker_facts(conn, *worker)? else {
+            continue;
+        };
+        let free = facts.cpu_millis - held.get(worker).copied().unwrap_or(0);
+        if facts.draining || free <= 0 {
+            continue;
+        }
+        eligible.push((index, facts, free));
+    }
+    if eligible.is_empty() {
+        return Ok(out);
+    }
+    // Most idle first; the id keeps the order stable between passes, so an
+    // unchanged queue yields an unchanged hint set.
+    eligible.sort_by(|a, b| b.2.cmp(&a.2).then(workers[a.0].cmp(&workers[b.0])));
+    let head = prefetch_head(conn)?;
+    let mut access: HashMap<(TenantId, PoolId), bool> = HashMap::new();
+    let mut hinted: HashMap<&str, usize> = HashMap::new();
+    for job in &head {
+        let count = hinted.entry(job.reference.as_str()).or_insert(0);
+        for (index, facts, _) in &eligible {
+            if *count >= PREFETCH_FANOUT {
+                break;
+            }
+            let hints = &mut out[*index].1;
+            if hints.len() >= MAX_PREFETCH_HINTS
+                || hints.contains(&job.reference)
+                || caches_image(&facts.avail_images, &job.key)
+                || job.arch.as_deref().is_some_and(|arch| arch != facts.arch)
+                || !labels_subset(&job.labels, &facts.labels)
+                || job.cpu_millis > facts.cpu_millis
+                || job.memory_bytes > facts.memory_bytes
+                || (job.disk_bytes > 0 && facts.disk_reported && job.disk_bytes > facts.disk_bytes)
+            {
+                continue;
+            }
+            let admits = match access.get(&(job.tenant, facts.pool)) {
+                Some(admits) => *admits,
+                None => {
+                    let admits = pool_admits(conn, job.tenant, facts.pool)?;
+                    access.insert((job.tenant, facts.pool), admits);
+                    admits
+                }
+            };
+            if !admits {
+                continue;
+            }
+            hints.push(job.reference.clone());
+            *count += 1;
+        }
+    }
+    Ok(out)
+}
+
 /// The locality views one placement has read, per tenant, and whether any
 /// worker reported an image at all (when none has, locality never holds and
 /// no view is read).
@@ -2985,6 +3180,7 @@ mod tests {
         ("blocked page", BLOCKED_PAGE_SQL, "jobs_waiting"),
         ("waiting count", WAITING_COUNT_SQL, "jobs_waiting"),
         ("group held", GROUP_HELD_SQL, "jobs_conc"),
+        ("prefetch head", PREFETCH_HEAD_SQL, "jobs_queued_since"),
     ];
 
     fn migrated() -> Connection {
@@ -3195,6 +3391,23 @@ mod tests {
             n
         };
         let t = tenant.as_bytes().to_vec();
+        // The prefetch head is a scan by design — of its partial index, in
+        // order, stopped by its bound: 2,000 ready jobs, `PREFETCH_SCAN`
+        // rows read, and no more index steps than that, never a sort.
+        {
+            let mut stmt = conn.prepare(PREFETCH_HEAD_SQL).unwrap();
+            let rows = stmt
+                .query_map([PREFETCH_SCAN as i64], |_| Ok(()))
+                .unwrap()
+                .count();
+            assert_eq!(rows, PREFETCH_SCAN);
+            let (steps, sorts) = (
+                stmt.get_status(StatementStatus::FullscanStep),
+                stmt.get_status(StatementStatus::Sort),
+            );
+            assert!(steps < PREFETCH_SCAN as i32, "prefetch head: {steps} steps");
+            assert_eq!(sorts, 0, "prefetch head sorts");
+        }
         assert_eq!(run("candidate page", CANDIDATES_SQL, page), PAGE);
         assert_eq!(run("pull-request page", PR_CANDIDATES_SQL, page), 0);
         assert_eq!(run("large-job probe", LARGE_WAITING_SQL, bounds), 0);
