@@ -574,7 +574,21 @@ Options that could not do better:
 - `SIGKILL`, `SIGTERM` and `SIGINT` all left a tunnelled connection open for more than 30 s. A graceful stop therefore tells the worker nothing.
 - Starting the new helper before stopping the old one does not help. The tunnelled stream lives in the old process, and the heartbeat deadline, not the new helper, sets the floor.
 
-Shortening that floor would mean changing the protocol's heartbeat constants, which this change does not do. The rule itself is also covered by the fake-helper test `sentinel-link/tests/tailcat.rs::a_lost_session_replaces_a_settled_helper_at_once_and_spares_a_young_one`. That test replaced `the_helper_is_replaced_only_after_consecutive_failed_sessions`, the `service.rs` unit test of the removed counter.
+Shortening that floor would mean changing the protocol's heartbeat constants, which this change does not do.
+
+**Addition-only changes cannot keep the old helper (checked, not implemented).** The idea: for a change that only adds keys, such as an enrollment, start a helper with the wider list and leave the old one serving until it idles or a key is removed. That needs one node key live in two helpers at once, and the pinned helper does not support it. The experiment was a scratch script using the real v0.6.0 helper on WSL2 with rootful Podman:
+
+- **Setup.** Helper A served the controller's key with `--allow=K1`. Worker 1 (key K1) ran in a container's network namespace. It held one TCP connection through the tunnel, echoed on it every second, and also opened a new connection every second. Helper B was then started with the **same** key and `--allow=K1,K2`; it printed the same address. Worker 2 (key K2, admitted only by B) connected in a second namespace. Both ran for 60 s.
+- **Direct paths possible.** Nothing failed in 60 s: 67 of 67 samples for worker 1 and 58 of 58 for worker 2, held and fresh connections alike. Direct UDP between the peers carried everything.
+- **Relay only** (UDP other than DNS dropped inside both worker namespaces; the relay is a supported deployment). Worker 1's held connection through A died 8.2–9.4 s after B started (last good sample, then first failed one). Worker 2's held connection through B died 29.4–31.2 s after it connected. Fresh connections from both workers then failed on and off for as long as both helpers ran. An earlier relay-only run behaved the same way: both held connections died and fresh connections failed on and off.
+- **Conclusion.** Two helpers holding one key break each other whenever the relay carries the traffic. A deployment that relies on relays would see an addition turn into an outage of unbounded length rather than one of about 20 s.
+
+Other routes checked:
+
+- **The rotation machinery.** It runs two helpers only because their keys differ. A second key means a second address, and every worker already connected would have to move to it.
+- **The helper's control inputs.** There is no allow-list file and no reload signal. The helper reads only `TAILCAT_DERPMAP_URL` and its key files.
+
+The outage on addition therefore stays at about 20 s per change, and the docs advise making changes in batches. The rule itself is also covered by the fake-helper test `sentinel-link/tests/tailcat.rs::a_lost_session_replaces_a_settled_helper_at_once_and_spares_a_young_one`. That test replaced `the_helper_is_replaced_only_after_consecutive_failed_sessions`, the `service.rs` unit test of the removed counter.
 
 **Browser launch smoke test** (O04/O07 recorded "Real browser launch not automated"). The commit is `test: launch the real browser opener against a harmless stand-in`, and production code is unchanged.
 
