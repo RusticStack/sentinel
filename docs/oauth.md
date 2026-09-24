@@ -313,7 +313,7 @@ Tests: `crates/sentinel-store/tests/oauth_device.rs` and `oauth_service.rs` (sto
 
 Known limits, deliberately not hidden:
 
-- **Signing in needs a local password or an existing session.** The consent and device pages embed only the password sign-in (`/api/v1/login`); GitHub web sign-in is not routed through them, so an account that exists only through GitHub cannot complete an OAuth login yet. Tracked as a follow-up in [TODO](../TODO.md).
+- **GitHub-only accounts sign in through GitHub (U07, closed).** With GitHub sign-in configured, the consent and device pages offer "Sign in with GitHub" beside the password form; the browser returns to the same page with its parameters intact, and the consent form token is minted from the new session ([GitHub sign-in](github-sign-in.md#browser-routes-u07)). A consent page shows such an account as "you", since it has no username. `oauth_e2e.rs::a_github_only_account_signs_the_cli_in_through_github` drives the whole CLI login this way.
 - **One profile, one machine.** Two machines sharing one profile's credential present the same refresh token twice, which is replay and revokes the grant; the lock only serializes processes that share one configuration directory. Separate configuration directories on one machine hold separate credentials (the OS-store key names the directory; [CLI](cli.md)).
 - **Narrowing granularity.** A grant narrows to at most one tenant and one repository (the `Principal` shape).
 - **Open consent pages end with the process.** The form key is per process, so a controller restart invalidates consent and device pages that are already open; reloading them works.

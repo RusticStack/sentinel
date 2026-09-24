@@ -66,11 +66,18 @@ The OAuth authorization server's endpoints are at the deployment's root, not und
 |---|---|---|
 | `GET /.well-known/oauth-authorization-server` | none | RFC 8414 metadata: the issuer, the endpoints below, grant types, `S256`, the scopes |
 | `GET /.well-known/oauth-protected-resource/api/v1` | none | RFC 9728: `resource` `{issuer}/api/v1`, its authorization server and scopes |
-| `GET, POST /oauth/authorize` | session cookie (else the embedded password sign-in) | authorization code + PKCE consent (O01); approve or deny → `303` to the loopback redirect with `code`/`error`, `state`, `iss` |
+| `GET, POST /oauth/authorize` | session cookie (else the embedded password sign-in, and "Sign in with GitHub" when configured) | authorization code + PKCE consent (O01); approve or deny → `303` to the loopback redirect with `code`/`error`, `state`, `iss` |
 | `POST /oauth/token` | public client (`client_id`) | `authorization_code`, `refresh_token` (rotation with a 60 s lost-response grace, replay revokes the grant) and `urn:ietf:params:oauth:grant-type:device_code` grants → `TokenResponse`; `cache-control: no-store` |
 | `POST /oauth/revoke` | public client | RFC 7009: either token kind revokes its whole grant; always `200` |
 | `POST /oauth/device_authorization` | public client | RFC 8628 device request → `{device_code, user_code, verification_uri, verification_uri_complete, expires_in, interval}`; `429 slow_down` at 1024 pending |
-| `GET, POST /device` | session cookie (else the embedded password sign-in) | enter a user code, then approve (narrowing scopes, tenant, repository) or deny; five wrong codes in ten minutes lock the account out of the page for the rest of the window |
+| `GET, POST /device` | session cookie (else the embedded password sign-in, and "Sign in with GitHub" when configured) | enter a user code, then approve (narrowing scopes, tenant, repository) or deny; five wrong codes in ten minutes lock the account out of the page for the rest of the window |
+
+GitHub web sign-in (U07), present only when `<data_dir>/github-sign-in.json` configures it ([configuration](configuration.md), [GitHub sign-in](github-sign-in.md#browser-routes-u07)); both answer HTML pages, never JSON:
+
+| Route | Auth | Does |
+|---|---|---|
+| `GET /auth/github/start?return_to=<path>` | none; per client burst 10, then one per 2 s (deployment 20/s) | `return_to` must be `/`, `/oauth/authorize?…` or `/device[?…]` (issuer-relative, URL-safe characters only, at most 2048 bytes; absent means `/`), else `400` with no state and no cookie. Records a single-use 10-minute state with that destination, sets `__Host-sentinel_signin` (`SameSite=Lax`, `HttpOnly`, `Secure`, `Path=/`, `Max-Age=600`) and answers `303` to GitHub with the client ID, the exact redirect URI `{issuer}/auth/github/callback`, the state and no scope. Over the limit `429` with `retry-after` |
+| `GET /auth/github/callback?code&state` | the sign-in cookie, equal to `state` | a missing, foreign or replayed state is `400` and spends nothing it does not own; a GitHub denial `403`; then the code exchange and `GET /user`, and the account linked to that immutable GitHub ID — `403` "no active Sentinel account" for an unlinked, pending, rejected or suspended one, with no session. Success issues the ordinary session cookie (a fresh secret; a session the browser already held is revoked), clears the sign-in cookie and answers a page that continues to the recorded destination with its parameters intact. At most one exchange runs at a time; a second is `503` with its state still pending, so a reload completes |
 
 The first page (`GET /`) is a single static document; it accepts a
 `#/runs/<run id>` fragment and opens that run, which is what a check's
@@ -100,7 +107,7 @@ Draining needs a platform-admin credential on the API; on the controller's own h
 
 ## The page
 
-`GET /` serves one document: sign in (password login through `/login`), list a repository's runs, open a run's jobs with cancel and rerun, follow an attempt's log. It stores the CSRF secret the login returned and sends it on every mutation. Its requests are relative to the path it was served at, so it also works mounted under a path-carrying `public_url`. No framework, no build step, no request the CLI could not make.
+`GET /` serves one document: sign in (password login through `/login`, or "Sign in with GitHub" when it is configured, which returns here), list a repository's runs, open a run's jobs with cancel and rerun, follow an attempt's log. It stores the CSRF secret the login returned (in `sessionStorage`; a GitHub sign-in's callback page puts it there) and sends it on every mutation. Its requests are relative to the path it was served at, so it also works mounted under a path-carrying `public_url`. No framework, no build step, no request the CLI could not make.
 
 ## What is not here yet
 
