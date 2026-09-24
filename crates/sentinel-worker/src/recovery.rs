@@ -60,11 +60,12 @@ fn marker_path(root: &Path, attempt: AttemptId) -> PathBuf {
     root.join(ATTEMPTS_DIR).join(attempt.to_string())
 }
 
-/// Record that this process holds `attempt` under `fence`. Synced: a
-/// marker that only reached the page cache can vanish with the process
-/// and leave a spool recovery would discard as already reported.
+/// Record that this process holds `attempt` under `fence`. Synced — the
+/// file and the directory entries leading to it: a marker lost to a power
+/// cut would leave a spool recovery discards as already reported.
 pub fn mark(root: &Path, attempt: AttemptId, fence: Fence) -> Result<()> {
-    fs::create_dir_all(root.join(ATTEMPTS_DIR))?;
+    let dir = root.join(ATTEMPTS_DIR);
+    fs::create_dir_all(&dir)?;
     let mut marker = OpenOptions::new()
         .write(true)
         .create(true)
@@ -72,6 +73,10 @@ pub fn mark(root: &Path, attempt: AttemptId, fence: Fence) -> Result<()> {
         .open(marker_path(root, attempt))?;
     marker.write_all(format!("{}\n", fence.0).as_bytes())?;
     marker.sync_data()?;
+    // The marker's entry, then `attempts` in the data directory: the second
+    // is a no-op commit once the directory exists durably.
+    crate::sync_dir(&dir)?;
+    crate::sync_dir(root)?;
     Ok(())
 }
 

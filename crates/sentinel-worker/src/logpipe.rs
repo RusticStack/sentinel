@@ -9,18 +9,23 @@
 //! from memory; only a backlog is read back. An acknowledgement moves the
 //! cursor; a lost session — or a lost bulk connection, which may have taken
 //! frames with it — rewinds the cursor to the last acknowledgement before
-//! anything else is sent. The spool is synced every `SYNC_EVERY` frames and
-//! at the end: a worker crash can lose at most that many unsynced frames,
-//! and only ones the controller never acknowledged (acknowledged sequences
-//! are never reused), so what the controller holds stays consistent.
+//! anything else is sent. The spool is synced every `SYNC_EVERY` writes and
+//! at the end: a power loss can take the unsynced ones, and an acknowledged
+//! sequence is never reused, so what the controller holds stays consistent.
+//! The end goes out once every stored frame is acknowledged — a refused
+//! tail is declared, never waited for — and only after the spool holds it
+//! durably, so a restart re-sends the same end. A spool the previous
+//! process left without an end ([`LogPipe::recover`]) was cut short by the
+//! crash, and its end declares the unknown tail as a gap.
 //!
 //! The pipe owns the attempt's redactor: values registered for this attempt
 //! apply to its output only, from the moment they are registered, and go
-//! with it.
+//! with it. It counts what the spool refused, by cause, for the worker's
+//! diagnostics; the log itself carries the gaps.
 
 use std::{
     path::Path,
-    sync::{Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
@@ -31,7 +36,12 @@ use sentinel_protocol::{
     logs::Stream,
 };
 
-use crate::{Result, attempt::Output, redact::Redactor, spool::Spool};
+use crate::{
+    Result,
+    attempt::Output,
+    redact::Redactor,
+    spool::{MAX_SPOOL_BYTES, Refused, Spool, SpoolSpace},
+};
 
 /// How long finalization waits for the controller to acknowledge and close
 /// the log before the attempt is reported as a publication failure.
@@ -61,6 +71,10 @@ struct PipeState {
     /// The step whose output came last: held-back bytes are attributed to
     /// it when they are released.
     last_step: Option<u32>,
+    /// A leftover spool without an end: its end declares the cut tail.
+    cut: bool,
+    /// Frames the spool refused, by cause.
+    refusals: Refused,
 }
 
 impl PipeState {
@@ -106,12 +120,23 @@ impl PipeState {
     fn flush_carry(&mut self, step: u32) {
         for stream in [Stream::Stdout, Stream::Stderr] {
             let rest = self.redactor.flush(stream);
-            if !rest.is_empty()
-                && let Some(spool) = self.spool.as_mut()
-            {
-                for chunk in rest.chunks(MAX_LOG_FRAME_BYTES) {
-                    let _ = spool.append(step, stream, chunk);
+            for chunk in rest.chunks(MAX_LOG_FRAME_BYTES) {
+                self.store(step, stream, chunk);
+            }
+        }
+    }
+
+    /// Append one chunk; a refusal is counted by cause (the spool has
+    /// declared its sequence either way).
+    fn store(&mut self, step: u32, stream: Stream, chunk: &[u8]) -> Option<u64> {
+        let spool = self.spool.as_mut()?;
+        match spool.append(step, stream, chunk) {
+            Ok(Some(seq)) => Some(seq),
+            _ => {
+                if let Some(why) = spool.last_refusal() {
+                    self.refusals.count(why);
                 }
+                None
             }
         }
     }
@@ -124,15 +149,49 @@ pub struct LogPipe {
 }
 
 impl LogPipe {
+    /// A pipe over a spool bounded only by its per-attempt cap.
     pub fn open(
         root: &Path,
         attempt: AttemptId,
         redactor: Redactor,
         reporter: Option<Reporter>,
     ) -> Result<LogPipe> {
-        let spool = Spool::open(root, attempt)?;
+        Self::open_in(&SpoolSpace::unbounded(root), attempt, redactor, reporter)
+    }
+
+    /// A live attempt's pipe, its spool in the worker's shared spool space.
+    pub fn open_in(
+        space: &Arc<SpoolSpace>,
+        attempt: AttemptId,
+        redactor: Redactor,
+        reporter: Option<Reporter>,
+    ) -> Result<LogPipe> {
+        let spool = Spool::open_in(space, attempt, MAX_SPOOL_BYTES)?;
+        Ok(Self::with(attempt, spool, redactor, reporter, false))
+    }
+
+    /// The pipe of a spool the previous process left: delivered from its
+    /// cursor and closed. Without an end record the attempt was cut short
+    /// by the crash, and its end says so.
+    pub fn recover(
+        space: &Arc<SpoolSpace>,
+        attempt: AttemptId,
+        reporter: Option<Reporter>,
+    ) -> Result<LogPipe> {
+        let spool = Spool::open_in(space, attempt, MAX_SPOOL_BYTES)?;
+        let cut = !spool.ended();
+        Ok(Self::with(attempt, spool, Redactor::new(), reporter, cut))
+    }
+
+    fn with(
+        attempt: AttemptId,
+        spool: Spool,
+        redactor: Redactor,
+        reporter: Option<Reporter>,
+        cut: bool,
+    ) -> LogPipe {
         let sent = spool.acked();
-        Ok(LogPipe {
+        LogPipe {
             attempt,
             state: Mutex::new(PipeState {
                 spool: Some(spool),
@@ -147,9 +206,16 @@ impl LogPipe {
                 end_acked_protocol: false,
                 refused: false,
                 last_step: None,
+                cut,
+                refusals: Refused::default(),
             }),
             progress: Condvar::new(),
-        })
+        }
+    }
+
+    /// Frames the spool refused so far, by cause.
+    pub fn refusals(&self) -> Refused {
+        self.lock().refusals
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, PipeState> {
@@ -203,8 +269,22 @@ impl LogPipe {
                 }
             }
         }
-        let spool = st.spool.as_ref().expect("checked above");
-        if st.ended && !st.end_sent && spool.acked() == spool.last_seq() {
+        let spool = st.spool.as_mut().expect("checked above");
+        // Every stored frame acknowledged: the end can go. Declared gaps are
+        // never acknowledged, so they are not waited for.
+        if st.ended && !st.end_sent && spool.acked() >= spool.last_stored() {
+            if !spool.ended() {
+                if std::mem::take(&mut st.cut) {
+                    // Past everything the controller acknowledged: never a
+                    // sequence it holds. A failed write still spent it; the
+                    // end record below retries the `declared` file.
+                    let _ = spool.declare_cut();
+                }
+                // Durable before it is declared; retried at the next pump.
+                if spool.persist_end().is_err() {
+                    return;
+                }
+            }
             let gaps = spool.gaps().to_vec();
             if reporter
                 .log_end(self.attempt, spool.last_seq(), &gaps)
@@ -303,15 +383,16 @@ impl Output for LogPipe {
                 }
                 _ => None,
             };
-            let Some(spool) = st.spool.as_mut() else {
+            if st.spool.is_none() {
                 return;
-            };
-            // Every chunk spends its sequence whether the write lands, the
-            // cap refuses it, or the disk fails — `append` declares what it
+            }
+            // Every chunk spends its sequence whether the write lands, a
+            // bound refuses it, or the disk fails — `append` declares what it
             // could not hold, and the next chunk must still spend its own.
-            let Ok(Some(seq)) = spool.append(step, stream, chunk) else {
+            let Some(seq) = st.store(step, stream, chunk) else {
                 continue;
             };
+            let spool = st.spool.as_mut().expect("stored above");
             if let Some(reporter) = direct {
                 match reporter.log_frame(self.attempt, seq, step, stream, chunk) {
                     // A route that changed under this send is left for the
@@ -356,13 +437,18 @@ impl Output for LogPipe {
         if !st.ended {
             let step = st.last_step.unwrap_or(0);
             st.flush_carry(step);
-            if let Some(spool) = st.spool.as_mut() {
+            let s = &mut *st;
+            if let Some(spool) = s.spool.as_mut() {
                 let _ = spool.sync();
                 // The `last_seq` and gaps `LogEnd` declares must survive a
-                // restart unchanged, or a re-sent end would conflict.
-                let _ = spool.persist_end();
+                // restart unchanged, or a re-sent end would conflict. A
+                // recovered spool's end waits for the controller's
+                // acknowledgements, which may move it (`pump`).
+                if !s.cut {
+                    let _ = spool.persist_end();
+                }
             }
-            st.ended = true;
+            s.ended = true;
         }
         self.pump(&mut st);
         let deadline = Instant::now() + LOG_FLUSH_TIMEOUT;

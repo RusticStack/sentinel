@@ -186,6 +186,62 @@ fn torn_tails_are_cut_on_reopen() {
     );
 }
 
+/// A power cut can persist a segment's new size without the data written
+/// into it: the unacknowledged tail reads back as zeros. It is cut like a
+/// torn record — readers and the writer go on — where before the fix the
+/// whole log was reported corrupt. Garbage that is not zeros still is.
+#[test]
+fn a_zeroed_tail_from_a_power_cut_is_cut_but_garbage_is_corrupt() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let (zeroed, garbled) = (AttemptId::new(), AttemptId::new());
+    for attempt in [zeroed, garbled] {
+        logs.append(run(), job(), attempt, &frame(1, "a")).unwrap();
+        logs.append(run(), job(), attempt, &frame(2, "b")).unwrap();
+    }
+    drop(logs);
+    let append = |attempt: AttemptId, bytes: &[u8]| {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(
+                temp.path()
+                    .join("logs")
+                    .join(run().to_string())
+                    .join(job().to_string())
+                    .join(attempt.to_string())
+                    .join("seg-000000"),
+            )
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    };
+    append(zeroed, &[0; 4096]);
+    append(garbled, &[7; 64]);
+    let reopened = LogStore::open(temp.path().join("logs")).unwrap();
+    let dir = reopened.attempt_dir(run(), job(), zeroed);
+    assert_eq!(read_dir(&dir, 0, 10, None).unwrap().frames.len(), 2);
+    assert_eq!(
+        reopened
+            .append(run(), job(), zeroed, &frame(3, "c"))
+            .unwrap(),
+        Appended::Stored { through: 3 }
+    );
+    assert_eq!(
+        read_dir(&dir, 0, 10, None)
+            .unwrap()
+            .frames
+            .iter()
+            .map(|f| f.seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert!(matches!(
+        reopened.append(run(), job(), garbled, &frame(3, "c")),
+        Err(Error::Corrupt(_))
+    ));
+}
+
 #[test]
 fn sealed_segments_compress_and_still_read() {
     let temp = tempfile::tempdir().unwrap();

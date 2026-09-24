@@ -48,6 +48,11 @@ use crate::{
 
 /// What the attempt is: identity, fence, the spec, which job of it, and
 /// the controller's context for its expressions.
+/// Test builds only: a step with this id panics the attempt thread just
+/// before it would run (P04-30).
+#[cfg(test)]
+pub(crate) const PANIC_STEP: &str = "panic-injected";
+
 pub struct Job {
     pub worker: WorkerId,
     pub attempt: AttemptId,
@@ -626,6 +631,13 @@ fn execute(
         if failure.is_some() {
             summary.steps.push(record);
             continue;
+        }
+        // The executor's panic containment (P04-30) is tested by panicking
+        // here, with the container running and output spooled. Test builds
+        // only: no pipeline can reach this in any other build.
+        #[cfg(test)]
+        if step.id == PANIC_STEP {
+            panic!("injected panic before step {index}");
         }
         if cancel.load(Ordering::Acquire) {
             summary.steps.push(record);

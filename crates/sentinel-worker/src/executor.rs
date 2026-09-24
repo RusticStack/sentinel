@@ -42,6 +42,7 @@ use crate::{
     podman,
     recovery::{self, Leftover, Recovered},
     redact::Redactor,
+    spool::{DEFAULT_SPOOL_QUOTA, DEFAULT_SPOOL_RESERVE, Refused, SpoolSpace},
 };
 
 /// What happened, for the process's diagnostics.
@@ -71,6 +72,13 @@ pub enum Notice {
     /// The mirrors root could not be opened at start; every checkout runs
     /// direct for the life of this process. The reason is bounded.
     MirrorsUnavailable(String),
+    /// An attempt's spool refused output — its cap, the worker's spool
+    /// quota, the free-space reserve, a failed write — and declared it as
+    /// gaps in the log. Emitted once, when the attempt finishes.
+    SpoolRefused {
+        attempt: AttemptId,
+        refused: Refused,
+    },
     /// A declared cache's publication settled during finalization —
     /// sealed, skipped or failed; the attempt's verdict never depends on it.
     CachePublished {
@@ -265,6 +273,9 @@ pub struct Inner {
     /// probe and the root are settled for the process's life. `None` —
     /// configured off, or open failed — runs every checkout direct.
     mirrors: Option<crate::checkout::Mirrors>,
+    /// The disk every attempt's spool shares: a quota and a free-space
+    /// reserve on the data directory.
+    spool: Arc<SpoolSpace>,
     state: Mutex<State>,
     /// One cache reclamation pass at a time; a second caller skips rather
     /// than waits, because the running pass already covers its work. The
@@ -314,6 +325,7 @@ impl Executor {
             crate::prefetch::Bounds::default(),
             crate::prefetch::PodmanProbe::new(),
         );
+        let spool = SpoolSpace::new(root.clone(), DEFAULT_SPOOL_RESERVE, DEFAULT_SPOOL_QUOTA);
         let executor = Executor(Arc::new(Inner {
             root,
             worker,
@@ -321,6 +333,7 @@ impl Executor {
             images,
             prefetch,
             mirrors,
+            spool,
             state: Mutex::new(State {
                 reporter: None,
                 awaiting: HashMap::new(),
@@ -363,6 +376,14 @@ impl Executor {
                 }
             })?;
         Ok(executor)
+    }
+
+    /// The free space every spool leaves on the data directory's file
+    /// system, and the bytes all of them may hold together (defaults
+    /// `DEFAULT_SPOOL_RESERVE` and `DEFAULT_SPOOL_QUOTA`). Output past
+    /// either is declared as gaps in the attempt's log.
+    pub fn set_spool_limits(&self, reserve: u64, quota: u64) {
+        self.spool.set_limits(reserve, quota);
     }
 
     /// How long a canceled step gets between `SIGTERM` and the forced stop.
@@ -414,7 +435,7 @@ impl Executor {
             for secret in &secrets {
                 redactor.register(secret);
             }
-            match LogPipe::open(&self.root, offer.attempt, redactor, state.reporter.clone()) {
+            match LogPipe::open_in(&self.spool, offer.attempt, redactor, state.reporter.clone()) {
                 Ok(pipe) => Arc::new(pipe),
                 Err(_) => {
                     drop(state);
@@ -470,6 +491,7 @@ impl Executor {
             .spawn(move || {
                 let (attempt, fence) = (job.attempt, job.fence);
                 (executor.notify)(Notice::Started(attempt));
+                let pipe = Arc::clone(&logs);
                 let output: Arc<dyn attempt::Output> = logs;
                 let sink: &dyn artifacts::Sink = &*executor;
                 // A panic anywhere in the attempt must not leave it held,
@@ -490,6 +512,11 @@ impl Executor {
                                 .join(crate::workspace::WORKSPACES_DIR)
                                 .join(attempt.to_string()),
                         );
+                        // What it printed before the panic is delivered and
+                        // the log closed, so the spool goes too.
+                        if attempt::Output::complete(&*pipe) {
+                            recovery::mark_ended(&executor.root, attempt);
+                        }
                         executor.send(
                             attempt,
                             fence,
@@ -513,6 +540,13 @@ impl Executor {
                 };
                 if delivered {
                     recovery::unmark(&executor.root, job.attempt);
+                }
+                let refused = pipe.refusals();
+                if refused.total() > 0 {
+                    (executor.notify)(Notice::SpoolRefused {
+                        attempt: job.attempt,
+                        refused,
+                    });
                 }
                 (executor.notify)(Notice::Finished(job.attempt, verdict));
                 // Finalization is where the store grows: one bounded pass
@@ -578,12 +612,7 @@ impl Inner {
     fn abandon_leftovers(&self, leftovers: Vec<Leftover>, reporter: Reporter) {
         for leftover in leftovers {
             let delivered = if leftover.spooled {
-                match LogPipe::open(
-                    &self.root,
-                    leftover.attempt,
-                    Redactor::new(),
-                    Some(reporter.clone()),
-                ) {
+                match LogPipe::recover(&self.spool, leftover.attempt, Some(reporter.clone())) {
                     Ok(pipe) => {
                         let pipe = Arc::new(pipe);
                         self.state()
@@ -1317,5 +1346,81 @@ impl Drop for Inner {
         for live in self.state().live.values() {
             live.cancel.store(true, Ordering::Release);
         }
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/support/live.rs"]
+mod live;
+
+#[cfg(test)]
+mod tests {
+    use super::live::{DIGEST, IMAGE, Live, eventually, podman_enabled};
+    use super::*;
+    use sentinel_core::{FailureClass, JobState, Outcome};
+
+    /// P04-30. A step panics the attempt thread (a test-only hook in
+    /// `attempt::run`) while its container runs and its output is spooled.
+    /// Before the fix nothing caught it: the attempt stayed held and renewed
+    /// until the controller's backstop, the container and the workspace
+    /// until the next restart. Now the panic is contained: the container
+    /// and the workspace are removed, what the attempt printed reaches the
+    /// controller and the log is closed, and it is reported as the runtime
+    /// failure it is — nothing is left held.
+    #[test]
+    fn a_panicking_attempt_is_torn_down_and_reported() {
+        if !podman_enabled() {
+            return;
+        }
+        let (live, executor) = Live::start(|dir, worker| {
+            Executor::start(dir.to_path_buf(), worker, |_| {}, false).unwrap()
+        });
+        let yaml = format!(
+            "schema: 1\non: [push]\njobs:\n  work:\n    image: {IMAGE}@{DIGEST}\n    resources: {{ cpu: 1, memory: 128MiB }}\n    steps:\n      - id: first\n        run: 'echo before the panic'\n      - id: {}\n        run: 'sleep 300'\n",
+            attempt::PANIC_STEP
+        );
+        let (run, jobs) = live.enqueue(&yaml);
+        let job = jobs[0];
+        eventually("the job ended", Duration::from_secs(120), || {
+            matches!(live.job(job).state, JobState::Terminal(_))
+        });
+        let row = live.job(job);
+        assert_eq!(
+            (row.state, row.failure_class),
+            (
+                JobState::Terminal(Outcome::InfraFailed),
+                Some(FailureClass::Runtime)
+            )
+        );
+        eventually("the container removed", Duration::from_secs(30), || {
+            podman::owned(live.worker).unwrap().is_empty()
+        });
+        eventually("nothing held", Duration::from_secs(30), || {
+            executor.state_is_idle()
+        });
+        assert!(
+            crate::workspace::Workspace::leftovers(&live.worker_dir)
+                .unwrap()
+                .is_empty()
+        );
+        let attempt = live.attempt(job).unwrap();
+        let tail = live.logs.tail(run, job, attempt, 0, 100, None).unwrap();
+        assert!(tail.complete, "the log was closed");
+        assert!(
+            tail.frames
+                .iter()
+                .any(|f| String::from_utf8_lossy(&f.bytes).contains("before the panic"))
+        );
+        eventually(
+            "the marker and the spool gone",
+            Duration::from_secs(30),
+            || {
+                recovery::leftovers(&live.worker_dir).unwrap().is_empty()
+                    && crate::spool::Spool::leftovers(&live.worker_dir)
+                        .unwrap()
+                        .is_empty()
+            },
+        );
+        live.stop();
     }
 }
