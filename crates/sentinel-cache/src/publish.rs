@@ -245,9 +245,32 @@ pub fn commit(
     // The commit pins its entry like a reader does: reclamation never takes
     // an entry — its source generation included — out from under a writer,
     // hit or miss.
-    let _pin = Lease::acquire(&entry, "publish", crate::lease::DEFAULT_TTL)?;
-    let Some(_lock) = WriteLock::acquire(&entry, "publish")? else {
-        return Ok(Published::Skipped(SkipReason::Busy));
+    //
+    // Collection takes an unpinned entry out of the tree by renaming it
+    // aside, then judges it again and puts it back when a pin landed in
+    // between. A pin taken inside that window moves with the entry, and a
+    // lock taken while the entry is away makes a fresh entry directory the
+    // put-back cannot replace: the pin would then guard nothing here. So
+    // the pin is checked in place once the lock is held, and taken again
+    // when it went with the old directory.
+    let mut turns = 3;
+    let (_pin, _lock) = loop {
+        let pin = Lease::acquire(&entry, "publish", crate::lease::DEFAULT_TTL)?;
+        let Some(lock) = WriteLock::acquire(&entry, "publish")? else {
+            return Ok(Published::Skipped(SkipReason::Busy));
+        };
+        if pin.path().is_file() {
+            break (pin, lock);
+        }
+        turns -= 1;
+        if turns == 0 {
+            return Err(PublishError::Lock(crate::lease::LeaseError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "the entry kept moving under the pin",
+                ),
+            )));
+        }
     };
     let generation = scope::gen_name(now.0, rand_u32());
     let staging = entry.join(scope::WRITING_NAME).join(&generation);

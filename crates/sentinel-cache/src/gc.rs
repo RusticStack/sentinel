@@ -356,7 +356,14 @@ impl Gc {
         }
         // Nothing left to serve and no pointer: an empty shell (a writer
         // that never sealed, a hydration that failed) goes whole.
+        // A shell younger than the lease bound is left alone, like a young
+        // `writing/`: it can be a pin or a writer between making the entry
+        // directory and landing its marker — removing it there answers that
+        // holder `NotFound` and, under a busy sweeper, again on every retry.
         if used_ms.is_none() && gens.is_empty() {
+            if self.young(entry) {
+                return;
+            }
             self.remove_entry(Stale {
                 entry: entry.to_path_buf(),
                 used_ms: 0,
@@ -415,6 +422,23 @@ impl Gc {
         }
     }
 
+    /// Whether a directory was modified within the lease bound — or its
+    /// age cannot be read, which counts as young: never removed blind.
+    fn fresh(&self, meta: &fs::Metadata) -> bool {
+        !meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|d| {
+                d.as_millis() as i64 + lease::MAX_TTL.as_millis() as i64 <= self.now_ms
+            })
+    }
+
+    /// [`Gc::fresh`] for `dir` by path; a directory already gone is not.
+    fn young(&self, dir: &Path) -> bool {
+        fs::symlink_metadata(dir).is_ok_and(|meta| self.fresh(&meta))
+    }
+
     /// Remove a stale `writing/` tree: no live lock marker and the
     /// directory itself older than the lease bound — fresh enough to
     /// belong to a writer between `create_dir_all` and its marker, it is
@@ -430,14 +454,7 @@ impl Gc {
         if lease::writing_lock_live(entry, self.now_ms) {
             return;
         }
-        let stale = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .is_some_and(|d| {
-                d.as_millis() as i64 + lease::MAX_TTL.as_millis() as i64 <= self.now_ms
-            });
-        if !stale {
+        if self.fresh(&meta) {
             return;
         }
         if !self.tick() {

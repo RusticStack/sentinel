@@ -113,6 +113,31 @@ fn rewrite(file: &Path, owner: &str, ttl: Duration) -> std::io::Result<()> {
     f.write_all(format!("{expires} {owner}").as_bytes())
 }
 
+/// Turns a marker acquisition takes before it gives up on a directory
+/// that keeps vanishing under it.
+const DIR_RACE_TURNS: u32 = 4;
+
+/// `create_dir_all`, tolerant of the tree moving under it: collection
+/// renames an unpinned entry aside, and when that lands between the
+/// parent's creation and the child's, the walk answers `NotFound` for a
+/// path it is about to recreate — or `AlreadyExists` for one that was
+/// there when it was made and gone when it was checked. Retried a bounded
+/// number of times.
+fn make_dir(dir: &Path) -> std::io::Result<()> {
+    let mut turns = DIR_RACE_TURNS;
+    loop {
+        match fs::create_dir_all(dir) {
+            Err(e)
+                if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::AlreadyExists)
+                    && turns > 1 =>
+            {
+                turns -= 1
+            }
+            done => return done,
+        }
+    }
+}
+
 /// A held pin on `entry`. Dropping it removes the marker; a process that
 /// dies first leaves it to expire.
 pub struct Lease {
@@ -128,12 +153,15 @@ impl Lease {
             return Err(LeaseError::BadOwner);
         }
         let dir = entry.join(LEASE_NAME);
-        fs::create_dir_all(&dir)?;
+        make_dir(&dir)?;
         let expires = unix_ms() + ttl.min(MAX_TTL).as_millis() as i64;
         // create_new makes a duplicate name a retryable collision rather
-        // than a silent share. Two attempts is generous: names carry an
-        // attempt/random tail.
-        for attempt in 0..2 {
+        // than a silent share; names carry an attempt/random tail, so one
+        // retry is generous for that. The directory can also vanish between
+        // `make_dir` and the marker: collection takes an unpinned entry out
+        // of the tree by renaming it aside, and a pin taken after that
+        // rename belongs in a fresh entry directory — made again, retried.
+        for attempt in 0..DIR_RACE_TURNS {
             let id = format!("l{}-{:08x}", unix_ms(), rand_u32().wrapping_add(attempt));
             let file = dir.join(id);
             match fs::File::create_new(&file) {
@@ -151,12 +179,13 @@ impl Lease {
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                Err(e) if e.kind() == ErrorKind::NotFound => make_dir(&dir)?,
                 Err(e) => return Err(e.into()),
             }
         }
         Err(LeaseError::Io(std::io::Error::new(
             ErrorKind::AlreadyExists,
-            "lease name collision",
+            "lease did not settle",
         )))
     }
 
@@ -230,9 +259,11 @@ impl WriteLock {
         }
         let dir = entry.join(WRITING_NAME);
         let file = dir.join(WRITE_LOCK_NAME);
-        // Three turns: the first can race the directory's absence or a
-        // stale marker, the second reaps either, the third takes it.
-        for _ in 0..3 {
+        // The first turn can race the directory's absence or a stale
+        // marker, the second reaps either, the third takes it; one more
+        // absorbs a `writing/` that went with its entry in between (an
+        // unpinned entry renamed aside by collection).
+        for _ in 0..DIR_RACE_TURNS {
             match fs::File::create_new(&file) {
                 Ok(mut f) => {
                     use std::io::Write;
@@ -269,7 +300,7 @@ impl WriteLock {
                 Err(e) if e.kind() == ErrorKind::NotFound => {
                     // `writing/` is not there yet (or was removed under
                     // us); make it and retry the marker.
-                    fs::create_dir_all(&dir)?;
+                    make_dir(&dir)?;
                 }
                 Err(e) => return Err(e.into()),
             }
