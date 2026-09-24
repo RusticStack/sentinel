@@ -42,6 +42,7 @@ use crate::{
     podman,
     recovery::{self, Leftover, Recovered},
     redact::Redactor,
+    spool::{DEFAULT_SPOOL_QUOTA, DEFAULT_SPOOL_RESERVE, Refused, SpoolSpace},
 };
 
 /// What happened, for the process's diagnostics.
@@ -71,6 +72,13 @@ pub enum Notice {
     /// The mirrors root could not be opened at start; every checkout runs
     /// direct for the life of this process. The reason is bounded.
     MirrorsUnavailable(String),
+    /// An attempt's spool refused output — its cap, the worker's spool
+    /// quota, the free-space reserve, a failed write — and declared it as
+    /// gaps in the log. Emitted once, when the attempt finishes.
+    SpoolRefused {
+        attempt: AttemptId,
+        refused: Refused,
+    },
     /// A declared cache's publication settled during finalization —
     /// sealed, skipped or failed; the attempt's verdict never depends on it.
     CachePublished {
@@ -262,6 +270,9 @@ pub struct Inner {
     /// probe and the root are settled for the process's life. `None` —
     /// configured off, or open failed — runs every checkout direct.
     mirrors: Option<crate::checkout::Mirrors>,
+    /// The disk every attempt's spool shares: a quota and a free-space
+    /// reserve on the data directory.
+    spool: Arc<SpoolSpace>,
     state: Mutex<State>,
     /// One cache reclamation pass at a time; a second caller skips rather
     /// than waits, because the running pass already covers its work. The
@@ -305,12 +316,14 @@ impl Executor {
         // disk and in the runtime; what it owed the controller waits for
         // the session.
         let (recovered, leftovers) = recovery::recover(&root, worker)?;
+        let spool = SpoolSpace::new(root.clone(), DEFAULT_SPOOL_RESERVE, DEFAULT_SPOOL_QUOTA);
         let executor = Executor(Arc::new(Inner {
             root,
             worker,
             runtime,
             images: Images::new(),
             mirrors,
+            spool,
             state: Mutex::new(State {
                 reporter: None,
                 awaiting: HashMap::new(),
@@ -353,6 +366,14 @@ impl Executor {
                 }
             })?;
         Ok(executor)
+    }
+
+    /// The free space every spool leaves on the data directory's file
+    /// system, and the bytes all of them may hold together (defaults
+    /// `DEFAULT_SPOOL_RESERVE` and `DEFAULT_SPOOL_QUOTA`). Output past
+    /// either is declared as gaps in the attempt's log.
+    pub fn set_spool_limits(&self, reserve: u64, quota: u64) {
+        self.spool.set_limits(reserve, quota);
     }
 
     /// How long a canceled step gets between `SIGTERM` and the forced stop.
@@ -404,7 +425,7 @@ impl Executor {
             for secret in &secrets {
                 redactor.register(secret);
             }
-            match LogPipe::open(&self.root, offer.attempt, redactor, state.reporter.clone()) {
+            match LogPipe::open_in(&self.spool, offer.attempt, redactor, state.reporter.clone()) {
                 Ok(pipe) => Arc::new(pipe),
                 Err(_) => {
                     drop(state);
@@ -460,6 +481,7 @@ impl Executor {
             .spawn(move || {
                 let (attempt, fence) = (job.attempt, job.fence);
                 (executor.notify)(Notice::Started(attempt));
+                let pipe = Arc::clone(&logs);
                 let output: Arc<dyn attempt::Output> = logs;
                 let sink: &dyn artifacts::Sink = &*executor;
                 // A panic anywhere in the attempt must not leave it held,
@@ -480,6 +502,11 @@ impl Executor {
                                 .join(crate::workspace::WORKSPACES_DIR)
                                 .join(attempt.to_string()),
                         );
+                        // What it printed before the panic is delivered and
+                        // the log closed, so the spool goes too.
+                        if attempt::Output::complete(&*pipe) {
+                            recovery::mark_ended(&executor.root, attempt);
+                        }
                         executor.send(
                             attempt,
                             fence,
@@ -503,6 +530,13 @@ impl Executor {
                 };
                 if delivered {
                     recovery::unmark(&executor.root, job.attempt);
+                }
+                let refused = pipe.refusals();
+                if refused.total() > 0 {
+                    (executor.notify)(Notice::SpoolRefused {
+                        attempt: job.attempt,
+                        refused,
+                    });
                 }
                 (executor.notify)(Notice::Finished(job.attempt, verdict));
                 // Finalization is where the store grows: one bounded pass
@@ -563,12 +597,7 @@ impl Inner {
     fn abandon_leftovers(&self, leftovers: Vec<Leftover>, reporter: Reporter) {
         for leftover in leftovers {
             let delivered = if leftover.spooled {
-                match LogPipe::open(
-                    &self.root,
-                    leftover.attempt,
-                    Redactor::new(),
-                    Some(reporter.clone()),
-                ) {
+                match LogPipe::recover(&self.spool, leftover.attempt, Some(reporter.clone())) {
                     Ok(pipe) => {
                         let pipe = Arc::new(pipe);
                         self.state()

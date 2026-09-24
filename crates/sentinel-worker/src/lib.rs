@@ -74,6 +74,18 @@ impl From<std::io::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Make the entries of `dir` durable: a file created, renamed or removed in
+/// it survives a power loss only once its directory is synced.
+#[cfg(unix)]
+pub(crate) fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sync_dir(_dir: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Whether the worker's cache root — `<data_dir>/cache` — can serve
 /// reflink clones: the `Capabilities::REFLINK` bit a `worker` role's Hello
 /// advertises. The answer is `clone::detect`'s, probed once per root and

@@ -76,6 +76,10 @@ struct FileConfig {
     // the free space of the data directory at start.
     labels: Option<Vec<String>>,
     disk_bytes: Option<u64>,
+    // Worker: free space the log spools leave on the data directory's file
+    // system, and the bytes they may hold together (R01/D06).
+    spool_reserve_bytes: Option<u64>,
+    spool_quota_bytes: Option<u64>,
     // Worker: keep per-repository object mirrors under the data directory
     // (default on; `false` checks out every attempt directly).
     git_mirrors: Option<bool>,
@@ -212,6 +216,10 @@ struct WorkerLink {
     labels: Vec<String>,
     /// Scratch disk offered to jobs; `None` measures free space at start.
     disk_bytes: Option<u64>,
+    /// The spools' free-space reserve and shared quota; `None` keeps the
+    /// executor's defaults.
+    spool_reserve_bytes: Option<u64>,
+    spool_quota_bytes: Option<u64>,
     /// The helper to run, when the worker dials through Tailcat.
     tailcat: Option<TailcatFile>,
     /// The controller's `tc…` address the helper carries.
@@ -325,10 +333,12 @@ impl Config {
                 || file.git_mirrors.is_some()
                 || file.labels.is_some()
                 || file.disk_bytes.is_some()
+                || file.spool_reserve_bytes.is_some()
+                || file.spool_quota_bytes.is_some()
                 || file.tailcat_address.is_some()
             {
                 return Err(Error::config(
-                    "controller, controller_fingerprint, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, disk_bytes and tailcat_address apply to the worker role only",
+                    "controller, controller_fingerprint, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, disk_bytes, spool_reserve_bytes, spool_quota_bytes and tailcat_address apply to the worker role only",
                 ));
             }
             let listen: SocketAddr = file
@@ -391,6 +401,8 @@ impl Config {
                         || file.git_mirrors.is_some()
                         || file.labels.is_some()
                         || file.disk_bytes.is_some()
+                        || file.spool_reserve_bytes.is_some()
+                        || file.spool_quota_bytes.is_some()
                         || file.tailcat.is_some()
                         || file.tailcat_address.is_some()
                         || file.remote_cache.is_some()
@@ -437,6 +449,11 @@ impl Config {
                     if file.disk_bytes == Some(0) {
                         return Err(Error::config("disk_bytes must be positive when set"));
                     }
+                    if file.spool_quota_bytes == Some(0) {
+                        return Err(Error::config(
+                            "spool_quota_bytes must be positive when set: a zero quota would declare every line of output lost",
+                        ));
+                    }
                     let tailcat_on = file
                         .tailcat
                         .as_ref()
@@ -461,6 +478,8 @@ impl Config {
                         git_mirrors: file.git_mirrors.unwrap_or(true),
                         labels,
                         disk_bytes: file.disk_bytes,
+                        spool_reserve_bytes: file.spool_reserve_bytes,
+                        spool_quota_bytes: file.spool_quota_bytes,
                         tailcat: file.tailcat,
                         tailcat_address: file.tailcat_address,
                         remote_cache: file
@@ -1301,6 +1320,7 @@ mod worker_role {
         data_dir: &Path,
         worker: sentinel_core::WorkerId,
         git_mirrors: bool,
+        spool: (Option<u64>, Option<u64>),
     ) -> Box<dyn LinkExecutor> {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
@@ -1334,6 +1354,9 @@ mod worker_role {
                     sentinel_worker::executor::Notice::MirrorsUnavailable(why) => {
                         tracing::warn!(event = "mirrors_unavailable", reason = %why, "checkouts will fetch directly for this process");
                     }
+                    sentinel_worker::executor::Notice::SpoolRefused { attempt, refused } => {
+                        tracing::warn!(event = "spool_refused", attempt = %attempt, cap = refused.cap, quota = refused.quota, low_space = refused.low_space, failed_writes = refused.failed, gap_limit = refused.gap_limit, "output the spool could not hold is declared as gaps in the attempt's log");
+                    }
                     sentinel_worker::executor::Notice::CachePublished { attempt, note } => {
                         tracing::info!(event = "cache_published", attempt = %attempt, cache = %note.name, outcome = ?note.outcome);
                     }
@@ -1356,6 +1379,15 @@ mod worker_role {
             git_mirrors,
         ) {
             Ok(executor) => {
+                // Before the link starts: no attempt has spooled a byte yet.
+                executor.set_spool_limits(
+                    spool
+                        .0
+                        .unwrap_or(sentinel_worker::spool::DEFAULT_SPOOL_RESERVE),
+                    spool
+                        .1
+                        .unwrap_or(sentinel_worker::spool::DEFAULT_SPOOL_QUOTA),
+                );
                 let runtime = executor.runtime();
                 let recovered = executor.recovered();
                 tracing::info!(
@@ -1708,7 +1740,12 @@ mod worker_role {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
         let enrollment_file = link.enrollment_file.clone();
-        let executor = executor(&config.data_dir, worker, link.git_mirrors);
+        let executor = executor(
+            &config.data_dir,
+            worker,
+            link.git_mirrors,
+            (link.spool_reserve_bytes, link.spool_quota_bytes),
+        );
         let tunnel = forward.clone();
         let watch = TunnelWatch::default();
         let thread = std::thread::Builder::new()

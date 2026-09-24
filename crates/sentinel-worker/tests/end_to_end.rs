@@ -690,11 +690,14 @@ jobs:
         Some(sentinel_core::FailureClass::Reconciled)
     );
     // What it printed before the crash reached the controller and the log
-    // is complete; the spool and the marker are gone; nothing was re-run.
+    // is closed — ending in a gap, since whatever the attempt printed after
+    // its last durable frame is unknown; the spool and the marker are gone;
+    // nothing was re-run.
     let tail = logs.tail(orphan_run, orphan, attempt, 0, 10, None).unwrap();
     assert!(tail.complete);
     assert_eq!(tail.frames.len(), 1);
     assert_eq!(tail.frames[0].bytes, b"printed before the crash\n");
+    assert_eq!(tail.gaps, vec![(2, 2)]);
     eventually("leftover settled", || {
         notices2
             .lock()

@@ -267,6 +267,45 @@ mod linux {
         assert!(!data.exists());
     }
 
+    /// The spool's free-space reserve and quota belong to a worker with a
+    /// controller; a zero quota would declare every line of output lost
+    /// and is refused.
+    #[test]
+    fn spool_limits_are_worker_link_settings_and_a_zero_quota_is_refused() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("config.toml");
+        let data = temp.path().join("data");
+        let link = format!(
+            "controller = '127.0.0.1:7443'\ncontroller_fingerprint = '{}'\n",
+            "ab".repeat(32)
+        );
+        let check = |role: &str, body: &str| {
+            fs::write(&file, format!("data_dir = '{}'\n{body}", data.display())).unwrap();
+            invoke(&[role, "--config", file.to_str().unwrap(), "--check"])
+                .status
+                .code()
+        };
+        if cfg!(feature = "server") {
+            assert_eq!(check("server", "spool_reserve_bytes = 1024"), Some(2));
+            assert_eq!(check("server", "spool_quota_bytes = 1024"), Some(2));
+        }
+        if cfg!(feature = "worker") {
+            assert_eq!(check("worker", "spool_quota_bytes = 1024"), Some(2));
+            assert_eq!(
+                check("worker", &format!("{link}spool_quota_bytes = 0")),
+                Some(2)
+            );
+            assert_eq!(
+                check(
+                    "worker",
+                    &format!("{link}spool_reserve_bytes = 0\nspool_quota_bytes = 1073741824")
+                ),
+                Some(0)
+            );
+        }
+        assert!(!data.exists());
+    }
+
     #[test]
     fn malformed_oversized_and_missing_configuration_fail_without_echoing_input() {
         let temp = tempdir().unwrap();
