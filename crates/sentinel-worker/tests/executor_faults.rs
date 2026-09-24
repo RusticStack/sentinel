@@ -9,9 +9,12 @@
 //!   again instead of being dropped for the rest of the step.
 //! - P04-27: a stop order must not run `podman rm -f` on the heartbeat
 //!   thread, where a slow removal would hold the next heartbeat.
+//! - Duplicate offers: an offer of an attempt the executor already awaits
+//!   or runs is acknowledged again and never starts it a second time.
 //!
 //! `podman` is wrapped on `PATH` by a shim that passes every call to the
-//! real binary, but can hold a step's `exec` or slow a removal on request.
+//! real binary, but can hold a step's `exec` or slow a removal on request,
+//! and counts container creations.
 //! The shim is process-wide, so the tests here run one at a time.
 
 #![cfg(target_os = "linux")]
@@ -46,6 +49,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 const SHIM: &str = r#"#!/bin/sh
 dir="$(dirname "$0")"
+if [ "$1" = create ]; then echo "$*" >> "$dir/creates"; fi
 case "$1 $2" in
   "exec --workdir")
     # A step's exec, not the runtime's own: held while asked, so a cancel
@@ -89,16 +93,22 @@ fn shim() -> &'static PathBuf {
     })
 }
 
+/// A spec delivery the probe held back.
+type HeldSpec = (AttemptId, JobContext, Vec<u8>);
+
 /// The real executor, seen through the link: a skewed clock on renewals,
-/// and a record of the cancel and stop orders and how long a stop held the
-/// heartbeat thread.
+/// a record of the offers and of the cancel and stop orders and how long a
+/// stop held the heartbeat thread, and specs held back on request.
 struct Probe {
     inner: Executor,
     /// Milliseconds the worker's wall clock is ahead of the controller's.
     skew_ms: i64,
+    offers: Mutex<Vec<Offer>>,
     cancels: AtomicUsize,
     stops: Mutex<Vec<Duration>>,
     notices: Arc<Mutex<Vec<String>>>,
+    /// `Some` while specs are held back: what arrived meanwhile.
+    held_specs: Mutex<Option<Vec<HeldSpec>>>,
 }
 
 impl Probe {
@@ -116,9 +126,11 @@ impl Probe {
         Probe {
             inner,
             skew_ms,
+            offers: Mutex::new(Vec::new()),
             cancels: AtomicUsize::new(0),
             stops: Mutex::new(Vec::new()),
             notices,
+            held_specs: Mutex::new(None),
         }
     }
 
@@ -129,6 +141,44 @@ impl Probe {
             .iter()
             .any(|n| n.contains(what))
     }
+
+    fn notices_of(&self, what: &str) -> usize {
+        self.notices
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n.starts_with(what))
+            .count()
+    }
+
+    /// Hold back every spec from now on, leaving its attempt awaiting.
+    fn hold_specs(&self) {
+        *self.held_specs.lock().unwrap() = Some(Vec::new());
+    }
+
+    fn specs_held(&self) -> usize {
+        self.held_specs.lock().unwrap().as_ref().map_or(0, Vec::len)
+    }
+
+    /// Deliver the specs held back, in arrival order, and stop holding.
+    fn release_specs(&self) {
+        let held = self.held_specs.lock().unwrap().take().unwrap_or_default();
+        for (attempt, context, bytes) in held {
+            self.inner.spec(attempt, context, bytes);
+        }
+    }
+
+    /// The offer again, as a later session delivers it: that session has
+    /// not seen the attempt, so it asks the executor, acknowledges when
+    /// told to take it and then reports it accepted. Returns whether the
+    /// offer was acknowledged.
+    fn offer_again(&self, offer: &Offer) -> bool {
+        let take = self.inner.offered(offer);
+        if take {
+            self.inner.accepted(offer.attempt);
+        }
+        take
+    }
 }
 
 impl LinkExecutor for Probe {
@@ -136,6 +186,7 @@ impl LinkExecutor for Probe {
         self.inner.accepted(attempt);
     }
     fn offered(&self, offer: &Offer) -> bool {
+        self.offers.lock().unwrap().push(offer.clone());
         self.inner.offered(offer)
     }
     fn stop(&self, attempt: AttemptId) {
@@ -167,6 +218,13 @@ impl LinkExecutor for Probe {
         self.inner.detached();
     }
     fn spec(&self, attempt: AttemptId, context: JobContext, bytes: Vec<u8>) {
+        {
+            let mut held = self.held_specs.lock().unwrap();
+            if let Some(held) = held.as_mut() {
+                held.push((attempt, context, bytes));
+                return;
+            }
+        }
         self.inner.spec(attempt, context, bytes);
     }
     fn no_spec(&self, attempt: AttemptId) {
@@ -334,5 +392,77 @@ fn a_stop_order_never_holds_the_heartbeat_thread() {
     // The session never dropped for it.
     assert_eq!(live.controller().connected(), vec![worker]);
     assert!(probe.noticed("Stopped"));
+    live.stop();
+}
+
+/// Duplicate offers. A session acknowledges an attempt it has already seen
+/// by itself, but a later session (after a reconnect) asks the executor,
+/// which must know the attempt as its own: acknowledge it again and change
+/// nothing. The duplicate arrives twice here — while the attempt awaits its
+/// spec (held back by the probe) and while its step runs. Before the fix a
+/// running attempt was taken as a new offer: it was held twice (running and
+/// awaiting a spec), its spec was asked for again and it was started a
+/// second time, which failed on its own workspace and ended the job
+/// `infra_failed`.
+#[test]
+fn a_repeated_offer_is_acknowledged_again_and_never_started_twice() {
+    if !podman_enabled() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let creates = shim().join("creates");
+    let _ = fs::remove_file(&creates);
+    let (live, probe) = Live::start(|dir, worker| Probe::start(dir, worker, 0));
+    probe.hold_specs();
+    let (run, jobs) = live.enqueue(&one_job(
+        "      - id: work\n        run: 'echo started; sleep 5; echo done'\n",
+    ));
+    let job = jobs[0];
+    eventually("the spec held back", Duration::from_secs(60), || {
+        probe.specs_held() > 0
+    });
+    let offer = probe.offers.lock().unwrap()[0].clone();
+    assert_eq!(Some(offer.attempt), live.attempt(job));
+
+    // Awaiting its spec.
+    assert!(
+        probe.offer_again(&offer),
+        "awaiting: not acknowledged again"
+    );
+    assert_eq!(probe.inner.held(), vec![offer.attempt]);
+    probe.release_specs();
+
+    // Running its step.
+    eventually("the step started", Duration::from_secs(120), || {
+        live.printed(run, job, "started")
+    });
+    assert!(probe.offer_again(&offer), "running: not acknowledged again");
+    assert_eq!(probe.inner.held(), vec![offer.attempt]);
+
+    eventually("the job ended", Duration::from_secs(120), || {
+        matches!(live.job(job).state, JobState::Terminal(_))
+    });
+    let row = live.job(job);
+    assert_eq!(
+        (row.state, row.failure_class),
+        (JobState::Terminal(Outcome::Passed), None),
+        "notices: {:?}",
+        probe.notices.lock().unwrap()
+    );
+    assert!(live.printed(run, job, "done"));
+    assert_eq!(live.attempt(job), Some(offer.attempt), "no second attempt");
+    // Started once, finished once, one container.
+    assert_eq!(
+        (probe.notices_of("Started("), probe.notices_of("Finished(")),
+        (1, 1),
+        "notices: {:?}",
+        probe.notices.lock().unwrap()
+    );
+    assert!(!probe.noticed("SpecRefused"));
+    let created = fs::read_to_string(&creates).unwrap_or_default();
+    assert_eq!(created.lines().count(), 1, "podman create calls: {created}");
+    eventually("nothing held", Duration::from_secs(30), || {
+        probe.inner.held().is_empty()
+    });
     live.stop();
 }

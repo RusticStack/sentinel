@@ -111,7 +111,7 @@ Doc corrections (`cde19ef`, `b3fc93d`):
 | P04-12 | medium | Redaction registration was executor-global and snapshotted at spawn. | Values could not reach a live attempt. All tenants shared one unbounded list. Prefix probing across tenants was possible. | `register_secret(attempt, value) -> bool`, per attempt, live or pending. The global list is gone (`9d99000`). | `logpipe::tests::registration_is_per_attempt_and_takes_effect_while_it_runs` |
 | P04-13 | medium | The protocol-7 bulk connection had no keepalive, and frames lost when it closed were acknowledged past. | Quiet-then-print steps lost log data. | Idle bulk lives as long as its session. On detach, the pipe rewinds to the acknowledged sequence before any fallback send (`4b6dd39`, `9d99000`). | `hardening.rs::an_idle_bulk_connection_lives_as_long_as_its_session`; `spool::tests::rewinds_to_the_acknowledgement_resume_at_the_recorded_offset` |
 | P04-14 | medium | A cancel during an offer, followed by a lapse, parked the job `Queued` for 6 h. | The job ended `timed_out`, and supersession was blocked. | `lapse` and `decline` share `give_back`, which applies `CancelBeforeStart` and releases dependents (`414f3ca`). | `execution.rs::a_cancel_recorded_while_offered_ends_the_job_when_the_offer_goes_back` |
-| P04-15 | medium | A cancel could be lost for the rest of a step. | Capacity stayed held up to the job timeout. | `step_pids` reads nested cgroups. `canceling` resets on `Gone`/`Err` so the next beat retries (`9d99000`). | Follow-up: `executor_faults.rs::a_cancel_that_finds_the_step_still_starting_is_tried_again` holds the step's `podman exec` in a shim while the cancel lands (fails with `canceling` left set). The nested-cgroup read has no dedicated test. |
+| P04-15 | medium | A cancel could be lost for the rest of a step. | Capacity stayed held up to the job timeout. | `step_pids` reads nested cgroups. `canceling` resets on `Gone`/`Err` so the next beat retries (`9d99000`). | Follow-up: `executor_faults.rs::a_cancel_that_finds_the_step_still_starting_is_tried_again` holds the step's `podman exec` in a shim while the cancel lands (fails with `canceling` left set). ~~The nested-cgroup read has no dedicated test.~~ Closed: `podman.rs::a_step_in_a_nested_cgroup_is_found_and_terminated` moves the step into a real nested cgroup (fails with `Gone` when only the container's own cgroup is read); see [the test-gap follow-up](#follow-up-three-test-gaps-closed). |
 | P04-16 | medium | Cancel did not kill `git` or `podman pull` helpers. | A slot could stay "canceling" for about 25 min. | `sentinel_git::cancel_scope` and `process::run_canceled` kill helper process groups. Followers of a cancelled pull re-lead it (`9d99000`). | `process::tests::a_cancel_kills_a_running_helper` |
 | P04-17 | medium | Link sockets had no write timeout, and ended sessions kept their sockets. | A peer that stopped reading stalled the dispatcher and held spec permits. | `set_write_timeout(HEARTBEAT_DEADLINE)` on every socket; sessions close their sockets (`4b6dd39`). | `session::tests::a_send_to_a_peer_that_never_reads_fails_within_the_write_timeout` |
 | P04-18 | medium | `GET /queue` explained every job before applying `limit`. | Unbounded work per request. | Same as P08-8 (fleet, `972618d`, `476f8ed`). | See P08-8 |
@@ -141,7 +141,7 @@ Evidence corrections (execution, `5cef78b` and `b000489`):
   - The "never cleared" claim now notes the GitHub rerequest exception.
   - The wording about clocks and ownership was corrected.
 - **Executor and `podman.rs`:** "only bind mount" was corrected.
-- **Duplicate offers:** `Executor::offered` now re-acknowledges a held or awaiting attempt explicitly. There is no Podman-backed test for that path.
+- **Duplicate offers:** `Executor::offered` now re-acknowledges a held or awaiting attempt explicitly. ~~There is no Podman-backed test for that path.~~ Closed by `executor_faults.rs::a_repeated_offer_is_acknowledged_again_and_never_started_twice`; see [the test-gap follow-up](#follow-up-three-test-gaps-closed).
 
 ## Part 05 — Git sources, event intake and GitHub PR feedback (G01–G08)
 
@@ -367,7 +367,7 @@ Items fixed without an automated regression test, with the fix report's reason:
 - **P02-8:** docs only.
 - ~~**P04-5:** no dedicated clock-skew test.~~ Closed by the [follow-up](#follow-up-spool-space-crash-durability-and-p04-regression-tests).
 - **P04-8:** no contention test. Storage's `tput.rs` harness measures the per-attempt lock.
-- ~~**P04-15:** needs a real exec race or a nested-cgroup runtime.~~ The exec race is closed by the follow-up; the nested-cgroup read still has no dedicated test.
+- ~~**P04-15:** needs a real exec race or a nested-cgroup runtime.~~ The exec race is closed by the follow-up; the nested-cgroup read is closed by `podman.rs::a_step_in_a_nested_cgroup_is_found_and_terminated` ([test-gap follow-up](#follow-up-three-test-gaps-closed)).
 - **P04-23:** eviction is a map removal. Storage's writer-eviction test covers the bound.
 - ~~**P04-27:** thread placement only.~~ Closed by the follow-up.
 - ~~**P04-28:** power-loss durability needs a fault-injecting filesystem.~~ Verified by the follow-up, without one: a POSIX-strict crash model and `dm-flakey` in WSL2.
@@ -581,7 +581,7 @@ What the two show about P04-28 itself: with its directory syncs removed, the mod
 | P04-27 | `a_stop_order_never_holds_the_heartbeat_thread`: the attempt is abandoned under the worker's fence, the next heartbeat orders it stopped, and the shim makes `podman rm` take 3 s. `stop` must return within 500 ms, the container must go and the session must stay up | `stop held the heartbeat thread for 3.22 s` |
 | P04-30 | `executor::tests::a_panicking_attempt_is_torn_down_and_reported`: a `#[cfg(test)]` hook in `attempt::run` (absent from every other build) panics before a step while the container runs. The job ends `infra_failed`/`runtime`; container, workspace, marker and spool are gone; the output printed before the panic is in the closed log | The job never ended (timed out after 120 s) |
 
-The panic path now also closes the attempt's log, so its spool no longer waits for a restart. P04-15's nested-cgroup read still has no dedicated test.
+The panic path now also closes the attempt's log, so its spool no longer waits for a restart. P04-15's nested-cgroup read got its dedicated test later ([test-gap follow-up](#follow-up-three-test-gaps-closed)).
 
 **Verification on the final tree**, run one command at a time:
 
@@ -837,7 +837,7 @@ In the stressed failures a reader also reported an `Invalid` miss. That was a si
 
 **`sentinel-store` `faults::log_frames_carry_binary_and_the_oversized_are_refused` on Windows (`fix: read a log segment's compressed twin when Windows holds the plain file`).** This was a product bug in the log reader, not antivirus or a test problem. The compressor renames `seg-N.z` into place and then removes the plain `seg-N`. A reader that listed the directory before the rename opens the plain file. On Linux that open fails with `NotFound` and the reader falls back to the twin. On Windows, if another handle still had the plain file open when it was removed, the file stays listed but delete-pending, and opening it fails with `ERROR_ACCESS_DENIED`. The reader then failed the read.
 
-An instrumented run confirmed where the error came from: all 10 failures were the open of `seg-000000`. Both segment readers now share one open path. It treats that refusal on a plain segment as the rename it is, and still reports the error when no twin exists. A deterministic test could not be built with public APIs: `std`'s `remove_file` uses POSIX delete semantics when it can, so a handle the test holds does not leave the file delete-pending. Stress used the prebuilt Windows binary with 16 parallel loops:
+An instrumented run confirmed where the error came from: all 10 failures were the open of `seg-000000`. Both segment readers now share one open path. It treats that refusal on a plain segment as the rename it is, and still reports the error when no twin exists. ~~A deterministic test could not be built with public APIs: `std`'s `remove_file` uses POSIX delete semantics when it can, so a handle the test holds does not leave the file delete-pending.~~ Closed since: `logs::windows_tests::a_plain_segment_pending_delete_is_read_from_its_compressed_twin` builds the state with the classic `FileDispositionInfo` disposition, and the fallback now also covers `ERROR_DELETE_PENDING` ([test-gap follow-up](#follow-up-three-test-gaps-closed)). Stress used the prebuilt Windows binary with 16 parallel loops:
 
 | Build | Runs | Failed |
 |---|---|---|
@@ -878,3 +878,29 @@ Still open:
 - ~~Podman test shims leaving a `/tmp/.tmp*` directory per run.~~ Closed since by `test: keep one podman shim directory per test binary and sweep dead runs`: `executor_faults.rs`, `runtime_failures.rs` and `recovery.rs` now use one `sentinel-<tag>-shim-<pid>` directory per test binary and remove those of exited runs; the 164 leftover directories in WSL `/tmp` were removed.
 - S05 tenant-scoped registry authorization.
 - B04, R01 and R04 as written in the tracker.
+
+## Follow-up: three test gaps closed
+
+Three fixes had no regression test. Each now has one. Each test was run with its fix reverted in place, and each failed:
+
+| Gap | Test | How it gets there | With the fix reverted |
+|---|---|---|---|
+| P04-15, the nested-cgroup read | `crates/sentinel-worker/tests/podman.rs::a_step_in_a_nested_cgroup_is_found_and_terminated` (rootless Podman as `sentinelbench`) | A real nested cgroup: WSL2's cgroup v2 delegates `cpu memory pids` to `user@1000.service`, and the container's `libpod-….scope` belongs to the worker account. The test moves the step's `sleep` two levels down (`<scope>/step/inner`), so the container's own cgroup holds only the keepalive. `terminate_named` must answer `Graceful`, and the step must end by `SIGTERM`. With the nested cgroups still there but empty, it must answer `Gone`. No injectable cgroup root was needed | `left: Gone, right: Graceful`: the step was reported as not running while it ran |
+| Duplicate offers | `crates/sentinel-worker/tests/executor_faults.rs::a_repeated_offer_is_acknowledged_again_and_never_started_twice` (live controller, process-wide shim) | A session re-acknowledges an attempt it has already seen without asking the executor, and the controller never re-offers an attempt ID. The duplicate therefore arrives the way a later session delivers it: `offered`, then `accepted` when taken. It arrives once while the attempt awaits its spec (the probe holds specs back) and once while its step runs. The test asserts the re-ack both times, that the attempt is held once, one `Started` and one `Finished`, a single `podman create` (counted by the shim), one attempt, and a passed job | `held()` listed the running attempt twice. With that assertion set aside, it was started a second time (`Started` twice), and the job ended `infra_failed`/`preparation`: "workspace … already exists" |
+| Windows log-segment read | `crates/sentinel-store/src/logs.rs::windows_tests::a_plain_segment_pending_delete_is_read_from_its_compressed_twin` (`#[cfg(windows)]`) | Probed on this host, a file held open with `FILE_SHARE_DELETE` and deleted with `std::fs::remove_file` or `DeleteFileW` is unlisted at once (POSIX semantics; the open answers `NotFound`, error 2). `SetFileInformationByHandle` with the classic `FileDispositionInfo`, on a handle kept open, leaves it listed, and its open fails with `ERROR_ACCESS_DENIED` (5). The test puts a compressed log's `seg-000000` in that state next to its `seg-000000.z`. The shared open path, called as a reader that listed only the plain segment, must return frames 1–3 from the twin. With the twin removed, it must report the refusal, not an early end | `Io(Os { code: 5, kind: PermissionDenied })` |
+
+**Product change.** `std` files `ERROR_DELETE_PENDING` (303) as `Uncategorized`, so the fallback did not cover it. The plain-segment open now also falls back on raw OS error 303. On this host the pending-delete open answered error 5, not 303, so that branch has no reproducer here.
+
+**Verification**, one command at a time:
+
+| Where | Command | Exit | Result |
+|---|---|---|---|
+| Windows | `cargo fmt-check` | 0 | clean |
+| Windows | `cargo lint` | 0 | no warnings |
+| Windows | `cargo test --locked -p sentinel-store --lib --test logs --test faults` | 0 | lib 16, `faults` 11, `logs` 12 passed |
+| WSL2 | `cargo lint-linux` | 0 | no warnings |
+| WSL2 | `cargo test --locked -p sentinel-store --lib --test logs --test faults` | 0 | lib 15, `faults` 11, `logs` 12 passed |
+| WSL2, rootless Podman 4.9.3 as `sentinelbench` | `podman` binary with `SENTINEL_PODMAN_TESTS=1` | 0 | 3 passed |
+| WSL2, rootless Podman 4.9.3 as `sentinelbench` | `executor_faults` binary with `SENTINEL_PODMAN_TESTS=1` | 0 | 4 passed (77.2 s) |
+
+Afterwards `sentinelbench` held no container, and the shim directory of the last `executor_faults` run was removed from `/tmp`.
