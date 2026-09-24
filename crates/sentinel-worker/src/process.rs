@@ -270,28 +270,47 @@ mod tests {
     /// threads — not an extra poll interval (the old 20 ms sleep added
     /// 10 ms on average and at least 20 ms to a helper that outlived the
     /// first check).
+    ///
+    /// Measured in interleaved pairs (alternating which goes first) and
+    /// judged by the median paired difference, so a host whose load drifts
+    /// during the test — a full parallel suite — moves both sides alike. A
+    /// 2 ms child would cost about 18 ms more under the old poll.
     #[test]
     fn a_quick_helper_is_not_held_by_a_poll_interval() {
-        const N: u32 = 20;
+        const PAIRS: usize = 21;
         let sleep = || {
             let mut cmd = Command::new("sh");
-            cmd.args(["-c", "sleep 0.01"]);
+            cmd.args(["-c", "sleep 0.002"]);
             cmd
         };
-        let started = Instant::now();
-        for _ in 0..N {
+        let blocking = || {
+            let started = Instant::now();
             assert!(sleep().status().unwrap().success());
-        }
-        let blocking = started.elapsed() / N;
-        let started = Instant::now();
-        for _ in 0..N {
+            started.elapsed()
+        };
+        let ours = || {
+            let started = Instant::now();
             let output = run(sleep(), Instant::now() + Duration::from_secs(10), "sleep").unwrap();
             assert!(output.success());
-        }
-        let ours = started.elapsed() / N;
+            started.elapsed()
+        };
+        let mut extra: Vec<i128> = (0..PAIRS)
+            .map(|i| {
+                let (b, o) = if i % 2 == 0 {
+                    let b = blocking();
+                    (b, ours())
+                } else {
+                    let o = ours();
+                    (blocking(), o)
+                };
+                o.as_micros() as i128 - b.as_micros() as i128
+            })
+            .collect();
+        extra.sort_unstable();
+        let median = extra[PAIRS / 2];
         assert!(
-            ours < blocking + Duration::from_millis(8),
-            "{ours:?} per helper against {blocking:?} blocking"
+            median < 8_000,
+            "a helper cost {median} µs more than a blocking wait (median of {PAIRS} pairs: {extra:?})"
         );
     }
 }
