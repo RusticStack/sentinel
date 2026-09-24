@@ -258,6 +258,9 @@ pub struct Inner {
     /// One in-flight pull per image reference across every attempt, and
     /// the record of what the local store holds.
     images: Images,
+    /// K05: background pulls of what the controller's hints name, through
+    /// `images`, within their own bounds.
+    prefetch: crate::prefetch::Prefetcher,
     /// The worker-local object mirrors, opened once here so the reflink
     /// probe and the root are settled for the process's life. `None` —
     /// configured off, or open failed — runs every checkout direct.
@@ -305,11 +308,18 @@ impl Executor {
         // disk and in the runtime; what it owed the controller waits for
         // the session.
         let (recovered, leftovers) = recovery::recover(&root, worker)?;
+        let images = Images::new();
+        let prefetch = crate::prefetch::Prefetcher::new(
+            images.clone(),
+            crate::prefetch::Bounds::default(),
+            crate::prefetch::PodmanProbe::new(),
+        );
         let executor = Executor(Arc::new(Inner {
             root,
             worker,
             runtime,
-            images: Images::new(),
+            images,
+            prefetch,
             mirrors,
             state: Mutex::new(State {
                 reporter: None,
@@ -533,6 +543,11 @@ impl Inner {
     /// the locality record a later part advertises to placement.
     pub fn images(&self) -> &Images {
         &self.images
+    }
+
+    /// The background prefetcher the controller's hints drive (K05).
+    pub fn prefetcher(&self) -> &crate::prefetch::Prefetcher {
+        &self.prefetch
     }
 
     /// What starting this executor found of the previous process.
@@ -966,6 +981,12 @@ impl LinkExecutor for Executor {
                 load_ns: 0,
             },
         ))
+    }
+
+    /// K05: the controller's latest hint replaces the wanted set; pulls
+    /// run in the background within the prefetcher's bounds.
+    fn prefetch(&self, images: &[String]) {
+        self.prefetch.hint(images);
     }
 
     fn offered(&self, offer: &Offer) -> bool {

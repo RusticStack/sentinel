@@ -247,7 +247,10 @@ fn stalled_bulk_never_holds_up_the_control_beat() {
     .unwrap();
     // Protocol 7: report the profile, then dial the bulk connection and read
     // its answers on their own thread (log acknowledgements included).
-    assert_eq!(link.negotiated.protocol, ProtocolVersion(8));
+    assert_eq!(
+        link.negotiated.protocol,
+        sentinel_protocol::negotiate::SUPPORTED_MAX
+    );
     link.send_profile(&Profile::default()).unwrap();
     let bulk = link
         .bulk_dialer()
@@ -371,7 +374,10 @@ fn bulk_traffic_on_control_is_served_as_fallback() {
         capacity(),
     )
     .unwrap();
-    assert_eq!(link.negotiated.protocol, ProtocolVersion(8));
+    assert_eq!(
+        link.negotiated.protocol,
+        sentinel_protocol::negotiate::SUPPORTED_MAX
+    );
     link.send_profile(&Profile::default()).unwrap();
     // No bulk connection is dialled: the session falls back to control.
     let closer = link.sender();

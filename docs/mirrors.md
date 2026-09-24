@@ -9,7 +9,7 @@ materialized from it with a **private** object store.
 The win is fetch traffic: a repository's history accumulates in the mirror
 once, and each attempt negotiates only what is new instead of re-cloning or
 re-fetching a depth-1 snapshot with no common base. The costs that remain —
-init, the object copy, the worktree write — are measured and reported
+init, the private object store, the worktree write — are measured and reported
 separately as `checkout_materialize_ns`; the mirror update is
 `checkout_fetch_ns`; `checkout_ns` stays the total.
 
@@ -83,14 +83,35 @@ reader's copy only ever sees a superset of the verified store.
 
 ## Private materialization
 
-A workspace's `.git/objects` is populated file-by-file — never
-`clone --local` hardlinks, never an `alternates` pointer into shared
-storage — so a job that `chmod`s or rewrites its own `.git` cannot touch
-the mirror's bytes. Where the data directory's filesystem supports it, the
-copy is a **reflink** (`FICLONE`: shared extents, separate inode), probed
-once at worker start; elsewhere it is a plain byte copy. `tmp_*` files and
-`info/alternates` are never copied. After `checkout --detach <sha>`, `HEAD`
-is verified against the pin. A materialization failure marks the mirror
+A workspace's `.git/objects` is always its own — never `clone --local`
+hardlinks, never an `alternates` pointer into shared storage — so a job
+that `chmod`s or rewrites its own `.git` cannot touch the mirror's bytes.
+It is built the cheapest measured way (P07-20):
+
+- **Reflink** the whole store (`FICLONE`: shared extents, separate inode)
+  where the data directory's filesystem supports it, probed once at worker
+  start. The cost is per file, not per byte, and GC keeps the file count
+  small. (Until this change the probe opened its source write-only, which
+  `FICLONE` refuses, so it answered "no" on XFS and Btrfs too.)
+- **Copy** the store byte for byte when it is at most 48 MiB
+  (`COPY_MAX_BYTES`).
+- Otherwise **fetch the pinned commit alone** at depth 1 out of the mirror
+  (protocol v2 over the local path, which serves a SHA that is not a tip):
+  Git packs only the objects the checkout reaches and the workspace indexes
+  its own pack. The job's `.git` then holds one tree and is shallow, exactly
+  like a direct checkout, instead of every revision the mirror ever fetched.
+
+`tmp_*` files and `info/alternates` are never copied. After
+`checkout --detach <sha>`, `HEAD` is verified against the pin.
+
+Measured with `tests/mirror_cost.rs` (release, WSL2 ext4, 8 MiB tree,
+materialization plus the `syncfs` its write-back costs, median of 5): a
+262 MiB store took 337–725 ms and wrote 262 MiB into every job before, and
+takes 142–157 ms and writes 8.5 MiB with the fetch; a 76 MiB store went from
+493 ms to 145 ms. Below the threshold the copy stays faster: 70–132 ms across
+runs for 9–42 MiB stores, against 145–205 ms for the fetch. On a reflink XFS the
+262 MiB store now clones in 78.5 ms (it took the 193 ms fetch path while
+the probe was broken). Raw records: [`bench/b04-transfer-copies.jsonl`](../bench/b04-transfer-copies.jsonl). A materialization failure marks the mirror
 `suspect` only when the store itself is damaged (the health probe below
 fails): a deadline, a full workspace or a checkout error on a healthy store
 never forces a full refetch.

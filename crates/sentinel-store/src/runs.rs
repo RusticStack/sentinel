@@ -84,14 +84,18 @@ pub fn create_run(
             dispatch::encode_labels(&job.spec.runs_on.labels)?,
             group,
         ])?;
-        if let Some(digest) = sentinel_pipeline::run::ImageRef::parse(&job.spec.image)
-            .ok()
-            .and_then(|image| image.digest)
-        {
-            tx.execute(
-                "UPDATE jobs SET image_digest = ?1 WHERE id = ?2",
-                params![digest, id.as_bytes()],
-            )?;
+        if let Ok(image) = sentinel_pipeline::run::ImageRef::parse(&job.spec.image) {
+            // The repository part travels with the digest so a prefetch
+            // hint can name `name@digest` without decoding the spec (K05);
+            // a name outside the reference charset is simply never hinted.
+            let name = dispatch::prefetch_name(&image.name).then_some(image.name.as_str());
+            if image.digest.is_some() || name.is_some() {
+                tx.execute(
+                    "UPDATE jobs SET image_digest = COALESCE(?1, image_digest), image_name = ?2
+                     WHERE id = ?3",
+                    params![image.digest, name, id.as_bytes()],
+                )?;
+            }
         }
         if job.needs.is_empty() {
             jobs::transition(

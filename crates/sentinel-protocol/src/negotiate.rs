@@ -24,8 +24,25 @@ pub struct ProtocolVersion(pub u16);
 /// fields. Protocol 8 adds the third cache trust class (`Trust::Unprotected`
 /// in `Context2`), `CacheCancel` for an abandoned transfer, and allows a
 /// later `Profile` on the same session as an availability refresh.
+/// Protocol 9 adds `Prefetch`, the controller's bounded hint of image
+/// references queued work needs (K05), and lets a cache offer state its
+/// digest in the end marker instead of up front (the all-zero
+/// `Upload::digest`).
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(8);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(9);
+
+/// First protocol whose offers may state their digest at their end. An
+/// older session's offers keep naming it up front.
+pub const DIGEST_AT_END_MIN: ProtocolVersion = ProtocolVersion(9);
+
+/// First protocol a controller sends `Prefetch` hints on. An older session
+/// is never hinted, and a worker refuses a hint below it.
+pub const PREFETCH_MIN: ProtocolVersion = ProtocolVersion(9);
+
+/// Image references one `Prefetch` hint may carry, and the longest one.
+/// A hint over either bound is a protocol error, never a truncation.
+pub const MAX_PREFETCH_IMAGES: usize = 8;
+pub const MAX_PREFETCH_REFERENCE_BYTES: usize = 512;
 
 /// First protocol that can carry `Trust::Unprotected`, `CacheCancel` and a
 /// refreshed `Profile`. An older session is sent `PullRequest` for an
@@ -290,7 +307,11 @@ mod tests {
     #[test]
     fn version_mismatch_says_who_must_upgrade() {
         assert_eq!(
-            negotiate(&hello(9, 10, Capabilities::REQUIRED)),
+            negotiate(&hello(
+                SUPPORTED_MAX.0 + 1,
+                SUPPORTED_MAX.0 + 2,
+                Capabilities::REQUIRED
+            )),
             Err(Rejected::UnsupportedVersion {
                 supported_min: SUPPORTED_MIN,
                 supported_max: SUPPORTED_MAX,

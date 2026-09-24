@@ -33,7 +33,9 @@ use sentinel_core::{
 };
 use sentinel_protocol::limits::{MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES, MAX_RUN_ARTIFACT_BYTES};
 use sentinel_protocol::logs::Frame;
-use sentinel_protocol::negotiate::{Hello, PROFILE_MIN, Profile};
+use sentinel_protocol::negotiate::{
+    Hello, MAX_PREFETCH_IMAGES, PREFETCH_MIN, PROFILE_MIN, Profile,
+};
 use sentinel_store::{
     Store, artifacts, dispatch,
     logs::LogStore,
@@ -54,6 +56,13 @@ use crate::{
 /// How long the dispatcher sleeps without a wake before re-checking the
 /// queue and sweeping unacknowledged offers. A safety net, not the clock.
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+/// The prefetch pass (K05) reads the queue at most this often: a hint is
+/// advisory, so a burst of wakes never becomes a burst of reads.
+pub const PREFETCH_INTERVAL: Duration = Duration::from_millis(500);
+const _: () = assert!(
+    dispatch::MAX_PREFETCH_HINTS <= MAX_PREFETCH_IMAGES,
+    "a hint must fit the wire bound"
+);
 /// Sessions accepted at once; beyond this a connection is closed unserved.
 pub const MAX_SESSIONS: usize = 1024;
 /// Connections that have not finished their handshake and hello yet. A
@@ -138,6 +147,9 @@ pub struct Stats {
     /// failed, counted and logged the same way. A sweep that found its row
     /// already moved (renewed, acknowledged, released) is not a failure.
     pub sweep_errors: AtomicU64,
+    /// Prefetch hints sent (protocol 9, K05): one per session whose wanted
+    /// set changed.
+    pub prefetch_hints: AtomicU64,
     /// Live sessions closed because their worker was revoked (P08-7).
     pub revoked_sessions: AtomicU64,
 }
@@ -176,6 +188,9 @@ struct Peer {
     /// The protocol-7 bulk connection attached to this session, closed with
     /// it: a bulk connection lives exactly as long as its control session.
     bulk: Mutex<Option<Sender>>,
+    /// The prefetch hint (protocol 9) this session was last sent; `None`
+    /// until the first, so a new session always learns the current set.
+    prefetch_sent: Mutex<Option<Vec<String>>>,
 }
 
 /// A file currently receiving `ArtifactData` chunks.
@@ -366,6 +381,9 @@ struct Inner {
     /// When a placement or sweep failure was last logged, for the
     /// once-a-minute limit.
     warned: [AtomicI64; 2],
+    /// When the prefetch pass last read the queue: it runs at most once
+    /// per `PREFETCH_INTERVAL`, however often the dispatcher wakes.
+    prefetch_at: Mutex<Option<Instant>>,
 }
 
 /// Placement and sweep failures are logged at most this often per kind.
@@ -572,6 +590,7 @@ impl Inner {
             transport: Mutex::new(None),
             logging: Mutex::new(HashMap::new()),
             bulk: Mutex::new(None),
+            prefetch_sent: Mutex::new(None),
         });
         self.register(worker, Arc::clone(&peer));
         self.wake();
@@ -726,6 +745,54 @@ impl Inner {
         }
         self.revocation_pass(now);
         self.placement_pass();
+        self.prefetch_pass();
+    }
+
+    /// K05: tell each idle or underused protocol-9 worker which images the
+    /// work still queued after placement needs and it does not hold
+    /// (`dispatch::prefetch_hints` decides eligibility, fan-out and
+    /// bounds). A session is sent a hint only when its wanted set changed
+    /// — an empty set included, which is how a stale prefetch is stopped.
+    /// One store read per pass, at most once per [`PREFETCH_INTERVAL`];
+    /// nothing is read when no connected session speaks protocol 9.
+    fn prefetch_pass(&self) {
+        let peers: Vec<(WorkerId, Arc<Peer>)> = self
+            .fleet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(_, p)| p.protocol >= PREFETCH_MIN.0)
+            .map(|(w, p)| (*w, Arc::clone(p)))
+            .collect();
+        if peers.is_empty() {
+            return;
+        }
+        {
+            let mut at = self.prefetch_at.lock().unwrap_or_else(|p| p.into_inner());
+            if at.is_some_and(|at| at.elapsed() < PREFETCH_INTERVAL) {
+                return;
+            }
+            *at = Some(Instant::now());
+        }
+        let workers: Vec<WorkerId> = peers.iter().map(|(w, _)| *w).collect();
+        let hints = match self
+            .store
+            .read(move |c| dispatch::prefetch_hints(c, &workers))
+        {
+            Ok(hints) => hints,
+            Err(e) => return self.failed(true, "prefetch", &e),
+        };
+        // `prefetch_hints` answers every worker, in the order asked.
+        for ((_, images), (_, peer)) in hints.into_iter().zip(&peers) {
+            let mut sent = peer.prefetch_sent.lock().unwrap_or_else(|p| p.into_inner());
+            if sent.as_ref() == Some(&images) {
+                continue;
+            }
+            if session::prefetch(&peer.sender, &images).is_ok() {
+                self.stats.prefetch_hints.fetch_add(1, Ordering::Relaxed);
+                *sent = Some(images);
+            }
+        }
     }
 
     /// Count a batched sweep's failed rows: each is a sweep error, logged
@@ -1719,7 +1786,12 @@ impl SessionHandler for Inner {
                 },
             )
         })
-        .map_err(|_| Error::Internal("profile write"))
+        .map_err(|_| Error::Internal("profile write"))?;
+        // A worker that just reported an image warm — often one it
+        // prefetched — may now take work a locality hold kept from it, so
+        // placement runs now rather than at the next reconciliation.
+        self.wake();
+        Ok(())
     }
 
     /// Protocol 7 (Q07). The worker's latest transport telemetry, kept on
@@ -2491,6 +2563,7 @@ impl Controller {
             stats: Stats::default(),
             revocations: Mutex::new((-1, -1)),
             warned: [AtomicI64::new(i64::MIN), AtomicI64::new(i64::MIN)],
+            prefetch_at: Mutex::new(None),
         });
         let _ = inner.me.set(Arc::downgrade(&inner));
         let acceptor = {

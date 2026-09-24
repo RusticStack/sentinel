@@ -1271,3 +1271,227 @@ fn a_passed_lease_stays_expired_and_a_renewed_one_is_not_expired() {
         .unwrap();
     assert_eq!(state(&f, a.job), JobState::Terminal(Outcome::InfraFailed));
 }
+
+// ——— bounded image prefetch (K05, B04) ———
+
+fn hints(f: &Fixture, workers: &[WorkerId]) -> Vec<(WorkerId, Vec<String>)> {
+    let workers = workers.to_vec();
+    f.store
+        .read(move |c| dispatch::prefetch_hints(c, &workers))
+        .unwrap()
+}
+
+/// A digest of 64 hex nibbles, all `nibble`.
+fn digest_of(nibble: char) -> String {
+    format!("sha256:{}", nibble.to_string().repeat(64))
+}
+
+/// A run of one job per `(name, digest, extra)`, each image pinned by its
+/// own digest and resolved to it.
+fn pinned_run(
+    f: &Fixture,
+    tenant: TenantId,
+    repo: RepoId,
+    images: &[(&str, String, &str)],
+    now: UnixMillis,
+) -> Vec<JobId> {
+    let mut yaml = String::from("schema: 1\non: [push]\njobs:\n");
+    for (i, (name, digest, extra)) in images.iter().enumerate() {
+        yaml.push_str(&format!(
+            "  j{i:03}:\n    image: {name}@{digest}\n{extra}    resources: {{ cpu: 1, memory: 128MiB, disk: 1GiB }}\n    steps: [{{ id: s, run: 'true' }}]\n"
+        ));
+    }
+    let spec = spec(&yaml);
+    let digests: Vec<String> = images.iter().map(|(_, d, _)| d.clone()).collect();
+    f.store
+        .writer()
+        .write(move |tx| {
+            let ids = runs::create_run(tx, tenant, repo, RunId::new(), &spec, now)?;
+            // Compiled order is by job name, which is the listed order here.
+            for (job, digest) in ids.iter().zip(&digests) {
+                runs::resolve_image(tx, tenant, *job, digest, "linux/amd64")?;
+            }
+            Ok(ids)
+        })
+        .unwrap()
+}
+
+/// K05's placement payoff. A job whose image one busy worker holds warm is
+/// passed over by the idle cold worker (the bounded locality hold). The
+/// prefetch pass hints exactly that idle worker — not the warm one — and
+/// once its profile reports the image, the next placement puts the job on
+/// it at once instead of waiting out the hold or the warm worker.
+#[test]
+fn a_prefetch_hint_warms_the_idle_worker_a_locality_hold_passed_over() {
+    let f = fixture();
+    let key = [0xaa_u8; 8];
+    let cold = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let warm = worker(&f, f.pool, 8_000, 16 << 30, 20 << 30, &[], None, &[key]);
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (_, filler) = run(
+        &f,
+        tenant,
+        repo,
+        "schema: 1
+on: [push]
+jobs:
+  one:
+    image: alpine:3
+    timeout: 20s
+    resources: { cpu: 1, memory: 1GiB, disk: 1GiB }
+    steps: [{ id: s, run: 'true' }]
+",
+        at(2_000),
+    );
+    let (_, target) = run(
+        &f,
+        tenant,
+        repo,
+        single_job(4, "4GiB", "4GiB").as_str(),
+        at(2_100),
+    );
+    assert_eq!(place(&f, warm, pool, at(2_200)).unwrap().job, filler[0]);
+    assert_eq!(place(&f, cold, pool, at(2_300)), None, "held for locality");
+
+    let reference = format!("alpine@{DIGEST}");
+    assert_eq!(
+        hints(&f, &[warm, cold]),
+        vec![(warm, vec![]), (cold, vec![reference])],
+        "only the worker without the image is told to pull it"
+    );
+    // The worker pulled it and its profile refresh says so.
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::report_profile(
+                tx,
+                cold,
+                &dispatch::ReportedProfile {
+                    labels: &[],
+                    host_id: None,
+                    avail_images: &[key],
+                    cache_bytes: Some(0),
+                    load_ns: Some(0),
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        place(&f, cold, pool, at(2_400)).unwrap().job,
+        target[0],
+        "placed well inside the locality window"
+    );
+    const { assert!(2_400 - 2_100 < dispatch::LOCALITY_WAIT_MS) };
+    assert_eq!(
+        hints(&f, &[warm, cold]),
+        vec![(warm, vec![]), (cold, vec![])]
+    );
+}
+
+/// A hint names only what the worker could run: its tenant may use the
+/// worker's pool, its architecture, labels and resources fit, the worker is
+/// not draining and not already full. It is bounded per worker and fanned
+/// out to at most `PREFETCH_FANOUT` of the most idle workers.
+#[test]
+fn prefetch_hints_follow_placement_eligibility_and_stay_bounded() {
+    let f = fixture();
+    let (tenant, repo, pool) = (f.tenant, f.repo, f.pool);
+    let (other, other_repo, private) = isolated_tenant(&f, "private");
+    let small = worker(&f, pool, 2_000, 4 << 30, 20 << 30, &[], None, &[]);
+    let big = worker(&f, pool, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+    let gpu = worker(&f, pool, 4_000, 8 << 30, 20 << 30, &["gpu"], None, &[]);
+    let stranger = worker(&f, private, 8_000, 16 << 30, 20 << 30, &[], None, &[]);
+
+    // Ineligible everywhere in the fixture's pool: another architecture, a
+    // label nobody but `gpu` has, and a job too large for `small`.
+    let arm = digest_of('1');
+    let labeled = digest_of('2');
+    pinned_run(
+        &f,
+        tenant,
+        repo,
+        &[
+            (
+                "docker.io/library/arm",
+                arm.clone(),
+                "    runs_on: { arch: arm64 }\n",
+            ),
+            (
+                "docker.io/library/gpu",
+                labeled.clone(),
+                "    runs_on: { labels: [gpu] }\n",
+            ),
+        ],
+        at(2_000),
+    );
+    // Six more images than one worker may be hinted.
+    let plain: Vec<String> = ('3'..='8').map(digest_of).collect();
+    let listed: Vec<(&str, String, &str)> = plain
+        .iter()
+        .map(|d| ("docker.io/library/plain", d.clone(), ""))
+        .collect();
+    pinned_run(&f, tenant, repo, &listed, at(2_100));
+    // The dedicated pool's tenant: never hinted to the shared pool.
+    let secret = digest_of('9');
+    pinned_run(
+        &f,
+        other,
+        other_repo,
+        &[("registry.example/secret", secret.clone(), "")],
+        at(2_200),
+    );
+
+    let got = hints(&f, &[small, big, gpu, stranger]);
+    let of = |w: WorkerId| got.iter().find(|(id, _)| *id == w).unwrap().1.clone();
+    for (w, hinted) in &got {
+        assert!(
+            hinted.len() <= dispatch::MAX_PREFETCH_HINTS,
+            "{w:?}: {hinted:?}"
+        );
+        assert!(
+            !hinted.iter().any(|h| h.ends_with(&arm)),
+            "no worker is arm64"
+        );
+    }
+    assert_eq!(
+        of(stranger),
+        vec![format!("registry.example/secret@{secret}")]
+    );
+    for w in [small, big, gpu] {
+        assert!(!of(w).iter().any(|h| h.ends_with(&secret)));
+    }
+    assert_eq!(
+        of(gpu).first(),
+        Some(&format!("docker.io/library/gpu@{labeled}")),
+        "the labeled job goes to the labeled worker: {got:?}"
+    );
+    assert!(!of(big).iter().any(|h| h.ends_with(&labeled)));
+    // Each plain image reaches at most the fan-out, most idle first.
+    for digest in &plain {
+        let reached = [small, big, gpu]
+            .iter()
+            .filter(|w| of(**w).iter().any(|h| h.ends_with(digest)))
+            .count();
+        assert!(reached <= dispatch::PREFETCH_FANOUT, "{digest}: {reached}");
+    }
+    assert_eq!(of(big).len(), dispatch::MAX_PREFETCH_HINTS);
+    assert!(
+        of(big)[0].ends_with(&plain[0]),
+        "queue order: {:?}",
+        of(big)
+    );
+
+    // A draining worker and a full one are told nothing.
+    f.store
+        .writer()
+        .write(move |tx| workers::drain(tx, Authority::HostLocal, big, NOW))
+        .unwrap();
+    let tiny = worker(&f, pool, 1_000, 4 << 30, 20 << 30, &[], None, &[]);
+    assert!(!hints(&f, &[tiny])[0].1.is_empty(), "idle, it is hinted");
+    let busy = place(&f, tiny, pool, at(3_000)).unwrap();
+    assert_eq!(busy.cpu_millis, 1_000);
+    let got = hints(&f, &[tiny, big, gpu]);
+    assert_eq!(got[0], (tiny, vec![]), "a full worker");
+    assert_eq!(got[1], (big, vec![]), "a draining worker");
+    assert!(!got[2].1.is_empty());
+}
