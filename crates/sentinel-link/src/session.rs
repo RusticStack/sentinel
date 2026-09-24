@@ -113,7 +113,9 @@ pub struct TransportStats {
     pub reconnects: u64,
     /// The Tailcat helper's version when one is running; `None` without one.
     pub helper_version: Option<String>,
-    /// Bytes written to / read from the control connection over this session.
+    /// Bytes written to / read from the session's connections: the control
+    /// connection plus, from protocol 7, every bulk connection it has had.
+    /// Cumulative counters: throughput is their rate between two reports.
     pub bytes_out: u64,
     pub bytes_in: u64,
 }
@@ -1467,6 +1469,22 @@ pub struct LinkRemote {
 struct BulkSlot {
     sender: Option<Sender>,
     route: Route,
+    /// Bytes out/in of the bulk connections this session already lost, so
+    /// the transport totals keep counting across a bulk redial.
+    done: (u64, u64),
+}
+
+impl BulkSlot {
+    /// Retire the live bulk sender, keeping its byte counts.
+    fn retire(&mut self) -> bool {
+        let Some(sender) = self.sender.take() else {
+            return false;
+        };
+        let (out, in_) = sender.bytes();
+        self.done.0 += out;
+        self.done.1 += in_;
+        true
+    }
 }
 
 /// Which route a bulk-class send took, as counts of bulk attachments and
@@ -1513,6 +1531,7 @@ impl LinkRemote {
     /// The bulk connection is up: bulk-class traffic moves to it.
     fn attach_bulk(&self, bulk: Sender) {
         let mut slot = self.bulk.lock().unwrap_or_else(|p| p.into_inner());
+        slot.retire();
         slot.sender = Some(bulk);
         slot.route.attached += 1;
     }
@@ -1521,9 +1540,17 @@ impl LinkRemote {
     /// back until a new one is up.
     fn detach_bulk(&self) {
         let mut slot = self.bulk.lock().unwrap_or_else(|p| p.into_inner());
-        if slot.sender.take().is_some() {
+        if slot.retire() {
             slot.route.detached += 1;
         }
+    }
+
+    /// Bytes out/in over every bulk connection this session has had (Q07's
+    /// throughput counts the bulk traffic, not only control).
+    fn bulk_bytes(&self) -> (u64, u64) {
+        let slot = self.bulk.lock().unwrap_or_else(|p| p.into_inner());
+        let (out, in_) = slot.sender.as_ref().map_or((0, 0), Sender::bytes);
+        (slot.done.0 + out, slot.done.1 + in_)
     }
 
     /// Route one received cache answer to its waiting transfer.
@@ -3029,8 +3056,9 @@ impl Link {
         };
         stats.rtt_ns = Some(rtt.as_nanos().min(u64::MAX as u128) as u64);
         let (out, bytes_in) = self.tx.bytes();
-        stats.bytes_out = out;
-        stats.bytes_in = bytes_in;
+        let (bulk_out, bulk_in) = self.remote.bulk_bytes();
+        stats.bytes_out = out + bulk_out;
+        stats.bytes_in = bytes_in + bulk_in;
         if self.beats.is_multiple_of(TRANSPORT_BEATS) {
             // What the process measured about the path since: the helper's
             // latest probe. Round-trip time stays this session's own beat,
@@ -3427,6 +3455,65 @@ pub fn listen(addr: SocketAddr) -> Result<TcpListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One loopback TLS connection, split: the worker end's sender and the
+    /// controller end's receiver (kept so the peer stays open).
+    fn tls_pair() -> (Sender, Receiver) {
+        let server_identity = crate::identity::Identity::generate("controller").unwrap();
+        let pin = server_identity.fingerprint();
+        let server = crate::tls::server_config(server_identity).unwrap();
+        let client =
+            crate::tls::client_config(crate::identity::Identity::generate("worker").unwrap(), pin)
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut conn = rustls::Connection::Server(ServerConnection::new(server).unwrap());
+            handshake(&mut conn, &socket, HEARTBEAT_DEADLINE).unwrap();
+            split(conn, socket).unwrap().1
+        });
+        let socket = TcpStream::connect(addr).unwrap();
+        let mut conn = rustls::Connection::Client(
+            ClientConnection::new(client, ServerName::try_from("sentinel").unwrap()).unwrap(),
+        );
+        handshake(&mut conn, &socket, HEARTBEAT_DEADLINE).unwrap();
+        let (tx, _) = split(conn, socket).unwrap();
+        (tx, accept.join().unwrap())
+    }
+
+    /// Q07: the transport's byte totals count the bulk connection too, and
+    /// keep counting across a bulk redial instead of restarting from zero.
+    #[test]
+    fn transport_bytes_count_every_bulk_connection_of_the_session() {
+        let (control, _control_peer) = tls_pair();
+        let remote = LinkRemote {
+            control,
+            bulk: Mutex::new(BulkSlot::default()),
+            router: Arc::new(CacheRouter::default()),
+            protocol: CACHE_CANCEL_MIN.0,
+        };
+        let cancel = ClientMessage::CacheCancel { attempt: [3; 16] };
+        let (first, _first_peer) = tls_pair();
+        remote.attach_bulk(first.clone());
+        remote.send(&cancel).unwrap();
+        remote.send(&cancel).unwrap();
+        let first_out = first.bytes().0;
+        assert!(first_out > 0);
+        assert_eq!(remote.bulk_bytes().0, first_out);
+        assert_eq!(remote.control.bytes().0, 0, "bulk-class sends went bulk");
+        // The bulk connection drops; its bytes stay counted while control
+        // carries the traffic, and a redialled connection adds to them.
+        remote.detach_bulk();
+        remote.send(&cancel).unwrap();
+        assert_eq!(remote.bulk_bytes().0, first_out);
+        let (second, _second_peer) = tls_pair();
+        remote.attach_bulk(second.clone());
+        remote.send(&cancel).unwrap();
+        let second_out = second.bytes().0;
+        assert!(second_out > 0);
+        assert_eq!(remote.bulk_bytes().0, first_out + second_out);
+    }
 
     /// The borrowed log frame is byte-for-byte the owned message: the
     /// variant index and field order of `ClientMessage::Log` are the wire.

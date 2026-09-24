@@ -111,7 +111,10 @@ reported at start — `Relay` for a pong via DERP, `Direct` for one from an
 control-session Ping/Pong pair; before the first beat, the latency that
 `tailcat ping` itself reported, else absent), `reconnects` (control sessions
 opened since process start), `helper_version` (the Tailcat helper's version, absent
-without one), and `bytes_in`/`bytes_out` (control-connection counters). It is
+without one), and `bytes_in`/`bytes_out` (cumulative counters over the
+session's control connection and every bulk connection it has had, so a
+bulk redial never restarts them; throughput is their rate between two
+reports). It is
 sent once per session after `Profile` and refreshed every 12 beats. The worker
 process hands the link a live source (`worker::Handle::set_transport_source`,
 fed from the helper's `Forward::telemetry()`): each session starts from the
