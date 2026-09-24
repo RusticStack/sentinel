@@ -785,10 +785,10 @@ What the intermediate variants showed:
 
 The test is now `tailcat_live.rs::an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper`, replacing `an_allow_list_change_interrupts_a_worker_for_one_heartbeat_deadline`. On each path it runs four cut changes (printed as the "before" figure) and six handed-off ones, then the removal. It asserts that each handed-off change closed the tunnelled session, that the worker saw the close within 1 s, and that the change cost less than 6 s. The largest measured value is 4.60 s. The previous bound was 25 s. In the verification run the removal's close reached the worker after 394 ms (the hand-off waited 499 ms), and the worker stayed out for the 45 s checked.
 
-Still not covered by the hand-off:
+Still not covered by the hand-off (both closed since, [below](#follow-up-tailcat-hand-off-edges)):
 
-- A connection still in its TLS handshake or hello when the helper restarts is not in the fleet and is cut as before, so its worker waits for its handshake deadline.
-- A close that does not get through the old helper (once in 52) falls back to heartbeat detection.
+- ~~A connection still in its TLS handshake or hello when the helper restarts is not in the fleet and is cut as before, so its worker waits for its handshake deadline.~~
+- ~~A close that does not get through the old helper (once in 52) falls back to heartbeat detection.~~
 
 Verification on `tailcat-handoff`, one command at a time:
 
@@ -904,3 +904,83 @@ Three fixes had no regression test. Each now has one. Each test was run with its
 | WSL2, rootless Podman 4.9.3 as `sentinelbench` | `executor_faults` binary with `SENTINEL_PODMAN_TESTS=1` | 0 | 4 passed (77.2 s) |
 
 Afterwards `sentinelbench` held no container, and the shim directory of the last `executor_faults` run was removed from `/tmp`.
+
+## Follow-up: Tailcat hand-off edges
+
+Branch `tailcat-edges` from `ac3f345` closes the two cases the [allow-list hand-off](#follow-up-tailcat-allow-list-hand-off) left falling back to about 20 s. Both are **closed**. The commit is `fix: close Tailcat connections still in their handshake and resend lost hand-off closes`, and the behaviour is in [configuration](configuration.md#optional-tailcat-transport), [worker link](worker-link.md), [protocol](protocol.md) (capability bit 8) and [compatibility](compatibility.md).
+
+**How it was measured.** `tailcat_live.rs::an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper` was extended, on the same setup as before: the pinned v0.6.0 helper, WSL2, rootful Podman, a real worker link in a parked container's network namespace, relay-only by dropping UDP other than DNS there, outages on `CLOCK_MONOTONIC` from the change to the next welcomed session, and 11 s of settled session before each change. The worker link now dials its forward through a slow link in its own process. It passes bytes and ends as they are, except on the one connection opened after the controller side asks for a stall: once the controller's TLS flight has come back, the worker's bytes stop getting through, so the controller holds that connection in its TLS handshake. That hook is test-only; nothing in the library knows about it. On each path the test runs:
+
+- 4 cut changes;
+- 64 handed-off changes of a settled session, so a close lost once in 52 would show;
+- 10 changes that meet a connection held in its handshake: the redial after a first hand-off is stalled, then the second change is made;
+- 6 changes during 800 ms in which everything arriving in the worker's namespace is dropped (`iptables` on `INPUT`);
+- 10 changes with a worker that keeps the forward rule from before this change and does not advertise the new bit. It otherwise runs this branch's link.
+
+"Before" is the same test built against the unchanged library (`ac3f345`).
+
+**1. Connections still in their handshake or hello.** Of the three options, only closing them removes the wait. Holding off new accepts during the hand-off does nothing for a connection accepted before the change, which is the case here and on any slow handshake. Shortening the worker's deadline does not help either: the worker waits 15 s for the welcome, and that bound also has to hold for a slow handshake over a relay. Design:
+
+- The controller keeps a `session::Arrival` for each connection accepted from loopback until it is registered as a session. A Tailcat helper always dials the link port on loopback, and a remote peer costs nothing. Per loopback connection the cost is one small allocation, a push and a remove under a mutex, and a counter increment.
+- `session::accept_arriving` runs the handshake and waits for the hello with the socket's read timeout at 20 ms, so a peer that answers sooner costs no extra wake-up. Between reads it looks for a claim.
+- The hand-off claims (`Arrival::hand_off`) every arrival whose address the helper carries. The claimed connection's own thread then sends a `close_notify` alert and a FIN, and reads until the worker's end (the close was delivered) or 600 ms. After the server's TLS flight, the alert is encrypted under the handshake the worker verified.
+- A connection whose hello already arrived cannot be claimed. The hand-off waits for it to be registered and closes it as a session. Registration comes before the arrival leaves the list, so no connection is missed in between.
+- On the worker, a `close_notify` before the welcome is also `Error::Closed`. It resets the back-off and replaces the forward, as a close after the welcome does.
+
+`handoff.rs::a_connection_closed_in_its_handshake_ends_at_once_and_redials_on_the_shortest_back_off` holds three connections in their handshake through a slow link and claims each one. The worker must see each close within 500 ms and redial within 1.6 s every time. Run against the old worker rule (reset only after a welcome), it failed with `redialled after 2.007524261s`. `tailcat.rs::a_hand_off_closes_a_carried_connection_still_in_its_handshake` has a fake helper dial the link port itself and send nothing. The hand-off must report `arrivals: 1, ended: 1`, and the helper must receive exactly a TLS close_notify alert before it is replaced.
+
+**2. The close that did not get through.** Two causes were found, both on Sentinel's side; the underlying packet loss is the helper's:
+
+- **The worker killed its own answer.** At the 600 ms bound, `ss` on the controller showed its socket in `FIN-WAIT-2`, and the old helper's in `CLOSE-WAIT` with nothing unread. The helper had taken the close and the worker had seen it (after 2 ms), but the worker's end never came back. The worker replaced its forward in the same millisecond it saw the close (`replaced@0.002s`), before the forward had relayed its FIN. In the baseline, 19 of 64 direct and 17 of 64 relayed closes went unanswered this way. So "unanswered" could not tell a delivered close from a lost one, and the controller could not confirm delivery.
+- **The fixed 600 ms bound killed the only process that could resend.** A close was really lost in a development run on the unchanged library: the first relayed change after the worker's restart was noticed only after 5.19 s (outage 7.54 s). `ss` again showed the old helper in `CLOSE-WAIT` with nothing unread, so the close was lost after the helper had taken it, inside the helper or the tunnel. The baseline's 128 settled changes lost none, so loss was induced. With everything arriving at the worker dropped for 800 ms from the change, all 6 direct closes were lost, and those changes cost 17.7–20.5 s. The old helper, the only process that could resend them, was gone at 600 ms. The 6 relayed closes still arrived after 0.92–0.99 s, because the DERP server held them. With the old helper kept for up to 3 s, the direct closes arrived at 1.40 s, on the helper's own retransmission, and the changes cost 4.7–5.7 s.
+- **Ruled out.** The old helper exiting before it flushed: it had read everything, and a delivered close already got 100 ms of settle. TCP FIN ordering: the `close_notify` precedes the FIN in one stream, and every delivered close was read as `Closed`.
+- **Not determined.** Why the tunnel lost the natural close, inside the pinned helper, was not found. Sentinel cannot prevent that loss, but it can keep the helper that resends the close.
+
+The fix:
+
+- The worker replaces its forward 200 ms after a clean close (`Forward::session_closed`), whatever the forward's age, so its own end gets out first. That is well inside its shortest back-off.
+- A worker that does this advertises it: capability bit 8, `HANDOFF_ANSWER`. For such a worker, an unanswered close means an undelivered one.
+- When every session a hand-off closed carries the bit, the controller keeps the old helper for up to 3 s (`HANDOFF_RESEND_BOUND`) for a close still unanswered at 600 ms (`HANDOFF_BOUND`). While it waits, a new loopback arrival makes it read the helper's connections from `/proc` again, and any redial into the old helper is closed as well.
+- Otherwise the helper goes at 600 ms, as before. That covers a worker without the bit and a connection still in its handshake, whose worker is not known yet.
+
+The gate is needed. In a development run with the longer wait applied to every worker, a worker on the old forward rule (it replaces the forward at once, and only when the forward is older than 10 s) redialled into the old helper twice during the wait in 2 of 20 changes. It then kept a forward that had carried those connections, and it was stuck for 21.2 s.
+
+**Measurements**, per path, handed-off changes unless stated:
+
+| | Direct, before | Direct, after | Relay only, before | Relay only, after |
+|---|---|---|---|---|
+| Cut, no hand-off (4) | 19.69–20.44 s | 18.03–20.56 s | 20.38–20.81 s | 20.53–21.10 s |
+| Settled session (64): outage | 3.32–4.39 s | 3.30–4.29 s | 3.61–4.64 s | 3.61–4.60 s |
+| Settled: close seen after | 1.5–5.9 ms | 1.6–9.2 ms | 34.5–38.7 ms | 33.6–40.2 ms |
+| Settled: close not seen within 1 s | 0 of 64 | 0 of 64 | 0 of 64 | 0 of 64 |
+| Settled: close unanswered when the helper went | 19 of 64 | 0 of 64 | 17 of 64 | 0 of 64 |
+| Settled: old helper kept | 106–630 ms | 106–114 ms | 172–627 ms | 167–179 ms |
+| Connection held in its handshake (10) | 16.74–17.80 s | 3.34–4.27 s | 17.01–18.07 s | 4.14–4.62 s |
+| 800 ms of loss at the worker (6) | 17.67–20.48 s | 4.75–5.63 s | 4.14–4.48 s | 4.59–5.99 s |
+| Loss: close seen after | never (heartbeat) | 1.40 s | 0.92–0.99 s | 0.96–1.89 s |
+| Worker without the bit (10) | — | 3.87–4.35 s; 3 unanswered; kept at most 600.4 ms | — | 4.14–4.63 s; 4 unanswered; kept at most 600.2 ms |
+
+"Before" is the baseline run on the unchanged library (one run, 2,997.9 s). The loss row is the exception: the old test had no loss rounds, so its "before" is this branch's worker against a controller that still replaced the helper at 600 ms. "After" is the verification run of the full suite, below. In the baseline, the worker of a held connection noticed only at its 15 s deadline for the welcome, 14.98–15.22 s after the change. A development run of the branch before the capability gate gave the same picture for workers with the bit: 128 of 128 settled closes answered, held connections 3.37–4.53 s, loss 5.11–5.68 s. Across both runs of the branch, 256 settled handed-off changes lost no close and left none unanswered. The 44 loss changes with the 3 s wait, over five runs, cost 4.6–7.0 s.
+
+For every change handed off to a worker with the bit, the live test now asserts three things:
+
+- The close came back answered.
+- The worker saw it within 500 ms (3 s through the loss). The previous bound was 1 s.
+- The change cost less than 5.5 s (9 s through the loss). The previous bound was 6 s.
+
+For the worker without the bit, it asserts that the helper was never kept past the short bound. The removal still closes the removed worker at once (after 207 ms; helper kept 310 ms) and keeps it out for the 45 s checked.
+
+Verification on `tailcat-edges`, one command at a time. The first round ran before a last change to the settle cap: 100 ms of settle may no longer run past 600 ms for a worker without the bit. Every command in the table was repeated after that change, except `sentinel-protocol`, with the same results:
+
+| Where | Command | Exit | Result |
+|---|---|---|---|
+| Windows | `cargo fmt-check` | 0 | clean |
+| Windows | `cargo lint` | 0 | no warnings |
+| Windows | `cargo test --locked -p sentinel-link --all-features` | 0 | 60 passed, 0 failed, 1 ignored (the Linux-only suites do not build on Windows) |
+| Windows | `cargo test --locked -p sentinel-protocol` | 0 | 33 passed, 0 failed |
+| WSL2 | `cargo lint-linux` | 0 | no warnings |
+| WSL2 | `cargo test --locked -p sentinel-link --all-features` | 0 | 87 passed, 0 failed, 9 ignored (the 8 live tests and one measurement) |
+| WSL2 | `cargo test --locked -p sentinel --all-features` | 0 | 99 passed, 0 failed |
+| WSL2, rootful Podman | the live Tailcat suite as its header documents (`SENTINEL_TAILCAT_LIVE`, `SENTINEL_TAILCAT_DERPER`, `SENTINEL_TAILCAT_DERP_CA` = `SSL_CERT_FILE`, `/usr/sbin` on `PATH`, `nsenter`, `iptables`) | 0 | 8 passed in 3,470.7 s; live probe `path Relay, rtt 68.32ms`; self-hosted relay `pong in 330µs via DERP(local)`; hand-off figures as in the "after" columns |
+
+The full workspace suite was left to the integrator. Two runs stopped by hand left eight `/tmp/.tmp*` test directories and one container (`sentinel-live-derp-bridge`), and those were removed. Afterwards no `tailcat` or `derper` process, no container of root or `sentinelbench`, no test `iptables` rule and no `/tmp` scratch of these runs was left.

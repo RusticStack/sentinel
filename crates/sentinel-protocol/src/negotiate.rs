@@ -80,6 +80,12 @@ impl Capabilities {
     pub const TAILCAT: Capabilities = Capabilities(1 << 6);
     /// Worker can run without egress for jobs that request `network: none`.
     pub const NETWORK_NONE: Capabilities = Capabilities(1 << 7);
+    /// Worker answers a controller's clean close (a Tailcat hand-off) before
+    /// it replaces its own transport, and replaces it on every clean close.
+    /// The controller may then read an unanswered close as undelivered and
+    /// keep the helper that can still resend it; a worker without the bit
+    /// may redial into that helper instead.
+    pub const HANDOFF_ANSWER: Capabilities = Capabilities(1 << 8);
 
     /// The minimum a worker must prove before it may receive any job.
     pub const REQUIRED: Capabilities = Capabilities(
@@ -99,7 +105,7 @@ impl Capabilities {
         Capabilities(self.0 & !other.0)
     }
     /// Bits this controller build knows; unknown bits are masked on receipt.
-    pub const KNOWN: Capabilities = Capabilities((1 << 8) - 1);
+    pub const KNOWN: Capabilities = Capabilities((1 << 9) - 1);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

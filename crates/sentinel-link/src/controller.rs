@@ -34,7 +34,7 @@ use sentinel_core::{
 use sentinel_protocol::limits::{MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES, MAX_RUN_ARTIFACT_BYTES};
 use sentinel_protocol::logs::Frame;
 use sentinel_protocol::negotiate::{
-    Hello, MAX_PREFETCH_IMAGES, PREFETCH_MIN, PROFILE_MIN, Profile,
+    Capabilities, Hello, MAX_PREFETCH_IMAGES, PREFETCH_MIN, PROFILE_MIN, Profile,
 };
 use sentinel_store::{
     Store, artifacts, dispatch,
@@ -157,6 +157,12 @@ pub struct Stats {
 
 struct Peer {
     sender: Sender,
+    /// The connection's remote end as accepted (canonical): what a hand-off
+    /// matches against the helper's connections, without a socket call.
+    addr: SocketAddr,
+    /// The worker advertised `HANDOFF_ANSWER`: its silence after a hand-off
+    /// close means the close was not delivered.
+    answers_handoff: bool,
     pool: PoolId,
     generation: u64,
     /// The CPU and memory the hello reported: the sweep's order and what the
@@ -373,6 +379,14 @@ struct Inner {
     sessions: AtomicUsize,
     /// Connections still in their handshake or hello.
     pending: AtomicUsize,
+    /// Those of them from loopback, by the peer's (canonical) address: the
+    /// only ones a Tailcat helper can carry, so the only ones a hand-off may
+    /// have to close before they are sessions. A remote peer costs nothing
+    /// here.
+    arrivals: Mutex<Vec<(SocketAddr, Arc<session::Arrival>)>>,
+    /// Loopback arrivals so far: a hand-off in progress reads the helper's
+    /// connections again when this moves.
+    arrived: AtomicU64,
     max_pending: AtomicUsize,
     handshake_ms: AtomicU64,
     stats: Stats,
@@ -544,6 +558,19 @@ impl Inner {
         }
     }
 
+    /// Its thread is done with an arrival (a session now, closed, or
+    /// failed): it leaves the list a hand-off reads.
+    fn leave(&self, arrival: Option<&Arc<session::Arrival>>) {
+        let Some(arrival) = arrival else {
+            return;
+        };
+        arrival.leave();
+        let mut arrivals = self.arrivals.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(index) = arrivals.iter().position(|(_, a)| Arc::ptr_eq(a, arrival)) {
+            arrivals.swap_remove(index);
+        }
+    }
+
     fn unregister(&self, worker: WorkerId, generation: u64) {
         let mut fleet = self.fleet.lock().unwrap_or_else(|p| p.into_inner());
         if fleet
@@ -554,19 +581,46 @@ impl Inner {
         }
     }
 
-    fn serve(self: &Arc<Self>, socket: TcpStream) {
+    fn serve(self: &Arc<Self>, socket: TcpStream, addr: SocketAddr) {
         let deadline = Duration::from_millis(self.handshake_ms.load(Ordering::Relaxed));
-        let outcome = session::accept_within(socket, Arc::clone(&self.config), &**self, deadline);
+        let addr = canonical(addr);
+        let arrival = addr.ip().is_loopback().then(|| {
+            let arrival = Arc::new(session::Arrival::default());
+            self.arrivals
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((addr, Arc::clone(&arrival)));
+            self.arrived.fetch_add(1, Ordering::AcqRel);
+            arrival
+        });
+        let outcome = match &arrival {
+            Some(arrival) => session::accept_arriving(
+                socket,
+                Arc::clone(&self.config),
+                &**self,
+                deadline,
+                arrival,
+                HANDOFF_BOUND,
+            ),
+            None => session::accept_within(socket, Arc::clone(&self.config), &**self, deadline),
+        };
         // Handshake and hello are over, one way or the other: the slot of
         // the pre-admission cap is free again.
         self.pending.fetch_sub(1, Ordering::AcqRel);
         let mut session = match outcome {
             Ok(Accepted::Control(session)) => session,
             Ok(Accepted::Bulk(bulk)) => {
+                self.leave(arrival.as_ref());
                 self.serve_bulk(bulk);
                 return;
             }
+            // Closed by a hand-off before it was a session.
+            Err(Error::Closed) if arrival.as_ref().is_some_and(|a| a.answered().is_some()) => {
+                self.leave(arrival.as_ref());
+                return;
+            }
             Err(_) => {
+                self.leave(arrival.as_ref());
                 self.stats.rejected.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -577,6 +631,12 @@ impl Inner {
         let capacity = session.capacity();
         let peer = Arc::new(Peer {
             sender: session.sender(),
+            addr,
+            answers_handoff: session
+                .admitted
+                .negotiated
+                .capabilities
+                .contains(Capabilities::HANDOFF_ANSWER),
             pool,
             generation,
             // Admission already refused a capacity that is not an i64.
@@ -594,6 +654,9 @@ impl Inner {
             prefetch_sent: Mutex::new(None),
         });
         self.register(worker, Arc::clone(&peer));
+        // Only now: a hand-off that found this connection being admitted
+        // waits for it to leave, then finds the session registered.
+        self.leave(arrival.as_ref());
         self.wake();
         let _ = session.serve(&**self);
         self.unregister(worker, generation);
@@ -2559,6 +2622,8 @@ impl Controller {
             stop: AtomicBool::new(false),
             sessions: AtomicUsize::new(0),
             pending: AtomicUsize::new(0),
+            arrivals: Mutex::new(Vec::new()),
+            arrived: AtomicU64::new(0),
             max_pending: AtomicUsize::new(MAX_PENDING),
             handshake_ms: AtomicU64::new(session::HANDSHAKE_DEADLINE.as_millis() as u64),
             stats: Stats::default(),
@@ -2683,11 +2748,14 @@ impl Controller {
 }
 
 fn accept_loop(inner: &Arc<Inner>, listener: &TcpListener) {
-    for socket in listener.incoming() {
+    loop {
+        let accepted = listener.accept();
         if inner.stop.load(Ordering::Acquire) {
             return;
         }
-        let Ok(socket) = socket else { continue };
+        let Ok((socket, addr)) = accepted else {
+            continue;
+        };
         // Two caps: every session, and — much smaller — connections that
         // have not authenticated yet, each also bounded by the handshake
         // deadline. Peers that prove nothing can never hold the slots the
@@ -2705,7 +2773,7 @@ fn accept_loop(inner: &Arc<Inner>, listener: &TcpListener) {
         let spawned = thread::Builder::new()
             .name("sentinel-link-session".into())
             .spawn(move || {
-                session.serve(socket);
+                session.serve(socket, addr);
                 session.sessions.fetch_sub(1, Ordering::AcqRel);
             });
         if spawned.is_err() {
@@ -2772,31 +2840,40 @@ impl Handle {
     }
 
     /// Replace the allow list of the Tailcat helper that carries this link
-    /// port, handing the tunnelled sessions over instead of cutting them.
+    /// port, handing the tunnelled connections over instead of cutting them.
     ///
     /// Restarting the helper (its only way to take a new list) leaves every
-    /// session it carried open at the worker's end: a killed helper closes
-    /// nothing through the tunnel, so the worker would notice only at its
-    /// heartbeat deadline, about 20 s later. So, while the old helper still
-    /// runs, every session whose connection arrived through it — told apart
-    /// from direct TLS by the helper owning the socket's other end — is
-    /// closed cleanly (`close_notify` and a FIN), which the helper carries
-    /// to the worker at once, and only then is the helper replaced. The
-    /// wait is bounded by [`HANDOFF_BOUND`]: it ends as soon as every closed
-    /// session has seen its worker close too, plus [`HANDOFF_SETTLE`] for
-    /// the helper to flush its last packets. Direct-TLS sessions are never
-    /// touched. `None` when the list is unchanged: no restart, no close.
+    /// connection it carried open at the worker's end: a killed helper
+    /// closes nothing through the tunnel, so the worker would notice only at
+    /// a deadline, about 20 s later. So, while the old helper still runs,
+    /// every connection that arrived through it — told apart from direct TLS
+    /// by the helper owning the socket's other end — is closed cleanly (a
+    /// TLS `close_notify` and a FIN), which the helper carries to the worker,
+    /// and only then is the helper replaced. That covers sessions and also
+    /// connections still in their TLS handshake or hello
+    /// ([`session::Arrival`]). Direct-TLS sessions are never touched. `None`
+    /// when the list is unchanged: no restart, no close.
+    ///
+    /// The helper is replaced as soon as every closed connection has ended
+    /// at the worker's side too (the close was delivered), plus
+    /// [`HANDOFF_SETTLE`], and after [`HANDOFF_BOUND`] at most. A close the
+    /// tunnel lost is resent only by the helper that took it, so when every
+    /// closed session's worker advertised `HANDOFF_ANSWER` (its silence then
+    /// means the close was not delivered, and it cannot be stranded by a
+    /// redial) the old helper is kept for up to [`HANDOFF_RESEND_BOUND`]
+    /// while a close is unanswered. A worker that redials into it meanwhile
+    /// is closed the same way: a new loopback arrival makes the helper's
+    /// connections be read again.
     ///
     /// The worker reads the close as [`crate::Error::Closed`], replaces its
-    /// own helper (a forward that carried a session through the old helper
-    /// took 23.7-70.3 s to carry the next one) and redials on its shortest
-    /// back-off. Live, the change then cost 3.3-4.6 s, the restarted
-    /// helper's own start (3.2-4.3 s), where cutting cost 18.0-21.0 s.
+    /// own helper once its answer had time to leave, and redials on its
+    /// shortest back-off. Live, a change then costs about the restarted
+    /// helper's own start (3.2-4.3 s) where cutting cost 18.0-21.0 s.
     pub fn hand_off(&self, server: &Server, allow: &[NodeKey]) -> Option<Handoff> {
         let started = Instant::now();
         let mut handoff = Handoff::default();
         let changed = server.set_allow_draining(allow, |carried| {
-            handoff = self.drain(carried, HANDOFF_BOUND);
+            handoff = self.drain(carried, HANDOFF_BOUND, HANDOFF_RESEND_BOUND);
         });
         changed.then(|| {
             handoff.waited = started.elapsed();
@@ -2804,11 +2881,132 @@ impl Handle {
         })
     }
 
-    /// Close every session (and its bulk connection) whose socket's remote
-    /// end is one of `from`, cleanly, and wait until each has ended or
-    /// `within` passed. `from` must be sorted.
-    fn drain(&self, from: &[SocketAddr], within: Duration) -> Handoff {
-        let deadline = Instant::now() + within;
+    /// Close cleanly every session (and its bulk connection) and every
+    /// connection still in its handshake or hello that `carried` names, and
+    /// wait until each has ended or `within` passed; `patiently`, when every
+    /// closed connection is a session whose worker answers hand-offs.
+    /// `carried` is read again whenever a loopback connection arrives
+    /// meanwhile.
+    fn drain(
+        &self,
+        carried: &dyn Fn() -> Vec<SocketAddr>,
+        within: Duration,
+        patiently: Duration,
+    ) -> Handoff {
+        let started = Instant::now();
+        let (short, long) = (started + within, started + patiently.max(within));
+        let mut seen = self.0.arrived.load(Ordering::Acquire);
+        let mut from = carried();
+        let mut handoff = Handoff {
+            tunnelled: from.len(),
+            ..Handoff::default()
+        };
+        if from.is_empty() {
+            return handoff;
+        }
+        let mut claimed = Vec::new();
+        let mut admitting = Vec::new();
+        let mut closed: Vec<Closed> = Vec::new();
+        let mut patient = None;
+        self.claim(&from, &mut claimed, &mut admitting);
+        self.close_carried(&from, &mut closed);
+        loop {
+            // A connection that arrived meanwhile may be a worker redialling
+            // into the old helper: it would be cut with it.
+            let arrived = self.0.arrived.load(Ordering::Acquire);
+            if arrived != seen {
+                seen = arrived;
+                from = carried();
+                self.claim(&from, &mut claimed, &mut admitting);
+                self.close_carried(&from, &mut closed);
+            }
+            let admitted = admitting.len();
+            admitting.retain(|arrival| arrival.admitting());
+            if admitting.len() < admitted {
+                self.close_carried(&from, &mut closed);
+            }
+            let open = {
+                let fleet = self.0.fleet.lock().unwrap_or_else(|p| p.into_inner());
+                closed
+                    .iter()
+                    .filter(|closed| {
+                        fleet
+                            .get(&closed.worker)
+                            .is_some_and(|peer| peer.generation == closed.generation)
+                    })
+                    .count()
+            };
+            let (mut concluded, mut answered) = (0, 0);
+            for arrival in &claimed {
+                if let Some(yes) = arrival.answered() {
+                    concluded += 1;
+                    answered += usize::from(yes);
+                }
+            }
+            handoff.closed = closed.len();
+            handoff.arrivals = claimed.len();
+            handoff.ended = closed.len() - open + answered;
+            let now = Instant::now();
+            if open == 0 && concluded == claimed.len() && admitting.is_empty() {
+                if handoff.closed + handoff.arrivals > 0 {
+                    let bound = if patient == Some(true) { long } else { short };
+                    thread::sleep(HANDOFF_SETTLE.min(bound.saturating_duration_since(now)));
+                }
+                return handoff;
+            }
+            // Past the short bound only for workers that answer a delivered
+            // close: one that does not could be redialling into this helper.
+            // Decided once, at the short bound, so a redial closed later
+            // still gets its close through.
+            let deadline = if now < short {
+                short
+            } else if *patient.get_or_insert_with(|| {
+                claimed.is_empty()
+                    && admitting.is_empty()
+                    && closed.iter().all(|closed| closed.answers)
+            }) {
+                long
+            } else {
+                short
+            };
+            if now >= deadline {
+                return handoff;
+            }
+            thread::sleep(HANDOFF_POLL.min(deadline - now));
+        }
+    }
+
+    /// Claim the connections still in their handshake or hello whose remote
+    /// end is one of `from` (each then closes itself from its own thread),
+    /// and note those whose hello is being admitted: they become sessions,
+    /// closed once registered.
+    fn claim(
+        &self,
+        from: &[SocketAddr],
+        claimed: &mut Vec<Arc<session::Arrival>>,
+        admitting: &mut Vec<Arc<session::Arrival>>,
+    ) {
+        for (addr, arrival) in self
+            .0
+            .arrivals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
+            if from.binary_search(addr).is_err() {
+                continue;
+            }
+            if arrival.hand_off() {
+                claimed.push(Arc::clone(arrival));
+            } else if arrival.admitting() && !admitting.iter().any(|a| Arc::ptr_eq(a, arrival)) {
+                admitting.push(Arc::clone(arrival));
+            }
+        }
+    }
+
+    /// Close cleanly the registered sessions whose remote end is one of
+    /// `from` and that are not in `closed` yet, adding them there.
+    fn close_carried(&self, from: &[SocketAddr], closed: &mut Vec<Closed>) {
         // The fleet lock is not held across the socket calls below.
         let peers: Vec<(WorkerId, Arc<Peer>)> = self
             .0
@@ -2816,68 +3014,59 @@ impl Handle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
+            .filter(|(_, peer)| from.binary_search(&peer.addr).is_ok())
             .map(|(worker, peer)| (*worker, Arc::clone(peer)))
             .collect();
-        let mut closed: Vec<(WorkerId, u64)> = Vec::new();
-        for (worker, peer) in &peers {
-            let tunnelled = peer
-                .sender
-                .peer_addr()
-                .is_ok_and(|addr| from.binary_search(&canonical(addr)).is_ok());
-            if !tunnelled {
+        for (worker, peer) in peers {
+            if closed
+                .iter()
+                .any(|closed| closed.worker == worker && closed.generation == peer.generation)
+            {
                 continue;
             }
             if let Some(bulk) = peer.bulk.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
                 bulk.close_notify();
             }
             peer.sender.close_notify();
-            closed.push((*worker, peer.generation));
-        }
-        drop(peers);
-        let mut handoff = Handoff {
-            tunnelled: from.len(),
-            closed: closed.len(),
-            ..Handoff::default()
-        };
-        if closed.is_empty() {
-            return handoff;
-        }
-        loop {
-            let open = {
-                let fleet = self.0.fleet.lock().unwrap_or_else(|p| p.into_inner());
-                closed
-                    .iter()
-                    .filter(|(worker, generation)| {
-                        fleet
-                            .get(worker)
-                            .is_some_and(|peer| peer.generation == *generation)
-                    })
-                    .count()
-            };
-            let now = Instant::now();
-            if open == 0 {
-                handoff.ended = closed.len();
-                thread::sleep(HANDOFF_SETTLE.min(deadline.saturating_duration_since(now)));
-                return handoff;
-            }
-            if now >= deadline {
-                handoff.ended = closed.len() - open;
-                return handoff;
-            }
-            thread::sleep(HANDOFF_POLL.min(deadline - now));
+            closed.push(Closed {
+                worker,
+                generation: peer.generation,
+                answers: peer.answers_handoff,
+            });
         }
     }
 }
 
-/// Longest [`Handle::hand_off`] waits for closed sessions before replacing
-/// the helper. Below the worker's shortest reconnect back-off (1 s less its
-/// 25 % jitter), so a worker that saw the close cannot have redialled into
-/// the old helper before it goes.
+/// A session a hand-off closed.
+struct Closed {
+    worker: WorkerId,
+    generation: u64,
+    /// Its worker advertised `HANDOFF_ANSWER`.
+    answers: bool,
+}
+
+/// Longest [`Handle::hand_off`] waits for closed connections before it
+/// replaces the helper, whoever the workers are. Below the shortest
+/// reconnect back-off (1 s less its 25 % jitter) of a worker that saw the
+/// close, so it cannot redial into the old helper before it goes: a worker
+/// older than `HANDOFF_ANSWER` keeps a forward younger than 10 s, and one
+/// that redialled through it into the old helper was stuck for 21 s when
+/// the wait was longer.
 pub const HANDOFF_BOUND: Duration = Duration::from_millis(600);
-/// After the last closed session ended: time for the old helper to send the
-/// close on through the tunnel before it is killed.
+/// Longest [`Handle::hand_off`] keeps the old helper for a close still
+/// unanswered when every closed session's worker advertised
+/// `HANDOFF_ANSWER`, so the silence means the close was not delivered. A
+/// close the tunnel dropped is resent only by the helper that took it, on
+/// its own retransmission clock: live, with 800 ms of loss at the worker,
+/// closes arrived 1.4 s (direct) and up to 2.8 s (relayed) after they were
+/// sent, and the direct ones were lost for good when the helper went at
+/// 600 ms. Such a worker that redials into the old helper meanwhile is
+/// closed as well, and replaces its forward on that close too.
+pub const HANDOFF_RESEND_BOUND: Duration = Duration::from_millis(3_000);
+/// After the last closed connection ended: time for the old helper to send
+/// the close on through the tunnel before it is killed.
 pub const HANDOFF_SETTLE: Duration = Duration::from_millis(100);
-/// How often the hand-off looks for the closed sessions' end.
+/// How often the hand-off looks for the closed connections' end.
 const HANDOFF_POLL: Duration = Duration::from_millis(5);
 
 /// What one [`Handle::hand_off`] did, for the operator's log.
@@ -2887,8 +3076,11 @@ pub struct Handoff {
     pub tunnelled: usize,
     /// Sessions among them that were closed cleanly.
     pub closed: usize,
-    /// Of those, the ones whose worker closed its end before the helper was
-    /// replaced.
+    /// Connections among them still in their TLS handshake or hello, not
+    /// yet sessions, that were closed cleanly.
+    pub arrivals: usize,
+    /// Of the closed sessions and connections, the ones whose worker closed
+    /// its end before the helper was replaced: the close was delivered.
     pub ended: usize,
     /// From the call to the helper's replacement.
     pub waited: Duration,

@@ -1902,17 +1902,161 @@ pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Drive a TLS handshake to completion, bounded in absolute time: every
 /// read or write waits at most `deadline`, and the loop gives up once the
-/// whole handshake has taken that long.
-fn handshake(conn: &mut rustls::Connection, socket: &TcpStream, deadline: Duration) -> Result<()> {
+/// whole handshake has taken that long. With an `arrival`, reads wait
+/// [`ARRIVAL_POLL`] at a time (the socket's read timeout) and a hand-off's
+/// claim ends the loop with [`Error::Closed`], for the caller to close.
+fn handshake(
+    conn: &mut rustls::Connection,
+    socket: &TcpStream,
+    deadline: Duration,
+    arrival: Option<&Arrival>,
+) -> Result<()> {
     let started = Instant::now();
     let mut sock = socket;
     while conn.is_handshaking() {
+        if arrival.is_some_and(Arrival::handed) {
+            return Err(Error::Closed);
+        }
         if started.elapsed() >= deadline {
             return Err(Error::Lost);
         }
-        conn.complete_io(&mut sock)?;
+        match conn.complete_io(&mut sock) {
+            Ok(_) => {}
+            Err(e)
+                if arrival.is_some()
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(())
+}
+
+/// How often a connection a hand-off may claim ([`Arrival`]) looks for the
+/// claim while it waits for its peer's handshake or hello: the longest a
+/// claim waits to be acted on. It is the socket's read timeout then, so a
+/// peer that answers sooner costs no extra wake-up.
+pub const ARRIVAL_POLL: Duration = Duration::from_millis(20);
+
+/// A connection still in its TLS handshake or hello that a Tailcat hand-off
+/// may claim. The controller keeps one per loopback arrival (a helper dials
+/// the link port on loopback) and gives it to [`accept_arriving`].
+///
+/// A claim ([`Arrival::hand_off`]) succeeds only while the connection waits
+/// for its peer. Its own thread then ends it the way a hand-off ends a
+/// session: a TLS `close_notify` and a FIN, which the helper carries to the
+/// worker, then it reads and drops what still comes until the worker's own
+/// end (the close was delivered) or the bound passes. A connection whose
+/// hello already arrived is being admitted and cannot be claimed: it
+/// becomes a session, and the hand-off closes it as one once it is
+/// registered ([`Arrival::leave`]).
+#[derive(Debug, Default)]
+pub struct Arrival(std::sync::atomic::AtomicU8);
+
+impl Arrival {
+    const WAITING: u8 = 0;
+    const HANDED: u8 = 1;
+    const ADMITTING: u8 = 2;
+    const ANSWERED: u8 = 3;
+    const UNANSWERED: u8 = 4;
+    const LEFT: u8 = 5;
+
+    /// Claim the connection for a hand-off; `false` once its hello arrived
+    /// or it ended.
+    pub fn hand_off(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::WAITING,
+                Self::HANDED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Its hello arrived and is being admitted; it has not yet been
+    /// registered as a session.
+    pub fn admitting(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::ADMITTING
+    }
+
+    /// For a claimed connection: `Some(true)` once it ended at the other
+    /// side too, `Some(false)` when the bound passed first, `None` while
+    /// its close is still under way.
+    pub fn answered(&self) -> Option<bool> {
+        match self.0.load(Ordering::Acquire) {
+            Self::ANSWERED => Some(true),
+            Self::UNANSWERED => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Its thread is done with it: registered as a session, or failed. A
+    /// claimed connection that failed before its close was sent ended all
+    /// the same, so it counts as answered.
+    pub fn leave(&self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| match state {
+                Self::WAITING | Self::ADMITTING => Some(Self::LEFT),
+                Self::HANDED => Some(Self::ANSWERED),
+                _ => None,
+            });
+    }
+
+    fn handed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::HANDED
+    }
+
+    /// The hello arrived: from now on the connection cannot be claimed.
+    /// `false` when a claim came first.
+    fn admit(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::WAITING,
+                Self::ADMITTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// End a claimed connection: `close_notify` and a FIN through `tx`, then
+    /// read and drop until the peer ends too or `within` passes.
+    fn close(&self, tx: &Sender, socket: &TcpStream, within: Duration) {
+        tx.close_notify();
+        let started = Instant::now();
+        let _ = socket.set_read_timeout(Some(ARRIVAL_POLL));
+        let mut sink = [0u8; 2048];
+        let answered = loop {
+            match (&*socket).read(&mut sink) {
+                Ok(0) => break true,
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                // Reset: the other side ended as well, if less politely.
+                Err(_) => break true,
+            }
+            if started.elapsed() >= within {
+                break false;
+            }
+        };
+        self.0.store(
+            if answered {
+                Self::ANSWERED
+            } else {
+                Self::UNANSWERED
+            },
+            Ordering::Release,
+        );
+    }
 }
 
 /// Socket options every link connection carries: no Nagle delay, and a
@@ -1943,24 +2087,82 @@ pub fn accept_within(
     admission: &dyn Admission,
     deadline: Duration,
 ) -> Result<Accepted> {
+    accept_watched(socket, config, admission, deadline, None)
+}
+
+/// [`accept_within`] for a connection a hand-off may claim until its hello
+/// arrives. Claimed, it is closed cleanly and waits up to `answer_within`
+/// for the peer's end ([`Arrival`]); the result is then [`Error::Closed`].
+pub fn accept_arriving(
+    socket: TcpStream,
+    config: Arc<rustls::ServerConfig>,
+    admission: &dyn Admission,
+    deadline: Duration,
+    arrival: &Arrival,
+    answer_within: Duration,
+) -> Result<Accepted> {
+    accept_watched(
+        socket,
+        config,
+        admission,
+        deadline,
+        Some((arrival, answer_within)),
+    )
+}
+
+fn accept_watched(
+    socket: TcpStream,
+    config: Arc<rustls::ServerConfig>,
+    admission: &dyn Admission,
+    deadline: Duration,
+    arrival: Option<(&Arrival, Duration)>,
+) -> Result<Accepted> {
     let started = Instant::now();
-    configure(&socket, deadline.min(HEARTBEAT_DEADLINE))?;
+    let watched = arrival.map(|(arrival, _)| arrival);
+    configure(
+        &socket,
+        match watched {
+            Some(_) => ARRIVAL_POLL.min(deadline),
+            None => deadline.min(HEARTBEAT_DEADLINE),
+        },
+    )?;
     let mut conn = rustls::Connection::Server(
         ServerConnection::new(config).map_err(|e| Error::Tls(e.to_string()))?,
     );
     // Drive the handshake so the peer certificate is available.
-    handshake(&mut conn, &socket, deadline)?;
+    let handshaken = handshake(&mut conn, &socket, deadline, watched);
+    if let (Err(Error::Closed), Some((arrival, within))) = (&handshaken, arrival) {
+        let (tx, rx) = split(conn, socket)?;
+        arrival.close(&tx, &rx.sock, within);
+        return Err(Error::Closed);
+    }
+    handshaken?;
     let fingerprint = conn
         .peer_certificates()
         .and_then(|certs| certs.first())
         .map(fingerprint_of)
         .ok_or(Error::Protocol("no client certificate"))?;
     let (tx, mut rx) = split(conn, socket)?;
-    let remaining = deadline.saturating_sub(started.elapsed());
-    if remaining.is_zero() {
-        return Err(Error::Lost);
-    }
-    match rx.recv::<ClientMessage>(remaining)? {
+    let first = loop {
+        let remaining = deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(Error::Lost);
+        }
+        let Some((arrival, within)) = arrival else {
+            break rx.recv::<ClientMessage>(remaining)?;
+        };
+        if !arrival.handed()
+            && let Some(message) = rx.recv_timeout::<ClientMessage>(ARRIVAL_POLL.min(remaining))?
+            && arrival.admit()
+        {
+            break message;
+        }
+        if arrival.handed() {
+            arrival.close(&tx, &rx.sock, within);
+            return Err(Error::Closed);
+        }
+    };
+    match first {
         ClientMessage::Hello {
             hello,
             worker,
@@ -2744,7 +2946,7 @@ pub fn connect(
         ClientConnection::new(Arc::clone(&config), server_name)
             .map_err(|e| Error::Tls(e.to_string()))?,
     );
-    handshake(&mut conn, &socket, HEARTBEAT_DEADLINE)?;
+    handshake(&mut conn, &socket, HEARTBEAT_DEADLINE, None)?;
     let (tx, mut rx) = split(conn, socket)?;
     let enrollment = enrollment.map(sentinel_auth::token::format);
     let range = hello.protocol_min.0..=hello.protocol_max.0;
@@ -3539,7 +3741,7 @@ impl BulkDialer {
             ClientConnection::new(Arc::clone(&self.client), server_name)
                 .map_err(|e| Error::Tls(e.to_string()))?,
         );
-        handshake(&mut conn, &socket, HEARTBEAT_DEADLINE)?;
+        handshake(&mut conn, &socket, HEARTBEAT_DEADLINE, None)?;
         let (tx, rx) = split(conn, socket)?;
         tx.send(&ClientMessage::BulkHello {
             worker: *self.worker.as_bytes(),
@@ -3657,14 +3859,14 @@ mod tests {
         let accept = thread::spawn(move || {
             let (socket, _) = listener.accept().unwrap();
             let mut conn = rustls::Connection::Server(ServerConnection::new(server).unwrap());
-            handshake(&mut conn, &socket, HEARTBEAT_DEADLINE).unwrap();
+            handshake(&mut conn, &socket, HEARTBEAT_DEADLINE, None).unwrap();
             split(conn, socket).unwrap().1
         });
         let socket = TcpStream::connect(addr).unwrap();
         let mut conn = rustls::Connection::Client(
             ClientConnection::new(client, ServerName::try_from("sentinel").unwrap()).unwrap(),
         );
-        handshake(&mut conn, &socket, HEARTBEAT_DEADLINE).unwrap();
+        handshake(&mut conn, &socket, HEARTBEAT_DEADLINE, None).unwrap();
         let (tx, _) = split(conn, socket).unwrap();
         (tx, accept.join().unwrap())
     }
@@ -3775,13 +3977,13 @@ mod tests {
             let mut conn = rustls::Connection::Client(
                 ClientConnection::new(client, ServerName::try_from("sentinel").unwrap()).unwrap(),
             );
-            handshake(&mut conn, &socket, HEARTBEAT_DEADLINE).unwrap();
+            handshake(&mut conn, &socket, HEARTBEAT_DEADLINE, None).unwrap();
             thread::sleep(Duration::from_secs(10));
             drop(socket);
         });
         let (socket, _) = listener.accept().unwrap();
         let mut conn = rustls::Connection::Server(ServerConnection::new(server).unwrap());
-        handshake(&mut conn, &socket, HEARTBEAT_DEADLINE).unwrap();
+        handshake(&mut conn, &socket, HEARTBEAT_DEADLINE, None).unwrap();
         socket
             .set_write_timeout(Some(Duration::from_millis(200)))
             .unwrap();

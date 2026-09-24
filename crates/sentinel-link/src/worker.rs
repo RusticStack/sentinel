@@ -315,7 +315,11 @@ pub fn run(
         if welcomed.load(Ordering::Acquire) {
             enrollment = None;
         }
-        let closed = matches!(outcome, Err(Error::Closed)) && welcomed.load(Ordering::Acquire);
+        // A controller's `close_notify` is deliberate whether or not it came
+        // after the welcome: a hand-off closes a connection still in its
+        // handshake or hello the same way. Encrypted under the handshake the
+        // pinned certificate authenticated, it cannot be forged on the path.
+        let closed = matches!(outcome, Err(Error::Closed));
         match outcome {
             Ok(()) => return Ok(()),
             // The controller's store was briefly unavailable (a restart
@@ -331,9 +335,9 @@ pub fn run(
             Err(_) if handle.stopped() => return Ok(()),
             Err(error) => on_event(Event::Disconnected(error)),
         }
-        // A session the controller closed on purpose (a hand-off to its
-        // restarted transport) is not a failure: the next dial waits only
-        // the shortest back-off, however short the session was.
+        // A session (or connection) the controller closed on purpose (a
+        // hand-off to its restarted transport) is not a failure: the next
+        // dial waits only the shortest back-off, however short it was.
         if started.elapsed() >= STABLE_SESSION || closed {
             backoff = BACKOFF_MIN;
         }

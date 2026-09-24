@@ -114,6 +114,11 @@ const PROBE_EVERY: Duration = Duration::from_secs(30);
 /// this long: well past the 1.0-1.4 s a fresh helper took to carry a session
 /// in the live suite, so a successor is never judged before it could connect.
 pub const SESSION_SETTLE: Duration = Duration::from_secs(10);
+/// How long [`Forward::session_closed`] leaves the forward running after a
+/// clean close, for the worker's own end to reach the controller. Below the
+/// worker's shortest back-off (750 ms), so its next dial meets a fresh
+/// forward.
+pub const CLOSE_GRACE: Duration = Duration::from_millis(200);
 /// Reconnect back-off bounds for helper restarts.
 const RESTART_MIN: Duration = Duration::from_secs(1);
 const RESTART_MAX: Duration = Duration::from_secs(30);
@@ -936,13 +941,19 @@ impl Server {
     }
 
     /// [`Server::set_allow`], with a hand-off: when the list really changes,
-    /// `drain` is first given the local addresses of the connections the
-    /// running helpers carry into the link port (sorted), while those
-    /// helpers still run, and they are replaced only once it returns. A
-    /// connection counts as carried when the helper process owns its other
-    /// end, so a direct-TLS peer, even one on loopback, is never among them.
-    /// `false`, without calling `drain`, when the list is unchanged.
-    pub fn set_allow_draining(&self, allow: &[NodeKey], drain: impl FnOnce(&[SocketAddr])) -> bool {
+    /// `drain` is first called while the running helpers still run, and they
+    /// are replaced only once it returns. It is given a reader of the local
+    /// addresses of the connections those helpers carry into the link port
+    /// (sorted, read from `/proc` at each call), so it can look again when
+    /// new connections arrive while it waits. A connection counts as carried
+    /// when the helper process owns its other end, so a direct-TLS peer,
+    /// even one on loopback, is never among them. `false`, without calling
+    /// `drain`, when the list is unchanged.
+    pub fn set_allow_draining(
+        &self,
+        allow: &[NodeKey],
+        drain: impl FnOnce(&dyn Fn() -> Vec<SocketAddr>),
+    ) -> bool {
         let wanted = normalize(allow);
         let helpers = self.helpers();
         let runners = std::iter::once(&helpers.main).chain(helpers.staged.as_ref().map(|(_, r)| r));
@@ -955,10 +966,7 @@ impl Server {
         if !changed {
             return false;
         }
-        let carried = carried_connections(&pids, self.port);
-        if !carried.is_empty() {
-            drain(&carried);
-        }
+        drain(&|| carried_connections(&pids, self.port));
         if let Some((_, runner)) = &helpers.staged {
             runner.shared.set_allow(wanted.clone());
         }
@@ -1112,6 +1120,36 @@ impl Forward {
     /// it.
     pub fn session_lost(&self) -> bool {
         self.session_lost_after(SESSION_SETTLE)
+    }
+
+    /// The controller closed a session (or a connection still in its
+    /// handshake) over this forward on purpose, with a TLS `close_notify`:
+    /// a hand-off before its helper restarts. The forward carried that
+    /// connection through the helper now going away, so it is replaced
+    /// whatever its age (a close is authenticated, so a controller that is
+    /// down cannot trigger it). Not at once, though: the worker's own end
+    /// of the connection must first get through, or the controller never
+    /// learns its close was delivered. Live, killing the forward in the same
+    /// millisecond left the controller unanswered on most changes. The
+    /// replacement therefore waits [`CLOSE_GRACE`], well inside the worker's
+    /// shortest back-off, on a thread of its own.
+    pub fn session_closed(&self) {
+        let Some((generation, _)) = self.run.shared.current_child() else {
+            return;
+        };
+        let shared = Arc::clone(&self.run.shared);
+        let spawned = thread::Builder::new()
+            .name("tailcat-close-grace".into())
+            .spawn(move || {
+                thread::sleep(CLOSE_GRACE);
+                if !shared.stopped() {
+                    shared.replace_probed(generation);
+                }
+            });
+        if spawned.is_err() {
+            // No thread to wait on: a late answer beats a stale forward.
+            self.run.shared.replace_probed(generation);
+        }
     }
 
     /// As [`Forward::session_lost`], with the settle time stated (tests use
