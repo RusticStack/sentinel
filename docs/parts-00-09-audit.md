@@ -875,6 +875,6 @@ An instrumented run confirmed where the error came from: all 10 failures were th
 
 Still open:
 
-- The Podman test shims in `executor_faults.rs` and `runtime_failures.rs` keep their temporary directory (`TempDir::keep`) for the life of the process, so every run leaves one small `/tmp/.tmp*` directory.
+- ~~Podman test shims leaving a `/tmp/.tmp*` directory per run.~~ Closed since by `test: keep one podman shim directory per test binary and sweep dead runs`: `executor_faults.rs`, `runtime_failures.rs` and `recovery.rs` now use one `sentinel-<tag>-shim-<pid>` directory per test binary and remove those of exited runs; the 164 leftover directories in WSL `/tmp` were removed.
 - S05 tenant-scoped registry authorization.
 - B04, R01 and R04 as written in the tracker.
