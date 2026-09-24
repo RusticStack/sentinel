@@ -89,6 +89,31 @@ pub struct Live {
     pub sha: String,
     handle: Arc<Handle>,
     link: Option<thread::JoinHandle<sentinel_link::Result<()>>>,
+    /// Set once [`Live::stop`] has checked that nothing leaked.
+    settled: bool,
+}
+
+/// Every container the runtime still knows under `worker`'s ownership
+/// label, running or not: `sentinel-<attempt>` for each of the test's
+/// attempts, since the worker id is the test's own. `None` when `podman`
+/// could not be asked. Asked of `podman` directly: this file names no
+/// `sentinel_worker` item.
+pub fn containers_of(worker: WorkerId) -> Option<Vec<String>> {
+    let output = Command::new("podman")
+        .args(["ps", "-a", "--filter"])
+        .arg(format!("label=io.sentinel.worker={worker}"))
+        .args(["--format", "{{.Names}}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 impl Live {
@@ -210,6 +235,7 @@ impl Live {
                 sha,
                 handle,
                 link: Some(link),
+                settled: false,
             },
             executor,
         )
@@ -270,7 +296,9 @@ impl Live {
         })
     }
 
-    /// Stop the worker link and the controller.
+    /// Stop the worker link and the controller, then assert that no
+    /// container of the test's attempts survives the test: the executor
+    /// tears down every container it started, whatever ended the attempt.
     pub fn stop(mut self) {
         self.handle.stop();
         if let Some(link) = self.link.take() {
@@ -278,6 +306,35 @@ impl Live {
         }
         if let Some(controller) = self.controller.take() {
             assert!(controller.shutdown(Duration::from_secs(10)));
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let left = containers_of(self.worker).expect("podman ps");
+            if left.is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "containers left: {left:?}");
+            thread::sleep(Duration::from_millis(100));
+        }
+        self.settled = true;
+    }
+}
+
+/// A test that fails ends while its attempts may still run: the process
+/// exits before their threads tear their containers down, and no later
+/// worker start reconciles a test's one-off worker id (W07 does, for a
+/// real worker). Force-remove them here, so a failing test leaves nothing
+/// running behind it.
+impl Drop for Live {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.handle.stop();
+        for name in containers_of(self.worker).unwrap_or_default() {
+            let _ = Command::new("podman")
+                .args(["rm", "-f", "-t", "0", "--", &name])
+                .output();
         }
     }
 }
