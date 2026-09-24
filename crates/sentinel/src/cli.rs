@@ -223,6 +223,8 @@ pub enum AdminCommand {
     Pool(PoolArgs),
     /// Enroll, list, drain and revoke workers
     Worker(WorkerArgs),
+    /// Rotate Tailcat node keys with an overlap window and edit the controller's allow list
+    Tailcat(TailcatArgs),
     /// Record cancellation for a job or a whole run; running attempts are told on their next heartbeat
     Cancel {
         #[command(flatten)]
@@ -428,6 +430,56 @@ pub enum WorkerCommand {
         /// The `wrk_` identifier the worker generated
         #[arg(long)]
         id: String,
+    },
+}
+
+/// Host-local Tailcat identity operations. Authorized by access to the role's
+/// data directory. Node keys travel on standard input and output, never in
+/// argv; diagnostics name files, never keys or addresses.
+#[derive(Args)]
+pub struct TailcatArgs {
+    #[command(subcommand)]
+    pub command: TailcatCommand,
+}
+
+/// The role whose node key an operation rotates.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TailcatRole {
+    Server,
+    Worker,
+}
+
+/// The role's configuration file, as `sentinel server|worker --config` reads it.
+#[derive(Args)]
+pub struct TailcatRoleConfig {
+    /// Which role's key to rotate
+    #[arg(long, value_enum)]
+    pub role: TailcatRole,
+    /// The role's strict TOML configuration file with `[tailcat] enabled = true`
+    #[arg(long, value_name = "FILE")]
+    pub config: PathBuf,
+    /// Absolute role data directory; overrides the configuration file
+    #[arg(long, value_name = "PATH")]
+    pub data_dir: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+pub enum TailcatCommand {
+    /// Stage a new node key beside the active one; a worker prints its allow-list line
+    Rotate(TailcatRoleConfig),
+    /// Switch to the staged key once it is admitted (worker) or served (server)
+    Commit(TailcatRoleConfig),
+    /// Drop a staged key that has not been committed
+    Abandon(TailcatRoleConfig),
+    /// Add the `nodekey:<hex> wrk_<id>` line on standard input to the controller's allow list
+    Allow {
+        #[command(flatten)]
+        data: DataDir,
+    },
+    /// Make the line on standard input its worker's only listed key
+    Retire {
+        #[command(flatten)]
+        data: DataDir,
     },
 }
 

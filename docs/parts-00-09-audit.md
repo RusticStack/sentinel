@@ -360,7 +360,7 @@ These came from merging the seven branches and from the flakes seen in their ver
 | P07-20: mirror materialization copies the whole object store on non-reflink filesystems | **B04 — closed** | A performance item that needs before/after measurement on ext4 or overlay. It is bounded by `MAX_OBJECT_FILES`. With manual runs out of mirrors (P07-17), the exposure it widened is closed. **Closed** by the B04 follow-up, measured. |
 | P08-C8 remainder: hydration writes each byte three times, the offer reads the payload twice, and the bundle digest is not stored with the generation | **B04 — closed** | Throughput work on a transfer already bounded to at most 5 s per job. **Closed** by the B04 follow-up, measured. The digest is not stored with the generation: a protocol-9 offer needs no digest before its bytes, so there is nothing to store; an older controller still gets the up-front hash. |
 | Worker-side spool free-space admission (noted against D06) | **R01**, then closed by the [follow-up](#follow-up-spool-space-crash-durability-and-p04-regression-tests) | D06 covers the controller's disk admission. The worker's spool is capped per attempt and a failed write is a declared gap, so the bound holds; admission by free space was moved as retention/operations work. The follow-up added a worker-wide spool quota and a free-space reserve, and removed the item from R01's text. |
-| Tailcat node-key rotation (noted against Q06) | **R04** | Not in Q06's text; plan §5 asks for rotatable identities. Key rotation sits with the key-material operations in R04. |
+| Tailcat node-key rotation (noted against Q06) | ~~R04~~ **Closed** | First moved to R04, since Q06's text did not ask for it and plan §5 asks for rotatable identities. It is now implemented, and R04's text no longer names it. See [Follow-up: Tailcat key rotation and browser launch](#follow-up-tailcat-key-rotation-and-browser-launch). |
 
 Items fixed without an automated regression test, with the fix report's reason:
 
@@ -454,7 +454,7 @@ Not met, stated plainly:
 The audit notes raised three more gaps without finding IDs, and no cluster took them:
 
 - **D06, worker-side spool free space.** D06 is the controller's disk admission (its reserve protects the metadata database and log evidence), and that is met. The worker's log spool is capped per attempt (256 MiB) and a failed write becomes a declared gap, but the worker has no free-space probe. Moved to **R01**; closed by the [follow-up](#follow-up-spool-space-crash-durability-and-p04-regression-tests), and R01's text no longer names it.
-- **Q06, Tailcat key rotation.** Q06's text does not ask for it; plan §5 asks for rotatable identities. Moved to **R04** (key material operations), whose text now names it.
+- **Q06, Tailcat key rotation.** Q06's text does not ask for it; plan §5 asks for rotatable identities. It first moved to **R04** (key material operations). It is now closed by the [follow-up](#follow-up-tailcat-key-rotation-and-browser-launch), and R04's text no longer names it.
 - **Q07, throughput.** Fixed in `529d4a7` (see [Found during integration](#found-during-integration)).
 
 K08's costly-hit rule remains a fixed heuristic (hit + reflink root + everything copied, or more than 5 s of lock wait plus clone); it does not compare against a measured rebuild. K08's text asks to flag costly hits, which it does; comparing against a rebuild belongs with B05's cache-usefulness measurements.
@@ -595,3 +595,92 @@ The panic path now also closes the attempt's log, so its spool no longer waits f
 | WSL2, rootless Podman 4.9.3 | each Podman-gated worker binary as `sentinelbench` with `SENTINEL_PODMAN_TESTS=1` | 0 | `podman` 2, `end_to_end` 1, `compiler_cache` 1, `k09` 3, `slice` 1, `executor_faults` 3, the lib's `executor::tests` 1: all passed, none skipped |
 | WSL2 | `SENTINEL_CRASH_TESTS=1 cargo test -p sentinel-worker --test crash_consistency -- posix_crash_states` | 0 | 752 traced calls, 917 crash points, 2,403 crash states, every promise kept |
 | WSL2, root | `SENTINEL_POWER_LOSS_TESTS=1 cargo test -p sentinel-worker --test crash_consistency -- power_cut_on_dm_flakey` | 0 | 52 power cuts on ext4 and 52 on XFS, every promise kept (120 s) |
+
+## Follow-up: Tailcat key rotation and browser launch
+
+Branch `close-tailcat-browser` from `fca2d1e` closes two items that this audit left open. Both are now **closed**.
+
+**Tailcat node-key rotation** (moved from Q06 to R04 above) is implemented, and R04's text no longer names it. The commit is `feat: rotate Tailcat node keys with an overlap window`, and the procedure is in [configuration](configuration.md) under "Key rotation".
+
+- **Commands.** `sentinel admin tailcat rotate|commit|abandon --role server|worker --config …` runs on the role's own host, in server or worker builds. `sentinel admin tailcat allow|retire --data-dir …` edits the controller's `tailcat-allow`, one `nodekey:<hex> wrk_<id>` line per key.
+- **Overlap window.** A worker's new key is listed beside its old one. It commits only after a `tailcat ping` with the new key succeeds, which proves the controller admits it. The running worker then switches its helper within one probe interval, and `retire` removes the old line. The controller serves a staged key from a second helper with the same port and allow list, and that helper writes `address.next`. On commit that helper becomes the main one without a restart; the old key's helper stops.
+- **Credentials.** Keys move only on standard input and output. Argv carries only the key names `--key=rotated` and `--key=client-rotated`. Errors and standard error name files and worker ids, never a key or an address.
+- **Revocation.** It still withdraws every key a worker has listed.
+- **State.** All rotation state is owner-only and written by atomic replacement.
+
+Tests:
+
+- `sentinel-link/tests/tailcat.rs` (fake helper):
+  - `a_worker_key_rotates_only_once_the_controller_admits_it`
+  - `the_controller_serves_both_keys_until_its_rotation_commits`
+  - `the_allow_list_is_edited_per_worker_with_an_overlap_window`
+- `sentinel/tests/tailcat_admin.rs::a_worker_rotation_runs_through_the_admin_commands_with_keys_only_on_stdio` runs the real binary. It checks that stdout carries only the allow-list line and that no key or address reaches stderr.
+- `service::tests::a_revoked_worker_loses_every_tailcat_key_and_an_unenrolled_one_keeps_it` covers revocation of both keys during an overlap.
+- The live test `tailcat_live.rs::node_keys_rotate_with_an_overlap_window_and_revocation_still_applies` runs on the pinned helper and rootful Podman. It checks each of these:
+  - An unlisted worker key cannot commit.
+  - Both worker keys carry the link during the overlap.
+  - A fresh helper holding the retired key is refused.
+  - Both controller addresses answer during the overlap.
+  - After the commit, a worker already on the new address keeps its tunnel with no helper restart.
+  - The old address stops answering.
+  - Emptying the allow list refuses the rotated identity.
+
+**Allow-list change outage** (found while writing the rotation live test, then measured and fixed in `fix: replace a worker's Tailcat helper as soon as its session is lost`).
+
+Every allow-list change restarts the controller's helper. The rotation test's containers run a bare `tailcat forward` probed with short `nc` connections. Such a forward did not answer again within 300 s after each of three restarts, so that test replaces a container's helper after each change.
+
+What a real worker pays was measured separately, in `tailcat_live.rs::an_allow_list_change_interrupts_a_worker_for_one_heartbeat_deadline`. That test runs Sentinel's controller link and helper supervisor on the host, and the worker link with its own supervisor in a container's network namespace (`nsenter`). The outage is timed on `CLOCK_MONOTONIC` from the change to the next welcomed session.
+
+- **Where the time goes.** The worker notices the cut session only at the heartbeat deadline, 15.1–19.6 s after the change. The same forward then took 0.9–30.4 s more to carry a new session. A fresh helper took 1.0–1.4 s.
+- **Previous rule** (keep the forward until three sessions fail in a row), three runs:
+  - eight changes: 22.2, 23.5, 24.1, 26.1, 31.8, 32.6, 39.8 and 45.6 s;
+  - four changes: 19.4, 20.5, 20.6 and 27.4 s;
+  - four changes (the verification run): 19.3, 20.0, 20.5 and 20.8 s.
+
+  The forward was never replaced; each time the same forward recovered, only later. Four of the sixteen outages exceeded the 30 s lease length.
+- **Shipped rule** (`Forward::session_lost`: a lost session replaces a helper that has run at least 10 s). 20.56, 20.62, 20.69 and 20.74 s, then 20.53, 20.67, 20.74 and 20.89 s in the verification run. Each set ran alongside the second and third previous-rule sets. The test asserts that every change stays under 25 s (heartbeat interval plus deadline plus 5 s) and that the helper was replaced.
+- **Net effect.** The rule removes the tail (19.3–45.6 s becomes 20.5–20.9 s). It does not lower the typical cost of about 20 s, which is the heartbeat detection.
+
+Options that could not do better:
+
+- The pinned helper has no reload for `--allow`.
+- `SIGKILL`, `SIGTERM` and `SIGINT` all left a tunnelled connection open for more than 30 s. A graceful stop therefore tells the worker nothing.
+- Starting the new helper before stopping the old one does not help. The tunnelled stream lives in the old process, and the heartbeat deadline, not the new helper, sets the floor.
+
+Shortening that floor would mean changing the protocol's heartbeat constants, which this change does not do.
+
+**Addition-only changes cannot keep the old helper (checked, not implemented).** The idea: for a change that only adds keys, such as an enrollment, start a helper with the wider list and leave the old one serving until it idles or a key is removed. That needs one node key live in two helpers at once, and the pinned helper does not support it. The experiment was a scratch script using the real v0.6.0 helper on WSL2 with rootful Podman:
+
+- **Setup.** Helper A served the controller's key with `--allow=K1`. Worker 1 (key K1) ran in a container's network namespace. It held one TCP connection through the tunnel, echoed on it every second, and also opened a new connection every second. Helper B was then started with the **same** key and `--allow=K1,K2`; it printed the same address. Worker 2 (key K2, admitted only by B) connected in a second namespace. Both ran for 60 s.
+- **Direct paths possible.** Nothing failed in 60 s: 67 of 67 samples for worker 1 and 58 of 58 for worker 2, held and fresh connections alike. Direct UDP between the peers carried everything.
+- **Relay only** (UDP other than DNS dropped inside both worker namespaces; the relay is a supported deployment). Worker 1's held connection through A died 8.2–9.4 s after B started (last good sample, then first failed one). Worker 2's held connection through B died 29.4–31.2 s after it connected. Fresh connections from both workers then failed on and off for as long as both helpers ran. An earlier relay-only run behaved the same way: both held connections died and fresh connections failed on and off.
+- **Conclusion.** Two helpers holding one key break each other whenever the relay carries the traffic. A deployment that relies on relays would see an addition turn into an outage of unbounded length rather than one of about 20 s.
+
+Other routes checked:
+
+- **The rotation machinery.** It runs two helpers only because their keys differ. A second key means a second address, and every worker already connected would have to move to it.
+- **The helper's control inputs.** There is no allow-list file and no reload signal. The helper reads only `TAILCAT_DERPMAP_URL` and its key files.
+
+The outage on addition therefore stays at about 20 s per change, and the docs advise making changes in batches. The rule itself is also covered by the fake-helper test `sentinel-link/tests/tailcat.rs::a_lost_session_replaces_a_settled_helper_at_once_and_spares_a_young_one`. That test replaced `the_helper_is_replaced_only_after_consecutive_failed_sessions`, the `service.rs` unit test of the removed counter.
+
+**Browser launch smoke test** (O04/O07 recorded "Real browser launch not automated"). The commit is `test: launch the real browser opener against a harmless stand-in`, and production code is unchanged.
+
+- `sentinel/tests/browser.rs` has its own `main` instead of the libtest harness. It runs the unmodified `browser::open` in a copy of itself.
+- A second copy, named `rundll32.exe`, `open` or `xdg-open`, sits where the real launcher is looked up first and records its argv. On Windows that place is the launching program's own directory, which comes before the system directory. On other platforms it is the first `PATH` entry.
+- A URL with `;`, `&`, `|`, `^`, `$(…)`, backticks, quotes, spaces, `%PATH%` and `$HOME` arrives as one argv element, byte for byte, after `url.dll,FileProtocolHandler` on Windows. None of its shell canaries runs.
+- Non-http URLs and `--no-browser` launch nothing.
+- See [CLI](cli.md#verification).
+
+Verification on `close-tailcat-browser`, run one command at a time:
+
+| Where | Command | Exit | Result |
+|---|---|---|---|
+| Windows | `cargo fmt-check` | 0 | clean |
+| Windows | `cargo lint` | 0 | no warnings |
+| Windows | `cargo test-cli --no-fail-fast` | 0 | 129 binaries: 866 passed, 0 failed, 3 ignored (`browser` 4 of them) |
+| WSL2 | `cargo lint-linux` | 0 | no warnings |
+| WSL2 | `cargo test-linux --no-fail-fast` | 0 | 129 binaries: 1,031 passed, 0 failed, 12 ignored (the new live test is the 12th) |
+| WSL2, rootful Podman | the live Tailcat suite as its header documents (`SENTINEL_TAILCAT_LIVE`, `SENTINEL_TAILCAT_DERPER`, `SENTINEL_TAILCAT_DERP_CA` = `SSL_CERT_FILE`, `/usr/sbin` on `PATH`) | 0 | 7 passed in 184.6 s; live probe `path Direct, rtt 270µs`; self-hosted relay `pong in 380µs via DERP(local)` |
+| Windows, after the outage fix | `cargo fmt-check`, `cargo lint`, `cargo test-cli --no-fail-fast` | 0, 0, 0 | clean; no warnings; 129 binaries: 866 passed, 0 failed, 3 ignored |
+| WSL2, after the outage fix | `cargo lint-linux`, `cargo test-linux --no-fail-fast` | 0, 0 | no warnings; 129 binaries: 1,031 passed, 0 failed, 13 ignored (the eight live Tailcat tests among them). The first `test-linux` attempt failed to link (`Cannot allocate memory` while other builds ran) and passed on retry |
+| WSL2, rootful Podman, after the outage fix | the live Tailcat suite as above, `nsenter` on `PATH` too | 0 | 8 passed in 471.9 s; live probe `path Relay, rtt 69ms`; self-hosted relay `pong in 300µs via DERP(local)`; allow-list outages as listed above (verification run) |

@@ -14,6 +14,8 @@
 //! `iptables` on the default `10.88.0.0/16` bridge and the self-hosted relay
 //! binds that bridge's gateway): the helper crosses a real network-namespace
 //! and NAT boundary, but rootless Podman / slirp4netns is not what is proven.
+//! The allow-list outage test also needs `nsenter` (util-linux): it runs a
+//! worker link in a parked container's network namespace.
 //!
 //! One side of each tunnel runs in a container, so the link port on the host
 //! and in the container are different sockets: a byte that comes back went
@@ -337,6 +339,20 @@ impl ContainerWorker {
         port: u16,
         extra: &[String],
     ) -> Self {
+        Self::start_keyed(binary, name, keys, controller, port, extra, None)
+    }
+
+    /// As [`ContainerWorker::start`], forwarding with the saved key `key`
+    /// (`--key=<name>`) instead of the helper's default client key.
+    fn start_keyed(
+        binary: &Path,
+        name: &str,
+        keys: &Path,
+        controller: &Address,
+        port: u16,
+        extra: &[String],
+        key: Option<&str>,
+    ) -> Self {
         remove_container(name);
         let mut args = vec![
             "run".to_owned(),
@@ -357,6 +373,9 @@ impl ContainerWorker {
             "forward".to_owned(),
             "--bind=127.0.0.1".to_owned(),
         ]);
+        if let Some(key) = key {
+            args.push(format!("--key={key}"));
+        }
         if let Some(url) = extra
             .iter()
             .find_map(|arg| arg.strip_prefix("TAILCAT_DERPMAP_URL="))
@@ -627,6 +646,599 @@ fn the_controller_supervisor_admits_only_listed_workers() {
     wait_until("the revoked worker's tunnel to close", PROBLEM, || {
         worker.echo("revoked").is_empty()
     });
+    server.shutdown();
+}
+
+/// `CLOCK_MONOTONIC` in nanoseconds: one clock for this process and the
+/// worker it runs in another network namespace, so their events compare.
+fn mono_ns() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, writable timespec; CLOCK_MONOTONIC exists on
+    // every Linux kernel this suite runs on.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    assert_eq!(result, 0);
+    now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+}
+
+/// When set, this binary plays the Sentinel worker in another network
+/// namespace; the value names its working directory.
+const WORKER_ROLE: &str = "SENTINEL_TAILCAT_LIVE_WORKER";
+/// When also set, the worker reacts to a lost session with the rule it used
+/// before [`tailcat::Forward::session_lost`], for the comparison.
+const PREVIOUS_RULE: &str = "SENTINEL_TAILCAT_LIVE_PREVIOUS_RULE";
+
+struct Idle;
+impl sentinel_link::session::Executor for Idle {
+    fn offered(&self, _: &sentinel_link::session::Offer) -> bool {
+        false
+    }
+    fn stop(&self, _: sentinel_core::AttemptId) {}
+    fn cancel(&self, _: sentinel_core::AttemptId) {}
+    fn held(&self) -> Vec<sentinel_core::AttemptId> {
+        Vec::new()
+    }
+    fn renewed(&self, _: sentinel_core::UnixMillis) {}
+    fn attached(&self, _: sentinel_link::session::Reporter) {}
+    fn detached(&self) {}
+    fn spec(&self, _: sentinel_core::AttemptId, _: sentinel_link::session::JobContext, _: Vec<u8>) {
+    }
+    fn no_spec(&self, _: sentinel_core::AttemptId) {}
+    fn log_acked(&self, _: sentinel_core::AttemptId, _: u64) {}
+    fn log_refused(&self, _: sentinel_core::AttemptId) {}
+}
+
+/// The worker role: Sentinel's helper supervisor (production probe interval)
+/// and the real worker link, fed the same session events `sentinel worker`
+/// feeds it, appending `<event> <monotonic ns>` lines to `<dir>/events`.
+fn play_worker(dir: &Path) {
+    use sentinel_link::{identity::Identity, worker};
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+    let port: u16 = read("port").trim().parse().unwrap();
+    let address = Address::parse(read("address").trim()).unwrap();
+    let hex = read("fingerprint");
+    let mut fingerprint = [0u8; 32];
+    for (index, byte) in fingerprint.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex.trim()[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    let config = config(&PathBuf::from(read("binary").trim()), port);
+    let forward = tailcat::start_forward(&config, &dir.join("data"), &address).unwrap();
+    let log = std::sync::Mutex::new(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(dir.join("events"))
+            .unwrap(),
+    );
+    let note = |event: &str| {
+        let mut file = log.lock().unwrap();
+        writeln!(file, "{event} {}", mono_ns()).unwrap();
+        file.flush().unwrap();
+    };
+    let previous_rule = std::env::var_os(PREVIOUS_RULE).is_some();
+    let failures = std::sync::atomic::AtomicU32::new(0);
+    // Presented only until the first session was welcomed.
+    let secret = std::fs::read_to_string(dir.join("enrollment"))
+        .ok()
+        .and_then(|text| sentinel_auth::secret::Secret::parse(text.trim()));
+    let settings = worker::Config {
+        controller: forward.local_addr(),
+        server: sentinel_auth::secret::Digest(fingerprint),
+        worker: read("worker").trim().parse().unwrap(),
+        name: "live-worker".into(),
+        hello: sentinel_protocol::negotiate::Hello {
+            protocol_min: sentinel_protocol::negotiate::ProtocolVersion(1),
+            protocol_max: sentinel_protocol::negotiate::ProtocolVersion(3),
+            capabilities: sentinel_protocol::negotiate::Capabilities::REQUIRED,
+            arch: sentinel_protocol::negotiate::Arch::X86_64,
+            software: "live".into(),
+        },
+        capacity: sentinel_link::session::Capacity {
+            cpu_millis: 1_000,
+            memory_bytes: 1 << 30,
+        },
+        profile: sentinel_protocol::negotiate::Profile::default(),
+        transport: sentinel_link::session::TransportStats::default(),
+        remote_cache: false,
+    };
+    let identity = Identity::load(&dir.join("worker.crt"), &dir.join("worker.key")).unwrap();
+    let handle = worker::Handle::new();
+    let _ = worker::run(
+        settings,
+        identity,
+        secret,
+        &Idle,
+        &handle,
+        &|event| match event {
+            worker::Event::Connected { .. } => {
+                failures.store(0, std::sync::atomic::Ordering::Relaxed);
+                note("connected");
+                note(&format!("helper-restarts={}", forward.telemetry().restarts));
+            }
+            worker::Event::Disconnected(_) => {
+                note("lost");
+                let replaced = if previous_rule {
+                    // The rule `sentinel worker` used before: replace the
+                    // helper after three failed sessions in a row.
+                    let failed = failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    failed >= 3 && {
+                        failures.store(0, std::sync::atomic::Ordering::Relaxed);
+                        forward.restart();
+                        true
+                    }
+                } else {
+                    forward.session_lost()
+                };
+                if replaced {
+                    note("replaced");
+                }
+            }
+            worker::Event::Backoff(_) => {}
+        },
+    );
+}
+
+/// The worker process in the network namespace of a parked container, so
+/// its loopback forward and the controller's link port on the host are
+/// different sockets.
+struct NetnsWorker {
+    child: Child,
+    events: PathBuf,
+}
+
+impl NetnsWorker {
+    fn start(netns_pid: &str, dir: &Path, previous_rule: bool) -> Self {
+        let events = dir.join("events");
+        let _ = std::fs::remove_file(&events);
+        let mut command = Command::new("nsenter");
+        if previous_rule {
+            command.env(PREVIOUS_RULE, "1");
+        }
+        let child = command
+            .arg(format!("--net=/proc/{netns_pid}/ns/net"))
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "an_allow_list_change_interrupts_a_worker_for_one_heartbeat_deadline",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(WORKER_ROLE, dir)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        Self { child, events }
+    }
+
+    /// `(event, monotonic ns)` for every line the worker wrote so far.
+    fn events(&self) -> Vec<(String, u64)> {
+        std::fs::read_to_string(&self.events)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let (event, at) = line.split_once(' ')?;
+                Some((event.to_owned(), at.parse().ok()?))
+            })
+            .collect()
+    }
+
+    /// The first `event` at or after `since`, waiting at most `within`.
+    fn first_after(&self, event: &str, since: u64, within: Duration) -> Option<u64> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some((_, at)) = self
+                .events()
+                .into_iter()
+                .find(|(name, at)| name == event && *at >= since)
+            {
+                return Some(at);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for NetnsWorker {
+    fn drop(&mut self) {
+        // The helper dies with the thread that started it (PDEATHSIG).
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The outage an allow-list change costs a connected worker, measured on a
+/// real worker link: Sentinel's controller link and helper supervisor on the
+/// host, the worker link and its helper supervisor in a container's network
+/// namespace. The change restarts the controller's helper, which cuts the
+/// tunnelled session without a close reaching the worker; the worker sees it
+/// at the session heartbeat deadline. The outage is from the change to the
+/// next welcomed session. Two rules are measured on fresh workers: the rule
+/// the worker used before (keep the forward until three sessions fail in a
+/// row), which is printed, and the shipped rule (a settled forward is
+/// replaced on the first lost session), which is bounded.
+#[test]
+#[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman + nsenter"]
+fn an_allow_list_change_interrupts_a_worker_for_one_heartbeat_deadline() {
+    if let Some(dir) = std::env::var_os(WORKER_ROLE) {
+        play_worker(Path::new(&dir));
+        return;
+    }
+    let _serial = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(helper) = gate(&["podman", "nsenter"]) else {
+        return;
+    };
+    use sentinel_link::{controller::Controller, identity::Identity};
+    use sentinel_store::{Durability, Store, auth::Authority, tenancy, workers};
+
+    // The controller: store, a shared pool, the link on the helper's port.
+    let state = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(
+        Store::open(state.path().join("metadata.sqlite"), Durability::Normal).unwrap(),
+    );
+    let pool = sentinel_core::PoolId::new();
+    let secret = store
+        .writer()
+        .write(move |tx| {
+            let now = sentinel_core::UnixMillis::now();
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                pool,
+                "live",
+                tenancy::PoolKind::Shared,
+                now,
+            )?;
+            workers::issue_enrollment(tx, Authority::HostLocal, pool, 600_000, now)
+        })
+        .unwrap()
+        .secret;
+    let port = free_port();
+    let controller = Controller::start(
+        std::sync::Arc::clone(&store),
+        std::sync::Arc::new(
+            sentinel_store::logs::LogStore::open(state.path().join("logs")).unwrap(),
+        ),
+        std::sync::Arc::new(
+            sentinel_store::objects::Objects::open(state.path().join("objects")).unwrap(),
+        ),
+        Identity::generate("controller").unwrap(),
+        std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+    )
+    .unwrap();
+
+    // The worker's files, readable from the other namespace (same host).
+    let worker_dir = tempfile::tempdir().unwrap();
+    let dir = worker_dir.path();
+    let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap();
+    std::fs::create_dir(dir.join("data")).unwrap();
+    let key = tailcat::ensure_key(
+        &config(&helper.binary, port),
+        &dir.join("data"),
+        Role::Worker,
+    )
+    .unwrap();
+    Identity::generate("worker")
+        .unwrap()
+        .save(&dir.join("worker.crt"), &dir.join("worker.key"))
+        .unwrap();
+    let mut text = String::new();
+    secret.expose(&mut text);
+    write("enrollment", &text);
+    write("worker", &sentinel_core::WorkerId::new().to_string());
+    write("port", &port.to_string());
+    write("binary", &helper.binary.display().to_string());
+    write(
+        "fingerprint",
+        &controller
+            .fingerprint()
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    );
+    let controller_dir = tempfile::tempdir().unwrap();
+    let server = tailcat::start_server(
+        &config(&helper.binary, port),
+        controller_dir.path(),
+        std::slice::from_ref(&key),
+    )
+    .unwrap();
+    write("address", server.wait_ready(READY).unwrap().expose());
+
+    // A parked container lends its network namespace (NAT to the relays).
+    let parked = "sentinel-live-netns";
+    remove_container(parked);
+    let started = Command::new("podman")
+        .args(["run", "-d", "--name", parked, "alpine:3", "sleep", "3600"])
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(started.success());
+    let pid = String::from_utf8(
+        Command::new("podman")
+            .args(["inspect", "--format", "{{.State.Pid}}", parked])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+
+    // Four allow-list changes per rule, each worker started fresh; every
+    // change widens the list, so the worker stays admitted throughout.
+    let mut change = 0u8;
+    let mut measure = |previous_rule: bool| -> Vec<(Duration, Vec<String>)> {
+        let worker = NetnsWorker::start(&pid, dir, previous_rule);
+        assert!(
+            worker.first_after("connected", 0, READY * 2).is_some(),
+            "the worker never connected over the tunnel"
+        );
+        let _ = std::fs::remove_file(dir.join("enrollment"));
+        let mut rounds = Vec::new();
+        for _ in 0..4 {
+            // Past the settle time, as a long-running worker's helper is.
+            std::thread::sleep(tailcat::SESSION_SETTLE + Duration::from_secs(1));
+            change += 1;
+            let other =
+                NodeKey::parse(&format!("nodekey:{}", format!("{change:02x}").repeat(32))).unwrap();
+            let changed = mono_ns();
+            server.set_allow(&[key.clone(), other]);
+            let back = worker
+                .first_after("connected", changed, Duration::from_secs(300))
+                .expect("the worker never came back after an allow-list change");
+            let since = |at: u64| Duration::from_nanos(at - changed);
+            let trail: Vec<String> = worker
+                .events()
+                .into_iter()
+                .filter(|(_, at)| *at >= changed && *at <= back)
+                .map(|(event, at)| format!("{event}@{:.2}s", since(at).as_secs_f64()))
+                .collect();
+            eprintln!(
+                "allow-list change {change} ({}): welcomed again after {:?}; worker events {trail:?}",
+                if previous_rule {
+                    "previous rule"
+                } else {
+                    "shipped rule"
+                },
+                since(back)
+            );
+            rounds.push((since(back), trail));
+        }
+        rounds
+    };
+    let previous = measure(true);
+    let shipped = measure(false);
+    remove_container(parked);
+    server.shutdown();
+    drop(controller);
+    eprintln!(
+        "allow-list change outages: previous rule {:?}; shipped rule {:?}",
+        previous
+            .iter()
+            .map(|(outage, _)| *outage)
+            .collect::<Vec<_>>(),
+        shipped
+            .iter()
+            .map(|(outage, _)| *outage)
+            .collect::<Vec<_>>()
+    );
+
+    // The bound for the shipped rule: the session's heartbeat interval and
+    // deadline (when the loss is noticed), then a fresh helper and a
+    // handshake over it within 5 s.
+    let bound = sentinel_link::session::HEARTBEAT_INTERVAL
+        + sentinel_link::session::HEARTBEAT_DEADLINE
+        + Duration::from_secs(5);
+    for (outage, trail) in &shipped {
+        assert!(
+            *outage < bound,
+            "an allow-list change interrupted the worker for {outage:?} (bound {bound:?}): {trail:?}"
+        );
+        assert!(
+            trail.iter().any(|event| event.starts_with("replaced")),
+            "the lost session did not replace the helper: {trail:?}"
+        );
+    }
+}
+
+/// Operator-driven rotation of both identities, end to end on the pinned
+/// helper: a worker's staged key cannot commit until the controller lists
+/// it; both worker keys are admitted through the overlap, and retiring the
+/// old one refuses only it; the controller's staged key is served beside the
+/// active one, and the commit keeps the workers already on the new address
+/// connected while the old address stops answering; revocation still closes
+/// the rotated tunnel.
+///
+/// An allow-list change restarts the controller's helper. The containers
+/// here run a bare `tailcat forward` probed with short `nc` connections, and
+/// such a forward was measured not to answer again within 300 s of the
+/// restart (three restarts, none recovered). A Sentinel worker's link does
+/// recover through its own forward (see
+/// `an_allow_list_change_interrupts_a_worker_for_one_heartbeat_deadline`), so
+/// this test replaces a container's helper after an allow-list change
+/// before judging it.
+#[test]
+#[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman"]
+fn node_keys_rotate_with_an_overlap_window_and_revocation_still_applies() {
+    let _serial = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(helper) = gate(&["podman"]) else {
+        return;
+    };
+    let binary = &helper.binary;
+    let port = free_port();
+    let _echo = HostEcho::start(port);
+    let config = config(binary, port);
+    let (old_name, new_name, moved_name) = (
+        "sentinel-live-rotate-old",
+        "sentinel-live-rotate-new",
+        "sentinel-live-rotate-moved",
+    );
+
+    let worker_dir = tempfile::tempdir().unwrap();
+    let keys = worker_dir.path().join("tailcat");
+    let old = tailcat::ensure_key(&config, worker_dir.path(), Role::Worker).unwrap();
+    let controller_dir = tempfile::tempdir().unwrap();
+    let server =
+        tailcat::start_server(&config, controller_dir.path(), std::slice::from_ref(&old)).unwrap();
+    let address = server.wait_ready(READY).unwrap();
+    let before = ContainerWorker::start(binary, old_name, &keys, &address, port, &[]);
+    wait_until("the old key's echo", READY, || {
+        before.echo("old-key") == "old-key"
+    });
+
+    // Worker rotation. Unlisted, the staged key cannot commit: the
+    // controller's helper refuses its handshake.
+    let new = tailcat::stage_rotation(&config, worker_dir.path(), Role::Worker).unwrap();
+    assert_ne!(new, old);
+    assert!(
+        tailcat::commit_rotation(&config, worker_dir.path(), Role::Worker, Some(&address)).is_err(),
+        "a key the controller does not list must not commit"
+    );
+    assert_eq!(
+        tailcat::staged_rotation(worker_dir.path(), Role::Worker).unwrap(),
+        Some(new.clone())
+    );
+    // The old key's material, kept aside by the test only, to show later
+    // that the retired key is refused (the commit deletes it).
+    let old_keys = tempfile::tempdir().unwrap();
+    let saved = Path::new(".config/tailcat/keys/client-default.private.json");
+    std::fs::create_dir_all(old_keys.path().join(saved.parent().unwrap())).unwrap();
+    std::fs::copy(keys.join(saved), old_keys.path().join(saved)).unwrap();
+
+    // Listed beside the old key: the old key is still admitted, and the
+    // commit's ping with the new key succeeds.
+    server.set_allow(&[old.clone(), new.clone()]);
+    let before = ContainerWorker::start(binary, old_name, &keys, &address, port, &[]);
+    wait_until("the old key with both listed", READY, || {
+        before.echo("listed") == "listed"
+    });
+    let deadline = Instant::now() + READY;
+    let committed = loop {
+        match tailcat::commit_rotation(&config, worker_dir.path(), Role::Worker, Some(&address)) {
+            Ok(committed) => break committed,
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the listed key never committed: {error}"
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    };
+    assert_eq!(committed.key, new);
+    assert!(committed.previous_deleted);
+    // Both keys carry the link at once through the overlap.
+    let after = ContainerWorker::start_keyed(
+        binary,
+        new_name,
+        &keys,
+        &address,
+        port,
+        &[],
+        Some("client-rotated"),
+    );
+    wait_until("the new key's echo", READY, || {
+        after.echo("new-key") == "new-key"
+    });
+    assert_eq!(before.echo("overlap"), "overlap");
+
+    // Retired: the new key is the worker's only one; a fresh helper with the
+    // old key is refused.
+    server.set_allow(std::slice::from_ref(&new));
+    let after = ContainerWorker::start_keyed(
+        binary,
+        new_name,
+        &keys,
+        &address,
+        port,
+        &[],
+        Some("client-rotated"),
+    );
+    wait_until("the kept key after the retire", READY, || {
+        after.echo("kept") == "kept"
+    });
+    let before = ContainerWorker::start(binary, old_name, old_keys.path(), &address, port, &[]);
+    std::thread::sleep(Duration::from_secs(8));
+    assert_eq!(before.echo("retired"), "", "the retired key was admitted");
+    drop(before);
+
+    // Controller rotation: the staged key is served beside the active one,
+    // and both addresses carry the link.
+    let staged = tailcat::stage_rotation(&config, controller_dir.path(), Role::Controller).unwrap();
+    server.reload_keys().unwrap();
+    wait_until("the staged address", READY, || {
+        server.staged_address().is_some()
+    });
+    let next = server.staged_address().unwrap();
+    assert_ne!(next.expose(), address.expose());
+    assert_eq!(
+        std::fs::read_to_string(tailcat::staged_address_file(controller_dir.path()))
+            .unwrap()
+            .trim(),
+        next.expose()
+    );
+    let moved = ContainerWorker::start_keyed(
+        binary,
+        moved_name,
+        &keys,
+        &next,
+        port,
+        &[],
+        Some("client-rotated"),
+    );
+    wait_until("the staged address's echo", READY, || {
+        moved.echo("next") == "next"
+    });
+    assert_eq!(
+        after.echo("both"),
+        "both",
+        "the active address during the overlap"
+    );
+
+    // Commit: the helper serving the new key becomes the main one without a
+    // restart, so the worker already on the new address keeps its tunnel;
+    // the old address stops answering.
+    let committed =
+        tailcat::commit_rotation(&config, controller_dir.path(), Role::Controller, None).unwrap();
+    assert_eq!(committed.key, staged);
+    server.reload_keys().unwrap();
+    assert!(server.staged_telemetry().is_none());
+    assert_eq!(server.address().unwrap().expose(), next.expose());
+    assert_eq!(
+        std::fs::read_to_string(server.address_file())
+            .unwrap()
+            .trim(),
+        next.expose()
+    );
+    assert_eq!(
+        moved.echo("committed"),
+        "committed",
+        "the switch broke the new address"
+    );
+    wait_until("the old address to stop answering", PROBLEM, || {
+        after.echo("old-address").is_empty()
+    });
+    eprintln!("live rotation: both identities rotated with an overlap window");
+
+    // Revocation still applies to the rotated identity.
+    server.set_allow(&[]);
+    let moved = ContainerWorker::start_keyed(
+        binary,
+        moved_name,
+        &keys,
+        &next,
+        port,
+        &[],
+        Some("client-rotated"),
+    );
+    std::thread::sleep(Duration::from_secs(8));
+    assert_eq!(moved.echo("revoked"), "", "a revoked worker was admitted");
     server.shutdown();
 }
 

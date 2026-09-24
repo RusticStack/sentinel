@@ -59,5 +59,12 @@ tempfile = "3.20"
 serde_json = "1.0"
 time = { version = "0.3", features = ["formatting"] }
 
+# The browser opener test plays the opener it launches, so it has its own
+# `main` instead of the libtest harness.
+[[test]]
+name = "browser"
+path = "tests/browser.rs"
+harness = false
+
 [lints]
 workspace = true

@@ -107,6 +107,7 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
         AdminCommand::Source(args) => crate::source_admin::run(args)?,
         AdminCommand::Intake(args) => crate::intake_admin::run(args)?,
         AdminCommand::Objects(args) => objects(args)?,
+        AdminCommand::Tailcat(args) => crate::tailcat_admin::run(args).map_err(fail)?,
         AdminCommand::Bootstrap {
             data,
             username,
