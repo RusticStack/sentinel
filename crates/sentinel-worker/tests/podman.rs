@@ -204,3 +204,129 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
     assert!(podman::owned(worker).unwrap().is_empty());
     ws.destroy().unwrap();
 }
+
+/// The container's cgroup on the host, as Podman reports it.
+fn host_cgroup(name: &str) -> std::path::PathBuf {
+    let output = std::process::Command::new("podman")
+        .args(["inspect", "--format", "{{.State.CgroupPath}}", "--", name])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let path = String::from_utf8(output.stdout).unwrap();
+    std::path::Path::new("/sys/fs/cgroup").join(path.trim().trim_start_matches('/'))
+}
+
+/// Removes the container when a failed assertion unwinds past it, which
+/// also ends a step still running in it — a scoped thread blocked in that
+/// step would otherwise hold the failure until the step's timeout.
+struct RemoveOnFailure(String);
+
+impl Drop for RemoveOnFailure {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let _ = podman::remove_named(&self.0);
+        }
+    }
+}
+
+fn procs(cgroup: &std::path::Path) -> Vec<i32> {
+    fs::read_to_string(cgroup.join("cgroup.procs"))
+        .unwrap()
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect()
+}
+
+/// P04-15. A runtime may run an exec'd step in a cgroup nested under the
+/// container's own, which then holds only the keepalive. A cancel decides
+/// from the cgroup tree whether a step is running: reading the container's
+/// cgroup alone, it found nothing, answered `Gone`, and the step ran on.
+/// Here the step is moved two levels down a real nested cgroup (cgroup v2,
+/// delegated to the rootless account); termination must find it there,
+/// signal it and see it leave — and once the nested cgroups are empty,
+/// report that nothing is running.
+#[test]
+fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
+    if !enabled() {
+        return;
+    }
+    podman::pull(
+        IMAGE,
+        Duration::from_secs(600),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let (worker, attempt) = (WorkerId::new(), AttemptId::new());
+    let ws = Workspace::create(temp.path(), attempt).unwrap();
+    let container = Container::start(
+        worker,
+        attempt,
+        IMAGE,
+        Limits {
+            cpu_millis: 500,
+            memory_bytes: 64 << 20,
+            pids: 32,
+        },
+        ws.path(),
+        &[],
+    )
+    .unwrap();
+    let _outer = RemoveOnFailure(container.name().to_owned());
+    let cgroup = host_cgroup(container.name());
+    let init = procs(&cgroup);
+    assert_eq!(init.len(), 1, "only the keepalive before the step");
+
+    let exit = std::thread::scope(|scope| {
+        let _inner = RemoveOnFailure(container.name().to_owned());
+        let step = scope.spawn(|| {
+            let sleep = StepCommand {
+                argv: vec!["sleep".into(), "300".into()],
+                env: Vec::new(),
+                workdir: None,
+                timeout_secs: 120,
+            };
+            container.exec(&sleep, &[]).unwrap()
+        });
+        // The step's host pid, once the runtime has exec'd `sleep` in it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let pid = loop {
+            let found = procs(&cgroup).into_iter().find(|pid| {
+                !init.contains(pid)
+                    && fs::read_to_string(format!("/proc/{pid}/comm"))
+                        .is_ok_and(|comm| comm.trim() == "sleep")
+            });
+            if let Some(pid) = found {
+                break pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "the step never ran");
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let nested = cgroup.join("step").join("inner");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("cgroup.procs"), pid.to_string()).unwrap();
+        assert_eq!(
+            procs(&cgroup),
+            init,
+            "the container's cgroup holds only init"
+        );
+        assert_eq!(procs(&nested), vec![pid]);
+
+        assert_eq!(
+            podman::terminate_named(container.name(), Duration::from_secs(10)).unwrap(),
+            podman::Terminated::Graceful
+        );
+        step.join().unwrap()
+    });
+    assert_eq!((exit.code, exit.signal), (None, Some(15)), "{exit:?}");
+    // The nested cgroups are still there, empty: nothing runs any more.
+    assert!(cgroup.join("step").join("inner").exists());
+    assert_eq!(
+        podman::terminate_named(container.name(), Duration::from_secs(1)).unwrap(),
+        podman::Terminated::Gone
+    );
+
+    container.destroy().unwrap();
+    assert!(podman::owned(worker).unwrap().is_empty());
+    ws.destroy().unwrap();
+}
