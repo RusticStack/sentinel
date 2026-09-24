@@ -1172,3 +1172,136 @@ fn the_allow_list_is_edited_per_worker_with_an_overlap_window() {
     assert_no_credentials(&unlisted.to_string());
     assert_eq!(tailcat::allow_list(dir.path()).unwrap().len(), 2);
 }
+
+struct Idle;
+impl sentinel_link::session::Executor for Idle {
+    fn offered(&self, _: &sentinel_link::session::Offer) -> bool {
+        false
+    }
+    fn stop(&self, _: sentinel_core::AttemptId) {}
+    fn cancel(&self, _: sentinel_core::AttemptId) {}
+    fn held(&self) -> Vec<sentinel_core::AttemptId> {
+        Vec::new()
+    }
+    fn renewed(&self, _: sentinel_core::UnixMillis) {}
+    fn attached(&self, _: sentinel_link::session::Reporter) {}
+    fn detached(&self) {}
+    fn spec(&self, _: sentinel_core::AttemptId, _: sentinel_link::session::JobContext, _: Vec<u8>) {
+    }
+    fn no_spec(&self, _: sentinel_core::AttemptId) {}
+    fn log_acked(&self, _: sentinel_core::AttemptId, _: u64) {}
+    fn log_refused(&self, _: sentinel_core::AttemptId) {}
+}
+
+/// The hand-off closes only what the helper carries: a worker on direct TLS
+/// over loopback (the same address family and host a tunnelled session
+/// comes from) keeps its session through a real change, and an unchanged
+/// list neither restarts the helper nor touches a session.
+#[test]
+fn a_hand_off_restarts_the_helper_only_on_a_change_and_spares_direct_tls() {
+    use sentinel_link::{controller::Controller, identity::Identity, worker};
+    use sentinel_store::{Durability, Store, auth::Authority, tenancy, workers};
+    use std::sync::Arc;
+
+    let state = tempfile::tempdir().unwrap();
+    let store =
+        Arc::new(Store::open(state.path().join("metadata.sqlite"), Durability::Normal).unwrap());
+    let pool = sentinel_core::PoolId::new();
+    let secret = store
+        .writer()
+        .write(move |tx| {
+            let now = sentinel_core::UnixMillis::now();
+            tenancy::create_pool(
+                tx,
+                Authority::HostLocal,
+                pool,
+                "p",
+                tenancy::PoolKind::Shared,
+                now,
+            )?;
+            workers::issue_enrollment(tx, Authority::HostLocal, pool, 600_000, now)
+        })
+        .unwrap()
+        .secret;
+    let controller = Controller::start(
+        Arc::clone(&store),
+        Arc::new(sentinel_store::logs::LogStore::open(state.path().join("logs")).unwrap()),
+        Arc::new(sentinel_store::objects::Objects::open(state.path().join("objects")).unwrap()),
+        Identity::generate("controller").unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
+    let port = controller.local_addr().port();
+    let link = controller.handle();
+
+    let fake = Fake::write(SERVE_FOREVER);
+    let server = tailcat::start_server(&fake.config(port), fake.path(), &[key(KEY)]).unwrap();
+    server.wait_ready(Duration::from_secs(10)).unwrap();
+    wait_until("the helper's pid", || server.telemetry().pid.is_some());
+
+    let config = worker::Config {
+        controller: controller.local_addr(),
+        server: controller.fingerprint(),
+        worker: WorkerId::new(),
+        name: "direct".into(),
+        hello: sentinel_protocol::negotiate::Hello {
+            protocol_min: sentinel_protocol::negotiate::ProtocolVersion(1),
+            protocol_max: sentinel_protocol::negotiate::SUPPORTED_MAX,
+            capabilities: sentinel_protocol::negotiate::Capabilities::REQUIRED,
+            arch: sentinel_protocol::negotiate::Arch::X86_64,
+            software: "direct".into(),
+        },
+        capacity: sentinel_link::session::Capacity {
+            cpu_millis: 1_000,
+            memory_bytes: 1 << 30,
+        },
+        profile: sentinel_protocol::negotiate::Profile::default(),
+        transport: sentinel_link::session::TransportStats::default(),
+        remote_cache: false,
+    };
+    let handle = Arc::new(worker::Handle::new());
+    let running = {
+        let handle = Arc::clone(&handle);
+        std::thread::spawn(move || {
+            let _ = worker::run(
+                config,
+                Identity::generate("worker").unwrap(),
+                Some(secret),
+                &Idle,
+                &handle,
+                &|_| {},
+            );
+        })
+    };
+    wait_until("the direct session", || link.connected().len() == 1);
+
+    // Unchanged (a reordered duplicate of the same key): nothing happens.
+    assert_eq!(link.hand_off(&server, &[key(KEY), key(KEY)]), None);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(fake.calls("serve").len(), 1);
+
+    // Changed: the helper restarts, carrying nothing, so nothing is closed.
+    let old = server.telemetry().pid.unwrap();
+    let handoff = link.hand_off(&server, &[key(KEY), key(OTHER)]).unwrap();
+    assert_eq!(
+        (handoff.tunnelled, handoff.closed, handoff.ended),
+        (0, 0, 0)
+    );
+    wait_until("the restarted helper", || fake.calls("serve").len() == 2);
+    wait_until("the old helper to be gone", || !alive(old));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(handle.sessions(), 1, "the direct-TLS session was closed");
+    assert_eq!(
+        controller
+            .stats()
+            .sessions_ended
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(link.connected().len(), 1);
+
+    handle.stop();
+    running.join().unwrap();
+    server.shutdown();
+    assert!(controller.shutdown(Duration::from_secs(5)));
+}

@@ -14,8 +14,9 @@
 //! `iptables` on the default `10.88.0.0/16` bridge and the self-hosted relay
 //! binds that bridge's gateway): the helper crosses a real network-namespace
 //! and NAT boundary, but rootless Podman / slirp4netns is not what is proven.
-//! The allow-list outage test also needs `nsenter` (util-linux): it runs a
-//! worker link in a parked container's network namespace.
+//! The allow-list hand-off test also needs `nsenter` (util-linux): it runs a
+//! worker link in a parked container's network namespace, and for its
+//! relay-only half drops UDP other than DNS there with `iptables`.
 //!
 //! One side of each tunnel runs in a container, so the link port on the host
 //! and in the container are different sockets: a byte that comes back went
@@ -666,9 +667,11 @@ fn mono_ns() -> u64 {
 /// When set, this binary plays the Sentinel worker in another network
 /// namespace; the value names its working directory.
 const WORKER_ROLE: &str = "SENTINEL_TAILCAT_LIVE_WORKER";
-/// When also set, the worker reacts to a lost session with the rule it used
-/// before [`tailcat::Forward::session_lost`], for the comparison.
-const PREVIOUS_RULE: &str = "SENTINEL_TAILCAT_LIVE_PREVIOUS_RULE";
+/// How the worker reacts to a lost session: unset is the shipped rule
+/// ([`tailcat::Forward::session_lost`]); `previous` replaces the forward
+/// after three failed sessions in a row; `keep` never replaces it. The last
+/// two are for comparison only.
+const WORKER_RULE: &str = "SENTINEL_TAILCAT_LIVE_WORKER_RULE";
 
 struct Idle;
 impl sentinel_link::session::Executor for Idle {
@@ -717,8 +720,7 @@ fn play_worker(dir: &Path) {
         writeln!(file, "{event} {}", mono_ns()).unwrap();
         file.flush().unwrap();
     };
-    let previous_rule = std::env::var_os(PREVIOUS_RULE).is_some();
-    let failures = std::sync::atomic::AtomicU32::new(0);
+    let rule = std::env::var(WORKER_RULE).unwrap_or_default();
     // Presented only until the first session was welcomed.
     let secret = std::fs::read_to_string(dir.join("enrollment"))
         .ok()
@@ -745,12 +747,38 @@ fn play_worker(dir: &Path) {
     };
     let identity = Identity::load(&dir.join("worker.crt"), &dir.join("worker.key")).unwrap();
     let handle = worker::Handle::new();
+    std::thread::scope(|scope| {
+        // Which path the tunnel took, as `tailcat ping` measures it, once
+        // the first session is up.
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_secs(5));
+            match forward.probe() {
+                Ok(measured) => note(&format!("path={:?}", measured.path)),
+                Err(_) => note("path=unmeasured"),
+            }
+        });
+        play_link(settings, identity, secret, &handle, &forward, &rule, &note);
+    });
+}
+
+/// The worker link of [`play_worker`], reacting to lost sessions by `rule`.
+fn play_link(
+    settings: sentinel_link::worker::Config,
+    identity: sentinel_link::identity::Identity,
+    secret: Option<sentinel_auth::secret::Secret>,
+    handle: &sentinel_link::worker::Handle,
+    forward: &tailcat::Forward,
+    rule: &str,
+    note: &(dyn Fn(&str) + Sync),
+) {
+    use sentinel_link::worker;
+    let failures = std::sync::atomic::AtomicU32::new(0);
     let _ = worker::run(
         settings,
         identity,
         secret,
         &Idle,
-        &handle,
+        handle,
         &|event| match event {
             worker::Event::Connected { .. } => {
                 failures.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -759,7 +787,9 @@ fn play_worker(dir: &Path) {
             }
             worker::Event::Disconnected(_) => {
                 note("lost");
-                let replaced = if previous_rule {
+                let replaced = if rule == "keep" {
+                    false
+                } else if rule == "previous" {
                     // The rule `sentinel worker` used before: replace the
                     // helper after three failed sessions in a row.
                     let failed = failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -789,22 +819,15 @@ struct NetnsWorker {
 }
 
 impl NetnsWorker {
-    fn start(netns_pid: &str, dir: &Path, previous_rule: bool) -> Self {
+    fn start(netns_pid: &str, dir: &Path, rule: &str) -> Self {
         let events = dir.join("events");
         let _ = std::fs::remove_file(&events);
         let mut command = Command::new("nsenter");
-        if previous_rule {
-            command.env(PREVIOUS_RULE, "1");
-        }
+        command.env(WORKER_RULE, rule);
         let child = command
             .arg(format!("--net=/proc/{netns_pid}/ns/net"))
             .arg(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "an_allow_list_change_interrupts_a_worker_for_one_heartbeat_deadline",
-                "--ignored",
-                "--nocapture",
-            ])
+            .args(["--exact", HANDOFF_TEST, "--ignored", "--nocapture"])
             .env(WORKER_ROLE, dir)
             .stdout(Stdio::null())
             .spawn()
@@ -851,25 +874,29 @@ impl Drop for NetnsWorker {
     }
 }
 
+/// This test's name, for the worker process it starts in another namespace.
+const HANDOFF_TEST: &str = "an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper";
+
 /// The outage an allow-list change costs a connected worker, measured on a
 /// real worker link: Sentinel's controller link and helper supervisor on the
 /// host, the worker link and its helper supervisor in a container's network
-/// namespace. The change restarts the controller's helper, which cuts the
-/// tunnelled session without a close reaching the worker; the worker sees it
-/// at the session heartbeat deadline. The outage is from the change to the
-/// next welcomed session. Two rules are measured on fresh workers: the rule
-/// the worker used before (keep the forward until three sessions fail in a
-/// row), which is printed, and the shipped rule (a settled forward is
-/// replaced on the first lost session), which is bounded.
+/// namespace, over a direct path and then over a relay only (UDP other than
+/// DNS dropped inside the worker's namespace). The change restarts the
+/// controller's helper. Cut, as `Server::set_allow` alone does it, the
+/// tunnelled session ends without a close reaching the worker, which sees it
+/// only at the session heartbeat deadline; handed off, as
+/// `Handle::hand_off` does it, the controller first closes that session
+/// through the old helper. The outage is from the change to the next
+/// welcomed session, on `CLOCK_MONOTONIC`.
 #[test]
-#[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman + nsenter"]
-fn an_allow_list_change_interrupts_a_worker_for_one_heartbeat_deadline() {
+#[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman + nsenter + iptables"]
+fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
     if let Some(dir) = std::env::var_os(WORKER_ROLE) {
         play_worker(Path::new(&dir));
         return;
     }
     let _serial = LIVE.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(helper) = gate(&["podman", "nsenter"]) else {
+    let Some(helper) = gate(&["podman", "nsenter", "iptables"]) else {
         return;
     };
     use sentinel_link::{controller::Controller, identity::Identity};
@@ -910,6 +937,7 @@ fn an_allow_list_change_interrupts_a_worker_for_one_heartbeat_deadline() {
         std::net::SocketAddr::from(([127, 0, 0, 1], port)),
     )
     .unwrap();
+    let link = controller.handle();
 
     // The worker's files, readable from the other namespace (same host).
     let worker_dir = tempfile::tempdir().unwrap();
@@ -951,99 +979,255 @@ fn an_allow_list_change_interrupts_a_worker_for_one_heartbeat_deadline() {
     write("address", server.wait_ready(READY).unwrap().expose());
 
     // A parked container lends its network namespace (NAT to the relays).
-    let parked = "sentinel-live-netns";
-    remove_container(parked);
-    let started = Command::new("podman")
-        .args(["run", "-d", "--name", parked, "alpine:3", "sleep", "3600"])
-        .stdout(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(started.success());
-    let pid = String::from_utf8(
-        Command::new("podman")
-            .args(["inspect", "--format", "{{.State.Pid}}", parked])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_owned();
+    let parked = ParkedNetns::start("sentinel-live-netns");
 
-    // Four allow-list changes per rule, each worker started fresh; every
-    // change widens the list, so the worker stays admitted throughout.
+    // Rounds of allow-list changes, each set on a fresh worker; every change
+    // widens the list, so the worker stays admitted throughout.
     let mut change = 0u8;
-    let mut measure = |previous_rule: bool| -> Vec<(Duration, Vec<String>)> {
-        let worker = NetnsWorker::start(&pid, dir, previous_rule);
+    let mut measure = |rule: &str, handoff: bool, relay: bool, count: usize| -> Vec<Round> {
+        let worker = NetnsWorker::start(&parked.pid, dir, rule);
         assert!(
             worker.first_after("connected", 0, READY * 2).is_some(),
             "the worker never connected over the tunnel"
         );
         let _ = std::fs::remove_file(dir.join("enrollment"));
+        let label = format!(
+            "{} path, {}, worker rule {}",
+            if relay { "relay" } else { "direct" },
+            if handoff { "handed off" } else { "cut" },
+            if rule.is_empty() { "shipped" } else { rule }
+        );
+        // The path the worker's helper measured; a relay-only namespace must
+        // not find a direct one.
+        let mut path = None;
+        wait_until("the worker's path probe", Duration::from_secs(40), || {
+            path = worker
+                .events()
+                .into_iter()
+                .find_map(|(event, _)| event.strip_prefix("path=").map(str::to_owned));
+            path.is_some()
+        });
+        eprintln!("{label}: probe path {path:?}");
+        if relay {
+            assert_eq!(path.as_deref(), Some("Relay"), "{label}: not relayed");
+        }
         let mut rounds = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..count {
             // Past the settle time, as a long-running worker's helper is.
             std::thread::sleep(tailcat::SESSION_SETTLE + Duration::from_secs(1));
             change += 1;
             let other =
                 NodeKey::parse(&format!("nodekey:{}", format!("{change:02x}").repeat(32))).unwrap();
+            let allow = [key.clone(), other];
             let changed = mono_ns();
-            server.set_allow(&[key.clone(), other]);
+            let handed = if handoff {
+                Some(link.hand_off(&server, &allow).expect("the list changed"))
+            } else {
+                server.set_allow(&allow);
+                None
+            };
             let back = worker
                 .first_after("connected", changed, Duration::from_secs(300))
                 .expect("the worker never came back after an allow-list change");
+            // The line written right after `connected` says which path the
+            // new session took.
+            std::thread::sleep(Duration::from_millis(200));
             let since = |at: u64| Duration::from_nanos(at - changed);
             let trail: Vec<String> = worker
                 .events()
                 .into_iter()
-                .filter(|(_, at)| *at >= changed && *at <= back)
+                .filter(|(_, at)| *at >= changed && *at <= back + 100_000_000)
                 .map(|(event, at)| format!("{event}@{:.2}s", since(at).as_secs_f64()))
                 .collect();
+            let lost = worker
+                .first_after("lost", changed, Duration::ZERO)
+                .filter(|at| *at <= back)
+                .map(since);
             eprintln!(
-                "allow-list change {change} ({}): welcomed again after {:?}; worker events {trail:?}",
-                if previous_rule {
-                    "previous rule"
-                } else {
-                    "shipped rule"
-                },
+                "allow-list change {change} ({label}): welcomed again after {:?}; lost after {lost:?}; hand-off {handed:?}; worker events {trail:?}",
                 since(back)
             );
-            rounds.push((since(back), trail));
+            rounds.push(Round {
+                outage: since(back),
+                lost,
+                handed,
+                trail,
+            });
         }
         rounds
     };
-    let previous = measure(true);
-    let shipped = measure(false);
-    remove_container(parked);
+    let mut results = Vec::new();
+    for relay in [false, true] {
+        let _block = relay.then(|| NetnsUdpBlock::engage(&parked.pid));
+        for (rule, handoff, rounds) in PLAN {
+            results.push((
+                relay,
+                *rule,
+                *handoff,
+                measure(rule, *handoff, relay, *rounds),
+            ));
+        }
+    }
+
+    // A removal is handed off too, and still cuts the removed worker off:
+    // its session is closed at once, and the restarted helper no longer
+    // admits it, so it never gets back in.
+    let worker = NetnsWorker::start(&parked.pid, dir, "");
+    assert!(
+        worker.first_after("connected", 0, READY * 2).is_some(),
+        "the worker never connected over the tunnel"
+    );
+    std::thread::sleep(tailcat::SESSION_SETTLE + Duration::from_secs(1));
+    let other = NodeKey::parse(&format!("nodekey:{}", "ee".repeat(32))).unwrap();
+    let removed = mono_ns();
+    let handed = link
+        .hand_off(&server, std::slice::from_ref(&other))
+        .expect("the list changed");
+    let lost = worker.first_after("lost", removed, Duration::from_secs(2));
+    eprintln!(
+        "removal: hand-off {handed:?}; lost after {:?}",
+        lost.map(|at| Duration::from_nanos(at - removed))
+    );
+    assert!(
+        lost.is_some(),
+        "the removed worker's session was not closed: {handed:?}"
+    );
+    assert_eq!(
+        worker.first_after("connected", removed, Duration::from_secs(45)),
+        None,
+        "the removed worker got back in: {:?}",
+        worker.events()
+    );
+    drop(worker);
+
+    drop(parked);
     server.shutdown();
     drop(controller);
-    eprintln!(
-        "allow-list change outages: previous rule {:?}; shipped rule {:?}",
-        previous
-            .iter()
-            .map(|(outage, _)| *outage)
-            .collect::<Vec<_>>(),
-        shipped
-            .iter()
-            .map(|(outage, _)| *outage)
-            .collect::<Vec<_>>()
-    );
+    for (relay, rule, handoff, rounds) in &results {
+        eprintln!(
+            "summary: {} path, {}, worker rule {}: outages {:?}; lost after {:?}",
+            if *relay { "relay" } else { "direct" },
+            if *handoff { "handed off" } else { "cut" },
+            if rule.is_empty() { "shipped" } else { rule },
+            rounds.iter().map(|round| round.outage).collect::<Vec<_>>(),
+            rounds.iter().map(|round| round.lost).collect::<Vec<_>>()
+        );
+    }
 
-    // The bound for the shipped rule: the session's heartbeat interval and
-    // deadline (when the loss is noticed), then a fresh helper and a
-    // handshake over it within 5 s.
-    let bound = sentinel_link::session::HEARTBEAT_INTERVAL
-        + sentinel_link::session::HEARTBEAT_DEADLINE
-        + Duration::from_secs(5);
-    for (outage, trail) in &shipped {
-        assert!(
-            *outage < bound,
-            "an allow-list change interrupted the worker for {outage:?} (bound {bound:?}): {trail:?}"
-        );
-        assert!(
-            trail.iter().any(|event| event.starts_with("replaced")),
-            "the lost session did not replace the helper: {trail:?}"
-        );
+    // Handed off, the worker sees the close within a relay round trip and
+    // is welcomed again once the restarted helper answers: measured at
+    // 3.3-4.3 s direct and 3.6-4.6 s relayed (twelve changes each), where a
+    // fresh helper answered 3.2-4.3 s after its start. Cut, the same
+    // changes cost 18.0-21.0 s (heartbeat detection).
+    for (relay, _, handoff, rounds) in &results {
+        for round in rounds.iter().filter(|_| *handoff) {
+            let label = if *relay { "relay" } else { "direct" };
+            assert!(
+                round.handed.is_some_and(|handed| handed.closed == 1),
+                "{label}: the tunnelled session was not closed: {round:?}"
+            );
+            assert!(
+                round.lost.is_some_and(|lost| lost < HANDOFF_NOTICED),
+                "{label}: the worker did not see the close at once: {round:?}"
+            );
+            assert!(
+                round.outage < HANDOFF_OUTAGE,
+                "{label}: a handed-off change interrupted the worker for {:?} (bound {HANDOFF_OUTAGE:?}): {round:?}",
+                round.outage
+            );
+        }
+    }
+}
+
+/// A handed-off worker sees its session end within this long (measured:
+/// 1.5-4.2 ms direct, 35.3-38.4 ms relayed).
+const HANDOFF_NOTICED: Duration = Duration::from_secs(1);
+/// A handed-off change costs a worker less than this, from the change to
+/// the next welcomed session (measured: at most 4.60 s).
+const HANDOFF_OUTAGE: Duration = Duration::from_secs(6);
+
+/// (worker rule, handed off, changes) measured on each path: the cut the
+/// controller made before the hand-off, then the hand-off.
+const PLAN: &[(&str, bool, usize)] = &[("", false, 4), ("", true, 6)];
+
+/// One measured allow-list change.
+#[derive(Debug)]
+// `trail` is read only through `Debug`, in failure messages.
+#[allow(dead_code)]
+struct Round {
+    /// From the change to the next welcomed session.
+    outage: Duration,
+    /// From the change to the worker seeing its session end.
+    lost: Option<Duration>,
+    handed: Option<sentinel_link::controller::Handoff>,
+    trail: Vec<String>,
+}
+
+/// A parked container whose network namespace a worker process enters.
+struct ParkedNetns {
+    name: &'static str,
+    pid: String,
+}
+
+impl ParkedNetns {
+    fn start(name: &'static str) -> Self {
+        remove_container(name);
+        let started = Command::new("podman")
+            .args(["run", "-d", "--name", name, "alpine:3", "sleep", "3600"])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(started.success());
+        let pid = String::from_utf8(
+            Command::new("podman")
+                .args(["inspect", "--format", "{{.State.Pid}}", name])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        Self { name, pid }
+    }
+}
+
+impl Drop for ParkedNetns {
+    fn drop(&mut self) {
+        remove_container(self.name);
+    }
+}
+
+/// Every UDP datagram but DNS dropped inside one network namespace: the
+/// helper there can reach its peer only through a DERP relay (over TCP).
+struct NetnsUdpBlock {
+    pid: String,
+}
+
+impl NetnsUdpBlock {
+    const RULE: [&str; 8] = ["OUTPUT", "-p", "udp", "!", "--dport", "53", "-j", "DROP"];
+
+    fn engage(pid: &str) -> Self {
+        let engaged = Command::new("nsenter")
+            .arg(format!("--net=/proc/{pid}/ns/net"))
+            .args(["iptables", "-I"])
+            .args(Self::RULE)
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(engaged, "iptables failed inside the worker's namespace");
+        Self {
+            pid: pid.to_owned(),
+        }
+    }
+}
+
+impl Drop for NetnsUdpBlock {
+    fn drop(&mut self) {
+        let _ = Command::new("nsenter")
+            .arg(format!("--net=/proc/{}/ns/net", self.pid))
+            .args(["iptables", "-D"])
+            .args(Self::RULE)
+            .status();
     }
 }
 
@@ -1060,7 +1244,7 @@ fn an_allow_list_change_interrupts_a_worker_for_one_heartbeat_deadline() {
 /// such a forward was measured not to answer again within 300 s of the
 /// restart (three restarts, none recovered). A Sentinel worker's link does
 /// recover through its own forward (see
-/// `an_allow_list_change_interrupts_a_worker_for_one_heartbeat_deadline`), so
+/// `an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper`), so
 /// this test replaces a container's helper after an allow-list change
 /// before judging it.
 #[test]

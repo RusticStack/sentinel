@@ -50,6 +50,7 @@ use crate::{
         self, Accepted, Admission, Admitted, ArtifactCode, ArtifactReply, Beat, BulkSession,
         Capacity, JobContext, LogVerdict, Offer, Rejection, Sender, SessionHandler, TransportStats,
     },
+    tailcat::{NodeKey, Server, canonical},
     tls,
 };
 
@@ -2769,6 +2770,128 @@ impl Handle {
             None => false,
         }
     }
+
+    /// Replace the allow list of the Tailcat helper that carries this link
+    /// port, handing the tunnelled sessions over instead of cutting them.
+    ///
+    /// Restarting the helper (its only way to take a new list) leaves every
+    /// session it carried open at the worker's end: a killed helper closes
+    /// nothing through the tunnel, so the worker would notice only at its
+    /// heartbeat deadline, about 20 s later. So, while the old helper still
+    /// runs, every session whose connection arrived through it — told apart
+    /// from direct TLS by the helper owning the socket's other end — is
+    /// closed cleanly (`close_notify` and a FIN), which the helper carries
+    /// to the worker at once, and only then is the helper replaced. The
+    /// wait is bounded by [`HANDOFF_BOUND`]: it ends as soon as every closed
+    /// session has seen its worker close too, plus [`HANDOFF_SETTLE`] for
+    /// the helper to flush its last packets. Direct-TLS sessions are never
+    /// touched. `None` when the list is unchanged: no restart, no close.
+    ///
+    /// The worker reads the close as [`crate::Error::Closed`], replaces its
+    /// own helper (a forward that carried a session through the old helper
+    /// took 23.7-70.3 s to carry the next one) and redials on its shortest
+    /// back-off. Live, the change then cost 3.3-4.6 s, the restarted
+    /// helper's own start (3.2-4.3 s), where cutting cost 18.0-21.0 s.
+    pub fn hand_off(&self, server: &Server, allow: &[NodeKey]) -> Option<Handoff> {
+        let started = Instant::now();
+        let mut handoff = Handoff::default();
+        let changed = server.set_allow_draining(allow, |carried| {
+            handoff = self.drain(carried, HANDOFF_BOUND);
+        });
+        changed.then(|| {
+            handoff.waited = started.elapsed();
+            handoff
+        })
+    }
+
+    /// Close every session (and its bulk connection) whose socket's remote
+    /// end is one of `from`, cleanly, and wait until each has ended or
+    /// `within` passed. `from` must be sorted.
+    fn drain(&self, from: &[SocketAddr], within: Duration) -> Handoff {
+        let deadline = Instant::now() + within;
+        // The fleet lock is not held across the socket calls below.
+        let peers: Vec<(WorkerId, Arc<Peer>)> = self
+            .0
+            .fleet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(worker, peer)| (*worker, Arc::clone(peer)))
+            .collect();
+        let mut closed: Vec<(WorkerId, u64)> = Vec::new();
+        for (worker, peer) in &peers {
+            let tunnelled = peer
+                .sender
+                .peer_addr()
+                .is_ok_and(|addr| from.binary_search(&canonical(addr)).is_ok());
+            if !tunnelled {
+                continue;
+            }
+            if let Some(bulk) = peer.bulk.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                bulk.close_notify();
+            }
+            peer.sender.close_notify();
+            closed.push((*worker, peer.generation));
+        }
+        drop(peers);
+        let mut handoff = Handoff {
+            tunnelled: from.len(),
+            closed: closed.len(),
+            ..Handoff::default()
+        };
+        if closed.is_empty() {
+            return handoff;
+        }
+        loop {
+            let open = {
+                let fleet = self.0.fleet.lock().unwrap_or_else(|p| p.into_inner());
+                closed
+                    .iter()
+                    .filter(|(worker, generation)| {
+                        fleet
+                            .get(worker)
+                            .is_some_and(|peer| peer.generation == *generation)
+                    })
+                    .count()
+            };
+            let now = Instant::now();
+            if open == 0 {
+                handoff.ended = closed.len();
+                thread::sleep(HANDOFF_SETTLE.min(deadline.saturating_duration_since(now)));
+                return handoff;
+            }
+            if now >= deadline {
+                handoff.ended = closed.len() - open;
+                return handoff;
+            }
+            thread::sleep(HANDOFF_POLL.min(deadline - now));
+        }
+    }
+}
+
+/// Longest [`Handle::hand_off`] waits for closed sessions before replacing
+/// the helper. Below the worker's shortest reconnect back-off (1 s less its
+/// 25 % jitter), so a worker that saw the close cannot have redialled into
+/// the old helper before it goes.
+pub const HANDOFF_BOUND: Duration = Duration::from_millis(600);
+/// After the last closed session ended: time for the old helper to send the
+/// close on through the tunnel before it is killed.
+pub const HANDOFF_SETTLE: Duration = Duration::from_millis(100);
+/// How often the hand-off looks for the closed sessions' end.
+const HANDOFF_POLL: Duration = Duration::from_millis(5);
+
+/// What one [`Handle::hand_off`] did, for the operator's log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Handoff {
+    /// Connections the old helper carried into the link port.
+    pub tunnelled: usize,
+    /// Sessions among them that were closed cleanly.
+    pub closed: usize,
+    /// Of those, the ones whose worker closed its end before the helper was
+    /// replaced.
+    pub ended: usize,
+    /// From the call to the helper's replacement.
+    pub waited: Duration,
 }
 
 impl std::fmt::Debug for Controller {

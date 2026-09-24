@@ -39,8 +39,14 @@ pub enum Error {
     /// The peer sent something outside the protocol: too large, undecodable,
     /// or out of sequence. The session is closed.
     Protocol(&'static str),
-    /// The peer stopped answering within the heartbeat deadline.
+    /// The peer stopped answering within the heartbeat deadline, or its
+    /// connection ended without a TLS close.
     Lost,
+    /// The peer ended the session with a TLS `close_notify`: on purpose,
+    /// not a failure. The controller does this to hand its Tailcat-carried
+    /// sessions over to a restarted helper; the worker reconnects on its
+    /// shortest back-off.
+    Closed,
     /// The controller refused the hello; the worker must not retry unchanged.
     Rejected(session::Rejection),
     /// The controller's own store refused or failed; the session ends and the
@@ -56,6 +62,7 @@ impl fmt::Display for Error {
             Self::Tls(what) => write!(f, "tls: {what}"),
             Self::Protocol(what) => write!(f, "protocol violation: {what}"),
             Self::Lost => f.write_str("peer stopped answering"),
+            Self::Closed => f.write_str("peer closed the session"),
             Self::Rejected(why) => write!(f, "rejected: {why:?}"),
             Self::Internal(what) => write!(f, "controller: {what}"),
             Self::Io(e) => write!(f, "io: {e}"),

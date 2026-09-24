@@ -1123,6 +1123,9 @@ struct Shared {
     /// Q07 telemetry reports is measured here, never estimated.
     out: AtomicU64,
     in_: AtomicU64,
+    /// Set by [`Sender::close_notify`]: the connection is ending on purpose,
+    /// and frames sent from then on are dropped rather than failing it.
+    closing: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
@@ -1175,6 +1178,13 @@ impl Sender {
     }
 
     fn write_frame(&self, frame: &[u8]) -> Result<()> {
+        if self.0.closing.load(Ordering::Acquire) {
+            // Past the close: a failed write here would tear the socket
+            // down (and reset it on unread bytes) before the peer read the
+            // close, so the frame is dropped, as it would be by a
+            // connection that is ending anyway.
+            return Ok(());
+        }
         let mut conn = self.0.conn.lock().unwrap_or_else(|p| p.into_inner());
         let written = (|| -> Result<()> {
             conn.writer().write_all(frame)?;
@@ -1219,7 +1229,54 @@ impl Sender {
     pub fn close(&self) {
         let _ = self.0.sock.shutdown(Shutdown::Both);
     }
+
+    /// End the connection cleanly from any thread: a TLS `close_notify`,
+    /// then a FIN on this side only. The peer reads the end of its stream at
+    /// once, wherever the bytes travel (a relaying helper passes the close
+    /// on), and the reading side here keeps running until the peer closes
+    /// its half too, so the session's end marks the close as delivered.
+    ///
+    /// Frames sent after this are dropped, so a reply the session thread
+    /// still makes cannot fail the socket before the peer has read the
+    /// close. Bounded: another thread's write in progress is waited for at
+    /// most [`CLOSE_WRITE_TIMEOUT`] (after that the alert is skipped and
+    /// only the FIN goes out), and so is a peer that stopped reading.
+    pub fn close_notify(&self) {
+        self.0.closing.store(true, Ordering::Release);
+        let deadline = Instant::now() + CLOSE_WRITE_TIMEOUT;
+        let conn = loop {
+            match self.0.conn.try_lock() {
+                Ok(conn) => break Some(conn),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    break Some(poisoned.into_inner());
+                }
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => break None,
+            }
+        };
+        if let Some(mut conn) = conn {
+            conn.send_close_notify();
+            let _ = self.0.sock.set_write_timeout(Some(CLOSE_WRITE_TIMEOUT));
+            let mut sock = &self.0.sock;
+            while conn.wants_write() {
+                if conn.write_tls(&mut sock).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = self.0.sock.shutdown(Shutdown::Write);
+    }
+
+    /// The remote end of the socket; fails once the socket is shut down.
+    pub fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.0.sock.peer_addr()
+    }
 }
+
+/// Longest [`Sender::close_notify`] waits to hand its alert to the socket.
+const CLOSE_WRITE_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// The receiving half: exactly one thread reads the socket.
 pub struct Receiver {
@@ -1251,7 +1308,7 @@ impl Receiver {
     }
 
     /// Move decrypted bytes out of rustls into the plaintext buffer. Returns
-    /// whether anything arrived; `Lost` on the peer's close_notify.
+    /// whether anything arrived; `Closed` on the peer's close_notify.
     fn drain_plaintext(&mut self) -> Result<bool> {
         let mut conn = self.shared.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut got = false;
@@ -1261,7 +1318,7 @@ impl Receiver {
             match conn.reader().read(&mut self.plain[start..]) {
                 Ok(0) => {
                     self.plain.truncate(start);
-                    return Err(Error::Lost);
+                    return Err(Error::Closed);
                 }
                 Ok(n) => {
                     self.plain.truncate(start + n);
@@ -1398,6 +1455,7 @@ fn split(conn: rustls::Connection, sock: TcpStream) -> Result<(Sender, Receiver)
         sock,
         out: AtomicU64::new(0),
         in_: AtomicU64::new(0),
+        closing: std::sync::atomic::AtomicBool::new(false),
     });
     Ok((
         Sender(Arc::clone(&shared)),

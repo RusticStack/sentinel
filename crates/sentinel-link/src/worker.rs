@@ -315,6 +315,7 @@ pub fn run(
         if welcomed.load(Ordering::Acquire) {
             enrollment = None;
         }
+        let closed = matches!(outcome, Err(Error::Closed)) && welcomed.load(Ordering::Acquire);
         match outcome {
             Ok(()) => return Ok(()),
             // The controller's store was briefly unavailable (a restart
@@ -330,7 +331,10 @@ pub fn run(
             Err(_) if handle.stopped() => return Ok(()),
             Err(error) => on_event(Event::Disconnected(error)),
         }
-        if started.elapsed() >= STABLE_SESSION {
+        // A session the controller closed on purpose (a hand-off to its
+        // restarted transport) is not a failure: the next dial waits only
+        // the shortest back-off, however short the session was.
+        if started.elapsed() >= STABLE_SESSION || closed {
             backoff = BACKOFF_MIN;
         }
         let wait = jitter(backoff, &mut seed);

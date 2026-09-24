@@ -661,7 +661,7 @@ Other routes checked:
 - **The rotation machinery.** It runs two helpers only because their keys differ. A second key means a second address, and every worker already connected would have to move to it.
 - **The helper's control inputs.** There is no allow-list file and no reload signal. The helper reads only `TAILCAT_DERPMAP_URL` and its key files.
 
-The outage on addition therefore stays at about 20 s per change, and the docs advise making changes in batches. The rule itself is also covered by the fake-helper test `sentinel-link/tests/tailcat.rs::a_lost_session_replaces_a_settled_helper_at_once_and_spares_a_young_one`. That test replaced `the_helper_is_replaced_only_after_consecutive_failed_sessions`, the `service.rs` unit test of the removed counter.
+The outage on addition therefore stays at about 20 s per change, and the docs advise making changes in batches. (Superseded: [the hand-off](#follow-up-tailcat-allow-list-hand-off) brought every change down to about 4 s.) The rule itself is also covered by the fake-helper test `sentinel-link/tests/tailcat.rs::a_lost_session_replaces_a_settled_helper_at_once_and_spares_a_young_one`. That test replaced `the_helper_is_replaced_only_after_consecutive_failed_sessions`, the `service.rs` unit test of the removed counter.
 
 **Browser launch smoke test** (O04/O07 recorded "Real browser launch not automated"). The commit is `test: launch the real browser opener against a harmless stand-in`, and production code is unchanged.
 
@@ -734,7 +734,7 @@ Still open after this verification:
 
 - ~~macOS hardware runs.~~ No longer open: macOS was dropped by decision on 2026-09-24.
 - U07 — closed since: GitHub web sign-in is routed through the consent, device and first pages (migration 37; [GitHub sign-in](github-sign-in.md#browser-routes-u07)).
-- The ~20 s allow-list outage floor (heartbeat detection).
+- The ~20 s allow-list outage floor (heartbeat detection). Closed since by [the hand-off](#follow-up-tailcat-allow-list-hand-off).
 - S05 tenant-scoped registry authorization.
 - B04, R01 and R04 as written in the tracker.
 
@@ -747,3 +747,58 @@ On 2026-09-24 the owner decided that Sentinel supports Linux (server, worker and
 - The `aarch64-apple-darwin` type-check rows above record runs of a target that is no longer built; the zig recipe is retired.
 - The browser opener's `open` path and the `$HOME/Library/Application Support` configuration directory are gone. On Linux the opener is `xdg-open` and the directory is `${XDG_CONFIG_HOME:-$HOME/.config}/sentinel`.
 - Linux is the only supported Unix. `cfg(unix)` code keeps compiling where it did, but other Unix targets are not built or tested ([Rust foundation](rust-foundation.md#platform-and-feature-matrix)).
+
+## Follow-up: Tailcat allow-list hand-off
+
+Branch `tailcat-handoff` from `20bd18a` shortens the outage every Tailcat allow-list change costs a connected worker. Before, the controller's helper restart cut each tunnelled session without a close, and the worker noticed only at its heartbeat deadline (about 20.5–20.9 s, above). The item "the ~20 s allow-list outage floor" in the list above is **closed**: a change now costs about the restarted helper's start, 3.3–4.6 s. The commit is `feat: hand Tailcat sessions off before an allow-list restart`, and the behaviour is in [configuration](configuration.md#optional-tailcat-transport) and [worker link](worker-link.md).
+
+**Design.**
+
+1. **Close through the old helper.** `controller::Handle::hand_off(server, keys)` replaces `Server::set_allow` in the controller's 10 s allow-list refresher. When the normalized key set really changes, `Server::set_allow_draining` reads which connections the running helper (and a staged rotation helper) carries into the link port: the helper's socket inodes from `/proc/<pid>/fd`, matched against `/proc/<pid>/net/tcp{,6}` for loopback connections to the link port. The controller then closes each session whose socket's remote end is one of those, and its bulk connection, with `Sender::close_notify`: a TLS `close_notify` and a FIN on its write half (`shutdown(Write)`). Frames sent afterwards are dropped, so a late `Pong` cannot fail the socket and reset it before the worker has read the close. Only then is the helper replaced.
+2. **How long the old helper is kept.** The wait ends when every closed session has ended, meaning the worker closed its side too, plus 100 ms for the helper to send its last packets. It is capped at 600 ms. The cap is below the worker's shortest reconnect back-off (1 s less 25 % jitter), so a worker that saw the close cannot redial into the old helper. When the worker's close did not come back in time, the cap is simply reached. That happened in 3 of 12 direct changes (waited 601–603 ms), and the worker had already seen the close in each. Otherwise the wait was 106–109 ms direct and 172–174 ms relayed.
+3. **Only tunnelled sessions.** Ownership decides, not the address: a direct-TLS worker on loopback is never closed. `sentinel-link/tests/tailcat.rs::a_hand_off_restarts_the_helper_only_on_a_change_and_spares_direct_tls` runs a real `Controller`, a fake helper and a direct worker on loopback. It checks that an unchanged (reordered, duplicated) list neither restarts the helper nor closes anything, and that a real change restarts the helper while the direct session stays up. The unit tests `carried_connections_are_the_owners_dials_into_the_port` and `proc_tcp_addresses_parse_in_host_order` cover the `/proc` reading, including IPv4-mapped IPv6 from a dual-stack listener.
+4. **The worker side.** The close arrives as a TLS `close_notify`, which the link now reports as `Error::Closed` instead of `Lost`. `worker::run` treats it as deliberate and returns to the shortest back-off, whatever the session's length. `sentinel-link/tests/handoff.rs` checks four clean closes in a row, each redialled within 1.6 s. With the old rule the third wait was at least 3 s; the test was run against it and failed with `redialled after 2.03 s`. The worker still replaces its own helper on the lost session (`Forward::session_lost`), see below.
+5. **No-op writes.** They already restarted nothing: `set_allow` compares the sorted, deduplicated key set. The hand-off keeps that rule and returns `None` without closing anything.
+6. **Removal.** A removal goes through the same hand-off. The removed worker's session closes at once, and the new helper does not admit its key. The live test's last step removes the worker's key and asserts that the worker saw the close within 2 s and did not get back in within 45 s. Access through the old helper can outlast the change by the hand-off's wait, 600 ms at most, which is small next to the refresher's 10 s tick.
+7. **Compatibility.** Nothing on the wire changes and the protocol stays at `1..=9`, because `close_notify` is part of TLS. An older worker reads the close as a lost session: it reconnects at once under its existing back-off, still far sooner than at its heartbeat deadline. An older controller never sends it.
+
+**Measurements.** All were taken on the pinned v0.6.0 helper on WSL2 with rootful Podman. Sentinel's controller link and helper supervisor ran on the host. A real worker link and its supervisor ran in a parked container's network namespace (`nsenter`). "Relay" means UDP other than DNS was dropped inside that namespace, and the worker's own `tailcat ping` then reported `Relay` (asserted). Outages are timed on `CLOCK_MONOTONIC` from the change to the next welcomed session. Each change followed 11 s of a settled session.
+
+| Variant | Direct | Relay only |
+|---|---|---|
+| Cut, as before (`set_allow`), shipped worker rule, development run | 18.06, 20.62, 20.63, 20.40 s | 21.02, 20.88, 20.71, 20.55 s |
+| The same, verification run | 17.97, 20.18, 20.57, 20.53 s | 20.67, 20.43, 20.79, 20.78 s |
+| Handed off, final design, development run | 4.27, 3.36, 4.05, 4.07, 4.08, 4.08 s | 4.54, 3.62, 4.32, 4.34, 4.35, 4.36 s |
+| The same, verification run | 4.01, 3.97, 4.28, 3.33, 4.05, 3.95 s | 4.29, 4.24, 4.56, 4.60, 4.32, 4.23 s |
+| Worker saw the close after (handed off, both runs) | 1.5–4.2 ms | 35.3–38.4 ms |
+| Handed off, back-off not reset on a clean close | 4.06, 3.85, 8.12, 18.17 s | 4.34, 4.12, 8.38, 18.43 s |
+| Handed off, worker keeps its forward | 23.7, 41.1, 70.1, 69.6 s | 23.9, 41.3, 70.3, 69.9 s |
+| Handed off, worker pings the controller before redialling | 3.98, 5.25, 7.83, 19.50, 20.27, 4.32 s | 4.25, 5.44, 8.05, 19.77, 37.15, 26.59 s |
+
+What the intermediate variants showed:
+
+- **Back-off.** The first hand-off grew 4 → 8 → 18 s from one change to the next. The cause was the worker's back-off, not the tunnel. The back-off resets only after a 30 s session, so the 11 s sessions between changes doubled it (1, 2, 4, 8, 16 s). A cut change never hit this, because heartbeat detection made each of its sessions last about 30 s. Resetting the back-off on a clean close is what removed it.
+- **Keeping the forward is wrong.** A forward that carried a session through the old helper then took 23.7–70.3 s to carry a new one, and hung a first redial for 17–47 s. Replacing it on the lost session, as `session_lost` already does for a helper older than 10 s, is needed. Distinguishing a clean close from a timeout therefore matters only for the back-off, not for the helper.
+- **Gating the redial on a `tailcat ping` did not help.** The worker was made to replace its forward, then wait for a successful ping of the controller before dialling. Three pings succeeded 0.2–0.45 s after the change, before the old helper had stopped, so they proved nothing about the new one. Two pings failed at their 10 s timeout, and those changes cost 26.6 and 37.2 s. The variant was removed. That run also showed the only close, in 52 handed-off changes over four runs, that did not reach the worker: the controller closed the session, saw no reply within 600 ms, and the worker noticed at its heartbeat deadline (20.27 s).
+
+**The floor is the helper's own start.** This was measured with the bare helper and a scratch script, not Sentinel. The controller's `tailcat serve` was killed and restarted with the same key. A fresh `tailcat ping` from the worker namespace first got through 3.2–4.2 s after the restart (22 restarts, pings started 0–3 s after it). A ping to a settled helper took 0.17–0.61 s. A fresh `tailcat forward` started at the restart carried an echo after 3.55–4.15 s with one dial from 1 s, and after 3.23–3.42 s with a new 1 s dial every second (6 restarts each). Relayed, a single dial took 3.74–4.32 s. A concurrent ping did not slow the forward (4.14–4.21 s). Across these 46 restarts the new helper answered 3.2–4.3 s after its start. That is the hand-off's floor, and the handed-off outages above sit on it.
+
+The test is now `tailcat_live.rs::an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper`, replacing `an_allow_list_change_interrupts_a_worker_for_one_heartbeat_deadline`. On each path it runs four cut changes (printed as the "before" figure) and six handed-off ones, then the removal. It asserts that each handed-off change closed the tunnelled session, that the worker saw the close within 1 s, and that the change cost less than 6 s. The largest measured value is 4.60 s. The previous bound was 25 s. In the verification run the removal's close reached the worker after 394 ms (the hand-off waited 499 ms), and the worker stayed out for the 45 s checked.
+
+Still not covered by the hand-off:
+
+- A connection still in its TLS handshake or hello when the helper restarts is not in the fleet and is cut as before, so its worker waits for its handshake deadline.
+- A close that does not get through the old helper (once in 52) falls back to heartbeat detection.
+
+Verification on `tailcat-handoff`, one command at a time:
+
+| Where | Command | Exit | Result |
+|---|---|---|---|
+| Windows | `cargo fmt-check` | 0 | clean |
+| Windows | `cargo lint` | 0 | no warnings |
+| Windows | `cargo test-cli --no-fail-fast` | 0 | 124 binaries and 14 doc-test runs: 882 passed, 0 failed, 4 ignored. The first run had 2 failures. One was the new `handoff.rs` test itself: its controller dropped the final session while the worker was still running, which the worker read as `Lost`. The fix keeps that session open until the worker stops; the test then passed 15 of 15 runs. The other was `sentinel-store` `faults::log_frames_carry_binary_and_the_oversized_are_refused`, a Windows `PermissionDenied` on a file. That test touches no changed code and passed 3 of 3 runs alone |
+| WSL2 | `cargo lint-linux` | 0 | no warnings |
+| WSL2 | `cargo test-linux --no-fail-fast` | 0 | 124 binaries and 14 doc-test runs: 1,069 passed, 0 failed, 18 ignored |
+| WSL2, rootful Podman | the live Tailcat suite as its header documents (`SENTINEL_TAILCAT_LIVE`, `SENTINEL_TAILCAT_DERPER`, `SENTINEL_TAILCAT_DERP_CA` = `SSL_CERT_FILE`, `/usr/sbin` on `PATH`, `nsenter`, `iptables`) | 0 | 8 passed in 765.9 s; live probe `path Relay, rtt 68.36ms`; self-hosted relay `pong in 320µs via DERP(local)`; allow-list outages as in the verification rows above |
+
+Afterwards no `tailcat` or `derper` process and no root container was left. The eight `sentinel-att_*` containers of `sentinelbench` date from 2026-09-15 and from 2026-09-24 09:07–09:08, before this work began, and were left alone.
