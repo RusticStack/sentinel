@@ -801,4 +801,80 @@ Verification on `tailcat-handoff`, one command at a time:
 | WSL2 | `cargo test-linux --no-fail-fast` | 0 | 124 binaries and 14 doc-test runs: 1,069 passed, 0 failed, 18 ignored |
 | WSL2, rootful Podman | the live Tailcat suite as its header documents (`SENTINEL_TAILCAT_LIVE`, `SENTINEL_TAILCAT_DERPER`, `SENTINEL_TAILCAT_DERP_CA` = `SSL_CERT_FILE`, `/usr/sbin` on `PATH`, `nsenter`, `iptables`) | 0 | 8 passed in 765.9 s; live probe `path Relay, rtt 68.36ms`; self-hosted relay `pong in 320µs via DERP(local)`; allow-list outages as in the verification rows above |
 
-Afterwards no `tailcat` or `derper` process and no root container was left. The eight `sentinel-att_*` containers of `sentinelbench` date from 2026-09-15 and from 2026-09-24 09:07–09:08, before this work began, and were left alone.
+Afterwards no `tailcat` or `derper` process and no root container was left. The eight `sentinel-att_*` containers of `sentinelbench` date from 2026-09-15 and from 2026-09-24 09:07–09:08, before this work began, and were left alone. They were traced and removed [below](#final-verification-after-the-macos-removal-u07-and-the-hand-off).
+
+## Final verification after the macOS removal, U07 and the hand-off
+
+Three branches were merged into `part-09` and each had been verified only on its own: `drop-macos` (macOS removed; Linux and Windows are the supported platforms), `close-u07` (GitHub web sign-in, migration 37) and `tailcat-handoff`. The merged tree was verified in full, one cargo command at a time, on the development host above (WSL2, i7-13700KF). Four intermittent failures were found or confirmed during this work, and each was fixed at its cause. The tree verified is `02ad22c`: the merges plus the four fixes below. Test counts come from the `test result:` lines. "Binaries" counts libtest harnesses; doc tests are counted separately.
+
+**Leaked test containers (`test: fail a live executor test that leaves a container, and reap it when one fails`).** `sentinelbench` held eight busybox containers named `sentinel-att_*`. All of them ran the executor's keepalive, and their workspaces were mounted from `/tmp/.tmp*/worker/workspaces/<attempt>`, the layout of the live test harnesses. Those temporary directories were gone. Six of the containers were from 2026-09-15 21:21–21:32, two per worker id. They had kept running until WSL shut down on 2026-09-16. The Podman event log starts on 2026-09-23, so the test that left them can no longer be named. The other two were from 2026-09-24 and were still running. The event log identifies both:
+
+- `09:07:52`: the step's `exec` started 16 s after the container. That is the held exec of P04-15's cancel test. No `exec_died` or `died` event followed. This was the red run of `a_cancel_that_finds_the_step_still_starting_is_tried_again`, before its fix: the cancel was dropped and the test timed out after 30 s.
+- `09:08:49`: one short `exec` (`echo before the panic`), then nothing. This was the red run of P04-30's `a_panicking_attempt_is_torn_down_and_reported`, before its fix: the panic was not contained, so the container was never torn down.
+
+In each case a test failed while its attempt was still running. The test's temporary directory was dropped, the process exited before the attempt thread could finalize, and no later worker start reconciles a test's one-off worker id. A real worker is reconciled by W07 at its next start. The executor itself removes the container on every path the current code has: finalization, abandonment (`stop`), cancel, lease loss and a contained panic. So this is a test-teardown defect, not a product one. The product bugs behind the two red runs were already fixed by P04-15 and P04-30.
+
+The shared harness `tests/support/live.rs`, used by `executor_faults.rs` and the executor's unit test, has two changes:
+
+- `Live::stop` now asserts that no container carrying the test worker's ownership label survives the test. That label is on one container per attempt of the test.
+- Dropping a `Live` that never reached that check force-removes those containers.
+
+To check the guard, the P04-30 teardown (`remove_named` on the panic path) was removed in place and the test was run as `sentinelbench`. It failed at "the container removed", and afterwards the account held no container. The eight leaked containers were then removed.
+
+**`sentinel-cache` `k09::concurrent_clones_during_republishing_are_never_torn` (`fix: keep cache pins and write locks through an entry collection moves`).** This was a real race in the Part 07 pin and GC design. GC takes an unpinned entry out of the tree by renaming it aside, and then judges it again. A publisher could create the entry's `lease/` or `writing/` directory just before that rename. Its marker's `create_new` then failed with `NotFound`, and `publish::commit` returned `write lock: io: No such file or directory`. `create_dir_all` fails the same way with `AlreadyExists` when the path goes away between its creation and its check. The fix has three parts:
+
+1. Lease and write-lock acquisition now remake a directory that vanished under them, and retry for a bounded number of turns.
+2. An entry shell (no pointer and no generation) younger than the lease bound is no longer collected, the same rule a young `writing/` already had. Otherwise, under a busy sweeper, a fresh shell was removed again before its marker landed, and the retries ran out.
+3. A publish checks, once it holds the write lock, that its pin is still in the entry. If the pin went away with a moved directory, the publish takes both again.
+
+In the stressed failures a reader also reported an `Invalid` miss. That was a side effect: the writer's panic dropped the test's temporary directory while the readers were still running. Stress used the prebuilt debug binary in WSL2 with 16 parallel loops:
+
+| Build | Runs | Failed |
+|---|---|---|
+| Before the fix | 320, then 640 | 25, then 37 |
+| Retries only | 640, then 800 | 7, then 3 (`File exists`, the `create_dir_all` case) |
+| Final | 1,280 (16 × 80) | 0 |
+
+**`sentinel-store` `faults::log_frames_carry_binary_and_the_oversized_are_refused` on Windows (`fix: read a log segment's compressed twin when Windows holds the plain file`).** This was a product bug in the log reader, not antivirus or a test problem. The compressor renames `seg-N.z` into place and then removes the plain `seg-N`. A reader that listed the directory before the rename opens the plain file. On Linux that open fails with `NotFound` and the reader falls back to the twin. On Windows, if another handle still had the plain file open when it was removed, the file stays listed but delete-pending, and opening it fails with `ERROR_ACCESS_DENIED`. The reader then failed the read.
+
+An instrumented run confirmed where the error came from: all 10 failures were the open of `seg-000000`. Both segment readers now share one open path. It treats that refusal on a plain segment as the rename it is, and still reports the error when no twin exists. A deterministic test could not be built with public APIs: `std`'s `remove_file` uses POSIX delete semantics when it can, so a handle the test holds does not leave the file delete-pending. Stress used the prebuilt Windows binary with 16 parallel loops:
+
+| Build | Runs | Failed |
+|---|---|---|
+| Before the fix | 4,800, then 4,800 | 6, then 10 |
+| After the fix | 9,600 (16 × 600) | 0 |
+
+**Found by the verification: `spool_space::a_spool_refusing_its_tail_still_closes_the_log_with_the_gaps_declared` (`fix: keep a log spool until the end marker is durable on a live session`).** The first `test-linux` run failed at `tail.complete`, and this was a product bug. A log pipe learned the session's protocol only from `attached`, which runs when a session comes up. The executor opens each attempt's pipe after the session is already attached. On protocol 5 such a pipe therefore used the old send boundary: `complete` returned, and the spool was deleted, as soon as `LogEnd` was written, before the controller's end marker was durable. A session lost in that window lost the end that the spool was kept to re-send. The pipe now takes the protocol from the reporter it opens with. Stress of the prebuilt binary (8 parallel loops): 38 of 400 runs failed before the fix and 0 of 800 after.
+
+| Where | Command | Exit | Result |
+|---|---|---|---|
+| Windows | `cargo fmt-check` | 0 | clean |
+| Windows | `cargo lint` | 0 | no warnings |
+| Windows | `cargo test-cli --no-fail-fast` | 0 | 125 binaries and 14 doc-test runs: 896 passed, 0 failed, 4 ignored |
+| Windows | `cargo release-cli` | 0 | built |
+| WSL2 | `cargo lint-linux` | 0 | no warnings |
+| WSL2 | `cargo test-server --no-fail-fast` | 0 | 125 binaries and 14 doc-test runs: 1,084 passed, 0 failed, 18 ignored |
+| WSL2 | `cargo test-linux --no-fail-fast` | 0 | 125 binaries and 14 doc-test runs: 1,084 passed, 0 failed, 18 ignored. The first run, before `02ad22c`, had 1 failure: the `spool_space` race above |
+| WSL2 | `cargo release-linux` | 0 | built |
+| WSL2, rootless Podman 4.9.3 as `sentinelbench` | each gated worker binary with `SENTINEL_PODMAN_TESTS=1` | 0 each | `podman` 2, `end_to_end` 1, `compiler_cache` 1, `k09` 3, `slice` 1, `prefetch` 2 (+1 ignored measurement), `executor_faults` 3, `executor::tests::a_panicking_attempt_is_torn_down_and_reported` 1: 14 passed, 0 failed, none skipped; no container left after any binary |
+| WSL2 | `SENTINEL_CRASH_TESTS=1` `crash_consistency` `posix_crash_states` | 0 | 752 traced calls, 917 crash points, 2,403 distinct crash states, every promise kept (49.8 s) |
+| WSL2, root | `SENTINEL_POWER_LOSS_TESTS=1` `crash_consistency` `power_cut_on_dm_flakey` | 0 | 52 power cuts on ext4 and 52 on XFS, every promise kept (138.5 s) |
+| WSL2, rootful Podman | the live Tailcat suite as its header documents (`SENTINEL_TAILCAT_LIVE`, `SENTINEL_TAILCAT_DERPER`, `SENTINEL_TAILCAT_DERP_CA` = `SSL_CERT_FILE`, `/usr/sbin` on `PATH`, `nsenter`, `iptables`) | 0 | 8 passed in 765.7 s; live probe `path Direct, rtt 630µs`; self-hosted relay `pong in 350µs via DERP(local)`; allow-list changes handed off 3.86–4.27 s direct and 4.14–4.54 s relay-only (6 each), against 18.06–20.48 s and 20.47–20.77 s cut (4 each); the removal's close reached the worker after 405 ms |
+| WSL2, release | `cargo test --release -p sentinel-store --test fleet_load -- --ignored --nocapture --test-threads=1` | 0 | 2 passed; 10,000 of 10,000 jobs placed, 0 placement failures, first wave per tenant [700, 300, 300, 300], 7 waves, 107 rounds, 4,242 ms, `place()` p99 581 µs |
+
+**Other checks.**
+
+- **macOS.** No macOS mention outside history is left in the repository: the README, the platform matrix, the development guide and the OAuth credential-store note state that macOS is not supported. The only `Blocked by: … macOS …` text is in the struck-through O07 item and in the two historical `aarch64-apple-darwin` rows above.
+- **Contracts.** [Compatibility](compatibility.md) states migration 37 and worker protocol `1..=9`, and `SUPPORTED_MAX` is 9.
+
+**Cleanup.** Afterwards no `tailcat` or `derper` process was running, and neither root nor `sentinelbench` Podman held a container. The following Sentinel scratch was removed from WSL:
+
+- `/root/k02-ext4`, `/root/bench`, `/root/e-bench` and `/root/p0710-target-new`. No document names any of them as a required fixture. `bench/k02-cache-clone.sh` and the `remote_cost`/`mirror_cost` measurements create their directories on demand.
+- `k07`, `k07-probe`, `g08`, `pilot` and `sentinel-bench` in `/home/sentinelbench`, including three copies of the `k07` directories whose names ended in a carriage return.
+- 66 `/tmp/sentinel-*` entries, and 15 anonymous `/tmp/.tmp*` directories that held `sentinel-att_*` shim files.
+
+Still open:
+
+- The Podman test shims in `executor_faults.rs` and `runtime_failures.rs` keep their temporary directory (`TempDir::keep`) for the life of the process, so every run leaves one small `/tmp/.tmp*` directory.
+- S05 tenant-scoped registry authorization.
+- B04, R01 and R04 as written in the tracker.
