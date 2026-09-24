@@ -826,6 +826,11 @@ fn a_drained_worker_takes_no_new_offers_and_keeps_its_held_attempt() {
     eventually("the second job leased after undrain", || {
         d.state(d.tenant_a, second) == JobState::Leased
     });
+    // Leased is written with the offer; the worker records the offer when
+    // it arrives.
+    eventually("the second offer delivered", || {
+        recorder.offers.lock().unwrap().len() >= 2
+    });
     assert_eq!(recorder.offers.lock().unwrap().len(), 2);
     assert_eq!(d.held(id).len(), 2);
 
