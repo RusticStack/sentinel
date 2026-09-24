@@ -1327,3 +1327,79 @@ impl Drop for Inner {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/live.rs"]
+mod live;
+
+#[cfg(test)]
+mod tests {
+    use super::live::{DIGEST, IMAGE, Live, eventually, podman_enabled};
+    use super::*;
+    use sentinel_core::{FailureClass, JobState, Outcome};
+
+    /// P04-30. A step panics the attempt thread (a test-only hook in
+    /// `attempt::run`) while its container runs and its output is spooled.
+    /// Before the fix nothing caught it: the attempt stayed held and renewed
+    /// until the controller's backstop, the container and the workspace
+    /// until the next restart. Now the panic is contained: the container
+    /// and the workspace are removed, what the attempt printed reaches the
+    /// controller and the log is closed, and it is reported as the runtime
+    /// failure it is — nothing is left held.
+    #[test]
+    fn a_panicking_attempt_is_torn_down_and_reported() {
+        if !podman_enabled() {
+            return;
+        }
+        let (live, executor) = Live::start(|dir, worker| {
+            Executor::start(dir.to_path_buf(), worker, |_| {}, false).unwrap()
+        });
+        let yaml = format!(
+            "schema: 1\non: [push]\njobs:\n  work:\n    image: {IMAGE}@{DIGEST}\n    resources: {{ cpu: 1, memory: 128MiB }}\n    steps:\n      - id: first\n        run: 'echo before the panic'\n      - id: {}\n        run: 'sleep 300'\n",
+            attempt::PANIC_STEP
+        );
+        let (run, jobs) = live.enqueue(&yaml);
+        let job = jobs[0];
+        eventually("the job ended", Duration::from_secs(120), || {
+            matches!(live.job(job).state, JobState::Terminal(_))
+        });
+        let row = live.job(job);
+        assert_eq!(
+            (row.state, row.failure_class),
+            (
+                JobState::Terminal(Outcome::InfraFailed),
+                Some(FailureClass::Runtime)
+            )
+        );
+        eventually("the container removed", Duration::from_secs(30), || {
+            podman::owned(live.worker).unwrap().is_empty()
+        });
+        eventually("nothing held", Duration::from_secs(30), || {
+            executor.state_is_idle()
+        });
+        assert!(
+            crate::workspace::Workspace::leftovers(&live.worker_dir)
+                .unwrap()
+                .is_empty()
+        );
+        let attempt = live.attempt(job).unwrap();
+        let tail = live.logs.tail(run, job, attempt, 0, 100, None).unwrap();
+        assert!(tail.complete, "the log was closed");
+        assert!(
+            tail.frames
+                .iter()
+                .any(|f| String::from_utf8_lossy(&f.bytes).contains("before the panic"))
+        );
+        eventually(
+            "the marker and the spool gone",
+            Duration::from_secs(30),
+            || {
+                recovery::leftovers(&live.worker_dir).unwrap().is_empty()
+                    && crate::spool::Spool::leftovers(&live.worker_dir)
+                        .unwrap()
+                        .is_empty()
+            },
+        );
+        live.stop();
+    }
+}
