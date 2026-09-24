@@ -684,3 +684,65 @@ Verification on `close-tailcat-browser`, run one command at a time:
 | Windows, after the outage fix | `cargo fmt-check`, `cargo lint`, `cargo test-cli --no-fail-fast` | 0, 0, 0 | clean; no warnings; 129 binaries: 866 passed, 0 failed, 3 ignored |
 | WSL2, after the outage fix | `cargo lint-linux`, `cargo test-linux --no-fail-fast` | 0, 0 | no warnings; 129 binaries: 1,031 passed, 0 failed, 13 ignored (the eight live Tailcat tests among them). The first `test-linux` attempt failed to link (`Cannot allocate memory` while other builds ran) and passed on retry |
 | WSL2, rootful Podman, after the outage fix | the live Tailcat suite as above, `nsenter` on `PATH` too | 0 | 8 passed in 471.9 s; live probe `path Relay, rtt 69ms`; self-hosted relay `pong in 300µs via DERP(local)`; allow-list outages as listed above (verification run) |
+
+## Final verification after the follow-ups
+
+The three follow-up branches were merged into `part-09` (`4159752` `close-prefetch`, `293286c` `close-durability`, `9bd0d52` `close-tailcat-browser`) with only lint checked. The merged tree was then verified in full, one cargo command at a time, on the development host above (WSL2 kernel 6.18.33.2). The tree is `cb334ca`: the merges plus one test fix. Test counts come from the `test result:` lines. "Binaries" counts libtest harnesses, and doc tests are counted separately.
+
+**Flaky test: `priority::stalled_bulk_never_holds_up_the_control_beat`.** The test assumed the link was at fault, but the problem was a timing assumption in the test. It flooded the stalled bulk connection with a fixed 256 × 16 KiB (4 MiB) and required the flood not to finish within 2 s. Its comment still said 64 MiB, the size it had before `d722ff8` shrank it. Linux autotunes a loopback socket's send buffer up to `tcp_wmem`'s maximum of 4 MiB (WSL2: `4096 16384 4194304`; `tcp_rmem` up to 32 MiB). The test was instrumented to record how many frames the socket took before the writer blocked. The result was 164 on an idle host, in 60 of 60 runs (6 lanes × 10). Under CPU load (36 busy loops, 12 lanes × 5), the counts were 164 in 48 runs, 167 in 8 and **258** in 4. In those 4 runs the whole 4 MiB flood fit in the kernel buffers and "completed". That is the failure seen once under the full suite. The link was never at fault: the control beat was never late.
+
+The flood now has no fixed size. It writes until the controller drains it. The stall is taken once the frame counter has stood still for 1 s while the writer is still running (the loop never sleeps). The pong must then arrive while the counter is still at that frame. After the drain, the blocked write must complete cleanly and every frame must reach the controller. The old test did not assert either of these. Stress on the prebuilt WSL2 binary: 60 of 60 (6 lanes × 10) and 60 of 60 under the same CPU load (12 lanes × 5 beside 36 busy loops). It also passes on Windows, where the socket took 11 frames. Commit: `test: flood the stalled bulk connection until it blocks, not a fixed 4 MiB`.
+
+**The `sentinel-store` SIGSEGV.** In a `close-durability` run, four store binaries crashed in SQLite at their first open. They passed once relinked. It did not come back on clean artifacts. The steps were:
+
+1. Delete `target/wsl` entirely.
+2. Rebuild the store suites and run them: `cargo test -p sentinel-store --all-features`, 36 binaries, 0 failures.
+3. Run 35 of those 36 binaries five more times each (the loop's name filter missed one): 175 of 175 passed, no signals. The four that crashed before (`local_auth`, `oauth_code`, `oauth_device`, `oauth_tokens`) are among them.
+4. Build and run the whole workspace from that clean directory (`test-server` and `test-linux` below): no signal.
+
+This is consistent with a damaged link output from the out-of-memory builds, which a relink replaced. It rules out a defect in the rusqlite build or the code. With no failure left to reproduce, nothing was changed.
+
+**macOS type-check recipe.** The whole-workspace check runs in WSL2 with these settings:
+
+- `CC_aarch64_apple_darwin` and `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER` point to a wrapper that drops `--target=` and runs `/opt/zig/zig cc -target aarch64-macos`.
+- `AR_aarch64_apple_darwin` runs `zig ar`.
+- `CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS=--sysroot=<dir>`, where `<dir>/lib/rustlib/aarch64-apple-darwin` links to the Windows toolchain's copy.
+
+Two pitfalls:
+
+- A plain `RUSTFLAGS` also reaches host build scripts under `clippy`, which then cannot find the host `std`.
+- `--target` must come before clippy's `--`. After it, the flag goes to `CLIPPY_ARGS` and cross-compiles every build script.
+
+| Where | Command | Exit | Result |
+|---|---|---|---|
+| Windows | `cargo fmt-check` | 0 | clean |
+| Windows | `cargo lint` | 0 | no warnings |
+| Windows | `cargo test-cli --no-fail-fast` | 0 | 123 binaries and 14 doc-test runs: 881 passed, 0 failed, 4 ignored |
+| Windows | `cargo release-cli` | 0 | built |
+| WSL2 (fresh `target/wsl`) | `cargo lint-linux` | 0 | no warnings |
+| WSL2 | `cargo test-server --no-fail-fast` | 0 | 123 binaries and 14 doc-test runs: 1,065 passed, 0 failed, 18 ignored |
+| WSL2 | `cargo test-linux --no-fail-fast` | 0 | 123 binaries and 14 doc-test runs: 1,065 passed, 0 failed, 18 ignored |
+| WSL2 | `cargo release-linux` | 0 | built |
+| WSL2, rootless Podman 4.9.3 as `sentinelbench` | each gated worker binary with `SENTINEL_PODMAN_TESTS=1` | 0 each | `podman` 2, `end_to_end` 1, `compiler_cache` 1, `k09` 3, `slice` 1, `prefetch` 2 (+1 ignored measurement), `executor_faults` 3, `executor::tests::a_panicking_attempt_is_torn_down_and_reported` 1: 14 passed, 0 failed, none skipped |
+| WSL2 | `SENTINEL_CRASH_TESTS=1` `crash_consistency` `posix_crash_states` | 0 | 724 traced calls, 889 crash points, 2,403 distinct crash states, every promise kept (45.2 s) |
+| WSL2, root | `SENTINEL_POWER_LOSS_TESTS=1` `crash_consistency` `power_cut_on_dm_flakey` | 0 | 52 power cuts on ext4 and 52 on XFS, every promise kept (40.8 s); a second run gave the same result |
+| WSL2, rootful Podman | the live Tailcat suite as its header documents (`SENTINEL_TAILCAT_LIVE`, `SENTINEL_TAILCAT_DERPER`, `SENTINEL_TAILCAT_DERP_CA` = `SSL_CERT_FILE`, `/usr/sbin` on `PATH`, `nsenter`) | 0 | 8 passed in 517.7 s; live probe `path Direct, rtt 440µs`; self-hosted relay `pong in 350µs via DERP(local)`; allow-list outages 19.2–21.6 s (previous rule) and 20.5–20.8 s (shipped rule), 4 changes each |
+| WSL2, release | `cargo test --release -p sentinel-store --test fleet_load -- --ignored --nocapture --test-threads=1` | 0 | 2 passed; 10,000 of 10,000 jobs placed, 0 placement failures, first wave per tenant [700, 300, 300, 300], 7 waves, 107 rounds |
+| WSL2 (zig 0.16, recipe above) | `cargo check --locked --workspace --all-targets --target aarch64-apple-darwin` and `cargo clippy --locked --workspace --all-targets --target aarch64-apple-darwin -- -D warnings` | 0, 0 | clean. A type-check, not a macOS run (Blocked by: no macOS hardware) |
+
+**`fleet_load` timing.** The first three runs of the merged tree took 9,961, 5,601 and 10,583 ms, against 4,444–4,638 ms recorded on `93884b4`. To tell a regression from host noise, the release binary of the pre-follow-up tree (`fca2d1e`) and of the merged tree were run alternately, five times each:
+
+- `fca2d1e`: 4,106, 4,154, 4,494, 4,323 and 5,078 ms; `place()` p99 560–862 µs.
+- merged tree: 4,217, 4,401, 4,383, 4,329 and 4,510 ms; `place()` p99 596–718 µs.
+
+The follow-ups did not slow placement. The slow runs were host noise. They are not benchmark records, and nothing was appended to `bench/`.
+
+**Contracts after the merges.** Migrations run contiguously from 031 to 036 (`schema.rs` also checks this at compile time). [Compatibility](compatibility.md) states migration 36 and worker protocol `1..=9`. `SUPPORTED_MAX` is 9.
+
+Still open after this verification:
+
+- macOS hardware runs.
+- U07.
+- The ~20 s allow-list outage floor (heartbeat detection).
+- S05 tenant-scoped registry authorization.
+- B04, R01 and R04 as written in the tracker.
