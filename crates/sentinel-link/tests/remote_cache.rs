@@ -465,6 +465,32 @@ fn an_offer_after_the_terminal_report_is_stored_and_serves_the_next_attempt() {
             .load(std::sync::atomic::Ordering::Relaxed)
             > denied_before
     );
+
+    // Protocol 9 (P08-C8): the offer names its digest only in its end
+    // marker — the worker reads the stream once and hashes it on the way
+    // out — and the controller stores it under the digest the bytes prove.
+    assert!(remote.digest_at_end());
+    let restream: Vec<u8> = (0..300_000u32).map(|i| (i % 239) as u8).collect();
+    let mut late = upload(&d, first, &restream);
+    late.digest = sentinel_cache::remote::DIGEST_AT_END;
+    let stored = remote
+        .offer(
+            &late,
+            Instant::now() + Duration::from_secs(20),
+            &mut Cursor::new(restream.clone()),
+        )
+        .expect("a digest-at-end offer is stored");
+    assert_eq!(stored, *blake3::hash(&restream).as_bytes());
+    let mut refetched = Collect::default();
+    remote
+        .fetch(
+            &need(&late, second),
+            Instant::now() + Duration::from_secs(20),
+            &mut refetched,
+        )
+        .unwrap();
+    assert_eq!(refetched.bytes, restream);
+    assert_eq!(refetched.grant.unwrap().digest, stored);
     let _ = JobId::new();
 }
 

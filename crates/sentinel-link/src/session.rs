@@ -39,7 +39,9 @@ use std::{
 
 use rustls::{ClientConnection, ServerConnection, pki_types::ServerName};
 use sentinel_auth::secret::{Digest, Secret};
-use sentinel_cache::remote::{Chunk, End, Grant, Need, Push, Refusal, Refused, Serving, Upload};
+use sentinel_cache::remote::{
+    Chunk, DIGEST_AT_END, End, Grant, Need, Push, Refusal, Refused, Serving, Upload,
+};
 use sentinel_core::{
     AttemptId, Event, FailureClass, Fence, JobId, Outcome, RepoId, RunId, TenantId, UnixMillis,
     WorkerId,
@@ -51,7 +53,9 @@ use sentinel_protocol::{
         MAX_ARTIFACT_PATH_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_LIST_ITEMS, MAX_LOG_FRAME_BYTES,
     },
     logs::{Frame, MAX_GAPS, Stream},
-    negotiate::{CACHE_CANCEL_MIN, Hello, Negotiated, PROFILE_MIN, Profile, Rejected},
+    negotiate::{
+        CACHE_CANCEL_MIN, DIGEST_AT_END_MIN, Hello, Negotiated, PROFILE_MIN, Profile, Rejected,
+    },
     summary::MAX_SUMMARY_BYTES,
 };
 use serde::{Deserialize, Serialize};
@@ -281,6 +285,49 @@ struct LogRef<'a> {
 
 /// `ClientMessage::Log`'s position in the enum; asserted by a test.
 const LOG_VARIANT: u32 = 6;
+
+/// `ClientMessage::CachePush` from a borrowed chunk: the same postcard
+/// bytes as the owned message (variant index, then `Push`'s fields in
+/// order), so an offer sends each chunk straight from its read buffer
+/// instead of copying it into an owned `Vec` first (P08-C8).
+struct PushRef<'a> {
+    attempt: &'a [u8; 16],
+    offset: u64,
+    bytes: &'a [u8],
+}
+
+/// `ClientMessage::CachePush`'s position in the enum; asserted by a test.
+const CACHE_PUSH_VARIANT: u32 = 20;
+
+impl Serialize for PushRef<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // A newtype variant around the struct, exactly as `CachePush(Push)`
+        // derives it.
+        struct Body<'b>(&'b PushRef<'b>);
+        impl Serialize for Body<'_> {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                let mut s = serializer.serialize_struct("Push", 3)?;
+                s.serialize_field("attempt", self.0.attempt)?;
+                s.serialize_field("offset", &self.0.offset)?;
+                s.serialize_field("bytes", self.0.bytes)?;
+                s.end()
+            }
+        }
+        serializer.serialize_newtype_variant(
+            "ClientMessage",
+            CACHE_PUSH_VARIANT,
+            "CachePush",
+            &Body(self),
+        )
+    }
+}
 
 impl Serialize for LogRef<'_> {
     fn serialize<S: serde::Serializer>(
@@ -1620,7 +1667,13 @@ impl sentinel_cache::remote::Remote for LinkRemote {
         upload: &Upload,
         deadline: Instant,
         source: &mut dyn Read,
-    ) -> std::result::Result<(), Refusal> {
+    ) -> std::result::Result<[u8; 32], Refusal> {
+        // A digest named only at the end needs a controller that takes it
+        // there (protocol 9); an older one would store nothing.
+        let at_end = upload.digest == DIGEST_AT_END;
+        if at_end && !self.digest_at_end() {
+            return Err(Refusal::Store);
+        }
         let attempt = AttemptId::from_bytes(upload.attempt).map_err(|_| Refusal::Denied)?;
         let answers = self.router.register(attempt)?;
         let mut claim = Claim {
@@ -1637,12 +1690,13 @@ impl sentinel_cache::remote::Remote for LinkRemote {
                 claim.terminal = true;
                 return Err(Refusal::from_code(refused.code).unwrap_or(Refusal::Denied));
             }
-            CacheAnswer::End => {
+            // Only a digest stated up front can already be stored.
+            CacheAnswer::End if !at_end => {
                 claim.terminal = true;
-                return Ok(());
+                return Ok(upload.digest);
             }
             CacheAnswer::Grant(grant) => grant,
-            CacheAnswer::Chunk(_) => return Err(Refusal::Store),
+            CacheAnswer::End | CacheAnswer::Chunk(_) => return Err(Refusal::Store),
         };
         let mut offset = 0u64;
         // A granted offset is where the controller wants the stream to start;
@@ -1650,6 +1704,9 @@ impl sentinel_cache::remote::Remote for LinkRemote {
         let mut skip = start.offset;
         let mut buffer = vec![0u8; MAX_CACHE_CHUNK_BYTES];
         let mut sent = 0u64;
+        // Hashed as it goes out when the digest is stated at the end: the
+        // one read that sends the stream also names it (P08-C8).
+        let mut hasher = at_end.then(blake3::Hasher::new);
         loop {
             if Instant::now() >= deadline {
                 return Err(Refusal::Aborted);
@@ -1659,6 +1716,9 @@ impl sentinel_cache::remote::Remote for LinkRemote {
                 break;
             }
             let mut piece = &buffer[..read];
+            if let Some(hasher) = hasher.as_mut() {
+                hasher.update(piece);
+            }
             if skip > 0 {
                 let drop = skip.min(piece.len() as u64) as usize;
                 skip -= drop as u64;
@@ -1667,11 +1727,13 @@ impl sentinel_cache::remote::Remote for LinkRemote {
             if piece.is_empty() {
                 continue;
             }
-            self.send(&ClientMessage::CachePush(Push {
-                attempt: upload.attempt,
+            // Encoded straight from the read buffer: no owned copy of the
+            // chunk is made to build the message.
+            self.send(&PushRef {
+                attempt: &upload.attempt,
                 offset,
-                bytes: piece.to_vec(),
-            }))
+                bytes: piece,
+            })
             .map_err(|_| Refusal::Aborted)?;
             offset += piece.len() as u64;
             sent += piece.len() as u64;
@@ -1684,20 +1746,28 @@ impl sentinel_cache::remote::Remote for LinkRemote {
             // complete stream the bytes do not back.
             return Err(Refusal::Aborted);
         }
+        let digest = match hasher {
+            Some(hasher) => *hasher.finalize().as_bytes(),
+            None => upload.digest,
+        };
         self.send(&ClientMessage::CachePushEnd(End {
             attempt: upload.attempt,
-            digest: upload.digest,
+            digest,
         }))
         .map_err(|_| Refusal::Aborted)?;
         let answer = wait_answer(&answers, deadline)?;
         claim.terminal = answer.terminal();
         match answer {
-            CacheAnswer::End => Ok(()),
+            CacheAnswer::End => Ok(digest),
             CacheAnswer::Refused(refused) => {
                 Err(Refusal::from_code(refused.code).unwrap_or(Refusal::Denied))
             }
             CacheAnswer::Grant(_) | CacheAnswer::Chunk(_) => Err(Refusal::Store),
         }
+    }
+
+    fn digest_at_end(&self) -> bool {
+        self.protocol >= DIGEST_AT_END_MIN.0
     }
 }
 
@@ -2345,6 +2415,12 @@ fn serve_connection(
                     // One upload per attempt, a few per connection: an
                     // abandoned one cannot pin more than its share.
                     send_cache_refused(tx, attempt, Refusal::Busy)?;
+                    continue;
+                }
+                // A digest stated only at the end is a protocol-9 offer; an
+                // older session never agreed to it.
+                if upload.digest == DIGEST_AT_END && protocol < DIGEST_AT_END_MIN.0 {
+                    send_cache_refused(tx, attempt, Refusal::Store)?;
                     continue;
                 }
                 match handler.cache_offer(worker, &upload) {
@@ -3513,6 +3589,31 @@ mod tests {
         let second_out = second.bytes().0;
         assert!(second_out > 0);
         assert_eq!(remote.bulk_bytes().0, first_out + second_out);
+    }
+
+    /// The borrowed cache push is byte-for-byte the owned message, so an
+    /// offer can send each chunk without copying it into a `Push` first.
+    #[test]
+    fn a_borrowed_cache_push_encodes_exactly_like_the_owned_message() {
+        let attempt = AttemptId::new();
+        let bytes: Vec<u8> = (0..MAX_CACHE_CHUNK_BYTES as u32).map(|i| i as u8).collect();
+        let owned = postcard::to_allocvec(&ClientMessage::CachePush(Push {
+            attempt: *attempt.as_bytes(),
+            offset: 3 << 33,
+            bytes: bytes.clone(),
+        }))
+        .unwrap();
+        let borrowed = postcard::to_allocvec(&PushRef {
+            attempt: attempt.as_bytes(),
+            offset: 3 << 33,
+            bytes: &bytes,
+        })
+        .unwrap();
+        assert_eq!(owned, borrowed);
+        assert!(matches!(
+            postcard::from_bytes::<ClientMessage>(&borrowed).unwrap(),
+            ClientMessage::CachePush(push) if push.offset == 3 << 33 && push.bytes == bytes
+        ));
     }
 
     /// The borrowed log frame is byte-for-byte the owned message: the

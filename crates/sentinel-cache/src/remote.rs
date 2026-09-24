@@ -81,9 +81,17 @@ pub const OFFER_BUDGET: Duration = Duration::from_secs(30);
 /// been measured — an early burst must not promise more than the link
 /// can hold.
 const RATE_SAMPLE: Duration = Duration::from_millis(250);
-/// The partial a hydration resumes: one file per entry's staging area,
-/// written and resumed only under `writing/.lock`.
-const PART_NAME: &str = "remote.part";
+/// The staging generation a hydration streams into and resumes: one per
+/// entry, written and resumed only under `writing/.lock`, promoted into
+/// the entry by rename once complete.
+const STAGE_NAME: &str = "remote.stage";
+/// Inside the staging generation: the head, manifest and listing while
+/// they are still arriving. Replaced by the generation's own `manifest`
+/// and `files` once whole.
+const PREFIX_NAME: &str = "prefix.part";
+/// The single-file partial hydrations resumed from before the stream was
+/// staged in place; an upgraded worker drops it and restarts cold.
+const LEGACY_PART: &str = "remote.part";
 /// The longest prefix a serve hashes to prove a resume point; beyond it
 /// the transfer restarts cold. A hydration budget of at most 5 s never
 /// leaves a partial anywhere near this.
@@ -350,14 +358,31 @@ pub trait Remote: Send + Sync {
     /// Offer `upload`'s canonical stream, read from `source` in order.
     /// The implementation sends `CacheOffer`, pushes the stream in `Push`
     /// chunks from the granted offset, ends with `CachePushEnd`, and
-    /// answers once the controller stored it (or refused).
+    /// answers once the controller stored it (or refused), with the digest
+    /// it stored.
+    ///
+    /// `upload.digest` is the stream's digest, or [`DIGEST_AT_END`] when
+    /// [`Remote::digest_at_end`] said the peer takes it in the end marker:
+    /// the implementation then hashes the bytes as it sends them, so the
+    /// stream is read once rather than hashed in a pass of its own first.
     fn offer(
         &self,
         upload: &Upload,
         deadline: Instant,
         source: &mut dyn Read,
-    ) -> Result<(), Refusal>;
+    ) -> Result<[u8; 32], Refusal>;
+
+    /// Whether the controller takes an offer's digest in its end marker
+    /// (protocol 9). An older one needs it up front.
+    fn digest_at_end(&self) -> bool {
+        false
+    }
 }
+
+/// `Upload::digest` of an offer whose digest is named only by its
+/// `CachePushEnd` (protocol 9). The stream's content address is BLAKE3, so
+/// no real stream has this digest.
+pub const DIGEST_AT_END: [u8; 32] = [0; 32];
 
 /// The receiving half of one fetch. Both calls run on the fetch's thread,
 /// in order: one `plan`, then ordered `chunk`s.
@@ -424,11 +449,14 @@ const TRANSFER_MISS: Miss = Miss::Unavailable;
 /// Hydrate `attached`'s entry from the controller. Called only when the
 /// local lookup missed; a local hit never reaches this.
 ///
-/// Bounded as one transfer: one partial file, one staging writer per
-/// entry (`writing/.lock`), one lease for the whole flow. The bundle is
-/// verified as its stream arrives, then again by the *local* lookup and
-/// listing checks before a byte reaches the job — corrupt or wrong-scope
-/// content can never serve.
+/// Bounded as one transfer: one staging generation, one staging writer
+/// per entry (`writing/.lock`), one lease for the whole flow. The stream
+/// is demultiplexed as it arrives — head, manifest and listing checked
+/// against *this* request before a payload byte is written, every payload
+/// file written once, straight into the staging generation, and verified
+/// against its listing entry as it completes (P08-C8). The local listing
+/// checks run once more before a byte reaches the job — corrupt or
+/// wrong-scope content can never serve.
 pub(crate) fn hydrate(
     env: &Context<'_>,
     attached: &mut Attached,
@@ -436,7 +464,7 @@ pub(crate) fn hydrate(
     policy: Policy<'_>,
 ) -> Hydro {
     // The clock is the job's: it started before the first restore and
-    // covers resuming the partial, the transfer and the install alike.
+    // covers resuming the staged prefix, the transfer and the install.
     let deadline = policy.deadline;
     let started = Instant::now();
     if started >= deadline {
@@ -454,25 +482,30 @@ pub(crate) fn hydrate(
     let Ok(lease) = Lease::acquire(&entry, owner, lease::DEFAULT_TTL) else {
         return Hydro::Nothing;
     };
-    let part = entry.join(scope::WRITING_NAME).join(PART_NAME);
-    let Ok((file, offset, hasher)) = open_partial(&part, deadline) else {
-        // Unreadable, or the resume hash itself ran out of budget: the
-        // partial is kept for an attempt with more time.
+    let writing = entry.join(scope::WRITING_NAME);
+    // A single-file partial from before streaming installs cannot be
+    // resumed into a staging generation: it restarts cold.
+    let _ = fs::remove_file(writing.join(LEGACY_PART));
+    let stage = writing.join(STAGE_NAME);
+    let request = Req {
+        scope: attached.scope.clone(),
+        key: attached.key.clone(),
+        compat: attached.compat.clone(),
+        targets: attached.targets.len(),
+    };
+    let copies = env.backend == crate::clone::Backend::Copy;
+    let Ok(mut sink) = Stager::open(stage.clone(), request, copies, deadline, started) else {
+        // Unreadable, or resuming the staged prefix ran out of budget: it
+        // is kept for an attempt with more time.
         return Hydro::Nothing;
     };
-    let have = *hasher.clone().finalize().as_bytes();
-    let need = Need::of(policy.attempt, &attached.scope, entry_key, offset, have);
-    let mut sink = Partial {
-        file,
-        hasher,
-        offset,
-        total: 0,
-        grant: None,
-        deadline,
-        started,
-        received: 0,
-        halt: None,
-    };
+    let need = Need::of(
+        policy.attempt,
+        &attached.scope,
+        entry_key,
+        sink.offset,
+        sink.have(),
+    );
     let fetched = policy.source.fetch(&need, deadline, &mut sink);
     attached.stats.remote_ns = Some(ns(started));
     attached.stats.remote_bytes = sink.received;
@@ -480,77 +513,101 @@ pub(crate) fn hydrate(
     // not the one this side asked for (P08-C7).
     attached.stats.remote_from = sink.grant.map(|g| g.offset).filter(|o| *o > 0);
     let halt = sink.halt;
+    let drop_stage = || {
+        let _ = fs::remove_dir_all(&stage);
+    };
 
     match fetched {
         Ok(()) => {}
-        // The controller has no bundle for the entry: whatever partial was
-        // here can never complete, so it goes (an empty one is no resume
-        // point either).
+        // The controller has no bundle for the entry: whatever was staged
+        // can never complete, so it goes.
         Err(Refusal::NoBundle) => {
-            let _ = fs::remove_file(&part);
+            drop(sink);
+            drop_stage();
             return Hydro::Nothing;
         }
         // Refused for now (`denied`, `busy`): the local lookup's own reason
-        // is the honest answer, and a valid partial stays for later (P08-C7).
+        // is the honest answer, and a valid staged prefix stays for later
+        // (P08-C7); an empty one is no resume point.
         Err(Refusal::Denied) | Err(Refusal::Busy) => {
+            let empty = sink.offset == 0;
             drop(sink);
-            if fs::metadata(&part).is_ok_and(|m| m.len() == 0) {
-                let _ = fs::remove_file(&part);
+            if empty {
+                drop_stage();
             }
             return Hydro::Nothing;
         }
-        // A transfer whose bytes cannot be the promised stream is dropped
-        // whole; a budget or deadline abort keeps its partial — the next
-        // attempt resumes it — and answers with the transient reason.
+        // A transfer whose bytes cannot be the promised stream — or whose
+        // head is not this request's — is dropped whole; a budget or
+        // deadline abort keeps what it staged, and the next attempt
+        // resumes it.
         Err(_) => {
             return match halt {
                 Some(Halt::Corrupt) => {
-                    let _ = fs::remove_file(&part);
+                    drop(sink);
+                    drop_stage();
                     Hydro::Refused(Miss::Corrupt)
                 }
-                Some(Halt::Budget) | None => Hydro::Refused(TRANSFER_MISS),
+                Some(Halt::Refused(miss)) => {
+                    drop(sink);
+                    drop_stage();
+                    Hydro::Refused(miss)
+                }
+                Some(Halt::Budget | Halt::Io) | None => Hydro::Refused(TRANSFER_MISS),
             };
         }
     }
-    let Some(grant) = sink.grant else {
-        // A transport that "succeeded" without a plan delivered nothing.
-        let _ = fs::remove_file(&part);
+    let complete = sink.grant.is_some_and(|grant| {
+        sink.offset == grant.total && sink.hasher.clone().finalize().as_bytes() == &grant.digest
+    });
+    let layout = sink.finished();
+    let (true, Some(layout)) = (complete, layout) else {
+        // A transport that "succeeded" without a plan, or bytes that are
+        // not the stream that was promised: staging that can never verify
+        // is worse than none.
+        drop_stage();
         return Hydro::Refused(Miss::Corrupt);
     };
-    let complete =
-        sink.offset == grant.total && sink.hasher.clone().finalize().as_bytes() == &grant.digest;
-    drop(sink);
-    if !complete {
-        // The bytes on disk are not the stream that was promised; a
-        // partial that can never verify is worse than none.
-        let _ = fs::remove_file(&part);
-        return Hydro::Refused(Miss::Corrupt);
-    }
 
     if Instant::now() >= deadline {
-        // Complete but out of time to install: the verified stream stays
-        // as the partial, and the next attempt installs it without a byte
-        // on the wire.
+        // Complete but out of time to install: the verified staging stays,
+        // and the next attempt installs it without a byte on the wire.
         return Hydro::Refused(TRANSFER_MISS);
     }
-    match install(env, &entry, &part, attached) {
-        Ok(installed) => {
-            // Promotion is best-effort: the served bytes are already
-            // verified and materialized, so a store failure here is a
-            // lost local copy, not a lost restore.
-            let _ = promote(&entry, &installed.staging, &installed.generation);
-            let _ = fs::remove_file(&part);
-            Hydro::Served(Box::new(Hydrated {
-                hit: installed.hit,
-                generation: installed.generation,
-                lease,
-            }))
-        }
+    // The local listing checks run again over the staged tree, then the
+    // clone into the job's private view — the materialization a local hit
+    // gets, from the generation this transfer just staged.
+    attached.stats.reflink = env.backend == crate::clone::Backend::Reflink;
+    let blob = match restore::materialize(
+        &stage,
+        &layout.manifest,
+        &attached.targets,
+        env.backend,
+        &mut attached.stats,
+    ) {
+        Ok(blob) => blob,
         Err(miss) => {
-            let _ = fs::remove_file(&part);
-            Hydro::Refused(miss)
+            drop_stage();
+            return Hydro::Refused(miss);
         }
+    };
+    attached.stats.first_touch_ns = restore::first_touch(&blob, &attached.targets);
+    let generation = scope::gen_name(layout.manifest.sealed_ms as i64, lease::rand_u32());
+    // Promotion is best-effort: the served bytes are already verified and
+    // materialized, so a store failure here is a lost local copy, not a
+    // lost restore — and staging that did not land is not kept either.
+    if promote(&entry, &stage, &generation).is_err() {
+        drop_stage();
     }
+    let bytes = layout.bytes;
+    Hydro::Served(Box::new(Hydrated {
+        hit: Hit {
+            manifest: layout.manifest,
+            bytes,
+        },
+        generation,
+        lease,
+    }))
 }
 
 fn ns(started: Instant) -> u64 {
@@ -560,29 +617,6 @@ fn ns(started: Instant) -> u64 {
 /// The empty-prefix digest: what `have` is at offset 0.
 fn empty_digest() -> [u8; 32] {
     *blake3::Hasher::new().finalize().as_bytes()
-}
-
-/// Open `<entry>/writing/remote.part` for resume: the bytes already
-/// there, their length and their running digest. A partial that cannot be
-/// read as a stream prefix is dropped, never trusted: a cold start is
-/// always safe, a guessed resume is not.
-fn open_partial(path: &Path, deadline: Instant) -> io::Result<(fs::File, u64, blake3::Hasher)> {
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    let len = file.metadata()?.len();
-    if len > MAX_BUNDLE_BYTES {
-        file.set_len(0)?;
-        return Ok((file, 0, blake3::Hasher::new()));
-    }
-    if len == 0 {
-        return Ok((file, 0, blake3::Hasher::new()));
-    }
-    let hasher = hash_prefix(&mut file, len, Some(deadline))?;
-    Ok((file, len, hasher))
 }
 
 /// Hash `len` bytes from the start, leaving the cursor at `len` — the
@@ -595,7 +629,20 @@ fn hash_prefix(
 ) -> io::Result<blake3::Hasher> {
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; BLOCK_BYTES];
+    hash_into(file, len, &mut hasher, None, deadline)?;
+    Ok(hasher)
+}
+
+/// Feed the next `len` bytes of `file` into `hasher` (and `also`, when
+/// given). Past `deadline` it stops with `TimedOut`.
+fn hash_into(
+    file: &mut fs::File,
+    len: u64,
+    hasher: &mut blake3::Hasher,
+    mut also: Option<&mut blake3::Hasher>,
+    deadline: Option<Instant>,
+) -> io::Result<()> {
+    let mut buf = vec![0u8; BLOCK_BYTES.min(usize::try_from(len).unwrap_or(BLOCK_BYTES))];
     let mut left = len;
     while left > 0 {
         if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -613,29 +660,91 @@ fn hash_prefix(
             ));
         }
         hasher.update(&buf[..read]);
+        if let Some(also) = also.as_deref_mut() {
+            also.update(&buf[..read]);
+        }
         left -= read as u64;
     }
-    Ok(hasher)
+    Ok(())
 }
 
 /// Why a sink stopped its own transfer. `Budget` is the restore-cost or
-/// deadline bound doing its job; `Corrupt` means the bytes on disk are not
-/// the stream the controller promised — a partial that can never verify.
+/// deadline bound doing its job; `Corrupt` means the bytes are not the
+/// stream the controller promised; `Refused` is a head that decoded but
+/// cannot serve this request (wrong scope, unsealed, unknown format) — the
+/// same typed miss the local lookup would answer.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Halt {
     Budget,
+    /// A staging write failed: the transfer stops, what is staged stays,
+    /// and a resume re-derives its offset from the disk.
+    Io,
     Corrupt,
+    Refused(Miss),
 }
 
-/// The receiving side of one fetch: the partial file, its running digest
-/// and the budget checks. Every refusal is the driver's too — the
-/// transport stops and returns it verbatim.
-struct Partial {
-    file: fs::File,
+/// What the stream must answer: the lookup a local generation would face.
+struct Req {
+    scope: Scope,
+    key: String,
+    compat: crate::manifest::Compat,
+    /// Declared paths: a listing may only name `payload/<i>` below this.
+    targets: usize,
+}
+
+/// A staged stream's decoded head: the sealed manifest and the listing in
+/// stream order (sorted by path, as offers write it).
+struct Layout {
+    manifest: Manifest,
+    entries: Vec<FileEntry>,
+    /// Logical bytes the hit reports (`Manifest::compatible`'s answer).
+    bytes: u64,
+    /// Head, manifest and listing: where the payload starts.
+    prefix: u64,
+    /// Total payload bytes the listing promises.
+    payload: u64,
+}
+
+/// The payload file being written.
+struct Cursor {
+    index: usize,
+    file: Option<fs::File>,
+    /// Bytes of this file still to come.
+    left: u64,
+    /// This file's own digest, checked against its listing entry when the
+    /// last byte lands.
+    hasher: Box<blake3::Hasher>,
+}
+
+enum Phase {
+    /// Head, manifest and listing still arriving: held in memory (bounded
+    /// by the head's own limits) and appended to `prefix.part` so a resume
+    /// can continue it.
+    Prefix { buf: Vec<u8>, file: fs::File },
+    /// Payload bytes go straight into their files in the staging
+    /// generation.
+    Payload(Box<Layout>, Cursor),
+    /// Every byte the head promised is staged and verified.
+    Done(Box<Layout>),
+    /// A failed write left the phase unknown; the transfer stops.
+    Broken,
+}
+
+/// The receiving side of one fetch: a staging generation under
+/// `writing/remote.stage` that the stream is written into exactly once,
+/// its running digest, and the budget checks. Every refusal is the
+/// driver's too — the transport stops and returns it verbatim.
+struct Stager {
+    dir: PathBuf,
+    request: Req,
+    phase: Phase,
     hasher: blake3::Hasher,
     offset: u64,
     total: u64,
     grant: Option<Grant>,
+    /// The job's view will be byte-copied from staging (no reflink): the
+    /// budget estimate charges that copy at the measured rate.
+    copies: bool,
     deadline: Instant,
     started: Instant,
     /// Bytes this attempt received — the measured rate's numerator.
@@ -644,35 +753,434 @@ struct Partial {
     halt: Option<Halt>,
 }
 
-impl Sink for Partial {
+impl Stager {
+    /// Open `dir` for this request, resuming whatever a previous attempt
+    /// staged: the prefix it holds is re-hashed (within `deadline`) and
+    /// the transfer asks to continue from its end. Staging that cannot be
+    /// read as a stream prefix of this request is dropped, never trusted:
+    /// a cold start is always safe, a guessed resume is not.
+    fn open(
+        dir: PathBuf,
+        request: Req,
+        copies: bool,
+        deadline: Instant,
+        started: Instant,
+    ) -> io::Result<Stager> {
+        fs::create_dir_all(&dir)?;
+        let mut stager = Stager {
+            dir,
+            request,
+            phase: Phase::Broken,
+            hasher: blake3::Hasher::new(),
+            offset: 0,
+            total: 0,
+            grant: None,
+            copies,
+            deadline,
+            started,
+            received: 0,
+            halt: None,
+        };
+        match stager.resume() {
+            Ok(true) => {}
+            Ok(false) => stager.reset()?,
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err(e),
+            Err(_) => stager.reset()?,
+        }
+        Ok(stager)
+    }
+
+    /// The running digest of everything staged.
+    fn have(&self) -> [u8; 32] {
+        *self.hasher.clone().finalize().as_bytes()
+    }
+
+    /// Rebuild the running state from what is on disk. `Ok(false)` means
+    /// the staging is not a usable prefix and must restart empty.
+    fn resume(&mut self) -> io::Result<bool> {
+        let manifest_path = self.dir.join(scope::MANIFEST_NAME);
+        let files_path = self.dir.join(scope::FILES_NAME);
+        if !manifest_path.exists() || !files_path.exists() {
+            // Only the head so far, if anything.
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .create(true)
+                .open(self.dir.join(PREFIX_NAME))?;
+            let len = file.metadata()?.len();
+            if len > STREAM_HEAD as u64 + MAX_MANIFEST_BYTES + MAX_FILES_BLOB_BYTES {
+                return Ok(false);
+            }
+            let mut buf = Vec::with_capacity(len as usize);
+            file.read_to_end(&mut buf)?;
+            self.hasher.update(&buf);
+            self.offset = buf.len() as u64;
+            self.phase = Phase::Prefix { buf, file };
+            return Ok(true);
+        }
+        // A crash between writing the head's files and dropping the raw
+        // prefix leaves both: the files are the authority.
+        let _ = fs::remove_file(self.dir.join(PREFIX_NAME));
+        let manifest_raw = read_bounded(&manifest_path, MAX_MANIFEST_BYTES)?;
+        let files_raw = read_bounded(&files_path, MAX_FILES_BLOB_BYTES)?;
+        let Ok(layout) = self.layout(&manifest_raw, &files_raw) else {
+            return Ok(false);
+        };
+        let head = head_bytes(
+            manifest_raw.len() as u64,
+            files_raw.len() as u64,
+            layout.payload,
+        );
+        self.hasher.update(&head);
+        self.hasher.update(&manifest_raw);
+        self.hasher.update(&files_raw);
+        self.offset = layout.prefix;
+        let deadline = Some(self.deadline);
+        for index in 0..layout.entries.len() {
+            let entry = &layout.entries[index];
+            let path = self.dir.join(&entry.path);
+            let len = match fs::metadata(&path) {
+                Ok(meta) => meta.len(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    self.phase = Phase::Payload(
+                        Box::new(layout),
+                        Cursor {
+                            index,
+                            file: None,
+                            left: 0,
+                            hasher: Box::default(),
+                        },
+                    );
+                    return Ok(true);
+                }
+                Err(e) => return Err(e),
+            };
+            if len > entry.size {
+                return Ok(false);
+            }
+            let mut file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
+            if len == entry.size {
+                // Complete files were verified against their listing entry
+                // when they landed; the stream digest proves them again.
+                hash_into(&mut file, len, &mut self.hasher, None, deadline)?;
+                self.offset += len;
+                continue;
+            }
+            let mut own = blake3::Hasher::new();
+            hash_into(&mut file, len, &mut self.hasher, Some(&mut own), deadline)?;
+            self.offset += len;
+            let left = entry.size - len;
+            self.phase = Phase::Payload(
+                Box::new(layout),
+                Cursor {
+                    index,
+                    file: Some(file),
+                    left,
+                    hasher: Box::new(own),
+                },
+            );
+            return Ok(true);
+        }
+        self.phase = Phase::Done(Box::new(layout));
+        Ok(true)
+    }
+
+    /// Restart empty: the staging directory is recreated and the running
+    /// digest is the empty prefix's.
+    fn reset(&mut self) -> io::Result<()> {
+        self.phase = Phase::Broken;
+        match fs::remove_dir_all(&self.dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        fs::create_dir_all(&self.dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join(PREFIX_NAME))?;
+        self.phase = Phase::Prefix {
+            buf: Vec::new(),
+            file,
+        };
+        self.hasher = blake3::Hasher::new();
+        self.offset = 0;
+        Ok(())
+    }
+
+    /// Decode and check a complete head against this request: the same
+    /// checks, in the same order, a local lookup of the generation runs.
+    fn layout(&self, manifest_raw: &[u8], files_raw: &[u8]) -> Result<Layout, Miss> {
+        let manifest = Manifest::decode(manifest_raw)?;
+        if !manifest.sealed() {
+            return Err(Miss::Unsealed);
+        }
+        // Wrong scope, wrong key or wrong compat never serves, whatever
+        // the controller claimed — and is known before a payload byte.
+        let bytes = manifest.compatible(&Request {
+            scope: &self.request.scope,
+            key: &self.request.key,
+            compat: &self.request.compat,
+        })?;
+        if blake3::hash(files_raw).as_bytes() != &manifest.files_digest {
+            return Err(Miss::Corrupt);
+        }
+        let blob = FilesBlob::decode(files_raw)?;
+        if blob.entries.len() as u32 != manifest.files {
+            return Err(Miss::Corrupt);
+        }
+        let mut entries = blob.entries;
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut payload = 0u64;
+        for entry in &entries {
+            if !sentinel_pipeline::schema::valid_relative_path(&entry.path) {
+                return Err(Miss::Invalid);
+            }
+            // A listing may only name `payload/<i>` for a declared path.
+            if !payload_index(&entry.path).is_some_and(|index| index < self.request.targets) {
+                return Err(Miss::Invalid);
+            }
+            payload = payload.checked_add(entry.size).ok_or(Miss::Corrupt)?;
+        }
+        let prefix = STREAM_HEAD as u64 + manifest_raw.len() as u64 + files_raw.len() as u64;
+        Ok(Layout {
+            manifest,
+            entries,
+            bytes,
+            prefix,
+            payload,
+        })
+    }
+
+    /// The staged layout once every promised byte landed.
+    fn finished(&mut self) -> Option<Layout> {
+        match std::mem::replace(&mut self.phase, Phase::Broken) {
+            Phase::Done(layout) => Some(*layout),
+            _ => None,
+        }
+    }
+
+    /// Write `bytes` — already proven to extend the promised stream — into
+    /// the staging generation.
+    fn feed(&mut self, mut bytes: &[u8]) -> Result<(), Halt> {
+        while !bytes.is_empty() {
+            match &mut self.phase {
+                Phase::Prefix { buf, file } => {
+                    let want = prefix_want(buf, self.total)?;
+                    let take = want.min(bytes.len());
+                    buf.extend_from_slice(&bytes[..take]);
+                    file.write_all(&bytes[..take]).map_err(|_| Halt::Io)?;
+                    bytes = &bytes[take..];
+                    if buf.len() >= STREAM_HEAD && prefix_want(buf, self.total)? == 0 {
+                        self.enter_payload()?;
+                    }
+                }
+                Phase::Payload(layout, cursor) => {
+                    let entry = &layout.entries[cursor.index];
+                    if cursor.file.is_none() {
+                        let path = self.dir.join(&entry.path);
+                        if let Some(parent) = path.parent() {
+                            fs::create_dir_all(parent).map_err(|_| Halt::Io)?;
+                        }
+                        cursor.file = Some(fs::File::create(&path).map_err(|_| Halt::Io)?);
+                        cursor.left = entry.size;
+                        cursor.hasher.reset();
+                    }
+                    let take = usize::try_from(cursor.left)
+                        .unwrap_or(usize::MAX)
+                        .min(bytes.len());
+                    if let Some(file) = cursor.file.as_mut() {
+                        file.write_all(&bytes[..take]).map_err(|_| Halt::Io)?;
+                    }
+                    cursor.hasher.update(&bytes[..take]);
+                    cursor.left -= take as u64;
+                    bytes = &bytes[take..];
+                    if cursor.left == 0 {
+                        self.close_file()?;
+                    }
+                }
+                // The plan bounds the stream to the head's total, so a
+                // finished layout never sees more bytes.
+                Phase::Done(_) | Phase::Broken => return Err(Halt::Corrupt),
+            }
+        }
+        Ok(())
+    }
+
+    /// The head is complete: decode and check it, write the generation's
+    /// `manifest` and `files`, and start the payload.
+    fn enter_payload(&mut self) -> Result<(), Halt> {
+        let Phase::Prefix { buf, .. } = std::mem::replace(&mut self.phase, Phase::Broken) else {
+            return Err(Halt::Corrupt);
+        };
+        let manifest_len = u64_at(&buf, 16) as usize;
+        let manifest_raw = &buf[STREAM_HEAD..STREAM_HEAD + manifest_len];
+        let files_raw = &buf[STREAM_HEAD + manifest_len..];
+        let layout = self
+            .layout(manifest_raw, files_raw)
+            .map_err(Halt::Refused)?;
+        if u64_at(&buf, 32) != layout.payload
+            || layout.prefix.checked_add(layout.payload) != Some(self.total)
+        {
+            return Err(Halt::Corrupt);
+        }
+        fs::write(self.dir.join(scope::MANIFEST_NAME), manifest_raw).map_err(|_| Halt::Io)?;
+        fs::write(self.dir.join(scope::FILES_NAME), files_raw).map_err(|_| Halt::Io)?;
+        let _ = fs::remove_file(self.dir.join(PREFIX_NAME));
+        self.phase = Phase::Payload(
+            Box::new(layout),
+            Cursor {
+                index: 0,
+                file: None,
+                left: 0,
+                hasher: Box::default(),
+            },
+        );
+        self.skip_empty()
+    }
+
+    /// The current file's last byte landed: verify it against its listing
+    /// entry, apply its mode, move to the next.
+    fn close_file(&mut self) -> Result<(), Halt> {
+        self.seal_current()?;
+        self.skip_empty()
+    }
+
+    /// Verify the file at the cursor against its listing entry, apply its
+    /// mode and advance.
+    fn seal_current(&mut self) -> Result<(), Halt> {
+        let Phase::Payload(layout, cursor) = &mut self.phase else {
+            return Err(Halt::Corrupt);
+        };
+        let entry = &layout.entries[cursor.index];
+        cursor.file = None;
+        if cursor.hasher.finalize().as_bytes() != &entry.digest {
+            return Err(Halt::Corrupt);
+        }
+        publish::stamp_mode(&self.dir.join(&entry.path), entry.mode).map_err(|_| Halt::Io)?;
+        cursor.index += 1;
+        Ok(())
+    }
+
+    /// Land every empty file at the cursor (they carry no stream bytes),
+    /// and finish the layout when no file is left.
+    fn skip_empty(&mut self) -> Result<(), Halt> {
+        loop {
+            let Phase::Payload(layout, cursor) = &mut self.phase else {
+                return Ok(());
+            };
+            match layout.entries.get(cursor.index) {
+                None => {
+                    if let Phase::Payload(layout, _) =
+                        std::mem::replace(&mut self.phase, Phase::Broken)
+                    {
+                        self.phase = Phase::Done(layout);
+                    }
+                    return Ok(());
+                }
+                Some(entry) if entry.size > 0 => return Ok(()),
+                Some(entry) => {
+                    let path = self.dir.join(&entry.path);
+                    cursor.hasher.reset();
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent).map_err(|_| Halt::Io)?;
+                    }
+                    fs::File::create(&path).map_err(|_| Halt::Io)?;
+                    self.seal_current()?;
+                }
+            }
+        }
+    }
+}
+
+/// How many more head bytes `buf` needs: first the fixed head, then the
+/// manifest and listing it announces. Checks the head as soon as it is
+/// whole — a foreign format or impossible lengths stop the transfer before
+/// anything else is buffered.
+fn prefix_want(buf: &[u8], total: u64) -> Result<usize, Halt> {
+    if buf.len() < STREAM_HEAD {
+        return Ok(STREAM_HEAD - buf.len());
+    }
+    if &buf[..12] != STREAM_MAGIC || buf[13..16] != [0, 0, 0] {
+        return Err(Halt::Corrupt);
+    }
+    if buf[12] != STREAM_FORMAT {
+        return Err(Halt::Refused(Miss::UnsupportedVersion));
+    }
+    let manifest_len = u64_at(buf, 16);
+    let files_len = u64_at(buf, 24);
+    if manifest_len > MAX_MANIFEST_BYTES || files_len > MAX_FILES_BLOB_BYTES {
+        return Err(Halt::Corrupt);
+    }
+    let whole = STREAM_HEAD as u64 + manifest_len + files_len;
+    if whole > total {
+        return Err(Halt::Corrupt);
+    }
+    Ok((whole - buf.len() as u64) as usize)
+}
+
+/// A small metadata file, refused past `limit` rather than read whole.
+fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    if file.metadata()?.len() > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "oversize"));
+    }
+    let mut out = Vec::new();
+    file.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+impl Sink for Stager {
     fn plan(&mut self, grant: &Grant) -> Result<(), Refusal> {
         if grant.total > MAX_BUNDLE_BYTES || grant.offset > grant.total {
             return Err(Refusal::TooLarge);
         }
-        // The controller may only continue from a prefix this partial
+        // The controller may only continue from a prefix this staging
         // actually holds; a longer one cannot be invented.
         if grant.offset > self.offset {
             self.halt = Some(Halt::Corrupt);
             return Err(Refusal::Aborted);
         }
         if grant.offset < self.offset {
-            // Its bundle differs from the prefix on disk: truncate to the
-            // granted point and rebuild the running digest.
-            self.file
-                .set_len(grant.offset)
-                .map_err(|_| Refusal::Store)?;
-            self.hasher = hash_prefix(&mut self.file, grant.offset, Some(self.deadline))
-                .map_err(|_| Refusal::Store)?;
-            self.offset = grant.offset;
+            // Its bundle does not extend what is staged. A controller
+            // restarts cold (offset 0); any other point is not a prefix a
+            // staging generation can be cut back to.
+            if grant.offset != 0 {
+                self.halt = Some(Halt::Corrupt);
+                return Err(Refusal::Aborted);
+            }
+            self.reset().map_err(|_| Refusal::Store)?;
         }
-        if self.hasher.clone().finalize().as_bytes() != &grant.prefix {
-            // The bytes on disk are not the prefix the controller is about
-            // to continue: abort rather than splice two streams.
+        if self.have() != grant.prefix {
+            // What is staged is not the prefix the controller is about to
+            // continue: abort rather than splice two streams.
             self.halt = Some(Halt::Corrupt);
             return Err(Refusal::Aborted);
         }
         self.total = grant.total;
         self.grant = Some(*grant);
+        // A resumed head must still add up to the whole stream.
+        let fits = match &self.phase {
+            Phase::Payload(layout, _) | Phase::Done(layout) => {
+                layout.prefix.checked_add(layout.payload) == Some(grant.total)
+            }
+            Phase::Prefix { buf, .. } => prefix_want(buf, grant.total).is_ok(),
+            Phase::Broken => false,
+        };
+        if !fits {
+            self.halt = Some(Halt::Corrupt);
+            return Err(Refusal::Aborted);
+        }
+        // A head that was staged whole before the cut goes straight on to
+        // the payload: no further byte of it will arrive.
+        if let Phase::Prefix { buf, .. } = &self.phase
+            && buf.len() >= STREAM_HEAD
+            && prefix_want(buf, grant.total) == Ok(0)
+            && let Err(halt) = self.enter_payload()
+        {
+            self.halt = Some(halt);
+            return Err(Refusal::Aborted);
+        }
         Ok(())
     }
 
@@ -687,18 +1195,26 @@ impl Sink for Partial {
         if next > self.total {
             return Err(Refusal::Store);
         }
-        self.file
-            .write_all(&chunk.bytes)
-            .map_err(|_| Refusal::Store)?;
+        // Proven before a byte is written: corruption is caught at the
+        // chunk that caused it and never reaches the staging generation.
         self.hasher.update(&chunk.bytes);
-        self.offset = next;
-        self.received += chunk.bytes.len() as u64;
-        if self.hasher.clone().finalize().as_bytes() != &chunk.prefix {
-            // Corruption at the chunk that caused it, not at the end of
-            // the transfer.
+        if self.have() != chunk.prefix {
             self.halt = Some(Halt::Corrupt);
             return Err(Refusal::Aborted);
         }
+        if let Err(halt) = self.feed(&chunk.bytes) {
+            // A write failure is transient (`Budget` keeps the staging for
+            // a resume, which re-derives its offset from the disk); a head
+            // or file that cannot verify drops it.
+            self.halt = Some(halt);
+            return Err(if halt == Halt::Io {
+                Refusal::Store
+            } else {
+                Refusal::Aborted
+            });
+        }
+        self.offset = next;
+        self.received += chunk.bytes.len() as u64;
         let now = Instant::now();
         if now >= self.deadline {
             self.halt = Some(Halt::Budget);
@@ -713,9 +1229,11 @@ impl Sink for Partial {
             // `remaining / rate > left`, i.e. `remaining * elapsed >
             // left * received`, in `u128` — never an integer ns-per-byte
             // that truncates to zero on a fast link (P08-C7). The install
-            // re-reads and writes the whole bundle once more, so its cost
-            // is estimated at the measured rate too (P08-C6).
-            let remaining = u128::from(self.total - self.offset) + u128::from(self.total);
+            // only copies the payload into the job's view when there is no
+            // reflink; that copy is estimated at the measured rate too
+            // (P08-C6). The stream itself is written once, as it arrives.
+            let install = if self.copies { self.total } else { 0 };
+            let remaining = u128::from(self.total - self.offset) + u128::from(install);
             let left = self.deadline.saturating_duration_since(now).as_nanos();
             if remaining.saturating_mul(elapsed) > left.saturating_mul(u128::from(self.received)) {
                 self.halt = Some(Halt::Budget);
@@ -724,160 +1242,6 @@ impl Sink for Partial {
         }
         Ok(())
     }
-}
-
-/// What `install` produced: the sealed generation's directory (still
-/// under `writing/` until promotion), its name, and the hit it answers.
-struct Installed {
-    staging: PathBuf,
-    generation: String,
-    hit: Hit,
-}
-
-/// Build a staging generation from the verified partial: decode the
-/// stream, run the *local* lookup and listing checks, materialize the
-/// targets, and leave the generation ready to promote. Every failure is a
-/// typed miss; nothing here can serve bytes the local store would not
-/// have served.
-fn install(
-    env: &Context<'_>,
-    entry: &Path,
-    part: &Path,
-    attached: &mut Attached,
-) -> Result<Installed, Miss> {
-    let mut file = fs::File::open(part).map_err(|_| Miss::Unavailable)?;
-    let mut head = [0u8; STREAM_HEAD];
-    file.read_exact(&mut head).map_err(|_| Miss::Corrupt)?;
-    if &head[..12] != STREAM_MAGIC {
-        return Err(Miss::Corrupt);
-    }
-    if head[12] != STREAM_FORMAT {
-        return Err(Miss::UnsupportedVersion);
-    }
-    if head[13..16] != [0, 0, 0] {
-        return Err(Miss::Corrupt);
-    }
-    let manifest_len = u64_at(&head, 16);
-    let files_len = u64_at(&head, 24);
-    let payload_len = u64_at(&head, 32);
-    if manifest_len > MAX_MANIFEST_BYTES || files_len > MAX_FILES_BLOB_BYTES {
-        return Err(Miss::Corrupt);
-    }
-    let mut manifest_raw = vec![0u8; manifest_len as usize];
-    file.read_exact(&mut manifest_raw)
-        .map_err(|_| Miss::Corrupt)?;
-    let manifest = Manifest::decode(&manifest_raw)?;
-    if !manifest.sealed() {
-        return Err(Miss::Unsealed);
-    }
-    // The same check `manifest::lookup` makes, against the request this
-    // restore was made for: wrong scope, wrong key or wrong compat never
-    // serves, whatever the controller claimed.
-    let bytes = manifest.compatible(&Request {
-        scope: &attached.scope,
-        key: &attached.key,
-        compat: &attached.compat,
-    })?;
-    let mut files_raw = vec![0u8; files_len as usize];
-    file.read_exact(&mut files_raw).map_err(|_| Miss::Corrupt)?;
-    if blake3::hash(&files_raw).as_bytes() != &manifest.files_digest {
-        return Err(Miss::Corrupt);
-    }
-    let blob = FilesBlob::decode(&files_raw)?;
-    if blob.entries.len() as u32 != manifest.files || payload_bytes(&blob)? != payload_len {
-        return Err(Miss::Corrupt);
-    }
-
-    let generation = scope::gen_name(manifest.sealed_ms as i64, lease::rand_u32());
-    let staging = entry.join(scope::WRITING_NAME).join(&generation);
-    fs::create_dir_all(&staging).map_err(|_| Miss::Unavailable)?;
-    if let Err(miss) = stage_payload(
-        &mut file,
-        &staging,
-        &manifest_raw,
-        &files_raw,
-        &manifest,
-        &blob,
-        attached.targets.len(),
-    ) {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(miss);
-    }
-    // The local listing checks run again over the staged tree, then the
-    // clone into the job's private view — the materialization a local hit
-    // gets, from the generation this install just built.
-    attached.stats.reflink = env.backend == crate::clone::Backend::Reflink;
-    let blob = match restore::materialize(
-        &staging,
-        &manifest,
-        &attached.targets,
-        env.backend,
-        &mut attached.stats,
-    ) {
-        Ok(blob) => blob,
-        Err(miss) => {
-            let _ = fs::remove_dir_all(&staging);
-            return Err(miss);
-        }
-    };
-    attached.stats.first_touch_ns = restore::first_touch(&blob, &attached.targets);
-    Ok(Installed {
-        staging,
-        generation,
-        hit: Hit { manifest, bytes },
-    })
-}
-
-/// Write the manifest, the listing and every payload file into the
-/// staging generation, verifying each file against the listing as it
-/// lands: the listing is the payload's whole authority.
-fn stage_payload(
-    file: &mut fs::File,
-    staging: &Path,
-    manifest_raw: &[u8],
-    files_raw: &[u8],
-    manifest: &Manifest,
-    blob: &FilesBlob,
-    targets: usize,
-) -> Result<(), Miss> {
-    fs::write(staging.join(scope::MANIFEST_NAME), manifest_raw).map_err(|_| Miss::Unavailable)?;
-    fs::write(staging.join(scope::FILES_NAME), files_raw).map_err(|_| Miss::Unavailable)?;
-    let mut entries: Vec<&FileEntry> = blob.entries.iter().collect();
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    if entries.len() as u32 != manifest.files {
-        return Err(Miss::Corrupt);
-    }
-    let mut buf = vec![0u8; BLOCK_BYTES];
-    for entry in entries {
-        if !sentinel_pipeline::schema::valid_relative_path(&entry.path) {
-            return Err(Miss::Invalid);
-        }
-        match payload_index(&entry.path) {
-            Some(index) if index < targets => {}
-            // A listing may only name `payload/<i>` for a declared path.
-            _ => return Err(Miss::Invalid),
-        }
-        let path = staging.join(&entry.path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|_| Miss::Unavailable)?;
-        }
-        let mut out = fs::File::create(&path).map_err(|_| Miss::Unavailable)?;
-        let mut hasher = blake3::Hasher::new();
-        let mut size = entry.size;
-        while size > 0 {
-            let want = size.min(buf.len() as u64) as usize;
-            file.read_exact(&mut buf[..want])
-                .map_err(|_| Miss::Corrupt)?;
-            hasher.update(&buf[..want]);
-            out.write_all(&buf[..want]).map_err(|_| Miss::Unavailable)?;
-            size -= want as u64;
-        }
-        if hasher.finalize().as_bytes() != &entry.digest {
-            return Err(Miss::Corrupt);
-        }
-        publish::stamp_mode(&path, entry.mode).map_err(|_| Miss::Unavailable)?;
-    }
-    Ok(())
 }
 
 /// Promote a staging generation exactly as a publication does: the
@@ -906,14 +1270,6 @@ fn payload_index(path: &str) -> Option<usize> {
     index.parse().ok()
 }
 
-/// Total bytes a listing promises, checked against the stream's head.
-fn payload_bytes(blob: &FilesBlob) -> Result<u64, Miss> {
-    blob.entries
-        .iter()
-        .try_fold(0u64, |total, entry| total.checked_add(entry.size))
-        .ok_or(Miss::Corrupt)
-}
-
 /// `u64` from eight big-endian bytes at `at`; the caller has already read
 /// the whole head, so the slice is in bounds.
 fn u64_at(bytes: &[u8], at: usize) -> u64 {
@@ -924,12 +1280,17 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
 
 // ——— offering ——————————————————————————————————————————————
 
-/// Offer one sealed generation to the controller: hash it, offer the
-/// metadata, stream the canonical bytes. `Ok` carries the digest the
-/// controller stored; every error is a refusal the caller treats as a
-/// dropped offer, never a failure of anything else. The attempt's
-/// finalization calls this after its terminal report already left
-/// (`OFFER_BUDGET` bounds it), so an offer can never change a verdict.
+/// Offer one sealed generation to the controller: offer the metadata,
+/// stream the canonical bytes. `Ok` carries the digest the controller
+/// stored; every error is a refusal the caller treats as a dropped offer,
+/// never a failure of anything else. The attempt's finalization calls
+/// this after its terminal report already left (`OFFER_BUDGET` bounds
+/// it), so an offer can never change a verdict.
+///
+/// A controller that takes the digest at the end (protocol 9) gets the
+/// stream read once and hashed as it is sent (P08-C8); an older one needs
+/// the digest up front, which costs a hashing pass over the generation
+/// before the bytes go out.
 pub fn offer_generation(
     cache_root: &Path,
     attached: &Attached,
@@ -947,43 +1308,45 @@ pub fn offer_generation(
         attach::entry_key(attached.scope.class, &attached.key),
     );
     let generation_dir = entry.join(generation);
-    let (total, digest) = stream_digest(&generation_dir, deadline, cancel).map_err(|miss| {
-        if miss == Miss::Unavailable {
-            // The deadline or the cancel flag stopped the hash.
-            Refusal::Aborted
-        } else {
-            Refusal::Store
-        }
-    })?;
+    let bundle = bundle_of(&generation_dir).map_err(|_| Refusal::Store)?;
+    let total = bundle.total().ok_or(Refusal::Store)?;
+    let digest = if source.digest_at_end() {
+        DIGEST_AT_END
+    } else {
+        stream_digest(&bundle, &generation_dir, deadline, cancel).map_err(|miss| {
+            if miss == Miss::Unavailable {
+                // The deadline or the cancel flag stopped the hash.
+                Refusal::Aborted
+            } else {
+                Refusal::Store
+            }
+        })?
+    };
     if cancel() {
         return Err(Refusal::Aborted);
     }
-    let mut reader = BundleReader::open(&generation_dir).map_err(|_| Refusal::Store)?;
     let key = attach::entry_key(attached.scope.class, &attached.key);
     let upload = Upload::of(attempt, &attached.scope, key, total, digest);
-    source.offer(&upload, deadline, &mut reader)?;
-    Ok(digest)
+    let mut reader = BundleReader {
+        bundle,
+        dir: generation_dir,
+        part: 0,
+        cur: None,
+        cancel,
+    };
+    source.offer(&upload, deadline, &mut reader)
 }
 
-/// The canonical stream's length and digest for a sealed generation
-/// directory: content addressing for the offer, and the value the
+/// The canonical stream's digest for a sealed generation: the value the
 /// controller must reproduce before it stores anything. Bounded by
 /// `deadline` and `cancel` — an offer is optional work and never holds a
 /// worker past its budget.
 fn stream_digest(
+    bundle: &Bundle,
     generation_dir: &Path,
     deadline: Instant,
     cancel: &dyn Fn() -> bool,
-) -> Result<(u64, [u8; 32]), Miss> {
-    let bundle = bundle_of(generation_dir)?;
-    let total = (STREAM_HEAD as u64)
-        .checked_add(bundle.manifest.len() as u64)
-        .and_then(|total| total.checked_add(bundle.files.len() as u64))
-        .and_then(|total| total.checked_add(bundle.payload))
-        .ok_or(Miss::Corrupt)?;
-    if total > MAX_BUNDLE_BYTES {
-        return Err(Miss::Corrupt);
-    }
+) -> Result<[u8; 32], Miss> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&bundle.head);
     hasher.update(&bundle.manifest);
@@ -1009,7 +1372,7 @@ fn stream_digest(
             left -= read as u64;
         }
     }
-    Ok((total, *hasher.finalize().as_bytes()))
+    Ok(*hasher.finalize().as_bytes())
 }
 
 /// One sealed generation as its canonical stream: head, manifest bytes,
@@ -1021,6 +1384,17 @@ struct Bundle {
     entries: Vec<FileEntry>,
     /// Total payload bytes the listing promises.
     payload: u64,
+}
+
+impl Bundle {
+    /// The canonical stream's length, `None` past [`MAX_BUNDLE_BYTES`].
+    fn total(&self) -> Option<u64> {
+        (STREAM_HEAD as u64)
+            .checked_add(self.manifest.len() as u64)
+            .and_then(|total| total.checked_add(self.files.len() as u64))
+            .and_then(|total| total.checked_add(self.payload))
+            .filter(|total| *total <= MAX_BUNDLE_BYTES)
+    }
 }
 
 fn bundle_of(generation_dir: &Path) -> Result<Bundle, Miss> {
@@ -1062,35 +1436,28 @@ fn head_bytes(manifest_len: u64, files_len: u64, payload_len: u64) -> [u8; STREA
 }
 
 /// The upload half of a bundle: `Read` yields the canonical stream in
-/// order, bounded per call exactly like a file.
-struct BundleReader {
+/// order, bounded per call exactly like a file, straight out of the
+/// bundle's own buffers and files — nothing is copied aside first. A read
+/// after the offer's cancel flag tripped fails, so the transport stops.
+struct BundleReader<'a> {
     bundle: Bundle,
     dir: PathBuf,
     part: usize,
     cur: Option<Cur>,
+    cancel: &'a dyn Fn() -> bool,
 }
 
 enum Cur {
-    Bytes(Vec<u8>, usize),
+    /// `(part, at)`: part 0 is the head, 1 the manifest, 2 the listing.
+    Mem(usize, usize),
     File(fs::File, u64),
 }
 
-impl BundleReader {
-    fn open(generation_dir: &Path) -> Result<BundleReader, Miss> {
-        Ok(BundleReader {
-            bundle: bundle_of(generation_dir)?,
-            dir: generation_dir.to_path_buf(),
-            part: 0,
-            cur: None,
-        })
-    }
-
+impl BundleReader<'_> {
     /// Advance to the next stream part; `Ok(false)` when it is done.
     fn next_part(&mut self) -> io::Result<bool> {
         self.cur = match self.part {
-            0 => Some(Cur::Bytes(self.bundle.head.to_vec(), 0)),
-            1 => Some(Cur::Bytes(self.bundle.manifest.clone(), 0)),
-            2 => Some(Cur::Bytes(self.bundle.files.clone(), 0)),
+            part @ 0..=2 => Some(Cur::Mem(part, 0)),
             n => match self.bundle.entries.get(n - 3) {
                 Some(entry) => Some(Cur::File(
                     fs::File::open(self.dir.join(&entry.path))?,
@@ -1102,12 +1469,23 @@ impl BundleReader {
         self.part += 1;
         Ok(self.cur.is_some())
     }
+
+    fn mem(&self, part: usize) -> &[u8] {
+        match part {
+            0 => &self.bundle.head,
+            1 => &self.bundle.manifest,
+            _ => &self.bundle.files,
+        }
+    }
 }
 
-impl Read for BundleReader {
+impl Read for BundleReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
+        }
+        if (self.cancel)() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "offer canceled"));
         }
         loop {
             // `take` moves the part out so a finished one can be dropped
@@ -1118,13 +1496,14 @@ impl Read for BundleReader {
                         return Ok(0);
                     }
                 }
-                Some(Cur::Bytes(bytes, at)) => {
+                Some(Cur::Mem(part, at)) => {
+                    let bytes = self.mem(part);
                     if at >= bytes.len() {
                         continue;
                     }
                     let n = (bytes.len() - at).min(buf.len());
                     buf[..n].copy_from_slice(&bytes[at..at + n]);
-                    self.cur = Some(Cur::Bytes(bytes, at + n));
+                    self.cur = Some(Cur::Mem(part, at + n));
                     return Ok(n);
                 }
                 Some(Cur::File(mut file, left)) => {
@@ -1403,12 +1782,18 @@ impl Receiving {
     /// Begin receiving `upload`, or `Ok(None)` when this exact digest is
     /// already stored — the idempotent answer an offer of known content
     /// deserves. A live writer is `busy`; staging is created lazily.
+    ///
+    /// An upload whose digest is [`DIGEST_AT_END`] (protocol 9; the session
+    /// admits it only there) names its digest in `end`: it is staged under
+    /// the attempt's name and verified the same way once the digest is
+    /// known. Such an offer cannot be answered "already stored" up front.
     pub fn begin(store_root: &Path, upload: &Upload) -> Result<Option<Receiving>, Refusal> {
         let entry = Entry::of_upload(upload).dir(store_root)?;
         if upload.total > MAX_BUNDLE_BYTES {
             return Err(Refusal::TooLarge);
         }
-        if bundle_path(&entry, &upload.digest).is_file() {
+        let at_end = upload.digest == DIGEST_AT_END;
+        if !at_end && bundle_path(&entry, &upload.digest).is_file() {
             return Ok(None);
         }
         // The store shares its disk with SQLite and the object store: an
@@ -1427,9 +1812,14 @@ impl Receiving {
         else {
             return Err(Refusal::Busy);
         };
-        let part = entry
-            .join(scope::WRITING_NAME)
-            .join(format!("{}.part", hex32(&upload.digest)));
+        let name = if at_end {
+            let mut attempt = [0u8; 32];
+            attempt[..16].copy_from_slice(&upload.attempt);
+            format!("offer-{}.part", hex32(&attempt))
+        } else {
+            format!("{}.part", hex32(&upload.digest))
+        };
+        let part = entry.join(scope::WRITING_NAME).join(name);
         // A previous attempt's partial is discarded, never resumed: an
         // offer restarts from zero, so no bytes can be spliced into a
         // stream the sender did not reproduce.
@@ -1488,6 +1878,14 @@ impl Receiving {
     /// keeps one bundle. Until this returns `Ok`, nothing of the transfer
     /// is visible to a serve; a failed end removes the staging file.
     pub fn end(&mut self, digest: [u8; 32]) -> Result<(), Refusal> {
+        if self.id == DIGEST_AT_END {
+            // The offer stated its digest only now; the running hash below
+            // is what proves it.
+            if digest == DIGEST_AT_END {
+                return Err(Refusal::Store);
+            }
+            self.id = digest;
+        }
         if digest != self.id
             || self.offset != self.total
             || self.hasher.finalize().as_bytes() != &self.id

@@ -125,7 +125,7 @@ The controller keeps the latest per session (`Handle::transport(worker)`) and
 `GET /api/v1/workers` shows it per connected worker as `transport` ([API](api.md));
 a field nothing measured stays absent — never a zero claim.
 
-## Cache transfers (protocol 7, Q08; cancel and refresh from 8)
+## Cache transfers (protocol 7, Q08; cancel and refresh from 8; digest at the end from 9)
 
 Remote cache hydration prefers the bulk connection, in both directions,
 with the cache crate owning the objects and the link owning framing; a
@@ -147,6 +147,13 @@ connection (the bulk-class fallback):
   transfer of it (`busy`) meanwhile, so a stale tail is never routed into the
   next stream; answers queue at most 64 deep per transfer and a caller that
   falls behind abandons the transfer instead of buffering without bound.
+- Protocol 9: a `CacheOffer` may name the all-zero digest
+  (`DIGEST_AT_END`) and state the real one in `CachePushEnd`. The worker
+  then reads the generation once, hashing each chunk as it pushes it, and
+  the controller verifies the stated digest against its running hash
+  before storing. A session below 9 keeps the digest up front, and its
+  controller refuses an all-zero one (`store`). Pushes are encoded from the
+  read buffer (`PushRef`), byte-for-byte the owned `CachePush`.
 - Authorization is the **fenced attempt**, never the request
   (`dispatch::cache_scope`): the attempt must be owned by that worker — held
   for a fetch, or released within 10 minutes for an offer, which always

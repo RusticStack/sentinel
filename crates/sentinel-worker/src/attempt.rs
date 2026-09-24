@@ -1223,7 +1223,7 @@ mod tests {
             upload: &sentinel_cache::remote::Upload,
             _: Instant,
             source: &mut dyn std::io::Read,
-        ) -> std::result::Result<(), sentinel_cache::remote::Refusal> {
+        ) -> std::result::Result<[u8; 32], sentinel_cache::remote::Refusal> {
             let mut bytes = Vec::new();
             source
                 .read_to_end(&mut bytes)
@@ -1233,7 +1233,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((upload.key.clone(), bytes.len() as u64));
-            Ok(())
+            Ok(upload.digest)
         }
     }
 
