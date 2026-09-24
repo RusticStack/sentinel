@@ -191,6 +191,10 @@ impl LogPipe {
         cut: bool,
     ) -> LogPipe {
         let sent = spool.acked();
+        // A pipe opened on a live session takes its protocol now, as
+        // `attached` would: on protocol 5 the spool must wait for the end
+        // marker's acknowledgement, not merely for `LogEnd` to be sent.
+        let end_acked_protocol = reporter.as_ref().is_some_and(|r| r.protocol() >= 5);
         LogPipe {
             attempt,
             state: Mutex::new(PipeState {
@@ -203,7 +207,7 @@ impl LogPipe {
                 ended: false,
                 end_sent: false,
                 end_acked: false,
-                end_acked_protocol: false,
+                end_acked_protocol,
                 refused: false,
                 last_step: None,
                 cut,
