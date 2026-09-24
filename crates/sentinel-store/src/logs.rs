@@ -2110,13 +2110,17 @@ fn seg_decoder(dir: &Path, seg: u32, compressed: bool) -> Result<Decoder> {
 /// before the plain file goes. On Windows a plain file whose delete is
 /// still pending (another handle — a concurrent reader, a scanner — held
 /// it open when the compressor removed it) refuses the open with
-/// `PermissionDenied`, not `NotFound`; the twin is already there, so it
-/// is read the same way.
+/// `PermissionDenied` (or, from some paths, `ERROR_DELETE_PENDING`), not
+/// `NotFound`; the twin is already there, so it is read the same way.
 fn listed_seg_decoder(dir: &Path, seg: u32, compressed: bool) -> Result<Option<Decoder>> {
     use std::io::ErrorKind;
+    /// `ERROR_DELETE_PENDING`, which `std` files as `Uncategorized`.
+    const DELETE_PENDING: i32 = 303;
     let replaced = |e: &std::io::Error| {
         e.kind() == ErrorKind::NotFound
-            || (cfg!(windows) && e.kind() == ErrorKind::PermissionDenied)
+            || (cfg!(windows)
+                && (e.kind() == ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(DELETE_PENDING)))
     };
     match seg_decoder(dir, seg, compressed) {
         Ok(decoder) => Ok(Some(decoder)),
@@ -2334,4 +2338,122 @@ pub fn read_tail_page(path: &Path, after: u64, page: Page, step: Option<u32>) ->
         }
     }
     Ok(tail)
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::{
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+        time::{Duration, Instant},
+    };
+
+    use sentinel_protocol::logs::Stream;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    use super::*;
+
+    /// Create `path` and leave it delete-pending: marked for deletion by a
+    /// handle that stays open, so the name is still listed and every open
+    /// is refused until the returned handle closes. `std`'s `remove_file`
+    /// and `DeleteFileW` cannot build this state: both use POSIX delete
+    /// semantics, which unlink the name at once. The classic disposition
+    /// (`FileDispositionInfo`) is what a removal falls back to when POSIX
+    /// semantics are unavailable, and what leaves the name behind.
+    fn delete_pending(path: &Path) -> File {
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)
+            .unwrap();
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: `file` is an open handle with `DELETE` access that outlives
+        // the call; `info` is a live `FILE_DISPOSITION_INFO` and the size
+        // passed is its own, as the `FileDispositionInfo` class requires.
+        let marked = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&raw const info).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        assert_ne!(marked, 0, "{}", std::io::Error::last_os_error());
+        file
+    }
+
+    /// The compressor renames `seg-N.z` into place and then removes the
+    /// plain `seg-N`. A reader that listed the directory before the rename
+    /// opens the plain file; when another handle held it at the removal,
+    /// Windows keeps it listed but delete-pending and refuses the open with
+    /// access denied. The reader must read the twin, not fail the read —
+    /// and with no twin, the refusal is an error, never an early end.
+    #[test]
+    fn a_plain_segment_pending_delete_is_read_from_its_compressed_twin() {
+        let temp = tempfile::tempdir().unwrap();
+        let logs = LogStore::open(temp.path().join("logs")).unwrap();
+        let (run, job, attempt) = (RunId::new(), JobId::new(), AttemptId::new());
+        for seq in 1..=3u64 {
+            let frame = Frame {
+                seq,
+                step: 0,
+                stream: Stream::Stdout,
+                bytes: format!("line {seq}\n").into_bytes(),
+            };
+            logs.append(run, job, attempt, &frame).unwrap();
+        }
+        logs.finish(run, job, attempt, 3, &[]).unwrap();
+        let dir = logs.attempt_dir(run, job, attempt);
+        let (plain, twin) = (seg_path(&dir, 0, false), seg_path(&dir, 0, true));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !twin.exists() || plain.exists() {
+            assert!(Instant::now() < deadline, "seg-000000 never compressed");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        let pending = delete_pending(&plain);
+        assert!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.path() == plain),
+            "a delete-pending file stays listed"
+        );
+        let refused = File::open(&plain).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+
+        // What a reader that listed only the plain segment does next.
+        let mut decoder = listed_seg_decoder(&dir, 0, false)
+            .unwrap()
+            .expect("the twin is read");
+        let mut read = Vec::new();
+        while let Some(record) = decoder.next().unwrap() {
+            if let Record::Frame(frame) = record {
+                read.push((frame.seq, String::from_utf8(frame.bytes).unwrap()));
+            }
+        }
+        assert_eq!(
+            read,
+            (1..=3u64)
+                .map(|seq| (seq, format!("line {seq}\n")))
+                .collect::<Vec<_>>()
+        );
+
+        fs::remove_file(&twin).unwrap();
+        match listed_seg_decoder(&dir, 0, false) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+            Ok(found) => panic!(
+                "a refused segment without a twin read as {:?}",
+                found.is_some()
+            ),
+            Err(e) => panic!("unexpected {e:?}"),
+        }
+        drop(pending);
+        assert!(!plain.exists());
+    }
 }
