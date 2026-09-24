@@ -15,6 +15,8 @@ mod source_admin;
 
 #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]
 mod service;
+#[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]
+mod tailcat_admin;
 
 use clap::Parser;
 use sentinel::{client, commands::Invocation};
@@ -33,7 +35,26 @@ fn run_admin(args: cli::AdminArgs) -> ExitCode {
     }
 }
 
-#[cfg(not(all(target_os = "linux", feature = "server")))]
+/// A worker host has no metadata store; only its Tailcat identity is
+/// administered there.
+#[cfg(all(target_os = "linux", feature = "worker", not(feature = "server")))]
+fn run_admin(args: cli::AdminArgs) -> ExitCode {
+    let cli::AdminCommand::Tailcat(args) = args.command else {
+        eprintln!(
+            "error: this admin command runs on the controller's own host; use a Linux binary built with --features server"
+        );
+        return ExitCode::from(2);
+    };
+    match tailcat_admin::run(&args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", any(feature = "server", feature = "worker"))))]
 fn run_admin(_args: cli::AdminArgs) -> ExitCode {
     eprintln!(
         "error: admin runs on the controller's own host; use a Linux binary built with --features server"

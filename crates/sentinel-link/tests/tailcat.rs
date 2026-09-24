@@ -41,17 +41,23 @@ struct Fake {
 
 impl Fake {
     fn write(body: &str) -> Self {
+        Self::script(&format!(
+            "  --version) printf 'tailcat v0.6.0\\n'; exit 0 ;;\n  genkey) case \"$*\" in *--client*) printf 'nodekey:{key}\\n' ;; *) printf '# wrote a key\\n{address}\\n' ;; esac; exit 0 ;;\n  parse) printf '{{\\n  \"ServerPublic\": \"nodekey:{key}\"\\n}}\\n'; exit 0 ;;\n{body}",
+            key = KEY,
+            address = ADDRESS,
+        ))
+    }
+
+    /// A fake whose `case "$1"` arms are exactly `cases`.
+    fn script(cases: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("argv.log");
         // Not "tailcat": that name is the key directory inside the data dir,
         // which is this same temporary directory.
         let binary = dir.path().join("helper");
         let script = format!(
-            "#!/bin/sh\nprintf 'argv %s\\n' \"$*\" >> \"{log}\"\ncase \"$1\" in\n  --version) printf 'tailcat v0.6.0\\n'; exit 0 ;;\n  genkey) case \"$*\" in *--client*) printf 'nodekey:{key}\\n' ;; *) printf '# wrote a key\\n{address}\\n' ;; esac; exit 0 ;;\n  parse) printf '{{\\n  \"ServerPublic\": \"nodekey:{key}\"\\n}}\\n'; exit 0 ;;\n{body}esac\nexit 64\n",
+            "#!/bin/sh\nprintf 'argv %s\\n' \"$*\" >> \"{log}\"\ncase \"$1\" in\n{cases}esac\nexit 64\n",
             log = log.display(),
-            key = KEY,
-            address = ADDRESS,
-            body = body,
         );
         fs::write(&binary, script).unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
@@ -731,4 +737,396 @@ fn a_derp_map_url_with_mode_like_path_segments_is_accepted() {
         ]
     );
     server.shutdown();
+}
+
+/// The address a controller's rotated key is served at.
+const ADDRESS2: &str = "tczyxwvutsrqponmlkjihgfedcba9876";
+
+/// A fake that tells its key pairs apart: the default keys are `KEY` (worker)
+/// and `ADDRESS`/`KEY` (controller), the rotated ones `OTHER` and
+/// `ADDRESS2`/`OTHER`. A worker's `ping` with the rotated key succeeds only
+/// once `$HOME/admitted` exists — the controller listing that key.
+fn rotating() -> Fake {
+    Fake::script(&format!(
+        concat!(
+            "  --version) printf 'tailcat v0.6.0\\n'; exit 0 ;;\n",
+            "  genkey) case \"$*\" in\n",
+            "    *--delete*) exit 0 ;;\n",
+            "    *--key=client-rotated*) printf 'nodekey:{other}\\n' ;;\n",
+            "    *--client*) printf 'nodekey:{key}\\n' ;;\n",
+            "    *--key=rotated*) printf '{address2}\\n' ;;\n",
+            "    *) printf '{address}\\n' ;;\n",
+            "  esac; exit 0 ;;\n",
+            "  parse) case \"$2\" in\n",
+            "    {address2}) printf '\"ServerPublic\": \"nodekey:{other}\"\\n' ;;\n",
+            "    *) printf '\"ServerPublic\": \"nodekey:{key}\"\\n' ;;\n",
+            "  esac; exit 0 ;;\n",
+            "  serve) case \"$*\" in\n",
+            "    *--key=rotated*) printf 'listening on {address2}\\n' ;;\n",
+            "    *) printf 'listening on {address}\\n' ;;\n",
+            "  esac; exec sleep 3600 ;;\n",
+            "  forward) printf 'forwarding\\n'; exec sleep 3600 ;;\n",
+            "  ping) case \"$*\" in\n",
+            "    *--key=client-rotated*) [ -e \"$HOME/admitted\" ] && exit 0; exit 1 ;;\n",
+            "    *) exit 0 ;;\n",
+            "  esac ;;\n",
+        ),
+        key = KEY,
+        other = OTHER,
+        address = ADDRESS,
+        address2 = ADDRESS2,
+    ))
+}
+
+fn recorded(path: &Path) -> String {
+    fs::read_to_string(path).unwrap().trim().to_owned()
+}
+
+fn mode(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// No node key or address, of either generation, in what a diagnostic prints.
+fn assert_no_credentials(printed: &str) {
+    for secret in [KEY, OTHER, ADDRESS, ADDRESS2] {
+        assert!(!printed.contains(secret), "{printed}");
+    }
+}
+
+#[test]
+fn a_worker_key_rotates_only_once_the_controller_admits_it() {
+    let fake = rotating();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config = fake.config(port);
+    let controller = Address::parse(ADDRESS).unwrap();
+    let forward = tailcat::start_forward_every(
+        &config,
+        fake.path(),
+        &controller,
+        Duration::from_millis(200),
+    )
+    .unwrap();
+    let record = tailcat::nodekey_file(fake.path(), Role::Worker);
+    assert_eq!(recorded(&record), key(KEY).expose());
+    let plain = format!("argv forward --bind=127.0.0.1 {ADDRESS} {port}:{port}");
+    wait_until("the forward", || {
+        fake.calls("forward") == vec![plain.clone()]
+    });
+
+    // Staging generates a second key beside the active one and changes
+    // nothing that runs. A second stage returns the same key.
+    let staged = tailcat::stage_rotation(&config, fake.path(), Role::Worker).unwrap();
+    assert_eq!(staged, key(OTHER));
+    assert!(
+        fake.calls("genkey")
+            .contains(&"argv genkey --key=client-rotated --force --client".to_owned()),
+        "{:?}",
+        fake.calls("genkey")
+    );
+    let generated = fake.calls("genkey").len();
+    assert_eq!(
+        tailcat::stage_rotation(&config, fake.path(), Role::Worker).unwrap(),
+        staged
+    );
+    assert_eq!(fake.calls("genkey").len(), generated, "staged once");
+    assert_eq!(
+        tailcat::staged_rotation(fake.path(), Role::Worker).unwrap(),
+        Some(key(OTHER))
+    );
+    assert_eq!(
+        mode(&fake.path().join("tailcat").join("staged.nodekey")),
+        0o600
+    );
+
+    // The controller does not list the new key yet: the commit is refused
+    // after a ping with that key, and the worker keeps its admitted key.
+    let refused = tailcat::commit_rotation(&config, fake.path(), Role::Worker, Some(&controller))
+        .unwrap_err();
+    assert_no_credentials(&refused.to_string());
+    assert_no_credentials(&format!("{refused:?}"));
+    assert!(
+        fake.calls("ping")
+            .iter()
+            .any(|call| call.contains("--key=client-rotated")),
+        "{:?}",
+        fake.calls("ping")
+    );
+    assert_eq!(recorded(&record), key(KEY).expose());
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        fake.calls("forward").iter().all(|call| *call == plain),
+        "an unadmitted key was used: {:?}",
+        fake.calls("forward")
+    );
+
+    // Listed: the commit switches, the record names the new key and the old
+    // private key is deleted through the helper.
+    fs::write(fake.path().join("tailcat").join("admitted"), "").unwrap();
+    let committed =
+        tailcat::commit_rotation(&config, fake.path(), Role::Worker, Some(&controller)).unwrap();
+    assert_eq!(committed.key, key(OTHER));
+    assert!(committed.previous_deleted);
+    assert_eq!(recorded(&record), key(OTHER).expose());
+    assert_eq!(mode(&record), 0o600);
+    assert_eq!(
+        tailcat::staged_rotation(fake.path(), Role::Worker).unwrap(),
+        None
+    );
+    assert!(
+        fake.calls("genkey")
+            .contains(&"argv genkey --delete --key=client-default".to_owned())
+    );
+
+    // The running worker follows within a probe interval: its helper and
+    // its probes use the new key from then on.
+    let rotated =
+        format!("argv forward --bind=127.0.0.1 --key=client-rotated {ADDRESS} {port}:{port}");
+    wait_until("the forward on the new key", || {
+        fake.calls("forward").last() == Some(&rotated)
+    });
+    let pings = fake.calls("ping").len();
+    wait_until("a probe with the new key", || {
+        fake.calls("ping").len() > pings
+    });
+    assert!(
+        fake.calls("ping")[pings..]
+            .iter()
+            .all(|call| call.contains("--key=client-rotated")),
+        "{:?}",
+        fake.calls("ping")
+    );
+    assert_no_credentials(&format!("{:?}", forward.telemetry()));
+
+    // Nothing left to commit; a new rotation stages the other name, and
+    // abandoning it deletes that key and changes nothing in use.
+    assert!(
+        tailcat::commit_rotation(&config, fake.path(), Role::Worker, Some(&controller)).is_err()
+    );
+    assert_eq!(
+        tailcat::stage_rotation(&config, fake.path(), Role::Worker).unwrap(),
+        key(KEY)
+    );
+    assert!(tailcat::abandon_rotation(&config, fake.path(), Role::Worker).unwrap());
+    assert_eq!(
+        fake.calls("genkey")
+            .iter()
+            .filter(|call| *call == "argv genkey --delete --key=client-default")
+            .count(),
+        2
+    );
+    assert_eq!(
+        tailcat::staged_rotation(fake.path(), Role::Worker).unwrap(),
+        None
+    );
+    assert!(!tailcat::abandon_rotation(&config, fake.path(), Role::Worker).unwrap());
+    assert_eq!(recorded(&record), key(OTHER).expose());
+    forward.shutdown();
+}
+
+#[test]
+fn the_controller_serves_both_keys_until_its_rotation_commits() {
+    let fake = rotating();
+    let config = fake.config(7443);
+    let worker = key(THIRD);
+    let server =
+        tailcat::start_server(&config, fake.path(), std::slice::from_ref(&worker)).unwrap();
+    assert_eq!(
+        server.wait_ready(Duration::from_secs(10)).unwrap().expose(),
+        ADDRESS
+    );
+    let keydir = fake.path().join("tailcat");
+    let staged_file = tailcat::staged_address_file(fake.path());
+    assert_eq!(staged_file, keydir.join(tailcat::STAGED_ADDRESS_FILE));
+    assert!(tailcat::commit_rotation(&config, fake.path(), Role::Controller, None).is_err());
+
+    // A staged key is served beside the active one once the controller
+    // reloads; abandoning it stops that helper and removes its address.
+    tailcat::stage_rotation(&config, fake.path(), Role::Controller).unwrap();
+    server.reload_keys().unwrap();
+    wait_until("the staged address", || staged_file.exists());
+    assert!(tailcat::abandon_rotation(&config, fake.path(), Role::Controller).unwrap());
+    server.reload_keys().unwrap();
+    assert!(server.staged_telemetry().is_none());
+    assert!(!staged_file.exists());
+
+    let staged = tailcat::stage_rotation(&config, fake.path(), Role::Controller).unwrap();
+    assert_eq!(staged, key(OTHER));
+    assert!(
+        fake.calls("genkey")
+            .contains(&"argv genkey --key=rotated --force --fixed-region".to_owned())
+    );
+    // Not served yet, so no worker can have its address: no commit.
+    let early = tailcat::commit_rotation(&config, fake.path(), Role::Controller, None).unwrap_err();
+    assert!(early.to_string().contains("has not served"), "{early}");
+
+    server.reload_keys().unwrap();
+    wait_until("the staged helper's address", || {
+        server
+            .staged_address()
+            .is_some_and(|address| address.expose() == ADDRESS2)
+    });
+    assert_eq!(
+        fs::read_to_string(&staged_file).unwrap(),
+        format!("{ADDRESS2}\n")
+    );
+    assert_eq!(mode(&staged_file), 0o600);
+    let both = |allow: &str| {
+        let serves = fake.calls("serve");
+        serves.contains(&format!("argv serve --allow={allow} 7443"))
+            && serves.contains(&format!("argv serve --allow={allow} --key=rotated 7443"))
+    };
+    assert!(both(worker.expose()), "{:?}", fake.calls("serve"));
+    // The active identity is untouched through the overlap.
+    assert_eq!(server.address().unwrap().expose(), ADDRESS);
+    assert_eq!(
+        fs::read_to_string(keydir.join(tailcat::ADDRESS_FILE)).unwrap(),
+        format!("{ADDRESS}\n")
+    );
+    assert_no_credentials(&format!("{:?}", server.staged_telemetry()));
+    assert_no_credentials(&format!("{server:?}"));
+
+    // An allow-list change reaches both helpers; an unchanged reload
+    // restarts neither.
+    let second = key(KEY);
+    server.set_allow(&[worker.clone(), second.clone()]);
+    // Sorted: THIRD's body sorts before KEY's.
+    let widened = format!("{},{}", worker.expose(), second.expose());
+    wait_until("both helpers on the wider list", || both(&widened));
+    std::thread::sleep(Duration::from_millis(300));
+    let serves = fake.calls("serve").len();
+    server.reload_keys().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        fake.calls("serve").len(),
+        serves,
+        "a no-op reload restarted a helper"
+    );
+
+    // Commit: the address file names the new address at once, the record
+    // the new key, and the old private key is deleted.
+    let committed = tailcat::commit_rotation(&config, fake.path(), Role::Controller, None).unwrap();
+    assert_eq!(committed.key, key(OTHER));
+    assert!(committed.previous_deleted);
+    assert_eq!(
+        fs::read_to_string(keydir.join(tailcat::ADDRESS_FILE)).unwrap(),
+        format!("{ADDRESS2}\n")
+    );
+    assert!(!staged_file.exists());
+    assert_eq!(
+        recorded(&tailcat::nodekey_file(fake.path(), Role::Controller)),
+        key(OTHER).expose()
+    );
+    assert!(
+        fake.calls("genkey")
+            .contains(&"argv genkey --delete --key=default".to_owned())
+    );
+
+    // The running controller switches: the helper already serving the new
+    // key becomes the main one without a restart (its workers keep their
+    // tunnel), and the old key's helper stops.
+    let (old_main, promoted) = (
+        server.telemetry().pid.unwrap(),
+        server.staged_telemetry().unwrap().pid.unwrap(),
+    );
+    let serves = fake.calls("serve").len();
+    server.reload_keys().unwrap();
+    assert!(server.staged_telemetry().is_none());
+    assert_eq!(server.address().unwrap().expose(), ADDRESS2);
+    assert_eq!(server.telemetry().pid, Some(promoted));
+    assert!(!alive(old_main), "the old key is still served");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        fake.calls("serve").len(),
+        serves,
+        "the switch restarted a helper"
+    );
+    assert_eq!(
+        fs::read_to_string(keydir.join(tailcat::ADDRESS_FILE)).unwrap(),
+        format!("{ADDRESS2}\n")
+    );
+    assert!(!staged_file.exists());
+
+    // The promoted helper follows later allow-list changes, and a restart of
+    // it keeps serving the committed key.
+    server.set_allow(std::slice::from_ref(&worker));
+    wait_until("the promoted helper on the narrower list", || {
+        fake.calls("serve").last()
+            == Some(&format!(
+                "argv serve --allow={} --key=rotated 7443",
+                worker.expose()
+            ))
+    });
+    assert_eq!(
+        server.wait_ready(Duration::from_secs(10)).unwrap().expose(),
+        ADDRESS2
+    );
+    assert!(
+        !staged_file.exists(),
+        "the promoted helper wrote the staged file"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn the_allow_list_is_edited_per_worker_with_an_overlap_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(tailcat::ALLOW_LIST_FILE);
+    let (one, two) = (WorkerId::new(), WorkerId::new());
+    let old = Admission {
+        key: key(KEY),
+        worker: one,
+    };
+    let new = Admission {
+        key: key(OTHER),
+        worker: one,
+    };
+    let other = Admission {
+        key: key(THIRD),
+        worker: two,
+    };
+
+    // An absent list is created owner-only.
+    assert!(tailcat::admit(dir.path(), &old).unwrap());
+    assert_eq!(mode(&path), 0o600);
+    fs::write(&path, format!("# builders\n{} {one}", key(KEY).expose())).unwrap();
+    assert!(!tailcat::admit(dir.path(), &old).unwrap(), "already listed");
+    // The worker's new key is listed beside its old one: both are admitted.
+    assert!(tailcat::admit(dir.path(), &new).unwrap());
+    assert!(tailcat::admit(dir.path(), &other).unwrap());
+    let listed = tailcat::allow_list(dir.path()).unwrap();
+    for admission in [&old, &new, &other] {
+        assert!(listed.contains(admission));
+    }
+    assert_eq!(mode(&path), 0o600);
+
+    // One key belongs to one worker; the refusal changes nothing.
+    let before = fs::read_to_string(&path).unwrap();
+    let taken = tailcat::admit(
+        dir.path(),
+        &Admission {
+            key: key(OTHER),
+            worker: two,
+        },
+    )
+    .unwrap_err();
+    assert_no_credentials(&taken.to_string());
+    assert_eq!(fs::read_to_string(&path).unwrap(), before);
+
+    // Retiring keeps the named key as the worker's only one, and every
+    // other worker's line and every comment.
+    assert_eq!(tailcat::retire(dir.path(), &new).unwrap(), 1);
+    let listed = tailcat::allow_list(dir.path()).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed.contains(&new) && listed.contains(&other));
+    assert!(
+        fs::read_to_string(&path)
+            .unwrap()
+            .starts_with("# builders\n")
+    );
+    assert_eq!(tailcat::retire(dir.path(), &new).unwrap(), 0);
+    // A key that is not listed for that worker cannot be the one kept.
+    let unlisted = tailcat::retire(dir.path(), &old).unwrap_err();
+    assert_no_credentials(&unlisted.to_string());
+    assert_eq!(tailcat::allow_list(dir.path()).unwrap().len(), 2);
 }

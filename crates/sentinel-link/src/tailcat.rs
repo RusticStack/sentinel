@@ -23,6 +23,14 @@
 //! leak them; `expose` is the deliberate accessor for argv and owner-only
 //! files.
 //!
+//! Identities rotate without a gap: [`stage_rotation`] generates a second key
+//! beside the active one; the controller serves a staged key *alongside* the
+//! active one (same port, same allow list) until [`commit_rotation`] switches,
+//! and a worker's staged key is committed only after a `ping` with it proves
+//! the controller admits it. The allow list names each key with its worker
+//! ([`admit`], [`retire`]), so a rotating worker is listed twice during the
+//! overlap and revoking it withdraws both keys.
+//!
 //! Supervision is own-process, not library: [`start_server`] and
 //! [`start_forward`] spawn a thread that starts the helper, restarts it when
 //! it dies (or exits after failing to connect), and takes it down on
@@ -75,12 +83,28 @@ pub const ALLOW_LIST_FILE: &str = "tailcat-allow";
 /// Under the key directory: the controller's own `tc…` address, written
 /// owner-only once the helper reports it, for the operator to hand to workers.
 pub const ADDRESS_FILE: &str = "address";
+/// Under the key directory: during a controller key rotation, the address
+/// the staged key is served at (owner-only), for the operator to hand to
+/// workers before the rotation commits.
+pub const STAGED_ADDRESS_FILE: &str = "address.next";
 
 /// Keys and the helper's own state live here, under the data directory.
 const KEY_DIR: &str = "tailcat";
 /// The helper's key name; `HOME` is pointed at [`KEY_DIR`], so this is also
-/// which key `serve`/`forward`/`ping` use.
+/// which key `serve`/`forward`/`ping` use when no `--key` is passed.
 const KEY_NAME: &str = "default";
+/// The second helper key name of each role. A rotation stages a key under
+/// whichever of the two names is not active and commits by switching.
+const ROTATED_SERVER_KEY: &str = "rotated";
+const ROTATED_CLIENT_KEY: &str = "client-rotated";
+/// Under the key directory, owner-only: the helper key name in use when it is
+/// not the role's magic default. Absent means the default name.
+const ACTIVE_FILE: &str = "active-key";
+/// Under the key directory, owner-only: a staged rotation, as the staged
+/// helper key name and its node key on one line.
+const STAGED_FILE: &str = "staged.nodekey";
+/// Bound on reading the two small rotation files above.
+const SMALL_FILE_CAP: u64 = 256;
 /// A fresh helper must report readiness (an address, or a working tunnel)
 /// within this long; one that never connects is replaced.
 const READY_DEADLINE: Duration = Duration::from_secs(60);
@@ -342,9 +366,17 @@ pub struct Admission {
 /// arrives asynchronously, so [`Server::wait_ready`] is the way to obtain it.
 pub fn start_server(config: &TailcatConfig, data_dir: &Path, allow: &[NodeKey]) -> Result<Server> {
     let shared = prepare(config, data_dir, Role::Controller, normalize(allow), None)?;
-    Ok(Server {
-        run: Runner::spawn(shared, None),
-    })
+    let server = Server {
+        keydir: shared.network.keydir.clone(),
+        port: shared.port,
+        helpers: Mutex::new(Helpers {
+            main: Runner::spawn(shared, None),
+            staged: None,
+        }),
+    };
+    // A rotation staged while the controller was down is served at once.
+    server.reload_keys()?;
+    Ok(server)
 }
 
 /// Starts the worker's helper: `forward` the controller's address to loopback
@@ -401,9 +433,345 @@ pub fn nodekey_file(data_dir: &Path, role: Role) -> PathBuf {
 }
 
 fn key_name(role: Role) -> &'static str {
+    key_names(role)[0]
+}
+
+/// The role's two helper key names: the magic default the helper loads on
+/// its own, and the name a rotation alternates with it.
+fn key_names(role: Role) -> [&'static str; 2] {
     match role {
-        Role::Controller => KEY_NAME,
-        Role::Worker => "client-default",
+        Role::Controller => [KEY_NAME, ROTATED_SERVER_KEY],
+        Role::Worker => ["client-default", ROTATED_CLIENT_KEY],
+    }
+}
+
+/// The owner-only file where the controller's helper writes the address of a
+/// staged key while a rotation is in its overlap window.
+#[must_use]
+pub fn staged_address_file(data_dir: &Path) -> PathBuf {
+    data_dir.join(KEY_DIR).join(STAGED_ADDRESS_FILE)
+}
+
+/// Stages a node-key rotation: generates a second key beside the active one
+/// and records its node key, which is returned. Nothing that runs changes:
+/// the running controller starts serving the staged key *as well* on its next
+/// allow-list tick (writing its address to [`staged_address_file`]); a
+/// worker's staged key is only used once [`commit_rotation`] proves the
+/// controller admits it. Idempotent: a rotation already staged returns its
+/// key without generating another.
+pub fn stage_rotation(config: &TailcatConfig, data_dir: &Path, role: Role) -> Result<NodeKey> {
+    let network = config.network(data_dir)?;
+    ensure(&network, role)?;
+    if let Some((_, key)) = read_staged(&network.keydir, role)? {
+        return Ok(key);
+    }
+    let active = active_name(&network.keydir, role)?;
+    let next = other_name(role, active);
+    let key = generate(&network, role, next, true)?;
+    write_private(
+        &network.keydir,
+        STAGED_FILE,
+        format!("{next} {}\n", key.expose()).as_bytes(),
+    )?;
+    Ok(key)
+}
+
+/// The node key of the rotation staged for this role, if one is.
+pub fn staged_rotation(data_dir: &Path, role: Role) -> Result<Option<NodeKey>> {
+    Ok(read_staged(&data_dir.join(KEY_DIR), role)?.map(|(_, key)| key))
+}
+
+/// Commits a staged rotation and returns the node key now in use.
+///
+/// The old key is dropped only once the new one is known to be admitted: a
+/// worker first `ping`s the controller with the staged key (the controller's
+/// `--allow` must already list it — `controller` is required), and a
+/// controller requires [`staged_address_file`], which only its running helper
+/// writes once it serves the staged key. The switch itself is one atomic file
+/// replacement; the running process follows it on its next tick: a worker
+/// within one probe interval, restarting its helper on the new key, and the
+/// controller within one allow-list tick ([`Server::reload_keys`]), keeping
+/// the helper that already serves the new key and stopping the old one. The
+/// old private key is then deleted
+/// through the helper; `Committed::previous_deleted` says whether that
+/// worked. A commit interrupted after the switch finishes on a retry.
+pub fn commit_rotation(
+    config: &TailcatConfig,
+    data_dir: &Path,
+    role: Role,
+    controller: Option<&Address>,
+) -> Result<Committed> {
+    let network = config.network(data_dir)?;
+    let keydir = &network.keydir;
+    let (next, key) = read_staged(keydir, role)?
+        .ok_or_else(|| Error::Unavailable("no key rotation is staged".to_owned()))?;
+    let active = active_name(keydir, role)?;
+    if active != next {
+        match role {
+            Role::Worker => {
+                let controller = controller.ok_or_else(|| {
+                    Error::Unavailable(
+                        "a worker rotation needs the controller's address".to_owned(),
+                    )
+                })?;
+                admitted_as(&network, next, controller)?;
+            }
+            Role::Controller => {
+                if !keydir.join(STAGED_ADDRESS_FILE).is_file() {
+                    return Err(Error::Unavailable(
+                        "the running controller has not served the staged key yet; workers \
+                         cannot have its address"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        write_private(keydir, ACTIVE_FILE, format!("{next}\n").as_bytes())?;
+    }
+    // From here the rotation is committed; every step below is idempotent.
+    record_key(&keydir.join(format!("{}.nodekey", key_name(role))), &key)?;
+    if role == Role::Controller {
+        match fs::rename(keydir.join(STAGED_ADDRESS_FILE), keydir.join(ADDRESS_FILE)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::Unavailable(format!(
+                    "cannot record the rotated address: {error}"
+                )));
+            }
+        }
+    }
+    remove_if_present(&keydir.join(STAGED_FILE))?;
+    sync_dir(keydir)?;
+    let previous_deleted = delete_key(&network, other_name(role, next)).is_ok();
+    Ok(Committed {
+        key,
+        previous_deleted,
+    })
+}
+
+/// Drops a staged rotation that has not committed: its key is deleted and
+/// nothing that runs changes (the controller stops serving it on its next
+/// tick). `false` when nothing was staged.
+pub fn abandon_rotation(config: &TailcatConfig, data_dir: &Path, role: Role) -> Result<bool> {
+    let network = config.network(data_dir)?;
+    let keydir = &network.keydir;
+    let Some((next, _)) = read_staged(keydir, role)? else {
+        return Ok(false);
+    };
+    if active_name(keydir, role)? == next {
+        return Err(Error::Unavailable(
+            "the rotation already switched keys; run commit to finish it".to_owned(),
+        ));
+    }
+    delete_key(&network, next)?;
+    remove_if_present(&keydir.join(STAGED_FILE))?;
+    if role == Role::Controller {
+        remove_if_present(&keydir.join(STAGED_ADDRESS_FILE))?;
+    }
+    Ok(true)
+}
+
+/// A committed rotation: the node key now in use, and whether the previous
+/// private key was deleted (a failure leaves it on disk, unused).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Committed {
+    pub key: NodeKey,
+    pub previous_deleted: bool,
+}
+
+/// Adds `admission` to the controller's allow list, keeping every other line
+/// (and the worker's other keys: a rotating worker is listed twice until
+/// [`retire`]). `false` when that exact line was already listed. The file is
+/// replaced atomically and owner-only; a key listed for another worker is
+/// refused and leaves the file unchanged.
+pub fn admit(data_dir: &Path, admission: &Admission) -> Result<bool> {
+    let listed = allow_list(data_dir)?;
+    match listed.iter().find(|line| line.key == admission.key) {
+        Some(line) if line.worker == admission.worker => return Ok(false),
+        Some(_) => {
+            return Err(Error::Unavailable(
+                "that nodekey is already listed for another worker".to_owned(),
+            ));
+        }
+        None => {}
+    }
+    let mut text = read_allow_text(data_dir)?;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(admission.key.expose());
+    text.push(' ');
+    text.push_str(&admission.worker.to_string());
+    text.push('\n');
+    if text.len() as u64 > ALLOW_LIST_CAP {
+        return Err(Error::Unavailable(
+            "the tailcat allow list would exceed 64 KiB".to_owned(),
+        ));
+    }
+    write_private(data_dir, ALLOW_LIST_FILE, text.as_bytes())?;
+    Ok(true)
+}
+
+/// Makes `keep` its worker's only listed key: every other line naming that
+/// worker is removed, every other worker's line and every comment is kept.
+/// Returns how many lines were removed. `keep` must already be listed, so a
+/// retire can never leave a rotating worker with no admitted key by mistake.
+pub fn retire(data_dir: &Path, keep: &Admission) -> Result<usize> {
+    if !allow_list(data_dir)?.contains(keep) {
+        return Err(Error::Unavailable(
+            "that nodekey is not listed for that worker; admit it first".to_owned(),
+        ));
+    }
+    let text = read_allow_text(data_dir)?;
+    let mut kept = String::with_capacity(text.len());
+    let mut removed = 0;
+    for line in text.lines() {
+        let retired = parse_admission(line)
+            .is_some_and(|listed| listed.worker == keep.worker && listed.key != keep.key);
+        if retired {
+            removed += 1;
+        } else {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    if removed > 0 {
+        write_private(data_dir, ALLOW_LIST_FILE, kept.as_bytes())?;
+    }
+    Ok(removed)
+}
+
+/// One allow-list line as an admission; `None` for a comment, a blank line
+/// or anything malformed (callers validate the file with [`allow_list`]).
+fn parse_admission(line: &str) -> Option<Admission> {
+    let mut fields = line.split_whitespace();
+    let (Some(key), Some(worker), None) = (fields.next(), fields.next(), fields.next()) else {
+        return None;
+    };
+    Some(Admission {
+        key: NodeKey::parse(key)?,
+        worker: worker.parse().ok()?,
+    })
+}
+
+/// The allow list's text, already validated by [`allow_list`]; empty when
+/// the file does not exist.
+fn read_allow_text(data_dir: &Path) -> Result<String> {
+    match fs::read_to_string(data_dir.join(ALLOW_LIST_FILE)) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(Error::Unavailable(format!(
+            "cannot read the tailcat allow list: {error}"
+        ))),
+    }
+}
+
+/// The name of the role's key pair that is not `name`.
+fn other_name(role: Role, name: &str) -> &'static str {
+    let [first, second] = key_names(role);
+    if name == first { second } else { first }
+}
+
+/// The helper key name in use: the role's default unless a committed
+/// rotation switched to the other one. Anything else in the file is refused
+/// rather than guessed at.
+fn active_name(keydir: &Path, role: Role) -> Result<&'static str> {
+    let names = key_names(role);
+    let Some(text) = read_small(keydir, ACTIVE_FILE)? else {
+        return Ok(names[0]);
+    };
+    let text = text.trim();
+    names.into_iter().find(|name| *name == text).ok_or_else(|| {
+        Error::Unavailable("the tailcat active-key file names no key of this role".to_owned())
+    })
+}
+
+/// The staged rotation: its helper key name and node key.
+fn read_staged(keydir: &Path, role: Role) -> Result<Option<(&'static str, NodeKey)>> {
+    let Some(text) = read_small(keydir, STAGED_FILE)? else {
+        return Ok(None);
+    };
+    let malformed =
+        || Error::Unavailable("the staged tailcat rotation record is malformed".to_owned());
+    let (name, key) = text.trim().split_once(' ').ok_or_else(malformed)?;
+    let name = key_names(role)
+        .into_iter()
+        .find(|candidate| *candidate == name)
+        .ok_or_else(malformed)?;
+    Ok(Some((name, NodeKey::parse(key).ok_or_else(malformed)?)))
+}
+
+/// A small Sentinel-owned file under the key directory, bounded.
+fn read_small(keydir: &Path, name: &str) -> Result<Option<String>> {
+    let file = match fs::File::open(keydir.join(name)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Error::Unavailable(format!(
+                "cannot read the tailcat {name} file: {error}"
+            )));
+        }
+    };
+    let mut text = String::new();
+    file.take(SMALL_FILE_CAP)
+        .read_to_string(&mut text)
+        .map_err(|error| {
+            Error::Unavailable(format!("cannot read the tailcat {name} file: {error}"))
+        })?;
+    Ok(Some(text))
+}
+
+/// Proves the controller admits the worker key `name`: a bounded `ping` of
+/// its address with that key. A refused key cannot complete the handshake.
+fn admitted_as(network: &Network, name: &str, controller: &Address) -> Result<()> {
+    let mut args = vec![
+        "ping".to_owned(),
+        format!("--timeout={}s", PING_TIMEOUT.as_secs()),
+        format!("--key={name}"),
+    ];
+    if let Some(url) = &network.derpmap {
+        args.push(format!("--derpmap-url={url}"));
+    }
+    args.push(controller.expose().to_owned());
+    let captured = output_within(network.spawn(&args)?, PING_TIMEOUT + PING_MARGIN, &|| false)?;
+    if captured.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Unavailable(
+            "the controller does not admit the staged key yet; list it in the controller's \
+             allow list and retry"
+                .to_owned(),
+        ))
+    }
+}
+
+/// Deletes a saved helper key through the helper itself (its key store is
+/// its own layout, not Sentinel's).
+fn delete_key(network: &Network, name: &str) -> Result<()> {
+    let args = [
+        "genkey".to_owned(),
+        "--delete".to_owned(),
+        format!("--key={name}"),
+    ];
+    let captured = output_within(network.spawn(&args)?, GENKEY_TIMEOUT, &|| false)?;
+    if captured.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Unavailable(format!(
+            "genkey did not delete the key ({})",
+            describe(&captured.status)
+        )))
+    }
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::Unavailable(format!(
+            "cannot remove tailcat rotation state: {error}"
+        ))),
     }
 }
 
@@ -487,14 +855,28 @@ pub fn allow_list(data_dir: &Path) -> Result<Vec<Admission>> {
 
 /// The controller's supervised helper.
 pub struct Server {
-    run: Runner,
+    keydir: PathBuf,
+    port: u16,
+    helpers: Mutex<Helpers>,
+}
+
+/// The helpers a controller runs: the one serving the active key and, during
+/// a rotation's overlap window, a second one serving the staged key (the
+/// same port and allow list) with that key.
+struct Helpers {
+    main: Runner,
+    staged: Option<(NodeKey, Runner)>,
 }
 
 impl Server {
+    fn helpers(&self) -> std::sync::MutexGuard<'_, Helpers> {
+        self.helpers.lock().expect("tailcat helpers")
+    }
+
     /// The address the helper advertises, once it has reported one.
     #[must_use]
     pub fn address(&self) -> Option<Address> {
-        self.run.state().address.clone()
+        self.helpers().main.state().address.clone()
     }
 
     /// Waits for the advertised address, bounded. The supervisor has written
@@ -503,13 +885,16 @@ impl Server {
     pub fn wait_ready(&self, within: Duration) -> Result<Address> {
         let deadline = Instant::now() + within;
         loop {
-            if let Some(address) = self.address() {
-                return Ok(address);
-            }
-            if self.run.shared.stopped() {
-                return Err(Error::Unavailable(
-                    "the tailcat helper was shut down".to_owned(),
-                ));
+            {
+                let helpers = self.helpers();
+                if let Some(address) = helpers.main.state().address.clone() {
+                    return Ok(address);
+                }
+                if helpers.main.shared.stopped() {
+                    return Err(Error::Unavailable(
+                        "the tailcat helper was shut down".to_owned(),
+                    ));
+                }
             }
             if Instant::now() >= deadline {
                 return Err(Error::Timeout("no address was reported"));
@@ -521,42 +906,116 @@ impl Server {
     /// The link port the helper serves.
     #[must_use]
     pub fn port(&self) -> u16 {
-        self.run.shared.port
+        self.port
     }
 
     /// The owner-only file (`<data_dir>/tailcat/address`) holding the
     /// address once the helper reported it, replaced atomically.
     #[must_use]
     pub fn address_file(&self) -> PathBuf {
-        self.run.shared.network.keydir.join(ADDRESS_FILE)
+        self.keydir.join(ADDRESS_FILE)
     }
 
     /// Replaces the allow list. When the set actually changes the helper is
     /// restarted at once with the wider (or narrower) list — existing tunnels
     /// are briefly interrupted and the link reconnects on its own. An empty
     /// list restarts it with `--allow=none`: every tunnel closes and no peer
-    /// is admitted until a key is listed again.
+    /// is admitted until a key is listed again. A staged key's helper gets
+    /// the same list.
     pub fn set_allow(&self, allow: &[NodeKey]) {
         let wanted = normalize(allow);
-        {
-            let mut current = self.run.shared.allow.lock().expect("tailcat allow");
-            if *current == wanted {
-                return;
-            }
-            *current = wanted;
+        let helpers = self.helpers();
+        if let Some((_, runner)) = &helpers.staged {
+            runner.shared.set_allow(wanted.clone());
         }
-        self.run.shared.replace();
+        helpers.main.shared.set_allow(wanted);
+    }
+
+    /// Follows the key files an operator's rotation changed (two small reads
+    /// when nothing did). A staged key gets a second helper serving it beside
+    /// the active one, with the same allow list — the overlap window in which
+    /// workers move to its address; an abandoned one loses it. On a commit
+    /// the helper already serving the new key becomes the main one, without
+    /// a restart, so workers already on the new address keep their tunnel;
+    /// the old key's helper stops, and workers still dialing the old address
+    /// lose theirs. Two helpers never serve one identity.
+    pub fn reload_keys(&self) -> Result<()> {
+        let mut helpers = self.helpers();
+        let active = active_name(&self.keydir, Role::Controller)?;
+        let staged =
+            read_staged(&self.keydir, Role::Controller)?.filter(|(name, _)| *name != active);
+        if helpers.main.shared.key() != active && self.promotable(&helpers, active)? {
+            let (_, runner) = helpers.staged.take().expect("a promotable staged helper");
+            runner.shared.promote();
+            std::mem::replace(&mut helpers.main, runner).shutdown();
+        }
+        let current = matches!(
+            (&staged, &helpers.staged),
+            (Some((_, wanted)), Some((serving, _))) if wanted == serving
+        );
+        if !current && let Some((_, runner)) = helpers.staged.take() {
+            runner.shutdown();
+        }
+        helpers.main.shared.use_key(active);
+        match staged {
+            Some((name, key)) if helpers.staged.is_none() => {
+                let runner = Runner::spawn(Arc::new(helpers.main.shared.staged(name)), None);
+                helpers.staged = Some((key, runner));
+            }
+            Some(_) => {}
+            None => remove_if_present(&self.keydir.join(STAGED_ADDRESS_FILE))?,
+        }
+        Ok(())
+    }
+
+    /// Whether the staged helper serves exactly the key a commit made active:
+    /// the same name, and the node key the active record now names.
+    fn promotable(&self, helpers: &Helpers, active: &'static str) -> Result<bool> {
+        let Some((key, runner)) = &helpers.staged else {
+            return Ok(false);
+        };
+        if runner.shared.key() != active {
+            return Ok(false);
+        }
+        let record = self
+            .keydir
+            .join(format!("{}.nodekey", key_name(Role::Controller)));
+        Ok(read_key(&record)?.as_ref() == Some(key))
+    }
+
+    /// The address the staged key is served at, once its helper reported it.
+    #[must_use]
+    pub fn staged_address(&self) -> Option<Address> {
+        let helpers = self.helpers();
+        helpers
+            .staged
+            .as_ref()
+            .and_then(|(_, runner)| runner.state().address.clone())
+    }
+
+    /// The staged key's helper, while a rotation is in its overlap window.
+    #[must_use]
+    pub fn staged_telemetry(&self) -> Option<Telemetry> {
+        let helpers = self.helpers();
+        helpers
+            .staged
+            .as_ref()
+            .map(|(_, runner)| runner.telemetry())
     }
 
     /// A snapshot for diagnostics.
     #[must_use]
     pub fn telemetry(&self) -> Telemetry {
-        self.run.telemetry()
+        self.helpers().main.telemetry()
     }
 
-    /// Stops the helper and waits for supervision to end. Idempotent.
+    /// Stops the helpers and waits for supervision to end. Idempotent.
     pub fn shutdown(&self) {
-        self.run.shutdown();
+        let mut helpers = self.helpers();
+        if let Some((_, runner)) = helpers.staged.take() {
+            runner.shutdown();
+        }
+        helpers.main.shutdown();
     }
 }
 
@@ -569,8 +1028,9 @@ impl Drop for Server {
 impl fmt::Debug for Server {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Server")
-            .field("port", &self.run.shared.port)
+            .field("port", &self.port)
             .field("telemetry", &self.telemetry())
+            .field("staged", &self.staged_telemetry())
             .finish_non_exhaustive()
     }
 }
@@ -948,6 +1408,7 @@ impl Runner {
 
 /// The stop flag and the live child, under one lock: taking the flag and
 /// killing the process is atomic, so a stopping supervisor cannot be missed.
+#[derive(Default)]
 struct Stop {
     stopped: bool,
     /// The live child was killed on purpose (a new allow list, a failed
@@ -963,10 +1424,17 @@ struct Stop {
 }
 
 struct Shared {
-    network: Network,
+    network: Arc<Network>,
     role: Role,
     port: u16,
     controller: Option<Address>,
+    /// The helper key name this supervisor runs with; `--key` is passed only
+    /// when it is not the role's magic default.
+    key: Mutex<&'static str>,
+    /// Where a controller's helper records its address, under the key
+    /// directory: [`ADDRESS_FILE`], or [`STAGED_ADDRESS_FILE`] for the staged
+    /// key's helper until a commit promotes it.
+    address_file: Mutex<&'static str>,
     /// Canonical node keys, sorted and deduplicated.
     allow: Mutex<Vec<String>>,
     state: Mutex<Telemetry>,
@@ -975,6 +1443,87 @@ struct Shared {
 }
 
 impl Shared {
+    /// A supervisor for the controller's staged key: the same helper, port
+    /// and allow list, its own key name and address file.
+    fn staged(&self, key: &'static str) -> Self {
+        let version = self.state.lock().expect("tailcat state").version.clone();
+        Self {
+            network: Arc::clone(&self.network),
+            role: self.role,
+            port: self.port,
+            controller: None,
+            key: Mutex::new(key),
+            address_file: Mutex::new(STAGED_ADDRESS_FILE),
+            allow: Mutex::new(self.allow.lock().expect("tailcat allow").clone()),
+            state: Mutex::new(Telemetry {
+                version,
+                ..Telemetry::default()
+            }),
+            stop: Mutex::new(Stop::default()),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Replaces the allow list; the helper restarts only on a real change.
+    fn set_allow(&self, wanted: Vec<String>) {
+        {
+            let mut current = self.allow.lock().expect("tailcat allow");
+            if *current == wanted {
+                return;
+            }
+            *current = wanted;
+        }
+        self.replace();
+    }
+
+    /// The helper key name this supervisor runs with.
+    fn key(&self) -> &'static str {
+        *self.key.lock().expect("tailcat key")
+    }
+
+    /// A staged key's helper becomes the controller's main one: it records
+    /// its address in [`ADDRESS_FILE`] from now on (the commit already moved
+    /// the file there; this rewrites it only if the address is known).
+    fn promote(&self) {
+        *self.address_file.lock().expect("tailcat address file") = ADDRESS_FILE;
+        let mut state = self.state.lock().expect("tailcat state");
+        if let Some(address) = state.address.clone()
+            && let Err(problem) = record_address(&self.network.keydir, ADDRESS_FILE, &address)
+        {
+            state.problem = Some(problem);
+        }
+    }
+
+    /// Runs the helper with key `name` from now on, replacing it at once if
+    /// it used another. `true` when that happened.
+    fn use_key(&self, name: &'static str) -> bool {
+        {
+            let mut key = self.key.lock().expect("tailcat key");
+            if *key == name {
+                return false;
+            }
+            *key = name;
+        }
+        self.replace();
+        true
+    }
+
+    /// Follows a rotation committed by the operator: a worker's helper
+    /// switches to the key the active-key file names.
+    fn follow_active_key(&self) -> bool {
+        match active_name(&self.network.keydir, self.role) {
+            Ok(active) => self.use_key(active),
+            // An unreadable file changes nothing; commit writes it atomically.
+            Err(_) => false,
+        }
+    }
+
+    /// `--key=<name>` when this supervisor's key is not the role's default.
+    fn key_arg(&self) -> Option<String> {
+        let key = self.key();
+        (key != key_name(self.role)).then(|| format!("--key={key}"))
+    }
+
     fn stopped(&self) -> bool {
         self.stop.lock().expect("tailcat stop").stopped
     }
@@ -1068,6 +1617,7 @@ impl Shared {
                     args.push(format!("--allow={}", allow.join(",")));
                 }
                 drop(allow);
+                args.extend(self.key_arg());
                 if let Some(url) = &self.network.derpmap {
                     args.push(format!("--derpmap-url={url}"));
                 }
@@ -1076,6 +1626,7 @@ impl Shared {
             Role::Worker => {
                 args.push("forward".to_owned());
                 args.push("--bind=127.0.0.1".to_owned());
+                args.extend(self.key_arg());
                 if let Some(url) = &self.network.derpmap {
                     args.push(format!("--derpmap-url={url}"));
                 }
@@ -1106,7 +1657,8 @@ impl Shared {
                 // Written before the address is published in telemetry, so a
                 // caller that saw `wait_ready` succeed finds the file.
                 let recorded = if changed {
-                    record_address(&self.network.keydir, &address)
+                    let file = *self.address_file.lock().expect("tailcat address file");
+                    record_address(&self.network.keydir, file, &address)
                 } else {
                     Ok(())
                 };
@@ -1137,24 +1689,21 @@ fn prepare(
 ) -> Result<Arc<Shared>> {
     let network = config.network(data_dir)?;
     ensure(&network, role)?;
+    let key = active_name(&network.keydir, role)?;
     let version = version_of(&network);
     Ok(Arc::new(Shared {
-        network,
+        network: Arc::new(network),
         role,
         port: config.listen_port,
         controller,
+        key: Mutex::new(key),
+        address_file: Mutex::new(ADDRESS_FILE),
         allow: Mutex::new(allow),
         state: Mutex::new(Telemetry {
             version,
             ..Telemetry::default()
         }),
-        stop: Mutex::new(Stop {
-            stopped: false,
-            replacing: false,
-            child: None,
-            generation: 0,
-            born: None,
-        }),
+        stop: Mutex::new(Stop::default()),
         wake: Condvar::new(),
     }))
 }
@@ -1370,6 +1919,11 @@ fn watch_tunnel(shared: Arc<Shared>, every: Duration) {
             continue;
         }
         next = Instant::now() + every;
+        // A rotation the operator committed: the helper restarts on the new
+        // key, and that successor is judged only after its own interval.
+        if shared.follow_active_key() {
+            continue;
+        }
         let Some((generation, born)) = shared.current_child() else {
             continue;
         };
@@ -1413,6 +1967,8 @@ fn probe_tunnel(shared: &Shared) -> Result<Measured> {
         "ping".to_owned(),
         format!("--timeout={}s", PING_TIMEOUT.as_secs()),
     ];
+    // The probe proves the identity the forward uses is still admitted.
+    args.extend(shared.key_arg());
     if let Some(url) = &shared.network.derpmap {
         args.push(format!("--derpmap-url={url}"));
     }
@@ -1535,12 +2091,22 @@ fn drain<R: Read + Send + 'static>(pipe: R) -> thread::JoinHandle<Vec<u8>> {
 /// The helper's own naming rule applies: a server key is `default`, a client
 /// key is `client-default` — `genkey --client --key=default` is refused.
 fn ensure(network: &Network, role: Role) -> Result<NodeKey> {
-    let name = key_name(role);
-    let record = network.keydir.join(format!("{name}.nodekey"));
+    let record = network.keydir.join(format!("{}.nodekey", key_name(role)));
     if let Some(key) = read_key(&record)? {
         return Ok(key);
     }
+    let key = generate(network, role, active_name(&network.keydir, role)?, false)?;
+    record_key(&record, &key)?;
+    Ok(key)
+}
+
+/// Runs `genkey` for the helper key `name` (`force` replaces a leftover one)
+/// and returns the node key it printed; the key material stays owner-only.
+fn generate(network: &Network, role: Role, name: &str, force: bool) -> Result<NodeKey> {
     let mut args = vec!["genkey".to_owned(), format!("--key={name}")];
+    if force {
+        args.push("--force".to_owned());
+    }
     if role == Role::Worker {
         args.push("--client".to_owned());
     }
@@ -1575,7 +2141,6 @@ fn ensure(network: &Network, role: Role) -> Result<NodeKey> {
     }
     .ok_or_else(|| Error::Unavailable("genkey printed no nodekey".to_owned()))?;
     tighten(&network.keydir, 0)?;
-    record_key(&record, &key)?;
     Ok(key)
 }
 
@@ -1650,20 +2215,15 @@ fn read_key(path: &Path) -> Result<Option<NodeKey>> {
 }
 
 fn record_key(path: &Path, key: &NodeKey) -> Result<()> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|error| Error::Unavailable(format!("cannot record the nodekey: {error}")))?;
-    file.write_all(key.expose().as_bytes())
-        .and_then(|()| file.write_all(b"\n"))
-        .map_err(|error| Error::Unavailable(format!("cannot record the nodekey: {error}")))?;
-    tighten_file(path)
+    let (Some(dir), Some(name)) = (
+        path.parent(),
+        path.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return Err(Error::Unavailable(
+            "the nodekey record path has no directory".to_owned(),
+        ));
+    };
+    write_private(dir, name, format!("{}\n", key.expose()).as_bytes())
 }
 
 /// The key directory is the helper's `HOME`: it is created if needed and its
@@ -1734,27 +2294,20 @@ fn tighten(_path: &Path, _depth: u32) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn tighten_file(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-        Error::Unavailable(format!("cannot restrict the recorded nodekey: {error}"))
-    })
+/// Replaces `<keydir>/<name>` atomically with the controller's address.
+fn record_address(keydir: &Path, name: &str, address: &Address) -> Result<()> {
+    write_private(keydir, name, format!("{}\n", address.expose()).as_bytes())
 }
 
-#[cfg(not(unix))]
-fn tighten_file(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-/// Replaces `<keydir>/address` atomically with the controller's address,
-/// owner-only from creation: a temporary file opened `0600` is written,
-/// synced and renamed over the old one.
-fn record_address(keydir: &Path, address: &Address) -> Result<()> {
-    let target = keydir.join(ADDRESS_FILE);
-    let staging = keydir.join(".address.tmp");
+/// Replaces `<dir>/<name>` atomically, owner-only from creation: a temporary
+/// file opened `0600` (never through a symlink) is written, synced and
+/// renamed over the old one, so a reader sees the old or the new content and
+/// nothing in between. Errors name the file, never its content.
+fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let target = dir.join(name);
+    let staging = dir.join(format!(".{name}.tmp"));
     let failed = |error: io::Error| {
-        Error::Unavailable(format!("cannot record the tailcat address: {error}"))
+        Error::Unavailable(format!("cannot write the tailcat {name} file: {error}"))
     };
     let _ = fs::remove_file(&staging);
     let mut options = fs::OpenOptions::new();
@@ -1765,12 +2318,26 @@ fn record_address(keydir: &Path, address: &Address) -> Result<()> {
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(&staging).map_err(failed)?;
-    file.write_all(address.expose().as_bytes())
-        .and_then(|()| file.write_all(b"\n"))
+    file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(failed)?;
     drop(file);
     fs::rename(&staging, &target).map_err(failed)
+}
+
+/// Makes the renames in `dir` durable before a step that depends on them.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<()> {
+    fs::File::open(dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| {
+            Error::Unavailable(format!("cannot sync the tailcat key directory: {error}"))
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// SHA-256 of the helper, streamed from the open file and compared before it

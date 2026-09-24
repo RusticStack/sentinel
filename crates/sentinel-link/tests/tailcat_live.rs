@@ -337,6 +337,20 @@ impl ContainerWorker {
         port: u16,
         extra: &[String],
     ) -> Self {
+        Self::start_keyed(binary, name, keys, controller, port, extra, None)
+    }
+
+    /// As [`ContainerWorker::start`], forwarding with the saved key `key`
+    /// (`--key=<name>`) instead of the helper's default client key.
+    fn start_keyed(
+        binary: &Path,
+        name: &str,
+        keys: &Path,
+        controller: &Address,
+        port: u16,
+        extra: &[String],
+        key: Option<&str>,
+    ) -> Self {
         remove_container(name);
         let mut args = vec![
             "run".to_owned(),
@@ -357,6 +371,9 @@ impl ContainerWorker {
             "forward".to_owned(),
             "--bind=127.0.0.1".to_owned(),
         ]);
+        if let Some(key) = key {
+            args.push(format!("--key={key}"));
+        }
         if let Some(url) = extra
             .iter()
             .find_map(|arg| arg.strip_prefix("TAILCAT_DERPMAP_URL="))
@@ -627,6 +644,198 @@ fn the_controller_supervisor_admits_only_listed_workers() {
     wait_until("the revoked worker's tunnel to close", PROBLEM, || {
         worker.echo("revoked").is_empty()
     });
+    server.shutdown();
+}
+
+/// Operator-driven rotation of both identities, end to end on the pinned
+/// helper: a worker's staged key cannot commit until the controller lists
+/// it; both worker keys are admitted through the overlap, and retiring the
+/// old one refuses only it; the controller's staged key is served beside the
+/// active one, and the commit keeps the workers already on the new address
+/// connected while the old address stops answering; revocation still closes
+/// the rotated tunnel.
+///
+/// An allow-list change restarts the controller's helper. In this suite's
+/// first run an established container forward did not re-handshake with the
+/// restarted helper within 60 s; the Sentinel worker replaces its helper
+/// after three failed control sessions, so after an allow-list change this
+/// test replaces a container's helper the same way before judging it.
+#[test]
+#[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman"]
+fn node_keys_rotate_with_an_overlap_window_and_revocation_still_applies() {
+    let _serial = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(helper) = gate(&["podman"]) else {
+        return;
+    };
+    let binary = &helper.binary;
+    let port = free_port();
+    let _echo = HostEcho::start(port);
+    let config = config(binary, port);
+    let (old_name, new_name, moved_name) = (
+        "sentinel-live-rotate-old",
+        "sentinel-live-rotate-new",
+        "sentinel-live-rotate-moved",
+    );
+
+    let worker_dir = tempfile::tempdir().unwrap();
+    let keys = worker_dir.path().join("tailcat");
+    let old = tailcat::ensure_key(&config, worker_dir.path(), Role::Worker).unwrap();
+    let controller_dir = tempfile::tempdir().unwrap();
+    let server =
+        tailcat::start_server(&config, controller_dir.path(), std::slice::from_ref(&old)).unwrap();
+    let address = server.wait_ready(READY).unwrap();
+    let before = ContainerWorker::start(binary, old_name, &keys, &address, port, &[]);
+    wait_until("the old key's echo", READY, || {
+        before.echo("old-key") == "old-key"
+    });
+
+    // Worker rotation. Unlisted, the staged key cannot commit: the
+    // controller's helper refuses its handshake.
+    let new = tailcat::stage_rotation(&config, worker_dir.path(), Role::Worker).unwrap();
+    assert_ne!(new, old);
+    assert!(
+        tailcat::commit_rotation(&config, worker_dir.path(), Role::Worker, Some(&address)).is_err(),
+        "a key the controller does not list must not commit"
+    );
+    assert_eq!(
+        tailcat::staged_rotation(worker_dir.path(), Role::Worker).unwrap(),
+        Some(new.clone())
+    );
+    // The old key's material, kept aside by the test only, to show later
+    // that the retired key is refused (the commit deletes it).
+    let old_keys = tempfile::tempdir().unwrap();
+    let saved = Path::new(".config/tailcat/keys/client-default.private.json");
+    std::fs::create_dir_all(old_keys.path().join(saved.parent().unwrap())).unwrap();
+    std::fs::copy(keys.join(saved), old_keys.path().join(saved)).unwrap();
+
+    // Listed beside the old key: the old key is still admitted, and the
+    // commit's ping with the new key succeeds.
+    server.set_allow(&[old.clone(), new.clone()]);
+    let before = ContainerWorker::start(binary, old_name, &keys, &address, port, &[]);
+    wait_until("the old key with both listed", READY, || {
+        before.echo("listed") == "listed"
+    });
+    let deadline = Instant::now() + READY;
+    let committed = loop {
+        match tailcat::commit_rotation(&config, worker_dir.path(), Role::Worker, Some(&address)) {
+            Ok(committed) => break committed,
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the listed key never committed: {error}"
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    };
+    assert_eq!(committed.key, new);
+    assert!(committed.previous_deleted);
+    // Both keys carry the link at once through the overlap.
+    let after = ContainerWorker::start_keyed(
+        binary,
+        new_name,
+        &keys,
+        &address,
+        port,
+        &[],
+        Some("client-rotated"),
+    );
+    wait_until("the new key's echo", READY, || {
+        after.echo("new-key") == "new-key"
+    });
+    assert_eq!(before.echo("overlap"), "overlap");
+
+    // Retired: the new key is the worker's only one; a fresh helper with the
+    // old key is refused.
+    server.set_allow(std::slice::from_ref(&new));
+    let after = ContainerWorker::start_keyed(
+        binary,
+        new_name,
+        &keys,
+        &address,
+        port,
+        &[],
+        Some("client-rotated"),
+    );
+    wait_until("the kept key after the retire", READY, || {
+        after.echo("kept") == "kept"
+    });
+    let before = ContainerWorker::start(binary, old_name, old_keys.path(), &address, port, &[]);
+    std::thread::sleep(Duration::from_secs(8));
+    assert_eq!(before.echo("retired"), "", "the retired key was admitted");
+    drop(before);
+
+    // Controller rotation: the staged key is served beside the active one,
+    // and both addresses carry the link.
+    let staged = tailcat::stage_rotation(&config, controller_dir.path(), Role::Controller).unwrap();
+    server.reload_keys().unwrap();
+    wait_until("the staged address", READY, || {
+        server.staged_address().is_some()
+    });
+    let next = server.staged_address().unwrap();
+    assert_ne!(next.expose(), address.expose());
+    assert_eq!(
+        std::fs::read_to_string(tailcat::staged_address_file(controller_dir.path()))
+            .unwrap()
+            .trim(),
+        next.expose()
+    );
+    let moved = ContainerWorker::start_keyed(
+        binary,
+        moved_name,
+        &keys,
+        &next,
+        port,
+        &[],
+        Some("client-rotated"),
+    );
+    wait_until("the staged address's echo", READY, || {
+        moved.echo("next") == "next"
+    });
+    assert_eq!(
+        after.echo("both"),
+        "both",
+        "the active address during the overlap"
+    );
+
+    // Commit: the helper serving the new key becomes the main one without a
+    // restart, so the worker already on the new address keeps its tunnel;
+    // the old address stops answering.
+    let committed =
+        tailcat::commit_rotation(&config, controller_dir.path(), Role::Controller, None).unwrap();
+    assert_eq!(committed.key, staged);
+    server.reload_keys().unwrap();
+    assert!(server.staged_telemetry().is_none());
+    assert_eq!(server.address().unwrap().expose(), next.expose());
+    assert_eq!(
+        std::fs::read_to_string(server.address_file())
+            .unwrap()
+            .trim(),
+        next.expose()
+    );
+    assert_eq!(
+        moved.echo("committed"),
+        "committed",
+        "the switch broke the new address"
+    );
+    wait_until("the old address to stop answering", PROBLEM, || {
+        after.echo("old-address").is_empty()
+    });
+    eprintln!("live rotation: both identities rotated with an overlap window");
+
+    // Revocation still applies to the rotated identity.
+    server.set_allow(&[]);
+    let moved = ContainerWorker::start_keyed(
+        binary,
+        moved_name,
+        &keys,
+        &next,
+        port,
+        &[],
+        Some("client-rotated"),
+    );
+    std::thread::sleep(Duration::from_secs(8));
+    assert_eq!(moved.echo("revoked"), "", "a revoked worker was admitted");
     server.shutdown();
 }
 

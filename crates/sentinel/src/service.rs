@@ -635,6 +635,98 @@ pub fn run(role: &str, args: ServiceArgs) -> Result<(), Error> {
     result
 }
 
+/// The helper configuration of an enabled `[tailcat]` section (Q06); `None`
+/// leaves the link on direct TLS. `listen_port` is the role's default for the
+/// port the helper carries.
+fn helper_config(
+    file: Option<&TailcatFile>,
+    listen_port: u16,
+) -> Result<Option<sentinel_link::tailcat::TailcatConfig>, Error> {
+    let Some(file) = file.filter(|file| file.enabled == Some(true)) else {
+        return Ok(None);
+    };
+    let binary = file
+        .binary
+        .clone()
+        .ok_or_else(|| Error::config("tailcat.binary is required when tailcat is enabled"))?;
+    Ok(Some(sentinel_link::tailcat::TailcatConfig {
+        enabled: true,
+        binary,
+        sha256: file
+            .sha256
+            .clone()
+            .unwrap_or_else(|| sentinel_link::tailcat::PINNED_SHA256.to_owned()),
+        derpmap_url: file.derpmap_url.clone(),
+        region: file.region.clone(),
+        listen_port: file.listen_port.unwrap_or(listen_port),
+    }))
+}
+
+/// The controller's `tc…` address a worker dials through the helper.
+fn tailcat_address(link: &WorkerLink) -> Result<sentinel_link::tailcat::Address, Error> {
+    let text = link
+        .tailcat_address
+        .as_deref()
+        .ok_or_else(|| Error::config("tailcat_address is required when tailcat is enabled"))?;
+    sentinel_link::tailcat::Address::parse(text).ok_or_else(|| {
+        Error::config("tailcat_address must be a tailcat address, as in tc<20+ characters>")
+    })
+}
+
+/// What `sentinel admin tailcat` needs from a role's configuration file: the
+/// data directory, the enabled helper and, for a worker, the controller's
+/// address. The file is validated exactly as the role itself would.
+pub(crate) struct TailcatSetup {
+    pub data_dir: PathBuf,
+    pub helper: sentinel_link::tailcat::TailcatConfig,
+    pub controller: Option<sentinel_link::tailcat::Address>,
+}
+
+pub(crate) fn tailcat_setup(
+    role: &str,
+    config: PathBuf,
+    data_dir: Option<PathBuf>,
+) -> Result<TailcatSetup, Error> {
+    let args = ServiceArgs {
+        config: Some(config),
+        data_dir,
+        check: true,
+        log_format: None,
+        log_level: None,
+    };
+    let mut io = Executor::new(WorkClass::BlockingIo, 1)
+        .map_err(|error| Error::runtime(format!("cannot start I/O lane: {error}")))?;
+    let mut cpu = Executor::new(WorkClass::Cpu, 1)
+        .map_err(|error| Error::runtime(format!("cannot start CPU lane: {error}")))?;
+    let loaded = Config::load(role, &args, &io, &cpu);
+    io.shutdown(Duration::from_secs(1));
+    cpu.shutdown(Duration::from_secs(1));
+    let loaded = loaded?;
+    let disabled = || Error::config("[tailcat] is not enabled in this configuration");
+    let (helper, controller) = match &loaded.role {
+        Role::Server {
+            listen, tailcat, ..
+        } => (
+            helper_config(tailcat.as_ref(), listen.port())?.ok_or_else(disabled)?,
+            None,
+        ),
+        Role::Worker(Some(link)) => (
+            helper_config(
+                link.tailcat.as_ref(),
+                sentinel_link::tailcat::DEFAULT_LINK_PORT,
+            )?
+            .ok_or_else(disabled)?,
+            Some(tailcat_address(link)?),
+        ),
+        Role::Worker(None) => return Err(disabled()),
+    };
+    Ok(TailcatSetup {
+        data_dir: loaded.data_dir,
+        helper,
+        controller,
+    })
+}
+
 fn bootstrap_work<T: Send + 'static>(
     executor: &Executor,
     work: impl FnOnce() -> T + Send + 'static,
@@ -761,26 +853,8 @@ fn start_tailcat(
     file: Option<&TailcatFile>,
     listen: SocketAddr,
 ) -> Result<Option<TailcatServer>, Error> {
-    let Some(file) = file else {
+    let Some(helper) = helper_config(file, listen.port())? else {
         return Ok(None);
-    };
-    if file.enabled != Some(true) {
-        return Ok(None);
-    }
-    let binary = file
-        .binary
-        .clone()
-        .ok_or_else(|| Error::config("tailcat.binary is required when tailcat is enabled"))?;
-    let helper = sentinel_link::tailcat::TailcatConfig {
-        enabled: true,
-        binary,
-        sha256: file
-            .sha256
-            .clone()
-            .unwrap_or_else(|| sentinel_link::tailcat::PINNED_SHA256.to_owned()),
-        derpmap_url: file.derpmap_url.clone(),
-        region: file.region.clone(),
-        listen_port: file.listen_port.unwrap_or(listen.port()),
     };
     let mut listed = sentinel_link::tailcat::allow_list(&config.data_dir)
         .map_err(|error| Error::runtime(format!("cannot read the tailcat allow list: {error}")))?;
@@ -820,9 +894,24 @@ fn start_tailcat(
             .spawn(move || {
                 tracing::dispatcher::with_default(&dispatch, || {
                     let (mut file_warned, mut store_warned) = (false, false);
+                    let mut rotation_warned = false;
                     while let Err(mpsc::RecvTimeoutError::Timeout) =
                         wake.recv_timeout(TAILCAT_ALLOW_REFRESH)
                     {
+                        // A key rotation staged, committed or abandoned by
+                        // `sentinel admin tailcat`: serve the staged key
+                        // beside the active one, or switch.
+                        match server.reload_keys() {
+                            Ok(()) => rotation_warned = false,
+                            Err(_) if !rotation_warned => {
+                                rotation_warned = true;
+                                tracing::warn!(
+                                    event = "tailcat_rotation_unreadable",
+                                    "keeping the node keys in use"
+                                );
+                            }
+                            Err(_) => {}
+                        }
                         match sentinel_link::tailcat::allow_list(&data_dir) {
                             // An empty or absent file is a decision: it
                             // closes every tunnel (`--allow=none`).
@@ -1511,34 +1600,14 @@ mod worker_role {
             path: sentinel_link::session::Path::Direct,
             ..sentinel_link::session::TransportStats::default()
         };
-        let Some(file) = &link.tailcat else {
+        let Some(config) = helper_config(
+            link.tailcat.as_ref(),
+            sentinel_link::tailcat::DEFAULT_LINK_PORT,
+        )?
+        else {
             return Ok((link.controller, stats, None));
         };
-        if file.enabled != Some(true) {
-            return Ok((link.controller, stats, None));
-        }
-        let binary = file
-            .binary
-            .clone()
-            .ok_or_else(|| Error::config("tailcat.binary is required when tailcat is enabled"))?;
-        let address_text = link
-            .tailcat_address
-            .as_deref()
-            .ok_or_else(|| Error::config("tailcat_address is required when tailcat is enabled"))?;
-        let address = sentinel_link::tailcat::Address::parse(address_text).ok_or_else(|| {
-            Error::config("tailcat_address must be a tailcat address, as in tc<20+ characters>")
-        })?;
-        let config = sentinel_link::tailcat::TailcatConfig {
-            enabled: true,
-            binary,
-            sha256: file
-                .sha256
-                .clone()
-                .unwrap_or_else(|| sentinel_link::tailcat::PINNED_SHA256.to_owned()),
-            derpmap_url: file.derpmap_url.clone(),
-            region: file.region.clone(),
-            listen_port: file.listen_port.unwrap_or(7443),
-        };
+        let address = tailcat_address(link)?;
         let forward = sentinel_link::tailcat::start_forward(&config, data_dir, &address)
             .map_err(|error| Error::runtime(format!("cannot start the tailcat helper: {error}")))?;
         stats.helper_version = forward.telemetry().version;
@@ -1906,7 +1975,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_revoked_worker_loses_its_tailcat_key_and_an_unenrolled_one_keeps_it() {
+    fn a_revoked_worker_loses_every_tailcat_key_and_an_unenrolled_one_keeps_it() {
         use sentinel_auth::secret::Secret;
         use sentinel_core::{PoolId, UnixMillis, WorkerId};
         use sentinel_link::tailcat::{Admission, NodeKey};
@@ -1965,10 +2034,16 @@ mod tests {
                 key: key('b').unwrap(),
                 worker: pending,
             },
+            // The enrolled worker mid-rotation: its new key is listed beside
+            // the old one until the old one is retired.
+            Admission {
+                key: key('c').unwrap(),
+                worker: enrolled,
+            },
         ];
         assert_eq!(
             admitted_keys(&store, &listed).unwrap(),
-            vec![key('a').unwrap(), key('b').unwrap()]
+            vec![key('a').unwrap(), key('b').unwrap(), key('c').unwrap()]
         );
         store
             .writer()
@@ -1977,7 +2052,7 @@ mod tests {
         assert_eq!(
             admitted_keys(&store, &listed).unwrap(),
             vec![key('b').unwrap()],
-            "revoking the worker withdraws its tunnel key"
+            "revoking the worker withdraws its tunnel keys, the rotated one too"
         );
     }
 
