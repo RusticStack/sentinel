@@ -360,7 +360,7 @@ These came from merging the seven branches and from the flakes seen in their ver
 | P07-20: mirror materialization copies the whole object store on non-reflink filesystems | **B04** | A performance item that needs before/after measurement on ext4 or overlay. It is bounded by `MAX_OBJECT_FILES`. With manual runs out of mirrors (P07-17), the exposure it widened is closed. |
 | P08-C8 remainder: hydration writes each byte three times, the offer reads the payload twice, and the bundle digest is not stored with the generation | **B04** | Throughput work on a transfer already bounded to at most 5 s per job. |
 | Worker-side spool free-space admission (noted against D06) | **R01** | D06 covers the controller's disk admission. The worker's spool is capped per attempt and a failed write is a declared gap, so the bound holds; admission by free space is retention/operations work. |
-| Tailcat node-key rotation (noted against Q06) | **R04** | Not in Q06's text; plan §5 asks for rotatable identities. Key rotation sits with the key-material operations in R04. |
+| Tailcat node-key rotation (noted against Q06) | ~~R04~~ **Closed** | First moved to R04, since Q06's text did not ask for it and plan §5 asks for rotatable identities. It is now implemented, and R04's text no longer names it. See [Follow-up: Tailcat key rotation and browser launch](#follow-up-tailcat-key-rotation-and-browser-launch). |
 
 Items fixed without an automated regression test, with the fix report's reason:
 
@@ -415,7 +415,7 @@ The audits marked these tasks Partial or Missing. Each one is met now, with the 
 | Q03 | Partial | P08-6 |
 | Q04 | Partial | P08-7, P08-8 |
 | Q05 | Partial | P08-11. Mid-flight revocation is reconciled in the pass (P08-7). The cache docs about the control fallback were corrected. |
-| Q06 | Partial | P08-T1, P08-T5. DERP and self-hosted relay docs (`fbf72cb`). Key rotation (a plan item, not in Q06's text) moved to R04. |
+| Q06 | Partial | P08-T1, P08-T5. DERP and self-hosted relay docs (`fbf72cb`). Key rotation (a plan item, not in Q06's text) first moved to R04, then was closed by the [follow-up](#follow-up-tailcat-key-rotation-and-browser-launch). |
 | Q07 | Partial | P08-T2, P08-T3, P08-T6; throughput counts the bulk connection (`529d4a7`) |
 | Q08 | Partial | P08-C1 to P08-C9; part of C8 is deferred to B04 as a performance item. |
 | Q09 | Partial | Load run rewritten to hold capacity and recorded in `bench/`; noisy-tenant fairness observable; P08-9 |
@@ -430,7 +430,7 @@ Not met, stated plainly:
 The audit notes raised three more gaps without finding IDs, and no cluster took them:
 
 - **D06, worker-side spool free space.** D06 is the controller's disk admission (its reserve protects the metadata database and log evidence), and that is met. The worker's log spool is capped per attempt (256 MiB) and a failed write becomes a declared gap, but the worker has no free-space probe. Moved to **R01**, whose text now names it.
-- **Q06, Tailcat key rotation.** Q06's text does not ask for it; plan §5 asks for rotatable identities. Moved to **R04** (key material operations), whose text now names it.
+- **Q06, Tailcat key rotation.** Q06's text does not ask for it; plan §5 asks for rotatable identities. It first moved to **R04** (key material operations). It is now closed by the [follow-up](#follow-up-tailcat-key-rotation-and-browser-launch), and R04's text no longer names it.
 - **Q07, throughput.** Fixed in `529d4a7` (see [Found during integration](#found-during-integration)).
 
 K08's costly-hit rule remains a fixed heuristic (hit + reflink root + everything copied, or more than 5 s of lock wait plus clone); it does not compare against a measured rebuild. K08's text asks to flag costly hits, which it does; comparing against a rebuild belongs with B05's cache-usefulness measurements.
@@ -522,3 +522,53 @@ Flaky-test fixes, re-run under load (6 parallel lanes):
 | `list_queue` 5,000 jobs, limit 100 / 500 | 3,981 / 1,683 µs | 3,728 / 1,426 µs | 3,491 / 1,483 µs | 3,420 / 1,460 µs |
 
 All 10,000 jobs were placed with 0 placement failures in every run. The merged tree is at least as fast as the fleet branch; this is one host, three runs, and not a production benchmark.
+
+## Follow-up: Tailcat key rotation and browser launch
+
+Branch `close-tailcat-browser` from `fca2d1e` closes two items that this audit left open. Both are now **closed**.
+
+**Tailcat node-key rotation** (moved from Q06 to R04 above) is implemented, and R04's text no longer names it. The commit is `feat: rotate Tailcat node keys with an overlap window`, and the procedure is in [configuration](configuration.md) under "Key rotation".
+
+- **Commands.** `sentinel admin tailcat rotate|commit|abandon --role server|worker --config …` runs on the role's own host, in server or worker builds. `sentinel admin tailcat allow|retire --data-dir …` edits the controller's `tailcat-allow`, one `nodekey:<hex> wrk_<id>` line per key.
+- **Overlap window.** A worker's new key is listed beside its old one. It commits only after a `tailcat ping` with the new key succeeds, which proves the controller admits it. The running worker then switches its helper within one probe interval, and `retire` removes the old line. The controller serves a staged key from a second helper with the same port and allow list, and that helper writes `address.next`. On commit that helper becomes the main one without a restart; the old key's helper stops.
+- **Credentials.** Keys move only on standard input and output. Argv carries only the key names `--key=rotated` and `--key=client-rotated`. Errors and standard error name files and worker ids, never a key or an address.
+- **Revocation.** It still withdraws every key a worker has listed.
+- **State.** All rotation state is owner-only and written by atomic replacement.
+
+Tests:
+
+- `sentinel-link/tests/tailcat.rs` (fake helper):
+  - `a_worker_key_rotates_only_once_the_controller_admits_it`
+  - `the_controller_serves_both_keys_until_its_rotation_commits`
+  - `the_allow_list_is_edited_per_worker_with_an_overlap_window`
+- `sentinel/tests/tailcat_admin.rs::a_worker_rotation_runs_through_the_admin_commands_with_keys_only_on_stdio` runs the real binary. It checks that stdout carries only the allow-list line and that no key or address reaches stderr.
+- `service::tests::a_revoked_worker_loses_every_tailcat_key_and_an_unenrolled_one_keeps_it` covers revocation of both keys during an overlap.
+- The live test `tailcat_live.rs::node_keys_rotate_with_an_overlap_window_and_revocation_still_applies` runs on the pinned helper and rootful Podman. It checks each of these:
+  - An unlisted worker key cannot commit.
+  - Both worker keys carry the link during the overlap.
+  - A fresh helper holding the retired key is refused.
+  - Both controller addresses answer during the overlap.
+  - After the commit, a worker already on the new address keeps its tunnel with no helper restart.
+  - The old address stops answering.
+  - Emptying the allow list refuses the rotated identity.
+
+Observed while writing the live test, and not changed here: an allow-list change restarts the controller's helper. In the first run, an established container forward did not re-handshake with the restarted helper within 60 s. The Sentinel worker recovers by replacing its helper after three failed control sessions (`tailcat_replaced`). The live test therefore replaces a container's helper after each allow-list change before judging it. How long an unreplaced forward takes to recover was not measured.
+
+**Browser launch smoke test** (O04/O07 recorded "Real browser launch not automated"). The commit is `test: launch the real browser opener against a harmless stand-in`, and production code is unchanged.
+
+- `sentinel/tests/browser.rs` has its own `main` instead of the libtest harness. It runs the unmodified `browser::open` in a copy of itself.
+- A second copy, named `rundll32.exe`, `open` or `xdg-open`, sits where the real launcher is looked up first and records its argv. On Windows that place is the launching program's own directory, which comes before the system directory. On other platforms it is the first `PATH` entry.
+- A URL with `;`, `&`, `|`, `^`, `$(…)`, backticks, quotes, spaces, `%PATH%` and `$HOME` arrives as one argv element, byte for byte, after `url.dll,FileProtocolHandler` on Windows. None of its shell canaries runs.
+- Non-http URLs and `--no-browser` launch nothing.
+- See [CLI](cli.md#verification).
+
+Verification on `close-tailcat-browser`, run one command at a time:
+
+| Where | Command | Exit | Result |
+|---|---|---|---|
+| Windows | `cargo fmt-check` | 0 | clean |
+| Windows | `cargo lint` | 0 | no warnings |
+| Windows | `cargo test-cli --no-fail-fast` | 0 | 129 binaries: 866 passed, 0 failed, 3 ignored (`browser` 4 of them) |
+| WSL2 | `cargo lint-linux` | 0 | no warnings |
+| WSL2 | `cargo test-linux --no-fail-fast` | 0 | 129 binaries: 1,031 passed, 0 failed, 12 ignored (the new live test is the 12th) |
+| WSL2, rootful Podman | the live Tailcat suite as its header documents (`SENTINEL_TAILCAT_LIVE`, `SENTINEL_TAILCAT_DERPER`, `SENTINEL_TAILCAT_DERP_CA` = `SSL_CERT_FILE`, `/usr/sbin` on `PATH`) | 0 | 7 passed in 184.6 s; live probe `path Direct, rtt 270µs`; self-hosted relay `pong in 380µs via DERP(local)` |
