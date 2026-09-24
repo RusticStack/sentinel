@@ -18,6 +18,8 @@
 
 #[path = "support/live.rs"]
 mod live;
+#[path = "support/shim_dir.rs"]
+mod shim_dir;
 
 use std::{
     fs,
@@ -69,7 +71,7 @@ fn shim() -> &'static PathBuf {
             .unwrap();
         let real = String::from_utf8(real.stdout).unwrap().trim().to_owned();
         assert!(!real.is_empty(), "podman not found");
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = shim_dir::create("executor-faults");
         let path = dir.join("podman");
         fs::write(&path, SHIM.replace("REAL", &real)).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();

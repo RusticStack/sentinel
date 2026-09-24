@@ -8,6 +8,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "support/shim_dir.rs"]
+mod shim_dir;
+
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::OnceLock};
 
 use sentinel_core::{AttemptId, Fence, WorkerId};
@@ -42,7 +45,7 @@ esac
 fn shim() -> &'static PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = shim_dir::create("runtime-failures");
         let path = dir.join("podman");
         fs::write(&path, SHIM).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();

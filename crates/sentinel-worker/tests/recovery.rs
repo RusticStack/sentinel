@@ -6,6 +6,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "support/shim_dir.rs"]
+mod shim_dir;
+
 use std::fs;
 
 use sentinel_core::{AttemptId, Fence, WorkerId};
@@ -22,7 +25,7 @@ fn empty_runtime() {
     use std::os::unix::fs::PermissionsExt;
     static SHIM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     SHIM.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = shim_dir::create("recovery");
         let path = dir.join("podman");
         fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
