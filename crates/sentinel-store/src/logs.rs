@@ -326,7 +326,14 @@ impl LogStore {
     /// where the default is too generous (and for tests).
     pub fn open_with_limit(dir: impl Into<PathBuf>, max_bytes: u64) -> Result<LogStore> {
         let dir = dir.into();
-        fs::create_dir_all(&dir)?;
+        if !dir.is_dir() {
+            fs::create_dir_all(&dir)?;
+            // Every acknowledgement below promises a path through this
+            // directory: its own entry must be durable first.
+            if let Some(parent) = dir.parent() {
+                sync_dir(parent)?;
+            }
+        }
         let compressor = Arc::new(Compressor {
             queue: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
@@ -444,7 +451,15 @@ impl LogStore {
         if guard.is_none() {
             *guard = Some(self.open_attempt(run, job, attempt)?);
         }
-        f(guard.as_mut().expect("opened above"))
+        let result = f(guard.as_mut().expect("opened above"));
+        if matches!(result, Err(Error::Io(_))) {
+            // A write or sync that failed may have left part of a record in
+            // the segment, and the writer's offsets no longer match the
+            // file. Drop it: the next call reopens from disk, which cuts the
+            // torn record — a later frame is never written behind one.
+            *guard = None;
+        }
+        result
     }
 
     /// Remove attempt directories and legacy flat logs whose newest byte is
@@ -616,19 +631,19 @@ impl LogStore {
     /// memory and the persisted holes of the ones it does.
     fn open_attempt(&self, run: RunId, job: JobId, attempt: AttemptId) -> Result<Open> {
         let dir = self.attempt_dir(run, job, attempt);
-        if !dir.is_dir() {
-            // A new attempt directory (and possibly its job and run
-            // parents): make each new entry durable before any frame in it
-            // is acknowledged.
-            fs::create_dir_all(&dir)?;
-            let mut at = dir.as_path();
-            while let Some(parent) = at.parent() {
-                sync_dir(parent)?;
-                if parent == self.dir {
-                    break;
-                }
-                at = parent;
+        // The attempt directory and its job and run parents: make each
+        // entry durable before any frame in it is acknowledged. Also when
+        // the directories already exist — a process that crashed between
+        // creating and syncing them left entries a power cut can still take.
+        // Once per writer open; syncing an unchanged directory is cheap.
+        fs::create_dir_all(&dir)?;
+        let mut at = dir.as_path();
+        while let Some(parent) = at.parent() {
+            sync_dir(parent)?;
+            if parent == self.dir {
+                break;
             }
+            at = parent;
         }
         sweep_tmp(&dir);
         let segs = segs(&dir)?;
@@ -883,11 +898,15 @@ impl LogStore {
             // could vanish with it. Once per segment.
             sync_dir(&w.dir)?;
         }
-        w.file
-            .as_mut()
-            .expect("opened above")
-            .write_all(&w.scratch)?;
-        w.file.as_mut().expect("opened above").sync_data()?;
+        let file = w.file.as_mut().expect("opened above");
+        if let Err(e) = file.write_all(&w.scratch).and_then(|()| file.sync_data()) {
+            // Never acknowledged, so never kept: a short write (ENOSPC, a
+            // file size limit) or a failed sync must not leave a record for
+            // the next frame to land behind. `with_writer` reopens from
+            // disk, which cuts whatever this could not.
+            let _ = file.set_len(w.seg_len);
+            return Err(e.into());
+        }
         let step_changed = frame.step != w.step;
         w.seg_len += record_len;
         w.len += record_len;
@@ -1106,6 +1125,7 @@ impl LogStore {
             reader: Box::new(file),
             buf: Vec::new(),
             complete: 0,
+            plain: true,
         };
         let mut ended = false;
         while let Some(record) = decoder.next()? {
@@ -2011,6 +2031,8 @@ struct Decoder {
     buf: Vec<u8>,
     /// Bytes consumed so far: where the complete prefix ends.
     complete: u64,
+    /// An uncompressed segment, whose tail a power cut can leave zeroed.
+    plain: bool,
 }
 
 impl Decoder {
@@ -2022,7 +2044,19 @@ impl Decoder {
                     self.complete += used as u64;
                     return Ok(Some(record));
                 }
-                Err(RecordError::Invalid) => return Err(Error::Corrupt("log record")),
+                // A power cut can persist a file's new size before the data
+                // written into it (a journal commit for another file carries
+                // the size): the unsynced tail then reads back as zeros. It
+                // was never acknowledged — an fsync would have written it —
+                // so it ends the stream like a torn record. Anything else
+                // that does not decode is corruption.
+                Err(RecordError::Invalid) => {
+                    return if self.plain && self.rest_is_zero()? {
+                        Ok(None)
+                    } else {
+                        Err(Error::Corrupt("log record"))
+                    };
+                }
                 Err(RecordError::Incomplete) => {
                     let mut chunk = [0u8; 64 << 10];
                     let read = self.reader.read(&mut chunk)?;
@@ -2031,6 +2065,24 @@ impl Decoder {
                     }
                     self.buf.extend_from_slice(&chunk[..read]);
                 }
+            }
+        }
+    }
+
+    /// Whether everything from the current position to the end is zero.
+    /// Only a stream that failed to decode pays for it.
+    fn rest_is_zero(&mut self) -> Result<bool> {
+        if self.buf.iter().any(|b| *b != 0) {
+            return Ok(false);
+        }
+        let mut chunk = [0u8; 64 << 10];
+        loop {
+            let read = self.reader.read(&mut chunk)?;
+            if read == 0 {
+                return Ok(true);
+            }
+            if chunk[..read].iter().any(|b| *b != 0) {
+                return Ok(false);
             }
         }
     }
@@ -2043,6 +2095,7 @@ fn seg_decoder(dir: &Path, seg: u32, compressed: bool) -> Result<Decoder> {
             reader: Box::new(file),
             buf: Vec::new(),
             complete: 0,
+            plain: true,
         });
     }
     let mut header = [0u8; 7];
@@ -2057,6 +2110,7 @@ fn seg_decoder(dir: &Path, seg: u32, compressed: bool) -> Result<Decoder> {
         reader: Box::new(ZlibDecoder::new(file)),
         buf: Vec::new(),
         complete: 0,
+        plain: false,
     })
 }
 
@@ -2238,6 +2292,7 @@ pub fn read_tail_page(path: &Path, after: u64, page: Page, step: Option<u32>) ->
         reader: Box::new(file),
         buf: Vec::new(),
         complete: 0,
+        plain: true,
     };
     let mut taken = 0u64;
     while let Some(record) = decoder.next()? {
