@@ -24,6 +24,11 @@ use crate::{
 /// attempt is not a standing target.
 pub const STATE_TTL_MS: i64 = 10 * 60 * 1000;
 
+/// Longest destination recorded with a pending attempt (migration 37): room
+/// for an OAuth authorization request's whole query, so a sign-in started on
+/// the consent page returns to it with its parameters intact.
+pub const MAX_REDIRECT_BYTES: usize = 2048;
+
 /// Where to send the browser once sign-in completes. Same-site paths only: an
 /// absolute URL here would turn a successful login into an open redirect.
 fn destination(redirect_to: Option<&str>) -> Result<Option<String>> {
@@ -32,7 +37,7 @@ fn destination(redirect_to: Option<&str>) -> Result<Option<String>> {
     };
     let acceptable = path.starts_with('/')
         && !path.starts_with("//")
-        && path.len() <= 512
+        && path.len() <= MAX_REDIRECT_BYTES
         && !path.contains('\\')
         && !path.chars().any(char::is_control);
     if !acceptable {

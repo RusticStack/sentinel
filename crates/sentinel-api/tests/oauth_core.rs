@@ -122,6 +122,7 @@ pub fn deployment_under(path: Option<&str>) -> Deployment {
         github_webhook_secret: None,
         intake: None,
         public_url: public_url.clone(),
+        github_sign_in: None,
     })
     .unwrap();
     let base = format!("http://{}", server.local_addr());

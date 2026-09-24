@@ -1347,6 +1347,12 @@ fn start_server(
         orphaned = reconciled.orphaned,
         "workers pin this fingerprint with their enrollment"
     );
+    let github_sign_in = crate::source_admin::load_sign_in(&config.data_dir)
+        .map_err(|error| Error::runtime(error.message))?;
+    if let Some(sign_in) = &github_sign_in {
+        // The client ID is public; the secret is never logged.
+        tracing::info!(event = "github_sign_in_enabled", client_id = %sign_in.client_id);
+    }
     let api = sentinel_api::Server::start(sentinel_api::Config {
         listen: api_listen,
         store: Arc::clone(&store),
@@ -1357,6 +1363,7 @@ fn start_server(
         github_webhook_secret,
         intake: Some(lane.waker()),
         public_url,
+        github_sign_in,
     })
     .map_err(|error| Error::runtime(format!("cannot listen on {api_listen}: {error}")))?;
     tracing::info!(event = "api_listening", addr = %api.local_addr(), issuer = %api.issuer());

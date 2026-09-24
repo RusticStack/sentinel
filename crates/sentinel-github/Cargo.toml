@@ -15,6 +15,10 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 serde_json = "1.0"
 ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip"] }
 
+[features]
+# A GitHub-shaped OAuth server on loopback, for other crates' tests.
+fake = []
+
 [dev-dependencies]
 sentinel-auth = { path = "../sentinel-auth" }
 sentinel-core = { path = "../sentinel-core" }

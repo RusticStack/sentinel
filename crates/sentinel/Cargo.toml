@@ -53,6 +53,7 @@ uuid = { version = "1.24", optional = true, features = ["v4"] }
 ring = "0.17"
 sentinel-api = { path = "../sentinel-api" }
 sentinel-core = { path = "../sentinel-core" }
+sentinel-github = { path = "../sentinel-github", features = ["fake"] }
 sentinel-link = { path = "../sentinel-link", features = ["controller"] }
 sentinel-store = { path = "../sentinel-store" }
 tempfile = "3.20"

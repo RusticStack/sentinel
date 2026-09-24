@@ -40,7 +40,6 @@ use serde_json::{Value, json};
 use crate::{
     LOG_WAIT, MAX_UPLOAD_CHUNK, State, TRANSFERS,
     auth::{self, Identity, Refusal},
-    web,
 };
 
 /// What a route answers: a JSON body, a bounded stream from the object
@@ -112,7 +111,7 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
     // A proxy that forwards a path-carrying issuer's paths unstripped.
     let path = state.oauth.local_path(&full_path);
     if method == "GET" && path == "/" {
-        let response = Response::from_string(web::INDEX_HTML)
+        let response = Response::from_string(state.index.as_str())
             .with_header(header("content-type", "text/html; charset=utf-8"));
         let _ = request.respond(response);
         return;
@@ -294,6 +293,9 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
     // The OAuth authorization server owns `/.well-known/*`, `/oauth/*`,
     // `/device`, `/api/v1/grants*` and `/api/v1/tenants/*/service-accounts*`.
     if let Some(reply) = crate::oauth::route(state, request, method, &parts, query) {
+        return reply;
+    }
+    if let Some(reply) = crate::github::route(state, request, method, &parts, query) {
         return reply;
     }
     match (method, parts.as_slice()) {

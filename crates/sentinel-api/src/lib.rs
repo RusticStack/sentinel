@@ -13,6 +13,7 @@
 //! read. The OAuth authorization server (O01–O06) lives in [`oauth`].
 
 pub mod auth;
+mod github;
 mod http;
 mod oauth;
 mod routes;
@@ -30,6 +31,8 @@ use std::{
 use sentinel_core::UserId;
 use sentinel_link::controller::Handle;
 use sentinel_store::{Store, logs::LogStore, objects::Objects};
+
+pub use github::GithubSignIn;
 
 /// Requests being handled at once; further connections wait on a permit.
 pub const WORKERS: usize = 8;
@@ -80,6 +83,9 @@ pub struct Config {
     /// slash). It is the OAuth issuer; without it the issuer is
     /// `http://{bound address}`, which is right only for direct loopback use.
     pub public_url: Option<String>,
+    /// GitHub web sign-in (U07). Without it the `/auth/github/*` routes do
+    /// not exist and no page offers the button.
+    pub github_sign_in: Option<GithubSignIn>,
 }
 
 pub(crate) struct State {
@@ -102,6 +108,10 @@ pub(crate) struct State {
     pub stop: Arc<AtomicBool>,
     /// The OAuth authorization server's issuer, keys and in-memory limits.
     pub oauth: oauth::OAuthState,
+    /// GitHub web sign-in, when configured.
+    pub github: Option<github::Github>,
+    /// The first page, rendered once for this configuration.
+    pub index: String,
 }
 
 /// Who holds the parked long-poll slots: at most [`SUBSCRIBERS`] in total
@@ -186,6 +196,17 @@ impl Server {
             Some(url) => url.trim_end_matches('/').to_owned(),
             None => format!("http://{addr}"),
         };
+        let github = config
+            .github_sign_in
+            .map(|sign_in| github::Github::new(sign_in, &issuer))
+            .transpose()
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("GitHub sign-in: {e}"),
+                )
+            })?;
+        let index = web::index(github.is_some());
         let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::new(State {
             store: config.store,
@@ -199,6 +220,8 @@ impl Server {
             subscribers: Subscribers::default(),
             stop: Arc::clone(&stop),
             oauth: oauth::OAuthState::new(issuer.clone()),
+            github,
+            index,
         });
         let conns = http::listen(
             listener,

@@ -3,7 +3,21 @@
 //! run's jobs, and an attempt's log with follow. No framework, no build
 //! step, no request the CLI could not make.
 
-pub const INDEX_HTML: &str = r#"<!doctype html>
+/// Marks where [`index`] records whether GitHub sign-in is offered.
+const GITHUB_MARK: &str = "/*github*/false";
+
+/// The first page for this deployment: with `github`, it offers "Sign in with
+/// GitHub" next to the password form, returning here (`/`) afterwards.
+/// Rendered once at start, not per request.
+pub(crate) fn index(github: bool) -> String {
+    if github {
+        INDEX_HTML.replacen(GITHUB_MARK, "true", 1)
+    } else {
+        INDEX_HTML.to_owned()
+    }
+}
+
+const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -32,6 +46,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
   <input id="username" placeholder="username" autocomplete="username" required>
   <input id="password" type="password" placeholder="password" autocomplete="current-password" required>
   <button>Sign in</button>
+  <a id="github" hidden>Sign in with GitHub</a>
   <span id="who" class="muted"></span>
 </form>
 <div class="row">
@@ -46,6 +61,10 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 let csrf = null, following = null;
+// A GitHub sign-in hands this session's CSRF secret over through session
+// storage (the callback page), a password sign-in through its response.
+try { csrf = sessionStorage.getItem("sentinel-csrf"); } catch (e) {}
+const github = /*github*/false;
 // Served only at the mount point ("/" here, "/sentinel/" behind a proxy
 // for a path-carrying public_url), so that is the prefix every call needs.
 const root = location.pathname.replace(/\/+$/, "");
@@ -64,7 +83,8 @@ $("login").onsubmit = async (e) => {
   e.preventDefault();
   try {
     const me = await api("POST", "/api/v1/login", { username: $("username").value, password: $("password").value });
-    csrf = me.csrf; $("who").textContent = `signed in as ${me.user}`; $("password").value = "";
+    csrf = me.csrf; try { sessionStorage.setItem("sentinel-csrf", csrf); } catch (e) {}
+    $("who").textContent = `signed in as ${me.user}`; $("password").value = "";
     openHash();
   } catch (err) { $("who").textContent = err.message; }
 };
@@ -116,6 +136,8 @@ async function openHash() {
   if (m) await showRun(m[1]);
 }
 window.addEventListener("hashchange", openHash);
+if (github) { $("github").href = root + "/auth/github/start?return_to=%2F"; $("github").hidden = false; }
+api("GET", "/api/v1/me").then((me) => { $("who").textContent = `signed in as ${me.username || me.user}`; }).catch(() => {});
 openHash();
 </script>
 </body>

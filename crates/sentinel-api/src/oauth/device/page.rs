@@ -114,8 +114,20 @@ impl WrongCodes {
 /// `GET`/`POST /device`.
 pub(crate) fn page(state: &State, request: &mut Request, method: &str, query: &str) -> Route {
     let Some((who, csrf)) = session(state, request).and_then(|who| Some((who, who.csrf?))) else {
+        // A GET keeps its query (a verification_uri_complete carries the
+        // user code); a POST without a session starts over at the entry form.
+        let here = if method == "GET" && !query.is_empty() {
+            format!("/device?{query}")
+        } else {
+            "/device".to_owned()
+        };
+        let github = state
+            .github
+            .as_ref()
+            .map(|g| (g.start_url.as_str(), here.as_str()));
         return Ok(html::sign_in_page(
             &state.oauth.login_url,
+            github,
             TITLE,
             "Sign in to connect a device to your account.",
         ));

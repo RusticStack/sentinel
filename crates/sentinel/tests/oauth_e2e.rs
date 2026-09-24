@@ -4,7 +4,9 @@
 //! store. A "browser" is played by this test: it signs in with a local
 //! password (`/api/v1/login`), submits the consent or device page with the
 //! session cookie, and follows the `303` to the CLI's own loopback
-//! listener. Opening a real browser is not automated: every browser login
+//! listener; one login instead signs a GitHub-only account in through
+//! "Sign in with GitHub" against `sentinel_github::fake` (U07). Opening a
+//! real browser is not automated here: every browser login
 //! here uses `--no-browser`, which prints the same URL.
 //!
 //! Every CLI output (stdout and stderr) passes [`assert_no_token_material`].
@@ -34,6 +36,7 @@ use sentinel_core::{
     GrantId, RepoId, TenantId, UnixMillis, UserId,
     auth::{Audience, Namespace, Permissions as P, Principal, Role, Scopes},
 };
+use sentinel_github::fake::{Account, FakeGithub};
 use sentinel_link::{controller::Controller, identity::Identity};
 use sentinel_protocol::oauth::CLI_CLIENT_ID;
 use sentinel_store::{
@@ -43,11 +46,13 @@ use sentinel_store::{
     logs::LogStore,
     oauth::{self, GrantKind, NewGrant, RefreshError},
     objects::Objects,
+    registration::{self, Admission, Applicant, Terms},
     tokens::{self, Grant},
 };
 use serde_json::{Value, json};
 
 const PASSWORD: &str = "correct horse battery staple";
+const GITHUB_SECRET: &str = "e2e-github-client-secret";
 /// Bound on any one CLI process, so a hang fails the test instead of CI.
 const PROCESS_LIMIT: Duration = Duration::from_secs(90);
 
@@ -64,6 +69,10 @@ struct Deployment {
     root_token: String,
     dev: UserId,
     tenant: TenantId,
+    root: UserId,
+    repo: RepoId,
+    /// The GitHub-shaped fake, when GitHub sign-in is configured (U07).
+    github: Option<FakeGithub>,
 }
 
 impl Deployment {
@@ -84,6 +93,11 @@ impl Drop for Deployment {
 /// operator of `acme` with read and run on `app`; both sign in with
 /// [`PASSWORD`].
 fn deployment() -> Deployment {
+    deployment_with(false)
+}
+
+/// [`deployment`], optionally with GitHub web sign-in against a fake GitHub.
+fn deployment_with(github_sign_in: bool) -> Deployment {
     let dir = tempfile::tempdir().unwrap();
     let store =
         Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
@@ -123,6 +137,7 @@ fn deployment() -> Deployment {
         "127.0.0.1:0".parse().unwrap(),
     )
     .unwrap();
+    let github = github_sign_in.then(|| FakeGithub::start(GITHUB_SECRET));
     let server = sentinel_api::Server::start(sentinel_api::Config {
         listen: "127.0.0.1:0".parse().unwrap(),
         store: Arc::clone(&store),
@@ -133,6 +148,11 @@ fn deployment() -> Deployment {
         github_webhook_secret: None,
         intake: None,
         public_url: None,
+        github_sign_in: github.as_ref().map(|github| sentinel_api::GithubSignIn {
+            client_id: "Iv1.e2e0123456789".into(),
+            client_secret: GITHUB_SECRET.into(),
+            endpoints: github.endpoints(),
+        }),
     })
     .unwrap();
     let base = format!("http://{}", server.local_addr());
@@ -146,6 +166,9 @@ fn deployment() -> Deployment {
         root_token: sentinel_auth::token::format(&granted.secret),
         dev,
         tenant,
+        root,
+        repo,
+        github,
     }
 }
 
@@ -707,6 +730,168 @@ fn browser_login_then_status_and_commands_work() {
         .unwrap();
     assert_eq!(grants.len(), 1);
     assert_eq!((grants[0].id, grants[0].kind), (grant, GrantKind::Code));
+}
+
+/// U07: an account that exists only through GitHub (admitted by an
+/// invitation bound to its GitHub account, no password) signs the CLI in.
+/// The "browser" opens the printed URL, finds no session, follows "Sign in
+/// with GitHub" through the fake GitHub and the callback, lands back on the
+/// same consent request, approves, and follows the `303` to the CLI.
+#[test]
+fn a_github_only_account_signs_the_cli_in_through_github() {
+    let d = deployment_with(true);
+    let github = d.github.as_ref().unwrap();
+    let now = UnixMillis::now();
+    let tenant = d.tenant;
+    let invitation = d
+        .store
+        .writer()
+        .write(move |tx| {
+            registration::invite(
+                tx,
+                Authority::HostLocal,
+                Terms {
+                    tenant: Some(tenant),
+                    role: Some(Role::Operator),
+                    identity: Some(("github", "4242")),
+                    ..Terms::default()
+                },
+                now,
+            )
+        })
+        .unwrap();
+    let octo = match registration::register(
+        &d.store,
+        Applicant::External {
+            display_name: "Octo",
+            provider: "github",
+            subject: "4242",
+        },
+        Some(&invitation.secret),
+        now,
+    )
+    .unwrap()
+    {
+        Admission::Admitted(user) => user,
+        other => panic!("{other:?}"),
+    };
+    let (root, repo) = (d.root, d.repo);
+    d.store
+        .writer()
+        .write(move |tx| {
+            let admin = Principal::new(root, P::ALL, None, None);
+            auth::set_repo_grant(tx, admin, repo, octo, P::READ.union(P::RUN))
+        })
+        .unwrap();
+    github.sign_in_as(Some(Account {
+        id: 4242,
+        login: "octo".into(),
+        email: "octo@example.com".into(),
+    }));
+
+    let m = Machine::new();
+    let login = m.spawn(&[
+        "auth",
+        "login",
+        "--server",
+        &d.base,
+        "--profile",
+        "gh",
+        "--no-browser",
+    ]);
+    let url = authorize_url(&login, &d);
+    let mut pages = Vec::new();
+    // No session: the sign-in page offers GitHub beside the password form.
+    let page = request("GET", &url, Body::None, &[]);
+    assert_eq!(page.status, 200);
+    let text = page.text();
+    let at = text
+        .find("id=\"sentinel-github\" href=\"")
+        .expect("a GitHub link")
+        + 27;
+    let start = text[at..].split('"').next().unwrap().replace("&amp;", "&");
+    pages.push(text.to_owned());
+    let started = request("GET", &start, Body::None, &[]);
+    assert_eq!(started.status, 303);
+    let signin_cookie = started
+        .header("set-cookie")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let at_github = request("GET", started.header("location").unwrap(), Body::None, &[]);
+    assert_eq!(at_github.status, 302);
+    let callback = at_github.header("location").unwrap().to_owned();
+    let done = request("GET", &callback, Body::None, &[("cookie", &signin_cookie)]);
+    assert_eq!(done.status, 200, "{}", done.text());
+    let session = done
+        .headers
+        .iter()
+        .find(|(k, v)| k == "set-cookie" && v.starts_with("__Host-sentinel_session="))
+        .map(|(_, v)| v.split(';').next().unwrap().to_owned())
+        .expect("a session");
+    pages.push(done.text().to_owned());
+    // The page continues to the exact request the CLI printed.
+    let at = done.text().find("url=").unwrap() + 4;
+    let target = done.text()[at..]
+        .split('"')
+        .next()
+        .unwrap()
+        .replace("&amp;", "&");
+    assert_eq!(format!("{}{target}", d.base), url);
+
+    let consent = request("GET", &url, Body::None, &[("cookie", &session)]);
+    assert_eq!(consent.status, 200, "{}", consent.text());
+    pages.push(consent.text().to_owned());
+    let mut fields = hidden_fields(consent.text());
+    fields.push(("decision".into(), "approve".into()));
+    let pairs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let back = send(
+        &d,
+        "POST",
+        "/oauth/authorize",
+        Body::Form(&encode(&pairs)),
+        &[("cookie", &session), ("origin", &d.base)],
+    );
+    assert_eq!(back.status, 303, "{}", back.body);
+    let landed = request("GET", back.header("location").unwrap(), Body::None, &[]);
+    assert_eq!(landed.status, 200);
+    let out = login.finish();
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(out.stderr.contains("Signed in to"), "{}", out.stderr);
+
+    let runs = run_list(&m, "gh");
+    assert_eq!(runs.code, 0, "{runs:?}");
+    let status = m.run(&["auth", "status", "--json"]);
+    assert_eq!(status.code, 0, "{status:?}");
+    let doc: Value = serde_json::from_str(&status.stdout).unwrap();
+    assert_eq!(doc["signed_in"], true);
+    let grants = d
+        .store
+        .read(|c| oauth::grants(c, Authority::HostLocal, octo, 10))
+        .unwrap();
+    assert_eq!(grants.len(), 1);
+
+    // No page and no CLI output holds a GitHub token or code, the client
+    // secret, or Sentinel token material.
+    for text in pages.iter().chain([
+        &out.stdout,
+        &out.stderr,
+        &runs.stdout,
+        &runs.stderr,
+        &status.stdout,
+    ]) {
+        assert_no_token_material("a GitHub sign-in page or output", text);
+        assert!(!text.contains("gho_") && !text.contains("ghcode"), "{text}");
+        assert!(!text.contains(GITHUB_SECRET), "{text}");
+        for token in github.issued_tokens() {
+            assert!(!text.contains(&token), "{text}");
+        }
+    }
 }
 
 #[test]
