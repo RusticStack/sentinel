@@ -718,6 +718,34 @@ fn key(args: &KeyArgs) -> Result<(), Error> {
                 path.display()
             );
         }
+        KeyCommand::Rotate {
+            data,
+            key_file,
+            backup,
+        } => {
+            if !data.data_dir.is_absolute() || !backup.is_absolute() {
+                return Err(fail("data_dir and backup must be absolute paths"));
+            }
+            let path = key_file
+                .clone()
+                .unwrap_or_else(|| data.data_dir.join(MASTER_KEY_FILE));
+            // Hold the controller's database ownership lock for the whole
+            // rotation. A running controller must not keep sealing with the
+            // old in-memory key after the file changes.
+            let _owner = data
+                .data_dir
+                .join(METADATA_FILE)
+                .exists()
+                .then(|| open(data, true))
+                .transpose()?;
+            let id = sentinel_auth::sealed::Key::rotate(&path, backup)
+                .map_err(|error| fail(format!("cannot rotate the key: {error:?}")))?;
+            eprintln!(
+                "activated key {id}; retain {} and the pre-rotation backup {} with their matching database snapshots",
+                path.display(),
+                backup.display()
+            );
+        }
     }
     Ok(())
 }

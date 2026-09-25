@@ -211,7 +211,7 @@ pub enum AdminCommand {
     Invite(InviteArgs),
     /// Review pending applications; approve or reject accounts
     Account(AccountArgs),
-    /// Create the sealing key that protects second-factor seeds
+    /// Create or rotate the sealing key for second factors and source credentials
     Key(KeyArgs),
     /// Inspect or remove an account's second factor
     Mfa(MfaArgs),
@@ -588,6 +588,17 @@ pub enum KeyCommand {
         /// Where to write it; defaults to master.key inside the data directory
         #[arg(long, value_name = "FILE")]
         key_file: Option<PathBuf>,
+    },
+    /// Rotate offline, retaining old keys and writing an exclusive backup
+    Rotate {
+        #[command(flatten)]
+        data: DataDir,
+        /// Key file; defaults to master.key inside the data directory
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
+        /// New owner-only backup file for the pre-rotation key
+        #[arg(long, value_name = "FILE")]
+        backup: PathBuf,
     },
 }
 

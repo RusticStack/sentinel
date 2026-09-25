@@ -56,6 +56,8 @@ See [Tenancy](docs/tenancy.md) for tenant suspension, what it revokes and cancel
 
 See [Step-up](docs/step-up.md) for second factors, sealed TOTP seeds, recovery codes, and the step-up that gates changes to who can authenticate.
 
+See [Sealed storage](docs/sealed-storage.md) for the versioned encryption format, ownership binding, and offline master-key rotation and restore.
+
 See [Protocol contracts](docs/protocol.md) for structured errors, idempotency, event cursors, size limits and worker capability negotiation.
 
 See [Pipeline schema](docs/pipeline-schema.md) for the strict, bounded `.sentinel.yml` format and its deterministic compiler.

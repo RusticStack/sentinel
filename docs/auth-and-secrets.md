@@ -72,6 +72,8 @@ sentinel secret delete REGISTRY_TOKEN --repo RusticStack/app --if-version <versi
 
 ## 5. Storage and job injection
 
+S01's implemented encryption, key format, rotation and restore procedure are in [sealed storage](sealed-storage.md). S02–S07 supply the secret records, authorization, CLI and execution binding below.
+
 - Authenticated encryption with a maintained AEAD implementation; versioned ciphertext, unique nonces, and authenticated tenant/repo/name/version context. Master key outside SQLite under operator-controlled permissions; document rotation, backup, and restore. Never build our own cryptography.
 - Resolve allowed bindings at job preparation and record version IDs, not values. A rerun specifies whether it uses still-authorized original versions or current versions; unavailable/revoked versions fail explicitly rather than silently changing provenance.
 - Prefer job-local read-only mounted files for multiline/large secrets; allow explicit step environment bindings when a tool requires them. Short-lived delivery over authenticated worker sessions, scoped to attempt and worker identity. Prevent later unrelated steps from inheriting undeclared secrets.

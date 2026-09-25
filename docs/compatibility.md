@@ -1,5 +1,7 @@
 # Schema and API compatibility policy (C08)
 
+**S01 sealed storage.** New recoverable values use ciphertext format 2 with an authenticated key ID and ownership context; format 1 remains readable with legacy key ID 0. New master key files use the bounded `SNTLKEY2` keyring; existing raw 32-byte files remain readable and are converted on offline rotation. An old binary cannot read format-2 ciphertexts or the new key file. Upgrade controller/admin together, keep the matching key with every database backup and follow [sealed storage](sealed-storage.md) for rotation and restore. No SQLite or worker-protocol version changes.
+
 Sentinel carries several independently versioned contracts. Each has one owner, one version marker and one rule for what a change may do. Nothing is versioned implicitly: if a shape is not listed here it is internal and may change with any commit.
 
 | Contract | Marker | Where | Consumers |
@@ -10,6 +12,8 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | Cache file listing | `sentinel.files` magic + format `u8` (currently 1) | `sentinel-cache::manifest` | workers |
 | Cache miss reasons | `Miss::as_str` vocabulary | `sentinel-cache::outcome` | workers, reports |
 | Metadata database | `schema_migrations.version` (currently 37) | `sentinel-store` | controller |
+| Sealed ciphertext | leading format byte (writes 2; reads 1–2) | `sentinel-auth::sealed` | controller, host-local admin |
+| Master key file | `SNTLKEY2` magic (also reads legacy raw 32-byte file) | `sentinel-auth::sealed` | controller, host-local admin |
 | Manifest file | `SNMF` magic + format `u16` (currently 1) | `sentinel-store::objects` | controller |
 | API error | `schema: "sentinel.error/1"` | `sentinel-protocol` | CLI, MCP, UI, workers |
 | Explain output | `schema: "sentinel.explain/1"` | `sentinel-pipeline::explain` | CLI, agents |
