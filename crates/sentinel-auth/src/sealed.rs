@@ -153,17 +153,15 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("sentinel-sealed-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("master.key")
+    /// A fresh directory for key files, removed when the test ends.
+    fn scratch() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
     }
 
     #[test]
     fn a_sealed_value_opens_only_with_its_key_and_its_context() {
-        let path = scratch("roundtrip");
-        let _ = std::fs::remove_file(&path);
+        let dir = scratch();
+        let path = dir.path().join("master.key");
         Key::create(&path).unwrap();
         let key = Key::load(&path).unwrap();
 
@@ -175,8 +173,7 @@ mod tests {
         // Two sealings of one value differ: the nonce is fresh each time.
         assert_ne!(sealed, key.seal(b"usr_a", b"a totp seed"));
 
-        let other = scratch("other");
-        let _ = std::fs::remove_file(&other);
+        let other = dir.path().join("other.key");
         Key::create(&other).unwrap();
         let other = Key::load(&other).unwrap();
         assert_eq!(other.open(b"usr_a", &sealed), Err(SealError::Unsealable));
@@ -185,8 +182,8 @@ mod tests {
 
     #[test]
     fn damaged_truncated_or_unknown_versions_are_refused() {
-        let path = scratch("damaged");
-        let _ = std::fs::remove_file(&path);
+        let dir = scratch();
+        let path = dir.path().join("master.key");
         Key::create(&path).unwrap();
         let key = Key::load(&path).unwrap();
         let sealed = key.seal(b"ctx", b"seed");
@@ -212,8 +209,8 @@ mod tests {
 
     #[test]
     fn a_key_file_is_created_once_and_must_be_the_right_size() {
-        let path = scratch("create");
-        let _ = std::fs::remove_file(&path);
+        let dir = scratch();
+        let path = dir.path().join("master.key");
         Key::create(&path).unwrap();
         assert_eq!(
             Key::create(&path),
