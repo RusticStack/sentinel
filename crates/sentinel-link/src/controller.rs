@@ -3057,11 +3057,14 @@ pub const HANDOFF_BOUND: Duration = Duration::from_millis(600);
 /// unanswered when every closed session's worker advertised
 /// `HANDOFF_ANSWER`, so the silence means the close was not delivered. A
 /// close the tunnel dropped is resent only by the helper that took it, on
-/// its own retransmission clock: live, with 800 ms of loss at the worker,
-/// closes arrived 1.4 s (direct) and up to 2.8 s (relayed) after they were
-/// sent, and the direct ones were lost for good when the helper went at
-/// 600 ms. Such a worker that redials into the old helper meanwhile is
-/// closed as well, and replaces its forward on that close too.
+/// its own retransmission clock: live, with exactly 800 ms of loss at the
+/// worker, closes arrived 1.40 s (direct) and 0.95-1.03 s (relayed) after
+/// they were sent, answered in 40 of 40 changes, and the direct ones were
+/// lost for good when the helper went at 600 ms. A loss held longer moves
+/// the resend to a later retransmission (about 2.9 s relayed after about
+/// 0.9 s of loss), which this bound does not wait for. Such a worker that
+/// redials into the old helper meanwhile is closed as well, and replaces
+/// its forward on that close too.
 pub const HANDOFF_RESEND_BOUND: Duration = Duration::from_millis(3_000);
 /// After the last closed connection ended: time for the old helper to send
 /// the close on through the tunnel before it is killed.

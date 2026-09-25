@@ -16,8 +16,9 @@
 //! and NAT boundary, but rootless Podman / slirp4netns is not what is proven.
 //! The allow-list hand-off test also needs `nsenter` (util-linux): it runs a
 //! worker link in a parked container's network namespace, and for its
-//! relay-only half drops UDP other than DNS there with `iptables` (and, for
-//! 800 ms around some changes, everything arriving there).
+//! relay-only half drops UDP other than DNS there with `iptables`; for
+//! 800 ms around some changes it drops everything arriving there with `nft`
+//! (nftables), through a set element the kernel expires on time.
 //!
 //! One side of each tunnel runs in a container, so the link port on the host
 //! and in the container are different sockets: a byte that comes back went
@@ -36,7 +37,7 @@
 //! cp /etc/ssl/certs/ca-certificates.crt /tmp/tailcat-live-ca.pem
 //! SENTINEL_TAILCAT_DERPER=/root/derper-bin/derper \
 //! SENTINEL_TAILCAT_DERP_CA=/tmp/tailcat-live-ca.pem SSL_CERT_FILE=/tmp/tailcat-live-ca.pem \
-//!   (plus the command above; PATH must include /usr/sbin for podman and iptables)
+//!   (plus the command above; PATH must include /usr/sbin for podman, iptables and nft)
 //! ```
 
 #![cfg(target_os = "linux")]
@@ -988,14 +989,14 @@ const HANDOFF_TEST: &str = "an_allow_list_change_hands_tunnelled_sessions_to_the
 /// It takes about 55 minutes; the `SENTINEL_TAILCAT_LIVE_*` counts in
 /// [`plan`] shorten a development run.
 #[test]
-#[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman + nsenter + iptables"]
+#[ignore = "live helper: SENTINEL_TAILCAT_LIVE=<pinned tailcat> + podman + nsenter + iptables + nft"]
 fn an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper() {
     if let Some(dir) = std::env::var_os(WORKER_ROLE) {
         play_worker(Path::new(&dir));
         return;
     }
     let _serial = LIVE.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(helper) = gate(&["podman", "nsenter", "iptables"]) else {
+    let Some(helper) = gate(&["podman", "nsenter", "iptables", "nft"]) else {
         return;
     };
     use sentinel_link::{controller::Controller, identity::Identity};
@@ -1483,52 +1484,82 @@ impl Drop for NetnsUdpBlock {
 const LOSS: Duration = Duration::from_millis(800);
 
 /// Everything arriving in one network namespace other than on loopback
-/// dropped for [`LOSS`], from `engage` on; the rule is removed on its own
-/// timer (a hand-off in progress must not hold it up), and `lift` waits for
-/// that.
+/// dropped for [`LOSS`], from `engage` on. The kernel ends the loss: the
+/// drop matches an nft set element that expires after [`LOSS`], so neither
+/// a hand-off in progress nor a slow `nft` or `iptables` call can stretch
+/// it. (Removing an `iptables` rule from a timer thread did: the "800 ms"
+/// held for 0.85-4.1 s, and a close resent after it was lifted reached the
+/// worker after the old helper had gone.) `lift` waits out the window and
+/// removes the table.
 struct NetnsLoss {
-    lifter: Option<std::thread::JoinHandle<()>>,
+    pid: String,
+    until: Instant,
+    removed: bool,
 }
 
 impl NetnsLoss {
-    const RULE: [&str; 5] = ["INPUT", "!", "-i", "lo", "-j"];
+    const TABLE: &str = "sentinel_live_loss";
 
-    fn rule(pid: &str, op: &str) -> bool {
-        Command::new("nsenter")
+    fn nft(pid: &str, script: &str) -> bool {
+        let Ok(mut child) = Command::new("nsenter")
             .arg(format!("--net=/proc/{pid}/ns/net"))
-            .args(["iptables", op])
-            .args(Self::RULE)
-            .arg("DROP")
-            .status()
-            .is_ok_and(|status| status.success())
+            .args(["nft", "-f", "-"])
+            .stdin(Stdio::piped())
+            .spawn()
+        else {
+            return false;
+        };
+        let written = child
+            .stdin
+            .take()
+            .is_some_and(|mut stdin| stdin.write_all(script.as_bytes()).is_ok());
+        child.wait().is_ok_and(|status| status.success()) && written
     }
 
     fn engage(pid: &str) -> Self {
-        assert!(
-            Self::rule(pid, "-I"),
-            "iptables failed inside the worker's namespace"
+        let table = Self::TABLE;
+        let ms = LOSS.as_millis();
+        // `add` then `delete` makes the reset idempotent; the element is
+        // added last, so the window starts once everything is in place.
+        let script = format!(
+            "add table inet {table}\n\
+             delete table inet {table}\n\
+             table inet {table} {{\n\
+               set until {{ type iface_type; flags timeout; }}\n\
+               chain input {{ type filter hook input priority raw; policy accept; meta iiftype @until drop; }}\n\
+             }}\n\
+             add element inet {table} until {{ ether timeout {ms}ms }}\n"
         );
-        let pid = pid.to_owned();
-        let lifter = std::thread::spawn(move || {
-            std::thread::sleep(LOSS);
-            assert!(Self::rule(&pid, "-D"), "the loss rule could not be removed");
-        });
+        let engaged_at = Instant::now();
+        assert!(
+            Self::nft(pid, &script),
+            "nft failed inside the worker's namespace"
+        );
         Self {
-            lifter: Some(lifter),
+            pid: pid.to_owned(),
+            // The element may have been added at any point of the call.
+            until: engaged_at + LOSS,
+            removed: false,
         }
     }
 
+    fn remove(&self) -> bool {
+        Self::nft(&self.pid, &format!("delete table inet {}\n", Self::TABLE))
+    }
+
     fn lift(mut self) {
-        if let Some(lifter) = self.lifter.take() {
-            lifter.join().unwrap();
-        }
+        // Nothing reaching the worker is dropped past the element's expiry;
+        // the table goes so that the next round starts from nothing.
+        std::thread::sleep(self.until.saturating_duration_since(Instant::now()));
+        self.removed = self.remove();
+        assert!(self.removed, "the loss table could not be removed");
     }
 }
 
 impl Drop for NetnsLoss {
     fn drop(&mut self) {
-        if let Some(lifter) = self.lifter.take() {
-            let _ = lifter.join();
+        if !self.removed {
+            let _ = self.remove();
         }
     }
 }
