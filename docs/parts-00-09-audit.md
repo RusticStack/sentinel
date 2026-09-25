@@ -72,7 +72,7 @@ Evidence corrections (foundation, `20bbeb1` and `cbde766`):
   - The crash test is described as proving commit-before-acknowledge ordering, not fsync durability.
 - **[Protocol](protocol.md):** the limits table now lists the artifact and OAuth-form limits.
 - **`Hello`:** the comment now says `software` is bounded only by the frame.
-- **Still open:** README.md line 5 still says the Parts 01–02 audit "records open execution-integration gates". The integrator must correct it; see the TODO edits.
+- ~~**Still open:** README.md line 5 still says the Parts 01–02 audit "records open execution-integration gates".~~ Closed: `fca2d1e` corrected the README.
 
 ## Part 03 — identity, tenants and registration (A01–A08)
 
@@ -735,8 +735,7 @@ Still open after this verification:
 - ~~macOS hardware runs.~~ No longer open: macOS was dropped by decision on 2026-09-24.
 - U07 — closed since: GitHub web sign-in is routed through the consent, device and first pages (migration 37; [GitHub sign-in](github-sign-in.md#browser-routes-u07)).
 - The ~20 s allow-list outage floor (heartbeat detection). Closed since by [the hand-off](#follow-up-tailcat-allow-list-hand-off).
-- S05 tenant-scoped registry authorization.
-- B04, R01 and R04 as written in the tracker.
+- S05, B04, R01 and R04: see the final list in [Closing verification](#closing-verification-parts-0009).
 
 ## macOS dropped
 
@@ -876,8 +875,7 @@ An instrumented run confirmed where the error came from: all 10 failures were th
 Still open:
 
 - ~~Podman test shims leaving a `/tmp/.tmp*` directory per run.~~ Closed since by `test: keep one podman shim directory per test binary and sweep dead runs`: `executor_faults.rs`, `runtime_failures.rs` and `recovery.rs` now use one `sentinel-<tag>-shim-<pid>` directory per test binary and remove those of exited runs; the 164 leftover directories in WSL `/tmp` were removed.
-- S05 tenant-scoped registry authorization.
-- B04, R01 and R04 as written in the tracker.
+- S05, B04, R01 and R04: see the final list in [Closing verification](#closing-verification-parts-0009).
 
 ## Follow-up: three test gaps closed
 
@@ -984,3 +982,83 @@ Verification on `tailcat-edges`, one command at a time. The first round ran befo
 | WSL2, rootful Podman | the live Tailcat suite as its header documents (`SENTINEL_TAILCAT_LIVE`, `SENTINEL_TAILCAT_DERPER`, `SENTINEL_TAILCAT_DERP_CA` = `SSL_CERT_FILE`, `/usr/sbin` on `PATH`, `nsenter`, `iptables`) | 0 | 8 passed in 3,470.7 s; live probe `path Relay, rtt 68.32ms`; self-hosted relay `pong in 330µs via DERP(local)`; hand-off figures as in the "after" columns |
 
 The full workspace suite was left to the integrator. Two runs stopped by hand left eight `/tmp/.tmp*` test directories and one container (`sentinel-live-derp-bridge`), and those were removed. Afterwards no `tailcat` or `derper` process, no container of root or `sentinelbench`, no test `iptables` rule and no `/tmp` scratch of these runs was left.
+
+## Closing verification (Parts 00–09)
+
+Two branches were merged into `part-09` last, and each had been checked only with its own tests: `close-test-gaps` (tests for P04-15, duplicate offers and the Windows pending-delete log segment, plus the `ERROR_DELETE_PENDING` fallback) and `tailcat-edges` (hand-off of connections still in their handshake; capability bit 8 `HANDOFF_ANSWER` and the resend window). This is the closing verification of the merged tree, on the development host above (WSL2 kernel 6.18.33.2, i7-13700KF). Every cargo command ran on its own. Before the build, `cargo clean` confirmed that `target` did not exist on either side, `target/wsl` included, so every build started from scratch.
+
+The matrix ran on `8551d38`. It found two defects, both in tests, and each was fixed at its cause:
+
+- `b878a4a` `test: keep the sealed-key tests' scratch in removed temporary directories`
+- `fedabfc` `test: end the live Tailcat loss window in the kernel, not from a timer thread`
+
+The tree after them is `fedabfc`. Neither commit touches library code apart from one doc comment. The live suite was run again on `fedabfc`. The sealed-key tests were run again on both platforms, and `fmt-check` and `lint-linux` were run again after both fixes. Test counts come from the `test result:` lines. "Binaries" counts libtest harnesses; doc-test runs are counted separately.
+
+**Failure 1: the live suite, `an_allow_list_change_hands_tunnelled_sessions_to_the_new_helper` (relay path, loss round 1 of 6).** The assertion was `relay Lossy: a close went unanswered`. The worker saw the close after 3.005 s, just past the 3 s resend bound, so the old helper had already gone and the change cost 7.29 s. The other 5 relayed and 6 direct loss changes passed. Diagnosis:
+
+- `tcpdump` is not installed, so the TCP state was sampled every 20 ms with `ss -tino`, in the worker's namespace and on the host. The loss rule was sampled as well, in a diagnostic run of loss rounds only.
+- The test meant to drop everything arriving at the worker for 800 ms. It inserted an `iptables` rule, and a timer thread removed it with `nsenter iptables -D`. The `iptables` process's latency held the rule for **0.85–4.1 s**: 12 samples were 0.854, 0.855, 0.931, 3.864, 2.618, 0.913, 0.873, 0.848, 1.811, 3.251, 4.115 and 1.152 s.
+- The TCP samples show the retransmission of the worker's own segment backing off: RTO 0.25, 0.5, 1, 2 and 4 s. A relayed close therefore arrived only on the first retransmission after the rule was lifted. That was 0.95–1.03 s after an 800 ms window, 1.95 s after a 1.8 s one, and 2.98–7.7 s after longer ones.
+- A diagnostic run with loss rounds only (3 per path) reproduced the failure: relay round 3 was seen at 7.67 s. A second diagnostic run (6 per path) had two direct rounds cut at 16.2 and 17.8 s, and three relay rounds unanswered.
+- The product behaved as designed. The fault was a loss window that ran past the one the test specified.
+
+The fix: the drop now matches an nftables set element with an 800 ms timeout, and the kernel expires it. `NetnsLoss` loads the table idempotently and adds the element. `lift` waits out the window and removes the table, and dropping a `NetnsLoss` removes it too. The live test now also requires `nft`, and its header says so. A veth probe of the mechanism gave windows of 0.801–0.812 s over 10 runs. Stress with the fixed harness, 20 loss changes per path: **40 of 40 answered**. The close was seen after 1.403–1.405 s direct and 0.95–1.03 s relayed, and the changes cost 4.73–5.68 s and 5.08–5.66 s.
+
+The earlier loss figures ([hand-off edges](#follow-up-tailcat-hand-off-edges): "0.96–1.89 s" relayed, and the resend bound's comment, "up to 2.8 s") were measured through windows that may have run long. The comment on `HANDOFF_RESEND_BOUND` now cites the figures above. [Configuration](configuration.md#optional-tailcat-transport) notes the change. The bound itself was not changed: with a true 800 ms loss every close came back well inside 3 s. A loss held longer defers the resend to a later retransmission, which the bound does not wait for, and the worker then falls back as the design describes.
+
+**Failure 2: the sealed-key unit tests leaked scratch (found while inventorying `/tmp` before the Podman suites).** Each workspace test run left four `sentinel-sealed-<pid>-*` directories in the system temp directory, and some held a generated `master.key`. On Linux, the four test runs of this verification left 16 in `/tmp`. The Windows temp directory had accumulated 311, 162 of them holding a key file. `sentinel-auth/src/sealed.rs` now uses `tempfile` directories, so `tempfile` became a dev-dependency of `sentinel-auth` and `Cargo.lock` gained one line. The fix was checked with the sealed-key tests on Windows (3 passed) and the lib tests on WSL2 (29 passed): no directory was left on either side. The old directories were removed.
+
+**Log capture (not a failure).** The first `test-server` and `test-linux` runs sent stdout and stderr through one redirect out of `wsl.exe`. That log lost lines: it showed 114 and 122 binaries with 986 and 958 passes, although both exited 0. Both were run again with stdout and stderr in separate files inside WSL. The table gives those runs, and they agree with each other.
+
+| Where | Command | Exit | Result |
+|---|---|---|---|
+| Windows (fresh `target`) | `cargo fmt-check` | 0 | clean |
+| Windows | `cargo lint` | 0 | no warnings (44 s) |
+| Windows | `cargo test-cli --no-fail-fast` | 0 | 125 binaries and 14 doc-test runs: 898 passed, 0 failed, 4 ignored (464 s) |
+| Windows | `cargo release-cli` | 0 | built (52 s) |
+| WSL2 (fresh `target/wsl`) | `cargo lint-linux` | 0 | no warnings (28 s); 0 again on `fedabfc` |
+| WSL2 | `cargo test-server --no-fail-fast` | 0 | 125 binaries and 14 doc-test runs: 1,088 passed, 0 failed, 18 ignored (456 s) |
+| WSL2 | `cargo test-linux --no-fail-fast` | 0 | 125 binaries and 14 doc-test runs: 1,088 passed, 0 failed, 18 ignored (518 s) |
+| WSL2 | `cargo release-linux` | 0 | built (60 s) |
+| WSL2, rootless Podman 4.9.3 as `sentinelbench` | each gated worker binary with `SENTINEL_PODMAN_TESTS=1` | 0 each | `podman` 3, `end_to_end` 1, `compiler_cache` 1, `k09` 3, `slice` 1 (36.7 s), `images` 2, `prefetch` 2 (+1 ignored measurement), `executor_faults` 4 (86.2 s), `executor::tests::a_panicking_attempt_is_torn_down_and_reported` 1: 18 passed, 0 failed, none skipped; no container left after any binary |
+| WSL2 | `SENTINEL_CRASH_TESTS=1` `crash_consistency` `posix_crash_states` | 0 | 724 traced calls, 889 crash points, 2,403 distinct crash states, every promise kept (46.8 s) |
+| WSL2, root | `SENTINEL_POWER_LOSS_TESTS=1` `crash_consistency` `power_cut_on_dm_flakey` | 0 | 52 power cuts on ext4 and 52 on XFS, every promise kept (48.5 s); no `dm` or loop device left |
+| WSL2, rootful Podman, `8551d38` | the live Tailcat suite as its header documents (`SENTINEL_TAILCAT_LIVE`, `SENTINEL_TAILCAT_DERPER`, `SENTINEL_TAILCAT_DERP_CA` = `SSL_CERT_FILE`, `/usr/sbin` on `PATH`), default counts | 101 | 7 passed, 1 failed in 3,664.3 s: failure 1 above |
+| WSL2, rootful Podman, `fedabfc` | the same, with `nft` | 0 | **8 passed in 3,520.8 s** (3,689.8 s with the build); figures below |
+| Windows, `fedabfc` | `cargo test --locked -p sentinel-auth --lib sealed` | 0 | 3 passed; no `sentinel-sealed-*` left |
+| WSL2, `fedabfc` | `cargo test --locked -p sentinel-auth --lib` | 0 | 29 passed; no `sentinel-sealed-*` left |
+| WSL2, release | `cargo test --release -p sentinel-store --test fleet_load -- --ignored --nocapture --test-threads=1` | 0 | 2 passed; 10,000 of 10,000 jobs placed, 0 placement failures, first wave per tenant [700, 300, 300, 300], 7 waves, 107 rounds, 4,526 ms, `place()` p50 276 µs, p99 674 µs; a 5,000-job queue listed in 4,446 µs (limit 100) |
+
+**Live figures on `fedabfc`** (per path; changes are handed off unless stated):
+
+| | Direct | Relay only |
+|---|---|---|
+| Path probe | `path Direct, rtt 260µs` | `DERP(local)`: pong in 430 µs |
+| Cut, no hand-off (4) | 18.25–20.55 s | 20.69–20.84 s |
+| Settled session (64): outage | 3.32–4.30 s | 3.61–4.70 s |
+| Settled: close not seen within 500 ms, unanswered | 0, 0 | 0, 0 |
+| Settled: old helper kept | 106–109 ms | 172–204 ms |
+| Connection held in its handshake (10) | 3.35–4.27 s | 4.32–4.56 s |
+| 800 ms of loss at the worker (6): outage | 5.53–5.70 s | 5.31–5.46 s |
+| Loss: close seen after, unanswered | 1.405–1.407 s, 0 | 0.95–0.99 s, 0 |
+| Worker without the bit (10) | 4.10–4.29 s; helper kept at most 600.4 ms | 4.32–4.54 s; kept at most 600.3 ms |
+| Removal | close seen after 411 ms (helper kept 513 ms); kept out for the 45 s checked | |
+
+The other live tests passed as well: key rotation with an overlap window, a revoked peer's re-dial, a dead address, supervisor admission, and the relay-only DERP report.
+
+**Contracts.** [Compatibility](compatibility.md) records migration 37 (`037_sign_in_return`, the last entry in `schema.rs`) and capability bit 8 (`HANDOFF_ANSWER = 1 << 8` in `negotiate.rs`). The worker protocol range is `1..=9` and `SUPPORTED_MAX` is 9.
+
+**Cleanup.** No `tailcat` or `derper` process was running afterwards, and neither root nor `sentinelbench` Podman held a container. No network namespace or test nftables table was left. From WSL `/tmp`, the following Sentinel scratch was removed:
+
+- the three Podman shim directories of exited test runs (`sentinel-executor-faults-shim-*`, `sentinel-recovery-shim-*` and `sentinel-runtime-failures-shim-*`);
+- the 16 `sentinel-sealed-*` directories of failure 2;
+- the live suite's CA copy.
+
+No `/tmp/.tmp*` directory was left. Among Windows temp directories, the 311 `sentinel-sealed-*` directories were removed. Four `sentinel-q06-*` directories from 2026-09-17 (a fake helper and its argument log) were left; no current code creates them. Finally, `cargo clean` removed 27.1 GiB (60,628 files), and `target` no longer exists, `target/wsl` included. GitLab, Gitea, kind and docker in WSL were not touched.
+
+**Parts 00–09 are closed.** Still open, and each belongs to a later backlog task:
+
+- **S05:** tenant-scoped private-registry authorization (P07-12). A pull should authorize with the attempt's tenant's own registry credential. A digest already in the worker's store should serve a tenant only after that tenant's authorization. Until then, registry authority is worker-wide and `podman image exists` serves any tenant ([executor](executor.md)). This arrives with per-attempt secret delivery.
+- **B04:** profile source, image and cache materialization, build and test execution, disk wait, CPU throttling, lock wait and required output publication; then optimize the largest measured critical-path cost, with before/after artifacts. The three audit items deferred to B04 are closed ([B04 follow-up](#b04-follow-up-image-prefetch-and-transfer-copies)); the task itself remains.
+- **R01:** byte and age quotas and retention at the deployment, tenant, repository and run levels; active-use-safe LRU/GC; stale upload cleanup; disk watermarks and reserved metadata capacity; defaults chosen from measured hardware. The worker spool's free-space item is closed and no longer in R01's text.
+- **R04:** consistent online backup of metadata, manifests and objects; integrity verification; secret-key backup instructions; a restore command or procedure; and recovery-point and recovery-time objectives with a measured drill. Tailcat node-key rotation is closed and no longer in R04's text.
