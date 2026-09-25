@@ -99,6 +99,11 @@ identifier!(
     "rep"
 );
 identifier!(
+    /// One tenant-owned secret name and scope; versions retain this identity.
+    SecretId,
+    "sec"
+);
+identifier!(
     /// One compiled pipeline execution for one source revision.
     RunId,
     "run"

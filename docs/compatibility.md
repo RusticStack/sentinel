@@ -88,6 +88,8 @@ Readers reject a database newer than their highest known migration. Migration 4 
 
 **Limits.** Every numeric limit in `sentinel-protocol::limits` and the pipeline crate may be raised without a version change and lowered only with one, since lowering can reject previously valid input.
 
+**Scoped secrets (migration 38, S02).** Migration 38 adds `secrets`, `secret_versions`, `secret_repo_allow`, `secret_bindings`, and `secret_audit`; existing rows and wire formats do not change. Secret IDs use the new `sec_` typed UUID prefix. Scope is tenant or repository; secret names are at most 64 bytes and match `[A-Z_][A-Z0-9_]*`; values are 1–65,536 bytes before sealing. Version numbers start at 1, increase on each rotation, and are never reused. The repository allowlist and bindings are separate: allowing a tenant secret does not itself inject it. A stored binding names a source secret ID and job/step selector, and a collision requires an explicit repository override. Encrypted values use S01's format-2 ciphertext and `secret/v1` ownership context. An older release refuses migration marker 38. [Scoped secrets](secrets.md) defines the resolution and audit behavior. S02 adds no HTTP or worker-protocol messages.
+
 ## Verification behind this policy
 
 The C08 test suites exercise the failure modes the policy relies on:

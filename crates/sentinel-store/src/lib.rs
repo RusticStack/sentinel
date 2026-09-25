@@ -31,6 +31,7 @@ pub mod provenance;
 pub mod registration;
 pub mod runs;
 pub mod schema;
+pub mod secrets;
 pub mod sign_in;
 pub mod sources;
 pub mod sources_forge;
