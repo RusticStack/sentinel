@@ -1,6 +1,6 @@
 # OAuth, CLI/MCP access, and secret management
 
-Status: OAuth/secrets implementation contract. The CLI half of the OAuth design is implemented (Part 09): the integrated authorization server with authorization code + PKCE, device authorization, rotating refresh tokens and service-account grants ([OAuth](oauth.md)), and CLI sign-in with profiles and OS/owner-only credential storage ([CLI](cli.md)). Remote MCP OAuth (§3, Part 11) and secret management (Part 10) are not implemented yet, and the consent and device pages sign in with a local password or, when configured, through GitHub (U07). This extends the multi-tenant roles/registration policy in [plan.md](../plan.md). Built for humans and coding agents to use the same scoped operations with little repeated setup.
+Status: the integrated authorization server, CLI profiles, secret management, MCP stdio, and protected Streamable HTTP MCP transport are implemented ([OAuth](oauth.md), [CLI](cli.md), [MCP](mcp.md), [secrets](secrets.md)). Client metadata discovery/registration and actual-client conformance remain in X06–X07. Consent and device pages sign in with a local password or, when configured, through GitHub (U07). This extends the multi-tenant roles/registration policy in [plan.md](../plan.md). Built for humans and coding agents to use the same scoped operations with little repeated setup.
 
 ## 1. Identities and tokens
 
@@ -37,14 +37,14 @@ Support authorization-server metadata, token/revocation endpoints, PKCE, and dev
 
 ## 3. Remote MCP OAuth
 
-Pin an MCP protocol version during implementation; current research used the **2025-11-25** authorization specification. Implement:
+The remote Streamable HTTP transport pins protocol revision **2025-11-25**. Its protected-resource metadata, authorization-server discovery, PKCE, resource-bound audience, session and origin checks, and refusal to pass tokens upstream are implemented. Remaining client registration and metadata policy is tracked under X06; actual-client conformance is tracked under X07. The following contracts apply:
 
 - OAuth Protected Resource Metadata (RFC 9728) advertising authorization server(s); useful HTTP 401 `WWW-Authenticate` discovery.
 - Authorization server discovery/metadata; authorization code + PKCE for public clients.
 - Resource indicators and token audience validation for the intended MCP endpoint. Reject a token intended for another API/resource even if issued by the same deployment. No upstream token passthrough.
 - Pre-registered clients for first-party CLI/test clients. Support Client ID Metadata Documents where target clients use them, with bounded HTTPS fetch/redirect behavior and SSRF protection; permit dynamic registration only when required by selected clients and instance policy. Client registration does not register users or approve tenants.
 - Exact permitted redirect URI validation, explicit consent/grants, scope errors, refresh/revocation, origin/session handling, and per-resource tenant authorization.
-- Compatibility tests against at least two actual target MCP clients: discovery, login, refresh, insufficient scopes, denied registration, changed roles, expired grants, wrong audience, and reconnect. A generic bearer-token endpoint alone is not “MCP OAuth support.”
+- Compatibility tests against at least two actual target MCP clients: discovery, login, refresh, insufficient scopes, denied registration, changed roles, expired grants, wrong audience, and reconnect.
 
 Stdio is different: `sentinel mcp` retrieves the local CLI credential profile and talks to the API. It does not implement OAuth redirects over stdio. The X04 tools use repository-scoped reads and writes plus metadata-only secret inspection; see [MCP](mcp.md). Environment-based credentials may be supported for explicit automation, but prefer local credential handles to copying tokens into MCP configuration or model messages.
 

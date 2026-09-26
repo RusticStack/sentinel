@@ -55,6 +55,7 @@ pub(super) struct Params<'a> {
     pub state: &'a str,
     pub code_challenge: &'a str,
     pub scopes: Scopes,
+    pub audience: Audience,
     pub resource: Option<&'a str>,
 }
 
@@ -167,7 +168,7 @@ fn approve(state: &State, form: &Form, params: &Params<'_>, who: &Identity) -> R
         scopes: params.scopes,
         tenant,
         repo,
-        audience: Audience::Api,
+        audience: params.audience,
     };
     match codes::approve(&state.store, &approval, UnixMillis::now()) {
         Ok(code) => {
@@ -290,18 +291,20 @@ fn validate<'a>(state: &State, form: &'a Form) -> Result<Params<'a>, Reply> {
         );
     }
     let resource = form.get("resource");
-    if resource.is_some_and(|r| r != state.oauth.api_resource) {
-        return fail(
-            OAuthErrorCode::InvalidTarget,
-            "resource must be this deployment's API",
-        );
-    }
+    let audience = match resource {
+        None => Audience::Api,
+        Some(resource) => match state.oauth.resource_audience(resource) {
+            Some(audience) => audience,
+            None => return fail(OAuthErrorCode::InvalidTarget, "resource is not served here"),
+        },
+    };
     Ok(Params {
         client,
         redirect_uri,
         state: state_value,
         code_challenge,
         scopes,
+        audience,
         resource,
     })
 }
@@ -382,7 +385,12 @@ fn unavailable(e: &sentinel_store::Error) -> Reply {
 /// looked-up `client_id`; `resource` has already been checked. A client
 /// could only have obtained a code through a redirect it may use, so there
 /// is no separate capability flag: the code binds the client.
-pub(crate) fn token(state: &State, client: &Client, form: &Form) -> Reply {
+pub(crate) fn token(
+    state: &State,
+    client: &Client,
+    form: &Form,
+    resource: Option<Audience>,
+) -> Reply {
     let (Some(code), Some(redirect_uri), Some(verifier)) = (
         form.get("code"),
         form.get("redirect_uri"),
@@ -397,7 +405,15 @@ pub(crate) fn token(state: &State, client: &Client, form: &Form) -> Reply {
         return super::error(OAuthErrorCode::InvalidGrant, "code is not valid");
     };
     let now = UnixMillis::now();
-    match codes::exchange(&state.store, &client.id, &code, redirect_uri, verifier, now) {
+    match codes::exchange(
+        &state.store,
+        &client.id,
+        &code,
+        redirect_uri,
+        verifier,
+        resource,
+        now,
+    ) {
         Ok(minted) => super::token_reply(&minted, now),
         Err(CodeError::Invalid | CodeError::Replay) => {
             super::error(OAuthErrorCode::InvalidGrant, "code is not valid")

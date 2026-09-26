@@ -122,17 +122,7 @@ pub fn identify(
                         sentinel_store::oauth::authenticate_access(c, &secret, Audience::Api, now)
                     })
                     .map_err(refused)?;
-                let principal = authenticated.principal;
-                Ok(Identity {
-                    principal,
-                    user: principal.user,
-                    super_admin: principal.permissions.contains(Permissions::PLATFORM_ADMIN),
-                    via: Via::OAuth,
-                    csrf: None,
-                    scopes: authenticated.scopes,
-                    grant: Some(authenticated.grant),
-                    expires: Some(authenticated.expires),
-                })
+                Ok(oauth_identity(authenticated))
             }
         };
     }
@@ -159,6 +149,37 @@ pub fn identify(
         grant: None,
         expires: None,
     })
+}
+
+/// Authenticate only an OAuth access token issued for the remote MCP
+/// resource. API credentials and browser sessions are not ambient MCP auth.
+pub(crate) fn identify_mcp(
+    store: &Store,
+    authorization: Option<&str>,
+    now: UnixMillis,
+) -> Result<Identity, Refusal> {
+    let header = authorization.ok_or(Refusal::Unauthenticated)?;
+    let Bearer::Access(secret) = oauth::bearer(header).ok_or(Refusal::Unauthenticated)? else {
+        return Err(Refusal::Unauthenticated);
+    };
+    let authenticated = store
+        .read(|c| sentinel_store::oauth::authenticate_access(c, &secret, Audience::Mcp, now))
+        .map_err(refused)?;
+    Ok(oauth_identity(authenticated))
+}
+
+fn oauth_identity(authenticated: sentinel_store::oauth::Authenticated) -> Identity {
+    let principal = authenticated.principal;
+    Identity {
+        principal,
+        user: principal.user,
+        super_admin: principal.permissions.contains(Permissions::PLATFORM_ADMIN),
+        via: Via::OAuth,
+        csrf: None,
+        scopes: authenticated.scopes,
+        grant: Some(authenticated.grant),
+        expires: Some(authenticated.expires),
+    }
 }
 
 /// Require every scope in `required`. The refusal is `forbidden` with

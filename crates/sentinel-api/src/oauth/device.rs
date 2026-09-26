@@ -16,7 +16,10 @@ use std::{
 };
 
 use sentinel_auth::oauth::{self as forms, Kind};
-use sentinel_core::{UnixMillis, auth::Scopes};
+use sentinel_core::{
+    UnixMillis,
+    auth::{Audience, Scopes},
+};
 use sentinel_protocol::oauth::{DEVICE_VERIFICATION_PATH, DeviceAuthorization, OAuthErrorCode};
 use sentinel_store::{
     Error as StoreError,
@@ -66,15 +69,13 @@ fn authorize(state: &State, request: &mut Request) -> Reply {
             "this client may not use the device flow",
         );
     }
-    if form
-        .get("resource")
-        .is_some_and(|resource| resource != state.oauth.api_resource)
-    {
-        return error(
-            OAuthErrorCode::InvalidTarget,
-            "resource must be this deployment's API",
-        );
-    }
+    let audience = match form.get("resource") {
+        None => Audience::Api,
+        Some(resource) => match state.oauth.resource_audience(resource) {
+            Some(audience) => audience,
+            None => return error(OAuthErrorCode::InvalidTarget, "resource is not served here"),
+        },
+    };
     let scopes = match form.get("scope").map(Scopes::parse) {
         None => Scopes::CLI_DEFAULT.intersect(client.max_scopes),
         Some(Ok(scopes)) => scopes,
@@ -87,13 +88,7 @@ fn authorize(state: &State, request: &mut Request) -> Reply {
         );
     }
     let now = UnixMillis::now();
-    let start = match device::begin(
-        &state.store,
-        &client.id,
-        scopes,
-        sentinel_core::auth::Audience::Api,
-        now,
-    ) {
+    let start = match device::begin(&state.store, &client.id, scopes, audience, now) {
         Ok(start) => start,
         Err(StoreError::QuotaExceeded) => {
             let mut reply = error_status(
@@ -179,7 +174,12 @@ fn remember(
 /// §3.4–3.5): `authorization_pending`, `slow_down`, `access_denied`,
 /// `expired_token`, or the tokens exactly once; any later poll is
 /// `invalid_grant`.
-pub(crate) fn token(state: &State, client: &Client, form: &Form) -> Reply {
+pub(crate) fn token(
+    state: &State,
+    client: &Client,
+    form: &Form,
+    resource: Option<Audience>,
+) -> Reply {
     if !client.device {
         return error(
             OAuthErrorCode::UnauthorizedClient,
@@ -202,7 +202,7 @@ pub(crate) fn token(state: &State, client: &Client, form: &Form) -> Reply {
         );
     }
     let now = UnixMillis::now();
-    let outcome = device::poll(&state.store, &client.id, &presented, now);
+    let outcome = device::poll(&state.store, &client.id, &presented, resource, now);
     // A final answer ends pacing; a busy store is retried at the same pace.
     if matches!(
         outcome,

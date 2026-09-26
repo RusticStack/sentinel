@@ -175,6 +175,13 @@ pub fn send(
             }
             request.call()
         }
+        ("DELETE", _) => {
+            let mut request = agent.delete(&url);
+            for (k, v) in headers {
+                request = request.header(*k, *v);
+            }
+            request.call()
+        }
         (_, body) => {
             let mut request = agent.post(&url);
             for (k, v) in headers {
@@ -214,6 +221,329 @@ pub fn send(
         headers,
         body,
     }
+}
+
+fn exchange_target(d: &Deployment, code: &str, verifier: &str, resource: &str) -> Reply {
+    let body = encode(&[
+        ("grant_type", "authorization_code"),
+        ("client_id", CLI_CLIENT_ID),
+        ("code", code),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", verifier),
+        ("resource", resource),
+    ]);
+    send(d, "POST", "/oauth/token", Body::Form(&body), &[])
+}
+
+fn mint_api_access(d: &Deployment) -> Secret {
+    let verifier = pkce::verifier();
+    let challenge = pkce::challenge(&verifier);
+    let code = sentinel_store::oauth::code::approve(
+        &d.store,
+        &sentinel_store::oauth::code::Approval {
+            client_id: CLI_CLIENT_ID,
+            redirect_uri: REDIRECT,
+            code_challenge: &challenge,
+            user: d.dev,
+            scopes: sentinel_core::auth::Scopes::RUNS_READ,
+            tenant: None,
+            repo: None,
+            audience: sentinel_core::auth::Audience::Api,
+        },
+        UnixMillis::now(),
+    )
+    .unwrap();
+    sentinel_store::oauth::code::exchange(
+        &d.store,
+        CLI_CLIENT_ID,
+        &code,
+        REDIRECT,
+        &verifier,
+        None,
+        UnixMillis::now(),
+    )
+    .unwrap()
+    .access
+}
+
+fn mcp_request(
+    d: &Deployment,
+    method: &str,
+    body: Option<&Value>,
+    authorization: Option<&str>,
+    extra: &[(&str, &str)],
+) -> Reply {
+    let mut headers = vec![("accept", "application/json, text/event-stream")];
+    if let Some(authorization) = authorization {
+        headers.push(("authorization", authorization));
+    }
+    headers.extend_from_slice(extra);
+    send(
+        d,
+        method,
+        "/mcp",
+        body.map(Body::Json).unwrap_or(Body::None),
+        &headers,
+    )
+}
+
+#[test]
+fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
+    let d = deployment();
+    let resource = format!("{}/mcp", d.base);
+    let metadata = send(
+        &d,
+        "GET",
+        "/.well-known/oauth-protected-resource/mcp",
+        Body::None,
+        &[],
+    );
+    assert_eq!(metadata.status, 200);
+    assert_eq!(metadata.body["resource"], resource);
+    assert_eq!(metadata.body["authorization_servers"][0], d.base);
+    assert!(
+        metadata.body["scopes_supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s == "logs:read")
+    );
+
+    let verifier = pkce::verifier();
+    let challenge = pkce::challenge(&verifier);
+    let pairs = with(
+        with(request_pairs(&challenge), "scope", Some("runs:read")),
+        "resource",
+        Some(&resource),
+    );
+    let cookie = sign_in(&d, "dev");
+    let fields = consent(&d, &cookie, &pairs);
+    assert!(
+        fields
+            .iter()
+            .any(|(name, value)| name == "resource" && value == &resource)
+    );
+    let back = returned(&post_consent(
+        &d,
+        Some(&cookie),
+        Some(&d.base),
+        &fields,
+        &[("decision", "approve")],
+    ));
+    let code = param(&back, "code").unwrap();
+    let token = exchange_target(&d, code, &verifier, &resource);
+    assert_eq!(token.status, 200, "{:?}", token.body);
+    assert_eq!(token.body["scope"], "runs:read");
+    let token_text = token.body["access_token"].as_str().unwrap();
+    let access = forms::parse(Kind::Access, token_text).unwrap();
+    let authorization = bearer(&access);
+
+    let initialize = json!({
+        "jsonrpc":"2.0", "id":1, "method":"initialize",
+        "params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+    });
+    let old_version = json!({
+        "jsonrpc":"2.0", "id":0, "method":"initialize",
+        "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+    });
+    let missing_initialize_fields = json!({
+        "jsonrpc":"2.0", "id":9, "method":"initialize",
+        "params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"test","version":"1"}}
+    });
+    let invalid_initialize = mcp_request(
+        &d,
+        "POST",
+        Some(&missing_initialize_fields),
+        Some(&authorization),
+        &[],
+    );
+    assert_eq!(invalid_initialize.status, 400);
+    let unsupported = mcp_request(&d, "POST", Some(&old_version), Some(&authorization), &[]);
+    assert_eq!(unsupported.status, 400);
+    assert_eq!(unsupported.body["error"]["code"], -32602);
+    let initialized = mcp_request(
+        &d,
+        "POST",
+        Some(&initialize),
+        Some(&authorization),
+        &[("origin", &d.base)],
+    );
+    assert_eq!(initialized.status, 200, "{:?}", initialized.body);
+    assert_eq!(initialized.body["result"]["protocolVersion"], "2025-11-25");
+    let session = initialized.header("mcp-session-id").unwrap().to_owned();
+    assert_eq!(session.len(), 64);
+
+    let notification = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+    let version = ("mcp-protocol-version", "2025-11-25");
+    let session_header = ("mcp-session-id", session.as_str());
+    let active = mcp_request(
+        &d,
+        "POST",
+        Some(&notification),
+        Some(&authorization),
+        &[version, session_header],
+    );
+    assert_eq!(active.status, 202);
+
+    let missing_version = mcp_request(
+        &d,
+        "POST",
+        Some(&json!({"jsonrpc":"2.0","id":8,"method":"ping"})),
+        Some(&authorization),
+        &[session_header],
+    );
+    assert_eq!(missing_version.status, 426);
+
+    let list = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
+    let tools = mcp_request(
+        &d,
+        "POST",
+        Some(&list),
+        Some(&authorization),
+        &[version, session_header],
+    );
+    assert_eq!(tools.status, 200);
+    assert_eq!(tools.body["result"]["tools"].as_array().unwrap().len(), 13);
+
+    let denied = json!({
+        "jsonrpc":"2.0","id":3,"method":"tools/call",
+        "params":{"name":"get_logs","arguments":{"attempt":"00000000000000000000000000000000"}}
+    });
+    let scope = mcp_request(
+        &d,
+        "POST",
+        Some(&denied),
+        Some(&authorization),
+        &[version, session_header],
+    );
+    assert_eq!(scope.status, 403);
+    let challenge = scope.header("www-authenticate").unwrap();
+    assert!(challenge.contains("insufficient_scope") && challenge.contains("logs:read"));
+    assert!(challenge.contains("oauth-protected-resource/mcp"));
+
+    let api_access = mint_api_access(&d);
+    let api_authorization = bearer(&api_access);
+    let wrong_audience = mcp_request(&d, "POST", Some(&initialize), Some(&api_authorization), &[]);
+    assert_eq!(wrong_audience.status, 401);
+    assert!(
+        wrong_audience
+            .header("www-authenticate")
+            .unwrap()
+            .contains("oauth-protected-resource/mcp")
+    );
+
+    let static_token = sentinel_store::tokens::provision(
+        &d.store,
+        sentinel_store::tokens::Grant::new(
+            d.dev,
+            "MCP audience rejection",
+            sentinel_core::auth::Permissions::READ,
+        ),
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let static_authorization = format!(
+        "Bearer {}",
+        sentinel_auth::token::format(&static_token.secret)
+    );
+    let static_rejected = mcp_request(
+        &d,
+        "POST",
+        Some(&initialize),
+        Some(&static_authorization),
+        &[],
+    );
+    assert_eq!(static_rejected.status, 401);
+    let cookie_only = mcp_request(&d, "POST", Some(&initialize), None, &[("cookie", &cookie)]);
+    assert_eq!(cookie_only.status, 401);
+
+    let session_only = mcp_request(&d, "POST", Some(&list), None, &[version, session_header]);
+    assert_eq!(
+        session_only.status, 401,
+        "session id never replaces bearer authentication"
+    );
+    let foreign_origin = mcp_request(
+        &d,
+        "POST",
+        Some(&list),
+        Some(&authorization),
+        &[
+            ("origin", "https://attacker.example"),
+            version,
+            session_header,
+        ],
+    );
+    assert_eq!(foreign_origin.status, 403);
+
+    let get = mcp_request(
+        &d,
+        "GET",
+        None,
+        Some(&authorization),
+        &[version, session_header],
+    );
+    assert_eq!(get.status, 405);
+    assert_eq!(get.header("allow"), Some("POST, DELETE"));
+
+    let deleted = mcp_request(
+        &d,
+        "DELETE",
+        None,
+        Some(&authorization),
+        &[version, session_header],
+    );
+    assert_eq!(deleted.status, 200);
+    let gone = mcp_request(
+        &d,
+        "POST",
+        Some(&list),
+        Some(&authorization),
+        &[version, session_header],
+    );
+    assert_eq!(gone.status, 404);
+}
+
+#[test]
+fn mcp_refresh_requires_the_same_resource_indicator() {
+    let d = deployment();
+    let resource = format!("{}/mcp", d.base);
+    let verifier = pkce::verifier();
+    let challenge = pkce::challenge(&verifier);
+    let pairs = with(
+        with(request_pairs(&challenge), "scope", Some("runs:read")),
+        "resource",
+        Some(&resource),
+    );
+    let cookie = sign_in(&d, "dev");
+    let fields = consent(&d, &cookie, &pairs);
+    let back = returned(&post_consent(
+        &d,
+        Some(&cookie),
+        Some(&d.base),
+        &fields,
+        &[("decision", "approve")],
+    ));
+    let token = exchange_target(&d, param(&back, "code").unwrap(), &verifier, &resource);
+    assert_eq!(token.status, 200);
+    let refresh = token.body["refresh_token"].as_str().unwrap();
+
+    let omitted = encode(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", CLI_CLIENT_ID),
+        ("refresh_token", refresh),
+    ]);
+    let rejected = send(&d, "POST", "/oauth/token", Body::Form(&omitted), &[]);
+    assert_eq!(rejected.status, 400);
+    assert_eq!(rejected.body["error"], "invalid_grant");
+
+    let included = encode(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", CLI_CLIENT_ID),
+        ("refresh_token", refresh),
+        ("resource", &resource),
+    ]);
+    let rotated = send(&d, "POST", "/oauth/token", Body::Form(&included), &[]);
+    assert_eq!(rotated.status, 200, "{:?}", rotated.body);
 }
 
 pub fn bearer(access: &Secret) -> String {

@@ -15,6 +15,7 @@
 pub mod auth;
 mod github;
 mod http;
+mod mcp;
 mod oauth;
 mod routes;
 mod web;
@@ -112,6 +113,8 @@ pub(crate) struct State {
     pub stop: Arc<AtomicBool>,
     /// The OAuth authorization server's issuer, keys and in-memory limits.
     pub oauth: oauth::OAuthState,
+    /// Bounded, expiring Streamable HTTP MCP sessions.
+    pub mcp_sessions: mcp::Sessions,
     /// GitHub web sign-in, when configured.
     pub github: Option<github::Github>,
     /// The first page, rendered once for this configuration.
@@ -225,6 +228,7 @@ impl Server {
             subscribers: Subscribers::default(),
             stop: Arc::clone(&stop),
             oauth: oauth::OAuthState::new(issuer.clone()),
+            mcp_sessions: mcp::Sessions::default(),
             github,
             index,
         });

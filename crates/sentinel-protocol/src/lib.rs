@@ -11,6 +11,7 @@ pub mod idempotency;
 pub mod intake;
 pub mod limits;
 pub mod logs;
+pub mod mcp;
 pub mod negotiate;
 pub mod oauth;
 pub mod secrets;

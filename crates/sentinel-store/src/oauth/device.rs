@@ -91,8 +91,8 @@ pub fn begin(
         let expires = now.0.saturating_add(DEVICE_LIFETIME_MS);
         let mut insert = tx.prepare_cached(
             "INSERT INTO oauth_device_codes(device_digest, user_code, client_id, scopes,
-                audience, created_ms, expires_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(user_code) DO NOTHING",
+                audience, created_ms, expires_ms, resource)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7) ON CONFLICT(user_code) DO NOTHING",
         )?;
         for _ in 0..USER_CODE_ATTEMPTS {
             let user_code = forms::user_code();
@@ -101,9 +101,9 @@ pub fn begin(
                 user_code,
                 client_id,
                 scopes.bits(),
-                audience.code(),
                 now.0,
-                expires
+                expires,
+                audience.code()
             ])?;
             if inserted == 1 {
                 return Ok(DeviceStart {
@@ -294,7 +294,13 @@ pub enum Poll {
 /// terms, [`LOGIN_GRANT_MS`]), mints its first pair and marks the request
 /// redeemed. `NotFound`: unknown device code, another client's, or already
 /// redeemed (the endpoint answers `invalid_grant`).
-pub fn poll(store: &Store, client_id: &str, device: &Secret, now: UnixMillis) -> Result<Poll> {
+pub fn poll(
+    store: &Store,
+    client_id: &str,
+    device: &Secret,
+    resource: Option<Audience>,
+    now: UnixMillis,
+) -> Result<Poll> {
     let digest = device.digest().0;
     let (status, expires) = store.read(|c| state(c, &digest, client_id))?;
     if let Some(answer) = classify(status, expires, now)? {
@@ -303,7 +309,7 @@ pub fn poll(store: &Store, client_id: &str, device: &Secret, now: UnixMillis) ->
     let client_id = client_id.to_owned();
     store
         .writer()
-        .write(move |tx| redeem(tx, &digest, &client_id, now))
+        .write(move |tx| redeem(tx, &digest, &client_id, resource, now))
 }
 
 /// Status and expiry of a device request of `client_id`.
@@ -335,13 +341,14 @@ fn redeem(
     tx: &Transaction<'_>,
     digest: &[u8; 32],
     client_id: &str,
+    requested_resource: Option<Audience>,
     now: UnixMillis,
 ) -> Result<Poll> {
     // Re-read in the writing transaction: a concurrent poll may have
     // redeemed it since the snapshot above.
     let row = tx
         .prepare_cached(
-            "SELECT status, expires_ms, scopes, audience, user_id, tenant_id, repo_id
+            "SELECT status, expires_ms, scopes, resource, user_id, tenant_id, repo_id
              FROM oauth_device_codes WHERE device_digest = ?1 AND client_id = ?2",
         )?
         .query_row(params![digest, client_id], |r| {
@@ -361,6 +368,11 @@ fn redeem(
     if let Some(answer) = classify(status, expires, now)? {
         return Ok(answer);
     }
+    let audience =
+        Audience::from_code(audience).ok_or(Error::Corrupt("oauth_device_codes.resource"))?;
+    if !super::resource_matches(audience, requested_resource) {
+        return Ok(Poll::Denied);
+    }
     let user = user_of(user.ok_or(Error::Corrupt("oauth_device_codes.user_id"))?)?;
     let scopes = decode_scopes(scopes)?;
     let grant = NewGrant {
@@ -370,8 +382,7 @@ fn redeem(
         scopes,
         tenant: tenant_of(tenant)?,
         repo: repo_of(repo)?,
-        audience: Audience::from_code(audience)
-            .ok_or(Error::Corrupt("oauth_device_codes.audience"))?,
+        audience,
         name: None,
         lifetime_ms: LOGIN_GRANT_MS,
         created_by: None,

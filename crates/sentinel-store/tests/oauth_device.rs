@@ -88,7 +88,7 @@ fn begin(store: &Store, scopes: Scopes, now: UnixMillis) -> device::DeviceStart 
 }
 
 fn poll(store: &Store, device: &Secret, now: UnixMillis) -> Result<Poll, Error> {
-    device::poll(store, CLI_CLIENT_ID, device, now)
+    device::poll(store, CLI_CLIENT_ID, device, None, now)
 }
 
 fn approve(scopes: Scopes) -> Decision {
@@ -195,7 +195,7 @@ fn unknown_and_foreign_device_codes_are_not_found() {
     ));
     store_client(&store, "other-device", true);
     assert!(matches!(
-        device::poll(&store, "other-device", &start.device, at(1)),
+        device::poll(&store, "other-device", &start.device, None, at(1)),
         Err(Error::NotFound)
     ));
     assert!(matches!(

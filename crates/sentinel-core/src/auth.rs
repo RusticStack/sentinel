@@ -222,12 +222,15 @@ impl Scopes {
 }
 
 /// Who a token may be presented to (RFC 8707 resource). Stored as its
-/// integer; value 2 is reserved for the MCP endpoint (X05).
+/// integer in `oauth_* .resource`; the historical `audience` column remains
+/// API-only for migration compatibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Audience {
     /// `{issuer}/api/v1`.
     Api = 1,
+    /// `{issuer}/mcp`.
+    Mcp = 2,
 }
 
 impl Audience {
@@ -237,6 +240,7 @@ impl Audience {
     pub const fn from_code(code: u8) -> Option<Self> {
         match code {
             1 => Some(Self::Api),
+            2 => Some(Self::Mcp),
             _ => None,
         }
     }
@@ -372,7 +376,7 @@ mod tests {
     fn audience_codes_are_stable() {
         assert_eq!(Audience::Api.code(), 1);
         assert_eq!(Audience::from_code(1), Some(Audience::Api));
-        assert_eq!(Audience::from_code(2), None, "reserved for MCP");
+        assert_eq!(Audience::from_code(2), Some(Audience::Mcp));
         assert_eq!(Audience::from_code(0), None);
     }
 }

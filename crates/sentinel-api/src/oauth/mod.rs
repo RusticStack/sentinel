@@ -30,14 +30,17 @@ pub(crate) mod service;
 use std::{collections::HashMap, sync::Mutex, time::Instant};
 
 use sentinel_auth::oauth::{self as forms, Kind};
-use sentinel_core::{UnixMillis, auth::Scopes};
+use sentinel_core::{
+    UnixMillis,
+    auth::{Audience, Scopes},
+};
 use sentinel_protocol::{
     error::ErrorCode,
     limits::MAX_OAUTH_FORM_BYTES,
     oauth::{
         API_RESOURCE_SUFFIX, DEVICE_VERIFICATION_PATH, GRANT_AUTHORIZATION_CODE, GRANT_DEVICE_CODE,
-        GRANT_REFRESH_TOKEN, Metadata, OAuthError, OAuthErrorCode, ProtectedResource,
-        TokenResponse,
+        GRANT_REFRESH_TOKEN, MCP_RESOURCE_SUFFIX, Metadata, OAuthError, OAuthErrorCode,
+        ProtectedResource, TokenResponse,
     },
 };
 use sentinel_store::oauth::{self as grants, Client, Minted, RefreshError};
@@ -84,9 +87,13 @@ pub(crate) struct OAuthState {
     pub path: String,
     /// `{issuer}/api/v1`, the `resource` of `Audience::Api`.
     pub api_resource: String,
+    /// `{issuer}/mcp`, the `resource` of `Audience::Mcp`.
+    pub mcp_resource: String,
     /// The RFC 9728 §3.1 metadata URL of `api_resource`, named in every
     /// `401` challenge.
     pub resource_metadata: String,
+    /// RFC 9728 metadata URL for the MCP resource.
+    pub mcp_resource_metadata: String,
     /// `{issuer}/api/v1/login`, which the embedded sign-in posts to.
     pub login_url: String,
     /// `{issuer}/device`, which the device page's forms submit to.
@@ -119,8 +126,12 @@ impl OAuthState {
         let now = Instant::now();
         Self {
             api_resource: format!("{issuer}{API_RESOURCE_SUFFIX}"),
+            mcp_resource: format!("{issuer}{MCP_RESOURCE_SUFFIX}"),
             resource_metadata: format!(
                 "{origin}/.well-known/oauth-protected-resource{path}{API_RESOURCE_SUFFIX}"
+            ),
+            mcp_resource_metadata: format!(
+                "{origin}/.well-known/oauth-protected-resource{path}{MCP_RESOURCE_SUFFIX}"
             ),
             login_url: format!("{issuer}/api/v1/login"),
             device_url: format!("{issuer}{DEVICE_VERIFICATION_PATH}"),
@@ -133,6 +144,23 @@ impl OAuthState {
             device_budget: Mutex::new(Limiter::new(DEVICE_CLIENT, None, now)),
             device_polls: Mutex::new(HashMap::new()),
             user_code_failures: Mutex::new(device::WrongCodes::new()),
+        }
+    }
+
+    pub(crate) fn resource(&self, audience: Audience) -> &str {
+        match audience {
+            Audience::Api => &self.api_resource,
+            Audience::Mcp => &self.mcp_resource,
+        }
+    }
+
+    pub(crate) fn resource_audience(&self, resource: &str) -> Option<Audience> {
+        if resource == self.api_resource {
+            Some(Audience::Api)
+        } else if resource == self.mcp_resource {
+            Some(Audience::Mcp)
+        } else {
+            None
         }
     }
 
@@ -184,7 +212,12 @@ pub(crate) fn route(
         ("GET", [".well-known", "oauth-protected-resource", rest @ ..])
             if rest == ["api", "v1"] || state.oauth.issuer_path_then(rest, &["api", "v1"]) =>
         {
-            protected_resource(state)
+            protected_resource(state, Audience::Api)
+        }
+        ("GET", [".well-known", "oauth-protected-resource", rest @ ..])
+            if rest == ["mcp"] || state.oauth.issuer_path_then(rest, &["mcp"]) =>
+        {
+            protected_resource(state, Audience::Mcp)
         }
         ("POST", ["oauth", "token"]) => Ok(token(state, request)),
         ("POST", ["oauth", "revoke"]) => Ok(revoke(state, request)),
@@ -206,8 +239,9 @@ fn metadata(state: &State) -> Route {
     )))
 }
 
-fn protected_resource(state: &State) -> Route {
-    routes::ok(json!(ProtectedResource::for_issuer(
+fn protected_resource(state: &State, audience: Audience) -> Route {
+    routes::ok(json!(ProtectedResource::for_resource(
+        state.oauth.resource(audience),
         &state.oauth.issuer,
         &Scopes::NAMES
     )))
@@ -370,7 +404,7 @@ pub(crate) fn session(state: &State, request: &Request) -> Option<Identity> {
 }
 
 /// The OAuth token endpoint (RFC 6749 §3.2): public clients identify by
-/// `client_id`; `resource`, when given, must be this deployment's API.
+/// `client_id`; `resource`, when given, must name a resource of this deployment.
 fn token(state: &State, request: &mut Request) -> Reply {
     if let Err(reply) = admit(state, request, Budget::Token) {
         return reply;
@@ -392,19 +426,17 @@ fn token(state: &State, request: &mut Request) -> Reply {
         }
         Err(e) => return store_failure(e),
     };
-    if form
-        .get("resource")
-        .is_some_and(|resource| resource != state.oauth.api_resource)
-    {
-        return error(
-            OAuthErrorCode::InvalidTarget,
-            "resource must be this deployment's API",
-        );
-    }
+    let resource = match form.get("resource") {
+        None => None,
+        Some(resource) => match state.oauth.resource_audience(resource) {
+            Some(resource) => Some(resource),
+            None => return error(OAuthErrorCode::InvalidTarget, "resource is not served here"),
+        },
+    };
     match grant_type {
-        GRANT_REFRESH_TOKEN => refresh(state, &client, &form),
-        GRANT_AUTHORIZATION_CODE => code::token(state, &client, &form),
-        GRANT_DEVICE_CODE => device::token(state, &client, &form),
+        GRANT_REFRESH_TOKEN => refresh(state, &client, &form, resource),
+        GRANT_AUTHORIZATION_CODE => code::token(state, &client, &form, resource),
+        GRANT_DEVICE_CODE => device::token(state, &client, &form, resource),
         _ => error(
             OAuthErrorCode::UnsupportedGrantType,
             "grant_type is not supported",
@@ -413,7 +445,7 @@ fn token(state: &State, request: &mut Request) -> Reply {
 }
 
 /// The `refresh_token` grant: rotate, optionally narrowing `scope`.
-fn refresh(state: &State, client: &Client, form: &Form) -> Reply {
+fn refresh(state: &State, client: &Client, form: &Form, resource: Option<Audience>) -> Reply {
     let Some(text) = form.get("refresh_token") else {
         return error(OAuthErrorCode::InvalidRequest, "refresh_token is required");
     };
@@ -426,7 +458,7 @@ fn refresh(state: &State, client: &Client, form: &Form) -> Reply {
         Some(Err(_)) => return error(OAuthErrorCode::InvalidScope, "unknown scope"),
     };
     let now = UnixMillis::now();
-    match grants::refresh(&state.store, &client.id, &presented, narrow, now) {
+    match grants::refresh(&state.store, &client.id, &presented, narrow, resource, now) {
         Ok(minted) => token_reply(&minted, now),
         Err(RefreshError::Invalid | RefreshError::Replay) => {
             error(OAuthErrorCode::InvalidGrant, "refresh token is not valid")

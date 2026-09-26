@@ -107,7 +107,7 @@ fn exchange(
     verifier: &str,
     now: UnixMillis,
 ) -> Result<oauth::Minted, CodeError> {
-    code::exchange(store, CLI_CLIENT_ID, code, REDIRECT, verifier, now)
+    code::exchange(store, CLI_CLIENT_ID, code, REDIRECT, verifier, None, now)
 }
 
 fn record(store: &Store, user: UserId, grant: sentinel_core::GrantId) -> GrantRecord {
@@ -275,7 +275,7 @@ fn a_replayed_code_revokes_its_grant_and_is_audited() {
         store.read(|c| oauth::authenticate_access(c, &minted.access, Audience::Api, at(3))),
         Err(Error::NotFound)
     ));
-    assert!(oauth::refresh(&store, CLI_CLIENT_ID, &minted.refresh, None, at(3)).is_err());
+    assert!(oauth::refresh(&store, CLI_CLIENT_ID, &minted.refresh, None, None, at(3)).is_err());
 }
 
 #[test]
@@ -300,13 +300,21 @@ fn a_wrong_verifier_redirect_or_client_is_invalid_and_spends_the_code() {
     type Attempt = fn(&Store, &Secret, &str) -> Result<oauth::Minted, CodeError>;
     let attempts: [(&str, Attempt); 5] = [
         ("wrong verifier", |s, c, _| {
-            code::exchange(s, CLI_CLIENT_ID, c, REDIRECT, &pkce::verifier(), NOW)
+            code::exchange(s, CLI_CLIENT_ID, c, REDIRECT, &pkce::verifier(), None, NOW)
         }),
         ("malformed verifier", |s, c, _| {
-            code::exchange(s, CLI_CLIENT_ID, c, REDIRECT, "short", NOW)
+            code::exchange(s, CLI_CLIENT_ID, c, REDIRECT, "short", None, NOW)
         }),
         ("the challenge itself as verifier", |s, c, v| {
-            code::exchange(s, CLI_CLIENT_ID, c, REDIRECT, &pkce::challenge(v), NOW)
+            code::exchange(
+                s,
+                CLI_CLIENT_ID,
+                c,
+                REDIRECT,
+                &pkce::challenge(v),
+                None,
+                NOW,
+            )
         }),
         ("another port", |s, c, v| {
             code::exchange(
@@ -315,11 +323,12 @@ fn a_wrong_verifier_redirect_or_client_is_invalid_and_spends_the_code() {
                 c,
                 "http://127.0.0.1:49153/callback",
                 v,
+                None,
                 NOW,
             )
         }),
         ("another client", |s, c, v| {
-            code::exchange(s, "other-cli", c, REDIRECT, v, NOW)
+            code::exchange(s, "other-cli", c, REDIRECT, v, None, NOW)
         }),
     ];
     assert_ne!(verifier, wrong_verifier);

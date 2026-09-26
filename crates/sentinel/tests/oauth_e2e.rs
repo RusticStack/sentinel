@@ -1336,6 +1336,7 @@ fn a_lost_refresh_response_is_recovered_inside_the_grace_window_and_replayed_out
         CLI_CLIENT_ID,
         &forms::parse(Kind::Refresh, &second).unwrap(),
         None,
+        None,
         UnixMillis(UnixMillis::now().0 + oauth::ROTATION_GRACE_MS + 1_000),
     );
     assert!(matches!(late, Err(RefreshError::Replay)));

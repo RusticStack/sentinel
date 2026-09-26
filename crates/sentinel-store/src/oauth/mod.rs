@@ -325,8 +325,8 @@ pub(crate) fn insert_grant(
     let id = GrantId::new();
     tx.prepare_cached(
         "INSERT INTO oauth_grants(id, user_id, client_id, kind, scopes, tenant_id, repo_id,
-            audience, name, created_by, created_ms, expires_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            audience, name, created_by, created_ms, expires_ms, resource)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12)",
     )?
     .execute(params![
         id.as_bytes(),
@@ -336,11 +336,11 @@ pub(crate) fn insert_grant(
         g.scopes.bits(),
         g.tenant.as_ref().map(TenantId::as_bytes),
         g.repo.as_ref().map(RepoId::as_bytes),
-        g.audience.code(),
         g.name,
         g.created_by.as_ref().map(UserId::as_bytes),
         now.0,
-        now.0.saturating_add(g.lifetime_ms)
+        now.0.saturating_add(g.lifetime_ms),
+        g.audience.code()
     ])
     .map_err(refused)?;
     Ok(id)
@@ -518,8 +518,16 @@ const AUTHENTICATE_ACCESS: &str = "SELECT g.id, g.user_id, a.scopes & g.scopes, 
      JOIN oauth_grants g ON g.id = a.grant_id
      JOIN users u ON u.id = g.user_id
      WHERE a.token_digest = ?1 AND a.expires_ms > ?2
-     AND g.revoked_ms IS NULL AND g.expires_ms > ?2 AND g.audience = ?3
+     AND g.revoked_ms IS NULL AND g.expires_ms > ?2 AND g.audience = 1 AND g.resource = ?3
      AND u.active = 1 AND (u.kind = 0 OR u.service_tenant_id = g.tenant_id)";
+
+/// Existing API clients may omit `resource`; an MCP grant never may.
+pub(crate) fn resource_matches(granted: Audience, requested: Option<Audience>) -> bool {
+    match requested {
+        Some(requested) => granted == requested,
+        None => granted == Audience::Api,
+    }
+}
 
 /// Why a refresh produced no tokens.
 #[derive(Debug)]
@@ -550,13 +558,14 @@ pub fn refresh(
     client_id: &str,
     presented: &Secret,
     narrow: Option<Scopes>,
+    resource: Option<Audience>,
     now: UnixMillis,
 ) -> std::result::Result<Minted, RefreshError> {
     let digest = presented.digest();
     let client_id = client_id.to_owned();
     let outcome = store
         .writer()
-        .write(move |tx| rotate(tx, &client_id, digest, narrow, now))
+        .write(move |tx| rotate(tx, &client_id, digest, narrow, resource, now))
         .map_err(RefreshError::Store)?;
     match outcome {
         Refreshed::Minted(minted) => Ok(minted),
@@ -571,13 +580,15 @@ fn rotate(
     client_id: &str,
     digest: Digest,
     narrow: Option<Scopes>,
+    resource: Option<Audience>,
     now: UnixMillis,
 ) -> Result<Refreshed> {
     let row = tx
         .prepare_cached(
             "SELECT r.grant_id, r.generation, r.rotated_ms, r.superseded, r.idle_expires_ms,
                     g.client_id, g.kind, g.scopes, g.expires_ms, g.revoked_ms IS NULL,
-                    g.user_id, u.active = 1 AND (u.kind = 0 OR u.service_tenant_id = g.tenant_id)
+                    g.user_id, u.active = 1 AND (u.kind = 0 OR u.service_tenant_id = g.tenant_id),
+                    g.resource
              FROM oauth_refresh_tokens r
              JOIN oauth_grants g ON g.id = r.grant_id
              JOIN users u ON u.id = g.user_id
@@ -597,6 +608,7 @@ fn rotate(
                 r.get::<_, bool>(9)?,
                 r.get::<_, [u8; 16]>(10)?,
                 r.get::<_, bool>(11)?,
+                r.get::<_, u8>(12)?,
             ))
         })
         .optional()?;
@@ -613,11 +625,19 @@ fn rotate(
         live,
         user,
         account,
+        grant_resource,
     )) = row
     else {
         return Ok(Refreshed::Invalid);
     };
-    if !live || expires <= now.0 || !account || client != client_id {
+    let grant_resource =
+        Audience::from_code(grant_resource).ok_or(Error::Corrupt("oauth_grants.resource"))?;
+    if !live
+        || expires <= now.0
+        || !account
+        || client != client_id
+        || !resource_matches(grant_resource, resource)
+    {
         return Ok(Refreshed::Invalid);
     }
     let terms = GrantTerms {

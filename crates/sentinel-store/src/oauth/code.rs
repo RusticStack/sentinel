@@ -201,8 +201,8 @@ pub fn approve(store: &Store, a: &Approval<'_>, now: UnixMillis) -> Result<Secre
         }
         tx.prepare_cached(
             "INSERT INTO oauth_codes(code_digest, client_id, redirect_uri, code_challenge,
-                user_id, scopes, tenant_id, repo_id, audience, created_ms, expires_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                user_id, scopes, tenant_id, repo_id, audience, created_ms, expires_ms, resource)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11)",
         )?
         .execute(params![
             digest.0,
@@ -213,9 +213,9 @@ pub fn approve(store: &Store, a: &Approval<'_>, now: UnixMillis) -> Result<Secre
             scopes.bits(),
             tenant.as_ref().map(TenantId::as_bytes),
             repo.as_ref().map(RepoId::as_bytes),
-            audience.code(),
             now.0,
-            now.0.saturating_add(CODE_LIFETIME_MS)
+            now.0.saturating_add(CODE_LIFETIME_MS),
+            audience.code()
         ])?;
         Ok(())
     })?;
@@ -265,6 +265,7 @@ pub fn exchange(
     code: &Secret,
     redirect_uri: &str,
     verifier: &str,
+    resource: Option<Audience>,
     now: UnixMillis,
 ) -> std::result::Result<Minted, CodeError> {
     let digest = code.digest();
@@ -284,6 +285,7 @@ pub fn exchange(
                 client_id,
                 redirect_uri,
                 expected.as_deref(),
+                resource,
                 now,
             )
         })
@@ -300,7 +302,7 @@ pub fn exchange(
 const CONSUME: &str = "UPDATE oauth_codes SET consumed_ms = ?2
      WHERE code_digest = ?1 AND consumed_ms IS NULL
      RETURNING client_id = ?3 AND redirect_uri = ?4 AND expires_ms > ?2,
-        code_challenge, user_id, scopes, tenant_id, repo_id, audience";
+        code_challenge, user_id, scopes, tenant_id, repo_id, resource";
 
 fn redeem(
     tx: &Transaction<'_>,
@@ -308,6 +310,7 @@ fn redeem(
     client_id: &str,
     redirect_uri: &str,
     expected: Option<&str>,
+    requested_resource: Option<Audience>,
     now: UnixMillis,
 ) -> Result<Exchanged> {
     let row = tx
@@ -335,6 +338,10 @@ fn redeem(
     if !valid {
         return Ok(Exchanged::Invalid);
     }
+    let audience = Audience::from_code(audience).ok_or(Error::Corrupt("oauth_codes.resource"))?;
+    if !super::resource_matches(audience, requested_resource) {
+        return Ok(Exchanged::Invalid);
+    }
     let user = user_of(user)?;
     let scopes = decode_scopes(scopes)?;
     let grant = NewGrant {
@@ -344,7 +351,7 @@ fn redeem(
         scopes,
         tenant: tenant_of(tenant)?,
         repo: repo_of(repo)?,
-        audience: Audience::from_code(audience).ok_or(Error::Corrupt("oauth_codes.audience"))?,
+        audience,
         name: None,
         lifetime_ms: LOGIN_GRANT_MS,
         created_by: None,

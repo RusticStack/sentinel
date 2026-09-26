@@ -60,7 +60,9 @@ pub(super) fn page_status(
     escape_into(&mut body, &state.oauth.issuer);
     body.push_str("</code> as <strong>");
     escape_into(&mut body, username.as_deref().unwrap_or("you"));
-    body.push_str("</strong>.</p>\n<p>It will be allowed to:</p>\n<ul>\n");
+    body.push_str("</strong>.</p>\n<p>Resource: <code>");
+    escape_into(&mut body, state.oauth.resource(params.audience));
+    body.push_str("</code>.</p>\n<p>It will be allowed to:</p>\n<ul>\n");
     for name in params.scopes.names() {
         body.push_str("<li><code>");
         body.push_str(name);

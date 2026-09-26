@@ -60,6 +60,15 @@ pub fn tenant_by_slug(conn: &Connection, slug: &str) -> Result<TenantId> {
     TenantId::from_bytes(bytes).map_err(|_| Error::Corrupt("tenant_id"))
 }
 
+/// The active tenant's canonical slug for an already tenant-bound principal.
+/// Callers must still authorize every requested repository or resource.
+pub fn tenant_slug(conn: &Connection, tenant: TenantId) -> Result<String> {
+    conn.prepare_cached("SELECT slug FROM tenants WHERE id = ?1 AND active = 1")?
+        .query_row([tenant.as_bytes()], |row| row.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)
+}
+
 /// A namespace by slug whatever its state: an operator lifting a suspension
 /// must be able to name a suspended tenant.
 pub fn tenant_by_slug_any(conn: &Connection, slug: &str) -> Result<TenantId> {

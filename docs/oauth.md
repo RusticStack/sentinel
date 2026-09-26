@@ -1,6 +1,6 @@
 # OAuth authorization server (Part 09, O01–O07)
 
-Sentinel is its own OAuth 2.0 authorization server for its API. The CLI (`sentinel auth login`) and agents sign in through it instead of pasting long-lived `sntl_` credentials; the result is a **grant** — one refresh-token family bound to an account, a client, a scope set, an optional tenant/repository narrowing and an audience — from which short-lived access tokens are minted. Service accounts receive grants the same way (O06).
+Sentinel is its own OAuth 2.0 authorization server for its API and remote MCP endpoint. The CLI (`sentinel auth login`), MCP clients, and agents sign in through it instead of pasting long-lived `sntl_` credentials; the result is a **grant** — one refresh-token family bound to an account, a client, a scope set, an optional tenant/repository narrowing and an audience — from which short-lived access tokens are minted. Service accounts receive grants the same way (O06). Remote MCP uses its own resource indicator and audience; see [MCP](mcp.md#streamable-http-x05).
 
 Implemented in `sentinel-core::auth` (`Scopes`, `Audience`), `sentinel-auth::oauth` (token text forms, PKCE, user codes, loopback redirects), `sentinel-protocol::oauth` (wire types), `sentinel-store::oauth` (migration 30, grants and tokens) and `sentinel-api` (`oauth/` router, bearer authentication and scope checks). The API routes it protects are in [API](api.md); the CLI side is in [CLI](cli.md).
 
@@ -12,15 +12,17 @@ The issuer is `public_url` from the server configuration ([configuration](config
 |---|---|---|---|
 | `/.well-known/oauth-authorization-server` | GET | none | RFC 8414 metadata: `issuer`, the four endpoints, `response_types_supported ["code"]`, `response_modes_supported ["query"]`, the three grant types, `code_challenge_methods_supported ["S256"]`, `token_endpoint_auth_methods_supported ["none"]`, `revocation_endpoint_auth_methods_supported ["none"]`, the ten scopes, `authorization_response_iss_parameter_supported: true` |
 | `/.well-known/oauth-protected-resource/api/v1` | GET | none | RFC 9728: `resource` = `{issuer}/api/v1`, `authorization_servers [issuer]`, the scopes, `bearer_methods_supported ["header"]` |
+| `/.well-known/oauth-protected-resource/mcp` | GET | none | RFC 9728 for `{issuer}/mcp`; MCP scope list and bearer header support |
 | `/oauth/token` | POST | public client (`client_id`) | `refresh_token` grant (below); `authorization_code` (O01) and `urn:ietf:params:oauth:grant-type:device_code` (O03) |
 | `/oauth/revoke` | POST | public client | RFC 7009: either token kind revokes its whole grant; always `200` |
 | `/oauth/authorize` | GET, POST | session cookie | consent (O01) |
 | `/oauth/device_authorization` | POST | public client | device request (O03) |
 | `/device` | GET, POST | session cookie | enter and approve a user code (O03) |
+| `/mcp` | POST, DELETE | MCP-audience bearer token | pinned Streamable HTTP transport; GET returns 405 ([MCP](mcp.md#streamable-http-x05)) |
 
 Only public clients exist; there are no client secrets. Migration 30 seeds the first-party client `sentinel-cli` (loopback redirects to `/callback`, device flow allowed, every scope).
 
-The `/oauth/*` endpoints take `application/x-www-form-urlencoded` bodies of at most 8 KiB (`MAX_OAUTH_FORM_BYTES`; larger is `413 invalid_request`); a repeated parameter is `invalid_request`, an empty value counts as absent (RFC 6749 §3.1). They answer the RFC 6749 error shape `{"error", "error_description"}` — `invalid_client` is 401, `server_error` 500, `temporarily_unavailable` 503, everything else 400 — never `sentinel.error/1`, and every answer carries `cache-control: no-store` and `pragma: no-cache`. A `resource` parameter, when present, must equal `{issuer}/api/v1` (`invalid_target`).
+The `/oauth/*` endpoints take `application/x-www-form-urlencoded` bodies of at most 8 KiB (`MAX_OAUTH_FORM_BYTES`; larger is `413 invalid_request`); a repeated parameter is `invalid_request`, an empty value counts as absent (RFC 6749 §3.1). They answer the RFC 6749 error shape `{"error", "error_description"}` — `invalid_client` is 401, `server_error` 500, `temporarily_unavailable` 503, everything else 400 — never `sentinel.error/1`, and every answer carries `cache-control: no-store` and `pragma: no-cache`. The `resource` parameter must match its OAuth client flow: `{issuer}/api/v1` for API clients or `{issuer}/mcp` for remote MCP clients (`invalid_target`). The server stores that resource on the grant and requires it again for MCP refresh.
 
 **Admission.** Unauthenticated OAuth POSTs are admitted per client first and then under a deployment-wide ceiling, in two separate budgets, so one client flooding one endpoint spends its own allowance and never anyone else's refresh (`oauth/limit.rs`):
 

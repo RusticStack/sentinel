@@ -1,4 +1,4 @@
-# MCP integration (X04)
+# MCP integration (X04–X05)
 
 `sentinel mcp` runs the MCP stdio transport as a child process. It implements
 the `2025-11-25` protocol revision using newline-delimited UTF-8 JSON-RPC on
@@ -61,5 +61,44 @@ read checks, decodes the immutable stored run spec, and returns the existing
 `sentinel.explain/1` contract. It reports secret names and requirements only;
 it never returns secret values.
 
-Streamable HTTP MCP authorization and client compatibility are tracked by
-X05–X07; stdio support does not imply HTTP MCP authentication.
+Stdio support does not imply HTTP MCP authentication. The HTTP transport is a
+separate OAuth resource and uses the same tool schemas and authorization checks.
+
+## Streamable HTTP (X05)
+
+Configure an MCP client with the deployment's `{issuer}/mcp` endpoint. Sentinel
+implements the `2025-11-25` Streamable HTTP revision with JSON responses; it
+does not open an event stream. The authorization-server metadata is at
+`{issuer}/.well-known/oauth-authorization-server`; the protected-resource
+metadata is at
+`{origin}/.well-known/oauth-protected-resource{issuer-path}/mcp`. For an issuer
+mounted at `/sentinel`, the latter is
+`https://ci.example.com/.well-known/oauth-protected-resource/sentinel/mcp`.
+Reverse proxies must forward the host-root well-known path. The 401 challenge
+names the same protected-resource metadata URL.
+
+The client uses authorization code + PKCE S256 and sends the exact resource
+indicator `{issuer}/mcp` through authorization, code exchange, and refresh.
+Sentinel issues an MCP-audience access token; an API token cannot access this
+endpoint, and an MCP token cannot access `/api/v1`. The token remains between
+the MCP client and Sentinel and is never forwarded to a model provider or
+another server. OAuth refresh, revocation, and account/membership/tenant
+changes retain the normal grant behavior.
+
+Every request needs `Authorization: Bearer` with a live MCP-audience token.
+Browser cookies, static API credentials, and API-audience tokens do not
+authenticate MCP requests. The server checks an optional `Origin` against the
+configured issuer origin. `POST` requires `Content-Type: application/json` and
+an `Accept` header containing both `application/json` and `text/event-stream`.
+Messages are limited to 2 MiB and serialized responses to 8 MiB. `GET` returns
+405 because server-initiated event streams are not enabled; `DELETE` ends the
+session.
+
+Initialization creates a random session identifier. The server stores only
+its digest, binds it to the authenticated user, caps the table at 1,024
+sessions, and expires it after 60 minutes idle. Every follow-up still needs a
+valid bearer token and the pinned `MCP-Protocol-Version`; a session ID is not
+an authentication credential. Tool calls pass through Sentinel's API scope,
+tenant, repository, and ownership checks. See [OAuth](oauth.md) for audience
+and grant details. Client registration and metadata-document retrieval are
+tracked by X06; actual-client conformance is tracked by X07.

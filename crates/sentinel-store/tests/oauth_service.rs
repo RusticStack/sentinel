@@ -224,7 +224,7 @@ fn terms_are_bounded_confined_and_never_administrative() {
     with(&|r| r.lifetime_ms = SERVICE_MIN_MS).unwrap();
     with(&|r| r.lifetime_ms = SERVICE_MAX_MS).unwrap();
     let (grant, refresh, _) = with(&|r| r.repo = Some(i.repo)).unwrap();
-    let minted = oauth::refresh(&store, CLI_CLIENT_ID, &refresh, None, at(1)).unwrap();
+    let minted = oauth::refresh(&store, CLI_CLIENT_ID, &refresh, None, None, at(1)).unwrap();
     assert_eq!(minted.grant, grant);
     let who = store
         .read(|c| oauth::authenticate_access(c, &minted.access, Audience::Api, at(2)))
@@ -241,10 +241,10 @@ fn the_refresh_token_is_returned_once_and_stored_only_as_a_digest() {
     let (grant, refresh, expires) = issue(&store, Issue::by(i, person(i.admin, false))).unwrap();
     // The holder's first refresh works and keeps the service life: the
     // refresh token lives exactly as long as the grant.
-    let minted = oauth::refresh(&store, CLI_CLIENT_ID, &refresh, None, at(10)).unwrap();
+    let minted = oauth::refresh(&store, CLI_CLIENT_ID, &refresh, None, None, at(10)).unwrap();
     assert_eq!(minted.refresh_expires, expires);
     assert!(matches!(
-        oauth::refresh(&store, "other", &minted.refresh, None, at(11)),
+        oauth::refresh(&store, "other", &minted.refresh, None, None, at(11)),
         Err(RefreshError::Invalid)
     ));
     let listed = store
@@ -346,7 +346,7 @@ fn owner_tenant_admin_and_platform_admin_revoke_anyone_else_sees_nothing() {
     }
     revoke(Authority::credential(admin), grant).unwrap();
     assert!(matches!(
-        oauth::refresh(&store, CLI_CLIENT_ID, &refresh, None, at(6)),
+        oauth::refresh(&store, CLI_CLIENT_ID, &refresh, None, None, at(6)),
         Err(RefreshError::Invalid)
     ));
     // The owner (the service principal's own credential) and a platform

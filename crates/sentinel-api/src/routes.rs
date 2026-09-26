@@ -49,6 +49,9 @@ use crate::{
 /// carry the page security headers ([`crate::oauth::html`]).
 pub(crate) enum Reply {
     Json(u16, Value, Vec<Header>),
+    /// A JSON document encoded once by a bounded protocol endpoint.
+    JsonText(u16, String, Vec<Header>),
+    Empty(u16, Vec<Header>),
     Stream(u16, Box<dyn Read + Send>, u64, Vec<Header>),
     Html(u16, String, Vec<Header>),
 }
@@ -135,6 +138,24 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
             }
             let _ = request.respond(response);
         }
+        Reply::JsonText(status, body, headers) => {
+            let mut response = Response::from_string(body)
+                .with_status_code(StatusCode(status))
+                .with_header(header("content-type", JSON))
+                .with_header(header("cache-control", "no-store"));
+            for h in headers {
+                response = response.with_header(h);
+            }
+            let _ = request.respond(response);
+        }
+        Reply::Empty(status, headers) => {
+            let mut response =
+                Response::from_string(String::new()).with_status_code(StatusCode(status));
+            for h in headers {
+                response = response.with_header(h);
+            }
+            let _ = request.respond(response);
+        }
         Reply::Html(status, body, headers) => {
             let mut response = Response::from_string(body)
                 .with_status_code(StatusCode(status))
@@ -172,6 +193,29 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
 /// names the missing scope. The GitHub and intake hooks have their own
 /// secrets and are not OAuth resources.
 fn challenge(state: &State, request: &Request, path: &str, error: &ApiError) -> Vec<Header> {
+    if path == "/mcp" {
+        return match error.code {
+            ErrorCode::Unauthenticated => {
+                let mut value = format!(
+                    "Bearer realm=\"sentinel-mcp\", resource_metadata=\"{}\"",
+                    state.oauth.mcp_resource_metadata
+                );
+                if header_value(request, "authorization").is_some() {
+                    value.push_str(", error=\"invalid_token\"");
+                }
+                vec![header("www-authenticate", &value)]
+            }
+            ErrorCode::Forbidden => error.details.as_ref()
+                .and_then(|details| details.get("scope"))
+                .and_then(Value::as_str)
+                .map(|scope| vec![header("www-authenticate", &format!(
+                    "Bearer error=\"insufficient_scope\", scope=\"{scope}\", resource_metadata=\"{}\"",
+                    state.oauth.mcp_resource_metadata
+                ))])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+    }
     let Some(rest) = path.strip_prefix("/api/v1/") else {
         return Vec::new();
     };
@@ -180,9 +224,14 @@ fn challenge(state: &State, request: &Request, path: &str, error: &ApiError) -> 
     }
     match error.code {
         ErrorCode::Unauthenticated => {
+            let metadata = if path == "/mcp" {
+                &state.oauth.mcp_resource_metadata
+            } else {
+                &state.oauth.resource_metadata
+            };
             let mut value = format!(
                 "Bearer realm=\"sentinel\", resource_metadata=\"{}\"",
-                state.oauth.resource_metadata
+                metadata
             );
             if header_value(request, "authorization").is_some() {
                 value.push_str(", error=\"invalid_token\"");
@@ -195,10 +244,20 @@ fn challenge(state: &State, request: &Request, path: &str, error: &ApiError) -> 
             .and_then(|d| d.get("scope"))
             .and_then(Value::as_str)
         {
-            Some(scope) => vec![header(
-                "www-authenticate",
-                &format!("Bearer error=\"insufficient_scope\", scope=\"{scope}\""),
-            )],
+            Some(scope) => {
+                let metadata = if path == "/mcp" {
+                    format!(
+                        ", resource_metadata=\"{}\"",
+                        state.oauth.mcp_resource_metadata
+                    )
+                } else {
+                    String::new()
+                };
+                vec![header(
+                    "www-authenticate",
+                    &format!("Bearer error=\"insufficient_scope\", scope=\"{scope}\"{metadata}"),
+                )]
+            }
             None => Vec::new(),
         },
         _ => Vec::new(),
@@ -256,6 +315,9 @@ pub(crate) fn identify(
     request: &Request,
     mutation: bool,
 ) -> Result<Identity, ApiError> {
+    if let Some(identity) = request.trusted_identity() {
+        return Ok(identity);
+    }
     auth::identify(
         &state.store,
         state.sessions,
@@ -288,7 +350,13 @@ pub(crate) fn id<T: std::str::FromStr>(text: &str, what: &str) -> Result<T, ApiE
     })
 }
 
-fn route(state: &State, request: &mut Request, method: &str, path: &str, query: &str) -> Route {
+pub(crate) fn route(
+    state: &State,
+    request: &mut Request,
+    method: &str,
+    path: &str,
+    query: &str,
+) -> Route {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     // The OAuth authorization server owns `/.well-known/*`, `/oauth/*`,
     // `/device`, `/api/v1/grants*` and `/api/v1/tenants/*/service-accounts*`.
@@ -300,6 +368,9 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
     }
     match (method, parts.as_slice()) {
         ("GET", ["api", "v1", "health"]) => ok(json!({ "ok": true })),
+        ("POST", ["mcp"]) => crate::mcp::post(state, request),
+        ("GET", ["mcp"]) => crate::mcp::get(state, request),
+        ("DELETE", ["mcp"]) => crate::mcp::delete(state, request),
         ("POST", ["api", "v1", "hooks", "github"]) => github_hook(state, request),
         ("POST", ["api", "v1", "intake", repo]) => generic_intake(state, request, repo),
         ("POST", ["api", "v1", "login"]) => login(state, request),

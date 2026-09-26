@@ -123,7 +123,7 @@ fn refresh(
     narrow: Option<Scopes>,
     now: UnixMillis,
 ) -> Result<Minted, RefreshError> {
-    oauth::refresh(store, CLI_CLIENT_ID, token, narrow, now)
+    oauth::refresh(store, CLI_CLIENT_ID, token, narrow, None, now)
 }
 
 fn revoked(store: &Store, grant: GrantId, user: UserId) -> bool {
@@ -425,7 +425,14 @@ fn rotation_issues_exactly_one_successor() {
     assert_eq!(generations, 3);
     // Only the right client may present it.
     assert!(matches!(
-        oauth::refresh(&store, "other-client", &third.refresh, None, at(3_000)),
+        oauth::refresh(
+            &store,
+            "other-client",
+            &third.refresh,
+            None,
+            None,
+            at(3_000)
+        ),
         Err(RefreshError::Invalid)
     ));
     assert!(matches!(

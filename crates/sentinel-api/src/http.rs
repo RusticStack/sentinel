@@ -15,7 +15,7 @@
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Cursor, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
     sync::{
         Arc, Condvar, Mutex,
@@ -347,6 +347,7 @@ enum Body<'a> {
     Empty,
     Fixed(Limited<'a>),
     Chunked(Chunked<'a>),
+    Internal(Cursor<Vec<u8>>),
 }
 
 impl Body<'_> {
@@ -355,6 +356,7 @@ impl Body<'_> {
             Body::Empty => true,
             Body::Fixed(f) => f.left == 0,
             Body::Chunked(c) => c.done,
+            Body::Internal(c) => c.position() == c.get_ref().len() as u64,
         }
     }
 }
@@ -365,6 +367,7 @@ impl Read for Body<'_> {
             Body::Empty => Ok(0),
             Body::Fixed(f) => f.read(buf),
             Body::Chunked(c) => c.read(buf),
+            Body::Internal(c) => c.read(buf),
         }
     }
 }
@@ -753,6 +756,9 @@ pub(crate) struct Request<'a> {
     stall: Duration,
     close: bool,
     responded: bool,
+    /// Only set on a child request created after the outer MCP bearer was
+    /// checked. Network requests can never populate this field.
+    trusted_identity: Option<crate::auth::Identity>,
 }
 
 impl Request<'_> {
@@ -777,6 +783,36 @@ impl Request<'_> {
     pub(crate) fn body_length(&self) -> Option<usize> {
         self.length
             .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+    }
+
+    pub(crate) fn trusted_identity(&self) -> Option<crate::auth::Identity> {
+        self.trusted_identity
+    }
+
+    /// Build a bounded in-process child request after the caller authenticates.
+    pub(crate) fn internal(
+        &self,
+        method: String,
+        url: String,
+        headers: Vec<Header>,
+        body: Vec<u8>,
+        identity: crate::auth::Identity,
+    ) -> Request<'_> {
+        let length = body.len() as u64;
+        Request {
+            method,
+            url,
+            headers,
+            length: Some(length),
+            body: Body::Internal(Cursor::new(body)),
+            writer: self.writer,
+            stop: self.stop,
+            poll: self.poll,
+            stall: self.stall,
+            close: true,
+            responded: false,
+            trusted_identity: Some(identity),
+        }
     }
 
     pub(crate) fn as_reader(&mut self) -> &mut dyn Read {
@@ -1094,6 +1130,7 @@ fn connection(
             stall: tune.write_stall,
             close: head.close,
             responded: false,
+            trusted_identity: None,
         };
         let panicked =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve(&mut request))).is_err();
@@ -1335,6 +1372,7 @@ mod tests {
             stall: Duration::from_secs(1),
             close: false,
             responded: false,
+            trusted_identity: None,
         };
         request.respond(Response::from_string("hi")).unwrap();
         drop(server);
@@ -1361,6 +1399,7 @@ mod tests {
             stall: Duration::from_secs(1),
             close: false,
             responded: false,
+            trusted_identity: None,
         };
         request.respond(Response::from_string("no")).unwrap();
         assert!(request.must_close());

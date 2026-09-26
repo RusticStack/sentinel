@@ -11,7 +11,7 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | Cache manifest | `sentinel.cache` magic + format `u8` (currently 1) | `sentinel-cache::manifest` | workers |
 | Cache file listing | `sentinel.files` magic + format `u8` (currently 1) | `sentinel-cache::manifest` | workers |
 | Cache miss reasons | `Miss::as_str` vocabulary | `sentinel-cache::outcome` | workers, reports |
-| Metadata database | `schema_migrations.version` (currently 40) | `sentinel-store` | controller |
+| Metadata database | `schema_migrations.version` (currently 41) | `sentinel-store` | controller |
 | Sealed ciphertext | leading format byte (writes 2; reads 1–2) | `sentinel-auth::sealed` | controller, host-local admin |
 | Master key file | `SNTLKEY2` magic (also reads legacy raw 32-byte file) | `sentinel-auth::sealed` | controller, host-local admin |
 | Manifest file | `SNMF` magic + format `u16` (currently 1) | `sentinel-store::objects` | controller |
@@ -19,6 +19,7 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | Diagnostic report | `schema_version` (currently 1; `sentinel.diagnostics/1`) | `sentinel-protocol::diagnostics` | API, CLI, MCP, UI |
 | Failure view | `schema: "sentinel.failure/1"` | `sentinel-api` | CLI, MCP, UI |
 | MCP stdio protocol | revision `2025-11-25` | `sentinel::mcp` | MCP clients using `sentinel mcp` |
+| MCP Streamable HTTP protocol | revision `2025-11-25` | `sentinel-api::mcp` | Remote MCP clients at `/mcp` |
 | Explain output | `schema: "sentinel.explain/1"` | `sentinel-pipeline::explain` | CLI, agents |
 | Event cursor | text prefix `c1` | `sentinel-protocol::cursor` | API clients (`GET /attempts/{id}/logs` and `/failure` `next`/`cursor`) |
 | Worker protocol | `protocol_min..=protocol_max` in `Hello` (currently 1..=10) | `sentinel-protocol::negotiate` | workers |
@@ -28,7 +29,7 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | Capabilities | bit positions in `Capabilities` | `sentinel-protocol` | workers, scheduler |
 | OAuth token text | prefixes `sntl_at_`, `sntl_rt_`, `sntl_ac_`, `sntl_dc_` + 64 hex (72 chars) | `sentinel-auth::oauth` | CLI, agents, secret scanners |
 | OAuth scopes | stored bit positions of `Scopes` (bits 0–9) and their names | `sentinel-core::auth` | grants, tokens, clients |
-| OAuth audience | stored `Audience` code (1 = API; 2 reserved for MCP) | `sentinel-core::auth` | grants, codes, tokens |
+| OAuth audience | stored `Audience` code (1 = API; 2 = MCP) | `sentinel-core::auth` | grants, codes, tokens |
 | OAuth error | RFC 6749 `{"error", "error_description"}` at `/oauth/*` | `sentinel-protocol::oauth` | OAuth clients |
 | CLI profiles | `schema: "sentinel.profiles/1"` in `profiles.json` | `sentinel` CLI | the CLI on one machine |
 | CLI exit codes | 0–8 ([CLI](cli.md#exit-codes)) | `sentinel::client::Exit` | scripts, agents |
@@ -36,6 +37,8 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 **Secret write surface (S03–S04, migration 39).** Secret routes are additive under `/api/v1`; old clients may ignore them. Writes use raw value bytes, compare-and-set versions and idempotency keys. Migration 39 adds bounded metadata-only replay records. Env-file import accepts the documented literal format and commits all rows in one SQLite writer transaction; this format is a CLI/API contract documented in [secrets](secrets.md).
 
 **Secret delivery (S05–S06, run spec 6, migration 40, protocol 10).** Run spec format 6 adds optional job `registry_auth`, step environment-secret names and secret-file targets; readers still decode formats 3–5 through their shadow layouts. Migration 40 marks jobs that require worker secret delivery so dispatch will not offer them to workers that lack protocol 10 or `SECRET_DELIVERY` bit 9. Protocol 10 appends `SecretBegin`/`SecretChunk`; each transfer is attempt- and fence-bound, ordered, and capped at 1 MiB. The controller resolves only declared bindings and records versioned use in the same writer transaction that checks the acknowledged attempt and opens the sealed values. Workers reject missing, extra, malformed or conflicting targets before execution. Every new attempt, including a rerun, receives the then-current active version. Secret values are not added to the run spec blob or SQLite plaintext; the worker keeps them in private per-attempt files outside workspaces, caches and artifacts, redacts before spool persistence, and reaps crash leftovers. Upgrade controllers and workers together for secret-using jobs; older workers remain eligible for jobs with no secret targets. See [secrets](secrets.md), [protocol](protocol.md#protocol-10-secret-delivery) and [executor](executor.md#the-image-pull-k05).
+
+**MCP resource audience (migration 41).** OAuth grant, authorization-code, and device-code rows gain an immutable `resource` column (1 = `{issuer}/api/v1`, 2 = `{issuer}/mcp`). Existing `audience` columns and rows remain API=1 for compatibility with prior constraints; new access-token validation uses the resource audience. MCP authorization, code exchange, and refresh must carry the exact MCP resource indicator. Upgrade the controller and OAuth clients together; migration 41 preserves existing API grants and tokens. The HTTP transport pins protocol revision `2025-11-25`, requires a bearer token and protocol version on session requests, caps request/response bodies, and stores only session digests ([MCP](mcp.md#streamable-http-x05)).
 
 ## Rules
 

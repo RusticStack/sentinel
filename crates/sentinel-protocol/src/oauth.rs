@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub const METADATA_PATH: &str = "/.well-known/oauth-authorization-server";
 pub const PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource/api/v1";
+pub const MCP_PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource/mcp";
 pub const AUTHORIZE_PATH: &str = "/oauth/authorize";
 pub const TOKEN_PATH: &str = "/oauth/token";
 pub const REVOKE_PATH: &str = "/oauth/revoke";
@@ -19,6 +20,8 @@ pub const DEVICE_AUTHORIZATION_PATH: &str = "/oauth/device_authorization";
 pub const DEVICE_VERIFICATION_PATH: &str = "/device";
 /// Appended to the issuer to name the API resource (`Audience::Api`).
 pub const API_RESOURCE_SUFFIX: &str = "/api/v1";
+/// Appended to the issuer to name the remote MCP resource (`Audience::Mcp`).
+pub const MCP_RESOURCE_SUFFIX: &str = "/mcp";
 
 /// The first-party public client every deployment seeds.
 pub const CLI_CLIENT_ID: &str = "sentinel-cli";
@@ -84,8 +87,13 @@ pub struct ProtectedResource {
 
 impl ProtectedResource {
     pub fn for_issuer(issuer: &str, scopes: &[&str]) -> Self {
+        Self::for_resource(&format!("{issuer}{API_RESOURCE_SUFFIX}"), issuer, scopes)
+    }
+
+    /// Metadata for one resource served by this deployment.
+    pub fn for_resource(resource: &str, issuer: &str, scopes: &[&str]) -> Self {
         Self {
-            resource: format!("{issuer}{API_RESOURCE_SUFFIX}"),
+            resource: resource.to_owned(),
             authorization_servers: vec![issuer.to_owned()],
             scopes_supported: scopes.iter().map(|s| (*s).to_owned()).collect(),
             bearer_methods_supported: vec!["header".to_owned()],

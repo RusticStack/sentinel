@@ -1361,6 +1361,7 @@ dependencies = [
 name = "sentinel-protocol"
 version = "0.1.0-dev"
 dependencies = [
+ "form_urlencoded",
  "postcard",
  "quick-xml",
  "sentinel-core",
