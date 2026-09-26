@@ -896,6 +896,20 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
         &[],
     );
     assert_eq!((status, view["state"].as_str()), (200, Some("pending")));
+    let (status, pipeline) = call(
+        &d,
+        "GET",
+        &format!("/api/v1/runs/{run_id}/pipeline"),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(
+        (status, pipeline["schema"].as_str()),
+        (200, Some("sentinel.explain/1"))
+    );
+    assert_eq!(pipeline["jobs"].as_array().unwrap().len(), 2);
+    assert_eq!(pipeline["digest"].as_str().map(str::len), Some(32));
     let (status, body) = call(
         &d,
         "GET",
@@ -944,6 +958,7 @@ fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     let build = run["jobs"][0]["id"].as_str().unwrap().to_owned();
     for (method, path) in [
         ("GET", format!("/api/v1/runs/{run_id}")),
+        ("GET", format!("/api/v1/runs/{run_id}/pipeline")),
         ("POST", format!("/api/v1/jobs/{build}/cancel")),
         ("POST", format!("/api/v1/jobs/{build}/rerun")),
         ("POST", format!("/api/v1/runs/{run_id}/cancel")),

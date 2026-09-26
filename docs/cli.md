@@ -8,6 +8,7 @@
 | `sentinel context use\|show` | the profile's default tenant |
 | `sentinel run dispatch\|status\|list\|cancel\|wait`, `status`, `wait`, `job`, `log`, `workers`, `queue`, `artifact`, `cache` | the O05 command surface ([below](#commands)) |
 | `sentinel service-account create\|allow\|grant\|grants\|revoke` | service principals and their grants ([below](#service-accounts)) |
+| `sentinel mcp` | local stdio MCP server using the shared credential profile ([MCP](mcp.md)) |
 | `sentinel doctor` | configuration and connectivity checks with fixes ([below](#doctor)) |
 | `sentinel api …` | the W08 commands with a static credential ([below](#legacy-sentinel-api)) |
 

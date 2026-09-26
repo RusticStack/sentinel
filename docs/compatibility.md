@@ -18,6 +18,7 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | API error | `schema: "sentinel.error/1"` | `sentinel-protocol` | CLI, MCP, UI, workers |
 | Diagnostic report | `schema_version` (currently 1; `sentinel.diagnostics/1`) | `sentinel-protocol::diagnostics` | API, CLI, MCP, UI |
 | Failure view | `schema: "sentinel.failure/1"` | `sentinel-api` | CLI, MCP, UI |
+| MCP stdio protocol | revision `2025-11-25` | `sentinel::mcp` | MCP clients using `sentinel mcp` |
 | Explain output | `schema: "sentinel.explain/1"` | `sentinel-pipeline::explain` | CLI, agents |
 | Event cursor | text prefix `c1` | `sentinel-protocol::cursor` | API clients (`GET /attempts/{id}/logs` and `/failure` `next`/`cursor`) |
 | Worker protocol | `protocol_min..=protocol_max` in `Hello` (currently 1..=10) | `sentinel-protocol::negotiate` | workers |

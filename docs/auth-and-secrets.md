@@ -46,7 +46,7 @@ Pin an MCP protocol version during implementation; current research used the **2
 - Exact permitted redirect URI validation, explicit consent/grants, scope errors, refresh/revocation, origin/session handling, and per-resource tenant authorization.
 - Compatibility tests against at least two actual target MCP clients: discovery, login, refresh, insufficient scopes, denied registration, changed roles, expired grants, wrong audience, and reconnect. A generic bearer-token endpoint alone is not “MCP OAuth support.”
 
-Stdio is different: `sentinel mcp` retrieves the local CLI credential profile and talks to the API. It does not implement OAuth redirects over stdio. Environment-based credentials may be supported for explicit automation, but prefer local credential handles to copying tokens into MCP configuration or model messages.
+Stdio is different: `sentinel mcp` retrieves the local CLI credential profile and talks to the API. It does not implement OAuth redirects over stdio. The X04 tools use repository-scoped reads and writes plus metadata-only secret inspection; see [MCP](mcp.md). Environment-based credentials may be supported for explicit automation, but prefer local credential handles to copying tokens into MCP configuration or model messages.
 
 ## 4. Secrets through CLI and API
 

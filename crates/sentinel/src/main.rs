@@ -81,6 +81,7 @@ fn main() -> ExitCode {
         Command::Worker(args) => ("worker", args),
         Command::Pipeline(args) => return pipeline::run(args),
         Command::Api(args) => return finish(api::run(args)),
+        Command::Mcp(args) => return finish(sentinel::mcp::run(args)),
         Command::Admin(args) => return run_admin(args),
         Command::Auth(args) => return finish(sentinel::auth_cmd::run(args)),
         Command::Context(args) => return finish(sentinel::auth_cmd::run_context(args)),

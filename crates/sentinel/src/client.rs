@@ -425,6 +425,11 @@ fn static_credential(text: &str) -> Result<String, Error> {
 
 /// The most a token file may hold: a credential is under 100 bytes.
 pub const MAX_TOKEN_FILE_BYTES: u64 = 4 << 10;
+/// Bound API JSON responses before they are parsed into a `Value`. A log
+/// page is limited by the server to 1 MiB of frame payload; JSON escaping
+/// can expand that payload several times.
+const MAX_JSON_RESPONSE_BYTES: u64 = 8 << 20;
+const MAX_ERROR_RESPONSE_BYTES: u64 = 64 << 10;
 
 /// A `--token-file`, read with a bound on the bytes actually read.
 pub fn read_token_file(path: &std::path::Path) -> Result<String, Error> {
@@ -625,6 +630,8 @@ impl Client {
         }
         let text = response
             .into_body()
+            .into_with_config()
+            .limit(MAX_JSON_RESPONSE_BYTES)
             .read_to_string()
             .map_err(|e| Error::remote(format!("cannot read the response: {e}")))?;
         if text.is_empty() {
@@ -740,6 +747,8 @@ impl Client {
         }
         let text = response
             .into_body()
+            .into_with_config()
+            .limit(MAX_JSON_RESPONSE_BYTES)
             .read_to_string()
             .map_err(|e| Error::remote(format!("cannot read the response: {e}")))?;
         if text.is_empty() {
@@ -756,7 +765,12 @@ impl Client {
     /// Turn a non-success answer into an [`Error`].
     fn failure(&self, response: Response) -> Error {
         let status = response.status().as_u16();
-        let text = response.into_body().read_to_string().unwrap_or_default();
+        let text = response
+            .into_body()
+            .into_with_config()
+            .limit(MAX_ERROR_RESPONSE_BYTES)
+            .read_to_string()
+            .unwrap_or_default();
         match serde_json::from_str::<Value>(&text) {
             Ok(api) if api["schema"] == "sentinel.error/1" => {
                 let code = api["code"].as_str().unwrap_or("error").to_owned();

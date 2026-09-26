@@ -32,6 +32,7 @@ pub mod commands;
 pub mod doctor;
 pub mod keystore;
 pub mod loopback;
+pub mod mcp;
 pub mod profile;
 pub mod service_accounts;
 

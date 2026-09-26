@@ -22,6 +22,8 @@ pub enum Command {
     Admin(AdminArgs),
     /// Talk to a controller's API with a credential: dispatch, status, logs, cancel, rerun, workers, queue, drain
     Api(ApiArgs),
+    /// Run the local stdio MCP server using a signed-in profile or static credential
+    Mcp(sentinel::mcp::McpArgs),
     /// Sign in to a controller (browser or device), show the session, sign out
     Auth(sentinel::auth_cmd::AuthArgs),
     /// Choose or show the profile's default tenant

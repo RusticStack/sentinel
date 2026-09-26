@@ -389,6 +389,20 @@ fn route(state: &State, request: &mut Request, method: &str, path: &str, query: 
             dispatch_run(state, request, slug, name)
         }
         ("GET", ["api", "v1", "runs", run, "wait"]) => run_wait(state, request, run, query),
+        ("GET", ["api", "v1", "runs", run, "pipeline"]) => {
+            let who = identify(state, request, false)?;
+            auth::require_scope(&who, Scopes::RUNS_READ)?;
+            let run: RunId = id(run, "run")?;
+            let spec = state
+                .store
+                .read(|c| {
+                    let repo = lookup::run_repo(c, run)?;
+                    let tenant = authz::require_repo(c, who.principal, repo, Permissions::READ)?;
+                    runs::get_run_spec(c, tenant, run)
+                })
+                .map_err(store_error)?;
+            ok(json!(sentinel_pipeline::Explanation::of(&spec.pipeline)))
+        }
         ("GET", ["api", "v1", "attempts", attempt, "logs", "search"]) => {
             log_search(state, request, attempt, query)
         }
