@@ -1,7 +1,7 @@
 # Sentinel — implementation plan
 
-Status: design and acceptance criteria. Parts 01–10 of the [backlog](TODO.md) are implemented — foundations, contracts, identity and authorization, durable execution, sources and GitHub feedback, storage, caches, fleet scheduling, the OAuth server and developer CLI, and scoped secret management through fenced job delivery. Later parts remain open. See [TODO](TODO.md) for per-task evidence and the [Parts 01–02 audit](docs/parts-01-02-audit.md) for outstanding gates.
-Reviewed: 2026-09-14. Repository: `RusticStack/sentinel`.
+Status: design and acceptance criteria. Parts 01–11 of the [backlog](TODO.md) are implemented — foundations, contracts, identity and authorization, durable execution, sources and GitHub feedback, storage, caches, fleet scheduling, OAuth CLI/MCP, scoped secret management through fenced job delivery, and bounded structured diagnostics. The human web interface and later operations/performance work remain open; Part 11 does not close the full M4 gate. See [TODO](TODO.md) for per-task evidence and the [Parts 01–02 audit](docs/parts-01-02-audit.md) for outstanding gates.
+Reviewed: 2026-09-26. Repository: `RusticStack/sentinel`.
 
 Development tracker: [TODO.md](TODO.md) splits this design into actionable parts, dependencies, first-slice work, and verification gates. Implementation progress is recorded there.
 
