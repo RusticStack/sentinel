@@ -140,9 +140,12 @@ pub fn check_private_input(path: &Path, file: &File) -> Result<(), Error> {
     #[cfg(windows)]
     {
         acl::check_input(file).map_err(|_| {
-            Error::usage(
-                "secret input file permissions must allow only the current user and SYSTEM",
-            )
+            Error::usage(format!(
+                "{} must be owned by you and allow only you and SYSTEM; fix: icacls \"{}\" /setowner \"%USERNAME%\" && icacls \"{}\" /inheritance:r /grant:r \"%USERNAME%:F\"",
+                path.display(),
+                path.display(),
+                path.display()
+            ))
         })
     }
     #[cfg(not(any(unix, windows)))]
@@ -255,9 +258,9 @@ mod acl {
                 TRUSTEE_IS_USER, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_TYPE, TRUSTEE_W,
             },
             CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-            GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_MAX_SID_SIZE,
-            SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY, TOKEN_USER, TokenUser,
-            WinLocalSystemSid,
+            GetTokenInformation, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+            PSID, SECURITY_MAX_SID_SIZE, SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY,
+            TOKEN_USER, TokenUser, WinLocalSystemSid,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
@@ -408,15 +411,17 @@ mod acl {
             return Err(io::Error::last_os_error());
         }
         let mut dacl: *mut ACL = ptr::null_mut();
+        let mut owner: PSID = ptr::null_mut();
         let mut descriptor = ptr::null_mut();
         // SAFETY: the handle belongs to the still-open `file`; the returned
-        // DACL and descriptor are valid until the descriptor is freed.
+        // owner SID, DACL and descriptor are valid until the descriptor is
+        // freed.
         let code = unsafe {
             GetSecurityInfo(
                 file.as_raw_handle().cast(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
+                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                &mut owner,
                 ptr::null_mut(),
                 &mut dacl,
                 ptr::null_mut(),
@@ -426,8 +431,21 @@ mod acl {
         if code != ERROR_SUCCESS {
             return Err(io::Error::from_raw_os_error(code as i32));
         }
+        // The owner holds implicit WRITE_DAC whatever the DACL says, so a
+        // file owned by anyone but this user or SYSTEM is refused too.
+        // SAFETY: `owner` points into the live descriptor; both SIDs are
+        // valid for these calls.
+        let owned = !owner.is_null()
+            && unsafe {
+                EqualSid(owner, user_sid) != 0 || EqualSid(owner, system.as_mut_ptr().cast()) != 0
+            };
         let result = if dacl.is_null() {
             Err(io::Error::new(io::ErrorKind::PermissionDenied, "null DACL"))
+        } else if !owned {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "owned by another principal",
+            ))
         } else {
             let mut info = ACL_SIZE_INFORMATION::default();
             // SAFETY: `dacl` came from GetSecurityInfo and `info` is writable
