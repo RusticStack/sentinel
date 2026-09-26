@@ -72,6 +72,9 @@ pub struct Config {
     pub logs: Arc<LogStore>,
     pub objects: Arc<Objects>,
     pub controller: Handle,
+    /// Deployment master key for sealed secret values. Secret routes remain
+    /// unavailable until the operator has initialized it.
+    pub secret_key: Option<Arc<sentinel_auth::sealed::Key>>,
     /// Session policy for password logins.
     pub sessions: sentinel_store::local_auth::Policy,
     /// The GitHub App webhook secret, when one is configured. Without it the
@@ -93,6 +96,7 @@ pub(crate) struct State {
     pub logs: Arc<LogStore>,
     pub objects: Arc<Objects>,
     pub controller: Handle,
+    pub secret_key: Option<Arc<sentinel_auth::sealed::Key>>,
     pub sessions: sentinel_store::local_auth::Policy,
     pub github_webhook_secret: Option<Arc<[u8]>>,
     pub intake: Option<sentinel_intake::Waker>,
@@ -213,6 +217,7 @@ impl Server {
             logs: config.logs,
             objects: config.objects,
             controller: config.controller,
+            secret_key: config.secret_key,
             sessions: config.sessions,
             github_webhook_secret: config.github_webhook_secret,
             intake: config.intake,

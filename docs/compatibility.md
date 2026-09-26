@@ -11,7 +11,7 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | Cache manifest | `sentinel.cache` magic + format `u8` (currently 1) | `sentinel-cache::manifest` | workers |
 | Cache file listing | `sentinel.files` magic + format `u8` (currently 1) | `sentinel-cache::manifest` | workers |
 | Cache miss reasons | `Miss::as_str` vocabulary | `sentinel-cache::outcome` | workers, reports |
-| Metadata database | `schema_migrations.version` (currently 37) | `sentinel-store` | controller |
+| Metadata database | `schema_migrations.version` (currently 39) | `sentinel-store` | controller |
 | Sealed ciphertext | leading format byte (writes 2; reads 1–2) | `sentinel-auth::sealed` | controller, host-local admin |
 | Master key file | `SNTLKEY2` magic (also reads legacy raw 32-byte file) | `sentinel-auth::sealed` | controller, host-local admin |
 | Manifest file | `SNMF` magic + format `u16` (currently 1) | `sentinel-store::objects` | controller |
@@ -29,6 +29,8 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | OAuth error | RFC 6749 `{"error", "error_description"}` at `/oauth/*` | `sentinel-protocol::oauth` | OAuth clients |
 | CLI profiles | `schema: "sentinel.profiles/1"` in `profiles.json` | `sentinel` CLI | the CLI on one machine |
 | CLI exit codes | 0–8 ([CLI](cli.md#exit-codes)) | `sentinel::client::Exit` | scripts, agents |
+
+**Secret write surface (S03–S04, migration 39).** Secret routes are additive under `/api/v1`; old clients may ignore them. Writes use raw value bytes, compare-and-set versions and idempotency keys. Migration 39 adds bounded metadata-only replay records. Env-file import accepts the documented literal format and commits all rows in one SQLite writer transaction; this format is a CLI/API contract documented in [secrets](secrets.md).
 
 ## Rules
 

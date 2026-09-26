@@ -20,6 +20,7 @@ mod artifacts;
 mod fleet;
 mod logs;
 mod runs;
+mod secrets;
 
 /// Most items a listing prints, whatever `--limit` or `--all` asks for.
 pub const MAX_ITEMS: usize = 10_000;
@@ -266,6 +267,91 @@ pub enum Invocation {
     Queue(QueueArgs),
     Artifact(ArtifactArgs),
     Cache(CacheArgs),
+    Secret(SecretArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SecretArgs {
+    #[command(flatten)]
+    pub client: ClientArgs,
+    #[command(subcommand)]
+    pub command: SecretCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SecretCommand {
+    /// Create or replace a secret using hidden prompt, stdin or a protected file
+    Set {
+        name: String,
+        #[command(flatten)]
+        scope: SecretScopeArgs,
+        #[arg(long, conflicts_with = "stdin")]
+        file: Option<std::path::PathBuf>,
+        #[arg(long, conflicts_with = "file")]
+        stdin: bool,
+        /// Expected current version (0 creates); omitted means read then compare-and-set
+        #[arg(long)]
+        if_version: Option<u64>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Replace an existing secret at exactly this current version
+    Rotate {
+        name: String,
+        #[command(flatten)]
+        scope: SecretScopeArgs,
+        #[arg(long, conflicts_with = "stdin")]
+        file: Option<std::path::PathBuf>,
+        #[arg(long, conflicts_with = "file")]
+        stdin: bool,
+        #[arg(long, required = true)]
+        if_version: u64,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// List metadata only
+    List {
+        #[command(flatten)]
+        scope: SecretScopeArgs,
+    },
+    /// Describe one secret without retrieving its value
+    Describe {
+        name: String,
+        #[command(flatten)]
+        scope: SecretScopeArgs,
+    },
+    /// Permanently revoke a secret and every retained version
+    Delete {
+        name: String,
+        #[command(flatten)]
+        scope: SecretScopeArgs,
+        #[arg(long, required = true)]
+        if_version: u64,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Atomically import literal NAME=value records from an env file
+    Import {
+        #[command(flatten)]
+        scope: SecretScopeArgs,
+        #[arg(long, value_name = "PATH", required = true)]
+        env_file: std::path::PathBuf,
+        /// Show names and observed versions only; make no changes
+        #[arg(long)]
+        preview: bool,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+}
+
+#[derive(Args, Clone, Debug, Default)]
+pub struct SecretScopeArgs {
+    /// Tenant slug (default: profile context)
+    #[arg(long, value_name = "SLUG")]
+    pub tenant: Option<String>,
+    /// Repository name; omit for tenant-wide secrets
+    #[arg(long)]
+    pub repo: Option<String>,
 }
 
 pub fn run(invocation: Invocation) -> Result<(), client::Error> {
@@ -369,6 +455,10 @@ pub fn run(invocation: Invocation) -> Result<(), client::Error> {
             match args.command {
                 CacheCommand::Show { attempt } => artifacts::cache(&client, output, &attempt),
             }
+        }
+        Invocation::Secret(args) => {
+            let (client, output) = connect(&args.client)?;
+            secrets::run(&client, output, args.command)
         }
     }
 }

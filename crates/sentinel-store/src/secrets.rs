@@ -7,10 +7,109 @@ use sentinel_core::{
     AttemptId, RepoId, SecretId, TenantId, UnixMillis, UserId,
     auth::{Permissions, Principal},
 };
+use sentinel_protocol::idempotency::{Fingerprint, IDEMPOTENCY_TTL_MS, IdempotencyKey};
 
 use crate::{Error, Result, auth};
 
 pub const MAX_VALUE: usize = 65_536;
+
+#[derive(Clone, Copy)]
+pub struct Idempotency<'a> {
+    pub tenant: TenantId,
+    pub principal: &'a str,
+    pub route: &'a str,
+    pub key: IdempotencyKey,
+    pub fingerprint: Fingerprint,
+}
+
+/// Return a completed metadata-only response for an identical secret write.
+/// The write and saved response share the same transaction, so there is no
+/// durable in-flight state after a crash.
+pub fn idempotency_replay(
+    tx: &Transaction<'_>,
+    idempotency: Idempotency<'_>,
+    now: UnixMillis,
+) -> Result<Option<Vec<u8>>> {
+    let stored: Option<(Vec<u8>, i64, Vec<u8>)> = tx
+        .query_row(
+            "SELECT fingerprint,created_ms,response_json FROM secret_idempotency
+             WHERE tenant_id=?1 AND principal=?2 AND route=?3 AND key=?4",
+            params![
+                idempotency.tenant.as_bytes(),
+                idempotency.principal,
+                idempotency.route,
+                idempotency.key.as_str()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((bytes, created, response)) = stored else {
+        return Ok(None);
+    };
+    if created < now.0.saturating_sub(IDEMPOTENCY_TTL_MS) {
+        tx.execute(
+            "DELETE FROM secret_idempotency WHERE tenant_id=?1 AND principal=?2 AND route=?3 AND key=?4",
+            params![
+                idempotency.tenant.as_bytes(),
+                idempotency.principal,
+                idempotency.route,
+                idempotency.key.as_str()
+            ],
+        )?;
+        return Ok(None);
+    }
+    let stored: [u8; 16] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Corrupt("secret_idempotency.fingerprint"))?;
+    if stored != idempotency.fingerprint.0.to_le_bytes() {
+        return Err(Error::Conflict);
+    }
+    Ok(Some(response))
+}
+
+/// Save only a bounded JSON result containing secret metadata, never values.
+pub fn idempotency_save(
+    tx: &Transaction<'_>,
+    idempotency: Idempotency<'_>,
+    response: &[u8],
+    now: UnixMillis,
+) -> Result<()> {
+    if !(2..=65_536).contains(&response.len()) {
+        return Err(Error::InvalidInput("secret response"));
+    }
+    tx.execute(
+        "INSERT INTO secret_idempotency(tenant_id,principal,route,key,fingerprint,created_ms,response_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(tenant_id,principal,route,key) DO UPDATE SET
+           fingerprint=excluded.fingerprint,created_ms=excluded.created_ms,response_json=excluded.response_json",
+        params![
+            idempotency.tenant.as_bytes(),
+            idempotency.principal,
+            idempotency.route,
+            idempotency.key.as_str(),
+            idempotency.fingerprint.0.to_le_bytes(),
+            now.0,
+            response
+        ],
+    )?;
+    Ok(())
+}
+
+/// Bound retained secret-write retry records independently of ordinary run
+/// idempotency records. The controller maintenance tick calls this in small
+/// indexed batches.
+pub fn purge_idempotency(store: &crate::Store, now: UnixMillis, limit: u32) -> Result<usize> {
+    let cutoff = now.0 - IDEMPOTENCY_TTL_MS;
+    store.writer().write(move |tx| {
+        Ok(tx.execute(
+            "DELETE FROM secret_idempotency WHERE (tenant_id,principal,route,key) IN (
+               SELECT tenant_id,principal,route,key FROM secret_idempotency
+               WHERE created_ms < ?1 ORDER BY created_ms LIMIT ?2)",
+            params![cutoff, limit],
+        )?)
+    })
+}
 
 type MetadataRow = (
     [u8; 16],
@@ -132,6 +231,13 @@ fn scope_owner(
             Ok((tenant, None))
         }
     }
+}
+
+/// Check current store authority for an operation before returning a cached
+/// idempotent response. A retry must never preserve access after a grant or
+/// membership was removed.
+pub fn authorize(conn: &Connection, principal: Principal, scope: Scope, write: bool) -> Result<()> {
+    scope_owner(conn, principal, scope, write).map(|_| ())
 }
 
 fn metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MetadataRow> {
@@ -358,9 +464,9 @@ pub fn delete(
     name: &str,
     expected: u64,
     now: UnixMillis,
-) -> Result<()> {
+) -> Result<Metadata> {
     let (tenant, repo) = scope_owner(tx, principal, scope, true)?;
-    let meta = lookup(tx, tenant, repo, name)?;
+    let mut meta = lookup(tx, tenant, repo, name)?;
     if !meta.active || meta.version != expected {
         return Err(Error::Conflict);
     }
@@ -383,7 +489,10 @@ pub fn delete(
             result: "ok",
         },
         now,
-    )
+    )?;
+    meta.active = false;
+    meta.updated_ms = now.0;
+    Ok(meta)
 }
 
 /// Revoke one historical version without changing the current number. A

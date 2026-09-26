@@ -99,6 +99,7 @@ fn main() -> ExitCode {
             return finish(sentinel::commands::run(Invocation::Artifact(args)));
         }
         Command::Cache(args) => return finish(sentinel::commands::run(Invocation::Cache(args))),
+        Command::Secret(args) => return finish(sentinel::commands::run(Invocation::Secret(args))),
     };
 
     #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]
@@ -126,4 +127,21 @@ fn main() -> ExitCode {
         "error: {role} is unavailable in this build; use a Linux binary built with --features {role}"
     );
     ExitCode::from(2)
+}
+
+#[cfg(test)]
+mod secret_cli_tests {
+    use clap::Parser;
+
+    use crate::Cli;
+
+    #[test]
+    fn set_refuses_conflicting_secret_input_sources() {
+        let base = ["sentinel", "secret", "set", "TOKEN", "--tenant", "acme"];
+        assert!(Cli::try_parse_from([base.as_slice(), &["--stdin"]].concat()).is_ok());
+        assert!(
+            Cli::try_parse_from([base.as_slice(), &["--stdin", "--file", "secret.txt"]].concat())
+                .is_err()
+        );
+    }
 }

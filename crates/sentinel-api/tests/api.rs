@@ -216,6 +216,7 @@ fn deployment_with(sessions: local_auth::Policy) -> Deployment {
     )
     .unwrap();
     let objects = Arc::new(Objects::open(dir.path()).unwrap());
+    let api_secret_key = Arc::new(sentinel_auth::sealed::Key::load(&key_path).unwrap());
     let controller = Controller::start(
         Arc::clone(&store),
         Arc::clone(&logs),
@@ -230,6 +231,7 @@ fn deployment_with(sessions: local_auth::Policy) -> Deployment {
         logs: Arc::clone(&logs),
         objects,
         controller: controller.handle(),
+        secret_key: Some(api_secret_key),
         sessions,
         github_webhook_secret: Some(Arc::from(WEBHOOK_SECRET)),
         intake: None,
@@ -297,6 +299,42 @@ fn call(
             .unwrap(),
         None => request.send_empty().unwrap(),
     };
+    let status = response.status().as_u16();
+    let text = response.into_body().read_to_string().unwrap();
+    let json = if text.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+    };
+    (status, json)
+}
+
+fn call_bytes(
+    d: &Deployment,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    auth: &str,
+    extra: &[(&str, &str)],
+) -> (u16, serde_json::Value) {
+    let url = format!("{}{path}", d.base);
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let mut request = match method {
+        "POST" => agent.post(&url),
+        "PUT" => agent.put(&url),
+        "DELETE" => agent.delete(&url).force_send_body(),
+        _ => unreachable!(),
+    }
+    .header("authorization", auth)
+    .header("content-type", "application/octet-stream");
+    for (key, value) in extra {
+        request = request.header(*key, *value);
+    }
+    let response = request.send(body).unwrap();
     let status = response.status().as_u16();
     let text = response.into_body().read_to_string().unwrap();
     let json = if text.is_empty() {
@@ -380,6 +418,154 @@ fn credentials_are_required_and_errors_are_structured() {
     let (status, page) = call(&d, "GET", "/", None, None, &[]);
     assert_eq!(status, 200);
     assert!(page.as_str().unwrap().contains("/api/v1/login"));
+}
+
+#[test]
+fn secret_http_writes_are_versioned_idempotent_and_metadata_only() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let path = "/api/v1/tenants/acme/secrets/ACCESS_TOKEN";
+    let value = b"binary-secret-\xff";
+    let create_headers = [
+        ("if-match", "0"),
+        ("idempotency-key", "create-access-token"),
+    ];
+
+    let (status, created) = call_bytes(&d, "PUT", path, value, &auth, &create_headers);
+    assert_eq!(status, 200);
+    assert_eq!(created["secret"]["version"], 1);
+    assert_eq!(created["secret"]["active"], true);
+    assert!(
+        !serde_json::to_string(&created)
+            .unwrap()
+            .contains("binary-secret")
+    );
+
+    let (status, replay) = call_bytes(&d, "PUT", path, value, &auth, &create_headers);
+    assert_eq!(status, 200);
+    assert_eq!(replay, created);
+
+    let changed = [
+        ("if-match", "0"),
+        ("idempotency-key", "create-access-token"),
+    ];
+    let (status, conflict) = call_bytes(&d, "PUT", path, b"different-secret", &auth, &changed);
+    assert_eq!(status, 409);
+    assert_eq!(conflict["code"], "conflict");
+    assert!(
+        !serde_json::to_string(&conflict)
+            .unwrap()
+            .contains("different-secret")
+    );
+
+    let stale = [("if-match", "0"), ("idempotency-key", "stale-access-token")];
+    assert_eq!(
+        call_bytes(&d, "PUT", path, b"replacement", &auth, &stale).0,
+        409
+    );
+
+    let rotate = [
+        ("if-match", "1"),
+        ("idempotency-key", "rotate-access-token"),
+    ];
+    let (status, rotated) = call_bytes(&d, "PUT", path, b"replacement", &auth, &rotate);
+    assert_eq!(status, 200);
+    assert_eq!(rotated["secret"]["version"], 2);
+
+    let (status, listed) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/secrets?limit=100",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(listed["secrets"][0]["name"], "ACCESS_TOKEN");
+    assert!(
+        !serde_json::to_string(&listed)
+            .unwrap()
+            .contains("replacement")
+    );
+
+    let delete_headers = [
+        ("if-match", "2"),
+        ("idempotency-key", "delete-access-token"),
+    ];
+    let (status, deleted) = call_bytes(&d, "DELETE", path, b"", &auth, &delete_headers);
+    assert_eq!(status, 200);
+    assert_eq!(deleted["secret"]["active"], false);
+
+    let (root, tenant) = (d.root, d.tenant);
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::remove_membership(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                root,
+                now,
+            )
+        })
+        .unwrap();
+    let (status, _) = call_bytes(&d, "PUT", path, value, &auth, &create_headers);
+    assert_eq!(status, 404, "a saved response cannot outlive its authority");
+}
+
+#[test]
+fn secret_import_is_atomic_and_replays_metadata_only() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let secret_path = "/api/v1/tenants/acme/secrets/DB_PASS";
+    let create = [("if-match", "0"), ("idempotency-key", "initial-db-pass")];
+    assert_eq!(
+        call_bytes(&d, "PUT", secret_path, b"initial", &auth, &create).0,
+        200
+    );
+
+    let import_path = "/api/v1/tenants/acme/secrets/import";
+    let body = b"DB_PASS=rotated\nAPI_KEY=new-key\n";
+    let stale = [
+        ("if-match", "DB_PASS=1,API_KEY=9"),
+        ("idempotency-key", "atomic-secret-import"),
+    ];
+    let (status, failure) = call_bytes(&d, "POST", import_path, body, &auth, &stale);
+    assert_eq!(status, 409);
+    assert!(!serde_json::to_string(&failure).unwrap().contains("rotated"));
+
+    let (status, db_pass) = call(&d, "GET", secret_path, None, Some(&auth), &[]);
+    assert_eq!(status, 200);
+    assert_eq!(db_pass["secret"]["version"], 1);
+    assert_eq!(
+        call(
+            &d,
+            "GET",
+            "/api/v1/tenants/acme/secrets/API_KEY",
+            None,
+            Some(&auth),
+            &[],
+        )
+        .0,
+        404
+    );
+
+    let expected = [
+        ("if-match", "DB_PASS=1,API_KEY=0"),
+        ("idempotency-key", "atomic-secret-import"),
+    ];
+    let (status, imported) = call_bytes(&d, "POST", import_path, body, &auth, &expected);
+    assert_eq!(status, 200);
+    assert_eq!(imported["secrets"].as_array().unwrap().len(), 2);
+    assert!(
+        !serde_json::to_string(&imported)
+            .unwrap()
+            .contains("rotated")
+    );
+    let (status, replay) = call_bytes(&d, "POST", import_path, body, &auth, &expected);
+    assert_eq!(status, 200);
+    assert_eq!(replay, imported);
 }
 
 /// Manual dispatch on a repository with no binding: the worker fetches the

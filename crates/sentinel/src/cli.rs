@@ -48,6 +48,8 @@ pub enum Command {
     Artifact(sentinel::commands::ArtifactArgs),
     /// Cache records of an attempt
     Cache(sentinel::commands::CacheArgs),
+    /// Manage tenant and repository secrets using protected input
+    Secret(sentinel::commands::SecretArgs),
 }
 
 /// Client options: the controller and the credential come from flags or

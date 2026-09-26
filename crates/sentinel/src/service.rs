@@ -1060,12 +1060,16 @@ type Purge =
 #[cfg(feature = "server")]
 fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
     let now = sentinel_core::UnixMillis::now();
-    let purges: [(&str, Purge); 5] = [
+    let purges: [(&str, Purge); 6] = [
         ("oauth", sentinel_store::oauth::purge_expired),
         ("api_tokens", sentinel_store::tokens::purge_expired),
         ("sessions", sentinel_store::local_auth::purge_expired),
         ("sign_in", sentinel_store::sign_in::purge_expired),
         ("idempotency", sentinel_store::idempotency::purge_expired),
+        (
+            "secret_idempotency",
+            sentinel_store::secrets::purge_idempotency,
+        ),
     ];
     let mut backlog = false;
     for (kind, purge) in purges {
@@ -1374,6 +1378,7 @@ fn start_server(
         logs: Arc::clone(&logs),
         objects,
         controller: controller.handle(),
+        secret_key: key.clone(),
         sessions: sentinel_store::local_auth::Policy::default(),
         github_webhook_secret,
         intake: Some(lane.waker()),

@@ -153,6 +153,7 @@ fn deployment_with(github_sign_in: bool) -> Deployment {
             client_secret: GITHUB_SECRET.into(),
             endpoints: github.endpoints(),
         }),
+        secret_key: None,
     })
     .unwrap();
     let base = format!("http://{}", server.local_addr());

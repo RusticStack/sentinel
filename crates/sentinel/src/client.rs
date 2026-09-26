@@ -380,6 +380,7 @@ const ATTEMPTS: u32 = 3;
 const BACKOFF: Duration = Duration::from_millis(200);
 const MAX_BACKOFF: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy)]
 enum Method {
     Get,
     Post,
@@ -388,6 +389,15 @@ enum Method {
 }
 
 type Response = ureq::http::Response<ureq::Body>;
+
+struct BytesRequest<'a> {
+    method: Method,
+    path: &'a str,
+    payload: &'a [u8],
+    content_type: &'a str,
+    headers: &'a [(&'a str, &'a str)],
+    idempotency: Option<&'a str>,
+}
 
 /// A download: status (200 or 206), declared length, and the body.
 pub type Download = (u16, Option<u64>, Box<dyn Read>);
@@ -524,6 +534,62 @@ impl Client {
         self.json(Method::Delete, path, None, None)
     }
 
+    /// Send an explicitly bounded secret value as raw bytes. The payload is
+    /// never converted to text or included in a local diagnostic.
+    pub fn put_bytes(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        content_type: &str,
+        headers: &[(&str, &str)],
+        idempotency: &str,
+    ) -> Result<Value, Error> {
+        self.bytes_json(
+            Method::Put,
+            path,
+            bytes,
+            content_type,
+            headers,
+            Some(idempotency),
+        )
+    }
+
+    /// Idempotent raw-byte request used by the atomic env-file importer.
+    pub fn post_bytes(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        content_type: &str,
+        headers: &[(&str, &str)],
+        idempotency: &str,
+    ) -> Result<Value, Error> {
+        self.bytes_json(
+            Method::Post,
+            path,
+            bytes,
+            content_type,
+            headers,
+            Some(idempotency),
+        )
+    }
+
+    /// A version-checked deletion with an idempotency key.
+    pub fn delete_with(
+        &self,
+        path: &str,
+        headers: &[(&str, &str)],
+        idempotency: &str,
+    ) -> Result<Value, Error> {
+        self.bytes_json(
+            Method::Delete,
+            path,
+            &[],
+            "application/octet-stream",
+            headers,
+            Some(idempotency),
+        )
+    }
+
     /// Stream a body (an object download). `range` is `[start, end)` in
     /// bytes. Returns the status (200 or 206), the declared length and the
     /// reader; any other status is an error.
@@ -554,6 +620,121 @@ impl Client {
         idempotency: Option<&str>,
     ) -> Result<Value, Error> {
         let response = self.exchange(&method, path, body, idempotency, None)?;
+        if !response.status().is_success() {
+            return Err(self.failure(response));
+        }
+        let text = response
+            .into_body()
+            .read_to_string()
+            .map_err(|e| Error::remote(format!("cannot read the response: {e}")))?;
+        if text.is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|_| {
+            Error::remote(format!(
+                "{} did not answer JSON; is it a Sentinel controller (and not a proxy's page)?",
+                self.base
+            ))
+        })
+    }
+
+    fn bytes_json(
+        &self,
+        method: Method,
+        path: &str,
+        payload: &[u8],
+        content_type: &str,
+        headers: &[(&str, &str)],
+        idempotency: Option<&str>,
+    ) -> Result<Value, Error> {
+        let repeatable = idempotency.is_some();
+        let mut token = self.bearer()?;
+        let mut refreshed = false;
+        let mut attempt = 1;
+        loop {
+            let outcome = self.send_bytes_once(
+                BytesRequest {
+                    method,
+                    path,
+                    payload,
+                    content_type,
+                    headers,
+                    idempotency,
+                },
+                &token,
+            );
+            let outcome: Result<Response, (Error, Option<Duration>)> = match outcome {
+                Ok(response) if response.status().as_u16() == 401 => {
+                    if let (Credential::Profile(handle), false) = (&self.credential, refreshed) {
+                        refreshed = true;
+                        token = handle.force_refresh(&self.agent, &token)?;
+                        continue;
+                    }
+                    return self.json_response(response);
+                }
+                Ok(response) if response.status().as_u16() == 429 => {
+                    let error = self.failure(response);
+                    if server_backoff(&error).is_some() {
+                        return Err(error);
+                    }
+                    Err((error, None))
+                }
+                Ok(response) if retryable_status(response.status().as_u16()) => {
+                    let hint = retry_hint(&response);
+                    Err((self.failure(response), hint))
+                }
+                Ok(response) => return self.json_response(response),
+                Err(error) => Err((self.transport(error), None)),
+            };
+            let (error, retry_after) = match outcome {
+                Err(pair) => pair,
+                Ok(_) => unreachable!("successful responses return above"),
+            };
+            if !repeatable || attempt >= ATTEMPTS {
+                return Err(error);
+            }
+            let backoff = retry_after
+                .unwrap_or(BACKOFF * (1 << (attempt - 1)))
+                .min(MAX_BACKOFF);
+            std::thread::sleep(backoff);
+            attempt += 1;
+        }
+    }
+
+    fn send_bytes_once(
+        &self,
+        request: BytesRequest<'_>,
+        token: &str,
+    ) -> Result<Response, ureq::Error> {
+        let BytesRequest {
+            method,
+            path,
+            payload,
+            content_type,
+            headers,
+            idempotency,
+        } = request;
+        let url = format!("{}{path}", self.base);
+        let auth = format!("Bearer {token}");
+        let mut request = match method {
+            Method::Post => self.agent.post(&url),
+            Method::Put => self.agent.put(&url),
+            Method::Delete => self.agent.delete(&url).force_send_body(),
+            Method::Get => self.agent.get(&url).force_send_body(),
+        }
+        .header("authorization", &auth)
+        .header("accept", "application/json")
+        .header("content-type", content_type);
+        if let Some(key) = idempotency {
+            request = request.header("idempotency-key", key);
+        }
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.send(payload)
+    }
+
+    fn json_response(&self, response: Response) -> Result<Value, Error> {
         if !response.status().is_success() {
             return Err(self.failure(response));
         }

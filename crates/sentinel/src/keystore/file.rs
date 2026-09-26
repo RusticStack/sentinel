@@ -126,6 +126,31 @@ pub fn check_private(path: &Path) -> Result<(), Error> {
     check_meta(path, &meta, meta.is_dir())
 }
 
+/// Check the already-open secret input itself, so the read and permission
+/// check refer to the same file even if its path changes concurrently.
+pub fn check_private_input(path: &Path, file: &File) -> Result<(), Error> {
+    let meta = file.metadata().map_err(|e| io_error("inspect", path, &e))?;
+    if !meta.is_file() {
+        return Err(Error::usage("secret input must be a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        check_unix(path, &meta, false, rustix::process::geteuid().as_raw())
+    }
+    #[cfg(windows)]
+    {
+        acl::check_input(file).map_err(|_| {
+            Error::usage(
+                "secret input file permissions must allow only the current user and SYSTEM",
+            )
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(())
+    }
+}
+
 /// [`check_private`] as if the effective user were `euid`: lets tests
 /// exercise the foreign-owner refusal without a second account.
 #[cfg(unix)]
@@ -218,19 +243,19 @@ fn io_error(what: &str, path: &Path, error: &io::Error) -> Error {
 /// everything created inside. The equivalent of `chmod 700`.
 #[cfg(windows)]
 mod acl {
-    use std::{ffi::c_void, io, iter, os::windows::ffi::OsStrExt, path::Path, ptr};
+    use std::{ffi::c_void, fs::File, io, iter, os::windows::ffi::OsStrExt, path::Path, ptr};
 
     use windows_sys::Win32::{
         Foundation::{CloseHandle, ERROR_SUCCESS, GENERIC_ALL, HANDLE, LocalFree},
         Security::{
-            ACL,
+            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
             Authorization::{
-                EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS,
-                SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
-                TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_TYPE, TRUSTEE_W,
+                EXPLICIT_ACCESS_W, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
+                SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
+                TRUSTEE_IS_USER, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_TYPE, TRUSTEE_W,
             },
-            CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetTokenInformation,
-            PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_MAX_SID_SIZE,
+            CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+            GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_MAX_SID_SIZE,
             SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY, TOKEN_USER, TokenUser,
             WinLocalSystemSid,
         },
@@ -335,5 +360,131 @@ mod acl {
             return Err(io::Error::from_raw_os_error(code as i32));
         }
         Ok(())
+    }
+
+    pub(super) fn check_input(file: &File) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+
+        let mut token: HANDLE = ptr::null_mut();
+        // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no
+        // closing; `token` is a valid out-pointer for the opened handle.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut user = [0u64; 16];
+        let mut user_len = 0u32;
+        // SAFETY: `token` is live; `user` is aligned writable storage large
+        // enough for TOKEN_USER and its bounded SID.
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                user.as_mut_ptr().cast(),
+                size_of_val(&user) as u32,
+                &mut user_len,
+            )
+        };
+        let error = io::Error::last_os_error();
+        // SAFETY: this token was opened above and is closed exactly once.
+        unsafe { CloseHandle(token) };
+        if ok == 0 {
+            return Err(error);
+        }
+        // SAFETY: on success the token buffer begins with TOKEN_USER; its SID
+        // pointer refers into `user`, which remains alive through the checks.
+        let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let mut system = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut system_len = SECURITY_MAX_SID_SIZE;
+        // SAFETY: writable storage is at least SECURITY_MAX_SID_SIZE bytes.
+        if unsafe {
+            CreateWellKnownSid(
+                WinLocalSystemSid,
+                ptr::null_mut(),
+                system.as_mut_ptr().cast(),
+                &mut system_len,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor = ptr::null_mut();
+        // SAFETY: the handle belongs to the still-open `file`; the returned
+        // DACL and descriptor are valid until the descriptor is freed.
+        let code = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if code != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        let result = if dacl.is_null() {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "null DACL"))
+        } else {
+            let mut info = ACL_SIZE_INFORMATION::default();
+            // SAFETY: `dacl` came from GetSecurityInfo and `info` is writable
+            // for exactly its declared size.
+            let ok = unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                    size_of_val(&info) as u32,
+                    AclSizeInformation,
+                )
+            };
+            if ok == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                let mut safe = true;
+                for index in 0..info.AceCount {
+                    let mut ace = ptr::null_mut();
+                    // SAFETY: `index` is below the ACE count returned for the
+                    // same valid DACL and `ace` is a writable out-pointer.
+                    if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                        safe = false;
+                        break;
+                    }
+                    // SAFETY: GetAce returned an ACE within the DACL; every
+                    // ACE begins with ACE_HEADER, as guaranteed by Win32.
+                    let header =
+                        unsafe { &*ace.cast::<windows_sys::Win32::Security::ACE_HEADER>() };
+                    if header.AceType != 0 {
+                        safe = false;
+                        break;
+                    }
+                    // SAFETY: standard ACCESS_ALLOWED ACE type guarantees the
+                    // ACCESS_ALLOWED_ACE header and SID field layout.
+                    let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+                    let sid = (&allowed.SidStart as *const u32).cast_mut().cast();
+                    // SAFETY: both SIDs are valid for this loop iteration.
+                    let user = unsafe { EqualSid(sid, user_sid) } != 0;
+                    // SAFETY: the SYSTEM SID buffer remains alive here.
+                    let system_user = unsafe { EqualSid(sid, system.as_mut_ptr().cast()) } != 0;
+                    if !user && !system_user {
+                        safe = false;
+                        break;
+                    }
+                }
+                if safe {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "DACL allows another principal",
+                    ))
+                }
+            }
+        };
+        // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc.
+        unsafe { LocalFree(descriptor.cast()) };
+        result
     }
 }

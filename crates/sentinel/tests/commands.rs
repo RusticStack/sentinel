@@ -96,6 +96,7 @@ fn deployment() -> Deployment {
         intake: None,
         public_url: None,
         github_sign_in: None,
+        secret_key: None,
     })
     .unwrap();
     Deployment {

@@ -84,6 +84,16 @@ The first page (`GET /`) is a single static document; it accepts a
 `details_url` points at ([checks](checks.md)). Signing in with a fragment
 present opens the run immediately afterwards.
 
+Secret mutations are raw-byte writes; only metadata is returned. Authorization requires both the OAuth scope below and the store's current tenant/repository permission.
+
+| Route | Store authority | Scope | Does |
+|---|---|---|---|
+| `GET /tenants/{slug}/secrets?repo&after&limit` | member or secret writer | `secrets:metadata` | keyset page of names, versions, active state and timestamps; `limit` is 1–100; no ciphertext or value |
+| `GET /tenants/{slug}/secrets/{name}?repo` | member or secret writer | `secrets:metadata` | one metadata record; no value read-back |
+| `PUT /tenants/{slug}/secrets/{name}?repo` | secret writer | `secrets:write` | raw body 1–65,536 bytes; required `If-Match` current version (`0` creates) and `Idempotency-Key`; atomic sealed write → metadata |
+| `DELETE /tenants/{slug}/secrets/{name}?repo` | secret writer | `secrets:write` | required `If-Match` and `Idempotency-Key`; revokes all versions and reserves the name |
+| `POST /tenants/{slug}/secrets/import?repo` | secret writer | `secrets:write` | strict env-file bytes ≤ 1 MiB; `If-Match` lists every `NAME=version`; one transaction creates/rotates every entry or none; requires `Idempotency-Key` |
+
 ## The CLI
 
 ```sh

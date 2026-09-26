@@ -12,6 +12,7 @@ pub mod limits;
 pub mod logs;
 pub mod negotiate;
 pub mod oauth;
+pub mod secrets;
 pub mod source;
 pub mod summary;
 

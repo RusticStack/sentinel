@@ -128,6 +128,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (36, include_str!("migrations/036_image_prefetch.sql")),
     (37, include_str!("migrations/037_sign_in_return.sql")),
     (38, include_str!("migrations/038_secrets.sql")),
+    (39, include_str!("migrations/039_secret_idempotency.sql")),
 ];
 
 /// Whether `versions` are exactly `1..=N` in order. `migrate` skips every

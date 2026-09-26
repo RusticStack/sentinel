@@ -94,6 +94,7 @@ fn deployment() -> Deployment {
         logs: Arc::clone(&logs),
         objects,
         controller: controller.handle(),
+        secret_key: None,
         sessions: local_auth::Policy::default(),
         github_webhook_secret: None,
         intake: None,
