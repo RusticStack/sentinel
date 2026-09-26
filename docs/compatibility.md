@@ -16,6 +16,7 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | Master key file | `SNTLKEY2` magic (also reads legacy raw 32-byte file) | `sentinel-auth::sealed` | controller, host-local admin |
 | Manifest file | `SNMF` magic + format `u16` (currently 1) | `sentinel-store::objects` | controller |
 | API error | `schema: "sentinel.error/1"` | `sentinel-protocol` | CLI, MCP, UI, workers |
+| Diagnostic report | `schema_version` (currently 1; `sentinel.diagnostics/1`) | `sentinel-protocol::diagnostics` | API, CLI, MCP, UI |
 | Explain output | `schema: "sentinel.explain/1"` | `sentinel-pipeline::explain` | CLI, agents |
 | Event cursor | text prefix `c1` | `sentinel-protocol::cursor` | API clients (`GET /attempts/{id}/logs` `next`/`cursor`) |
 | Worker protocol | `protocol_min..=protocol_max` in `Hello` (currently 1..=10) | `sentinel-protocol::negotiate` | workers |
@@ -35,6 +36,14 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 **Secret delivery (S05–S06, run spec 6, migration 40, protocol 10).** Run spec format 6 adds optional job `registry_auth`, step environment-secret names and secret-file targets; readers still decode formats 3–5 through their shadow layouts. Migration 40 marks jobs that require worker secret delivery so dispatch will not offer them to workers that lack protocol 10 or `SECRET_DELIVERY` bit 9. Protocol 10 appends `SecretBegin`/`SecretChunk`; each transfer is attempt- and fence-bound, ordered, and capped at 1 MiB. The controller resolves only declared bindings and records versioned use in the same writer transaction that checks the acknowledged attempt and opens the sealed values. Workers reject missing, extra, malformed or conflicting targets before execution. Every new attempt, including a rerun, receives the then-current active version. Secret values are not added to the run spec blob or SQLite plaintext; the worker keeps them in private per-attempt files outside workspaces, caches and artifacts, redacts before spool persistence, and reaps crash leftovers. Upgrade controllers and workers together for secret-using jobs; older workers remain eligible for jobs with no secret targets. See [secrets](secrets.md), [protocol](protocol.md#protocol-10-secret-delivery) and [executor](executor.md#the-image-pull-k05).
 
 ## Rules
+
+**Diagnostic reports.** Report inputs name an exact `schema_version`; unknown
+fields and unsupported versions are rejected. A compatible v1 change may add
+optional fields only when v1 readers can safely ignore them; changing field
+meaning, enum vocabulary, evidence-offset semantics, or validation bounds
+requires a new version. Server-authored provenance and freshness remain
+outside the custom input shape. Reports are evidence and cannot override the
+fenced attempt result. See [structured diagnostics](diagnostics.md).
 
 **Pipeline schema.** A file names the schema it was written for and is accepted only by builds that implement that exact version. Within a version, changes may only widen what is accepted (new optional keys, new functions, relaxed limits). Rejecting something that was previously accepted, changing the meaning of an accepted construct, or tightening a limit requires a new schema number; the old number stays supported for at least two minor releases and its removal is announced in the changelog. Unknown keys are always errors, so a file cannot silently depend on a feature its declared schema does not have.
 

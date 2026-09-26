@@ -5,6 +5,7 @@
 
 pub mod cache;
 pub mod cursor;
+pub mod diagnostics;
 pub mod error;
 pub mod idempotency;
 pub mod intake;
