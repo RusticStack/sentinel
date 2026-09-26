@@ -244,9 +244,9 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
     let notices = Arc::new(Mutex::new(Vec::<String>::new()));
     let log = Arc::clone(&notices);
     let worker_id = WorkerId::new();
-    // The value a secret binding would inject (S05) is registered for each
-    // attempt as it starts — per attempt, before its first step — so it
-    // never reaches that attempt's log.
+    // The inspect-job redaction fixture prints a synthetic value. Register it
+    // before each attempt so the test covers redaction from its first output;
+    // `secret_use` below exercises the separate S05 delivery path.
     let registrar: Arc<std::sync::OnceLock<Executor>> = Arc::new(std::sync::OnceLock::new());
     let hook = Arc::clone(&registrar);
     let executor = Executor::start(
