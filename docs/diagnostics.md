@@ -96,5 +96,25 @@ it is not silently promoted to a fresh pass. Report text, source paths, test
 names, and log content are untrusted data, never instructions. Any inferred
 root cause must be labeled as an inference and cite evidence ranges.
 
+## Parser behavior (X02)
+
+`sentinel-protocol::diagnostics` exposes streaming-by-record parsers for
+newline-delimited Go test JSON and rustc compiler JSON, a forward-only JUnit
+XML reader, and strict custom JSON decoding. Go test output is retained as a
+4 KiB circular tail per active test; successful tests release it. Go
+`Action=fail` creates test/package diagnostics and recognizes race and panic
+markers. Rust errors/warnings use the primary source span and compiler code;
+rendered duplicates are discarded. JUnit reports keep one testcase and one
+failure body at a time, reject DTDs and unresolved entities, and preserve
+skipped tests as informational records. Unknown XML extensions are skipped.
+
+All parsers stop after 256 MiB or 2,000,000 records, reject individual JSON
+records or XML tags above 64 KiB, and return no more than 1,024 diagnostics.
+Custom JSON is capped at the API's 1 MiB body limit before deserialization.
+They report malformed, omitted, and scanned-byte counts without echoing
+invalid parser payloads. Go/rustc record offsets are half-open byte ranges in
+the input stream; the log layer maps these back to stable frame positions.
+Parser output is never an attempt transition.
+
 See [logs](logs.md) for frame durability and bounded search, [API](api.md) for
 authorization, and [compatibility](compatibility.md) for schema evolution.

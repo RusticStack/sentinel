@@ -5,6 +5,12 @@
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+mod parse;
+pub use parse::{
+    CustomInputError, MAX_PARSER_INPUT_BYTES, ParseResult, ParsedDiagnostic, parse_custom_json,
+    parse_go_test_json, parse_junit_xml, parse_rust_compiler_json,
+};
+
 pub const REPORT_SCHEMA_VERSION: u16 = 1;
 pub const MAX_REPORT_DIAGNOSTICS: usize = 1_024;
 pub const MAX_REPORT_EVIDENCE_PER_DIAGNOSTIC: usize = 8;
