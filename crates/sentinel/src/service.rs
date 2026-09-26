@@ -756,6 +756,51 @@ fn bootstrap_work<T: Send + 'static>(
         .map_err(|error| Error::runtime(error.to_string()))
 }
 
+/// The sealing key, always `<data_dir>/master.key` (the path `admin key`
+/// writes). Absent is fine only while the database holds no sealed value;
+/// otherwise, or when the key does not open this database's newest sealed
+/// values (a mismatched restore), the controller refuses to start (exit 2)
+/// instead of serving 500s at first use.
+#[cfg(feature = "server")]
+fn master_key(
+    data_dir: &Path,
+    store: &sentinel_store::Store,
+) -> Result<Option<Arc<sentinel_auth::sealed::Key>>, Error> {
+    let path = data_dir.join(sentinel_store::MASTER_KEY_FILE);
+    let missing = matches!(
+        fs::symlink_metadata(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    if missing {
+        let sealed = store
+            .read(sentinel_store::reseal::sealed_rows_exist)
+            .map_err(|error| Error::runtime(format!("cannot inspect sealed values: {error}")))?;
+        if sealed {
+            return Err(Error::config(format!(
+                "{} is missing, but the database holds sealed secrets, second factors or source credentials; restore the key file that matches this database",
+                path.display()
+            )));
+        }
+        return Ok(None);
+    }
+    let key = sentinel_auth::sealed::Key::load(&path).map_err(|error| {
+        let reason = match error {
+            sentinel_auth::sealed::SealError::Key(reason) => reason,
+            sentinel_auth::sealed::SealError::Unsealable => "invalid key file",
+        };
+        Error::config(format!("cannot load {}: {reason}", path.display()))
+    })?;
+    store
+        .read(|conn| sentinel_store::reseal::verify_key(conn, &key))
+        .map_err(|_| {
+            Error::config(format!(
+                "{} does not open the sealed values in this database; restore the key file that matches this database snapshot",
+                path.display()
+            ))
+        })?;
+    Ok(Some(Arc::new(key)))
+}
+
 /// Load the role's TLS identity from the data directory, generating it on
 /// first start. The key file is the process's secret and stays owner-only.
 fn identity(data_dir: &Path, stem: &str) -> Result<sentinel_link::identity::Identity, Error> {
@@ -1108,6 +1153,9 @@ fn start_server(
             }
         })?;
     let store = Arc::new(store);
+    // Before anything listens: a controller whose sealed values it cannot
+    // open must not come up looking healthy (P10S-4).
+    let key = master_key(&config.data_dir, &store)?;
     let identity = identity(&config.data_dir, "controller")?;
     let fingerprint = hex32(&identity.fingerprint().0);
     let logs = Arc::new(
@@ -1193,15 +1241,6 @@ fn start_server(
     if let Some(app) = &app {
         controller.set_source_app(Arc::clone(&app.app));
     }
-    let source_key = config.data_dir.join("master.key");
-    let key = if source_key.exists() {
-        Some(Arc::new(
-            sentinel_auth::sealed::Key::load(&source_key)
-                .map_err(|_| Error::runtime("cannot load source sealing key"))?,
-        ))
-    } else {
-        None
-    };
     if let Some(key) = &key {
         controller.set_source_key(Arc::clone(key));
     }

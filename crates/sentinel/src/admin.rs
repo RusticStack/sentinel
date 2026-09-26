@@ -704,13 +704,12 @@ fn account(args: &AccountArgs, now: UnixMillis) -> Result<(), Error> {
 
 fn key(args: &KeyArgs) -> Result<(), Error> {
     match &args.command {
-        KeyCommand::Create { data, key_file } => {
+        KeyCommand::Create { data } => {
             if !data.data_dir.is_absolute() {
                 return Err(fail("data_dir must be an absolute path"));
             }
-            let path = key_file
-                .clone()
-                .unwrap_or_else(|| data.data_dir.join(MASTER_KEY_FILE));
+            // The one path the controller reads (P10S-4).
+            let path = data.data_dir.join(MASTER_KEY_FILE);
             sentinel_auth::sealed::Key::create(&path)
                 .map_err(|error| fail(format!("cannot create the key: {error:?}")))?;
             eprintln!(
@@ -718,17 +717,16 @@ fn key(args: &KeyArgs) -> Result<(), Error> {
                 path.display()
             );
         }
-        KeyCommand::Rotate {
+        KeyCommand::Reseal {
             data,
-            key_file,
+            retire,
             backup,
-        } => {
+        } => reseal(data, *retire, backup.as_deref())?,
+        KeyCommand::Rotate { data, backup } => {
             if !data.data_dir.is_absolute() || !backup.is_absolute() {
                 return Err(fail("data_dir and backup must be absolute paths"));
             }
-            let path = key_file
-                .clone()
-                .unwrap_or_else(|| data.data_dir.join(MASTER_KEY_FILE));
+            let path = data.data_dir.join(MASTER_KEY_FILE);
             // Hold the controller's database ownership lock for the whole
             // rotation. A running controller must not keep sealing with the
             // old in-memory key after the file changes.
@@ -746,6 +744,60 @@ fn key(args: &KeyArgs) -> Result<(), Error> {
                 backup.display()
             );
         }
+    }
+    Ok(())
+}
+
+/// Offline re-encryption (P10S-5): with the controller stopped (the database
+/// ownership lock is held throughout), move every sealed value to the active
+/// key in bounded batches, then optionally drop every other key. Rerunning
+/// after an interruption continues where it stopped; `--retire` refuses
+/// while any value still needs a retired key.
+fn reseal(data: &DataDir, retire: bool, backup: Option<&std::path::Path>) -> Result<(), Error> {
+    if !data.data_dir.is_absolute() || backup.is_some_and(|b| !b.is_absolute()) {
+        return Err(fail("data_dir and backup must be absolute paths"));
+    }
+    let path = data.data_dir.join(MASTER_KEY_FILE);
+    let store = open(data, true)?;
+    let key = std::sync::Arc::new(
+        sentinel_auth::sealed::Key::load(&path)
+            .map_err(|error| fail(format!("cannot load {}: {error:?}", path.display())))?,
+    );
+    let progress = sentinel_store::reseal::reseal_all(&store, std::sync::Arc::clone(&key))
+        .map_err(|error| {
+            fail(format!(
+                "reseal stopped ({error}); values already moved stay moved, rerun to continue"
+            ))
+        })?;
+    eprintln!(
+        "resealed {} of {} sealed values under key {}",
+        progress.resealed,
+        progress.examined,
+        key.active_id()
+    );
+    if !retire {
+        return Ok(());
+    }
+    let backup = backup.ok_or_else(|| fail("--retire needs --backup"))?;
+    let stale = store
+        .read(|conn| sentinel_store::reseal::stale(conn, &key))
+        .map_err(|error| fail(format!("cannot check sealed values: {error}")))?;
+    if stale != 0 {
+        return Err(fail(format!(
+            "{stale} sealed values still need a retired key; nothing was retired"
+        )));
+    }
+    let retired = sentinel_auth::sealed::Key::retire(&path, backup)
+        .map_err(|error| fail(format!("cannot retire keys: {error:?}")))?;
+    if retired == 0 {
+        eprintln!("only the active key remains; nothing to retire");
+    } else {
+        eprintln!(
+            "retired {retired} keys; {} now holds key {} only, and {} holds the file as it was",
+            path.display(),
+            key.active_id(),
+            backup.display()
+        );
     }
     Ok(())
 }
