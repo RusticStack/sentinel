@@ -1502,11 +1502,12 @@ impl Inner {
         for try_no in 0..SPEC_TRIES {
             match resolve_spec(
                 &self.store,
-                key.as_deref(),
+                key.clone(),
                 app.as_ref(),
                 &destinations,
                 worker,
                 attempt,
+                request.protocol,
             ) {
                 Ok(spec) => {
                     let _ = send_resolved(&request.sender, attempt, request.protocol, Some(spec));
@@ -2352,16 +2353,24 @@ impl From<sentinel_store::Error> for SpecFault {
 
 fn resolve_spec(
     store: &Store,
-    key: Option<&sentinel_auth::sealed::Key>,
+    key: Option<Arc<sentinel_auth::sealed::Key>>,
     app: Option<&Arc<sentinel_github::app::App>>,
     destinations: &[String],
     worker: WorkerId,
     attempt: AttemptId,
-) -> std::result::Result<(JobContext, Vec<u8>), SpecFault> {
-    use sentinel_store::{Error as StoreError, sources};
+    protocol: u16,
+) -> std::result::Result<
+    (
+        JobContext,
+        Vec<u8>,
+        Option<sentinel_store::secrets::PreparedDelivery>,
+    ),
+    SpecFault,
+> {
+    use sentinel_store::{Error as StoreError, secrets, sources};
     // One read snapshot: the attempt's context and spec, the binding that
     // authorizes it, and the destination policy.
-    let (mut context, bytes, binding) = store.read(|conn| {
+    let (mut context, bytes, binding, requires_secret_delivery) = store.read(|conn| {
         let tx = conn.unchecked_transaction()?;
         let c = dispatch::job_context(&tx, worker, attempt)?;
         let bytes = dispatch::spec_bytes(&tx, worker, attempt)?;
@@ -2386,6 +2395,15 @@ fn resolve_spec(
             tenant: Some(c.tenant),
             trust: c.trust,
         };
+        let spec = sentinel_pipeline::RunSpec::decode(&bytes)
+            .map_err(|_| StoreError::Corrupt("run spec"))?;
+        let job_spec = spec
+            .pipeline
+            .jobs
+            .iter()
+            .find(|job| job.name == context.job_name)
+            .ok_or(StoreError::Corrupt("job spec index"))?;
+        let requires_secret_delivery = job_spec.spec.requires_secret_delivery();
         let binding = match sentinel_intake::source::lookup_conn(&tx, context.repo)? {
             None => None,
             Some(binding) => {
@@ -2399,22 +2417,21 @@ fn resolve_spec(
                 if (tenant, repo) != (binding.tenant, binding.repo) {
                     return Err(StoreError::Forbidden);
                 }
-                let spec = sentinel_pipeline::RunSpec::decode(&bytes)
-                    .map_err(|_| StoreError::Corrupt("run spec"))?;
                 sources::validate_source(&tx, repo, &spec.source)?;
                 Some(binding)
             }
         };
-        Ok((context, bytes, binding))
+        Ok((context, bytes, binding, requires_secret_delivery))
     })?;
     if let Some(binding) = binding {
         // The only network step; a revocation that lands while a token is
         // being minted wins the race (rechecked inside `issue`).
-        let access = sentinel_intake::source::issue(store, key, app, &binding, UnixMillis::now())
-            .map_err(|e| match e {
-            sentinel_intake::source::Error::Unavailable(_) => SpecFault::Transient,
-            sentinel_intake::source::Error::Refused(_) => SpecFault::Refused,
-        })?;
+        let access =
+            sentinel_intake::source::issue(store, key.as_deref(), app, &binding, UnixMillis::now())
+                .map_err(|e| match e {
+                    sentinel_intake::source::Error::Unavailable(_) => SpecFault::Transient,
+                    sentinel_intake::source::Error::Refused(_) => SpecFault::Refused,
+                })?;
         // And the lease that authorized this delivery must still be live.
         let (tenant, repo) = (binding.tenant, binding.repo);
         store.read(move |conn| {
@@ -2425,21 +2442,45 @@ fn resolve_spec(
         })?;
         context.source = Some(access);
     }
-    Ok((context, bytes))
+    let prepared = if requires_secret_delivery {
+        if protocol < 10 {
+            return Err(SpecFault::Refused);
+        }
+        let Some(key) = key else {
+            return Err(SpecFault::Refused);
+        };
+        Some(
+            store
+                .writer()
+                .write(move |tx| {
+                    secrets::prepare_delivery(tx, &key, worker, attempt, UnixMillis::now())
+                })
+                .map_err(SpecFault::from)?,
+        )
+    } else {
+        None
+    };
+    Ok((context, bytes, prepared))
 }
 
 fn send_resolved(
     sender: &Sender,
     attempt: AttemptId,
     protocol: u16,
-    spec: Option<(JobContext, Vec<u8>)>,
+    spec: Option<(
+        JobContext,
+        Vec<u8>,
+        Option<sentinel_store::secrets::PreparedDelivery>,
+    )>,
 ) -> Result<()> {
     use session::ServerMessage;
     // Protocol 3 carries the event context and (from 2) the source access;
     // anything older is served `NoSpec` rather than a message it cannot decode.
-    let Some((context, bytes)) =
-        spec.filter(|(_, b)| protocol >= 3 && b.len() <= session::MAX_SPEC_BYTES)
-    else {
+    let Some((context, bytes, delivery)) = spec.filter(|(_, b, delivery)| {
+        protocol >= 3
+            && b.len() <= session::MAX_SPEC_BYTES
+            && (delivery.is_none() || protocol >= 10)
+    }) else {
         return sender.send(&ServerMessage::NoSpec {
             attempt: *attempt.as_bytes(),
         });
@@ -2453,6 +2494,34 @@ fn send_resolved(
             attempt: *attempt.as_bytes(),
             access,
         })?;
+    }
+    if let Some(prepared) = delivery {
+        use sentinel_protocol::secrets::{MAX_DELIVERY_BYTES, SecretBytes};
+        let fence = prepared.fence;
+        let payload = prepared.encoded;
+        if payload.is_empty() || payload.len() > MAX_DELIVERY_BYTES {
+            return sender.send(&ServerMessage::NoSpec {
+                attempt: *attempt.as_bytes(),
+            });
+        }
+        let length =
+            u32::try_from(payload.len()).map_err(|_| Error::Protocol("secret bundle length"))?;
+        sender.send(&ServerMessage::SecretBegin {
+            attempt: *attempt.as_bytes(),
+            fence: fence.0,
+            length,
+        })?;
+        let chunks = payload.as_slice().chunks(session::SPEC_CHUNK_BYTES);
+        let count = chunks.len();
+        for (seq, chunk) in chunks.enumerate() {
+            sender.send_sensitive(&ServerMessage::SecretChunk {
+                attempt: *attempt.as_bytes(),
+                fence: fence.0,
+                seq: seq as u32,
+                last: seq + 1 == count,
+                bytes: SecretBytes::copy_from(chunk),
+            })?;
+        }
     }
     let chunks = bytes.chunks(session::SPEC_CHUNK_BYTES);
     let count = chunks.len();

@@ -138,7 +138,7 @@ fn entry_dir(worker_dir: &Path, repo: RepoId, trust: Trust) -> PathBuf {
     )
 }
 
-fn make_job(repo_dir: &Path, sha: &str, repo: RepoId, trust: Trust) -> Job {
+fn make_job(worker_dir: &Path, repo_dir: &Path, sha: &str, repo: RepoId, trust: Trust) -> Job {
     let compiled = compile_str(PIPELINE).unwrap();
     let source = PinnedSource::new(repo_dir.to_str().unwrap(), sha, Some("main")).unwrap();
     Job {
@@ -168,7 +168,8 @@ fn make_job(repo_dir: &Path, sha: &str, repo: RepoId, trust: Trust) -> Job {
             tenant: None,
             trust,
         },
-        images: Images::new(),
+        images: Images::for_worker_data_dir(worker_dir).unwrap(),
+        secret_bundle: sentinel_protocol::secrets::DeliveryBundle::empty(),
         caches: Vec::new(),
         mirrors: None,
         prepare_hold: Duration::ZERO,
@@ -206,7 +207,7 @@ fn a_failing_publish_is_a_note_never_the_verdict() {
     let worker_dir = temp.path().join("worker");
 
     // First attempt: a clean publish seals the protected entry.
-    let mut job = make_job(&repo_dir, &sha, repo, Trust::Protected);
+    let mut job = make_job(&worker_dir, &repo_dir, &sha, repo, Trust::Protected);
     let (verdict, summary, notes) = run_attempt(&worker_dir, &mut job);
     assert_eq!(verdict, Verdict::Passed);
     assert_eq!(summary.caches.len(), 1);
@@ -220,7 +221,7 @@ fn a_failing_publish_is_a_note_never_the_verdict() {
 
     // Second attempt: restore still hits — the read path is unaffected —
     // and the publication failure reports as a note while every step ran.
-    let mut job = make_job(&repo_dir, &sha, repo, Trust::Protected);
+    let mut job = make_job(&worker_dir, &repo_dir, &sha, repo, Trust::Protected);
     let (verdict, summary, notes) = run_attempt(&worker_dir, &mut job);
     assert_eq!(
         verdict,
@@ -258,7 +259,7 @@ fn a_pull_request_attempt_never_touches_protected_state() {
 
     // Protected state exists first: a real publish under the protected
     // scope, same repo and image.
-    let mut job = make_job(&repo_dir, &sha, repo, Trust::Protected);
+    let mut job = make_job(&worker_dir, &repo_dir, &sha, repo, Trust::Protected);
     let (verdict, _, _) = run_attempt(&worker_dir, &mut job);
     assert_eq!(verdict, Verdict::Passed);
     let protected = entry_dir(&worker_dir, repo, Trust::Protected);
@@ -267,7 +268,7 @@ fn a_pull_request_attempt_never_touches_protected_state() {
 
     // The PR attempt: no restored bytes (`absent`), steps still run, and
     // the publish can only land under the pull-request scope.
-    let mut job = make_job(&repo_dir, &sha, repo, Trust::PullRequest);
+    let mut job = make_job(&worker_dir, &repo_dir, &sha, repo, Trust::PullRequest);
     let (verdict, summary, notes) = run_attempt(&worker_dir, &mut job);
     assert_eq!(verdict, Verdict::Passed);
     assert_eq!(summary.caches[0].outcome, "absent");
@@ -312,7 +313,13 @@ fn publish_runs_with_the_container_stopped() {
     let repo_dir = temp.path().join("origin");
     let sha = make_repo(&repo_dir);
     let worker_dir = temp.path().join("worker");
-    let mut job = make_job(&repo_dir, &sha, RepoId::new(), Trust::Protected);
+    let mut job = make_job(
+        &worker_dir,
+        &repo_dir,
+        &sha,
+        RepoId::new(),
+        Trust::Protected,
+    );
     // The step returns at once but leaves a writer behind in the view.
     let yaml = PIPELINE.replace(
         "run: 'mkdir -p vendor && echo payload > vendor/lib'",

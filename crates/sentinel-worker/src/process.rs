@@ -61,6 +61,14 @@ impl Output {
     }
 }
 
+impl Drop for Output {
+    fn drop(&mut self) {
+        self.stdout.fill(0);
+        self.stderr.fill(0);
+        core::hint::black_box((&mut self.stdout, &mut self.stderr));
+    }
+}
+
 /// The last [`OUTPUT_TAIL_BYTES`] of a stream: a fixed ring written in
 /// place, so keeping the tail of a long stream costs no memmove per chunk.
 struct Tail {
@@ -104,7 +112,14 @@ impl Tail {
         if self.ring.len() == OUTPUT_TAIL_BYTES {
             self.ring.rotate_left(self.head);
         }
-        self.ring
+        std::mem::take(&mut self.ring)
+    }
+}
+
+impl Drop for Tail {
+    fn drop(&mut self) {
+        self.ring.fill(0);
+        core::hint::black_box(&mut self.ring);
     }
 }
 
@@ -128,6 +143,7 @@ fn drain(
                             sink(which, &chunk[..n]);
                         }
                         tail.push(&chunk[..n]);
+                        chunk[..n].fill(0);
                     }
                 }
             }

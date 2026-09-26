@@ -8,15 +8,14 @@
 //! values never touch another's output, and they go with the attempt. Boundaries are
 //! handled: the redactor holds back the last `longest - 1` bytes of each
 //! stream until the next chunk arrives, so a value split across two reads
-//! is still caught. Values shorter than `MIN_SECRET_BYTES` are not
-//! registered: replacing every "a" in the output would be worse than
-//! useless, and such a value is not a secret worth the name.
+//! is still caught. Every non-empty secret is registered; short values can
+//! cause noisy redaction, but leaving an authorized value visible is worse.
 
 use std::{borrow::Cow, collections::BTreeSet};
 
 use sentinel_protocol::logs::Stream;
 
-pub const MIN_SECRET_BYTES: usize = 8;
+pub const MIN_SECRET_BYTES: usize = 1;
 pub const REPLACEMENT: &[u8] = b"***";
 
 #[derive(Default)]
@@ -35,9 +34,9 @@ impl Redactor {
         Redactor::default()
     }
 
-    /// Register a value; returns whether it was long enough to matter.
+    /// Register a non-empty value; returns whether it was accepted.
     pub fn register(&mut self, secret: &[u8]) -> bool {
-        if secret.len() < MIN_SECRET_BYTES {
+        if secret.is_empty() {
             return false;
         }
         self.longest = self.longest.max(secret.len());
@@ -64,6 +63,7 @@ impl Redactor {
         let mut out = Vec::with_capacity(buf.len());
         let at = self.scan(&buf, true, &mut out);
         // The held tail becomes the next carry in place: no second copy.
+        buf[..at].fill(0);
         buf.drain(..at);
         self.carry[stream as usize] = buf;
         Cow::Owned(out)
@@ -139,6 +139,17 @@ impl Redactor {
     }
 }
 
+impl Drop for Redactor {
+    fn drop(&mut self) {
+        while let Some(mut secret) = self.secrets.pop_first() {
+            secret.fill(0);
+        }
+        for carry in &mut self.carry {
+            carry.fill(0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,7 +196,7 @@ mod tests {
     fn secrets_are_replaced_even_when_split_across_chunks() {
         let mut r = Redactor::new();
         assert!(r.register(b"ghs_supersecret_token"));
-        assert!(!r.register(b"short"));
+        assert!(r.register(b"short"));
         assert_eq!(
             run(&mut r, &[b"token=ghs_supersecret_token done\n"]),
             b"token=*** done\n".to_vec()

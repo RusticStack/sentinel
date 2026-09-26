@@ -6,9 +6,203 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 pub const MAX_SECRET_BYTES: usize = 65_536;
 pub const MAX_IMPORT_ENTRIES: usize = 100;
 pub const MAX_IMPORT_BYTES: usize = super::limits::MAX_API_BODY_BYTES;
+pub const MAX_DELIVERY_BYTES: usize = 1024 * 1024;
+pub const MAX_DELIVERY_TARGETS: usize = 16 * 64 + 1;
+pub const MAX_DELIVERY_VALUES: usize = MAX_DELIVERY_TARGETS;
+const DELIVERY_VALUE_WIRE_OVERHEAD: usize = 16;
+const DELIVERY_TARGET_WIRE_UPPER_BOUND: usize = 384;
+
+/// Byte storage used for a serialized secret bundle. Its debug view exposes
+/// only the size, and every owned buffer is wiped when released.
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn copy_from(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for SecretBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SecretBytes({} bytes)", self.0.len())
+    }
+}
+
+impl Drop for SecretBytes {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        core::hint::black_box(&mut self.0);
+    }
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryValue {
+    value: SecretBytes,
+}
+
+impl DeliveryValue {
+    pub fn new(value: Vec<u8>) -> Self {
+        Self {
+            value: SecretBytes::new(value),
+        }
+    }
+
+    pub fn expose(&self) -> &[u8] {
+        self.value.as_slice()
+    }
+}
+
+impl fmt::Debug for DeliveryValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DeliveryValue([redacted])")
+    }
+}
+
+/// An explicitly authorized use of one value by one compiled step.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DeliveryTarget {
+    pub step: u16,
+    pub name: String,
+    pub value: u16,
+    pub target: TargetKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TargetKind {
+    Environment,
+    File {
+        path: String,
+    },
+    /// OCI `auth.json` bytes kept on the host and used only for this job's
+    /// image pull. `step` is zero by convention; it is never exposed to a step.
+    RegistryAuth,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryBundle {
+    pub values: Vec<DeliveryValue>,
+    pub targets: Vec<DeliveryTarget>,
+}
+
+impl fmt::Debug for DeliveryBundle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeliveryBundle")
+            .field("values", &self.values.len())
+            .field("targets", &self.targets.len())
+            .finish()
+    }
+}
+
+impl DeliveryBundle {
+    pub fn empty() -> Self {
+        Self {
+            values: Vec::new(),
+            targets: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    /// A conservative allocation-free upper bound for its postcard wire
+    /// size. The target bound covers both maximum-length names and file
+    /// paths; value overhead covers the byte-string length prefix and struct
+    /// framing. Preparation checks this as it grows so oversized bundles do
+    /// not first allocate every secret value.
+    pub fn within_wire_limit(&self) -> bool {
+        if self.values.len() > MAX_DELIVERY_VALUES || self.targets.len() > MAX_DELIVERY_TARGETS {
+            return false;
+        }
+        let Some(size) = self
+            .values
+            .iter()
+            .try_fold(16usize, |size, value| {
+                size.checked_add(value.value.len())?
+                    .checked_add(DELIVERY_VALUE_WIRE_OVERHEAD)
+            })
+            .and_then(|size| {
+                size.checked_add(
+                    self.targets
+                        .len()
+                        .checked_mul(DELIVERY_TARGET_WIRE_UPPER_BOUND)?,
+                )
+            })
+        else {
+            return false;
+        };
+        size <= MAX_DELIVERY_BYTES
+    }
+
+    /// Bound the decoded control data before any worker filesystem work.
+    pub fn valid(&self) -> bool {
+        self.within_wire_limit()
+            && self
+                .values
+                .iter()
+                .all(|v| (1..=MAX_SECRET_BYTES).contains(&v.value.len()))
+            && self.targets.iter().all(|target| {
+                target.step < 64
+                    && valid_secret_name(&target.name)
+                    && (target.value as usize) < self.values.len()
+                    && match &target.target {
+                        TargetKind::Environment => true,
+                        TargetKind::File { path } => valid_delivery_path(path),
+                        TargetKind::RegistryAuth => target.step == 0,
+                    }
+            })
+    }
+}
+
+fn valid_secret_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && !bytes[0].is_ascii_digit()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+fn valid_delivery_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 256
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && !path.contains("//")
+        && !path.ends_with('/')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
 
 struct WipeEntries(Vec<(String, Vec<u8>)>);
 impl Drop for WipeEntries {
@@ -101,6 +295,25 @@ pub fn parse_env_file(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ImportErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_wire_size_bound_rejects_oversized_values_before_encoding() {
+        let too_large = DeliveryBundle {
+            values: (0..16)
+                .map(|_| DeliveryValue::new(vec![b'x'; MAX_SECRET_BYTES]))
+                .collect(),
+            targets: Vec::new(),
+        };
+        assert!(!too_large.within_wire_limit());
+
+        let bounded = DeliveryBundle {
+            values: (0..16)
+                .map(|_| DeliveryValue::new(vec![b'x'; 60 * 1024]))
+                .collect(),
+            targets: Vec::new(),
+        };
+        assert!(bounded.within_wire_limit());
+    }
 
     #[test]
     fn parses_literal_values_and_crlf_without_expansion() {

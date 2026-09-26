@@ -356,6 +356,7 @@ struct Pick {
     arch: Option<String>,
     labels: Vec<u8>,
     pull_request: bool,
+    requires_secret_delivery: bool,
     queued_ms: i64,
     /// The fair-order key after `queued_ms`: the keyset a next page resumes
     /// from.
@@ -377,14 +378,15 @@ struct WorkerFacts {
     cpu_millis: i64,
     memory_bytes: i64,
     disk_bytes: i64,
+    secret_delivery: bool,
 }
-type WorkerFactsRow = ([u8; 16], String, Vec<u8>, bool, i64, Vec<u8>, i64, i64);
+type WorkerFactsRow = ([u8; 16], String, Vec<u8>, bool, i64, Vec<u8>, i64, i64, i64);
 
 fn worker_facts(conn: &Connection, worker: WorkerId) -> Result<Option<(WorkerId, WorkerFacts)>> {
     let row: Option<WorkerFactsRow> = conn
         .prepare_cached(
             "SELECT pool_id, arch, labels, drain_ms IS NOT NULL, disk_bytes, avail_images,
-                    cpu_millis, memory_bytes
+                    cpu_millis, memory_bytes, capabilities
              FROM workers WHERE id = ?1 AND revoked_ms IS NULL",
         )?
         .query_row([worker.as_bytes()], |r| {
@@ -397,10 +399,13 @@ fn worker_facts(conn: &Connection, worker: WorkerId) -> Result<Option<(WorkerId,
                 r.get(5)?,
                 r.get(6)?,
                 r.get(7)?,
+                r.get(8)?,
             ))
         })
         .optional()?;
-    let Some((pool, arch, labels, draining, disk_bytes, avail_images, cpu, memory)) = row else {
+    let Some((pool, arch, labels, draining, disk_bytes, avail_images, cpu, memory, capabilities)) =
+        row
+    else {
         return Ok(None);
     };
     Ok(Some((
@@ -415,6 +420,9 @@ fn worker_facts(conn: &Connection, worker: WorkerId) -> Result<Option<(WorkerId,
             cpu_millis: cpu,
             memory_bytes: memory,
             disk_bytes,
+            secret_delivery: capabilities as u64
+                & sentinel_protocol::negotiate::Capabilities::SECRET_DELIVERY.0
+                != 0,
         },
     )))
 }
@@ -426,7 +434,7 @@ fn worker_facts(conn: &Connection, worker: WorkerId) -> Result<Option<(WorkerId,
 fn pool_workers(conn: &Connection, tenant: TenantId) -> Result<Vec<(WorkerId, WorkerFacts)>> {
     let mut stmt = conn.prepare_cached(
         "SELECT w.id, w.pool_id, w.arch, w.labels, w.drain_ms IS NOT NULL, w.disk_bytes,
-                w.avail_images, w.cpu_millis, w.memory_bytes
+                w.avail_images, w.cpu_millis, w.memory_bytes, w.capabilities
          FROM workers w
          JOIN pools p ON p.id = w.pool_id AND p.active = 1
          JOIN tenants t ON t.id = ?1 AND t.active = 1
@@ -444,11 +452,12 @@ fn pool_workers(conn: &Connection, tenant: TenantId) -> Result<Vec<(WorkerId, Wo
             r.get::<_, Vec<u8>>(6)?,
             r.get::<_, i64>(7)?,
             r.get::<_, i64>(8)?,
+            r.get::<_, i64>(9)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, pool, arch, labels, draining, disk, images, cpu, memory) = row?;
+        let (id, pool, arch, labels, draining, disk, images, cpu, memory, capabilities) = row?;
         out.push((
             WorkerId::from_bytes(id).map_err(|_| Error::Corrupt("worker id"))?,
             WorkerFacts {
@@ -461,6 +470,9 @@ fn pool_workers(conn: &Connection, tenant: TenantId) -> Result<Vec<(WorkerId, Wo
                 cpu_millis: cpu,
                 memory_bytes: memory,
                 disk_bytes: disk,
+                secret_delivery: capabilities as u64
+                    & sentinel_protocol::negotiate::Capabilities::SECRET_DELIVERY.0
+                    != 0,
             },
         ));
     }
@@ -484,6 +496,7 @@ macro_rules! eligible_sql {
            AND (j.arch IS NULL OR j.arch = :arch)
            AND j.cpu_millis <= :cpu AND j.memory_bytes <= :memory
            AND (j.disk_bytes = 0 OR :disk_reported = 0 OR j.disk_bytes <= :disk)
+           AND (j.requires_secret_delivery = 0 OR :worker_secret_delivery = 1)
            AND (j.labels = X'' OR sentinel_labels_subset(j.labels, :labels))"
     };
 }
@@ -548,7 +561,7 @@ macro_rules! candidates_sql {
         concat!(
             "SELECT j.id, j.run_id, j.cpu_millis, j.memory_bytes, j.disk_bytes, j.image_digest,
                     j.image_platform, j.spec_index, j.arch, j.labels, j.queued_ms,
-                    j.pull_request, j.priority, j.created_seq
+                    j.pull_request, j.priority, j.created_seq, j.requires_secret_delivery
              FROM ",
             $from,
             "
@@ -763,6 +776,7 @@ fn waiting_fairness(conn: &Connection, pool: PoolId, facts: &WorkerFacts) -> Res
         ":disk_reported": reported,
         ":disk": facts.disk_bytes,
         ":labels": facts.labels,
+        ":worker_secret_delivery": i64::from(facts.secret_delivery),
     };
     let large: Option<(i64, i64)> = conn
         .prepare_cached(LARGE_WAITING_SQL)?
@@ -1297,6 +1311,7 @@ impl Placement<'_, '_> {
                 ":disk_reported": i64::from(self.facts.disk_reported),
                 ":disk": self.free.disk_bytes,
                 ":labels": self.facts.labels,
+                ":worker_secret_delivery": i64::from(self.facts.secret_delivery),
                 ":after_priority": after.0,
                 ":after_queued": after.1,
                 ":after_seq": after.2,
@@ -1323,6 +1338,7 @@ impl Placement<'_, '_> {
                     r.get::<_, i64>(10)?,
                     r.get::<_, bool>(11)?,
                     (r.get::<_, i64>(12)?, r.get::<_, i64>(13)?),
+                    r.get::<_, bool>(14)?,
                 ))
             },
         )?;
@@ -1342,6 +1358,7 @@ impl Placement<'_, '_> {
                 queued,
                 pr,
                 order,
+                requires_secret_delivery,
             ) = row?;
             out.push(Pick {
                 tenant: stream.tenant,
@@ -1357,6 +1374,7 @@ impl Placement<'_, '_> {
                 arch,
                 labels,
                 pull_request: pr,
+                requires_secret_delivery,
                 queued_ms: queued,
                 priority: order.0,
                 created_seq: order.1,
@@ -2795,7 +2813,8 @@ macro_rules! waiting_columns {
         "SELECT j.id, j.run_id, j.repo_id, j.queued_ms, j.state_code, j.cpu_millis,
                 j.memory_bytes, j.disk_bytes, j.cancel_requested, j.arch, j.labels,
                 j.image_digest, j.image_platform IS NOT NULL,
-                j.concurrency_group IS NOT NULL, j.pull_request, j.spec_index
+                j.concurrency_group IS NOT NULL, j.pull_request, j.spec_index,
+                j.requires_secret_delivery
          FROM jobs j "
     };
 }
@@ -2849,6 +2868,7 @@ fn waiting_row(tenant: TenantId, r: &rusqlite::Row<'_>) -> rusqlite::Result<Resu
         r.get::<_, Vec<u8>>(10)?,
         r.get::<_, bool>(14)?,
         r.get::<_, i64>(15)?,
+        r.get::<_, bool>(16)?,
     );
     let (state, cancel, resolved, grouped) = (
         r.get::<_, i64>(4)?,
@@ -2859,7 +2879,16 @@ fn waiting_row(tenant: TenantId, r: &rusqlite::Row<'_>) -> rusqlite::Result<Resu
     Ok((|| {
         let job = JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?;
         let run = RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?;
-        let (cpu_millis, memory_bytes, disk_bytes, arch, labels, pull_request, spec_index) = pick;
+        let (
+            cpu_millis,
+            memory_bytes,
+            disk_bytes,
+            arch,
+            labels,
+            pull_request,
+            spec_index,
+            requires_secret_delivery,
+        ) = pick;
         Ok(Waiting {
             job,
             run,
@@ -2883,6 +2912,7 @@ fn waiting_row(tenant: TenantId, r: &rusqlite::Row<'_>) -> rusqlite::Result<Resu
                 arch,
                 labels,
                 pull_request,
+                requires_secret_delivery,
                 queued_ms: queued.unwrap_or(0),
                 priority: 0,
                 created_seq: 0,
@@ -2947,6 +2977,21 @@ impl<'c> Explainer<'c> {
             Some(workers) => workers,
             None => pool_workers(self.conn, self.tenant)?,
         };
+        if pick.requires_secret_delivery
+            && !workers.iter().any(|(_, facts)| {
+                facts.secret_delivery
+                    && pick
+                        .arch
+                        .as_deref()
+                        .is_none_or(|arch| arch == facts.arch.as_str())
+                    && labels_subset(&pick.labels, &facts.labels)
+            })
+        {
+            self.workers = Some(workers);
+            return Ok(WaitReason::Policy(
+                "no matching worker supports secret delivery",
+            ));
+        }
         let reason = self.against(&workers, pick);
         self.workers = Some(workers);
         reason
@@ -2959,6 +3004,9 @@ impl<'c> Explainer<'c> {
         let (mut draining_fit, mut offline_fit) = (false, false);
         let (mut any_connected, mut held_fairness, mut held_locality) = (false, false, false);
         for (id, facts) in workers {
+            if pick.requires_secret_delivery && !facts.secret_delivery {
+                continue;
+            }
             let arch_matches = pick
                 .arch
                 .as_deref()
@@ -3358,6 +3406,7 @@ mod tests {
             ":disk_reported": 1i64,
             ":disk": 64i64 << 30,
             ":labels": Vec::<u8>::new(),
+            ":worker_secret_delivery": 0i64,
         };
         let page = named_params! {
             ":tenant": tenant.as_bytes(),
@@ -3368,6 +3417,7 @@ mod tests {
             ":disk_reported": 1i64,
             ":disk": 64i64 << 30,
             ":labels": Vec::<u8>::new(),
+            ":worker_secret_delivery": 0i64,
             ":after_priority": i64::MIN,
             ":after_queued": i64::MIN,
             ":after_seq": i64::MIN,

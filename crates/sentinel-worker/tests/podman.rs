@@ -16,6 +16,10 @@ use sentinel_worker::{
 
 pub const IMAGE: &str = "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
 
+fn authfile(root: &std::path::Path) -> std::path::PathBuf {
+    sentinel_worker::images::prepare_anonymous_authfile(root).unwrap()
+}
+
 fn enabled() -> bool {
     if std::env::var_os("SENTINEL_PODMAN_TESTS").is_some() {
         return true;
@@ -24,26 +28,28 @@ fn enabled() -> bool {
     false
 }
 
-/// With the pull deadline already spent, only the `image exists` fast
-/// path can return `Ok` — a real `podman pull` would outlive a
-/// millisecond and be killed as a timeout. Proves a present image never
-/// reaches the download.
+/// A resident digest still contacts its registry under the scoped auth file;
+/// `true` reports that it was present before this authorization check.
 #[test]
-fn a_present_image_skips_the_download() {
+fn a_present_image_still_checks_registry_authorization() {
     if !enabled() {
         return;
     }
+    let temp = tempfile::tempdir().unwrap();
+    let authfile = authfile(temp.path());
     podman::pull(
         IMAGE,
+        &authfile,
         Duration::from_secs(600),
         &std::sync::atomic::AtomicBool::new(false),
     )
     .unwrap();
-    // `true` is the exists fast path's answer (K08): nothing downloaded.
+    // The image was resident, but this pull still authorizes with the file.
     assert!(
         podman::pull(
             IMAGE,
-            Duration::from_millis(1),
+            &authfile,
+            Duration::from_secs(600),
             &std::sync::atomic::AtomicBool::new(false)
         )
         .unwrap()
@@ -54,6 +60,8 @@ fn sh(script: &str, timeout_secs: u64) -> StepCommand {
     StepCommand {
         argv: vec!["/bin/sh".into(), "-e".into(), "-c".into(), script.into()],
         env: Vec::new(),
+        secrets: Vec::new(),
+        secret_files: Vec::new(),
         workdir: None,
         timeout_secs,
     }
@@ -66,8 +74,11 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
     }
     let runtime = podman::probe().unwrap();
     assert_eq!(runtime.cgroup_version, "v2");
+    let temp = tempfile::tempdir().unwrap();
+    let authfile = authfile(temp.path());
     podman::pull(
         IMAGE,
+        &authfile,
         Duration::from_secs(600),
         &std::sync::atomic::AtomicBool::new(false),
     )
@@ -75,13 +86,13 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
     assert!(
         podman::pull(
             "docker.io/library/busybox:latest",
+            &authfile,
             Duration::from_secs(1),
             &std::sync::atomic::AtomicBool::new(false)
         )
         .is_err()
     );
 
-    let temp = tempfile::tempdir().unwrap();
     let (worker, attempt) = (WorkerId::new(), AttemptId::new());
     let ws = Workspace::create(temp.path(), attempt).unwrap();
     let container = Container::start(
@@ -250,13 +261,15 @@ fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
     if !enabled() {
         return;
     }
+    let temp = tempfile::tempdir().unwrap();
+    let authfile = authfile(temp.path());
     podman::pull(
         IMAGE,
+        &authfile,
         Duration::from_secs(600),
         &std::sync::atomic::AtomicBool::new(false),
     )
     .unwrap();
-    let temp = tempfile::tempdir().unwrap();
     let (worker, attempt) = (WorkerId::new(), AttemptId::new());
     let ws = Workspace::create(temp.path(), attempt).unwrap();
     let container = Container::start(
@@ -283,6 +296,8 @@ fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
             let sleep = StepCommand {
                 argv: vec!["sleep".into(), "300".into()],
                 env: Vec::new(),
+                secrets: Vec::new(),
+                secret_files: Vec::new(),
                 workdir: None,
                 timeout_secs: 120,
             };

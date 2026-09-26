@@ -18,7 +18,7 @@
 //! failure.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -160,7 +160,181 @@ struct Awaiting {
     /// It is being handed back; a spec arriving now is not used.
     declining: bool,
     /// Values registered before the attempt started, for its redactor.
-    secrets: Vec<Vec<u8>>,
+    secrets: Vec<sentinel_protocol::secrets::SecretBytes>,
+}
+
+fn valid_delivery(
+    spec: &RunSpec,
+    job_index: usize,
+    bundle: &sentinel_protocol::secrets::DeliveryBundle,
+) -> bool {
+    use sentinel_protocol::secrets::TargetKind;
+    let Some(job) = spec.pipeline.jobs.get(job_index).map(|job| &job.spec) else {
+        return false;
+    };
+    if !bundle.valid() {
+        return false;
+    }
+    let mut expected = HashSet::with_capacity(
+        job.steps
+            .iter()
+            .map(|step| step.secrets.len() + step.secret_files.len())
+            .sum::<usize>()
+            + usize::from(job.registry_auth.is_some()),
+    );
+    for (index, step) in job.steps.iter().enumerate() {
+        for name in &step.secrets {
+            expected.insert((index as u16, name.clone(), TargetKind::Environment));
+        }
+        for file in &step.secret_files {
+            expected.insert((
+                index as u16,
+                file.name.clone(),
+                TargetKind::File {
+                    path: file.path.clone(),
+                },
+            ));
+        }
+    }
+    if let Some(name) = &job.registry_auth {
+        expected.insert((0, name.clone(), TargetKind::RegistryAuth));
+    }
+    if expected.len() != bundle.targets.len() {
+        return false;
+    }
+    let mut seen = HashSet::with_capacity(expected.len());
+    let mut referenced = vec![false; bundle.values.len()];
+    for target in &bundle.targets {
+        let key = (target.step, target.name.clone(), target.target.clone());
+        if !expected.contains(&key) || !seen.insert(key) {
+            return false;
+        }
+        let Some(value) = bundle.values.get(target.value as usize) else {
+            return false;
+        };
+        referenced[target.value as usize] = true;
+        match &target.target {
+            TargetKind::Environment => {
+                let bytes = value.expose();
+                if std::str::from_utf8(bytes).is_err()
+                    || bytes.iter().any(|b| matches!(*b, 0 | b'\n' | b'\r'))
+                {
+                    return false;
+                }
+            }
+            TargetKind::File { .. } => {}
+            TargetKind::RegistryAuth => {
+                let Ok(auth) = serde_json::from_slice::<serde_json::Value>(value.expose()) else {
+                    return false;
+                };
+                let Some(auth) = auth.as_object() else {
+                    return false;
+                };
+                // Credential helpers and Docker config extensions can invoke
+                // worker-side helpers or introduce unrelated auth sources.
+                // The protocol accepts only the tenant's explicit auth map.
+                if auth.len() != 1 || !auth.get("auths").is_some_and(serde_json::Value::is_object) {
+                    return false;
+                }
+            }
+        }
+    }
+    referenced.into_iter().all(|used| used)
+}
+
+#[cfg(test)]
+mod secret_delivery_tests {
+    use super::*;
+    use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
+    use sentinel_protocol::secrets::{DeliveryBundle, DeliveryTarget, DeliveryValue, TargetKind};
+
+    fn spec() -> RunSpec {
+        let yaml = "schema: 1\non: [push]\njobs:\n  build:\n    image: busybox\n    secrets: [TOKEN, CERT, OCI_AUTH]\n    registry_auth: OCI_AUTH\n    steps:\n      - id: test\n        run: echo test\n        secrets: [TOKEN]\n        secret_files: { CERT: tls/client.pem }\n";
+        RunSpec::new(
+            PinnedSource::new("https://example.test/repo.git", &"a".repeat(40), None).unwrap(),
+            compile_str(yaml).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn bundle(token: &[u8], auth: &[u8], include_file: bool) -> DeliveryBundle {
+        let mut targets = vec![
+            DeliveryTarget {
+                step: 0,
+                name: "OCI_AUTH".into(),
+                value: 0,
+                target: TargetKind::RegistryAuth,
+            },
+            DeliveryTarget {
+                step: 0,
+                name: "TOKEN".into(),
+                value: 1,
+                target: TargetKind::Environment,
+            },
+        ];
+        let mut values = vec![
+            DeliveryValue::new(auth.to_vec()),
+            DeliveryValue::new(token.to_vec()),
+        ];
+        if include_file {
+            targets.push(DeliveryTarget {
+                step: 0,
+                name: "CERT".into(),
+                value: 2,
+                target: TargetKind::File {
+                    path: "tls/client.pem".into(),
+                },
+            });
+            values.push(DeliveryValue::new(b"certificate".to_vec()));
+        }
+        DeliveryBundle { values, targets }
+    }
+
+    #[test]
+    fn only_the_exact_declared_targets_and_oci_auth_shape_are_accepted() {
+        let spec = spec();
+        let auth = br#"{"auths":{"ghcr.io":{"auth":"dG9rZW4="}}}"#;
+        assert!(valid_delivery(&spec, 0, &bundle(b"token", auth, true)));
+        assert!(!valid_delivery(&spec, 0, &bundle(b"token", auth, false)));
+        assert!(!valid_delivery(
+            &spec,
+            0,
+            &bundle(b"token\nINJECTED=x", auth, true)
+        ));
+        assert!(!valid_delivery(
+            &spec,
+            0,
+            &bundle(b"token", br#"{"auths":[]}"#, true)
+        ));
+        assert!(!valid_delivery(
+            &spec,
+            0,
+            &bundle(
+                b"token",
+                br#"{"auths":{},"credHelpers":{"ghcr.io":"secretservice"}}"#,
+                true
+            )
+        ));
+
+        let mut extra = bundle(b"token", auth, true);
+        extra.targets.push(DeliveryTarget {
+            step: 0,
+            name: "OTHER".into(),
+            value: 1,
+            target: TargetKind::Environment,
+        });
+        assert!(!valid_delivery(&spec, 0, &extra));
+
+        let mut duplicate = bundle(b"token", auth, true);
+        duplicate.targets.push(duplicate.targets[1].clone());
+        assert!(!valid_delivery(&spec, 0, &duplicate));
+
+        let mut unreferenced = bundle(b"token", auth, true);
+        unreferenced
+            .values
+            .push(DeliveryValue::new(b"extra".to_vec()));
+        assert!(!valid_delivery(&spec, 0, &unreferenced));
+    }
 }
 
 struct State {
@@ -319,7 +493,7 @@ impl Executor {
         // disk and in the runtime; what it owed the controller waits for
         // the session.
         let (recovered, leftovers) = recovery::recover(&root, worker)?;
-        let images = Images::new();
+        let images = Images::for_worker_data_dir(&root)?;
         let prefetch = crate::prefetch::Prefetcher::new(
             images.clone(),
             crate::prefetch::Bounds::default(),
@@ -400,16 +574,18 @@ impl Executor {
     /// Redact `value` from `attempt`'s output — only that attempt's, from
     /// now on, for its lifetime; it goes with the attempt. A value
     /// registered before the attempt starts applies from its first byte.
-    /// Returns whether it was accepted: `false` for a value too short to be
-    /// a secret (`redact::MIN_SECRET_BYTES`) or an attempt not held here.
+    /// Returns whether it was accepted: `false` for an empty value or an
+    /// attempt not held here.
     pub fn register_secret(&self, attempt: AttemptId, value: &[u8]) -> bool {
-        if value.len() < crate::redact::MIN_SECRET_BYTES {
+        if value.is_empty() {
             return false;
         }
         let pipe = {
             let mut state = self.state();
             if let Some(waiting) = state.awaiting.get_mut(&attempt) {
-                waiting.secrets.push(value.to_vec());
+                waiting
+                    .secrets
+                    .push(sentinel_protocol::secrets::SecretBytes::copy_from(value));
                 return true;
             }
             match state.live.get(&attempt) {
@@ -420,20 +596,61 @@ impl Executor {
         pipe.register_secret(value)
     }
 
+    fn accept_spec(
+        &self,
+        attempt: AttemptId,
+        context: JobContext,
+        bytes: Vec<u8>,
+        secret_bundle: sentinel_protocol::secrets::DeliveryBundle,
+    ) {
+        let waiting = {
+            let mut state = self.state();
+            if state.awaiting.get(&attempt).is_none_or(|w| w.declining) {
+                return;
+            }
+            state.awaiting.remove(&attempt).expect("checked present")
+        };
+        let offer = waiting.offer;
+        let job_index = offer.job_index as usize;
+        let decoded = RunSpec::decode(&bytes);
+        match decoded {
+            Ok(spec) if valid_delivery(&spec, job_index, &secret_bundle) => {
+                self.spawn(
+                    offer,
+                    spec,
+                    context,
+                    job_index,
+                    waiting.secrets,
+                    secret_bundle,
+                );
+            }
+            _ => self.send(
+                attempt,
+                offer.fence,
+                Event::Failed(sentinel_core::FailureClass::Preparation),
+                None,
+            ),
+        }
+    }
+
     fn spawn(
         &self,
         offer: Offer,
         spec: RunSpec,
         context: JobContext,
         job_index: usize,
-        secrets: Vec<Vec<u8>>,
+        secrets: Vec<sentinel_protocol::secrets::SecretBytes>,
+        secret_bundle: sentinel_protocol::secrets::DeliveryBundle,
     ) {
         let cancel: Cancel = Arc::new(AtomicBool::new(false));
         let logs = {
             let state = self.state();
             let mut redactor = Redactor::new();
             for secret in &secrets {
-                redactor.register(secret);
+                redactor.register(secret.as_slice());
+            }
+            for value in &secret_bundle.values {
+                redactor.register(value.expose());
             }
             match LogPipe::open_in(&self.spool, offer.attempt, redactor, state.reporter.clone()) {
                 Ok(pipe) => Arc::new(pipe),
@@ -471,6 +688,7 @@ impl Executor {
             caches: Vec::new(),
             mirrors: self.mirrors.clone(),
             prepare_hold: self.state().prepare_hold,
+            secret_bundle,
         };
         // On disk before anything runs: a crash from here on leaves a
         // marker the next process reconciles. If the marker cannot be
@@ -1295,29 +1513,22 @@ impl LinkExecutor for Executor {
     }
 
     fn spec(&self, attempt: AttemptId, context: JobContext, bytes: Vec<u8>) {
-        let waiting = {
-            let mut state = self.state();
-            // Being handed back: too late, it is no longer this worker's.
-            if state.awaiting.get(&attempt).is_none_or(|w| w.declining) {
-                return;
-            }
-            state.awaiting.remove(&attempt).expect("checked present")
-        };
-        let offer = waiting.offer;
-        match RunSpec::decode(&bytes) {
-            Ok(spec) => {
-                let job_index = offer.job_index as usize;
-                self.spawn(offer, spec, context, job_index, waiting.secrets);
-            }
-            Err(_) => {
-                self.send(
-                    attempt,
-                    offer.fence,
-                    Event::Failed(sentinel_core::FailureClass::Preparation),
-                    None,
-                );
-            }
-        }
+        self.accept_spec(
+            attempt,
+            context,
+            bytes,
+            sentinel_protocol::secrets::DeliveryBundle::empty(),
+        );
+    }
+
+    fn spec_with_secrets(
+        &self,
+        attempt: AttemptId,
+        context: JobContext,
+        bytes: Vec<u8>,
+        secrets: sentinel_protocol::secrets::DeliveryBundle,
+    ) {
+        self.accept_spec(attempt, context, bytes, secrets);
     }
 
     /// A definitive refusal: the attempt is settled at once as the

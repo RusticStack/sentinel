@@ -3,7 +3,11 @@
 //! with idempotency, status, cancel, rerun, log tail/follow through the
 //! same files the controller writes, and worker status.
 
-use std::{sync::Arc, thread, time::Duration};
+use std::{
+    sync::{Arc, Barrier},
+    thread,
+    time::Duration,
+};
 
 use sentinel_core::{
     AttemptId, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
@@ -566,6 +570,141 @@ fn secret_import_is_atomic_and_replays_metadata_only() {
     let (status, replay) = call_bytes(&d, "POST", import_path, body, &auth, &expected);
     assert_eq!(status, 200);
     assert_eq!(replay, imported);
+}
+
+#[test]
+fn concurrent_secret_import_retries_and_version_races_are_atomic() {
+    fn request(
+        base: String,
+        auth: String,
+        barrier: Arc<Barrier>,
+        body: &'static [u8],
+        expected: &'static str,
+        idempotency: &'static str,
+    ) -> (u16, serde_json::Value) {
+        barrier.wait();
+        let response = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .build(),
+        )
+        .post(&format!("{base}/api/v1/tenants/acme/secrets/import"))
+        .header("authorization", &auth)
+        .header("content-type", "application/octet-stream")
+        .header("if-match", expected)
+        .header("idempotency-key", idempotency)
+        .send(body)
+        .unwrap();
+        let status = response.status().as_u16();
+        let text = response.into_body().read_to_string().unwrap();
+        (status, serde_json::from_str(&text).unwrap())
+    }
+
+    let d = deployment();
+    let auth = bearer(&d);
+    let base = d.base.clone();
+    let barrier = Arc::new(Barrier::new(3));
+    let retries: Vec<_> = [0, 1]
+        .into_iter()
+        .map(|_| {
+            let (base, auth, barrier) = (base.clone(), auth.clone(), Arc::clone(&barrier));
+            thread::spawn(move || {
+                request(
+                    base,
+                    auth,
+                    barrier,
+                    b"RACE_RETRY=one-value\n",
+                    "RACE_RETRY=0",
+                    "same-import-retry",
+                )
+            })
+        })
+        .collect();
+    barrier.wait();
+    let replies: Vec<_> = retries
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(replies[0].0, 200);
+    assert_eq!(replies[1].0, 200);
+    assert_eq!(replies[0].1, replies[1].1);
+    assert!(
+        replies
+            .iter()
+            .all(|(_, body)| !body.to_string().contains("one-value"))
+    );
+
+    let barrier = Arc::new(Barrier::new(3));
+    let competitors: Vec<_> = [
+        (
+            b"RACE_LEFT=alpha\nRACE_RIGHT=bravo\n" as &'static [u8],
+            "import-left",
+        ),
+        (
+            b"RACE_LEFT=charlie\nRACE_RIGHT=delta\n" as &'static [u8],
+            "import-right",
+        ),
+    ]
+    .into_iter()
+    .map(|(body, idempotency)| {
+        let (base, auth, barrier) = (base.clone(), auth.clone(), Arc::clone(&barrier));
+        thread::spawn(move || {
+            request(
+                base,
+                auth,
+                barrier,
+                body,
+                "RACE_LEFT=0,RACE_RIGHT=0",
+                idempotency,
+            )
+        })
+    })
+    .collect();
+    barrier.wait();
+    let replies: Vec<_> = competitors
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(
+        replies.iter().filter(|(status, _)| *status == 200).count(),
+        1
+    );
+    assert_eq!(
+        replies.iter().filter(|(status, _)| *status == 409).count(),
+        1
+    );
+    assert!(replies.iter().all(|(_, body)| {
+        let body = body.to_string();
+        !body.contains("alpha")
+            && !body.contains("bravo")
+            && !body.contains("charlie")
+            && !body.contains("delta")
+    }));
+
+    let (retry_version, race_rows): (i64, (i64, i64, i64)) = d
+        .store
+        .read(|conn| {
+            let retry = conn.query_row(
+                "SELECT current_version FROM secrets
+                 WHERE tenant_id=?1 AND scope_repo_id IS NULL AND name='RACE_RETRY'",
+                [d.tenant.as_bytes()],
+                |row| row.get(0),
+            )?;
+            let race = conn.query_row(
+                "SELECT count(*),min(current_version),max(current_version) FROM secrets
+                 WHERE tenant_id=?1 AND scope_repo_id IS NULL AND name IN ('RACE_LEFT','RACE_RIGHT')",
+                [d.tenant.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            Ok((retry, race))
+        })
+        .unwrap();
+    assert_eq!(retry_version, 1, "the racing retry writes one version");
+    assert_eq!(
+        race_rows,
+        (2, 1, 1),
+        "the losing import leaves no partial version"
+    );
 }
 
 /// Manual dispatch on a repository with no binding: the worker fetches the

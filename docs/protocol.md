@@ -77,7 +77,7 @@ Invariants between limits are compile-time assertions. Raise a limit only with a
 
 ## Worker negotiation
 
-A session opens with `Hello { protocol_min, protocol_max, capabilities, arch, software }`. The controller supports protocol versions in an inclusive range (currently 1 to 7) and answers with the highest version both sides share and the worker's capability bits it recognises. Capabilities are a `u64` bit set so storing, comparing and intersecting is one instruction; bits the controller does not know are masked, never rejected, so newer workers stay compatible.
+A session opens with `Hello { protocol_min, protocol_max, capabilities, arch, software }`. The controller supports protocol versions in an inclusive range (currently 1 to 10) and answers with the highest version both sides share and the worker's capability bits it recognises. Capabilities are a `u64` bit set so storing, comparing and intersecting is one instruction; bits the controller does not know are masked, never rejected, so newer workers stay compatible.
 
 | Bit | Capability |
 |---|---|
@@ -88,6 +88,7 @@ A session opens with `Hello { protocol_min, protocol_max, capabilities, arch, so
 | 6 | `TAILCAT` helper available |
 | 7 | `NETWORK_NONE` supported |
 | 8 | `HANDOFF_ANSWER`: the worker answers a Tailcat hand-off close before it replaces its forward, and replaces it on every clean close ([worker link](worker-link.md)) |
+| 9 | `SECRET_DELIVERY`: the worker accepts bounded secret bundles for acknowledged, fenced attempts |
 
 Bits 0 to 3 are required (the set the F07 probe proved enforceable); a hello without them is rejected. Rejections are typed and final for that hello: `unsupported_version` names the supported range and whether the worker is the side that must upgrade, `missing_capabilities` names the missing bits, `invalid_range` flags `protocol_min > protocol_max`. A worker must not retry an unchanged rejected hello. `software` is a diagnostic string only and never a compatibility input.
 
@@ -118,6 +119,10 @@ connection when it is up and are still accepted on the control connection as
 a fallback; control classes (heartbeat, offers, reports) are refused there.
 Each connection has its own rustls state behind its own lock, so bulk traffic
 cannot delay a beat. See [worker link](worker-link.md#control-and-bulk-protocol-7-q05).
+
+## Protocol 10 secret delivery
+
+Protocol 10 appends `SecretBegin { attempt, fence, length }` and `SecretChunk { attempt, fence, seq, last, bytes }`. The controller sends them only after the worker's durable offer acknowledgement and ties every chunk to that attempt and offer fence. A bundle is at most 1 MiB, each value at most 64 KiB, and chunks are at most 48 KiB. The worker accepts only the ordered bounded transfer and checks that its targets exactly match the stored run spec before any filesystem or container work. Values are carried in a sensitive frame whose debug output is redacted and whose buffers are zeroed after handling. `SECRET_DELIVERY` is required for placement of a job that declares environment, file or registry-auth secrets; older workers continue to run jobs that do not require delivery.
 
 ## Versioning policy
 

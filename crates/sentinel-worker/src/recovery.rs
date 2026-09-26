@@ -24,6 +24,7 @@ use sentinel_core::{AttemptId, Fence, WorkerId};
 use crate::{Result, podman, spool::Spool, workspace};
 
 pub const ATTEMPTS_DIR: &str = "attempts";
+const SECRET_DELIVERY_DIR: &str = "secret-delivery";
 
 /// A marker an earlier process left: the attempt and its fence, plus
 /// whether its log end had already gone out before the end report.
@@ -159,6 +160,7 @@ pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover
         // The askpass helper of a checkout that was under way, if any.
         let _ = fs::remove_dir_all(path.with_extension("askpass"));
     }
+    reap_secret_directories(root)?;
     // The same for a mirror fetch the previous process died inside: its
     // credential helper is a `<repo>.askpass` sibling of the mirror.
     if let Ok(entries) = fs::read_dir(root.join(sentinel_git::mirror::MIRRORS_DIR)) {
@@ -195,4 +197,73 @@ pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover
     }
     done.leftovers = markers.into_iter().map(|m| (m.attempt, m.fence)).collect();
     Ok((done, pending))
+}
+
+/// Secret scratch is outside workspace and artifact roots. A process crash
+/// skips RAII cleanup, so remove its attempt trees before accepting work.
+fn reap_secret_directories(root: &Path) -> Result<()> {
+    let dir = root.join(SECRET_DELIVERY_DIR);
+    let metadata = match fs::symlink_metadata(&dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(crate::Error::Preparation(
+            "secret recovery directory".into(),
+        ));
+    }
+    let mut count = 0usize;
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        count += 1;
+        if count > sentinel_protocol::limits::MAX_LIST_ITEMS {
+            return Err(crate::Error::Preparation("secret recovery bound".into()));
+        }
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_reaps_secret_scratch_before_work_resumes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("worker");
+        let attempt = root.join(SECRET_DELIVERY_DIR).join("abandoned-attempt");
+        fs::create_dir_all(attempt.join("files")).unwrap();
+        fs::write(attempt.join("files/token"), b"secret-value").unwrap();
+        fs::write(root.join(SECRET_DELIVERY_DIR).join("orphan"), b"orphan").unwrap();
+
+        reap_secret_directories(&root).unwrap();
+        assert!(!attempt.exists());
+        assert!(!root.join(SECRET_DELIVERY_DIR).join("orphan").exists());
+        assert!(root.join(SECRET_DELIVERY_DIR).is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_refuses_a_secret_root_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("worker");
+        fs::create_dir_all(&root).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join(SECRET_DELIVERY_DIR)).unwrap();
+        assert!(matches!(
+            reap_secret_directories(&root),
+            Err(crate::Error::Preparation(_))
+        ));
+        assert!(outside.is_dir());
+    }
 }

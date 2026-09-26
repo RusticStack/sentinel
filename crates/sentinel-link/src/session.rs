@@ -74,6 +74,9 @@ const TLS_READ_BYTES: usize = 16 * 1024 + 512;
 /// [`MAX_SPEC_BYTES`]; a spec is bounded by the pipeline file it came from.
 pub const SPEC_CHUNK_BYTES: usize = 48 * 1024;
 pub const MAX_SPEC_BYTES: usize = MAX_API_BODY_BYTES;
+/// The controller may interleave a few spec requests on one session; the
+/// aggregate secret transfer state remains bounded independently of holds.
+const MAX_IN_FLIGHT_SECRET_BYTES: usize = 8 * sentinel_protocol::secrets::MAX_DELIVERY_BYTES;
 /// One cache chunk on the wire. The frame cap is
 /// [`MAX_CONTROL_MESSAGE_BYTES`], so a chunk's payload has to leave room for
 /// its envelope; the link refuses anything larger as `TooLarge` rather than
@@ -505,6 +508,39 @@ pub enum ServerMessage {
     Prefetch {
         images: Vec<String>,
     },
+    /// Protocol 10. Starts an attempt-bound secret bundle transfer. The
+    /// following chunks are accepted only for this attempt and total length.
+    SecretBegin {
+        attempt: [u8; 16],
+        fence: u64,
+        length: u32,
+    },
+    /// Protocol 10. A bounded ordered chunk of the sealed-store values
+    /// resolved for one fenced attempt. The payload's debug view is redacted
+    /// and its owned bytes are wiped after handling.
+    SecretChunk {
+        attempt: [u8; 16],
+        fence: u64,
+        seq: u32,
+        last: bool,
+        bytes: sentinel_protocol::secrets::SecretBytes,
+    },
+}
+
+pub(crate) trait SensitiveFrame {
+    fn is_sensitive(&self) -> bool;
+}
+
+impl SensitiveFrame for ClientMessage {
+    fn is_sensitive(&self) -> bool {
+        false
+    }
+}
+
+impl SensitiveFrame for ServerMessage {
+    fn is_sensitive(&self) -> bool {
+        matches!(self, ServerMessage::SecretChunk { .. })
+    }
 }
 
 /// What the controller did with a log frame.
@@ -1155,23 +1191,53 @@ impl Sender {
     /// an unknown state, so the connection is torn down: the reader fails
     /// out, the session ends, and nothing waits on a dead peer forever.
     pub(crate) fn send<M: Serialize>(&self, message: &M) -> Result<()> {
+        self.send_inner(message, false)
+    }
+
+    /// Same frame path as `send`, but wipe the reusable postcard buffer after
+    /// a secret payload is encoded and written.
+    pub(crate) fn send_sensitive<M: Serialize>(&self, message: &M) -> Result<()> {
+        self.send_inner(message, true)
+    }
+
+    fn send_inner<M: Serialize>(&self, message: &M, sensitive: bool) -> Result<()> {
         ENCODE.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
             scratch.clear();
             scratch.extend_from_slice(&[0; 4]);
             let mut buffer = std::mem::take(&mut *scratch);
-            let encoded = postcard::to_extend(message, buffer);
-            buffer = match encoded {
-                Ok(buffer) => buffer,
-                Err(_) => return Err(Error::Protocol("encode")),
-            };
-            let len = buffer.len() - 4;
-            let outcome = if len > MAX_CONTROL_MESSAGE_BYTES {
-                Err(Error::Protocol("frame too large"))
+            let outcome = if sensitive {
+                match postcard::to_allocvec(message) {
+                    Err(_) => Err(Error::Protocol("encode")),
+                    Ok(mut payload) => {
+                        buffer.extend_from_slice(&payload);
+                        payload.fill(0);
+                        let len = buffer.len() - 4;
+                        if len > MAX_CONTROL_MESSAGE_BYTES {
+                            Err(Error::Protocol("frame too large"))
+                        } else {
+                            buffer[..4].copy_from_slice(&(len as u32).to_be_bytes());
+                            self.write_frame(&buffer)
+                        }
+                    }
+                }
             } else {
-                buffer[..4].copy_from_slice(&(len as u32).to_be_bytes());
-                self.write_frame(&buffer)
+                let encoded = postcard::to_extend(message, buffer);
+                buffer = match encoded {
+                    Ok(encoded) => encoded,
+                    Err(_) => return Err(Error::Protocol("encode")),
+                };
+                let len = buffer.len() - 4;
+                if len > MAX_CONTROL_MESSAGE_BYTES {
+                    Err(Error::Protocol("frame too large"))
+                } else {
+                    buffer[..4].copy_from_slice(&(len as u32).to_be_bytes());
+                    self.write_frame(&buffer)
+                }
             };
+            if sensitive {
+                buffer.fill(0);
+            }
             *scratch = buffer;
             outcome
         })
@@ -1289,7 +1355,7 @@ pub struct Receiver {
 
 impl Receiver {
     /// Parse one frame out of the plaintext buffer, if a whole one is there.
-    fn take_frame<M: for<'de> Deserialize<'de>>(&mut self) -> Result<Option<M>> {
+    fn take_frame<M: for<'de> Deserialize<'de> + SensitiveFrame>(&mut self) -> Result<Option<M>> {
         if self.plain.len() < 4 {
             return Ok(None);
         }
@@ -1301,8 +1367,13 @@ impl Receiver {
         if self.plain.len() < 4 + len {
             return Ok(None);
         }
-        let message =
+        let message: M =
             postcard::from_bytes(&self.plain[4..4 + len]).map_err(|_| Error::Protocol("decode"))?;
+        if message.is_sensitive() {
+            // The deserialized SecretChunk owns and wipes its copy. Clear the
+            // decrypted frame too before Vec::drain shifts later messages.
+            self.plain[..4 + len].fill(0);
+        }
         self.plain.drain(..4 + len);
         Ok(Some(message))
     }
@@ -1341,7 +1412,7 @@ impl Receiver {
     /// on each read: a peer dripping one byte just inside the socket's read
     /// timeout still runs out after at most twice `timeout` (the check runs
     /// between reads, so no per-read timer syscall is spent on it).
-    pub(crate) fn recv_timeout<M: for<'de> Deserialize<'de>>(
+    pub(crate) fn recv_timeout<M: for<'de> Deserialize<'de> + SensitiveFrame>(
         &mut self,
         timeout: Duration,
     ) -> Result<Option<M>> {
@@ -1419,7 +1490,10 @@ impl Receiver {
     }
 
     /// Wait for the next frame; the peer is `Lost` after `deadline`.
-    pub(crate) fn recv<M: for<'de> Deserialize<'de>>(&mut self, deadline: Duration) -> Result<M> {
+    pub(crate) fn recv<M: for<'de> Deserialize<'de> + SensitiveFrame>(
+        &mut self,
+        deadline: Duration,
+    ) -> Result<M> {
         self.recv_timeout(deadline)?.ok_or(Error::Lost)
     }
 }
@@ -1574,6 +1648,10 @@ impl CacheRouter {
 pub struct LinkRemote {
     control: Sender,
     bulk: Mutex<BulkSlot>,
+    /// Offer fences are received on control while protocol-10 spec and
+    /// secret frames normally arrive on bulk. Keep the accepted fence in
+    /// session state shared by both readers.
+    fences: Mutex<HashMap<AttemptId, Fence>>,
     router: Arc<CacheRouter>,
     /// The negotiated protocol: from 8 an abandoned transfer is cancelled
     /// on the controller (`CacheCancel`).
@@ -1615,6 +1693,36 @@ pub struct Route {
 }
 
 impl LinkRemote {
+    fn set_fence(&self, attempt: AttemptId, fence: Fence) {
+        self.fences
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(attempt, fence);
+    }
+
+    fn has_fence(&self, attempt: AttemptId, fence: Fence) -> bool {
+        self.fences
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&attempt)
+            .copied()
+            == Some(fence)
+    }
+
+    fn forget_fence(&self, attempt: AttemptId) {
+        self.fences
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&attempt);
+    }
+
+    fn retain_fences(&self, held: &[AttemptId]) {
+        self.fences
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|attempt, _| held.contains(attempt));
+    }
+
     /// Tell the controller this worker abandoned the attempt's transfer
     /// (P08-C2): a serve stops at its next chunk instead of streaming the
     /// rest of the bundle into a dropped channel, and an upload releases its
@@ -2407,6 +2515,19 @@ fn serve_connection(
                 }
                 match handler.spec(worker, id) {
                     Some((context, bytes)) if bytes.len() <= MAX_SPEC_BYTES => {
+                        let requires_secrets = sentinel_pipeline::RunSpec::decode(&bytes)
+                            .ok()
+                            .is_some_and(|spec| {
+                                spec.pipeline
+                                    .jobs
+                                    .iter()
+                                    .find(|job| job.name == context.job_name)
+                                    .is_some_and(|job| job.spec.requires_secret_delivery())
+                            });
+                        if requires_secrets {
+                            tx.send(&ServerMessage::NoSpec { attempt })?;
+                            continue;
+                        }
                         tx.send(&context_message(protocol, &context, id))?;
                         if let Some(access) = context.source {
                             tx.send(&ServerMessage::Source { attempt, access })?;
@@ -2981,6 +3102,7 @@ pub fn connect(
             remote: Arc::new(LinkRemote {
                 control: tx,
                 bulk: Mutex::new(BulkSlot::default()),
+                fences: Mutex::new(HashMap::new()),
                 router: Arc::new(CacheRouter::default()),
                 protocol: negotiated.protocol.0,
             }),
@@ -3009,7 +3131,9 @@ pub fn connect(
         | ServerMessage::CacheChunk(_)
         | ServerMessage::CacheEnd(_)
         | ServerMessage::CacheRefused(_)
-        | ServerMessage::Prefetch { .. } => Err(Error::Protocol("message before welcome")),
+        | ServerMessage::Prefetch { .. }
+        | ServerMessage::SecretBegin { .. }
+        | ServerMessage::SecretChunk { .. } => Err(Error::Protocol("message before welcome")),
     }
 }
 
@@ -3265,6 +3389,21 @@ pub trait Executor: Send + Sync {
     /// The run spec asked for with `Reporter::need_spec`, whole, with the
     /// job context that precedes it.
     fn spec(&self, attempt: AttemptId, context: JobContext, bytes: Vec<u8>);
+    /// Protocol 10: the attempt's run spec and its separately framed secret
+    /// bundle. Old executors fail closed if a non-empty bundle reaches them.
+    fn spec_with_secrets(
+        &self,
+        attempt: AttemptId,
+        context: JobContext,
+        bytes: Vec<u8>,
+        secrets: sentinel_protocol::secrets::DeliveryBundle,
+    ) {
+        if secrets.is_empty() {
+            self.spec(attempt, context, bytes);
+        } else {
+            self.no_spec(attempt);
+        }
+    }
     /// The controller will not serve the attempt's spec: it is not held
     /// here, it was settled canceled, or its source or spec was refused for
     /// good. A transient controller fault is never answered this way — the
@@ -3495,6 +3634,9 @@ impl Link {
             }
             ServerMessage::Offer(wire) => {
                 let offer = Offer::from_wire(wire)?;
+                if self.negotiated.protocol.0 >= 10 {
+                    self.remote.set_fence(offer.attempt, offer.fence);
+                }
                 // Dedup within the session: a repeated offer of an attempt
                 // already taken is re-acknowledged, never re-executed.
                 let seen = &mut state.seen;
@@ -3593,6 +3735,9 @@ impl Link {
                 // Forget answered attempts the executor no longer holds.
                 let held = executor.held();
                 state.seen.retain(|a| held.contains(a));
+                if self.negotiated.protocol.0 >= 10 {
+                    self.remote.retain_fences(&held);
+                }
             }
         }
         self.tx.send(&ClientMessage::Bye)
@@ -3628,7 +3773,93 @@ fn handle_bulk_message(
                     .contexts
                     .remove(&attempt)
                     .ok_or(Error::Protocol("spec without context"))?;
-                executor.spec(attempt, context, bytes);
+                if state.secret_parts.contains_key(&attempt) {
+                    return Err(Error::Protocol("spec before secret bundle end"));
+                }
+                let secrets = state.secret_bundles.remove(&attempt).map_or_else(
+                    sentinel_protocol::secrets::DeliveryBundle::empty,
+                    |(bundle, length)| {
+                        state.secret_bytes = state.secret_bytes.saturating_sub(length);
+                        bundle
+                    },
+                );
+                executor.spec_with_secrets(attempt, context, bytes, secrets);
+            }
+        }
+        ServerMessage::SecretBegin {
+            attempt,
+            fence,
+            length,
+        } => {
+            if remote.protocol < 10 {
+                return Err(Error::Protocol("secret delivery needs protocol 10"));
+            }
+            let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+            let length = length as usize;
+            if length == 0
+                || length > sentinel_protocol::secrets::MAX_DELIVERY_BYTES
+                || state.secret_bytes.saturating_add(length) > MAX_IN_FLIGHT_SECRET_BYTES
+                || state.secret_parts.contains_key(&attempt)
+                || state.secret_bundles.contains_key(&attempt)
+                || !state.contexts.contains_key(&attempt)
+                || !remote.has_fence(attempt, Fence(fence))
+            {
+                return Err(Error::Protocol("secret bundle length or duplicate"));
+            }
+            state.secret_bytes += length;
+            state.secret_parts.insert(
+                attempt,
+                SecretAssembly {
+                    bytes: sentinel_protocol::secrets::SecretBytes::new(Vec::with_capacity(length)),
+                    length,
+                    fence: Fence(fence),
+                    next_seq: 0,
+                },
+            );
+        }
+        ServerMessage::SecretChunk {
+            attempt,
+            fence,
+            seq,
+            last,
+            bytes,
+        } => {
+            if remote.protocol < 10 {
+                return Err(Error::Protocol("secret delivery needs protocol 10"));
+            }
+            let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
+            if bytes.len() > SPEC_CHUNK_BYTES {
+                return Err(Error::Protocol("secret chunk size"));
+            }
+            let assembly = state
+                .secret_parts
+                .get_mut(&attempt)
+                .ok_or(Error::Protocol("secret chunk without begin"))?;
+            if assembly.fence.0 != fence
+                || !remote.has_fence(attempt, Fence(fence))
+                || seq != assembly.next_seq
+                || assembly.bytes.len().saturating_add(bytes.len()) > assembly.length
+            {
+                return Err(Error::Protocol("secret chunk order or length"));
+            }
+            assembly.bytes.extend_from_slice(bytes.as_slice());
+            assembly.next_seq += 1;
+            if last {
+                let assembly = state.secret_parts.remove(&attempt).expect("checked above");
+                if assembly.bytes.len() != assembly.length {
+                    return Err(Error::Protocol("secret bundle incomplete"));
+                }
+                let bundle: sentinel_protocol::secrets::DeliveryBundle =
+                    postcard::from_bytes(assembly.bytes.as_slice())
+                        .map_err(|_| Error::Protocol("secret bundle encoding"))?;
+                if !bundle.valid() || bundle.is_empty() {
+                    return Err(Error::Protocol("secret bundle invalid"));
+                }
+                state
+                    .secret_bundles
+                    .insert(attempt, (bundle, assembly.length));
+            } else if assembly.bytes.len() == assembly.length {
+                return Err(Error::Protocol("secret bundle missing final marker"));
             }
         }
         ServerMessage::Context(wire) => {
@@ -3682,6 +3913,13 @@ fn handle_bulk_message(
             let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
             state.specs.remove(&attempt);
             state.contexts.remove(&attempt);
+            remote.forget_fence(attempt);
+            if let Some(assembly) = state.secret_parts.remove(&attempt) {
+                state.secret_bytes = state.secret_bytes.saturating_sub(assembly.length);
+            }
+            if let Some((_, length)) = state.secret_bundles.remove(&attempt) {
+                state.secret_bytes = state.secret_bytes.saturating_sub(length);
+            }
             executor.no_spec(attempt);
         }
         ServerMessage::CacheGrant(grant) => {
@@ -3809,12 +4047,23 @@ impl BulkLink {
     }
 }
 
+struct SecretAssembly {
+    bytes: sentinel_protocol::secrets::SecretBytes,
+    length: usize,
+    fence: Fence,
+    next_seq: u32,
+}
+
 /// Per-session inbound state: offers already answered, specs in flight.
 #[derive(Default)]
 struct Inbound {
     seen: std::collections::HashSet<AttemptId>,
     specs: std::collections::HashMap<AttemptId, (Vec<u8>, usize)>,
     contexts: std::collections::HashMap<AttemptId, JobContext>,
+    secret_parts: std::collections::HashMap<AttemptId, SecretAssembly>,
+    secret_bundles:
+        std::collections::HashMap<AttemptId, (sentinel_protocol::secrets::DeliveryBundle, usize)>,
+    secret_bytes: usize,
 }
 
 /// The machine identity a worker reports in its protocol-7 profile: 16 bytes
@@ -3879,6 +4128,7 @@ mod tests {
         let remote = LinkRemote {
             control,
             bulk: Mutex::new(BulkSlot::default()),
+            fences: Mutex::new(HashMap::new()),
             router: Arc::new(CacheRouter::default()),
             protocol: CACHE_CANCEL_MIN.0,
         };

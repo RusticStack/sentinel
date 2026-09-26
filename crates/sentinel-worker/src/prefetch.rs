@@ -490,7 +490,7 @@ mod tests {
             started: Mutex::new(tx),
         });
         let seen = Arc::clone(&gate);
-        let images = Images::with_download(move |image, _, cancel| {
+        let images = Images::with_download(move |image, _, _, cancel| {
             let now = seen.running.fetch_add(1, Ordering::SeqCst) + 1;
             seen.peak.fetch_max(now, Ordering::SeqCst);
             let _ = seen.started.lock().unwrap().send(image.to_owned());

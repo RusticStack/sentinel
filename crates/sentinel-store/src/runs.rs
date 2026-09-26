@@ -55,7 +55,8 @@ pub fn create_run(
     let group = create_group(tx, tenant, repo, run, spec)?;
     let mut mark_index = tx.prepare_cached(
         "UPDATE jobs SET spec_index = ?1, cpu_millis = ?3, memory_bytes = ?4, timeout_ms = ?5,
-                disk_bytes = ?6, arch = ?7, labels = ?8, concurrency_group = ?9
+                disk_bytes = ?6, arch = ?7, labels = ?8, concurrency_group = ?9,
+                requires_secret_delivery = ?10
          WHERE id = ?2",
     )?;
     for (index, job) in spec.pipeline.jobs.iter().enumerate() {
@@ -83,6 +84,12 @@ pub fn create_run(
             job_arch(job.spec.runs_on.arch),
             dispatch::encode_labels(&job.spec.runs_on.labels)?,
             group,
+            job.spec.registry_auth.is_some()
+                || job
+                    .spec
+                    .steps
+                    .iter()
+                    .any(|step| { !step.secrets.is_empty() || !step.secret_files.is_empty() }),
         ])?;
         if let Ok(image) = sentinel_pipeline::run::ImageRef::parse(&job.spec.image) {
             // The repository part travels with the digest so a prefetch

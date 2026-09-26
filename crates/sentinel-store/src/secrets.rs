@@ -1,15 +1,15 @@
 //! Tenant-owned sealed secrets and explicit repository/job/step eligibility.
-//! This module exposes metadata to clients; plaintext has no read API. S05
-//! adds attempt-bound delivery after resolving these durable bindings.
+//! This module exposes metadata to clients; plaintext has no read API. Only
+//! fenced preparation may open a sealed value for an authorized attempt.
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::sealed::{Key, secret_context};
 use sentinel_core::{
-    AttemptId, RepoId, SecretId, TenantId, UnixMillis, UserId,
+    AttemptId, Fence, RepoId, SecretId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Permissions, Principal},
 };
 use sentinel_protocol::idempotency::{Fingerprint, IDEMPOTENCY_TTL_MS, IdempotencyKey};
 
-use crate::{Error, Result, auth};
+use crate::{Error, Result, auth, dispatch};
 
 pub const MAX_VALUE: usize = 65_536;
 
@@ -167,6 +167,12 @@ pub struct Resolved {
     pub name: String,
 }
 
+pub struct PreparedDelivery {
+    pub fence: Fence,
+    /// One bounded postcard encoding, ready for the link to chunk directly.
+    pub encoded: sentinel_protocol::secrets::SecretBytes,
+}
+
 fn name_valid(name: &str) -> bool {
     let bytes = name.as_bytes();
     (1..=64).contains(&bytes.len())
@@ -283,7 +289,7 @@ fn audit(tx: &Transaction<'_>, meta: &Metadata, event: Audit<'_>, now: UnixMilli
 
 /// Create or rotate using compare-and-set. `expected=0` creates; later writes
 /// require the observed current version. Old versions remain sealed until
-/// explicitly revoked, so S05 may implement authorized original-version reruns.
+/// explicitly revoked for audit and history; each new attempt resolves current.
 pub fn put(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -682,7 +688,7 @@ fn tenant_name_exists(
 }
 
 /// Return the current version identity selected by exact step, job, then repo
-/// binding. Only S05 may turn this identity into attempt-bound plaintext.
+/// binding. Only fenced preparation may turn this identity into attempt-bound plaintext.
 pub fn resolve(
     conn: &Connection,
     repo: RepoId,
@@ -741,7 +747,7 @@ fn tenant_name_exists_repo(conn: &Connection, repo: RepoId, name: &str) -> Resul
 }
 
 /// Record actual use only inside the same writer transaction as the
-/// preparation decision. S05 calls this after its fenced worker/attempt check.
+/// preparation decision. The caller holds the fenced delivery transaction.
 pub fn audit_use(
     tx: &Transaction<'_>,
     attempt: AttemptId,
@@ -757,4 +763,250 @@ pub fn audit_use(
     }
     tx.execute("INSERT INTO secret_audit(tenant_id,repo_id,secret_id,version,actor,attempt_id,step,action,result,at_ms) VALUES(?1,?2,?3,?4,NULL,?5,?6,'use','ok',?7)",params![tenant.as_bytes(),repo.as_bytes(),resolved.secret.as_bytes(),resolved.version as i64,attempt.as_bytes(),step,now.0])?;
     Ok(())
+}
+
+/// Resolve and open only the declared targets of the acknowledged attempt's
+/// durable spec. The writer transaction serializes this fence/capability
+/// check with revocation, binding changes, version rotation and the use audit.
+pub fn prepare_delivery(
+    tx: &Transaction<'_>,
+    key: &Key,
+    worker: WorkerId,
+    attempt: AttemptId,
+    now: UnixMillis,
+) -> Result<PreparedDelivery> {
+    use sentinel_protocol::secrets::{DeliveryBundle, DeliveryTarget, DeliveryValue, TargetKind};
+
+    if dispatch::spec_gate(tx, worker, attempt)? != dispatch::SpecGate::Ready {
+        return Err(Error::NotFound);
+    }
+    let (tenant, run, job, job_index) = dispatch::attempt_scope(tx, worker, attempt)?;
+    let fence: i64 = tx
+        .prepare_cached(
+            "SELECT a.fence FROM attempts a JOIN workers w ON w.id=a.worker_id
+             WHERE a.id=?1 AND a.worker_id=?2 AND a.acked_ms IS NOT NULL
+               AND a.released_ms IS NULL AND w.revoked_ms IS NULL",
+        )?
+        .query_row(params![attempt.as_bytes(), worker.as_bytes()], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    let (repo, job_name): ([u8; 16], String) = tx
+        .query_row(
+            "SELECT r.repo_id,j.name FROM jobs j JOIN runs r ON r.id=j.run_id
+             WHERE j.id=?1 AND j.tenant_id=?2 AND r.tenant_id=?2 AND r.id=?3",
+            params![job.as_bytes(), tenant.as_bytes(), run.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    let repo = RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("attempt repo"))?;
+    let bytes = dispatch::spec_bytes(tx, worker, attempt)?;
+    let spec =
+        sentinel_pipeline::RunSpec::decode(&bytes).map_err(|_| Error::Corrupt("run spec"))?;
+    let compiled = spec
+        .pipeline
+        .jobs
+        .get(job_index as usize)
+        .filter(|compiled| compiled.name == job_name)
+        .ok_or(Error::Corrupt("job spec index"))?;
+    if compiled.spec.registry_auth.is_none()
+        && !compiled
+            .spec
+            .steps
+            .iter()
+            .any(|step| !step.secrets.is_empty() || !step.secret_files.is_empty())
+    {
+        return Ok(PreparedDelivery {
+            fence: Fence(fence as u64),
+            encoded: sentinel_protocol::secrets::SecretBytes::new(
+                postcard::to_allocvec(&DeliveryBundle::empty())
+                    .map_err(|_| Error::Corrupt("secret delivery encoding"))?,
+            ),
+        });
+    }
+    let (protocol, capabilities): (i64, i64) = tx
+        .prepare_cached(
+            "SELECT protocol,capabilities FROM workers WHERE id=?1 AND revoked_ms IS NULL",
+        )?
+        .query_row([worker.as_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    if protocol < 10
+        || capabilities as u64 & sentinel_protocol::negotiate::Capabilities::SECRET_DELIVERY.0 == 0
+    {
+        return Err(Error::Forbidden);
+    }
+
+    let mut bundle = DeliveryBundle {
+        values: Vec::with_capacity(compiled.spec.secrets.len().min(16)),
+        targets: Vec::new(),
+    };
+    let mut value_indices: std::collections::HashMap<(SecretId, u64), u16> =
+        std::collections::HashMap::with_capacity(compiled.spec.secrets.len().min(16));
+    if let Some(name) = &compiled.spec.registry_auth {
+        let resolved = resolve(tx, repo, &job_name, "", name)?;
+        let identity = (resolved.secret, resolved.version);
+        let value_index = match value_indices.get(&identity) {
+            Some(index) => *index,
+            None => {
+                if bundle.values.len() >= sentinel_protocol::secrets::MAX_DELIVERY_VALUES {
+                    return Err(Error::InvalidInput("secret delivery values"));
+                }
+                let value = open_value(tx, key, &resolved)?;
+                let index = u16::try_from(bundle.values.len())
+                    .map_err(|_| Error::InvalidInput("secret delivery values"))?;
+                bundle.values.push(DeliveryValue::new(value));
+                if !bundle.within_wire_limit() {
+                    return Err(Error::InvalidInput("secret delivery size"));
+                }
+                value_indices.insert(identity, index);
+                index
+            }
+        };
+        audit_use(tx, attempt, "", &resolved, now)?;
+        bundle.targets.push(DeliveryTarget {
+            step: 0,
+            name: name.clone(),
+            value: value_index,
+            target: TargetKind::RegistryAuth,
+        });
+        if !bundle.within_wire_limit() {
+            return Err(Error::InvalidInput("secret delivery size"));
+        }
+    }
+    for (step_index, step) in compiled.spec.steps.iter().enumerate() {
+        let mut step_values: Vec<(String, Resolved, u16)> = Vec::new();
+        let mut target = |name: &str, kind: TargetKind| -> Result<()> {
+            let cached = step_values.iter().find(|(existing, _, _)| existing == name);
+            let value_index = if let Some((_, _, index)) = cached {
+                *index
+            } else {
+                let resolved = resolve(tx, repo, &job_name, &step.id, name)?;
+                let identity = (resolved.secret, resolved.version);
+                let value_index = match value_indices.get(&identity) {
+                    Some(index) => *index,
+                    None => {
+                        if bundle.values.len() >= sentinel_protocol::secrets::MAX_DELIVERY_VALUES {
+                            return Err(Error::InvalidInput("secret delivery values"));
+                        }
+                        let value = open_value(tx, key, &resolved)?;
+                        let index = u16::try_from(bundle.values.len())
+                            .map_err(|_| Error::InvalidInput("secret delivery values"))?;
+                        bundle.values.push(DeliveryValue::new(value));
+                        if !bundle.within_wire_limit() {
+                            return Err(Error::InvalidInput("secret delivery size"));
+                        }
+                        value_indices.insert(identity, index);
+                        index
+                    }
+                };
+                audit_use(tx, attempt, &step.id, &resolved, now)?;
+                step_values.push((name.to_owned(), resolved.clone(), value_index));
+                value_index
+            };
+            if bundle.targets.len() >= sentinel_protocol::secrets::MAX_DELIVERY_TARGETS {
+                return Err(Error::InvalidInput("secret delivery targets"));
+            }
+            bundle.targets.push(DeliveryTarget {
+                step: step_index as u16,
+                name: name.to_owned(),
+                value: value_index,
+                target: kind,
+            });
+            if !bundle.within_wire_limit() {
+                return Err(Error::InvalidInput("secret delivery size"));
+            }
+            Ok(())
+        };
+        for name in &step.secrets {
+            target(name, TargetKind::Environment)?;
+        }
+        for file in &step.secret_files {
+            target(
+                &file.name,
+                TargetKind::File {
+                    path: file.path.clone(),
+                },
+            )?;
+        }
+    }
+    if !bundle.valid() {
+        return Err(Error::Corrupt("secret delivery bundle"));
+    }
+    let encoded = sentinel_protocol::secrets::SecretBytes::new(
+        postcard::to_allocvec(&bundle).map_err(|_| Error::Corrupt("secret delivery encoding"))?,
+    );
+    if encoded.len() > sentinel_protocol::secrets::MAX_DELIVERY_BYTES {
+        return Err(Error::InvalidInput("secret delivery size"));
+    }
+    Ok(PreparedDelivery {
+        fence: Fence(fence as u64),
+        encoded,
+    })
+}
+
+/// Open exactly one already-authorized immutable version. This stays private
+/// to the store preparation path; client-facing metadata never exposes it.
+type StoredSecretVersion = ([u8; 16], Option<[u8; 16]>, String, i64, bool, Vec<u8>, bool);
+
+fn open_value(conn: &Connection, key: &Key, resolved: &Resolved) -> Result<Vec<u8>> {
+    let row: Option<StoredSecretVersion> = conn
+        .query_row(
+            "SELECT s.tenant_id,s.scope_repo_id,s.name,s.current_version,s.active,
+                    v.sealed,v.revoked
+             FROM secrets s JOIN secret_versions v ON v.secret_id=s.id
+             WHERE s.id=?1 AND v.version=?2",
+            params![resolved.secret.as_bytes(), resolved.version as i64],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((tenant, repo, name, current, active, sealed, revoked)) = row else {
+        return Err(Error::NotFound);
+    };
+    let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("secret tenant"))?;
+    let scope = match repo {
+        Some(repo) => {
+            Scope::Repo(RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("secret repo"))?)
+        }
+        None => Scope::Tenant(tenant),
+    };
+    if !active
+        || revoked
+        || current != resolved.version as i64
+        || name != resolved.name
+        || scope != resolved.scope
+    {
+        return Err(Error::NotFound);
+    }
+    let scope_repo = match resolved.scope {
+        Scope::Tenant(_) => None,
+        Scope::Repo(repo) => Some(*repo.as_bytes()),
+    };
+    let context = secret_context(
+        tenant.as_bytes(),
+        scope_repo.as_ref(),
+        &name,
+        resolved.version,
+    );
+    let mut plaintext = key
+        .open(&context, &sealed)
+        .map_err(|_| Error::Corrupt("sealed secret"))?;
+    if !(1..=MAX_VALUE).contains(&plaintext.len()) {
+        plaintext.fill(0);
+        core::hint::black_box(&mut plaintext);
+        return Err(Error::Corrupt("secret value length"));
+    }
+    Ok(plaintext)
 }

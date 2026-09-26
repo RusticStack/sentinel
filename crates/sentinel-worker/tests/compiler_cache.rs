@@ -95,6 +95,7 @@ fn mounts_of(a: &sentinel_cache::attach::Attached) -> Vec<Mount> {
         .map(|t| Mount {
             host: t.dir.clone(),
             container: t.container.clone(),
+            read_only: false,
         })
         .collect()
 }
@@ -103,6 +104,8 @@ fn sh(script: &str) -> StepCommand {
     StepCommand {
         argv: vec!["/bin/sh".into(), "-e".into(), "-c".into(), script.into()],
         env: Vec::new(),
+        secrets: Vec::new(),
+        secret_files: Vec::new(),
         workdir: None,
         timeout_secs: 120,
     }
@@ -133,13 +136,15 @@ fn a_compiler_namespace_persists_across_attempts_and_the_tool_decides_staleness(
     if !enabled() {
         return;
     }
+    let tmp = tempfile::tempdir().unwrap();
+    let authfile = sentinel_worker::images::prepare_anonymous_authfile(tmp.path()).unwrap();
     podman::pull(
         IMAGE,
+        &authfile,
         Duration::from_secs(600),
         &std::sync::atomic::AtomicBool::new(false),
     )
     .unwrap();
-    let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("cache");
     let repo = RepoId::new();
     let d = decl();

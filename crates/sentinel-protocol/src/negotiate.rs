@@ -27,9 +27,9 @@ pub struct ProtocolVersion(pub u16);
 /// Protocol 9 adds `Prefetch`, the controller's bounded hint of image
 /// references queued work needs (K05), and lets a cache offer state its
 /// digest in the end marker instead of up front (the all-zero
-/// `Upload::digest`).
+/// `Upload::digest`). Protocol 10 adds attempt-scoped secret bundle transfer.
 pub const SUPPORTED_MIN: ProtocolVersion = ProtocolVersion(1);
-pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(9);
+pub const SUPPORTED_MAX: ProtocolVersion = ProtocolVersion(10);
 
 /// First protocol whose offers may state their digest at their end. An
 /// older session's offers keep naming it up front.
@@ -86,6 +86,9 @@ impl Capabilities {
     /// keep the helper that can still resend it; a worker without the bit
     /// may redial into that helper instead.
     pub const HANDOFF_ANSWER: Capabilities = Capabilities(1 << 8);
+    /// Worker can accept bounded, attempt-scoped secret bundles and inject
+    /// only explicitly declared step targets.
+    pub const SECRET_DELIVERY: Capabilities = Capabilities(1 << 9);
 
     /// The minimum a worker must prove before it may receive any job.
     pub const REQUIRED: Capabilities = Capabilities(
@@ -105,7 +108,7 @@ impl Capabilities {
         Capabilities(self.0 & !other.0)
     }
     /// Bits this controller build knows; unknown bits are masked on receipt.
-    pub const KNOWN: Capabilities = Capabilities((1 << 9) - 1);
+    pub const KNOWN: Capabilities = Capabilities((1 << 10) - 1);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -287,7 +290,7 @@ mod tests {
         let future_bit = Capabilities(1 << 40);
         let h = hello(
             1,
-            9,
+            10,
             Capabilities::REQUIRED
                 .union(Capabilities::REFLINK)
                 .union(future_bit),

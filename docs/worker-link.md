@@ -214,6 +214,14 @@ in `Stats::prefetch_hints`.
 - `Executor::prefetch(&[String])` is the executor's side, a no-op by
   default.
 
+## Secret delivery (protocol 10, S05–S06)
+
+A job with environment secrets, secret files or a private registry auth binding can be placed only on a worker that negotiated protocol 10 and advertised capability bit 9, `SECRET_DELIVERY`. Migration 40 stores that requirement on the job, so an older worker still runs ordinary jobs but never receives a secret-bearing one.
+
+After the offer is durably acknowledged, the worker requests its spec. The controller checks the worker, attempt, live lease and fence under the store writer transaction, resolves only the secret names declared in that job, opens their current active versions and records value-free `use` audit rows. The response sends `SecretBegin { attempt, fence, length }`, then ordered `SecretChunk { attempt, fence, seq, last, bytes }` frames before `Spec`. The bundle is capped at 1 MiB, one value at 64 KiB and one chunk at 48 KiB. A retry or re-offer uses the new attempt fence; a stale request cannot receive values. A new attempt, including a rerun, selects current versions again.
+
+The secret transfer travels on the same control connection as the spec response. Its payload is marked sensitive for frame encoding and has a redacted debug view. The worker rejects a transfer with the wrong fence, incomplete or out-of-order chunks, oversized data, an invalid auth JSON shape, or any target set that differs from the stored run spec. It registers every value with the log redactor before execution; env and file targets are materialized only for the declared step. Private registry auth stays on the host for that attempt's `podman pull` and never enters the container. Worker cleanup removes secret files on normal completion, failure, cancellation and panic, and restart recovery reaps leftovers. See [scoped secrets](secrets.md) and [executor](executor.md#the-image-pull-k05).
+
 ## Dispatch (W02)
 
 **The ready queue is the database.** A job is queued when its row says so (`jobs_ready`, the partial index on `(priority, created_seq) WHERE state_code = 1`); nothing in memory has to be rebuilt after a restart. Its resource needs (`cpu_millis`, `memory_bytes`) are copied from the compiled spec at run creation so placement never decodes a spec blob.

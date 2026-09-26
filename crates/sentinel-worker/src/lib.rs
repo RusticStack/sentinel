@@ -67,6 +67,17 @@ impl fmt::Display for Error {
         }
     }
 }
+impl Drop for Error {
+    fn drop(&mut self) {
+        let text = match self {
+            Self::Preparation(text) | Self::Runtime(text) | Self::Workspace(text) => text,
+            Self::Timeout(_) | Self::Io(_) => return,
+        };
+        let mut bytes = std::mem::take(text).into_bytes();
+        bytes.fill(0);
+        core::hint::black_box(&mut bytes);
+    }
+}
 impl std::error::Error for Error {}
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {

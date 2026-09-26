@@ -64,6 +64,21 @@ pub struct Job {
     /// worker injects each as an environment variable of the same name only
     /// if the repository has been granted that secret.
     pub secrets: Vec<String>,
+    /// Optional declared secret containing the tenant's OCI `auth.json`.
+    /// It authorizes this job's image pull and is never exposed to a step.
+    pub registry_auth: Option<String>,
+}
+
+impl Job {
+    /// Whether preparing this job requires the negotiated secret-delivery
+    /// contract, including host-only registry authentication.
+    pub fn requires_secret_delivery(&self) -> bool {
+        self.registry_auth.is_some()
+            || self
+                .steps
+                .iter()
+                .any(|step| !step.secrets.is_empty() || !step.secret_files.is_empty())
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,8 +111,19 @@ pub struct Step {
     pub condition: Option<Expr>,
     pub shell: Shell,
     pub env: Vec<(String, String)>,
+    /// Secret names exposed to this step as same-name environment variables.
+    pub secrets: Vec<String>,
+    /// Secret names materialized as files below `/run/sentinel-secrets`.
+    pub secret_files: Vec<SecretFile>,
     pub workdir: Option<String>,
     pub timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretFile {
+    pub name: String,
+    /// Normalized path relative to `/run/sentinel-secrets`.
+    pub path: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -783,6 +809,42 @@ fn step(path: &str, node: &Node) -> Result<Step> {
         Some(n) => env(&map.child("env"), n)?,
         None => Vec::new(),
     };
+    let secrets = match map.take("secrets") {
+        None => Vec::new(),
+        Some(n) => secret_names(&map.child("secrets"), n)?,
+    };
+    let secret_files = match map.take("secret_files") {
+        None => Vec::new(),
+        Some(n) => {
+            let child = map.child("secret_files");
+            let entries = match n {
+                Node::Map(entries) if !entries.is_empty() => entries,
+                Node::Map(_) => return Err(err(&child, SchemaErrorKind::Empty)),
+                other => {
+                    return Err(err(
+                        &child,
+                        SchemaErrorKind::WrongType {
+                            expected: "mapping",
+                            found: other.kind(),
+                        },
+                    ));
+                }
+            };
+            if entries.len() > MAX_SECRETS {
+                return Err(err(&child, SchemaErrorKind::TooMany { limit: MAX_SECRETS }));
+            }
+            let mut files = Vec::with_capacity(entries.len());
+            for (name, path_node) in entries {
+                let name_path = format!("{child}.{name}");
+                validate_secret_name(&name_path, name)?;
+                files.push(SecretFile {
+                    name: name.clone(),
+                    path: relative_path(&name_path, path_node)?,
+                });
+            }
+            files
+        }
+    };
     let workdir = match map.take("workdir") {
         Some(n) => Some(relative_path(&map.child("workdir"), n)?),
         None => None,
@@ -798,9 +860,45 @@ fn step(path: &str, node: &Node) -> Result<Step> {
         condition,
         shell,
         env,
+        secrets,
+        secret_files,
         workdir,
         timeout_secs,
     })
+}
+
+fn validate_secret_name(path: &str, name: &str) -> Result<()> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_ID_BYTES
+        || bytes[0].is_ascii_digit()
+        || name == "CI"
+        || name.starts_with("SENTINEL_")
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+    {
+        return Err(err(
+            path,
+            SchemaErrorKind::Invalid("secret names must match [A-Z_][A-Z0-9_]*".into()),
+        ));
+    }
+    Ok(())
+}
+
+fn secret_names(path: &str, node: &Node) -> Result<Vec<String>> {
+    let items = expect_seq(path, node, MAX_SECRETS)?;
+    let mut out: Vec<String> = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let p = format!("{path}[{i}]");
+        let name = expect_str(&p, item, MAX_ID_BYTES)?;
+        validate_secret_name(&p, name)?;
+        if out.iter().any(|existing| existing == name) {
+            return Err(err(&p, SchemaErrorKind::Invalid("duplicate secret".into())));
+        }
+        out.push(name.to_owned());
+    }
+    Ok(out)
 }
 
 /// A path inside the job workspace: relative, normalised, no `..`, no
@@ -1063,31 +1161,72 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy) -> Result<Job> {
     };
     let secrets = match map.take("secrets") {
         None => Vec::new(),
+        Some(n) => secret_names(&map.child("secrets"), n)?,
+    };
+    let registry_auth = match map.take("registry_auth") {
+        None => None,
         Some(n) => {
-            let child = map.child("secrets");
-            let items = expect_seq(&child, n, MAX_SECRETS)?;
-            let mut out: Vec<String> = Vec::with_capacity(items.len());
-            for (i, item) in items.iter().enumerate() {
-                let p = format!("{child}[{i}]");
-                let s = expect_str(&p, item, MAX_ID_BYTES)?;
-                let valid = s
-                    .bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-                    && !s.as_bytes()[0].is_ascii_digit();
-                if !valid {
-                    return Err(err(
-                        &p,
-                        SchemaErrorKind::Invalid("secret names must match [A-Z_][A-Z0-9_]*".into()),
-                    ));
-                }
-                if out.iter().any(|o| o == s) {
-                    return Err(err(&p, SchemaErrorKind::Invalid("duplicate secret".into())));
-                }
-                out.push(s.to_owned());
-            }
-            out
+            let path = map.child("registry_auth");
+            let name = expect_str(&path, n, MAX_ID_BYTES)?;
+            validate_secret_name(&path, name)?;
+            Some(name.to_owned())
         }
     };
+    if registry_auth
+        .as_ref()
+        .is_some_and(|name| !secrets.iter().any(|declared| declared == name))
+    {
+        return Err(err(
+            &map.child("registry_auth"),
+            SchemaErrorKind::Invalid("registry_auth must be declared by the job's secrets".into()),
+        ));
+    }
+    for (step_index, step) in steps.iter().enumerate() {
+        let path = format!("{steps_path}[{step_index}]");
+        for name in step
+            .secrets
+            .iter()
+            .chain(step.secret_files.iter().map(|f| &f.name))
+        {
+            if !secrets.iter().any(|declared| declared == name) {
+                return Err(err(
+                    &path,
+                    SchemaErrorKind::Invalid("step secrets must be declared by the job".into()),
+                ));
+            }
+            if name == "CI"
+                || name.starts_with("SENTINEL_")
+                || job_env_has_name(&env, name)
+                || step.env.iter().any(|(env_name, _)| env_name == name)
+            {
+                return Err(err(
+                    &path,
+                    SchemaErrorKind::Invalid(
+                        "secret target conflicts with a reserved or ordinary environment variable"
+                            .into(),
+                    ),
+                ));
+            }
+        }
+        for (i, file) in step.secret_files.iter().enumerate() {
+            if step.secret_files[..i].iter().any(|previous| {
+                previous.path == file.path
+                    || previous
+                        .path
+                        .strip_prefix(&file.path)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                    || file
+                        .path
+                        .strip_prefix(&previous.path)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            }) {
+                return Err(err(
+                    &path,
+                    SchemaErrorKind::Invalid("overlapping secret file paths".into()),
+                ));
+            }
+        }
+    }
     let artifacts = match map.take("artifacts") {
         None => Vec::new(),
         Some(n) => {
@@ -1113,7 +1252,12 @@ fn job(path: &str, node: &Node, policy: &ResourcePolicy) -> Result<Job> {
         cache,
         artifacts,
         secrets,
+        registry_auth,
     })
+}
+
+fn job_env_has_name(env: &[(String, String)], name: &str) -> bool {
+    env.iter().any(|(env_name, _)| env_name == name)
 }
 
 /// Decode a loaded document into the typed schema. Structural only: DAG
@@ -1239,6 +1383,35 @@ mod tests {
         assert!(valid_image("rust:1-bookworm"));
         assert!(valid_image("ghcr.io/o/i@sha256:abc"));
         assert!(!valid_image("a b"));
+    }
+
+    #[test]
+    fn secret_file_targets_must_not_overlap() {
+        for files in [
+            "        secret_files:\n          TOKEN: config\n          OTHER: config/token\n",
+            "        secret_files:\n          TOKEN: config/token\n          OTHER: config\n",
+        ] {
+            let doc = format!(
+                "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    secrets: [TOKEN, OTHER]\n    steps:\n      - id: s\n        run: echo\n{files}"
+            );
+            let error = crate::compile_str(&doc).unwrap_err();
+            assert!(error.to_string().contains("overlapping secret file paths"));
+        }
+    }
+
+    #[test]
+    fn registry_auth_alone_requires_secret_delivery() {
+        let pipeline = crate::compile_str(
+            "schema: 1\non: [push]\njobs:\n  image:\n    image: ghcr.io/acme/app\n    secrets: [OCI_AUTH]\n    registry_auth: OCI_AUTH\n    steps:\n      - id: build\n        run: make\n",
+        )
+        .unwrap();
+        assert!(pipeline.jobs[0].spec.requires_secret_delivery());
+
+        let pipeline = crate::compile_str(
+            "schema: 1\non: [push]\njobs:\n  build:\n    image: busybox\n    steps:\n      - id: test\n        run: test\n",
+        )
+        .unwrap();
+        assert!(!pipeline.jobs[0].spec.requires_secret_delivery());
     }
 
     #[test]

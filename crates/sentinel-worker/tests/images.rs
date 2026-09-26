@@ -98,7 +98,7 @@ fn the_pull_overlaps_the_checkout() {
     let seen = Arc::new(Mutex::new(Seen::default()));
     let images = Images::with_download({
         let (seen, workspace) = (Arc::clone(&seen), workspace.clone());
-        move |image, _, _| {
+        move |image, _, _, _| {
             {
                 let mut seen = seen.lock().unwrap();
                 seen.image = image.to_owned();
@@ -152,6 +152,7 @@ fn the_pull_overlaps_the_checkout() {
             trust: sentinel_protocol::cache::Trust::Protected,
         },
         images: images.clone(),
+        secret_bundle: sentinel_protocol::secrets::DeliveryBundle::empty(),
         caches: Vec::new(),
         mirrors: None,
         prepare_hold: Duration::ZERO,
@@ -187,8 +188,8 @@ fn the_pull_overlaps_the_checkout() {
     // the run pinned joins the worker's held record.
     assert!(summary.checkout_ns.is_some());
     assert!(summary.image_pull_ns.is_some());
-    // K08: the stub downloaded, so the summary records `image_present:
-    // false` — the exists fast path did not serve.
+    // The image was absent before the stub's pull, so `image_present` is
+    // false even though production still runs its scoped auth pull.
     assert_eq!(summary.image_present, Some(false));
     assert!(images.holds(DIGEST));
     // There is no podman image behind the stub, so the container start —
@@ -211,13 +212,13 @@ fn the_pull_overlaps_the_checkout() {
 /// shared path just as on the direct one.
 #[test]
 fn an_unpinned_reference_is_still_refused() {
-    let images = Images::new();
+    let images = Images::with_download(|_, _, _, _| Ok(false));
     match images.pull(
         "example.test/image:latest",
         Duration::from_secs(1),
         &uncanceled(),
     ) {
-        Err(sentinel_worker::Error::Preparation(what)) => {
+        Err(sentinel_worker::Error::Preparation(ref what)) => {
             assert_eq!(what, "image is not pinned by digest")
         }
         other => panic!("unpinned reference got {other:?}"),

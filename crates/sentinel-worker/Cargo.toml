@@ -15,6 +15,8 @@ sentinel-git = { path = "../sentinel-git" }
 sentinel-link = { path = "../sentinel-link" }
 sentinel-pipeline = { path = "../sentinel-pipeline" }
 sentinel-protocol = { path = "../sentinel-protocol" }
+serde_json = "1.0"
+blake3 = "1.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -24,7 +26,7 @@ sentinel-api = { path = "../sentinel-api" }
 sentinel-auth = { path = "../sentinel-auth" }
 sentinel-link = { path = "../sentinel-link", features = ["controller"] }
 sentinel-store = { path = "../sentinel-store" }
-serde_json = "1.0"
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3.20"
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 

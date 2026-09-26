@@ -168,8 +168,9 @@ pub enum SpecError {
 /// [`SPEC_FORMAT_READ_MIN`] are rejected rather than misread. Format 2:
 /// `on` carries ref filters (`policy::Triggers`) instead of a trigger
 /// list. Format 3: artifacts carry `required`. Format 4: caches carry
-/// `class`.
-pub const SPEC_FORMAT: u8 = 4;
+/// `class`. Format 5: steps carry secret targets. Format 6 adds tenant
+/// registry credentials to the job's image-pull authorization.
+pub const SPEC_FORMAT: u8 = 6;
 
 /// The oldest format `decode` still accepts. Format 3 differs from 4 only
 /// in the absent `cache.class`; its blobs upgrade to `Dependencies` —
@@ -204,8 +205,10 @@ impl RunSpec {
     }
 
     /// The byte that heads a stored spec decides which layout follows.
-    /// Format 3 decodes through the shadow types below and upgrades every
-    /// cache to `Dependencies`; any other format byte, a body its layout
+    /// Formats 3 through 5 decode through shadow types. Older steps receive
+    /// empty secret targets; old jobs have no registry credential. Format 3
+    /// also upgrades caches to `Dependencies`. Any
+    /// other format byte, a body its layout
     /// cannot parse, or bytes left over after it is `Decode`. The format
     /// byte alone chooses the type — a v3 body is never fed to the v4
     /// layout hoping the extra field swallows leftover bytes — and the
@@ -220,7 +223,9 @@ impl RunSpec {
         }
         match bytes.split_first() {
             Some((&SPEC_FORMAT, body)) => whole(body),
-            Some((&SPEC_FORMAT_READ_MIN, body)) => whole::<RunSpecV3>(body).map(RunSpec::from),
+            Some((&5, body)) => whole::<RunSpecV5>(body).map(RunSpec::from),
+            Some((&4, body)) => whole::<RunSpecV4>(body).map(RunSpec::from),
+            Some((&3, body)) => whole::<RunSpecV3>(body).map(RunSpec::from),
             _ => Err(SpecError::Decode),
         }
     }
@@ -248,7 +253,56 @@ struct CacheV3 {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct JobV3 {
+struct StepV4 {
+    id: String,
+    run: String,
+    condition: Option<Expr>,
+    shell: Shell,
+    env: Vec<(String, String)>,
+    workdir: Option<String>,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JobV4 {
+    image: String,
+    needs: Vec<String>,
+    condition: Option<Expr>,
+    runs_on: RunsOn,
+    resources: Resources,
+    timeout_secs: u64,
+    env: Vec<(String, String)>,
+    workdir: Option<String>,
+    steps: Vec<StepV4>,
+    cache: Vec<Cache>,
+    artifacts: Vec<Artifact>,
+    secrets: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompiledJobV4 {
+    name: String,
+    needs: Vec<u16>,
+    spec: JobV4,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompiledPipelineV4 {
+    on: Triggers,
+    concurrency: Option<Concurrency>,
+    jobs: Vec<CompiledJobV4>,
+    digest: u128,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSpecV4 {
+    source: PinnedSource,
+    pipeline: CompiledPipelineV4,
+    images: Vec<ImageRef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JobV5 {
     image: String,
     needs: Vec<String>,
     condition: Option<Expr>,
@@ -258,6 +312,44 @@ struct JobV3 {
     env: Vec<(String, String)>,
     workdir: Option<String>,
     steps: Vec<Step>,
+    cache: Vec<Cache>,
+    artifacts: Vec<Artifact>,
+    secrets: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompiledJobV5 {
+    name: String,
+    needs: Vec<u16>,
+    spec: JobV5,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompiledPipelineV5 {
+    on: Triggers,
+    concurrency: Option<Concurrency>,
+    jobs: Vec<CompiledJobV5>,
+    digest: u128,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSpecV5 {
+    source: PinnedSource,
+    pipeline: CompiledPipelineV5,
+    images: Vec<ImageRef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JobV3 {
+    image: String,
+    needs: Vec<String>,
+    condition: Option<Expr>,
+    runs_on: RunsOn,
+    resources: Resources,
+    timeout_secs: u64,
+    env: Vec<(String, String)>,
+    workdir: Option<String>,
+    steps: Vec<StepV4>,
     cache: Vec<CacheV3>,
     artifacts: Vec<Artifact>,
     secrets: Vec<String>,
@@ -296,7 +388,7 @@ impl From<JobV3> for Job {
             timeout_secs: v3.timeout_secs,
             env: v3.env,
             workdir: v3.workdir,
-            steps: v3.steps,
+            steps: v3.steps.into_iter().map(Step::from).collect(),
             cache: v3
                 .cache
                 .into_iter()
@@ -309,6 +401,99 @@ impl From<JobV3> for Job {
                 .collect(),
             artifacts: v3.artifacts,
             secrets: v3.secrets,
+            registry_auth: None,
+        }
+    }
+}
+
+impl From<StepV4> for Step {
+    fn from(old: StepV4) -> Step {
+        Step {
+            id: old.id,
+            run: old.run,
+            condition: old.condition,
+            shell: old.shell,
+            env: old.env,
+            secrets: Vec::new(),
+            secret_files: Vec::new(),
+            workdir: old.workdir,
+            timeout_secs: old.timeout_secs,
+        }
+    }
+}
+
+impl From<RunSpecV4> for RunSpec {
+    fn from(v4: RunSpecV4) -> RunSpec {
+        RunSpec {
+            source: v4.source,
+            pipeline: CompiledPipeline {
+                on: v4.pipeline.on,
+                concurrency: v4.pipeline.concurrency,
+                jobs: v4
+                    .pipeline
+                    .jobs
+                    .into_iter()
+                    .map(|j| CompiledJob {
+                        name: j.name,
+                        needs: j.needs,
+                        spec: Job {
+                            image: j.spec.image,
+                            needs: j.spec.needs,
+                            condition: j.spec.condition,
+                            runs_on: j.spec.runs_on,
+                            resources: j.spec.resources,
+                            timeout_secs: j.spec.timeout_secs,
+                            env: j.spec.env,
+                            workdir: j.spec.workdir,
+                            steps: j.spec.steps.into_iter().map(Step::from).collect(),
+                            cache: j.spec.cache,
+                            artifacts: j.spec.artifacts,
+                            secrets: j.spec.secrets,
+                            registry_auth: None,
+                        },
+                    })
+                    .collect(),
+                digest: v4.pipeline.digest,
+            },
+            images: v4.images,
+        }
+    }
+}
+
+impl From<RunSpecV5> for RunSpec {
+    fn from(v5: RunSpecV5) -> RunSpec {
+        RunSpec {
+            source: v5.source,
+            pipeline: CompiledPipeline {
+                on: v5.pipeline.on,
+                concurrency: v5.pipeline.concurrency,
+                jobs: v5
+                    .pipeline
+                    .jobs
+                    .into_iter()
+                    .map(|j| CompiledJob {
+                        name: j.name,
+                        needs: j.needs,
+                        spec: Job {
+                            image: j.spec.image,
+                            needs: j.spec.needs,
+                            condition: j.spec.condition,
+                            runs_on: j.spec.runs_on,
+                            resources: j.spec.resources,
+                            timeout_secs: j.spec.timeout_secs,
+                            env: j.spec.env,
+                            workdir: j.spec.workdir,
+                            steps: j.spec.steps,
+                            cache: j.spec.cache,
+                            artifacts: j.spec.artifacts,
+                            secrets: j.spec.secrets,
+                            registry_auth: None,
+                        },
+                    })
+                    .collect(),
+                digest: v5.pipeline.digest,
+            },
+            images: v5.images,
         }
     }
 }
@@ -349,6 +534,10 @@ pub struct StepCommand {
     /// worker adds its own `SENTINEL_*` context variables after these so a
     /// pipeline cannot spoof them.
     pub env: Vec<(String, String)>,
+    /// Explicit secret injection targets, kept separate from ordinary env
+    /// so the worker can avoid putting plaintext into process arguments.
+    pub secrets: Vec<String>,
+    pub secret_files: Vec<crate::schema::SecretFile>,
     /// Relative to the workspace root; `None` means the root itself.
     pub workdir: Option<String>,
     pub timeout_secs: u64,
@@ -386,6 +575,8 @@ impl StepCommand {
         Self {
             argv,
             env,
+            secrets: step.secrets.clone(),
+            secret_files: step.secret_files.clone(),
             workdir,
             timeout_secs: step.timeout_secs.unwrap_or(job.timeout_secs),
         }
@@ -398,6 +589,18 @@ mod tests {
     use crate::compile_str;
 
     const SHA: &str = "0c87e0181c794fe2bbfeb15dc34e7b6aae375d8b";
+
+    fn old_step(step: &Step) -> StepV4 {
+        StepV4 {
+            id: step.id.clone(),
+            run: step.run.clone(),
+            condition: step.condition.clone(),
+            shell: step.shell,
+            env: step.env.clone(),
+            workdir: step.workdir.clone(),
+            timeout_secs: step.timeout_secs,
+        }
+    }
 
     /// Encode `spec` in the format-3 layout: the shadow type graph, format
     /// byte 3. This is what pre-class builds wrote into `run_specs`.
@@ -424,7 +627,7 @@ mod tests {
                             timeout_secs: j.spec.timeout_secs,
                             env: j.spec.env.clone(),
                             workdir: j.spec.workdir.clone(),
-                            steps: j.spec.steps.clone(),
+                            steps: j.spec.steps.iter().map(old_step).collect(),
                             cache: j
                                 .spec
                                 .cache
@@ -444,6 +647,84 @@ mod tests {
             images: spec.images.clone(),
         };
         let mut out = vec![SPEC_FORMAT_READ_MIN];
+        out.extend(postcard::to_allocvec(&shadow).unwrap());
+        out
+    }
+
+    /// Format 4 added cache classes but predates per-step secret targets.
+    fn encode_v4(spec: &RunSpec) -> Vec<u8> {
+        let shadow = RunSpecV4 {
+            source: spec.source.clone(),
+            pipeline: CompiledPipelineV4 {
+                on: spec.pipeline.on.clone(),
+                concurrency: spec.pipeline.concurrency.clone(),
+                digest: spec.pipeline.digest,
+                jobs: spec
+                    .pipeline
+                    .jobs
+                    .iter()
+                    .map(|j| CompiledJobV4 {
+                        name: j.name.clone(),
+                        needs: j.needs.clone(),
+                        spec: JobV4 {
+                            image: j.spec.image.clone(),
+                            needs: j.spec.needs.clone(),
+                            condition: j.spec.condition.clone(),
+                            runs_on: j.spec.runs_on.clone(),
+                            resources: j.spec.resources,
+                            timeout_secs: j.spec.timeout_secs,
+                            env: j.spec.env.clone(),
+                            workdir: j.spec.workdir.clone(),
+                            steps: j.spec.steps.iter().map(old_step).collect(),
+                            cache: j.spec.cache.clone(),
+                            artifacts: j.spec.artifacts.clone(),
+                            secrets: j.spec.secrets.clone(),
+                        },
+                    })
+                    .collect(),
+            },
+            images: spec.images.clone(),
+        };
+        let mut out = vec![4];
+        out.extend(postcard::to_allocvec(&shadow).unwrap());
+        out
+    }
+
+    /// Format 5 added step targets but had no job-level registry auth field.
+    fn encode_v5(spec: &RunSpec) -> Vec<u8> {
+        let shadow = RunSpecV5 {
+            source: spec.source.clone(),
+            pipeline: CompiledPipelineV5 {
+                on: spec.pipeline.on.clone(),
+                concurrency: spec.pipeline.concurrency.clone(),
+                digest: spec.pipeline.digest,
+                jobs: spec
+                    .pipeline
+                    .jobs
+                    .iter()
+                    .map(|j| CompiledJobV5 {
+                        name: j.name.clone(),
+                        needs: j.needs.clone(),
+                        spec: JobV5 {
+                            image: j.spec.image.clone(),
+                            needs: j.spec.needs.clone(),
+                            condition: j.spec.condition.clone(),
+                            runs_on: j.spec.runs_on.clone(),
+                            resources: j.spec.resources,
+                            timeout_secs: j.spec.timeout_secs,
+                            env: j.spec.env.clone(),
+                            workdir: j.spec.workdir.clone(),
+                            steps: j.spec.steps.clone(),
+                            cache: j.spec.cache.clone(),
+                            artifacts: j.spec.artifacts.clone(),
+                            secrets: j.spec.secrets.clone(),
+                        },
+                    })
+                    .collect(),
+            },
+            images: spec.images.clone(),
+        };
+        let mut out = vec![5];
         out.extend(postcard::to_allocvec(&shadow).unwrap());
         out
     }
@@ -526,7 +807,7 @@ mod tests {
             Err(SpecError::Decode)
         );
         assert_eq!(RunSpec::decode(&[]), Err(SpecError::Decode));
-        // A format-4 head on a truncated body is not a spec either.
+        // A format-6 head on a truncated body is not a spec either.
         assert_eq!(
             RunSpec::decode(&bytes[..bytes.len() / 2]),
             Err(SpecError::Decode)
@@ -593,8 +874,8 @@ mod tests {
     }
 
     #[test]
-    fn run_spec_v4_carries_cache_class() {
-        let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    cache:\n      - name: dl\n        class: downloads\n        key: k\n        paths: [/root/.cargo/registry]\n    steps:\n      - id: s\n        run: echo hi\n";
+    fn run_spec_v6_carries_registry_auth_and_secret_targets() {
+        let text = "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    secrets: [TOKEN, REGISTRY]\n    registry_auth: REGISTRY\n    cache:\n      - name: dl\n        class: downloads\n        key: k\n        paths: [/root/.cargo/registry]\n    steps:\n      - id: s\n        run: echo hi\n        secrets: [TOKEN]\n        secret_files: {TOKEN: config/token}\n";
         let spec = RunSpec::new(
             PinnedSource::new("r", SHA, None).unwrap(),
             compile_str(text).unwrap(),
@@ -602,9 +883,26 @@ mod tests {
         .unwrap();
         assert_eq!(spec.pipeline.jobs[0].spec.cache[0].class, Class::Downloads);
         let bytes = spec.encode().unwrap();
-        assert_eq!(bytes[0], 4);
+        assert_eq!(bytes[0], 6);
         let decoded = RunSpec::decode(&bytes).unwrap();
         assert_eq!(decoded, spec);
+        let v5 = encode_v5(&spec);
+        assert_eq!(v5[0], 5);
+        let previous = RunSpec::decode(&v5).unwrap();
+        assert_eq!(previous.pipeline.jobs[0].spec.registry_auth, None);
+        assert_eq!(
+            previous.pipeline.jobs[0].spec.steps[0].secret_files,
+            spec.pipeline.jobs[0].spec.steps[0].secret_files
+        );
+    }
+
+    #[test]
+    fn run_spec_v4_decodes_with_empty_secret_targets() {
+        let spec = full_spec();
+        let v4 = encode_v4(&spec);
+        assert_eq!(v4[0], 4);
+        assert_eq!(RunSpec::decode(&v4).unwrap(), spec);
+        assert_eq!(RunSpec::decode(&v4[..v4.len() - 1]), Err(SpecError::Decode));
     }
 
     #[test]

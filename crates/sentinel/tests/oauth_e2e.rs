@@ -30,6 +30,7 @@ use std::{
 
 use sentinel_auth::{
     oauth::{self as forms, Kind, pkce},
+    sealed::Key,
     secret::Secret,
 };
 use sentinel_core::{
@@ -62,6 +63,8 @@ struct Deployment {
     _dir: tempfile::TempDir,
     store: Arc<Store>,
     _controller: Controller,
+    #[cfg(target_os = "linux")]
+    logs: Arc<LogStore>,
     server: Option<sentinel_api::Server>,
     /// `http://127.0.0.1:PORT`; also the issuer.
     base: String,
@@ -101,6 +104,9 @@ fn deployment_with(github_sign_in: bool) -> Deployment {
     let dir = tempfile::tempdir().unwrap();
     let store =
         Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
+    let key_path = dir.path().join("master.key");
+    Key::create(&key_path).unwrap();
+    let secret_key = Arc::new(Key::load(&key_path).unwrap());
     let logs = Arc::new(LogStore::open(dir.path().join("logs")).unwrap());
     let objects = Arc::new(Objects::open(dir.path()).unwrap());
     let now = UnixMillis::now();
@@ -137,11 +143,12 @@ fn deployment_with(github_sign_in: bool) -> Deployment {
         "127.0.0.1:0".parse().unwrap(),
     )
     .unwrap();
+    controller.set_source_key(Arc::clone(&secret_key));
     let github = github_sign_in.then(|| FakeGithub::start(GITHUB_SECRET));
     let server = sentinel_api::Server::start(sentinel_api::Config {
         listen: "127.0.0.1:0".parse().unwrap(),
         store: Arc::clone(&store),
-        logs,
+        logs: Arc::clone(&logs),
         objects,
         controller: controller.handle(),
         sessions: local_auth::Policy::default(),
@@ -153,7 +160,7 @@ fn deployment_with(github_sign_in: bool) -> Deployment {
             client_secret: GITHUB_SECRET.into(),
             endpoints: github.endpoints(),
         }),
-        secret_key: None,
+        secret_key: Some(secret_key),
     })
     .unwrap();
     let base = format!("http://{}", server.local_addr());
@@ -162,6 +169,8 @@ fn deployment_with(github_sign_in: bool) -> Deployment {
         _dir: dir,
         store,
         _controller: controller,
+        #[cfg(target_os = "linux")]
+        logs,
         server: Some(server),
         base,
         root_token: sentinel_auth::token::format(&granted.secret),
@@ -731,6 +740,122 @@ fn browser_login_then_status_and_commands_work() {
         .unwrap();
     assert_eq!(grants.len(), 1);
     assert_eq!((grants[0].id, grants[0].kind), (grant, GrantKind::Code));
+}
+
+#[test]
+fn a_delegated_cli_writer_can_provision_a_secret_for_a_job_without_disclosure() {
+    let d = deployment();
+    let root = Principal::new(d.root, P::ALL, None, None);
+    let repo = d.repo;
+    let dev = d.dev;
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::set_repo_grant(
+                tx,
+                root,
+                repo,
+                dev,
+                P::READ.union(P::RUN).union(P::WRITE_SECRETS),
+            )
+        })
+        .unwrap();
+    let machine = Machine::new();
+    let reader_login = browser_login(&d, &machine, "dev", "reader");
+    assert_eq!(reader_login.code, 0, "{reader_login:?}");
+    let value = b"cli-provisioned-secret-plaintext";
+    // The sign-in created a private config directory with an owner-only DACL
+    // on Windows; its file input inherits that DACL.
+    let input = machine.config().join("secret.txt");
+    std::fs::write(&input, value).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let input = input.to_str().unwrap();
+    let denied = machine.run(&[
+        "secret",
+        "--profile",
+        "reader",
+        "set",
+        "CLI_TOKEN",
+        "--tenant",
+        "acme",
+        "--repo",
+        "app",
+        "--file",
+        input,
+        "--if-version",
+        "0",
+    ]);
+    assert_eq!(denied.code, 3, "{denied:?}");
+    assert!(!denied.stdout.contains(std::str::from_utf8(value).unwrap()));
+    assert!(!denied.stderr.contains(std::str::from_utf8(value).unwrap()));
+
+    let writer_login = browser_login_with(
+        &d,
+        &machine,
+        "dev",
+        "writer",
+        &["--scope", "secrets:metadata secrets:write"],
+    );
+    assert_eq!(writer_login.code, 0, "{writer_login:?}");
+    let created = machine.run(&[
+        "secret",
+        "--profile",
+        "writer",
+        "--output",
+        "json",
+        "set",
+        "CLI_TOKEN",
+        "--tenant",
+        "acme",
+        "--repo",
+        "app",
+        "--file",
+        input,
+        "--if-version",
+        "0",
+    ]);
+    assert_eq!(created.code, 0, "{created:?}");
+    let metadata: Value = serde_json::from_str(&created.stdout).unwrap();
+    assert_eq!(metadata["name"], "CLI_TOKEN");
+    assert_eq!(metadata["version"], 1);
+    assert!(!created.stdout.contains(std::str::from_utf8(value).unwrap()));
+    assert!(!created.stderr.contains(std::str::from_utf8(value).unwrap()));
+
+    let described = machine.run(&[
+        "secret",
+        "--profile",
+        "writer",
+        "--output",
+        "json",
+        "describe",
+        "CLI_TOKEN",
+        "--tenant",
+        "acme",
+        "--repo",
+        "app",
+    ]);
+    assert_eq!(described.code, 0, "{described:?}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&described.stdout).unwrap()["version"],
+        1
+    );
+    assert!(
+        !described
+            .stdout
+            .contains(std::str::from_utf8(value).unwrap())
+    );
+    assert!(
+        !described
+            .stderr
+            .contains(std::str::from_utf8(value).unwrap())
+    );
+
+    #[cfg(target_os = "linux")]
+    secret_runtime::use_cli_secret_in_rootless_job(&d, value);
 }
 
 /// U07: an account that exists only through GitHub (admitted by an
@@ -1597,4 +1722,283 @@ fn a_missing_scope_names_the_login_that_asks_for_it() {
         (error["code"].as_str(), error["details"]["scope"].as_str()),
         (Some("forbidden"), Some("artifacts:read"))
     );
+}
+
+#[cfg(target_os = "linux")]
+mod secret_runtime {
+    use super::*;
+    use sentinel_core::{JobState, Outcome, PoolId, RunId, WorkerId};
+    use sentinel_link::{
+        session::Capacity,
+        worker::{self, Handle},
+    };
+    use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
+    use sentinel_protocol::negotiate::{Arch, Capabilities, Hello, Profile, ProtocolVersion};
+    use sentinel_store::{
+        dispatch, runs,
+        secrets::{self, Binding, Scope},
+        tenancy::{self, PoolKind},
+        workers,
+    };
+    use sentinel_worker::{executor::Executor, podman};
+
+    const IMAGE: &str = "docker.io/library/busybox";
+    const DIGEST: &str = "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "Sentinel test")
+            .env("GIT_AUTHOR_EMAIL", "sentinel@example.test")
+            .env("GIT_COMMITTER_NAME", "Sentinel test")
+            .env("GIT_COMMITTER_EMAIL", "sentinel@example.test")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn tree_contains(root: &Path, needle: &[u8]) -> std::io::Result<bool> {
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                if tree_contains(&path, needle)? {
+                    return Ok(true);
+                }
+            } else if kind.is_file()
+                && std::fs::read(path)?
+                    .windows(needle.len())
+                    .any(|window| window == needle)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(super) fn use_cli_secret_in_rootless_job(d: &Deployment, value: &[u8]) {
+        if std::env::var_os("SENTINEL_PODMAN_TESTS").is_none() {
+            return;
+        }
+
+        let admin = Principal::new(d.root, P::ALL, None, None);
+        let repo_id = d.repo;
+        let pool = PoolId::new();
+        let tenant = d.tenant;
+        let now = UnixMillis::now();
+        let enrollment = d
+            .store
+            .writer()
+            .write(move |tx| {
+                tenancy::create_pool(
+                    tx,
+                    Authority::HostLocal,
+                    pool,
+                    "secret-e2e",
+                    PoolKind::Dedicated(tenant),
+                    now,
+                )?;
+                workers::issue_enrollment(tx, Authority::HostLocal, pool, 60_000, now)
+            })
+            .unwrap()
+            .secret;
+        let metadata = d
+            .store
+            .read(|conn| secrets::describe(conn, admin, Scope::Repo(d.repo), "CLI_TOKEN"))
+            .unwrap();
+        d.store
+            .writer()
+            .write(move |tx| {
+                secrets::bind(
+                    tx,
+                    admin,
+                    &Binding {
+                        repo: repo_id,
+                        job: "use".into(),
+                        step: "read".into(),
+                        name: "CLI_TOKEN".into(),
+                        secret: metadata.id,
+                        override_tenant: false,
+                    },
+                    UnixMillis::now(),
+                )
+            })
+            .unwrap();
+
+        let source = tempfile::tempdir().unwrap();
+        git(source.path(), &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(source.path().join("input.txt"), "source\n").unwrap();
+        git(source.path(), &["add", "."]);
+        git(source.path(), &["commit", "-q", "-m", "source"]);
+        let sha = git(source.path(), &["rev-parse", "HEAD"]);
+        let yaml = format!(
+            "schema: 1\non: [push]\njobs:\n  use:\n    image: {IMAGE}\n    resources: {{ cpu: 1, memory: 128MiB }}\n    secrets: [CLI_TOKEN]\n    cache:\n      - {{ name: token-path, key: token-file, paths: [token] }}\n    artifacts:\n      - {{ name: token-path, paths: [token], when: always }}\n    steps:\n      - id: read\n        run: 'test -n \"$CLI_TOKEN\" && test \"$(cat /run/sentinel-secrets/token)\" = \"$CLI_TOKEN\" && test ! -f \"$SENTINEL_WORKSPACE/token\" && echo \"secret=$CLI_TOKEN\"'\n        secrets: [CLI_TOKEN]\n        secret_files: {{ CLI_TOKEN: token }}\n"
+        );
+        let spec = RunSpec::new(
+            PinnedSource::new(source.path().to_str().unwrap(), &sha, Some("main")).unwrap(),
+            compile_str(&yaml).unwrap(),
+        )
+        .unwrap();
+        let run = RunId::new();
+        let tenant = d.tenant;
+        let ids = d
+            .store
+            .writer()
+            .write(move |tx| {
+                let ids = runs::create_run(tx, tenant, repo_id, run, &spec, UnixMillis::now())?;
+                runs::resolve_image(tx, tenant, ids[0], DIGEST, "linux/amd64")?;
+                Ok(ids)
+            })
+            .unwrap();
+        let job = ids[0];
+
+        let worker_dir = source.path().join("worker");
+        std::fs::create_dir(&worker_dir).unwrap();
+        let worker_id = WorkerId::new();
+        let executor = Executor::start(worker_dir.clone(), worker_id, |_| {}, true).unwrap();
+        let handle = Arc::new(Handle::new());
+        let config = worker::Config {
+            controller: d._controller.local_addr(),
+            server: d._controller.fingerprint(),
+            worker: worker_id,
+            name: "secret-cli-worker".into(),
+            hello: Hello {
+                protocol_min: ProtocolVersion(1),
+                protocol_max: ProtocolVersion(10),
+                capabilities: Capabilities(
+                    Capabilities::REQUIRED.0 | Capabilities::SECRET_DELIVERY.0,
+                ),
+                arch: Arch::X86_64,
+                software: "test".into(),
+            },
+            capacity: Capacity {
+                cpu_millis: 4_000,
+                memory_bytes: 1 << 30,
+            },
+            profile: Profile::default(),
+            transport: sentinel_link::session::TransportStats::default(),
+            remote_cache: false,
+        };
+        let identity = Identity::generate("secret-cli-worker").unwrap();
+        let worker_thread = {
+            let (executor, handle) = (executor.clone(), Arc::clone(&handle));
+            thread::spawn(move || {
+                worker::run(
+                    config,
+                    identity,
+                    Some(enrollment),
+                    &executor,
+                    &handle,
+                    &|_| {},
+                )
+            })
+        };
+        let connect_deadline = Instant::now() + Duration::from_secs(120);
+        while !d._controller.connected().contains(&worker_id) {
+            assert!(Instant::now() < connect_deadline, "worker did not connect");
+            thread::sleep(Duration::from_millis(25));
+        }
+        d._controller.wake();
+
+        let state = || {
+            d.store
+                .read(|conn| sentinel_store::jobs::get_job(conn, tenant, job))
+                .unwrap()
+        };
+        let job_deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let current = state();
+            if current.state == JobState::Terminal(Outcome::Passed) {
+                break;
+            }
+            assert!(
+                Instant::now() < job_deadline,
+                "CLI secret job did not pass: state={:?}, failure={:?}",
+                current.state,
+                current.failure_class
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        let attempt = d
+            .store
+            .read(|conn| dispatch::latest_attempt(conn, tenant, job))
+            .unwrap()
+            .unwrap();
+        let tail = d.logs.tail(run, job, attempt, 0, 4096, None).unwrap();
+        assert!(tail.complete);
+        let log = tail
+            .frames
+            .iter()
+            .flat_map(|frame| frame.bytes.iter().copied())
+            .collect::<Vec<_>>();
+        let log = String::from_utf8(log).unwrap();
+        assert!(log.contains("secret=***"), "{log}");
+        assert!(!log.contains(std::str::from_utf8(value).unwrap()));
+        let artifacts = d
+            .store
+            .read(|conn| sentinel_store::artifacts::for_attempt(conn, attempt))
+            .unwrap();
+        assert_eq!(
+            artifacts,
+            vec![(
+                "token-path".into(),
+                sentinel_store::artifacts::State::Absent
+            )],
+            "the secret mount is outside the workspace artifact path"
+        );
+        assert!(
+            !worker_dir
+                .join("secret-delivery")
+                .join(attempt.to_string())
+                .exists(),
+            "attempt secret scratch survived finalization"
+        );
+        assert!(
+            !tree_contains(&worker_dir, value).unwrap(),
+            "plaintext appeared in worker scratch or cache files"
+        );
+        let sealed: Vec<u8> = d
+            .store
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT v.sealed FROM secret_versions v JOIN secrets s ON s.id=v.secret_id
+                     WHERE s.id=?1 AND v.version=1",
+                    [metadata.id.as_bytes()],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert!(!sealed.windows(value.len()).any(|part| part == value));
+        let audit = d
+            .store
+            .read(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT action,result,step FROM secret_audit WHERE secret_id=?1")?;
+                Ok(stmt
+                    .query_map([metadata.id.as_bytes()], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        assert!(audit.iter().any(|(action, result, step)| {
+            action == "use" && result == "ok" && step.as_deref() == Some("read")
+        }));
+        assert!(!format!("{audit:?}").contains(std::str::from_utf8(value).unwrap()));
+
+        handle.stop();
+        worker_thread.join().unwrap().unwrap();
+        assert!(podman::owned(worker_id).unwrap().is_empty());
+    }
 }

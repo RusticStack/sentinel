@@ -17,9 +17,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use sentinel_auth::sealed::Key;
 use sentinel_core::{
-    JobState, Outcome, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
-    auth::{Namespace, Permissions as P, Principal},
+    JobId, JobState, Outcome, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
+    auth::{Namespace, Permissions as P, Principal, Role},
 };
 use sentinel_link::{
     controller::Controller,
@@ -36,6 +37,7 @@ use sentinel_store::{
     dispatch,
     logs::LogStore,
     runs,
+    secrets::{self, Binding, Scope},
     tenancy::{self, PoolKind},
     workers,
 };
@@ -88,6 +90,42 @@ fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
     }
 }
 
+fn attempt_detail(store: &Store, tenant: TenantId, job: JobId) -> Option<String> {
+    let attempt = store
+        .read(|c| dispatch::latest_attempt(c, tenant, job))
+        .ok()??;
+    let bytes = store
+        .read(|c| dispatch::attempt_summary(c, tenant, attempt))
+        .ok()??;
+    AttemptSummary::decode(&bytes)
+        .ok()
+        .map(|summary| summary.detail)
+}
+
+fn latest_attempt_acked(store: &Store, tenant: TenantId, job: JobId) -> Option<bool> {
+    let attempt = store
+        .read(|c| dispatch::latest_attempt(c, tenant, job))
+        .ok()??;
+    store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT acked_ms IS NOT NULL FROM attempts WHERE id=?1 AND tenant_id=?2",
+                rusqlite::params![attempt.as_bytes(), tenant.as_bytes()],
+                |row| row.get(0),
+            )?)
+        })
+        .ok()
+}
+
+fn notice_kinds(notices: &Mutex<Vec<String>>) -> Vec<String> {
+    notices
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|notice| notice.split(['(', '{']).next().unwrap_or(notice).to_owned())
+        .collect()
+}
+
 #[test]
 fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
     if !enabled() {
@@ -120,6 +158,13 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
                 NamespaceKind::Organization,
                 UnixMillis(1),
             )?;
+            auth::set_membership(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                root,
+                Role::TenantAdmin,
+            )?;
             sentinel_store::jobs::insert_repo(tx, tenant, repo_id, "app", UnixMillis(1))?;
             tenancy::create_pool(
                 tx,
@@ -142,6 +187,49 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
         "127.0.0.1:0".parse().unwrap(),
     )
     .unwrap();
+    let master_key_path = temp.path().join("master.key");
+    Key::create(&master_key_path).unwrap();
+    let secret_key = Arc::new(Key::load(&master_key_path).unwrap());
+    controller.set_source_key(Arc::clone(&secret_key));
+    let root_principal = Principal::new(root, P::ALL, None, None);
+    let token = store
+        .writer()
+        .write({
+            let secret_key = Arc::clone(&secret_key);
+            move |tx| {
+                secrets::put(
+                    tx,
+                    root_principal,
+                    secrets::Update {
+                        scope: Scope::Repo(repo_id),
+                        name: "TOKEN",
+                        expected: 0,
+                        value: b"managed-only-plaintext-value",
+                    },
+                    &secret_key,
+                    UnixMillis::now(),
+                )
+            }
+        })
+        .unwrap();
+    store
+        .writer()
+        .write(move |tx| {
+            secrets::bind(
+                tx,
+                root_principal,
+                &Binding {
+                    repo: repo_id,
+                    job: "secret_use".into(),
+                    step: "read".into(),
+                    name: "TOKEN".into(),
+                    secret: token.id,
+                    override_tenant: false,
+                },
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
     let enrollment = store
         .writer()
         .write(move |tx| {
@@ -189,8 +277,10 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
             name: "builder-1".into(),
             hello: Hello {
                 protocol_min: ProtocolVersion(1),
-                protocol_max: ProtocolVersion(3),
-                capabilities: Capabilities::REQUIRED,
+                protocol_max: ProtocolVersion(10),
+                capabilities: Capabilities(
+                    Capabilities::REQUIRED.0 | Capabilities::SECRET_DELIVERY.0,
+                ),
                 arch: Arch::X86_64,
                 software: "test".into(),
             },
@@ -243,6 +333,14 @@ jobs:
         run: 'echo about to fail; false; echo never'
       - id: after
         run: 'true'
+  secret_use:
+    image: {IMAGE}@{DIGEST}
+    resources: {{ cpu: 1, memory: 128MiB }}
+    secrets: [TOKEN]
+    steps:
+      - id: read
+        run: 'test \"$TOKEN\" = \"managed-only-plaintext-value\" && echo \"secret=$TOKEN\"'
+        secrets: [TOKEN]
   gated:
     image: {IMAGE}@{DIGEST}
     needs: [inspect]
@@ -319,9 +417,10 @@ jobs:
     // Compiled order is dependencies first, then by name.
     let compiled = spec_names(&yaml);
     let by_name = |name: &str| ids[compiled.iter().position(|n| n == name).unwrap()];
-    let (broken, inspect, gated, unknown, oom, slow, polite, stubborn) = (
+    let (broken, inspect, secret_use, gated, unknown, oom, slow, polite, stubborn) = (
         by_name("broken"),
         by_name("inspect"),
+        by_name("secret_use"),
         by_name("gated"),
         by_name("unknown"),
         by_name("oom"),
@@ -329,9 +428,48 @@ jobs:
         by_name("polite"),
         by_name("stubborn"),
     );
-    eventually("inspect passed", || {
-        state(inspect).state == JobState::Terminal(Outcome::Passed)
-    });
+    let inspect_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let current = state(inspect);
+        if current.state == JobState::Terminal(Outcome::Passed) {
+            break;
+        }
+        assert!(
+            Instant::now() < inspect_deadline,
+            "timed out waiting for inspect passed: state={:?}, failure={:?}, worker_notices={}, detail={:?}",
+            current.state,
+            current.failure_class,
+            notices.lock().unwrap().len(),
+            attempt_detail(&store, tenant, inspect)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let secret_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let current = state(secret_use);
+        if current.state == JobState::Terminal(Outcome::Passed) {
+            break;
+        }
+        assert!(
+            Instant::now() < secret_deadline,
+            "timed out waiting for secret job passed: state={:?}, failure={:?}, attempt_acked={:?}, connected_workers={}, handed_back={}, sessions_ended={}, worker_notices={:?}, detail={:?}",
+            current.state,
+            current.failure_class,
+            latest_attempt_acked(&store, tenant, secret_use),
+            controller.connected().len(),
+            controller
+                .stats()
+                .handed_back
+                .load(std::sync::atomic::Ordering::Relaxed),
+            controller
+                .stats()
+                .sessions_ended
+                .load(std::sync::atomic::Ordering::Relaxed),
+            notice_kinds(&notices),
+            attempt_detail(&store, tenant, secret_use)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
     eventually("broken failed", || {
         state(broken).state == JobState::Terminal(Outcome::Failed)
     });
@@ -410,6 +548,31 @@ jobs:
             .iter()
             .all(|s| s.outcome == StepOutcome::Passed)
     );
+    let secret_attempt = store
+        .read(|c| dispatch::latest_attempt(c, tenant, secret_use))
+        .unwrap()
+        .unwrap();
+    let secret_tail = logs
+        .tail(run, secret_use, secret_attempt, 0, 1000, None)
+        .unwrap();
+    let secret_log = secret_tail
+        .frames
+        .iter()
+        .flat_map(|frame| frame.bytes.iter().copied())
+        .collect::<Vec<_>>();
+    let secret_log = String::from_utf8(secret_log).unwrap();
+    assert!(secret_log.contains("secret=***"), "{secret_log}");
+    assert!(!secret_log.contains("managed-only-plaintext-value"));
+    let use_version: i64 = store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT version FROM secret_audit WHERE secret_id=?1 AND attempt_id=?2 AND action='use'",
+                rusqlite::params![token.id.as_bytes(), secret_attempt.as_bytes()],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(use_version, 1);
 
     // Conditions: a false `if` skips; dependency results, hash_files on the
     // checkout, event.sha and success() resolve on the worker; a context
@@ -523,13 +686,13 @@ jobs:
     assert!(stamps.running <= stamps.finalizing);
     assert!(stamps.finalizing <= stamps.terminal);
     assert!(stamps.preparing.is_some() && stamps.finalizing.is_some());
-    // Eight jobs, each a full lifecycle of four reports (a preparation
+    // Nine jobs, each a full lifecycle of four reports (a preparation
     // failure inside the steps phase still passes through every phase).
     let reports = controller
         .stats()
         .reports
         .load(std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(reports, 8 * 4, "every report was applied");
+    assert_eq!(reports, 9 * 4, "every report was applied");
     assert_eq!(
         controller
             .stats()

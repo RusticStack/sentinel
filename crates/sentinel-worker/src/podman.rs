@@ -46,16 +46,64 @@ pub struct Runtime {
     pub cgroup_manager: String,
 }
 
-/// `podman` inherits the worker's environment: `HOME`/`XDG_CONFIG_HOME`
-/// (`~/.config/containers/auth.json`) and `REGISTRY_AUTH_FILE` carry the
-/// registry credentials private images need. Only `DOCKER_HOST` is
-/// removed — a stray daemon address must not redirect a rootless pull.
-/// Contrast the checkout, which deliberately runs Git with a cleared
-/// environment; authorization here is the account's own.
+/// `DOCKER_HOST` is removed so a stray daemon address cannot redirect a
+/// rootless operation. The pull path also removes auth-file overrides.
 fn podman() -> Command {
     let mut cmd = Command::new("podman");
     cmd.env_remove("DOCKER_HOST");
+    cmd.env_remove("REGISTRY_AUTH_FILE");
     cmd
+}
+
+/// Find the executable before `pull` clears PATH. The containers/image
+/// credential-helper lookup uses PATH, so leaving it populated would let a
+/// host-wide helper authorize a tenant's pull outside its scoped auth file.
+fn podman_executable() -> Result<std::path::PathBuf> {
+    let Some(path) = std::env::var_os("PATH") else {
+        return Err(Error::Preparation(
+            "podman executable is unavailable".into(),
+        ));
+    };
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("podman");
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        return Ok(candidate);
+    }
+    Err(Error::Preparation(
+        "podman executable is unavailable".into(),
+    ))
+}
+
+/// A pull is authorized solely by its explicit auth file. Keeping external
+/// credential-helper binaries off the subprocess PATH prevents worker-wide
+/// helper credentials from overriding the tenant-scoped file.
+fn podman_for_pull() -> Result<Command> {
+    let mut cmd = Command::new(podman_executable()?);
+    cmd.env_remove("DOCKER_HOST");
+    cmd.env_remove("REGISTRY_AUTH_FILE");
+    cmd.env_remove("DOCKER_CONFIG");
+    cmd.env("PATH", "");
+    Ok(cmd)
+}
+
+fn podman_pull_command(image: &str, authfile: &Path) -> Result<Command> {
+    let mut cmd = podman_for_pull()?;
+    cmd.args(["pull", "--authfile"])
+        .arg(authfile)
+        .args(["-q", "--", image]);
+    Ok(cmd)
 }
 
 fn deadline(timeout: Duration) -> Instant {
@@ -140,11 +188,13 @@ pub fn image_bytes(image: &str) -> Option<u64> {
 }
 
 /// Make `image` (a `name@sha256:…` reference) available locally.
-/// `Ok(true)` means the store already held it — the `image exists` fast
-/// path, nothing downloaded — and `Ok(false)` means `podman pull` fetched
-/// it (K08's `image_present` signal). `cancel` kills a pull under way.
+/// The returned bool is whether `podman image exists` found the digest
+/// before the pull (`image_present`); the explicit pull still runs with
+/// the attempt's auth file so resident layers cannot bypass authorization.
+/// `cancel` kills a pull under way.
 pub fn pull(
     image: &str,
+    authfile: &Path,
     timeout: Duration,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<bool> {
@@ -153,20 +203,18 @@ pub fn pull(
     }
     let mut exists = podman();
     exists.args(["image", "exists", "--", image]);
-    if process::run(
+    let present = process::run(
         exists,
         deadline(Duration::from_secs(30)),
         "podman image exists",
     )?
-    .success()
-    {
-        return Ok(true);
-    }
-    let mut cmd = podman();
-    cmd.args(["pull", "-q", "--", image]);
+    .success();
+    let cmd = podman_pull_command(image, authfile)?;
+    // Even a resident digest must pass the registry's current authorization
+    // check for this tenant before a container can use it.
     let output = process::run_canceled(cmd, deadline(timeout), "podman pull", None, Some(cancel))?;
     if output.success() {
-        Ok(false)
+        Ok(present)
     } else {
         Err(Error::Preparation(format!(
             "image pull: {}",
@@ -192,6 +240,8 @@ pub struct Mount {
     pub host: std::path::PathBuf,
     /// The absolute path the container sees (`/cache`, …).
     pub container: String,
+    /// Secret mounts are read-only; cache mount views remain writable.
+    pub read_only: bool,
 }
 
 /// One running container, created with the limits and torn down whole.
@@ -335,6 +385,14 @@ pub struct Exit {
     pub stderr: Vec<u8>,
 }
 
+impl Drop for Exit {
+    fn drop(&mut self) {
+        self.stdout.fill(0);
+        self.stderr.fill(0);
+        core::hint::black_box((&mut self.stdout, &mut self.stderr));
+    }
+}
+
 impl Exit {
     /// The last non-empty stderr line, printable characters only.
     pub fn stderr_excerpt(&self) -> String {
@@ -405,8 +463,12 @@ impl Container {
             .arg("--volume")
             .arg(format!("{}:{WORKSPACE_MOUNT}", workspace.display()));
         for mount in mounts {
-            cmd.arg("--volume")
-                .arg(format!("{}:{}:rw", mount.host.display(), mount.container));
+            cmd.arg("--volume").arg(format!(
+                "{}:{}:{}",
+                mount.host.display(),
+                mount.container,
+                if mount.read_only { "ro" } else { "rw" }
+            ));
         }
         cmd.arg("--").arg(image).args([
             "/bin/sh",
@@ -457,6 +519,18 @@ impl Container {
         extra: &[(String, String)],
         sink: Option<process::Sink>,
     ) -> Result<Exit> {
+        self.exec_streaming_with_env_file(step, extra, None, sink)
+    }
+
+    /// Execute with secrets supplied from a short-lived host env file. The
+    /// values never appear in Podman's argv or its inherited environment.
+    pub fn exec_streaming_with_env_file(
+        &self,
+        step: &StepCommand,
+        extra: &[(String, String)],
+        env_file: Option<&Path>,
+        sink: Option<process::Sink>,
+    ) -> Result<Exit> {
         let mut cmd = podman();
         cmd.args(["exec", "--workdir"]);
         cmd.arg(match &step.workdir {
@@ -466,17 +540,20 @@ impl Container {
         for (k, v) in step.env.iter().chain(extra) {
             cmd.arg("--env").arg(format!("{k}={v}"));
         }
+        if let Some(env_file) = env_file {
+            cmd.arg("--env-file").arg(env_file);
+        }
         cmd.arg("--").arg(&self.name).args(&step.argv);
         let timeout = Duration::from_secs(step.timeout_secs.max(1));
         match process::run_with(cmd, deadline(timeout), "step", sink) {
-            Ok(output) => Ok(Exit {
+            Ok(mut output) => Ok(Exit {
                 // Podman reports a signal death as 128 + n; 125–127 are the
                 // client's own failures, which we surface as-is.
                 signal: output.code.filter(|c| *c > 128).map(|c| c - 128),
                 code: output.code.filter(|c| *c <= 128),
                 timed_out: false,
-                stdout: output.stdout,
-                stderr: output.stderr,
+                stdout: std::mem::take(&mut output.stdout),
+                stderr: std::mem::take(&mut output.stderr),
             }),
             Err(Error::Timeout(_)) => {
                 // The step is over either way; a stop that fails here is
@@ -617,12 +694,12 @@ pub fn remove_named(name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Private-image authorization reaches the helper: `podman` removes
-    /// `DOCKER_HOST` and nothing else, so `HOME`, `XDG_CONFIG_HOME` and
-    /// `REGISTRY_AUTH_FILE` — the rootless user's registry credentials —
-    /// are passed through by `Command`'s inherited environment.
+    /// Ordinary Podman commands remove only the daemon override. Pulls use
+    /// an explicit per-attempt auth file and a cleared PATH, so neither
+    /// environment auth overrides nor host credential helpers can provide
+    /// worker-wide credentials.
     #[test]
-    fn podman_commands_keep_the_workers_environment() {
+    fn ordinary_podman_commands_remove_daemon_override() {
         let cmd = podman();
         let overrides: Vec<(String, Option<String>)> = cmd
             .get_envs()
@@ -633,18 +710,50 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(overrides, vec![("DOCKER_HOST".to_owned(), None)]);
+        assert_eq!(
+            overrides,
+            vec![
+                ("DOCKER_HOST".to_owned(), None),
+                ("REGISTRY_AUTH_FILE".to_owned(), None),
+            ]
+        );
     }
 
-    /// And the plumbing delivers an environment variable to a helper
-    /// process, which is all `REGISTRY_AUTH_FILE` needs from us.
     #[test]
-    fn a_helper_receives_its_callers_environment() {
-        let mut cmd = Command::new("sh");
-        cmd.env("REGISTRY_AUTH_FILE", "/run/sentinel-test/auth.json");
-        cmd.args(["-c", "printf %s \"$REGISTRY_AUTH_FILE\""]);
-        let output = process::run(cmd, deadline(Duration::from_secs(10)), "env probe").unwrap();
-        assert!(output.success());
-        assert_eq!(output.stdout, b"/run/sentinel-test/auth.json");
+    fn registry_pull_uses_only_the_explicit_authfile_and_disables_helpers() {
+        let Ok(cmd) = podman_pull_command(
+            "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Path::new("/worker/tenant/auth.json"),
+        ) else {
+            // Portable checks need not have Podman installed.
+            return;
+        };
+        let env: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .map(|(name, value)| (name.to_string_lossy().into_owned(), value))
+            .collect();
+        assert_eq!(
+            env.get("PATH").copied().flatten(),
+            Some(std::ffi::OsStr::new(""))
+        );
+        assert_eq!(env.get("REGISTRY_AUTH_FILE"), Some(&None));
+        assert_eq!(env.get("DOCKER_CONFIG"), Some(&None));
+        assert_eq!(env.get("DOCKER_HOST"), Some(&None));
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy()).collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--authfile", "/worker/tenant/auth.json"])
+        );
+        assert!(args.iter().any(|arg| arg == "pull"));
+        assert!(!args.iter().any(|arg| arg.starts_with("--policy")));
+    }
+
+    /// The worker's own registry login must not be able to provide a pull
+    /// credential after PATH has been cleared.
+    #[test]
+    fn pull_command_resolves_podman_before_clearing_path() {
+        if let Ok(cmd) = podman_pull_command("example@sha256:abc", Path::new("auth.json")) {
+            assert!(std::path::Path::new(cmd.get_program()).is_absolute());
+        }
     }
 }

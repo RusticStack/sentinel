@@ -19,7 +19,9 @@
 //! and the summary travels with the terminal report.
 
 use std::{
-    path::Path,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -62,6 +64,9 @@ pub struct Job {
     pub digest: String,
     pub spec: RunSpec,
     pub context: JobContext,
+    /// Controller-authorized values bound to the acknowledged attempt's
+    /// fence. The protocol wrapper wipes each owned value on drop.
+    pub secret_bundle: sentinel_protocol::secrets::DeliveryBundle,
     /// The worker's image pulls: concurrent attempts share one download
     /// per `name@sha256:…`.
     pub images: Images,
@@ -78,6 +83,210 @@ pub struct Job {
     /// cancel that arrives during preparation can be exercised
     /// deterministically. Zero in production.
     pub prepare_hold: std::time::Duration,
+}
+
+/// Protected, host-only scratch for one attempt. It is outside the checkout
+/// so artifacts and cache publication never traverse secret material.
+struct SecretDirectory {
+    attempt_dir: PathBuf,
+    files_dir: PathBuf,
+    env_dir: PathBuf,
+}
+
+impl SecretDirectory {
+    fn create(root: &Path, attempt: AttemptId) -> Result<Self> {
+        let base = root.join("secret-delivery");
+        create_private_dir(&base, true)?;
+        let attempt_dir = base.join(attempt.to_string());
+        create_private_dir(&attempt_dir, false)?;
+        let files_dir = attempt_dir.join("files");
+        let env_dir = attempt_dir.join("env");
+        let result = (|| {
+            create_private_dir(&files_dir, false)?;
+            create_private_dir(&env_dir, false)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(&attempt_dir);
+            return Err(error);
+        }
+        Ok(Self {
+            attempt_dir,
+            files_dir,
+            env_dir,
+        })
+    }
+
+    fn write_registry_auth(&self, value: &[u8]) -> Result<PathBuf> {
+        let path = self.attempt_dir.join("registry-auth.json");
+        let mut file = create_secret_file(&path)?;
+        file.write_all(value)?;
+        Ok(path)
+    }
+}
+
+impl Drop for SecretDirectory {
+    fn drop(&mut self) {
+        wipe_file(&self.attempt_dir.join("registry-auth.json"));
+        let _ = fs::remove_dir_all(&self.attempt_dir);
+    }
+}
+
+/// Per-step paths are removed and overwritten before another step starts,
+/// including error, timeout, cancellation, and unwind paths.
+struct StepSecrets {
+    env_file: Option<PathBuf>,
+    files: Vec<PathBuf>,
+    directories: Vec<PathBuf>,
+}
+
+impl Drop for StepSecrets {
+    fn drop(&mut self) {
+        if let Some(path) = &self.env_file {
+            wipe_file(path);
+            let _ = fs::remove_file(path);
+        }
+        for path in &self.files {
+            wipe_file(path);
+            let _ = fs::remove_file(path);
+        }
+        for dir in self.directories.iter().rev() {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+}
+
+fn create_private_dir(path: &Path, allow_existing: bool) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if allow_existing && error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = fs::symlink_metadata(path)?;
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                return Err(Error::Preparation("secret directory".into()));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn create_secret_file(path: &Path) -> Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    Ok(options.open(path)?)
+}
+
+fn wipe_file(path: &Path) {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut file) = OpenOptions::new().write(true).open(path) else {
+        return;
+    };
+    let Ok(length) = file.metadata().map(|meta| meta.len()) else {
+        return;
+    };
+    let zeros = [0u8; 8192];
+    let mut left = length;
+    while left > 0 {
+        let n = usize::try_from(left.min(zeros.len() as u64)).unwrap_or(zeros.len());
+        if file.write_all(&zeros[..n]).is_err() {
+            break;
+        }
+        left -= n as u64;
+    }
+    let _ = file.seek(SeekFrom::Start(0));
+}
+
+fn materialize_step_secrets(
+    directory: &SecretDirectory,
+    bundle: &sentinel_protocol::secrets::DeliveryBundle,
+    step: usize,
+) -> Result<StepSecrets> {
+    use sentinel_protocol::secrets::TargetKind;
+    let mut cleanup = StepSecrets {
+        env_file: None,
+        files: Vec::new(),
+        directories: Vec::new(),
+    };
+    let mut has_env = false;
+    for target in &bundle.targets {
+        if target.step as usize == step && matches!(target.target, TargetKind::Environment) {
+            has_env = true;
+            break;
+        }
+    }
+    let env_path = has_env.then(|| directory.env_dir.join(format!("step-{step}.env")));
+    if let Some(path) = &env_path {
+        cleanup.env_file = Some(path.clone());
+    }
+    let mut env_file = match &env_path {
+        Some(path) => Some(create_secret_file(path)?),
+        None => None,
+    };
+    for target in &bundle.targets {
+        if target.step as usize != step {
+            continue;
+        }
+        let value = bundle
+            .values
+            .get(target.value as usize)
+            .ok_or_else(|| Error::Preparation("secret target index".into()))?
+            .expose();
+        match &target.target {
+            TargetKind::Environment => {
+                let file = env_file
+                    .as_mut()
+                    .ok_or_else(|| Error::Preparation("secret env file".into()))?;
+                file.write_all(target.name.as_bytes())?;
+                file.write_all(b"=")?;
+                file.write_all(value)?;
+                file.write_all(b"\n")?;
+            }
+            TargetKind::File { path } => {
+                let path = directory.files_dir.join(path);
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| Error::Preparation("secret file path".into()))?;
+                let mut current = directory.files_dir.clone();
+                let relative_parent = parent
+                    .strip_prefix(&directory.files_dir)
+                    .map_err(|_| Error::Preparation("secret file path".into()))?;
+                for component in relative_parent.components() {
+                    current.push(component);
+                    match fs::create_dir(&current) {
+                        Ok(()) => {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                fs::set_permissions(&current, fs::Permissions::from_mode(0o700))?;
+                            }
+                            cleanup.directories.push(current.clone());
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            let meta = fs::symlink_metadata(&current)?;
+                            if !meta.is_dir() || meta.file_type().is_symlink() {
+                                return Err(Error::Preparation("secret file parent".into()));
+                            }
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                cleanup.files.push(path.clone());
+                create_secret_file(&path)?.write_all(value)?;
+            }
+            TargetKind::RegistryAuth => continue,
+        }
+    }
+    Ok(cleanup)
 }
 
 /// Where the phases are reported. Ordered per attempt; the link's reporter
@@ -219,13 +428,14 @@ pub fn run(
             }
             Verdict::Failed(FailureClass::Preparation, e.to_string())
         }
-        Ok((workspace, container)) => {
+        Ok(prepared) => {
             report.event(job.attempt, job.fence, Event::StepsStarted);
             let started = Instant::now();
             let verdict = execute(
                 job,
-                &container,
-                workspace.path(),
+                &prepared.container,
+                prepared.workspace.path(),
+                prepared.secret_directory.as_ref(),
                 &output,
                 cancel,
                 &mut summary,
@@ -245,12 +455,12 @@ pub fn run(
                 .unwrap_or(&[]);
             let artifact_failure = capture_artifacts(
                 job.attempt,
-                workspace.path(),
+                prepared.workspace.path(),
                 declared,
                 matches!(verdict, Verdict::Passed),
                 sink,
             );
-            sealed = finalize(root, job, &verdict, report, workspace, container, cancel);
+            sealed = finalize(root, job, &verdict, report, prepared, cancel);
             // The log is part of finalization: the attempt is not done until
             // what it printed is durable on the controller, or the wait ran
             // out and the failure is on record.
@@ -330,7 +540,7 @@ fn prepare(
     cancel: &Cancel,
     summary: &mut AttemptSummary,
     remote: Option<&dyn sentinel_cache::remote::Remote>,
-) -> Result<(Workspace, Container)> {
+) -> Result<PreparedExecution> {
     let compiled = job
         .spec
         .pipeline
@@ -348,6 +558,17 @@ fn prepare(
     let declared = compiled.spec.cache.clone();
     let resources = compiled.spec.resources;
     let workspace = Workspace::create(root, job.attempt)?;
+    let secret_directory = if job.secret_bundle.is_empty() {
+        None
+    } else {
+        match SecretDirectory::create(root, job.attempt) {
+            Ok(directory) => Some(directory),
+            Err(error) => {
+                let _ = workspace.destroy();
+                return Err(error);
+            }
+        }
+    };
     let outcome = (|| {
         // The checkout and the image pull are independent — one fills the
         // fresh workspace, the other the worker's content store — so the
@@ -407,11 +628,52 @@ fn prepare(
             join_checkout(&mut co, summary)?;
         }
         let started = Instant::now();
-        let pulled = job.images.pull(&image, podman::IMAGE_PULL_TIMEOUT, cancel);
+        let registry_auth = job.secret_bundle.targets.iter().find(|target| {
+            matches!(
+                target.target,
+                sentinel_protocol::secrets::TargetKind::RegistryAuth
+            )
+        });
+        let has_registry_auth = registry_auth.is_some();
+        let (authfile, credential) = match registry_auth {
+            Some(target) => {
+                let value = job
+                    .secret_bundle
+                    .values
+                    .get(target.value as usize)
+                    .ok_or_else(|| Error::Preparation("registry auth target".into()))?
+                    .expose();
+                let directory = secret_directory
+                    .as_ref()
+                    .ok_or_else(|| Error::Preparation("registry auth directory".into()))?;
+                (
+                    directory.write_registry_auth(value)?,
+                    *blake3::hash(value).as_bytes(),
+                )
+            }
+            None => (job.images.anonymous_authfile().to_path_buf(), [0; 32]),
+        };
+        let tenant = job
+            .context
+            .tenant
+            .map(|tenant| *tenant.as_bytes())
+            .unwrap_or(*job.attempt.as_bytes());
+        let pulled = job.images.pull_for_tenant(
+            &image,
+            tenant,
+            credential,
+            &authfile,
+            podman::IMAGE_PULL_TIMEOUT,
+            cancel,
+        );
+        if has_registry_auth {
+            wipe_file(&authfile);
+            let _ = fs::remove_file(&authfile);
+        }
         if let Ok(present) = &pulled {
             summary.image_pull_ns = ns(started);
-            // K08: whether the `image exists` fast path served or a
-            // download ran — the availability signal placement reads.
+            // K08: whether the digest was resident before the authorized
+            // registry check — the availability signal placement reads.
             summary.image_present = Some(*present);
         }
         // Join before the workspace could be torn down under a checkout
@@ -427,7 +689,22 @@ fn prepare(
         // directories a job always sees. Never fatal: a cache-path error
         // is an explainable miss recorded on the entry. Absolute declared
         // paths reach the container through the collected bind mounts.
-        let mounts = restore_caches(root, job, &declared, workspace.path(), &image, remote);
+        let mut mounts = restore_caches(root, job, &declared, workspace.path(), &image, remote);
+        if job.secret_bundle.targets.iter().any(|target| {
+            matches!(
+                target.target,
+                sentinel_protocol::secrets::TargetKind::File { .. }
+            )
+        }) {
+            let directory = secret_directory
+                .as_ref()
+                .ok_or_else(|| Error::Preparation("secret directory".into()))?;
+            mounts.push(podman::Mount {
+                host: directory.files_dir.clone(),
+                container: "/run/sentinel-secrets".into(),
+                read_only: true,
+            });
+        }
         let started = Instant::now();
         let container = Container::start(
             job.worker,
@@ -445,7 +722,11 @@ fn prepare(
         Ok(container)
     })();
     match outcome {
-        Ok(container) => Ok((workspace, container)),
+        Ok(container) => Ok(PreparedExecution {
+            workspace,
+            container,
+            secret_directory,
+        }),
         Err(e) => {
             let _ = workspace.destroy();
             Err(e)
@@ -575,6 +856,7 @@ fn restore_caches(
         .map(|t| podman::Mount {
             host: t.dir.clone(),
             container: t.container.clone(),
+            read_only: false,
         })
         .collect()
 }
@@ -596,6 +878,7 @@ fn execute(
     job: &Job,
     container: &Container,
     workspace: &Path,
+    secret_directory: Option<&SecretDirectory>,
     output: &Arc<dyn Output>,
     cancel: &Cancel,
     summary: &mut AttemptSummary,
@@ -686,12 +969,43 @@ fn execute(
         let remaining = job_deadline.saturating_duration_since(Instant::now());
         command.timeout_secs = command.timeout_secs.min(remaining.as_secs().max(1));
         let started = Instant::now();
+        let step_secrets = if command.secrets.is_empty() && command.secret_files.is_empty() {
+            None
+        } else {
+            let Some(directory) = secret_directory else {
+                summary.steps.push(record);
+                failure = Some((
+                    FailureClass::Preparation,
+                    format!("step {index} secret directory is unavailable"),
+                ));
+                continue;
+            };
+            match materialize_step_secrets(directory, &job.secret_bundle, index) {
+                Ok(paths) => Some(paths),
+                Err(_) => {
+                    summary.steps.push(record);
+                    failure = Some((
+                        FailureClass::Preparation,
+                        format!("step {index} secret delivery failed"),
+                    ));
+                    continue;
+                }
+            }
+        };
         let sink: crate::process::Sink = {
             let output = Arc::clone(output);
             let step_index = index as u32;
             Arc::new(move |stream, bytes: &[u8]| output.write(step_index, stream, bytes))
         };
-        let exec = container.exec_streaming(&command, &extra, Some(sink));
+        let exec = container.exec_streaming_with_env_file(
+            &command,
+            &extra,
+            step_secrets
+                .as_ref()
+                .and_then(|secret| secret.env_file.as_deref()),
+            Some(sink),
+        );
+        drop(step_secrets);
         // Whatever the step printed last and the redactor held back is
         // this step's output, released before the next one starts.
         output.step_done(index as u32);
@@ -949,15 +1263,25 @@ fn publish_caches(
     sealed
 }
 
+struct PreparedExecution {
+    workspace: Workspace,
+    container: Container,
+    secret_directory: Option<SecretDirectory>,
+}
+
 fn finalize(
     root: &Path,
     job: &mut Job,
     verdict: &Verdict,
     report: &dyn Report,
-    workspace: Workspace,
-    container: Container,
+    prepared: PreparedExecution,
     cancel: &Cancel,
 ) -> Vec<SealedCache> {
+    let PreparedExecution {
+        workspace,
+        container,
+        secret_directory,
+    } = prepared;
     // The container goes first (P07-1): once it is stopped and removed no
     // job process — the keepalive, or anything a step left running — can
     // rewrite, swap or re-link the writable views while publication reads
@@ -966,6 +1290,7 @@ fn finalize(
     // Publication then walks them confined beneath the workspace anyway, so
     // a container that would not stop cannot redirect it either.
     let _ = container.destroy();
+    drop(secret_directory);
     // Cache publication is finalization work: it reads the job's writable
     // views, so it must precede the workspace's teardown — and a verdict
     // that never ran the job's commands leaves nothing worth keeping.
@@ -1037,6 +1362,70 @@ mod tests {
     use sentinel_protocol::cache::Trust;
 
     use super::*;
+
+    #[test]
+    fn delivered_env_and_files_live_outside_workspace_and_are_removed_after_step() {
+        use sentinel_protocol::secrets::{
+            DeliveryBundle, DeliveryTarget, DeliveryValue, TargetKind,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("worker");
+        let workspace = root.join("workspaces").join("attempt");
+        fs::create_dir_all(&workspace).unwrap();
+        let attempt = AttemptId::new();
+        let attempt_dir = root.join("secret-delivery").join(attempt.to_string());
+        let directory = SecretDirectory::create(&root, attempt).unwrap();
+        let bundle = DeliveryBundle {
+            values: vec![
+                DeliveryValue::new(b"a-token-value".to_vec()),
+                DeliveryValue::new(b"certificate-bytes".to_vec()),
+            ],
+            targets: vec![
+                DeliveryTarget {
+                    step: 0,
+                    name: "TOKEN".into(),
+                    value: 0,
+                    target: TargetKind::Environment,
+                },
+                DeliveryTarget {
+                    step: 0,
+                    name: "CERT".into(),
+                    value: 1,
+                    target: TargetKind::File {
+                        path: "tls/client.pem".into(),
+                    },
+                },
+            ],
+        };
+        let paths = materialize_step_secrets(&directory, &bundle, 0).unwrap();
+        let env = paths.env_file.as_ref().unwrap().clone();
+        let cert = directory.files_dir.join("tls/client.pem");
+        assert!(env.starts_with(root.join("secret-delivery")));
+        assert!(cert.starts_with(root.join("secret-delivery")));
+        assert!(!env.starts_with(&workspace));
+        assert!(!cert.starts_with(&workspace));
+        assert_eq!(fs::read(&env).unwrap(), b"TOKEN=a-token-value\n");
+        assert_eq!(fs::read(&cert).unwrap(), b"certificate-bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&env).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&cert).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        drop(paths);
+        assert!(!env.exists());
+        assert!(!cert.exists());
+        drop(directory);
+        assert!(!attempt_dir.exists());
+    }
 
     /// P07-24: a failed attempt keeps the mirror fallback reason next to
     /// its own, bounded.
@@ -1128,10 +1517,11 @@ mod tests {
                 tenant: None,
                 trust: Trust::Protected,
             },
-            images: Images::new(),
+            images: Images::with_download(|_, _, _, _| Ok(false)),
             caches: Vec::new(),
             mirrors: None,
             prepare_hold: Duration::ZERO,
+            secret_bundle: sentinel_protocol::secrets::DeliveryBundle::empty(),
         }
     }
 

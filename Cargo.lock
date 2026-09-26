@@ -1365,6 +1365,7 @@ dependencies = [
  "blake3",
  "flate2",
  "memchr",
+ "postcard",
  "rusqlite",
  "rustix",
  "sentinel-auth",
@@ -1380,7 +1381,9 @@ dependencies = [
 name = "sentinel-worker"
 version = "0.1.0-dev"
 dependencies = [
+ "blake3",
  "libc",
+ "rusqlite",
  "sentinel-api",
  "sentinel-auth",
  "sentinel-cache",

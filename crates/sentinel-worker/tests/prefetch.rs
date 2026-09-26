@@ -22,6 +22,7 @@ use sentinel_worker::{
     podman,
     prefetch::{Bounds, PodmanProbe, Prefetcher},
 };
+use tempfile::TempDir;
 
 /// 25 KB: a prefetch that lands in well under a second.
 const SMALL: &str = "docker.io/library/hello-world@sha256:5e23090353324d887c48ad5e5c56d294eab81588df9605b07d1afe895f9cc8f8";
@@ -75,6 +76,12 @@ fn uncanceled() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
+fn new_images() -> (TempDir, Images) {
+    let root = tempfile::tempdir().unwrap();
+    let images = Images::for_worker_data_dir(root.path()).unwrap();
+    (root, images)
+}
+
 /// A hint lands the image through the real store: the prefetch pulls it,
 /// records it held (what the profile then reports warm) and charges its
 /// real size to the byte window; the attempt that then needs it finds it
@@ -86,7 +93,7 @@ fn a_hinted_image_is_prefetched_and_the_attempt_finds_it_held() {
         return;
     }
     remove(SMALL);
-    let images = Images::new();
+    let (_auth_root, images) = new_images();
     let prefetcher = Prefetcher::new(images.clone(), Bounds::default(), PodmanProbe::new());
     prefetcher.hint(&[SMALL.to_owned()]);
     eventually("the prefetch", Duration::from_secs(180), || {
@@ -119,7 +126,7 @@ fn a_stale_prefetch_kills_the_real_pull() {
         return;
     }
     remove(LARGE);
-    let images = Images::new();
+    let (_auth_root, images) = new_images();
     let prefetcher = Prefetcher::new(images.clone(), Bounds::default(), PodmanProbe::new());
     let started = Instant::now();
     prefetcher.hint(&[LARGE.to_owned()]);
@@ -157,7 +164,7 @@ fn prefetch_saves_the_attempt_pull() {
     }
     for round in 0..3 {
         remove(LARGE);
-        let images = Images::new();
+        let (_auth_root, images) = new_images();
         let started = Instant::now();
         let present = images
             .pull(LARGE, podman::IMAGE_PULL_TIMEOUT, &uncanceled())
@@ -166,7 +173,7 @@ fn prefetch_saves_the_attempt_pull() {
         assert!(!present);
 
         remove(LARGE);
-        let images = Images::new();
+        let (_auth_root, images) = new_images();
         let prefetcher = Prefetcher::new(images.clone(), Bounds::default(), PodmanProbe::new());
         let hinted = Instant::now();
         prefetcher.hint(&[LARGE.to_owned()]);

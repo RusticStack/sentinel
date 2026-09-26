@@ -352,6 +352,15 @@ fn digest_step(d: &mut Digest, s: &Step) {
         d.str(k);
         d.str(v);
     }
+    d.u64(s.secrets.len() as u64);
+    for name in &s.secrets {
+        d.str(name);
+    }
+    d.u64(s.secret_files.len() as u64);
+    for file in &s.secret_files {
+        d.str(&file.name);
+        d.str(&file.path);
+    }
     d.opt_str(s.workdir.as_deref());
     d.u64(s.timeout_secs.unwrap_or(0));
 }
@@ -362,7 +371,7 @@ fn digest_of(
     jobs: &[CompiledJob],
 ) -> u128 {
     let mut d = Digest::new();
-    d.str("sentinel.pipeline/2");
+    d.str("sentinel.pipeline/4");
     d.u64(u64::from(on.push.is_some()));
     d.u64(u64::from(on.pull_request.is_some()));
     d.u64(u64::from(on.tag.is_some()));
@@ -430,6 +439,7 @@ fn digest_of(
         for name in &s.secrets {
             d.str(name);
         }
+        d.opt_str(s.registry_auth.as_deref());
         d.u64(s.artifacts.len() as u64);
         for a in &s.artifacts {
             d.str(&a.name);

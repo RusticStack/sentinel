@@ -1750,7 +1750,8 @@ mod worker_role {
         // controller may keep its old helper for a close it did not hear
         // answered.
         let mut capabilities = sentinel_protocol::negotiate::Capabilities::REQUIRED
-            .union(sentinel_protocol::negotiate::Capabilities::HANDOFF_ANSWER);
+            .union(sentinel_protocol::negotiate::Capabilities::HANDOFF_ANSWER)
+            .union(sentinel_protocol::negotiate::Capabilities::SECRET_DELIVERY);
         if sentinel_worker::cache_reflink(&config.data_dir) {
             capabilities = capabilities.union(sentinel_protocol::negotiate::Capabilities::REFLINK);
         }

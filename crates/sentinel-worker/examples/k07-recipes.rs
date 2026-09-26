@@ -228,6 +228,10 @@ mod imp {
             Ok(s) => s,
             Err(e) => return fail(recipe, case, format!("run spec: {e:?}")),
         };
+        let images = match Images::for_worker_data_dir(&args.worker_dir) {
+            Ok(images) => images,
+            Err(e) => return fail(recipe, case, format!("image auth setup: {e}")),
+        };
         let mut job = Job {
             worker: WorkerId::new(),
             attempt: AttemptId::new(),
@@ -255,8 +259,9 @@ mod imp {
                 tenant: None,
                 trust: Trust::Protected,
             },
-            images: Images::new(),
+            images,
             caches: Vec::new(),
+            secret_bundle: sentinel_protocol::secrets::DeliveryBundle::empty(),
             mirrors: None,
             prepare_hold: Duration::ZERO,
         };

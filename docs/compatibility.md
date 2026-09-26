@@ -7,18 +7,18 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | Contract | Marker | Where | Consumers |
 |---|---|---|---|
 | Pipeline schema | `schema: N` in `.sentinel.yml` (currently 1) | `sentinel-pipeline` | repositories |
-| Run spec blob | leading format byte (currently 4; reads 3–4) | `sentinel-pipeline::run`, `run_specs.format` | store, workers |
+| Run spec blob | leading format byte (currently 6; reads 3–6) | `sentinel-pipeline::run`, `run_specs.format` | store, workers |
 | Cache manifest | `sentinel.cache` magic + format `u8` (currently 1) | `sentinel-cache::manifest` | workers |
 | Cache file listing | `sentinel.files` magic + format `u8` (currently 1) | `sentinel-cache::manifest` | workers |
 | Cache miss reasons | `Miss::as_str` vocabulary | `sentinel-cache::outcome` | workers, reports |
-| Metadata database | `schema_migrations.version` (currently 39) | `sentinel-store` | controller |
+| Metadata database | `schema_migrations.version` (currently 40) | `sentinel-store` | controller |
 | Sealed ciphertext | leading format byte (writes 2; reads 1–2) | `sentinel-auth::sealed` | controller, host-local admin |
 | Master key file | `SNTLKEY2` magic (also reads legacy raw 32-byte file) | `sentinel-auth::sealed` | controller, host-local admin |
 | Manifest file | `SNMF` magic + format `u16` (currently 1) | `sentinel-store::objects` | controller |
 | API error | `schema: "sentinel.error/1"` | `sentinel-protocol` | CLI, MCP, UI, workers |
 | Explain output | `schema: "sentinel.explain/1"` | `sentinel-pipeline::explain` | CLI, agents |
 | Event cursor | text prefix `c1` | `sentinel-protocol::cursor` | API clients (`GET /attempts/{id}/logs` `next`/`cursor`) |
-| Worker protocol | `protocol_min..=protocol_max` in `Hello` (currently 1..=9) | `sentinel-protocol::negotiate` | workers |
+| Worker protocol | `protocol_min..=protocol_max` in `Hello` (currently 1..=10) | `sentinel-protocol::negotiate` | workers |
 | Log segment index | `SNLI` magic + format `u16` (currently 1) | `sentinel-store::logs` | controller |
 | Compressed log segment | `SNLZ` magic + format `u16` + codec `u8` (currently 1, zlib) | `sentinel-store::logs` | controller |
 | Log end marker | `SNLE` magic + format `u16` (currently 1) | `sentinel-store::logs` | controller |
@@ -31,6 +31,8 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | CLI exit codes | 0–8 ([CLI](cli.md#exit-codes)) | `sentinel::client::Exit` | scripts, agents |
 
 **Secret write surface (S03–S04, migration 39).** Secret routes are additive under `/api/v1`; old clients may ignore them. Writes use raw value bytes, compare-and-set versions and idempotency keys. Migration 39 adds bounded metadata-only replay records. Env-file import accepts the documented literal format and commits all rows in one SQLite writer transaction; this format is a CLI/API contract documented in [secrets](secrets.md).
+
+**Secret delivery (S05–S06, run spec 6, migration 40, protocol 10).** Run spec format 6 adds optional job `registry_auth`, step environment-secret names and secret-file targets; readers still decode formats 3–5 through their shadow layouts. Migration 40 marks jobs that require worker secret delivery so dispatch will not offer them to workers that lack protocol 10 or `SECRET_DELIVERY` bit 9. Protocol 10 appends `SecretBegin`/`SecretChunk`; each transfer is attempt- and fence-bound, ordered, and capped at 1 MiB. The controller resolves only declared bindings and records versioned use in the same writer transaction that checks the acknowledged attempt and opens the sealed values. Workers reject missing, extra, malformed or conflicting targets before execution. Every new attempt, including a rerun, receives the then-current active version. Secret values are not added to the run spec blob or SQLite plaintext; the worker keeps them in private per-attempt files outside workspaces, caches and artifacts, redacts before spool persistence, and reaps crash leftovers. Upgrade controllers and workers together for secret-using jobs; older workers remain eligible for jobs with no secret targets. See [secrets](secrets.md), [protocol](protocol.md#protocol-10-secret-delivery) and [executor](executor.md#the-image-pull-k05).
 
 ## Rules
 
@@ -70,7 +72,7 @@ Readers reject a database newer than their highest known migration. Migration 4 
 
 **K06 compiler state.** No format or wire change: the manifest and `files` blob stay at version 1, `Compat::Compiler` keeps its single `flags` field, and no `Miss` or `SkipReason` string changes. K06 pins a serving contract that was already implied and proves it with tests: a bare `class: compiler` declaration namespaces by the rendered key's stem (everything before the last `-`), which selects the entry directory and is re-verified inside it, while `flags` remains `""` — the reserved channel for a recipe-pinned namespace token (K07). Entries sealed by earlier builds recorded the same empty `flags`, so they keep serving. The `cc-<mode>-<hash>` key shape is a pipeline-side convention, not a schema field. A compiler-cache hit is bytes restored, never a cached verdict — every declared step still runs. See [cache](cache.md).
 
-**K08 cache metrics.** AttemptSummary moves to format 3 (above): dual decode keeps formats 1–2 readable, and the added `CacheRecord` strings reuse existing stable vocabularies — `Miss::as_str`, `SkipReason::as_str`, `"hit"`/`"sealed"`/`"failed"` — plus the `Costly` names (`copied_all`, `slow`). No worker-protocol or on-disk change: the availability snapshot travels inside the existing summary blob and the process-local `Notice` channel, so the protocol range stays 1..=6 and no capability bit is allocated. The `image_present` flag is recorded only — `podman pull`'s exists fast path semantics are unchanged.
+**K08 cache metrics.** AttemptSummary moves to format 3 (above): dual decode keeps formats 1–2 readable, and the added `CacheRecord` strings reuse existing stable vocabularies — `Miss::as_str`, `SkipReason::as_str`, `"hit"`/`"sealed"`/`"failed"` — plus the `Costly` names (`copied_all`, `slow`). No worker-protocol or on-disk change: the availability snapshot travels inside the existing summary blob and the process-local `Notice` channel, so the protocol range stays 1..=6 and no capability bit is allocated. `image_present` remains a record of local presence; since S05 it reports whether the digest was present before the mandatory scoped authorization pull.
 
 **Cursors.** Opaque to clients. `GET /attempts/{id}/logs` is the first route on the wire with the versioned `Cursor` (`c1`): its answer carries `next`, bound to the tenant, the attempt-log stream and the attempt, and the request accepts it back as `cursor` (a malformed, foreign or other-attempt cursor is `400 invalid_cursor`; `after` and `cursor` together are refused). The numeric `after=` sequence on the log routes and the run list's `before=` (returned as `next`) remain route query syntax governed by the API path version, not by this rule. The version byte changes when the layout does; old cursors are then rejected as `invalid_cursor` and the client restarts from the beginning of the stream, which is always safe because event sequences are dense and idempotent to re-read.
 

@@ -4,12 +4,12 @@
 //! one in-flight pull: the first caller leads it, the rest wait for its
 //! outcome — bounded by their own deadline and stopped early by their
 //! cancel flag — instead of running competing copies of the same
-//! download. The pull itself is the podman one (`podman image exists`,
-//! then `podman pull -q` when it does not), so a leader that finds the
-//! store already holding the image resolves every follower in one cheap
-//! lookup. A finished pull leaves no slot behind, so a failure retries
-//! fresh on the next attempt, and a slot whose leader vanished before
-//! publishing is dropped by the first follower whose deadline passes.
+//! download. The pull checks `podman image exists`, then runs
+//! `podman pull -q --authfile …` even for a resident digest to recheck the
+//! attempt's registry authority. A finished pull leaves no slot behind,
+//! so a failure retries fresh on the next attempt, and a slot whose leader
+//! vanished before publishing is dropped by the first follower whose
+//! deadline passes.
 //!
 //! Every confirmed pull records the digest in a bounded held set — what a
 //! later part advertises for locality-aware placement. The set is
@@ -19,6 +19,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -36,10 +37,95 @@ pub const MAX_HELD: usize = 1024;
 /// How often a follower's wait re-checks its cancel flag.
 const FOLLOW_POLL: Duration = Duration::from_millis(50);
 
-/// What does the pulling: `podman::pull` in production, a stub in tests.
-/// The bool is the `image exists` fast path — true when the store already
-/// held the reference and nothing was downloaded.
-type Download = Arc<dyn Fn(&str, Duration, &AtomicBool) -> Result<bool> + Send + Sync>;
+/// What performs the pull: `podman::pull` in production, a stub in tests.
+/// The bool reports whether the image was present before the authorization
+/// pull; it does not mean that the pull was skipped.
+type Download = Arc<dyn Fn(&str, &Path, Duration, &AtomicBool) -> Result<bool> + Send + Sync>;
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct PullKey {
+    image: Box<str>,
+    tenant: Option<[u8; 16]>,
+    credential: [u8; 32],
+}
+
+impl PullKey {
+    fn anonymous(image: &str) -> Self {
+        Self {
+            image: image.into(),
+            tenant: None,
+            credential: [0; 32],
+        }
+    }
+}
+
+/// An empty, worker-owned OCI auth file makes an anonymous pull explicit.
+/// Pulls also clear external credential helpers and auth-file overrides.
+pub fn prepare_anonymous_authfile(root: &Path) -> Result<PathBuf> {
+    use std::io::Write;
+    let root_metadata = std::fs::symlink_metadata(root)?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Err(Error::Preparation("worker data directory".into()));
+    }
+    let dir = root.join("registry-auth");
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&dir)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(Error::Preparation("registry auth directory".into()));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    restrict_dir(&dir)?;
+    let path = dir.join("anonymous.json");
+    const EMPTY: &[u8] = b"{\"auths\":{}}\n";
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            restrict_file(&path)?;
+            file.write_all(EMPTY)?;
+            file.sync_data()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || std::fs::read(&path)? != EMPTY
+            {
+                return Err(Error::Preparation("anonymous registry auth file".into()));
+            }
+            restrict_file(&path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(path)
+}
+
+fn restrict_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn restrict_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
 
 /// One in-flight pull: the outcome the leader publishes exactly once.
 /// `Ok` carries the leader's present/downloaded answer to every follower.
@@ -91,7 +177,7 @@ impl Shared {
 struct State {
     /// References with a pull in flight. A slot leaves the map as its
     /// outcome is published, so it never outlives its use.
-    pulling: HashMap<String, Arc<Pull>>,
+    pulling: HashMap<PullKey, Arc<Pull>>,
     /// Digests (`sha256:…`) confirmed in the local store.
     held: HashSet<Box<str>>,
     /// The `held` digests oldest-first, for eviction past [`MAX_HELD`].
@@ -101,12 +187,13 @@ struct State {
     version: u64,
     /// References in `pulling` whose leader is a prefetch (K05), not an
     /// attempt: a prefetch yields to attempts' own pulls.
-    prefetching: HashSet<String>,
+    prefetching: HashSet<PullKey>,
 }
 
 struct Inner {
     state: Mutex<State>,
     download: Download,
+    anonymous_authfile: PathBuf,
 }
 
 /// The worker's image-pull state: one per process, cheap to clone —
@@ -119,8 +206,18 @@ pub struct Images {
 
 impl Images {
     /// Pulls through podman, which enforces the digest pin itself.
-    pub fn new() -> Self {
-        Self::with_download(podman::pull)
+    pub fn new(anonymous_authfile: PathBuf) -> Self {
+        Self::with_authfile_and_download(anonymous_authfile, podman::pull)
+    }
+
+    /// Create the worker's pull state and its strict empty fallback authfile
+    /// below its private data directory.
+    pub fn for_worker_data_dir(root: &Path) -> Result<Self> {
+        Ok(Self::new(prepare_anonymous_authfile(root)?))
+    }
+
+    pub fn anonymous_authfile(&self) -> &Path {
+        &self.inner.anonymous_authfile
     }
 
     /// A pull backend other than podman's — the test seam. The closure's
@@ -128,7 +225,14 @@ impl Images {
     /// already held the image.
     #[doc(hidden)]
     pub fn with_download(
-        download: impl Fn(&str, Duration, &AtomicBool) -> Result<bool> + Send + Sync + 'static,
+        download: impl Fn(&str, &Path, Duration, &AtomicBool) -> Result<bool> + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_authfile_and_download(PathBuf::from("unused-anonymous-auth.json"), download)
+    }
+
+    fn with_authfile_and_download(
+        anonymous_authfile: PathBuf,
+        download: impl Fn(&str, &Path, Duration, &AtomicBool) -> Result<bool> + Send + Sync + 'static,
     ) -> Self {
         Images {
             inner: Arc::new(Inner {
@@ -140,6 +244,7 @@ impl Images {
                     prefetching: HashSet::new(),
                 }),
                 download: Arc::new(download),
+                anonymous_authfile,
             }),
         }
     }
@@ -147,9 +252,9 @@ impl Images {
     /// Make `image` — the exact `name@sha256:…` reference handed to the
     /// pull — available in the local store, sharing the in-flight pull
     /// for it if there is one. The leader's outcome is what every waiter
-    /// gets: `Ok(true)` when the `image exists` fast path served it
-    /// (nothing was downloaded), `Ok(false)` when it was pulled, and on
-    /// failure the same typed error (`Preparation` for a refused or
+    /// gets: `Ok(true)` when `image exists` found it before the scoped
+    /// authorization pull, `Ok(false)` when it was absent, and on failure
+    /// the same typed error (`Preparation` for a refused or
     /// failed pull, `Timeout` past the deadline, `Io` for a helper that
     /// would not start).
     ///
@@ -159,22 +264,61 @@ impl Images {
     /// followers are then told to pull for themselves, never handed a
     /// cancellation that was not theirs.
     pub fn pull(&self, image: &str, timeout: Duration, cancel: &Cancel) -> Result<bool> {
+        validate_pinned_reference(image)?;
+        let key = PullKey::anonymous(image);
+        self.pull_keyed(key, image, &self.inner.anonymous_authfile, timeout, cancel)
+    }
+
+    /// Pull using an attempt's own registry authority. The single-flight key
+    /// includes tenant and a secret-value fingerprint: neither another
+    /// tenant nor a rotated credential can inherit a successful auth check.
+    pub fn pull_for_tenant(
+        &self,
+        image: &str,
+        tenant: [u8; 16],
+        credential: [u8; 32],
+        authfile: &Path,
+        timeout: Duration,
+        cancel: &Cancel,
+    ) -> Result<bool> {
+        validate_pinned_reference(image)?;
+        self.pull_keyed(
+            PullKey {
+                image: image.into(),
+                tenant: Some(tenant),
+                credential,
+            },
+            image,
+            authfile,
+            timeout,
+            cancel,
+        )
+    }
+
+    fn pull_keyed(
+        &self,
+        key: PullKey,
+        image: &str,
+        authfile: &Path,
+        timeout: Duration,
+        cancel: &Cancel,
+    ) -> Result<bool> {
         if cancel.load(Ordering::Acquire) {
             return Err(Error::Preparation("canceled".into()));
         }
         let (slot, leader) = {
             let mut state = self.state();
-            match state.pulling.get(image) {
+            match state.pulling.get(&key) {
                 Some(slot) => (Arc::clone(slot), false),
                 None => {
                     let slot = Arc::new(Pull::default());
-                    state.pulling.insert(image.to_owned(), Arc::clone(&slot));
+                    state.pulling.insert(key.clone(), Arc::clone(&slot));
                     (slot, true)
                 }
             }
         };
         if leader {
-            return self.lead(image, &slot, timeout, cancel);
+            return self.lead(&key, image, authfile, &slot, timeout, cancel);
         }
         slot.waiters.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + timeout;
@@ -188,7 +332,7 @@ impl Images {
                     // The leader was cancelled, not this attempt: lead (or
                     // follow) a fresh pull within what is left of the wait.
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    return self.pull(image, remaining, cancel);
+                    return self.pull_keyed(key.clone(), image, authfile, remaining, cancel);
                 }
                 if outcome.is_ok() {
                     self.record(image);
@@ -206,10 +350,10 @@ impl Images {
                 let mut state = self.state();
                 if state
                     .pulling
-                    .get(image)
+                    .get(&key)
                     .is_some_and(|s| Arc::ptr_eq(s, &slot))
                 {
-                    state.pulling.remove(image);
+                    state.pulling.remove(&key);
                 }
                 return Err(Error::Timeout("image pull"));
             }
@@ -223,8 +367,16 @@ impl Images {
 
     /// Run the download for `slot` and publish its outcome to every
     /// follower, then retire the slot.
-    fn lead(&self, image: &str, slot: &Pull, timeout: Duration, cancel: &Cancel) -> Result<bool> {
-        let outcome = (self.inner.download)(image, timeout, cancel);
+    fn lead(
+        &self,
+        key: &PullKey,
+        image: &str,
+        authfile: &Path,
+        slot: &Pull,
+        timeout: Duration,
+        cancel: &Cancel,
+    ) -> Result<bool> {
+        let outcome = (self.inner.download)(image, authfile, timeout, cancel);
         if outcome.is_ok() {
             self.record(image);
         }
@@ -239,8 +391,8 @@ impl Images {
         *slot.result.lock().unwrap_or_else(|p| p.into_inner()) = Some(shared);
         slot.done.notify_all();
         let mut state = self.state();
-        state.pulling.remove(image);
-        state.prefetching.remove(image);
+        state.pulling.remove(key);
+        state.prefetching.remove(key);
         outcome
     }
 
@@ -260,15 +412,24 @@ impl Images {
         let slot = {
             let mut state = self.state();
             let digest = image.split_once('@')?.1;
-            if state.held.contains(digest) || state.pulling.contains_key(image) {
+            let key = PullKey::anonymous(image);
+            if state.held.contains(digest) || state.pulling.contains_key(&key) {
                 return None;
             }
             let slot = Arc::new(Pull::default());
-            state.pulling.insert(image.to_owned(), Arc::clone(&slot));
-            state.prefetching.insert(image.to_owned());
+            state.pulling.insert(key.clone(), Arc::clone(&slot));
+            state.prefetching.insert(key);
             slot
         };
-        Some(self.lead(image, &slot, timeout, cancel))
+        let key = PullKey::anonymous(image);
+        Some(self.lead(
+            &key,
+            image,
+            &self.inner.anonymous_authfile,
+            &slot,
+            timeout,
+            cancel,
+        ))
     }
 
     /// Pulls in flight that an attempt leads — what a prefetch yields to.
@@ -277,7 +438,7 @@ impl Images {
         state
             .pulling
             .keys()
-            .filter(|image| !state.prefetching.contains(*image))
+            .filter(|key| !state.prefetching.contains(*key))
             .count()
     }
 
@@ -287,8 +448,10 @@ impl Images {
     pub fn followers(&self, image: &str) -> usize {
         self.state()
             .pulling
-            .get(image)
-            .map_or(0, |slot| slot.waiters.load(Ordering::Relaxed))
+            .iter()
+            .filter(|(key, _)| key.image.as_ref() == image)
+            .map(|(_, slot)| slot.waiters.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Whether `digest` — the `sha256:…` half of a pulled reference — is
@@ -370,16 +533,22 @@ impl Images {
     }
 }
 
-impl Default for Images {
-    fn default() -> Self {
-        Self::new()
+fn validate_pinned_reference(image: &str) -> Result<()> {
+    if image.contains("@sha256:") {
+        Ok(())
+    } else {
+        Err(Error::Preparation("image is not pinned by digest".into()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Barrier, atomic::AtomicBool, mpsc},
+        sync::{
+            Barrier,
+            atomic::{AtomicBool, AtomicUsize},
+            mpsc,
+        },
         thread,
     };
 
@@ -387,6 +556,37 @@ mod tests {
 
     const IMAGE: &str = "example.test/image@sha256:0000000000000000000000000000000000000000000000000000000000000001";
     const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[test]
+    fn anonymous_auth_file_is_private_and_refuses_a_symlink_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let authfile = prepare_anonymous_authfile(root.path()).unwrap();
+        assert_eq!(std::fs::read(&authfile).unwrap(), b"{\"auths\":{}}\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(authfile.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&authfile).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let other = tempfile::tempdir().unwrap();
+            let linked = other.path().join("worker");
+            std::os::unix::fs::symlink(root.path(), &linked).unwrap();
+            assert!(prepare_anonymous_authfile(&linked).is_err());
+        }
+    }
 
     fn cancel() -> Cancel {
         Arc::new(AtomicBool::new(false))
@@ -397,7 +597,7 @@ mod tests {
         images
             .state()
             .pulling
-            .get(image)
+            .get(&PullKey::anonymous(image))
             .map(|slot| slot.waiters.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
@@ -443,7 +643,7 @@ mod tests {
                 Arc::clone(&self.release),
                 self.outcome,
             );
-            Images::with_download(move |_, _, _| {
+            Images::with_download(move |_, _, _, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 let _ = entered.send(());
                 release.wait();
@@ -480,6 +680,66 @@ mod tests {
         assert_eq!(images.in_flight(), 0, "no slot left behind");
         assert!(images.holds(DIGEST));
         assert_eq!(images.held(), vec![DIGEST.to_string()]);
+    }
+
+    #[test]
+    fn tenant_and_credential_changes_never_share_an_authorized_pull() {
+        fn calls_for(tenants: [[u8; 16]; 2], credentials: [[u8; 32]; 2]) -> usize {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new(AtomicBool::new(false));
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let images = Images::with_download({
+                let (calls, release, entered_tx) =
+                    (Arc::clone(&calls), Arc::clone(&release), entered_tx);
+                move |_, authfile, _, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    entered_tx.send(authfile.to_path_buf()).unwrap();
+                    while !release.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    Ok(false)
+                }
+            });
+            let first = {
+                let images = images.clone();
+                thread::spawn(move || {
+                    images.pull_for_tenant(
+                        IMAGE,
+                        tenants[0],
+                        credentials[0],
+                        Path::new("auth-first.json"),
+                        Duration::from_secs(5),
+                        &cancel(),
+                    )
+                })
+            };
+            assert_eq!(
+                entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                PathBuf::from("auth-first.json")
+            );
+            let second = {
+                let images = images.clone();
+                thread::spawn(move || {
+                    images.pull_for_tenant(
+                        IMAGE,
+                        tenants[1],
+                        credentials[1],
+                        Path::new("auth-second.json"),
+                        Duration::from_secs(5),
+                        &cancel(),
+                    )
+                })
+            };
+            let second_entered = entered_rx.recv_timeout(Duration::from_secs(2)).ok();
+            release.store(true, Ordering::Release);
+            assert!(first.join().unwrap().is_ok());
+            assert!(second.join().unwrap().is_ok());
+            assert_eq!(second_entered, Some(PathBuf::from("auth-second.json")));
+            calls.load(Ordering::SeqCst)
+        }
+
+        assert_eq!(calls_for([[1; 16], [2; 16]], [[7; 32], [7; 32]]), 2);
+        assert_eq!(calls_for([[1; 16], [1; 16]], [[7; 32], [8; 32]]), 2);
     }
 
     #[test]
@@ -541,7 +801,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || tx.send(follower.join().unwrap()).unwrap());
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
-            Err(Error::Preparation(what)) => assert_eq!(what, "canceled"),
+            Err(Error::Preparation(ref what)) => assert_eq!(what, "canceled"),
             other => panic!("canceled follower got {other:?}"),
         }
         assert_eq!(images.in_flight(), 1, "the leader's pull goes on");
@@ -556,7 +816,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let images = Images::with_download({
             let calls = Arc::clone(&calls);
-            move |_, _, _| {
+            move |_, _, _, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(true)
             }
@@ -578,7 +838,7 @@ mod tests {
 
     #[test]
     fn the_held_record_is_bounded_and_evicts_the_oldest() {
-        let images = Images::with_download(|_, _, _| Ok(false));
+        let images = Images::with_download(|_, _, _, _| Ok(false));
         let flag = cancel();
         for i in 0..MAX_HELD + 1 {
             let image = format!("example.test/i@sha256:{i:064}");
@@ -592,17 +852,53 @@ mod tests {
 
     #[test]
     fn the_wrapped_pull_still_refuses_an_unpinned_reference() {
-        // With the real backend this stops before any helper runs; the
-        // stubbed one would not be asked either way.
-        let images = Images::new();
+        // The real backend retains the same check as a second boundary.
+        let images = Images::new(PathBuf::new());
         match images.pull(
             "example.test/image:latest",
             Duration::from_secs(1),
             &cancel(),
         ) {
-            Err(Error::Preparation(what)) => assert_eq!(what, "image is not pinned by digest"),
+            Err(Error::Preparation(ref what)) => {
+                assert_eq!(what, "image is not pinned by digest")
+            }
             other => panic!("unpinned reference got {other:?}"),
         }
+        assert_eq!(images.in_flight(), 0);
+        assert!(images.held().is_empty());
+    }
+
+    #[test]
+    fn anonymous_and_tenant_pulls_refuse_unpinned_images_before_download() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let images = Images::with_download({
+            let calls = Arc::clone(&calls);
+            move |_, _, _, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(false)
+            }
+        });
+        let authfile = tempfile::tempdir().unwrap();
+        let image = "example.test/image:latest";
+        let cancel = cancel();
+
+        for result in [
+            images.pull(image, Duration::from_secs(1), &cancel),
+            images.pull_for_tenant(
+                image,
+                [0; 16],
+                [0; 32],
+                authfile.path(),
+                Duration::from_secs(1),
+                &cancel,
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(Error::Preparation(ref why)) if why == "image is not pinned by digest"
+            ));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert_eq!(images.in_flight(), 0);
         assert!(images.held().is_empty());
     }

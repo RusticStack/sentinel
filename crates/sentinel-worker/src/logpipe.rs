@@ -119,10 +119,11 @@ impl PipeState {
     /// Release the held-back tail of both streams as `step`'s output.
     fn flush_carry(&mut self, step: u32) {
         for stream in [Stream::Stdout, Stream::Stderr] {
-            let rest = self.redactor.flush(stream);
+            let mut rest = self.redactor.flush(stream);
             for chunk in rest.chunks(MAX_LOG_FRAME_BYTES) {
                 self.store(step, stream, chunk);
             }
+            rest.fill(0);
         }
     }
 
@@ -227,7 +228,7 @@ impl LogPipe {
     }
 
     /// Redact a registered value from this attempt's output from now on.
-    /// Returns whether it was accepted (long enough to be a secret).
+    /// Returns whether it was accepted (non-empty).
     pub fn register_secret(&self, value: &[u8]) -> bool {
         self.lock().redactor.register(value)
     }
@@ -433,7 +434,10 @@ impl Output for LogPipe {
         if st.redactor.is_empty() {
             return text;
         }
-        String::from_utf8_lossy(&st.redactor.redact_all(text.as_bytes())).into_owned()
+        let mut raw = text.into_bytes();
+        let redacted = st.redactor.redact_all(&raw);
+        raw.fill(0);
+        String::from_utf8_lossy(&redacted).into_owned()
     }
 
     fn complete(&self) -> bool {
@@ -509,7 +513,7 @@ mod tests {
         let b = LogPipe::open(root.path(), AttemptId::new(), Redactor::new(), None).unwrap();
         a.write(0, Stream::Stdout, b"before tok-1234567890\n");
         assert!(a.register_secret(b"tok-1234567890"));
-        assert!(!a.register_secret(b"short"));
+        assert!(a.register_secret(b"short"));
         a.write(0, Stream::Stdout, b"after tok-1234567890\n");
         b.write(0, Stream::Stdout, b"other tok-1234567890\n");
         a.step_done(0);
@@ -525,6 +529,18 @@ mod tests {
             b.redact("Error: tok-1234567890 refused".into()),
             "Error: tok-1234567890 refused"
         );
+    }
+
+    #[test]
+    fn a_secret_split_across_output_calls_is_redacted() {
+        let root = tempfile::tempdir().unwrap();
+        let mut redactor = Redactor::new();
+        redactor.register(b"split-secret-value");
+        let pipe = LogPipe::open(root.path(), AttemptId::new(), redactor, None).unwrap();
+        pipe.write(0, Stream::Stdout, b"before split-secret-");
+        pipe.write(0, Stream::Stdout, b"value after\n");
+        pipe.step_done(0);
+        assert_eq!(text(&spooled(&pipe)), "before *** after\n");
     }
 
     /// P04-21: bytes held back as a possible secret prefix are released as
