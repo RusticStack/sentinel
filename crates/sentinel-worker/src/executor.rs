@@ -1336,7 +1336,8 @@ impl LinkExecutor for Executor {
         let spawned = thread::Builder::new()
             .name(format!("sentinel-cancel-{attempt}"))
             .spawn(move || {
-                let outcome = podman::terminate_named(&format!("sentinel-{attempt}"), &store, grace);
+                let outcome =
+                    podman::terminate_named(&format!("sentinel-{attempt}"), &store, grace);
                 match outcome {
                     Ok(podman::Terminated::Graceful | podman::Terminated::Forced) => {
                         let forced = matches!(outcome, Ok(podman::Terminated::Forced));
@@ -1544,6 +1545,16 @@ impl LinkExecutor for Executor {
         secrets: sentinel_protocol::secrets::DeliveryBundle,
     ) {
         self.accept_spec(attempt, context, bytes, secrets);
+    }
+
+    /// P10D-3: the offer this worker acknowledged, whichever session it
+    /// came on, binds the secret transfer that answers its spec request.
+    fn fence_of(&self, attempt: AttemptId) -> Option<Fence> {
+        self.state()
+            .awaiting
+            .get(&attempt)
+            .filter(|waiting| !waiting.declining)
+            .map(|waiting| waiting.offer.fence)
     }
 
     /// A definitive refusal: the attempt is settled at once as the

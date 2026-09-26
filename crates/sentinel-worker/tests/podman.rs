@@ -335,7 +335,12 @@ fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
         assert_eq!(procs(&nested), vec![pid]);
 
         assert_eq!(
-            podman::terminate_named(container.name(), &podman::Store::Shared, Duration::from_secs(10)).unwrap(),
+            podman::terminate_named(
+                container.name(),
+                &podman::Store::Shared,
+                Duration::from_secs(10)
+            )
+            .unwrap(),
             podman::Terminated::Graceful
         );
         step.join().unwrap()
@@ -344,7 +349,12 @@ fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
     // The nested cgroups are still there, empty: nothing runs any more.
     assert!(cgroup.join("step").join("inner").exists());
     assert_eq!(
-        podman::terminate_named(container.name(), &podman::Store::Shared, Duration::from_secs(1)).unwrap(),
+        podman::terminate_named(
+            container.name(),
+            &podman::Store::Shared,
+            Duration::from_secs(1)
+        )
+        .unwrap(),
         podman::Terminated::Gone
     );
 

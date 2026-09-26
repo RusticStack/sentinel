@@ -108,10 +108,7 @@ impl Automaton {
             } else {
                 automaton.out[automaton.fail[n] as usize]
             };
-            let (start, end) = (
-                automaton.first[n] as usize,
-                automaton.first[n + 1] as usize,
-            );
+            let (start, end) = (automaton.first[n] as usize, automaton.first[n + 1] as usize);
             for index in start..end {
                 let (byte, child) = automaton.edges[index];
                 automaton.fail[child as usize] = automaton.next(automaton.fail[n], byte);
@@ -550,7 +547,9 @@ mod tests {
             let mut secrets: Vec<Vec<u8>> = Vec::new();
             for _ in 0..1 + rng.below(5) {
                 let len = 1 + rng.below(6) as usize;
-                let value: Vec<u8> = (0..len).map(|_| b'a' + rng.below(alphabet.into()) as u8).collect();
+                let value: Vec<u8> = (0..len)
+                    .map(|_| b'a' + rng.below(alphabet.into()) as u8)
+                    .collect();
                 if !secrets.contains(&value) {
                     secrets.push(value);
                 }
@@ -566,7 +565,11 @@ mod tests {
             let mut expected = Vec::new();
             let at = reference(&secrets, &text, false, &mut expected);
             expected.extend_from_slice(&text[at..]);
-            assert_eq!(r.redact_all(&text), expected, "case {case}: {secrets:?} {text:?}");
+            assert_eq!(
+                r.redact_all(&text),
+                expected,
+                "case {case}: {secrets:?} {text:?}"
+            );
             // Streamed in random chunks: the reference applied to the same
             // carry discipline.
             let mut streamed = Vec::new();

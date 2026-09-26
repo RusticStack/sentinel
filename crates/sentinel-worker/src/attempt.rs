@@ -1632,7 +1632,10 @@ mod tests {
             ],
             3,
         );
-        assert!(argv.iter().all(|a| !a.contains("$HOME `id`") && !a.contains(&big)));
+        assert!(
+            argv.iter()
+                .all(|a| !a.contains("$HOME `id`") && !a.contains(&big))
+        );
         let script = argv[2].replace(SECRET_ENV_MOUNT, &directory.env_dir.display().to_string());
         let status = std::process::Command::new(&argv[0])
             .arg(&argv[1])
@@ -1642,7 +1645,10 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        assert_eq!(fs::read_to_string(temp.path().join("seen")).unwrap(), tricky);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("seen")).unwrap(),
+            tricky
+        );
         assert_eq!(
             fs::read_to_string(temp.path().join("seen.len")).unwrap(),
             big.len().to_string()
