@@ -29,6 +29,7 @@ pub mod objects;
 pub mod poll;
 pub mod provenance;
 pub mod registration;
+pub mod reseal;
 pub mod runs;
 pub mod schema;
 pub mod secrets;
@@ -102,6 +103,9 @@ pub enum Error {
     /// A write was refused because the tenant reached its storage quota
     /// (D06). Not transient: bytes must be reclaimed or the quota raised.
     QuotaExceeded,
+    /// An idempotency key was reused for a different request (P10C-9):
+    /// a client bug, distinct from a stale compare-and-set `Conflict`.
+    IdempotencyMismatch,
     Io(std::io::Error),
 }
 
@@ -125,6 +129,9 @@ impl fmt::Display for Error {
             Self::Unresolved => f.write_str("image digest and platform not yet resolved"),
             Self::StorageFull => f.write_str("storage admission refused: disk below watermark"),
             Self::QuotaExceeded => f.write_str("tenant storage quota exceeded"),
+            Self::IdempotencyMismatch => {
+                f.write_str("idempotency key reused for a different request")
+            }
             Self::Io(e) => write!(f, "io: {e}"),
         }
     }
@@ -153,6 +160,7 @@ impl Error {
             Self::Unresolved => "unresolved",
             Self::StorageFull => "storage_full",
             Self::QuotaExceeded => "quota_exceeded",
+            Self::IdempotencyMismatch => "idempotency_mismatch",
             Self::Io(_) => "io",
         }
     }

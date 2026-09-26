@@ -352,6 +352,74 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
         }),
         Err(Error::NotFound)
     ));
+    // P10S-6: through `deliver`, the refusal itself is audited (one `use`
+    // row with result `missing`, the attempt, step and version), while the
+    // refused preparation's own `use` rows (OCI_AUTH resolved before TOKEN
+    // failed) are rolled back.
+    assert!(matches!(
+        secrets::deliver(
+            &f.store,
+            f.key.clone(),
+            f.worker,
+            second.attempt,
+            UnixMillis(2_850)
+        ),
+        Err(Error::NotFound)
+    ));
+    let refusals: Vec<(Option<String>, String, i64, String, String)> = f
+        .store
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT a.step, a.name, a.version, a.result, s.name FROM secret_audit a
+                 JOIN secrets s ON s.id=a.secret_id
+                 WHERE a.action='use' AND a.result!='ok' AND a.attempt_id=?1",
+            )?;
+            Ok(stmt
+                .query_map([second.attempt.as_bytes()], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap();
+    assert_eq!(
+        refusals,
+        [(
+            Some("test".into()),
+            "TOKEN".into(),
+            2,
+            "missing".into(),
+            "TOKEN".into()
+        )]
+    );
+    let ok_uses: i64 = f
+        .store
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT count(*) FROM secret_audit WHERE action='use' AND result='ok' AND attempt_id=?1",
+                [second.attempt.as_bytes()],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(ok_uses, 3, "a refused preparation leaves no use row");
+    // The audit is append-only.
+    for sql in [
+        "UPDATE secret_audit SET result='ok'",
+        "DELETE FROM secret_audit",
+    ] {
+        assert!(
+            f.store
+                .writer()
+                .write(move |tx| Ok(tx.execute(sql, [])?))
+                .is_err()
+        );
+    }
 
     let audit_versions: Vec<(String, i64)> = f
         .store
@@ -359,7 +427,7 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
             let mut stmt = conn.prepare(
                 "SELECT s.name, a.version FROM secret_audit a
                  JOIN secrets s ON s.id=a.secret_id
-                 WHERE a.action='use' AND a.attempt_id=?1 ORDER BY s.name",
+                 WHERE a.action='use' AND a.result='ok' AND a.attempt_id=?1 ORDER BY s.name",
             )?;
             Ok(stmt
                 .query_map([first.attempt.as_bytes()], |row| {
@@ -382,7 +450,7 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
             let mut stmt = conn.prepare(
                 "SELECT s.name, a.version FROM secret_audit a
                  JOIN secrets s ON s.id=a.secret_id
-                 WHERE a.action='use' AND a.attempt_id=?1 ORDER BY s.name",
+                 WHERE a.action='use' AND a.result='ok' AND a.attempt_id=?1 ORDER BY s.name",
             )?;
             Ok(stmt
                 .query_map([second.attempt.as_bytes()], |row| {

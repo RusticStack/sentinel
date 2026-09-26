@@ -2449,12 +2449,10 @@ fn resolve_spec(
         let Some(key) = key else {
             return Err(SpecFault::Refused);
         };
+        // A policy refusal (missing binding, revoked version, ambiguity)
+        // commits its `denied`/`missing` audit row and fails the delivery.
         Some(
-            store
-                .writer()
-                .write(move |tx| {
-                    secrets::prepare_delivery(tx, &key, worker, attempt, UnixMillis::now())
-                })
+            secrets::deliver(store, key, worker, attempt, UnixMillis::now())
                 .map_err(SpecFault::from)?,
         )
     } else {

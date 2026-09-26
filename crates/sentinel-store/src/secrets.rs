@@ -1,6 +1,8 @@
 //! Tenant-owned sealed secrets and explicit repository/job/step eligibility.
 //! This module exposes metadata to clients; plaintext has no read API. Only
 //! fenced preparation may open a sealed value for an authorized attempt.
+use std::sync::Arc;
+
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::sealed::{Key, secret_context};
 use sentinel_core::{
@@ -9,7 +11,7 @@ use sentinel_core::{
 };
 use sentinel_protocol::idempotency::{Fingerprint, IDEMPOTENCY_TTL_MS, IdempotencyKey};
 
-use crate::{Error, Result, auth, dispatch};
+use crate::{Error, Result, Store, auth, dispatch};
 
 pub const MAX_VALUE: usize = 65_536;
 
@@ -19,21 +21,26 @@ pub struct Idempotency<'a> {
     pub principal: &'a str,
     pub route: &'a str,
     pub key: IdempotencyKey,
+    /// A keyed MAC of the request (`Key::fingerprinter`), never an unkeyed
+    /// digest of a value: this row is stored beside the ciphertext.
     pub fingerprint: Fingerprint,
 }
 
 /// Return a completed metadata-only response for an identical secret write.
 /// The write and saved response share the same transaction, so there is no
-/// durable in-flight state after a crash.
+/// durable in-flight state after a crash. A key reused for a different
+/// request is [`Error::IdempotencyMismatch`], not a version conflict.
 pub fn idempotency_replay(
     tx: &Transaction<'_>,
     idempotency: Idempotency<'_>,
     now: UnixMillis,
 ) -> Result<Option<Vec<u8>>> {
     let stored: Option<(Vec<u8>, i64, Vec<u8>)> = tx
-        .query_row(
+        .prepare_cached(
             "SELECT fingerprint,created_ms,response_json FROM secret_idempotency
              WHERE tenant_id=?1 AND principal=?2 AND route=?3 AND key=?4",
+        )?
+        .query_row(
             params![
                 idempotency.tenant.as_bytes(),
                 idempotency.principal,
@@ -63,7 +70,7 @@ pub fn idempotency_replay(
         .try_into()
         .map_err(|_| Error::Corrupt("secret_idempotency.fingerprint"))?;
     if stored != idempotency.fingerprint.0.to_le_bytes() {
-        return Err(Error::Conflict);
+        return Err(Error::IdempotencyMismatch);
     }
     Ok(Some(response))
 }
@@ -78,21 +85,21 @@ pub fn idempotency_save(
     if !(2..=65_536).contains(&response.len()) {
         return Err(Error::InvalidInput("secret response"));
     }
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO secret_idempotency(tenant_id,principal,route,key,fingerprint,created_ms,response_json)
          VALUES(?1,?2,?3,?4,?5,?6,?7)
          ON CONFLICT(tenant_id,principal,route,key) DO UPDATE SET
            fingerprint=excluded.fingerprint,created_ms=excluded.created_ms,response_json=excluded.response_json",
-        params![
-            idempotency.tenant.as_bytes(),
-            idempotency.principal,
-            idempotency.route,
-            idempotency.key.as_str(),
-            idempotency.fingerprint.0.to_le_bytes(),
-            now.0,
-            response
-        ],
-    )?;
+    )?
+    .execute(params![
+        idempotency.tenant.as_bytes(),
+        idempotency.principal,
+        idempotency.route,
+        idempotency.key.as_str(),
+        idempotency.fingerprint.0.to_le_bytes(),
+        now.0,
+        response
+    ])?;
     Ok(())
 }
 
@@ -193,7 +200,15 @@ fn tenant_secret_admin(conn: &Connection, principal: Principal, tenant: TenantId
     {
         return Err(Error::NotFound);
     }
-    let allowed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM memberships m JOIN users u ON u.id=m.user_id JOIN tenants t ON t.id=m.tenant_id WHERE m.tenant_id=?1 AND m.user_id=?2 AND m.role=3 AND u.kind=0 AND u.active=1 AND t.active=1)",params![tenant.as_bytes(),principal.user.as_bytes()],|r|r.get(0))?;
+    let allowed: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM memberships m JOIN users u ON u.id=m.user_id
+             JOIN tenants t ON t.id=m.tenant_id WHERE m.tenant_id=?1 AND m.user_id=?2
+             AND m.role=3 AND u.kind=0 AND u.active=1 AND t.active=1)",
+        )?
+        .query_row(params![tenant.as_bytes(), principal.user.as_bytes()], |r| {
+            r.get(0)
+        })?;
     if allowed {
         Ok(())
     } else {
@@ -283,7 +298,21 @@ struct Audit<'a> {
     result: &'a str,
 }
 fn audit(tx: &Transaction<'_>, meta: &Metadata, event: Audit<'_>, now: UnixMillis) -> Result<()> {
-    tx.execute("INSERT INTO secret_audit(tenant_id,repo_id,secret_id,version,actor,attempt_id,action,result,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![meta.tenant.as_bytes(),event.repo.as_ref().map(RepoId::as_bytes),meta.id.as_bytes(),meta.version as i64,event.actor.as_ref().map(UserId::as_bytes),event.attempt.as_ref().map(AttemptId::as_bytes),event.action,event.result,now.0])?;
+    tx.prepare_cached(
+        "INSERT INTO secret_audit(tenant_id,repo_id,secret_id,version,actor,attempt_id,action,result,at_ms)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+    )?
+    .execute(params![
+        meta.tenant.as_bytes(),
+        event.repo.as_ref().map(RepoId::as_bytes),
+        meta.id.as_bytes(),
+        meta.version as i64,
+        event.actor.as_ref().map(UserId::as_bytes),
+        event.attempt.as_ref().map(AttemptId::as_bytes),
+        event.action,
+        event.result,
+        now.0
+    ])?;
     Ok(())
 }
 
@@ -297,13 +326,57 @@ pub fn put(
     key: &Key,
     now: UnixMillis,
 ) -> Result<Metadata> {
+    let owner = scope_owner(tx, principal, update.scope, true)?;
+    put_owned(tx, principal.user, owner, &update, key, now)
+}
+
+/// An atomic multi-name write (env-file import): authority is checked once
+/// for the scope, then every entry is created or rotated in this
+/// transaction. Any refusal rolls the whole import back with the caller's
+/// transaction.
+pub fn put_all<'a>(
+    tx: &Transaction<'_>,
+    principal: Principal,
+    scope: Scope,
+    entries: impl IntoIterator<Item = (&'a str, u64, &'a [u8])>,
+    key: &Key,
+    now: UnixMillis,
+) -> Result<Vec<Metadata>> {
+    let owner = scope_owner(tx, principal, scope, true)?;
+    let entries = entries.into_iter();
+    let mut out = Vec::with_capacity(entries.size_hint().0);
+    for (name, expected, value) in entries {
+        out.push(put_owned(
+            tx,
+            principal.user,
+            owner,
+            &Update {
+                scope,
+                name,
+                expected,
+                value,
+            },
+            key,
+            now,
+        )?);
+    }
+    Ok(out)
+}
+
+fn put_owned(
+    tx: &Transaction<'_>,
+    actor: UserId,
+    (tenant, repo): (TenantId, Option<RepoId>),
+    update: &Update<'_>,
+    key: &Key,
+    now: UnixMillis,
+) -> Result<Metadata> {
     let Update {
-        scope,
         name,
         expected,
         value,
-    } = update;
-    let (tenant, repo) = scope_owner(tx, principal, scope, true)?;
+        ..
+    } = *update;
     if !name_valid(name) || !(1..=MAX_VALUE).contains(&value.len()) || expected >= i64::MAX as u64 {
         return Err(Error::InvalidInput("secret name, value or version"));
     }
@@ -311,11 +384,15 @@ pub fn put(
     let (id, created_ms) = if expected == 0 {
         (SecretId::new(), now.0)
     } else {
-        let (old,created_ms) = tx.query_row("SELECT id,created_ms FROM secrets WHERE tenant_id=?1 AND scope_repo_id IS ?2 AND name=?3 AND current_version=?4 AND active=1",params![tenant.as_bytes(),repo.as_ref().map(RepoId::as_bytes),name,expected as i64],|r|Ok((r.get::<_,[u8;16]>(0)?,r.get::<_,i64>(1)?))).optional()?.ok_or(Error::Conflict)?;
-        (
-            SecretId::from_bytes(old).map_err(|_| Error::Corrupt("secret id"))?,
-            created_ms,
-        )
+        let current = lookup(tx, tenant, repo, name)
+            .map(Some)
+            .or_else(|e| match e {
+                Error::NotFound => Ok(None),
+                e => Err(e),
+            })?
+            .filter(|meta| meta.active && meta.version == expected)
+            .ok_or(Error::Conflict)?;
+        (current.id, current.created_ms)
     };
     let context = secret_context(
         tenant.as_bytes(),
@@ -325,13 +402,41 @@ pub fn put(
     );
     let sealed = key.seal(&context, value);
     if expected == 0 {
-        let inserted = tx.execute("INSERT INTO secrets(id,tenant_id,scope_repo_id,name,current_version,created_ms,updated_ms) VALUES(?1,?2,?3,?4,?5,?6,?6) ON CONFLICT DO NOTHING",params![id.as_bytes(),tenant.as_bytes(),repo.as_ref().map(RepoId::as_bytes),name,version as i64,now.0])?;
-        if inserted == 0 { return Err(Error::Conflict); }
-    } else if tx.execute("UPDATE secrets SET current_version=?2,updated_ms=?3 WHERE id=?1 AND current_version=?4 AND active=1",params![id.as_bytes(),version as i64,now.0,expected as i64])? != 1 { return Err(Error::Conflict); }
-    tx.execute(
+        let inserted = tx
+            .prepare_cached(
+                "INSERT INTO secrets(id,tenant_id,scope_repo_id,name,current_version,created_ms,updated_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?6) ON CONFLICT DO NOTHING",
+            )?
+            .execute(params![
+                id.as_bytes(),
+                tenant.as_bytes(),
+                repo.as_ref().map(RepoId::as_bytes),
+                name,
+                version as i64,
+                now.0
+            ])?;
+        if inserted == 0 {
+            return Err(Error::Conflict);
+        }
+    } else if tx
+        .prepare_cached(
+            "UPDATE secrets SET current_version=?2,updated_ms=?3
+             WHERE id=?1 AND current_version=?4 AND active=1",
+        )?
+        .execute(params![
+            id.as_bytes(),
+            version as i64,
+            now.0,
+            expected as i64
+        ])?
+        != 1
+    {
+        return Err(Error::Conflict);
+    }
+    tx.prepare_cached(
         "INSERT INTO secret_versions(secret_id,version,sealed,created_ms) VALUES(?1,?2,?3,?4)",
-        params![id.as_bytes(), version as i64, sealed, now.0],
-    )?;
+    )?
+    .execute(params![id.as_bytes(), version as i64, sealed, now.0])?;
     let meta = Metadata {
         id,
         tenant,
@@ -347,7 +452,7 @@ pub fn put(
         &meta,
         Audit {
             repo,
-            actor: Some(principal.user),
+            actor: Some(actor),
             attempt: None,
             action: if expected == 0 { "create" } else { "rotate" },
             result: "ok",
@@ -372,18 +477,40 @@ pub fn describe(
     lookup(conn, tenant, repo, name)
 }
 
+/// One name in one scope. Each scope has its own statement so each is served
+/// by its unique partial index (`secrets_tenant_name`, `secrets_repo_name`).
 fn lookup(
     conn: &Connection,
     tenant: TenantId,
     repo: Option<RepoId>,
     name: &str,
 ) -> Result<Metadata> {
-    let row=conn.query_row("SELECT id,tenant_id,scope_repo_id,name,current_version,active,created_ms,updated_ms FROM secrets WHERE tenant_id=?1 AND scope_repo_id IS ?2 AND name=?3",params![tenant.as_bytes(),repo.as_ref().map(RepoId::as_bytes),name],metadata_row).optional()?.ok_or(Error::NotFound)?;
-    decode(row)
+    let row = match repo {
+        None => conn
+            .prepare_cached(
+                "SELECT id,tenant_id,scope_repo_id,name,current_version,active,created_ms,updated_ms
+                 FROM secrets WHERE tenant_id=?1 AND scope_repo_id IS NULL AND name=?2",
+            )?
+            .query_row(params![tenant.as_bytes(), name], metadata_row)
+            .optional()?,
+        Some(repo) => conn
+            .prepare_cached(
+                "SELECT id,tenant_id,scope_repo_id,name,current_version,active,created_ms,updated_ms
+                 FROM secrets WHERE scope_repo_id=?1 AND name=?2 AND tenant_id=?3",
+            )?
+            .query_row(
+                params![repo.as_bytes(), name, tenant.as_bytes()],
+                metadata_row,
+            )
+            .optional()?,
+    };
+    decode(row.ok_or(Error::NotFound)?)
 }
 
 /// Keyset pagination by name. No ciphertext or value-derived fingerprint is
-/// read, even temporarily. At most 100 metadata records per call.
+/// read, even temporarily. At most 100 metadata records per call. A tenant
+/// page and a repository page each walk only their own partial index, never
+/// the other scope's names (P10S-11).
 pub fn list(
     conn: &Connection,
     principal: Principal,
@@ -395,23 +522,30 @@ pub fn list(
     if !(1..=100).contains(&limit) || after.len() > 64 {
         return Err(Error::InvalidInput("secret page"));
     }
-    let mut stmt=conn.prepare_cached("SELECT id,tenant_id,scope_repo_id,name,current_version,active,created_ms,updated_ms FROM secrets WHERE tenant_id=?1 AND scope_repo_id IS ?2 AND name>?3 ORDER BY name LIMIT ?4")?;
-    stmt.query_map(
-        params![
-            tenant.as_bytes(),
-            repo.as_ref().map(RepoId::as_bytes),
-            after,
-            limit
-        ],
-        metadata_row,
-    )?
-    .map(|r| decode(r?))
-    .collect()
+    let mut stmt = match repo {
+        None => conn.prepare_cached(
+            "SELECT id,tenant_id,scope_repo_id,name,current_version,active,created_ms,updated_ms
+             FROM secrets WHERE tenant_id=?1 AND scope_repo_id IS NULL AND name>?2
+             ORDER BY name LIMIT ?3",
+        )?,
+        Some(_) => conn.prepare_cached(
+            "SELECT id,tenant_id,scope_repo_id,name,current_version,active,created_ms,updated_ms
+             FROM secrets WHERE scope_repo_id=?1 AND name>?2 ORDER BY name LIMIT ?3",
+        )?,
+    };
+    let owner: &[u8; 16] = match &repo {
+        None => tenant.as_bytes(),
+        Some(repo) => repo.as_bytes(),
+    };
+    stmt.query_map(params![owner, after, limit], metadata_row)?
+        .map(|r| decode(r?))
+        .collect()
 }
 
-/// Allow a tenant secret in exactly one owned repository. Revoking the allow
-/// entry immediately makes its bindings unresolvable, even if they remain as
-/// metadata until explicitly removed.
+/// Allow (or stop allowing) a tenant secret in exactly one owned
+/// repository. Idempotent: setting the state it already has changes and
+/// audits nothing. Removing the allow entry removes its bindings in the
+/// same transaction, and resolution rechecks the allowlist anyway.
 pub fn allow_repo(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -422,30 +556,43 @@ pub fn allow_repo(
     now: UnixMillis,
 ) -> Result<()> {
     tenant_secret_admin(tx, principal, tenant)?;
+    if !name_valid(name) {
+        return Err(Error::InvalidInput("secret name"));
+    }
     let meta = lookup(tx, tenant, None, name)?;
     let owner: [u8; 16] = tx
-        .query_row(
-            "SELECT tenant_id FROM repos WHERE id=?1",
-            [repo.as_bytes()],
-            |r| r.get(0),
-        )
+        .prepare_cached("SELECT tenant_id FROM repos WHERE id=?1")?
+        .query_row([repo.as_bytes()], |r| r.get(0))
         .optional()?
         .ok_or(Error::NotFound)?;
     let owner = TenantId::from_bytes(owner).map_err(|_| Error::Corrupt("repo owner"))?;
     if owner != tenant {
         return Err(Error::NotFound);
     }
-    if allow {
-        tx.execute("INSERT INTO secret_repo_allow(secret_id,tenant_id,repo_id,granted_ms) VALUES(?1,?2,?3,?4) ON CONFLICT(secret_id,repo_id) DO NOTHING",params![meta.id.as_bytes(),tenant.as_bytes(),repo.as_bytes(),now.0])?;
+    let changed = if allow {
+        if !meta.active {
+            return Err(Error::NotFound);
+        }
+        tx.prepare_cached(
+            "INSERT INTO secret_repo_allow(secret_id,tenant_id,repo_id,granted_ms)
+             VALUES(?1,?2,?3,?4) ON CONFLICT(secret_id,repo_id) DO NOTHING",
+        )?
+        .execute(params![
+            meta.id.as_bytes(),
+            tenant.as_bytes(),
+            repo.as_bytes(),
+            now.0
+        ])?
     } else {
-        tx.execute(
-            "DELETE FROM secret_repo_allow WHERE secret_id=?1 AND repo_id=?2",
-            params![meta.id.as_bytes(), repo.as_bytes()],
-        )?;
-        tx.execute(
-            "DELETE FROM secret_bindings WHERE secret_id=?1 AND repo_id=?2",
-            params![meta.id.as_bytes(), repo.as_bytes()],
-        )?;
+        let removed = tx
+            .prepare_cached("DELETE FROM secret_repo_allow WHERE secret_id=?1 AND repo_id=?2")?
+            .execute(params![meta.id.as_bytes(), repo.as_bytes()])?;
+        tx.prepare_cached("DELETE FROM secret_bindings WHERE secret_id=?1 AND repo_id=?2")?
+            .execute(params![meta.id.as_bytes(), repo.as_bytes()])?;
+        removed
+    };
+    if changed == 0 {
+        return Ok(());
     }
     audit(
         tx,
@@ -459,6 +606,40 @@ pub fn allow_repo(
         },
         now,
     )
+}
+
+/// The repositories a tenant secret is allowed in: a keyset page by
+/// repository ID, at most 100. Readable by a tenant member or its
+/// administrator; names only, never a value.
+pub fn list_allowed(
+    conn: &Connection,
+    principal: Principal,
+    tenant: TenantId,
+    name: &str,
+    after: Option<RepoId>,
+    limit: u16,
+) -> Result<Vec<(RepoId, String)>> {
+    scope_owner(conn, principal, Scope::Tenant(tenant), false)?;
+    if !name_valid(name) || !(1..=100).contains(&limit) {
+        return Err(Error::InvalidInput("secret allowlist page"));
+    }
+    let meta = lookup(conn, tenant, None, name)?;
+    let after = after.map_or([0u8; 16], |repo| *repo.as_bytes());
+    let mut stmt = conn.prepare_cached(
+        "SELECT a.repo_id,r.name FROM secret_repo_allow a JOIN repos r ON r.id=a.repo_id
+         WHERE a.secret_id=?1 AND a.repo_id>?2 ORDER BY a.repo_id LIMIT ?3",
+    )?;
+    stmt.query_map(params![meta.id.as_bytes(), after, limit], |r| {
+        Ok((r.get::<_, [u8; 16]>(0)?, r.get::<_, String>(1)?))
+    })?
+    .map(|row| {
+        let (id, name) = row?;
+        Ok((
+            RepoId::from_bytes(id).map_err(|_| Error::Corrupt("repo id"))?,
+            name,
+        ))
+    })
+    .collect()
 }
 
 /// Permanently disable a secret and every retained version. Its name is
@@ -503,6 +684,8 @@ pub fn delete(
 
 /// Revoke one historical version without changing the current number. A
 /// revoked current version makes resolution fail until a fresh rotation.
+/// Idempotent: revoking an already revoked version changes and audits
+/// nothing; a version that never existed is `NotFound`.
 pub fn revoke_version(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -512,16 +695,21 @@ pub fn revoke_version(
     now: UnixMillis,
 ) -> Result<()> {
     let (tenant, repo) = scope_owner(tx, principal, scope, true)?;
+    if !name_valid(name) || version == 0 || version > i64::MAX as u64 {
+        return Err(Error::InvalidInput("secret name or version"));
+    }
     let mut meta = lookup(tx, tenant, repo, name)?;
-    if !meta.active || version == 0 || version > i64::MAX as u64 {
+    if !meta.active || version > meta.version {
         return Err(Error::NotFound);
     }
-    if tx.execute(
-        "UPDATE secret_versions SET revoked=1 WHERE secret_id=?1 AND version=?2 AND revoked=0",
-        params![meta.id.as_bytes(), version as i64],
-    )? != 1
+    if tx
+        .prepare_cached(
+            "UPDATE secret_versions SET revoked=1 WHERE secret_id=?1 AND version=?2 AND revoked=0",
+        )?
+        .execute(params![meta.id.as_bytes(), version as i64])?
+        != 1
     {
-        return Err(Error::NotFound);
+        return Ok(());
     }
     meta.version = version;
     audit(
@@ -548,6 +736,48 @@ pub fn bind(
     now: UnixMillis,
 ) -> Result<()> {
     let tenant = auth::require_repo(tx, principal, binding.repo, Permissions::WRITE_SECRETS)?;
+    bind_owned(tx, principal.user, tenant, binding, now)
+}
+
+/// [`bind`] by name: the source is the repository's own secret of that name,
+/// or with `from_tenant` the tenant secret, which must be allowlisted for the
+/// repository. A missing or foreign source is `NotFound`.
+#[allow(clippy::too_many_arguments)]
+pub fn bind_named(
+    tx: &Transaction<'_>,
+    principal: Principal,
+    repo: RepoId,
+    job: &str,
+    step: &str,
+    name: &str,
+    from_tenant: bool,
+    override_tenant: bool,
+    now: UnixMillis,
+) -> Result<Binding> {
+    let tenant = auth::require_repo(tx, principal, repo, Permissions::WRITE_SECRETS)?;
+    if !name_valid(name) {
+        return Err(Error::InvalidInput("secret binding"));
+    }
+    let source = lookup(tx, tenant, (!from_tenant).then_some(repo), name)?;
+    let binding = Binding {
+        repo,
+        job: job.to_owned(),
+        step: step.to_owned(),
+        name: name.to_owned(),
+        secret: source.id,
+        override_tenant,
+    };
+    bind_owned(tx, principal.user, tenant, &binding, now)?;
+    Ok(binding)
+}
+
+fn bind_owned(
+    tx: &Transaction<'_>,
+    actor: UserId,
+    tenant: TenantId,
+    binding: &Binding,
+    now: UnixMillis,
+) -> Result<()> {
     if !name_valid(&binding.name)
         || !selector_valid(&binding.job)
         || !selector_valid(&binding.step)
@@ -555,7 +785,14 @@ pub fn bind(
     {
         return Err(Error::InvalidInput("secret binding"));
     }
-    let row=tx.query_row("SELECT id,tenant_id,scope_repo_id,name,current_version,active,created_ms,updated_ms FROM secrets WHERE id=?1",[binding.secret.as_bytes()],metadata_row).optional()?.ok_or(Error::NotFound)?;
+    let row = tx
+        .prepare_cached(
+            "SELECT id,tenant_id,scope_repo_id,name,current_version,active,created_ms,updated_ms
+             FROM secrets WHERE id=?1",
+        )?
+        .query_row([binding.secret.as_bytes()], metadata_row)
+        .optional()?
+        .ok_or(Error::NotFound)?;
     let meta = decode(row)?;
     if meta.tenant != tenant
         || !meta.active
@@ -565,12 +802,7 @@ pub fn bind(
         return Err(Error::NotFound);
     }
     if meta.repo.is_none() {
-        let allowed: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM secret_repo_allow WHERE secret_id=?1 AND repo_id=?2)",
-            params![meta.id.as_bytes(), binding.repo.as_bytes()],
-            |r| r.get(0),
-        )?;
-        if !allowed || binding.override_tenant {
+        if !allowed_in(tx, meta.id, binding.repo)? || binding.override_tenant {
             return Err(Error::NotFound);
         }
         if tenant_name_exists_repo(tx, binding.repo, &binding.name)? {
@@ -581,22 +813,35 @@ pub fn bind(
     {
         return Err(Error::Conflict);
     }
-    tx.execute(
+    tx.prepare_cached(
         "DELETE FROM secret_bindings WHERE repo_id=?1 AND job=?2 AND step=?3 AND name=?4",
-        params![
-            binding.repo.as_bytes(),
-            binding.job,
-            binding.step,
-            binding.name
-        ],
-    )?;
-    tx.execute("INSERT INTO secret_bindings(tenant_id,repo_id,job,step,name,secret_id,override_tenant,created_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![tenant.as_bytes(),binding.repo.as_bytes(),binding.job,binding.step,binding.name,meta.id.as_bytes(),binding.override_tenant,now.0])?;
+    )?
+    .execute(params![
+        binding.repo.as_bytes(),
+        binding.job,
+        binding.step,
+        binding.name
+    ])?;
+    tx.prepare_cached(
+        "INSERT INTO secret_bindings(tenant_id,repo_id,job,step,name,secret_id,override_tenant,created_ms)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+    )?
+    .execute(params![
+        tenant.as_bytes(),
+        binding.repo.as_bytes(),
+        binding.job,
+        binding.step,
+        binding.name,
+        meta.id.as_bytes(),
+        binding.override_tenant,
+        now.0
+    ])?;
     audit(
         tx,
         &meta,
         Audit {
             repo: Some(binding.repo),
-            actor: Some(principal.user),
+            actor: Some(actor),
             attempt: None,
             action: "bind",
             result: "ok",
@@ -605,6 +850,8 @@ pub fn bind(
     )
 }
 
+/// Remove one binding. Idempotent: removing a binding that does not exist
+/// changes and audits nothing, so a retried unbind is not an error.
 pub fn unbind(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -618,13 +865,29 @@ pub fn unbind(
     if !name_valid(name) || !selector_valid(job) || !selector_valid(step) {
         return Err(Error::InvalidInput("secret binding"));
     }
-    let secret=tx.query_row("SELECT secret_id FROM secret_bindings WHERE repo_id=?1 AND job=?2 AND step=?3 AND name=?4",params![repo.as_bytes(),job,step,name],|r|r.get::<_,[u8;16]>(0)).optional()?.ok_or(Error::NotFound)?;
+    let Some(secret) = tx
+        .prepare_cached(
+            "SELECT secret_id FROM secret_bindings WHERE repo_id=?1 AND job=?2 AND step=?3 AND name=?4",
+        )?
+        .query_row(params![repo.as_bytes(), job, step, name], |r| {
+            r.get::<_, [u8; 16]>(0)
+        })
+        .optional()?
+    else {
+        return Ok(());
+    };
     let secret = SecretId::from_bytes(secret).map_err(|_| Error::Corrupt("secret id"))?;
-    let meta=decode(tx.query_row("SELECT id,tenant_id,scope_repo_id,name,current_version,active,created_ms,updated_ms FROM secrets WHERE id=?1",[secret.as_bytes()],metadata_row)?)?;
-    tx.execute(
-        "DELETE FROM secret_bindings WHERE repo_id=?1 AND job=?2 AND step=?3 AND name=?4",
-        params![repo.as_bytes(), job, step, name],
+    let meta = decode(
+        tx.prepare_cached(
+            "SELECT id,tenant_id,scope_repo_id,name,current_version,active,created_ms,updated_ms
+             FROM secrets WHERE id=?1",
+        )?
+        .query_row([secret.as_bytes()], metadata_row)?,
     )?;
+    tx.prepare_cached(
+        "DELETE FROM secret_bindings WHERE repo_id=?1 AND job=?2 AND step=?3 AND name=?4",
+    )?
+    .execute(params![repo.as_bytes(), job, step, name])?;
     audit(
         tx,
         &meta,
@@ -678,13 +941,57 @@ pub fn list_bindings(
     .collect()
 }
 
+fn allowed_in(conn: &Connection, secret: SecretId, repo: RepoId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM secret_repo_allow WHERE secret_id=?1 AND repo_id=?2)",
+        )?
+        .query_row(params![secret.as_bytes(), repo.as_bytes()], |r| r.get(0))?)
+}
+
 fn tenant_name_exists(
     conn: &Connection,
     tenant: TenantId,
     repo: RepoId,
     name: &str,
 ) -> Result<bool> {
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM secrets s JOIN secret_repo_allow a ON a.secret_id=s.id AND a.repo_id=?2 WHERE s.tenant_id=?1 AND s.scope_repo_id IS NULL AND s.name=?3 AND s.active=1)",params![tenant.as_bytes(),repo.as_bytes(),name],|r|r.get(0))?)
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM secrets s JOIN secret_repo_allow a ON a.secret_id=s.id AND a.repo_id=?2
+             WHERE s.tenant_id=?1 AND s.scope_repo_id IS NULL AND s.name=?3 AND s.active=1)",
+        )?
+        .query_row(
+            params![tenant.as_bytes(), repo.as_bytes(), name],
+            |r| r.get(0),
+        )?)
+}
+
+fn tenant_name_exists_repo(conn: &Connection, repo: RepoId, name: &str) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM secrets WHERE scope_repo_id=?1 AND name=?2 AND active=1)",
+        )?
+        .query_row(params![repo.as_bytes(), name], |r| r.get(0))?)
+}
+
+/// Why resolution refused a target, carried out of a failed preparation so
+/// the refusal can be audited (P10S-6). IDs only; never a value.
+struct Refused {
+    secret: Option<SecretId>,
+    version: u64,
+    /// `denied`: a binding exists but policy refuses it (ambiguity, removed
+    /// allowlist). `missing`: no binding, or its version or secret is gone.
+    denied: bool,
+}
+
+impl Refused {
+    fn error(&self) -> Error {
+        if self.denied {
+            Error::Conflict
+        } else {
+            Error::NotFound
+        }
+    }
 }
 
 /// Return the current version identity selected by exact step, job, then repo
@@ -696,54 +1003,90 @@ pub fn resolve(
     step: &str,
     name: &str,
 ) -> Result<Resolved> {
+    resolve_detail(conn, repo, job, step, name)?.map_err(|refused| refused.error())
+}
+
+type BindingRow = ([u8; 16], [u8; 16], Option<[u8; 16]>, i64, bool, bool, bool);
+
+fn resolve_detail(
+    conn: &Connection,
+    repo: RepoId,
+    job: &str,
+    step: &str,
+    name: &str,
+) -> Result<std::result::Result<Resolved, Refused>> {
     if !name_valid(name) || !selector_valid(job) || !selector_valid(step) || job.is_empty() {
         return Err(Error::InvalidInput("secret selector"));
     }
-    let row=conn.query_row("SELECT s.id,s.tenant_id,s.scope_repo_id,s.current_version,s.active,b.override_tenant,EXISTS(SELECT 1 FROM secret_versions v WHERE v.secret_id=s.id AND v.version=s.current_version AND v.revoked=0) FROM secret_bindings b JOIN secrets s ON s.id=b.secret_id JOIN repos r ON r.id=b.repo_id AND r.tenant_id=b.tenant_id JOIN tenants t ON t.id=r.tenant_id AND t.active=1 WHERE b.repo_id=?1 AND b.name=?2 AND (b.job=?3 OR b.job='') AND (b.step=?4 OR b.step='') ORDER BY (b.job=?3) DESC,(b.step=?4 AND b.step!='') DESC LIMIT 1",params![repo.as_bytes(),name,job,step],|r|Ok((r.get::<_,[u8;16]>(0)?,r.get::<_,[u8;16]>(1)?,r.get::<_,Option<[u8;16]>>(2)?,r.get::<_,i64>(3)?,r.get::<_,bool>(4)?,r.get::<_,bool>(5)?,r.get::<_,bool>(6)?))).optional()?.ok_or(Error::NotFound)?;
+    let row: Option<BindingRow> = conn
+        .prepare_cached(
+            "SELECT s.id,s.tenant_id,s.scope_repo_id,s.current_version,s.active,b.override_tenant,
+                    EXISTS(SELECT 1 FROM secret_versions v WHERE v.secret_id=s.id
+                           AND v.version=s.current_version AND v.revoked=0)
+             FROM secret_bindings b JOIN secrets s ON s.id=b.secret_id
+             JOIN repos r ON r.id=b.repo_id AND r.tenant_id=b.tenant_id
+             JOIN tenants t ON t.id=r.tenant_id AND t.active=1
+             WHERE b.repo_id=?1 AND b.name=?2 AND (b.job=?3 OR b.job='') AND (b.step=?4 OR b.step='')
+             ORDER BY (b.job=?3) DESC,(b.step=?4 AND b.step!='') DESC LIMIT 1",
+        )?
+        .query_row(params![repo.as_bytes(), name, job, step], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(Err(Refused {
+            secret: None,
+            version: 0,
+            denied: false,
+        }));
+    };
     let id = SecretId::from_bytes(row.0).map_err(|_| Error::Corrupt("secret id"))?;
     let tenant = TenantId::from_bytes(row.1).map_err(|_| Error::Corrupt("secret tenant"))?;
+    let version = row.3 as u64;
+    let refused = |denied| {
+        Ok(Err(Refused {
+            secret: Some(id),
+            version,
+            denied,
+        }))
+    };
     let scope = if let Some(bytes) = row.2 {
         Scope::Repo(RepoId::from_bytes(bytes).map_err(|_| Error::Corrupt("secret repo"))?)
     } else {
         Scope::Tenant(tenant)
     };
     if !row.4 {
-        return Err(Error::NotFound);
+        return refused(false);
     }
     match scope {
         Scope::Tenant(_) => {
-            let allowed: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM secret_repo_allow WHERE secret_id=?1 AND repo_id=?2)",
-                params![id.as_bytes(), repo.as_bytes()],
-                |r| r.get(0),
-            )?;
-            if !allowed || tenant_name_exists_repo(conn, repo, name)? {
-                return Err(Error::Conflict);
+            if !allowed_in(conn, id, repo)? || tenant_name_exists_repo(conn, repo, name)? {
+                return refused(true);
             }
         }
         Scope::Repo(_) => {
             if !row.5 && tenant_name_exists(conn, tenant, repo, name)? {
-                return Err(Error::Conflict);
+                return refused(true);
             }
         }
     }
     if !row.6 {
-        return Err(Error::NotFound);
+        return refused(false);
     }
-    Ok(Resolved {
+    Ok(Ok(Resolved {
         secret: id,
-        version: row.3 as u64,
+        version,
         scope,
         name: name.to_owned(),
-    })
-}
-
-fn tenant_name_exists_repo(conn: &Connection, repo: RepoId, name: &str) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM secrets WHERE scope_repo_id=?1 AND name=?2 AND active=1)",
-        params![repo.as_bytes(), name],
-        |r| r.get(0),
-    )?)
+    }))
 }
 
 /// Record actual use only inside the same writer transaction as the
@@ -755,25 +1098,176 @@ pub fn audit_use(
     resolved: &Resolved,
     now: UnixMillis,
 ) -> Result<()> {
-    let (tenant,repo,job):([u8;16],[u8;16],String)=tx.query_row("SELECT a.tenant_id,r.repo_id,j.name FROM attempts a JOIN jobs j ON j.id=a.job_id AND j.tenant_id=a.tenant_id JOIN runs r ON r.id=j.run_id AND r.tenant_id=j.tenant_id WHERE a.id=?1",[attempt.as_bytes()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or(Error::NotFound)?;
+    let (tenant, repo, job): ([u8; 16], [u8; 16], String) = tx
+        .prepare_cached(
+            "SELECT a.tenant_id,r.repo_id,j.name FROM attempts a
+             JOIN jobs j ON j.id=a.job_id AND j.tenant_id=a.tenant_id
+             JOIN runs r ON r.id=j.run_id AND r.tenant_id=j.tenant_id WHERE a.id=?1",
+        )?
+        .query_row([attempt.as_bytes()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?
+        .ok_or(Error::NotFound)?;
     let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("attempt tenant"))?;
     let repo = RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("attempt repo"))?;
     if resolve(tx, repo, &job, step, &resolved.name)? != *resolved {
         return Err(Error::Conflict);
     }
-    tx.execute("INSERT INTO secret_audit(tenant_id,repo_id,secret_id,version,actor,attempt_id,step,action,result,at_ms) VALUES(?1,?2,?3,?4,NULL,?5,?6,'use','ok',?7)",params![tenant.as_bytes(),repo.as_bytes(),resolved.secret.as_bytes(),resolved.version as i64,attempt.as_bytes(),step,now.0])?;
+    record_use(tx, tenant, repo, attempt, step, resolved, now)
+}
+
+/// The use row for a target the caller resolved in this same transaction.
+fn record_use(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    repo: RepoId,
+    attempt: AttemptId,
+    step: &str,
+    resolved: &Resolved,
+    now: UnixMillis,
+) -> Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO secret_audit(tenant_id,repo_id,secret_id,version,actor,attempt_id,step,action,result,at_ms)
+         VALUES(?1,?2,?3,?4,NULL,?5,?6,'use','ok',?7)",
+    )?
+    .execute(params![
+        tenant.as_bytes(),
+        repo.as_bytes(),
+        resolved.secret.as_bytes(),
+        resolved.version as i64,
+        attempt.as_bytes(),
+        step,
+        now.0
+    ])?;
     Ok(())
+}
+
+/// A target an attempt was refused, recorded after its preparation rolled
+/// back: tenant, repository, attempt, step, the name and whatever secret
+/// ID and version were resolved. Never a value.
+struct Refusal {
+    tenant: TenantId,
+    repo: RepoId,
+    step: String,
+    name: String,
+    refused: Refused,
 }
 
 /// Resolve and open only the declared targets of the acknowledged attempt's
 /// durable spec. The writer transaction serializes this fence/capability
 /// check with revocation, binding changes, version rotation and the use audit.
+///
+/// A target refused by policy (no binding, an ambiguous name, a removed
+/// allowlist entry, a revoked current version) fails the preparation. The
+/// caller's transaction then rolls back; [`deliver`] instead commits one
+/// `use` audit row with result `denied` or `missing` for the refused target.
 pub fn prepare_delivery(
     tx: &Transaction<'_>,
     key: &Key,
     worker: WorkerId,
     attempt: AttemptId,
     now: UnixMillis,
+) -> Result<PreparedDelivery> {
+    prepare_recorded(tx, key, worker, attempt, now)?
+}
+
+/// Prepare an attempt's delivery in one writer transaction. A policy refusal
+/// commits only its audit row: the preparation's own writes are rolled back
+/// to a savepoint first, so no `use` row survives a refused attempt.
+pub fn deliver(
+    store: &Store,
+    key: Arc<Key>,
+    worker: WorkerId,
+    attempt: AttemptId,
+    now: UnixMillis,
+) -> Result<PreparedDelivery> {
+    store
+        .writer()
+        .write(move |tx| prepare_recorded(tx, &key, worker, attempt, now))?
+}
+
+fn prepare_recorded(
+    tx: &Transaction<'_>,
+    key: &Key,
+    worker: WorkerId,
+    attempt: AttemptId,
+    now: UnixMillis,
+) -> Result<Result<PreparedDelivery>> {
+    tx.execute_batch("SAVEPOINT secret_delivery")?;
+    let mut refusal = None;
+    match prepare(tx, key, worker, attempt, now, &mut refusal) {
+        Ok(prepared) => {
+            tx.execute_batch("RELEASE secret_delivery")?;
+            Ok(Ok(prepared))
+        }
+        Err(error) => {
+            tx.execute_batch("ROLLBACK TO secret_delivery; RELEASE secret_delivery")?;
+            if let Some(refusal) = refusal {
+                tx.prepare_cached(
+                    "INSERT INTO secret_audit(tenant_id,repo_id,secret_id,name,version,actor,attempt_id,step,action,result,at_ms)
+                     VALUES(?1,?2,?3,?4,?5,NULL,?6,?7,'use',?8,?9)",
+                )?
+                .execute(params![
+                    refusal.tenant.as_bytes(),
+                    refusal.repo.as_bytes(),
+                    refusal.refused.secret.as_ref().map(SecretId::as_bytes),
+                    refusal.name,
+                    refusal.refused.version as i64,
+                    attempt.as_bytes(),
+                    refusal.step,
+                    if refusal.refused.denied {
+                        "denied"
+                    } else {
+                        "missing"
+                    },
+                    now.0
+                ])?;
+            }
+            Ok(Err(error))
+        }
+    }
+}
+
+/// A heap buffer wiped when dropped, for postcard output holding values.
+struct Wiped(Vec<u8>);
+
+impl Drop for Wiped {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        core::hint::black_box(&mut self.0);
+    }
+}
+
+/// Encode into a buffer sized once, so no reallocation frees an unwiped
+/// copy of already-serialized values (P10S-8).
+fn encode_bundle(
+    bundle: &sentinel_protocol::secrets::DeliveryBundle,
+) -> Result<sentinel_protocol::secrets::SecretBytes> {
+    let size = postcard::experimental::serialized_size(bundle)
+        .map_err(|_| Error::Corrupt("secret delivery encoding"))?;
+    if size > sentinel_protocol::secrets::MAX_DELIVERY_BYTES {
+        return Err(Error::InvalidInput("secret delivery size"));
+    }
+    let mut buffer = Wiped(vec![0; size]);
+    let written = postcard::to_slice(bundle, &mut buffer.0)
+        .map_err(|_| Error::Corrupt("secret delivery encoding"))?
+        .len();
+    if written != size {
+        return Err(Error::Corrupt("secret delivery encoding"));
+    }
+    Ok(sentinel_protocol::secrets::SecretBytes::new(
+        std::mem::take(&mut buffer.0),
+    ))
+}
+
+fn prepare(
+    tx: &Transaction<'_>,
+    key: &Key,
+    worker: WorkerId,
+    attempt: AttemptId,
+    now: UnixMillis,
+    refusal: &mut Option<Refusal>,
 ) -> Result<PreparedDelivery> {
     use sentinel_protocol::secrets::{DeliveryBundle, DeliveryTarget, DeliveryValue, TargetKind};
 
@@ -793,9 +1287,11 @@ pub fn prepare_delivery(
         .optional()?
         .ok_or(Error::NotFound)?;
     let (repo, job_name): ([u8; 16], String) = tx
-        .query_row(
+        .prepare_cached(
             "SELECT r.repo_id,j.name FROM jobs j JOIN runs r ON r.id=j.run_id
              WHERE j.id=?1 AND j.tenant_id=?2 AND r.tenant_id=?2 AND r.id=?3",
+        )?
+        .query_row(
             params![job.as_bytes(), tenant.as_bytes(), run.as_bytes()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -820,10 +1316,7 @@ pub fn prepare_delivery(
     {
         return Ok(PreparedDelivery {
             fence: Fence(fence as u64),
-            encoded: sentinel_protocol::secrets::SecretBytes::new(
-                postcard::to_allocvec(&DeliveryBundle::empty())
-                    .map_err(|_| Error::Corrupt("secret delivery encoding"))?,
-            ),
+            encoded: encode_bundle(&DeliveryBundle::empty())?,
         });
     }
     let (protocol, capabilities): (i64, i64) = tx
@@ -839,6 +1332,25 @@ pub fn prepare_delivery(
         return Err(Error::Forbidden);
     }
 
+    // Resolve one declared target; a policy refusal is remembered for the
+    // audit and fails the preparation.
+    let mut resolve_target = |step: &str, name: &str| -> Result<Resolved> {
+        match resolve_detail(tx, repo, &job_name, step, name)? {
+            Ok(resolved) => Ok(resolved),
+            Err(refused) => {
+                let error = refused.error();
+                *refusal = Some(Refusal {
+                    tenant,
+                    repo,
+                    step: step.to_owned(),
+                    name: name.to_owned(),
+                    refused,
+                });
+                Err(error)
+            }
+        }
+    };
+
     let mut bundle = DeliveryBundle {
         values: Vec::with_capacity(compiled.spec.secrets.len().min(16)),
         targets: Vec::new(),
@@ -846,7 +1358,7 @@ pub fn prepare_delivery(
     let mut value_indices: std::collections::HashMap<(SecretId, u64), u16> =
         std::collections::HashMap::with_capacity(compiled.spec.secrets.len().min(16));
     if let Some(name) = &compiled.spec.registry_auth {
-        let resolved = resolve(tx, repo, &job_name, "", name)?;
+        let resolved = resolve_target("", name)?;
         let identity = (resolved.secret, resolved.version);
         let value_index = match value_indices.get(&identity) {
             Some(index) => *index,
@@ -865,7 +1377,7 @@ pub fn prepare_delivery(
                 index
             }
         };
-        audit_use(tx, attempt, "", &resolved, now)?;
+        record_use(tx, tenant, repo, attempt, "", &resolved, now)?;
         bundle.targets.push(DeliveryTarget {
             step: 0,
             name: name.clone(),
@@ -877,13 +1389,13 @@ pub fn prepare_delivery(
         }
     }
     for (step_index, step) in compiled.spec.steps.iter().enumerate() {
-        let mut step_values: Vec<(String, Resolved, u16)> = Vec::new();
+        let mut step_values: Vec<(String, u16)> = Vec::new();
         let mut target = |name: &str, kind: TargetKind| -> Result<()> {
-            let cached = step_values.iter().find(|(existing, _, _)| existing == name);
-            let value_index = if let Some((_, _, index)) = cached {
+            let cached = step_values.iter().find(|(existing, _)| existing == name);
+            let value_index = if let Some((_, index)) = cached {
                 *index
             } else {
-                let resolved = resolve(tx, repo, &job_name, &step.id, name)?;
+                let resolved = resolve_target(&step.id, name)?;
                 let identity = (resolved.secret, resolved.version);
                 let value_index = match value_indices.get(&identity) {
                     Some(index) => *index,
@@ -902,8 +1414,8 @@ pub fn prepare_delivery(
                         index
                     }
                 };
-                audit_use(tx, attempt, &step.id, &resolved, now)?;
-                step_values.push((name.to_owned(), resolved.clone(), value_index));
+                record_use(tx, tenant, repo, attempt, &step.id, &resolved, now)?;
+                step_values.push((name.to_owned(), value_index));
                 value_index
             };
             if bundle.targets.len() >= sentinel_protocol::secrets::MAX_DELIVERY_TARGETS {
@@ -935,15 +1447,9 @@ pub fn prepare_delivery(
     if !bundle.valid() {
         return Err(Error::Corrupt("secret delivery bundle"));
     }
-    let encoded = sentinel_protocol::secrets::SecretBytes::new(
-        postcard::to_allocvec(&bundle).map_err(|_| Error::Corrupt("secret delivery encoding"))?,
-    );
-    if encoded.len() > sentinel_protocol::secrets::MAX_DELIVERY_BYTES {
-        return Err(Error::InvalidInput("secret delivery size"));
-    }
     Ok(PreparedDelivery {
         fence: Fence(fence as u64),
-        encoded,
+        encoded: encode_bundle(&bundle)?,
     })
 }
 
@@ -953,11 +1459,13 @@ type StoredSecretVersion = ([u8; 16], Option<[u8; 16]>, String, i64, bool, Vec<u
 
 fn open_value(conn: &Connection, key: &Key, resolved: &Resolved) -> Result<Vec<u8>> {
     let row: Option<StoredSecretVersion> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT s.tenant_id,s.scope_repo_id,s.name,s.current_version,s.active,
                     v.sealed,v.revoked
              FROM secrets s JOIN secret_versions v ON v.secret_id=s.id
              WHERE s.id=?1 AND v.version=?2",
+        )?
+        .query_row(
             params![resolved.secret.as_bytes(), resolved.version as i64],
             |row| {
                 Ok((

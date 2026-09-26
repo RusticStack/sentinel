@@ -12,7 +12,7 @@ use sentinel_protocol::source::{Access, Binding, Credential};
 
 use crate::registration::Authority;
 
-fn context(tenant: TenantId, repo: RepoId, version: u64) -> [u8; 48] {
+pub(crate) fn context(tenant: TenantId, repo: RepoId, version: u64) -> [u8; 48] {
     let mut out = [0; 48];
     out[..8].copy_from_slice(b"source01");
     out[8..24].copy_from_slice(tenant.as_bytes());
