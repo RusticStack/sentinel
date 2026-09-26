@@ -454,8 +454,9 @@ fn secret_http_writes_are_versioned_idempotent_and_metadata_only() {
         ("idempotency-key", "create-access-token"),
     ];
     let (status, conflict) = call_bytes(&d, "PUT", path, b"different-secret", &auth, &changed);
-    assert_eq!(status, 409);
-    assert_eq!(conflict["code"], "conflict");
+    // P10C-9: key reuse is the client's bug, not someone else's rotation.
+    assert_eq!(status, 422);
+    assert_eq!(conflict["code"], "idempotency_mismatch");
     assert!(
         !serde_json::to_string(&conflict)
             .unwrap()
@@ -3195,4 +3196,546 @@ fn an_active_session_outlives_its_first_idle_deadline() {
     // Idle for a whole window: gone.
     at(14_700);
     assert_eq!(me(), 401);
+}
+
+/// A human with its own `sntl_` credential of `permissions`; a member of
+/// `acme` with `role` when given one.
+fn person(
+    d: &Deployment,
+    name: &'static str,
+    role: Option<sentinel_core::auth::Role>,
+    permissions: P,
+) -> (UserId, String) {
+    let (root, tenant) = (d.root, d.tenant);
+    let user = UserId::new();
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            provisioning::insert_human(tx, user, name, false, now)?;
+            if let Some(role) = role {
+                auth::set_membership(
+                    tx,
+                    Principal::new(root, P::ALL, None, None),
+                    tenant,
+                    user,
+                    role,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let granted = tokens::provision(&d.store, Grant::new(user, name, permissions), now).unwrap();
+    (
+        user,
+        format!("Bearer {}", sentinel_auth::token::format(&granted.secret)),
+    )
+}
+
+/// A second tenant `globex` with repository `hidden`, administered by root
+/// but not joined by anyone else.
+fn globex(d: &Deployment) -> (TenantId, RepoId) {
+    let (root, globex, hidden) = (d.root, TenantId::new(), RepoId::new());
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            let admin = Principal::new(root, P::ALL, None, None);
+            auth::create_namespace(
+                tx,
+                admin,
+                globex,
+                Namespace::parse("globex").unwrap(),
+                NamespaceKind::Organization,
+                now,
+            )?;
+            auth::set_membership(
+                tx,
+                admin,
+                globex,
+                root,
+                sentinel_core::auth::Role::TenantAdmin,
+            )?;
+            auth::create_repo(tx, admin, globex, hidden, "hidden", now)
+        })
+        .unwrap();
+    (globex, hidden)
+}
+
+fn status_code(reply: (u16, serde_json::Value)) -> (u16, String) {
+    (reply.0, reply.1["code"].as_str().unwrap_or("").to_owned())
+}
+
+/// P10S-3: for every secret route and every request shape (valid, bad page,
+/// empty body, bad If-Match), a foreign tenant answers exactly as a missing
+/// one, and a repository the caller cannot see exactly as a missing one.
+#[test]
+fn a_foreign_tenant_or_repo_is_not_found_on_every_secret_route() {
+    let d = deployment();
+    globex(&d);
+    let (_, auth) = person(
+        &d,
+        "member",
+        Some(sentinel_core::auth::Role::Reader),
+        P::READ.union(P::WRITE_SECRETS),
+    );
+    let requests: &[(&str, &str, &[u8], &[(&str, &str)])] = &[
+        ("GET", "secrets?limit=0", b"", &[]),
+        ("GET", "secrets", b"", &[]),
+        ("GET", "secrets/TOKEN", b"", &[]),
+        (
+            "PUT",
+            "secrets/TOKEN",
+            b"",
+            &[("if-match", "0"), ("idempotency-key", "k")],
+        ),
+        (
+            "PUT",
+            "secrets/TOKEN",
+            b"v",
+            &[("if-match", "x"), ("idempotency-key", "k")],
+        ),
+        (
+            "PUT",
+            "secrets/TOKEN",
+            b"v",
+            &[("if-match", "0"), ("idempotency-key", "k")],
+        ),
+        (
+            "DELETE",
+            "secrets/TOKEN",
+            b"",
+            &[("if-match", "1"), ("idempotency-key", "k")],
+        ),
+        (
+            "POST",
+            "secrets/import",
+            b"A=1\n",
+            &[("if-match", "A=0"), ("idempotency-key", "k")],
+        ),
+        (
+            "POST",
+            "secrets/import",
+            b"A=\n",
+            &[("if-match", "A=0"), ("idempotency-key", "k")],
+        ),
+        ("GET", "secrets/TOKEN/allow", b"", &[]),
+        ("POST", "secrets/TOKEN/versions/1/revoke", b"", &[]),
+        ("GET", "secret-bindings?limit=0", b"", &[]),
+        ("PUT", "secret-bindings/TOKEN", b"", &[]),
+        ("DELETE", "secret-bindings/TOKEN", b"", &[]),
+    ];
+    let send = |method: &str, path: &str, body: &[u8], headers: &[(&str, &str)]| {
+        status_code(match method {
+            "GET" => call(&d, "GET", path, None, Some(&auth), headers),
+            _ => call_bytes(&d, method, path, body, &auth, headers),
+        })
+    };
+    let with_repo = |path: &str, repo: &str| {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        format!("{path}{sep}repo={repo}")
+    };
+    for (method, path, body, headers) in requests {
+        let foreign = send(
+            method,
+            &format!("/api/v1/tenants/globex/{path}"),
+            body,
+            headers,
+        );
+        let missing = send(
+            method,
+            &format!("/api/v1/tenants/nope/{path}"),
+            body,
+            headers,
+        );
+        assert_eq!(foreign, missing, "{method} {path}");
+        // `widget` exists in acme but this member holds no grant on it.
+        let base = format!("/api/v1/tenants/acme/{path}");
+        let hidden = send(method, &with_repo(&base, "widget"), body, headers);
+        let absent = send(method, &with_repo(&base, "no-such-repo"), body, headers);
+        assert_eq!(hidden, absent, "{method} {path} ?repo");
+        let foreign_repo = send(
+            method,
+            &with_repo(&format!("/api/v1/tenants/globex/{path}"), "hidden"),
+            body,
+            headers,
+        );
+        let missing_repo = send(
+            method,
+            &with_repo(&format!("/api/v1/tenants/nope/{path}"), "hidden"),
+            body,
+            headers,
+        );
+        assert_eq!(foreign_repo, missing_repo, "{method} {path} foreign repo");
+    }
+}
+
+/// P10S-2: allowlists, bindings, unbinding, binding listing and single
+/// version revocation are served over HTTP under their scopes, idempotently,
+/// and refuse another tenant, another repository and a read-only scope.
+#[test]
+fn secret_bindings_allowlists_and_revocation_are_served_over_http() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let put = |path: &str, body: &[u8], key: &str, version: &str| {
+        call_bytes(
+            &d,
+            "PUT",
+            path,
+            body,
+            &auth,
+            &[("if-match", version), ("idempotency-key", key)],
+        )
+    };
+    assert_eq!(
+        put(
+            "/api/v1/tenants/acme/secrets/SHARED",
+            b"shared-v1",
+            "s1",
+            "0"
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        put(
+            "/api/v1/tenants/acme/secrets/OWN?repo=app",
+            b"own-v1",
+            "o1",
+            "0"
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        put(
+            "/api/v1/tenants/acme/secrets/OWN?repo=app",
+            b"own-v2",
+            "o2",
+            "1"
+        )
+        .0,
+        200
+    );
+
+    // Not yet allowlisted: a tenant source cannot be bound.
+    let bind_shared = "/api/v1/tenants/acme/secret-bindings/SHARED?repo=app&job=build";
+    let tenant_source = br#"{"from_tenant":true}"#;
+    assert_eq!(
+        call_bytes(&d, "PUT", bind_shared, tenant_source, &auth, &[]).0,
+        404
+    );
+    for _ in 0..2 {
+        let (status, allowed) = call_bytes(
+            &d,
+            "PUT",
+            "/api/v1/tenants/acme/secrets/SHARED/allow?repo=app",
+            b"",
+            &auth,
+            &[],
+        );
+        assert_eq!(status, 200, "{allowed}");
+        assert_eq!(allowed["allowed"], true);
+    }
+    let (status, listed) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/secrets/SHARED/allow",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(listed["repos"][0]["name"], "app");
+    let (status, bound) = call_bytes(&d, "PUT", bind_shared, tenant_source, &auth, &[]);
+    assert_eq!(status, 200, "{bound}");
+    assert_eq!(bound["binding"]["job"], "build");
+    let (status, own) = call_bytes(
+        &d,
+        "PUT",
+        "/api/v1/tenants/acme/secret-bindings/OWN?repo=app",
+        b"",
+        &auth,
+        &[],
+    );
+    assert_eq!(status, 200, "{own}");
+    let (status, page) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/secret-bindings?repo=app&limit=1",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(page["bindings"].as_array().unwrap().len(), 1);
+    assert_eq!(page["bindings"][0]["name"], "OWN");
+    let next = page["next"].as_str().unwrap().to_owned();
+    let (_, rest) = call(
+        &d,
+        "GET",
+        &format!(
+            "/api/v1/tenants/acme/secret-bindings?repo=app&after={}",
+            next.replace('/', "%2F")
+        ),
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(rest["bindings"][0]["name"], "SHARED");
+    assert!(!serde_json::to_string(&rest).unwrap().contains("shared-v1"));
+
+    // Another tenant's administrator sees none of it.
+    let (globex_tenant, _) = globex(&d);
+    let (outsider, outsider_auth) = person(
+        &d,
+        "outsider",
+        None,
+        P::READ.union(P::WRITE_SECRETS).union(P::TENANT_ADMIN),
+    );
+    let root = d.root;
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::set_membership(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                globex_tenant,
+                outsider,
+                sentinel_core::auth::Role::TenantAdmin,
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        call_bytes(&d, "PUT", bind_shared, tenant_source, &outsider_auth, &[]).0,
+        404
+    );
+    assert_eq!(
+        call(
+            &d,
+            "GET",
+            "/api/v1/tenants/acme/secret-bindings?repo=app",
+            None,
+            Some(&outsider_auth),
+            &[]
+        )
+        .0,
+        404
+    );
+
+    // A delegated writer on `app` cannot bind in `widget`.
+    let (writer, writer_auth) = person(
+        &d,
+        "writer",
+        Some(sentinel_core::auth::Role::Reader),
+        P::READ.union(P::WRITE_SECRETS),
+    );
+    let (repo, tenant) = (d.repo, d.tenant);
+    let _ = tenant;
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::set_repo_grant(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                repo,
+                writer,
+                P::READ.union(P::WRITE_SECRETS),
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        put(
+            "/api/v1/tenants/acme/secrets/OWN2?repo=widget",
+            b"x",
+            "w1",
+            "0"
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        call_bytes(
+            &d,
+            "PUT",
+            "/api/v1/tenants/acme/secret-bindings/OWN2?repo=widget",
+            b"",
+            &writer_auth,
+            &[]
+        )
+        .0,
+        404
+    );
+    assert_eq!(
+        call_bytes(
+            &d,
+            "DELETE",
+            "/api/v1/tenants/acme/secret-bindings/OWN?repo=app",
+            b"",
+            &writer_auth,
+            &[]
+        )
+        .0,
+        200
+    );
+
+    // A read-only credential lists but cannot bind or revoke.
+    let reader = member_bearer(&d, "reader");
+    let (status, denied) = call_bytes(&d, "PUT", bind_shared, tenant_source, &reader, &[]);
+    assert_eq!((status, denied["code"].as_str()), (403, Some("forbidden")));
+
+    // Single-version revocation, idempotent; the current version is kept.
+    for _ in 0..2 {
+        let (status, revoked) = call_bytes(
+            &d,
+            "POST",
+            "/api/v1/tenants/acme/secrets/OWN/versions/1/revoke?repo=app",
+            b"",
+            &auth,
+            &[],
+        );
+        assert_eq!(status, 200, "{revoked}");
+        assert_eq!(revoked["revoked_version"], 1);
+        assert_eq!(revoked["secret"]["version"], 2);
+        assert_eq!(revoked["secret"]["active"], true);
+    }
+    assert_eq!(
+        call_bytes(
+            &d,
+            "POST",
+            "/api/v1/tenants/acme/secrets/OWN/versions/3/revoke?repo=app",
+            b"",
+            &auth,
+            &[]
+        )
+        .0,
+        404
+    );
+    // Unbinding twice is harmless; denying the tenant secret removes its
+    // remaining binding.
+    for _ in 0..2 {
+        assert_eq!(
+            call_bytes(&d, "DELETE", bind_shared, b"", &auth, &[]).0,
+            200
+        );
+    }
+    let (status, denied) = call_bytes(
+        &d,
+        "DELETE",
+        "/api/v1/tenants/acme/secrets/SHARED/allow?repo=app",
+        b"",
+        &auth,
+        &[],
+    );
+    assert_eq!((status, denied["allowed"].as_bool()), (200, Some(false)));
+}
+
+/// P10C-6: a repository name that needs percent-encoding (the docs'
+/// `RusticStack/app`) is decoded once by the server.
+#[test]
+fn a_repository_name_with_a_slash_is_addressed_by_its_decoded_name() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let (root, tenant, repo) = (d.root, d.tenant, RepoId::new());
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::create_repo(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                repo,
+                "RusticStack/app",
+                now,
+            )
+        })
+        .unwrap();
+    let (status, created) = call_bytes(
+        &d,
+        "PUT",
+        "/api/v1/tenants/acme/secrets/TOKEN?repo=RusticStack%2Fapp",
+        b"value",
+        &auth,
+        &[("if-match", "0"), ("idempotency-key", "slash")],
+    );
+    assert_eq!(status, 200, "{created}");
+    assert_eq!(created["secret"]["repo"], repo.to_string());
+    let (status, listed) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/secrets?repo=RusticStack%2Fapp",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(listed["secrets"][0]["name"], "TOKEN");
+    // A raw `/` cannot be a query value on its own: the undecoded name
+    // `RusticStack%2Fapp` is simply another (missing) repository.
+    assert_eq!(
+        call(
+            &d,
+            "GET",
+            "/api/v1/tenants/acme/secrets?repo=RusticStack%252Fapp",
+            None,
+            Some(&auth),
+            &[],
+        )
+        .0,
+        404
+    );
+}
+
+/// P10S-1: the retry record keeps a keyed MAC, not the unkeyed FNV-1a of
+/// scope, name, version and value that a database copy could brute-force.
+#[test]
+fn the_stored_retry_fingerprint_is_not_an_unkeyed_digest_of_the_value() {
+    fn unkeyed(scope: &[u8], name: &str, expected: u64, body: &[u8]) -> [u8; 16] {
+        let mut hash: u128 = 0x6c62272e07bb014262b821756295c58d;
+        let mut feed = |bytes: &[u8]| {
+            for &byte in bytes {
+                hash ^= byte as u128;
+                hash = hash.wrapping_mul(0x0000000001000000000000000000013B);
+            }
+        };
+        feed(scope);
+        feed(&(name.len() as u32).to_be_bytes());
+        feed(name.as_bytes());
+        feed(&8u32.to_be_bytes());
+        feed(&expected.to_be_bytes());
+        feed(&(body.len() as u64).to_be_bytes());
+        feed(body);
+        hash.to_le_bytes()
+    }
+    let d = deployment();
+    let auth = bearer(&d);
+    let (status, _) = call_bytes(
+        &d,
+        "PUT",
+        "/api/v1/tenants/acme/secrets/PIN",
+        b"1234",
+        &auth,
+        &[("if-match", "0"), ("idempotency-key", "pin")],
+    );
+    assert_eq!(status, 200);
+    let stored: Vec<u8> = d
+        .store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT fingerprint FROM secret_idempotency WHERE key='pin'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    let mut scope = vec![0u8];
+    scope.extend_from_slice(d.tenant.as_bytes());
+    assert_eq!(stored.len(), 16);
+    assert_ne!(stored, unkeyed(&scope, "PIN", 0, b"1234"));
+    // Guessing the value from the row alone finds nothing.
+    for guess in 0..10_000u32 {
+        let guess = format!("{guess:04}");
+        assert_ne!(stored, unkeyed(&scope, "PIN", 0, guess.as_bytes()));
+    }
 }

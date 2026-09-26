@@ -18,6 +18,7 @@ mod http;
 mod mcp;
 mod oauth;
 mod routes;
+mod secret_routes;
 mod web;
 
 use std::{
