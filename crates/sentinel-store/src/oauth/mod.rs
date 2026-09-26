@@ -29,6 +29,8 @@ pub mod code;
 pub mod device;
 pub mod service;
 
+use std::collections::HashSet;
+
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::{
     oauth::{self as forms, Kind},
@@ -131,6 +133,9 @@ impl GrantKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Client {
     pub id: String,
+    /// Identifier safe to show in consent and grant listings. For CIMD this
+    /// is the metadata URL; internal storage uses a fixed-size digest ID.
+    pub display_id: String,
     pub name: String,
     pub first_party: bool,
     /// May redirect to `http://127.0.0.1:PORT<redirect_path>` / `[::1]`.
@@ -140,6 +145,8 @@ pub struct Client {
     pub device: bool,
     /// Ceiling on every grant issued to this client.
     pub max_scopes: Scopes,
+    /// OAuth resource this client may request.
+    pub resource: Audience,
 }
 
 /// Terms of a client registered by [`register_client`].
@@ -153,6 +160,33 @@ pub struct ClientSpec<'a> {
     pub device: bool,
     pub max_scopes: Scopes,
 }
+
+/// Which public MCP client registration path supplied the client metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpRegistrationKind {
+    Dynamic,
+    Metadata,
+}
+
+/// The bounded terms stored for one DCR or CIMD public client.
+#[derive(Clone, Copy, Debug)]
+pub struct McpClientSpec<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub max_scopes: Scopes,
+    pub kind: McpRegistrationKind,
+    pub metadata_url: Option<&'a str>,
+}
+
+/// Registration can be refused at the hard per-deployment client cap.
+#[derive(Debug)]
+pub enum McpRegistrationError {
+    Capacity,
+    Store(Error),
+}
+
+/// At most this many externally registered clients may be stored per deployment.
+pub const MAX_MCP_CLIENTS: i64 = 512;
 
 fn decode_scopes(bits: i64) -> Result<Scopes> {
     u32::try_from(bits)
@@ -201,30 +235,35 @@ pub fn client(conn: &Connection, client_id: &str) -> Result<Client> {
     }
     let row = conn
         .prepare_cached(
-            "SELECT client_id, name, first_party, loopback, redirect_path, device, max_scopes
+            "SELECT client_id, COALESCE(metadata_url, client_id), name, first_party,
+                    loopback, redirect_path, device, max_scopes, resource
              FROM oauth_clients WHERE client_id = ?1 AND disabled_ms IS NULL",
         )?
         .query_row([client_id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, bool>(2)?,
+                r.get::<_, String>(2)?,
                 r.get::<_, bool>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, bool>(5)?,
-                r.get::<_, i64>(6)?,
+                r.get::<_, bool>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, bool>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, u8>(8)?,
             ))
         })
         .optional()?
         .ok_or(Error::NotFound)?;
     Ok(Client {
         id: row.0,
-        name: row.1,
-        first_party: row.2,
-        loopback: row.3,
-        redirect_path: row.4,
-        device: row.5,
-        max_scopes: decode_scopes(row.6)?,
+        display_id: row.1,
+        name: row.2,
+        first_party: row.3,
+        loopback: row.4,
+        redirect_path: row.5,
+        device: row.6,
+        max_scopes: decode_scopes(row.7)?,
+        resource: Audience::from_code(row.8).ok_or(Error::Corrupt("oauth_clients.resource"))?,
     })
 }
 
@@ -279,6 +318,114 @@ pub fn register_client(store: &Store, spec: &ClientSpec<'_>, redirects: &[&str])
         }
         Ok(())
     })
+}
+
+/// Register a bounded public MCP OAuth client. DCR creates a new row; CIMD
+/// refreshes the metadata snapshot for its stable URL-derived ID. No user,
+/// grant, tenant or repository is created by either path.
+pub fn register_mcp_client(
+    store: &Store,
+    spec: &McpClientSpec<'_>,
+    redirects: &[&str],
+) -> std::result::Result<(), McpRegistrationError> {
+    if spec.id.is_empty()
+        || spec.id.len() > 64
+        || spec.name.trim().is_empty()
+        || spec.name.len() > 128
+        || spec.name.chars().any(char::is_control)
+        || spec.max_scopes.is_empty()
+        || !Scopes::MCP.contains(spec.max_scopes)
+        || redirects.is_empty()
+        || redirects.len() > 16
+        || redirects.iter().any(|uri| {
+            uri.is_empty() || uri.len() > 512 || uri.bytes().any(|byte| byte.is_ascii_control())
+        })
+        || (spec.kind == McpRegistrationKind::Metadata) != spec.metadata_url.is_some()
+        || spec.metadata_url.is_some_and(|url| url.len() > 2048)
+    {
+        return Err(McpRegistrationError::Store(Error::InvalidInput(
+            "MCP client registration",
+        )));
+    }
+    let mut unique = HashSet::with_capacity(redirects.len());
+    if redirects.iter().any(|uri| !unique.insert(*uri)) {
+        return Err(McpRegistrationError::Store(Error::InvalidInput(
+            "MCP client redirects",
+        )));
+    }
+    let id = spec.id.to_owned();
+    let name = spec.name.to_owned();
+    let max_scopes = spec.max_scopes.bits();
+    let kind = match spec.kind {
+        McpRegistrationKind::Dynamic => 1u8,
+        McpRegistrationKind::Metadata => 2u8,
+    };
+    let metadata_url = spec.metadata_url.map(str::to_owned);
+    let redirects: Vec<String> = redirects.iter().map(|uri| (*uri).to_owned()).collect();
+    let now = UnixMillis::now();
+    let inserted = store
+        .writer()
+        .write(move |tx| {
+            let existing = tx
+                .prepare_cached(
+                    "SELECT registration_kind, metadata_url, disabled_ms FROM oauth_clients
+                     WHERE client_id = ?1",
+                )?
+                .query_row([&id], |row| {
+                    Ok((
+                        row.get::<_, u8>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                })
+                .optional()?;
+            if let Some((existing_kind, existing_url, disabled)) = existing {
+                if kind != 2 || existing_kind != kind || existing_url != metadata_url {
+                    return Err(Error::Conflict);
+                }
+                if disabled.is_some() {
+                    return Err(Error::NotFound);
+                }
+                tx.execute(
+                    "UPDATE oauth_clients SET name = ?2, max_scopes = ?3
+                     WHERE client_id = ?1 AND disabled_ms IS NULL",
+                    params![id, name, max_scopes],
+                )?;
+                tx.execute(
+                    "DELETE FROM oauth_client_redirects WHERE client_id = ?1",
+                    [&id],
+                )?;
+            } else {
+                let count: i64 = tx.query_row(
+                    "SELECT count(*) FROM oauth_clients WHERE registration_kind != 0",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if count >= MAX_MCP_CLIENTS {
+                    return Ok(false);
+                }
+                tx.execute(
+                    "INSERT INTO oauth_clients(client_id, name, first_party, loopback,
+                        redirect_path, device, max_scopes, created_ms, resource,
+                        registration_kind, metadata_url)
+                     VALUES (?1, ?2, 0, 0, NULL, 0, ?3, ?4, 2, ?5, ?6)",
+                    params![id, name, max_scopes, now.0, kind, metadata_url],
+                )?;
+            }
+            for uri in &redirects {
+                tx.execute(
+                    "INSERT INTO oauth_client_redirects(client_id, uri) VALUES (?1, ?2)",
+                    params![id, uri],
+                )?;
+            }
+            Ok(true)
+        })
+        .map_err(McpRegistrationError::Store)?;
+    if inserted {
+        Ok(())
+    } else {
+        Err(McpRegistrationError::Capacity)
+    }
 }
 
 /// The terms of a new grant. The database re-checks the account, the
@@ -915,7 +1062,10 @@ pub struct GrantRecord {
 }
 
 /// Columns [`grant_record`] decodes, in order; for sibling modules' queries.
-pub(crate) const GRANT_COLUMNS: &str = "id, user_id, client_id, kind, scopes, tenant_id, repo_id,
+pub(crate) const GRANT_COLUMNS: &str = "id, user_id,
+    COALESCE((SELECT metadata_url FROM oauth_clients
+        WHERE oauth_clients.client_id = oauth_grants.client_id), oauth_grants.client_id),
+    kind, scopes, tenant_id, repo_id,
     name, created_ms, expires_ms, last_used_ms, revoked_ms";
 
 type RawGrant = (

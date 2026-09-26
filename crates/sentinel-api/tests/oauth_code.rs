@@ -29,6 +29,7 @@ use serde_json::{Value, json};
 
 pub const PASSWORD: &str = "correct horse battery staple";
 const REDIRECT: &str = "http://127.0.0.1:49152/callback";
+const MCP_TEST_REDIRECT: &str = "http://127.0.0.1:33419/callback";
 const STATE: &str = "af0ifjsldkj";
 
 /// Authorization request parameters, in order.
@@ -223,12 +224,36 @@ pub fn send(
     }
 }
 
-fn exchange_target(d: &Deployment, code: &str, verifier: &str, resource: &str) -> Reply {
+fn register_mcp_test_client(d: &Deployment) -> String {
+    let reply = send(
+        d,
+        "POST",
+        "/oauth/register",
+        Body::Json(&json!({
+            "client_name": "MCP integration test",
+            "redirect_uris": [MCP_TEST_REDIRECT],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none"
+        })),
+        &[],
+    );
+    assert_eq!(reply.status, 201, "{:?}", reply.body);
+    reply.body["client_id"].as_str().unwrap().to_owned()
+}
+
+fn exchange_mcp_test_target(
+    d: &Deployment,
+    client_id: &str,
+    code: &str,
+    verifier: &str,
+    resource: &str,
+) -> Reply {
     let body = encode(&[
         ("grant_type", "authorization_code"),
-        ("client_id", CLI_CLIENT_ID),
+        ("client_id", client_id),
         ("code", code),
-        ("redirect_uri", REDIRECT),
+        ("redirect_uri", MCP_TEST_REDIRECT),
         ("code_verifier", verifier),
         ("resource", resource),
     ]);
@@ -291,6 +316,7 @@ fn mcp_request(
 fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
     let d = deployment();
     let resource = format!("{}/mcp", d.base);
+    let client_id = register_mcp_test_client(&d);
     let metadata = send(
         &d,
         "GET",
@@ -316,6 +342,11 @@ fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
         "resource",
         Some(&resource),
     );
+    let pairs = with(
+        with(pairs, "client_id", Some(&client_id)),
+        "redirect_uri",
+        Some(MCP_TEST_REDIRECT),
+    );
     let cookie = sign_in(&d, "dev");
     let fields = consent(&d, &cookie, &pairs);
     assert!(
@@ -323,15 +354,18 @@ fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
             .iter()
             .any(|(name, value)| name == "resource" && value == &resource)
     );
-    let back = returned(&post_consent(
-        &d,
-        Some(&cookie),
-        Some(&d.base),
-        &fields,
-        &[("decision", "approve")],
-    ));
+    let back = returned_to(
+        &post_consent(
+            &d,
+            Some(&cookie),
+            Some(&d.base),
+            &fields,
+            &[("decision", "approve")],
+        ),
+        MCP_TEST_REDIRECT,
+    );
     let code = param(&back, "code").unwrap();
-    let token = exchange_target(&d, code, &verifier, &resource);
+    let token = exchange_mcp_test_target(&d, &client_id, code, &verifier, &resource);
     assert_eq!(token.status, 200, "{:?}", token.body);
     assert_eq!(token.body["scope"], "runs:read");
     let token_text = token.body["access_token"].as_str().unwrap();
@@ -507,6 +541,7 @@ fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
 fn mcp_refresh_requires_the_same_resource_indicator() {
     let d = deployment();
     let resource = format!("{}/mcp", d.base);
+    let client_id = register_mcp_test_client(&d);
     let verifier = pkce::verifier();
     let challenge = pkce::challenge(&verifier);
     let pairs = with(
@@ -514,36 +549,303 @@ fn mcp_refresh_requires_the_same_resource_indicator() {
         "resource",
         Some(&resource),
     );
+    let pairs = with(
+        with(pairs, "client_id", Some(&client_id)),
+        "redirect_uri",
+        Some(MCP_TEST_REDIRECT),
+    );
     let cookie = sign_in(&d, "dev");
     let fields = consent(&d, &cookie, &pairs);
-    let back = returned(&post_consent(
+    let back = returned_to(
+        &post_consent(
+            &d,
+            Some(&cookie),
+            Some(&d.base),
+            &fields,
+            &[("decision", "approve")],
+        ),
+        MCP_TEST_REDIRECT,
+    );
+    let token = exchange_mcp_test_target(
         &d,
-        Some(&cookie),
-        Some(&d.base),
-        &fields,
-        &[("decision", "approve")],
-    ));
-    let token = exchange_target(&d, param(&back, "code").unwrap(), &verifier, &resource);
+        &client_id,
+        param(&back, "code").unwrap(),
+        &verifier,
+        &resource,
+    );
     assert_eq!(token.status, 200);
     let refresh = token.body["refresh_token"].as_str().unwrap();
 
     let omitted = encode(&[
         ("grant_type", "refresh_token"),
-        ("client_id", CLI_CLIENT_ID),
+        ("client_id", &client_id),
         ("refresh_token", refresh),
     ]);
     let rejected = send(&d, "POST", "/oauth/token", Body::Form(&omitted), &[]);
     assert_eq!(rejected.status, 400);
-    assert_eq!(rejected.body["error"], "invalid_grant");
+    assert_eq!(rejected.body["error"], "invalid_target");
 
     let included = encode(&[
         ("grant_type", "refresh_token"),
-        ("client_id", CLI_CLIENT_ID),
+        ("client_id", &client_id),
         ("refresh_token", refresh),
         ("resource", &resource),
     ]);
     let rotated = send(&d, "POST", "/oauth/token", Body::Form(&included), &[]);
     assert_eq!(rotated.status, 200, "{:?}", rotated.body);
+}
+
+#[test]
+fn vscode_and_claude_public_clients_complete_the_remote_mcp_lifecycle() {
+    // These are the redirect registrations used by the selected VS Code and
+    // Claude MCP clients. Each is a public OAuth client; DCR never creates a
+    // Sentinel account or grants API-audience access.
+    let d = deployment();
+    let resource = format!("{}/mcp", d.base);
+    let before_users: i64 = d
+        .store
+        .read(|connection| {
+            Ok(connection.query_row("SELECT count(*) FROM users", [], |row| row.get(0))?)
+        })
+        .unwrap();
+    let clients = [
+        ("Visual Studio Code", "http://127.0.0.1:33418"),
+        ("Claude", "https://claude.ai/api/mcp/auth_callback"),
+    ];
+
+    let metadata = send(
+        &d,
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        Body::None,
+        &[],
+    );
+    assert_eq!(metadata.status, 200);
+    assert_eq!(
+        metadata.body["registration_endpoint"],
+        format!("{}/oauth/register", d.base)
+    );
+    assert_eq!(metadata.body["client_id_metadata_document_supported"], true);
+
+    let cookie = sign_in(&d, "dev");
+    for (client_name, redirect_uri) in clients {
+        let registration = send(
+            &d,
+            "POST",
+            "/oauth/register",
+            Body::Json(&json!({
+                "client_name": client_name,
+                "redirect_uris": [redirect_uri],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+                "scope": "runs:read logs:read"
+            })),
+            &[],
+        );
+        assert_eq!(registration.status, 201, "{:?}", registration.body);
+        let client_id = registration.body["client_id"].as_str().unwrap();
+        assert!(client_id.starts_with("m_"));
+        assert_eq!(registration.body["client_name"], client_name);
+        assert_eq!(registration.body["token_endpoint_auth_method"], "none");
+
+        let refused_pairs = vec![
+            ("response_type", "code".to_owned()),
+            ("client_id", client_id.to_owned()),
+            ("redirect_uri", redirect_uri.to_owned()),
+            ("state", STATE.to_owned()),
+            ("code_challenge", pkce::challenge(&pkce::verifier())),
+            ("code_challenge_method", "S256".to_owned()),
+            ("scope", "runs:write".to_owned()),
+            ("resource", resource.clone()),
+        ];
+        let refused = send(
+            &d,
+            "GET",
+            &authorize_path(&refused_pairs),
+            Body::None,
+            &[("cookie", &cookie)],
+        );
+        let refused = returned_to(&refused, redirect_uri);
+        assert_eq!(param(&refused, "error"), Some("invalid_scope"));
+        assert_eq!(param(&refused, "state"), Some(STATE));
+
+        let verifier = pkce::verifier();
+        let challenge = pkce::challenge(&verifier);
+        let pairs = vec![
+            ("response_type", "code".to_owned()),
+            ("client_id", client_id.to_owned()),
+            ("redirect_uri", redirect_uri.to_owned()),
+            ("state", STATE.to_owned()),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256".to_owned()),
+            ("scope", "runs:read".to_owned()),
+            ("resource", resource.clone()),
+        ];
+        let fields = consent(&d, &cookie, &pairs);
+        assert!(
+            fields
+                .iter()
+                .any(|(key, value)| { key == "client_id" && value == client_id })
+        );
+        let approved = post_consent(
+            &d,
+            Some(&cookie),
+            Some(&d.base),
+            &fields,
+            &[("decision", "approve")],
+        );
+        let back = returned_to(&approved, redirect_uri);
+        assert_eq!(param(&back, "state"), Some(STATE));
+        let code = param(&back, "code").unwrap();
+        let exchange = encode(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", &verifier),
+            ("resource", &resource),
+        ]);
+        let tokens = send(&d, "POST", "/oauth/token", Body::Form(&exchange), &[]);
+        assert_eq!(tokens.status, 200, "{:?}", tokens.body);
+        assert_eq!(tokens.body["scope"], "runs:read");
+        let initial_bearer = format!("Bearer {}", tokens.body["access_token"].as_str().unwrap());
+        let initial_refresh = tokens.body["refresh_token"].as_str().unwrap();
+
+        let initialize = json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize",
+            "params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":client_name,"version":"test"}}
+        });
+        let initialized = mcp_request(&d, "POST", Some(&initialize), Some(&initial_bearer), &[]);
+        assert_eq!(initialized.status, 200, "{:?}", initialized.body);
+        let session = initialized.header("mcp-session-id").unwrap().to_owned();
+        let session_header = ("mcp-session-id", session.as_str());
+        let notification = mcp_request(
+            &d,
+            "POST",
+            Some(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})),
+            Some(&initial_bearer),
+            &[("mcp-protocol-version", "2025-11-25"), session_header],
+        );
+        assert_eq!(notification.status, 202);
+
+        let denied = mcp_request(
+            &d,
+            "POST",
+            Some(&json!({
+                "jsonrpc":"2.0", "id":2, "method":"tools/call",
+                "params":{"name":"get_logs","arguments":{"attempt":"00000000000000000000000000000000"}}
+            })),
+            Some(&initial_bearer),
+            &[("mcp-protocol-version", "2025-11-25"), session_header],
+        );
+        assert_eq!(denied.status, 403);
+        assert!(
+            denied
+                .header("www-authenticate")
+                .unwrap()
+                .contains("logs:read")
+        );
+
+        let refresh = encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id),
+            ("refresh_token", initial_refresh),
+            ("resource", &resource),
+        ]);
+        let refreshed = send(&d, "POST", "/oauth/token", Body::Form(&refresh), &[]);
+        assert_eq!(refreshed.status, 200, "{:?}", refreshed.body);
+        let refreshed_access = refreshed.body["access_token"].as_str().unwrap();
+        let refreshed_bearer = format!("Bearer {refreshed_access}");
+        let reconnect = mcp_request(
+            &d,
+            "POST",
+            Some(&json!({"jsonrpc":"2.0","id":3,"method":"tools/list"})),
+            Some(&refreshed_bearer),
+            &[("mcp-protocol-version", "2025-11-25"), session_header],
+        );
+        assert_eq!(reconnect.status, 200, "{:?}", reconnect.body);
+
+        let revoke = encode(&[("client_id", client_id), ("token", refreshed_access)]);
+        let revoked = send(&d, "POST", "/oauth/revoke", Body::Form(&revoke), &[]);
+        assert_eq!(revoked.status, 200);
+        let after_revoke = mcp_request(
+            &d,
+            "POST",
+            Some(&json!({"jsonrpc":"2.0","id":4,"method":"tools/list"})),
+            Some(&refreshed_bearer),
+            &[("mcp-protocol-version", "2025-11-25"), session_header],
+        );
+        assert_eq!(after_revoke.status, 401);
+    }
+    let after_users: i64 = d
+        .store
+        .read(|connection| {
+            Ok(connection.query_row("SELECT count(*) FROM users", [], |row| row.get(0))?)
+        })
+        .unwrap();
+    assert_eq!(before_users, after_users, "OAuth clients are not users");
+}
+
+#[test]
+fn dynamic_registration_refuses_privileged_scopes_and_untrusted_redirects() {
+    let d = deployment();
+    for (metadata, error) in [
+        (
+            json!({
+                "client_name":"bad scope",
+                "redirect_uris":["https://client.example/callback"],
+                "scope":"runs:read platform:admin"
+            }),
+            "invalid_client_metadata",
+        ),
+        (
+            json!({
+                "client_name":"bad redirect",
+                "redirect_uris":["http://client.example/callback"]
+            }),
+            "invalid_redirect_uri",
+        ),
+        (
+            json!({
+                "client_name":"device flow",
+                "redirect_uris":["https://client.example/callback"],
+                "grant_types":["authorization_code","urn:ietf:params:oauth:grant-type:device_code"]
+            }),
+            "invalid_client_metadata",
+        ),
+        (
+            json!({
+                "client_name":"confidential client",
+                "redirect_uris":["https://client.example/callback"],
+                "client_secret":"must-not-be-accepted"
+            }),
+            "invalid_client_metadata",
+        ),
+    ] {
+        let reply = send(&d, "POST", "/oauth/register", Body::Json(&metadata), &[]);
+        assert_eq!(reply.status, 400, "{:?}", reply.body);
+        assert_eq!(reply.body["error"], error);
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+    }
+    let user_count: i64 = d
+        .store
+        .read(|connection| {
+            Ok(connection.query_row("SELECT count(*) FROM users", [], |row| row.get(0))?)
+        })
+        .unwrap();
+    assert_eq!(user_count, 2);
+    let client_count: i64 = d
+        .store
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT count(*) FROM oauth_clients WHERE registration_kind != 0",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(client_count, 0);
 }
 
 pub fn bearer(access: &Secret) -> String {
@@ -603,10 +905,14 @@ fn with(mut pairs: Pairs, name: &'static str, value: Option<&str>) -> Pairs {
 
 /// The query of a `303` back to the client, which must target `REDIRECT`.
 fn returned(reply: &Reply) -> Vec<(String, String)> {
+    returned_to(reply, REDIRECT)
+}
+
+fn returned_to(reply: &Reply, expected_redirect: &str) -> Vec<(String, String)> {
     assert_eq!(reply.status, 303, "{:?}", reply.body);
     let location = reply.header("location").expect("location");
     let (target, query) = location.split_once('?').expect("query");
-    assert_eq!(target, REDIRECT);
+    assert_eq!(target, expected_redirect);
     form_urlencoded::parse(query.as_bytes())
         .into_owned()
         .collect()

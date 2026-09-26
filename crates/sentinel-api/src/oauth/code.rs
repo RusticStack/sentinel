@@ -29,7 +29,7 @@ use sentinel_store::oauth::{
     code::{self as codes, Approval, CodeError},
 };
 
-use super::{Form, html};
+use super::{Form, client, html};
 use crate::{
     State,
     auth::Identity,
@@ -63,7 +63,7 @@ fn show(state: &State, request: &Request, query: &str) -> Reply {
     let Ok(form) = Form::parse(query.as_bytes()) else {
         return html::error_page(400, "The authorization request is malformed.");
     };
-    let params = match validate(state, &form) {
+    let params = match validate(state, request, &form) {
         Ok(params) => params,
         Err(reply) => return reply,
     };
@@ -112,7 +112,7 @@ fn decide(state: &State, request: &mut Request) -> Reply {
             "This consent form has expired. Start signing in again from the application.",
         );
     }
-    let params = match validate(state, &form) {
+    let params = match validate(state, request, &form) {
         Ok(params) => params,
         Err(reply) => return reply,
     };
@@ -210,31 +210,24 @@ fn signed_in(
 
 /// Validate an authorization request (query or re-posted form). Refusals
 /// before the redirect is trusted are pages; later ones are redirects.
-fn validate<'a>(state: &State, form: &'a Form) -> Result<Params<'a>, Reply> {
+fn validate<'a>(state: &State, request: &Request, form: &'a Form) -> Result<Params<'a>, Reply> {
     let Some(client_id) = form.get("client_id") else {
         return Err(html::error_page(400, "The request names no client."));
     };
     let Some(redirect_uri) = form.get("redirect_uri") else {
         return Err(html::error_page(400, "The request names no redirect URI."));
     };
-    let looked_up = state.store.read(|c| {
-        let client = grants::client(c, client_id)?;
-        let allowed = grants::redirect_allowed(c, &client, redirect_uri)?;
-        Ok((client, allowed))
-    });
-    let client = match looked_up {
-        Ok((client, true)) => client,
-        Ok((_, false)) => {
-            return Err(html::error_page(
-                400,
-                "The redirect URI is not registered for this client.",
-            ));
-        }
-        Err(sentinel_store::Error::NotFound) => {
-            return Err(html::error_page(400, "The client is not registered."));
-        }
-        Err(e) => return Err(unavailable(&e)),
-    };
+    let client = client::resolve(state, request, client_id)?;
+    let allowed = state
+        .store
+        .read(|connection| grants::redirect_allowed(connection, &client, redirect_uri))
+        .map_err(|error| unavailable(&error))?;
+    if !allowed {
+        return Err(html::error_page(
+            400,
+            "The redirect URI is not registered for this client.",
+        ));
+    }
     // From here on the client and its redirect are trusted with an answer.
     let state_param = form.get("state").filter(|s| s.len() <= MAX_STATE_BYTES);
     let fail = |code: OAuthErrorCode, description: &str| {
@@ -278,7 +271,14 @@ fn validate<'a>(state: &State, form: &'a Form) -> Result<Params<'a>, Reply> {
         );
     };
     let scopes = match form.get("scope") {
-        None => Scopes::CLI_DEFAULT.intersect(client.max_scopes),
+        None => {
+            let default = if client.resource == Audience::Mcp {
+                Scopes::MCP_DEFAULT
+            } else {
+                Scopes::CLI_DEFAULT
+            };
+            default.intersect(client.max_scopes)
+        }
         Some(text) => match Scopes::parse(text) {
             Ok(scopes) => scopes,
             Err(_) => return fail(OAuthErrorCode::InvalidScope, "unknown scope"),
@@ -298,6 +298,12 @@ fn validate<'a>(state: &State, form: &'a Form) -> Result<Params<'a>, Reply> {
             None => return fail(OAuthErrorCode::InvalidTarget, "resource is not served here"),
         },
     };
+    if audience != client.resource {
+        return fail(
+            OAuthErrorCode::InvalidTarget,
+            "resource is not permitted for this client",
+        );
+    }
     Ok(Params {
         client,
         redirect_uri,

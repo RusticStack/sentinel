@@ -18,6 +18,7 @@ pub const TOKEN_PATH: &str = "/oauth/token";
 pub const REVOKE_PATH: &str = "/oauth/revoke";
 pub const DEVICE_AUTHORIZATION_PATH: &str = "/oauth/device_authorization";
 pub const DEVICE_VERIFICATION_PATH: &str = "/device";
+pub const REGISTRATION_PATH: &str = "/oauth/register";
 /// Appended to the issuer to name the API resource (`Audience::Api`).
 pub const API_RESOURCE_SUFFIX: &str = "/api/v1";
 /// Appended to the issuer to name the remote MCP resource (`Audience::Mcp`).
@@ -40,6 +41,8 @@ pub struct Metadata {
     pub token_endpoint: String,
     pub revocation_endpoint: String,
     pub device_authorization_endpoint: String,
+    pub registration_endpoint: String,
+    pub client_id_metadata_document_supported: bool,
     pub response_types_supported: Vec<String>,
     pub response_modes_supported: Vec<String>,
     pub grant_types_supported: Vec<String>,
@@ -60,6 +63,8 @@ impl Metadata {
             token_endpoint: format!("{issuer}{TOKEN_PATH}"),
             revocation_endpoint: format!("{issuer}{REVOKE_PATH}"),
             device_authorization_endpoint: format!("{issuer}{DEVICE_AUTHORIZATION_PATH}"),
+            registration_endpoint: format!("{issuer}{REGISTRATION_PATH}"),
+            client_id_metadata_document_supported: true,
             response_types_supported: owned(&["code"]),
             response_modes_supported: owned(&["query"]),
             grant_types_supported: owned(&[
@@ -163,6 +168,8 @@ impl fmt::Debug for DeviceAuthorization {
 pub enum OAuthErrorCode {
     InvalidRequest,
     InvalidClient,
+    InvalidClientMetadata,
+    InvalidRedirectUri,
     InvalidGrant,
     UnauthorizedClient,
     UnsupportedGrantType,
@@ -182,6 +189,8 @@ impl OAuthErrorCode {
         match self {
             Self::InvalidRequest => "invalid_request",
             Self::InvalidClient => "invalid_client",
+            Self::InvalidClientMetadata => "invalid_client_metadata",
+            Self::InvalidRedirectUri => "invalid_redirect_uri",
             Self::InvalidGrant => "invalid_grant",
             Self::UnauthorizedClient => "unauthorized_client",
             Self::UnsupportedGrantType => "unsupported_grant_type",

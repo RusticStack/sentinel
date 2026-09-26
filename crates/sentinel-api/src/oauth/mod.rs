@@ -21,6 +21,7 @@
 //! issuer path). [`OAuthState::local_path`] strips the issuer path from a
 //! request that a proxy forwarded without stripping it.
 
+pub(crate) mod client;
 pub(crate) mod code;
 pub(crate) mod device;
 pub(crate) mod html;
@@ -64,6 +65,10 @@ pub(crate) enum Budget {
     /// `/oauth/device_authorization`: the revoke budget, plus the slow
     /// per-client device bucket.
     Device,
+    /// RFC 7591 client registration.
+    Registration,
+    /// Client ID Metadata Document retrieval.
+    Metadata,
 }
 
 /// Per client at the token endpoint: 10/s, burst 20.
@@ -76,6 +81,10 @@ const CEILING: Rate = Rate::per_sec(20, 40);
 /// client holds at most about 28 of the deployment's pending requests over
 /// a request's ten-minute life.
 const DEVICE_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(30), 8);
+const REGISTRATION_CLIENT: Rate = Rate::per_sec(2, 5);
+const REGISTRATION_CEILING: Rate = Rate::per_sec(10, 20);
+const METADATA_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(5), 4);
+const METADATA_CEILING: Rate = Rate::per_sec(10, 20);
 
 /// The authorization server's per-process state.
 pub(crate) struct OAuthState {
@@ -106,6 +115,12 @@ pub(crate) struct OAuthState {
     pub begin_budget: Mutex<Limiter>,
     /// The per-client device-request bucket.
     pub device_budget: Mutex<Limiter>,
+    /// Public DCR registration admission.
+    pub registration_budget: Mutex<Limiter>,
+    /// CIMD metadata fetch admission.
+    pub metadata_budget: Mutex<Limiter>,
+    /// Bounded in-memory CIMD cache.
+    pub client_metadata: client::MetadataCache,
     /// Device-code digest -> (last poll, current interval in ms), bounded by
     /// `sentinel_store::oauth::MAX_PENDING_DEVICE`.
     pub device_polls: Mutex<HashMap<[u8; 32], (Instant, u32)>>,
@@ -142,6 +157,13 @@ impl OAuthState {
             token_budget: Mutex::new(Limiter::new(TOKEN_CLIENT, Some(CEILING), now)),
             begin_budget: Mutex::new(Limiter::new(BEGIN_CLIENT, Some(CEILING), now)),
             device_budget: Mutex::new(Limiter::new(DEVICE_CLIENT, None, now)),
+            registration_budget: Mutex::new(Limiter::new(
+                REGISTRATION_CLIENT,
+                Some(REGISTRATION_CEILING),
+                now,
+            )),
+            metadata_budget: Mutex::new(Limiter::new(METADATA_CLIENT, Some(METADATA_CEILING), now)),
+            client_metadata: client::MetadataCache::default(),
             device_polls: Mutex::new(HashMap::new()),
             user_code_failures: Mutex::new(device::WrongCodes::new()),
         }
@@ -220,6 +242,7 @@ pub(crate) fn route(
             protected_resource(state, Audience::Mcp)
         }
         ("POST", ["oauth", "token"]) => Ok(token(state, request)),
+        ("POST", ["oauth", "register"]) => client::register(state, request),
         ("POST", ["oauth", "revoke"]) => Ok(revoke(state, request)),
         ("GET" | "POST", ["oauth", "authorize"]) => code::authorize(state, request, method, query),
         ("POST", ["oauth", "device_authorization"]) => device::authorization(state, request),
@@ -240,10 +263,14 @@ fn metadata(state: &State) -> Route {
 }
 
 fn protected_resource(state: &State, audience: Audience) -> Route {
+    let scopes: &[&str] = match audience {
+        Audience::Api => &Scopes::NAMES,
+        Audience::Mcp => &Scopes::MCP_NAMES,
+    };
     routes::ok(json!(ProtectedResource::for_resource(
         state.oauth.resource(audience),
         &state.oauth.issuer,
-        &Scopes::NAMES
+        scopes
     )))
 }
 
@@ -317,6 +344,8 @@ pub(crate) fn admit(state: &State, request: &Request, budget: Budget) -> Result<
         // The slow device bucket first: a client past it spends nothing
         // from the budget revocation shares.
         Budget::Device => take(&oauth.device_budget) && take(&oauth.begin_budget),
+        Budget::Registration => take(&oauth.registration_budget),
+        Budget::Metadata => take(&oauth.metadata_budget),
     };
     if admitted {
         Ok(())
@@ -419,7 +448,13 @@ fn token(state: &State, request: &mut Request) -> Reply {
     let Some(client_id) = form.get("client_id") else {
         return error(OAuthErrorCode::InvalidRequest, "client_id is required");
     };
-    let client = match state.store.read(|c| grants::client(c, client_id)) {
+    let Some(internal_id) = client::internal_id(client_id) else {
+        return error(OAuthErrorCode::InvalidClient, "client_id is not valid");
+    };
+    let client = match state
+        .store
+        .read(|c| grants::client(c, internal_id.as_ref()))
+    {
         Ok(client) => client,
         Err(sentinel_store::Error::NotFound) => {
             return error(OAuthErrorCode::InvalidClient, "unknown client");
@@ -433,6 +468,12 @@ fn token(state: &State, request: &mut Request) -> Reply {
             None => return error(OAuthErrorCode::InvalidTarget, "resource is not served here"),
         },
     };
+    if client.resource != resource.unwrap_or(Audience::Api) {
+        return error(
+            OAuthErrorCode::InvalidTarget,
+            "resource is not permitted for this client",
+        );
+    }
     match grant_type {
         GRANT_REFRESH_TOKEN => refresh(state, &client, &form, resource),
         GRANT_AUTHORIZATION_CODE => code::token(state, &client, &form, resource),
@@ -484,17 +525,23 @@ fn revoke(state: &State, request: &mut Request) -> Reply {
     let Some(client_id) = form.get("client_id") else {
         return error(OAuthErrorCode::InvalidRequest, "client_id is required");
     };
+    let Some(internal_id) = client::internal_id(client_id) else {
+        return error(OAuthErrorCode::InvalidClient, "client_id is not valid");
+    };
     let Some(token) = form.get("token") else {
         return error(OAuthErrorCode::InvalidRequest, "token is required");
     };
-    match state.store.read(|c| grants::client(c, client_id)) {
-        Ok(_) => {}
+    let client = match state
+        .store
+        .read(|c| grants::client(c, internal_id.as_ref()))
+    {
+        Ok(client) => client,
         Err(sentinel_store::Error::NotFound) => {
             return error(OAuthErrorCode::InvalidClient, "unknown client");
         }
         Err(e) => return store_failure(e),
-    }
-    match grants::revoke_presented(&state.store, client_id, token, UnixMillis::now()) {
+    };
+    match grants::revoke_presented(&state.store, &client.id, token, UnixMillis::now()) {
         Ok(()) => Reply::Json(200, json!({}), no_cache()),
         Err(e) => store_failure(e),
     }

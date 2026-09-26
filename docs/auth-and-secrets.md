@@ -1,6 +1,6 @@
 # OAuth, CLI/MCP access, and secret management
 
-Status: the integrated authorization server, CLI profiles, secret management, MCP stdio, and protected Streamable HTTP MCP transport are implemented ([OAuth](oauth.md), [CLI](cli.md), [MCP](mcp.md), [secrets](secrets.md)). Client metadata discovery/registration and actual-client conformance remain in X06–X07. Consent and device pages sign in with a local password or, when configured, through GitHub (U07). This extends the multi-tenant roles/registration policy in [plan.md](../plan.md). Built for humans and coding agents to use the same scoped operations with little repeated setup.
+Status: the integrated authorization server, CLI profiles, secret management, MCP stdio, and protected Streamable HTTP MCP transport are implemented ([OAuth](oauth.md), [CLI](cli.md), [MCP](mcp.md), [secrets](secrets.md)). Remote MCP supports bounded DCR/CIMD client registration; two client callback profiles exercise authorization, refresh, reconnect, scope denial and revoke, and a 100 MiB diagnostic log fixture proves bounded evidence and rerun behavior. The client GUI/browser windows are not launched by automated conformance tests. Consent and device pages sign in with a local password or, when configured, through GitHub (U07). This extends the multi-tenant roles/registration policy in [plan.md](../plan.md). Built for humans and coding agents to use the same scoped operations with little repeated setup.
 
 ## 1. Identities and tokens
 
@@ -37,14 +37,14 @@ Support authorization-server metadata, token/revocation endpoints, PKCE, and dev
 
 ## 3. Remote MCP OAuth
 
-The remote Streamable HTTP transport pins protocol revision **2025-11-25**. Its protected-resource metadata, authorization-server discovery, PKCE, resource-bound audience, session and origin checks, and refusal to pass tokens upstream are implemented. Remaining client registration and metadata policy is tracked under X06; actual-client conformance is tracked under X07. The following contracts apply:
+The remote Streamable HTTP transport pins protocol revision **2025-11-25**. Its protected-resource metadata, authorization-server discovery, PKCE, resource-bound audience, session and origin checks, bounded DCR/CIMD registration, and refusal to pass tokens upstream are implemented. The X07 API conformance fixtures cover two client callback profiles and stdio's non-redirect behavior. The following contracts apply:
 
 - OAuth Protected Resource Metadata (RFC 9728) advertising authorization server(s); useful HTTP 401 `WWW-Authenticate` discovery.
 - Authorization server discovery/metadata; authorization code + PKCE for public clients.
 - Resource indicators and token audience validation for the intended MCP endpoint. Reject a token intended for another API/resource even if issued by the same deployment. No upstream token passthrough.
-- Pre-registered clients for first-party CLI/test clients. Support Client ID Metadata Documents where target clients use them, with bounded HTTPS fetch/redirect behavior and SSRF protection; permit dynamic registration only when required by selected clients and instance policy. Client registration does not register users or approve tenants.
+- The first-party CLI remains pre-registered. Remote MCP supports Client ID Metadata Documents and Dynamic Client Registration, with bounded HTTPS retrieval, redirects disabled, public-address DNS filtering/pinning, and an MCP-only client/scope/resource policy. Client registration does not register users or approve tenants.
 - Exact permitted redirect URI validation, explicit consent/grants, scope errors, refresh/revocation, origin/session handling, and per-resource tenant authorization.
-- Compatibility tests against at least two actual target MCP clients: discovery, login, refresh, insufficient scopes, denied registration, changed roles, expired grants, wrong audience, and reconnect.
+- HTTP conformance fixtures for Visual Studio Code's loopback callback and Claude's remote callback cover discovery, registration, login/consent, refresh, insufficient scopes, revoke, and reconnect. The tests do not launch the client GUIs or real browser windows. API tests separately cover refused privileged scopes/redirects; the audience and session suites cover wrong audiences, origin checks, revocation, and expired credentials.
 
 Stdio is different: `sentinel mcp` retrieves the local CLI credential profile and talks to the API. It does not implement OAuth redirects over stdio. The X04 tools use repository-scoped reads and writes plus metadata-only secret inspection; see [MCP](mcp.md). Environment-based credentials may be supported for explicit automation, but prefer local credential handles to copying tokens into MCP configuration or model messages.
 

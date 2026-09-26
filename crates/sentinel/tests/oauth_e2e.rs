@@ -16,7 +16,7 @@
 //! clock 61 s ahead; their effect (a revoked grant) is observed over HTTP.
 
 use std::{
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -740,6 +740,79 @@ fn browser_login_then_status_and_commands_work() {
         .unwrap();
     assert_eq!(grants.len(), 1);
     assert_eq!((grants[0].id, grants[0].kind), (grant, GrantKind::Code));
+}
+
+#[test]
+fn mcp_stdio_reports_scope_denial_without_starting_an_oauth_redirect_flow() {
+    let d = deployment();
+    let machine = Machine::new();
+    let credential = tokens::provision(
+        &d.store,
+        Grant::new(d.root, "stdio MCP scope-denial check", P::RUN),
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let token_path = machine.config().join("mcp-token.txt");
+    std::fs::create_dir_all(machine.config()).unwrap();
+    let token = sentinel_auth::token::format(&credential.secret);
+    std::fs::write(&token_path, token).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &token_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+
+    let grants_before: i64 = d
+        .store
+        .read(|connection| {
+            Ok(connection.query_row("SELECT count(*) FROM oauth_grants", [], |row| row.get(0))?)
+        })
+        .unwrap();
+    let input = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"stdio-test\",\"version\":\"1\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"list_runs\",\"arguments\":{\"tenant\":\"acme\",\"repo\":\"app\"}}}\n"
+    );
+    let mut command = machine.command(&[
+        "mcp",
+        "--server",
+        &d.base,
+        "--token-file",
+        token_path.to_str().unwrap(),
+    ]);
+    command.stdin(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = Running::start(child).finish();
+    assert_eq!(out.code, 0, "{out:?}");
+    let replies: Vec<Value> = out
+        .stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0]["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(replies[1]["id"], 2);
+    assert_eq!(replies[1]["result"]["isError"], true);
+    assert_eq!(
+        replies[1]["result"]["structuredContent"]["code"],
+        "forbidden"
+    );
+    assert!(!out.stdout.contains("/oauth/authorize"));
+    assert!(!out.stderr.contains("/oauth/authorize"));
+    let grants_after: i64 = d
+        .store
+        .read(|connection| {
+            Ok(connection.query_row("SELECT count(*) FROM oauth_grants", [], |row| row.get(0))?)
+        })
+        .unwrap();
+    assert_eq!(grants_before, grants_after);
 }
 
 #[test]

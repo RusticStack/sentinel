@@ -58,7 +58,10 @@ fn authorize(state: &State, request: &mut Request) -> Reply {
     let Some(client_id) = form.get("client_id") else {
         return error(OAuthErrorCode::InvalidRequest, "client_id is required");
     };
-    let client = match state.store.read(|c| grants::client(c, client_id)) {
+    let Some(client_id) = super::client::internal_id(client_id) else {
+        return error(OAuthErrorCode::InvalidClient, "client_id is not valid");
+    };
+    let client = match state.store.read(|c| grants::client(c, client_id.as_ref())) {
         Ok(client) => client,
         Err(StoreError::NotFound) => return error(OAuthErrorCode::InvalidClient, "unknown client"),
         Err(e) => return store_failure(e),
@@ -76,6 +79,12 @@ fn authorize(state: &State, request: &mut Request) -> Reply {
             None => return error(OAuthErrorCode::InvalidTarget, "resource is not served here"),
         },
     };
+    if client.resource != audience {
+        return error(
+            OAuthErrorCode::InvalidTarget,
+            "resource is not permitted for this client",
+        );
+    }
     let scopes = match form.get("scope").map(Scopes::parse) {
         None => Scopes::CLI_DEFAULT.intersect(client.max_scopes),
         Some(Ok(scopes)) => scopes,

@@ -1199,6 +1199,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "ureq",
+ "url",
 ]
 
 [[package]]
@@ -1821,6 +1822,7 @@ dependencies = [
  "form_urlencoded",
  "idna",
  "percent-encoding",
+ "serde",
 ]
 
 [[package]]

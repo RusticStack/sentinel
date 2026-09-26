@@ -1,4 +1,4 @@
-# OAuth authorization server (Part 09, O01–O07)
+# OAuth authorization server (Part 09, O01–O07; MCP registration X06)
 
 Sentinel is its own OAuth 2.0 authorization server for its API and remote MCP endpoint. The CLI (`sentinel auth login`), MCP clients, and agents sign in through it instead of pasting long-lived `sntl_` credentials; the result is a **grant** — one refresh-token family bound to an account, a client, a scope set, an optional tenant/repository narrowing and an audience — from which short-lived access tokens are minted. Service accounts receive grants the same way (O06). Remote MCP uses its own resource indicator and audience; see [MCP](mcp.md#streamable-http-x05).
 
@@ -6,21 +6,30 @@ Implemented in `sentinel-core::auth` (`Scopes`, `Audience`), `sentinel-auth::oau
 
 ## Issuer and metadata
 
-The issuer is `public_url` from the server configuration ([configuration](configuration.md)), or `http://{api_listen}` without it — correct only for direct loopback use. Every endpoint is the issuer plus a fixed path, and every URL the server hands out — metadata endpoints, `verification_uri`, the pages' form targets and the embedded sign-in's `fetch` — is built from the issuer, so an issuer with a path (`https://ci.example.com/sentinel`) keeps every link inside its mount. A request forwarded with the issuer's path still on it (`/sentinel/device`) is routed as if the proxy had stripped it. For a path-carrying issuer the two metadata documents are also served at their RFC 8414 §3.1 / RFC 9728 §3.1 locations, with the well-known segment between host and path (`/.well-known/oauth-authorization-server/sentinel`, `/.well-known/oauth-protected-resource/sentinel/api/v1`); a proxy must forward those host-root paths to Sentinel for generic clients to find them, while the CLI reads `{issuer}/.well-known/oauth-authorization-server`, which works through the mount:
+The issuer is `public_url` from the server configuration ([configuration](configuration.md)), or `http://{api_listen}` without it — correct only for direct loopback use. Every endpoint is the issuer plus a fixed path, and every URL the server hands out — metadata endpoints, `verification_uri`, the pages' form targets and the embedded sign-in's `fetch` — is built from the issuer, so an issuer with a path (`https://ci.example.com/sentinel`) keeps every link inside its mount. A request forwarded with the issuer's path still on it (`/sentinel/device`) is routed as if the proxy had stripped it. For a path-carrying issuer the metadata documents are also served at their RFC 8414 §3.1 / RFC 9728 §3.1 locations, with the well-known segment between host and path (`/.well-known/oauth-authorization-server/sentinel`, `/.well-known/oauth-protected-resource/sentinel/api/v1`); a proxy must forward those host-root paths to Sentinel for generic clients to find them, while the CLI reads `{issuer}/.well-known/oauth-authorization-server`, which works through the mount:
 
 | Path | Method | Auth | Answers |
 |---|---|---|---|
-| `/.well-known/oauth-authorization-server` | GET | none | RFC 8414 metadata: `issuer`, the four endpoints, `response_types_supported ["code"]`, `response_modes_supported ["query"]`, the three grant types, `code_challenge_methods_supported ["S256"]`, `token_endpoint_auth_methods_supported ["none"]`, `revocation_endpoint_auth_methods_supported ["none"]`, the ten scopes, `authorization_response_iss_parameter_supported: true` |
+| `/.well-known/oauth-authorization-server` | GET | none | RFC 8414 metadata: `issuer`, authorization/token/revocation/device/registration endpoints, `response_types_supported ["code"]`, `response_modes_supported ["query"]`, the three grant types, `code_challenge_methods_supported ["S256"]`, `token_endpoint_auth_methods_supported ["none"]`, `revocation_endpoint_auth_methods_supported ["none"]`, the ten scopes, `client_id_metadata_document_supported: true`, `authorization_response_iss_parameter_supported: true` |
 | `/.well-known/oauth-protected-resource/api/v1` | GET | none | RFC 9728: `resource` = `{issuer}/api/v1`, `authorization_servers [issuer]`, the scopes, `bearer_methods_supported ["header"]` |
 | `/.well-known/oauth-protected-resource/mcp` | GET | none | RFC 9728 for `{issuer}/mcp`; MCP scope list and bearer header support |
 | `/oauth/token` | POST | public client (`client_id`) | `refresh_token` grant (below); `authorization_code` (O01) and `urn:ietf:params:oauth:grant-type:device_code` (O03) |
+| `/oauth/register` | POST | none | RFC 7591 registration for public MCP authorization-code clients (X06) |
 | `/oauth/revoke` | POST | public client | RFC 7009: either token kind revokes its whole grant; always `200` |
 | `/oauth/authorize` | GET, POST | session cookie | consent (O01) |
 | `/oauth/device_authorization` | POST | public client | device request (O03) |
 | `/device` | GET, POST | session cookie | enter and approve a user code (O03) |
 | `/mcp` | POST, DELETE | MCP-audience bearer token | pinned Streamable HTTP transport; GET returns 405 ([MCP](mcp.md#streamable-http-x05)) |
 
-Only public clients exist; there are no client secrets. Migration 30 seeds the first-party client `sentinel-cli` (loopback redirects to `/callback`, device flow allowed, every scope).
+Only public clients exist; there are no client secrets. Migration 30 seeds the first-party API client `sentinel-cli` (loopback redirects to `/callback`, device flow allowed, every API scope). Migration 42 adds separate public MCP client records for Dynamic Client Registration (DCR) and Client ID Metadata Documents (CIMD); registering an OAuth client does not create a Sentinel user, add tenant membership, or issue a grant.
+
+### MCP client registration and metadata discovery (X06)
+
+`POST /oauth/register` accepts at most 16 KiB of JSON. It registers a public MCP client only: `grant_types` must include `authorization_code` and `refresh_token` (the code response always includes a refresh token), `response_types` may only name `code`, `token_endpoint_auth_method` must be `none`, PKCE S256 is enforced, there may be at most 16 exact redirect URIs, and no client secret is accepted. HTTPS domain redirects and IP loopback HTTP redirects are accepted; `localhost`, non-loopback HTTP, URI userinfo, query and fragment are refused. The registered client is bound to `{issuer}/mcp`, cannot use the device grant, and cannot exceed `runs:read`, `runs:write`, `logs:read`, and `secrets:metadata`. The deployment stores at most 512 DCR/CIMD client rows. Registrations are independent of local user enrollment and tenant approval; each user separately signs in and consents to a grant. The endpoint is rate-limited per client address and across the deployment.
+
+CIMD client IDs must be canonical HTTPS document URLs with a non-root path, no userinfo, query, fragment or explicit port. The document must name the exact URL as `client_id`, a bounded `client_name`, and the allowed `redirect_uris`; optional grant/response/auth fields must describe the supported public authorization-code flow, and an optional `scope` may name only MCP scopes. Metadata retrieval verifies TLS, bypasses configured proxies, follows no redirects, rejects DNS answers that include any non-public address and pins the vetted addresses for the connection. Requests have a 4 s total timeout (2 s DNS), 16 KiB response-header limit and 64 KiB body limit; only HTTP 200 `application/json` is accepted. Metadata is cached in memory for its Cache-Control lifetime (default 60 s, maximum 1 hour), with at most 256 cache entries. Client policy, disabled status, consent, scopes, resource audience, and redirect matching are checked again when used. No metadata-supplied configuration or parser payload is echoed in errors.
+
+The authorization-server metadata advertises both `/oauth/register` and `client_id_metadata_document_supported: true`. See [MCP client support](mcp.md#client-registration-and-conformance-x06x07) for the selected client profiles and the conformance coverage.
 
 The `/oauth/*` endpoints take `application/x-www-form-urlencoded` bodies of at most 8 KiB (`MAX_OAUTH_FORM_BYTES`; larger is `413 invalid_request`); a repeated parameter is `invalid_request`, an empty value counts as absent (RFC 6749 §3.1). They answer the RFC 6749 error shape `{"error", "error_description"}` — `invalid_client` is 401, `server_error` 500, `temporarily_unavailable` 503, everything else 400 — never `sentinel.error/1`, and every answer carries `cache-control: no-store` and `pragma: no-cache`. The `resource` parameter must match its OAuth client flow: `{issuer}/api/v1` for API clients or `{issuer}/mcp` for remote MCP clients (`invalid_target`). The server stores that resource on the grant and requires it again for MCP refresh.
 
@@ -63,7 +72,7 @@ Scopes are stored bits (`sentinel_core::auth::Scopes`) and a ceiling on the acco
 | 256 | `tenant:admin` | tenant admin (never for a service principal) |
 | 512 | `platform:admin` | platform admin (only a super admin; dropped at authentication once demoted; a bearer never steps up) |
 
-The CLI asks for `runs:read runs:write logs:read artifacts:read cache:read` by default (`Scopes::CLI_DEFAULT`). The audience (`Audience::Api` = 1, `{issuer}/api/v1`) is stored with every grant, code and device request; code 2 is reserved for MCP (X05).
+The CLI asks for `runs:read runs:write logs:read artifacts:read cache:read` by default (`Scopes::CLI_DEFAULT`). The audience (`Audience::Api` = 1, `{issuer}/api/v1`) or MCP resource (`{issuer}/mcp`) is stored with every grant, code and device request; MCP uses resource code 2 (X05).
 
 ## Access tokens on the API
 
@@ -91,7 +100,7 @@ Browser sign-in for public clients (RFC 6749 §4.1 with PKCE, RFC 8252 loopback 
 **`GET /oauth/authorize`** takes a percent-encoded query (a repeated parameter is malformed). It is checked in this order:
 
 1. `client_id` must name an enabled client and `redirect_uri` must be one it may use: `http://127.0.0.1:PORT/callback` or `http://[::1]:PORT/callback` for the loopback CLI client (explicit port; no `localhost`, `https`, userinfo, query or fragment), or an exact registered URI. Otherwise the answer is a `400` **error page with no `location`** — an untrusted redirect is never followed.
-2. From here every refusal is a `303` to `redirect_uri` with `error`, `error_description`, `iss` (the issuer) and `state` (when one was given): `response_type` must be `code` (`unsupported_response_type`); `state` is required, 1–512 bytes; `code_challenge_method` must be `S256` (`plain` and absence are refused) and `code_challenge` a 43-character S256 challenge (`invalid_request`); `scope` defaults to `CLI_DEFAULT` ∩ the client's ceiling, and an unknown scope, an empty set or one beyond the ceiling is `invalid_scope`; `resource`, when given, must be `{issuer}/api/v1` (`invalid_target`).
+2. From here every refusal is a `303` to `redirect_uri` with `error`, `error_description`, `iss` (the issuer) and `state` (when one was given): `response_type` must be `code` (`unsupported_response_type`); `state` is required, 1–512 bytes; `code_challenge_method` must be `S256` (`plain` and absence are refused) and `code_challenge` a 43-character S256 challenge (`invalid_request`); `scope` defaults to `CLI_DEFAULT` ∩ an API client's ceiling or read-only `MCP_DEFAULT` ∩ an MCP client's ceiling, and an unknown scope, an empty set or one beyond the ceiling is `invalid_scope`; `resource`, when given, must match the client's `{issuer}/api/v1` or `{issuer}/mcp` resource (`invalid_target`).
 3. Without a browser session the page offers the embedded password sign-in (it posts to `{issuer}/api/v1/login` and reloads the same URL); nothing is stored and no cookie is set by the authorize endpoint itself. Bearer credentials never drive consent.
 4. `platform:admin` from an account that is not a super admin is `invalid_scope`.
 5. The consent page names the client, the deployment's issuer, the signed-in account, each requested scope in plain words (a warning on `tenant:admin` and `platform:admin`) and the redirect target, and offers a tenant selector (all tenants, or one of the account's active memberships, at most 100) and an optional repository name within it.
@@ -129,8 +138,8 @@ The contract Units B and C build on. `pub(crate)` items are for the sibling modu
 // SERVICE_DEFAULT_MS, SERVICE_MIN_MS, SERVICE_MAX_MS, MAX_PENDING_DEVICE: usize, ROTATED_RETENTION_MS
 pub mod reason { LOGOUT = 1, REFRESH_REPLAY = 2, CODE_REPLAY = 3, ACCOUNT = 4, MEMBERSHIP = 5, TENANT = 6, ADMIN = 7 } // u8 consts
 #[repr(u8)] pub enum GrantKind { Code = 1, Device = 2, Service = 3 }   // from_code, as_str
-pub struct Client { pub id: String, pub name: String, pub first_party: bool, pub loopback: bool,
-                    pub redirect_path: Option<String>, pub device: bool, pub max_scopes: Scopes }
+pub struct Client { pub id: String, pub display_id: String, pub name: String, pub first_party: bool, pub loopback: bool,
+                    pub redirect_path: Option<String>, pub device: bool, pub max_scopes: Scopes, pub resource: Audience }
 pub struct ClientSpec<'a> { pub id: &'a str, pub name: &'a str, pub first_party: bool, pub loopback: bool,
                             pub redirect_path: Option<&'a str>, pub device: bool, pub max_scopes: Scopes }
 pub fn client(conn: &Connection, client_id: &str) -> Result<Client>                 // NotFound: unknown/disabled

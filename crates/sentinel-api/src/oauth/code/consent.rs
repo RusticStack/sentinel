@@ -55,7 +55,7 @@ pub(super) fn page_status(
     body.push_str("<p><strong>");
     escape_into(&mut body, &params.client.name);
     body.push_str("</strong> (<code>");
-    escape_into(&mut body, &params.client.id);
+    escape_into(&mut body, &params.client.display_id);
     body.push_str("</code>) asks to use Sentinel at <code>");
     escape_into(&mut body, &state.oauth.issuer);
     body.push_str("</code> as <strong>");

@@ -76,6 +76,14 @@ impl Scopes {
     pub const TENANT_ADMIN: Self = Self(1 << 8);
     pub const PLATFORM_ADMIN: Self = Self(1 << 9);
     pub const ALL: Self = Self(0x3FF);
+    /// Maximum authority a remote MCP client may request; excludes secret
+    /// writes and all administrative scopes.
+    pub const MCP: Self =
+        Self(Self::RUNS_READ.0 | Self::RUNS_WRITE.0 | Self::LOGS_READ.0 | Self::SECRETS_METADATA.0);
+    /// Least-privilege default for a new remote MCP authorization.
+    pub const MCP_DEFAULT: Self = Self(Self::RUNS_READ.0 | Self::LOGS_READ.0);
+    pub const MCP_NAMES: [&'static str; 4] =
+        ["runs:read", "runs:write", "logs:read", "secrets:metadata"];
     /// What `sentinel auth login` asks for unless told otherwise.
     pub const CLI_DEFAULT: Self = Self(
         Self::RUNS_READ.0
