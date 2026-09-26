@@ -34,6 +34,12 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_at(10)
+}
+
+/// The fixture with its worker enrolled at `protocol`, still advertising
+/// the secret-delivery capability bit.
+fn fixture_at(protocol: u16) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("master.key");
     Key::create(&key_path).unwrap();
@@ -84,7 +90,7 @@ fn fixture() -> Fixture {
                         fingerprint,
                         name: "secret-test-worker",
                         negotiated: Negotiated {
-                            protocol: ProtocolVersion(10),
+                            protocol: ProtocolVersion(protocol),
                             capabilities: Capabilities(
                                 Capabilities::REQUIRED.0 | Capabilities::SECRET_DELIVERY.0,
                             ),
@@ -399,4 +405,109 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
             ("TOKEN".into(), 2)
         ]
     );
+}
+
+/// P10D-6: the capability bit alone does not make a worker able to receive
+/// secrets — a session that sets it on protocol 9 is never placed a job
+/// that needs them (it could only fail it).
+#[test]
+fn a_secret_job_is_never_placed_on_a_worker_below_protocol_10() {
+    let f = fixture_at(9);
+    create_run(&f, UnixMillis(2_000));
+    let (worker, pool) = (f.worker, f.pool);
+    let offer = f
+        .store
+        .writer()
+        .write(move |tx| {
+            dispatch::place(
+                tx,
+                worker,
+                pool,
+                dispatch::DEFAULT_LEASE_MS,
+                UnixMillis(2_100),
+            )
+        })
+        .unwrap();
+    assert!(offer.is_none(), "placed on a protocol-9 worker");
+    // The same job on a protocol-10 worker is placed.
+    let f = fixture();
+    create_run(&f, UnixMillis(2_000));
+    next_offer(&f, UnixMillis(2_100));
+}
+
+/// The attempt's `use` audit results, in order.
+fn use_audit(f: &Fixture, attempt: sentinel_core::AttemptId) -> Vec<(String, String)> {
+    f.store
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT s.name, a.result FROM secret_audit a JOIN secrets s ON s.id=a.secret_id
+                 WHERE a.action='use' AND a.attempt_id=?1 ORDER BY a.seq",
+            )?;
+            Ok(stmt
+                .query_map([attempt.as_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap()
+}
+
+fn refuse(f: &Fixture, offer: &dispatch::Offer) -> Option<secrets::Refusal> {
+    let (worker, attempt) = (f.worker, offer.attempt);
+    f.store
+        .writer()
+        .write(move |tx| secrets::refuse_delivery(tx, worker, attempt, UnixMillis(2_140)))
+        .unwrap()
+}
+
+/// P10D-7: a declared secret that cannot be delivered is explained by
+/// name and reason — never by value — and the denied use is on the
+/// secret's audit trail.
+#[test]
+fn a_refused_delivery_is_explained_and_audited() {
+    // Revoked current version.
+    let f = fixture();
+    let admin = Principal::new(f.root, Permissions::ALL, None, None);
+    create_run(&f, UnixMillis(2_000));
+    let offer = next_offer(&f, UnixMillis(2_100));
+    acknowledge(&f, &offer, UnixMillis(2_120));
+    let repo = f.repo;
+    f.store
+        .writer()
+        .write(move |tx| {
+            secrets::revoke_version(tx, admin, Scope::Repo(repo), "TOKEN", 1, UnixMillis(2_130))
+        })
+        .unwrap();
+    let refusal = refuse(&f, &offer).expect("a refusal");
+    assert_eq!(refusal.detail, "secret TOKEN: revoked");
+    assert_eq!(refusal.fence, Fence(offer.fence.0));
+    assert_eq!(
+        use_audit(&f, offer.attempt),
+        [("TOKEN".to_owned(), "denied".to_owned())]
+    );
+
+    // Unbound: the binding is gone; the secret of that name records the
+    // attempt's use as missing.
+    let f = fixture();
+    let admin = Principal::new(f.root, Permissions::ALL, None, None);
+    create_run(&f, UnixMillis(2_000));
+    let offer = next_offer(&f, UnixMillis(2_100));
+    acknowledge(&f, &offer, UnixMillis(2_120));
+    let repo = f.repo;
+    f.store
+        .writer()
+        .write(move |tx| secrets::unbind(tx, admin, repo, "build", "", "CERT", UnixMillis(2_130)))
+        .unwrap();
+    let refusal = refuse(&f, &offer).expect("a refusal");
+    assert_eq!(refusal.detail, "secret CERT: unbound");
+    assert_eq!(
+        use_audit(&f, offer.attempt),
+        [("CERT".to_owned(), "missing".to_owned())]
+    );
+
+    // Everything resolvable: nothing to explain, nothing audited.
+    let f = fixture();
+    create_run(&f, UnixMillis(2_000));
+    let offer = next_offer(&f, UnixMillis(2_100));
+    acknowledge(&f, &offer, UnixMillis(2_120));
+    assert!(refuse(&f, &offer).is_none());
+    assert!(use_audit(&f, offer.attempt).is_empty());
 }

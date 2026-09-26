@@ -1467,6 +1467,48 @@ impl Inner {
         }
     }
 
+    /// A spec refused for good because a declared secret cannot be
+    /// delivered — revoked, deleted, unbound, ambiguous — is settled here
+    /// as the preparation failure it is, with a value-free detail naming
+    /// the secret and why, and the denied use audited, in one transaction
+    /// (P10D-7). The worker's own `Failed` report after `NoSpec` is then
+    /// stale and changes nothing. Any other refusal is left to that report.
+    fn refuse_secrets(&self, request: &SpecRequest) {
+        let (worker, attempt) = (request.worker, request.attempt);
+        let settled = self.write(move |tx| {
+            let now = UnixMillis::now();
+            let Some(refusal) = sentinel_store::secrets::refuse_delivery(tx, worker, attempt, now)?
+            else {
+                return Ok(None);
+            };
+            let summary = sentinel_protocol::summary::AttemptSummary {
+                detail: refusal.detail,
+                ..Default::default()
+            };
+            let bytes = summary
+                .encode()
+                .map_err(|_| sentinel_store::Error::InvalidInput("attempt summary"))?;
+            dispatch::report(
+                tx,
+                worker,
+                attempt,
+                refusal.fence,
+                Event::Failed(sentinel_core::FailureClass::Preparation),
+                Some(&bytes),
+                now,
+                None,
+            )
+            .map(Some)
+        });
+        if let Ok(Some(state)) = settled {
+            self.stats.reports.fetch_add(1, Ordering::Relaxed);
+            if state.is_terminal() {
+                self.released(worker, attempt);
+                self.wake();
+            }
+        }
+    }
+
     /// Serve one spec request. A definitive answer is sent — the spec, or
     /// `NoSpec` for an attempt that is not this worker's, was settled
     /// canceled, or whose source or spec is refused for good. A transient
@@ -1521,7 +1563,10 @@ impl Inner {
                             self.settle_canceled(request, fence);
                         }
                         None => {}
-                        Some(_) => Self::no_spec(request),
+                        Some(_) => {
+                            self.refuse_secrets(request);
+                            Self::no_spec(request);
+                        }
                     }
                     return;
                 }

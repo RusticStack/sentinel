@@ -380,13 +380,32 @@ struct WorkerFacts {
     disk_bytes: i64,
     secret_delivery: bool,
 }
-type WorkerFactsRow = ([u8; 16], String, Vec<u8>, bool, i64, Vec<u8>, i64, i64, i64);
+type WorkerFactsRow = (
+    [u8; 16],
+    String,
+    Vec<u8>,
+    bool,
+    i64,
+    Vec<u8>,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
+/// Whether a worker can receive a secret bundle: the capability bit **and**
+/// a negotiated protocol that carries it (P10D-6). A session that sets the
+/// bit on an older protocol would be placed a job it can only fail.
+fn secret_capable(capabilities: i64, protocol: i64) -> bool {
+    protocol >= 10
+        && capabilities as u64 & sentinel_protocol::negotiate::Capabilities::SECRET_DELIVERY.0 != 0
+}
 
 fn worker_facts(conn: &Connection, worker: WorkerId) -> Result<Option<(WorkerId, WorkerFacts)>> {
     let row: Option<WorkerFactsRow> = conn
         .prepare_cached(
             "SELECT pool_id, arch, labels, drain_ms IS NOT NULL, disk_bytes, avail_images,
-                    cpu_millis, memory_bytes, capabilities
+                    cpu_millis, memory_bytes, capabilities, protocol
              FROM workers WHERE id = ?1 AND revoked_ms IS NULL",
         )?
         .query_row([worker.as_bytes()], |r| {
@@ -400,11 +419,22 @@ fn worker_facts(conn: &Connection, worker: WorkerId) -> Result<Option<(WorkerId,
                 r.get(6)?,
                 r.get(7)?,
                 r.get(8)?,
+                r.get(9)?,
             ))
         })
         .optional()?;
-    let Some((pool, arch, labels, draining, disk_bytes, avail_images, cpu, memory, capabilities)) =
-        row
+    let Some((
+        pool,
+        arch,
+        labels,
+        draining,
+        disk_bytes,
+        avail_images,
+        cpu,
+        memory,
+        capabilities,
+        protocol,
+    )) = row
     else {
         return Ok(None);
     };
@@ -420,9 +450,7 @@ fn worker_facts(conn: &Connection, worker: WorkerId) -> Result<Option<(WorkerId,
             cpu_millis: cpu,
             memory_bytes: memory,
             disk_bytes,
-            secret_delivery: capabilities as u64
-                & sentinel_protocol::negotiate::Capabilities::SECRET_DELIVERY.0
-                != 0,
+            secret_delivery: secret_capable(capabilities, protocol),
         },
     )))
 }
@@ -434,7 +462,7 @@ fn worker_facts(conn: &Connection, worker: WorkerId) -> Result<Option<(WorkerId,
 fn pool_workers(conn: &Connection, tenant: TenantId) -> Result<Vec<(WorkerId, WorkerFacts)>> {
     let mut stmt = conn.prepare_cached(
         "SELECT w.id, w.pool_id, w.arch, w.labels, w.drain_ms IS NOT NULL, w.disk_bytes,
-                w.avail_images, w.cpu_millis, w.memory_bytes, w.capabilities
+                w.avail_images, w.cpu_millis, w.memory_bytes, w.capabilities, w.protocol
          FROM workers w
          JOIN pools p ON p.id = w.pool_id AND p.active = 1
          JOIN tenants t ON t.id = ?1 AND t.active = 1
@@ -453,11 +481,13 @@ fn pool_workers(conn: &Connection, tenant: TenantId) -> Result<Vec<(WorkerId, Wo
             r.get::<_, i64>(7)?,
             r.get::<_, i64>(8)?,
             r.get::<_, i64>(9)?,
+            r.get::<_, i64>(10)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, pool, arch, labels, draining, disk, images, cpu, memory, capabilities) = row?;
+        let (id, pool, arch, labels, draining, disk, images, cpu, memory, capabilities, protocol) =
+            row?;
         out.push((
             WorkerId::from_bytes(id).map_err(|_| Error::Corrupt("worker id"))?,
             WorkerFacts {
@@ -470,9 +500,7 @@ fn pool_workers(conn: &Connection, tenant: TenantId) -> Result<Vec<(WorkerId, Wo
                 cpu_millis: cpu,
                 memory_bytes: memory,
                 disk_bytes: disk,
-                secret_delivery: capabilities as u64
-                    & sentinel_protocol::negotiate::Capabilities::SECRET_DELIVERY.0
-                    != 0,
+                secret_delivery: secret_capable(capabilities, protocol),
             },
         ));
     }

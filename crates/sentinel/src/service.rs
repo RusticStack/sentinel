@@ -573,7 +573,33 @@ fn read_config(path: &Path) -> Result<String, Error> {
     String::from_utf8(bytes).map_err(|_| Error::config("configuration must be UTF-8"))
 }
 
+/// Keep the process's memory out of core dumps and away from same-user
+/// debuggers (P10D-9): the controller opens sealed secret values and the
+/// worker holds delivered ones, and buffers that held them are wiped only
+/// where Sentinel owns them — not in every copy a library or allocator
+/// made. `RLIMIT_CORE` 0 (soft and hard) also covers every helper this
+/// process starts; `PR_SET_DUMPABLE` 0 additionally makes `/proc/<pid>`
+/// private and blocks `ptrace` by other processes of the same user. Best
+/// effort: a refusal leaves the process as it was.
+#[cfg(target_os = "linux")]
+fn keep_memory_out_of_dumps() {
+    let none = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: plain syscalls on this process with a valid, owned argument;
+    // lowering a limit and clearing the dumpable flag need no privilege.
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_CORE, &none);
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
+}
+
 pub fn run(role: &str, args: ServiceArgs) -> Result<(), Error> {
+    #[cfg(target_os = "linux")]
+    if !args.check {
+        keep_memory_out_of_dumps();
+    }
     let service_started = Instant::now();
     let mut io = Executor::new(WorkClass::BlockingIo, 16)
         .map_err(|error| Error::runtime(format!("cannot start I/O lane: {error}")))?;
@@ -1988,6 +2014,42 @@ fn initialize_and_wait(
             tracing::info!(event = "link_stopped", joined);
             Ok(())
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod hardening_tests {
+    /// P10D-9: a service process ends up with no core limit it could raise
+    /// and not dumpable. Checked in a forked child so the test binary's own
+    /// flags are left alone.
+    #[test]
+    fn a_service_process_keeps_its_memory_out_of_dumps() {
+        // SAFETY: the child only makes raw syscalls (setrlimit, prctl,
+        // getrlimit) and `_exit`s; nothing that could need a lock another
+        // thread held at fork.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            super::keep_memory_out_of_dumps();
+            let mut limit = libc::rlimit {
+                rlim_cur: 1,
+                rlim_max: 1,
+            };
+            // SAFETY: as above; `limit` is a valid out-pointer.
+            let ok = unsafe {
+                libc::getrlimit(libc::RLIMIT_CORE, &mut limit) == 0
+                    && limit.rlim_cur == 0
+                    && limit.rlim_max == 0
+                    && libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) == 0
+            };
+            // SAFETY: ends the forked child without running the parent's
+            // destructors or atexit handlers.
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child forked above.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
     }
 }
 
