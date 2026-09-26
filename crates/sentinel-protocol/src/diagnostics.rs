@@ -3,7 +3,7 @@
 //! exit summary remain the authority for whether a job passed or failed.
 
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
+use std::{borrow::Cow, str::FromStr};
 
 mod parse;
 pub use parse::{
@@ -19,12 +19,16 @@ pub const MAX_DIAGNOSTIC_LABEL_BYTES: usize = 256;
 pub const MAX_DIAGNOSTIC_PATH_BYTES: usize = 4 * 1024;
 pub const MAX_EVIDENCE_FRAME_OFFSET: u32 = 1 << 20;
 
-/// Input accepted by the custom-report endpoint. Provenance, scope and
-/// evidence freshness are supplied by the server after it binds this input to
-/// an authorized attempt; a repository cannot claim that its own report is
-/// fresh or complete.
+/// Custom report input, collected from a report file an attempt published
+/// (see docs/diagnostics.md). Provenance, scope and evidence freshness are
+/// supplied by the server after it binds this input to an authorized
+/// attempt; a repository cannot claim that its own report is fresh or
+/// complete. Input decoding is strict: this object and every nested object
+/// reject unknown fields ([`strict`]). The shared nested types themselves
+/// accept unknown fields so that v1 readers of server-authored reports stay
+/// compatible with additive fields (docs/compatibility.md).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "strict::ReportInput")]
 pub struct ReportInput {
     pub schema_version: u16,
     pub producer: Producer,
@@ -32,8 +36,8 @@ pub struct ReportInput {
 }
 
 /// A report after the server has attached trusted collection metadata.
+/// Server-authored: readers ignore fields they do not know.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DiagnosticReport {
     pub schema_version: u16,
     pub provenance: Provenance,
@@ -42,7 +46,6 @@ pub struct DiagnosticReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Producer {
     /// Stable producer name, for example `go test`, `rustc`, or a repository
     /// adapter name. It is display metadata and never selects control flow.
@@ -51,7 +54,6 @@ pub struct Producer {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Provenance {
     pub producer: Producer,
     pub format: ReportFormat,
@@ -99,7 +101,6 @@ pub enum EvidenceFreshness {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
@@ -162,7 +163,6 @@ impl From<sentinel_core::FailureClass> for FailureClass {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SourceReference {
     /// Repository-relative UTF-8 path using `/` separators.
     pub path: String,
@@ -173,7 +173,6 @@ pub struct SourceReference {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TestReference {
     pub name: String,
     pub package: Option<String>,
@@ -181,7 +180,6 @@ pub struct TestReference {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StepReference {
     /// Zero-based position in the compiled pipeline.
     pub index: u32,
@@ -199,7 +197,6 @@ pub enum EvidenceStream {
 /// A half-open byte range in one step's log stream. Frame sequence and
 /// payload offsets remain meaningful across log segmentation and paging.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EvidenceReference {
     pub step_index: u32,
     pub stream: EvidenceStream,
@@ -208,10 +205,145 @@ pub struct EvidenceReference {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FramePosition {
     pub sequence: u64,
     pub payload_offset: u32,
+}
+
+/// Strict decoding mirrors for [`ReportInput`]: identical shapes with
+/// `deny_unknown_fields` on every object, converted field by field. Report
+/// producers are untrusted, so an unknown field (for example a client trying
+/// to assert `freshness`) is a decode error rather than silently ignored.
+mod strict {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct ReportInput {
+        schema_version: u16,
+        producer: Producer,
+        diagnostics: Vec<Diagnostic>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Producer {
+        name: String,
+        version: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Diagnostic {
+        severity: super::Severity,
+        message: String,
+        code: Option<String>,
+        failure_class: Option<super::FailureClass>,
+        source: Option<SourceReference>,
+        test: Option<TestReference>,
+        step: Option<StepReference>,
+        evidence: Vec<EvidenceReference>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SourceReference {
+        path: String,
+        line: Option<u32>,
+        column: Option<u32>,
+        end_line: Option<u32>,
+        end_column: Option<u32>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct TestReference {
+        name: String,
+        package: Option<String>,
+        class_name: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StepReference {
+        index: u32,
+        key: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct EvidenceReference {
+        step_index: u32,
+        stream: super::EvidenceStream,
+        start: FramePosition,
+        end: FramePosition,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FramePosition {
+        sequence: u64,
+        payload_offset: u32,
+    }
+
+    impl From<ReportInput> for super::ReportInput {
+        fn from(value: ReportInput) -> Self {
+            Self {
+                schema_version: value.schema_version,
+                producer: super::Producer {
+                    name: value.producer.name,
+                    version: value.producer.version,
+                },
+                diagnostics: value.diagnostics.into_iter().map(Into::into).collect(),
+            }
+        }
+    }
+
+    impl From<Diagnostic> for super::Diagnostic {
+        fn from(value: Diagnostic) -> Self {
+            Self {
+                severity: value.severity,
+                message: value.message,
+                code: value.code,
+                failure_class: value.failure_class,
+                source: value.source.map(|source| super::SourceReference {
+                    path: source.path,
+                    line: source.line,
+                    column: source.column,
+                    end_line: source.end_line,
+                    end_column: source.end_column,
+                }),
+                test: value.test.map(|test| super::TestReference {
+                    name: test.name,
+                    package: test.package,
+                    class_name: test.class_name,
+                }),
+                step: value.step.map(|step| super::StepReference {
+                    index: step.index,
+                    key: step.key,
+                }),
+                evidence: value
+                    .evidence
+                    .into_iter()
+                    .map(|reference| super::EvidenceReference {
+                        step_index: reference.step_index,
+                        stream: reference.stream,
+                        start: reference.start.into(),
+                        end: reference.end.into(),
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    impl From<FramePosition> for super::FramePosition {
+        fn from(value: FramePosition) -> Self {
+            Self {
+                sequence: value.sequence,
+                payload_offset: value.payload_offset,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,17 +415,24 @@ fn validate_diagnostics(values: &[Diagnostic]) -> Result<(), ValidationError> {
     if values.len() > MAX_REPORT_DIAGNOSTICS {
         return Err(ValidationError::TooManyDiagnostics);
     }
-    for diagnostic in values {
-        if diagnostic.message.is_empty() {
+    values.iter().try_for_each(Diagnostic::validate)
+}
+
+impl Diagnostic {
+    /// Validate one diagnostic's bounds, so a collector can drop just the
+    /// offending diagnostic and count it; [`DiagnosticReport::validate`]
+    /// still refuses a whole report that contains one.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.message.is_empty() {
             return Err(ValidationError::EmptyMessage);
         }
-        if diagnostic.message.len() > MAX_DIAGNOSTIC_MESSAGE_BYTES {
+        if self.message.len() > MAX_DIAGNOSTIC_MESSAGE_BYTES {
             return Err(ValidationError::MessageTooLong);
         }
-        if let Some(code) = &diagnostic.code {
+        if let Some(code) = &self.code {
             validate_label(code)?;
         }
-        if let Some(source) = &diagnostic.source {
+        if let Some(source) = &self.source {
             validate_path(&source.path)?;
             if source.line == Some(0)
                 || source.column == Some(0)
@@ -304,7 +443,7 @@ fn validate_diagnostics(values: &[Diagnostic]) -> Result<(), ValidationError> {
                 return Err(ValidationError::InvalidLocation);
             }
         }
-        if let Some(test) = &diagnostic.test {
+        if let Some(test) = &self.test {
             validate_label(&test.name)?;
             if let Some(package) = &test.package {
                 validate_label(package)?;
@@ -313,13 +452,13 @@ fn validate_diagnostics(values: &[Diagnostic]) -> Result<(), ValidationError> {
                 validate_label(class_name)?;
             }
         }
-        if let Some(step) = &diagnostic.step {
+        if let Some(step) = &self.step {
             validate_step(step)?;
         }
-        if diagnostic.evidence.len() > MAX_REPORT_EVIDENCE_PER_DIAGNOSTIC {
+        if self.evidence.len() > MAX_REPORT_EVIDENCE_PER_DIAGNOSTIC {
             return Err(ValidationError::TooMuchEvidence);
         }
-        for reference in &diagnostic.evidence {
+        for reference in &self.evidence {
             if reference.step_index > 255
                 || reference.start.sequence == 0
                 || reference.end.sequence == 0
@@ -331,8 +470,25 @@ fn validate_diagnostics(values: &[Diagnostic]) -> Result<(), ValidationError> {
                 return Err(ValidationError::InvalidEvidenceRange);
             }
         }
+        Ok(())
     }
-    Ok(())
+}
+
+/// Display-safe diagnostic or excerpt text: every control character other
+/// than newline and tab becomes U+FFFD, so a response carries no terminal
+/// escape or NUL, and no character escapes to six JSON bytes. Borrowed when
+/// nothing needed replacing.
+pub fn display_text(text: &str) -> Cow<'_, str> {
+    let unsafe_char = |ch: char| ch.is_control() && ch != '\n' && ch != '\t';
+    let Some(first) = text.find(unsafe_char) else {
+        return Cow::Borrowed(text);
+    };
+    let mut out = String::with_capacity(text.len() + 8);
+    out.push_str(&text[..first]);
+    for ch in text[first..].chars() {
+        out.push(if unsafe_char(ch) { '\u{fffd}' } else { ch });
+    }
+    Cow::Owned(out)
 }
 
 fn validate_label(value: &str) -> Result<(), ValidationError> {
@@ -481,6 +637,66 @@ mod tests {
         let mut report = input();
         report.diagnostics[0].source.as_mut().unwrap().path = "./src/lib.rs".into();
         assert_eq!(report.validate(), Err(ValidationError::InvalidPath));
+    }
+
+    #[test]
+    fn input_rejects_unknown_fields_at_every_depth() {
+        let mut value = serde_json::to_value(input()).unwrap();
+        value["diagnostics"][0]["source"]["trusted"] = true.into();
+        assert!(serde_json::from_value::<ReportInput>(value).is_err());
+        let mut value = serde_json::to_value(input()).unwrap();
+        value["diagnostics"][0]["evidence"][0]["start"]["verified"] = true.into();
+        assert!(serde_json::from_value::<ReportInput>(value).is_err());
+        let mut value = serde_json::to_value(input()).unwrap();
+        value["producer"]["signature"] = "x".into();
+        assert!(serde_json::from_value::<ReportInput>(value).is_err());
+    }
+
+    #[test]
+    fn server_reports_ignore_additive_fields_from_newer_v1_servers() {
+        let input = input();
+        let report = DiagnosticReport {
+            schema_version: REPORT_SCHEMA_VERSION,
+            provenance: Provenance {
+                producer: input.producer,
+                format: ReportFormat::GoTestJson,
+                collected_from: CollectionSource::Stdout,
+                run_id: sentinel_core::RunId::new().to_string(),
+                job_id: sentinel_core::JobId::new().to_string(),
+                attempt_id: sentinel_core::AttemptId::new().to_string(),
+                step: None,
+                input_sha256: "b".repeat(64),
+                parser_version: "1".into(),
+            },
+            freshness: EvidenceFreshness::Fresh,
+            diagnostics: input.diagnostics,
+        };
+        let mut value = serde_json::to_value(&report).unwrap();
+        value["added_later"] = 1.into();
+        value["provenance"]["collector"] = "x".into();
+        value["provenance"]["producer"]["build"] = "y".into();
+        value["diagnostics"][0]["hint"] = "z".into();
+        value["diagnostics"][0]["source"]["snippet"] = "w".into();
+        value["diagnostics"][0]["test"] = serde_json::json!({
+            "name": "TestA", "package": null, "class_name": null, "duration_ns": 5
+        });
+        value["diagnostics"][0]["evidence"][0]["end"]["line"] = 3.into();
+        let decoded: DiagnosticReport = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.provenance, report.provenance);
+        assert_eq!(decoded.diagnostics[0].source, report.diagnostics[0].source);
+    }
+
+    #[test]
+    fn display_text_replaces_controls_but_keeps_lines_and_tabs() {
+        assert!(matches!(display_text("plain\ttext\n"), Cow::Borrowed(_)));
+        let shown = display_text("\u{1b}[31mred\u{1b}[0m\0\r\nnext\u{7f}\u{85}");
+        assert_eq!(
+            shown,
+            "\u{fffd}[31mred\u{fffd}[0m\u{fffd}\u{fffd}\nnext\u{fffd}\u{fffd}"
+        );
+        // Every replacement costs three JSON bytes, never six.
+        let json = serde_json::to_string(&shown).unwrap();
+        assert!(!json.contains("\\u00"));
     }
 
     #[test]
