@@ -60,6 +60,7 @@ sentinel secret set SIGNING_KEY --repo RusticStack/app --file <protected-path>
 sentinel secret import --repo RusticStack/app --env-file <protected-path>
 sentinel secret list --repo RusticStack/app --json
 sentinel secret describe REGISTRY_TOKEN --repo RusticStack/app --json
+sentinel secret bind REGISTRY_TOKEN --repo RusticStack/app --job build
 sentinel secret delete REGISTRY_TOKEN --repo RusticStack/app --if-version <version>
 ```
 
