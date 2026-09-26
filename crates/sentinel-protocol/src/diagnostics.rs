@@ -7,8 +7,9 @@ use std::{borrow::Cow, str::FromStr};
 
 mod parse;
 pub use parse::{
-    CustomInputError, MAX_PARSER_INPUT_BYTES, ParseResult, ParsedDiagnostic, parse_custom_json,
-    parse_go_test_json, parse_junit_xml, parse_rust_compiler_json,
+    CustomInputError, MAX_PARSER_INPUT_BYTES, MAX_PARSER_RECORD_BYTES, ParseResult,
+    ParsedDiagnostic, parse_custom_json, parse_custom_report, parse_go_test_json, parse_junit_xml,
+    parse_rust_compiler_json,
 };
 
 pub const REPORT_SCHEMA_VERSION: u16 = 1;

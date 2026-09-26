@@ -24,7 +24,10 @@ use std::{
 /// Existing attempt logs are capped at 256 MiB. Parsers stop at that same
 /// bound even when called with a larger slice.
 pub const MAX_PARSER_INPUT_BYTES: usize = 256 << 20;
-const MAX_RECORD_BYTES: usize = 64 << 10;
+/// Largest single JSON record or XML tag a parser decodes; longer ones are
+/// malformed without being parsed.
+pub const MAX_PARSER_RECORD_BYTES: usize = 64 << 10;
+const MAX_RECORD_BYTES: usize = MAX_PARSER_RECORD_BYTES;
 const MAX_PARSER_RECORDS: usize = 2_000_000;
 const MAX_TEST_OUTPUT_BYTES: usize = 4 << 10;
 /// JUnit documents nest `testsuites > testsuite > testcase > failure`, with
@@ -496,6 +499,49 @@ pub fn parse_custom_json(input: &[u8]) -> Result<ReportInput, CustomInputError> 
         .validate()
         .map_err(|_| CustomInputError::InvalidContract)?;
     Ok(report)
+}
+
+/// Decode a custom report collected from an attempt's files. The document
+/// itself must be a strict [`ReportInput`] of the supported version under the
+/// 1 MiB body cap; within it, a diagnostic that fails its bounds is dropped
+/// and counted as malformed instead of voiding every other diagnostic, and
+/// diagnostics past [`MAX_REPORT_DIAGNOSTICS`] are counted as omitted.
+pub fn parse_custom_report(
+    input: &[u8],
+) -> Result<(super::Producer, ParseResult), CustomInputError> {
+    if input.len() > crate::limits::MAX_API_BODY_BYTES {
+        return Err(CustomInputError::TooLarge);
+    }
+    let report: ReportInput =
+        serde_json::from_slice(input).map_err(|_| CustomInputError::InvalidJson)?;
+    if report.schema_version != super::REPORT_SCHEMA_VERSION
+        || super::validate_label(&report.producer.name).is_err()
+        || report
+            .producer
+            .version
+            .as_deref()
+            .is_some_and(|version| super::validate_label(version).is_err())
+    {
+        return Err(CustomInputError::InvalidContract);
+    }
+    let mut result = ParseResult::new(ReportFormat::CustomJson, input.len());
+    result.bytes_scanned = input.len() as u64;
+    for diagnostic in report.diagnostics {
+        if diagnostic.validate().is_err() {
+            result.malformed();
+            continue;
+        }
+        if result.diagnostics.len() == MAX_REPORT_DIAGNOSTICS {
+            result.omitted_diagnostics = result.omitted_diagnostics.saturating_add(1);
+            result.complete = false;
+            continue;
+        }
+        result.diagnostics.push(ParsedDiagnostic {
+            diagnostic,
+            input_range: None,
+        });
+    }
+    Ok((report.producer, result))
 }
 
 #[derive(Deserialize)]
@@ -1246,6 +1292,33 @@ mod tests {
         let parsed = parse_junit_xml(xml, None);
         assert_eq!(parsed.diagnostics[0].diagnostic.message, "first\none");
         assert_eq!(parsed.omitted_diagnostics, 1);
+    }
+
+    #[test]
+    fn a_collected_custom_report_loses_only_its_invalid_diagnostics() {
+        let report = br#"{"schema_version":1,"producer":{"name":"adapter","version":"2"},"diagnostics":[
+            {"severity":"failure","message":"kept","code":null,"failure_class":"command_failed","source":{"path":"a/b.go","line":3,"column":null,"end_line":null,"end_column":null},"test":null,"step":null,"evidence":[]},
+            {"severity":"failure","message":"escapes","code":null,"failure_class":null,"source":{"path":"../../etc/passwd","line":1,"column":null,"end_line":null,"end_column":null},"test":null,"step":null,"evidence":[]},
+            {"severity":"error","message":"","code":null,"failure_class":null,"source":null,"test":null,"step":null,"evidence":[]}
+        ]}"#;
+        let (producer, parsed) = parse_custom_report(report).unwrap();
+        assert_eq!(producer.name, "adapter");
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].diagnostic.message, "kept");
+        assert_eq!(parsed.malformed_records, 2);
+        assert!(!parsed.complete);
+        // The document shape itself stays strict.
+        let asserted = br#"{"schema_version":1,"producer":{"name":"a","version":null},"diagnostics":[],"freshness":"fresh"}"#;
+        assert_eq!(
+            parse_custom_report(asserted).unwrap_err(),
+            CustomInputError::InvalidJson
+        );
+        let version =
+            br#"{"schema_version":2,"producer":{"name":"a","version":null},"diagnostics":[]}"#;
+        assert_eq!(
+            parse_custom_report(version).unwrap_err(),
+            CustomInputError::InvalidContract
+        );
     }
 
     #[test]
