@@ -1064,6 +1064,52 @@ impl LogStore {
         guard.as_ref().map(|w| (w.last_seq, w.ended.is_some()))
     }
 
+    /// The newest sequence known for an attempt without decoding log
+    /// frames. Open writers answer from memory, completed writers from the
+    /// durable end marker, and recovered incomplete logs from their final
+    /// sparse-index entry.
+    pub fn last_seq(&self, run: RunId, job: JobId, attempt: AttemptId) -> Result<Option<u64>> {
+        if let Some((seq, _)) = self.frontier(attempt) {
+            return Ok(Some(seq));
+        }
+        let dir = self.attempt_dir(run, job, attempt);
+        if let Some((seq, _)) = end_marker(&dir) {
+            return Ok(Some(seq));
+        }
+        let path = dir.join("index");
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let len = file.metadata()?.len();
+        if len < 6 {
+            return Ok(None);
+        }
+        let mut header = [0u8; 6];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut header)?;
+        if header[..4] != *INDEX_MAGIC
+            || u16::from_le_bytes(header[4..6].try_into().expect("2")) != INDEX_FORMAT
+        {
+            return Err(Error::Corrupt("log index"));
+        }
+        let valid_len = len - 6;
+        if valid_len < INDEX_ENTRY_BYTES as u64 {
+            return Ok(None);
+        }
+        let end = len - (valid_len % INDEX_ENTRY_BYTES as u64);
+        if end < INDEX_ENTRY_BYTES as u64 + 6 {
+            return Ok(None);
+        }
+        file.seek(SeekFrom::Start(end - INDEX_ENTRY_BYTES as u64))?;
+        let mut encoded = [0u8; INDEX_ENTRY_BYTES];
+        file.read_exact(&mut encoded)?;
+        Entry::decode(&encoded)
+            .map(|entry| Some(entry.seq))
+            .ok_or(Error::Corrupt("log index"))
+    }
+
     /// Pre-D04 flat logs (`<logs>/<attempt>.log`), kept readable. The read
     /// streams in bounded chunks like a segmented log; the step filter
     /// applies during the scan so foreign frames never eat the limit.

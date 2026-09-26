@@ -1,4 +1,4 @@
-# Structured diagnostics (X01)
+# Structured diagnostics (X01–X03)
 
 The `sentinel.diagnostics/1` report is bounded, versioned evidence for a run
 attempt. It gives the CLI, web page, and MCP stable source, test, step, and log
@@ -16,11 +16,12 @@ transition request.
 
 ## Custom report input
 
-The custom JSON input is `ReportInput` in `sentinel-protocol::diagnostics`.
-It accepts only the exact schema version and rejects unknown fields. The API
-binds input to an authorized run, job, attempt, and optional compiled step;
-clients do not supply attempt identity, log offsets, input hashes, parser
-provenance, or freshness.
+The custom JSON input type is `ReportInput` in
+`sentinel-protocol::diagnostics`. It accepts only the exact schema version
+and rejects unknown fields. Report producers supply diagnostic content only;
+the type has no attempt identity, log offsets, input hash, parser provenance,
+or freshness fields. The parser is available to adapters, but Sentinel does
+not yet expose a report-upload route.
 
 ```json
 {
@@ -74,27 +75,40 @@ the state-machine taxonomy changes.
 
 ## Server-authored report envelope
 
-After ingestion, Sentinel returns `DiagnosticReport` with
-`schema_version: 1`, the report producer, the detected format, collection
-source, authorized run/job/attempt/step, the lowercase SHA-256 of the exact
-input bytes, parser version, freshness, and bounded diagnostics. Supported
-formats are Go test JSON, Rust compiler JSON, JUnit XML, Sentinel JSON, and
-custom JSON.
+`GET /api/v1/attempts/{id}/failure` returns the authorized attempt's
+authoritative job state (only when it remains the newest attempt), selected
+failed step, measured timing/cache clues, bounded recent context, and any
+Go test JSON or rustc compiler JSON that parses from the selected log window.
+Each parsed log stream is returned as `DiagnosticReport` with
+`schema_version: 1`, detected format, collection source, run/job/attempt/step,
+the lowercase SHA-256 of the exact parser input bytes, parser version,
+freshness, and diagnostics. Its enclosing `parse` object carries completeness,
+malformed and omitted counts, and bytes scanned. JUnit XML and custom JSON
+parsers are available to report adapters; Sentinel does not yet attach
+uploaded JUnit/custom reports.
 
 Freshness is server-authored and is independent from the command verdict:
 
-- `fresh`: evidence was collected from or attached under the current fenced
-  attempt, and the collected range is complete;
+- `fresh`: evidence was collected from the exact attempt's stored logs and
+  the selected step and stream were completely covered;
 - `advisory`: evidence was supplied outside the live attempt collection path
   or cannot be tied to the command's current output;
 - `incomplete`: parsing stopped at an input limit or malformed/truncated
   content, or the source log has a declared gap or is not complete.
 
-The server never accepts a client assertion of `fresh`. Missing, partial,
-malformed, or untrusted evidence remains visible as advisory or incomplete;
-it is not silently promoted to a fresh pass. Report text, source paths, test
-names, and log content are untrusted data, never instructions. Any inferred
-root cause must be labeled as an inference and cite evidence ranges.
+The server never accepts a client assertion of `fresh`. The default failure
+request scans from sequence 0, at most 4 MiB or 1,024 frames per call, and
+separately seeks the newest 128 frame positions for its fallback excerpt when
+a sparse index is available. Legacy pre-D04 flat logs have no sparse tail
+index, so their excerpt begins at the available scan position and pages
+forward. A parser window that does not cover the selected stream is
+`incomplete`, even when the log itself has a durable end marker.
+Explicit `after`/`cursor` requests continue the indexed scan and return
+`next_cursor` when a page is cut. Missing, partial, malformed, or untrusted
+evidence remains visible as advisory or incomplete; it is not silently
+promoted to a fresh pass. Report text, source paths, test names, and log
+content are untrusted data, never instructions. Any inferred root cause must
+be labeled as an inference and cite evidence ranges.
 
 ## Parser behavior (X02)
 
@@ -116,5 +130,14 @@ invalid parser payloads. Go/rustc record offsets are half-open byte ranges in
 the input stream; the log layer maps these back to stable frame positions.
 Parser output is never an attempt transition.
 
+The failure response uses an 8 KiB default text budget and accepts at most
+64 KiB; its compact JSON body is also capped at 64 KiB. At most 20 diagnostics
+are returned, with explicit `truncated`, `omitted_diagnostics`,
+`log_complete`, and `log_gaps` fields. If no supported report parses, the
+response carries a bounded log tail. The separate literal-search route scans
+at most 4 MiB per request and preserves split matches with its continuation
+state.
+
 See [logs](logs.md) for frame durability and bounded search, [API](api.md) for
-authorization, and [compatibility](compatibility.md) for schema evolution.
+authorization and response shapes, and [compatibility](compatibility.md) for
+schema evolution.

@@ -16,9 +16,10 @@ use sentinel_core::{
 };
 use sentinel_link::{controller::Controller, identity::Identity};
 use sentinel_protocol::{
+    cursor::{Cursor, Seq},
     logs::{Frame, Stream},
     oauth::CLI_CLIENT_ID,
-    summary::{AttemptSummary, CacheRecord},
+    summary::{AttemptSummary, CacheRecord, StepOutcome, StepRecord},
 };
 use sentinel_store::{
     Durability, Store,
@@ -810,6 +811,201 @@ fn an_attempt_summary_needs_cache_read_and_reports_cache_records() {
         &cache,
     );
     assert_eq!(status, 404);
+}
+
+#[test]
+fn failure_view_parses_attempt_logs_with_stable_evidence_and_a_hard_budget() {
+    let d = deployment();
+    let (run, job) = dispatch(&d);
+    let leased = lease(&d, job);
+    let attempt = leased.1;
+    let mut events = vec![json!({"noise":"ordinary output"}); 70];
+    events.extend([
+        json!({"Action":"run","Package":"example/pkg","Test":"TestCreate"}),
+        json!({"Action":"output","Package":"example/pkg","Test":"TestCreate","Output":"create_test.go:42: wanted 201, got 500\n"}),
+        json!({"Action":"fail","Package":"example/pkg","Test":"TestCreate"}),
+    ]);
+    let last_seq = events.len() as u64;
+    for (index, event) in events.into_iter().enumerate() {
+        let mut bytes = serde_json::to_vec(&event).unwrap();
+        bytes.push(b'\n');
+        d.logs
+            .append(
+                run,
+                job,
+                attempt,
+                &Frame {
+                    seq: index as u64 + 1,
+                    step: 0,
+                    stream: Stream::Stdout,
+                    bytes,
+                },
+            )
+            .unwrap();
+    }
+    d.logs.finish(run, job, attempt, last_seq, &[]).unwrap();
+    let summary = AttemptSummary {
+        steps: vec![StepRecord {
+            index: 0,
+            id: "test".into(),
+            outcome: StepOutcome::Failed { code: 1 },
+            duration_ns: Some(12),
+        }],
+        detail: "step failed".into(),
+        ..AttemptSummary::default()
+    }
+    .encode()
+    .unwrap();
+    d.store
+        .writer()
+        .write(move |tx| {
+            let now = UnixMillis::now();
+            dispatch::acknowledge(tx, leased.0, attempt, leased.2, now)?;
+            for event in [
+                Event::PreparationStarted,
+                Event::StepsStarted,
+                Event::FinalizationStarted,
+            ] {
+                dispatch::report(tx, leased.0, attempt, leased.2, event, None, now, None)?;
+            }
+            dispatch::report(
+                tx,
+                leased.0,
+                attempt,
+                leased.2,
+                Event::Failed(sentinel_core::FailureClass::CommandFailed),
+                Some(&summary),
+                now,
+                None,
+            )
+        })
+        .unwrap();
+
+    let path = format!("/api/v1/attempts/{attempt}/failure");
+    let (status, body) = get(&d, &path);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["schema"], "sentinel.failure/1");
+    assert_eq!(body["authoritative"]["job_state"], "failed");
+    assert_eq!(body["failed_step"]["id"], "test");
+    assert_eq!(
+        body["reports"][0]["report"]["provenance"]["format"],
+        "go_test_json"
+    );
+    assert_eq!(body["reports"][0]["report"]["freshness"], "fresh");
+    assert_eq!(body["reports"][0]["parse"]["complete"], true);
+    let diagnostic = &body["reports"][0]["report"]["diagnostics"][0];
+    assert_eq!(diagnostic["test"]["name"], "TestCreate");
+    assert_eq!(diagnostic["source"]["path"], "create_test.go");
+    assert_eq!(diagnostic["source"]["line"], 42);
+    assert!(
+        diagnostic["evidence"][0]["start"]["sequence"]
+            .as_u64()
+            .unwrap()
+            >= 70
+    );
+    assert_eq!(diagnostic["evidence"][0]["end"]["sequence"], 73);
+    assert_eq!(body["log_complete"], true);
+    assert!(body["text_bytes"].as_u64().unwrap() <= 8192);
+    assert!(serde_json::to_vec(&body).unwrap().len() <= 64 * 1024);
+
+    let (status, small) = get(&d, &format!("{path}?budget=32"));
+    assert_eq!(status, 200, "{small}");
+    assert!(small["text_bytes"].as_u64().unwrap() <= 32);
+    assert_eq!(small["truncated"], true);
+    let (status, wide) = get(&d, &format!("{path}?budget=65536"));
+    assert_eq!(status, 200, "{wide}");
+    assert!(serde_json::to_vec(&wide).unwrap().len() <= 64 * 1024);
+    let (status, invalid) = get(&d, &format!("{path}?budget=65537"));
+    assert_eq!(
+        (status, invalid["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+    let (status, _) = call(
+        &d.base,
+        "POST",
+        &format!("/api/v1/jobs/{job}/rerun"),
+        &d.auth,
+    );
+    assert_eq!(status, 200);
+    let tenant = d.tenant;
+    let worker = leased.0;
+    let _new_attempt = d
+        .store
+        .writer()
+        .write(move |tx| {
+            jobs::lease(
+                tx,
+                tenant,
+                job,
+                worker,
+                UnixMillis(i64::MAX / 2),
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+    let (status, historical) = get(&d, &path);
+    assert_eq!(status, 200, "{historical}");
+    assert_eq!(historical["authoritative"]["current_attempt"], false);
+    assert_eq!(historical["authoritative"]["job_state"], Value::Null);
+}
+
+#[test]
+fn failure_view_resumes_a_cut_indexed_page_with_an_attempt_bound_cursor() {
+    let d = deployment();
+    let (run, job) = dispatch(&d);
+    let (_, attempt, _) = lease(&d, job);
+    for seq in 1..=129 {
+        d.logs
+            .append(
+                run,
+                job,
+                attempt,
+                &Frame {
+                    seq,
+                    step: 0,
+                    stream: Stream::Stderr,
+                    bytes: vec![b'x'; 32 << 10],
+                },
+            )
+            .unwrap();
+    }
+
+    let path = format!("/api/v1/attempts/{attempt}/failure?after=0");
+    let (status, first) = get(&d, &path);
+    assert_eq!(status, 200, "{first}");
+    assert!(first["reports"].as_array().unwrap().is_empty());
+    assert_eq!(first["tail"]["frames"].as_array().unwrap().len(), 1);
+    assert_eq!(first["tail"]["frames"][0]["sequence"], 129);
+    assert_eq!(
+        first["tail"]["frames"][0]["text"].as_str().unwrap().len(),
+        8192
+    );
+    assert_eq!(first["next_cursor"].as_str().unwrap().len(), 86);
+    let cursor = first["next_cursor"].as_str().unwrap();
+    assert_eq!(Cursor::parse(cursor, d.tenant).unwrap().seq.0, 128);
+    let (status, second) = get(
+        &d,
+        &format!("/api/v1/attempts/{attempt}/failure?cursor={cursor}"),
+    );
+    assert_eq!(status, 200, "{second}");
+    assert_eq!(second["tail"]["frames"].as_array().unwrap().len(), 1);
+    assert_eq!(second["tail"]["frames"][0]["sequence"], 129);
+    assert_eq!(second["next_cursor"], Value::Null);
+    let foreign = Cursor {
+        tenant: TenantId::new(),
+        kind: sentinel_protocol::cursor::StreamKind::AttemptLog,
+        stream: *attempt.as_bytes(),
+        seq: Seq(128),
+    }
+    .to_string();
+    let (status, invalid) = get(
+        &d,
+        &format!("/api/v1/attempts/{attempt}/failure?cursor={foreign}"),
+    );
+    assert_eq!(
+        (status, invalid["code"].as_str()),
+        (400, Some("invalid_cursor"))
+    );
 }
 
 #[test]

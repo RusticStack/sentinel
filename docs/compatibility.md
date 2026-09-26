@@ -17,8 +17,9 @@ Sentinel carries several independently versioned contracts. Each has one owner, 
 | Manifest file | `SNMF` magic + format `u16` (currently 1) | `sentinel-store::objects` | controller |
 | API error | `schema: "sentinel.error/1"` | `sentinel-protocol` | CLI, MCP, UI, workers |
 | Diagnostic report | `schema_version` (currently 1; `sentinel.diagnostics/1`) | `sentinel-protocol::diagnostics` | API, CLI, MCP, UI |
+| Failure view | `schema: "sentinel.failure/1"` | `sentinel-api` | CLI, MCP, UI |
 | Explain output | `schema: "sentinel.explain/1"` | `sentinel-pipeline::explain` | CLI, agents |
-| Event cursor | text prefix `c1` | `sentinel-protocol::cursor` | API clients (`GET /attempts/{id}/logs` `next`/`cursor`) |
+| Event cursor | text prefix `c1` | `sentinel-protocol::cursor` | API clients (`GET /attempts/{id}/logs` and `/failure` `next`/`cursor`) |
 | Worker protocol | `protocol_min..=protocol_max` in `Hello` (currently 1..=10) | `sentinel-protocol::negotiate` | workers |
 | Log segment index | `SNLI` magic + format `u16` (currently 1) | `sentinel-store::logs` | controller |
 | Compressed log segment | `SNLZ` magic + format `u16` + codec `u8` (currently 1, zlib) | `sentinel-store::logs` | controller |

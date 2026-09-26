@@ -46,6 +46,50 @@ pub struct RunStatus {
     pub jobs: Vec<JobStatus>,
 }
 
+/// The job verdict visible from one attempt. An older attempt must not
+/// inherit the mutable state of a later rerun.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttemptJobStatus {
+    pub current: bool,
+    pub state: Option<JobState>,
+    pub failure_class: Option<FailureClass>,
+}
+
+/// Read the job state only when `attempt` still owns the job's newest fence.
+/// This is an indexed join over the requested attempt and does not build the
+/// run-wide status vector for a failure lookup.
+pub fn attempt_job_status(
+    conn: &Connection,
+    tenant: TenantId,
+    attempt: AttemptId,
+) -> Result<AttemptJobStatus> {
+    let (attempt_fence, job_fence, state, failure): (i64, i64, i64, Option<i64>) = conn
+        .prepare_cached(
+            "SELECT a.fence, j.fence, j.state_code, j.failure_class
+             FROM attempts a JOIN jobs j ON j.id = a.job_id
+             WHERE a.id = ?1 AND a.tenant_id = ?2",
+        )?
+        .query_row(params![attempt.as_bytes(), tenant.as_bytes()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    let current = attempt_fence == job_fence;
+    Ok(AttemptJobStatus {
+        current,
+        state: current
+            .then(|| decode_state(state).ok_or(Error::Corrupt("state_code")))
+            .transpose()?,
+        failure_class: if current {
+            failure
+                .map(|value| decode_failure(value).ok_or(Error::Corrupt("failure_class")))
+                .transpose()?
+        } else {
+            None
+        },
+    })
+}
+
 /// The run and every job of it, in one read snapshot.
 pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus> {
     let head: Option<([u8; 16], String, i64, i64)> = conn
