@@ -55,26 +55,41 @@ pub struct AttemptJobStatus {
     pub failure_class: Option<FailureClass>,
 }
 
-/// Read the job state only when `attempt` still owns the job's newest fence.
-/// This is an indexed join over the requested attempt and does not build the
-/// run-wide status vector for a failure lookup.
+/// Read the job state only when `attempt` still owns the job. This is an
+/// indexed join over the requested attempt and does not build the run-wide
+/// status vector for a failure lookup.
+///
+/// Only a lease advances the fence, so fence equality alone would let an
+/// attempt keep "owning" a job that was requeued under it. A requeued job no
+/// longer belongs to its last attempt: a rerun (or a push re-trigger)
+/// clears `leased_ms`, which only the next lease sets again — so a later
+/// cancel or queue timeout of the requeued job is not the old attempt's
+/// verdict either — and a lapsed or declined offer leaves the job `Queued`.
 pub fn attempt_job_status(
     conn: &Connection,
     tenant: TenantId,
     attempt: AttemptId,
 ) -> Result<AttemptJobStatus> {
-    let (attempt_fence, job_fence, state, failure): (i64, i64, i64, Option<i64>) = conn
-        .prepare_cached(
-            "SELECT a.fence, j.fence, j.state_code, j.failure_class
+    let (attempt_fence, job_fence, state, failure, leased): (i64, i64, i64, Option<i64>, bool) =
+        conn.prepare_cached(
+            "SELECT a.fence, j.fence, j.state_code, j.failure_class, j.leased_ms IS NOT NULL
              FROM attempts a JOIN jobs j ON j.id = a.job_id
              WHERE a.id = ?1 AND a.tenant_id = ?2",
         )?
         .query_row(params![attempt.as_bytes(), tenant.as_bytes()], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })
         .optional()?
         .ok_or(Error::NotFound)?;
-    let current = attempt_fence == job_fence;
+    let current = attempt_fence == job_fence
+        && leased
+        && decode_state(state).ok_or(Error::Corrupt("state_code"))? != JobState::Queued;
     Ok(AttemptJobStatus {
         current,
         state: current

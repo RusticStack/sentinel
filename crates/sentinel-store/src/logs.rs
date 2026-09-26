@@ -1049,6 +1049,19 @@ impl LogStore {
         read_page(&self.attempt_dir(run, job, attempt), after, page, step)
     }
 
+    /// [`read_newest`] for an attempt: the newest frames of `step` (of the
+    /// whole log without one) under `page`.
+    pub fn newest_page(
+        &self,
+        run: RunId,
+        job: JobId,
+        attempt: AttemptId,
+        page: Page,
+        step: Option<u32>,
+    ) -> Result<Tail> {
+        read_newest(&self.attempt_dir(run, job, attempt), page, step)
+    }
+
     /// The attempt's stored frontier as its live writer knows it — no
     /// I/O: `None` when this process holds no writer for it. A long poll
     /// compares it across wakes so appends to *other* attempts cost it
@@ -1064,10 +1077,13 @@ impl LogStore {
         guard.as_ref().map(|w| (w.last_seq, w.ended.is_some()))
     }
 
-    /// The newest sequence known for an attempt without decoding log
-    /// frames. Open writers answer from memory, completed writers from the
-    /// durable end marker, and recovered incomplete logs from their final
-    /// sparse-index entry.
+    /// The newest sequence stored for an attempt. Open writers answer from
+    /// memory and completed logs from the durable end marker. A log with
+    /// neither (its worker was lost, or the controller restarted) is read
+    /// from its final sparse-index entry forward: frames past the last
+    /// checkpoint are decoded — at most `INDEX_EVERY - 1` frames in the
+    /// segment that entry names and any later one — so the answer is the
+    /// real end, not the checkpoint.
     pub fn last_seq(&self, run: RunId, job: JobId, attempt: AttemptId) -> Result<Option<u64>> {
         if let Some((seq, _)) = self.frontier(attempt) {
             return Ok(Some(seq));
@@ -1105,9 +1121,24 @@ impl LogStore {
         file.seek(SeekFrom::Start(end - INDEX_ENTRY_BYTES as u64))?;
         let mut encoded = [0u8; INDEX_ENTRY_BYTES];
         file.read_exact(&mut encoded)?;
-        Entry::decode(&encoded)
-            .map(|entry| Some(entry.seq))
-            .ok_or(Error::Corrupt("log index"))
+        let entry = Entry::decode(&encoded).ok_or(Error::Corrupt("log index"))?;
+        let mut last = entry.seq;
+        let start = seek_start(std::slice::from_ref(&entry), entry.seq, false);
+        'decode: for (n, compressed) in segs(&dir)?.range(start..) {
+            let Some(mut decoder) = listed_seg_decoder(&dir, *n, *compressed)? else {
+                break;
+            };
+            while let Some(record) = decoder.next()? {
+                match record {
+                    Record::Frame(frame) => last = last.max(frame.seq),
+                    Record::End { last_seq, .. } => {
+                        last = last.max(last_seq);
+                        break 'decode;
+                    }
+                }
+            }
+        }
+        Ok(Some(last))
     }
 
     /// Pre-D04 flat logs (`<logs>/<attempt>.log`), kept readable. The read
@@ -2312,6 +2343,131 @@ pub fn read_page(dir: &Path, after: u64, page: Page, step: Option<u32>) -> Resul
         None => merge_holes(&mut tail.gaps, &read_holes(dir)),
     }
     Ok(tail)
+}
+
+/// The newest frames of `step` (of the whole log without one): at most
+/// `page.limit` frames and `page.bytes` of payload (the newest frame always
+/// fits), in stored order, whatever came after the step — a later
+/// `if: always()` step writing more than a page does not push the step's own
+/// output out of the window. The sparse index picks the start: the step ends
+/// at the first checkpoint of another step after its last checkpoint, and
+/// the read begins at the latest entry with at least a page of frames or
+/// bytes before that end, so the head is never decoded. A rolling window
+/// keeps memory at one page while the decoder runs to the real end — the
+/// frames past the last checkpoint included. At most `page.scan` payload
+/// bytes are decoded; a read cut by it (only a missing or damaged index
+/// makes the window that long) carries [`Tail::next_after`], meaning the
+/// frames are not the newest.
+pub fn read_newest(dir: &Path, page: Page, step: Option<u32>) -> Result<Tail> {
+    let segs = segs(dir)?;
+    let marker = end_marker(dir);
+    if segs.is_empty() && marker.is_none() {
+        return Err(Error::NotFound);
+    }
+    let index_bytes = fs::read(dir.join("index")).unwrap_or_default();
+    let entries = read_index(&index_bytes).unwrap_or_default();
+    let mut tail = Tail {
+        frames: Vec::new(),
+        complete: marker.is_some(),
+        gaps: Vec::new(),
+        next_after: None,
+        step_done: step.is_some_and(|want| step_moved_on(&entries, want)),
+    };
+    // `until`: the last sequence of the step, when a later step followed it;
+    // `end`: the first entry past it, whose cumulative bytes bound the step.
+    let mut until = u64::MAX;
+    let mut end: Option<&Entry> = entries.last();
+    if let Some(want) = step {
+        match entries
+            .iter()
+            .rposition(|e| e.kind == KIND_CHECKPOINT && e.step == want)
+        {
+            Some(last) => {
+                if let Some(next) = entries[last + 1..]
+                    .iter()
+                    .find(|e| e.kind == KIND_CHECKPOINT && e.step != want)
+                {
+                    until = next.seq.saturating_sub(1);
+                    end = Some(next);
+                }
+            }
+            // Every step change is checkpointed: with an index, a step
+            // without an entry wrote nothing (a fill aside).
+            None if !entries.is_empty() => {
+                merge_newest_gaps(dir, marker, &mut tail);
+                return Ok(tail);
+            }
+            None => {}
+        }
+    }
+    let after = match end {
+        Some(end) => entries
+            .iter()
+            .filter(|e| e.seq <= until && e.seq < end.seq)
+            .filter(|e| {
+                end.seq.saturating_sub(e.seq) >= page.limit as u64
+                    || end.bytes.saturating_sub(e.bytes) >= page.bytes
+            })
+            .map(|e| e.seq)
+            .next_back()
+            .unwrap_or(0),
+        None => 0,
+    };
+    let start = seek_start(&entries, after, false);
+    let mut window: VecDeque<Frame> = VecDeque::new();
+    let (mut held, mut scanned, mut consumed) = (0u64, 0u64, after);
+    'decode: for (n, compressed) in segs.range(start..) {
+        let Some(mut decoder) = listed_seg_decoder(dir, *n, *compressed)? else {
+            break;
+        };
+        while let Some(record) = decoder.next()? {
+            match record {
+                Record::Frame(frame) => {
+                    if frame.seq <= after {
+                        continue;
+                    }
+                    if frame.seq > until {
+                        // The next step began: nothing newer of this one.
+                        break 'decode;
+                    }
+                    let len = frame.bytes.len() as u64;
+                    if scanned > 0 && scanned.saturating_add(len) > page.scan {
+                        tail.next_after = Some(consumed);
+                        break 'decode;
+                    }
+                    scanned += len;
+                    consumed = consumed.max(frame.seq);
+                    if step.is_some_and(|want| frame.step != want) {
+                        continue;
+                    }
+                    held += len;
+                    window.push_back(frame);
+                    while window.len() > page.limit.max(1)
+                        || (window.len() > 1 && held > page.bytes)
+                    {
+                        if let Some(old) = window.pop_front() {
+                            held -= old.bytes.len() as u64;
+                        }
+                    }
+                }
+                Record::End { gaps, .. } => {
+                    tail.complete = true;
+                    merge_holes(&mut tail.gaps, &gaps);
+                    break 'decode;
+                }
+            }
+        }
+    }
+    tail.frames = window.into();
+    merge_newest_gaps(dir, marker, &mut tail);
+    Ok(tail)
+}
+
+fn merge_newest_gaps(dir: &Path, marker: Option<(u64, Vec<(u64, u64)>)>, tail: &mut Tail) {
+    match marker {
+        Some((_, gaps)) => merge_holes(&mut tail.gaps, &gaps),
+        None => merge_holes(&mut tail.gaps, &read_holes(dir)),
+    }
 }
 
 /// Whether the log has moved past step `want`: some checkpoint names a
