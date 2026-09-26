@@ -149,6 +149,9 @@ struct Live {
     /// The lease watchdog ended it: the controller has (or will have)
     /// settled it by expiry, so nothing about it is reported.
     lost: bool,
+    /// The store its container lives in (P10D-5): what a stop, cancel or
+    /// lease loss removes it from.
+    store: podman::Store,
 }
 
 /// An offer taken and waiting for its spec.
@@ -673,6 +676,7 @@ impl Executor {
                 logs: Arc::clone(&logs),
                 canceling: false,
                 lost: false,
+                store: podman::Store::Shared,
             },
         );
         let executor = Arc::clone(&self.0);
@@ -690,6 +694,11 @@ impl Executor {
             prepare_hold: self.state().prepare_hold,
             secret_bundle,
         };
+        // Deterministic: preparation derives the same store.
+        let store = attempt::store_for(&self.root, &job).unwrap_or(podman::Store::Shared);
+        if let Some(live) = self.state().live.get_mut(&offer.attempt) {
+            live.store = store.clone();
+        }
         // On disk before anything runs: a crash from here on leaves a
         // marker the next process reconciles. If the marker cannot be
         // written the attempt must not start — a crash would leave a
@@ -723,7 +732,7 @@ impl Executor {
                     Ok((verdict, _)) => verdict,
                     Err(_) => {
                         cancel.store(true, Ordering::Release);
-                        let _ = podman::remove_named(&format!("sentinel-{attempt}"));
+                        let _ = podman::remove_named(&format!("sentinel-{attempt}"), &store);
                         let _ = crate::workspace::remove_tree(
                             &executor
                                 .root
@@ -918,7 +927,7 @@ impl Inner {
     /// settles them by expiry, and a report would be stale, or worse,
     /// recorded as a cancel nobody asked for.
     fn watch_lease(&self) {
-        let lost: Vec<(AttemptId, Cancel)> = {
+        let lost: Vec<(AttemptId, Cancel, podman::Store)> = {
             let mut state = self.state();
             let Some(deadline) = state.lease_deadline else {
                 return;
@@ -933,16 +942,16 @@ impl Inner {
                 .map(|(id, live)| {
                     live.canceling = true;
                     live.lost = true;
-                    (*id, Arc::clone(&live.cancel))
+                    (*id, Arc::clone(&live.cancel), live.store.clone())
                 })
                 .collect()
         };
-        for (attempt, cancel) in &lost {
+        for (attempt, cancel, store) in &lost {
             cancel.store(true, Ordering::Release);
-            let _ = podman::remove_named(&format!("sentinel-{attempt}"));
+            let _ = podman::remove_named(&format!("sentinel-{attempt}"), store);
         }
         (self.notify)(Notice::LeaseLost(
-            lost.into_iter().map(|(a, _)| a).collect(),
+            lost.into_iter().map(|(a, _, _)| a).collect(),
         ));
     }
 
@@ -1283,33 +1292,39 @@ impl LinkExecutor for Executor {
         let live = {
             let mut state = self.state();
             state.awaiting.remove(&attempt);
-            state.live.get(&attempt).map(|l| Arc::clone(&l.cancel))
+            state
+                .live
+                .get(&attempt)
+                .map(|l| (Arc::clone(&l.cancel), l.store.clone()))
         };
-        if let Some(cancel) = live {
+        if let Some((cancel, store)) = live {
             cancel.store(true, Ordering::Release);
             // End the container now, off this thread — it is the session's
             // heartbeat thread, and a removal can take seconds; the attempt
             // thread finalizes what is left and exits.
             let spawned = thread::Builder::new()
                 .name(format!("sentinel-stop-{attempt}"))
-                .spawn(move || {
-                    let _ = podman::remove_named(&format!("sentinel-{attempt}"));
+                .spawn({
+                    let store = store.clone();
+                    move || {
+                        let _ = podman::remove_named(&format!("sentinel-{attempt}"), &store);
+                    }
                 });
             if spawned.is_err() {
-                let _ = podman::remove_named(&format!("sentinel-{attempt}"));
+                let _ = podman::remove_named(&format!("sentinel-{attempt}"), &store);
             }
         }
         (self.notify)(Notice::Stopped(attempt));
     }
 
     fn cancel(&self, attempt: AttemptId) {
-        let (cancel, grace) = {
+        let (cancel, grace, store) = {
             let mut state = self.state();
             let grace = state.cancel_grace;
             match state.live.get_mut(&attempt) {
                 Some(live) if !live.canceling => {
                     live.canceling = true;
-                    (Arc::clone(&live.cancel), grace)
+                    (Arc::clone(&live.cancel), grace, live.store.clone())
                 }
                 _ => return,
             }
@@ -1321,7 +1336,7 @@ impl LinkExecutor for Executor {
         let spawned = thread::Builder::new()
             .name(format!("sentinel-cancel-{attempt}"))
             .spawn(move || {
-                let outcome = podman::terminate_named(&format!("sentinel-{attempt}"), grace);
+                let outcome = podman::terminate_named(&format!("sentinel-{attempt}"), &store, grace);
                 match outcome {
                     Ok(podman::Terminated::Graceful | podman::Terminated::Forced) => {
                         let forced = matches!(outcome, Ok(podman::Terminated::Forced));

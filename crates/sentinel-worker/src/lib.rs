@@ -99,6 +99,31 @@ pub(crate) fn sync_dir(_dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Where the worker keeps short-lived private state that should never
+/// reach persistent disk — delivered secrets, private stores' run roots
+/// (P10D-8): `$XDG_RUNTIME_DIR/sentinel-<key>` when that variable names an
+/// absolute, owner-only directory of this user (a tmpfs on systemd hosts),
+/// keyed by the data directory so two workers of one account never share
+/// it; `<data_dir>/run` otherwise. Only the path is computed here; users
+/// create what they need beneath it owner-only.
+#[cfg(target_os = "linux")]
+pub fn runtime_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from)
+        && dir.is_absolute()
+        && let Ok(meta) = std::fs::symlink_metadata(&dir)
+        && meta.is_dir()
+        && meta.uid() == uid
+        && meta.mode() & 0o077 == 0
+    {
+        let key = blake3::hash(data_dir.as_os_str().as_bytes());
+        return dir.join(format!("sentinel-{}", &key.to_hex()[..16]));
+    }
+    data_dir.join("run")
+}
+
 /// Whether the worker's cache root — `<data_dir>/cache` — can serve
 /// reflink clones: the `Capabilities::REFLINK` bit a `worker` role's Hello
 /// advertises. The answer is `clone::detect`'s, probed once per root and

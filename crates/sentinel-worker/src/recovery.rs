@@ -146,9 +146,12 @@ pub fn leftovers(root: &Path) -> Result<Vec<Marker>> {
 /// recorded them reconciled.
 pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover>)> {
     let mut done = Recovered::default();
-    for (_, name) in podman::owned(worker)? {
-        podman::remove_named(&name)?;
-        done.containers_removed += 1;
+    // Every store: the shared one and each tenant's private one (P10D-5).
+    for store in podman::Store::all(root) {
+        for (_, name) in podman::owned_in(worker, &store)? {
+            podman::remove_named(&name, &store)?;
+            done.containers_removed += 1;
+        }
     }
     for attempt in workspace::Workspace::leftovers(root)? {
         let path = root
@@ -202,7 +205,14 @@ pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover
 /// Secret scratch is outside workspace and artifact roots. A process crash
 /// skips RAII cleanup, so remove its attempt trees before accepting work.
 fn reap_secret_directories(root: &Path) -> Result<()> {
-    let dir = root.join(SECRET_DELIVERY_DIR);
+    // Where an older worker staged them (the data directory), then where
+    // this one does (the runtime directory, P10D-8).
+    reap_secret_dir(&root.join(SECRET_DELIVERY_DIR))?;
+    reap_secret_dir(&crate::attempt::secret_root(root))
+}
+
+fn reap_secret_dir(dir: &Path) -> Result<()> {
+    let dir = dir.to_path_buf();
     let metadata = match fs::symlink_metadata(&dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -243,7 +253,13 @@ mod tests {
         fs::write(attempt.join("files/token"), b"secret-value").unwrap();
         fs::write(root.join(SECRET_DELIVERY_DIR).join("orphan"), b"orphan").unwrap();
 
+        // P10D-8: where this worker stages them now, too.
+        let staged = crate::attempt::secret_root(&root).join("live-attempt");
+        fs::create_dir_all(staged.join("env")).unwrap();
+        fs::write(staged.join("env/step-0.sh"), b"export T='v'\n").unwrap();
+
         reap_secret_directories(&root).unwrap();
+        assert!(!staged.exists());
         assert!(!attempt.exists());
         assert!(!root.join(SECRET_DELIVERY_DIR).join("orphan").exists());
         assert!(root.join(SECRET_DELIVERY_DIR).is_dir());

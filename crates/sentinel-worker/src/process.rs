@@ -47,17 +47,7 @@ impl Output {
 
     /// The last line of stderr, printable characters only, for an error.
     pub fn stderr_excerpt(&self) -> String {
-        let text = String::from_utf8_lossy(&self.stderr);
-        let line = text
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("");
-        let mut out: String = line.chars().filter(|c| !c.is_control()).take(200).collect();
-        if out.is_empty() {
-            out.push_str("no diagnostic output");
-        }
-        out
+        crate::redact::excerpt(&self.stderr)
     }
 }
 

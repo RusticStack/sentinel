@@ -98,7 +98,7 @@ fn the_pull_overlaps_the_checkout() {
     let seen = Arc::new(Mutex::new(Seen::default()));
     let images = Images::with_download({
         let (seen, workspace) = (Arc::clone(&seen), workspace.clone());
-        move |image, _, _, _| {
+        move |image, _, _, _, _| {
             {
                 let mut seen = seen.lock().unwrap();
                 seen.image = image.to_owned();
@@ -212,7 +212,7 @@ fn the_pull_overlaps_the_checkout() {
 /// shared path just as on the direct one.
 #[test]
 fn an_unpinned_reference_is_still_refused() {
-    let images = Images::with_download(|_, _, _, _| Ok(false));
+    let images = Images::with_download(|_, _, _, _, _| Ok(false));
     match images.pull(
         "example.test/image:latest",
         Duration::from_secs(1),

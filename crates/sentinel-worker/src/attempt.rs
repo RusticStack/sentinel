@@ -85,8 +85,48 @@ pub struct Job {
     pub prepare_hold: std::time::Duration,
 }
 
-/// Protected, host-only scratch for one attempt. It is outside the checkout
-/// so artifacts and cache publication never traverse secret material.
+/// Where a step's file targets appear in its container.
+pub const SECRET_FILES_MOUNT: &str = "/run/sentinel-secrets";
+/// Where a step's environment targets appear in its container, as a shell
+/// file its wrapper sources (P10D-8).
+pub const SECRET_ENV_MOUNT: &str = "/run/sentinel-env";
+
+/// Where delivered secrets are staged: under the worker's runtime
+/// directory — a tmpfs when `$XDG_RUNTIME_DIR` is usable (P10D-8) — never
+/// the workspace, caches or artifact roots.
+pub fn secret_root(root: &Path) -> PathBuf {
+    crate::runtime_dir(root).join("secret-delivery")
+}
+
+/// The store an attempt's image and container live in (P10D-5): the
+/// tenant's private store when the job pulls with `registry_auth`, the
+/// shared one otherwise. Deterministic, so the executor's teardown paths
+/// name the same store preparation used.
+pub fn store_for(root: &Path, job: &Job) -> Result<podman::Store> {
+    let private = job.secret_bundle.targets.iter().any(|target| {
+        matches!(
+            target.target,
+            sentinel_protocol::secrets::TargetKind::RegistryAuth
+        )
+    });
+    if !private {
+        return Ok(podman::Store::Shared);
+    }
+    // Registry auth only travels on protocol 10, whose context always
+    // names the tenant; without one there is no store to scope it to.
+    let tenant = job
+        .context
+        .tenant
+        .ok_or_else(|| Error::Preparation("registry auth without a tenant".into()))?;
+    podman::Store::private(root, *tenant.as_bytes())
+}
+
+/// Protected scratch for one attempt. It is outside the checkout so
+/// artifacts and cache publication never traverse secret material. The
+/// attempt directory is owner-only on the host; the two directories below
+/// it are mounted read-only into the attempt's container alone and are
+/// world-readable inside so an image that runs as a non-root user can read
+/// its targets (P10D-4).
 struct SecretDirectory {
     attempt_dir: PathBuf,
     files_dir: PathBuf,
@@ -95,15 +135,18 @@ struct SecretDirectory {
 
 impl SecretDirectory {
     fn create(root: &Path, attempt: AttemptId) -> Result<Self> {
-        let base = root.join("secret-delivery");
+        let base = secret_root(root);
+        if let Some(runtime) = base.parent() {
+            create_private_dir(runtime, true)?;
+        }
         create_private_dir(&base, true)?;
         let attempt_dir = base.join(attempt.to_string());
         create_private_dir(&attempt_dir, false)?;
         let files_dir = attempt_dir.join("files");
         let env_dir = attempt_dir.join("env");
         let result = (|| {
-            create_private_dir(&files_dir, false)?;
-            create_private_dir(&env_dir, false)?;
+            create_mounted_dir(&files_dir)?;
+            create_mounted_dir(&env_dir)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -175,15 +218,86 @@ fn create_private_dir(path: &Path, allow_existing: bool) -> Result<()> {
     Ok(())
 }
 
+/// A directory under a secret mount: readable and traversable by any
+/// container user (the mount is read-only and private to the attempt; the
+/// owner-only attempt directory above it is the host boundary).
+fn create_mounted_dir(path: &Path) -> Result<()> {
+    fs::create_dir(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+/// A host-only secret file (the registry auth file): owner-only.
 fn create_secret_file(path: &Path) -> Result<std::fs::File> {
+    create_file_mode(path, 0o600)
+}
+
+/// A file under a secret mount: readable by the image's user, whoever that
+/// is (P10D-4).
+fn create_mounted_file(path: &Path) -> Result<std::fs::File> {
+    create_file_mode(path, 0o644)
+}
+
+fn create_file_mode(path: &Path, mode: u32) -> Result<std::fs::File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(mode);
     }
-    Ok(options.open(path)?)
+    let file = options.open(path)?;
+    // The umask may have narrowed it; the mode is part of the contract.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    Ok(file)
+}
+
+/// Write `value` as one `export NAME='value'` line for the step's wrapper
+/// shell to source. Env values are UTF-8 without NUL, CR or LF (checked on
+/// arrival); inside single quotes only `'` itself needs care.
+fn write_export(file: &mut std::fs::File, name: &str, value: &[u8]) -> Result<()> {
+    let mut line = Vec::with_capacity(name.len() + value.len() + 12);
+    line.extend_from_slice(b"export ");
+    line.extend_from_slice(name.as_bytes());
+    line.extend_from_slice(b"='");
+    for &byte in value {
+        if byte == b'\'' {
+            line.extend_from_slice(b"'\\''");
+        } else {
+            line.push(byte);
+        }
+    }
+    line.extend_from_slice(b"'\n");
+    let written = file.write_all(&line);
+    line.fill(0);
+    written?;
+    Ok(())
+}
+
+/// The step's argv behind a `/bin/sh` wrapper that exports its secret
+/// environment from the private mount and then `exec`s it: the values
+/// never pass through Podman, which would copy them into the exec
+/// session's spec on disk (P10D-8), nor through any argv.
+fn wrap_with_env(argv: Vec<String>, step: usize) -> Vec<String> {
+    let mut wrapped = Vec::with_capacity(argv.len() + 4);
+    wrapped.push("/bin/sh".to_owned());
+    wrapped.push("-c".to_owned());
+    wrapped.push(format!(
+        ". {SECRET_ENV_MOUNT}/step-{step}.sh && exec \"$@\""
+    ));
+    wrapped.push("sentinel-step".to_owned());
+    wrapped.extend(argv);
+    wrapped
 }
 
 fn wipe_file(path: &Path) {
@@ -224,12 +338,12 @@ fn materialize_step_secrets(
             break;
         }
     }
-    let env_path = has_env.then(|| directory.env_dir.join(format!("step-{step}.env")));
+    let env_path = has_env.then(|| directory.env_dir.join(format!("step-{step}.sh")));
     if let Some(path) = &env_path {
         cleanup.env_file = Some(path.clone());
     }
     let mut env_file = match &env_path {
-        Some(path) => Some(create_secret_file(path)?),
+        Some(path) => Some(create_mounted_file(path)?),
         None => None,
     };
     for target in &bundle.targets {
@@ -246,10 +360,7 @@ fn materialize_step_secrets(
                 let file = env_file
                     .as_mut()
                     .ok_or_else(|| Error::Preparation("secret env file".into()))?;
-                file.write_all(target.name.as_bytes())?;
-                file.write_all(b"=")?;
-                file.write_all(value)?;
-                file.write_all(b"\n")?;
+                write_export(file, &target.name, value)?;
             }
             TargetKind::File { path } => {
                 let path = directory.files_dir.join(path);
@@ -267,7 +378,7 @@ fn materialize_step_secrets(
                             #[cfg(unix)]
                             {
                                 use std::os::unix::fs::PermissionsExt;
-                                fs::set_permissions(&current, fs::Permissions::from_mode(0o700))?;
+                                fs::set_permissions(&current, fs::Permissions::from_mode(0o755))?;
                             }
                             cleanup.directories.push(current.clone());
                         }
@@ -281,7 +392,7 @@ fn materialize_step_secrets(
                     }
                 }
                 cleanup.files.push(path.clone());
-                create_secret_file(&path)?.write_all(value)?;
+                create_mounted_file(&path)?.write_all(value)?;
             }
             TargetKind::RegistryAuth => continue,
         }
@@ -357,6 +468,12 @@ pub trait Output: Send + Sync {
     /// nothing.
     fn redact(&self, text: String) -> String {
         text
+    }
+    /// The bounded excerpt of a failed step's stderr tail for its verdict
+    /// detail, redacted before it is decoded, cut to a line and shortened
+    /// (P10D-2). The default redacts nothing.
+    fn excerpt(&self, stderr: &[u8]) -> String {
+        crate::redact::excerpt(stderr)
     }
 }
 
@@ -658,14 +775,19 @@ fn prepare(
             .tenant
             .map(|tenant| *tenant.as_bytes())
             .unwrap_or(*job.attempt.as_bytes());
-        let pulled = job.images.pull_for_tenant(
-            &image,
-            tenant,
-            credential,
-            &authfile,
-            podman::IMAGE_PULL_TIMEOUT,
-            cancel,
-        );
+        let store = store_for(root, job);
+        let pulled = match &store {
+            Ok(store) => job.images.pull_for_tenant(
+                &image,
+                tenant,
+                credential,
+                &authfile,
+                store,
+                podman::IMAGE_PULL_TIMEOUT,
+                cancel,
+            ),
+            Err(_) => Err(Error::Preparation("private image store".into())),
+        };
         if has_registry_auth {
             wipe_file(&authfile);
             let _ = fs::remove_file(&authfile);
@@ -684,26 +806,39 @@ fn prepare(
             return Err(Error::Preparation("canceled".into()));
         }
         checked_out.and(pulled)?;
+        let store = store?;
         // K02: attach the declared caches — each hit is cloned into the
         // job's private view, each miss still leaves the writable target
         // directories a job always sees. Never fatal: a cache-path error
         // is an explainable miss recorded on the entry. Absolute declared
         // paths reach the container through the collected bind mounts.
         let mut mounts = restore_caches(root, job, &declared, workspace.path(), &image, remote);
-        if job.secret_bundle.targets.iter().any(|target| {
-            matches!(
-                target.target,
-                sentinel_protocol::secrets::TargetKind::File { .. }
-            )
-        }) {
+        let (mut files, mut env) = (false, false);
+        for target in &job.secret_bundle.targets {
+            match target.target {
+                sentinel_protocol::secrets::TargetKind::File { .. } => files = true,
+                sentinel_protocol::secrets::TargetKind::Environment => env = true,
+                sentinel_protocol::secrets::TargetKind::RegistryAuth => {}
+            }
+        }
+        if files || env {
             let directory = secret_directory
                 .as_ref()
                 .ok_or_else(|| Error::Preparation("secret directory".into()))?;
-            mounts.push(podman::Mount {
-                host: directory.files_dir.clone(),
-                container: "/run/sentinel-secrets".into(),
-                read_only: true,
-            });
+            if files {
+                mounts.push(podman::Mount {
+                    host: directory.files_dir.clone(),
+                    container: SECRET_FILES_MOUNT.into(),
+                    read_only: true,
+                });
+            }
+            if env {
+                mounts.push(podman::Mount {
+                    host: directory.env_dir.clone(),
+                    container: SECRET_ENV_MOUNT.into(),
+                    read_only: true,
+                });
+            }
         }
         let started = Instant::now();
         let container = Container::start(
@@ -717,6 +852,7 @@ fn prepare(
             },
             workspace.path(),
             &mounts,
+            &store,
         )?;
         summary.container_start_ns = ns(started);
         Ok(container)
@@ -969,7 +1105,8 @@ fn execute(
         let remaining = job_deadline.saturating_duration_since(Instant::now());
         command.timeout_secs = command.timeout_secs.min(remaining.as_secs().max(1));
         let started = Instant::now();
-        let step_secrets = if command.secrets.is_empty() && command.secret_files.is_empty() {
+        let secret_step = !command.secrets.is_empty() || !command.secret_files.is_empty();
+        let step_secrets = if !secret_step {
             None
         } else {
             let Some(directory) = secret_directory else {
@@ -980,6 +1117,16 @@ fn execute(
                 ));
                 continue;
             };
+            // P10D-1: nothing an earlier step left running may watch this
+            // step's environment or files. The container is emptied down
+            // to its keepalive before anything is materialized; a
+            // container that cannot be emptied gets no secret.
+            if let Err(e) = container.clear_strays() {
+                record.outcome = StepOutcome::Runtime;
+                summary.steps.push(record);
+                failure = Some((FailureClass::Runtime, format!("step {index}: {e}")));
+                continue;
+            }
             match materialize_step_secrets(directory, &job.secret_bundle, index) {
                 Ok(paths) => Some(paths),
                 Err(_) => {
@@ -992,24 +1139,31 @@ fn execute(
                 }
             }
         };
+        if step_secrets.as_ref().is_some_and(|s| s.env_file.is_some()) {
+            command.argv = wrap_with_env(std::mem::take(&mut command.argv), index);
+        }
         let sink: crate::process::Sink = {
             let output = Arc::clone(output);
             let step_index = index as u32;
             Arc::new(move |stream, bytes: &[u8]| output.write(step_index, stream, bytes))
         };
-        let exec = container.exec_streaming_with_env_file(
-            &command,
-            &extra,
-            step_secrets
-                .as_ref()
-                .and_then(|secret| secret.env_file.as_deref()),
-            Some(sink),
-        );
+        let exec = container.exec_streaming(&command, &extra, Some(sink));
+        // …and nothing this step started outlives it into a later one,
+        // whatever it held. Its files go only once its processes have.
+        // A timed-out or canceled step's container is already stopped.
+        let cleared = if secret_step
+            && exec.as_ref().is_ok_and(|exit| !exit.timed_out)
+            && !cancel.load(Ordering::Acquire)
+        {
+            container.clear_strays().map(|_| ())
+        } else {
+            Ok(())
+        };
         drop(step_secrets);
         // Whatever the step printed last and the redactor held back is
         // this step's output, released before the next one starts.
         output.step_done(index as u32);
-        let exit = match exec {
+        let exit = match exec.and_then(|exit| cleared.map(|()| exit)) {
             Ok(exit) => exit,
             Err(e) => {
                 record.outcome = StepOutcome::Runtime;
@@ -1042,7 +1196,7 @@ fn execute(
                 StepOutcome::Runtime,
                 Some((
                     FailureClass::Runtime,
-                    format!("step {index}: {}", exit.stderr_excerpt()),
+                    format!("step {index}: {}", output.excerpt(&exit.stderr)),
                 )),
             )
         } else if exit.signal.is_some() || exit.code != Some(0) {
@@ -1374,7 +1528,7 @@ mod tests {
         let workspace = root.join("workspaces").join("attempt");
         fs::create_dir_all(&workspace).unwrap();
         let attempt = AttemptId::new();
-        let attempt_dir = root.join("secret-delivery").join(attempt.to_string());
+        let attempt_dir = secret_root(&root).join(attempt.to_string());
         let directory = SecretDirectory::create(&root, attempt).unwrap();
         let bundle = DeliveryBundle {
             values: vec![
@@ -1401,23 +1555,25 @@ mod tests {
         let paths = materialize_step_secrets(&directory, &bundle, 0).unwrap();
         let env = paths.env_file.as_ref().unwrap().clone();
         let cert = directory.files_dir.join("tls/client.pem");
-        assert!(env.starts_with(root.join("secret-delivery")));
-        assert!(cert.starts_with(root.join("secret-delivery")));
+        assert!(env.starts_with(secret_root(&root)));
+        assert!(cert.starts_with(secret_root(&root)));
         assert!(!env.starts_with(&workspace));
         assert!(!cert.starts_with(&workspace));
-        assert_eq!(fs::read(&env).unwrap(), b"TOKEN=a-token-value\n");
+        assert_eq!(fs::read(&env).unwrap(), b"export TOKEN='a-token-value'\n");
         assert_eq!(fs::read(&cert).unwrap(), b"certificate-bytes");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(&env).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-            assert_eq!(
-                fs::metadata(&cert).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            // P10D-4: the host boundary is the owner-only attempt
+            // directory; what is mounted read-only into the attempt's
+            // container is readable by whatever user its image runs as.
+            assert_eq!(mode(&attempt_dir), 0o700);
+            assert_eq!(mode(&secret_root(&root)), 0o700);
+            assert_eq!(mode(&directory.files_dir), 0o755);
+            assert_eq!(mode(&directory.files_dir.join("tls")), 0o755);
+            assert_eq!(mode(&cert), 0o644);
+            assert_eq!(mode(&env), 0o644);
         }
 
         drop(paths);
@@ -1425,6 +1581,74 @@ mod tests {
         assert!(!cert.exists());
         drop(directory);
         assert!(!attempt_dir.exists());
+    }
+
+    /// P10D-8: environment targets reach the step through the wrapper
+    /// shell that sources the private file and `exec`s the step — exactly,
+    /// whatever the value holds (quotes, `$`, backticks, spaces, non-ASCII)
+    /// and up to the 64 KiB value bound, which Podman's `--env-file`
+    /// reader refused. The values appear in no argv.
+    #[test]
+    fn env_targets_reach_the_step_exactly_through_the_wrapper() {
+        use sentinel_protocol::secrets::{
+            DeliveryBundle, DeliveryTarget, DeliveryValue, TargetKind,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("worker");
+        fs::create_dir_all(&root).unwrap();
+        let directory = SecretDirectory::create(&root, AttemptId::new()).unwrap();
+        let tricky = "it's $HOME `id` \"q\" \\n x  é";
+        let big = "b".repeat(sentinel_protocol::secrets::MAX_SECRET_BYTES);
+        let bundle = DeliveryBundle {
+            values: vec![
+                DeliveryValue::new(tricky.as_bytes().to_vec()),
+                DeliveryValue::new(big.as_bytes().to_vec()),
+            ],
+            targets: vec![
+                DeliveryTarget {
+                    step: 3,
+                    name: "TRICKY".into(),
+                    value: 0,
+                    target: TargetKind::Environment,
+                },
+                DeliveryTarget {
+                    step: 3,
+                    name: "BIG".into(),
+                    value: 1,
+                    target: TargetKind::Environment,
+                },
+            ],
+        };
+        let paths = materialize_step_secrets(&directory, &bundle, 3).unwrap();
+        let env = paths.env_file.clone().unwrap();
+        // The wrapper as the container runs it, with the mount path
+        // pointing at the host file.
+        let argv = wrap_with_env(
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '%s' \"$TRICKY\" > \"$0\"; printf '%s' \"${#BIG}\" > \"$0.len\"".into(),
+                temp.path().join("seen").display().to_string(),
+            ],
+            3,
+        );
+        assert!(argv.iter().all(|a| !a.contains("$HOME `id`") && !a.contains(&big)));
+        let script = argv[2].replace(SECRET_ENV_MOUNT, &directory.env_dir.display().to_string());
+        let status = std::process::Command::new(&argv[0])
+            .arg(&argv[1])
+            .arg(script)
+            .args(&argv[3..])
+            .env_clear()
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(temp.path().join("seen")).unwrap(), tricky);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("seen.len")).unwrap(),
+            big.len().to_string()
+        );
+        drop(paths);
+        assert!(!env.exists());
     }
 
     /// P07-24: a failed attempt keeps the mirror fallback reason next to
@@ -1517,7 +1741,7 @@ mod tests {
                 tenant: None,
                 trust: Trust::Protected,
             },
-            images: Images::with_download(|_, _, _, _| Ok(false)),
+            images: Images::with_download(|_, _, _, _, _| Ok(false)),
             caches: Vec::new(),
             mirrors: None,
             prepare_hold: Duration::ZERO,

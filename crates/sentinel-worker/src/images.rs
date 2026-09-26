@@ -40,13 +40,17 @@ const FOLLOW_POLL: Duration = Duration::from_millis(50);
 /// What performs the pull: `podman::pull` in production, a stub in tests.
 /// The bool reports whether the image was present before the authorization
 /// pull; it does not mean that the pull was skipped.
-type Download = Arc<dyn Fn(&str, &Path, Duration, &AtomicBool) -> Result<bool> + Send + Sync>;
+type Download =
+    Arc<dyn Fn(&str, &Path, &podman::Store, Duration, &AtomicBool) -> Result<bool> + Send + Sync>;
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct PullKey {
     image: Box<str>,
     tenant: Option<[u8; 16]>,
     credential: [u8; 32],
+    /// Where the image lands: a credentialed pull goes to the tenant's
+    /// private store (P10D-5).
+    store: podman::Store,
 }
 
 impl PullKey {
@@ -55,6 +59,7 @@ impl PullKey {
             image: image.into(),
             tenant: None,
             credential: [0; 32],
+            store: podman::Store::Shared,
         }
     }
 }
@@ -225,14 +230,20 @@ impl Images {
     /// already held the image.
     #[doc(hidden)]
     pub fn with_download(
-        download: impl Fn(&str, &Path, Duration, &AtomicBool) -> Result<bool> + Send + Sync + 'static,
+        download: impl Fn(&str, &Path, &podman::Store, Duration, &AtomicBool) -> Result<bool>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self::with_authfile_and_download(PathBuf::from("unused-anonymous-auth.json"), download)
     }
 
     fn with_authfile_and_download(
         anonymous_authfile: PathBuf,
-        download: impl Fn(&str, &Path, Duration, &AtomicBool) -> Result<bool> + Send + Sync + 'static,
+        download: impl Fn(&str, &Path, &podman::Store, Duration, &AtomicBool) -> Result<bool>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Images {
             inner: Arc::new(Inner {
@@ -269,15 +280,20 @@ impl Images {
         self.pull_keyed(key, image, &self.inner.anonymous_authfile, timeout, cancel)
     }
 
-    /// Pull using an attempt's own registry authority. The single-flight key
-    /// includes tenant and a secret-value fingerprint: neither another
-    /// tenant nor a rotated credential can inherit a successful auth check.
+    /// Pull using an attempt's own registry authority into `store` — the
+    /// tenant's private one for a credentialed pull. The single-flight key
+    /// includes tenant, a secret-value fingerprint and the store: neither
+    /// another tenant nor a rotated credential can inherit a successful
+    /// auth check. Only a shared-store pull joins the held record: it is
+    /// what any tenant's attempt may find resident.
+    #[allow(clippy::too_many_arguments)]
     pub fn pull_for_tenant(
         &self,
         image: &str,
         tenant: [u8; 16],
         credential: [u8; 32],
         authfile: &Path,
+        store: &podman::Store,
         timeout: Duration,
         cancel: &Cancel,
     ) -> Result<bool> {
@@ -287,6 +303,7 @@ impl Images {
                 image: image.into(),
                 tenant: Some(tenant),
                 credential,
+                store: store.clone(),
             },
             image,
             authfile,
@@ -334,7 +351,7 @@ impl Images {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     return self.pull_keyed(key.clone(), image, authfile, remaining, cancel);
                 }
-                if outcome.is_ok() {
+                if outcome.is_ok() && key.store == podman::Store::Shared {
                     self.record(image);
                 }
                 return outcome.map_err(Shared::into_error);
@@ -376,8 +393,8 @@ impl Images {
         timeout: Duration,
         cancel: &Cancel,
     ) -> Result<bool> {
-        let outcome = (self.inner.download)(image, authfile, timeout, cancel);
-        if outcome.is_ok() {
+        let outcome = (self.inner.download)(image, authfile, &key.store, timeout, cancel);
+        if outcome.is_ok() && key.store == podman::Store::Shared {
             self.record(image);
         }
         // A pull killed because its leader was cancelled says nothing about
@@ -643,7 +660,7 @@ mod tests {
                 Arc::clone(&self.release),
                 self.outcome,
             );
-            Images::with_download(move |_, _, _, _| {
+            Images::with_download(move |_, _, _, _, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 let _ = entered.send(());
                 release.wait();
@@ -691,7 +708,7 @@ mod tests {
             let images = Images::with_download({
                 let (calls, release, entered_tx) =
                     (Arc::clone(&calls), Arc::clone(&release), entered_tx);
-                move |_, authfile, _, _| {
+                move |_, authfile, _, _, _| {
                     calls.fetch_add(1, Ordering::SeqCst);
                     entered_tx.send(authfile.to_path_buf()).unwrap();
                     while !release.load(Ordering::Acquire) {
@@ -708,6 +725,7 @@ mod tests {
                         tenants[0],
                         credentials[0],
                         Path::new("auth-first.json"),
+                        &podman::Store::Shared,
                         Duration::from_secs(5),
                         &cancel(),
                     )
@@ -725,6 +743,7 @@ mod tests {
                         tenants[1],
                         credentials[1],
                         Path::new("auth-second.json"),
+                        &podman::Store::Shared,
                         Duration::from_secs(5),
                         &cancel(),
                     )
@@ -816,7 +835,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let images = Images::with_download({
             let calls = Arc::clone(&calls);
-            move |_, _, _, _| {
+            move |_, _, _, _, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(true)
             }
@@ -838,7 +857,7 @@ mod tests {
 
     #[test]
     fn the_held_record_is_bounded_and_evicts_the_oldest() {
-        let images = Images::with_download(|_, _, _, _| Ok(false));
+        let images = Images::with_download(|_, _, _, _, _| Ok(false));
         let flag = cancel();
         for i in 0..MAX_HELD + 1 {
             let image = format!("example.test/i@sha256:{i:064}");
@@ -873,7 +892,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let images = Images::with_download({
             let calls = Arc::clone(&calls);
-            move |_, _, _, _| {
+            move |_, _, _, _, _| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(false)
             }
@@ -889,6 +908,7 @@ mod tests {
                 [0; 16],
                 [0; 32],
                 authfile.path(),
+                &podman::Store::Shared,
                 Duration::from_secs(1),
                 &cancel,
             ),

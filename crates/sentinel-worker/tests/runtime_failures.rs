@@ -15,7 +15,7 @@ use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::OnceLock};
 
 use sentinel_core::{AttemptId, Fence, WorkerId};
 use sentinel_worker::{
-    podman::{Container, Limits},
+    podman::{self, Container, Limits},
     recovery,
 };
 
@@ -89,6 +89,7 @@ fn teardown_removes_the_container_even_when_its_stop_fails() {
         },
         workspace.path(),
         &[],
+        &podman::Store::Shared,
     )
     .unwrap();
     // The stop's failure is reported, and the removal ran anyway.

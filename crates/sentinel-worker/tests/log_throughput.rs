@@ -222,7 +222,7 @@ fn helper_wait_latency() {
     const N: u32 = 100;
     let started = Instant::now();
     for _ in 0..N {
-        podman::remove_named("sentinel-bench").unwrap();
+        podman::remove_named("sentinel-bench", &podman::Store::Shared).unwrap();
     }
     let per = started.elapsed() / N;
     let started = Instant::now();

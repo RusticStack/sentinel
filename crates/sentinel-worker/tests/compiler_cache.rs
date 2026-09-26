@@ -141,6 +141,7 @@ fn a_compiler_namespace_persists_across_attempts_and_the_tool_decides_staleness(
     podman::pull(
         IMAGE,
         &authfile,
+        &podman::Store::Shared,
         Duration::from_secs(600),
         &std::sync::atomic::AtomicBool::new(false),
     )
@@ -177,6 +178,7 @@ fn a_compiler_namespace_persists_across_attempts_and_the_tool_decides_staleness(
         limits,
         &ws1,
         &mounts,
+        &podman::Store::Shared,
     )
     .unwrap();
     let exit = c1.exec(&run_fakecc, &[]).unwrap();
@@ -219,6 +221,7 @@ fn a_compiler_namespace_persists_across_attempts_and_the_tool_decides_staleness(
         limits,
         &ws2,
         &mounts_of(&a2),
+        &podman::Store::Shared,
     )
     .unwrap();
     let exit = c2.exec(&run_fakecc, &[]).unwrap();
