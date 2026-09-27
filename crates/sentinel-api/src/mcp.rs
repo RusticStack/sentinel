@@ -647,6 +647,44 @@ fn rpc_error(id: Option<Value>, code: i32, message: &str, status: u16) -> Reply 
 mod tests {
     use super::*;
 
+    /// P11-5: one account cannot take the table from everyone else; its
+    /// seventeenth session replaces its least recently used one.
+    #[test]
+    fn mcp_sessions_are_capped_per_user_with_lru_eviction() {
+        let sessions = Sessions::default();
+        let (flood, other) = (UserId::new(), UserId::new());
+        let start = Instant::now();
+        let at = |n: u64| start + Duration::from_millis(n);
+        let ids: Vec<String> = (0..MAX_SESSIONS_PER_USER as u64)
+            .map(|n| sessions.create_at(flood, at(n)).unwrap())
+            .collect();
+        // Use the first so the second becomes the least recently used.
+        sessions.touch_at(&ids[0], flood, at(100)).unwrap();
+        for n in 0..(MAX_SESSIONS as u64) {
+            sessions.create_at(flood, at(200 + n)).unwrap();
+        }
+        let held = |user| sessions.lock().values().filter(|s| s.user == user).count();
+        assert_eq!(held(flood), MAX_SESSIONS_PER_USER);
+        assert!(sessions.create_at(other, at(5_000)).is_ok());
+        assert_eq!(
+            sessions
+                .touch_at(&ids[1], flood, at(5_001))
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+        // Idle sessions expire.
+        let late = at(5_001) + SESSION_IDLE;
+        let fresh = sessions.create_at(other, at(5_002)).unwrap();
+        assert_eq!(
+            sessions
+                .touch_at(&fresh, other, late + Duration::from_secs(1))
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+    }
+
     #[test]
     fn session_ids_are_random_hashed_and_bound_to_the_authenticated_user() {
         let sessions = Sessions::default();
