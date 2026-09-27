@@ -954,8 +954,13 @@ fn a_github_sign_in_replaces_the_browsers_previous_session() {
     browser.accept(&cookie);
     assert_eq!(sessions_of(&d, d.root), 1);
 
-    let page = browser.get(&format!("{base}/"));
-    assert!(page.text.contains("const github = true;"));
+    // The web interface learns that GitHub sign-in is offered from health.
+    let health = browser.get(&format!("{base}/api/v1/health"));
+    assert!(
+        health.text.contains("\"github_sign_in\":true"),
+        "{}",
+        health.text
+    );
     let done = through_github(
         &d,
         &mut browser,
@@ -1098,8 +1103,12 @@ fn without_github_configured_no_page_offers_it_and_the_routes_do_not_exist() {
     assert!(!page.text.contains("Sign in with GitHub"));
     let device = browser.get(&format!("{}/device", d.base));
     assert!(!device.text.contains("Sign in with GitHub"));
-    let index = browser.get(&format!("{}/", d.base));
-    assert!(index.text.contains("const github = /*github*/false;"));
+    let health = browser.get(&format!("{}/api/v1/health", d.base));
+    assert!(
+        health.text.contains("\"github_sign_in\":false"),
+        "{}",
+        health.text
+    );
     for path in [
         "/auth/github/start?return_to=%2F",
         "/auth/github/callback?code=a&state=b",
