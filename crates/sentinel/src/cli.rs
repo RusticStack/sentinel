@@ -211,6 +211,8 @@ pub enum AdminCommand {
     Identity(IdentityArgs),
     /// Show or change the deployment admission policy
     Policy(PolicyArgs),
+    /// List, disable and re-enable registered (DCR/CIMD) OAuth clients
+    OauthClient(OauthClientArgs),
     /// Create, list and revoke one-time invitations
     Invite(InviteArgs),
     /// Review pending applications; approve or reject accounts
@@ -689,6 +691,42 @@ pub enum PolicyCommand {
         /// super-admin-only or tenant-admins
         #[arg(long)]
         installation_binding: Option<String>,
+        /// Which OAuth client registrations to accept: off, metadata
+        /// (Client ID Metadata Documents only; the default) or open (also
+        /// anonymous RFC 7591 dynamic registration)
+        #[arg(long)]
+        oauth_client_registration: Option<String>,
+    },
+}
+
+#[derive(Args)]
+pub struct OauthClientArgs {
+    #[command(subcommand)]
+    pub command: OauthClientCommand,
+}
+
+#[derive(Subcommand)]
+pub enum OauthClientCommand {
+    /// List every DCR/CIMD client with its state and live grants
+    List {
+        #[command(flatten)]
+        data: DataDir,
+    },
+    /// Disable a client and revoke every grant it holds
+    Disable {
+        #[command(flatten)]
+        data: DataDir,
+        /// The client identifier, or a CIMD client's metadata URL
+        #[arg(long)]
+        client: String,
+    },
+    /// Re-enable a disabled client; its revoked grants stay revoked
+    Enable {
+        #[command(flatten)]
+        data: DataDir,
+        /// The client identifier, or a CIMD client's metadata URL
+        #[arg(long)]
+        client: String,
     },
 }
 

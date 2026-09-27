@@ -41,7 +41,14 @@ pub struct Metadata {
     pub token_endpoint: String,
     pub revocation_endpoint: String,
     pub device_authorization_endpoint: String,
-    pub registration_endpoint: String,
+    /// RFC 7591 registration, present only while the deployment's policy
+    /// allows Dynamic Client Registration. Optional on the wire: metadata
+    /// only ever gains optional members, so a newer client reads an older
+    /// controller's document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_endpoint: Option<String>,
+    /// Whether Client ID Metadata Documents are accepted; absent is `false`.
+    #[serde(default)]
     pub client_id_metadata_document_supported: bool,
     pub response_types_supported: Vec<String>,
     pub response_modes_supported: Vec<String>,
@@ -54,7 +61,17 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    /// The metadata this deployment publishes under `issuer`.
+    /// Advertise the client registration mechanisms the deployment's policy
+    /// currently allows.
+    #[must_use]
+    pub fn with_client_registration(mut self, dynamic: bool, metadata_documents: bool) -> Self {
+        self.registration_endpoint = dynamic.then(|| format!("{}{REGISTRATION_PATH}", self.issuer));
+        self.client_id_metadata_document_supported = metadata_documents;
+        self
+    }
+
+    /// The metadata this deployment publishes under `issuer`, with no
+    /// client registration advertised ([`Self::with_client_registration`]).
     pub fn for_issuer(issuer: &str, scopes: &[&str]) -> Self {
         let owned = |values: &[&str]| values.iter().map(|v| (*v).to_owned()).collect();
         Self {
@@ -63,8 +80,8 @@ impl Metadata {
             token_endpoint: format!("{issuer}{TOKEN_PATH}"),
             revocation_endpoint: format!("{issuer}{REVOKE_PATH}"),
             device_authorization_endpoint: format!("{issuer}{DEVICE_AUTHORIZATION_PATH}"),
-            registration_endpoint: format!("{issuer}{REGISTRATION_PATH}"),
-            client_id_metadata_document_supported: true,
+            registration_endpoint: None,
+            client_id_metadata_document_supported: false,
             response_types_supported: owned(&["code"]),
             response_modes_supported: owned(&["query"]),
             grant_types_supported: owned(&[
@@ -252,6 +269,27 @@ impl std::error::Error for OAuthError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P09S-4: a controller from before X06 publishes neither registration
+    /// member; a newer client must still read its document.
+    #[test]
+    fn metadata_from_a_controller_before_client_registration_still_parses() {
+        let older = r#"{"issuer":"https://ci.example","authorization_endpoint":"https://ci.example/oauth/authorize","token_endpoint":"https://ci.example/oauth/token","revocation_endpoint":"https://ci.example/oauth/revoke","device_authorization_endpoint":"https://ci.example/oauth/device_authorization","response_types_supported":["code"],"response_modes_supported":["query"],"grant_types_supported":["authorization_code"],"code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none"],"revocation_endpoint_auth_methods_supported":["none"],"scopes_supported":["runs:read"],"authorization_response_iss_parameter_supported":true}"#;
+        let meta: Metadata = serde_json::from_str(older).unwrap();
+        assert_eq!(meta.registration_endpoint, None);
+        assert!(!meta.client_id_metadata_document_supported);
+
+        let closed = serde_json::to_value(Metadata::for_issuer("https://ci.example", &[])).unwrap();
+        assert!(closed.get("registration_endpoint").is_none());
+        assert_eq!(closed["client_id_metadata_document_supported"], false);
+        let open =
+            Metadata::for_issuer("https://ci.example", &[]).with_client_registration(true, true);
+        assert_eq!(
+            open.registration_endpoint.as_deref(),
+            Some("https://ci.example/oauth/register")
+        );
+        assert!(open.client_id_metadata_document_supported);
+    }
 
     #[test]
     fn metadata_names_every_endpoint_under_the_issuer() {

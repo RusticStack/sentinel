@@ -26,6 +26,7 @@ pub mod lookup;
 pub mod mfa;
 pub mod oauth;
 pub mod objects;
+pub mod operations;
 pub mod poll;
 pub mod provenance;
 pub mod registration;

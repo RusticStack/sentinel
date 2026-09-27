@@ -147,6 +147,9 @@ pub struct Client {
     pub max_scopes: Scopes,
     /// OAuth resource this client may request.
     pub resource: Audience,
+    /// Registered by a third party (DCR or CIMD), not provisioned by this
+    /// deployment.
+    pub registered: bool,
 }
 
 /// Terms of a client registered by [`register_client`].
@@ -178,15 +181,277 @@ pub struct McpClientSpec<'a> {
     pub metadata_url: Option<&'a str>,
 }
 
-/// Registration can be refused at the hard per-deployment client cap.
+/// Why a registration was refused.
 #[derive(Debug)]
 pub enum McpRegistrationError {
+    /// The deployment holds [`MAX_MCP_CLIENTS`] enabled registrations and
+    /// none is old and unused enough to evict.
     Capacity,
+    /// The registering address already holds
+    /// [`MAX_MCP_CLIENTS_PER_REGISTRANT`] enabled registrations.
+    Registrant,
     Store(Error),
 }
 
-/// At most this many externally registered clients may be stored per deployment.
+/// At most this many enabled externally registered clients may be stored
+/// per deployment. The database enforces it too.
 pub const MAX_MCP_CLIENTS: i64 = 512;
+/// Enabled registrations one address (IPv4 address or IPv6 /64) may hold.
+pub const MAX_MCP_CLIENTS_PER_REGISTRANT: i64 = 16;
+/// A registration that holds no grant and no code is deleted by maintenance
+/// once it is this old: a client that never completed a sign-in, or whose
+/// every grant ended and was purged.
+pub const UNUSED_CLIENT_TTL_MS: i64 = DAY_MS;
+/// At capacity, the oldest unused registration at least this old is evicted
+/// to make room, so a flood cannot lock onboarding out: a legitimate client
+/// has this long to finish its first sign-in before it can be displaced.
+pub const EVICTABLE_CLIENT_AGE_MS: i64 = 15 * MINUTE_MS;
+
+/// Which client registration mechanisms the deployment offers (instance
+/// policy). Stored as its integer in `deployment_policy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ClientRegistration {
+    /// Neither: only provisioned clients (the CLI) exist.
+    Off = 0,
+    /// Client ID Metadata Documents only. The default: the MCP 2025-11-25
+    /// authorization profile prefers CIMD, and Sentinel stores a CIMD
+    /// client only for a signed-in account.
+    Metadata = 1,
+    /// CIMD and anonymous RFC 7591 Dynamic Client Registration.
+    Open = 2,
+}
+
+impl ClientRegistration {
+    pub const fn dynamic(self) -> bool {
+        matches!(self, Self::Open)
+    }
+    pub const fn metadata(self) -> bool {
+        matches!(self, Self::Metadata | Self::Open)
+    }
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Metadata => "metadata",
+            Self::Open => "open",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "metadata" => Some(Self::Metadata),
+            "open" => Some(Self::Open),
+            _ => None,
+        }
+    }
+}
+
+/// The deployment's client registration policy. One single-row read.
+pub fn client_registration(conn: &Connection) -> Result<ClientRegistration> {
+    let code: i64 = conn
+        .prepare_cached("SELECT oauth_client_registration FROM deployment_policy WHERE id = 1")?
+        .query_row([], |r| r.get(0))?;
+    match code {
+        0 => Ok(ClientRegistration::Off),
+        1 => Ok(ClientRegistration::Metadata),
+        2 => Ok(ClientRegistration::Open),
+        _ => Err(Error::Corrupt(
+            "deployment_policy.oauth_client_registration",
+        )),
+    }
+}
+
+/// Change the client registration policy: platform administration with a
+/// recent step-up (host-local counts), audited. Turning a mechanism off
+/// stops new registrations through it; clients already registered keep
+/// working until disabled ([`set_client_disabled`]) or reclaimed.
+pub fn set_client_registration(
+    tx: &Transaction<'_>,
+    authority: Authority,
+    mode: ClientRegistration,
+    now: UnixMillis,
+) -> Result<()> {
+    authority.require_privileged(tx)?;
+    tx.execute(
+        "UPDATE deployment_policy SET oauth_client_registration = ?1, updated_ms = ?2,
+         updated_by = ?3 WHERE id = 1",
+        params![
+            mode as u8,
+            now.0,
+            authority.actor().as_ref().map(UserId::as_bytes)
+        ],
+    )?;
+    let detail = format!("oauth_client_registration={}", mode.as_str());
+    audit(
+        tx,
+        Event::PolicyChanged,
+        authority.actor(),
+        None,
+        authority.host_local(),
+        Some(&detail),
+    )
+}
+
+/// One DCR or CIMD registration, for operators.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredClient {
+    pub id: String,
+    /// The metadata URL of a CIMD client.
+    pub metadata_url: Option<String>,
+    pub name: String,
+    pub kind: McpRegistrationKind,
+    pub created: UnixMillis,
+    pub disabled: Option<UnixMillis>,
+    /// Grants neither revoked nor expired.
+    pub live_grants: u32,
+}
+
+/// Every DCR/CIMD registration, oldest first. Bounded by the enabled cap
+/// plus the rows operators disabled.
+pub fn registered_clients(conn: &Connection, now: UnixMillis) -> Result<Vec<RegisteredClient>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT c.client_id, c.metadata_url, c.name, c.registration_kind, c.created_ms,
+                c.disabled_ms,
+                (SELECT count(*) FROM oauth_grants g WHERE g.client_id = c.client_id
+                    AND g.revoked_ms IS NULL AND g.expires_ms > ?1)
+         FROM oauth_clients c WHERE c.registration_kind != 0
+         ORDER BY c.registration_kind, c.created_ms",
+    )?;
+    let rows = statement.query_map([now.0], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, u8>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, Option<i64>>(5)?,
+            r.get::<_, i64>(6)?,
+        ))
+    })?;
+    let mut clients = Vec::new();
+    for row in rows {
+        let (id, metadata_url, name, kind, created, disabled, live) = row?;
+        clients.push(RegisteredClient {
+            id,
+            metadata_url,
+            name,
+            kind: match kind {
+                1 => McpRegistrationKind::Dynamic,
+                2 => McpRegistrationKind::Metadata,
+                _ => return Err(Error::Corrupt("oauth_clients.registration_kind")),
+            },
+            created: UnixMillis(created),
+            disabled: disabled.map(UnixMillis),
+            live_grants: u32::try_from(live).unwrap_or(u32::MAX),
+        });
+    }
+    Ok(clients)
+}
+
+/// Disable (or re-enable) a DCR/CIMD client, named by its identifier or its
+/// CIMD URL. Disabling also revokes every live grant it holds, so its tokens
+/// stop at once, and returns how many; a disabled CIMD client stays disabled
+/// however often its document is presented. Re-enabling restores only the
+/// ability to ask again, within the enabled-registration bound (`Conflict`
+/// past it). Stepped-up platform administration or host-local; audited.
+/// Provisioned clients are `NotFound`: they are not managed here.
+pub fn set_client_disabled(
+    tx: &Transaction<'_>,
+    authority: Authority,
+    client: &str,
+    disabled: bool,
+    now: UnixMillis,
+) -> Result<u32> {
+    authority.require_privileged(tx)?;
+    let (id, was_disabled): (String, bool) = tx
+        .prepare_cached(
+            "SELECT client_id, disabled_ms IS NOT NULL FROM oauth_clients
+             WHERE registration_kind != 0 AND (client_id = ?1 OR metadata_url = ?1)",
+        )?
+        .query_row([client], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    let mut revoked = 0;
+    if disabled {
+        tx.prepare_cached(
+            "UPDATE oauth_clients SET disabled_ms = ?2 WHERE client_id = ?1 AND disabled_ms IS NULL",
+        )?
+        .execute(params![id, now.0])?;
+        revoked = tx
+            .prepare_cached(
+                "UPDATE oauth_grants SET revoked_ms = ?2, revoked_reason = ?3
+                 WHERE client_id = ?1 AND revoked_ms IS NULL",
+            )?
+            .execute(params![id, now.0, reason::ADMIN])?;
+    } else if was_disabled {
+        let enabled: i64 = tx
+            .prepare_cached(
+                "SELECT count(*) FROM oauth_clients
+                 WHERE registration_kind != 0 AND disabled_ms IS NULL",
+            )?
+            .query_row([], |r| r.get(0))?;
+        if enabled >= MAX_MCP_CLIENTS {
+            return Err(Error::Conflict);
+        }
+        tx.prepare_cached("UPDATE oauth_clients SET disabled_ms = NULL WHERE client_id = ?1")?
+            .execute([&id])?;
+    }
+    let mut detail = String::with_capacity(96);
+    detail.push_str(if disabled {
+        "oauth client disabled "
+    } else {
+        "oauth client enabled "
+    });
+    detail.push_str(&id);
+    audit(
+        tx,
+        Event::PolicyChanged,
+        authority.actor(),
+        None,
+        authority.host_local(),
+        Some(&detail),
+    )?;
+    Ok(u32::try_from(revoked).unwrap_or(u32::MAX))
+}
+
+/// The digest a registering address is stored as: a 16-byte BLAKE3
+/// prefix of the rate-limit key, never the address.
+pub fn registrant_digest(key: u128) -> [u8; 16] {
+    let digest = blake3::hash(&key.to_be_bytes());
+    let mut out = [0; 16];
+    out.copy_from_slice(&digest.as_bytes()[..16]);
+    out
+}
+
+/// "Client `c` holds nothing": no grant (live, or dead and awaiting purge)
+/// and no authorization code. Both are index searches (migration 43).
+macro_rules! client_unused {
+    () => {
+        "NOT EXISTS(SELECT 1 FROM oauth_grants g WHERE g.client_id = c.client_id)
+         AND NOT EXISTS(SELECT 1 FROM oauth_codes k WHERE k.client_id = c.client_id)"
+    };
+}
+
+/// The oldest enabled registration that holds nothing and was created at or
+/// before `?1`: the one capacity eviction removes.
+const EVICTION_CANDIDATE: &str = concat!(
+    "SELECT c.client_id FROM oauth_clients c
+     WHERE c.registration_kind != 0 AND c.disabled_ms IS NULL AND c.created_ms <= ?1 AND ",
+    client_unused!(),
+    " ORDER BY c.registration_kind, c.created_ms LIMIT 1"
+);
+
+/// Registrations that hold nothing and were created at or before `?1`, at
+/// most `?2`. A disabled CIMD client is kept, or presenting its document
+/// again would register it afresh; a disabled DCR identifier is never
+/// issued again, so it goes.
+const UNUSED_CLIENTS: &str = concat!(
+    "SELECT c.client_id FROM oauth_clients c
+     WHERE c.registration_kind != 0 AND c.created_ms <= ?1
+       AND NOT (c.registration_kind = 2 AND c.disabled_ms IS NOT NULL) AND ",
+    client_unused!(),
+    " LIMIT ?2"
+);
 
 fn decode_scopes(bits: i64) -> Result<Scopes> {
     u32::try_from(bits)
@@ -236,7 +501,7 @@ pub fn client(conn: &Connection, client_id: &str) -> Result<Client> {
     let row = conn
         .prepare_cached(
             "SELECT client_id, COALESCE(metadata_url, client_id), name, first_party,
-                    loopback, redirect_path, device, max_scopes, resource
+                    loopback, redirect_path, device, max_scopes, resource, registration_kind
              FROM oauth_clients WHERE client_id = ?1 AND disabled_ms IS NULL",
         )?
         .query_row([client_id], |r| {
@@ -250,6 +515,7 @@ pub fn client(conn: &Connection, client_id: &str) -> Result<Client> {
                 r.get::<_, bool>(6)?,
                 r.get::<_, i64>(7)?,
                 r.get::<_, u8>(8)?,
+                r.get::<_, u8>(9)?,
             ))
         })
         .optional()?
@@ -264,12 +530,14 @@ pub fn client(conn: &Connection, client_id: &str) -> Result<Client> {
         device: row.6,
         max_scopes: decode_scopes(row.7)?,
         resource: Audience::from_code(row.8).ok_or(Error::Corrupt("oauth_clients.resource"))?,
+        registered: row.9 != 0,
     })
 }
 
 /// Whether `uri` is a redirect this client may use: a loopback URI on the
-/// client's path (any port), or an exact registered URI. No prefix, pattern
-/// or normalization matching.
+/// client's path (any port), an exact registered URI, or a registered
+/// loopback URI on any port (RFC 8252 §7.3, [`forms::loopback_redirect_key`]).
+/// No prefix, pattern or other normalization matching.
 pub fn redirect_allowed(conn: &Connection, client: &Client, uri: &str) -> Result<bool> {
     if client.loopback
         && let Some(path) = client.redirect_path.as_deref()
@@ -280,11 +548,16 @@ pub fn redirect_allowed(conn: &Connection, client: &Client, uri: &str) -> Result
     if uri.is_empty() || uri.len() > 512 {
         return Ok(false);
     }
+    let key = forms::loopback_redirect_key(uri);
     let listed: bool = conn
         .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM oauth_client_redirects WHERE client_id = ?1 AND uri = ?2)",
+            "SELECT EXISTS(SELECT 1 FROM oauth_client_redirects WHERE client_id = ?1
+             AND uri IN (?2, ?3))",
         )?
-        .query_row(params![client.id, uri], |r| r.get(0))?;
+        .query_row(
+            params![client.id, uri, key.as_deref().unwrap_or(uri)],
+            |r| r.get(0),
+        )?;
     Ok(listed)
 }
 
@@ -322,11 +595,33 @@ pub fn register_client(store: &Store, spec: &ClientSpec<'_>, redirects: &[&str])
 
 /// Register a bounded public MCP OAuth client. DCR creates a new row; CIMD
 /// refreshes the metadata snapshot for its stable URL-derived ID. No user,
-/// grant, tenant or repository is created by either path.
+/// grant, tenant or repository is created by either path. Same as
+/// [`register_mcp_client_from`] with no registrant.
 pub fn register_mcp_client(
     store: &Store,
     spec: &McpClientSpec<'_>,
     redirects: &[&str],
+) -> std::result::Result<(), McpRegistrationError> {
+    register_mcp_client_from(store, spec, redirects, None, UnixMillis::now())
+}
+
+/// Register a client on behalf of `registrant` ([`registrant_digest`]).
+///
+/// Bounds, all in the one writer transaction: at most
+/// [`MAX_MCP_CLIENTS_PER_REGISTRANT`] enabled registrations per registrant
+/// (`Registrant`), and at most [`MAX_MCP_CLIENTS`] enabled registrations in
+/// all. At that cap the oldest registration that holds nothing and is at
+/// least [`EVICTABLE_CLIENT_AGE_MS`] old is deleted to make room; only when
+/// none qualifies is the answer `Capacity`. A client name equal to a
+/// provisioned client's (ignoring ASCII case) is `InvalidInput`: a third
+/// party cannot present itself as the Sentinel CLI. Registered loopback
+/// redirects are stored port-free ([`forms::loopback_redirect_key`]).
+pub fn register_mcp_client_from(
+    store: &Store,
+    spec: &McpClientSpec<'_>,
+    redirects: &[&str],
+    registrant: Option<[u8; 16]>,
+    now: UnixMillis,
 ) -> std::result::Result<(), McpRegistrationError> {
     if spec.id.is_empty()
         || spec.id.len() > 64
@@ -353,6 +648,15 @@ pub fn register_mcp_client(
             "MCP client redirects",
         )));
     }
+    // Stored forms: loopback URIs lose their port, so two registrations that
+    // differ only by port are one stored redirect.
+    let mut stored: Vec<String> = Vec::with_capacity(redirects.len());
+    for uri in redirects {
+        let form = forms::loopback_redirect_key(uri).unwrap_or_else(|| (*uri).to_owned());
+        if !stored.contains(&form) {
+            stored.push(form);
+        }
+    }
     let id = spec.id.to_owned();
     let name = spec.name.to_owned();
     let max_scopes = spec.max_scopes.bits();
@@ -361,11 +665,18 @@ pub fn register_mcp_client(
         McpRegistrationKind::Metadata => 2u8,
     };
     let metadata_url = spec.metadata_url.map(str::to_owned);
-    let redirects: Vec<String> = redirects.iter().map(|uri| (*uri).to_owned()).collect();
-    let now = UnixMillis::now();
     let inserted = store
         .writer()
         .write(move |tx| {
+            let reserved: bool = tx
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM oauth_clients
+                     WHERE registration_kind = 0 AND lower(name) = lower(?1))",
+                )?
+                .query_row([&name], |row| row.get(0))?;
+            if reserved {
+                return Err(Error::InvalidInput("client_name"));
+            }
             let existing = tx
                 .prepare_cached(
                     "SELECT registration_kind, metadata_url, disabled_ms FROM oauth_clients
@@ -396,39 +707,68 @@ pub fn register_mcp_client(
                     [&id],
                 )?;
             } else {
-                let count: i64 = tx.query_row(
-                    "SELECT count(*) FROM oauth_clients WHERE registration_kind != 0",
-                    [],
-                    |row| row.get(0),
-                )?;
+                if let Some(registrant) = registrant {
+                    let held: i64 = tx
+                        .prepare_cached(
+                            "SELECT count(*) FROM oauth_clients
+                             WHERE registrant = ?1 AND disabled_ms IS NULL",
+                        )?
+                        .query_row([registrant], |row| row.get(0))?;
+                    if held >= MAX_MCP_CLIENTS_PER_REGISTRANT {
+                        return Ok(Some(McpRegistrationError::Registrant));
+                    }
+                }
+                let count: i64 = tx
+                    .prepare_cached(
+                        "SELECT count(*) FROM oauth_clients
+                         WHERE registration_kind != 0 AND disabled_ms IS NULL",
+                    )?
+                    .query_row([], |row| row.get(0))?;
                 if count >= MAX_MCP_CLIENTS {
-                    return Ok(false);
+                    let victim: Option<String> = tx
+                        .prepare_cached(EVICTION_CANDIDATE)?
+                        .query_row([now.0.saturating_sub(EVICTABLE_CLIENT_AGE_MS)], |row| {
+                            row.get(0)
+                        })
+                        .optional()?;
+                    let Some(victim) = victim else {
+                        return Ok(Some(McpRegistrationError::Capacity));
+                    };
+                    delete_client(tx, &victim)?;
                 }
                 tx.execute(
                     "INSERT INTO oauth_clients(client_id, name, first_party, loopback,
                         redirect_path, device, max_scopes, created_ms, resource,
-                        registration_kind, metadata_url)
-                     VALUES (?1, ?2, 0, 0, NULL, 0, ?3, ?4, 2, ?5, ?6)",
-                    params![id, name, max_scopes, now.0, kind, metadata_url],
+                        registration_kind, metadata_url, registrant)
+                     VALUES (?1, ?2, 0, 0, NULL, 0, ?3, ?4, 2, ?5, ?6, ?7)",
+                    params![id, name, max_scopes, now.0, kind, metadata_url, registrant],
                 )?;
             }
-            for uri in &redirects {
+            for uri in &stored {
                 tx.execute(
                     "INSERT INTO oauth_client_redirects(client_id, uri) VALUES (?1, ?2)",
                     params![id, uri],
                 )?;
             }
-            Ok(true)
+            Ok(None)
         })
         .map_err(McpRegistrationError::Store)?;
-    if inserted {
-        Ok(())
-    } else {
-        Err(McpRegistrationError::Capacity)
+    match inserted {
+        None => Ok(()),
+        Some(refusal) => Err(refusal),
     }
 }
 
-/// The terms of a new grant. The database re-checks the account, the
+/// Delete one DCR/CIMD client that holds nothing, with its redirects.
+fn delete_client(tx: &Transaction<'_>, client: &str) -> Result<()> {
+    tx.prepare_cached("DELETE FROM oauth_client_redirects WHERE client_id = ?1")?
+        .execute([client])?;
+    tx.prepare_cached("DELETE FROM oauth_clients WHERE client_id = ?1 AND registration_kind != 0")?
+        .execute([client])?;
+    Ok(())
+}
+
+// The terms of a new grant. The database re-checks the account, the
 /// client's ceiling, platform/tenant-admin eligibility, service confinement
 /// and repository ownership at insert.
 #[derive(Clone, Copy, Debug)]
@@ -1171,8 +1511,10 @@ pub fn issue_grant_trusted(store: &Store, g: NewGrant<'_>, now: UnixMillis) -> R
 /// category per call, in one bounded writer transaction: expired codes,
 /// device requests and access tokens; refresh tokens past their idle expiry
 /// or rotated more than [`ROTATED_RETENTION_MS`] ago; and expired or revoked
-/// grants with everything that references them. Maintenance only: every
-/// validation already checks expiry and revocation itself.
+/// grants with everything that references them; and DCR/CIMD registrations
+/// older than [`UNUSED_CLIENT_TTL_MS`] that hold no grant or code.
+/// Maintenance only: every validation already checks expiry and revocation
+/// itself.
 pub fn purge_expired(store: &Store, now: UnixMillis, limit: u32) -> Result<usize> {
     store.writer().write(move |tx| {
         let mut removed = 0;
@@ -1223,6 +1565,19 @@ pub fn purge_expired(store: &Store, now: UnixMillis, limit: u32) -> Result<usize
                 removed += tx.prepare_cached(sql)?.execute([grant])?;
             }
         }
+        // After the grants: a client whose last grant was just purged is
+        // unused now, not on the next tick.
+        let unused: Vec<String> = tx
+            .prepare_cached(UNUSED_CLIENTS)?
+            .query_map(
+                params![now.0.saturating_sub(UNUSED_CLIENT_TTL_MS), limit],
+                |r| r.get(0),
+            )?
+            .collect::<std::result::Result<_, _>>()?;
+        for client in &unused {
+            delete_client(tx, client)?;
+        }
+        removed += unused.len();
         Ok(removed)
     })
 }
@@ -1256,6 +1611,38 @@ mod tests {
         );
     }
 
+    /// Registration reclamation walks only the partial registration index
+    /// (at most the enabled cap plus disabled rows, never every client or
+    /// grant), and "holds nothing" is two key searches per candidate.
+    #[test]
+    fn registration_reclamation_reads_only_registrations_and_key_searches() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::migrate(&mut conn).unwrap();
+        for sql in [super::EVICTION_CANDIDATE, super::UNUSED_CLIENTS] {
+            let plans = plans(&conn, sql);
+            for plan in &plans {
+                assert!(
+                    !plan.starts_with("SCAN ")
+                        || plan == "SCAN c USING INDEX oauth_clients_by_registration",
+                    "{sql}: {plans:?}"
+                );
+                assert!(!plan.contains("TEMP B-TREE"), "{sql}: {plans:?}");
+            }
+            assert!(
+                plans
+                    .iter()
+                    .any(|p| p.contains("SEARCH g USING COVERING INDEX oauth_grants_by_client")),
+                "{plans:?}"
+            );
+            assert!(
+                plans
+                    .iter()
+                    .any(|p| p.contains("SEARCH k USING COVERING INDEX oauth_codes_by_client")),
+                "{plans:?}"
+            );
+        }
+    }
+
     /// Revocation cascades and the replay lookup use indexes, not scans.
     #[test]
     fn revocation_and_rotation_lookups_are_index_searches() {
@@ -1268,6 +1655,8 @@ mod tests {
             "UPDATE oauth_grants SET revoked_ms = ?2 WHERE tenant_id = ?1 AND revoked_ms IS NULL",
             "SELECT id FROM oauth_grants WHERE expires_ms <= ?1
              UNION ALL SELECT id FROM oauth_grants WHERE revoked_ms IS NOT NULL LIMIT ?2",
+            "UPDATE oauth_grants SET revoked_ms = ?2, revoked_reason = ?3
+             WHERE client_id = ?1 AND revoked_ms IS NULL",
         ] {
             let plans = plans(&conn, sql);
             assert!(

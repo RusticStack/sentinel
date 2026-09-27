@@ -138,6 +138,10 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         42,
         include_str!("migrations/042_mcp_client_registration.sql"),
     ),
+    (
+        43,
+        include_str!("migrations/043_oauth_client_lifecycle.sql"),
+    ),
 ];
 
 /// Whether `versions` are exactly `1..=N` in order. `migrate` skips every

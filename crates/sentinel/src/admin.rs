@@ -17,7 +17,7 @@ use sentinel_core::{
 use sentinel_store::{
     Durability, MASTER_KEY_FILE, METADATA_FILE, Store,
     local_auth::{self, Event},
-    lookup, mfa,
+    lookup, mfa, oauth, operations,
     registration::{
         self, Authority, DeploymentPolicy, InstallationBinding, Registration, TenantCreation, Terms,
     },
@@ -29,9 +29,10 @@ use sentinel_store::{
 
 use crate::cli::{
     AccountArgs, AccountCommand, AdminArgs, AdminCommand, DataDir, IdentityArgs, IdentityCommand,
-    InviteArgs, InviteCommand, KeyArgs, KeyCommand, MfaArgs, MfaCommand, ObjectsArgs,
-    ObjectsCommand, PolicyArgs, PolicyCommand, PoolArgs, PoolCommand, SessionArgs, SessionCommand,
-    TenantArgs, TenantCommand, TokenArgs, TokenCommand, WorkerArgs, WorkerCommand,
+    InviteArgs, InviteCommand, KeyArgs, KeyCommand, MfaArgs, MfaCommand, OauthClientArgs,
+    OauthClientCommand, ObjectsArgs, ObjectsCommand, PolicyArgs, PolicyCommand, PoolArgs,
+    PoolCommand, SessionArgs, SessionCommand, TenantArgs, TenantCommand, TokenArgs, TokenCommand,
+    WorkerArgs, WorkerCommand,
 };
 
 pub struct Error {
@@ -190,6 +191,7 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
         AdminCommand::Token(args) => token(args, now)?,
         AdminCommand::Identity(args) => identity(args, now)?,
         AdminCommand::Policy(args) => policy(args, now)?,
+        AdminCommand::OauthClient(args) => oauth_client(args, now)?,
         AdminCommand::Invite(args) => invite(args, now)?,
         AdminCommand::Account(args) => account(args, now)?,
         AdminCommand::Key(args) => key(args)?,
@@ -465,14 +467,29 @@ fn policy(args: &PolicyArgs, now: UnixMillis) -> Result<(), Error> {
                 "installation binding: {}",
                 installation_binding_name(policy.installation_binding)
             );
+            let clients = store
+                .read(oauth::client_registration)
+                .map_err(|error| fail(format!("cannot read the policy: {error}")))?;
+            sentinel::outln!("oauth client registration: {}", clients.as_str());
         }
         PolicyCommand::Set {
             data,
             registration: wanted,
             tenant_creation,
             installation_binding,
+            oauth_client_registration,
         } => {
             let store = open(data, true)?;
+            let clients = oauth_client_registration
+                .as_deref()
+                .map(|mode| {
+                    oauth::ClientRegistration::parse(mode).ok_or_else(|| {
+                        fail(format!(
+                            "unknown OAuth client registration mode {mode}; use off, metadata or open"
+                        ))
+                    })
+                })
+                .transpose()?;
             let current = store
                 .read(registration::policy)
                 .map_err(|error| fail(format!("cannot read the policy: {error}")))?;
@@ -511,14 +528,83 @@ fn policy(args: &PolicyArgs, now: UnixMillis) -> Result<(), Error> {
             };
             store
                 .writer()
-                .write(move |tx| registration::set_policy(tx, Authority::HostLocal, policy, now))
+                .write(move |tx| {
+                    registration::set_policy(tx, Authority::HostLocal, policy, now)?;
+                    match clients {
+                        Some(mode) => {
+                            oauth::set_client_registration(tx, Authority::HostLocal, mode, now)
+                        }
+                        None => Ok(()),
+                    }
+                })
                 .map_err(|error| fail(format!("cannot change the policy: {error}")))?;
+            if let Some(mode) = clients {
+                eprintln!("oauth_client_registration={}", mode.as_str());
+            }
             eprintln!(
                 "registration={} tenants={} installations={}",
                 registration_name(policy.registration),
                 tenant_creation_name(policy.tenant_creation),
                 installation_binding_name(policy.installation_binding)
             );
+        }
+    }
+    Ok(())
+}
+
+/// Registered OAuth clients (X06): the operator's view and switch, with no
+/// SQL. Disabling revokes the client's grants in the same transaction.
+fn oauth_client(args: &OauthClientArgs, now: UnixMillis) -> Result<(), Error> {
+    match &args.command {
+        OauthClientCommand::List { data } => {
+            let store = open(data, true)?;
+            let clients = store
+                .read(|conn| oauth::registered_clients(conn, now))
+                .map_err(|error| fail(format!("cannot list OAuth clients: {error}")))?;
+            for client in clients {
+                sentinel::outln!(
+                    "{} kind={} created={} grants={}{} name={:?}{}",
+                    client.id,
+                    match client.kind {
+                        oauth::McpRegistrationKind::Dynamic => "dcr",
+                        oauth::McpRegistrationKind::Metadata => "cimd",
+                    },
+                    client.created.0,
+                    client.live_grants,
+                    client
+                        .disabled
+                        .map(|at| format!(" disabled={}", at.0))
+                        .unwrap_or_default(),
+                    client.name,
+                    client
+                        .metadata_url
+                        .map(|url| format!(" url={url}"))
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        OauthClientCommand::Disable { data, client }
+        | OauthClientCommand::Enable { data, client } => {
+            let disable = matches!(args.command, OauthClientCommand::Disable { .. });
+            let store = open(data, true)?;
+            let id = client.clone();
+            let revoked = store
+                .writer()
+                .write(move |tx| {
+                    oauth::set_client_disabled(tx, Authority::HostLocal, &id, disable, now)
+                })
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound => fail("no registered OAuth client by that identifier or URL"),
+                    sentinel_store::Error::Conflict => fail(
+                        "the deployment already holds its limit of enabled registrations; disable another first",
+                    ),
+                    other => fail(format!("cannot change the client: {other}")),
+                })?;
+            if disable {
+                eprintln!("disabled {client}; revoked {revoked} grant(s)");
+            } else {
+                eprintln!("enabled {client}");
+            }
         }
     }
     Ok(())
@@ -1128,7 +1214,18 @@ fn cancel(
                 .map_err(|_| fail("no job with that identifier"))?;
             let outcome = store
                 .writer()
-                .write(move |tx| sentinel_store::dispatch::cancel(tx, tenant, job, now))
+                .write(move |tx| {
+                    let outcome = sentinel_store::dispatch::cancel(tx, tenant, job, now)?;
+                    operations::record(
+                        tx,
+                        tenant,
+                        operations::Action::CancelJob,
+                        *job.as_bytes(),
+                        operations::Actor::HostLocal,
+                        now,
+                    )?;
+                    Ok(outcome)
+                })
                 .map_err(|error| fail(format!("cannot cancel: {error}")))?;
             eprintln!("{job}: {outcome:?}");
         }
@@ -1141,7 +1238,18 @@ fn cancel(
                 .map_err(|_| fail("no run with that identifier"))?;
             let count = store
                 .writer()
-                .write(move |tx| sentinel_store::dispatch::cancel_run(tx, tenant, run, now))
+                .write(move |tx| {
+                    let count = sentinel_store::dispatch::cancel_run(tx, tenant, run, now)?;
+                    operations::record(
+                        tx,
+                        tenant,
+                        operations::Action::CancelRun,
+                        *run.as_bytes(),
+                        operations::Actor::HostLocal,
+                        now,
+                    )?;
+                    Ok(count)
+                })
                 .map_err(|error| fail(format!("cannot cancel: {error}")))?;
             eprintln!("{run}: cancellation recorded for {count} job(s)");
         }
