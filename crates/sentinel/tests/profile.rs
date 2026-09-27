@@ -1676,7 +1676,18 @@ fn windows_two_directories_never_refresh_one_legacy_entry_at_once() {
         .iter()
         .filter_map(|r| r.param("refresh_token"))
         .collect();
-    assert_eq!(presented, vec![token("sntl_rt_", 1)], "one presentation");
+    let shown: Vec<String> = results
+        .iter()
+        .map(|r| match r {
+            Ok(a) => a.clone(),
+            Err(e) => e.message.clone(),
+        })
+        .collect();
+    assert_eq!(
+        presented,
+        vec![token("sntl_rt_", 1)],
+        "one presentation: {shown:?} legacy={legacy}"
+    );
     let won = results.iter().filter(|r| r.is_ok()).count();
     assert_eq!(won, 1, "exactly one directory refreshed");
     for result in &results {

@@ -27,7 +27,21 @@ fn last_error() -> io::Error {
     io::Error::from_raw_os_error(code as i32)
 }
 
+/// How long a Credential Manager call waits for another Sentinel process's.
+const STORE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Held around every Credential Manager call. With several processes
+/// writing at once, `CredReadW` was measured answering `ERROR_NOT_FOUND`
+/// for an entry another thread had just written and nobody deleted (15 of
+/// 20 probe processes, four at a time, lost reads; one process alone never
+/// did). Sentinel processes of this logon session therefore take turns;
+/// each call holds the lock for one short system call.
+fn store_lock() -> io::Result<NamedLock> {
+    NamedLock::acquire(r"Local\sentinel-credential-manager", STORE_WAIT)
+}
+
 pub fn read(key: &str) -> io::Result<Option<Vec<u8>>> {
+    let _turn = store_lock()?;
     let target = wide(key);
     let mut credential: *mut CREDENTIALW = ptr::null_mut();
     // SAFETY: `target` is a NUL-terminated UTF-16 string alive for the call,
@@ -64,6 +78,7 @@ pub fn write(key: &str, blob: &[u8]) -> io::Result<()> {
             "credential larger than Credential Manager stores",
         ));
     }
+    let _turn = store_lock()?;
     let mut target = wide(key);
     let mut user = wide("sentinel");
     let credential = CREDENTIALW {
@@ -87,6 +102,7 @@ pub fn write(key: &str, blob: &[u8]) -> io::Result<()> {
 }
 
 pub fn delete(key: &str) -> io::Result<()> {
+    let _turn = store_lock()?;
     let target = wide(key);
     // SAFETY: `target` is a NUL-terminated UTF-16 string alive for the call.
     let ok = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
@@ -103,21 +119,34 @@ pub fn delete(key: &str) -> io::Result<()> {
 /// shared by every configuration directory of this user, while profile
 /// locks live in each directory, so two directories could otherwise both
 /// present its refresh token at once. A named mutex in this logon
-/// session's namespace, named after the key's digest, serializes them; the
-/// OS releases it if the holder dies (the next waiter then sees
-/// `WAIT_ABANDONED`, which still grants ownership). Ownership belongs to
-/// the acquiring thread, which releases it on drop.
-pub struct LegacyLock(windows_sys::Win32::Foundation::HANDLE);
+/// session's namespace, named after the key's digest, serializes them.
+pub struct LegacyLock(#[allow(dead_code)] NamedLock);
 
 impl LegacyLock {
     /// Wait at most `deadline` for the legacy entry `key`.
     pub fn acquire(key: &str, deadline: std::time::Duration) -> io::Result<LegacyLock> {
+        let digest = blake3::hash(key.as_bytes()).to_hex();
+        NamedLock::acquire(
+            &format!(r"Local\sentinel-legacy-{}", &digest[..32]),
+            deadline,
+        )
+        .map(LegacyLock)
+    }
+}
+
+/// An owned named mutex of this logon session. The OS releases it if the
+/// holder dies (the next waiter then sees `WAIT_ABANDONED`, which still
+/// grants ownership). Ownership belongs to the acquiring thread, which
+/// releases it on drop; the guard is not `Send`.
+struct NamedLock(windows_sys::Win32::Foundation::HANDLE);
+
+impl NamedLock {
+    fn acquire(name: &str, deadline: std::time::Duration) -> io::Result<NamedLock> {
         use windows_sys::Win32::{
             Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
             System::Threading::{CreateMutexW, WaitForSingleObject},
         };
-        let digest = blake3::hash(key.as_bytes()).to_hex();
-        let name = wide(&format!(r"Local\sentinel-legacy-{}", &digest[..32]));
+        let name = wide(name);
         // SAFETY: `name` is a NUL-terminated UTF-16 string alive for the
         // call; default security and no initial ownership.
         let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
@@ -127,10 +156,10 @@ impl LegacyLock {
         let millis = u32::try_from(deadline.as_millis()).unwrap_or(u32::MAX - 1);
         // SAFETY: `handle` is the live mutex handle opened above.
         match unsafe { WaitForSingleObject(handle, millis) } {
-            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(LegacyLock(handle)),
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(NamedLock(handle)),
             code => {
                 let error = if code == WAIT_TIMEOUT {
-                    io::Error::new(io::ErrorKind::TimedOut, "legacy credential entry is busy")
+                    io::Error::new(io::ErrorKind::TimedOut, "credential store is busy")
                 } else {
                     last_error()
                 };
@@ -142,11 +171,11 @@ impl LegacyLock {
     }
 }
 
-impl Drop for LegacyLock {
+impl Drop for NamedLock {
     fn drop(&mut self) {
         use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::ReleaseMutex};
-        // SAFETY: this thread owns the mutex (acquired in `acquire`, and the
-        // lock never leaves the acquiring call); the handle is closed once.
+        // SAFETY: this thread owns the mutex (the guard never leaves the
+        // acquiring thread); the handle is closed once.
         unsafe {
             ReleaseMutex(self.0);
             CloseHandle(self.0);
