@@ -568,7 +568,7 @@ fn a_github_only_account_approves_an_oauth_consent_and_lands_where_it_started() 
     assert!(browser.cookie("__Host-sentinel_signin").is_none());
     assert_eq!(continue_target(&done), format!("/oauth/authorize?{query}"));
     assert!(
-        !done.text.contains("sessionStorage"),
+        !done.text.contains("sentinel-csrf"),
         "no CSRF copy for OAuth pages"
     );
     assert_eq!(done.header("x-frame-options"), Some("DENY"));
@@ -975,10 +975,10 @@ fn a_github_sign_in_replaces_the_browsers_previous_session() {
         browser.cookie("__Host-sentinel_session"),
         Some(value.as_str())
     );
-    // The first page gets its CSRF secret through session storage, and the
+    // The web interface gets its CSRF secret through local storage, and the
     // secret works as the header for this session.
     assert_eq!(continue_target(&done), "/");
-    let needle = "sessionStorage.setItem(\"sentinel-csrf\", \"";
+    let needle = "localStorage.setItem(\"sentinel-csrf\", \"";
     let at = done.text.find(needle).unwrap() + needle.len();
     let csrf = done.text[at..at + 64].to_owned();
     let logout = browser.request(

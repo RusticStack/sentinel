@@ -645,6 +645,27 @@ pub fn narrowing_by_name(
     }
 }
 
+/// Refuse (`Conflict`) to take the administrator role from `user` when they
+/// are the tenant's last administrator: an organization that loses its last
+/// admin can only be recovered by the platform. A personal namespace's owner
+/// is already held by the schema. A tenant that has no administrator (one a
+/// platform administrator created bare) is not blocked: the change being
+/// made is how it gets one.
+fn keep_an_admin(tx: &Transaction<'_>, tenant: TenantId, user: UserId) -> Result<()> {
+    let last: bool = tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM memberships WHERE tenant_id = ?1 AND user_id = ?2
+                AND role = 3)
+             AND NOT EXISTS(SELECT 1 FROM memberships WHERE tenant_id = ?1 AND role = 3
+                AND user_id != ?2)",
+        )?
+        .query_row(params![tenant.as_bytes(), user.as_bytes()], |r| r.get(0))?;
+    if last {
+        return Err(Error::Conflict);
+    }
+    Ok(())
+}
+
 /// Set or change a member's role. A downgrade takes effect on the next query;
 /// the tenant's authorization epoch moves so anything long-lived re-checks.
 pub fn set_membership(
@@ -655,6 +676,9 @@ pub fn set_membership(
     role: Role,
 ) -> Result<()> {
     require_tenant_admin(tx, principal, tenant)?;
+    if role != Role::TenantAdmin {
+        keep_an_admin(tx, tenant, user)?;
+    }
     let changed = tx.execute(
         "INSERT INTO memberships(tenant_id, user_id, role)
         SELECT ?1, id, ?3 FROM users WHERE id = ?2 AND active = 1
@@ -691,6 +715,7 @@ pub fn remove_membership(
     now: UnixMillis,
 ) -> Result<()> {
     require_tenant_admin(tx, principal, tenant)?;
+    keep_an_admin(tx, tenant, user)?;
     let removed = tx.execute(
         "DELETE FROM memberships WHERE tenant_id = ?1 AND user_id = ?2",
         params![tenant.as_bytes(), user.as_bytes()],

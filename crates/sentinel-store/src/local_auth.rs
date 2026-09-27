@@ -120,6 +120,68 @@ pub enum Event {
 }
 
 impl Event {
+    /// The event's stable name, as the CLI and the API print it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Event::Bootstrap => "bootstrap",
+            Event::LoginAccepted => "login-accepted",
+            Event::LoginRejected => "login-rejected",
+            Event::LoginLocked => "login-locked",
+            Event::Logout => "logout",
+            Event::LogoutAll => "logout-all",
+            Event::PasswordChanged => "password-changed",
+            Event::PasswordRecovered => "password-recovered",
+            Event::SuperAdminGranted => "super-admin-granted",
+            Event::SuperAdminRevoked => "super-admin-revoked",
+            Event::AccountActivated => "account-activated",
+            Event::AccountDeactivated => "account-deactivated",
+            Event::TokenIssued => "token-issued",
+            Event::TokenRevoked => "token-revoked",
+            Event::IdentityLinked => "identity-linked",
+            Event::IdentityUnlinked => "identity-unlinked",
+            Event::RegistrationAdmitted => "registration-admitted",
+            Event::RegistrationPending => "registration-pending",
+            Event::RegistrationRefused => "registration-refused",
+            Event::AccountApproved => "account-approved",
+            Event::AccountRejected => "account-rejected",
+            Event::InvitationCreated => "invitation-created",
+            Event::InvitationRedeemed => "invitation-redeemed",
+            Event::InvitationRevoked => "invitation-revoked",
+            Event::PolicyChanged => "policy-changed",
+            Event::InstallationBound => "installation-bound",
+            Event::InstallationUnbound => "installation-unbound",
+            Event::MfaEnrolled => "mfa-enrolled",
+            Event::MfaDisabled => "mfa-disabled",
+            Event::SteppedUp => "stepped-up",
+            Event::StepUpFailed => "step-up-failed",
+            Event::RecoveryCodeUsed => "recovery-code-used",
+            Event::RecoveryCodesIssued => "recovery-codes-issued",
+            Event::SessionRevoked => "session-revoked",
+            Event::TenantSuspended => "tenant-suspended",
+            Event::TenantReactivated => "tenant-reactivated",
+            Event::MembershipSet => "membership-set",
+            Event::MembershipRemoved => "membership-removed",
+            Event::GrantChanged => "grant-changed",
+            Event::PoolCreated => "pool-created",
+            Event::PoolGranted => "pool-granted",
+            Event::PoolGrantRevoked => "pool-grant-revoked",
+            Event::NamespaceCreated => "namespace-created",
+            Event::WorkerEnrollmentIssued => "worker-enrollment-issued",
+            Event::WorkerEnrollmentRefused => "worker-enrollment-refused",
+            Event::WorkerEnrolled => "worker-enrolled",
+            Event::WorkerRevoked => "worker-revoked",
+            Event::OAuthGrantIssued => "oauth-grant-issued",
+            Event::OAuthGrantRevoked => "oauth-grant-revoked",
+            Event::OAuthRefreshReplay => "oauth-refresh-replay",
+            Event::OAuthCodeReplay => "oauth-code-replay",
+            Event::OAuthConsentDenied => "oauth-consent-denied",
+            Event::OAuthDeviceApproved => "oauth-device-approved",
+            Event::OAuthDeviceDenied => "oauth-device-denied",
+            Event::ServiceGrantIssued => "service-grant-issued",
+            Event::ServiceAccountCreated => "service-account-created",
+        }
+    }
+
     const fn from_code(code: i64) -> Option<Event> {
         Some(match code {
             1 => Event::Bootstrap,
@@ -990,14 +1052,20 @@ pub struct AuditRecord {
 
 /// Most recent records first. At most 100 per call.
 pub fn recent_audit(conn: &Connection, limit: u16) -> Result<Vec<AuditRecord>> {
+    audit_page(conn, None, limit)
+}
+
+/// Records strictly older than sequence `before` (the newest without one),
+/// newest first, at most 100: a keyset page down the primary key.
+pub fn audit_page(conn: &Connection, before: Option<i64>, limit: u16) -> Result<Vec<AuditRecord>> {
     if !(1..=100).contains(&limit) {
         return Err(Error::InvalidInput("page size"));
     }
     let mut stmt = conn.prepare_cached(
         "SELECT seq, at_ms, event, actor_user_id, subject_user_id, host_local, detail
-         FROM auth_audit ORDER BY seq DESC LIMIT ?1",
+         FROM auth_audit WHERE seq < ?1 ORDER BY seq DESC LIMIT ?2",
     )?;
-    let rows = stmt.query_map([limit], |r| {
+    let rows = stmt.query_map(params![before.unwrap_or(i64::MAX), limit], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, i64>(1)?,

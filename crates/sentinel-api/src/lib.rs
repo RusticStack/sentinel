@@ -19,7 +19,6 @@ mod mcp;
 mod oauth;
 mod routes;
 mod secret_routes;
-mod web;
 
 use std::{
     net::SocketAddr,
@@ -39,6 +38,9 @@ pub use oauth::limit::TrustedProxy;
 
 /// Requests being handled at once; further connections wait on a permit.
 pub const WORKERS: usize = 8;
+/// Connections held at once (one reader thread each); further handshakes
+/// wait in the listener backlog.
+pub const CONNECTIONS: usize = 64;
 /// How long a `wait=1` log poll holds before answering with nothing new.
 pub const LOG_WAIT: Duration = Duration::from_secs(25);
 /// Upload/download bodies in flight at once (D02), counted until the last
@@ -47,21 +49,27 @@ pub const LOG_WAIT: Duration = Duration::from_secs(25);
 /// transfer work.
 pub const TRANSFERS: usize = 3;
 /// Long-poll subscribers parked at once — run waits and `wait=1` log polls
-/// together. Beyond it a poll is `rate_limited` with
-/// `details.retry_after_ms`.
-pub const SUBSCRIBERS: usize = 3;
+/// together, including every live view of the web interface (U03/U04).
+/// A parked poll holds its connection but gives its handler permit back
+/// while it waits, so parked polls never starve requests doing work.
+/// Beyond it a poll is `rate_limited` with `details.retry_after_ms`.
+pub const SUBSCRIBERS: usize = 32;
 /// Of those, how many one user (a person or a service account, whatever
 /// credential it presents) may hold at once: a single credential looping
 /// parked polls can never take every slot from everyone else (P09-12).
-pub const SUBSCRIBERS_PER_USER: usize = 2;
+pub const SUBSCRIBERS_PER_USER: usize = 8;
 const _: () = assert!(
     SUBSCRIBERS_PER_USER >= 1 && SUBSCRIBERS_PER_USER < SUBSCRIBERS,
     "one user must leave a subscriber slot for others"
 );
-/// Handler permits neither transfers nor long polls can take: however many
-/// slow bodies and parked polls there are, this many requests — logins,
-/// token refreshes, health checks, run reads — are always served.
-pub const RESERVED_HANDLERS: usize = WORKERS - TRANSFERS - SUBSCRIBERS;
+const _: () = assert!(
+    CONNECTIONS - SUBSCRIBERS >= 16,
+    "parked polls must leave connections for everything else"
+);
+/// Handler permits transfers cannot take: however many slow bodies there
+/// are (parked polls hold none), this many requests — logins, token
+/// refreshes, health checks, run reads — are always served.
+pub const RESERVED_HANDLERS: usize = WORKERS - TRANSFERS;
 const _: () = assert!(
     RESERVED_HANDLERS >= 2,
     "keep handler permits for control requests"
@@ -70,12 +78,12 @@ const _: () = assert!(
 /// GitHub sign-in's code exchange (up to two ten-second calls) and Client ID
 /// Metadata Document fetches (two seconds) draw on this one budget. A
 /// request past it is answered "busy, retry" at once, never queued, so with
-/// [`TRANSFERS`] and [`SUBSCRIBERS`] a handler always remains for logins,
+/// [`TRANSFERS`] (parked polls hold none) a handler always remains for logins,
 /// token refreshes, health checks and run reads — however slow the third
 /// party, and however many anonymous or signed-in callers ask.
 pub const OUTBOUND: usize = 1;
 const _: () = assert!(
-    WORKERS - TRANSFERS - SUBSCRIBERS - OUTBOUND >= 1,
+    WORKERS - TRANSFERS - OUTBOUND >= 1,
     "keep a handler permit for control requests"
 );
 
@@ -173,15 +181,13 @@ pub(crate) struct State {
     pub trusted_proxies: Vec<TrustedProxy>,
     /// Outbound calls to third parties in flight ([`OUTBOUND`]).
     pub outbound: Outbound,
-    /// The first page, rendered once for this configuration.
-    pub index: String,
 }
 
 /// Who holds the parked long-poll slots: at most [`SUBSCRIBERS`] in total
 /// and [`SUBSCRIBERS_PER_USER`] per user. A fixed table, never a map: with
 /// at most `SUBSCRIBERS` slots held there are at most that many distinct
-/// holders, so a take or a release is one short lock and a scan of three
-/// entries, and nothing grows with the number of users.
+/// holders, so a take or a release is one short lock and a scan of at most
+/// that many entries, and nothing grows with the number of users.
 #[derive(Default)]
 pub(crate) struct Subscribers {
     held: Mutex<[(Option<UserId>, u8); SUBSCRIBERS]>,
@@ -269,7 +275,6 @@ impl Server {
                     format!("GitHub sign-in: {e}"),
                 )
             })?;
-        let index = web::index(github.is_some());
         let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::new(State {
             store: config.store,
@@ -288,7 +293,6 @@ impl Server {
             github,
             trusted_proxies: config.trusted_proxies,
             outbound: Outbound::default(),
-            index,
         });
         let conns = http::listen(
             listener,

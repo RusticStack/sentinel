@@ -413,12 +413,14 @@ fn finish(state: &State, github: &Github, request: &Request) -> Reply {
     target.push_str(&destination);
     let mut body = String::with_capacity(512 + 2 * target.len());
     if destination == "/" {
-        // The first page makes its own API calls and needs this session's
+        // The web interface makes its own API calls and needs this session's
         // CSRF secret, which exists in plain text only now; the login
-        // response hands it over the same way. OAuth pages need no copy.
+        // response hands it over the same way. It goes to `localStorage` so
+        // every tab of the browser can act, as the interface keeps it. OAuth
+        // pages need no copy.
         let mut csrf = String::with_capacity(Secret::TEXT_LEN);
         issued.csrf.expose(&mut csrf);
-        body.push_str("<script>try { sessionStorage.setItem(\"sentinel-csrf\", \"");
+        body.push_str("<script>try { localStorage.setItem(\"sentinel-csrf\", \"");
         body.push_str(&csrf);
         body.push_str("\"); } catch (e) {}</script>\n");
     }

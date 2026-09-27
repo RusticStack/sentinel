@@ -479,7 +479,7 @@ mod tests {
             title: "Passed".into(),
             summary: "run run_1".into(),
             external_id: "sentinel:run_1:test".into(),
-            details_url: Some("https://ci.example/#/runs/run_1".into()),
+            details_url: Some("https://ci.example/runs/run_1".into()),
             completed_at: None,
         };
         assert!(payload(&check).is_ok());

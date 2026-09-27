@@ -25,14 +25,14 @@ use sentinel_protocol::{
     error::{ApiError, ErrorCode},
     idempotency::{Fingerprint, IdempotencyKey},
     intake::{MAX_HOOK_BODY_BYTES, MAX_WEBHOOK_BODY_BYTES},
-    limits::{MAX_API_BODY_BYTES, MAX_PAGE_ITEMS, page_size},
+    limits::{MAX_API_BODY_BYTES, page_size},
 };
 use sentinel_store::{
     Error as StoreError, artifacts, auth as authz,
     auth::Authority,
     checks, dispatch, idempotency, local_auth, logs, lookup,
     objects::{Digest, Touch},
-    operations, provenance, runs, status, tenancy, workers,
+    operations, provenance, runs, status, workers,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -42,7 +42,9 @@ use crate::{
     auth::{self, Identity, Refusal, Via},
 };
 
+mod admin;
 mod failure;
+mod views;
 use failure::attempt_failure;
 
 /// What a route answers: a JSON body, a bounded stream from the object
@@ -120,12 +122,6 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
     };
     // A proxy that forwards a path-carrying issuer's paths unstripped.
     let path = state.oauth.local_path(&full_path);
-    if method == "GET" && path == "/" {
-        let response = Response::from_string(state.index.as_str())
-            .with_header(header("content-type", "text/html; charset=utf-8"));
-        let _ = request.respond(response);
-        return;
-    }
     let outcome = route(state, request, &method, path, &query);
     let reply = match outcome {
         Ok(reply) => reply,
@@ -368,8 +364,15 @@ pub(crate) fn route(
     if let Some(reply) = crate::github::route(state, request, method, &parts, query) {
         return reply;
     }
+    if let Some(reply) = admin::route(state, request, method, &parts, query) {
+        return reply;
+    }
     match (method, parts.as_slice()) {
-        ("GET", ["api", "v1", "health"]) => ok(json!({ "ok": true })),
+        // Public: whether the deployment offers GitHub sign-in is what a
+        // sign-in page shows, not a secret.
+        ("GET", ["api", "v1", "health"]) => {
+            ok(json!({ "ok": true, "github_sign_in": state.github.is_some() }))
+        }
         ("POST", ["mcp"]) => crate::mcp::post(state, request),
         ("GET", ["mcp"]) => crate::mcp::get(state, request),
         ("DELETE", ["mcp"]) => crate::mcp::delete(state, request),
@@ -397,7 +400,14 @@ pub(crate) fn route(
                 "scopes": who.scopes.names().collect::<Vec<_>>(),
                 "grant": who.grant.map(|g| g.to_string()),
                 "expires_ms": who.expires.map(|t| t.0),
+                "stepped_up": who.stepped_up,
+                "mfa": admin::mfa_enrolled(state, who.user)?,
             }))
+        }
+        ("GET", ["api", "v1", "tenants"]) => views::my_tenants(state, request),
+        ("GET", ["api", "v1", "tenants", slug, "sync"]) => views::sync(state, request, slug, query),
+        ("GET", ["api", "v1", "attempts", attempt, "steps"]) => {
+            views::attempt_steps(state, request, attempt)
         }
         ("GET", ["api", "v1", "tenants", slug, "repos"]) => {
             let who = identify(state, request, false)?;
@@ -417,31 +427,7 @@ pub(crate) fn route(
             }))
         }
         ("GET", ["api", "v1", "tenants", slug, "repos", name, "runs"]) => {
-            let who = identify(state, request, false)?;
-            auth::require_scope(&who, Scopes::RUNS_READ)?;
-            let (slug, name) = ((*slug).to_owned(), (*name).to_owned());
-            let limit = page_size(query_param(query, "limit").and_then(|v| v.parse().ok()))
-                .min(MAX_PAGE_ITEMS) as u16;
-            // Keyset cursor: the last run of the previous page.
-            let before: Option<RunId> = query_param(query, "before")
-                .map(|v| id(v, "run"))
-                .transpose()?;
-            let page = state
-                .store
-                .read(|c| {
-                    let tenant = lookup::tenant_by_slug(c, &slug)?;
-                    let repo = lookup::repo_by_name(c, tenant, &name)?;
-                    authz::require_repo(c, who.principal, repo, Permissions::READ)?;
-                    status::runs_page(c, tenant, repo, before, limit)
-                })
-                .map_err(store_error)?;
-            ok(json!({
-                "runs": page.runs.iter().map(|r| json!({
-                    "id": r.id.to_string(), "sha": r.sha, "created_ms": r.created.0,
-                    "state": run_state(r.state),
-                })).collect::<Vec<_>>(),
-                "next": page.next.map(|r| r.to_string()),
-            }))
+            views::runs(state, request, slug, name, query)
         }
         (
             _,
@@ -632,41 +618,7 @@ pub(crate) fn route(
         ("GET", ["api", "v1", "attempts", attempt, "logs"]) => {
             attempt_logs(state, request, attempt, query)
         }
-        ("GET", ["api", "v1", "workers"]) => {
-            let who = identify(state, request, false)?;
-            auth::require_scope(&who, Scopes::RUNS_READ)?;
-            let slug = query_param(query, "tenant")
-                .ok_or_else(|| err(ErrorCode::InvalidRequest, "tenant query parameter required"))?
-                .to_owned();
-            let connected = state.controller.connected();
-            let pools = state
-                .store
-                .read(|c| {
-                    let tenant = lookup::tenant_by_slug(c, &slug)?;
-                    let authority = Authority::credential(who.principal);
-                    let pools = tenancy::pools_for_tenant(c, authority, tenant)?;
-                    let mut out = Vec::with_capacity(pools.len());
-                    for pool in pools {
-                        let live = workers::in_pool(c, authority, pool.id)?;
-                        out.push((pool, live));
-                    }
-                    Ok(out)
-                })
-                .map_err(store_error)?;
-            ok(json!({
-                "pools": pools.iter().map(|(pool, live)| json!({
-                    "id": pool.id.to_string(), "name": pool.name, "active": pool.active,
-                    "kind": match pool.kind { tenancy::PoolKind::Shared => "shared", tenancy::PoolKind::Dedicated(_) => "dedicated" },
-                    "workers": live.iter().map(|w| json!({
-                        "id": w.id.to_string(), "name": w.name,
-                        "arch": format!("{:?}", w.negotiated.arch).to_lowercase(),
-                        "connected": connected.contains(&w.id),
-                        "last_seen_ms": w.last_seen.map(|t| t.0),
-                        "transport": state.controller.transport(w.id).map(|t| transport_json(&t)),
-                    })).collect::<Vec<_>>(),
-                })).collect::<Vec<_>>()
-            }))
-        }
+        ("GET", ["api", "v1", "workers"]) => views::workers_view(state, request, query),
         ("GET", ["api", "v1", "queue"]) => {
             let who = identify(state, request, false)?;
             auth::require_scope(&who, Scopes::RUNS_READ)?;
@@ -1326,6 +1278,59 @@ const RECHECK: std::time::Duration = std::time::Duration::from_millis(10);
 /// How often a parked wait looks at the shutdown flag.
 const STOP_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// A parked poll's standing, kept current: whenever the tenant's
+/// authorization epoch moves (a membership, role or grant change, a
+/// suspension) the poll re-authorizes before it keeps waiting, so a person
+/// removed from a tenant stops receiving its runs and logs at once rather
+/// than when the poll's 25 s run out; and a poll whose client hung up ends,
+/// giving its subscriber slot back. Checked at most every [`STOP_SLICE`]:
+/// one primary-key read and one `peek` per parked poll per slice.
+struct Standing {
+    tenant: sentinel_core::TenantId,
+    epoch: i64,
+    checked: std::time::Instant,
+}
+
+impl Standing {
+    fn new(state: &State, tenant: sentinel_core::TenantId) -> Result<Standing, ApiError> {
+        let epoch = state
+            .store
+            .read(|c| sentinel_store::tenancy::epoch(c, tenant))
+            .map_err(store_error)?;
+        Ok(Standing {
+            tenant,
+            epoch,
+            checked: std::time::Instant::now(),
+        })
+    }
+
+    fn recheck(
+        &mut self,
+        state: &State,
+        request: &Request,
+        reauthorize: impl FnOnce() -> Result<(), ApiError>,
+    ) -> Result<(), ApiError> {
+        if self.checked.elapsed() < STOP_SLICE {
+            return Ok(());
+        }
+        self.checked = std::time::Instant::now();
+        if request.peer_gone() {
+            // Nobody reads the answer; it only has to end the park.
+            return Err(err(ErrorCode::InvalidRequest, "the client went away"));
+        }
+        let tenant = self.tenant;
+        let epoch = state
+            .store
+            .read(|c| sentinel_store::tenancy::epoch(c, tenant))
+            .map_err(store_error)?;
+        if epoch != self.epoch {
+            reauthorize()?;
+            self.epoch = epoch;
+        }
+        Ok(())
+    }
+}
+
 /// A parked long poll's slot for `user`: refused `rate_limited` (with
 /// `details.retry_after_ms`) when every slot is parked or this user already
 /// holds its [`crate::SUBSCRIBERS_PER_USER`].
@@ -1374,7 +1379,7 @@ const LOG_RECHECK: std::time::Duration = std::time::Duration::from_millis(100);
 /// notifier, re-reading only when this attempt's stored frontier moved —
 /// until something arrives, the log completes, the step has finished, or
 /// the deadline.
-fn attempt_logs(state: &State, request: &Request, attempt: &str, query: &str) -> Route {
+fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::LOGS_READ)?;
     let attempt: AttemptId = id(attempt, "attempt")?;
@@ -1446,6 +1451,7 @@ fn attempt_logs(state: &State, request: &Request, attempt: &str, query: &str) ->
     // SUBSCRIBERS slots it shares with run waits before it parks.
     let mut parked: Option<crate::Subscriber<'_>> = None;
     let mut checked = std::time::Instant::now();
+    let mut standing: Option<Standing> = None;
     while wait
         && tail.frames.is_empty()
         && !tail.complete
@@ -1454,6 +1460,14 @@ fn attempt_logs(state: &State, request: &Request, attempt: &str, query: &str) ->
     {
         if parked.is_none() {
             parked = Some(subscriber(state, who.principal.user)?);
+            standing = Some(Standing::new(state, tenant)?);
+            // Waiting is not work: the handler permit goes back.
+            request.yield_handler();
+        }
+        if let Some(standing) = standing.as_mut() {
+            standing.recheck(state, request, || {
+                attempt_log(state, who.principal, attempt).map(|_| ())
+            })?;
         }
         let now = std::time::Instant::now();
         if now >= deadline || state.stop.load(Ordering::Acquire) {
@@ -1498,6 +1512,7 @@ fn attempt_logs(state: &State, request: &Request, attempt: &str, query: &str) ->
         "gaps": tail.gaps,
         "next_after": tail.next_after,
         "next": next.to_string(),
+        "step_done": tail.step_done,
         "frames": tail.frames.iter().map(|f| json!({
             "seq": f.seq, "step": f.step,
             "stream": stream_name(f.stream),
@@ -1511,7 +1526,7 @@ fn attempt_logs(state: &State, request: &Request, attempt: &str, query: &str) ->
 /// the run is finished; otherwise park on the store's commit notifier until
 /// something commits, re-reading only the allocation-free version, until
 /// the deadline or shutdown. The answer always carries the current run.
-fn run_wait(state: &State, request: &Request, run: &str, query: &str) -> Route {
+fn run_wait(state: &State, request: &mut Request, run: &str, query: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::RUNS_READ)?;
     let run: RunId = id(run, "run")?;
@@ -1553,9 +1568,18 @@ fn run_wait(state: &State, request: &Request, run: &str, query: &str) -> Route {
     let mut current = version()?;
     let mut checked = std::time::Instant::now();
     let mut parked: Option<crate::Subscriber<'_>> = None;
+    let mut standing: Option<Standing> = None;
     while since == Some(current.version) && !current.finished {
         if parked.is_none() {
             parked = Some(subscriber(state, who.principal.user)?);
+            standing = Some(Standing::new(state, tenant)?);
+            // Waiting is not work: the handler permit goes back.
+            request.yield_handler();
+        }
+        if let Some(standing) = standing.as_mut() {
+            standing.recheck(state, request, || {
+                authorize_run(state, who.principal, run, Permissions::READ).map(|_| ())
+            })?;
         }
         let now = std::time::Instant::now();
         if now >= deadline || state.stop.load(std::sync::atomic::Ordering::Acquire) {

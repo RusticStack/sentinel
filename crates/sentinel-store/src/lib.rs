@@ -41,6 +41,7 @@ pub mod space;
 pub mod status;
 pub mod tenancy;
 pub mod tokens;
+pub mod views;
 pub mod workers;
 
 use std::{

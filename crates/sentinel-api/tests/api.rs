@@ -419,10 +419,10 @@ fn credentials_are_required_and_errors_are_structured() {
     assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
     let (status, _) = call(&d, "GET", "/api/v1/health", None, None, &[]);
     assert_eq!(status, 200);
-    // The page itself needs no credential; everything it does goes through the API.
+    // The controller serves no page: the web interface is its own process
+    // (`web/`), a client of these same routes.
     let (status, page) = call(&d, "GET", "/", None, None, &[]);
-    assert_eq!(status, 200);
-    assert!(page.as_str().unwrap().contains("/api/v1/login"));
+    assert_eq!((status, page["code"].as_str()), (404, Some("not_found")));
 }
 
 #[test]
@@ -507,13 +507,18 @@ fn secret_http_writes_are_versioned_idempotent_and_metadata_only() {
     d.store
         .writer()
         .write(move |tx| {
-            auth::remove_membership(
+            // Another administrator first: a tenant's last one keeps the role.
+            let other = sentinel_core::UserId::new();
+            let admin = Principal::new(root, P::ALL, None, None);
+            auth::provisioning::insert_human(tx, other, "Other admin", false, now)?;
+            auth::set_membership(
                 tx,
-                Principal::new(root, P::ALL, None, None),
+                admin,
                 tenant,
-                root,
-                now,
-            )
+                other,
+                sentinel_core::auth::Role::TenantAdmin,
+            )?;
+            auth::remove_membership(tx, admin, tenant, root, now)
         })
         .unwrap();
     let (status, _) = call_bytes(&d, "PUT", path, value, &auth, &create_headers);
@@ -2684,15 +2689,19 @@ fn downloads_hold_their_slot_and_control_requests_keep_handlers() {
         &[],
     );
     let version = first["version"].as_str().unwrap().to_owned();
-    // Two users park them, each within its per-user share.
-    let other = member_bearer(&d, "other");
+    // As many users as it takes park them, each within its per-user share.
+    const NAMES: [&str; 8] = [
+        "holder-0", "holder-1", "holder-2", "holder-3", "holder-4", "holder-5", "holder-6",
+        "holder-7",
+    ];
+    let users = sentinel_api::SUBSCRIBERS.div_ceil(sentinel_api::SUBSCRIBERS_PER_USER);
+    let holders: Vec<String> = NAMES[..users]
+        .iter()
+        .map(|n| member_bearer(&d, n))
+        .collect();
     let waits: Vec<_> = (0..sentinel_api::SUBSCRIBERS)
         .map(|i| {
-            let who = if i < sentinel_api::SUBSCRIBERS_PER_USER {
-                &other
-            } else {
-                &auth
-            };
+            let who = &holders[i / sentinel_api::SUBSCRIBERS_PER_USER];
             let (base, auth, run, version) =
                 (d.base.clone(), who.clone(), run.clone(), version.clone());
             thread::spawn(move || {

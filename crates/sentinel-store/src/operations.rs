@@ -81,26 +81,45 @@ pub fn record(
 }
 
 /// The tenant's newest records, newest first, at most `limit`. Host-local
-/// and test inspection; no route exposes it.
+/// and test inspection; the API pages through [`page`].
 pub fn recent(conn: &Connection, tenant: TenantId, limit: u32) -> Result<Vec<Record>> {
+    Ok(page(conn, tenant, None, limit)?
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect())
+}
+
+/// The tenant's records strictly older than sequence `before` (the newest
+/// without one), newest first, each with its sequence — the next page's
+/// cursor.
+pub fn page(
+    conn: &Connection,
+    tenant: TenantId,
+    before: Option<i64>,
+    limit: u32,
+) -> Result<Vec<(i64, Record)>> {
     let mut statement = conn.prepare_cached(
-        "SELECT at_ms, action, target, actor_user_id, via, grant_id, client_id
-         FROM operation_audit WHERE tenant_id = ?1 ORDER BY seq DESC LIMIT ?2",
+        "SELECT at_ms, action, target, actor_user_id, via, grant_id, client_id, seq
+         FROM operation_audit WHERE tenant_id = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3",
     )?;
-    let rows = statement.query_map(params![tenant.as_bytes(), limit], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, u8>(1)?,
-            r.get::<_, [u8; 16]>(2)?,
-            r.get::<_, Option<[u8; 16]>>(3)?,
-            r.get::<_, u8>(4)?,
-            r.get::<_, Option<[u8; 16]>>(5)?,
-            r.get::<_, Option<String>>(6)?,
-        ))
-    })?;
+    let rows = statement.query_map(
+        params![tenant.as_bytes(), before.unwrap_or(i64::MAX), limit],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, u8>(1)?,
+                r.get::<_, [u8; 16]>(2)?,
+                r.get::<_, Option<[u8; 16]>>(3)?,
+                r.get::<_, u8>(4)?,
+                r.get::<_, Option<[u8; 16]>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, i64>(7)?,
+            ))
+        },
+    )?;
     let mut records = Vec::new();
     for row in rows {
-        let (at, action, target, user, via, grant, client) = row?;
+        let (at, action, target, user, via, grant, client, seq) = row?;
         let action = match action {
             1 => Action::CancelRun,
             2 => Action::CancelJob,
@@ -120,13 +139,16 @@ pub fn recent(conn: &Connection, tenant: TenantId, limit: u32) -> Result<Vec<Rec
             ),
             _ => return Err(Error::Corrupt("operation_audit.via")),
         };
-        records.push(Record {
-            at: UnixMillis(at),
-            action,
-            target,
-            actor,
-            client,
-        });
+        records.push((
+            seq,
+            Record {
+                at: UnixMillis(at),
+                action,
+                target,
+                actor,
+                client,
+            },
+        ));
     }
     Ok(records)
 }
