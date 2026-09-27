@@ -38,9 +38,7 @@ impl Fake {
                     return;
                 }
                 let Ok(stream) = stream else { continue };
-                if answer(stream, status, &body) {
-                    seen.fetch_add(1, Ordering::AcqRel);
-                }
+                answer(stream, status, &body, &seen);
             }
         });
         Fake {
@@ -66,8 +64,11 @@ impl Drop for Fake {
     }
 }
 
-/// Read one request head (and any declared body), answer, close.
-fn answer(stream: TcpStream, status: u16, body: &str) -> bool {
+/// Read one request head (and any declared body), count it, answer, close.
+/// The count happens-before the response is written: a client that has read
+/// the answer to its last attempt always finds that attempt counted (it
+/// used to be counted after the write, so a fast client could look first).
+fn answer(stream: TcpStream, status: u16, body: &str, seen: &AtomicUsize) {
     let mut reader = BufReader::new(&stream);
     let mut length = 0usize;
     let mut line = String::new();
@@ -75,7 +76,7 @@ fn answer(stream: TcpStream, status: u16, body: &str) -> bool {
     loop {
         line.clear();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            return false;
+            return;
         }
         if first {
             first = false;
@@ -93,6 +94,7 @@ fn answer(stream: TcpStream, status: u16, body: &str) -> bool {
     }
     let mut discard = vec![0u8; length];
     let _ = reader.read_exact(&mut discard);
+    seen.fetch_add(1, Ordering::AcqRel);
     let content_type = if body.starts_with('{') {
         "application/json"
     } else {
@@ -105,7 +107,6 @@ fn answer(stream: TcpStream, status: u16, body: &str) -> bool {
     let mut stream = &stream;
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
-    true
 }
 
 fn error_body(code: &str) -> String {
