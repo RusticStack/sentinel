@@ -32,6 +32,8 @@ See the [Part 03 audit](docs/part-03-audit.md) for what was re-read, what was fo
 
 See the [Parts 00–09 audit](docs/parts-00-09-audit.md) for the full re-audit of every task through Part 09: each finding with its fix, commit and regression test, what was kept by design, what moved to a later task, and the verification evidence.
 
+See the [Parts 09–11 audit](docs/parts-09-11-audit.md) for the second re-audit of the OAuth server and CLI, secret management and delivery, and diagnostics and MCP: every finding with its outcome, commit and test, how the five fix branches were merged, the leftovers and flaky tests closed afterwards, and the final verification. X07 (real MCP clients) remains open.
+
 See [Vertical slice](docs/vertical-slice.md) for what Part 04 was exercised against and what held.
 
 See [API](docs/api.md) for the one authenticated surface the CLI, the page and later agents share.
