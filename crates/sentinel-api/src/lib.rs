@@ -34,6 +34,7 @@ use sentinel_link::controller::Handle;
 use sentinel_store::{Store, logs::LogStore, objects::Objects};
 
 pub use github::GithubSignIn;
+pub use oauth::limit::TrustedProxy;
 
 /// Requests being handled at once; further connections wait on a permit.
 pub const WORKERS: usize = 8;
@@ -64,6 +65,52 @@ const _: () = assert!(
     RESERVED_HANDLERS >= 2,
     "keep handler permits for control requests"
 );
+/// Handler permits that outbound calls to third parties may hold at once:
+/// GitHub sign-in's code exchange (up to two ten-second calls) and Client ID
+/// Metadata Document fetches (two seconds) draw on this one budget. A
+/// request past it is answered "busy, retry" at once, never queued, so with
+/// [`TRANSFERS`] and [`SUBSCRIBERS`] a handler always remains for logins,
+/// token refreshes, health checks and run reads — however slow the third
+/// party, and however many anonymous or signed-in callers ask.
+pub const OUTBOUND: usize = 1;
+const _: () = assert!(
+    WORKERS - TRANSFERS - SUBSCRIBERS - OUTBOUND >= 1,
+    "keep a handler permit for control requests"
+);
+
+/// The [`OUTBOUND`] budget.
+#[derive(Default)]
+pub(crate) struct Outbound(AtomicUsize);
+
+/// One held outbound slot, released on drop (unwinding included).
+pub(crate) struct OutboundSlot<'a>(&'a AtomicUsize);
+
+impl Drop for OutboundSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl Outbound {
+    /// Take a slot without waiting, or `None` when all are held.
+    pub(crate) fn take(&self) -> Option<OutboundSlot<'_>> {
+        use std::sync::atomic::Ordering;
+        let mut held = self.0.load(Ordering::Acquire);
+        loop {
+            if held >= OUTBOUND {
+                return None;
+            }
+            match self
+                .0
+                .compare_exchange_weak(held, held + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(OutboundSlot(&self.0)),
+                Err(next) => held = next,
+            }
+        }
+    }
+}
+
 /// Largest single upload chunk; resume boundaries let clients pick smaller.
 pub const MAX_UPLOAD_CHUNK: usize = 8 << 20;
 
@@ -90,6 +137,10 @@ pub struct Config {
     /// GitHub web sign-in (U07). Without it the `/auth/github/*` routes do
     /// not exist and no page offers the button.
     pub github_sign_in: Option<GithubSignIn>,
+    /// The reverse proxy's networks: only a request from one of these is
+    /// counted under its `X-Forwarded-For` address by the unauthenticated
+    /// admission budgets. [`TrustedProxy::loopback`] by default.
+    pub trusted_proxies: Vec<TrustedProxy>,
 }
 
 pub(crate) struct State {
@@ -117,6 +168,10 @@ pub(crate) struct State {
     pub mcp_sessions: mcp::Sessions,
     /// GitHub web sign-in, when configured.
     pub github: Option<github::Github>,
+    /// Networks whose `X-Forwarded-For` is believed ([`Config::trusted_proxies`]).
+    pub trusted_proxies: Vec<TrustedProxy>,
+    /// Outbound calls to third parties in flight ([`OUTBOUND`]).
+    pub outbound: Outbound,
     /// The first page, rendered once for this configuration.
     pub index: String,
 }
@@ -230,6 +285,8 @@ impl Server {
             oauth: oauth::OAuthState::new(issuer.clone()),
             mcp_sessions: mcp::Sessions::default(),
             github,
+            trusted_proxies: config.trusted_proxies,
+            outbound: Outbound::default(),
             index,
         });
         let conns = http::listen(
@@ -257,5 +314,32 @@ impl Server {
     /// Stop accepting, close live connections and wait out the readers.
     pub fn shutdown(self) {
         self.conns.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P09S-1 / P11-2: however many requests want an outbound call at once
+    /// (a CIMD fetch or a GitHub exchange), at most [`OUTBOUND`] hold a
+    /// handler on a third party; the rest are refused without waiting, and
+    /// a slot is returned when its call ends, even by unwinding.
+    #[test]
+    fn outbound_calls_are_capped_without_queueing() {
+        let outbound = Outbound::default();
+        let first = outbound.take().unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| assert!(outbound.take().is_none()));
+            }
+        });
+        drop(first);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = outbound.take().unwrap();
+            panic!("the call failed");
+        }));
+        assert!(unwound.is_err());
+        assert!(outbound.take().is_some());
     }
 }

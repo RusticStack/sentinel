@@ -7,16 +7,18 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
-use sentinel_auth::secret::Secret;
+use sentinel_auth::{oauth as forms, secret::Secret};
 use sentinel_core::{
     UnixMillis,
     auth::{Audience, Scopes},
 };
-use sentinel_protocol::oauth::OAuthErrorCode;
+use sentinel_protocol::oauth::{
+    GRANT_AUTHORIZATION_CODE, GRANT_DEVICE_CODE, GRANT_REFRESH_TOKEN, OAuthErrorCode,
+};
 use sentinel_store::oauth::{
     self as grants, McpClientSpec, McpRegistrationError, McpRegistrationKind,
 };
@@ -205,40 +207,58 @@ fn parse_scope(value: Option<&str>) -> Option<Scopes> {
     }
 }
 
+/// What every registered client is actually given, whatever it declared
+/// (RFC 7591 §3.2.1 lets the server replace requested values): the code
+/// grant, and refresh tokens, which every code exchange returns.
+const EFFECTIVE_GRANT_TYPES: [&str; 2] = [GRANT_AUTHORIZATION_CODE, GRANT_REFRESH_TOKEN];
+
+/// Whether declared registration metadata describes a public
+/// authorization-code client. Omitted `grant_types` is RFC 7591's default
+/// (`authorization_code`). A declared list must include the code grant and
+/// may name only grants this server advertises; one it will not issue to a
+/// registered client (the device grant) is intersected away rather than
+/// refused, because clients commonly echo `grant_types_supported`.
 fn validate_protocol_fields(
     grant_types: Option<&[String]>,
     response_types: Option<&[String]>,
     token_endpoint_auth_method: Option<&str>,
 ) -> bool {
+    let distinct = |values: &[String]| {
+        !values
+            .iter()
+            .enumerate()
+            .any(|(index, value)| values[..index].contains(value))
+    };
     if token_endpoint_auth_method.is_some_and(|method| method != "none") {
         return false;
     }
     if response_types.is_some_and(|types| {
-        types.is_empty()
-            || types.iter().any(|value| value != "code")
-            || types
-                .iter()
-                .enumerate()
-                .any(|(index, value)| types[..index].contains(value))
+        types.is_empty() || types.iter().any(|value| value != "code") || !distinct(types)
     }) {
         return false;
     }
-    grant_types.is_some_and(|types| {
-        types.iter().any(|value| value == "authorization_code")
-            && types.iter().any(|value| value == "refresh_token")
-            && types
-                .iter()
-                .all(|value| value == "authorization_code" || value == "refresh_token")
-            && !types
-                .iter()
-                .enumerate()
-                .any(|(index, value)| types[..index].contains(value))
+    grant_types.is_none_or(|types| {
+        types.iter().any(|value| value == GRANT_AUTHORIZATION_CODE)
+            && types.iter().all(|value| {
+                matches!(
+                    value.as_str(),
+                    GRANT_AUTHORIZATION_CODE | GRANT_REFRESH_TOKEN | GRANT_DEVICE_CODE
+                )
+            })
+            && distinct(types)
     })
 }
 
+/// A redirect URI a registration may declare: an HTTPS URI on a domain, or
+/// an HTTP loopback URI (`127.0.0.1`, `[::1]` or `localhost`, any port;
+/// RFC 8252 §7.3/§8.3) in the exact shape [`forms::loopback_redirect_key`]
+/// stores and matches. No userinfo, query or fragment.
 fn valid_redirect_uri(value: &str) -> bool {
     if value.is_empty() || value.len() > 512 {
         return false;
+    }
+    if value.starts_with("http://") {
+        return forms::loopback_redirect_key(value).is_some();
     }
     let Ok(url) = Url::parse(value) else {
         return false;
@@ -250,12 +270,7 @@ fn valid_redirect_uri(value: &str) -> bool {
     {
         return false;
     }
-    match (url.scheme(), url.host()) {
-        ("https", Some(Host::Domain(_))) => true,
-        ("http", Some(Host::Ipv4(ip))) => ip.is_loopback(),
-        ("http", Some(Host::Ipv6(ip))) => ip.is_loopback(),
-        _ => false,
-    }
+    matches!((url.scheme(), url.host()), ("https", Some(Host::Domain(_))))
 }
 
 fn valid_redirects(uris: &[String]) -> bool {
@@ -331,22 +346,32 @@ fn public_ipv6(ip: Ipv6Addr) -> bool {
         && !ip.is_loopback()
 }
 
-fn metadata_agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .https_only(true)
-        .proxy(None)
-        .max_redirects(0)
-        .max_response_header_size(MAX_METADATA_HEADERS)
-        .timeout_global(Some(Duration::from_secs(4)))
-        .timeout_resolve(Some(Duration::from_secs(2)))
-        .http_status_as_error(false)
-        .user_agent(concat!("sentinel/", env!("CARGO_PKG_VERSION")))
-        .build();
-    ureq::Agent::with_parts(
-        config,
-        DefaultConnector::default(),
-        PublicResolver::default(),
-    )
+/// Whole-request bound of one metadata fetch, DNS included. A fetch holds a
+/// handler permit this long at most, under the deployment's shared
+/// [`crate::OUTBOUND`] budget; a request past the budget is told to retry.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The one metadata agent: its TLS configuration and root store are built
+/// once, and it may reuse a connection to the same host.
+fn metadata_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        let config = ureq::Agent::config_builder()
+            .https_only(true)
+            .proxy(None)
+            .max_redirects(0)
+            .max_response_header_size(MAX_METADATA_HEADERS)
+            .timeout_global(Some(METADATA_TIMEOUT))
+            .timeout_resolve(Some(Duration::from_secs(1)))
+            .http_status_as_error(false)
+            .user_agent(concat!("sentinel/", env!("CARGO_PKG_VERSION")))
+            .build();
+        ureq::Agent::with_parts(
+            config,
+            DefaultConnector::default(),
+            PublicResolver::default(),
+        )
+    })
 }
 
 fn cache_ttl(header: Option<&str>) -> Option<Duration> {
@@ -378,8 +403,7 @@ fn cache_ttl(header: Option<&str>) -> Option<Duration> {
 }
 
 fn fetch_metadata(url: &str) -> Option<(ClientMetadata, Option<Duration>)> {
-    let agent = metadata_agent();
-    let mut response = agent
+    let mut response = metadata_agent()
         .get(url)
         .header("accept", "application/json")
         .call()
@@ -437,9 +461,29 @@ fn metadata_scopes(metadata: &ClientMetadata, url: &str) -> Option<Scopes> {
     parse_scope(metadata.scope.as_deref())
 }
 
+/// A busy page that tells the browser when to try again.
+fn busy(message: &str) -> Reply {
+    let mut reply = super::html::error_page(503, message);
+    if let Reply::Html(_, _, headers) = &mut reply {
+        headers.push(routes::header("retry-after", "2"));
+    }
+    reply
+}
+
+/// The registrant digest of this request's client address.
+fn registrant(state: &State, request: &Request) -> [u8; 16] {
+    grants::registrant_digest(super::client_of(state, request))
+}
+
 /// Resolve a normal registered id locally or fetch and validate a CIMD URL.
 /// The cache only avoids repeated network reads; disabled clients and current
 /// database policy are checked on every request.
+///
+/// Callers fetch only for a signed-in account ([`super::code`]): an
+/// anonymous request never makes this server call out. A fetch also passes
+/// the per-client metadata budget and takes a [`crate::OUTBOUND`] slot, so
+/// however many accounts ask at once, at most that many handler permits
+/// wait on third-party hosts.
 pub(crate) fn resolve(
     state: &State,
     request: &Request,
@@ -452,7 +496,7 @@ pub(crate) fn resolve(
                 "The client identifier is invalid.",
             ));
         };
-        return state
+        let client = state
             .store
             .read(|connection| grants::client(connection, id.as_ref()))
             .map_err(|error| match error {
@@ -460,7 +504,17 @@ pub(crate) fn resolve(
                     super::html::error_page(400, "The client is not registered.")
                 }
                 other => super::store_failure(other),
-            });
+            })?;
+        // A CIMD client is only ever addressed by its metadata URL: its
+        // internal `c_…` key would skip the document's freshness check and
+        // keep serving withdrawn redirects.
+        if client.display_id != client.id {
+            return Err(super::html::error_page(
+                400,
+                "The client is not registered.",
+            ));
+        }
+        return Ok(client);
     }
     let Some(url) = metadata_url(external_id) else {
         return Err(super::html::error_page(
@@ -468,6 +522,16 @@ pub(crate) fn resolve(
             "The client metadata URL is not allowed.",
         ));
     };
+    let policy = state
+        .store
+        .read(grants::client_registration)
+        .map_err(super::store_failure)?;
+    if !policy.metadata() {
+        return Err(super::html::error_page(
+            400,
+            "This deployment does not accept client metadata documents.",
+        ));
+    }
     let id = metadata_internal_id(&url);
     let now = Instant::now();
     if state.oauth.client_metadata.is_fresh(&url, now) {
@@ -482,6 +546,11 @@ pub(crate) fn resolve(
             });
     }
     admit(state, request, Budget::Metadata)?;
+    let Some(_slot) = state.outbound.take() else {
+        return Err(busy(
+            "Sentinel is checking another application's details. Try again in a moment.",
+        ));
+    };
     let Some((metadata, ttl)) = fetch_metadata(&url) else {
         return Err(super::html::error_page(
             400,
@@ -502,18 +571,29 @@ pub(crate) fn resolve(
         kind: McpRegistrationKind::Metadata,
         metadata_url: Some(&url),
     };
-    match grants::register_mcp_client(&state.store, &spec, &redirects) {
+    match grants::register_mcp_client_from(
+        &state.store,
+        &spec,
+        &redirects,
+        Some(registrant(state, request)),
+        UnixMillis::now(),
+    ) {
         Ok(()) => {}
-        Err(McpRegistrationError::Capacity) => {
-            return Err(super::error(
-                OAuthErrorCode::TemporarilyUnavailable,
-                "MCP client registration capacity reached",
+        Err(McpRegistrationError::Capacity | McpRegistrationError::Registrant) => {
+            return Err(busy(
+                "This deployment cannot register another application right now.",
             ));
         }
         Err(McpRegistrationError::Store(sentinel_store::Error::NotFound)) => {
             return Err(super::html::error_page(
                 400,
                 "This client has been disabled.",
+            ));
+        }
+        Err(McpRegistrationError::Store(sentinel_store::Error::InvalidInput(_))) => {
+            return Err(super::html::error_page(
+                400,
+                "The client's metadata is invalid or requests an unsupported redirect.",
             ));
         }
         Err(McpRegistrationError::Store(error)) => return Err(super::store_failure(error)),
@@ -531,6 +611,7 @@ pub(crate) fn resolve(
         device: false,
         max_scopes,
         resource: Audience::Mcp,
+        registered: true,
     })
 }
 
@@ -538,10 +619,22 @@ fn registration_error(code: OAuthErrorCode, description: &str) -> Route {
     Ok(error(code, description))
 }
 
-/// RFC 7591 Dynamic Client Registration for public MCP clients only.
+/// RFC 7591 Dynamic Client Registration for public MCP clients only, while
+/// the deployment's policy allows it.
 pub(crate) fn register(state: &State, request: &mut Request) -> Route {
     if let Err(reply) = admit(state, request, Budget::Registration) {
         return Ok(reply);
+    }
+    let policy = match state.store.read(grants::client_registration) {
+        Ok(policy) => policy,
+        Err(e) => return Ok(super::store_failure(e)),
+    };
+    if !policy.dynamic() {
+        return Ok(error_status(
+            403,
+            OAuthErrorCode::AccessDenied,
+            "dynamic client registration is disabled on this deployment",
+        ));
     }
     let is_json = routes::header_value(request, "content-type").is_some_and(|value| {
         value
@@ -571,8 +664,8 @@ pub(crate) fn register(state: &State, request: &mut Request) -> Route {
             );
         }
     };
-    let request: RegistrationRequest = match serde_json::from_slice(&bytes) {
-        Ok(request) => request,
+    let registration: RegistrationRequest = match serde_json::from_slice(&bytes) {
+        Ok(registration) => registration,
         Err(_) => {
             return registration_error(
                 OAuthErrorCode::InvalidClientMetadata,
@@ -580,29 +673,29 @@ pub(crate) fn register(state: &State, request: &mut Request) -> Route {
             );
         }
     };
-    if request.client_id.is_some() || request.client_secret.is_some() {
+    if registration.client_id.is_some() || registration.client_secret.is_some() {
         return registration_error(
             OAuthErrorCode::InvalidClientMetadata,
             "client_id and client_secret are assigned by Sentinel",
         );
     }
-    if !valid_redirects(&request.redirect_uris) {
+    if !valid_redirects(&registration.redirect_uris) {
         return registration_error(
             OAuthErrorCode::InvalidRedirectUri,
-            "redirect_uris must contain exact HTTPS or IP loopback URIs",
+            "redirect_uris must contain exact HTTPS or HTTP loopback URIs",
         );
     }
     if !validate_protocol_fields(
-        request.grant_types.as_deref(),
-        request.response_types.as_deref(),
-        request.token_endpoint_auth_method.as_deref(),
+        registration.grant_types.as_deref(),
+        registration.response_types.as_deref(),
+        registration.token_endpoint_auth_method.as_deref(),
     ) {
         return registration_error(
             OAuthErrorCode::InvalidClientMetadata,
             "only public authorization-code clients with PKCE are supported",
         );
     }
-    let name = request
+    let name = registration
         .client_name
         .unwrap_or_else(|| "MCP client".to_owned());
     if name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
@@ -611,21 +704,19 @@ pub(crate) fn register(state: &State, request: &mut Request) -> Route {
             "client_name must be nonempty, bounded and control-free",
         );
     }
-    let Some(max_scopes) = parse_scope(request.scope.as_deref()) else {
+    let Some(max_scopes) = parse_scope(registration.scope.as_deref()) else {
         return registration_error(
             OAuthErrorCode::InvalidClientMetadata,
             "scope contains an unsupported MCP permission",
         );
     };
-    let grant_types = request
-        .grant_types
-        .unwrap_or_else(|| vec!["authorization_code".to_owned()]);
-    let response_types = request
-        .response_types
-        .unwrap_or_else(|| vec!["code".to_owned()]);
-    let registered_scope = request.scope.as_ref().map(|_| max_scopes.to_names());
+    let registered_scope = registration.scope.as_ref().map(|_| max_scopes.to_names());
     let id = random_client_id();
-    let redirects: Vec<&str> = request.redirect_uris.iter().map(String::as_str).collect();
+    let redirects: Vec<&str> = registration
+        .redirect_uris
+        .iter()
+        .map(String::as_str)
+        .collect();
     let spec = McpClientSpec {
         id: &id,
         name: &name,
@@ -633,7 +724,13 @@ pub(crate) fn register(state: &State, request: &mut Request) -> Route {
         kind: McpRegistrationKind::Dynamic,
         metadata_url: None,
     };
-    match grants::register_mcp_client(&state.store, &spec, &redirects) {
+    match grants::register_mcp_client_from(
+        &state.store,
+        &spec,
+        &redirects,
+        Some(registrant(state, request)),
+        UnixMillis::now(),
+    ) {
         Ok(()) => {}
         Err(McpRegistrationError::Capacity) => {
             return Ok(error(
@@ -641,6 +738,24 @@ pub(crate) fn register(state: &State, request: &mut Request) -> Route {
                 "MCP client registration capacity reached",
             ));
         }
+        Err(McpRegistrationError::Registrant) => {
+            return Ok(error_status(
+                429,
+                OAuthErrorCode::TemporarilyUnavailable,
+                "this address holds its share of client registrations",
+            ));
+        }
+        Err(McpRegistrationError::Store(sentinel_store::Error::InvalidInput("client_name"))) => {
+            return registration_error(
+                OAuthErrorCode::InvalidClientMetadata,
+                "client_name is reserved for a client of this deployment",
+            );
+        }
+        Err(McpRegistrationError::Store(
+            e @ (sentinel_store::Error::WriterUnavailable
+            | sentinel_store::Error::Overloaded
+            | sentinel_store::Error::WriteAmbiguous),
+        )) => return Ok(super::store_failure(e)),
         Err(McpRegistrationError::Store(_)) => {
             return registration_error(
                 OAuthErrorCode::InvalidClientMetadata,
@@ -653,9 +768,9 @@ pub(crate) fn register(state: &State, request: &mut Request) -> Route {
         "client_id": id,
         "client_id_issued_at": issued_at,
         "client_name": name,
-        "redirect_uris": request.redirect_uris,
-        "grant_types": grant_types,
-        "response_types": response_types,
+        "redirect_uris": registration.redirect_uris,
+        "grant_types": EFFECTIVE_GRANT_TYPES,
+        "response_types": ["code"],
         "token_endpoint_auth_method": "none",
     });
     if let Some(scope) = registered_scope {
@@ -698,10 +813,13 @@ mod tests {
     }
 
     #[test]
-    fn redirects_are_exact_public_https_or_ip_loopback_uris() {
+    fn redirects_are_exact_public_https_or_loopback_uris() {
         for accepted in [
             "http://127.0.0.1:33418",
+            "http://127.0.0.1/callback",
             "http://[::1]:33418/callback",
+            "http://localhost",
+            "http://localhost:33418/",
             "https://vscode.dev/redirect",
             "https://claude.ai/api/mcp/auth_callback",
         ] {
@@ -709,7 +827,8 @@ mod tests {
         }
         for denied in [
             "http://client.example/callback",
-            "http://localhost/callback",
+            "http://localhost.client.example/callback",
+            "http://127.0.0.1:33418/callback?x=1",
             "https://user@client.example/callback",
             "https://client.example/callback?next=other",
             "https://client.example/callback#fragment",
@@ -763,30 +882,45 @@ mod tests {
         );
     }
 
+    /// P11-3 / P09S-5: RFC 7591 defaults and echoed advertised grants are
+    /// accepted; anything not a public code-flow client is still refused.
     #[test]
     fn registered_clients_must_declare_only_supported_grants_and_responses() {
-        let grants = vec!["authorization_code".to_owned()];
-        let full = vec!["authorization_code".to_owned(), "refresh_token".to_owned()];
-        let duplicate = vec![
-            "authorization_code".to_owned(),
-            "authorization_code".to_owned(),
-        ];
-        let code = vec!["code".to_owned()];
+        let owned = |values: &[&str]| values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
+        let code = owned(&["code"]);
+        let accepts = |grants: Option<&[&str]>| {
+            let grants = grants.map(owned);
+            validate_protocol_fields(grants.as_deref(), Some(&code), Some("none"))
+        };
+        assert!(accepts(None), "omitted grant_types is authorization_code");
+        assert!(accepts(Some(&["authorization_code"])));
+        assert!(accepts(Some(&["authorization_code", "refresh_token"])));
+        assert!(accepts(Some(&[
+            "authorization_code",
+            "refresh_token",
+            "urn:ietf:params:oauth:grant-type:device_code"
+        ])));
+        assert!(!accepts(Some(&["refresh_token"])));
+        assert!(!accepts(Some(&[])));
+        assert!(!accepts(Some(&[
+            "authorization_code",
+            "client_credentials"
+        ])));
+        assert!(!accepts(Some(&["authorization_code", "implicit"])));
+        assert!(!accepts(Some(&[
+            "authorization_code",
+            "authorization_code"
+        ])));
+        assert!(validate_protocol_fields(None, None, None));
         assert!(!validate_protocol_fields(
-            Some(&grants),
-            Some(&code),
-            Some("none")
-        ));
-        assert!(!validate_protocol_fields(None, Some(&code), Some("none")));
-        assert!(validate_protocol_fields(
-            Some(&full),
-            Some(&code),
-            Some("none")
+            None,
+            Some(&owned(&["token"])),
+            None
         ));
         assert!(!validate_protocol_fields(
-            Some(&duplicate),
-            Some(&code),
-            Some("none")
+            None,
+            None,
+            Some("client_secret_basic")
         ));
     }
 

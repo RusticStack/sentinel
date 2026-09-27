@@ -255,11 +255,17 @@ pub(crate) fn route(
     })
 }
 
+/// RFC 8414 metadata. The registration members follow the live instance
+/// policy (one single-row read), so turning DCR off also stops advertising it.
 fn metadata(state: &State) -> Route {
-    routes::ok(json!(Metadata::for_issuer(
-        &state.oauth.issuer,
-        &Scopes::NAMES
-    )))
+    let policy = state
+        .store
+        .read(grants::client_registration)
+        .map_err(routes::store_error)?;
+    routes::ok(json!(
+        Metadata::for_issuer(&state.oauth.issuer, &Scopes::NAMES)
+            .with_client_registration(policy.dynamic(), policy.metadata())
+    ))
 }
 
 fn protected_resource(state: &State, audience: Audience) -> Route {
@@ -326,10 +332,7 @@ pub(crate) fn token_reply(minted: &Minted, now: UnixMillis) -> Reply {
 /// Admit one unauthenticated OAuth POST from this request's client against
 /// `budget` ([`limit`]).
 pub(crate) fn admit(state: &State, request: &Request, budget: Budget) -> Result<(), Reply> {
-    let client = limit::client_key(
-        request.peer(),
-        routes::header_value(request, "x-forwarded-for"),
-    );
+    let client = client_of(state, request);
     let now = Instant::now();
     let take = |limiter: &Mutex<Limiter>| {
         limiter
@@ -359,6 +362,15 @@ pub(crate) fn admit(state: &State, request: &Request, budget: Budget) -> Result<
         }
         Err(reply)
     }
+}
+
+/// The admission key of this request's client ([`limit::client_key`]).
+pub(crate) fn client_of(state: &State, request: &Request) -> u128 {
+    limit::client_key(
+        request.peer(),
+        routes::header_value(request, "x-forwarded-for"),
+        &state.trusted_proxies,
+    )
 }
 
 /// A parsed `application/x-www-form-urlencoded` body. Each name appears at

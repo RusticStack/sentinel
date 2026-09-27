@@ -15,7 +15,7 @@
 //!   an active account. Nothing is matched by login or email.
 //!
 //! A successful callback issues the same session cookie as password login
-//! (a fresh secret; a session the browser already held is revoked) and
+//! (a fresh secret that replaces whatever cookie the browser held) and
 //! answers a small page that moves the browser on to its destination. It
 //! cannot be a `303`: the callback is a navigation GitHub started, and a
 //! browser does not send the `SameSite=Strict` session cookie along a
@@ -25,17 +25,11 @@
 //!
 //! Both routes are admitted per client ([`crate::oauth::limit`]). The code
 //! exchange and the identity read are outbound calls of up to ten seconds
-//! each, so at most [`EXCHANGES`] run at once; a callback past that is told to
+//! each, so they draw on the deployment's [`crate::OUTBOUND`] budget (shared
+//! with CIMD metadata fetches); a callback past it is told to
 //! reload, with its state still unspent.
 
-use std::{
-    fmt,
-    sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Instant,
-};
+use std::{fmt, sync::Mutex, time::Instant};
 
 use sentinel_auth::{
     cookie,
@@ -57,7 +51,7 @@ use crate::{
     http::Request,
     oauth::{
         html,
-        limit::{Limiter, Rate, client_key},
+        limit::{Limiter, Rate},
     },
     routes::{self, Reply, Route},
 };
@@ -84,15 +78,6 @@ impl fmt::Debug for GithubSignIn {
     }
 }
 
-/// Code exchanges in flight at once. Each can hold a handler permit for up
-/// to two ten-second outbound calls; with [`crate::TRANSFERS`] and
-/// [`crate::SUBSCRIBERS`] this still leaves a handler for everything else.
-pub const EXCHANGES: usize = 1;
-const _: () = assert!(
-    crate::WORKERS - crate::TRANSFERS - crate::SUBSCRIBERS - EXCHANGES >= 1,
-    "keep a handler permit for control requests"
-);
-
 /// Per client: a burst of 10, then one sign-in step every 2 s. One sign-in
 /// is two steps (start and callback).
 const CLIENT: Rate = Rate::new(std::time::Duration::from_secs(2), 10);
@@ -109,7 +94,6 @@ pub(crate) struct Github {
     http: Client,
     /// `{issuer}/auth/github/start`, linked from the sign-in pages.
     pub start_url: String,
-    exchanges: AtomicUsize,
     budget: Mutex<Limiter>,
 }
 
@@ -128,16 +112,12 @@ impl Github {
             endpoints: config.endpoints,
             http: Client::new(),
             start_url: format!("{issuer}/auth/github/start"),
-            exchanges: AtomicUsize::new(0),
             budget: Mutex::new(Limiter::new(CLIENT, Some(CEILING), Instant::now())),
         })
     }
 
-    fn admit(&self, request: &Request) -> bool {
-        let client = client_key(
-            request.peer(),
-            routes::header_value(request, "x-forwarded-for"),
-        );
+    fn admit(&self, state: &State, request: &Request) -> bool {
+        let client = crate::oauth::client_of(state, request);
         self.budget
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -200,7 +180,7 @@ fn busy_page(status: u16, message: &str) -> Reply {
 }
 
 fn start(state: &State, github: &Github, request: &Request, query: &str) -> Reply {
-    if !github.admit(request) {
+    if !github.admit(state, request) {
         return busy_page(
             429,
             "Too many sign-in attempts from this address. Wait a moment, then try again.",
@@ -259,32 +239,10 @@ fn ended(status: u16, message: &str) -> Reply {
     reply
 }
 
-/// One exchange slot, released on drop.
-struct Slot<'a>(&'a AtomicUsize);
-
-impl Drop for Slot<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-fn slot(counter: &AtomicUsize) -> Option<Slot<'_>> {
-    let mut held = counter.load(Ordering::Acquire);
-    loop {
-        if held >= EXCHANGES {
-            return None;
-        }
-        match counter.compare_exchange_weak(held, held + 1, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Some(Slot(counter)),
-            Err(next) => held = next,
-        }
-    }
-}
-
 const START_AGAIN: &str = "This sign-in did not start in this browser, or it has already been used. Start again from the page you were on.";
 
 fn callback(state: &State, github: &Github, request: &Request, query: &str) -> Reply {
-    if !github.admit(request) {
+    if !github.admit(state, request) {
         return busy_page(
             429,
             "Too many sign-in attempts from this address. Wait a moment, then reload this page.",
@@ -310,7 +268,7 @@ fn callback(state: &State, github: &Github, request: &Request, query: &str) -> R
     }
     // Taken before the state is spent, so a busy answer leaves it pending
     // and a reload of this same URL completes.
-    let Some(_slot) = slot(&github.exchanges) else {
+    let Some(_slot) = state.outbound.take() else {
         return busy_page(
             503,
             "Sentinel is busy signing someone else in. Reload this page in a moment.",
@@ -349,8 +307,13 @@ fn callback(state: &State, github: &Github, request: &Request, query: &str) -> R
         }
         Err(_) => return ended(503, "Sentinel is busy. Start again in a moment."),
     };
-    // Fixation-safe: the browser gets a fresh session secret, and a session
-    // it already held is revoked rather than left alive behind the new one.
+    // Fixation-safe because the browser gets a fresh session secret whose
+    // `Set-Cookie` replaces any `__Host-` cookie it held (and `__Host-` keeps
+    // a sibling host from planting one). A browser never sends the
+    // `SameSite=Strict` session cookie on this cross-site navigation, so a
+    // previous session is not seen here and stays valid until its own idle
+    // or absolute expiry; only a non-browser client that sends the cookie
+    // has it revoked.
     if let Some(previous) = routes::header_value(request, "cookie")
         .and_then(|header| cookie::read(cookie::SESSION_COOKIE, header))
     {

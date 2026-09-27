@@ -25,6 +25,20 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:7443";
 /// Where the API answers unless configured otherwise: loopback; TLS and
 /// exposure are the reverse proxy's.
 const DEFAULT_API_LISTEN: &str = "127.0.0.1:7080";
+/// Most `trusted_proxies` entries a configuration may list.
+const MAX_TRUSTED_PROXIES: usize = 64;
+
+/// Whether a `trusted_proxies` entry is an address or a CIDR network.
+#[cfg(feature = "server")]
+fn trusted_proxy_valid(entry: &str) -> bool {
+    sentinel_api::TrustedProxy::parse(entry).is_some()
+}
+
+/// A build without the server role never uses the entries.
+#[cfg(not(feature = "server"))]
+fn trusted_proxy_valid(_: &str) -> bool {
+    true
+}
 /// Bounded drains at shutdown: sessions and dispatcher, then the store.
 const LINK_SHUTDOWN: Duration = Duration::from_secs(2);
 const STORE_SHUTDOWN: Duration = Duration::from_secs(5);
@@ -64,6 +78,9 @@ struct FileConfig {
     api_listen: Option<String>,
     // Server: the deployment-facing base URL, which is the OAuth issuer (O02).
     public_url: Option<String>,
+    // Server: the reverse proxy's networks, whose X-Forwarded-For the
+    // unauthenticated admission budgets believe. Absent means loopback only.
+    trusted_proxies: Option<Vec<String>>,
     // Worker: which controller to reach and how to trust it.
     controller: Option<String>,
     controller_fingerprint: Option<String>,
@@ -234,6 +251,8 @@ enum Role {
         api_listen: SocketAddr,
         /// The OAuth issuer; `None` means `http://{api_listen}`.
         public_url: Option<String>,
+        /// Validated `trusted_proxies` entries; `None` means loopback only.
+        trusted_proxies: Option<Vec<String>>,
         /// The helper the server runs for its link port (Q06), when enabled.
         tailcat: Option<TailcatFile>,
         /// Whether the controller serves remote cache objects (Q08).
@@ -375,10 +394,20 @@ impl Config {
                     )),
                 })
                 .transpose()?;
+            let trusted_proxies = file.trusted_proxies;
+            if let Some(proxies) = &trusted_proxies
+                && (proxies.len() > MAX_TRUSTED_PROXIES
+                    || proxies.iter().any(|proxy| !trusted_proxy_valid(proxy)))
+            {
+                return Err(Error::config(
+                    "trusted_proxies must list at most 64 IP addresses or CIDR networks with zero host bits, as in [\"127.0.0.1\", \"10.0.0.0/24\"]",
+                ));
+            }
             Role::Server {
                 listen,
                 api_listen,
                 public_url,
+                trusted_proxies,
                 tailcat: file.tailcat,
                 remote_cache: file
                     .remote_cache
@@ -387,9 +416,13 @@ impl Config {
                     .unwrap_or(true),
             }
         } else {
-            if file.listen.is_some() || file.api_listen.is_some() || file.public_url.is_some() {
+            if file.listen.is_some()
+                || file.api_listen.is_some()
+                || file.public_url.is_some()
+                || file.trusted_proxies.is_some()
+            {
                 return Err(Error::config(
-                    "listen, api_listen and public_url apply to the server role only",
+                    "listen, api_listen, public_url and trusted_proxies apply to the server role only",
                 ));
             }
             let link = match (file.controller, file.controller_fingerprint) {
@@ -1093,6 +1126,7 @@ fn start_server(
     listen: SocketAddr,
     api_listen: SocketAddr,
     public_url: Option<String>,
+    trusted_proxies: Option<&[String]>,
     tailcat: Option<&TailcatFile>,
     remote_cache: bool,
 ) -> Result<Running, Error> {
@@ -1384,6 +1418,14 @@ fn start_server(
         intake: Some(lane.waker()),
         public_url,
         github_sign_in,
+        trusted_proxies: match trusted_proxies {
+            // Validated when the configuration was read.
+            Some(proxies) => proxies
+                .iter()
+                .filter_map(|proxy| sentinel_api::TrustedProxy::parse(proxy))
+                .collect(),
+            None => sentinel_api::TrustedProxy::loopback(),
+        },
     })
     .map_err(|error| Error::runtime(format!("cannot listen on {api_listen}: {error}")))?;
     tracing::info!(event = "api_listening", addr = %api.local_addr(), issuer = %api.issuer());
@@ -1905,6 +1947,7 @@ fn initialize_and_wait(
                 listen,
                 api_listen,
                 public_url,
+                trusted_proxies,
                 tailcat,
                 remote_cache,
             } => start_server(
@@ -1912,6 +1955,7 @@ fn initialize_and_wait(
                 *listen,
                 *api_listen,
                 public_url.clone(),
+                trusted_proxies.as_deref(),
                 tailcat.as_ref(),
                 *remote_cache,
             ),
