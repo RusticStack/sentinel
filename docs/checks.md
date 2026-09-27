@@ -61,9 +61,10 @@ The aggregate is the run's own aggregate (`sentinel-core`'s precedence:
 infra failure > failed > timed out > canceled > passed; all-skipped is
 `skipped`) and its output summarises `n/m jobs passed · …`.
 
-`details_url` is `<public_url>/#/runs/<run id>` when the deployment configures
-a public URL; the first page serves that hash route (and re-opens the run after
-sign-in). A check that belongs to no run — a refused event — has no link, and a
+`details_url` is `<public_url>/runs/<run id>` when the deployment configures
+a public URL: the web interface's run page ([web interface](web-ui.md)), which
+asks a signed-out visitor to sign in and then opens it. Links published before
+Part 12 (`<public_url>/#/runs/<run id>`) still open the run. A check that belongs to no run — a refused event — has no link, and a
 deployment without `public_url` publishes checks without one.
 
 Each check row has a stable id `sentinel:<run id>:<aggregate|job id>` (or

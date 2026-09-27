@@ -1,6 +1,6 @@
 # Sentinel — implementation plan
 
-Status: design and acceptance criteria. Parts 01–11 of the [backlog](TODO.md) are implemented — foundations, contracts, identity and authorization, durable execution, sources and GitHub feedback, storage, caches, fleet scheduling, OAuth CLI/MCP, scoped secret management through fenced job delivery, and bounded structured diagnostics. The human web interface and later operations/performance work remain open; Part 11 does not close the full M4 gate. See [TODO](TODO.md) for per-task evidence and the [Parts 01–02 audit](docs/parts-01-02-audit.md) for outstanding gates.
+Status: design and acceptance criteria. Parts 01–12 of the [backlog](TODO.md) are implemented — foundations, contracts, identity and authorization, durable execution, sources and GitHub feedback, storage, caches, fleet scheduling, OAuth CLI/MCP, scoped secret management through fenced job delivery, bounded structured diagnostics, and the human web interface ([web interface](docs/web-ui.md)). Operations and performance work remain open. See [TODO](TODO.md) for per-task evidence and the [Parts 01–02 audit](docs/parts-01-02-audit.md) for outstanding gates.
 Reviewed: 2026-09-26. Repository: `RusticStack/sentinel`.
 
 Development tracker: [TODO.md](TODO.md) splits this design into actionable parts, dependencies, first-slice work, and verification gates. Implementation progress is recorded there.
@@ -28,7 +28,7 @@ Build a fully open-source, self-hosted CI engine optimized for fast feedback on 
 |---|---|
 | One queue, slots on one VPS | Durable event-driven fleet scheduler with resource reservations and fairness |
 | Reuse/fork the Fresh UI | New UI; old implementation is reference material |
-| Go or Rust; four mandatory processes | Rust workspace; server embeds UI and storage; workers remain separate execution boundaries |
+| Go or Rust; four mandatory processes | Rust workspace; server embeds storage; workers remain separate execution boundaries; the optional web interface is its own Node process (decided 2026-09-27) |
 | Dropping Actions guarantees speed | Measure dispatch, preparation, execution, transfer, and total feedback independently |
 | Cache is always a snapshot mount | Local CoW fast path plus ordinary-filesystem and remote-transfer paths |
 | Hardlink clone is a snapshot substitute | Never hardlink writable jobs into shared caches; writes corrupt other jobs |
@@ -73,21 +73,22 @@ Git/API/hook/poll -> sentinel server -> durable queue / scheduler
 
 One Rust workspace, initially one `sentinel` binary with subcommands:
 
-- `server`: API, generic Git and forge event intake, bounded source/pipeline resolution and opt-in ref polling, scheduler, GitHub synchronization, embedded UI assets, metadata/storage maintenance.
+- `server`: API, generic Git and forge event intake, bounded source/pipeline resolution and opt-in ref polling, scheduler, GitHub synchronization, metadata/storage maintenance.
+- `sentinel-web` (optional, Node): the human web interface in front of the API ([web interface](docs/web-ui.md)).
 - `worker`: executor and local store; connects to server even on the same host.
 - Developer/operator CLI commands.
 - `mcp`: stdio adapter using the same API. Authenticated Streamable HTTP can be served by the server.
 
 Keep roles in separate processes/OS identities. The web server never executes repository code. A smaller worker executable can follow if distribution measurements warrant it.
 
-Logical modules/crates: `core`, `pipeline`, `protocol`, `scheduler`, `github`, `store`, `executor`, `server`, `cli`, `mcp`; create crates when useful, not as empty scaffolding. `web/` holds new UI assets; `fixtures/` and `benchmarks/` hold reproducible workloads.
+Logical modules/crates: `core`, `pipeline`, `protocol`, `scheduler`, `github`, `store`, `executor`, `server`, `cli`, `mcp`; create crates when useful, not as empty scaffolding. `web/` holds the web interface (Nuxt); `fixtures/` and `benchmarks/` hold reproducible workloads.
 
 ### Dependency policy
 
 - Use maintained Rust libraries for async networking, TLS, serialization, hashing, compression, and embedded SQLite. Pin and justify dependencies.
 - Required worker tooling: Git and a rootless OCI runtime. **Podman first**; Docker only after runtime conformance tests. Do not implement containers, cryptography, TLS, or Git transport ourselves.
 - Project tools (Go, Rust, Python, Java, Node, Bun, pnpm, Gradle, Bazel, compilers, browsers, builders) belong in project-selected versioned images/scripts. Cookbook profiles expose cache paths and diagnostics, not privileged plugins. Optional runtime capabilities must be justified across workloads; Lockwell's current Docker harness does not mandate VM lifecycle support in Sentinel.
-- No required Redis, Postgres, MinIO, Elasticsearch, Kubernetes, Deno, Node server, or message broker. UI tooling can be build-time only.
+- No required Redis, Postgres, MinIO, Elasticsearch, Kubernetes, Deno, or message broker. The web interface is an optional Node process (`sentinel-web`, Nuxt): the project owner chose on 2026-09-27 a full-stack interface over build-time-only assets, for its components, server rendering and maintainability; the controller, CLI and MCP never need it. It holds no credential and no state.
 - Build the application-specific storage layer ourselves; embed SQLite instead of inventing a database engine. Reconsider a custom engine only after profiling demonstrates a real bottleneck and a separate durability/recovery design exists.
 - Optional Tailcat helper/self-hosted DERP and optional S3 are explicit dependencies, not hidden cloud requirements.
 
@@ -348,7 +349,7 @@ Stdio uses the CLI's locally provisioned credential source; it does not run an H
 
 ### New human UI
 
-Serve lightweight build-time UI assets from Rust; choose stack after accessible live-log prototype. Browser interaction need not be Rust/WASM to obtain a fast Rust backend.
+A Nuxt 4 server (Vue, TypeScript, Nuxt UI) beside the controller renders pages as the signed-in person, streams live run and log updates as server-sent events (the controller's long polls, held on the browser's behalf) and proxies the controller's routes as one origin. The stack was chosen after measuring the accessible live-log view four ways (U01): windowing is what matters, and the windowed renderings are within noise of each other ([web interface](docs/web-ui.md#stack-choice-u01)). Changed on 2026-09-27 from "lightweight build-time assets served by Rust" by the owner's decision.
 
 - Runs by installation/repo/branch/PR/SHA, queue/execute timings, cache effectiveness.
 - Failure summary first, file/test evidence links, job DAG, step timelines.
@@ -516,7 +517,7 @@ Resolve through hardware/workflow evidence:
 1. Actual worker CPU/RAM/filesystems/cgroups/RTT and relay host.
 2. Repos blocked by services, matrices, image publishing, deployments, merge queues, forks.
 3. Optimized cache backend and byte/retention defaults.
-4. UI stack and measured binary/RSS limits.
+4. ~~UI stack and measured binary/RSS limits.~~ Resolved: Nuxt web interface, measured in [web interface](docs/web-ui.md#running-it).
 5. Tailcat pin/upgrade policy, wire framing, bulk concurrency.
 6. Key backup, recovery-point/recovery-time goals, and S3-outage policy.
 
