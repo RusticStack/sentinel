@@ -1,18 +1,22 @@
 //! The single-use loopback listener the browser sign-in redirects to (O04,
 //! RFC 8252 §7.3): bound to `127.0.0.1:0`, the whole wait bounded (five
-//! minutes), each request head at most 8 KiB, only `GET /callback`
-//! considered — any other path is answered `404` and the wait goes on. The
-//! first `/callback` decides: its `state` must equal this login's (constant
-//! time) and its `iss` the issuer (RFC 9207), otherwise the login stops.
-//! The browser gets a static page either way; nothing from the request is
-//! echoed.
+//! minutes), each request head at most 8 KiB and 10 s, only `GET /callback`
+//! considered — any other path is answered `404` and the wait goes on.
+//! Only a `/callback` carrying this login's `state` (compared in constant
+//! time) decides: its `iss` must be the issuer (RFC 9207), then it carries
+//! the code or the refusal. A callback with any other `state` — a stray
+//! local process, or a web page that found the port — is answered `400`
+//! and ignored, so it cannot end the sign-in. Each connection is served on
+//! its own short-lived thread (at most [`MAX_CONNECTIONS`] at once), so an
+//! idle connection never holds up the browser's. The browser gets a static
+//! page either way; nothing from the request is echoed.
 
 use std::{
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -29,6 +33,14 @@ pub const WAIT: Duration = Duration::from_secs(5 * 60);
 pub const MAX_HEAD: usize = 8 << 10;
 /// How long one connection may take to send its head.
 const PER_REQUEST: Duration = Duration::from_secs(10);
+/// Connections served at once; beyond this a new one is closed unanswered
+/// until one ends, which bounds the threads and memory a flood can take.
+pub const MAX_CONNECTIONS: usize = 32;
+/// The pause after a failed `accept` (a persistent error such as `EMFILE`
+/// must not spin a core until the deadline).
+const ACCEPT_PAUSE: Duration = Duration::from_millis(10);
+/// Stack for a connection thread: it holds one 8 KiB head buffer.
+const CONNECTION_STACK: usize = 64 << 10;
 
 const DONE_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Sentinel sign-in</title></head>\
 <body><p>Sentinel sign-in is complete. You can close this window and return to the terminal.</p></body></html>";
@@ -41,9 +53,10 @@ pub struct Listener {
     addr: SocketAddr,
 }
 
-/// What a callback carried, once it passed the state and issuer checks.
+/// What one connection amounted to.
 enum Outcome {
-    /// Not the callback (another path, oversized, or unreadable): keep waiting.
+    /// Not this login's callback (another path or `state`, oversized, or
+    /// unreadable): keep waiting.
     Ignored,
     Done(Result<String, Error>),
 }
@@ -67,17 +80,19 @@ impl Listener {
         format!("http://127.0.0.1:{}{CLI_REDIRECT_PATH}", self.addr.port())
     }
 
-    /// Wait at most `timeout` for the callback and return its authorization
-    /// code. `state` and `issuer` are what the callback must carry.
+    /// Wait at most `timeout` for this login's callback and return its
+    /// authorization code. `state` and `issuer` are what the callback must
+    /// carry.
     pub fn wait(self, state: &str, issuer: &str, timeout: Duration) -> Result<String, Error> {
         let deadline = Instant::now() + timeout;
+        let addr = self.addr;
         // A blocking accept has no timeout: a watchdog connects to the
         // listener once the deadline passes, unless told the wait is over.
+        // A connection thread that decided the login wakes it the same way.
         let expired = Arc::new(AtomicBool::new(false));
         let (finished, finished_rx) = mpsc::channel::<()>();
         let watchdog = {
             let expired = Arc::clone(&expired);
-            let addr = self.addr;
             thread::spawn(move || {
                 if let Err(mpsc::RecvTimeoutError::Timeout) = finished_rx.recv_timeout(timeout) {
                     expired.store(true, Ordering::Release);
@@ -85,8 +100,14 @@ impl Listener {
                 }
             })
         };
+        let expected: Arc<(String, String)> = Arc::new((state.to_owned(), issuer.to_owned()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let (decided, decision) = mpsc::channel::<Result<String, Error>>();
         let result = loop {
             let accepted = self.listener.accept();
+            if let Ok(result) = decision.try_recv() {
+                break result;
+            }
             if expired.load(Ordering::Acquire) || Instant::now() >= deadline {
                 break Err(Error::new(
                     Exit::Auth,
@@ -96,10 +117,32 @@ impl Listener {
                     ),
                 ));
             }
-            let Ok((stream, _)) = accepted else { continue };
-            match serve(stream, state, issuer, deadline) {
-                Outcome::Ignored => continue,
-                Outcome::Done(result) => break result,
+            let stream = match accepted {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    thread::sleep(ACCEPT_PAUSE);
+                    continue;
+                }
+            };
+            if active.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+                active.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
+            let (expected, held, decided) =
+                (Arc::clone(&expected), Arc::clone(&active), decided.clone());
+            let spawned = thread::Builder::new()
+                .name("sentinel-callback".into())
+                .stack_size(CONNECTION_STACK)
+                .spawn(move || {
+                    if let Outcome::Done(result) = serve(stream, &expected.0, &expected.1, deadline)
+                        && decided.send(result).is_ok()
+                    {
+                        let _ = TcpStream::connect_timeout(&addr, Duration::from_secs(1));
+                    }
+                    held.fetch_sub(1, Ordering::AcqRel);
+                });
+            if spawned.is_err() {
+                active.fetch_sub(1, Ordering::AcqRel);
             }
         };
         drop(finished);
@@ -169,12 +212,12 @@ fn serve(stream: TcpStream, state: &str, issuer: &str, deadline: Instant) -> Out
         respond(&stream, "405 Method Not Allowed", FAILED_PAGE);
         return Outcome::Ignored;
     }
-    let result = callback(query, state, issuer);
-    match &result {
-        Ok(_) => respond(&stream, "200 OK", DONE_PAGE),
-        Err(_) => respond(&stream, "400 Bad Request", FAILED_PAGE),
+    let outcome = callback(query, state, issuer);
+    match &outcome {
+        Outcome::Done(Ok(_)) => respond(&stream, "200 OK", DONE_PAGE),
+        _ => respond(&stream, "400 Bad Request", FAILED_PAGE),
     }
-    Outcome::Done(result)
+    outcome
 }
 
 /// Constant-time equality of two strings (length is not secret).
@@ -193,41 +236,48 @@ fn refused(message: &str) -> Error {
     Error::new(Exit::Auth, message.to_owned())
 }
 
-/// Check a callback query: exactly one of each parameter, the state first,
-/// then the issuer, then an error or the code.
-fn callback(query: &[u8], state: &str, issuer: &str) -> Result<String, Error> {
-    let (mut got_state, mut got_iss, mut code, mut error) = (None, None, None, None);
+/// Judge a callback query. Without this login's `state` it is not this
+/// login's callback and is ignored. With it: exactly one of each
+/// parameter, then the issuer, then an error or the code.
+fn callback(query: &[u8], state: &str, issuer: &str) -> Outcome {
+    let (mut got_iss, mut code, mut error) = (None, None, None);
+    let (mut states, mut ours, mut repeated) = (0u32, false, false);
     for (name, value) in form_urlencoded::parse(query) {
         let slot = match &*name {
-            "state" => &mut got_state,
+            "state" => {
+                states += 1;
+                ours |= same(&value, state);
+                continue;
+            }
             "iss" => &mut got_iss,
             "code" => &mut code,
             "error" => &mut error,
             _ => continue,
         };
-        if slot.replace(value.into_owned()).is_some() {
-            return Err(refused("the sign-in callback repeated a parameter"));
-        }
+        repeated |= slot.replace(value.into_owned()).is_some();
     }
-    if !got_state.as_deref().is_some_and(|s| same(s, state)) {
-        return Err(refused(
-            "the sign-in callback does not belong to this login (state mismatch); run the login again",
-        ));
+    if !ours {
+        return Outcome::Ignored;
+    }
+    if repeated || states > 1 {
+        return Outcome::Done(Err(refused("the sign-in callback repeated a parameter")));
     }
     if got_iss.as_deref() != Some(issuer) {
-        return Err(refused(
+        return Outcome::Done(Err(refused(
             "the sign-in callback came from another issuer (iss mismatch); run the login again",
-        ));
+        )));
     }
     if let Some(error) = error {
         let known = !error.is_empty()
             && error.len() <= 64
             && error.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
-        return Err(refused(&format!(
+        return Outcome::Done(Err(refused(&format!(
             "the sign-in was not approved ({})",
             if known { error.as_str() } else { "error" }
-        )));
+        ))));
     }
-    code.filter(|c| !c.is_empty())
-        .ok_or_else(|| refused("the sign-in callback carried no code"))
+    Outcome::Done(
+        code.filter(|c| !c.is_empty())
+            .ok_or_else(|| refused("the sign-in callback carried no code")),
+    )
 }

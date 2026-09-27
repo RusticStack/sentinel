@@ -254,6 +254,7 @@ fn credentials(n: u64, access_left_ms: i64) -> Credentials {
         access: token("sntl_at_", n),
         access_expires_ms: (now + access_left_ms).max(0) as u64,
         refresh_expires_ms: (now + 86_400_000) as u64,
+        grant: None,
     }
 }
 
@@ -637,10 +638,43 @@ fn the_loopback_listener_checks_state_and_issuer_and_ignores_other_paths() {
     assert!(favicon.contains("404"), "{favicon}");
     assert!(ok.contains("200"), "{ok}");
 
-    // Wrong state, wrong issuer, missing issuer, a repeated parameter, and
-    // a denial: each refused (exit 3) and the browser gets a 400 page.
+    // P09C-4: a callback with another `state` (a stray process or a web
+    // page that found the port), a denial for another login, and an idle
+    // connection that never sends a head: each answered or left, none ends
+    // the wait or holds it up, and this login's callback then wins at once.
+    let listener = Listener::bind().unwrap();
+    let port = listener.port();
+    let (target, other) = (good(&state, issuer), "cd".repeat(32));
+    let browser = thread::spawn(move || {
+        let idle = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let wrong = hit(port, &good(&other, issuer));
+        let denied = hit(
+            port,
+            &format!("/callback?error=access_denied&state={other}&iss={issuer}"),
+        );
+        let ok = hit(port, &target);
+        drop(idle);
+        (wrong, denied, ok)
+    });
+    let started = Instant::now();
+    let code = listener
+        .wait(&state, issuer, Duration::from_secs(30))
+        .unwrap();
+    assert_eq!(code, token("sntl_ac_", 7));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "an idle connection held up the listener: {:?}",
+        started.elapsed()
+    );
+    let (wrong, denied, ok) = browser.join().unwrap();
+    assert!(wrong.contains("400"), "{wrong}");
+    assert!(denied.contains("400"), "{denied}");
+    assert!(ok.contains("200"), "{ok}");
+
+    // This login's callback with the wrong issuer, a missing issuer, a
+    // repeated parameter, or a denial: each refused (exit 3) and the
+    // browser gets a 400 page.
     for target in [
-        good(&"cd".repeat(32), issuer),
         good(&state, "http://127.0.0.1:10"),
         format!("/callback?code=x&state={state}"),
         format!("{}&state={state}", good(&state, issuer)),
@@ -1333,4 +1367,231 @@ fn windows_credential_manager_stores_reads_and_deletes() {
 
     config.delete_credentials("default", &entry).unwrap();
     assert_eq!(config.read_credentials("default", &entry).unwrap(), None);
+}
+
+/// P09C-3: `profiles.json` decides where refresh tokens go (`issuer`) and
+/// which OS-store entry is read and deleted (`key`). An entry no sign-in
+/// could have written is refused before anything is sent or deleted.
+#[test]
+fn a_tampered_profile_is_refused_before_any_request() {
+    let server = oauth_server(|_| (200, tokens_json(2, "grt_seeded")));
+    let thief = oauth_server(|_| (200, tokens_json(9, "grt_seeded")));
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(&dir);
+    // The access token is spent, so the next command refreshes.
+    let entry = seed(&config, "default", &server.url, &credentials(1, 0));
+    let tamper = |change: &dyn Fn(&mut Profile)| {
+        config
+            .update(|p| {
+                let mut edited = entry.clone();
+                change(&mut edited);
+                p.profiles.insert("default".into(), edited);
+                Ok(())
+            })
+            .unwrap();
+    };
+
+    tamper(&|p| p.issuer = thief.url.clone());
+    let error = config.handle(None).unwrap_err();
+    assert_eq!(error.exit, Exit::Usage, "{}", error.message);
+    let output = run(
+        config.dir(),
+        &["run", "list", "--tenant", "acme", "--repo", "app"],
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("issuer"), "{}", stderr(&output));
+
+    // A key naming another profile's (or another application's) entry is
+    // neither read nor deleted.
+    tamper(&|p| p.key = Some("sentinel:http://127.0.0.1:1:other:0123456789abcdef".into()));
+    assert_eq!(config.handle(None).unwrap_err().exit, Exit::Usage);
+    let edited = config.load().unwrap().profiles["default"].clone();
+    assert_eq!(
+        config
+            .delete_credentials("default", &edited)
+            .unwrap_err()
+            .exit,
+        Exit::Usage
+    );
+    let output = run(config.dir(), &["auth", "logout"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+
+    assert_eq!(thief.total(), 0, "nothing reached the rewritten issuer");
+    assert_eq!(server.total(), 0);
+    // The genuine entry still works.
+    tamper(&|_| {});
+    let handle = config.handle(None).unwrap().unwrap();
+    assert_eq!(handle.access_token(&agent()).unwrap(), token("sntl_at_", 2));
+}
+
+/// P09C-3: on Windows a configuration directory that existed before —
+/// here one another account can modify — is refused (exit 2) the way Unix
+/// refuses a loose mode, `doctor` reports it, and the `icacls` command the
+/// refusal names fixes it.
+#[cfg(windows)]
+#[test]
+fn windows_a_preexisting_configuration_directory_others_can_modify_is_refused() {
+    use std::os::windows::process::CommandExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Made owner-only by the first sign-in (a directory under %TEMP% may
+    // already let other accounts in, and would be refused outright); from
+    // then on it is a directory that exists.
+    let shared = dir.path().join("shared");
+    let config = Config::at(&shared).unwrap();
+    seed(
+        &config,
+        "default",
+        "http://127.0.0.1:1",
+        &credentials(1, 600_000),
+    );
+    assert!(config.handle(None).unwrap().is_some());
+
+    // Authenticated Users may now modify it, and everything inside.
+    let granted = Command::new("icacls")
+        .arg(&shared)
+        .args(["/grant", "*S-1-5-11:(OI)(CI)M"])
+        .output()
+        .unwrap();
+    assert!(granted.status.success(), "{granted:?}");
+
+    let error = config.load().unwrap_err();
+    assert_eq!(error.exit, Exit::Usage);
+    assert!(error.message.contains("S-1-5-11"), "{}", error.message);
+    let (_, fix) = error.message.split_once("; fix: ").expect("a fix");
+    assert!(fix.starts_with("icacls "), "{fix}");
+    assert!(config.handle(None).is_err());
+
+    let output = run(&shared, &["doctor", "--json"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let check = &report["checks"][0];
+    assert_eq!(check["name"], "config_dir");
+    assert_eq!(check["ok"], false);
+    assert_eq!(check["fix"], fix);
+
+    // The command the refusal names restores owner-only access.
+    let fixed = Command::new("cmd")
+        .raw_arg("/C")
+        .raw_arg(fix)
+        .output()
+        .unwrap();
+    assert!(fixed.status.success(), "{fixed:?}");
+    config.load().unwrap();
+    assert!(config.handle(None).unwrap().is_some());
+    let output = run(&shared, &["doctor", "--json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    assert_eq!(report["checks"][0]["ok"], true, "{}", stderr(&output));
+}
+
+/// P09C-8: profiles signed in before OS-store keys named their directory
+/// share one Credential Manager entry per profile name and issuer. The
+/// next refresh moves this directory's credential to its own key; an entry
+/// that turns out to hold another directory's sign-in is left to it.
+#[cfg(windows)]
+#[test]
+fn windows_a_legacy_shared_entry_moves_to_its_directory_or_is_left_to_its_owner() {
+    use sentinel::keystore::windows;
+    struct Cleanup(Vec<String>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for key in &self.0 {
+                let _ = windows::delete(key);
+            }
+        }
+    }
+    let grant = Arc::new(Mutex::new("grt_seeded"));
+    let answering = Arc::clone(&grant);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let server = oauth_server(move |_| {
+        let n = counted.fetch_add(1, Ordering::SeqCst) as u64;
+        (200, tokens_json(10 + n, *answering.lock().unwrap()))
+    });
+    let legacy = keystore::key(&server.url, "default");
+    let blob = |creds: &Credentials| serde_json::to_vec(creds).unwrap();
+    let legacy_profile = |config: &Config| {
+        let entry = Profile {
+            server: server.url.clone(),
+            issuer: server.url.clone(),
+            client_id: "sentinel-cli".into(),
+            user: "usr_0123456789abcdef0123456789".into(),
+            username: None,
+            grant: "grt_seeded".into(),
+            scopes: "runs:read".into(),
+            tenant: None,
+            store: Backend::Os,
+            key: None,
+            created_ms: 0,
+        };
+        let stored = entry.clone();
+        config
+            .update(|p| {
+                p.profiles.insert("default".into(), stored);
+                p.current = Some("default".into());
+                Ok(())
+            })
+            .unwrap();
+        entry
+    };
+
+    // Directory A's own sign-in, from an older build (no grant recorded),
+    // with its access token spent.
+    let a_dir = tempfile::tempdir().unwrap();
+    let a = config(&a_dir);
+    legacy_profile(&a);
+    // Computed once the directory exists, as sign-in does.
+    let scoped = keystore::scoped_key(a.dir(), &server.url, "default");
+    let _cleanup = Cleanup(vec![legacy.clone(), scoped.clone()]);
+    windows::write(&legacy, &blob(&credentials(1, 0))).unwrap();
+    let handle = a.handle(None).unwrap().unwrap();
+    assert_eq!(
+        handle.access_token(&agent()).unwrap(),
+        token("sntl_at_", 10)
+    );
+    let moved = a.load().unwrap().profiles["default"].clone();
+    assert_eq!(moved.key.as_deref(), Some(scoped.as_str()));
+    assert_eq!(
+        windows::read(&legacy).unwrap(),
+        None,
+        "the shared entry is gone"
+    );
+    let stored = a.read_credentials("default", &moved).unwrap().unwrap();
+    assert_eq!(stored.refresh, token("sntl_rt_", 10));
+    assert_eq!(stored.grant.as_deref(), Some("grt_seeded"));
+    // A fresh handle (another process) finds it under the scoped key.
+    let again = a.handle(None).unwrap().unwrap();
+    assert_eq!(again.access_token(&agent()).unwrap(), token("sntl_at_", 10));
+
+    // Directory B's legacy profile, but the shared entry holds another
+    // directory's newer sign-in (another grant): refreshing it hands that
+    // directory's successor back and signs B out.
+    *grant.lock().unwrap() = "grt_other";
+    let b_dir = tempfile::tempdir().unwrap();
+    let b = config(&b_dir);
+    legacy_profile(&b);
+    windows::write(&legacy, &blob(&credentials(2, 0))).unwrap();
+    let handle = b.handle(None).unwrap().unwrap();
+    let error = handle.access_token(&agent()).unwrap_err();
+    assert_eq!(error.exit, Exit::Auth, "{}", error.message);
+    let kept: Credentials =
+        serde_json::from_slice(&windows::read(&legacy).unwrap().unwrap()).unwrap();
+    assert_eq!(kept.refresh, token("sntl_rt_", 11), "the owner's successor");
+    assert_eq!(kept.grant.as_deref(), Some("grt_other"));
+    assert!(b.load().unwrap().profiles["default"].is_legacy());
+
+    // Now the entry names its grant: B is refused without a request, and
+    // signing out of B neither revokes nor deletes the other directory's
+    // sign-in.
+    let before = calls.load(Ordering::SeqCst);
+    let handle = b.handle(None).unwrap().unwrap();
+    assert_eq!(handle.access_token(&agent()).unwrap_err().exit, Exit::Auth);
+    let output = run(b.dir(), &["auth", "logout"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(server.requests("/oauth/revoke").is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), before);
+    assert!(
+        windows::read(&legacy).unwrap().is_some(),
+        "left to its owner"
+    );
 }

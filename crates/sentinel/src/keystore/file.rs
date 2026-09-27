@@ -9,7 +9,10 @@
 //! every credential write, get a protected DACL granting only the current
 //! user and SYSTEM (inherited by the files inside), so the store is
 //! owner-only wherever `SENTINEL_CONFIG_DIR` points — not only under the
-//! per-user `%APPDATA%`.
+//! per-user `%APPDATA%`. Every directory and file that already exists is
+//! checked on its open handle, as on Unix: it must be owned by this user,
+//! SYSTEM or Administrators, and its DACL may allow no one else; anything
+//! looser is refused with the `icacls` command that fixes it.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -49,12 +52,14 @@ pub fn read(dir: &Path, profile: &str) -> Result<Option<Vec<u8>>, Error> {
 pub fn write(dir: &Path, profile: &str, blob: &[u8]) -> Result<(), Error> {
     ensure_private_dir(dir)?;
     let creds = credentials_dir(dir);
-    ensure_private_dir(&creds)?;
-    // A directory made by an older Sentinel, or by someone else, is brought
-    // to owner-only before a refresh token goes into it (Unix refuses a
-    // loose one in `ensure_private_dir` instead).
+    // A credentials directory made by an older Sentinel is brought to
+    // owner-only before a refresh token goes into it; one owned by someone
+    // else is still refused below (Unix refuses any loose one instead).
     #[cfg(windows)]
-    acl::owner_only(&creds).map_err(|e| io_error("restrict access to", &creds, &e))?;
+    if creds.is_dir() {
+        acl::owner_only(&creds).map_err(|e| io_error("restrict access to", &creds, &e))?;
+    }
+    ensure_private_dir(&creds)?;
     write_private(&path(dir, profile), blob)
 }
 
@@ -76,6 +81,9 @@ pub fn read_private(path: &Path) -> Result<Option<Vec<u8>>, Error> {
         Err(e) => return Err(io_error("read", path, &e)),
     };
     let meta = file.metadata().map_err(|e| io_error("read", path, &e))?;
+    #[cfg(windows)]
+    check_windows(path, &file, false)?;
+    #[cfg(not(windows))]
     check_meta(path, &meta, false)?;
     if meta.len() > MAX_FILE {
         return Err(Error::usage(format!(
@@ -119,8 +127,8 @@ pub fn ensure_private_dir(path: &Path) -> Result<(), Error> {
     }
 }
 
-/// Check that `path` is owner-only and owned by this user (Unix; always
-/// accepted elsewhere).
+/// Check that `path` is owner-only and owned by this user (Unix mode and
+/// owner; Windows owner and DACL).
 pub fn check_private(path: &Path) -> Result<(), Error> {
     let meta = fs::metadata(path).map_err(|e| io_error("read", path, &e))?;
     check_meta(path, &meta, meta.is_dir())
@@ -165,9 +173,62 @@ fn check_meta(path: &Path, meta: &fs::Metadata, dir: bool) -> Result<(), Error> 
     check_unix(path, meta, dir, rustix::process::geteuid().as_raw())
 }
 
-#[cfg(not(unix))]
+/// Windows: open the object and judge its owner and DACL on the handle.
+#[cfg(windows)]
+fn check_meta(path: &Path, _meta: &fs::Metadata, dir: bool) -> Result<(), Error> {
+    let file = acl::open(path).map_err(|e| io_error("inspect", path, &e))?;
+    check_windows(path, &file, dir)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn check_meta(_path: &Path, _meta: &fs::Metadata, _dir: bool) -> Result<(), Error> {
     Ok(())
+}
+
+/// The Windows equivalent of the Unix owner and mode check (P09C-3): the
+/// object must be owned by this user (or SYSTEM, or Administrators) and its
+/// DACL may allow no one else, whether Sentinel created it or it existed
+/// before. A refusal names the `icacls` commands that fix it.
+#[cfg(windows)]
+fn check_windows(path: &Path, file: &File, dir: bool) -> Result<(), Error> {
+    let shown = path.display();
+    match acl::check_private(file) {
+        Ok(()) => Ok(()),
+        Err(acl::Refusal::Io(e)) => Err(io_error("inspect the permissions of", path, &e)),
+        Err(acl::Refusal::Owner(owner)) => Err(Error::usage(format!(
+            "{shown} is owned by another account ({owner}), not by you; fix: remove it, or take \
+             ownership (then run sentinel doctor for the ACL): takeown /F \"{shown}\"{}",
+            if dir { " /R /D Y" } else { "" }
+        ))),
+        Err(acl::Refusal::Loose(others)) => {
+            let listed = if others.is_empty() {
+                "an entry Sentinel does not accept".to_owned()
+            } else {
+                others.join(", ")
+            };
+            let fix = if dir {
+                let mut remove = String::new();
+                for sid in &others {
+                    remove.push_str(&format!(" *{sid}"));
+                }
+                let remove = if remove.is_empty() {
+                    String::new()
+                } else {
+                    format!(" /remove:g{remove}")
+                };
+                format!(
+                    "icacls \"{shown}\" /inheritance:r /grant:r *{user}:(OI)(CI)F *S-1-5-18:(OI)(CI)F{remove} \
+                     && icacls \"{shown}\\*\" /reset /T /C",
+                    user = acl::user_text()
+                )
+            } else {
+                format!("icacls \"{shown}\" /reset")
+            };
+            Err(Error::usage(format!(
+                "{shown} is accessible to other users (its ACL allows {listed}); fix: {fix}"
+            )))
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -240,44 +301,135 @@ fn io_error(what: &str, path: &Path, error: &io::Error) -> Error {
 
 /// Owner-only access on Windows: a protected DACL (no inherited entries)
 /// granting full control to the current user and to SYSTEM, inherited by
-/// everything created inside. The equivalent of `chmod 700`.
+/// everything created inside — the equivalent of `chmod 700` — and the
+/// checks that refuse anything looser, made on an open handle.
 #[cfg(windows)]
 mod acl {
-    use std::{ffi::c_void, fs::File, io, iter, os::windows::ffi::OsStrExt, path::Path, ptr};
+    use std::{
+        ffi::c_void,
+        fs::{File, OpenOptions},
+        io, iter,
+        os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
+        path::Path,
+        ptr,
+        sync::OnceLock,
+    };
 
     use windows_sys::Win32::{
         Foundation::{CloseHandle, ERROR_SUCCESS, GENERIC_ALL, HANDLE, LocalFree},
         Security::{
-            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+            ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
             Authorization::{
-                EXPLICIT_ACCESS_W, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
-                SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
-                TRUSTEE_IS_USER, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_TYPE, TRUSTEE_W,
+                ConvertSidToStringSidW, EXPLICIT_ACCESS_W, GetSecurityInfo, NO_MULTIPLE_TRUSTEE,
+                SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW,
+                TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_TYPE,
+                TRUSTEE_W,
             },
-            CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-            GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_MAX_SID_SIZE,
+            CopySid, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+            GetAclInformation, GetLengthSid, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_MAX_SID_SIZE,
             SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY, TOKEN_USER, TokenUser,
-            WinLocalSystemSid,
+            WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinLocalSystemSid,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
 
-    fn entry(sid: *mut c_void, kind: TRUSTEE_TYPE) -> EXPLICIT_ACCESS_W {
-        EXPLICIT_ACCESS_W {
-            grfAccessPermissions: GENERIC_ALL,
-            grfAccessMode: SET_ACCESS,
-            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-            Trustee: TRUSTEE_W {
-                pMultipleTrustee: ptr::null_mut(),
-                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: kind,
-                ptstrName: sid.cast(),
-            },
+    /// `READ_CONTROL`: enough access to read an object's security.
+    const READ_CONTROL: u32 = 0x0002_0000;
+    /// `FILE_FLAG_BACKUP_SEMANTICS`: required to open a directory handle.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+    /// A SID copied into owned, 4-aligned storage.
+    struct Sid(Box<[u32]>);
+
+    impl Sid {
+        fn as_psid(&self) -> PSID {
+            self.0.as_ptr().cast_mut().cast()
+        }
+
+        /// Copy the SID at `sid`.
+        ///
+        /// # Safety
+        /// `sid` must point at a valid SID.
+        unsafe fn copy(sid: PSID) -> io::Result<Sid> {
+            // SAFETY: the caller guarantees `sid` is a valid SID.
+            let len = unsafe { GetLengthSid(sid) };
+            let mut storage = vec![0u32; (len as usize).div_ceil(4)].into_boxed_slice();
+            // SAFETY: `storage` is writable for at least `len` bytes and
+            // `sid` is valid; CopySid writes exactly the SID's length.
+            if unsafe { CopySid(len, storage.as_mut_ptr().cast(), sid) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Sid(storage))
+        }
+
+        fn well_known(kind: WELL_KNOWN_SID_TYPE) -> io::Result<Sid> {
+            let mut storage = vec![0u32; (SECURITY_MAX_SID_SIZE as usize).div_ceil(4)];
+            let mut len = SECURITY_MAX_SID_SIZE;
+            // SAFETY: `storage` is writable for SECURITY_MAX_SID_SIZE bytes,
+            // the size of the largest SID; no domain SID is needed for the
+            // built-in accounts asked for here.
+            let ok = unsafe {
+                CreateWellKnownSid(kind, ptr::null_mut(), storage.as_mut_ptr().cast(), &mut len)
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Sid(storage.into_boxed_slice()))
+        }
+
+        /// Whether `other` (a valid SID) is this SID.
+        fn is(&self, other: PSID) -> bool {
+            // SAFETY: both pointers refer to valid SIDs for the call.
+            unsafe { EqualSid(self.as_psid(), other) != 0 }
+        }
+
+        /// The `S-1-…` text of the SID at `sid` (valid), for a fix command.
+        fn text_of(sid: PSID) -> String {
+            let mut wide: *mut u16 = ptr::null_mut();
+            // SAFETY: `sid` is valid; on success `wide` receives a
+            // LocalAlloc'd NUL-terminated string owned by this function.
+            if unsafe { ConvertSidToStringSidW(sid, &mut wide) } == 0 || wide.is_null() {
+                return "?".to_owned();
+            }
+            let mut len = 0;
+            // SAFETY: the string is NUL-terminated, so every unit up to and
+            // including the terminator is readable.
+            while unsafe { *wide.add(len) } != 0 {
+                len += 1;
+            }
+            // SAFETY: `len` units were just read as initialized.
+            let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
+            // SAFETY: allocated by ConvertSidToStringSidW; freed once.
+            unsafe { LocalFree(wide.cast()) };
+            text
         }
     }
 
-    pub(super) fn owner_only(path: &Path) -> io::Result<()> {
+    /// This process's user and the built-in accounts the checks accept,
+    /// looked up once per process.
+    struct Sids {
+        user: Sid,
+        system: Sid,
+        admins: Sid,
+    }
+
+    fn sids() -> io::Result<&'static Sids> {
+        static SIDS: OnceLock<Sids> = OnceLock::new();
+        if let Some(sids) = SIDS.get() {
+            return Ok(sids);
+        }
+        let sids = Sids {
+            user: token_user()?,
+            system: Sid::well_known(WinLocalSystemSid)?,
+            admins: Sid::well_known(WinBuiltinAdministratorsSid)?,
+        };
+        Ok(SIDS.get_or_init(|| sids))
+    }
+
+    fn token_user() -> io::Result<Sid> {
         let mut token: HANDLE = ptr::null_mut();
         // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no
         // closing; `token` is a valid out-pointer for the opened handle.
@@ -306,30 +458,35 @@ mod acl {
             return Err(error);
         }
         // SAFETY: on success the buffer starts with a TOKEN_USER whose SID
-        // pointer refers into the same buffer, which outlives its uses below.
-        let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-        let mut system = [0u8; SECURITY_MAX_SID_SIZE as usize];
-        let mut system_len = SECURITY_MAX_SID_SIZE;
-        // SAFETY: `system` is writable for `system_len` bytes, the maximum
-        // size of any SID; no domain SID is needed for LocalSystem.
-        let ok = unsafe {
-            CreateWellKnownSid(
-                WinLocalSystemSid,
-                ptr::null_mut(),
-                system.as_mut_ptr().cast(),
-                &mut system_len,
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
+        // pointer refers into the same buffer, alive for the copy.
+        unsafe { Sid::copy((*user.as_ptr().cast::<TOKEN_USER>()).User.Sid) }
+    }
+
+    fn entry(sid: *mut c_void, kind: TRUSTEE_TYPE) -> EXPLICIT_ACCESS_W {
+        EXPLICIT_ACCESS_W {
+            grfAccessPermissions: GENERIC_ALL,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: kind,
+                ptstrName: sid.cast(),
+            },
         }
+    }
+
+    pub(super) fn owner_only(path: &Path) -> io::Result<()> {
+        let sids = sids()?;
         let entries = [
-            entry(user_sid, TRUSTEE_IS_USER),
-            entry(system.as_mut_ptr().cast(), TRUSTEE_IS_WELL_KNOWN_GROUP),
+            entry(sids.user.as_psid(), TRUSTEE_IS_USER),
+            entry(sids.system.as_psid(), TRUSTEE_IS_WELL_KNOWN_GROUP),
         ];
         let mut acl: *mut ACL = ptr::null_mut();
-        // SAFETY: `entries` and the SIDs they point at live across the call;
-        // `acl` receives a LocalAlloc'd ACL owned by this function.
+        // SAFETY: `entries` and the SIDs they point at (process-lifetime
+        // copies) live across the call; `acl` receives a LocalAlloc'd ACL
+        // owned by this function.
         let code = unsafe { SetEntriesInAclW(2, entries.as_ptr(), ptr::null(), &mut acl) };
         if code != ERROR_SUCCESS {
             return Err(io::Error::from_raw_os_error(code as i32));
@@ -362,61 +519,77 @@ mod acl {
         Ok(())
     }
 
-    pub(super) fn check_input(file: &File) -> io::Result<()> {
-        use std::os::windows::io::AsRawHandle;
+    /// Why an object is not private.
+    pub(super) enum Refusal {
+        /// Owned by another account (the SID's text).
+        Owner(String),
+        /// The DACL lets another principal in: the SIDs it names (empty
+        /// for a null DACL or an entry type that is not a plain allow or
+        /// deny).
+        Loose(Vec<String>),
+        Io(io::Error),
+    }
 
-        let mut token: HANDLE = ptr::null_mut();
-        // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no
-        // closing; `token` is a valid out-pointer for the opened handle.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut user = [0u64; 16];
-        let mut user_len = 0u32;
-        // SAFETY: `token` is live; `user` is aligned writable storage large
-        // enough for TOKEN_USER and its bounded SID.
-        let ok = unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
-                user.as_mut_ptr().cast(),
-                size_of_val(&user) as u32,
-                &mut user_len,
-            )
-        };
-        let error = io::Error::last_os_error();
-        // SAFETY: this token was opened above and is closed exactly once.
-        unsafe { CloseHandle(token) };
-        if ok == 0 {
-            return Err(error);
-        }
-        // SAFETY: on success the token buffer begins with TOKEN_USER; its SID
-        // pointer refers into `user`, which remains alive through the checks.
-        let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-        let mut system = [0u8; SECURITY_MAX_SID_SIZE as usize];
-        let mut system_len = SECURITY_MAX_SID_SIZE;
-        // SAFETY: writable storage is at least SECURITY_MAX_SID_SIZE bytes.
-        if unsafe {
-            CreateWellKnownSid(
-                WinLocalSystemSid,
-                ptr::null_mut(),
-                system.as_mut_ptr().cast(),
-                &mut system_len,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+    /// What an object may grant.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Policy {
+        /// A secret input file: allow entries for this user and SYSTEM
+        /// only, nothing but allow entries, owner not checked.
+        SecretInput,
+        /// A configuration directory or file: owned by this user, SYSTEM
+        /// or Administrators, and allow entries only for those (the
+        /// Administrators group can take any file anyway); deny entries
+        /// are fine.
+        Private,
+    }
+
+    /// Open `path` (a file or a directory) with just enough access to read
+    /// its security.
+    pub(super) fn open(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .access_mode(READ_CONTROL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    }
+
+    /// The configuration directory's rule, checked on the open object.
+    pub(super) fn check_private(file: &File) -> Result<(), Refusal> {
+        check(file, Policy::Private)
+    }
+
+    pub(super) fn check_input(file: &File) -> io::Result<()> {
+        check(file, Policy::SecretInput).map_err(|refusal| match refusal {
+            Refusal::Io(e) => e,
+            _ => io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "DACL allows another principal",
+            ),
+        })
+    }
+
+    /// This user's SID text, for a fix command.
+    pub(super) fn user_text() -> String {
+        sids().map_or_else(|_| "?".to_owned(), |s| Sid::text_of(s.user.as_psid()))
+    }
+
+    fn check(file: &File, policy: Policy) -> Result<(), Refusal> {
+        let sids = sids().map_err(Refusal::Io)?;
+        let mut owner: PSID = ptr::null_mut();
         let mut dacl: *mut ACL = ptr::null_mut();
         let mut descriptor = ptr::null_mut();
+        let info = match policy {
+            Policy::Private => DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            Policy::SecretInput => DACL_SECURITY_INFORMATION,
+        };
         // SAFETY: the handle belongs to the still-open `file`; the returned
-        // DACL and descriptor are valid until the descriptor is freed.
+        // owner SID and DACL point into the descriptor, valid until it is
+        // freed below.
         let code = unsafe {
             GetSecurityInfo(
                 file.as_raw_handle().cast(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
+                info,
+                &mut owner,
                 ptr::null_mut(),
                 &mut dacl,
                 ptr::null_mut(),
@@ -424,67 +597,80 @@ mod acl {
             )
         };
         if code != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(code as i32));
+            return Err(Refusal::Io(io::Error::from_raw_os_error(code as i32)));
         }
-        let result = if dacl.is_null() {
-            Err(io::Error::new(io::ErrorKind::PermissionDenied, "null DACL"))
-        } else {
-            let mut info = ACL_SIZE_INFORMATION::default();
-            // SAFETY: `dacl` came from GetSecurityInfo and `info` is writable
-            // for exactly its declared size.
-            let ok = unsafe {
-                GetAclInformation(
-                    dacl,
-                    (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
-                    size_of_val(&info) as u32,
-                    AclSizeInformation,
-                )
-            };
-            if ok == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                let mut safe = true;
-                for index in 0..info.AceCount {
-                    let mut ace = ptr::null_mut();
-                    // SAFETY: `index` is below the ACE count returned for the
-                    // same valid DACL and `ace` is a writable out-pointer.
-                    if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
-                        safe = false;
-                        break;
-                    }
-                    // SAFETY: GetAce returned an ACE within the DACL; every
-                    // ACE begins with ACE_HEADER, as guaranteed by Win32.
-                    let header =
-                        unsafe { &*ace.cast::<windows_sys::Win32::Security::ACE_HEADER>() };
-                    if header.AceType != 0 {
-                        safe = false;
-                        break;
-                    }
-                    // SAFETY: standard ACCESS_ALLOWED ACE type guarantees the
-                    // ACCESS_ALLOWED_ACE header and SID field layout.
-                    let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
-                    let sid = (&allowed.SidStart as *const u32).cast_mut().cast();
-                    // SAFETY: both SIDs are valid for this loop iteration.
-                    let user = unsafe { EqualSid(sid, user_sid) } != 0;
-                    // SAFETY: the SYSTEM SID buffer remains alive here.
-                    let system_user = unsafe { EqualSid(sid, system.as_mut_ptr().cast()) } != 0;
-                    if !user && !system_user {
-                        safe = false;
-                        break;
-                    }
-                }
-                if safe {
-                    Ok(())
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "DACL allows another principal",
-                    ))
-                }
-            }
-        };
-        // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc.
+        let result = judge(sids, policy, owner, dacl);
+        // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc;
+        // `owner` and `dacl` are not used after this.
         unsafe { LocalFree(descriptor.cast()) };
         result
+    }
+
+    /// Judge an owner and a DACL, both from one live security descriptor.
+    fn judge(sids: &Sids, policy: Policy, owner: PSID, dacl: *mut ACL) -> Result<(), Refusal> {
+        let accepted = |sid: PSID| {
+            sids.user.is(sid)
+                || sids.system.is(sid)
+                || (policy == Policy::Private && sids.admins.is(sid))
+        };
+        if policy == Policy::Private && (owner.is_null() || !accepted(owner)) {
+            let who = if owner.is_null() {
+                "nobody".to_owned()
+            } else {
+                Sid::text_of(owner)
+            };
+            return Err(Refusal::Owner(who));
+        }
+        if dacl.is_null() {
+            // A null DACL grants everyone everything.
+            return Err(Refusal::Loose(Vec::new()));
+        }
+        let mut info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: `dacl` came from GetSecurityInfo and `info` is writable
+        // for exactly its declared size.
+        let ok = unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of_val(&info) as u32,
+                AclSizeInformation,
+            )
+        };
+        if ok == 0 {
+            return Err(Refusal::Io(io::Error::last_os_error()));
+        }
+        let mut others = Vec::new();
+        for index in 0..info.AceCount {
+            let mut ace = ptr::null_mut();
+            // SAFETY: `index` is below the ACE count returned for the same
+            // valid DACL and `ace` is a writable out-pointer.
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                return Err(Refusal::Io(io::Error::last_os_error()));
+            }
+            // SAFETY: GetAce returned an ACE within the DACL; every ACE
+            // begins with ACE_HEADER.
+            let kind = unsafe { (*ace.cast::<ACE_HEADER>()).AceType };
+            match (kind, policy) {
+                (ACCESS_ALLOWED_ACE_TYPE, _) => {}
+                (ACCESS_DENIED_ACE_TYPE, Policy::Private) => continue,
+                // Object, callback and other entry types are not judged.
+                _ => return Err(Refusal::Loose(others)),
+            }
+            // SAFETY: an ACCESS_ALLOWED ACE has the ACCESS_ALLOWED_ACE
+            // layout: the header, the mask, then the SID at `SidStart`.
+            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid: PSID = (&allowed.SidStart as *const u32).cast_mut().cast();
+            if !accepted(sid) {
+                let text = Sid::text_of(sid);
+                if !others.contains(&text) {
+                    others.push(text);
+                }
+            }
+        }
+        if others.is_empty() {
+            Ok(())
+        } else {
+            Err(Refusal::Loose(others))
+        }
     }
 }
