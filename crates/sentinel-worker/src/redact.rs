@@ -171,9 +171,10 @@ pub struct Redactor {
     longest: usize,
     /// Built on first use after a registration; `None` means stale.
     matcher: Option<Matcher>,
-    /// Longest value starting at each position of the buffer being
-    /// scanned; reused between calls.
-    starts: Vec<u32>,
+    /// `(position, length)` of the longest value starting at each position
+    /// of the buffer being scanned where one starts, decreasing position;
+    /// reused between calls.
+    starts: Vec<(u32, u32)>,
     /// Held-back tail per stream, indexed by `Stream as usize`.
     carry: [Vec<u8>; 3],
 }
@@ -296,14 +297,26 @@ impl Redactor {
         let longest = self.longest;
         let mut starts = std::mem::take(&mut self.starts);
         let matcher = self.matcher();
-        // Backward over the reversed values: `starts[i]` is the longest
-        // value that begins at `i` and ends inside `buf`.
+        // Backward over the reversed values: every position at which a
+        // value begins (and ends inside `buf`), with the longest such
+        // value, in decreasing position. Output that starts no value stays
+        // at the dense root: one table load per byte, nothing written.
         starts.clear();
-        starts.resize(buf.len(), 0);
+        let reversed = &matcher.reversed;
         let mut state = 0u32;
         for i in (0..buf.len()).rev() {
-            state = matcher.reversed.next(state, buf[i]);
-            starts[i] = matcher.reversed.out[state as usize];
+            let byte = buf[i];
+            state = if state == 0 {
+                reversed.root[byte as usize]
+            } else {
+                reversed.next(state, byte)
+            };
+            if state != 0 {
+                let len = reversed.out[state as usize];
+                if len != 0 {
+                    starts.push((i as u32, len));
+                }
+            }
         }
         // Where a held tail may begin: every tail of `buf` that is a
         // proper prefix of some value — the forward state's failure chain,
@@ -331,6 +344,8 @@ impl Redactor {
         // scan actually reaches; a candidate inside a replaced value is not
         // reached and cannot hold.
         let mut next_hold = candidate();
+        // `starts` is in decreasing position: its tail is the next match.
+        let mut next = starts.len();
         let mut at = 0;
         loop {
             while next_hold.is_some_and(|q| q < at) {
@@ -338,16 +353,24 @@ impl Redactor {
             }
             let stop = next_hold.unwrap_or(buf.len());
             let mut plain = at;
-            while at < stop {
-                let len = starts[at] as usize;
-                if len == 0 {
-                    at += 1;
-                    continue;
+            loop {
+                // A value starting inside one already replaced is skipped.
+                while next > 0 && (starts[next - 1].0 as usize) < at {
+                    next -= 1;
                 }
-                out.extend_from_slice(&buf[plain..at]);
+                if next == 0 || starts[next - 1].0 as usize >= stop {
+                    at = stop;
+                    break;
+                }
+                let (pos, len) = starts[next - 1];
+                next -= 1;
+                out.extend_from_slice(&buf[plain..pos as usize]);
                 out.extend_from_slice(REPLACEMENT);
-                at += len;
+                at = pos as usize + len as usize;
                 plain = at;
+                if at > stop {
+                    break;
+                }
             }
             if at == stop {
                 out.extend_from_slice(&buf[plain..at]);
@@ -355,7 +378,6 @@ impl Redactor {
             }
             // A value ran past the candidate: the scan never reached it.
         }
-        starts.fill(0);
         self.starts = starts;
         at
     }
