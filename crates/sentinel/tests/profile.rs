@@ -1595,3 +1595,95 @@ fn windows_a_legacy_shared_entry_moves_to_its_directory_or_is_left_to_its_owner(
         "left to its owner"
     );
 }
+
+/// P09C-8 residual: two configuration directories refresh the same legacy
+/// shared entry at the same moment. The token endpoint holds the first
+/// refresh until a second one arrives (or a second has passed), so without
+/// serialization both directories present the same refresh token. With the
+/// legacy-entry lock only one does: the winner moves the entry to its own
+/// directory, and the other finds it gone and is signed out instead of
+/// replaying a spent token.
+#[cfg(windows)]
+#[test]
+fn windows_two_directories_never_refresh_one_legacy_entry_at_once() {
+    use sentinel::keystore::windows;
+    struct Cleanup(Vec<String>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for key in &self.0 {
+                let _ = windows::delete(key);
+            }
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let server = oauth_server(move |_| {
+        let n = counted.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            let until = Instant::now() + Duration::from_secs(1);
+            while counted.load(Ordering::SeqCst) < 2 && Instant::now() < until {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        (200, tokens_json(10 + n as u64, "grt_seeded"))
+    });
+    let legacy = keystore::key(&server.url, "default");
+    let legacy_profile = |config: &Config| {
+        let entry = Profile {
+            server: server.url.clone(),
+            issuer: server.url.clone(),
+            client_id: "sentinel-cli".into(),
+            user: "usr_0123456789abcdef0123456789".into(),
+            username: None,
+            grant: "grt_seeded".into(),
+            scopes: "runs:read".into(),
+            tenant: None,
+            store: Backend::Os,
+            key: None,
+            created_ms: 0,
+        };
+        config
+            .update(|p| {
+                p.profiles.insert("default".into(), entry);
+                p.current = Some("default".into());
+                Ok(())
+            })
+            .unwrap();
+    };
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (config(&a_dir), config(&b_dir));
+    legacy_profile(&a);
+    legacy_profile(&b);
+    let _cleanup = Cleanup(vec![
+        legacy.clone(),
+        keystore::scoped_key(a.dir(), &server.url, "default"),
+        keystore::scoped_key(b.dir(), &server.url, "default"),
+    ]);
+    windows::write(&legacy, &serde_json::to_vec(&credentials(1, 0)).unwrap()).unwrap();
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let refresh = |config: Config| {
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            let handle = config.handle(None).unwrap().unwrap();
+            start.wait();
+            handle.access_token(&agent())
+        })
+    };
+    let (ra, rb) = (refresh(a.clone()), refresh(b.clone()));
+    let results = [ra.join().unwrap(), rb.join().unwrap()];
+    let presented: Vec<String> = server
+        .requests("/oauth/token")
+        .iter()
+        .filter_map(|r| r.param("refresh_token"))
+        .collect();
+    assert_eq!(presented, vec![token("sntl_rt_", 1)], "one presentation");
+    let won = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(won, 1, "exactly one directory refreshed");
+    for result in &results {
+        match result {
+            Ok(access) => assert_eq!(*access, token("sntl_at_", 10)),
+            Err(error) => assert_eq!(error.exit, Exit::Auth, "{}", error.message),
+        }
+    }
+    assert_eq!(windows::read(&legacy).unwrap(), None, "the entry moved");
+}

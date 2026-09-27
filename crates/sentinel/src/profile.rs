@@ -738,6 +738,25 @@ impl Handle {
         newer: impl Fn(&Credentials) -> bool,
     ) -> Result<String, Error> {
         let _lock = self.0.config.lock(&self.0.name)?;
+        // A legacy entry is shared with other configuration directories,
+        // whose profile locks are their own: this one serializes the refresh
+        // of the entry itself, so no two directories present its refresh
+        // token at once (P09C-8). The loser re-reads below and finds the
+        // winner's successor, or the entry moved and itself signed out.
+        #[cfg(windows)]
+        let _legacy = if self.legacy() {
+            let key = keystore::key(&self.0.profile.issuer, &self.0.name);
+            Some(
+                keystore::windows::LegacyLock::acquire(&key, LOCK_DEADLINE).map_err(|e| {
+                    Error::new(
+                        Exit::Busy,
+                        format!("another sentinel process holds the shared credential entry: {e}"),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
         let stored = self.stored()?;
         let now = now_ms();
         if stored.access_expires_ms > now + REFRESH_MARGIN_MS && newer(&stored) {

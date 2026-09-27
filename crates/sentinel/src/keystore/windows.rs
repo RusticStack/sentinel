@@ -98,3 +98,102 @@ pub fn delete(key: &str) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// Held while a legacy shared entry is refreshed (P09C-8): the entry is
+/// shared by every configuration directory of this user, while profile
+/// locks live in each directory, so two directories could otherwise both
+/// present its refresh token at once. A named mutex in this logon
+/// session's namespace, named after the key's digest, serializes them; the
+/// OS releases it if the holder dies (the next waiter then sees
+/// `WAIT_ABANDONED`, which still grants ownership). Ownership belongs to
+/// the acquiring thread, which releases it on drop.
+pub struct LegacyLock(windows_sys::Win32::Foundation::HANDLE);
+
+impl LegacyLock {
+    /// Wait at most `deadline` for the legacy entry `key`.
+    pub fn acquire(key: &str, deadline: std::time::Duration) -> io::Result<LegacyLock> {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::{CreateMutexW, WaitForSingleObject},
+        };
+        let digest = blake3::hash(key.as_bytes()).to_hex();
+        let name = wide(&format!(r"Local\sentinel-legacy-{}", &digest[..32]));
+        // SAFETY: `name` is a NUL-terminated UTF-16 string alive for the
+        // call; default security and no initial ownership.
+        let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(last_error());
+        }
+        let millis = u32::try_from(deadline.as_millis()).unwrap_or(u32::MAX - 1);
+        // SAFETY: `handle` is the live mutex handle opened above.
+        match unsafe { WaitForSingleObject(handle, millis) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(LegacyLock(handle)),
+            code => {
+                let error = if code == WAIT_TIMEOUT {
+                    io::Error::new(io::ErrorKind::TimedOut, "legacy credential entry is busy")
+                } else {
+                    last_error()
+                };
+                // SAFETY: the handle was opened above and is closed once.
+                unsafe { CloseHandle(handle) };
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for LegacyLock {
+    fn drop(&mut self) {
+        use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::ReleaseMutex};
+        // SAFETY: this thread owns the mutex (acquired in `acquire`, and the
+        // lock never leaves the acquiring call); the handle is closed once.
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
+    use super::LegacyLock;
+
+    /// One holder per legacy key at a time, across threads (and so across
+    /// processes of this session); other keys are independent; a waiter
+    /// past its deadline is told so.
+    #[test]
+    fn a_legacy_entry_is_refreshed_by_one_holder_at_a_time() {
+        let key = format!("sentinel:test-legacy-lock:{}", std::process::id());
+        let held = LegacyLock::acquire(&key, Duration::from_secs(1)).unwrap();
+        let other = LegacyLock::acquire(&format!("{key}:other"), Duration::from_millis(1));
+        assert!(other.is_ok(), "another key is independent");
+        drop(other);
+        let got = Arc::new(AtomicBool::new(false));
+        let (k, flag) = (key.clone(), Arc::clone(&got));
+        let waiter = thread::spawn(move || {
+            let timed_out = LegacyLock::acquire(&k, Duration::from_millis(20));
+            assert_eq!(
+                timed_out.err().unwrap().kind(),
+                std::io::ErrorKind::TimedOut
+            );
+            let lock = LegacyLock::acquire(&k, Duration::from_secs(10)).unwrap();
+            flag.store(true, Ordering::SeqCst);
+            drop(lock);
+        });
+        // The waiter cannot have it while this thread holds it.
+        thread::sleep(Duration::from_millis(100));
+        assert!(!got.load(Ordering::SeqCst));
+        drop(held);
+        waiter.join().unwrap();
+        assert!(got.load(Ordering::SeqCst));
+    }
+}
