@@ -743,45 +743,15 @@ fn browser_login_then_status_and_commands_work() {
     assert_eq!((grants[0].id, grants[0].kind), (grant, GrantKind::Code));
 }
 
-#[test]
-fn mcp_stdio_reports_scope_denial_without_starting_an_oauth_redirect_flow() {
-    let d = deployment();
-    let machine = Machine::new();
-    let credential = tokens::provision(
-        &d.store,
-        Grant::new(d.root, "stdio MCP scope-denial check", P::RUN),
-        UnixMillis::now(),
-    )
-    .unwrap();
-    let token_path = machine.config().join("mcp-token.txt");
-    std::fs::create_dir_all(machine.config()).unwrap();
-    let token = sentinel_auth::token::format(&credential.secret);
-    std::fs::write(&token_path, token).unwrap();
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        &token_path,
-        std::os::unix::fs::PermissionsExt::from_mode(0o600),
-    )
-    .unwrap();
-
-    let grants_before: i64 = d
-        .store
-        .read(|connection| {
-            Ok(connection.query_row("SELECT count(*) FROM oauth_grants", [], |row| row.get(0))?)
-        })
-        .unwrap();
+/// One stdio MCP session of `profile`: initialize, then `list_runs` on
+/// `acme/app`. Returns the process and its JSON-RPC replies.
+fn stdio_list_runs(d: &Deployment, machine: &Machine, profile: &str) -> (Out, Vec<Value>) {
     let input = concat!(
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"stdio-test\",\"version\":\"1\"}}}\n",
         "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"list_runs\",\"arguments\":{\"tenant\":\"acme\",\"repo\":\"app\"}}}\n"
     );
-    let mut command = machine.command(&[
-        "mcp",
-        "--server",
-        &d.base,
-        "--token-file",
-        token_path.to_str().unwrap(),
-    ]);
+    let mut command = machine.command(&["mcp", "--server", &d.base, "--profile", profile]);
     command.stdin(Stdio::piped());
     let mut child = command.spawn().unwrap();
     child
@@ -791,22 +761,105 @@ fn mcp_stdio_reports_scope_denial_without_starting_an_oauth_redirect_flow() {
         .write_all(input.as_bytes())
         .unwrap();
     let out = Running::start(child).finish();
-    assert_eq!(out.code, 0, "{out:?}");
-    let replies: Vec<Value> = out
+    let replies = out
         .stdout
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(replies.len(), 2);
+    (out, replies)
+}
+
+/// P11-10: stdio MCP on a real credential profile (a service grant imported
+/// with `auth login --grant-file` into a temporary `SENTINEL_CONFIG_DIR`),
+/// not a static token. A scope refusal is told apart from a repository
+/// refusal by its named scope; after the grant is revoked the profile's
+/// refresh fails; and neither path ever starts an OAuth redirect or creates
+/// a grant.
+#[test]
+fn mcp_stdio_reports_scope_denial_without_starting_an_oauth_redirect_flow() {
+    let d = deployment();
+    let bearer = format!("Bearer {}", d.root_token);
+    let created = send(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/service-accounts",
+        Body::Json(&json!({ "name": "stdio-agent", "role": "operator" })),
+        &[("authorization", &bearer)],
+    );
+    assert_eq!(created.status, 201, "{}", created.body);
+    let account = created.body["user"].as_str().unwrap().to_owned();
+    let allowed = send(
+        &d,
+        "PUT",
+        &format!("/api/v1/tenants/acme/service-accounts/{account}/repos/app"),
+        Body::Json(&json!({ "access": ["read", "run"] })),
+        &[("authorization", &bearer)],
+    );
+    assert_eq!(allowed.status, 200, "{}", allowed.body);
+    // Repository read is granted; the credential's scope lacks runs:read.
+    let issued = send(
+        &d,
+        "POST",
+        &format!("/api/v1/tenants/acme/service-accounts/{account}/grants"),
+        Body::Json(&json!({ "name": "stdio", "scope": "logs:read" })),
+        &[("authorization", &bearer)],
+    );
+    assert_eq!(issued.status, 201, "{}", issued.body);
+    let machine = Machine::new();
+    let file = machine.dir.path().join("stdio.grant");
+    std::fs::write(&file, issued.body["refresh_token"].as_str().unwrap()).unwrap();
+    let login = machine.run(&[
+        "auth",
+        "login",
+        "--server",
+        &d.base,
+        "--profile",
+        "stdio",
+        "--grant-file",
+        file.to_str().unwrap(),
+    ]);
+    assert_eq!(login.code, 0, "{login:?}");
+    let grant = machine.grant("stdio");
+    let grants_before: i64 = d
+        .store
+        .read(|connection| {
+            Ok(connection.query_row("SELECT count(*) FROM oauth_grants", [], |row| row.get(0))?)
+        })
+        .unwrap();
+
+    let (out, replies) = stdio_list_runs(&d, &machine, "stdio");
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(replies.len(), 2, "{out:?}");
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(replies[1]["id"], 2);
-    assert_eq!(replies[1]["result"]["isError"], true);
-    assert_eq!(
-        replies[1]["result"]["structuredContent"]["code"],
-        "forbidden"
+    let refusal = &replies[1]["result"]["structuredContent"];
+    assert_eq!(replies[1]["result"]["isError"], true, "{refusal}");
+    assert_eq!(refusal["code"], "forbidden", "{refusal}");
+    assert_eq!(refusal["details"]["scope"], "runs:read", "{refusal}");
+
+    // The grant is revoked: the stored access token and the refresh both
+    // fail, and the session answers that — it does not go looking for a
+    // browser.
+    d.store
+        .writer()
+        .write(move |tx| oauth::revoke_grant(tx, Authority::HostLocal, grant, UnixMillis::now()))
+        .unwrap();
+    let (revoked, replies) = stdio_list_runs(&d, &machine, "stdio");
+    assert_eq!(revoked.code, 0, "{revoked:?}");
+    assert_eq!(replies.len(), 2, "{revoked:?}");
+    let refused = &replies[1]["result"]["structuredContent"];
+    assert_eq!(replies[1]["result"]["isError"], true, "{refused}");
+    assert_eq!(refused["code"], "client_unauthenticated", "{refused}");
+    let message = refused["message"].as_str().unwrap();
+    assert!(message.contains("invalid_grant"), "{message}");
+    assert!(
+        message.contains("run: sentinel auth login"),
+        "the fix is a local sign-in: {message}"
     );
-    assert!(!out.stdout.contains("/oauth/authorize"));
-    assert!(!out.stderr.contains("/oauth/authorize"));
+    for text in [&out.stdout, &out.stderr, &revoked.stdout, &revoked.stderr] {
+        assert!(!text.contains("/oauth/authorize"), "{text}");
+        assert!(!text.contains("/device"), "{text}");
+    }
     let grants_after: i64 = d
         .store
         .read(|connection| {
@@ -814,6 +867,7 @@ fn mcp_stdio_reports_scope_denial_without_starting_an_oauth_redirect_flow() {
         })
         .unwrap();
     assert_eq!(grants_before, grants_after);
+    assert!(grant_revoked(&d, grant));
 }
 
 #[test]

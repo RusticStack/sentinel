@@ -160,10 +160,14 @@ device grant and lists `localhost` and port-bearing loopback redirects, which
 covers). No real MCP client application or SDK has been run against a
 Sentinel controller; X07's real-client exercise is outstanding.
 
-The CLI end-to-end test runs the actual `sentinel mcp` binary over stdio with
-a local credential that lacks `runs:read`. Its tool call returns the normal
-structured scope error, produces no OAuth grant, and does not start an HTTP
-redirect flow. Stdio remains an API client with local credentials; remote
+The CLI end-to-end test runs the actual `sentinel mcp` binary over stdio on a
+real credential profile: a service grant without `runs:read`, imported with
+`sentinel auth login --grant-file` into a temporary `SENTINEL_CONFIG_DIR`.
+Its tool call returns the normal structured scope error naming
+`runs:read` (not a repository refusal). After the grant is revoked, the same
+profile's refresh is refused and the tool answers `client_unauthenticated`
+with the local `auth login` fix. Neither run produces an OAuth grant or
+starts an HTTP redirect flow (P11-10). Stdio remains an API client with local credentials; remote
 HTTP MCP authentication is a separate transport.
 
 ## Bounded diagnosis and rerun (X08)
