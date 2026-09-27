@@ -118,7 +118,8 @@ pub enum Outcome {
     NoAccount,
 }
 
-/// Sign in with an already-verified provider identity.
+/// Sign in with an already-verified provider identity: [`resolve`] then
+/// [`finish`], with no previous session to end.
 ///
 /// The subject is the provider's immutable account ID. A renamed login resolves
 /// to the same account; a reused login handle resolves to nobody, because the
@@ -130,24 +131,62 @@ pub fn complete(
     policy: Policy,
     now: UnixMillis,
 ) -> Result<Outcome> {
+    match resolve(store, provider, subject)? {
+        Some(user) => finish(store, provider, user, None, policy, now),
+        None => Ok(Outcome::NoAccount),
+    }
+}
+
+/// The active account a verified provider identity is linked to, or `None`
+/// (audited as a rejected login) when nothing is. Issues nothing: a browser
+/// flow resolves on the provider's cross-site callback and issues the session
+/// on the same-site hop that follows ([`finish`]).
+pub fn resolve(store: &Store, provider: &str, subject: &str) -> Result<Option<UserId>> {
     let user = store
         .read(|conn| crate::auth::provisioning::resolve_verified_identity(conn, provider, subject));
-    let user = match user {
-        Ok(user) => user,
+    match user {
+        Ok(user) => Ok(Some(user)),
         Err(Error::NotFound) => {
             let provider = provider.to_owned();
             store.writer().write(move |tx| {
                 audit(tx, Event::LoginRejected, None, None, false, Some(&provider))
             })?;
-            return Ok(Outcome::NoAccount);
+            Ok(None)
         }
-        Err(other) => return Err(other),
-    };
+        Err(other) => Err(other),
+    }
+}
+
+/// Issue the session of an account [`resolve`] returned, first revoking the
+/// session the browser presented (`previous`, whoever it belongs to) in the
+/// same transaction: the browser is switching to this sign-in, so the session
+/// it held must not outlive the switch (P09S-10). The account could have been
+/// suspended since it was resolved: the session insert trigger refuses it,
+/// and that is the same honest answer as never having been linked.
+pub fn finish(
+    store: &Store,
+    provider: &str,
+    user: UserId,
+    previous: Option<&Secret>,
+    policy: Policy,
+    now: UnixMillis,
+) -> Result<Outcome> {
     let provider = provider.to_owned();
+    let previous = previous.map(Secret::digest);
     let issued = store.writer().write(move |tx| {
-        // The account could have been suspended between resolution and this
-        // transaction: the session insert trigger refuses it, and that refusal
-        // is the same honest answer as never having been linked.
+        if let Some(digest) = previous {
+            let ended: Option<[u8; 16]> = tx
+                .prepare_cached(
+                    "UPDATE sessions SET revoked_ms = ?2 WHERE token_digest = ?1
+                     AND revoked_ms IS NULL RETURNING user_id",
+                )?
+                .query_row(params![digest.0, now.0], |r| r.get(0))
+                .optional()?;
+            if let Some(owner) = ended {
+                let owner = UserId::from_bytes(owner).map_err(|_| Error::Corrupt("user_id"))?;
+                audit(tx, Event::Logout, Some(owner), Some(owner), false, None)?;
+            }
+        }
         let issued = match crate::local_auth::issue_session(tx, user, policy, now) {
             Err(Error::Sqlite(rusqlite::Error::SqliteFailure(code, _)))
                 if code.code == rusqlite::ErrorCode::ConstraintViolation =>

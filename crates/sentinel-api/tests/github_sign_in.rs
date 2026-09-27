@@ -201,9 +201,19 @@ impl Reply {
 }
 
 /// A browser: a cookie jar (name -> value), and everything it was served.
+///
+/// It keeps the cookie rules the sign-in depends on: a `SameSite=Strict`
+/// cookie is not sent on a navigation whose redirect chain came from another
+/// site (GitHub's redirect back to the callback), and is sent on a
+/// navigation a Sentinel page starts; every request to Sentinel carries the
+/// `Sec-Fetch-Site` label a browser gives it.
 #[derive(Default)]
 struct Browser {
     jar: Vec<(String, String)>,
+    /// Names of the jar's `SameSite=Strict` cookies.
+    strict: Vec<String>,
+    /// The next request is a cross-site navigation.
+    cross_site: bool,
     seen: Vec<String>,
     /// The fake GitHub's base URL, whose answers are not Sentinel's pages.
     github: String,
@@ -217,9 +227,10 @@ impl Browser {
         }
     }
 
-    fn cookie_header(&self) -> String {
+    fn cookie_header(&self, cross_site: bool) -> String {
         self.jar
             .iter()
+            .filter(|(k, _)| !(cross_site && self.strict.contains(k)))
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join("; ")
@@ -245,9 +256,20 @@ impl Browser {
                 .max_redirects(0)
                 .build(),
         );
-        let cookies = self.cookie_header();
+        let cross_site = std::mem::take(&mut self.cross_site);
+        let cookies = self.cookie_header(cross_site);
+        let site = if url.starts_with(&self.github) {
+            None
+        } else if cross_site {
+            Some("cross-site")
+        } else {
+            Some("same-origin")
+        };
         let response = if method == "GET" {
             let mut r = agent.get(url);
+            if let Some(site) = site {
+                r = r.header("sec-fetch-site", site);
+            }
             if !cookies.is_empty() {
                 r = r.header("cookie", &cookies);
             }
@@ -257,6 +279,9 @@ impl Browser {
             r.call()
         } else {
             let mut r = agent.post(url);
+            if let Some(site) = site {
+                r = r.header("sec-fetch-site", site);
+            }
             if !cookies.is_empty() {
                 r = r.header("cookie", &cookies);
             }
@@ -285,12 +310,7 @@ impl Browser {
             text,
         };
         for set in reply.set_cookies() {
-            let pair = set.split(';').next().unwrap();
-            let (name, value) = pair.split_once('=').unwrap();
-            self.jar.retain(|(k, _)| k != name);
-            if !set.contains("Max-Age=0") {
-                self.jar.push((name.to_owned(), value.to_owned()));
-            }
+            self.accept(set);
         }
         // What the browser was shown by Sentinel (GitHub's own redirect
         // back carries its code, as it must).
@@ -303,6 +323,40 @@ impl Browser {
 
     fn get(&mut self, url: &str) -> Reply {
         self.request("GET", url, None, &[])
+    }
+
+    /// Store one `Set-Cookie`, remembering whether it is `SameSite=Strict`.
+    fn accept(&mut self, set: &str) {
+        let pair = set.split(';').next().unwrap();
+        let (name, value) = pair.split_once('=').unwrap();
+        self.jar.retain(|(k, _)| k != name);
+        self.strict.retain(|k| k != name);
+        if !set.contains("Max-Age=0") {
+            self.jar.push((name.to_owned(), value.to_owned()));
+            if set.contains("SameSite=Strict") {
+                self.strict.push(name.to_owned());
+            }
+        }
+    }
+
+    /// GitHub's redirect back: a cross-site navigation to the callback.
+    fn cross_site_get(&mut self, url: &str) -> Reply {
+        self.cross_site = true;
+        self.get(url)
+    }
+
+    /// GitHub's redirect back to the callback, then — when the callback
+    /// answers its page — the same-origin hop that page starts. Returns the
+    /// last answer.
+    fn callback(&mut self, url: &str) -> Reply {
+        let back = self.cross_site_get(url);
+        if back.status != 200 {
+            return back;
+        }
+        let hop = continue_target(&back);
+        assert!(hop.ends_with("/auth/github/finish"), "{hop}");
+        let base = url.split("/auth/github/callback").next().unwrap();
+        self.get(&format!("{base}{hop}"))
     }
 }
 
@@ -345,7 +399,7 @@ fn through_github(d: &Deployment, browser: &mut Browser, sign_in_page: &Reply) -
         back.starts_with(&format!("{}/auth/github/callback?", d.base)),
         "{back}"
     );
-    browser.get(&back)
+    browser.callback(&back)
 }
 
 fn encode(pairs: &[(&str, &str)]) -> String {
@@ -490,7 +544,7 @@ fn a_github_only_account_approves_an_oauth_consent_and_lands_where_it_started() 
 
     // The callback: a session like password login's, the sign-in cookie
     // cleared, and a page that continues to the exact authorize request.
-    let done = browser.get(&back);
+    let done = browser.callback(&back);
     assert_eq!(done.status, 200, "{}", done.text);
     let set = done.set_cookies();
     let session = set
@@ -684,7 +738,7 @@ fn replayed_foreign_and_cookie_less_states_are_refused_without_spending_anything
 
     // B's callback in A's browser (a foreign state), and with no cookie at
     // all (a stolen callback URL): refused, nothing spent, no session.
-    let foreign = a.get(&callback_b);
+    let foreign = a.cross_site_get(&callback_b);
     assert_eq!(foreign.status, 400);
     assert!(
         foreign
@@ -692,7 +746,7 @@ fn replayed_foreign_and_cookie_less_states_are_refused_without_spending_anything
             .iter()
             .all(|c| !c.contains("sentinel_session"))
     );
-    let bare = Browser::new(&d).get(&callback_b);
+    let bare = Browser::new(&d).cross_site_get(&callback_b);
     assert_eq!(bare.status, 400);
     assert!(bare.set_cookies().is_empty());
     assert_eq!(
@@ -705,8 +759,8 @@ fn replayed_foreign_and_cookie_less_states_are_refused_without_spending_anything
     assert_eq!(sessions_of(&d, octo), 0);
 
     // Each browser's own callback works once.
-    assert_eq!(a.get(&callback_a).status, 200);
-    assert_eq!(b.get(&callback_b).status, 200);
+    assert_eq!(a.callback(&callback_a).status, 200);
+    assert_eq!(b.callback(&callback_b).status, 200);
     assert_eq!(sessions_of(&d, octo), 2);
 
     // Replayed with the same cookie (put back): the state is spent.
@@ -715,7 +769,7 @@ fn replayed_foreign_and_cookie_less_states_are_refused_without_spending_anything
     replay
         .jar
         .push(("__Host-sentinel_signin".into(), state.clone()));
-    let again = replay.get(&callback_a);
+    let again = replay.callback(&callback_a);
     assert_eq!(again.status, 400, "{}", again.text);
     assert!(
         again
@@ -730,7 +784,7 @@ fn replayed_foreign_and_cookie_less_states_are_refused_without_spending_anything
     let mut c = Browser::new(&d);
     let to_github = c.get(&start).header("location").unwrap().to_owned();
     let back = c.get(&to_github).header("location").unwrap().to_owned();
-    let denied = c.get(&back);
+    let denied = c.cross_site_get(&back);
     assert_eq!(denied.status, 403);
     assert!(denied.text.contains("cancelled"));
     assert_eq!(sessions_of(&d, octo), 2);
@@ -843,7 +897,7 @@ fn pending_and_merely_matching_accounts_get_no_session_and_no_link() {
             .header("location")
             .unwrap()
             .to_owned();
-        let done = browser.get(&back);
+        let done = browser.callback(&back);
         assert_eq!(done.status, 403, "{}", done.text);
         assert!(done.text.contains("No active Sentinel account"));
         assert!(
@@ -889,8 +943,15 @@ fn a_github_sign_in_replaces_the_browsers_previous_session() {
         .to_str()
         .unwrap()
         .to_owned();
-    let (name, value) = cookie.split(';').next().unwrap().split_once('=').unwrap();
-    browser.jar.push((name.to_owned(), value.to_owned()));
+    let value = cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .split_once('=')
+        .unwrap()
+        .1
+        .to_owned();
+    browser.accept(&cookie);
     assert_eq!(sessions_of(&d, d.root), 1);
 
     let page = browser.get(&format!("{base}/"));
@@ -910,7 +971,10 @@ fn a_github_sign_in_replaces_the_browsers_previous_session() {
     // The old session is revoked; the new cookie is a different secret.
     assert_eq!(sessions_of(&d, d.root), 0);
     assert_eq!(sessions_of(&d, octo), 1);
-    assert_ne!(browser.cookie("__Host-sentinel_session"), Some(value));
+    assert_ne!(
+        browser.cookie("__Host-sentinel_session"),
+        Some(value.as_str())
+    );
     // The first page gets its CSRF secret through session storage, and the
     // secret works as the header for this session.
     assert_eq!(continue_target(&done), "/");
@@ -925,6 +989,86 @@ fn a_github_sign_in_replaces_the_browsers_previous_session() {
     );
     assert_eq!(logout.status, 200, "{}", logout.text);
     assert_eq!(sessions_of(&d, octo), 0);
+}
+
+/// P09S-10: the previous session is revoked in a real browser. GitHub's
+/// redirect back is cross-site, so the Strict session cookie is not sent to
+/// the callback, which therefore issues and revokes nothing; the same-origin
+/// hop its page starts does carry it, and that hop ends the old session and
+/// issues the new one together. Another site cannot make that hop for the
+/// browser, another browser cannot take its hand-off, and it happens once.
+#[test]
+fn the_same_origin_hop_revokes_the_session_the_callback_could_not_see() {
+    let (d, octo) = deployment(true);
+    d.github.sign_in_as(Some(octo_github()));
+    let base = d.base.clone();
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let login = agent
+        .post(&format!("{base}/api/v1/login"))
+        .header("content-type", "application/json")
+        .send(
+            json!({"username": "root", "password": PASSWORD})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(cookie.contains("SameSite=Strict"), "{cookie}");
+    let mut browser = Browser::new(&d);
+    browser.accept(&cookie);
+    assert_eq!(sessions_of(&d, d.root), 1);
+
+    let start = browser.get(&format!("{base}/auth/github/start?return_to=%2F"));
+    let to_github = start.header("location").unwrap().to_owned();
+    let back = browser
+        .get(&to_github)
+        .header("location")
+        .unwrap()
+        .to_owned();
+    // The callback: the Strict cookie stays home, nothing is issued or
+    // revoked, and the page moves on to the finish hop.
+    let page = browser.cross_site_get(&back);
+    assert_eq!(page.status, 200, "{}", page.text);
+    assert!(page.set_cookies().is_empty(), "{:?}", page.set_cookies());
+    assert_eq!(continue_target(&page), "/auth/github/finish");
+    assert_eq!(sessions_of(&d, d.root), 1);
+    assert_eq!(sessions_of(&d, octo), 0);
+    let finish = format!("{base}/auth/github/finish");
+
+    // Another site navigating the browser there is refused, and spends
+    // nothing; a browser without this sign-in cookie has no hand-off.
+    let forged = browser.cross_site_get(&finish);
+    assert_eq!(forged.status, 403, "{}", forged.text);
+    assert_eq!(Browser::new(&d).get(&finish).status, 400);
+    let mut stranger = Browser::new(&d);
+    stranger
+        .jar
+        .push(("__Host-sentinel_signin".into(), "0".repeat(64)));
+    assert_eq!(stranger.get(&finish).status, 400);
+    assert_eq!(sessions_of(&d, d.root), 1);
+    assert_eq!(sessions_of(&d, octo), 0);
+
+    // The real hop: the old session is revoked, the new one issued.
+    let done = browser.get(&finish);
+    assert_eq!(done.status, 200, "{}", done.text);
+    assert_eq!(continue_target(&done), "/");
+    assert_eq!(sessions_of(&d, d.root), 0);
+    assert_eq!(sessions_of(&d, octo), 1);
+    assert!(browser.cookie("__Host-sentinel_signin").is_none());
+
+    // Once only.
+    assert_eq!(browser.get(&finish).status, 400);
+    assert_eq!(sessions_of(&d, octo), 1);
 }
 
 #[test]

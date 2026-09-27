@@ -14,14 +14,21 @@
 //!   immutable account ID and resolves it only through a linked identity of
 //!   an active account. Nothing is matched by login or email.
 //!
-//! A successful callback issues the same session cookie as password login
-//! (a fresh secret that replaces whatever cookie the browser held) and
-//! answers a small page that moves the browser on to its destination. It
-//! cannot be a `303`: the callback is a navigation GitHub started, and a
-//! browser does not send the `SameSite=Strict` session cookie along a
-//! redirect chain that began on another site. A navigation this page starts
-//! is same-site, so the destination is loaded with the new session — and the
-//! consent page mints its form token from that session's CSRF digest.
+//! A successful callback issues nothing yet. It is a navigation GitHub
+//! started, and a browser never sends the `SameSite=Strict` session cookie
+//! on it, so the session this browser already holds cannot be seen there.
+//! The callback parks a hand-off — the resolved account, keyed by the digest
+//! of this browser's `__Host-sentinel_signin` cookie, for at most
+//! [`HANDOFF_TTL`] — and answers a small page that moves the browser on to
+//! `GET /auth/github/finish`. That navigation is started by a Sentinel page,
+//! so it is same-origin and carries the Strict cookie: `finish` revokes the
+//! session the browser held and issues the new one in one transaction
+//! (P09S-10), then answers the page that moves on to the destination, where
+//! the consent page mints its form token from the new session's CSRF digest.
+//! `finish` refuses a request a browser marks as not same-origin
+//! (`Sec-Fetch-Site`), so another site cannot complete it without the old
+//! session; a hand-off is bound to the sign-in cookie, so nobody can
+//! complete another browser's.
 //!
 //! Both routes are admitted per client ([`crate::oauth::limit`]). The code
 //! exchange and the identity read are outbound calls of up to ten seconds
@@ -29,22 +36,24 @@
 //! with CIMD metadata fetches); a callback past it is told to
 //! reload, with its state still unspent.
 
-use std::{fmt, sync::Mutex, time::Instant};
+use std::{
+    collections::VecDeque,
+    fmt,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use sentinel_auth::{
     cookie,
     secret::{Secret, digest_eq},
 };
-use sentinel_core::UnixMillis;
+use sentinel_core::{UnixMillis, UserId};
 use sentinel_github::{
     PROVIDER,
     http::Client,
     oauth::{self, App, Endpoints},
 };
-use sentinel_store::{
-    local_auth,
-    sign_in::{self, MAX_REDIRECT_BYTES, Outcome, STATE_TTL_MS},
-};
+use sentinel_store::sign_in::{self, MAX_REDIRECT_BYTES, Outcome, STATE_TTL_MS};
 
 use crate::{
     State,
@@ -95,6 +104,25 @@ pub(crate) struct Github {
     /// `{issuer}/auth/github/start`, linked from the sign-in pages.
     pub start_url: String,
     budget: Mutex<Limiter>,
+    /// Callbacks waiting for their same-origin hop, oldest first.
+    handoffs: Mutex<VecDeque<Handoff>>,
+}
+
+/// How long a verified callback waits for its same-origin hop: the page
+/// moves on at once, so this only covers a slow browser.
+pub(crate) const HANDOFF_TTL: Duration = Duration::from_secs(60);
+/// Pending hand-offs held at once. Callbacks are admitted at 20/s
+/// deployment-wide, so a minute's worth fits; past it the oldest is dropped
+/// and that browser starts again. Nothing secret is held: a digest and an
+/// account ID.
+const MAX_HANDOFFS: usize = 1024;
+
+struct Handoff {
+    /// Digest of the browser's sign-in cookie.
+    cookie: sentinel_auth::secret::Digest,
+    user: UserId,
+    destination: Option<String>,
+    deadline: Instant,
 }
 
 impl Github {
@@ -113,7 +141,26 @@ impl Github {
             http: Client::new(),
             start_url: format!("{issuer}/auth/github/start"),
             budget: Mutex::new(Limiter::new(CLIENT, Some(CEILING), Instant::now())),
+            handoffs: Mutex::new(VecDeque::new()),
         })
+    }
+
+    fn park(&self, handoff: Handoff, now: Instant) {
+        let mut queue = self.handoffs.lock().unwrap_or_else(|p| p.into_inner());
+        while queue.front().is_some_and(|h| h.deadline <= now) || queue.len() >= MAX_HANDOFFS {
+            queue.pop_front();
+        }
+        queue.push_back(handoff);
+    }
+
+    /// Take the live hand-off of this sign-in cookie, once.
+    fn take(&self, cookie: &sentinel_auth::secret::Digest, now: Instant) -> Option<Handoff> {
+        let mut queue = self.handoffs.lock().unwrap_or_else(|p| p.into_inner());
+        while queue.front().is_some_and(|h| h.deadline <= now) {
+            queue.pop_front();
+        }
+        let at = queue.iter().position(|h| digest_eq(&h.cookie, cookie))?;
+        queue.remove(at)
     }
 
     fn admit(&self, state: &State, request: &Request) -> bool {
@@ -138,6 +185,7 @@ pub(crate) fn route(
     Some(Ok(match (method, parts) {
         ("GET", ["auth", "github", "start"]) => start(state, github, request, query),
         ("GET", ["auth", "github", "callback"]) => callback(state, github, request, query),
+        ("GET", ["auth", "github", "finish"]) => finish(state, github, request),
         _ => return None,
     }))
 }
@@ -290,36 +338,74 @@ fn callback(state: &State, github: &Github, request: &Request, query: &str) -> R
             "GitHub did not confirm the sign-in. Start again from the page you were on.",
         );
     };
-    let issued = match sign_in::complete(
+    let user = match sign_in::resolve(&state.store, PROVIDER, &identity.subject) {
+        Ok(Some(user)) => user,
+        // One answer for "never linked", pending, rejected and suspended.
+        Ok(None) => return ended(403, NO_ACCOUNT),
+        Err(_) => return ended(503, "Sentinel is busy. Start again in a moment."),
+    };
+    let now = Instant::now();
+    github.park(
+        Handoff {
+            cookie: presented.digest(),
+            user,
+            destination,
+            deadline: now + HANDOFF_TTL,
+        },
+        now,
+    );
+    // The sign-in cookie stays: `finish` finds the hand-off by it.
+    let mut target = String::with_capacity(state.oauth.path.len() + 20);
+    target.push_str(&state.oauth.path);
+    target.push_str("/auth/github/finish");
+    let mut body = String::with_capacity(256 + 2 * target.len());
+    body.push_str("<meta http-equiv=\"refresh\" content=\"0; url=");
+    html::escape_into(&mut body, &target);
+    body.push_str("\">\n<p>GitHub confirmed the sign-in. <a href=\"");
+    html::escape_into(&mut body, &target);
+    body.push_str("\">Continue</a></p>");
+    Reply::Html(200, html::document("Signing in", &body), Vec::new())
+}
+
+const NO_ACCOUNT: &str = "No active Sentinel account is linked to this GitHub account. Ask an administrator for an invitation, or sign in with a password and link GitHub from your account.";
+
+/// The same-origin hop after a verified callback: revoke the session this
+/// browser held (its Strict cookie is sent here) and issue the new one, in
+/// one transaction, then move on to the destination.
+fn finish(state: &State, github: &Github, request: &Request) -> Reply {
+    // A browser labels every navigation; one another site started is
+    // refused without spending the hand-off, so only the real hop — which
+    // carries the old session's cookie — completes it. A client that sends
+    // no label is not a browser and has no ambient cookies to protect.
+    if routes::header_value(request, "sec-fetch-site").is_some_and(|site| site != "same-origin") {
+        return html::error_page(
+            403,
+            "Finish signing in from the page Sentinel showed after GitHub.",
+        );
+    }
+    let cookies = routes::header_value(request, "cookie");
+    let Some(presented) = cookies.and_then(|header| cookie::read(cookie::SIGN_IN_COOKIE, header))
+    else {
+        return html::error_page(400, START_AGAIN);
+    };
+    let Some(handoff) = github.take(&presented.digest(), Instant::now()) else {
+        return ended(400, START_AGAIN);
+    };
+    let previous = cookies.and_then(|header| cookie::read(cookie::SESSION_COOKIE, header));
+    let issued = match sign_in::finish(
         &state.store,
         PROVIDER,
-        &identity.subject,
+        handoff.user,
+        previous.as_ref(),
         state.sessions,
         UnixMillis::now(),
     ) {
         Ok(Outcome::SignedIn(issued)) => issued,
-        // One answer for "never linked", pending, rejected and suspended.
-        Ok(Outcome::NoAccount) => {
-            return ended(
-                403,
-                "No active Sentinel account is linked to this GitHub account. Ask an administrator for an invitation, or sign in with a password and link GitHub from your account.",
-            );
-        }
+        Ok(Outcome::NoAccount) => return ended(403, NO_ACCOUNT),
         Err(_) => return ended(503, "Sentinel is busy. Start again in a moment."),
     };
-    // Fixation-safe because the browser gets a fresh session secret whose
-    // `Set-Cookie` replaces any `__Host-` cookie it held (and `__Host-` keeps
-    // a sibling host from planting one). A browser never sends the
-    // `SameSite=Strict` session cookie on this cross-site navigation, so a
-    // previous session is not seen here and stays valid until its own idle
-    // or absolute expiry; only a non-browser client that sends the cookie
-    // has it revoked.
-    if let Some(previous) = routes::header_value(request, "cookie")
-        .and_then(|header| cookie::read(cookie::SESSION_COOKIE, header))
-    {
-        let _ = local_auth::logout(&state.store, &previous, UnixMillis::now());
-    }
-    let destination = destination
+    let destination = handoff
+        .destination
         .filter(|d| return_acceptable(d))
         .unwrap_or_else(|| "/".to_owned());
     let mut target = String::with_capacity(state.oauth.path.len() + destination.len());
