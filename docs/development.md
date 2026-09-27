@@ -95,7 +95,17 @@ For file-based configuration, copy the appropriate [server](../examples/server.t
 
 ### Windows with WSL2
 
-Run the Linux commands inside the Linux distribution, with Linux Rust/linker prerequisites installed. A checkout in the Linux filesystem is preferred. If sharing this Windows checkout through `/mnt/...`, set `export CARGO_TARGET_DIR=target/wsl` in both Linux terminals to keep native Windows and WSL build outputs separate. Current lifecycle checks can run this way; use a native Linux filesystem and identified hardware for cache/I/O benchmarks.
+Run the Linux commands inside the Linux distribution, with Linux Rust/linker prerequisites installed, from a checkout in the Linux filesystem — for example `/srv/sentinel`, world-readable so the rootless-Podman test account can run the built test binaries. A Windows checkout shared through `/mnt/...` is not suitable: that filesystem does not keep Unix permissions, so the owner-only file checks fail. Use a native Linux filesystem and identified hardware for cache/I/O benchmarks.
+
+**Testing on the storage users run.** Operators commonly run Sentinel on spinning disks, so test on one when the machine has it: put the Windows checkout (and so its `target/`) on that drive, and point test temp directories there with a machine-local Cargo config *outside* the repository, for example `E:\Projects\.cargo\config.toml`:
+
+```toml
+[env]
+TMP = { value = 'E:\Projects\.tmp', force = true }
+TEMP = { value = 'E:\Projects\.tmp', force = true }
+```
+
+`force` is needed because every Windows shell already sets `TMP`/`TEMP`; the temp directory must sit outside every Git work tree, since the CLI refuses a configuration directory inside one. For Linux, place the WSL distribution on the same drive (`wsl --manage <distro> --move <dir>`) so the Linux checkout, its `target/` and `/tmp` live there too.
 
 ## Generated data and credentials
 

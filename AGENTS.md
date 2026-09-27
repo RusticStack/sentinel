@@ -11,6 +11,7 @@ Sentinel is a performance-first, self-hosted Rust CI engine. Read [README.md](RE
 - Do not invent measurements. Record unavailable hardware or blocked prerequisites as `Blocked by: ...`.
 - Preserve the boundaries in the backlog: separate server/worker processes, tenant ownership, durable transitions, bounded resource usage. Add crates only when useful.
 - Commit with a conventional prefix (`feat:`, `build:`, `docs:`) and a message that describes behavior, not files.
+- Verify a small fix with the tests that cover it (the affected test binary, plus `cargo lint`/`cargo lint-linux`). Run the full suites once, when a piece of work is complete — not after every change — and keep stress runs short. Full runs cost hours and wear the disk.
 
 ## Commands
 
@@ -25,7 +26,7 @@ Run from the repository root; aliases live in `.cargo/config.toml`.
 
 All aliases pass `--locked`; a dependency change must update and commit `Cargo.lock` (use `cargo update --workspace --offline` for new members). Apply formatting with `cargo fmt --all`.
 
-On Windows, run the Linux checks inside WSL2 with `export CARGO_TARGET_DIR=target/wsl`. WSL2 verifies process/signal behavior; it is not a production benchmark host.
+On Windows, run the Linux checks inside WSL2 from a checkout in the Linux filesystem (not `/mnt/...`, which lacks Unix permissions), readable by the rootless-Podman test account; see [development](docs/development.md#windows-with-wsl2). WSL2 verifies process/signal behavior; it is not a production benchmark host.
 
 ## Layout
 
