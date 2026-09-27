@@ -759,6 +759,46 @@ fn log_show_reads_a_log_of_full_frames_past_the_client_body_limit() {
     assert_eq!(seqs, (1..=frames).collect::<Vec<_>>());
 }
 
+/// P09C-6: `log show --output json` holds its document whole, so it is
+/// bounded by bytes (16 MiB of frame text) as well as by frames, and a cut
+/// document says where to continue.
+#[test]
+fn log_show_json_stops_at_its_byte_budget_with_a_continuation() {
+    let d = deployment();
+    let (run, job) = dispatch_run(&d);
+    let (_, attempt, _) = lease(&d, job);
+    let frames = 520u64; // 16.25 MiB of 32 KiB frames
+    for seq in 1..=frames {
+        d.logs
+            .append(
+                run,
+                job,
+                attempt,
+                &sentinel_protocol::logs::Frame {
+                    seq,
+                    step: 0,
+                    stream: sentinel_protocol::logs::Stream::Stdout,
+                    bytes: vec![b'j'; 32 * 1024],
+                },
+            )
+            .unwrap();
+    }
+    d.logs.finish(run, job, attempt, frames, &[]).unwrap();
+    let out = cli(&d, &["log", "show", &attempt.to_string(), "--json"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let shown = doc["frames"].as_array().unwrap();
+    assert_eq!(shown.len(), 512, "16 MiB of 32 KiB frames");
+    assert_eq!(doc["complete"], false);
+    assert_eq!(doc["next_after"], 512);
+    // NDJSON streams the whole log.
+    let out = cli(
+        &d,
+        &["log", "show", &attempt.to_string(), "--output", "ndjson"],
+    );
+    assert_eq!(stdout(&out).lines().count(), frames as usize);
+}
+
 /// P09-16: when the match cap falls inside one frame's matches, the resume
 /// point is before that frame, so its remaining matches are not skipped.
 #[test]

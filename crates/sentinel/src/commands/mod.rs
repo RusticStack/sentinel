@@ -524,26 +524,17 @@ fn text<'a>(value: &'a Value, key: &str) -> &'a str {
 }
 
 /// Whether a failure was a subscriber-slot refusal worth waiting out, and
-/// for how long: the server's `retry_after_ms` (else one second), plus up
-/// to half again of jitter so refused pollers do not return in lockstep.
+/// for how long: the server's `retry_after_ms` (else one second), capped at
+/// [`client::MAX_SERVER_BACKOFF`], plus up to half again of jitter so
+/// refused pollers do not return in lockstep.
 fn busy_backoff(error: &Error) -> Option<Duration> {
     let api = error.api.as_ref()?;
     if api["code"] != "rate_limited" {
         return None;
     }
-    let base = api["details"]["retry_after_ms"].as_u64().unwrap_or(1_000);
-    Some(Duration::from_millis(base + jitter(base / 2 + 1)))
-}
-
-/// A cheap, dependency-free spread in `0..bound`: the clock's sub-second
-/// nanoseconds, mixed. Not random enough for anything but de-synchronizing
-/// retries.
-fn jitter(bound: u64) -> u64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::from(d.subsec_nanos()));
-    let mixed = nanos.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 17;
-    mixed % bound.max(1)
+    Some(client::named_backoff(
+        client::server_backoff(error).unwrap_or(1_000),
+    ))
 }
 
 /// Print a list: text lines and NDJSON items as they come; JSON collects
@@ -639,6 +630,16 @@ mod tests {
         };
         let wait = busy_backoff(&limited).unwrap();
         assert!(wait >= Duration::from_millis(1000) && wait <= Duration::from_millis(1501));
+        // P09C-10: a huge named back-off is capped, and never overflows.
+        let huge = Error {
+            api: Some(serde_json::json!({
+                "code": "rate_limited", "details": { "retry_after_ms": u64::MAX }
+            })),
+            ..Error::remote("x")
+        };
+        let cap = client::MAX_SERVER_BACKOFF;
+        let wait = busy_backoff(&huge).unwrap();
+        assert!(wait >= cap && wait <= cap + cap / 2, "{wait:?}");
         let other = Error {
             api: Some(serde_json::json!({ "code": "internal" })),
             ..Error::remote("x")

@@ -107,8 +107,11 @@ pub(super) fn list(
             next => break next,
         }
     };
+    // JSON carries the cursor as `next`; text and NDJSON name it on stderr,
+    // so an NDJSON consumer knows a cut listing from a complete one (the
+    // cursor is also the last line's `id`).
     if let Some(next) = &more
-        && output == Output::Text
+        && output != Output::Json
     {
         eprintln!("more runs: continue with --before {next}");
     }
@@ -187,7 +190,11 @@ pub(super) fn wait(
                 Output::Json => {}
             }
         }
-        if answer["finished"] == true {
+        // `finished` must describe the view it came with: a server that
+        // judged `finished` and read the view separately (before P09C-7) can
+        // pair it with a view taken after a rerun made the run live again.
+        // Such an answer is progress, not the end.
+        if answer["finished"] == true && settled(&answer["run"]) {
             let view = &answer["run"];
             match output {
                 Output::Json => client::emit(output, view, String::new),
@@ -204,6 +211,13 @@ pub(super) fn wait(
         }
         last = Some(answer);
     }
+}
+
+/// Every job of a run view is terminal: nothing about it changes by itself.
+fn settled(run: &Value) -> bool {
+    run["jobs"]
+        .as_array()
+        .is_none_or(|jobs| jobs.iter().all(|j| j["terminal"] == true))
 }
 
 /// One text line per change: the run's state and how many jobs finished.

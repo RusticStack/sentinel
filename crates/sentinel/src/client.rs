@@ -18,7 +18,10 @@ use std::{
     fmt,
     io::Read,
     path::PathBuf,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 
@@ -370,6 +373,8 @@ enum Credential {
 pub struct Client {
     base: String,
     agent: ureq::Agent,
+    /// The agent for object downloads ([`transfer_agent`]), made on first use.
+    transfer: OnceLock<ureq::Agent>,
     credential: Credential,
     tenant: Option<String>,
 }
@@ -379,6 +384,10 @@ pub struct Client {
 const ATTEMPTS: u32 = 3;
 const BACKOFF: Duration = Duration::from_millis(200);
 const MAX_BACKOFF: Duration = Duration::from_secs(2);
+/// The longest back-off a controller can name (`details.retry_after_ms`)
+/// that the client honors; a larger or overflowing value is cut to this, so
+/// a faulty or hostile server cannot park a command indefinitely.
+pub const MAX_SERVER_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 enum Method {
@@ -399,17 +408,148 @@ struct BytesRequest<'a> {
     idempotency: Option<&'a str>,
 }
 
-/// A download: status (200 or 206), declared length, and the body.
-pub type Download = (u16, Option<u64>, Box<dyn Read>);
+/// A streamed object body.
+pub struct Download {
+    /// 200 (the whole object) or 206 (the requested range).
+    pub status: u16,
+    /// The declared body length (`content-length`).
+    pub len: Option<u64>,
+    /// Where a `206` body starts (`content-range: bytes START-…`).
+    pub start: Option<u64>,
+    pub body: Box<dyn Read>,
+}
+
+/// The bound on one API call, request to last byte of the answer.
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest an object transfer may go without progress: no byte sent or
+/// received for this long is a stall. The transfer as a whole is unbounded,
+/// since an entry of up to 4 GiB takes minutes on a slow link.
+pub const TRANSFER_IDLE: Duration = Duration::from_secs(30);
+
+/// A debug-build override of [`CALL_TIMEOUT`] and [`TRANSFER_IDLE`]
+/// (`SENTINEL_TEST_TIMEOUT_MS`), so tests exercise slow and stalled
+/// transfers in seconds. Release builds never read it.
+fn test_timeout(normal: Duration) -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("SENTINEL_TEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    {
+        return Duration::from_millis(ms);
+    }
+    normal
+}
 
 fn agent() -> ureq::Agent {
     ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .http_status_as_error(false)
             .max_redirects(0)
-            .timeout_global(Some(Duration::from_secs(60)))
+            .timeout_global(Some(test_timeout(CALL_TIMEOUT)))
             .build(),
     )
+}
+
+/// The agent for object downloads: no whole-call bound, but every wait for
+/// the network — connecting, sending, the answer's head, each read of the
+/// body — is bounded by [`TRANSFER_IDLE`] (P09C-1). ureq bounds phases, and
+/// its body phase covers the whole body, so the per-read bound is imposed
+/// on the transport itself ([`idle::Idle`]).
+fn transfer_agent() -> ureq::Agent {
+    use ureq::unversioned::{
+        resolver::DefaultResolver,
+        transport::{Connector, DefaultConnector},
+    };
+    let idle = test_timeout(TRANSFER_IDLE);
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_connect(Some(idle))
+        .timeout_recv_response(Some(idle))
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        DefaultConnector::default().chain(idle::Idle(idle)),
+        DefaultResolver::default(),
+    )
+}
+
+/// A transport wrapper that caps each single wait for the network.
+mod idle {
+    use std::time::Duration;
+
+    use ureq::{
+        Timeout,
+        unversioned::transport::{Buffers, ConnectionDetails, Connector, NextTimeout, Transport},
+    };
+
+    #[derive(Debug)]
+    pub(super) struct Idle(pub(super) Duration);
+
+    impl Connector<Box<dyn Transport>> for Idle {
+        type Out = Bounded;
+
+        fn connect(
+            &self,
+            _: &ConnectionDetails,
+            chained: Option<Box<dyn Transport>>,
+        ) -> Result<Option<Bounded>, ureq::Error> {
+            Ok(chained.map(|inner| Bounded {
+                inner,
+                idle: self.0,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Bounded {
+        inner: Box<dyn Transport>,
+        idle: Duration,
+    }
+
+    impl Bounded {
+        /// The phase's own deadline, or the idle bound when that is sooner
+        /// (an unbounded phase included), named as the phase that stalled.
+        fn bound(&self, timeout: NextTimeout, stalled: Timeout) -> NextTimeout {
+            if *timeout.after > self.idle {
+                NextTimeout {
+                    after: self.idle.into(),
+                    reason: stalled,
+                }
+            } else {
+                timeout
+            }
+        }
+    }
+
+    impl Transport for Bounded {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            self.inner.buffers()
+        }
+
+        fn transmit_output(
+            &mut self,
+            amount: usize,
+            timeout: NextTimeout,
+        ) -> Result<(), ureq::Error> {
+            let timeout = self.bound(timeout, Timeout::SendBody);
+            self.inner.transmit_output(amount, timeout)
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+            let timeout = self.bound(timeout, Timeout::RecvBody);
+            self.inner.await_input(timeout)
+        }
+
+        fn is_open(&mut self) -> bool {
+            self.inner.is_open()
+        }
+
+        fn is_tls(&self) -> bool {
+            self.inner.is_tls()
+        }
+    }
 }
 
 /// A static credential must be a Sentinel bearer: `sntl_` or `sntl_at_`.
@@ -461,6 +601,7 @@ impl Client {
             return Ok(Client {
                 base: normalize_server(&server)?,
                 agent: agent(),
+                transfer: OnceLock::new(),
                 credential: Credential::Static(static_credential(&token)?),
                 tenant: None,
             });
@@ -486,6 +627,7 @@ impl Client {
         Ok(Client {
             base,
             agent: agent(),
+            transfer: OnceLock::new(),
             tenant: handle.tenant().map(str::to_owned),
             credential: Credential::Profile(handle),
         })
@@ -498,6 +640,7 @@ impl Client {
         Ok(Client {
             base: server.trim_end_matches('/').to_owned(),
             agent: agent(),
+            transfer: OnceLock::new(),
             credential: Credential::Static(static_credential(token)?),
             tenant: None,
         })
@@ -596,25 +739,41 @@ impl Client {
     }
 
     /// Stream a body (an object download). `range` is `[start, end)` in
-    /// bytes. Returns the status (200 or 206), the declared length and the
-    /// reader; any other status is an error.
+    /// bytes. Returns the status (200 or 206), the declared length, where a
+    /// `206` starts, and the reader; any other status is an error. The
+    /// transfer is bounded per wait for the network, not as a whole
+    /// ([`transfer_agent`]).
     pub fn download(&self, path: &str, range: Option<(u64, u64)>) -> Result<Download, Error> {
         if let Some((start, end)) = range
             && end <= start
         {
             return Err(Error::usage("empty download range"));
         }
-        let response = self.exchange(&Method::Get, path, None, None, range)?;
+        let agent = self.transfer.get_or_init(transfer_agent);
+        let response = self.exchange(agent, &Method::Get, path, None, None, range)?;
         let status = response.status().as_u16();
         if status != 200 && status != 206 {
             return Err(self.failure(response));
         }
-        let len = response
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok());
-        Ok((status, len, Box::new(response.into_body().into_reader())))
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let len = header("content-length").and_then(|v| v.parse().ok());
+        let start = header("content-range").and_then(|v| {
+            v.strip_prefix("bytes ")?
+                .split_once('-')
+                .and_then(|(start, _)| start.parse().ok())
+        });
+        Ok(Download {
+            status,
+            len,
+            start,
+            body: Box::new(response.into_body().into_reader()),
+        })
     }
 
     fn json(
@@ -624,7 +783,7 @@ impl Client {
         body: Option<&Value>,
         idempotency: Option<&str>,
     ) -> Result<Value, Error> {
-        let response = self.exchange(&method, path, body, idempotency, None)?;
+        let response = self.exchange(&self.agent, &method, path, body, idempotency, None)?;
         if !response.status().is_success() {
             return Err(self.failure(response));
         }
@@ -681,29 +840,24 @@ impl Client {
                 }
                 Ok(response) if response.status().as_u16() == 429 => {
                     let error = self.failure(response);
-                    if server_backoff(&error).is_some() {
-                        return Err(error);
-                    }
-                    Err((error, None))
+                    let named = server_backoff(&error).map(named_backoff);
+                    Err((error, named))
                 }
                 Ok(response) if retryable_status(response.status().as_u16()) => {
-                    let hint = retry_hint(&response);
+                    let hint = retry_hint(&response).map(|h| h.min(MAX_BACKOFF));
                     Err((self.failure(response), hint))
                 }
                 Ok(response) => return self.json_response(response),
                 Err(error) => Err((self.transport(error), None)),
             };
-            let (error, retry_after) = match outcome {
+            let (error, pause) = match outcome {
                 Err(pair) => pair,
                 Ok(_) => unreachable!("successful responses return above"),
             };
             if !repeatable || attempt >= ATTEMPTS {
                 return Err(error);
             }
-            let backoff = retry_after
-                .unwrap_or(BACKOFF * (1 << (attempt - 1)))
-                .min(MAX_BACKOFF);
-            std::thread::sleep(backoff);
+            std::thread::sleep(pause.unwrap_or(BACKOFF * (1 << (attempt - 1))));
             attempt += 1;
         }
     }
@@ -848,12 +1002,15 @@ impl Client {
     /// rejected access token is refreshed once; `rate_limited`,
     /// `storage_full`, `internal`, `outcome_unknown`, a proxy's 502/503/504
     /// and transport failures are retried with back-off for idempotent
-    /// methods and keyed POSTs. A `rate_limited` answer that carries
-    /// `details.retry_after_ms` is returned at once: the server named its own
-    /// back-off, which the caller (`wait`, `log show --follow`) applies with
-    /// jitter, so the client does not add lockstep retries of its own.
+    /// methods and keyed POSTs. A `rate_limited` answer that names
+    /// `details.retry_after_ms` (a store too busy to check the credential,
+    /// or every long-poll slot taken) is retried like any other overload,
+    /// but after the server's own back-off, capped at
+    /// [`MAX_SERVER_BACKOFF`], plus up to half again of jitter, so refused
+    /// clients do not return in lockstep.
     fn exchange(
         &self,
+        agent: &ureq::Agent,
         method: &Method,
         path: &str,
         body: Option<&Value>,
@@ -866,9 +1023,16 @@ impl Client {
         let mut refreshed = false;
         let mut attempt = 1;
         loop {
-            let outcome =
-                self.send_once(method, path, payload.as_deref(), idempotency, range, &token);
-            let (last, retry_after) = match outcome {
+            let outcome = self.send_once(
+                agent,
+                method,
+                path,
+                payload.as_deref(),
+                idempotency,
+                range,
+                &token,
+            );
+            let (last, pause) = match outcome {
                 Ok(response) if response.status().as_u16() == 401 => {
                     if let (Credential::Profile(handle), false) = (&self.credential, refreshed) {
                         refreshed = true;
@@ -879,15 +1043,13 @@ impl Client {
                 }
                 Ok(response) if response.status().as_u16() == 429 => {
                     // The hint is in the error document, so read it now; it
-                    // is small and bounded by the agent's body limit.
+                    // is small and the read is bounded.
                     let error = self.failure(response);
-                    if server_backoff(&error).is_some() {
-                        return Err(error);
-                    }
-                    (Err(error), None)
+                    let named = server_backoff(&error).map(named_backoff);
+                    (Err(error), named)
                 }
                 Ok(response) if retryable_status(response.status().as_u16()) => {
-                    let hint = retry_hint(&response);
+                    let hint = retry_hint(&response).map(|h| h.min(MAX_BACKOFF));
                     (Ok(response), hint)
                 }
                 Ok(response) => return Ok(response),
@@ -896,16 +1058,15 @@ impl Client {
             if !repeatable || attempt >= ATTEMPTS {
                 return last;
             }
-            let backoff = retry_after
-                .unwrap_or(BACKOFF * (1 << (attempt - 1)))
-                .min(MAX_BACKOFF);
-            std::thread::sleep(backoff);
+            std::thread::sleep(pause.unwrap_or(BACKOFF * (1 << (attempt - 1))));
             attempt += 1;
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send_once(
         &self,
+        agent: &ureq::Agent,
         method: &Method,
         path: &str,
         payload: Option<&str>,
@@ -919,8 +1080,8 @@ impl Client {
         match method {
             Method::Get | Method::Delete => {
                 let mut request = match method {
-                    Method::Get => self.agent.get(&url),
-                    _ => self.agent.delete(&url),
+                    Method::Get => agent.get(&url),
+                    _ => agent.delete(&url),
                 }
                 .header("authorization", &auth)
                 .header("accept", "application/json");
@@ -931,8 +1092,8 @@ impl Client {
             }
             Method::Post | Method::Put => {
                 let mut request = match method {
-                    Method::Post => self.agent.post(&url),
-                    _ => self.agent.put(&url),
+                    Method::Post => agent.post(&url),
+                    _ => agent.put(&url),
                 }
                 .header("authorization", &auth)
                 .header("accept", "application/json")
@@ -966,12 +1127,32 @@ fn retryable_status(status: u16) -> bool {
 }
 
 /// The back-off a `rate_limited` answer names in `details.retry_after_ms`.
-fn server_backoff(error: &Error) -> Option<u64> {
+pub fn server_backoff(error: &Error) -> Option<u64> {
     let api = error.api.as_ref()?;
     if api["code"] != "rate_limited" {
         return None;
     }
     api["details"]["retry_after_ms"].as_u64()
+}
+
+/// The pause for a server-named back-off of `retry_after_ms`: at most
+/// [`MAX_SERVER_BACKOFF`], plus up to half of it again of jitter, so refused
+/// clients spread out instead of returning together. Never overflows.
+pub fn named_backoff(retry_after_ms: u64) -> Duration {
+    let cap = MAX_SERVER_BACKOFF.as_millis() as u64;
+    let base = retry_after_ms.min(cap);
+    Duration::from_millis(base + jitter(base / 2 + 1))
+}
+
+/// A cheap, dependency-free spread in `0..bound`: the clock's sub-second
+/// nanoseconds, mixed. Not random enough for anything but de-synchronizing
+/// retries.
+fn jitter(bound: u64) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
+    let mixed = nanos.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 17;
+    mixed % bound.max(1)
 }
 
 /// A `retry-after` header in seconds, when an answer (typically a proxy's)
@@ -1059,5 +1240,21 @@ mod tests {
         let local = Error::usage("bad flag").document();
         assert_eq!(local["schema"], "sentinel.error/1");
         assert_eq!(local["code"], "client_usage");
+    }
+
+    #[test]
+    fn a_named_backoff_is_capped_and_jittered_without_overflow() {
+        // P09C-10: `retry_after_ms` near u64::MAX used to overflow.
+        let cap = MAX_SERVER_BACKOFF.as_millis() as u64;
+        for (named, low, high) in [
+            (0, 0, 0),
+            (1_000, 1_000, 1_500),
+            (cap, cap, cap + cap / 2),
+            (cap + 1, cap, cap + cap / 2),
+            (u64::MAX, cap, cap + cap / 2),
+        ] {
+            let pause = named_backoff(named).as_millis() as u64;
+            assert!((low..=high).contains(&pause), "{named}: {pause}");
+        }
     }
 }
