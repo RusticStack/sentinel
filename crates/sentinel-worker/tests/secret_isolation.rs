@@ -72,19 +72,22 @@ fn podman_ok(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
+/// What the replaying registry serves: manifest media type and bytes, config
+/// digest and bytes.
+type Served = (String, Vec<u8>, String, Vec<u8>);
+
 /// A registry that serves one tenant's manifest and config — and nothing
 /// else — the way a tenant replaying another's metadata would.
 struct Replay {
     port: u16,
-    served: Arc<Mutex<Option<(String, Vec<u8>, String, Vec<u8>)>>>,
+    served: Arc<Mutex<Option<Served>>>,
 }
 
 impl Replay {
     fn start() -> Replay {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let served: Arc<Mutex<Option<(String, Vec<u8>, String, Vec<u8>)>>> =
-            Arc::new(Mutex::new(None));
+        let served: Arc<Mutex<Option<Served>>> = Arc::new(Mutex::new(None));
         let content = Arc::clone(&served);
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
