@@ -66,13 +66,16 @@ The OAuth authorization server's endpoints are at the deployment's root, not und
 
 | Route | Auth | Does |
 |---|---|---|
-| `GET /.well-known/oauth-authorization-server` | none | RFC 8414 metadata: the issuer, the endpoints below, grant types, `S256`, the scopes |
+| `GET /.well-known/oauth-authorization-server` | none | RFC 8414 metadata: the issuer, the endpoints below (`registration_endpoint` only while policy allows DCR), grant types, `S256`, the scopes, `client_id_metadata_document_supported` per policy |
 | `GET /.well-known/oauth-protected-resource/api/v1` | none | RFC 9728: `resource` `{issuer}/api/v1`, its authorization server and scopes |
-| `GET, POST /oauth/authorize` | session cookie (else the embedded password sign-in, and "Sign in with GitHub" when configured) | authorization code + PKCE consent (O01); approve or deny → `303` to the loopback redirect with `code`/`error`, `state`, `iss` |
+| `GET /.well-known/oauth-protected-resource/mcp` | none | RFC 9728 for the remote MCP resource `{issuer}/mcp` and the MCP scopes ([MCP](mcp.md#streamable-http-x05)) |
+| `GET, POST /oauth/authorize` | session cookie (else the embedded password sign-in, and "Sign in with GitHub" when configured) | authorization code + PKCE consent (O01); approve or deny → `303` to the client's registered redirect (loopback for the CLI, HTTPS or loopback for a registered MCP client) with `code`/`error`, `state`, `iss`; a registered client's errors redirect only after sign-in |
 | `POST /oauth/token` | public client (`client_id`) | `authorization_code`, `refresh_token` (rotation with a 60 s lost-response grace, replay revokes the grant) and `urn:ietf:params:oauth:grant-type:device_code` grants → `TokenResponse`; `cache-control: no-store` |
+| `POST /oauth/register` | none; per client 2/s (deployment 10/s) | RFC 7591 registration of a public MCP client while the instance policy is `open` → `201`; otherwise `403 access_denied` ([OAuth](oauth.md#mcp-client-registration-and-metadata-discovery-x06)) |
 | `POST /oauth/revoke` | public client | RFC 7009: either token kind revokes its whole grant; always `200` |
 | `POST /oauth/device_authorization` | public client | RFC 8628 device request → `{device_code, user_code, verification_uri, verification_uri_complete, expires_in, interval}`; `429 slow_down` at 1024 pending |
 | `GET, POST /device` | session cookie (else the embedded password sign-in, and "Sign in with GitHub" when configured) | enter a user code, then approve (narrowing scopes, tenant, repository) or deny; five wrong codes in ten minutes lock the account out of the page for the rest of the window |
+| `POST, GET, DELETE /mcp` | MCP-audience OAuth access token only | Streamable HTTP MCP on revision `2025-11-25` (GET is `405`); errors are `sentinel.error/1` with the MCP `WWW-Authenticate` challenges ([MCP](mcp.md#streamable-http-x05)) |
 
 GitHub web sign-in (U07), present only when `<data_dir>/github-sign-in.json` configures it ([configuration](configuration.md), [GitHub sign-in](github-sign-in.md#browser-routes-u07)); both answer HTML pages, never JSON:
 
