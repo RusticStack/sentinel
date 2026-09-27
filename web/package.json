@@ -1,0 +1,27 @@
+{
+  "name": "sentinel-web",
+  "private": true,
+  "type": "module",
+  "description": "Sentinel's web interface: a Nuxt server in front of the controller's API",
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "preview": "nuxt preview",
+    "typecheck": "nuxt typecheck",
+    "postinstall": "nuxt prepare"
+  },
+  "dependencies": {
+    "@iconify-json/lucide": "^1.2.137",
+    "@nuxt/ui": "^4.11.2",
+    "nuxt": "^4.5.2",
+    "tailwindcss": "^4.1.0",
+    "vue": "^3.5.0",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.0",
+    "vue-tsc": "^3.0.0"
+  },
+  "packageManager": "pnpm@12.3.4"
+}
