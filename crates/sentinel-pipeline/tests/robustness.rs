@@ -23,10 +23,24 @@ fn fixtures() -> Vec<(String, String)> {
     out
 }
 
+/// Compile `text` (Ok or Err; a panic fails the test) within 500 ms. A
+/// pathological input is slow every time it runs; a loaded machine that
+/// preempts one run is not. So an overrun is measured again and the
+/// fastest of three runs is what is judged: the bound still catches
+/// super-linear work, and a descheduled thread no longer fails the sweep.
 fn check(name: &str, text: &str) {
-    let t = Instant::now();
-    let _ = compile_str(text); // Ok or Err; a panic fails the test.
-    let elapsed = t.elapsed();
+    let run = || {
+        let t = Instant::now();
+        let _ = compile_str(text);
+        t.elapsed()
+    };
+    let mut elapsed = run();
+    for _ in 0..2 {
+        if elapsed.as_millis() < 500 {
+            break;
+        }
+        elapsed = elapsed.min(run());
+    }
     assert!(
         elapsed.as_millis() < 500,
         "{name}: {} bytes took {elapsed:?}",
@@ -130,7 +144,19 @@ fn hostile_documents_fail_fast_with_structured_errors() {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let t = Instant::now();
     assert!(compile_str(&wide).is_err());
-    assert!(t.elapsed().as_millis() < 500);
+    // Bounded work, asserted as work rather than wall-clock time (a timing
+    // bound here failed under machine load): the loader stops at the node
+    // budget, well before the end of the document, instead of building
+    // all 40,000 nodes and rejecting them afterwards.
+    let e = yaml::load(&wide).unwrap_err();
+    assert_eq!(
+        e.kind,
+        yaml::YamlErrorKind::TooManyNodes {
+            limit: yaml::MAX_NODES
+        }
+    );
+    let jobs_line = wide.lines().nth(2).unwrap();
+    assert_eq!(e.line, 3, "{e}");
+    assert!(e.col < jobs_line.len() / 2, "stopped at column {}", e.col);
 }
