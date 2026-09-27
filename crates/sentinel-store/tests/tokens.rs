@@ -116,7 +116,12 @@ fn a_host_local_credential_authenticates_through_the_ordinary_authorization_laye
         store.read(|conn| auth::require_repo(conn, principal, i.repo, P::WRITE_SECRETS)),
         Err(Error::NotFound)
     ));
-    // Losing the membership behind the credential ends its access at once.
+    // Losing the membership behind the credential ends its access at once
+    // (a second administrator first: the tenant's last one cannot leave).
+    store
+        .writer()
+        .write(move |tx| auth::set_membership(tx, admin(i), i.tenant, i.root, Role::TenantAdmin))
+        .unwrap();
     store
         .writer()
         .write(move |tx| auth::remove_membership(tx, admin(i), i.tenant, i.dev, NOW))

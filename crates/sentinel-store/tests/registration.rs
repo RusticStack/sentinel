@@ -63,6 +63,16 @@ fn fixture() -> Fixture {
 }
 
 impl Fixture {
+    /// Make the root an administrator of `acme` too, so another admin can be
+    /// removed or downgraded without leaving the tenant without one.
+    fn second_admin(&self) {
+        let (admin, tenant, root) = (self.admin, self.tenant, self.root);
+        self.store
+            .writer()
+            .write(move |tx| auth::set_membership(tx, admin, tenant, root, Role::TenantAdmin))
+            .unwrap();
+    }
+
     fn set_registration(&self, registration: Registration) {
         let admin = self.admin;
         let policy = DeploymentPolicy {
@@ -879,6 +889,7 @@ fn an_invitation_dies_with_its_inviters_membership() {
     let f = fixture();
     let (dev, _, backdoor) = delegated_invitation(&f);
     let (admin, tenant) = (f.admin, f.tenant);
+    f.second_admin();
     f.store
         .writer()
         .write(move |tx| auth::remove_membership(tx, admin, tenant, dev, at(12)))
@@ -910,6 +921,7 @@ fn an_invitation_dies_with_its_inviters_downgrade_to_reader() {
     let f = fixture();
     let (dev, _, backdoor) = delegated_invitation(&f);
     let (admin, tenant) = (f.admin, f.tenant);
+    f.second_admin();
     f.store
         .writer()
         .write(move |tx| auth::set_membership(tx, admin, tenant, dev, Role::Reader))

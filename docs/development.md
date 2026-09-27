@@ -111,6 +111,17 @@ Every test — a single test binary, the full `test-*` suites, the web browser t
 
 Ship the branch as a git bundle (or push it) and run there, as root or the test account, from a checkout on the VPS's own filesystem. The VPS is shared with production services and another project's CI: run under `nice -n 19 ionice -c3` with `CARGO_BUILD_JOBS` limited, check `/proc/pressure/cpu` first, and when the host is heavily loaded skip the run and record the verification as pending. Record the load (`uptime`, CPU pressure) with every benchmark; a contended host is not a baseline.
 
+What is installed there (2026-09-27, Ubuntu 26.04, 12 vCPU EPYC, 31 GiB):
+
+| For | Installed |
+|---|---|
+| Rust suites | `build-essential`, `pkg-config`, rustup for root with the pinned 1.97.0 (clippy, rustfmt) |
+| Checkout | `/srv/sentinel`, world-readable; run logs, load snapshots and scripts in `/srv/sentinel-runs` |
+| Web interface and browser test | Ubuntu's `nodejs` (22) and `npm`, `pnpm` 10 (npm global), Chrome for Testing's `chrome-headless-shell` in `/opt/chrome-headless-shell` — Ubuntu ships Chromium only as a snap, whose private `/tmp` does not see the test's profile directory |
+| Executor tests and benchmarks | `podman` 5.7 (rootless, runc, overlay, cgroup v2), `uidmap`, `slirp4netns`; the `sentinelbench` account (subuid/subgid, lingering, `safe.directory` for `/srv/sentinel`) |
+
+Chrome refuses to run as root without `--no-sandbox`; `/opt/chrome-headless-shell/as-root` adds it, so a root run passes `SENTINEL_BROWSER=/opt/chrome-headless-shell/as-root`. Run the suites with `--no-fail-fast` so one pass reports every failing binary. Another project's CI runs `cargo test` on the same host: stop your own processes by PID, never by a pattern such as `pkill -f "cargo test"`.
+
 ### Windows with WSL2 (superseded)
 
 Not used for tests any more (see above). Kept for reference:

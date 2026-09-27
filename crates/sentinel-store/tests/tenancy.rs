@@ -317,6 +317,14 @@ fn suspension_stops_intake_revokes_scoped_credentials_and_cancels_live_work() {
 fn membership_and_grant_changes_are_audited_and_move_the_epoch() {
     let f = fixture();
     let admin = Principal::new(f.root, P::ALL, None, None);
+    // A second administrator, so the only one can be downgraded and removed.
+    f.store
+        .writer()
+        .write({
+            let (acme, root) = (f.acme, f.root);
+            move |tx| auth::set_membership(tx, admin, acme, root, Role::TenantAdmin)
+        })
+        .unwrap();
     let epoch0 = f.store.read(|c| tenancy::epoch(c, f.acme)).unwrap();
     let scoped = tokens::provision(
         &f.store,
