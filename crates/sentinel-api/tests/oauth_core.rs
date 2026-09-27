@@ -124,6 +124,7 @@ pub fn deployment_under(path: Option<&str>) -> Deployment {
         intake: None,
         public_url: public_url.clone(),
         github_sign_in: None,
+        trusted_proxies: sentinel_api::TrustedProxy::loopback(),
     })
     .unwrap();
     let base = format!("http://{}", server.local_addr());
@@ -308,7 +309,9 @@ fn metadata_documents_name_this_deployment_exactly() {
         &[],
     );
     assert_eq!(meta.status, 200);
-    let expected = Metadata::for_issuer(&d.base, &Scopes::NAMES);
+    // The default instance policy: metadata documents, no DCR.
+    let expected =
+        Metadata::for_issuer(&d.base, &Scopes::NAMES).with_client_registration(false, true);
     assert_eq!(
         serde_json::from_value::<Metadata>(meta.body.clone()).unwrap(),
         expected

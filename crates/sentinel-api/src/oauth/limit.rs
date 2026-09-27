@@ -138,22 +138,89 @@ impl Limiter {
     }
 }
 
+/// A network whose peers are the deployment's reverse proxy: a request from
+/// one is counted under the address its `X-Forwarded-For` names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrustedProxy {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl TrustedProxy {
+    /// Loopback only, `127.0.0.0/8` and `::1/128`: the default, right for a
+    /// proxy on the controller's own host.
+    pub fn loopback() -> Vec<TrustedProxy> {
+        vec![
+            TrustedProxy {
+                network: IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 0)),
+                prefix: 8,
+            },
+            TrustedProxy {
+                network: IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                prefix: 128,
+            },
+        ]
+    }
+
+    /// `ADDRESS` or `ADDRESS/PREFIX` (CIDR). Host bits must be zero, so a
+    /// typo cannot silently widen or shift the network.
+    pub fn parse(text: &str) -> Option<TrustedProxy> {
+        let (address, prefix) = match text.split_once('/') {
+            Some((address, prefix)) => (address, Some(prefix)),
+            None => (text, None),
+        };
+        let network: IpAddr = address.parse().ok()?;
+        let width = if network.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix {
+            None => width,
+            Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.len() <= 3 => {
+                p.parse::<u8>().ok().filter(|p| *p <= width)?
+            }
+            Some(_) => return None,
+        };
+        let proxy = TrustedProxy { network, prefix };
+        (proxy.masked(network) == network).then_some(proxy)
+    }
+
+    fn masked(&self, ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V4(v4) => {
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                IpAddr::V4((u32::from(v4) & mask).into())
+            }
+            IpAddr::V6(v6) => {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                IpAddr::V6((u128::from(v6) & mask).into())
+            }
+        }
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        ip.is_ipv4() == self.network.is_ipv4() && self.masked(ip) == self.network
+    }
+}
+
 /// The key a client is counted under. IPv6 clients are counted per /64,
 /// the smallest block a single subscriber is normally given, so one host
 /// cannot mint itself fresh buckets from its own prefix.
 ///
-/// A request that arrives from a loopback or private address is taken to
-/// come through the deployment's reverse proxy (TLS is the proxy's job,
-/// see the crate docs), and is counted under the last address in its
-/// `X-Forwarded-For`, which that proxy appended. A request from a public
-/// address is counted under that address, whatever headers it carries, so
-/// a client reaching the server directly cannot choose its own key.
-pub(crate) fn client_key(peer: Option<IpAddr>, forwarded_for: Option<&str>) -> u128 {
+/// A request that arrives from a configured `trusted` proxy network is
+/// counted under the last address in its `X-Forwarded-For`, which that
+/// proxy appended. Any other request is counted under its own address,
+/// whatever headers it carries, so a client reaching the server directly —
+/// from the internet or from a neighbouring private host — cannot choose
+/// its own key.
+pub(crate) fn client_key(
+    peer: Option<IpAddr>,
+    forwarded_for: Option<&str>,
+    trusted: &[TrustedProxy],
+) -> u128 {
     let peer = peer.map(canonical);
-    let via_proxy = peer.is_none_or(|ip| match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
-    });
+    let via_proxy = peer.is_some_and(|ip| trusted.iter().any(|proxy| proxy.contains(ip)));
     let client = match (via_proxy, forwarded_for) {
         (true, Some(header)) => header
             .rsplit(',')
@@ -245,29 +312,60 @@ mod tests {
 
     #[test]
     fn keys_trust_forwarding_only_from_a_proxy_address() {
+        let trusted = TrustedProxy::loopback();
+        let key = |peer: IpAddr, via| client_key(Some(peer), via, &trusted);
         let local: IpAddr = "127.0.0.1".parse().unwrap();
         let public: IpAddr = "203.0.113.9".parse().unwrap();
         let via = Some("198.51.100.1, 198.51.100.7");
-        assert_eq!(
-            client_key(Some(local), via),
-            client_key(Some("198.51.100.7".parse().unwrap()), None)
-        );
-        assert_eq!(
-            client_key(Some(public), via),
-            client_key(Some(public), None)
-        );
-        assert_eq!(
-            client_key(Some(local), None),
-            client_key(Some(local), Some("junk"))
-        );
+        assert_eq!(key(local, via), key("198.51.100.7".parse().unwrap(), None));
+        assert_eq!(key(public, via), key(public, None));
+        assert_eq!(key(local, None), key(local, Some("junk")));
         // One IPv6 /64 is one client; a mapped IPv4 address is that address.
         let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
         let b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
-        assert_eq!(client_key(Some(a), None), client_key(Some(b), None));
+        assert_eq!(key(a, None), key(b, None));
         let mapped: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
+        assert_eq!(key(mapped, None), key(public, None));
+    }
+
+    /// P09S-9: a neighbour on a private network reaching the listener
+    /// directly is not the proxy, and cannot mint keys through the header.
+    #[test]
+    fn private_peers_are_proxies_only_when_configured() {
+        let neighbour: IpAddr = "10.0.0.7".parse().unwrap();
+        let spoofed = Some("198.51.100.7");
+        let loopback = TrustedProxy::loopback();
         assert_eq!(
-            client_key(Some(mapped), None),
-            client_key(Some(public), None)
+            client_key(Some(neighbour), spoofed, &loopback),
+            client_key(Some(neighbour), None, &loopback)
         );
+        let configured = [TrustedProxy::parse("10.0.0.0/24").unwrap()];
+        assert_eq!(
+            client_key(Some(neighbour), spoofed, &configured),
+            client_key(Some("198.51.100.7".parse().unwrap()), None, &configured)
+        );
+        let outside: IpAddr = "10.0.1.7".parse().unwrap();
+        assert_eq!(
+            client_key(Some(outside), spoofed, &configured),
+            client_key(Some(outside), None, &configured)
+        );
+        assert_eq!(
+            TrustedProxy::parse("fd00::/8"),
+            Some(TrustedProxy {
+                network: "fd00::".parse().unwrap(),
+                prefix: 8
+            })
+        );
+        assert!(TrustedProxy::parse("::1").is_some());
+        for bad in [
+            "10.0.0.1/24",
+            "10.0.0.0/33",
+            "10.0.0.0/",
+            "10.0.0.0/+8",
+            "x",
+            "",
+        ] {
+            assert!(TrustedProxy::parse(bad).is_none(), "{bad}");
+        }
     }
 }

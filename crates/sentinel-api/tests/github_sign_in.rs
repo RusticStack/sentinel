@@ -157,6 +157,7 @@ fn deployment(configured: bool) -> (Deployment, UserId) {
             client_secret: SECRET.into(),
             endpoints: github.endpoints(),
         }),
+        trusted_proxies: sentinel_api::TrustedProxy::loopback(),
     })
     .unwrap();
     let base = format!("http://{}", server.local_addr());

@@ -52,6 +52,16 @@ pub(super) fn page_status(
         escape_into(&mut body, notice);
         body.push_str("</p>\n");
     }
+    if params.client.registered {
+        // A registered client names itself; nothing here vouches for it.
+        body.push_str(
+            "<p class=\"warn\">Third-party application: its name and details were supplied \
+             by whoever registered it and are not verified by this deployment.</p>\n\
+             <p>After you decide, your browser is sent to <strong><code>",
+        );
+        escape_into(&mut body, redirect_host(params.redirect_uri));
+        body.push_str("</code></strong>.</p>\n");
+    }
     body.push_str("<p><strong>");
     escape_into(&mut body, &params.client.name);
     body.push_str("</strong> (<code>");
@@ -125,6 +135,18 @@ pub(super) fn page_status(
     )
 }
 
+/// `scheme://host[:port]` of a redirect URI: where the browser goes, which
+/// the consent page shows prominently for third-party clients.
+fn redirect_host(uri: &str) -> &str {
+    let Some(at) = uri.find("://") else {
+        return uri;
+    };
+    match uri[at + 3..].find('/') {
+        Some(slash) => &uri[..at + 3 + slash],
+        None => uri,
+    }
+}
+
 fn hidden(out: &mut String, name: &str, value: &str) {
     out.push_str("<input type=\"hidden\" name=\"");
     out.push_str(name);
@@ -154,6 +176,18 @@ fn describe(scope: &str) -> &'static str {
 mod tests {
     use super::*;
     use sentinel_core::auth::Scopes;
+
+    #[test]
+    fn the_redirect_host_is_the_origin_of_the_redirect() {
+        assert_eq!(
+            redirect_host("https://claude.ai/api/mcp/auth_callback"),
+            "https://claude.ai"
+        );
+        assert_eq!(
+            redirect_host("http://127.0.0.1:33418"),
+            "http://127.0.0.1:33418"
+        );
+    }
 
     #[test]
     fn every_scope_has_words() {

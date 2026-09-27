@@ -32,14 +32,14 @@ use sentinel_store::{
     auth::Authority,
     checks, dispatch, idempotency, local_auth, logs, lookup,
     objects::{Digest, Touch},
-    provenance, runs, status, tenancy, workers,
+    operations, provenance, runs, status, tenancy, workers,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
     LOG_WAIT, MAX_UPLOAD_CHUNK, State, TRANSFERS,
-    auth::{self, Identity, Refusal},
+    auth::{self, Identity, Refusal, Via},
 };
 
 mod failure;
@@ -231,14 +231,9 @@ fn challenge(state: &State, request: &Request, path: &str, error: &ApiError) -> 
     }
     match error.code {
         ErrorCode::Unauthenticated => {
-            let metadata = if path == "/mcp" {
-                &state.oauth.mcp_resource_metadata
-            } else {
-                &state.oauth.resource_metadata
-            };
             let mut value = format!(
                 "Bearer realm=\"sentinel\", resource_metadata=\"{}\"",
-                metadata
+                state.oauth.resource_metadata
             );
             if header_value(request, "authorization").is_some() {
                 value.push_str(", error=\"invalid_token\"");
@@ -251,23 +246,23 @@ fn challenge(state: &State, request: &Request, path: &str, error: &ApiError) -> 
             .and_then(|d| d.get("scope"))
             .and_then(Value::as_str)
         {
-            Some(scope) => {
-                let metadata = if path == "/mcp" {
-                    format!(
-                        ", resource_metadata=\"{}\"",
-                        state.oauth.mcp_resource_metadata
-                    )
-                } else {
-                    String::new()
-                };
-                vec![header(
-                    "www-authenticate",
-                    &format!("Bearer error=\"insufficient_scope\", scope=\"{scope}\"{metadata}"),
-                )]
-            }
+            Some(scope) => vec![header(
+                "www-authenticate",
+                &format!("Bearer error=\"insufficient_scope\", scope=\"{scope}\""),
+            )],
             None => Vec::new(),
         },
         _ => Vec::new(),
+    }
+}
+
+/// Who a run control action is recorded as ([`operations`]): the account,
+/// how it authenticated and, for an OAuth token, the grant.
+fn actor(who: &Identity) -> operations::Actor {
+    match (who.via, who.grant) {
+        (Via::OAuth, Some(grant)) => operations::Actor::OAuth(who.user, grant),
+        (Via::Session, _) => operations::Actor::Session(who.user),
+        _ => operations::Actor::Credential(who.user),
     }
 }
 
@@ -508,7 +503,19 @@ pub(crate) fn route(
             let count = state
                 .store
                 .writer()
-                .write(move |tx| dispatch::cancel_run(tx, tenant, run, UnixMillis::now()))
+                .write(move |tx| {
+                    let now = UnixMillis::now();
+                    let count = dispatch::cancel_run(tx, tenant, run, now)?;
+                    operations::record(
+                        tx,
+                        tenant,
+                        operations::Action::CancelRun,
+                        *run.as_bytes(),
+                        actor(&who),
+                        now,
+                    )?;
+                    Ok(count)
+                })
                 .map_err(store_error)?;
             state.controller.wake();
             ok(json!({ "run": run.to_string(), "canceled": count }))
@@ -521,7 +528,19 @@ pub(crate) fn route(
             let outcome = state
                 .store
                 .writer()
-                .write(move |tx| dispatch::cancel(tx, tenant, job, UnixMillis::now()))
+                .write(move |tx| {
+                    let now = UnixMillis::now();
+                    let outcome = dispatch::cancel(tx, tenant, job, now)?;
+                    operations::record(
+                        tx,
+                        tenant,
+                        operations::Action::CancelJob,
+                        *job.as_bytes(),
+                        actor(&who),
+                        now,
+                    )?;
+                    Ok(outcome)
+                })
                 .map_err(store_error)?;
             state.controller.wake();
             ok(json!({ "job": job.to_string(), "outcome": format!("{outcome:?}").to_lowercase() }))
@@ -534,7 +553,19 @@ pub(crate) fn route(
             let next = state
                 .store
                 .writer()
-                .write(move |tx| runs::rerun_job(tx, tenant, job, UnixMillis::now()))
+                .write(move |tx| {
+                    let now = UnixMillis::now();
+                    let next = runs::rerun_job(tx, tenant, job, now)?;
+                    operations::record(
+                        tx,
+                        tenant,
+                        operations::Action::RerunJob,
+                        *job.as_bytes(),
+                        actor(&who),
+                        now,
+                    )?;
+                    Ok(next)
+                })
                 .map_err(store_error)?;
             state.controller.wake();
             ok(json!({ "job": job.to_string(), "state": next.as_str() }))

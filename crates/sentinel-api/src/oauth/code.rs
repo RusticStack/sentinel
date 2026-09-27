@@ -11,7 +11,10 @@
 //! Until the client and its redirect URI are established nothing is sent
 //! back to the client: an unknown client or an unacceptable redirect gets
 //! an error page with no `location`. Every later refusal is an RFC 6749
-//! §4.1.2.1 redirect carrying `error`, `state` and `iss` (RFC 9207).
+//! §4.1.2.1 redirect carrying `error`, `state` and `iss` (RFC 9207) — for a
+//! third-party (DCR/CIMD) client only once an account has signed in (RFC
+//! 9700 §4.11.2), and a CIMD document is fetched only for a signed-in
+//! account.
 
 mod consent;
 
@@ -59,36 +62,75 @@ pub(super) struct Params<'a> {
     pub resource: Option<&'a str>,
 }
 
+/// Before an account signs in, this server acts for no third party:
+///
+/// - A CIMD client (`client_id` is a URL) gets the sign-in page with no
+///   metadata fetch, so anonymous requests cannot make the server call out
+///   or hold a handler on a slow host.
+/// - A registered (DCR/CIMD) client's refusals are never redirects: RFC 9700
+///   §4.11.2 requires authenticating the user before redirecting to a URI a
+///   third party registered, or `/oauth/authorize` is an open redirector.
+///
+/// The first-party CLI's loopback redirects keep RFC 6749's error redirects
+/// before sign-in: they can only reach the user's own machine.
 fn show(state: &State, request: &Request, query: &str) -> Reply {
     let Ok(form) = Form::parse(query.as_bytes()) else {
         return html::error_page(400, "The authorization request is malformed.");
     };
-    let params = match validate(state, request, &form) {
-        Ok(params) => params,
+    let session = signed_in(state, request);
+    if session.is_none()
+        && form
+            .get("client_id")
+            .is_some_and(|id| id.starts_with("https://"))
+        && form.get("redirect_uri").is_some()
+    {
+        return sign_in(state, query, None);
+    }
+    let (client, redirect_uri) = match establish(state, request, &form) {
+        Ok(established) => established,
         Err(reply) => return reply,
     };
-    let Some((who, csrf)) = signed_in(state, request) else {
-        let mut message = String::with_capacity(64 + params.client.name.len());
-        message.push_str("Sign in to continue to ");
-        message.push_str(&params.client.name);
-        message.push('.');
-        let here = format!("/oauth/authorize?{query}");
-        let github = state
-            .github
-            .as_ref()
-            .map(|g| (g.start_url.as_str(), here.as_str()));
-        return html::sign_in_page(
-            &state.oauth.login_url,
-            github,
-            "Sign in to Sentinel",
-            &message,
-        );
+    let Some((who, csrf)) = session else {
+        if !client.registered
+            && let Err(reply) = validate_rest(state, &form, client.clone(), redirect_uri)
+        {
+            return reply;
+        }
+        return sign_in(state, query, Some(&client.name));
+    };
+    let params = match validate_rest(state, &form, client, redirect_uri) {
+        Ok(params) => params,
+        Err(reply) => return reply,
     };
     if let Err(reply) = eligible(state, &params, &who) {
         return reply;
     }
     let token = cookie::form_token(&state.oauth.form_key, &csrf);
     consent::page(state, &params, &who, &token, None)
+}
+
+/// The sign-in page that returns to this authorization request.
+fn sign_in(state: &State, query: &str, client_name: Option<&str>) -> Reply {
+    let mut message = String::with_capacity(64);
+    match client_name {
+        Some(name) => {
+            message.push_str("Sign in to continue to ");
+            message.push_str(name);
+            message.push('.');
+        }
+        None => message.push_str("Sign in to continue to the application."),
+    }
+    let here = format!("/oauth/authorize?{query}");
+    let github = state
+        .github
+        .as_ref()
+        .map(|g| (g.start_url.as_str(), here.as_str()));
+    html::sign_in_page(
+        &state.oauth.login_url,
+        github,
+        "Sign in to Sentinel",
+        &message,
+    )
 }
 
 fn decide(state: &State, request: &mut Request) -> Reply {
@@ -208,9 +250,21 @@ fn signed_in(
     Some((who, csrf))
 }
 
-/// Validate an authorization request (query or re-posted form). Refusals
-/// before the redirect is trusted are pages; later ones are redirects.
+/// Validate an authorization request (query or re-posted form) for a
+/// signed-in account. Refusals before the redirect is trusted are pages;
+/// later ones are redirects.
 fn validate<'a>(state: &State, request: &Request, form: &'a Form) -> Result<Params<'a>, Reply> {
+    let (client, redirect_uri) = establish(state, request, form)?;
+    validate_rest(state, form, client, redirect_uri)
+}
+
+/// Establish the client and its redirect URI. Every refusal is a page with
+/// no `location`: nothing goes to a redirect that is not yet trusted.
+fn establish<'a>(
+    state: &State,
+    request: &Request,
+    form: &'a Form,
+) -> Result<(Client, &'a str), Reply> {
     let Some(client_id) = form.get("client_id") else {
         return Err(html::error_page(400, "The request names no client."));
     };
@@ -228,7 +282,17 @@ fn validate<'a>(state: &State, request: &Request, form: &'a Form) -> Result<Para
             "The redirect URI is not registered for this client.",
         ));
     }
-    // From here on the client and its redirect are trusted with an answer.
+    Ok((client, redirect_uri))
+}
+
+/// The rest of the request, once `client` and `redirect_uri` are trusted
+/// with an answer: every refusal is an RFC 6749 error redirect.
+fn validate_rest<'a>(
+    state: &State,
+    form: &'a Form,
+    client: Client,
+    redirect_uri: &'a str,
+) -> Result<Params<'a>, Reply> {
     let state_param = form.get("state").filter(|s| s.len() <= MAX_STATE_BYTES);
     let fail = |code: OAuthErrorCode, description: &str| {
         Err(redirect_error(

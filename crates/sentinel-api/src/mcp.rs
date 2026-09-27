@@ -16,6 +16,7 @@ use sentinel_protocol::{
     error::{ApiError, ErrorCode},
     mcp::{self as contract, ApiCall, Backend},
 };
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -26,6 +27,11 @@ use crate::{
 };
 
 const MAX_SESSIONS: usize = 1024;
+/// Sessions one account may hold. A new one past it replaces that account's
+/// least recently used session, so one account can neither take the whole
+/// table from everyone else nor lock itself out.
+const MAX_SESSIONS_PER_USER: usize = 16;
+const _: () = assert!(MAX_SESSIONS_PER_USER >= 1 && MAX_SESSIONS_PER_USER * 4 <= MAX_SESSIONS);
 const SESSION_IDLE: Duration = Duration::from_secs(60 * 60);
 const MAX_RESPONSE_BYTES: usize = 8 << 20;
 const JSON_RPC: &str = "2.0";
@@ -52,10 +58,30 @@ impl Sessions {
     }
 
     fn create(&self, user: UserId) -> Result<String, ApiError> {
-        let now = Instant::now();
+        self.create_at(user, Instant::now())
+    }
+
+    fn create_at(&self, user: UserId, now: Instant) -> Result<String, ApiError> {
         let mut entries = self.lock();
-        entries
-            .retain(|_, session| now.saturating_duration_since(session.last_used) < SESSION_IDLE);
+        // One pass: drop idle sessions and find this account's share and
+        // its least recently used session.
+        let mut held = 0;
+        let mut oldest: Option<([u8; 32], Instant)> = None;
+        entries.retain(|digest, session| {
+            let live = now.saturating_duration_since(session.last_used) < SESSION_IDLE;
+            if live && session.user == user {
+                held += 1;
+                if oldest.is_none_or(|(_, at)| session.last_used < at) {
+                    oldest = Some((*digest, session.last_used));
+                }
+            }
+            live
+        });
+        if held >= MAX_SESSIONS_PER_USER
+            && let Some((digest, _)) = oldest
+        {
+            entries.remove(&digest);
+        }
         if entries.len() >= MAX_SESSIONS {
             return Err(
                 ApiError::new(ErrorCode::RateLimited, "MCP session capacity reached")
@@ -78,9 +104,12 @@ impl Sessions {
     }
 
     fn touch(&self, value: &str, user: UserId) -> Result<[u8; 32], ApiError> {
+        self.touch_at(value, user, Instant::now())
+    }
+
+    fn touch_at(&self, value: &str, user: UserId, now: Instant) -> Result<[u8; 32], ApiError> {
         let secret = Secret::parse(value).ok_or_else(session_not_found)?;
         let digest = secret.digest();
-        let now = Instant::now();
         let mut entries = self.lock();
         let Some(session) = entries.get_mut(&digest.0) else {
             return Err(session_not_found());
@@ -155,30 +184,52 @@ fn accepts(request: &Request, media_type: &str) -> bool {
     })
 }
 
-fn protocol_header(request: &Request) -> Result<(), ApiError> {
-    if routes::header_value(request, "mcp-protocol-version") == Some(contract::PROTOCOL_VERSION) {
-        Ok(())
-    } else {
-        Err(ApiError::new(
-            ErrorCode::UnsupportedVersion,
-            "MCP-Protocol-Version is required and unsupported",
-        )
-        .with_detail("supported", contract::PROTOCOL_VERSION))
+/// The Streamable HTTP version header (MCP 2025-11-25, "Protocol Version
+/// Header"). An unsupported value is `400 Bad Request` — still carrying the
+/// `unsupported_version` code and the supported revision. An absent header
+/// is accepted: every request after `initialize` belongs to a session, and
+/// a session only ever negotiated [`contract::PROTOCOL_VERSION`], which is
+/// the "other way to identify the version" the specification allows.
+fn protocol_header(request: &Request) -> Result<(), Reply> {
+    match routes::header_value(request, "mcp-protocol-version") {
+        None => Ok(()),
+        Some(version) if version == contract::PROTOCOL_VERSION => Ok(()),
+        Some(_) => {
+            let error = ApiError::new(
+                ErrorCode::UnsupportedVersion,
+                "MCP-Protocol-Version names an unsupported revision",
+            )
+            .with_detail("supported", contract::PROTOCOL_VERSION);
+            Err(Reply::Json(400, json!(error), Vec::new()))
+        }
     }
 }
 
+/// The request's session. A missing `Mcp-Session-Id` is `400` (the client
+/// must send one); an unknown or expired one is `404`, which tells the
+/// client to initialize a new session.
 fn session_digest(
     state: &State,
     request: &Request,
     identity: &Identity,
 ) -> Result<[u8; 32], ApiError> {
-    let value = routes::header_value(request, "mcp-session-id").ok_or_else(session_not_found)?;
+    let value = routes::header_value(request, "mcp-session-id").ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::InvalidRequest,
+            "Mcp-Session-Id is required after initialize",
+        )
+    })?;
     state.mcp_sessions.touch(value, identity.user)
 }
 
 fn json_response(value: Value, headers: Vec<Header>) -> Route {
     let body = serde_json::to_string(&value)
         .map_err(|_| ApiError::new(ErrorCode::Internal, "controller fault"))?;
+    bounded(body, headers)
+}
+
+/// A serialized JSON-RPC answer within the response limit.
+fn bounded(body: String, headers: Vec<Header>) -> Route {
     if body.len() > MAX_RESPONSE_BYTES {
         return Err(ApiError::new(
             ErrorCode::PayloadTooLarge,
@@ -272,12 +323,14 @@ pub(crate) fn post(state: &State, request: &mut Request) -> Route {
                 "initialize requires clientInfo and capabilities objects",
             ));
         }
-        if params.get("protocolVersion").and_then(Value::as_str) != Some(contract::PROTOCOL_VERSION)
-        {
+        // Lifecycle version negotiation: whatever revision the client asks
+        // for, the answer names the one this server supports, and the
+        // client decides whether to continue.
+        if !params.get("protocolVersion").is_some_and(Value::is_string) {
             return Ok(rpc_error(
                 Some(id),
                 -32602,
-                "unsupported protocol version",
+                "initialize requires a protocolVersion string",
                 400,
             ));
         }
@@ -291,7 +344,9 @@ pub(crate) fn post(state: &State, request: &mut Request) -> Route {
         return json_response(rpc_result(Some(id), result), presented);
     }
 
-    protocol_header(request)?;
+    if let Err(reply) = protocol_header(request) {
+        return Ok(reply);
+    }
     let digest = session_digest(state, request, &who)?;
 
     if method.starts_with("notifications/") {
@@ -309,50 +364,79 @@ pub(crate) fn post(state: &State, request: &mut Request) -> Route {
     let Some(id) = id else {
         return Ok(Reply::Empty(202, Vec::new()));
     };
-    let params = params.cloned().unwrap_or_default();
+    let empty = Map::new();
+    let params = params.unwrap_or(&empty);
     match method {
-        "ping" => json_response(rpc_result(Some(id), json!({})), Vec::new()),
-        "tools/list" => json_response(
-            rpc_result(Some(id), json!({ "tools": contract::tool_definitions() })),
-            Vec::new(),
-        ),
-        "resources/list" => json_response(
-            rpc_result(
-                Some(id),
-                json!({ "resources": contract::resource_definitions() }),
-            ),
-            Vec::new(),
-        ),
-        "resources/templates/list" => json_response(
-            rpc_result(Some(id), json!({ "resourceTemplates": [] })),
-            Vec::new(),
-        ),
+        "ping" => raw_result(&id, "{}"),
+        // The static catalogue and documents are serialized once per process.
+        "tools/list" => raw_result(&id, contract::tools_list_json()),
+        "resources/list" => raw_result(&id, contract::resources_list_json()),
+        "resources/templates/list" => raw_result(&id, r#"{"resourceTemplates":[]}"#),
         "resources/read" => {
             let uri = params.get("uri").and_then(Value::as_str);
-            match uri.and_then(contract::read_resource) {
-                Some(result) => json_response(rpc_result(Some(id), result), Vec::new()),
+            match uri.and_then(contract::read_resource_json) {
+                Some(result) => raw_result(&id, result),
                 None => Ok(rpc_error(Some(id), -32002, "resource not found", 200)),
             }
         }
-        "tools/call" => call_tool(state, request, &who, Some(id), &params),
+        "tools/call" => call_tool(state, request, &who, &id, params),
         _ => Ok(rpc_error(Some(id), -32601, "method not found", 200)),
     }
+}
+
+/// A JSON-RPC result whose `result` is already serialized JSON.
+fn raw_result(id: &Value, result: &str) -> Route {
+    let id = serde_json::to_string(id)
+        .map_err(|_| ApiError::new(ErrorCode::Internal, "controller fault"))?;
+    let mut body = String::with_capacity(40 + id.len() + result.len());
+    body.push_str(r#"{"jsonrpc":"2.0","id":"#);
+    body.push_str(&id);
+    body.push_str(r#","result":"#);
+    body.push_str(result);
+    body.push('}');
+    bounded(body, Vec::new())
+}
+
+/// A `tools/call` result: the payload once as structured content and once
+/// as its JSON text, which the specification asks of a tool returning
+/// structured content. Serialized in one pass over borrowed parts.
+#[derive(Serialize)]
+struct ToolReply<'a> {
+    jsonrpc: &'static str,
+    id: &'a Value,
+    result: ToolResult<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolResult<'a> {
+    content: [TextContent<'a>; 1],
+    structured_content: &'a Value,
+    is_error: bool,
+}
+
+#[derive(Serialize)]
+struct TextContent<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
 }
 
 fn call_tool(
     state: &State,
     request: &Request,
     who: &Identity,
-    id: Option<Value>,
+    id: &Value,
     params: &Map<String, Value>,
 ) -> Route {
     let name = params
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::new(ErrorCode::InvalidRequest, "tool name is required"))?;
+    let empty = Map::new();
     let args = match params.get("arguments") {
-        None => Map::new(),
-        Some(Value::Object(args)) => args.clone(),
+        None => &empty,
+        Some(Value::Object(args)) => args,
         Some(_) => {
             return Err(ApiError::new(
                 ErrorCode::InvalidRequest,
@@ -370,7 +454,7 @@ fn call_tool(
     auth::require_scope(who, required)?;
 
     let default_tenant = match who.principal.tenant {
-        Some(tenant) if needs_default_tenant(name, &args) => state
+        Some(tenant) if needs_default_tenant(name, args) => state
             .store
             .read(|connection| sentinel_store::lookup::tenant_slug(connection, tenant))
             .map_err(routes::store_error)?,
@@ -384,19 +468,31 @@ fn call_tool(
         default_tenant,
         scope_denied: None,
     };
-    let outcome = contract::execute_tool(&mut backend, name, &args);
+    let outcome = contract::execute_tool(&mut backend, name, args);
     if let Some(error) = backend.scope_denied {
         return Err(error);
     }
-    let result = match outcome {
-        Ok(value) => {
-            json!({ "content": [{"type":"text", "text": value.to_string()}], "structuredContent": value, "isError": false })
-        }
-        Err(error) => {
-            json!({ "content": [{"type":"text", "text": error.to_string()}], "structuredContent": error, "isError": true })
-        }
+    let (payload, is_error) = match &outcome {
+        Ok(value) => (value, false),
+        Err(error) => (error, true),
     };
-    json_response(rpc_result(id, result), Vec::new())
+    let text = serde_json::to_string(payload)
+        .map_err(|_| ApiError::new(ErrorCode::Internal, "controller fault"))?;
+    let reply = ToolReply {
+        jsonrpc: JSON_RPC,
+        id,
+        result: ToolResult {
+            content: [TextContent {
+                kind: "text",
+                text: &text,
+            }],
+            structured_content: payload,
+            is_error,
+        },
+    };
+    let body = serde_json::to_string(&reply)
+        .map_err(|_| ApiError::new(ErrorCode::Internal, "controller fault"))?;
+    bounded(body, Vec::new())
 }
 
 fn needs_default_tenant(name: &str, args: &Map<String, Value>) -> bool {
@@ -424,26 +520,10 @@ impl Backend for ApiBackend<'_, '_> {
         self.default_tenant
     }
 
+    /// The API route authorizes, scope included, exactly as for any other
+    /// caller; a scope refusal it answers is lifted to the HTTP `403` with
+    /// its `insufficient_scope` challenge so the client can step up.
     fn call_api(&mut self, call: ApiCall) -> Result<Value, Value> {
-        let required = if call.method == "GET" {
-            if call.path.contains("/logs?")
-                || call.path.contains("/failure?")
-                || call.path.ends_with("/logs")
-                || call.path.ends_with("/failure")
-            {
-                Scopes::LOGS_READ
-            } else if call.path.contains("/secrets") {
-                Scopes::SECRETS_METADATA
-            } else {
-                Scopes::RUNS_READ
-            }
-        } else {
-            Scopes::RUNS_WRITE
-        };
-        if let Err(error) = auth::require_scope(&self.identity, required) {
-            self.scope_denied = Some(error.clone());
-            return Err(serde_json::to_value(error).unwrap_or(Value::Null));
-        }
         let (path, query) = call.path.split_once('?').unwrap_or((&call.path, ""));
         let body = if call.body.is_null() {
             Vec::new()
@@ -471,8 +551,19 @@ impl Backend for ApiBackend<'_, '_> {
                 ErrorCode::Internal,
                 "unexpected API response",
             )),
-            Err(error) => Err(serde_json::to_value(error)
-                .unwrap_or_else(|_| api_error_value(ErrorCode::Internal, "controller fault"))),
+            Err(error) => {
+                let value = serde_json::to_value(&error)
+                    .unwrap_or_else(|_| api_error_value(ErrorCode::Internal, "controller fault"));
+                if error.code == ErrorCode::Forbidden
+                    && error
+                        .details
+                        .as_ref()
+                        .is_some_and(|details| details.get("scope").is_some())
+                {
+                    self.scope_denied = Some(error);
+                }
+                Err(value)
+            }
         }
     }
 
@@ -517,7 +608,9 @@ pub(crate) fn get(state: &State, request: &mut Request) -> Route {
     validate_origin(state, request)?;
     let who = identity(state, request)?;
     if routes::header_value(request, "mcp-session-id").is_some() {
-        protocol_header(request)?;
+        if let Err(reply) = protocol_header(request) {
+            return Ok(reply);
+        }
         session_digest(state, request, &who)?;
     }
     Ok(Reply::Json(
@@ -530,7 +623,9 @@ pub(crate) fn get(state: &State, request: &mut Request) -> Route {
 pub(crate) fn delete(state: &State, request: &mut Request) -> Route {
     validate_origin(state, request)?;
     let who = identity(state, request)?;
-    protocol_header(request)?;
+    if let Err(reply) = protocol_header(request) {
+        return Ok(reply);
+    }
     let digest = session_digest(state, request, &who)?;
     state.mcp_sessions.remove(&digest);
     Ok(Reply::Empty(200, Vec::new()))
@@ -551,6 +646,44 @@ fn rpc_error(id: Option<Value>, code: i32, message: &str, status: u16) -> Reply 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P11-5: one account cannot take the table from everyone else; its
+    /// seventeenth session replaces its least recently used one.
+    #[test]
+    fn mcp_sessions_are_capped_per_user_with_lru_eviction() {
+        let sessions = Sessions::default();
+        let (flood, other) = (UserId::new(), UserId::new());
+        let start = Instant::now();
+        let at = |n: u64| start + Duration::from_millis(n);
+        let ids: Vec<String> = (0..MAX_SESSIONS_PER_USER as u64)
+            .map(|n| sessions.create_at(flood, at(n)).unwrap())
+            .collect();
+        // Use the first so the second becomes the least recently used.
+        sessions.touch_at(&ids[0], flood, at(100)).unwrap();
+        for n in 0..(MAX_SESSIONS as u64) {
+            sessions.create_at(flood, at(200 + n)).unwrap();
+        }
+        let held = |user| sessions.lock().values().filter(|s| s.user == user).count();
+        assert_eq!(held(flood), MAX_SESSIONS_PER_USER);
+        assert!(sessions.create_at(other, at(5_000)).is_ok());
+        assert_eq!(
+            sessions
+                .touch_at(&ids[1], flood, at(5_001))
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+        // Idle sessions expire.
+        let late = at(5_001) + SESSION_IDLE;
+        let fresh = sessions.create_at(other, at(5_002)).unwrap();
+        assert_eq!(
+            sessions
+                .touch_at(&fresh, other, late + Duration::from_secs(1))
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+    }
 
     #[test]
     fn session_ids_are_random_hashed_and_bound_to_the_authenticated_user() {

@@ -102,6 +102,7 @@ fn deployment() -> Deployment {
         intake: None,
         public_url: None,
         github_sign_in: None,
+        trusted_proxies: sentinel_api::TrustedProxy::loopback(),
     })
     .unwrap();
     Deployment {
@@ -1375,6 +1376,42 @@ fn mcp_agent_finds_failure_in_a_hundred_mib_log_and_explicitly_reruns() {
         })
         .unwrap();
     assert_ne!(new_attempt, attempt);
+
+    // P11-6: the agent's control actions are traceable to the account, the
+    // grant to revoke and the client that held it.
+    mcp_tool(&d, &agent, "cancel", json!({"job": job.to_string()}));
+    let grant: [u8; 16] = d
+        .store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT id FROM oauth_grants WHERE client_id='x08-agent'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    let grant = sentinel_core::GrantId::from_bytes(grant).unwrap();
+    let records = d
+        .store
+        .read(|c| sentinel_store::operations::recent(c, tenant, 10))
+        .unwrap();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(
+        records[0].action,
+        sentinel_store::operations::Action::CancelJob
+    );
+    assert_eq!(
+        records[1].action,
+        sentinel_store::operations::Action::RerunJob
+    );
+    for record in &records {
+        assert_eq!(record.target, *job.as_bytes());
+        assert_eq!(
+            record.actor,
+            sentinel_store::operations::Actor::OAuth(d.root, grant)
+        );
+        assert_eq!(record.client.as_deref(), Some("x08-agent"));
+    }
 }
 
 #[test]

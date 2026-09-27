@@ -243,6 +243,7 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
         intake: None,
         public_url: None,
         github_sign_in: None,
+        trusted_proxies: sentinel_api::TrustedProxy::loopback(),
     })
     .unwrap();
     let api = Api {

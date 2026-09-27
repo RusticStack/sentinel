@@ -235,10 +235,104 @@ pub fn loopback_redirect(uri: &str, required_path: &str) -> Option<u16> {
     port.parse::<u16>().ok().filter(|p| *p != 0)
 }
 
+/// The port-free form of a **registered** loopback redirect URI, which is
+/// how it is stored and matched (RFC 8252 §7.3: "any port … at the time of
+/// the request"; §8.3 discourages but does not forbid `localhost`).
+///
+/// Accepts `http://` then exactly `127.0.0.1`, `[::1]` or `localhost`, an
+/// optional port 1–65535 without leading zeros, and an optional path of
+/// printable ASCII with no query, fragment, userinfo or markup characters.
+/// Answers `http://HOST/PATH` (an empty path is `/`). The host is kept:
+/// `localhost` never matches `127.0.0.1`.
+#[must_use]
+pub fn loopback_redirect_key(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("http://")?;
+    let (host, rest) = ["127.0.0.1", "[::1]", "localhost"]
+        .iter()
+        .find_map(|host| rest.strip_prefix(host).map(|rest| (*host, rest)))?;
+    let path = match rest.strip_prefix(':') {
+        Some(after) => {
+            let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+            let port = &after[..digits];
+            if port.is_empty()
+                || port.len() > 5
+                || port.starts_with('0')
+                || port.parse::<u16>().is_err()
+            {
+                return None;
+            }
+            &after[digits..]
+        }
+        None => rest,
+    };
+    if !(path.is_empty() || path.starts_with('/'))
+        || path.len() > 256
+        || path.bytes().any(|b| {
+            !(0x21..=0x7e).contains(&b)
+                || matches!(
+                    b,
+                    b'?' | b'#' | b'\\' | b'"' | b'<' | b'>' | b'`' | b'{' | b'}' | b'|' | b'^'
+                )
+        })
+    {
+        return None;
+    }
+    let path = if path.is_empty() { "/" } else { path };
+    let mut key = String::with_capacity(7 + host.len() + path.len());
+    key.push_str("http://");
+    key.push_str(host);
+    key.push_str(path);
+    Some(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::secret::digest_eq;
+
+    #[test]
+    fn registered_loopback_redirects_match_any_port_on_the_same_host_and_path() {
+        let key = |uri| loopback_redirect_key(uri);
+        assert_eq!(
+            key("http://127.0.0.1:33418").as_deref(),
+            Some("http://127.0.0.1/")
+        );
+        assert_eq!(
+            key("http://127.0.0.1/").as_deref(),
+            Some("http://127.0.0.1/")
+        );
+        assert_eq!(
+            key("http://127.0.0.1:1/cb"),
+            key("http://127.0.0.1:65535/cb")
+        );
+        assert_eq!(
+            key("http://[::1]:8080/cb").as_deref(),
+            Some("http://[::1]/cb")
+        );
+        assert_eq!(
+            key("http://localhost:33418/").as_deref(),
+            Some("http://localhost/")
+        );
+        assert_ne!(key("http://localhost/cb"), key("http://127.0.0.1/cb"));
+        assert_ne!(key("http://127.0.0.1/cb"), key("http://127.0.0.1/cb2"));
+        for denied in [
+            "https://127.0.0.1/cb",
+            "http://127.0.0.1:0/cb",
+            "http://127.0.0.1:65536/cb",
+            "http://127.0.0.1:080/cb",
+            "http://127.0.0.1:/cb",
+            "http://127.0.0.1.evil.example/cb",
+            "http://localhost.evil.example/cb",
+            "http://localhost@evil.example/cb",
+            "http://127.0.0.1/cb?x=1",
+            "http://127.0.0.1/cb#f",
+            "http://127.0.0.1/c b",
+            "http://127.0.0.2/cb",
+            "http://evil.example/cb",
+        ] {
+            assert!(key(denied).is_none(), "{denied}");
+        }
+    }
 
     const KINDS: [Kind; 4] = [Kind::Access, Kind::Refresh, Kind::Code, Kind::Device];
 

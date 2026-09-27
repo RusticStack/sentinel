@@ -62,7 +62,21 @@ read checks, decodes the immutable stored run spec, and returns the existing
 it never returns secret values.
 
 Stdio support does not imply HTTP MCP authentication. The HTTP transport is a
-separate OAuth resource and uses the same tool schemas and authorization checks.
+separate OAuth resource. Both transports run every tool through the one shared
+mapper (`sentinel_protocol::mcp::execute_tool`): the same schemas, argument
+checks and API calls, and the controller's API routes make every
+authorization decision, scope included. `arguments` is optional on both
+(absent is `{}`). Stdio compiles a dispatched pipeline locally first to save a
+round trip; over HTTP the route compiles it once.
+
+Tool annotations: every tool has `openWorldHint: false` (tools act only on this
+deployment); reads and `validate_pipeline` are read-only; `dispatch` is
+additive and idempotent (its idempotency key); `rerun_job` is additive and not
+idempotent (a repeat is `conflict`); `cancel` is the one destructive tool, and
+idempotent. Cancel and rerun, through MCP or any other client, are recorded
+in the append-only `operation_audit` table with the account, how it
+authenticated and, for an OAuth token, the grant and its client (migration 43;
+`sentinel_store::operations`).
 
 ## Streamable HTTP (X05)
 
@@ -94,27 +108,40 @@ Messages are limited to 2 MiB and serialized responses to 8 MiB. `GET` returns
 405 because server-initiated event streams are not enabled; `DELETE` ends the
 session.
 
-Initialization creates a random session identifier. The server stores only
-its digest, binds it to the authenticated user, caps the table at 1,024
-sessions, and expires it after 60 minutes idle. Every follow-up still needs a
-valid bearer token and the pinned `MCP-Protocol-Version`; a session ID is not
-an authentication credential. Tool calls pass through Sentinel's API scope,
+`initialize` negotiates as the lifecycle requires: whatever `protocolVersion`
+the client asks for, the answer names `2025-11-25` and the client decides
+whether to continue. Initialization creates a random session identifier. The
+server stores only its digest, binds it to the authenticated user, caps the
+table at 1,024 sessions and each account at 16 (a 17th replaces that account's
+least recently used session, so one account can never take the table from
+others), and expires a session after 60 minutes idle. Every follow-up still
+needs a valid bearer token; a session ID is not an authentication credential.
+An `MCP-Protocol-Version` other than `2025-11-25` is `400` with
+`sentinel.error/1` code `unsupported_version` and `details.supported`; an
+absent one means the session's negotiated revision. A missing
+`Mcp-Session-Id` after initialize is `400`; an unknown or expired one is `404`,
+which tells the client to initialize again. Tool calls pass through Sentinel's API scope,
 tenant, repository, and ownership checks. See [OAuth](oauth.md) for audience
 and grant details. Client registration and metadata-document retrieval are
 implemented under X06; conformance coverage is described below.
 
 ## Client registration and conformance (X06–X07)
 
-Authorization-server metadata advertises `registration_endpoint` at
-`{issuer}/oauth/register` and `client_id_metadata_document_supported: true`.
-Sentinel supports RFC 7591 DCR and MCP Client ID Metadata Documents. Both
-create only public MCP client records. They do not create Sentinel accounts,
-membership, or grants. Every user completes the ordinary sign-in and explicit
-consent flow. The client is limited to the MCP audience and the four MCP
-scopes; it cannot use device authorization. DCR allows at most 16 exact
-redirect URIs and accepts HTTPS domain callbacks or HTTP IP-loopback
-callbacks. Registration body, persistent client count, rate, and metadata
-retrieval are bounded; the details are in [OAuth](oauth.md#mcp-client-registration-and-metadata-discovery-x06).
+Sentinel supports MCP Client ID Metadata Documents and RFC 7591 DCR, subject
+to the instance policy (`sentinel admin policy set --oauth-client-registration
+off|metadata|open`; default `metadata`, CIMD only). The authorization-server
+metadata advertises `registration_endpoint` only while DCR is allowed and
+`client_id_metadata_document_supported` while CIMD is. Both create only public
+MCP client records. They do not create Sentinel accounts, membership, or
+grants. Every user completes the ordinary sign-in and explicit consent flow;
+a CIMD document is fetched only for a signed-in account, and a registered
+client's errors redirect only after sign-in. The client is limited to the MCP
+audience and the four MCP scopes; it cannot use device authorization. DCR
+accepts RFC 7591 defaults, at most 16 redirect URIs, HTTPS domain callbacks
+and HTTP loopback callbacks (`127.0.0.1`, `[::1]`, `localhost`) that match on
+any port. Registrations are bounded per address and in total, reclaimed when
+unused, and listed or disabled with `sentinel admin oauth-client`; the details
+are in [OAuth](oauth.md#mcp-client-registration-and-metadata-discovery-x06).
 
 The selected client profiles are Visual Studio Code's loopback callback
 (`http://127.0.0.1:33418`) and Claude's remote callback
@@ -124,8 +151,13 @@ scope refusal, MCP initialization, insufficient-scope refusal, refresh,
 reconnect with the same session, and revocation. The callback URLs are from
 the clients' published MCP setup guidance: [VS Code MCP extension guide](https://code.visualstudio.com/api/extension-guides/ai/mcp)
 and [Claude remote MCP integration guide](https://support.anthropic.com/en/articles/11503834-building-custom-integrations-via-remote-mcp-servers).
-These are deterministic HTTP conformance fixtures; the desktop/web client
-applications and their browser windows are not launched by the test.
+These are deterministic HTTP conformance fixtures written for Sentinel, not
+recordings of the clients: the payloads follow the clients' public
+documentation (VS Code's registration, for example, echoes the advertised
+device grant and lists `localhost` and port-bearing loopback redirects, which
+`standard_native_registrations_are_accepted_and_match_any_loopback_port`
+covers). No real MCP client application or SDK has been run against a
+Sentinel controller; X07's real-client exercise is outstanding.
 
 The CLI end-to-end test runs the actual `sentinel mcp` binary over stdio with
 a local credential that lacks `runs:read`. Its tool call returns the normal

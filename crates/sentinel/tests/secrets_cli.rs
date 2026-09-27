@@ -96,6 +96,7 @@ fn deployment() -> Deployment {
         public_url: None,
         github_sign_in: None,
         secret_key: Some(Arc::clone(&key)),
+        trusted_proxies: sentinel_api::TrustedProxy::loopback(),
     })
     .unwrap();
     Deployment {

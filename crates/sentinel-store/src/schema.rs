@@ -138,9 +138,11 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         42,
         include_str!("migrations/042_mcp_client_registration.sql"),
     ),
-    // Assigned file number 044 by the fix plan; registered as the next
-    // contiguous version on this branch. Renumbered at merge.
-    (43, include_str!("migrations/044_secret_hardening.sql")),
+    (
+        43,
+        include_str!("migrations/043_oauth_client_lifecycle.sql"),
+    ),
+    (44, include_str!("migrations/044_secret_hardening.sql")),
 ];
 
 /// Whether `versions` are exactly `1..=N` in order. `migrate` skips every

@@ -123,7 +123,8 @@ const APPROVAL_TERMS: &str = "SELECT u.active = 1 AND u.kind = 0, u.super_admin,
             WHERE m.tenant_id = ?3 AND m.user_id = u.id AND t.active = 1),
         ?4 IS NULL OR EXISTS(SELECT 1 FROM repos WHERE id = ?4 AND tenant_id = ?3),
         c.max_scopes, c.loopback, c.redirect_path,
-        EXISTS(SELECT 1 FROM oauth_client_redirects r WHERE r.client_id = c.client_id AND r.uri = ?5)
+        EXISTS(SELECT 1 FROM oauth_client_redirects r WHERE r.client_id = c.client_id
+            AND r.uri IN (?5, ?6))
      FROM users u JOIN oauth_clients c ON c.client_id = ?2 AND c.disabled_ms IS NULL
      WHERE u.id = ?1";
 
@@ -161,6 +162,8 @@ pub fn approve(store: &Store, a: &Approval<'_>, now: UnixMillis) -> Result<Secre
     store.writer().write(move |tx| {
         let (client_id, rest) = text.split_at(split);
         let (redirect_uri, challenge) = rest.split_at(challenge_at - split);
+        // A registered loopback redirect matches on any port (RFC 8252 §7.3).
+        let loopback_key = forms::loopback_redirect_key(redirect_uri);
         let terms = tx
             .prepare_cached(APPROVAL_TERMS)?
             .query_row(
@@ -169,7 +172,8 @@ pub fn approve(store: &Store, a: &Approval<'_>, now: UnixMillis) -> Result<Secre
                     client_id,
                     tenant.as_ref().map(TenantId::as_bytes),
                     repo.as_ref().map(RepoId::as_bytes),
-                    redirect_uri
+                    redirect_uri,
+                    loopback_key.as_deref().unwrap_or(redirect_uri)
                 ],
                 |r| {
                     let loopback = r.get::<_, bool>(5)?

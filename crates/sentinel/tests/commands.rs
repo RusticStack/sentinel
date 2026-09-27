@@ -96,6 +96,7 @@ fn deployment() -> Deployment {
         intake: None,
         public_url: None,
         github_sign_in: None,
+        trusted_proxies: sentinel_api::TrustedProxy::loopback(),
         secret_key: None,
     })
     .unwrap();
