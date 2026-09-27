@@ -55,7 +55,7 @@ pub fn verify_key(conn: &Connection, key: &Key) -> Result<()> {
         let user = UserId::from_bytes(user).map_err(|_| Error::Corrupt("mfa_totp.user_id"))?;
         opens(key, &crate::mfa::context(user), &sealed, "mfa_totp")?;
     }
-    let source: Option<([u8; 16], [u8; 16], i64, Vec<u8>)> = conn
+    let source: Option<SourceRow> = conn
         .query_row(
             "SELECT repo_id,tenant_id,version,credential FROM source_bindings
              ORDER BY updated_ms DESC LIMIT 1",
@@ -158,6 +158,7 @@ pub fn reseal_all(store: &Store, key: Arc<Key>) -> Result<Progress> {
 }
 
 type Row = ([u8; 16], i64, Vec<u8>, [u8; 16], Option<[u8; 16]>, String);
+type SourceRow = ([u8; 16], [u8; 16], i64, Vec<u8>);
 
 fn secret_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     Ok((
@@ -266,7 +267,6 @@ fn reseal_sources(
     key: &Key,
     after: [u8; 16],
 ) -> Result<Step<[u8; 16]>> {
-    type SourceRow = ([u8; 16], [u8; 16], i64, Vec<u8>);
     let rows = tx
         .prepare_cached(
             "SELECT repo_id,tenant_id,version,credential FROM source_bindings

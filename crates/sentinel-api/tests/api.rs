@@ -3279,7 +3279,8 @@ fn a_foreign_tenant_or_repo_is_not_found_on_every_secret_route() {
         Some(sentinel_core::auth::Role::Reader),
         P::READ.union(P::WRITE_SECRETS),
     );
-    let requests: &[(&str, &str, &[u8], &[(&str, &str)])] = &[
+    type Case<'a> = (&'a str, &'a str, &'a [u8], &'a [(&'a str, &'a str)]);
+    let requests: &[Case] = &[
         ("GET", "secrets?limit=0", b"", &[]),
         ("GET", "secrets", b"", &[]),
         ("GET", "secrets/TOKEN", b"", &[]),
