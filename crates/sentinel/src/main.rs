@@ -74,8 +74,45 @@ fn finish(outcome: Result<(), client::Error>) -> ExitCode {
     }
 }
 
+/// Parse arguments. For `sentinel secret`, a parse error that would quote
+/// an offending argument (a value typed where none is accepted, as in
+/// `secret set TOKEN hunter2` or `--value=hunter2`) is replaced by a fixed
+/// message, so the stray value is not copied into captured stderr (P10C-5).
+fn parse() -> Result<Cli, ExitCode> {
+    use clap::error::ErrorKind;
+    let error = match Cli::try_parse() {
+        Ok(cli) => return Ok(cli),
+        Err(error) => error,
+    };
+    let secret = std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "secret");
+    let quoting = matches!(
+        error.kind(),
+        ErrorKind::UnknownArgument
+            | ErrorKind::InvalidValue
+            | ErrorKind::InvalidSubcommand
+            | ErrorKind::ValueValidation
+            | ErrorKind::TooManyValues
+            | ErrorKind::WrongNumberOfValues
+            | ErrorKind::NoEquals
+            | ErrorKind::InvalidUtf8
+            | ErrorKind::ArgumentConflict
+    );
+    if secret && quoting {
+        eprintln!(
+            "error: unexpected or invalid argument to `sentinel secret` (not shown); secret values are never accepted as arguments: use --stdin, --file or the hidden prompt\n\nFor more information, try 'sentinel secret --help'."
+        );
+        return Err(ExitCode::from(2));
+    }
+    error.exit()
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match parse() {
+        Ok(cli) => cli,
+        Err(code) => return code,
+    };
     let (role, args) = match cli.command {
         Command::Server(args) => ("server", args),
         Command::Worker(args) => ("worker", args),
@@ -135,6 +172,12 @@ mod secret_cli_tests {
     use clap::Parser;
 
     use crate::Cli;
+
+    #[test]
+    fn the_command_tree_is_consistent() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
 
     #[test]
     fn set_refuses_conflicting_secret_input_sources() {

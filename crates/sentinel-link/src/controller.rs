@@ -1470,14 +1470,14 @@ impl Inner {
     /// A spec refused for good because a declared secret cannot be
     /// delivered — revoked, deleted, unbound, ambiguous — is settled here
     /// as the preparation failure it is, with a value-free detail naming
-    /// the secret and why, and the denied use audited, in one transaction
-    /// (P10D-7). The worker's own `Failed` report after `NoSpec` is then
+    /// the secret and why (P10D-7); the refused use was audited once by the
+    /// `secrets::deliver` that refused it (P10S-6). The worker's own `Failed` report after `NoSpec` is then
     /// stale and changes nothing. Any other refusal is left to that report.
     fn refuse_secrets(&self, request: &SpecRequest) {
         let (worker, attempt) = (request.worker, request.attempt);
         let settled = self.write(move |tx| {
             let now = UnixMillis::now();
-            let Some(refusal) = sentinel_store::secrets::refuse_delivery(tx, worker, attempt, now)?
+            let Some(refusal) = sentinel_store::secrets::refuse_delivery(tx, worker, attempt)?
             else {
                 return Ok(None);
             };
@@ -2494,12 +2494,10 @@ fn resolve_spec(
         let Some(key) = key else {
             return Err(SpecFault::Refused);
         };
+        // A policy refusal (missing binding, revoked version, ambiguity)
+        // commits its `denied`/`missing` audit row and fails the delivery.
         Some(
-            store
-                .writer()
-                .write(move |tx| {
-                    secrets::prepare_delivery(tx, &key, worker, attempt, UnixMillis::now())
-                })
+            secrets::deliver(store, key, worker, attempt, UnixMillis::now())
                 .map_err(SpecFault::from)?,
         )
     } else {

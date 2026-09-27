@@ -214,9 +214,14 @@ impl Drop for WipeEntries {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImportError {
+pub enum ImportFault {
     TooLarge,
     NotUtf8,
+    /// A UTF-16 byte-order mark: PowerShell 5.1's default `>` encoding.
+    Utf16,
+    /// A carriage return that does not end a CRLF line: records written
+    /// with bare CR would otherwise merge into one value.
+    BareCarriageReturn,
     InvalidLine,
     InvalidName,
     EmptyValue,
@@ -225,38 +230,90 @@ pub enum ImportError {
     TooManyEntries,
 }
 
-impl fmt::Display for ImportError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::TooLarge => "env file exceeds the byte limit",
-            Self::NotUtf8 => "env file must be UTF-8",
-            Self::InvalidLine => "env file line must be NAME=value",
-            Self::InvalidName => "env file contains an invalid secret name",
-            Self::EmptyValue => "env file contains an empty value",
-            Self::ValueTooLarge => "env file contains a value over the byte limit",
-            Self::DuplicateName => "env file contains a duplicate secret name",
-            Self::TooManyEntries => "env file contains too many secrets",
-        })
+/// Why an env file was refused, and the 1-based line when one is to blame.
+/// Neither ever includes a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportError {
+    pub fault: ImportFault,
+    /// 0 when the fault is the file as a whole.
+    pub line: usize,
+}
+
+impl ImportError {
+    const fn file(fault: ImportFault) -> Self {
+        Self { fault, line: 0 }
     }
 }
 
+impl fmt::Display for ImportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self.fault {
+            ImportFault::TooLarge => "env file exceeds the byte limit",
+            ImportFault::NotUtf8 => "env file must be UTF-8",
+            ImportFault::Utf16 => {
+                "env file is UTF-16; save it as UTF-8 (PowerShell: Set-Content -Encoding utf8)"
+            }
+            ImportFault::BareCarriageReturn => {
+                "env file has a carriage return that does not end a CRLF line"
+            }
+            ImportFault::InvalidLine => "env file line must be NAME=value",
+            ImportFault::InvalidName => "env file contains an invalid secret name",
+            ImportFault::EmptyValue => "env file contains an empty value",
+            ImportFault::ValueTooLarge => "env file contains a value over the byte limit",
+            ImportFault::DuplicateName => "env file contains a duplicate secret name",
+            ImportFault::TooManyEntries => "env file contains too many secrets",
+        };
+        if self.line == 0 {
+            f.write_str(text)
+        } else {
+            write!(f, "{text} (line {})", self.line)
+        }
+    }
+}
+
+/// Hints about a literal value that is probably not what the author meant,
+/// for the metadata-only import preview: whether it is wrapped in matching
+/// quotes (stored with them) or starts or ends with whitespace. Only these
+/// booleans leave; never the value.
+pub fn literal_hints(value: &[u8]) -> (bool, bool) {
+    let quoted =
+        value.len() >= 2 && matches!(value[0], b'"' | b'\'') && value[value.len() - 1] == value[0];
+    let padded = value.first().is_some_and(u8::is_ascii_whitespace)
+        || value.last().is_some_and(u8::is_ascii_whitespace);
+    (quoted, padded)
+}
+
 /// Parse `NAME=value` records. Blank and `#` comment lines are ignored;
-/// names are case-sensitive and must match `[A-Z_][A-Z0-9_]*`. One CR is
-/// removed before LF for CRLF files. A final newline is syntax, not part of
-/// a value. No value is included in an error.
+/// names are case-sensitive and must match `[A-Z_][A-Z0-9_]*`. A UTF-8 BOM
+/// at the start is skipped. Lines end with LF or CRLF; any other CR is
+/// refused. A final newline is syntax, not part of a value. Everything
+/// after the first `=` is the literal value: quotes, `#`, spaces and `$` are
+/// kept as written. Errors name the line, never a value.
 pub fn parse_env_file(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ImportError> {
     if bytes.len() > MAX_IMPORT_BYTES {
-        return Err(ImportError::TooLarge);
+        return Err(ImportError::file(ImportFault::TooLarge));
     }
-    std::str::from_utf8(bytes).map_err(|_| ImportError::NotUtf8)?;
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return Err(ImportError::file(ImportFault::Utf16));
+    }
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    std::str::from_utf8(bytes).map_err(|_| ImportError::file(ImportFault::NotUtf8))?;
     let mut entries = WipeEntries(Vec::new());
-    for raw in bytes.split(|byte| *byte == b'\n') {
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    for (index, raw) in body.split(|byte| *byte == b'\n').enumerate() {
+        let at = |fault| ImportError {
+            fault,
+            line: index + 1,
+        };
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.contains(&b'\r') {
+            return Err(at(ImportFault::BareCarriageReturn));
+        }
         if line.is_empty() || line.starts_with(b"#") {
             continue;
         }
         let Some(eq) = line.iter().position(|byte| *byte == b'=') else {
-            return Err(ImportError::InvalidLine);
+            return Err(at(ImportFault::InvalidLine));
         };
         let name = &line[..eq];
         let valid = (1..=64).contains(&name.len())
@@ -265,20 +322,20 @@ pub fn parse_env_file(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ImportErro
                 .iter()
                 .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_');
         if !valid {
-            return Err(ImportError::InvalidName);
+            return Err(at(ImportFault::InvalidName));
         }
         let value = &line[eq + 1..];
         if value.is_empty() {
-            return Err(ImportError::EmptyValue);
+            return Err(at(ImportFault::EmptyValue));
         }
         if value.len() > MAX_SECRET_BYTES {
-            return Err(ImportError::ValueTooLarge);
+            return Err(at(ImportFault::ValueTooLarge));
         }
         if entries.0.iter().any(|(old, _)| old.as_bytes() == name) {
-            return Err(ImportError::DuplicateName);
+            return Err(at(ImportFault::DuplicateName));
         }
         if entries.0.len() == MAX_IMPORT_ENTRIES {
-            return Err(ImportError::TooManyEntries);
+            return Err(at(ImportFault::TooManyEntries));
         }
         // Names were checked as ASCII and the file as UTF-8.
         entries.0.push((
@@ -287,7 +344,7 @@ pub fn parse_env_file(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ImportErro
         ));
     }
     if entries.0.is_empty() {
-        return Err(ImportError::InvalidLine);
+        return Err(ImportError::file(ImportFault::InvalidLine));
     }
     Ok(std::mem::take(&mut entries.0))
 }
@@ -317,30 +374,89 @@ mod tests {
 
     #[test]
     fn parses_literal_values_and_crlf_without_expansion() {
-        let parsed = parse_env_file(b"# copied literally\r\nTOKEN=$HOME\nURL=a=b=c\n").unwrap();
+        let parsed =
+            parse_env_file(b"# copied literally\r\nTOKEN=$HOME\nURL=a=b=c\nQ=\"x\" # c\n").unwrap();
         assert_eq!(
             parsed,
             [
                 ("TOKEN".into(), b"$HOME".to_vec()),
-                ("URL".into(), b"a=b=c".to_vec())
+                ("URL".into(), b"a=b=c".to_vec()),
+                ("Q".into(), b"\"x\" # c".to_vec()),
             ]
         );
     }
 
     #[test]
-    fn rejects_duplicate_invalid_empty_and_oversized_values_without_echoing_them() {
-        for (body, error) in [
-            (&b"A=one\nA=two"[..], ImportError::DuplicateName),
-            (&b"A"[..], ImportError::InvalidLine),
-            (&b"A="[..], ImportError::EmptyValue),
-            (&b"bad-name=x"[..], ImportError::InvalidName),
-        ] {
-            assert_eq!(parse_env_file(body), Err(error));
-        }
+    fn a_utf8_bom_is_skipped_and_utf16_is_named() {
         assert_eq!(
-            parse_env_file(&[b"A=".as_slice(), &vec![b'x'; MAX_SECRET_BYTES + 1]].concat()),
-            Err(ImportError::ValueTooLarge)
+            parse_env_file(b"\xEF\xBB\xBFA=1\r\n").unwrap(),
+            [("A".into(), b"1".to_vec())]
         );
-        assert!(!ImportError::DuplicateName.to_string().contains("one"));
+        let utf16 = parse_env_file(b"\xFF\xFEA\x00=\x001\x00").unwrap_err();
+        assert_eq!(utf16.fault, ImportFault::Utf16);
+        assert!(utf16.to_string().contains("UTF-8"));
+        assert_eq!(
+            parse_env_file(b"A=\xff").unwrap_err().fault,
+            ImportFault::NotUtf8
+        );
+    }
+
+    #[test]
+    fn a_bare_carriage_return_is_refused_with_its_line() {
+        // Old Mac line endings used to merge `B` into `A`'s value.
+        let error = parse_env_file(b"A=1\rB=2\r").unwrap_err();
+        assert_eq!(
+            error,
+            ImportError {
+                fault: ImportFault::BareCarriageReturn,
+                line: 1
+            }
+        );
+        assert_eq!(parse_env_file(b"A=1\nB=2\rC=3\n").unwrap_err().line, 2);
+    }
+
+    #[test]
+    fn rejects_duplicate_invalid_empty_and_oversized_values_without_echoing_them() {
+        for (body, fault, line) in [
+            (&b"A=one\nA=two"[..], ImportFault::DuplicateName, 2),
+            (&b"A"[..], ImportFault::InvalidLine, 1),
+            (&b"A=1\n\nB="[..], ImportFault::EmptyValue, 3),
+            (&b"bad-name=x"[..], ImportFault::InvalidName, 1),
+            (&b"export A=1"[..], ImportFault::InvalidName, 1),
+            (&b"   "[..], ImportFault::InvalidLine, 1),
+        ] {
+            let error = parse_env_file(body).unwrap_err();
+            assert_eq!((error.fault, error.line), (fault, line), "{body:?}");
+        }
+        let error = parse_env_file(&[b"A=".as_slice(), &vec![b'x'; MAX_SECRET_BYTES + 1]].concat())
+            .unwrap_err();
+        assert_eq!(error.fault, ImportFault::ValueTooLarge);
+        let message = parse_env_file(b"A=one\nA=two").unwrap_err().to_string();
+        assert!(message.ends_with("(line 2)") && !message.contains("one"));
+        assert_eq!(
+            parse_env_file(&vec![b'#'; MAX_IMPORT_BYTES + 1])
+                .unwrap_err()
+                .fault,
+            ImportFault::TooLarge
+        );
+        let many: String = (0..=MAX_IMPORT_ENTRIES)
+            .map(|i| format!("K{i}=v\n"))
+            .collect();
+        assert_eq!(
+            parse_env_file(many.as_bytes()).unwrap_err(),
+            ImportError {
+                fault: ImportFault::TooManyEntries,
+                line: MAX_IMPORT_ENTRIES + 1
+            }
+        );
+    }
+
+    #[test]
+    fn literal_hints_flag_quotes_and_padding_only() {
+        assert_eq!(literal_hints(b"\"x\""), (true, false));
+        assert_eq!(literal_hints(b"'x'"), (true, false));
+        assert_eq!(literal_hints(b"\"x'"), (false, false));
+        assert_eq!(literal_hints(b"x "), (false, true));
+        assert_eq!(literal_hints(b"\""), (false, false));
     }
 }

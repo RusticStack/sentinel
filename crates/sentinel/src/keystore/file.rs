@@ -148,9 +148,12 @@ pub fn check_private_input(path: &Path, file: &File) -> Result<(), Error> {
     #[cfg(windows)]
     {
         acl::check_input(file).map_err(|_| {
-            Error::usage(
-                "secret input file permissions must allow only the current user and SYSTEM",
-            )
+            Error::usage(format!(
+                "{} must be owned by you and allow only you and SYSTEM; fix: icacls \"{}\" /setowner \"%USERNAME%\" && icacls \"{}\" /inheritance:r /grant:r \"%USERNAME%:F\"",
+                path.display(),
+                path.display(),
+                path.display()
+            ))
         })
     }
     #[cfg(not(any(unix, windows)))]
@@ -534,7 +537,7 @@ mod acl {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Policy {
         /// A secret input file: allow entries for this user and SYSTEM
-        /// only, nothing but allow entries, owner not checked.
+        /// only, nothing but allow entries, owned by this user or SYSTEM.
         SecretInput,
         /// A configuration directory or file: owned by this user, SYSTEM
         /// or Administrators, and allow entries only for those (the
@@ -560,7 +563,11 @@ mod acl {
     pub(super) fn check_input(file: &File) -> io::Result<()> {
         check(file, Policy::SecretInput).map_err(|refusal| match refusal {
             Refusal::Io(e) => e,
-            _ => io::Error::new(
+            Refusal::Owner(_) => io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "owned by another principal",
+            ),
+            Refusal::Loose(_) => io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "DACL allows another principal",
             ),
@@ -577,10 +584,6 @@ mod acl {
         let mut owner: PSID = ptr::null_mut();
         let mut dacl: *mut ACL = ptr::null_mut();
         let mut descriptor = ptr::null_mut();
-        let info = match policy {
-            Policy::Private => DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
-            Policy::SecretInput => DACL_SECURITY_INFORMATION,
-        };
         // SAFETY: the handle belongs to the still-open `file`; the returned
         // owner SID and DACL point into the descriptor, valid until it is
         // freed below.
@@ -588,7 +591,7 @@ mod acl {
             GetSecurityInfo(
                 file.as_raw_handle().cast(),
                 SE_FILE_OBJECT,
-                info,
+                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
                 &mut owner,
                 ptr::null_mut(),
                 &mut dacl,
@@ -613,7 +616,9 @@ mod acl {
                 || sids.system.is(sid)
                 || (policy == Policy::Private && sids.admins.is(sid))
         };
-        if policy == Policy::Private && (owner.is_null() || !accepted(owner)) {
+        // The owner holds implicit WRITE_DAC whatever the DACL says, so both
+        // policies judge it (P10C-8).
+        if owner.is_null() || !accepted(owner) {
             let who = if owner.is_null() {
                 "nobody".to_owned()
             } else {

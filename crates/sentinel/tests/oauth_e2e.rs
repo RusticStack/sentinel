@@ -927,6 +927,48 @@ fn a_delegated_cli_writer_can_provision_a_secret_for_a_job_without_disclosure() 
             .contains(std::str::from_utf8(value).unwrap())
     );
 
+    // The delegated writer binds its secret to one job step through the CLI
+    // (P10S-2): no store call anywhere in the provisioning flow.
+    let bound = machine.run(&[
+        "secret",
+        "--profile",
+        "writer",
+        "--output",
+        "json",
+        "bind",
+        "CLI_TOKEN",
+        "--tenant",
+        "acme",
+        "--repo",
+        "app",
+        "--job",
+        "use",
+        "--step",
+        "read",
+    ]);
+    assert_eq!(bound.code, 0, "{bound:?}");
+    let binding: Value = serde_json::from_str(&bound.stdout).unwrap();
+    assert_eq!(
+        (&binding["job"], &binding["step"]),
+        (&json!("use"), &json!("read"))
+    );
+    let listed = machine.run(&[
+        "secret",
+        "--profile",
+        "writer",
+        "--output",
+        "json",
+        "bindings",
+        "--tenant",
+        "acme",
+        "--repo",
+        "app",
+    ]);
+    assert_eq!(listed.code, 0, "{listed:?}");
+    let listed: Value = serde_json::from_str(&listed.stdout).unwrap();
+    assert_eq!(listed["bindings"][0]["name"], "CLI_TOKEN");
+    assert!(!format!("{listed}").contains(std::str::from_utf8(value).unwrap()));
+
     #[cfg(target_os = "linux")]
     secret_runtime::use_cli_secret_in_rootless_job(&d, value);
 }
@@ -1824,7 +1866,7 @@ mod secret_runtime {
     use sentinel_protocol::negotiate::{Arch, Capabilities, Hello, Profile, ProtocolVersion};
     use sentinel_store::{
         dispatch, runs,
-        secrets::{self, Binding, Scope},
+        secrets::{self, Scope},
         tenancy::{self, PoolKind},
         workers,
     };
@@ -1897,27 +1939,10 @@ mod secret_runtime {
             })
             .unwrap()
             .secret;
+        // The binding was made through `sentinel secret bind` above.
         let metadata = d
             .store
             .read(|conn| secrets::describe(conn, admin, Scope::Repo(d.repo), "CLI_TOKEN"))
-            .unwrap();
-        d.store
-            .writer()
-            .write(move |tx| {
-                secrets::bind(
-                    tx,
-                    admin,
-                    &Binding {
-                        repo: repo_id,
-                        job: "use".into(),
-                        step: "read".into(),
-                        name: "CLI_TOKEN".into(),
-                        secret: metadata.id,
-                        override_tenant: false,
-                    },
-                    UnixMillis::now(),
-                )
-            })
             .unwrap();
 
         let source = tempfile::tempdir().unwrap();

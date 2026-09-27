@@ -336,11 +336,75 @@ pub enum SecretCommand {
         scope: SecretScopeArgs,
         #[arg(long, value_name = "PATH", required = true)]
         env_file: std::path::PathBuf,
-        /// Show names and observed versions only; make no changes
-        #[arg(long)]
+        /// Show names, observed versions and the --if-versions pin only; make no changes
+        #[arg(long, conflicts_with = "if_versions")]
         preview: bool,
+        /// Expected versions as printed by --preview (NAME=V,...); refuses if any changed
+        #[arg(long, value_name = "NAME=V,...")]
+        if_versions: Option<String>,
         #[arg(long)]
         idempotency_key: Option<String>,
+    },
+    /// Bind a secret to a repository, optionally to one job or one job step
+    Bind {
+        name: String,
+        #[command(flatten)]
+        target: SecretRepoArgs,
+        /// Job ID; omit for every job that declares the name
+        #[arg(long)]
+        job: Option<String>,
+        /// Step ID within --job; omit for every step of the job
+        #[arg(long, requires = "job")]
+        step: Option<String>,
+        /// Bind the tenant secret of this name (it must be allowed in the repository)
+        #[arg(long, conflicts_with = "override_tenant")]
+        from_tenant: bool,
+        /// Let the repository secret win over an allowed tenant secret of the same name
+        #[arg(long)]
+        override_tenant: bool,
+    },
+    /// Remove one binding; removing an absent binding succeeds
+    Unbind {
+        name: String,
+        #[command(flatten)]
+        target: SecretRepoArgs,
+        #[arg(long)]
+        job: Option<String>,
+        #[arg(long, requires = "job")]
+        step: Option<String>,
+    },
+    /// List a repository's bindings (metadata only)
+    Bindings {
+        #[command(flatten)]
+        target: SecretRepoArgs,
+    },
+    /// Allow a tenant secret in one repository
+    Allow {
+        name: String,
+        #[command(flatten)]
+        target: SecretRepoArgs,
+    },
+    /// Stop allowing a tenant secret in a repository; removes its bindings there
+    Deny {
+        name: String,
+        #[command(flatten)]
+        target: SecretRepoArgs,
+    },
+    /// List the repositories a tenant secret is allowed in
+    Allowed {
+        name: String,
+        /// Tenant slug (default: profile context)
+        #[arg(long, value_name = "SLUG")]
+        tenant: Option<String>,
+    },
+    /// Permanently revoke one version; the current version number is unchanged
+    RevokeVersion {
+        name: String,
+        /// The version to revoke
+        #[arg(value_name = "VERSION")]
+        revoke: u64,
+        #[command(flatten)]
+        scope: SecretScopeArgs,
     },
 }
 
@@ -352,6 +416,16 @@ pub struct SecretScopeArgs {
     /// Repository name; omit for tenant-wide secrets
     #[arg(long)]
     pub repo: Option<String>,
+}
+
+#[derive(Args, Clone, Debug, Default)]
+pub struct SecretRepoArgs {
+    /// Tenant slug (default: profile context)
+    #[arg(long, value_name = "SLUG")]
+    pub tenant: Option<String>,
+    /// Repository name
+    #[arg(long, required = true)]
+    pub repo: String,
 }
 
 pub fn run(invocation: Invocation) -> Result<(), client::Error> {

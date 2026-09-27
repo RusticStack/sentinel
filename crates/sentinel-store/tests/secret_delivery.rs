@@ -358,6 +358,74 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
         }),
         Err(Error::NotFound)
     ));
+    // P10S-6: through `deliver`, the refusal itself is audited (one `use`
+    // row with result `missing`, the attempt, step and version), while the
+    // refused preparation's own `use` rows (OCI_AUTH resolved before TOKEN
+    // failed) are rolled back.
+    assert!(matches!(
+        secrets::deliver(
+            &f.store,
+            f.key.clone(),
+            f.worker,
+            second.attempt,
+            UnixMillis(2_850)
+        ),
+        Err(Error::NotFound)
+    ));
+    let refusals: Vec<(Option<String>, String, i64, String, String)> = f
+        .store
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT a.step, a.name, a.version, a.result, s.name FROM secret_audit a
+                 JOIN secrets s ON s.id=a.secret_id
+                 WHERE a.action='use' AND a.result!='ok' AND a.attempt_id=?1",
+            )?;
+            Ok(stmt
+                .query_map([second.attempt.as_bytes()], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap();
+    assert_eq!(
+        refusals,
+        [(
+            Some("test".into()),
+            "TOKEN".into(),
+            2,
+            "missing".into(),
+            "TOKEN".into()
+        )]
+    );
+    let ok_uses: i64 = f
+        .store
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT count(*) FROM secret_audit WHERE action='use' AND result='ok' AND attempt_id=?1",
+                [second.attempt.as_bytes()],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(ok_uses, 3, "a refused preparation leaves no use row");
+    // The audit is append-only.
+    for sql in [
+        "UPDATE secret_audit SET result='ok'",
+        "DELETE FROM secret_audit",
+    ] {
+        assert!(
+            f.store
+                .writer()
+                .write(move |tx| Ok(tx.execute(sql, [])?))
+                .is_err()
+        );
+    }
 
     let audit_versions: Vec<(String, i64)> = f
         .store
@@ -365,7 +433,7 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
             let mut stmt = conn.prepare(
                 "SELECT s.name, a.version FROM secret_audit a
                  JOIN secrets s ON s.id=a.secret_id
-                 WHERE a.action='use' AND a.attempt_id=?1 ORDER BY s.name",
+                 WHERE a.action='use' AND a.result='ok' AND a.attempt_id=?1 ORDER BY s.name",
             )?;
             Ok(stmt
                 .query_map([first.attempt.as_bytes()], |row| {
@@ -388,7 +456,7 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
             let mut stmt = conn.prepare(
                 "SELECT s.name, a.version FROM secret_audit a
                  JOIN secrets s ON s.id=a.secret_id
-                 WHERE a.action='use' AND a.attempt_id=?1 ORDER BY s.name",
+                 WHERE a.action='use' AND a.result='ok' AND a.attempt_id=?1 ORDER BY s.name",
             )?;
             Ok(stmt
                 .query_map([second.attempt.as_bytes()], |row| {
@@ -440,7 +508,8 @@ fn use_audit(f: &Fixture, attempt: sentinel_core::AttemptId) -> Vec<(String, Str
     f.store
         .read(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT s.name, a.result FROM secret_audit a JOIN secrets s ON s.id=a.secret_id
+                "SELECT COALESCE(s.name,a.name), a.result FROM secret_audit a
+                 LEFT JOIN secrets s ON s.id=a.secret_id
                  WHERE a.action='use' AND a.attempt_id=?1 ORDER BY a.seq",
             )?;
             Ok(stmt
@@ -450,17 +519,23 @@ fn use_audit(f: &Fixture, attempt: sentinel_core::AttemptId) -> Vec<(String, Str
         .unwrap()
 }
 
+/// The controller's refusal path: the delivery fails (and audits the
+/// refused use), then the refusal is explained for the failure detail.
 fn refuse(f: &Fixture, offer: &dispatch::Offer) -> Option<secrets::Refusal> {
     let (worker, attempt) = (f.worker, offer.attempt);
-    f.store
+    let delivered = secrets::deliver(&f.store, f.key.clone(), worker, attempt, UnixMillis(2_135));
+    let refusal = f
+        .store
         .writer()
-        .write(move |tx| secrets::refuse_delivery(tx, worker, attempt, UnixMillis(2_140)))
-        .unwrap()
+        .write(move |tx| secrets::refuse_delivery(tx, worker, attempt))
+        .unwrap();
+    assert_eq!(delivered.is_err(), refusal.is_some());
+    refusal
 }
 
 /// P10D-7: a declared secret that cannot be delivered is explained by
-/// name and reason — never by value — and the denied use is on the
-/// secret's audit trail.
+/// name and reason — never by value — and the refused use is audited
+/// exactly once (by the delivery, P10S-6), not again by the explanation.
 #[test]
 fn a_refused_delivery_is_explained_and_audited() {
     // Revoked current version.
@@ -481,11 +556,10 @@ fn a_refused_delivery_is_explained_and_audited() {
     assert_eq!(refusal.fence, Fence(offer.fence.0));
     assert_eq!(
         use_audit(&f, offer.attempt),
-        [("TOKEN".to_owned(), "denied".to_owned())]
+        [("TOKEN".to_owned(), "missing".to_owned())]
     );
 
-    // Unbound: the binding is gone; the secret of that name records the
-    // attempt's use as missing.
+    // Unbound: the binding is gone; the refused use is recorded by name.
     let f = fixture();
     let admin = Principal::new(f.root, Permissions::ALL, None, None);
     create_run(&f, UnixMillis(2_000));
@@ -503,11 +577,13 @@ fn a_refused_delivery_is_explained_and_audited() {
         [("CERT".to_owned(), "missing".to_owned())]
     );
 
-    // Everything resolvable: nothing to explain, nothing audited.
+    // Everything resolvable: nothing to explain, and only delivered uses.
     let f = fixture();
     create_run(&f, UnixMillis(2_000));
     let offer = next_offer(&f, UnixMillis(2_100));
     acknowledge(&f, &offer, UnixMillis(2_120));
     assert!(refuse(&f, &offer).is_none());
-    assert!(use_audit(&f, offer.attempt).is_empty());
+    let audit = use_audit(&f, offer.attempt);
+    assert!(!audit.is_empty());
+    assert!(audit.iter().all(|(_, result)| result == "ok"), "{audit:?}");
 }

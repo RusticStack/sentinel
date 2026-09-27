@@ -41,7 +41,7 @@ pub const FACTOR_LOCKOUT_MS: i64 = 15 * 60 * 1000;
 
 /// Context binding a sealed seed to the account it belongs to, so a seed row
 /// copied onto another account cannot be opened.
-fn context(user: UserId) -> Vec<u8> {
+pub(crate) fn context(user: UserId) -> Vec<u8> {
     let mut context = Vec::with_capacity(21);
     context.extend_from_slice(b"totp:");
     context.extend_from_slice(user.as_bytes());

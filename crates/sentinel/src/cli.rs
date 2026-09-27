@@ -585,24 +585,30 @@ pub struct KeyArgs {
 
 #[derive(Subcommand)]
 pub enum KeyCommand {
-    /// Write a fresh 32-byte key, owner-only; refuses to overwrite one
+    /// Write a fresh key to <data-dir>/master.key, owner-only; refuses to overwrite one
     Create {
         #[command(flatten)]
         data: DataDir,
-        /// Where to write it; defaults to master.key inside the data directory
-        #[arg(long, value_name = "FILE")]
-        key_file: Option<PathBuf>,
     },
-    /// Rotate offline, retaining old keys and writing an exclusive backup
+    /// Rotate <data-dir>/master.key offline, retaining old keys and writing an exclusive backup
     Rotate {
         #[command(flatten)]
         data: DataDir,
-        /// Key file; defaults to master.key inside the data directory
-        #[arg(long, value_name = "FILE")]
-        key_file: Option<PathBuf>,
         /// New owner-only backup file for the pre-rotation key
         #[arg(long, value_name = "FILE")]
         backup: PathBuf,
+    },
+    /// Re-encrypt every sealed value under the active key, offline and resumable;
+    /// --retire then drops every other key
+    Reseal {
+        #[command(flatten)]
+        data: DataDir,
+        /// After resealing, remove every retired key from master.key
+        #[arg(long, requires = "backup")]
+        retire: bool,
+        /// New owner-only backup file for the key file before retiring
+        #[arg(long, value_name = "FILE")]
+        backup: Option<PathBuf>,
     },
 }
 

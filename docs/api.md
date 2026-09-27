@@ -95,6 +95,14 @@ Secret mutations are raw-byte writes; only metadata is returned. Authorization r
 | `PUT /tenants/{slug}/secrets/{name}?repo` | secret writer | `secrets:write` | raw body 1–65,536 bytes; required `If-Match` current version (`0` creates) and `Idempotency-Key`; atomic sealed write → metadata |
 | `DELETE /tenants/{slug}/secrets/{name}?repo` | secret writer | `secrets:write` | required `If-Match` and `Idempotency-Key`; revokes all versions and reserves the name |
 | `POST /tenants/{slug}/secrets/import?repo` | secret writer | `secrets:write` | strict env-file bytes ≤ 1 MiB; `If-Match` lists every `NAME=version`; one transaction creates/rotates every entry or none; requires `Idempotency-Key` |
+| `GET /tenants/{slug}/secrets/{name}/allow?after&limit` | member or tenant administrator | `secrets:metadata` | the repositories (ID and name) a tenant secret is allowed in, keyset by repository ID |
+| `PUT\|DELETE /tenants/{slug}/secrets/{name}/allow?repo` | tenant administrator | `secrets:write` | allow the tenant secret in that repository, or stop (removing its bindings there); idempotent |
+| `POST /tenants/{slug}/secrets/{name}/versions/{version}/revoke?repo` | secret writer | `secrets:write` | revoke one version permanently → the secret's metadata; idempotent; a version above the current one is `not_found` |
+| `GET /tenants/{slug}/secret-bindings?repo&after&limit` | member or secret writer | `secrets:metadata` | the repository's bindings (`job`, `step`, `name`, source `secret` ID, `override_tenant`); `after` is the previous page's `next`, `JOB/STEP/NAME` |
+| `PUT /tenants/{slug}/secret-bindings/{name}?repo&job&step` | secret writer | `secrets:write` | optional body `{"from_tenant": bool, "override_tenant": bool}`; binds the repository's secret (or the allowed tenant secret) at that selector, replacing what was there; idempotent |
+| `DELETE /tenants/{slug}/secret-bindings/{name}?repo&job&step` | secret writer | `secrets:write` | removes that binding; an absent one is not an error |
+
+Every secret route checks the path, query, headers and body shape first, then resolves the tenant slug through the caller's membership and the repository name inside the same transaction that authorizes the operation, so a foreign tenant or repository answers exactly like a missing one. `repo` is percent-decoded (`repo=RusticStack%2Fapp`). A reused `Idempotency-Key` with a different request is `idempotency_mismatch` (422), distinct from a stale `If-Match` (`conflict`, 409). The retry record stores a keyed MAC of the request under a subkey of the master key, never a digest that could be recomputed from the database.
 
 ## The CLI
 
