@@ -483,12 +483,37 @@ fn save_login(
     };
     let _lock = config.lock(name)?;
     if let Some(old) = &previous {
-        if let Ok(Some(stored)) = config.read_credentials(name, old)
+        // A legacy shared OS-store entry may hold another configuration
+        // directory's sign-in by now; only this profile's own is revoked
+        // and deleted (P09C-8).
+        let (stored, ours) = if old.is_legacy() {
+            match config.legacy_owner(&quick_agent(), name, old) {
+                profile::Owner::Ours(stored) => (Some(stored), true),
+                profile::Owner::Absent => (None, false),
+                profile::Owner::Theirs => {
+                    eprintln!(
+                        "notice: the previous sign-in's shared credential entry now belongs to another configuration directory; it is left alone"
+                    );
+                    (None, false)
+                }
+                profile::Owner::Unknown => {
+                    eprintln!(
+                        "notice: could not tell whose sign-in the previous shared credential entry holds; it is left in place and expires on its own"
+                    );
+                    (None, false)
+                }
+            }
+        } else {
+            (config.read_credentials(name, old).ok().flatten(), true)
+        };
+        if let Some(stored) = stored
             && old.grant != response.sentinel_grant
         {
             let _ = revoke(&quick_agent(), &old.issuer, &stored.refresh);
         }
-        let _ = config.delete_credentials(name, old);
+        if ours {
+            let _ = config.delete_credentials(name, old);
+        }
     }
     let (store, key) =
         config.store_credentials(name, server, keystore::preferred()?, &credentials)?;
@@ -736,16 +761,41 @@ fn run_logout(args: &LogoutArgs) -> Result<(), Error> {
     };
     let agent = profile::agent();
     let mut unrevoked = Vec::new();
+    let mut undecided: Vec<String> = Vec::new();
     for name in &names {
         let _lock = config.lock(name)?;
         let Some(entry) = config.load()?.profiles.remove(name) else {
             continue;
         };
-        let stored = match config.read_credentials(name, &entry) {
-            Ok(stored) => stored,
-            Err(e) => {
-                eprintln!("warning: {}", e.message);
-                None
+        // A legacy shared OS-store entry is revoked and deleted only when it
+        // still holds this profile's own grant (P09C-8).
+        let stored = if entry.is_legacy() {
+            match config.legacy_owner(&agent, name, &entry) {
+                profile::Owner::Ours(stored) => Some(stored),
+                profile::Owner::Absent => None,
+                profile::Owner::Theirs => {
+                    eprintln!(
+                        "Signed out of {} (profile {name}); the shared credential entry holds another configuration directory's sign-in and is left alone",
+                        entry.server
+                    );
+                    continue;
+                }
+                profile::Owner::Unknown => {
+                    eprintln!(
+                        "warning: could not tell whose sign-in the shared credential entry of profile {name} holds ({} is unreachable); nothing was deleted",
+                        entry.server
+                    );
+                    undecided.push(name.clone());
+                    continue;
+                }
+            }
+        } else {
+            match config.read_credentials(name, &entry) {
+                Ok(stored) => stored,
+                Err(e) => {
+                    eprintln!("warning: {}", e.message);
+                    None
+                }
             }
         };
         if let Some(stored) = stored
@@ -770,6 +820,15 @@ fn run_logout(args: &LogoutArgs) -> Result<(), Error> {
             }
             Ok(())
         })?;
+    }
+    if !undecided.is_empty() {
+        return Err(Error::new(
+            Exit::Busy,
+            format!(
+                "not signed out of {}: run sentinel auth logout again when the controller is reachable",
+                undecided.join(", ")
+            ),
+        ));
     }
     if unrevoked.is_empty() {
         Ok(())

@@ -1307,6 +1307,20 @@ fn the_cli_refuses_a_callback_with_the_wrong_state_or_issuer() {
         let landed = request("GET", &callback, Body::None, &[]);
         assert_eq!(landed.status, 400, "{what}");
         assert!(landed.text().contains("did not complete"), "{what}");
+        if wrong_state {
+            // P09C-4: a callback for another login is ignored, not fatal;
+            // the login still waits for its own, which here names the
+            // wrong issuer and so ends it.
+            let own = format!(
+                "{redirect}?{}",
+                encode(&[
+                    ("code", &fake_code),
+                    ("state", param(&pairs, "state")),
+                    ("iss", "http://127.0.0.1:1"),
+                ])
+            );
+            assert_eq!(request("GET", &own, Body::None, &[]).status, 400);
+        }
         let out = login.finish();
         assert_eq!(out.code, 3, "{what}: {out:?}");
         assert!(!out.stderr.contains(&fake_code), "the code is never echoed");

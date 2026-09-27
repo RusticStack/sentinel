@@ -1975,9 +1975,18 @@ fn run_wait(state: &State, request: &Request, run: &str, query: &str) -> Route {
         checked = std::time::Instant::now();
     }
     drop(parked);
-    let view = state
+    // The answer's version and `finished` are taken again from the same
+    // snapshot as the view, so a rerun committing after the loop's last
+    // check can never pair `finished: true` with a live run (P09C-7).
+    let (current, view) = state
         .store
-        .read(|c| status::run(c, tenant, run))
+        .read(|c| {
+            let snapshot = c.unchecked_transaction()?;
+            Ok((
+                status::run_version(&snapshot, tenant, run)?,
+                status::run(&snapshot, tenant, run)?,
+            ))
+        })
         .map_err(store_error)?;
     ok(json!({
         "version": format!("{:016x}", current.version),

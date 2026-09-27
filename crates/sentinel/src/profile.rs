@@ -20,7 +20,7 @@ use std::{
     fmt,
     fs::{File, TryLockError},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -108,6 +108,49 @@ impl Profile {
             None => keystore::key(&self.issuer, name),
         }
     }
+
+    /// Signed in before OS-store keys named their configuration directory:
+    /// the credential sits under the per-user [`keystore::key`], which
+    /// every configuration directory with this profile name and issuer
+    /// shares (P09C-8).
+    pub fn is_legacy(&self) -> bool {
+        self.store == Backend::Os && self.key.is_none()
+    }
+
+    /// Refuse an entry no sign-in could have written: `profiles.json`
+    /// decides where refresh tokens are sent (`issuer`) and which OS-store
+    /// entry is read and deleted (`key`), so a changed file must not steer
+    /// either. Sign-in records `issuer` equal to the normalized `server`,
+    /// and `key` as [`keystore::scoped_key`] of this profile.
+    pub fn check(&self, name: &str) -> Result<(), Error> {
+        let tampered = |what: &str| {
+            Error::usage(format!(
+                "profile {name} in profiles.json has {what}, which no sign-in writes; nothing was \
+                 sent. Sign in again: sentinel auth login --server {} --profile {name}",
+                self.server
+            ))
+        };
+        if client::normalize_server(&self.server).ok().as_deref() != Some(self.server.as_str())
+            || self.issuer != self.server
+        {
+            return Err(tampered("an issuer that is not its server"));
+        }
+        if let Some(key) = &self.key {
+            let scoped = key
+                .strip_prefix(&keystore::key(&self.issuer, name))
+                .and_then(|rest| rest.strip_prefix(':'))
+                .is_some_and(|digest| {
+                    digest.len() == 16
+                        && digest
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                });
+            if !scoped {
+                return Err(tampered("a credential-store key of another profile"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `profiles.json`.
@@ -140,6 +183,10 @@ pub struct Credentials {
     pub access: String,
     pub access_expires_ms: u64,
     pub refresh_expires_ms: u64,
+    /// `grt_…` of the grant these tokens belong to, as the token endpoint
+    /// named it. Absent in credentials stored by older builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
 }
 
 impl fmt::Debug for Credentials {
@@ -149,6 +196,7 @@ impl fmt::Debug for Credentials {
             .field("access", &"redacted")
             .field("access_expires_ms", &self.access_expires_ms)
             .field("refresh_expires_ms", &self.refresh_expires_ms)
+            .field("grant", &self.grant)
             .finish()
     }
 }
@@ -169,6 +217,7 @@ impl Credentials {
             access_expires_ms: sent_ms.saturating_add(response.expires_in.saturating_mul(1000)),
             refresh_expires_ms: sent_ms
                 .saturating_add(response.sentinel_refresh_expires_in.saturating_mul(1000)),
+            grant: Some(response.sentinel_grant.clone()),
         })
     }
 
@@ -345,12 +394,75 @@ impl Config {
                 "there is no profile {name}; run: sentinel auth login --server URL --profile {name}"
             )));
         };
+        profile.check(&name)?;
         Ok(Some(Handle(Box::new(Inner {
             config: self.clone(),
             name,
             profile,
             cached: Mutex::new(None),
+            migrated: OnceLock::new(),
         }))))
+    }
+
+    /// Whose sign-in the legacy shared OS-store entry of `name` holds
+    /// ([`Profile::is_legacy`]), before signing out of it or replacing it:
+    /// only this profile's own grant may be revoked or deleted, since
+    /// another configuration directory may have signed in under the same
+    /// entry since (P09C-8). A credential stored by this build names its
+    /// grant; an older one is asked about with `/api/v1/me` while its access
+    /// token lasts, else by spending its refresh token, whose answer names
+    /// the grant (another directory's successor is then put back for it).
+    /// The caller holds the profile lock ([`Config::lock`]).
+    pub fn legacy_owner(&self, agent: &ureq::Agent, name: &str, profile: &Profile) -> Owner {
+        let stored = match self.read_credentials(name, profile) {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return Owner::Absent,
+            Err(_) => return Owner::Unknown,
+        };
+        let ours = |grant: &str| grant == profile.grant;
+        if let Some(grant) = &stored.grant {
+            return if ours(grant) {
+                Owner::Ours(stored)
+            } else {
+                Owner::Theirs
+            };
+        }
+        let now = now_ms();
+        if stored.access_expires_ms > now + REFRESH_MARGIN_MS {
+            let url = format!("{}/api/v1/me", profile.server);
+            if let Ok((200, body)) = get(agent, &url, Some(&stored.access)) {
+                let me: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                return match me["grant"].as_str() {
+                    Some(grant) if ours(grant) => Owner::Ours(stored),
+                    Some(_) => Owner::Theirs,
+                    None => Owner::Unknown,
+                };
+            }
+        }
+        if stored.refresh_expires_ms <= now {
+            // Expired whoever holds it: nothing left to revoke.
+            return Owner::Ours(stored);
+        }
+        let form = form(&[
+            ("grant_type", GRANT_REFRESH_TOKEN),
+            ("refresh_token", &stored.refresh),
+            ("client_id", &profile.client_id),
+        ]);
+        let answer = token_call(agent, &format!("{}{TOKEN_PATH}", profile.issuer), &form);
+        let Ok(Ok(response)) = answer else {
+            return Owner::Unknown;
+        };
+        let Ok(fresh) = Credentials::from_response(&response, now) else {
+            return Owner::Unknown;
+        };
+        if ours(&response.sentinel_grant) {
+            Owner::Ours(fresh)
+        } else {
+            // Another directory's chain: its successor goes back where that
+            // directory will look for it.
+            let _ = self.write_credentials(name, profile, &fresh);
+            Owner::Theirs
+        }
     }
 
     /// The stored credential of `name`, from the backend its profile records.
@@ -360,6 +472,7 @@ impl Config {
         profile: &Profile,
     ) -> Result<Option<Credentials>, Error> {
         validate_name(name)?;
+        profile.check(name)?;
         keystore::read(profile.store, &self.dir, &profile.os_key(name), name)?
             .map(|blob| Credentials::parse(&blob))
             .transpose()
@@ -373,6 +486,7 @@ impl Config {
         credentials: &Credentials,
     ) -> Result<(), Error> {
         validate_name(name)?;
+        profile.check(name)?;
         let blob = serde_json::to_vec(credentials).expect("credentials serialize");
         keystore::write(profile.store, &self.dir, &profile.os_key(name), name, &blob)
     }
@@ -409,8 +523,23 @@ impl Config {
     /// Remove the stored credential of `name` (absent is fine).
     pub fn delete_credentials(&self, name: &str, profile: &Profile) -> Result<(), Error> {
         validate_name(name)?;
+        profile.check(name)?;
         keystore::delete(profile.store, &self.dir, &profile.os_key(name), name)
     }
+}
+
+/// Whose sign-in a legacy shared OS-store entry holds
+/// ([`Config::legacy_owner`]).
+#[derive(Debug)]
+pub enum Owner {
+    /// Nothing is stored.
+    Absent,
+    /// This profile's grant, with its current tokens (to revoke).
+    Ours(Credentials),
+    /// Another configuration directory's sign-in: leave it alone.
+    Theirs,
+    /// Could not tell (the controller is unreachable): leave it alone.
+    Unknown,
 }
 
 /// Resolve `name`, or the `current` profile when `None`. `Ok(None)` means
@@ -431,6 +560,9 @@ struct Inner {
     /// The access token last read or minted and its expiry, so a command
     /// making many requests reads the store once.
     cached: Mutex<Option<(String, u64)>>,
+    /// The directory-scoped key a legacy profile's credential moved to in
+    /// this process or another ([`Handle::migrate`]).
+    migrated: OnceLock<String>,
 }
 
 impl fmt::Debug for Handle {
@@ -480,11 +612,93 @@ impl Handle {
         access
     }
 
+    /// Where the credential is: the profile as recorded, or, once a legacy
+    /// profile has moved, the same profile under its scoped key.
+    fn location(&self) -> std::borrow::Cow<'_, Profile> {
+        match self.0.migrated.get() {
+            Some(key) => std::borrow::Cow::Owned(Profile {
+                key: Some(key.clone()),
+                ..self.0.profile.clone()
+            }),
+            None => std::borrow::Cow::Borrowed(&self.0.profile),
+        }
+    }
+
+    /// A legacy profile that has not moved yet.
+    fn legacy(&self) -> bool {
+        self.0.profile.is_legacy() && self.0.migrated.get().is_none()
+    }
+
     fn stored(&self) -> Result<Credentials, Error> {
-        self.0
-            .config
-            .read_credentials(&self.0.name, &self.0.profile)?
-            .ok_or_else(|| self.not_signed_in("no stored credential"))
+        let config = &self.0.config;
+        let mut stored = config.read_credentials(&self.0.name, &self.location())?;
+        if stored.is_none() && self.legacy() {
+            // Another process of this directory may have moved it.
+            let moved = config
+                .load()?
+                .profiles
+                .remove(&self.0.name)
+                .filter(|p| p.grant == self.0.profile.grant && p.store == Backend::Os)
+                .and_then(|p| p.check(&self.0.name).ok().and(p.key));
+            if let Some(key) = moved {
+                let _ = self.0.migrated.set(key);
+                stored = config.read_credentials(&self.0.name, &self.location())?;
+            }
+        }
+        let stored = stored.ok_or_else(|| self.not_signed_in("no stored credential"))?;
+        // A legacy entry is shared by every configuration directory with
+        // this profile name and server; one naming another grant holds
+        // another directory's sign-in, which this profile must not use.
+        if self.legacy()
+            && stored
+                .grant
+                .as_ref()
+                .is_some_and(|g| *g != self.0.profile.grant)
+        {
+            return Err(self.not_signed_in(
+                "the shared credential entry now holds another configuration directory's sign-in",
+            ));
+        }
+        Ok(stored)
+    }
+
+    /// Move a legacy profile's refreshed credential to its directory-scoped
+    /// key (P09C-8), under the profile lock. The successor is first written
+    /// back to the shared entry, so a failure below loses nothing. If the
+    /// refresh named another grant, the entry held another directory's
+    /// sign-in: it keeps its successor there, and this profile is signed
+    /// out. Otherwise the credential moves to the scoped key, the profile
+    /// records it, and the shared entry is deleted: a second directory that
+    /// shared this very grant is then signed out rather than left to replay
+    /// a spent refresh token.
+    fn migrate(&self, fresh: &Credentials) -> Result<(), Error> {
+        let (config, name, profile) = (&self.0.config, &self.0.name, &self.0.profile);
+        config.write_credentials(name, profile, fresh)?;
+        if fresh.grant.as_deref() != Some(profile.grant.as_str()) {
+            return Err(self.not_signed_in(
+                "the shared credential entry held another configuration directory's sign-in",
+            ));
+        }
+        let key = keystore::scoped_key(config.dir(), &profile.issuer, name);
+        let moved = Profile {
+            key: Some(key.clone()),
+            ..profile.clone()
+        };
+        config.write_credentials(name, &moved, fresh)?;
+        config.update(|profiles| {
+            if let Some(entry) = profiles.profiles.get_mut(name)
+                && entry.is_legacy()
+                && entry.grant == profile.grant
+            {
+                entry.key = Some(key.clone());
+            }
+            Ok(())
+        })?;
+        let _ = self.0.migrated.set(key);
+        // Best effort: an entry left behind holds a token this directory no
+        // longer presents.
+        let _ = config.delete_credentials(name, profile);
+        Ok(())
     }
 
     /// A usable access token, refreshed under the profile lock when fewer
@@ -558,9 +772,13 @@ impl Handle {
             Err(oauth) => return Err(oauth_failure(&oauth)),
         };
         let fresh = Credentials::from_response(&response, now)?;
-        self.0
-            .config
-            .write_credentials(&self.0.name, &self.0.profile, &fresh)?;
+        if self.legacy() {
+            self.migrate(&fresh)?;
+        } else {
+            self.0
+                .config
+                .write_credentials(&self.0.name, &self.location(), &fresh)?;
+        }
         Ok(self.remember(&fresh))
     }
 }

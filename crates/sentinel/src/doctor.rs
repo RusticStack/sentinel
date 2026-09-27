@@ -305,12 +305,10 @@ fn config_dir(report: &mut Report) -> Option<Config> {
             return None;
         }
     }
-    let access = if cfg!(unix) {
-        "owner-only, outside any Git work tree"
-    } else {
-        "outside any Git work tree; the per-user ACL of its parent applies"
-    };
-    report.pass(NAME, format!("{} ({access})", dir.display()));
+    report.pass(
+        NAME,
+        format!("{} (owner-only, outside any Git work tree)", dir.display()),
+    );
     Some(config)
 }
 

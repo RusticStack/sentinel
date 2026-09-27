@@ -7,11 +7,17 @@ use serde_json::{Map, Value, json};
 use super::{List, MAX_ITEMS, PAGE, busy_backoff, segment, text};
 use crate::client::{self, Client, Error, Output};
 
+/// The most frame text one `--output json` document collects. The JSON
+/// listing is held whole before it is printed, so it is bounded in bytes as
+/// well as frames: 10,000 full 32 KiB frames would be about 320 MiB.
+const MAX_JSON_TEXT: usize = 16 << 20;
+
 /// Print an attempt's frames page by page. Text writes each frame's bytes
 /// to the stream it came from (stdout or stderr), as the job wrote them;
 /// NDJSON prints one `{seq, step, stream, text}` line per frame; JSON one
-/// `{attempt, frames, complete, gaps}` document of at most 10,000 frames
-/// (`next_after` continues a cut one). Pages follow the server's
+/// `{attempt, frames, complete, gaps}` document of at most 10,000 frames and
+/// [`MAX_JSON_TEXT`] of frame text (`next_after` continues a cut one; the
+/// first frame is always included). Pages follow the server's
 /// `next_after`: a page is bounded in bytes as well as frames (1 MiB of
 /// payload), so a log of full 32 KiB frames never produces a response the
 /// client cannot read. Without `--follow` the command ends at the end of
@@ -27,6 +33,8 @@ pub(super) fn show(
     let mut after = 0u64;
     let mut list = List::new(output);
     let mut shown = 0usize;
+    let mut held = 0usize;
+    let mut capped = false;
     let (complete, gaps) = loop {
         let mut path = format!("/api/v1/attempts/{attempt}/logs?after={after}&limit={PAGE}");
         if let Some(step) = step {
@@ -47,8 +55,13 @@ pub(super) fn show(
         };
         let frames = page["frames"].as_array().map_or(&[][..], Vec::as_slice);
         for frame in frames {
-            if output == Output::Json && shown >= MAX_ITEMS {
-                break;
+            if output == Output::Json {
+                let size = text(frame, "text").len();
+                if shown >= MAX_ITEMS || (shown > 0 && held + size > MAX_JSON_TEXT) {
+                    capped = true;
+                    break;
+                }
+                held += size;
             }
             shown += 1;
             match output {
@@ -68,7 +81,7 @@ pub(super) fn show(
             client::stdout_flush();
         }
         let complete = page["complete"] == true;
-        let capped = output == Output::Json && shown >= MAX_ITEMS;
+        capped |= output == Output::Json && shown >= MAX_ITEMS;
         // A page the server cut (bytes, frames or a step filter's scan
         // bound) says where the next one starts; follow it at once.
         let more = page["next_after"].as_u64();
