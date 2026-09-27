@@ -1627,6 +1627,13 @@ fn give_back(
         return Err(Error::Conflict);
     }
     let mut next = jobs::transition(tx, tenant, job, Actor::Controller, Event::OfferLapsed, now)?;
+    // The durable requeue marker (P11D-2 residual): the job is no longer
+    // leased, so its lease stamp goes with the offer, as a rerun clears it.
+    // Only the next lease stamps it again (under a new fence), so a cancel
+    // or queue timeout before then is never the lapsed attempt's verdict,
+    // and the job's `leased_ms` no longer shows a lease that lapsed.
+    tx.prepare_cached("UPDATE jobs SET leased_ms = NULL WHERE id = ?1 AND tenant_id = ?2")?
+        .execute(params![job.as_bytes(), tenant.as_bytes()])?;
     tx.prepare_cached("UPDATE attempts SET released_ms = ?2 WHERE id = ?1")?
         .execute(params![attempt.as_bytes(), now.0])?;
     if current.cancel_requested {

@@ -82,7 +82,9 @@ the state-machine taxonomy changes.
 
 `GET /api/v1/attempts/{id}/failure` returns the authorized attempt's
 authoritative job state (only while that attempt still owns the job: a
-rerun or a lapsed offer ends ownership at once, not at the next lease),
+rerun or a lapsed offer ends ownership at once, not at the next lease, and
+clears the job's lease stamp, so a later cancel or queue timeout of the
+requeued job is never the old attempt's verdict),
 selected failed step, measured timing/cache clues, bounded recent context,
 any Go test JSON or rustc/cargo compiler JSON that parses from the selected
 log windows, and, with `artifacts:read`, the attempt's report files.

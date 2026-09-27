@@ -1369,3 +1369,104 @@ jobs:
     assert_eq!(state(&f, deploy), JobState::Terminal(Outcome::Skipped));
     assert_eq!(place(&f, w, f.pool, at(3_000)), None);
 }
+
+/// P11D-2 residual: an offer lapses and the requeued job is then canceled
+/// or times out in the queue before any new lease. The lapsed attempt never
+/// ran, so the job's verdict is not its verdict: it stops being current at
+/// the lapse and stays so, and the job no longer shows the lapsed lease.
+#[test]
+fn a_lapsed_attempt_never_inherits_the_queued_jobs_later_verdict() {
+    let f = fixture();
+    let tenant = f.tenant;
+    let w = worker(
+        &f,
+        f.pool,
+        Capacity {
+            cpu_millis: 8_000,
+            memory_bytes: 16 << 30,
+            disk_bytes: 0,
+        },
+    );
+    let (_, ids) = run(&f, TWO_JOBS, at(2_000));
+    let status = |attempt| {
+        f.store
+            .read(|c| sentinel_store::status::attempt_job_status(c, tenant, attempt))
+            .unwrap()
+    };
+    let leased_ms = |job: JobId| -> Option<i64> {
+        f.store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT leased_ms FROM jobs WHERE id = ?1",
+                    [job.as_bytes()],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap()
+    };
+
+    // Lapse, then cancel while queued.
+    let offer = place(&f, w, f.pool, at(2_100)).unwrap();
+    assert!(status(offer.attempt).current);
+    let (attempt, job) = (offer.attempt, offer.job);
+    f.store
+        .writer()
+        .write(move |tx| dispatch::lapse(tx, attempt, at(7_200)))
+        .unwrap();
+    assert_eq!(leased_ms(job), None);
+    assert!(!status(attempt).current);
+    f.store
+        .writer()
+        .write(move |tx| dispatch::cancel(tx, tenant, job, at(7_300)))
+        .unwrap();
+    assert_eq!(state(&f, job), JobState::Terminal(Outcome::Canceled));
+    let lapsed = status(attempt);
+    assert!(!lapsed.current);
+    assert_eq!((lapsed.state, lapsed.failure_class), (None, None));
+
+    // Lapse, then the queue timeout (the run's other job).
+    let offer = place(&f, w, f.pool, at(7_400)).unwrap();
+    let (attempt, job) = (offer.attempt, offer.job);
+    assert!(ids.contains(&job));
+    f.store
+        .writer()
+        .write(move |tx| dispatch::lapse(tx, attempt, at(7_500)))
+        .unwrap();
+    let swept = f
+        .store
+        .writer()
+        .write(|tx| dispatch::sweep_queue_timeouts(tx, at(2_000 + dispatch::QUEUE_TIMEOUT_MS)))
+        .unwrap();
+    assert_eq!(swept, 1);
+    assert_eq!(state(&f, job), JobState::Terminal(Outcome::TimedOut));
+    let lapsed = status(attempt);
+    assert!(!lapsed.current);
+    assert_eq!((lapsed.state, lapsed.failure_class), (None, None));
+
+    // Cancel requested while the offer is out: the lapse ends the job
+    // canceled in the same transaction, and that is not the attempt's
+    // verdict either.
+    let (_, ids) = run(&f, TWO_JOBS, at(8_000));
+    let offer = place(&f, w, f.pool, at(8_100)).unwrap();
+    let (attempt, job) = (offer.attempt, offer.job);
+    assert!(ids.contains(&job));
+    f.store
+        .writer()
+        .write(move |tx| dispatch::cancel(tx, tenant, job, at(8_200)))
+        .unwrap();
+    f.store
+        .writer()
+        .write(move |tx| dispatch::lapse(tx, attempt, at(8_300)))
+        .unwrap();
+    assert_eq!(state(&f, job), JobState::Terminal(Outcome::Canceled));
+    assert!(!status(attempt).current);
+
+    // A live lease is still its attempt's: the marker only follows a lapse.
+    let other = ids.iter().copied().find(|id| *id != job).unwrap();
+    let offer = place(&f, w, f.pool, at(8_400)).unwrap();
+    assert_eq!(offer.job, other);
+    assert!(leased_ms(other).is_some());
+    let live = status(offer.attempt);
+    assert!(live.current);
+    assert_eq!(live.state, Some(JobState::Leased));
+}

@@ -64,7 +64,9 @@ pub struct AttemptJobStatus {
 /// longer belongs to its last attempt: a rerun (or a push re-trigger)
 /// clears `leased_ms`, which only the next lease sets again — so a later
 /// cancel or queue timeout of the requeued job is not the old attempt's
-/// verdict either — and a lapsed or declined offer leaves the job `Queued`.
+/// verdict either. A lapsed or declined offer (`dispatch::give_back`) clears
+/// it too, so a job canceled or timed out in the queue after a lapse is not
+/// the lapsed attempt's verdict.
 pub fn attempt_job_status(
     conn: &Connection,
     tenant: TenantId,
