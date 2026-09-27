@@ -133,11 +133,18 @@ fn attached_for(scope: &Scope) -> Attached {
     }
 }
 
+/// A policy whose deadline no test run reaches. The restore-cost bound is
+/// wall-clock: it projects the remaining time from the rate measured so far
+/// (resume hashing and staging fsyncs included), so under a loaded machine a
+/// real 5 s budget aborted resumes these tests expect to finish (P08-C7's
+/// `Miss(Unavailable)` flake). Behavior tests do not depend on the clock;
+/// the budget itself is proven deterministically by
+/// `a_transfer_past_its_deadline_keeps_its_partial_for_the_next_attempt`.
 fn policy<'a>(source: &'a dyn Remote) -> remote::Policy<'a> {
     remote::Policy {
         source,
         attempt: *AttemptId::new().as_bytes(),
-        deadline: remote::Policy::deadline_for(Duration::from_secs(120)),
+        deadline: Instant::now() + Duration::from_secs(24 * 3600),
     }
 }
 
@@ -169,6 +176,10 @@ struct Fake {
     at_end: bool,
     /// The digest each offer's `Upload` carried.
     offered: Mutex<Vec<[u8; 32]>>,
+    /// After the first chunk of the next fetch, hold the rest until the
+    /// fetch's deadline has passed: a link too slow for the budget, made
+    /// deterministic.
+    outlast: Mutex<bool>,
 }
 
 impl Fake {
@@ -200,8 +211,9 @@ impl Fake {
 }
 
 impl Remote for Fake {
-    fn fetch(&self, need: &Need, _deadline: Instant, sink: &mut dyn Sink) -> Result<(), Refusal> {
+    fn fetch(&self, need: &Need, deadline: Instant, sink: &mut dyn Sink) -> Result<(), Refusal> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
+        let outlast = std::mem::take(&mut *self.outlast.lock().unwrap_or_else(|p| p.into_inner()));
         if std::mem::take(&mut *self.busy.lock().unwrap_or_else(|p| p.into_inner())) {
             return Err(Refusal::Busy);
         }
@@ -252,6 +264,11 @@ impl Remote for Fake {
                 *self.interrupt.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 self.transfer(offset, served);
                 return Err(Refusal::Store);
+            }
+            if outlast && served > 0 {
+                while Instant::now() < deadline {
+                    std::thread::sleep(deadline - Instant::now());
+                }
             }
             let outcome = sink.chunk(&Chunk {
                 attempt: need.attempt,
@@ -710,6 +727,53 @@ fn a_busy_answer_keeps_a_valid_partial() {
     let busy = hydrate(&root_b, &ws, &scope, &fake);
     assert_eq!(busy.outcome, Outcome::Miss(Miss::Absent));
     assert_eq!(staged_bytes(&part), partial, "kept whole");
+    let resumed = hydrate(&root_b, &ws, &scope, &fake);
+    assert!(resumed.outcome.is_hit(), "{:?}", resumed.outcome);
+    assert_eq!(resumed.stats.remote_from, Some(partial));
+}
+
+/// The restore-cost bound: a transfer still running when the job's
+/// hydration deadline passes stops at the next chunk as a miss, keeps what
+/// it staged, and the next attempt (with budget) resumes it. The fake holds
+/// the second chunk until the deadline has passed, so this is decided by
+/// the clock only in the direction the test asserts.
+#[test]
+fn a_transfer_past_its_deadline_keeps_its_partial_for_the_next_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let (root_a, root_b) = (temp.path().join("a"), temp.path().join("b"));
+    let ws = temp.path().join("ws");
+    let scope = test_scope(Trust::Protected);
+    fs::create_dir_all(&root_b).unwrap();
+    fs::create_dir_all(&ws).unwrap();
+    let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 241) as u8).collect();
+    let generation = seal_generation(
+        &root_a,
+        &scope,
+        &[("blob", payload.as_slice())],
+        "gen-1500000-0000abd3",
+    );
+    let fake = Fake::default();
+    offer(&fake, &root_a, &scope, &generation);
+    *fake.outlast.lock().unwrap() = true;
+    let short = remote::Policy {
+        source: &fake,
+        attempt: *AttemptId::new().as_bytes(),
+        deadline: Instant::now() + Duration::from_millis(200),
+    };
+    let late = restore::restore_remote(
+        &env(&root_b, &ws),
+        &decl(&["vendor"]),
+        Some(KEY.to_owned()),
+        scope.clone(),
+        "attempt-1",
+        Some(short),
+    );
+    assert_eq!(late.outcome, Outcome::Miss(Miss::Unavailable));
+    let part = entry_of(&root_b, &scope)
+        .join(scope::WRITING_NAME)
+        .join("remote.stage");
+    let partial = staged_bytes(&part);
+    assert!(partial > 0, "the staged prefix is kept");
     let resumed = hydrate(&root_b, &ws, &scope, &fake);
     assert!(resumed.outcome.is_hit(), "{:?}", resumed.outcome);
     assert_eq!(resumed.stats.remote_from, Some(partial));
