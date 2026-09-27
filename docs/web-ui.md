@@ -93,6 +93,8 @@ The reverse proxy terminates TLS and sends everything for the public origin to `
 
 Windowing is what matters: one element per line costs 200,000 elements and seconds per load. The three windowed renderings are within noise of each other and far under a frame's 16.7 ms, so the stack was chosen on what else it gives — Nuxt UI's accessible components, server rendering and typed code — and the viewer stays plain DOM for the reason above (bounded state outside reactivity), not for speed. The first measurement found the shipped viewer at 1.73 ms per jump; drawing each row with two nodes instead of three (the screen-reader "stderr:" prefix only on stderr rows) brought it to 1.11 ms.
 
+On the verification VPS (headless Chrome 154, AMD EPYC 9645, 12 vCPU, 2026-09-27, CPU pressure under 1 % at the start; second record in the file): one element per line 3,012 ms to load; Preact 1.96, Vue 1.92 and the shipped viewer 2.43 ms of work per jump, every windowed candidate at the same 33.3 ms wall per jump — the same order and the same conclusion on slower server cores.
+
 ## Verification (U06)
 
 `crates/sentinel-api/tests/web.rs` (13 tests, loopback HTTP against a seeded controller) covers the routes behind the views: run filters and keyset pages, the caller's tenants, attempt steps, worker load and drain, sync lag, member and last-administrator rules, platform administration with step-up, repositories without credentials, the run control audit, `health`, a parked poll ending when its reader loses the tenant, a departed client's slot coming back, and parked polls leaving every handler for work.
@@ -104,7 +106,7 @@ pnpm -C web build
 cargo test -p sentinel-api --test web_browser -- --ignored --nocapture the_web_interface
 ```
 
-Its 114 checks (2026-09-27, all passing):
+Its 114 checks (2026-09-27, all passing — on Windows in Edge 154, and again on the verification VPS in headless Chrome 154 on Linux):
 
 - **Structure and keyboard:** every control has an accessible name, one main landmark and navigation, one level-one heading per view; the first tab stop is "Skip to content" and it moves focus to the content; client-side navigation moves focus to the new heading; every tab stop on the run page shows a focus ring; cancel, rerun and log controls are reachable; the log viewer scrolls by line, page and end with the keyboard and steps fold from it.
 - **Contrast:** every visible text element meets WCAG AA (4.5:1, 3:1 for large text) in both colour schemes on every view — the default light palette did not (sky and green text at about 2.7:1); light mode uses darker shades.
