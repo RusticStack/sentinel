@@ -180,7 +180,7 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
                 sentinel::outln!(
                     "  {} {} {scope}{}",
                     record.at.0,
-                    event_name(record.event),
+                    Event::name(record.event),
                     record
                         .subject
                         .map(|id| format!(" subject={id}"))
@@ -1552,67 +1552,6 @@ fn logs(data: &DataDir, attempt: &str, follow: bool) -> Result<(), Error> {
         if tail.frames.is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
-    }
-}
-
-const fn event_name(event: Event) -> &'static str {
-    match event {
-        Event::Bootstrap => "bootstrap",
-        Event::LoginAccepted => "login-accepted",
-        Event::LoginRejected => "login-rejected",
-        Event::LoginLocked => "login-locked",
-        Event::Logout => "logout",
-        Event::LogoutAll => "logout-all",
-        Event::PasswordChanged => "password-changed",
-        Event::PasswordRecovered => "password-recovered",
-        Event::SuperAdminGranted => "super-admin-granted",
-        Event::SuperAdminRevoked => "super-admin-revoked",
-        Event::AccountActivated => "account-activated",
-        Event::AccountDeactivated => "account-deactivated",
-        Event::TokenIssued => "token-issued",
-        Event::TokenRevoked => "token-revoked",
-        Event::IdentityLinked => "identity-linked",
-        Event::IdentityUnlinked => "identity-unlinked",
-        Event::RegistrationAdmitted => "registration-admitted",
-        Event::RegistrationPending => "registration-pending",
-        Event::RegistrationRefused => "registration-refused",
-        Event::AccountApproved => "account-approved",
-        Event::AccountRejected => "account-rejected",
-        Event::InvitationCreated => "invitation-created",
-        Event::InvitationRedeemed => "invitation-redeemed",
-        Event::InvitationRevoked => "invitation-revoked",
-        Event::PolicyChanged => "policy-changed",
-        Event::InstallationBound => "installation-bound",
-        Event::InstallationUnbound => "installation-unbound",
-        Event::MfaEnrolled => "mfa-enrolled",
-        Event::MfaDisabled => "mfa-disabled",
-        Event::SteppedUp => "stepped-up",
-        Event::StepUpFailed => "step-up-failed",
-        Event::RecoveryCodeUsed => "recovery-code-used",
-        Event::RecoveryCodesIssued => "recovery-codes-issued",
-        Event::SessionRevoked => "session-revoked",
-        Event::TenantSuspended => "tenant-suspended",
-        Event::TenantReactivated => "tenant-reactivated",
-        Event::MembershipSet => "membership-set",
-        Event::MembershipRemoved => "membership-removed",
-        Event::GrantChanged => "grant-changed",
-        Event::PoolCreated => "pool-created",
-        Event::PoolGranted => "pool-granted",
-        Event::PoolGrantRevoked => "pool-grant-revoked",
-        Event::NamespaceCreated => "namespace-created",
-        Event::WorkerEnrollmentIssued => "worker-enrollment-issued",
-        Event::WorkerEnrollmentRefused => "worker-enrollment-refused",
-        Event::WorkerEnrolled => "worker-enrolled",
-        Event::WorkerRevoked => "worker-revoked",
-        Event::OAuthGrantIssued => "oauth-grant-issued",
-        Event::OAuthGrantRevoked => "oauth-grant-revoked",
-        Event::OAuthRefreshReplay => "oauth-refresh-replay",
-        Event::OAuthCodeReplay => "oauth-code-replay",
-        Event::OAuthConsentDenied => "oauth-consent-denied",
-        Event::OAuthDeviceApproved => "oauth-device-approved",
-        Event::OAuthDeviceDenied => "oauth-device-denied",
-        Event::ServiceGrantIssued => "service-grant-issued",
-        Event::ServiceAccountCreated => "service-account-created",
     }
 }
 

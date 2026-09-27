@@ -491,7 +491,11 @@ fn authorization_and_mutation_share_the_writer_transaction() {
         .unwrap();
     store
         .writer()
-        .write(move |tx| auth::set_membership(tx, principal(i.root), i.a, i.alice, Role::Reader))
+        .write(move |tx| {
+            // Another administrator first: a tenant's last one keeps the role.
+            auth::set_membership(tx, principal(i.root), i.a, i.bob, Role::TenantAdmin)?;
+            auth::set_membership(tx, principal(i.root), i.a, i.alice, Role::Reader)
+        })
         .unwrap();
     assert!(matches!(
         store.writer().write(move |tx| auth::create_repo(
@@ -794,4 +798,46 @@ fn dispatch_and_spec_read_derive_ownership_and_recheck_revoked_permissions() {
             Ok(())
         })
         .unwrap();
+}
+
+/// An organization never loses its last administrator by a demotion or a
+/// removal (only the platform could recover it); with a second
+/// administrator either change goes through, and a platform administrator
+/// can always give an administrator-less tenant one.
+#[test]
+fn the_last_tenant_administrator_keeps_the_role() {
+    let (_dir, store, i) = fixture();
+    for change in [
+        Box::new(move |tx: &sentinel_store::Transaction<'_>| {
+            auth::set_membership(tx, principal(i.root), i.a, i.alice, Role::Operator)
+        })
+            as Box<dyn Fn(&sentinel_store::Transaction<'_>) -> sentinel_store::Result<()> + Send>,
+        Box::new(move |tx: &sentinel_store::Transaction<'_>| {
+            auth::remove_membership(tx, principal(i.root), i.a, i.alice, NOW)
+        }),
+    ] {
+        assert!(matches!(store.writer().write(change), Err(Error::Conflict)));
+    }
+    // Still the administrator, and the refusal changed nothing.
+    store
+        .read(|c| auth::require_tenant_admin(c, principal(i.alice), i.a))
+        .unwrap();
+    store
+        .writer()
+        .write(move |tx| {
+            auth::set_membership(tx, principal(i.root), i.a, i.bob, Role::TenantAdmin)?;
+            auth::remove_membership(tx, principal(i.root), i.a, i.alice, NOW)
+        })
+        .unwrap();
+    // The new last administrator is held the same way.
+    assert!(matches!(
+        store.writer().write(move |tx| auth::set_membership(
+            tx,
+            principal(i.root),
+            i.a,
+            i.bob,
+            Role::Reader
+        )),
+        Err(Error::Conflict)
+    ));
 }

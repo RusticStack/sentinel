@@ -671,8 +671,13 @@ fn wait_rides_out_rate_limited_answers_instead_of_failing() {
     // Other long polls hold every subscriber slot for about 2 s.
     let (_, answer) = plain_get(&format!("{}/api/v1/runs/{busy}/wait", d.base), &d.token);
     let version = answer["version"].as_str().unwrap().to_owned();
-    // Two other users hold them, each within its per-user share (P09-12).
-    let others = [other_user(&d, "other-a"), other_user(&d, "other-b")];
+    // Other users hold them, each within its per-user share (P09-12).
+    const NAMES: [&str; 8] = [
+        "holder-0", "holder-1", "holder-2", "holder-3", "holder-4", "holder-5", "holder-6",
+        "holder-7",
+    ];
+    let users = sentinel_api::SUBSCRIBERS.div_ceil(sentinel_api::SUBSCRIBERS_PER_USER);
+    let others: Vec<String> = NAMES[..users].iter().map(|n| other_user(&d, n)).collect();
     let holders: Vec<_> = (0..sentinel_api::SUBSCRIBERS)
         .map(|i| {
             let url = format!(

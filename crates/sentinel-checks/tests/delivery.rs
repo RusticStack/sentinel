@@ -705,7 +705,7 @@ fn a_run_publishes_a_stable_aggregate_and_per_job_checks() {
     );
     assert_eq!(
         aggregate.body["details_url"],
-        format!("https://ci.example/#/runs/{run}")
+        format!("https://ci.example/runs/{run}")
     );
     assert!(aggregate.body["check_run_id"].is_null());
     // Every check call authenticates with the minted installation token, and

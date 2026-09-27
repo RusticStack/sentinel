@@ -8,7 +8,8 @@ Run the commands below from the **repository root**. The shared shortcuts live i
 
 - Git and rustup. The repository pins Rust 1.97.0 and requests rustfmt/Clippy in `rust-toolchain.toml`; rustup installs missing components when a Cargo command runs.
 - A native linker/toolchain: Linux C toolchain and libc development files; Windows Visual Studio Build Tools with the C++ workload and matching Windows SDK.
-- Network access for initial toolchain and locked dependency downloads. No GitHub App, cloud account, database service, Node/Deno process, or container engine is required for the currently implemented lifecycle tests.
+- Network access for initial toolchain and locked dependency downloads. No GitHub App, cloud account, database service, Node/Deno process, or container engine is required for the Rust lifecycle tests.
+- For the web interface only: Node 22+ and pnpm, and Edge, Chrome or Chromium for its browser test ([web interface](web-ui.md)).
 
 See [Rust foundation](rust-foundation.md) for the architecture/target matrix. Use a Linux host or Linux VM for server/worker work. Windows builds the portable CLI; macOS is not supported ([supported platforms](../README.md)). Linux x86_64 WSL2 is verified for the current process/signal tests; that does not qualify its filesystem or container isolation for executor benchmarks.
 
@@ -62,6 +63,17 @@ cargo release-linux
 
 The role tests cover each feature independently and together, including unavailable-role errors in single-role builds. `test-cli` runs with default features, which currently exclude both roles. `--all-targets` in the lint aliases checks package tests/examples as well as the binary; it does not cross-compile for every operating system. Cross-target checks are documented in [Rust foundation](rust-foundation.md).
 
+For web interface changes (`web/`):
+
+```sh
+pnpm -C web install --frozen-lockfile
+pnpm -C web typecheck
+pnpm -C web build
+cargo test -p sentinel-api --test web_browser -- --ignored --nocapture the_web_interface
+```
+
+The browser test starts a seeded controller and the built interface; `serve_the_fixture` (same test binary) serves them for a person to look at (`SENTINEL_SERVE_SECS`, default 600). For live editing, run `pnpm -C web dev` with `NUXT_SENTINEL_API` pointing at a controller (or at a running `sentinel-web`, which proxies the API); sign in on the origin the controller names as `public_url`, whose session cookie the dev server shares (cookies ignore the port).
+
 Each command returns Cargo's exit status. Stop and fix failures before proceeding. There is no aggregate alias hiding intermediate failures. Extra test arguments can be appended, for example `cargo test-linux -- --nocapture`.
 
 Release output is `target/release/sentinel` (`sentinel.exe` on Windows). CLI and role builds have the same binary name: the most recent build for that profile/target determines the available roles. `release-linux` produces the combined Linux distribution. Setting `CARGO_TARGET_DIR` changes output locations normally.
@@ -93,7 +105,16 @@ Both processes currently initialize their directories and wait for shutdown. The
 
 For file-based configuration, copy the appropriate [server](../examples/server.toml) or [worker](../examples/worker.toml) example into `.local/` and supply `--config .local/server.toml` or `--config .local/worker.toml`. Create `.local/` first and set an absolute writable `data_dir`, or override it on the command line. See [configuration](configuration.md) for precedence, size limits, and exit codes.
 
-### Windows with WSL2
+### Where tests run
+
+Every test — a single test binary, the full `test-*` suites, the web browser test and benchmarks — runs on the verification VPS, never on a workstation or in WSL (the owner's decision of 2026-09-27: local runs exhaust memory and wear the disk). The host, user and SSH key are in the git-ignored `.env` at the repository root; [`.env.example`](../.env.example) names the variables. Local work stops at `cargo fmt`, `cargo check`/`cargo lint` and `pnpm -C web typecheck`.
+
+Ship the branch as a git bundle (or push it) and run there, as root or the test account, from a checkout on the VPS's own filesystem. The VPS is shared with production services and another project's CI: run under `nice -n 19 ionice -c3` with `CARGO_BUILD_JOBS` limited, check `/proc/pressure/cpu` first, and when the host is heavily loaded skip the run and record the verification as pending. Record the load (`uptime`, CPU pressure) with every benchmark; a contended host is not a baseline.
+
+### Windows with WSL2 (superseded)
+
+Not used for tests any more (see above). Kept for reference:
+
 
 Run the Linux commands inside the Linux distribution, with Linux Rust/linker prerequisites installed, from a checkout in the Linux filesystem — for example `/srv/sentinel`, world-readable so the rootless-Podman test account can run the built test binaries. A Windows checkout shared through `/mnt/...` is not suitable: that filesystem does not keep Unix permissions, so the owner-only file checks fail. Use a native Linux filesystem and identified hardware for cache/I/O benchmarks.
 

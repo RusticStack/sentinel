@@ -4,7 +4,8 @@ log_format = "text"
 log_level = "info"
 # Where workers connect. Loopback by default; exposing it is an explicit decision.
 listen = "127.0.0.1:7443"
-# Where the API and the page answer. Loopback; put TLS in front to expose it.
+# Where the API answers (the web interface, sentinel-web, proxies to it).
+# Loopback; put TLS in front to expose it.
 api_listen = "127.0.0.1:7080"
 
 # Optional NAT-traversing transport (Q06): the pinned Tailcat helper serves

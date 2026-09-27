@@ -568,7 +568,7 @@ fn a_github_only_account_approves_an_oauth_consent_and_lands_where_it_started() 
     assert!(browser.cookie("__Host-sentinel_signin").is_none());
     assert_eq!(continue_target(&done), format!("/oauth/authorize?{query}"));
     assert!(
-        !done.text.contains("sessionStorage"),
+        !done.text.contains("sentinel-csrf"),
         "no CSRF copy for OAuth pages"
     );
     assert_eq!(done.header("x-frame-options"), Some("DENY"));
@@ -954,8 +954,13 @@ fn a_github_sign_in_replaces_the_browsers_previous_session() {
     browser.accept(&cookie);
     assert_eq!(sessions_of(&d, d.root), 1);
 
-    let page = browser.get(&format!("{base}/"));
-    assert!(page.text.contains("const github = true;"));
+    // The web interface learns that GitHub sign-in is offered from health.
+    let health = browser.get(&format!("{base}/api/v1/health"));
+    assert!(
+        health.text.contains("\"github_sign_in\":true"),
+        "{}",
+        health.text
+    );
     let done = through_github(
         &d,
         &mut browser,
@@ -975,10 +980,10 @@ fn a_github_sign_in_replaces_the_browsers_previous_session() {
         browser.cookie("__Host-sentinel_session"),
         Some(value.as_str())
     );
-    // The first page gets its CSRF secret through session storage, and the
+    // The web interface gets its CSRF secret through local storage, and the
     // secret works as the header for this session.
     assert_eq!(continue_target(&done), "/");
-    let needle = "sessionStorage.setItem(\"sentinel-csrf\", \"";
+    let needle = "localStorage.setItem(\"sentinel-csrf\", \"";
     let at = done.text.find(needle).unwrap() + needle.len();
     let csrf = done.text[at..at + 64].to_owned();
     let logout = browser.request(
@@ -1098,8 +1103,12 @@ fn without_github_configured_no_page_offers_it_and_the_routes_do_not_exist() {
     assert!(!page.text.contains("Sign in with GitHub"));
     let device = browser.get(&format!("{}/device", d.base));
     assert!(!device.text.contains("Sign in with GitHub"));
-    let index = browser.get(&format!("{}/", d.base));
-    assert!(index.text.contains("const github = /*github*/false;"));
+    let health = browser.get(&format!("{}/api/v1/health", d.base));
+    assert!(
+        health.text.contains("\"github_sign_in\":false"),
+        "{}",
+        health.text
+    );
     for path in [
         "/auth/github/start?return_to=%2F",
         "/auth/github/callback?code=a&state=b",

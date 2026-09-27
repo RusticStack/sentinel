@@ -47,6 +47,22 @@ pub struct Identity {
     pub grant: Option<GrantId>,
     /// When an OAuth access token stops working.
     pub expires: Option<UnixMillis>,
+    /// A browser session that proved presence within the step-up window
+    /// (A06). Never set for a bearer credential or an OAuth token, which
+    /// can never step up.
+    pub stepped_up: bool,
+}
+
+impl Identity {
+    /// The store authority this caller acts with: stepped up only for a
+    /// fresh session, so a privileged mutation from anything else is
+    /// `StepUpRequired`.
+    pub fn authority(&self) -> sentinel_store::auth::Authority {
+        sentinel_store::auth::Authority::Credential {
+            principal: self.principal,
+            stepped_up: self.stepped_up,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +130,7 @@ pub fn identify(
                     scopes: Scopes::from_permissions(principal.permissions),
                     grant: None,
                     expires: None,
+                    stepped_up: false,
                 })
             }
             Bearer::Access(secret) => {
@@ -148,6 +165,7 @@ pub fn identify(
         scopes: Scopes::from_permissions(principal.permissions),
         grant: None,
         expires: None,
+        stepped_up: session.stepped_up_within(sessions, now),
     })
 }
 
@@ -179,6 +197,7 @@ fn oauth_identity(authenticated: sentinel_store::oauth::Authenticated) -> Identi
         scopes: authenticated.scopes,
         grant: Some(authenticated.grant),
         expires: Some(authenticated.expires),
+        stepped_up: false,
     }
 }
 

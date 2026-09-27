@@ -11,7 +11,8 @@ Sentinel is a performance-first, self-hosted Rust CI engine. Read [README.md](RE
 - Do not invent measurements. Record unavailable hardware or blocked prerequisites as `Blocked by: ...`.
 - Preserve the boundaries in the backlog: separate server/worker processes, tenant ownership, durable transitions, bounded resource usage. Add crates only when useful.
 - Commit with a conventional prefix (`feat:`, `build:`, `docs:`) and a message that describes behavior, not files.
-- Verify a small fix with the tests that cover it (the affected test binary, plus `cargo lint`/`cargo lint-linux`). Run the full suites once, when a piece of work is complete — not after every change — and keep stress runs short. Full runs cost hours and wear the disk.
+- **Tests run only on the verification VPS**, never on a workstation or in WSL: every test of any size — a single test binary, the full suites, the web browser test, benchmarks. Local work stops at formatting, `cargo check`/lint and `pnpm -C web typecheck`. The VPS is named in the git-ignored `.env` ([`.env.example`](.env.example)); see [development](docs/development.md#where-tests-run). It is shared with production services: run under `nice`/`ionice` with limited jobs, and when it is heavily loaded skip the run and record the verification as pending — never invent results.
+- Verify a small fix with the tests that cover it (the affected test binary, plus `cargo lint`/`cargo lint-linux`). Run the full suites once, when a piece of work is complete — not after every change — and keep stress runs short. Full runs cost hours.
 
 ## Commands
 
@@ -23,10 +24,11 @@ Run from the repository root; aliases live in `.cargo/config.toml`.
 | Linux role checks | `cargo lint-linux`, `cargo test-server`, `cargo test-worker`, `cargo test-linux`, `cargo release-linux` |
 | Benchmark runner | `cargo bench-noop --runtime direct --warm-state warm` |
 | Feasibility probes | `cargo probe sqlite --path /tmp/d.sqlite` |
+| Web interface | `pnpm -C web install`, `pnpm -C web typecheck`, `pnpm -C web build`; browser test `cargo test -p sentinel-api --test web_browser -- --ignored` (Node, Edge/Chrome/Chromium) |
 
 All aliases pass `--locked`; a dependency change must update and commit `Cargo.lock` (use `cargo update --workspace --offline` for new members). Apply formatting with `cargo fmt --all`.
 
-On Windows, run the Linux checks inside WSL2 from a checkout in the Linux filesystem (not `/mnt/...`, which lacks Unix permissions), readable by the rootless-Podman test account; see [development](docs/development.md#windows-with-wsl2). WSL2 verifies process/signal behavior; it is not a production benchmark host.
+Test commands in this table run on the verification VPS, not locally ([development](docs/development.md#where-tests-run)).
 
 ## Layout
 
@@ -39,7 +41,7 @@ On Windows, run the Linux checks inside WSL2 from a checkout in the Linux filesy
 | `crates/sentinel-git` | Bounded Git: exact-revision checkout, file-at-revision reads, one credential and process-group discipline; shared by the worker and the controller's source resolution |
 | `crates/sentinel-store` | SQLite metadata store, single durable writer; see [docs/storage.md](docs/storage.md) |
 | `crates/sentinel-checks` | Durable check delivery: the outbox lane and the GitHub Checks publisher; see [checks](docs/checks.md) |
-| `crates/sentinel-api` | The controller's HTTP API and the first page; see [API](docs/api.md) |
+| `crates/sentinel-api` | The controller's HTTP API; see [API](docs/api.md) |
 | `crates/sentinel-worker` | Linux executor: fresh workspaces, exact-revision checkout, rootless Podman containers, attempt lifecycle, log redaction and spool; see [executor](docs/executor.md), [logs](docs/logs.md) |
 | `crates/sentinel-protocol` | Errors, idempotency, cursors, limits, negotiation; see [docs/protocol.md](docs/protocol.md) |
 | `crates/sentinel-pipeline` | `.sentinel.yml` loader, schema and compiler; see [docs/pipeline-schema.md](docs/pipeline-schema.md) |
@@ -47,6 +49,7 @@ On Windows, run the Linux checks inside WSL2 from a checkout in the Linux filesy
 | `crates/sentinel` | CLI (`pipeline`, `api` client, host-local `admin`) plus Linux `server`/`worker` roles behind features |
 | `crates/sentinel-bench` | Benchmark runner; see [docs/benchmarking.md](docs/benchmarking.md) |
 | `crates/sentinel-probes` | SQLite/clone probes; see [docs/feasibility-probes.md](docs/feasibility-probes.md) |
+| `web/` | The web interface, `sentinel-web` (Nuxt 4, Vue, TypeScript, Nuxt UI; pnpm): pages, live event streams, the proxy to the API, its browser test and U01 benchmark; see [web interface](docs/web-ui.md) |
 | `bench/` | Committed machine-readable benchmark records |
 | `fixtures/` | Valid and invalid pipeline fixtures exercised by tests |
 | `docs/` | Contracts and guides: [development](docs/development.md), [configuration](docs/configuration.md), [runtime foundations](docs/runtime-foundation.md) |

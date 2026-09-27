@@ -193,6 +193,27 @@ pub struct RunSummary {
     pub sha: String,
     pub created: UnixMillis,
     pub state: RunState,
+    /// From the run's provenance: `push`, `tag`, `pull_request`, `manual`;
+    /// `None` only for a run created without provenance.
+    pub trigger: Option<String>,
+    /// The ref the run was created for (a pull request's base branch).
+    pub ref_name: Option<String>,
+    pub pr_number: Option<u64>,
+}
+
+/// What [`filtered_runs`] narrows a repository's runs to. Each is a range on
+/// its own index (migration 45), so a filtered page costs what an
+/// unfiltered one does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunFilter<'a> {
+    /// Exactly this ref (`refs/heads/main`, `refs/tags/v1`).
+    Ref(&'a str),
+    /// Runs of this pull request.
+    Pr(u64),
+    /// Runs whose pinned commit starts with this lowercase hex prefix,
+    /// 7 to 64 characters: long enough that the matching range stays a
+    /// handful of rows.
+    Sha(&'a str),
 }
 
 /// The newest runs of a repository, newest first, at most `limit`.
@@ -259,13 +280,7 @@ pub fn runs_page(
             &cursor_id[..],
             fetch
         ],
-        |r| {
-            Ok((
-                r.get::<_, [u8; 16]>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        },
+        summary_row,
     )?;
     let mut out = Vec::with_capacity(usize::from(limit).min(64));
     for row in rows {
@@ -300,13 +315,9 @@ pub fn runs_page(
     }
     let runs = out
         .into_iter()
-        .map(|(id, sha, created)| {
-            Ok(RunSummary {
-                id: RunId::from_bytes(id).map_err(|_| Error::Corrupt("run_id"))?,
-                sha,
-                created: UnixMillis(created),
-                state: aggregate(states.get(&id).into_iter().flatten().copied()),
-            })
+        .map(|row| {
+            let state = aggregate(states.get(&row.id).into_iter().flatten().copied());
+            row.into_summary(state)
         })
         .collect::<Result<Vec<_>>>()?;
     let next = if more {
@@ -317,11 +328,214 @@ pub fn runs_page(
     Ok(RunPage { runs, next })
 }
 
+/// One listed run as its statement reads it, before its jobs are folded
+/// into a state. Column order: id, sha, created, trigger, ref, PR.
+struct SummaryRow {
+    id: [u8; 16],
+    sha: String,
+    created: i64,
+    trigger: Option<String>,
+    ref_name: Option<String>,
+    pr_number: Option<i64>,
+}
+
+fn summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SummaryRow> {
+    Ok(SummaryRow {
+        id: r.get(0)?,
+        sha: r.get(1)?,
+        created: r.get(2)?,
+        trigger: r.get(3)?,
+        ref_name: r.get(4)?,
+        pr_number: r.get(5)?,
+    })
+}
+
+impl SummaryRow {
+    fn into_summary(self, state: RunState) -> Result<RunSummary> {
+        Ok(RunSummary {
+            id: RunId::from_bytes(self.id).map_err(|_| Error::Corrupt("run_id"))?,
+            sha: self.sha,
+            created: UnixMillis(self.created),
+            state,
+            trigger: self.trigger,
+            ref_name: self.ref_name,
+            pr_number: self
+                .pr_number
+                .map(|n| u64::try_from(n).map_err(|_| Error::Corrupt("pr_number")))
+                .transpose()?,
+        })
+    }
+}
+
 /// A page of runs: a range on `runs_by_repo`, whose trailing primary key
-/// makes the index `(tenant_id, repo_id, created_ms, id)`.
-pub const PAGE_SQL: &str = "SELECT id, source_sha, created_ms FROM runs
-     WHERE tenant_id = ?1 AND repo_id = ?2 AND (created_ms, id) < (?3, ?4)
-     ORDER BY created_ms DESC, id DESC LIMIT ?5";
+/// makes the index `(tenant_id, repo_id, created_ms, id)`; each listed run's
+/// provenance is one primary-key probe.
+pub const PAGE_SQL: &str =
+    "SELECT r.id, r.source_sha, r.created_ms, p.trigger, p.ref_name, p.pr_number
+     FROM runs r LEFT JOIN run_provenance p ON p.run_id = r.id
+     WHERE r.tenant_id = ?1 AND r.repo_id = ?2 AND (r.created_ms, r.id) < (?3, ?4)
+     ORDER BY r.created_ms DESC, r.id DESC LIMIT ?5";
+
+/// Runs of one ref, newest first: a range on `provenance_by_ref`.
+pub const REF_PAGE_SQL: &str =
+    "SELECT p.run_id, r.source_sha, r.created_ms, p.trigger, p.ref_name, p.pr_number
+     FROM run_provenance p JOIN runs r ON r.id = p.run_id
+     WHERE p.tenant_id = ?1 AND p.repo_id = ?2 AND p.ref_name = ?3
+       AND (p.created_ms, p.run_id) < (?4, ?5)
+     ORDER BY p.created_ms DESC, p.run_id DESC LIMIT ?6";
+
+/// Runs of one pull request, newest first: a range on `provenance_by_pr`.
+pub const PR_PAGE_SQL: &str =
+    "SELECT p.run_id, r.source_sha, r.created_ms, p.trigger, p.ref_name, p.pr_number
+     FROM run_provenance p JOIN runs r ON r.id = p.run_id
+     WHERE p.tenant_id = ?1 AND p.repo_id = ?2 AND p.pr_number = ?3
+       AND (p.created_ms, p.run_id) < (?4, ?5)
+     ORDER BY p.created_ms DESC, p.run_id DESC LIMIT ?6";
+
+/// Runs of commits starting with a prefix: a range on `runs_by_sha`
+/// (`[prefix, prefix + "g")`, as hex digits sort below `g`), then ordered.
+/// A 7-digit prefix matches one commit in all but enormous histories, so the
+/// ordering works on that commit's runs, not the repository's.
+pub const SHA_PAGE_SQL: &str =
+    "SELECT r.id, r.source_sha, r.created_ms, p.trigger, p.ref_name, p.pr_number
+     FROM runs r INDEXED BY runs_by_sha LEFT JOIN run_provenance p ON p.run_id = r.id
+     WHERE r.tenant_id = ?1 AND r.repo_id = ?2 AND r.source_sha >= ?3 AND r.source_sha < ?4
+       AND (r.created_ms, r.id) < (?5, ?6)
+     ORDER BY r.created_ms DESC, r.id DESC LIMIT ?7";
+
+/// One page of a repository's runs narrowed by `filter`, newest first, with
+/// the same keyset contract as [`runs_page`]: `before` must be a run of this
+/// repository (it need not match the filter), and `next` is `None` on the
+/// last page. Ref and PR pages are ordered by the provenance row's creation
+/// time, written with the run.
+pub fn filtered_runs(
+    conn: &Connection,
+    tenant: TenantId,
+    repo: RepoId,
+    filter: RunFilter<'_>,
+    before: Option<RunId>,
+    limit: u16,
+) -> Result<RunPage> {
+    if !(1..=500).contains(&limit) {
+        return Err(Error::InvalidInput("page size"));
+    }
+    let by_provenance = !matches!(filter, RunFilter::Sha(_));
+    let (cursor_ms, cursor_id): (i64, [u8; 16]) = match before {
+        None => (i64::MAX, [0xff; 16]),
+        Some(run) => {
+            let sql = if by_provenance {
+                "SELECT created_ms FROM run_provenance
+                 WHERE run_id = ?1 AND tenant_id = ?2 AND repo_id = ?3"
+            } else {
+                "SELECT created_ms FROM runs WHERE id = ?1 AND tenant_id = ?2 AND repo_id = ?3"
+            };
+            let created: i64 = conn
+                .prepare_cached(sql)?
+                .query_row(
+                    params![run.as_bytes(), tenant.as_bytes(), repo.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or(Error::NotFound)?;
+            (created, *run.as_bytes())
+        }
+    };
+    let fetch = i64::from(limit) + 1;
+    let mut out: Vec<SummaryRow> = Vec::with_capacity(usize::from(limit).min(64));
+    match filter {
+        RunFilter::Ref(name) => {
+            if name.is_empty() || name.len() > 1024 {
+                return Err(Error::InvalidInput("ref"));
+            }
+            let mut stmt = conn.prepare_cached(REF_PAGE_SQL)?;
+            let rows = stmt.query_map(
+                params![
+                    tenant.as_bytes(),
+                    repo.as_bytes(),
+                    name,
+                    cursor_ms,
+                    &cursor_id[..],
+                    fetch
+                ],
+                summary_row,
+            )?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        RunFilter::Pr(number) => {
+            let number = i64::try_from(number)
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or(Error::InvalidInput("pull request number"))?;
+            let mut stmt = conn.prepare_cached(PR_PAGE_SQL)?;
+            let rows = stmt.query_map(
+                params![
+                    tenant.as_bytes(),
+                    repo.as_bytes(),
+                    number,
+                    cursor_ms,
+                    &cursor_id[..],
+                    fetch
+                ],
+                summary_row,
+            )?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        RunFilter::Sha(prefix) => {
+            if !(7..=64).contains(&prefix.len())
+                || !prefix
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                return Err(Error::InvalidInput("commit prefix"));
+            }
+            let mut upper = String::with_capacity(prefix.len() + 1);
+            upper.push_str(prefix);
+            upper.push('g');
+            let mut stmt = conn.prepare_cached(SHA_PAGE_SQL)?;
+            let rows = stmt.query_map(
+                params![
+                    tenant.as_bytes(),
+                    repo.as_bytes(),
+                    prefix,
+                    upper,
+                    cursor_ms,
+                    &cursor_id[..],
+                    fetch
+                ],
+                summary_row,
+            )?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+    }
+    let more = out.len() > usize::from(limit);
+    out.truncate(usize::from(limit));
+    // Each listed run's job states: one `jobs_by_run` range per run, at
+    // most `limit` of them, on one cached statement and one reused buffer.
+    let mut jobs = conn.prepare_cached("SELECT state_code FROM jobs WHERE run_id = ?1")?;
+    let mut codes = Vec::new();
+    let mut runs = Vec::with_capacity(out.len());
+    for row in out {
+        codes.clear();
+        let mut rows = jobs.query([&row.id[..]])?;
+        while let Some(job) = rows.next()? {
+            codes.push(decode_state(job.get(0)?).ok_or(Error::Corrupt("state_code"))?);
+        }
+        let state = aggregate(codes.iter().copied());
+        runs.push(row.into_summary(state)?);
+    }
+    let next = if more {
+        runs.last().map(|r| r.id)
+    } else {
+        None
+    };
+    Ok(RunPage { runs, next })
+}
 
 /// The job states of the same page.
 pub const PAGE_JOBS_SQL: &str = "SELECT run_id, state_code FROM jobs WHERE run_id IN (

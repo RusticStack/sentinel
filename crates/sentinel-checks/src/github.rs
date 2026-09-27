@@ -104,7 +104,7 @@ impl GithubChecks {
     fn details_url(&self, run: Option<sentinel_core::RunId>) -> Option<String> {
         let base = self.public_url.as_deref()?;
         let run = run?;
-        Some(format!("{base}/#/runs/{run}"))
+        Some(format!("{base}/runs/{run}"))
     }
 
     fn check(&self, publication: &checks::Publication, now: UnixMillis) -> Result<Check, Publish> {

@@ -2,7 +2,9 @@
 //! sockets to at most `Tune::connections` reader threads; each connection
 //! parses a head, then takes one of `Tune::handlers` permits before any
 //! route work — so request concurrency is `handlers`, reader threads are
-//! `connections`, and nothing else spawns. Heads and client bodies are
+//! `connections`, and nothing else spawns. A long poll gives its handler
+//! permit back while it is parked ([`Request::yield_handler`]): waiting is
+//! not work, and its own subscriber budget bounds it. Heads and client bodies are
 //! deadline-bounded; a stalled write fails its syscall instead of holding
 //! a handler permit forever. Responses always carry an explicit
 //! `content-length` (routes know their lengths) or close the connection.
@@ -48,7 +50,7 @@ pub(crate) struct Tune {
 
 impl Tune {
     pub(crate) const DEFAULT: Tune = Tune {
-        connections: 64,
+        connections: crate::CONNECTIONS,
         handlers: crate::WORKERS,
         head_bytes: 16 << 10,
         head_time: Duration::from_secs(15),
@@ -759,6 +761,10 @@ pub(crate) struct Request<'a> {
     /// Only set on a child request created after the outer MCP bearer was
     /// checked. Network requests can never populate this field.
     trusted_identity: Option<crate::auth::Identity>,
+    /// This request's handler permit, released when the request is done —
+    /// or earlier by [`Request::yield_handler`]. A child request has none
+    /// of its own (its parent holds one).
+    handler: Option<Permit>,
 }
 
 impl Request<'_> {
@@ -778,6 +784,35 @@ impl Request<'_> {
     /// few routes that key admission by client ask for it.
     pub(crate) fn peer(&self) -> Option<std::net::IpAddr> {
         self.writer.peer_addr().ok().map(|addr| addr.ip())
+    }
+
+    /// Whether the client has hung up (end of stream or reset) while its
+    /// request waits: a parked long poll whose caller left — a closed tab,
+    /// a web server that aborted its upstream request — gives its subscriber
+    /// slot back instead of holding it to the poll's deadline. One
+    /// non-blocking `peek`; bytes of a pipelined next request mean the
+    /// client is still there.
+    pub(crate) fn peer_gone(&self) -> bool {
+        if self.writer.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let mut byte = [0u8; 1];
+        let gone = match self.writer.peek(&mut byte) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => e.kind() != io::ErrorKind::WouldBlock,
+        };
+        let _ = self.writer.set_nonblocking(false);
+        gone
+    }
+
+    /// Give the handler permit back before the request is done: a long
+    /// poll about to park does no work while it waits, so it must not keep
+    /// a permit that bounds requests doing work. Whatever it does after
+    /// waking (a store read, the response) is bounded by the store's own
+    /// reader pool and the write-stall deadline.
+    pub(crate) fn yield_handler(&mut self) {
+        self.handler = None;
     }
 
     pub(crate) fn body_length(&self) -> Option<usize> {
@@ -812,6 +847,7 @@ impl Request<'_> {
             close: true,
             responded: false,
             trusted_identity: Some(identity),
+            handler: None,
         }
     }
 
@@ -1087,7 +1123,7 @@ fn connection(
         {
             break;
         }
-        let Some(_handler) = handlers.acquire(stop, tune.poll) else {
+        let Some(handler) = handlers.acquire(stop, tune.poll) else {
             break;
         };
         let body_deadline = Instant::now() + tune.body_time;
@@ -1131,6 +1167,7 @@ fn connection(
             close: head.close,
             responded: false,
             trusted_identity: None,
+            handler: Some(handler),
         };
         let panicked =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve(&mut request))).is_err();
@@ -1373,6 +1410,7 @@ mod tests {
             close: false,
             responded: false,
             trusted_identity: None,
+            handler: None,
         };
         request.respond(Response::from_string("hi")).unwrap();
         drop(server);
@@ -1400,6 +1438,7 @@ mod tests {
             close: false,
             responded: false,
             trusted_identity: None,
+            handler: None,
         };
         request.respond(Response::from_string("no")).unwrap();
         assert!(request.must_close());

@@ -1,0 +1,120 @@
+// The controller's API documents the interface reads (docs/api.md).
+
+export type Role = "reader" | "operator" | "admin";
+
+export interface Me {
+  user: string;
+  username: string | null;
+  super_admin: boolean;
+  via: "bearer" | "session" | "oauth";
+  scopes: string[];
+  stepped_up: boolean;
+  mfa: boolean;
+}
+
+export interface TenantChoice { slug: string; role: Role }
+
+export interface RunSummary {
+  id: string;
+  sha: string;
+  created_ms: number;
+  state: string;
+  trigger: string | null;
+  ref: string | null;
+  pr: number | null;
+}
+
+export interface JobTimestamps {
+  queued_ms: number | null;
+  leased_ms: number | null;
+  preparing_ms: number | null;
+  running_ms: number | null;
+  finalizing_ms: number | null;
+  terminal_ms: number | null;
+}
+
+export interface JobStatus {
+  id: string;
+  name: string;
+  state: string;
+  terminal: boolean;
+  failure_class: string | null;
+  cancel_requested: boolean;
+  attempt: string | null;
+  log_state: "pending" | "incomplete" | "complete" | null;
+  fence: number;
+  timestamps: JobTimestamps;
+}
+
+export interface Run {
+  id: string;
+  tenant: string;
+  repo: string;
+  sha: string;
+  created_ms: number;
+  cancel_requested: boolean;
+  state: string;
+  trigger: string | null;
+  jobs: JobStatus[];
+}
+
+export interface Explanation {
+  jobs: { name: string; needs: string[]; image: string; cpu_millis: number; memory_bytes: number; steps: { id: string; timeout_secs: number }[] }[];
+}
+
+export interface StepRecord { index: number; id: string; outcome: string; exit_code?: number; signal?: number; duration_ns?: number }
+
+export interface Steps {
+  attempt: string;
+  present: boolean;
+  timings_ns?: Record<string, number>;
+  steps?: StepRecord[];
+}
+
+export interface Frame { seq: number; step: number; stream: "stdout" | "stderr"; text: string }
+
+export interface LogPage {
+  attempt: string;
+  frames: Frame[];
+  complete: boolean;
+  gaps: [number, number][];
+  next_after: number | null;
+  next: string;
+  step_done: boolean;
+}
+
+export interface ApiErrorBody { code: string; message: string; details?: Record<string, any> }
+
+export interface Capacity { cpu_millis: number; memory_bytes: number; disk_bytes?: number }
+
+export interface Worker {
+  id: string;
+  name: string;
+  arch: string;
+  connected: boolean;
+  last_seen_ms: number | null;
+  transport: { path: string; reconnects: number; bytes_in: number; bytes_out: number; rtt_ns?: number; helper_version?: string } | null;
+  draining: boolean;
+  draining_since_ms?: number;
+  labels: string[];
+  held_attempts: number;
+  held: Capacity;
+  free: Capacity;
+  capacity?: Capacity;
+  cache_bytes?: number;
+  host_workers?: number;
+}
+
+export interface Pool { id: string; name: string; active: boolean; kind: "shared" | "dedicated"; workers: Worker[] }
+
+export interface RepoSync {
+  id: string;
+  name: string;
+  pending: number;
+  oldest_pending_ms: number | null;
+  refused: number;
+  last_refused_ms: number | null;
+  last_published_ms: number | null;
+  open_deliveries: number;
+  oldest_delivery_ms: number | null;
+}

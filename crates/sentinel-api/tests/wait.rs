@@ -460,16 +460,22 @@ fn a_parked_subscriber_past_the_cap_is_rate_limited_and_log_follows_share_it() {
         .unwrap();
     let (_, first) = get(&d, &format!("/api/v1/runs/{run}/wait"));
     let version = version_of(&first);
-    // Every slot parked, by two users: the cap is global, not per user.
-    let other = second_user(&d, "other");
+    // Every slot parked, by as many other users as it takes (each within
+    // its share): the cap is global, not per user.
+    const NAMES: [&str; 8] = [
+        "holder-0", "holder-1", "holder-2", "holder-3", "holder-4", "holder-5", "holder-6",
+        "holder-7",
+    ];
+    let users = sentinel_api::SUBSCRIBERS.div_ceil(sentinel_api::SUBSCRIBERS_PER_USER);
+    let holders: Vec<String> = NAMES[..users].iter().map(|n| second_user(&d, n)).collect();
     let parked: Vec<_> = (0..sentinel_api::SUBSCRIBERS)
         .map(|i| {
-            let auth = if i < sentinel_api::SUBSCRIBERS_PER_USER {
-                &other
-            } else {
-                &d.auth
-            };
-            park(&d, run, &version, auth)
+            park(
+                &d,
+                run,
+                &version,
+                &holders[i / sentinel_api::SUBSCRIBERS_PER_USER],
+            )
         })
         .collect();
     thread::sleep(Duration::from_millis(500));
