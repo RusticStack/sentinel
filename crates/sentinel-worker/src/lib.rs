@@ -108,20 +108,31 @@ pub(crate) fn sync_dir(_dir: &std::path::Path) -> std::io::Result<()> {
 /// create what they need beneath it owner-only.
 #[cfg(target_os = "linux")]
 pub fn runtime_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
-    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
-    // SAFETY: `geteuid` has no preconditions and cannot fail.
-    let uid = unsafe { libc::geteuid() };
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from)
-        && dir.is_absolute()
-        && let Ok(meta) = std::fs::symlink_metadata(&dir)
-        && meta.is_dir()
-        && meta.uid() == uid
-        && meta.mode() & 0o077 == 0
-    {
-        let key = blake3::hash(data_dir.as_os_str().as_bytes());
-        return dir.join(format!("sentinel-{}", &key.to_hex()[..16]));
+    use std::os::unix::ffi::OsStrExt;
+    match xdg_runtime_dir() {
+        Some(dir) => {
+            let key = blake3::hash(data_dir.as_os_str().as_bytes());
+            dir.join(format!("sentinel-{}", &key.to_hex()[..16]))
+        }
+        None => data_dir.join("run"),
     }
-    data_dir.join("run")
+}
+
+/// `$XDG_RUNTIME_DIR` when it is an absolute, owner-only directory of
+/// this user.
+#[cfg(target_os = "linux")]
+pub(crate) fn xdg_runtime_dir() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    (dir.is_absolute() && meta.is_dir() && meta.uid() == euid() && meta.mode() & 0o077 == 0)
+        .then_some(dir)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn euid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 /// Whether the worker's cache root — `<data_dir>/cache` — can serve

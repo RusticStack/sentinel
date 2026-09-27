@@ -75,9 +75,10 @@ impl Store {
     /// created owner-only on first use.
     pub fn private(root: &Path, tenant: [u8; 16]) -> Result<Store> {
         let name: String = tenant.iter().map(|b| format!("{b:02x}")).collect();
+        let graph = root.join(STORES_DIR).join(&name).join("graph");
         let store = Store::Private {
-            graph: root.join(STORES_DIR).join(&name).join("graph"),
-            run: crate::runtime_dir(root).join("stores").join(&name),
+            run: run_root(&graph),
+            graph,
         };
         if let Store::Private { graph, run } = &store {
             for dir in [graph, run] {
@@ -103,9 +104,10 @@ impl Store {
                     continue;
                 }
                 if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    let graph = entry.path().join("graph");
                     stores.push(Store::Private {
-                        graph: entry.path().join("graph"),
-                        run: crate::runtime_dir(root).join("stores").join(name),
+                        run: run_root(&graph),
+                        graph,
                     });
                 }
             }
@@ -120,16 +122,33 @@ impl Store {
     }
 }
 
-/// Create `dir` and its missing parents owner-only; an existing component
-/// that is a symlink or not a directory is refused.
+/// A private store's run root. Podman refuses one longer than 50 bytes, so
+/// it is a short name keyed by the graph root, in the runtime directory
+/// (tmpfs, cleared at boot like any run root) or, without one, `/tmp` —
+/// created owner-only and refused if someone else's.
+fn run_root(graph: &Path) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let key = blake3::hash(graph.as_os_str().as_bytes()).to_hex();
+    crate::xdg_runtime_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join(format!("sentinel-sr-{}", &key[..12]))
+}
+
+/// Create `dir` and its missing parents owner-only; an existing directory
+/// that is a symlink, not a directory, not this user's or open to others
+/// is refused.
 fn private_dirs(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
     let meta = std::fs::symlink_metadata(dir)?;
-    if !meta.is_dir() || meta.file_type().is_symlink() {
+    if !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || meta.uid() != crate::euid()
+        || meta.mode() & 0o077 != 0
+    {
         return Err(Error::Preparation("image store directory".into()));
     }
     Ok(())

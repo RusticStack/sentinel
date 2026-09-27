@@ -83,6 +83,8 @@ pub struct Live {
     pub tenant: TenantId,
     pub repo_id: RepoId,
     pub pool: PoolId,
+    /// The tenant admin every setup write is made as.
+    pub root: UserId,
     pub worker: WorkerId,
     pub worker_dir: PathBuf,
     pub repo: PathBuf,
@@ -123,6 +125,17 @@ impl Live {
     pub fn start<E: Executor + Send + Sync + 'static>(
         make: impl FnOnce(&Path, WorkerId) -> E,
     ) -> (Live, Arc<E>) {
+        Self::start_with(make, 5, Capabilities::REQUIRED, None)
+    }
+
+    /// [`Live::start`] with the worker's protocol ceiling and capabilities,
+    /// and the controller's sealing key when secrets are delivered.
+    pub fn start_with<E: Executor + Send + Sync + 'static>(
+        make: impl FnOnce(&Path, WorkerId) -> E,
+        protocol_max: u16,
+        capabilities: Capabilities,
+        key: Option<Arc<sentinel_auth::sealed::Key>>,
+    ) -> (Live, Arc<E>) {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("origin");
         fs::create_dir(&repo).unwrap();
@@ -148,6 +161,13 @@ impl Live {
                     NamespaceKind::Organization,
                     UnixMillis(1),
                 )?;
+                auth::set_membership(
+                    tx,
+                    Principal::new(root, P::ALL, None, None),
+                    tenant,
+                    root,
+                    sentinel_core::auth::Role::TenantAdmin,
+                )?;
                 sentinel_store::jobs::insert_repo(tx, tenant, repo_id, "app", UnixMillis(1))?;
                 tenancy::create_pool(
                     tx,
@@ -170,6 +190,9 @@ impl Live {
             "127.0.0.1:0".parse().unwrap(),
         )
         .unwrap();
+        if let Some(key) = key {
+            controller.set_source_key(key);
+        }
         let enrollment = store
             .writer()
             .write(move |tx| {
@@ -192,8 +215,8 @@ impl Live {
                 name: "builder-1".into(),
                 hello: Hello {
                     protocol_min: ProtocolVersion(1),
-                    protocol_max: ProtocolVersion(5),
-                    capabilities: Capabilities::REQUIRED,
+                    protocol_max: ProtocolVersion(protocol_max),
+                    capabilities,
                     arch: Arch::X86_64,
                     software: "test".into(),
                 },
@@ -229,6 +252,7 @@ impl Live {
                 tenant,
                 repo_id,
                 pool,
+                root,
                 worker: worker_id,
                 worker_dir,
                 repo,
@@ -248,6 +272,12 @@ impl Live {
     /// Enqueue a run of `yaml` (every job on the pinned busybox) and wake
     /// the dispatcher. Returns the run and its jobs in compiled order.
     pub fn enqueue(&self, yaml: &str) -> (RunId, Vec<JobId>) {
+        self.enqueue_pinned(yaml, DIGEST)
+    }
+
+    /// [`Live::enqueue`] with every job's image resolved to `digest`.
+    pub fn enqueue_pinned(&self, yaml: &str, digest: &str) -> (RunId, Vec<JobId>) {
+        let digest = digest.to_owned();
         let spec = RunSpec::new(
             PinnedSource::new(self.repo.to_str().unwrap(), &self.sha, Some("main")).unwrap(),
             compile_str(yaml).unwrap(),
@@ -260,7 +290,7 @@ impl Live {
             .write(move |tx| {
                 let ids = runs::create_run(tx, tenant, repo_id, run, &spec, UnixMillis::now())?;
                 for job in &ids {
-                    runs::resolve_image(tx, tenant, *job, DIGEST, "linux/amd64")?;
+                    runs::resolve_image(tx, tenant, *job, &digest, "linux/amd64")?;
                 }
                 Ok(ids)
             })
