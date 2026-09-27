@@ -3169,12 +3169,29 @@ fn an_active_session_outlives_its_first_idle_deadline() {
         ..local_auth::Policy::default()
     };
     let d = deployment_with(policy);
-    // The session's clock starts when the login request arrives, before the
-    // (slow, in a debug build) password hash: time everything from here.
-    let start = std::time::Instant::now();
-    let at = |ms: u64| {
-        let due = start + Duration::from_millis(ms);
-        thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
+    // Scheduled from the deadlines the server recorded, on the same wall
+    // clock it checks them against, never from when this thread sent a
+    // request: a request the loaded server handles late then moves the
+    // deadline it is asserted against with it (the old fixed 14.7 s probe
+    // sat 700 ms after a deadline that a late 8 s request pushed past it).
+    let deadlines = || -> (i64, i64) {
+        d.store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT created_ms, idle_deadline_ms FROM sessions
+                     WHERE revoked_ms IS NULL ORDER BY created_ms DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap()
+    };
+    // Sleep until the wall clock is strictly past `ms`.
+    let past = |ms: i64| {
+        while UnixMillis::now().0 <= ms {
+            let left = (ms + 1 - UnixMillis::now().0).max(1) as u64;
+            thread::sleep(Duration::from_millis(left));
+        }
     };
     let (status, cookie, _) = raw_login(
         &d,
@@ -3187,15 +3204,20 @@ fn an_active_session_outlives_its_first_idle_deadline() {
     assert!(cookie.contains(&max_age), "{cookie}");
     let cookie = cookie.split(';').next().unwrap().to_owned();
     let me = || call(&d, "GET", "/api/v1/me", None, None, &[("cookie", &cookie)]).0;
-    // Used at 4 s: the idle deadline slides to about 10 s.
-    at(4_000);
+    let (created, first) = deadlines();
+    assert_eq!(first, created + 6_000);
+    // Used after the refresh interval: the deadline slides past the first.
+    past(created + 4_000);
     assert_eq!(me(), 200);
-    // Past the first idle deadline (6 s after sign-in), still signed in;
-    // this use slides it to about 14 s.
-    at(8_000);
+    let (_, slid) = deadlines();
+    assert!(slid > first, "slid from {first} to {slid}");
+    // Past the first idle deadline, still signed in; this use slides it on.
+    past(first);
     assert_eq!(me(), 200);
+    let (_, last) = deadlines();
+    assert!(last > slid, "slid again from {slid} to {last}");
     // Idle for a whole window: gone.
-    at(14_700);
+    past(last);
     assert_eq!(me(), 401);
 }
 
