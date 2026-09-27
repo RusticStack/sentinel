@@ -782,6 +782,7 @@ jobs:
         },
         ws.path(),
         &[],
+        &podman::Store::Shared,
     )
     .unwrap();
     std::mem::forget(stale);

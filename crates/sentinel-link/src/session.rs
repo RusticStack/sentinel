@@ -3404,6 +3404,14 @@ pub trait Executor: Send + Sync {
             self.no_spec(attempt);
         }
     }
+    /// The fence of an attempt this executor accepted and still waits to
+    /// start (P10D-3). A secret transfer is bound to the fence of the offer
+    /// the worker acknowledged, which may have arrived on an earlier
+    /// session than the one the spec now answers on. The default knows
+    /// none: only fences offered on the current session are accepted.
+    fn fence_of(&self, _attempt: AttemptId) -> Option<Fence> {
+        None
+    }
     /// The controller will not serve the attempt's spec: it is not held
     /// here, it was settled canceled, or its source or spec was refused for
     /// good. A transient controller fault is never answered this way — the
@@ -3776,6 +3784,12 @@ fn handle_bulk_message(
                 if state.secret_parts.contains_key(&attempt) {
                     return Err(Error::Protocol("spec before secret bundle end"));
                 }
+                if state.discarded.remove(&attempt) {
+                    // Its secrets were bound to a fence this worker does not
+                    // hold: nothing of this answer is used. An attempt still
+                    // awaiting its spec here asks again or is handed back.
+                    return Ok(());
+                }
                 let secrets = state.secret_bundles.remove(&attempt).map_or_else(
                     sentinel_protocol::secrets::DeliveryBundle::empty,
                     |(bundle, length)| {
@@ -3801,10 +3815,17 @@ fn handle_bulk_message(
                 || state.secret_bytes.saturating_add(length) > MAX_IN_FLIGHT_SECRET_BYTES
                 || state.secret_parts.contains_key(&attempt)
                 || state.secret_bundles.contains_key(&attempt)
+                || state.discarded.contains(&attempt)
                 || !state.contexts.contains_key(&attempt)
-                || !remote.has_fence(attempt, Fence(fence))
             {
                 return Err(Error::Protocol("secret bundle length or duplicate"));
+            }
+            if !fence_held(remote, executor, attempt, Fence(fence)) {
+                // A stale or foreign fence for an attempt the controller
+                // still answers: refuse this transfer alone, keep the link
+                // that every other attempt's logs and caches ride on.
+                state.discarded.insert(attempt);
+                return Ok(());
             }
             state.secret_bytes += length;
             state.secret_parts.insert(
@@ -3831,12 +3852,16 @@ fn handle_bulk_message(
             if bytes.len() > SPEC_CHUNK_BYTES {
                 return Err(Error::Protocol("secret chunk size"));
             }
+            if state.discarded.contains(&attempt) {
+                // The owned chunk wipes itself on drop.
+                return Ok(());
+            }
             let assembly = state
                 .secret_parts
                 .get_mut(&attempt)
                 .ok_or(Error::Protocol("secret chunk without begin"))?;
             if assembly.fence.0 != fence
-                || !remote.has_fence(attempt, Fence(fence))
+                || !fence_held(remote, executor, attempt, Fence(fence))
                 || seq != assembly.next_seq
                 || assembly.bytes.len().saturating_add(bytes.len()) > assembly.length
             {
@@ -3914,6 +3939,7 @@ fn handle_bulk_message(
             state.specs.remove(&attempt);
             state.contexts.remove(&attempt);
             remote.forget_fence(attempt);
+            state.discarded.remove(&attempt);
             if let Some(assembly) = state.secret_parts.remove(&attempt) {
                 state.secret_bytes = state.secret_bytes.saturating_sub(assembly.length);
             }
@@ -4064,6 +4090,23 @@ struct Inbound {
     secret_bundles:
         std::collections::HashMap<AttemptId, (sentinel_protocol::secrets::DeliveryBundle, usize)>,
     secret_bytes: usize,
+    /// Attempts whose secret transfer named a fence this worker does not
+    /// hold them under: the transfer and its spec are dropped, never used
+    /// and never a reason to end the link (P10D-3). Bounded like `contexts`,
+    /// whose entry each one needs.
+    discarded: std::collections::HashSet<AttemptId>,
+}
+
+/// Whether a secret transfer's `fence` is the one this worker accepted the
+/// attempt under — offered on this session, or on an earlier one and still
+/// awaiting its spec here (P10D-3).
+fn fence_held(
+    remote: &LinkRemote,
+    executor: &dyn Executor,
+    attempt: AttemptId,
+    fence: Fence,
+) -> bool {
+    remote.has_fence(attempt, fence) || executor.fence_of(attempt) == Some(fence)
 }
 
 /// The machine identity a worker reports in its protocol-7 profile: 16 bytes
@@ -4405,5 +4448,128 @@ mod tests {
             }
             _ => panic!("Context2 must decode"),
         }
+    }
+
+    /// An executor that holds one attempt awaiting its spec under a fence
+    /// acknowledged on an earlier session, and records what it is handed.
+    struct Awaiting {
+        attempt: AttemptId,
+        fence: Fence,
+        delivered: std::sync::Mutex<Vec<(AttemptId, usize)>>,
+    }
+    impl Executor for Awaiting {
+        fn offered(&self, _: &Offer) -> bool {
+            true
+        }
+        fn stop(&self, _: AttemptId) {}
+        fn cancel(&self, _: AttemptId) {}
+        fn held(&self) -> Vec<AttemptId> {
+            vec![self.attempt]
+        }
+        fn renewed(&self, _: UnixMillis) {}
+        fn attached(&self, _: Reporter) {}
+        fn detached(&self) {}
+        fn spec(&self, attempt: AttemptId, _: JobContext, _: Vec<u8>) {
+            self.delivered.lock().unwrap().push((attempt, 0));
+        }
+        fn spec_with_secrets(
+            &self,
+            attempt: AttemptId,
+            _: JobContext,
+            _: Vec<u8>,
+            secrets: sentinel_protocol::secrets::DeliveryBundle,
+        ) {
+            self.delivered
+                .lock()
+                .unwrap()
+                .push((attempt, secrets.values.len()));
+        }
+        fn fence_of(&self, attempt: AttemptId) -> Option<Fence> {
+            (attempt == self.attempt).then_some(self.fence)
+        }
+        fn no_spec(&self, _: AttemptId) {}
+        fn log_acked(&self, _: AttemptId, _: u64) {}
+        fn log_refused(&self, _: AttemptId) {}
+    }
+
+    /// The controller's answer to a spec request: context, secret bundle
+    /// under `fence`, spec.
+    fn secret_answer(attempt: AttemptId, fence: u64) -> Vec<ServerMessage> {
+        use sentinel_protocol::secrets::{
+            DeliveryBundle, DeliveryTarget, DeliveryValue, SecretBytes, TargetKind,
+        };
+        let bundle = DeliveryBundle {
+            values: vec![DeliveryValue::new(b"token-value".to_vec())],
+            targets: vec![DeliveryTarget {
+                step: 0,
+                name: "TOKEN".into(),
+                value: 0,
+                target: TargetKind::Environment,
+            }],
+        };
+        let payload = postcard::to_allocvec(&bundle).unwrap();
+        vec![
+            context_message(
+                10,
+                &context(Some(TenantId::new()), Trust::Protected),
+                attempt,
+            ),
+            ServerMessage::SecretBegin {
+                attempt: *attempt.as_bytes(),
+                fence,
+                length: payload.len() as u32,
+            },
+            ServerMessage::SecretChunk {
+                attempt: *attempt.as_bytes(),
+                fence,
+                seq: 0,
+                last: true,
+                bytes: SecretBytes::copy_from(&payload),
+            },
+            ServerMessage::Spec {
+                attempt: *attempt.as_bytes(),
+                seq: 0,
+                last: true,
+                bytes: b"spec".to_vec(),
+            },
+        ]
+    }
+
+    /// P10D-3: a session that replaced the one the offer was acknowledged
+    /// on knows no fence of its own, yet the spec answering the re-asked
+    /// request carries its secret bundle through — bound to the fence the
+    /// executor accepted. A transfer under any other fence is dropped with
+    /// its spec, and the link stays up.
+    #[test]
+    fn a_secret_transfer_survives_a_new_session_between_ack_and_spec() {
+        let (control, _peer) = tls_pair();
+        let remote = LinkRemote {
+            control,
+            bulk: Mutex::new(BulkSlot::default()),
+            fences: Mutex::new(HashMap::new()),
+            router: Arc::new(CacheRouter::default()),
+            protocol: 10,
+        };
+        let attempt = AttemptId::new();
+        let executor = Awaiting {
+            attempt,
+            fence: Fence(7),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut state = Inbound::default();
+        for message in secret_answer(attempt, 7) {
+            handle_bulk_message(message, &executor, &mut state, &remote).unwrap();
+        }
+        assert_eq!(*executor.delivered.lock().unwrap(), vec![(attempt, 1)]);
+        assert_eq!(state.secret_bytes, 0);
+
+        // A stale fence: nothing delivered, nothing kept, no link error.
+        executor.delivered.lock().unwrap().clear();
+        for message in secret_answer(attempt, 6) {
+            handle_bulk_message(message, &executor, &mut state, &remote).unwrap();
+        }
+        assert!(executor.delivered.lock().unwrap().is_empty());
+        assert!(state.discarded.is_empty() && state.contexts.is_empty());
+        assert_eq!(state.secret_bytes, 0);
     }
 }

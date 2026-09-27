@@ -430,14 +430,22 @@ impl Output for LogPipe {
     }
 
     fn redact(&self, text: String) -> String {
-        let st = self.lock();
+        let mut st = self.lock();
         if st.redactor.is_empty() {
             return text;
         }
         let mut raw = text.into_bytes();
-        let redacted = st.redactor.redact_all(&raw);
+        let mut redacted = st.redactor.redact_all(&raw);
         raw.fill(0);
-        String::from_utf8_lossy(&redacted).into_owned()
+        let text = String::from_utf8_lossy(&redacted).into_owned();
+        redacted.fill(0);
+        text
+    }
+
+    fn excerpt(&self, stderr: &[u8]) -> String {
+        self.lock()
+            .redactor
+            .excerpt(stderr, stderr.len() >= crate::process::OUTPUT_TAIL_BYTES)
     }
 
     fn complete(&self) -> bool {
@@ -529,6 +537,30 @@ mod tests {
             b.redact("Error: tok-1234567890 refused".into()),
             "Error: tok-1234567890 refused"
         );
+    }
+
+    /// P10D-2: the excerpt a failed step's detail carries comes from the
+    /// attempt's redactor, applied to the raw stderr tail before any
+    /// transformation — a multi-line file value printed to stderr leaves
+    /// no line of it in the detail, and a tail that filled its ring drops
+    /// its first, cut line.
+    #[test]
+    fn a_failure_excerpt_is_redacted_before_it_is_cut() {
+        let root = tempfile::tempdir().unwrap();
+        let pipe = LogPipe::open(root.path(), AttemptId::new(), Redactor::new(), None).unwrap();
+        pipe.register_secret(b"apiVersion: v1\ntoken: kube-secret-token");
+        let excerpt = pipe.excerpt(b"cat config\napiVersion: v1\ntoken: kube-secret-token\n");
+        assert!(!excerpt.contains("kube-secret"), "{excerpt}");
+        // A step that printed it over and over: the ring's 64 KiB cut lands
+        // inside a value (64 Ki is not a multiple of its 40 bytes), and
+        // whatever follows the dropped first line is whole.
+        let printed = b"apiVersion: v1\ntoken: kube-secret-token\n".repeat(4_000);
+        let wrapped = &printed[printed.len() - crate::process::OUTPUT_TAIL_BYTES..];
+        let excerpt = pipe.excerpt(wrapped);
+        assert!(!excerpt.contains("secret-token"), "{excerpt}");
+        // With nothing registered the excerpt is the plain last line.
+        let plain = LogPipe::open(root.path(), AttemptId::new(), Redactor::new(), None).unwrap();
+        assert_eq!(plain.excerpt(b"a\nError: nope\n"), "Error: nope");
     }
 
     #[test]

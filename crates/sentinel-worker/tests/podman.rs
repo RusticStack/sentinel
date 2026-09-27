@@ -40,6 +40,7 @@ fn a_present_image_still_checks_registry_authorization() {
     podman::pull(
         IMAGE,
         &authfile,
+        &podman::Store::Shared,
         Duration::from_secs(600),
         &std::sync::atomic::AtomicBool::new(false),
     )
@@ -49,6 +50,7 @@ fn a_present_image_still_checks_registry_authorization() {
         podman::pull(
             IMAGE,
             &authfile,
+            &podman::Store::Shared,
             Duration::from_secs(600),
             &std::sync::atomic::AtomicBool::new(false)
         )
@@ -79,6 +81,7 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
     podman::pull(
         IMAGE,
         &authfile,
+        &podman::Store::Shared,
         Duration::from_secs(600),
         &std::sync::atomic::AtomicBool::new(false),
     )
@@ -87,6 +90,7 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
         podman::pull(
             "docker.io/library/busybox:latest",
             &authfile,
+            &podman::Store::Shared,
             Duration::from_secs(1),
             &std::sync::atomic::AtomicBool::new(false)
         )
@@ -106,6 +110,7 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
         },
         ws.path(),
         &[],
+        &podman::Store::Shared,
     )
     .unwrap();
     assert_eq!(container.name(), format!("sentinel-{attempt}"));
@@ -235,7 +240,7 @@ struct RemoveOnFailure(String);
 impl Drop for RemoveOnFailure {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            let _ = podman::remove_named(&self.0);
+            let _ = podman::remove_named(&self.0, &podman::Store::Shared);
         }
     }
 }
@@ -266,6 +271,7 @@ fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
     podman::pull(
         IMAGE,
         &authfile,
+        &podman::Store::Shared,
         Duration::from_secs(600),
         &std::sync::atomic::AtomicBool::new(false),
     )
@@ -283,6 +289,7 @@ fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
         },
         ws.path(),
         &[],
+        &podman::Store::Shared,
     )
     .unwrap();
     let _outer = RemoveOnFailure(container.name().to_owned());
@@ -328,7 +335,12 @@ fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
         assert_eq!(procs(&nested), vec![pid]);
 
         assert_eq!(
-            podman::terminate_named(container.name(), Duration::from_secs(10)).unwrap(),
+            podman::terminate_named(
+                container.name(),
+                &podman::Store::Shared,
+                Duration::from_secs(10)
+            )
+            .unwrap(),
             podman::Terminated::Graceful
         );
         step.join().unwrap()
@@ -337,7 +349,12 @@ fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
     // The nested cgroups are still there, empty: nothing runs any more.
     assert!(cgroup.join("step").join("inner").exists());
     assert_eq!(
-        podman::terminate_named(container.name(), Duration::from_secs(1)).unwrap(),
+        podman::terminate_named(
+            container.name(),
+            &podman::Store::Shared,
+            Duration::from_secs(1)
+        )
+        .unwrap(),
         podman::Terminated::Gone
     );
 

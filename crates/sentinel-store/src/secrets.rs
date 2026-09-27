@@ -947,6 +947,144 @@ pub fn prepare_delivery(
     })
 }
 
+/// Why a declared secret could not be delivered to an acknowledged
+/// attempt, value-free (P10D-7): what the attempt's failure detail says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// The fence the attempt is held under, for the failure report.
+    pub fence: Fence,
+    /// `secret NAME: unbound|deleted|revoked|ambiguous`.
+    pub detail: String,
+}
+
+/// The first declared secret of the acknowledged attempt that cannot be
+/// resolved, and why — checked in the same order preparation resolves
+/// them. The denied use is audited against the secret the name refers to
+/// (`denied`), or, for a name bound to nothing, against a secret of that
+/// name in the repository's reach if one exists (`missing`); a name that
+/// matches no secret at all concerns no secret's trail. `None` when the
+/// attempt is not acknowledged here or every declared name resolves (the
+/// refusal was something else). Runs in the writer transaction that then
+/// settles the attempt, so the detail and the audit rows land together.
+pub fn refuse_delivery(
+    tx: &Transaction<'_>,
+    worker: WorkerId,
+    attempt: AttemptId,
+    now: UnixMillis,
+) -> Result<Option<Refusal>> {
+    if dispatch::spec_gate(tx, worker, attempt)? != dispatch::SpecGate::Ready {
+        return Ok(None);
+    }
+    let (tenant, run, job, job_index) = dispatch::attempt_scope(tx, worker, attempt)?;
+    let Some(fence) = tx
+        .prepare_cached(
+            "SELECT a.fence FROM attempts a JOIN workers w ON w.id=a.worker_id
+             WHERE a.id=?1 AND a.worker_id=?2 AND a.acked_ms IS NOT NULL
+               AND a.released_ms IS NULL AND w.revoked_ms IS NULL",
+        )?
+        .query_row(params![attempt.as_bytes(), worker.as_bytes()], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let (repo, job_name): ([u8; 16], String) = tx.query_row(
+        "SELECT r.repo_id,j.name FROM jobs j JOIN runs r ON r.id=j.run_id
+         WHERE j.id=?1 AND j.tenant_id=?2 AND r.tenant_id=?2 AND r.id=?3",
+        params![job.as_bytes(), tenant.as_bytes(), run.as_bytes()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let repo = RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("attempt repo"))?;
+    let bytes = dispatch::spec_bytes(tx, worker, attempt)?;
+    let spec =
+        sentinel_pipeline::RunSpec::decode(&bytes).map_err(|_| Error::Corrupt("run spec"))?;
+    let Some(compiled) = spec
+        .pipeline
+        .jobs
+        .get(job_index as usize)
+        .filter(|compiled| compiled.name == job_name)
+    else {
+        return Err(Error::Corrupt("job spec index"));
+    };
+    let mut declared: Vec<(&str, &str)> = Vec::new();
+    if let Some(name) = &compiled.spec.registry_auth {
+        declared.push(("", name));
+    }
+    for step in &compiled.spec.steps {
+        for name in step
+            .secrets
+            .iter()
+            .chain(step.secret_files.iter().map(|file| &file.name))
+        {
+            declared.push((&step.id, name));
+        }
+    }
+    for (step, name) in declared {
+        let reason = match resolve(tx, repo, &job_name, step, name) {
+            Ok(_) => continue,
+            Err(Error::NotFound) => None,
+            Err(Error::Conflict) => Some("ambiguous"),
+            Err(e) => return Err(e),
+        };
+        // The binding the resolver would have followed, if any.
+        let bound: Option<([u8; 16], i64, bool, bool)> = tx
+            .query_row(
+                "SELECT s.id,s.current_version,s.active,
+                        EXISTS(SELECT 1 FROM secret_versions v WHERE v.secret_id=s.id
+                               AND v.version=s.current_version AND v.revoked=0)
+                 FROM secret_bindings b JOIN secrets s ON s.id=b.secret_id
+                 WHERE b.repo_id=?1 AND b.name=?2 AND (b.job=?3 OR b.job='')
+                   AND (b.step=?4 OR b.step='')
+                 ORDER BY (b.job=?3) DESC,(b.step=?4 AND b.step!='') DESC LIMIT 1",
+                params![repo.as_bytes(), name, job_name, step],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let (reason, audited, result) = match (reason, bound) {
+            (Some(reason), Some((id, version, _, _))) => (reason, Some((id, version)), "denied"),
+            (None, Some((id, version, false, _))) => ("deleted", Some((id, version)), "denied"),
+            (None, Some((id, version, true, false))) => ("revoked", Some((id, version)), "denied"),
+            (reason, _) => {
+                // Bound to nothing (or through an inactive tenant): a secret
+                // of that name the repository could reach is the trail.
+                let named: Option<([u8; 16], i64)> = tx
+                    .query_row(
+                        "SELECT id,current_version FROM secrets
+                         WHERE name=?3 AND (scope_repo_id=?2
+                               OR (tenant_id=?1 AND scope_repo_id IS NULL))
+                         ORDER BY scope_repo_id IS NULL LIMIT 1",
+                        params![tenant.as_bytes(), repo.as_bytes(), name],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                (reason.unwrap_or("unbound"), named, "missing")
+            }
+        };
+        if let Some((secret, version)) = audited {
+            tx.execute(
+                "INSERT INTO secret_audit(tenant_id,repo_id,secret_id,version,actor,attempt_id,step,action,result,at_ms)
+                 VALUES(?1,?2,?3,?4,NULL,?5,?6,'use',?7,?8)",
+                params![
+                    tenant.as_bytes(),
+                    repo.as_bytes(),
+                    secret,
+                    version,
+                    attempt.as_bytes(),
+                    step,
+                    result,
+                    now.0
+                ],
+            )?;
+        }
+        return Ok(Some(Refusal {
+            fence: Fence(fence as u64),
+            detail: format!("secret {name}: {reason}"),
+        }));
+    }
+    Ok(None)
+}
+
 /// Open exactly one already-authorized immutable version. This stays private
 /// to the store preparation path; client-facing metadata never exposes it.
 type StoredSecretVersion = ([u8; 16], Option<[u8; 16]>, String, i64, bool, Vec<u8>, bool);
