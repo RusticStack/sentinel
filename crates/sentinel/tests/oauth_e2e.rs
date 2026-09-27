@@ -1119,7 +1119,28 @@ fn a_github_only_account_signs_the_cli_in_through_github() {
     let at_github = request("GET", started.header("location").unwrap(), Body::None, &[]);
     assert_eq!(at_github.status, 302);
     let callback = at_github.header("location").unwrap().to_owned();
-    let done = request("GET", &callback, Body::None, &[("cookie", &signin_cookie)]);
+    // GitHub's redirect back is cross-site: the callback issues nothing and
+    // moves the browser on to the same-origin finish hop (P09S-10).
+    let back = request(
+        "GET",
+        &callback,
+        Body::None,
+        &[("cookie", &signin_cookie), ("sec-fetch-site", "cross-site")],
+    );
+    assert_eq!(back.status, 200, "{}", back.text());
+    pages.push(back.text().to_owned());
+    let at = back.text().find("url=").unwrap() + 4;
+    let hop = back.text()[at..].split('"').next().unwrap().to_owned();
+    assert_eq!(hop, "/auth/github/finish");
+    let done = request(
+        "GET",
+        &format!("{}{hop}", d.base),
+        Body::None,
+        &[
+            ("cookie", &signin_cookie),
+            ("sec-fetch-site", "same-origin"),
+        ],
+    );
     assert_eq!(done.status, 200, "{}", done.text());
     let session = done
         .headers
