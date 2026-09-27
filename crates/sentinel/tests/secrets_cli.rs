@@ -424,6 +424,12 @@ fn an_import_bound_to_its_preview_refuses_a_moved_version() {
 
     // A bare CR is refused with its line number, before any request.
     std::fs::write(dir.join("cr.env"), b"A=1\rB=2\r").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join("cr.env"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
     let cr = cli(
         &d,
         &[
