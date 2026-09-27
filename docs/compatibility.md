@@ -49,8 +49,14 @@ fields and unsupported versions are rejected. A compatible v1 change may add
 optional fields only when v1 readers can safely ignore them; changing field
 meaning, enum vocabulary, evidence-offset semantics, or validation bounds
 requires a new version. Server-authored provenance and freshness remain
-outside the custom input shape. Reports are evidence and cannot override the
-fenced attempt result. See [structured diagnostics](diagnostics.md).
+outside the custom input shape. Readers of server-authored reports
+(`DiagnosticReport` and everything nested in it) ignore unknown fields, so
+the additive rule holds for them; only `ReportInput` decoding is strict.
+The failure view (`sentinel.failure/1`) gains fields the same way: its
+`artifact_reports`, per-report `window`/`artifact`, and binary excerpt
+entries (`binary`, `bytes`, `end_sequence`) are additive. Reports are
+evidence and cannot override the fenced attempt result. See
+[structured diagnostics](diagnostics.md).
 
 **Pipeline schema.** A file names the schema it was written for and is accepted only by builds that implement that exact version. Within a version, changes may only widen what is accepted (new optional keys, new functions, relaxed limits). Rejecting something that was previously accepted, changing the meaning of an accepted construct, or tightening a limit requires a new schema number; the old number stays supported for at least two minor releases and its removal is announced in the changelog. Unknown keys are always errors, so a file cannot silently depend on a feature its declared schema does not have.
 

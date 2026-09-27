@@ -151,6 +151,38 @@ pub fn for_attempt(conn: &Connection, attempt: AttemptId) -> Result<Vec<(String,
         .collect()
 }
 
+/// The captured artifacts of one attempt of the tenant, by name, at
+/// most `limit`: `(name, manifest version)` for the failure view's report
+/// collection. One indexed read on `(attempt_id, name)`.
+pub fn captured_for_attempt(
+    conn: &Connection,
+    tenant: TenantId,
+    attempt: AttemptId,
+    limit: usize,
+) -> Result<Vec<(String, u64)>> {
+    let rows = conn
+        .prepare_cached(
+            "SELECT name, manifest_version FROM artifacts
+             WHERE attempt_id = ?1 AND tenant_id = ?2 AND state_code = 0
+             ORDER BY name LIMIT ?3",
+        )?
+        .query_map(
+            params![
+                attempt.as_bytes().as_slice(),
+                tenant.as_bytes().as_slice(),
+                limit.min(i64::MAX as usize) as i64
+            ],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(name, version)| {
+            let version = version.ok_or(Error::Corrupt("artifact manifest"))?;
+            Ok((name, version as u64))
+        })
+        .collect()
+}
+
 /// Total captured bytes of a run, across every job and attempt: the durable
 /// half of the per-run artifact budget.
 pub fn run_bytes(conn: &Connection, tenant: TenantId, run: RunId) -> Result<u64> {

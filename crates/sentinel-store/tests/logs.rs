@@ -509,3 +509,93 @@ fn pages_are_bounded_and_a_finished_step_is_reported() {
         cut.next_after
     );
 }
+
+/// P11D-6: the newest window of a failed step survives a later
+/// `if: always()` step that wrote more than a window, and a log without an
+/// end marker or live writer reports its real last frame, not the last
+/// sparse-index checkpoint.
+#[test]
+fn the_newest_page_of_a_step_ignores_later_steps_and_reaches_the_real_end() {
+    use sentinel_store::logs::Page;
+    let temp = tempfile::tempdir().unwrap();
+    let attempt = AttemptId::new();
+    let page = Page {
+        limit: 128,
+        bytes: 4 << 20,
+        scan: 16 << 20,
+    };
+    {
+        let logs = LogStore::open(temp.path().join("logs")).unwrap();
+        for seq in 1..=200u64 {
+            let text = format!("fail {seq}\n");
+            logs.append(run(), job(), attempt, &at_step(seq, 0, &text))
+                .unwrap();
+        }
+        for seq in 201..=400u64 {
+            logs.append(run(), job(), attempt, &at_step(seq, 1, "cleanup\n"))
+                .unwrap();
+        }
+        let failed = logs
+            .newest_page(run(), job(), attempt, page, Some(0))
+            .unwrap();
+        assert_eq!(
+            failed.frames.iter().map(|f| f.seq).collect::<Vec<_>>(),
+            (73..=200).collect::<Vec<_>>()
+        );
+        assert!(failed.step_done && failed.next_after.is_none());
+        // Frames past the last checkpoint exist only in the segment.
+        for seq in 401..=430u64 {
+            logs.append(run(), job(), attempt, &at_step(seq, 1, "late\n"))
+                .unwrap();
+        }
+        // The writer goes with the store: no end marker, no frontier.
+    }
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    assert_eq!(logs.last_seq(run(), job(), attempt).unwrap(), Some(430));
+    let newest = logs
+        .newest_page(run(), job(), attempt, Page { limit: 5, ..page }, None)
+        .unwrap();
+    assert_eq!(
+        newest.frames.iter().map(|f| f.seq).collect::<Vec<_>>(),
+        (426..=430).collect::<Vec<_>>()
+    );
+    assert!(!newest.complete);
+    // A step that never wrote has no frames.
+    let never = logs
+        .newest_page(run(), job(), attempt, page, Some(7))
+        .unwrap();
+    assert!(never.frames.is_empty());
+}
+
+/// The byte bound keeps the newest frames, however long the step was.
+#[test]
+fn the_newest_page_holds_at_most_its_byte_bound_of_the_newest_frames() {
+    use sentinel_store::logs::Page;
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let attempt = AttemptId::new();
+    let full = "z".repeat(32 * 1024);
+    for seq in 1..=400u64 {
+        logs.append(run(), job(), attempt, &frame(seq, &full))
+            .unwrap();
+    }
+    logs.finish(run(), job(), attempt, 400, &[]).unwrap();
+    let tail = logs
+        .newest_page(
+            run(),
+            job(),
+            attempt,
+            Page {
+                limit: 1_024,
+                bytes: 1 << 20,
+                scan: 16 << 20,
+            },
+            Some(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tail.frames.iter().map(|f| f.seq).collect::<Vec<_>>(),
+        (369..=400).collect::<Vec<_>>()
+    );
+    assert!(tail.complete && tail.next_after.is_none());
+}
