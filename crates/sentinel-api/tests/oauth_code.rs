@@ -108,6 +108,7 @@ pub fn deployment() -> Deployment {
         intake: None,
         public_url: None,
         github_sign_in: None,
+        trusted_proxies: sentinel_api::TrustedProxy::loopback(),
     })
     .unwrap();
     let base = format!("http://{}", server.local_addr());
@@ -224,7 +225,24 @@ pub fn send(
     }
 }
 
+/// Allow anonymous RFC 7591 registration, which the default instance
+/// policy (Client ID Metadata Documents only) does not.
+fn open_registration(d: &Deployment) {
+    d.store
+        .writer()
+        .write(|tx| {
+            sentinel_store::oauth::set_client_registration(
+                tx,
+                Authority::HostLocal,
+                sentinel_store::oauth::ClientRegistration::Open,
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+}
+
 fn register_mcp_test_client(d: &Deployment) -> String {
+    open_registration(d);
     let reply = send(
         d,
         "POST",
@@ -392,9 +410,11 @@ fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
         &[],
     );
     assert_eq!(invalid_initialize.status, 400);
-    let unsupported = mcp_request(&d, "POST", Some(&old_version), Some(&authorization), &[]);
-    assert_eq!(unsupported.status, 400);
-    assert_eq!(unsupported.body["error"]["code"], -32602);
+    // Lifecycle negotiation: an older requested revision is answered with
+    // the one this server supports, and the client decides.
+    let negotiated = mcp_request(&d, "POST", Some(&old_version), Some(&authorization), &[]);
+    assert_eq!(negotiated.status, 200, "{:?}", negotiated.body);
+    assert_eq!(negotiated.body["result"]["protocolVersion"], "2025-11-25");
     let initialized = mcp_request(
         &d,
         "POST",
@@ -419,14 +439,41 @@ fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
     );
     assert_eq!(active.status, 202);
 
+    // Streamable HTTP: an unsupported MCP-Protocol-Version is 400 (still
+    // naming the supported revision); an absent one is the session's
+    // negotiated revision.
+    let ping = json!({"jsonrpc":"2.0","id":8,"method":"ping"});
+    let wrong_version = mcp_request(
+        &d,
+        "POST",
+        Some(&ping),
+        Some(&authorization),
+        &[("mcp-protocol-version", "2024-11-05"), session_header],
+    );
+    assert_eq!(wrong_version.status, 400);
+    assert_eq!(wrong_version.body["code"], "unsupported_version");
+    assert_eq!(wrong_version.body["details"]["supported"], "2025-11-25");
     let missing_version = mcp_request(
         &d,
         "POST",
-        Some(&json!({"jsonrpc":"2.0","id":8,"method":"ping"})),
+        Some(&ping),
         Some(&authorization),
         &[session_header],
     );
-    assert_eq!(missing_version.status, 426);
+    assert_eq!(missing_version.status, 200, "{:?}", missing_version.body);
+    assert_eq!(missing_version.body["result"], json!({}));
+    // A missing session header is the client's error (400); an unknown one
+    // is an expired session (404), which makes the client re-initialize.
+    let no_session = mcp_request(&d, "POST", Some(&ping), Some(&authorization), &[version]);
+    assert_eq!(no_session.status, 400);
+    let unknown_session = mcp_request(
+        &d,
+        "POST",
+        Some(&ping),
+        Some(&authorization),
+        &[version, ("mcp-session-id", &"0".repeat(64))],
+    );
+    assert_eq!(unknown_session.status, 404);
 
     let list = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
     let tools = mcp_request(
@@ -454,6 +501,42 @@ fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
     let challenge = scope.header("www-authenticate").unwrap();
     assert!(challenge.contains("insufficient_scope") && challenge.contains("logs:read"));
     assert!(challenge.contains("oauth-protected-resource/mcp"));
+
+    // The reverse direction: an MCP-audience token is not an API credential.
+    let api_with_mcp = send(
+        &d,
+        "GET",
+        "/api/v1/me",
+        Body::None,
+        &[("authorization", &authorization)],
+    );
+    assert_eq!(api_with_mcp.status, 401);
+    let challenge = api_with_mcp.header("www-authenticate").unwrap();
+    assert!(
+        challenge.contains("oauth-protected-resource/api/v1")
+            && challenge.contains("invalid_token"),
+        "{challenge}"
+    );
+
+    // P11-7: the scope a tool needs is the route's, not a guess from the
+    // path. A tenant named like a secrets route needs only runs:read.
+    let secrets_named = mcp_request(
+        &d,
+        "POST",
+        Some(&json!({
+            "jsonrpc":"2.0","id":10,"method":"tools/call",
+            "params":{"name":"list_runs","arguments":{"tenant":"secrets","repo":"app"}}
+        })),
+        Some(&authorization),
+        &[version, session_header],
+    );
+    assert_eq!(secrets_named.status, 200, "{:?}", secrets_named.body);
+    assert_eq!(secrets_named.body["result"]["isError"], true);
+    assert!(
+        secrets_named.body["result"]["structuredContent"]["details"]["scope"].is_null(),
+        "{:?}",
+        secrets_named.body
+    );
 
     let api_access = mint_api_access(&d);
     let api_authorization = bearer(&api_access);
@@ -612,6 +695,7 @@ fn vscode_and_claude_public_clients_complete_the_remote_mcp_lifecycle() {
         ("Visual Studio Code", "http://127.0.0.1:33418"),
         ("Claude", "https://claude.ai/api/mcp/auth_callback"),
     ];
+    open_registration(&d);
 
     let metadata = send(
         &d,
@@ -790,12 +874,22 @@ fn vscode_and_claude_public_clients_complete_the_remote_mcp_lifecycle() {
 #[test]
 fn dynamic_registration_refuses_privileged_scopes_and_untrusted_redirects() {
     let d = deployment();
+    open_registration(&d);
     for (metadata, error) in [
         (
+            // Complete protocol fields, so only the scope can be refused.
             json!({
                 "client_name":"bad scope",
                 "redirect_uris":["https://client.example/callback"],
+                "grant_types":["authorization_code","refresh_token"],
                 "scope":"runs:read platform:admin"
+            }),
+            "invalid_client_metadata",
+        ),
+        (
+            json!({
+                "client_name":"Sentinel CLI",
+                "redirect_uris":["https://client.example/callback"]
             }),
             "invalid_client_metadata",
         ),
@@ -808,9 +902,9 @@ fn dynamic_registration_refuses_privileged_scopes_and_untrusted_redirects() {
         ),
         (
             json!({
-                "client_name":"device flow",
+                "client_name":"client credentials",
                 "redirect_uris":["https://client.example/callback"],
-                "grant_types":["authorization_code","urn:ietf:params:oauth:grant-type:device_code"]
+                "grant_types":["authorization_code","client_credentials"]
             }),
             "invalid_client_metadata",
         ),
@@ -1529,4 +1623,366 @@ fn approval_can_narrow_to_a_tenant_and_repository() {
         &[("authorization", &bearer(&access))],
     );
     assert_eq!(runs.status, 200, "{:?}", runs.body);
+}
+
+fn registered_clients(d: &Deployment) -> i64 {
+    d.store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM oauth_clients WHERE registration_kind != 0",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+/// P11-1: dynamic registration exists only while instance policy allows
+/// it, and the metadata advertises exactly what the policy allows.
+#[test]
+fn dynamic_registration_is_off_by_default_and_not_advertised() {
+    let d = deployment();
+    let metadata = send(
+        &d,
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        Body::None,
+        &[],
+    );
+    assert_eq!(metadata.status, 200);
+    assert!(metadata.body.get("registration_endpoint").is_none());
+    assert_eq!(metadata.body["client_id_metadata_document_supported"], true);
+    let refused = send(
+        &d,
+        "POST",
+        "/oauth/register",
+        Body::Json(&json!({"redirect_uris":["https://client.example.org/cb"]})),
+        &[],
+    );
+    assert_eq!(refused.status, 403, "{:?}", refused.body);
+    assert_eq!(refused.body["error"], "access_denied");
+    assert_eq!(registered_clients(&d), 0);
+
+    open_registration(&d);
+    let metadata = send(
+        &d,
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        Body::None,
+        &[],
+    );
+    assert_eq!(
+        metadata.body["registration_endpoint"],
+        format!("{}/oauth/register", d.base)
+    );
+
+    // Off: neither mechanism, and a metadata URL is refused before any fetch.
+    d.store
+        .writer()
+        .write(|tx| {
+            sentinel_store::oauth::set_client_registration(
+                tx,
+                Authority::HostLocal,
+                sentinel_store::oauth::ClientRegistration::Off,
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+    let metadata = send(
+        &d,
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        Body::None,
+        &[],
+    );
+    assert!(metadata.body.get("registration_endpoint").is_none());
+    assert_eq!(
+        metadata.body["client_id_metadata_document_supported"],
+        false
+    );
+    let cookie = sign_in(&d, "dev");
+    let challenge = pkce::challenge(&pkce::verifier());
+    let pairs = with(
+        with(
+            request_pairs(&challenge),
+            "client_id",
+            Some("https://client.example.org/mcp.json"),
+        ),
+        "redirect_uri",
+        Some("https://client.example.org/cb"),
+    );
+    let page = send(
+        &d,
+        "GET",
+        &authorize_path(&pairs),
+        Body::None,
+        &[("cookie", &cookie)],
+    );
+    assert_eq!(page.status, 400);
+    assert!(page.text().contains("does not accept client metadata"));
+    assert_eq!(registered_clients(&d), 0);
+}
+
+/// P11-3 / P09S-5 / P09S-6: a standard native-client registration — the
+/// RFC 7591 default grant, an echoed advertised grant, `localhost` and a
+/// port-free loopback redirect — is accepted, and the loopback redirect
+/// then works on whatever port the client bound (RFC 8252 §7.3).
+#[test]
+fn standard_native_registrations_are_accepted_and_match_any_loopback_port() {
+    let d = deployment();
+    open_registration(&d);
+    for body in [
+        json!({"client_name":"defaults","redirect_uris":["http://127.0.0.1/callback"]}),
+        json!({
+            "client_name":"Visual Studio Code",
+            "grant_types":["authorization_code","refresh_token","urn:ietf:params:oauth:grant-type:device_code"],
+            "response_types":["code"],
+            "token_endpoint_auth_method":"none",
+            "redirect_uris":["https://vscode.dev/redirect","http://127.0.0.1:33418","http://localhost:33418/","http://localhost"]
+        }),
+    ] {
+        let reply = send(&d, "POST", "/oauth/register", Body::Json(&body), &[]);
+        assert_eq!(reply.status, 201, "{:?}", reply.body);
+        // RFC 7591 §3.2.1: the answer states what the client actually got.
+        assert_eq!(
+            reply.body["grant_types"],
+            json!(["authorization_code", "refresh_token"])
+        );
+    }
+    let registration = send(
+        &d,
+        "POST",
+        "/oauth/register",
+        Body::Json(
+            &json!({"client_name":"ephemeral","redirect_uris":["http://127.0.0.1/callback"]}),
+        ),
+        &[],
+    );
+    let client_id = registration.body["client_id"].as_str().unwrap().to_owned();
+    let resource = format!("{}/mcp", d.base);
+    let cookie = sign_in(&d, "dev");
+    for (redirect, accepted) in [
+        ("http://127.0.0.1:54321/callback", true),
+        ("http://127.0.0.1:1/callback", true),
+        ("http://127.0.0.1:54321/other", false),
+        ("http://localhost:54321/callback", false),
+    ] {
+        let pairs = vec![
+            ("response_type", "code".to_owned()),
+            ("client_id", client_id.clone()),
+            ("redirect_uri", redirect.to_owned()),
+            ("state", STATE.to_owned()),
+            ("code_challenge", pkce::challenge(&pkce::verifier())),
+            ("code_challenge_method", "S256".to_owned()),
+            ("scope", "runs:read".to_owned()),
+            ("resource", resource.clone()),
+        ];
+        let page = send(
+            &d,
+            "GET",
+            &authorize_path(&pairs),
+            Body::None,
+            &[("cookie", &cookie)],
+        );
+        assert_eq!(page.status, if accepted { 200 } else { 400 }, "{redirect}");
+        assert!(page.header("location").is_none(), "{redirect}");
+        if accepted {
+            assert!(
+                page.text().contains("Third-party application"),
+                "{redirect}"
+            );
+        }
+    }
+}
+
+/// P09S-3 (RFC 9700 §4.11.2): before anyone signs in, a request for a
+/// registered client is never answered with a redirect, however malformed;
+/// the same request from a signed-in account gets the RFC 6749 redirect.
+#[test]
+fn a_registered_clients_errors_redirect_only_after_sign_in() {
+    let d = deployment();
+    let client_id = register_mcp_test_client(&d);
+    let pairs = vec![
+        ("client_id", client_id.clone()),
+        ("redirect_uri", MCP_TEST_REDIRECT.to_owned()),
+        ("state", STATE.to_owned()),
+    ];
+    let anonymous = send(&d, "GET", &authorize_path(&pairs), Body::None, &[]);
+    assert_eq!(anonymous.status, 200, "{:?}", anonymous.body);
+    assert!(anonymous.header("location").is_none());
+    assert!(anonymous.text().contains("/api/v1/login"));
+    assert_page_headers(&anonymous);
+
+    let cookie = sign_in(&d, "dev");
+    let signed_in = send(
+        &d,
+        "GET",
+        &authorize_path(&pairs),
+        Body::None,
+        &[("cookie", &cookie)],
+    );
+    let back = returned_to(&signed_in, MCP_TEST_REDIRECT);
+    assert_eq!(param(&back, "error"), Some("invalid_request"));
+    assert_eq!(param(&back, "state"), Some(STATE));
+}
+
+/// P09S-7: a CIMD client is reachable only through its metadata URL, never
+/// through the internal key that would skip the document's freshness check.
+#[test]
+fn a_metadata_document_client_is_not_addressable_by_its_internal_key() {
+    let d = deployment();
+    let internal = format!("c_{}", "d".repeat(62));
+    sentinel_store::oauth::register_mcp_client(
+        &d.store,
+        &sentinel_store::oauth::McpClientSpec {
+            id: &internal,
+            name: "Metadata client",
+            max_scopes: sentinel_core::auth::Scopes::RUNS_READ,
+            kind: sentinel_store::oauth::McpRegistrationKind::Metadata,
+            metadata_url: Some("https://client.example.org/mcp.json"),
+        },
+        &["https://client.example.org/cb"],
+    )
+    .unwrap();
+    let cookie = sign_in(&d, "dev");
+    let pairs = vec![
+        ("response_type", "code".to_owned()),
+        ("client_id", internal),
+        ("redirect_uri", "https://client.example.org/cb".to_owned()),
+        ("state", STATE.to_owned()),
+        ("code_challenge", pkce::challenge(&pkce::verifier())),
+        ("code_challenge_method", "S256".to_owned()),
+    ];
+    let page = send(
+        &d,
+        "GET",
+        &authorize_path(&pairs),
+        Body::None,
+        &[("cookie", &cookie)],
+    );
+    assert_eq!(page.status, 400);
+    assert!(page.header("location").is_none());
+    assert!(page.text().contains("not registered"));
+}
+
+/// P09S-1 / P11-2: an anonymous flood of authorization requests naming
+/// metadata documents on hosts it controls makes the server fetch nothing
+/// and store nothing, and the API keeps answering at once.
+#[test]
+fn anonymous_metadata_document_requests_neither_fetch_nor_hold_the_api() {
+    let d = deployment();
+    let challenge = pkce::challenge(&pkce::verifier());
+    let started = std::time::Instant::now();
+    let slowest = std::thread::scope(|scope| {
+        let flood: Vec<_> = (0..32)
+            .map(|n| {
+                let d = &d;
+                let challenge = challenge.clone();
+                scope.spawn(move || {
+                    // A distinct document per request defeats any cache.
+                    let url = format!("https://slow{n}.attacker.example.org/client.json");
+                    let pairs = with(
+                        with(request_pairs(&challenge), "client_id", Some(&url)),
+                        "redirect_uri",
+                        Some("https://attacker.example.org/cb"),
+                    );
+                    let at = std::time::Instant::now();
+                    let reply = send(d, "GET", &authorize_path(&pairs), Body::None, &[]);
+                    assert_eq!(reply.status, 200);
+                    assert!(reply.header("location").is_none());
+                    assert!(reply.text().contains("/api/v1/login"));
+                    at.elapsed()
+                })
+            })
+            .collect();
+        let health = scope.spawn(|| {
+            let at = std::time::Instant::now();
+            let reply = send(&d, "GET", "/api/v1/health", Body::None, &[]);
+            assert_eq!(reply.status, 200);
+            at.elapsed()
+        });
+        let health = health.join().unwrap();
+        let slowest = flood
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .max()
+            .unwrap();
+        (health, slowest)
+    });
+    // Nothing was fetched: every answer is local work, far below the
+    // metadata fetch's own two-second bound.
+    assert!(slowest.0 < std::time::Duration::from_secs(1), "{slowest:?}");
+    assert!(slowest.1 < std::time::Duration::from_secs(1), "{slowest:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(
+        registered_clients(&d),
+        0,
+        "no anonymous request stores a client"
+    );
+}
+
+/// P11-10: an expired MCP token is refused as `invalid_token`, with the
+/// MCP resource's metadata, so the client refreshes.
+#[test]
+fn an_expired_mcp_token_gets_the_invalid_token_challenge() {
+    let d = deployment();
+    let client_id = format!("m_{}", "e".repeat(62));
+    sentinel_store::oauth::register_mcp_client(
+        &d.store,
+        &sentinel_store::oauth::McpClientSpec {
+            id: &client_id,
+            name: "Expiring client",
+            max_scopes: sentinel_core::auth::Scopes::RUNS_READ,
+            kind: sentinel_store::oauth::McpRegistrationKind::Dynamic,
+            metadata_url: None,
+        },
+        &[MCP_TEST_REDIRECT],
+    )
+    .unwrap();
+    let verifier = pkce::verifier();
+    let challenge = pkce::challenge(&verifier);
+    let issued =
+        UnixMillis(UnixMillis::now().0 - sentinel_store::oauth::ACCESS_LIFETIME_MS - 60_000);
+    let code = sentinel_store::oauth::code::approve(
+        &d.store,
+        &sentinel_store::oauth::code::Approval {
+            client_id: &client_id,
+            redirect_uri: MCP_TEST_REDIRECT,
+            code_challenge: &challenge,
+            user: d.dev,
+            scopes: sentinel_core::auth::Scopes::RUNS_READ,
+            tenant: None,
+            repo: None,
+            audience: sentinel_core::auth::Audience::Mcp,
+        },
+        issued,
+    )
+    .unwrap();
+    let minted = sentinel_store::oauth::code::exchange(
+        &d.store,
+        &client_id,
+        &code,
+        MCP_TEST_REDIRECT,
+        &verifier,
+        Some(sentinel_core::auth::Audience::Mcp),
+        issued,
+    )
+    .unwrap();
+    let initialize = json!({
+        "jsonrpc":"2.0", "id":1, "method":"initialize",
+        "params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}
+    });
+    let expired = mcp_request(
+        &d,
+        "POST",
+        Some(&initialize),
+        Some(&bearer(&minted.access)),
+        &[],
+    );
+    assert_eq!(expired.status, 401);
+    let challenge = expired.header("www-authenticate").unwrap();
+    assert!(
+        challenge.contains("invalid_token") && challenge.contains("oauth-protected-resource/mcp"),
+        "{challenge}"
+    );
 }

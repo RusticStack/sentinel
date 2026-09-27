@@ -8,7 +8,7 @@ use std::{
 };
 
 use clap::Args;
-use sentinel_protocol::mcp::MAX_LOG_FRAMES;
+use sentinel_protocol::mcp::{ApiCall, Backend, execute_tool};
 use serde_json::{Map, Value, json};
 
 pub use sentinel_protocol::mcp::PROTOCOL_VERSION;
@@ -297,15 +297,19 @@ fn call_tool(client: &Client, params: &Map<String, Value>) -> Result<Value, RpcE
     if !known_tool(name) {
         return Err(RpcError::params("Unknown tool"));
     }
-    let arguments = params
-        .get("arguments")
-        .and_then(Value::as_object)
-        .ok_or_else(|| RpcError::params("tools/call requires an arguments object"))?;
-    let result = execute_tool(client, name, arguments);
-    match result {
-        Ok(value) => Ok(tool_result(value, false)),
-        Err(error) => Ok(tool_result(error, true)),
-    }
+    // `arguments` is optional in MCP: a tool with no required argument runs
+    // on an empty object, exactly as over Streamable HTTP.
+    let empty = Map::new();
+    let arguments = match params.get("arguments") {
+        None => &empty,
+        Some(Value::Object(arguments)) => arguments,
+        Some(_) => return Err(RpcError::params("tools/call arguments must be an object")),
+    };
+    let mut backend = Stdio { client };
+    Ok(match execute_tool(&mut backend, name, arguments) {
+        Ok(value) => tool_result(value, false),
+        Err(error) => tool_result(error, true),
+    })
 }
 
 fn known_tool(name: &str) -> bool {
@@ -336,143 +340,39 @@ fn tool_result(value: Value, is_error: bool) -> Value {
     })
 }
 
-fn execute_tool(client: &Client, name: &str, args: &Map<String, Value>) -> Result<Value, Value> {
-    match name {
-        "list_runs" => run_list(client, args),
-        "get_run" => run_get(client, args),
-        "wait_run" => run_wait(client, args),
-        "get_failure" => failure_get(client, args),
-        "get_logs" => logs_get(client, args),
-        "explain_queue" => queue_get(client, args),
-        "get_pipeline" => pipeline_get(client, args),
-        "validate_pipeline" => pipeline_validate(args),
-        "dispatch" => dispatch(client, args),
-        "rerun_job" => rerun(client, args),
-        "cancel" => cancel(client, args),
-        "list_secret_metadata" => secrets_list(client, args),
-        "get_secret_metadata" => secret_get(client, args),
-        _ => Err(local_error("invalid_request", "unknown tool")),
+/// The stdio transport's side of the shared tool mapper
+/// ([`sentinel_protocol::mcp::execute_tool`]): the same argument checks and
+/// API calls as Streamable HTTP, made through the profile's API client. A
+/// dispatched pipeline is compiled here first, which saves the round trip.
+struct Stdio<'a> {
+    client: &'a Client,
+}
+
+impl Backend for Stdio<'_> {
+    const PREFLIGHT_PIPELINE: bool = true;
+
+    fn default_tenant(&self) -> Option<&str> {
+        self.client.default_tenant()
     }
-}
 
-fn run_list(client: &Client, args: &Map<String, Value>) -> Result<Value, Value> {
-    let args = checked_args(args, &["tenant", "repo", "limit", "before"])?;
-    let tenant = tenant(client, args)?;
-    let repo = required_string(args, "repo", 128)?;
-    safe_segment("repository", repo)?;
-    let limit = optional_u64(args, "limit", 1, 100)?.unwrap_or(20);
-    let before = optional_string(args, "before", 64)?;
-    if let Some(cursor) = before {
-        safe_segment("cursor", cursor)?;
+    fn call_api(&mut self, call: ApiCall) -> Result<Value, Value> {
+        let result = if call.method == "GET" {
+            self.client.get(&call.path)
+        } else {
+            self.client
+                .post(&call.path, &call.body, call.idempotency_key.as_deref())
+        };
+        result.map_err(|error| error.document())
     }
-    let path = query_path(
-        &format!("/api/v1/tenants/{tenant}/repos/{repo}/runs"),
-        &[
-            ("limit", Some(limit.to_string())),
-            ("before", before.map(str::to_owned)),
-        ],
-    );
-    api(client.get(&path))
-}
 
-fn run_get(client: &Client, args: &Map<String, Value>) -> Result<Value, Value> {
-    let args = checked_args(args, &["run"])?;
-    let run = required_string(args, "run", 64)?;
-    safe_segment("run", run)?;
-    api(client.get(&format!("/api/v1/runs/{run}")))
-}
-
-fn run_wait(client: &Client, args: &Map<String, Value>) -> Result<Value, Value> {
-    let args = checked_args(args, &["run", "since", "timeout_ms"])?;
-    let run = required_string(args, "run", 64)?;
-    safe_segment("run", run)?;
-    let since = optional_string(args, "since", 16)?;
-    if since.is_some_and(|value| {
-        value.len() != 16 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
-    }) {
-        return Err(local_error(
-            "invalid_request",
-            "since must be 16 hexadecimal digits",
-        ));
-    }
-    let timeout = optional_u64(args, "timeout_ms", 1, 25_000)?.unwrap_or(25_000);
-    let path = query_path(
-        &format!("/api/v1/runs/{run}/wait"),
-        &[
-            ("since", since.map(str::to_owned)),
-            ("timeout_ms", Some(timeout.to_string())),
-        ],
-    );
-    api(client.get(&path))
-}
-
-fn failure_get(client: &Client, args: &Map<String, Value>) -> Result<Value, Value> {
-    let args = checked_args(args, &["attempt", "budget", "limit", "after", "cursor"])?;
-    let attempt = required_string(args, "attempt", 64)?;
-    safe_segment("attempt", attempt)?;
-    mutually_exclusive(args, "after", "cursor")?;
-    let budget = optional_u64(args, "budget", 1, 65_536)?;
-    let limit = optional_u64(args, "limit", 1, 20)?;
-    let after = optional_u64(args, "after", 0, u64::MAX)?;
-    let cursor = optional_string(args, "cursor", 256)?;
-    let path = query_path(
-        &format!("/api/v1/attempts/{attempt}/failure"),
-        &[
-            ("budget", budget.map(|v| v.to_string())),
-            ("limit", limit.map(|v| v.to_string())),
-            ("after", after.map(|v| v.to_string())),
-            ("cursor", cursor.map(str::to_owned)),
-        ],
-    );
-    api(client.get(&path))
-}
-
-fn logs_get(client: &Client, args: &Map<String, Value>) -> Result<Value, Value> {
-    let args = checked_args(args, &["attempt", "after", "cursor", "limit", "step"])?;
-    let attempt = required_string(args, "attempt", 64)?;
-    safe_segment("attempt", attempt)?;
-    mutually_exclusive(args, "after", "cursor")?;
-    let after = optional_u64(args, "after", 0, u64::MAX)?;
-    let cursor = optional_string(args, "cursor", 256)?;
-    let limit = optional_u64(args, "limit", 1, MAX_LOG_FRAMES)?.unwrap_or(MAX_LOG_FRAMES);
-    let step = optional_u64(args, "step", 0, u32::MAX as u64)?;
-    let path = query_path(
-        &format!("/api/v1/attempts/{attempt}/logs"),
-        &[
-            ("after", after.map(|v| v.to_string())),
-            ("cursor", cursor.map(str::to_owned)),
-            ("limit", Some(limit.to_string())),
-            ("step", step.map(|v| v.to_string())),
-        ],
-    );
-    api(client.get(&path))
-}
-
-fn queue_get(client: &Client, args: &Map<String, Value>) -> Result<Value, Value> {
-    let args = checked_args(args, &["tenant", "limit"])?;
-    let tenant = tenant(client, args)?;
-    let limit = optional_u64(args, "limit", 1, 500)?.unwrap_or(100);
-    api(client.get(&format!("/api/v1/queue?tenant={tenant}&limit={limit}")))
-}
-
-fn pipeline_get(client: &Client, args: &Map<String, Value>) -> Result<Value, Value> {
-    let args = checked_args(args, &["run"])?;
-    let run = required_string(args, "run", 64)?;
-    safe_segment("run", run)?;
-    api(client.get(&format!("/api/v1/runs/{run}/pipeline")))
-}
-
-fn pipeline_validate(args: &Map<String, Value>) -> Result<Value, Value> {
-    let args = checked_args(args, &["pipeline"])?;
-    let pipeline = required_string(
-        args,
-        "pipeline",
-        sentinel_protocol::limits::MAX_PIPELINE_FILE_BYTES,
-    )?;
-    match sentinel_pipeline::compile_str(pipeline) {
-        Ok(compiled) => serde_json::to_value(sentinel_pipeline::Explanation::of(&compiled))
-            .map_err(|_| local_error("internal", "could not serialize the pipeline explanation")),
-        Err(error) => Err(pipeline_error(&error)),
+    fn validate_pipeline(&mut self, pipeline: &str) -> Result<Value, Value> {
+        match sentinel_pipeline::compile_str(pipeline) {
+            Ok(compiled) => serde_json::to_value(sentinel_pipeline::Explanation::of(&compiled))
+                .map_err(|_| {
+                    local_error("internal", "could not serialize the pipeline explanation")
+                }),
+            Err(error) => Err(pipeline_error(&error)),
+        }
     }
 }
 
@@ -503,137 +403,6 @@ fn pipeline_error(error: &sentinel_pipeline::Error) -> Value {
     error
 }
 
-fn dispatch(client: &Client, args: &Map<String, Value>) -> Result<Value, Value> {
-    let args = checked_args(
-        args,
-        &[
-            "tenant",
-            "repo",
-            "pipeline",
-            "source",
-            "sha",
-            "ref",
-            "idempotency_key",
-        ],
-    )?;
-    let tenant = tenant(client, args)?;
-    let repo = required_string(args, "repo", 128)?;
-    safe_segment("repository", repo)?;
-    let pipeline = required_string(
-        args,
-        "pipeline",
-        sentinel_protocol::limits::MAX_PIPELINE_FILE_BYTES,
-    )?;
-    if let Err(error) = sentinel_pipeline::compile_str(pipeline) {
-        return Err(pipeline_error(&error));
-    }
-    let source = required_string(args, "source", 512)?;
-    let sha = required_string(args, "sha", 64)?;
-    if !((sha.len() == 40 || sha.len() == 64)
-        && sha
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-    {
-        return Err(local_error(
-            "invalid_request",
-            "sha must be a full lowercase hexadecimal revision",
-        ));
-    }
-    let ref_name = optional_string(args, "ref", 256)?;
-    let key = required_string(args, "idempotency_key", 64)?;
-    if key.bytes().any(|byte| !(0x21..=0x7e).contains(&byte)) {
-        return Err(local_error(
-            "invalid_request",
-            "idempotency key must be printable ASCII without spaces",
-        ));
-    }
-    let body = json!({
-        "pipeline": pipeline,
-        "source": { "repo": source, "sha": sha, "ref": ref_name }
-    });
-    api(client.post(
-        &format!("/api/v1/tenants/{tenant}/repos/{repo}/runs"),
-        &body,
-        Some(key),
-    ))
-}
-
-fn rerun(client: &Client, args: &Map<String, Value>) -> Result<Value, Value> {
-    let args = checked_args(args, &["job"])?;
-    let job = required_string(args, "job", 64)?;
-    safe_segment("job", job)?;
-    api(client.post(&format!("/api/v1/jobs/{job}/rerun"), &json!({}), None))
-}
-
-fn cancel(client: &Client, args: &Map<String, Value>) -> Result<Value, Value> {
-    let args = checked_args(args, &["run", "job"])?;
-    let run = optional_string(args, "run", 64)?;
-    let job = optional_string(args, "job", 64)?;
-    match (run, job) {
-        (Some(run), None) => {
-            safe_segment("run", run)?;
-            api(client.post(&format!("/api/v1/runs/{run}/cancel"), &json!({}), None))
-        }
-        (None, Some(job)) => {
-            safe_segment("job", job)?;
-            api(client.post(&format!("/api/v1/jobs/{job}/cancel"), &json!({}), None))
-        }
-        _ => Err(local_error(
-            "invalid_request",
-            "give exactly one of run or job",
-        )),
-    }
-}
-
-fn secrets_list(client: &Client, args: &Map<String, Value>) -> Result<Value, Value> {
-    let args = checked_args(args, &["tenant", "repo", "limit", "after"])?;
-    let tenant = tenant(client, args)?;
-    let repo = optional_string(args, "repo", 128)?;
-    if let Some(repo) = repo {
-        safe_segment("repository", repo)?;
-    }
-    let limit = optional_u64(args, "limit", 1, 100)?.unwrap_or(100);
-    let after = optional_string(args, "after", 64)?;
-    let path = query_path(
-        &format!("/api/v1/tenants/{tenant}/secrets"),
-        &[
-            ("repo", repo.map(str::to_owned)),
-            ("limit", Some(limit.to_string())),
-            ("after", after.map(str::to_owned)),
-        ],
-    );
-    api(client.get(&path))
-}
-
-fn secret_get(client: &Client, args: &Map<String, Value>) -> Result<Value, Value> {
-    let args = checked_args(args, &["tenant", "repo", "name"])?;
-    let tenant = tenant(client, args)?;
-    let name = required_string(args, "name", 64)?;
-    if !(name.as_bytes()[0].is_ascii_uppercase() || name.as_bytes()[0] == b'_')
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        return Err(local_error(
-            "invalid_request",
-            "secret name has invalid syntax",
-        ));
-    }
-    let repo = optional_string(args, "repo", 128)?;
-    if let Some(repo) = repo {
-        safe_segment("repository", repo)?;
-    }
-    let path = query_path(
-        &format!("/api/v1/tenants/{tenant}/secrets/{name}"),
-        &[("repo", repo.map(str::to_owned))],
-    );
-    api(client.get(&path))
-}
-
-fn api(result: Result<Value, Error>) -> Result<Value, Value> {
-    result.map_err(|error| error.document())
-}
-
 fn local_error(code: &str, message: &str) -> Value {
     json!({
         "schema": "sentinel.error/1",
@@ -643,104 +412,15 @@ fn local_error(code: &str, message: &str) -> Value {
     })
 }
 
-fn checked_args<'a>(
-    args: &'a Map<String, Value>,
-    allowed: &[&str],
-) -> Result<&'a Map<String, Value>, Value> {
-    if args.keys().any(|key| !allowed.contains(&key.as_str())) {
-        return Err(local_error("invalid_request", "unexpected tool argument"));
-    }
-    Ok(args)
-}
-
 fn required_string<'a>(
     args: &'a Map<String, Value>,
     name: &str,
     max_bytes: usize,
 ) -> Result<&'a str, Value> {
-    let value = args
-        .get(name)
+    args.get(name)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty() && value.len() <= max_bytes)
-        .ok_or_else(|| local_error("invalid_request", "missing or invalid tool argument"))?;
-    Ok(value)
-}
-
-fn optional_string<'a>(
-    args: &'a Map<String, Value>,
-    name: &str,
-    max_bytes: usize,
-) -> Result<Option<&'a str>, Value> {
-    match args.get(name) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) if value.len() <= max_bytes => Ok(Some(value)),
-        _ => Err(local_error("invalid_request", "invalid tool argument")),
-    }
-}
-
-fn optional_u64(
-    args: &Map<String, Value>,
-    name: &str,
-    minimum: u64,
-    maximum: u64,
-) -> Result<Option<u64>, Value> {
-    match args.get(name) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => value
-            .as_u64()
-            .filter(|value| (*value >= minimum) && (*value <= maximum))
-            .map(Some)
-            .ok_or_else(|| local_error("invalid_request", "invalid numeric tool argument")),
-    }
-}
-
-fn mutually_exclusive(args: &Map<String, Value>, first: &str, second: &str) -> Result<(), Value> {
-    if args.get(first).is_some_and(|value| !value.is_null())
-        && args.get(second).is_some_and(|value| !value.is_null())
-    {
-        return Err(local_error(
-            "invalid_request",
-            "use only one continuation position",
-        ));
-    }
-    Ok(())
-}
-
-fn safe_segment(what: &str, value: &str) -> Result<(), Value> {
-    if value.is_empty()
-        || value.len() > 256
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-    {
-        let message = format!("{what} identifier has invalid syntax");
-        return Err(local_error("invalid_request", &message));
-    }
-    Ok(())
-}
-
-fn tenant(client: &Client, args: &Map<String, Value>) -> Result<String, Value> {
-    let explicit = optional_string(args, "tenant", 64)?;
-    let tenant = explicit
-        .or_else(|| client.default_tenant())
-        .ok_or_else(|| local_error("invalid_request", "provide tenant or set profile context"))?;
-    safe_segment("tenant", tenant)?;
-    Ok(tenant.to_owned())
-}
-
-fn query_path(path: &str, fields: &[(&str, Option<String>)]) -> String {
-    let mut query = form_urlencoded::Serializer::new(String::new());
-    for (name, value) in fields {
-        if let Some(value) = value {
-            query.append_pair(name, value);
-        }
-    }
-    let query = query.finish();
-    if query.is_empty() {
-        path.to_owned()
-    } else {
-        format!("{path}?{query}")
-    }
+        .ok_or_else(|| local_error("invalid_request", "missing or invalid tool argument"))
 }
 
 #[cfg(test)]
@@ -814,7 +494,9 @@ mod tests {
             "pipeline".into(),
             Value::String(include_str!("../../../fixtures/pipelines/valid/minimal.yml").into()),
         );
-        let valid = pipeline_validate(&args).unwrap();
+        let client = Client::with_token("http://127.0.0.1:1", &test_token()).unwrap();
+        let mut stdio = Stdio { client: &client };
+        let valid = execute_tool(&mut stdio, "validate_pipeline", &args).unwrap();
         assert!(
             valid["schema"]
                 .as_str()
@@ -825,9 +507,42 @@ mod tests {
             "pipeline".into(),
             Value::String("schema: 1\njobs: []\n".into()),
         );
-        let invalid = pipeline_validate(&args).unwrap_err();
+        let invalid = execute_tool(&mut stdio, "validate_pipeline", &args).unwrap_err();
         assert_eq!(invalid["code"], "invalid_request");
         assert!(!invalid.to_string().contains("jobs: []"));
+    }
+
+    /// P11-8: `arguments` is optional in MCP. A tool with no required
+    /// argument is not refused as invalid params, and the shared mapper's
+    /// own checks answer, exactly as over Streamable HTTP.
+    #[test]
+    fn stdio_tools_call_without_arguments_uses_defaults() {
+        let client = Client::with_token("http://127.0.0.1:1", &test_token()).unwrap();
+        let mut session = Session {
+            initialize_seen: true,
+            initialized: true,
+        };
+        let reply = handle_message(
+            json!({ "jsonrpc":"2.0", "id":4, "method":"tools/call",
+                    "params":{"name":"explain_queue"} }),
+            &mut session,
+            &client,
+        )
+        .unwrap();
+        assert!(reply.get("error").is_none(), "{reply}");
+        assert_eq!(reply["result"]["isError"], true);
+        assert_eq!(
+            reply["result"]["structuredContent"]["message"],
+            "provide tenant or set profile context"
+        );
+        let bad = handle_message(
+            json!({ "jsonrpc":"2.0", "id":5, "method":"tools/call",
+                    "params":{"name":"explain_queue","arguments":[]} }),
+            &mut session,
+            &client,
+        )
+        .unwrap();
+        assert_eq!(bad["error"]["code"], -32602);
     }
 
     #[test]
