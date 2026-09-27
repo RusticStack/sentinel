@@ -40,6 +40,7 @@ ownership on each request.
 | `dispatch` | Compile, pin and dispatch an exact source revision | `runs:write` plus repository run permission |
 | `rerun_job`, `cancel` | Start an attempt or request cancellation | `runs:write` plus repository run permission |
 | `list_secret_metadata`, `get_secret_metadata` | Secret names, active state and version only | `secrets:metadata` plus tenant/repository authorization |
+| `list_secret_bindings` | One repository's bindings (secret name, job, step, source scope), keyset-paged; never values | `secrets:metadata` plus repository authorization |
 
 Read operations return structured JSON alongside JSON text for older clients.
 The pipeline resources are `sentinel://pipeline/schema`,

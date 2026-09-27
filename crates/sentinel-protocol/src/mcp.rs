@@ -294,9 +294,9 @@ pub fn prepare_tool(
                 checked_args(args, &["tenant", "repo", "name"])?
             };
             let tenant = tenant(a, default_tenant)?;
-            let repo = optional_string(a, "repo", 128)?;
+            let repo = optional_string(a, "repo", MAX_REPOSITORY_NAME)?;
             if let Some(repo) = repo {
-                safe_segment("repository", repo)?;
+                repository_name(repo)?;
             }
             let suffix = if name == "list_secret_metadata" {
                 String::new()
@@ -328,9 +328,53 @@ pub fn prepare_tool(
                 None,
             )
         }
+        "list_secret_bindings" => {
+            let a = checked_args(args, &["tenant", "repo", "limit", "after"])?;
+            let tenant = tenant(a, default_tenant)?;
+            let repo = required_string(a, "repo", MAX_REPOSITORY_NAME)?;
+            repository_name(repo)?;
+            let limit = optional_u64(a, "limit", 1, 100)?.unwrap_or(100);
+            let after = optional_string(a, "after", MAX_BINDING_CURSOR)?;
+            api(
+                "GET",
+                query_path(
+                    &format!("/api/v1/tenants/{tenant}/secret-bindings"),
+                    &[
+                        ("repo", Some(repo.to_owned())),
+                        ("limit", Some(limit.to_string())),
+                        ("after", after.map(str::to_owned)),
+                    ],
+                ),
+                Value::Null,
+                None,
+                None,
+            )
+        }
         _ => return Err(local_error("invalid_request", "unknown tool")),
     };
     Ok(result)
+}
+
+/// The store's repository name bound. Secret tools carry the name in the
+/// query string, form-encoded, so an `owner/name` repository is addressable
+/// there; path-addressed tools keep [`safe_segment`].
+const MAX_REPOSITORY_NAME: usize = 128;
+/// `JOB/STEP/NAME` of the last binding of a page: two 128-byte selectors
+/// and a 64-byte name.
+const MAX_BINDING_CURSOR: usize = 128 + 1 + 128 + 1 + 64;
+
+/// The store's rule for a repository name (1–128 bytes, no control
+/// characters), checked before a round trip.
+fn repository_name(value: &str) -> Result<(), Value> {
+    if value.is_empty() || value.len() > MAX_REPOSITORY_NAME || value.chars().any(char::is_control)
+    {
+        Err(local_error(
+            "invalid_request",
+            "repository names are 1 to 128 bytes without control characters",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn checked_args<'a>(
@@ -519,6 +563,13 @@ pub fn tool_definitions() -> Vec<Value> {
             READ,
         ),
         tool(
+            "list_secret_bindings",
+            "List one repository's secret bindings: which secret name each job and step receives and from which scope. Metadata only; this tool never retrieves values. Tenant defaults to the signed-in profile context.",
+            json!({"tenant":tenant,"repo":{"type":"string","minLength":1,"maxLength":MAX_REPOSITORY_NAME},"limit":{"type":"integer","minimum":1,"maximum":100},"after":{"type":"string","maxLength":MAX_BINDING_CURSOR}}),
+            &["repo"],
+            READ,
+        ),
+        tool(
             "get_secret_metadata",
             "Describe one secret's name, active state, and version metadata. Secret values are never returned.",
             json!({"tenant":tenant,"repo":text,"name":{"type":"string","pattern":"^[A-Z_][A-Z0-9_]{0,63}$"}}),
@@ -694,6 +745,62 @@ mod tests {
         assert_eq!(hints("dispatch"), (false, false, true));
         assert_eq!(hints("rerun_job"), (false, false, false));
         assert_eq!(hints("cancel"), (false, true, true));
+    }
+
+    /// P10S-2 / P10C-6 on MCP: bindings are listed metadata-only through
+    /// the secret-bindings route, and secret tools address an
+    /// `owner/name` repository by its form-encoded name.
+    #[test]
+    fn secret_tools_address_owner_slash_name_repositories_in_the_query() {
+        let call = |name: &str, args: Value| match prepare_tool(
+            name,
+            args.as_object().unwrap(),
+            Some("acme"),
+        ) {
+            Ok(ToolAction::Api(call)) => Ok((call.method, call.path)),
+            Ok(ToolAction::ValidatePipeline(_)) => unreachable!(),
+            Err(error) => Err(error["message"].as_str().unwrap().to_owned()),
+        };
+        assert_eq!(
+            call(
+                "list_secret_bindings",
+                json!({"repo":"RusticStack/app","after":"build/s/TOKEN"})
+            ),
+            Ok((
+                "GET",
+                "/api/v1/tenants/acme/secret-bindings?repo=RusticStack%2Fapp&limit=100&after=build%2Fs%2FTOKEN"
+                    .to_owned()
+            ))
+        );
+        assert_eq!(
+            call("list_secret_metadata", json!({"repo":"RusticStack/app"})),
+            Ok((
+                "GET",
+                "/api/v1/tenants/acme/secrets?repo=RusticStack%2Fapp&limit=100".to_owned()
+            ))
+        );
+        assert_eq!(
+            call(
+                "get_secret_metadata",
+                json!({"tenant":"t","repo":"a b&c","name":"TOKEN"})
+            ),
+            Ok((
+                "GET",
+                "/api/v1/tenants/t/secrets/TOKEN?repo=a+b%26c".to_owned()
+            ))
+        );
+        for bad in [
+            json!({}),
+            json!({"repo":""}),
+            json!({"repo":"a\nb"}),
+            json!({"repo":"x".repeat(129)}),
+            json!({"repo":"app","value":true}),
+        ] {
+            assert!(call("list_secret_bindings", bad.clone()).is_err(), "{bad}");
+        }
+        // Path-addressed tools keep the strict segment rule.
+        assert!(call("list_runs", json!({"repo":"RusticStack/app"})).is_err());
+        assert_eq!(annotations("list_secret_bindings")["readOnlyHint"], true);
     }
 
     #[test]

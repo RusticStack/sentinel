@@ -447,7 +447,9 @@ fn call_tool(
     let required = match name {
         "get_logs" | "get_failure" => Scopes::LOGS_READ,
         "dispatch" | "rerun_job" | "cancel" => Scopes::RUNS_WRITE,
-        "list_secret_metadata" | "get_secret_metadata" => Scopes::SECRETS_METADATA,
+        "list_secret_metadata" | "get_secret_metadata" | "list_secret_bindings" => {
+            Scopes::SECRETS_METADATA
+        }
         "validate_pipeline" => Scopes::NONE,
         _ => Scopes::RUNS_READ,
     };
@@ -504,6 +506,7 @@ fn needs_default_tenant(name: &str, args: &Map<String, Value>) -> bool {
                 | "dispatch"
                 | "list_secret_metadata"
                 | "get_secret_metadata"
+                | "list_secret_bindings"
         )
 }
 

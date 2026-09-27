@@ -328,6 +328,7 @@ fn known_tool(name: &str) -> bool {
             | "cancel"
             | "list_secret_metadata"
             | "get_secret_metadata"
+            | "list_secret_bindings"
     )
 }
 
@@ -464,7 +465,7 @@ mod tests {
             &client,
         )
         .unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 13);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 14);
     }
 
     #[test]
@@ -583,7 +584,7 @@ mod tests {
         let tools: Value = serde_json::from_slice(lines[1]).unwrap();
         let resources: Value = serde_json::from_slice(lines[2]).unwrap();
         assert_eq!(initialize["result"]["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 13);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 14);
         assert_eq!(
             resources["result"]["resources"].as_array().unwrap().len(),
             3

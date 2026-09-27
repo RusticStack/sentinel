@@ -3741,3 +3741,217 @@ fn the_stored_retry_fingerprint_is_not_an_unkeyed_digest_of_the_value() {
         assert_ne!(stored, unkeyed(&scope, "PIN", 0, guess.as_bytes()));
     }
 }
+
+/// A remote MCP session for `d.root` holding `scopes`: the `Authorization`
+/// header and the session ID.
+fn mcp_session(
+    d: &Deployment,
+    client_id: &'static str,
+    scopes: sentinel_core::auth::Scopes,
+) -> (String, String) {
+    use sentinel_auth::oauth::{self as auth_oauth, Kind, pkce};
+    use sentinel_core::auth::{Audience, Scopes};
+    sentinel_store::oauth::register_mcp_client(
+        &d.store,
+        &sentinel_store::oauth::McpClientSpec {
+            id: client_id,
+            name: "Binding reader",
+            max_scopes: Scopes::MCP,
+            kind: sentinel_store::oauth::McpRegistrationKind::Dynamic,
+            metadata_url: None,
+        },
+        &["http://127.0.0.1:49152/callback"],
+    )
+    .unwrap();
+    let verifier = pkce::verifier();
+    let challenge = pkce::challenge(&verifier);
+    let code = sentinel_store::oauth::code::approve(
+        &d.store,
+        &sentinel_store::oauth::code::Approval {
+            client_id,
+            redirect_uri: "http://127.0.0.1:49152/callback",
+            code_challenge: &challenge,
+            user: d.root,
+            scopes,
+            tenant: None,
+            repo: None,
+            audience: Audience::Mcp,
+        },
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let grant = sentinel_store::oauth::code::exchange(
+        &d.store,
+        client_id,
+        &code,
+        "http://127.0.0.1:49152/callback",
+        &verifier,
+        Some(Audience::Mcp),
+        UnixMillis::now(),
+    )
+    .unwrap();
+    let authorization = format!("Bearer {}", auth_oauth::format(Kind::Access, &grant.access));
+    let (status, headers, body) = mcp_post(
+        d,
+        &serde_json::json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize",
+            "params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"bindings-test","version":"1"}}
+        }),
+        &authorization,
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    let session = headers
+        .into_iter()
+        .find(|(key, _)| key == "mcp-session-id")
+        .unwrap()
+        .1;
+    let (status, _, body) = mcp_post(
+        d,
+        &serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        &authorization,
+        &[
+            ("mcp-protocol-version", "2025-11-25"),
+            ("mcp-session-id", session.as_str()),
+        ],
+    );
+    assert_eq!(status, 202, "{body}");
+    (authorization, session)
+}
+
+fn mcp_post(
+    d: &Deployment,
+    body: &serde_json::Value,
+    authorization: &str,
+    extra: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>, serde_json::Value) {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build(),
+    );
+    let mut request = agent
+        .post(format!("{}/mcp", d.base))
+        .header("accept", "application/json, text/event-stream")
+        .header("authorization", authorization)
+        .header("content-type", "application/json");
+    for (name, value) in extra {
+        request = request.header(*name, *value);
+    }
+    let response = request.send(body.to_string().as_bytes()).unwrap();
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_ascii_lowercase(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let text = response.into_body().read_to_string().unwrap();
+    let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+    (status, headers, body)
+}
+
+/// P10S-2 on MCP: an agent sees which secret each job and step of an
+/// `owner/name` repository receives, and from which scope — never a value —
+/// with `secrets:metadata`; without it the call is the scope challenge.
+#[test]
+fn mcp_lists_a_slash_named_repositorys_secret_bindings_as_metadata_only() {
+    use sentinel_core::auth::Scopes;
+    let d = deployment();
+    let auth = bearer(&d);
+    let (root, tenant, repo) = (d.root, d.tenant, RepoId::new());
+    let now = UnixMillis::now();
+    d.store
+        .writer()
+        .write(move |tx| {
+            auth::create_repo(
+                tx,
+                Principal::new(root, P::ALL, None, None),
+                tenant,
+                repo,
+                "RusticStack/app",
+                now,
+            )
+        })
+        .unwrap();
+    let (status, created) = call_bytes(
+        &d,
+        "PUT",
+        "/api/v1/tenants/acme/secrets/DEPLOY_TOKEN?repo=RusticStack%2Fapp",
+        b"bindings-mcp-secret-value",
+        &auth,
+        &[("if-match", "0"), ("idempotency-key", "mcp-bind")],
+    );
+    assert_eq!(status, 200, "{created}");
+    let (status, bound) = call_bytes(
+        &d,
+        "PUT",
+        "/api/v1/tenants/acme/secret-bindings/DEPLOY_TOKEN?repo=RusticStack%2Fapp&job=deploy&step=push",
+        b"",
+        &auth,
+        &[],
+    );
+    assert_eq!(status, 200, "{bound}");
+
+    let tool = |session: &(String, String), arguments: serde_json::Value| {
+        mcp_post(
+            &d,
+            &serde_json::json!({
+                "jsonrpc":"2.0", "id":2, "method":"tools/call",
+                "params":{"name":"list_secret_bindings","arguments":arguments}
+            }),
+            &session.0,
+            &[
+                ("mcp-protocol-version", "2025-11-25"),
+                ("mcp-session-id", session.1.as_str()),
+            ],
+        )
+    };
+    let reader = mcp_session(&d, "bindings-reader", Scopes::SECRETS_METADATA);
+    let (status, _, body) = tool(
+        &reader,
+        serde_json::json!({"tenant":"acme","repo":"RusticStack/app"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["isError"], false, "{body}");
+    let listed = &body["result"]["structuredContent"];
+    assert_eq!(listed["repo"], repo.to_string());
+    let bindings = listed["bindings"].as_array().unwrap();
+    assert_eq!(bindings.len(), 1, "{listed}");
+    assert_eq!(bindings[0]["name"], "DEPLOY_TOKEN");
+    assert_eq!(bindings[0]["job"], "deploy");
+    assert_eq!(bindings[0]["step"], "push");
+    assert!(
+        !body.to_string().contains("bindings-mcp-secret-value"),
+        "{body}"
+    );
+    // A name the store refuses never leaves the agent.
+    let (status, _, body) = tool(
+        &reader,
+        serde_json::json!({"tenant":"acme","repo":"Rustic\nStack"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    assert_eq!(
+        body["result"]["structuredContent"]["message"],
+        "repository names are 1 to 128 bytes without control characters"
+    );
+
+    let runs_only = mcp_session(&d, "bindings-runs-only", Scopes::RUNS_READ);
+    let (status, headers, body) = tool(
+        &runs_only,
+        serde_json::json!({"tenant":"acme","repo":"RusticStack/app"}),
+    );
+    assert_eq!(status, 403, "{body}");
+    let challenge = headers
+        .iter()
+        .find(|(key, _)| key == "www-authenticate")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default();
+    assert!(challenge.contains("insufficient_scope"), "{challenge}");
+}
