@@ -271,52 +271,53 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
-    /// A helper that exits is noticed at once, not at the next poll tick:
-    /// running one costs what a blocking `wait` costs, plus the reader
-    /// threads — not an extra poll interval (the old 20 ms sleep added
-    /// 10 ms on average and at least 20 ms to a helper that outlived the
-    /// first check).
-    ///
-    /// Measured in interleaved pairs (alternating which goes first) and
-    /// judged by the median paired difference, so a host whose load drifts
-    /// during the test — a full parallel suite — moves both sides alike. A
-    /// 2 ms child would cost about 18 ms more under the old poll.
+    /// A helper that exits is noticed at once, not at its deadline: a helper
+    /// held on a FIFO the test controls is still waited for after the test
+    /// has paused, and `run` returns once the test releases it, although its
+    /// deadline is minutes away. That the wake is the exit itself and not a
+    /// poll tick is `sentinel_git`'s `a_childs_exit_wakes_a_parked_wait`,
+    /// asserted here for the very watch `run` builds. Decided by events, not
+    /// by timing (the paired-timing test this replaces swung by ±2.9 s under
+    /// load).
     #[test]
     fn a_quick_helper_is_not_held_by_a_poll_interval() {
-        const PAIRS: usize = 21;
-        let sleep = || {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("release");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path in a directory this test owns.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let probe = Command::new("sleep").arg("600").spawn().unwrap();
+        assert!(sentinel_git::ExitWatch::of(&probe).wakes_on_exit());
+        let mut probe = probe;
+        probe.kill().unwrap();
+        probe.wait().unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let held = fifo.clone();
+        let helper = thread::spawn(move || {
             let mut cmd = Command::new("sh");
-            cmd.args(["-c", "sleep 0.002"]);
-            cmd
-        };
-        let blocking = || {
-            let started = Instant::now();
-            assert!(sleep().status().unwrap().success());
-            started.elapsed()
-        };
-        let ours = || {
-            let started = Instant::now();
-            let output = run(sleep(), Instant::now() + Duration::from_secs(10), "sleep").unwrap();
-            assert!(output.success());
-            started.elapsed()
-        };
-        let mut extra: Vec<i128> = (0..PAIRS)
-            .map(|i| {
-                let (b, o) = if i % 2 == 0 {
-                    let b = blocking();
-                    (b, ours())
-                } else {
-                    let o = ours();
-                    (blocking(), o)
-                };
-                o.as_micros() as i128 - b.as_micros() as i128
-            })
-            .collect();
-        extra.sort_unstable();
-        let median = extra[PAIRS / 2];
+            cmd.arg("-c")
+                .arg("cat \"$1\" >/dev/null")
+                .arg("sh")
+                .arg(held);
+            let output = run(cmd, Instant::now() + Duration::from_secs(300), "held");
+            flag.store(true, Ordering::Release);
+            output
+        });
+        thread::sleep(Duration::from_millis(200));
         assert!(
-            median < 8_000,
-            "a helper cost {median} µs more than a blocking wait (median of {PAIRS} pairs: {extra:?})"
+            !done.load(Ordering::Acquire),
+            "returned before the helper exited"
+        );
+        let released = Instant::now();
+        // Opening the write end and closing it lets `cat` read EOF and exit.
+        drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+        let output = helper.join().unwrap().unwrap();
+        assert!(output.success());
+        assert!(
+            released.elapsed() < Duration::from_secs(60),
+            "held towards its deadline"
         );
     }
 }

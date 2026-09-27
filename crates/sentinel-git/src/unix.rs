@@ -88,6 +88,19 @@ impl ExitWatch {
         }
     }
 
+    /// Whether the child's exit itself wakes a wait (a pidfd), rather than
+    /// the next [`POLL`] tick.
+    pub fn wakes_on_exit(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.0.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
     /// Block until the child may have exited or `wait` passed.
     fn park(&self, wait: Duration) {
         #[cfg(target_os = "linux")]
@@ -1059,6 +1072,49 @@ impl Drop for Askpass {
 #[cfg(test)]
 mod tests {
     use super::merge_ref_missing;
+
+    /// A helper's exit wakes its wait at once, with no poll tick: parked
+    /// for a minute, the wait does not return while the child lives (a
+    /// polling wait would be back within one 20 ms tick) and returns once
+    /// it exits. Decided by the child's exit, not by timing, so machine
+    /// load cannot fail it (the paired-timing test it replaces swung by
+    /// ±2.9 s under load).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_childs_exit_wakes_a_parked_wait() {
+        use std::{
+            process::Command,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+            thread,
+            time::{Duration, Instant},
+        };
+        let mut child = Command::new("sleep").arg("600").spawn().unwrap();
+        let watch = super::ExitWatch::of(&child);
+        assert!(watch.wakes_on_exit(), "this kernel has pidfds");
+        let woke = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&woke);
+        let parked = thread::spawn(move || {
+            watch.park(Duration::from_secs(60));
+            flag.store(true, Ordering::Release);
+        });
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !woke.load(Ordering::Acquire),
+            "the wait returned while the child was alive"
+        );
+        let killed = Instant::now();
+        child.kill().unwrap();
+        parked.join().unwrap();
+        assert!(woke.load(Ordering::Acquire));
+        assert!(
+            killed.elapsed() < Duration::from_secs(30),
+            "held to the park bound"
+        );
+        child.wait().unwrap();
+    }
 
     #[test]
     fn only_a_missing_ref_is_a_pending_merge() {
