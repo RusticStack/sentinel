@@ -553,6 +553,13 @@ pub struct Objects {
     /// The external copy's replicator status, when one runs (R03): what
     /// the API and metrics report.
     replication: OnceLock<Arc<crate::replicate::Status>>,
+    /// Held by anything that deletes committed bytes — the storage pass
+    /// (reclaim, orphans, log expiry) and eviction — and by a backup for its
+    /// whole run (R04), so a backup's snapshot never names a file that goes
+    /// before it is copied.
+    maintenance: Mutex<()>,
+    /// The backup scheduler, when `[backup]` is configured (R04).
+    backups: OnceLock<Arc<dyn crate::backup::Control>>,
 }
 
 /// The external copy an evicted object is fetched back from (R02). The
@@ -561,6 +568,26 @@ pub struct Objects {
 /// placed.
 pub trait Remote: Send + Sync {
     fn fetch(&self, key: &str, out: &mut dyn Write) -> Result<u64>;
+}
+
+/// Where a manifest version's file lives under the data directory:
+/// `manifests/<tenant>/<kind>/<blake3(name)>/<version>`.
+pub fn manifest_relpath(tenant: TenantId, kind: u8, name: &[u8], version: u64) -> PathBuf {
+    PathBuf::from(MANIFESTS_DIR)
+        .join(tenant.to_string())
+        .join(kind.to_string())
+        .join(blake3::hash(name).to_hex().to_string())
+        .join(version.to_string())
+}
+
+/// Where an object's file lives under the data directory:
+/// `objects/<tenant>/<hex[0..2]>/<hex>`.
+pub fn object_relpath(tenant: TenantId, digest: &Digest) -> PathBuf {
+    let hex = digest.to_string();
+    PathBuf::from(OBJECTS_DIR)
+        .join(tenant.to_string())
+        .join(&hex[..2])
+        .join(hex)
 }
 
 /// The external key of an object: `objects/<tenant>/<hex[0..2]>/<hex>`,
@@ -615,12 +642,39 @@ impl Objects {
             remote: OnceLock::new(),
             rehydrated: Mutex::new(Vec::new()),
             replication: OnceLock::new(),
+            maintenance: Mutex::new(()),
+            backups: OnceLock::new(),
         })
     }
 
     /// The data directory this store lives under.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Take the maintenance lock if no backup holds it: the caller deletes
+    /// committed bytes only while it holds the guard.
+    pub fn try_maintenance(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        match self.maintenance.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Wait for the maintenance lock and hold it (a backup's whole run).
+    pub fn hold_maintenance(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.maintenance.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Publish the backup scheduler (R04).
+    pub fn set_backups(&self, backups: Arc<dyn crate::backup::Control>) {
+        let _ = self.backups.set(backups);
+    }
+
+    /// The backup scheduler, when configured.
+    pub fn backups(&self) -> Option<&Arc<dyn crate::backup::Control>> {
+        self.backups.get()
     }
 
     /// Publish the replicator's status (R03).
@@ -909,11 +963,8 @@ impl Objects {
             .join(&hex)
     }
     fn manifest_path(&self, tenant: TenantId, kind: Kind, name: &[u8], version: u64) -> PathBuf {
-        self.manifests_root()
-            .join(tenant.to_string())
-            .join(kind.code().to_string())
-            .join(blake3::hash(name).to_hex().to_string())
-            .join(version.to_string())
+        self.root
+            .join(manifest_relpath(tenant, kind.code(), name, version))
     }
     fn upload_path(&self, upload: UploadId) -> PathBuf {
         self.root.join(INCOMING_DIR).join(upload.to_string())

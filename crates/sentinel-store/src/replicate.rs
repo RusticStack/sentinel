@@ -530,6 +530,10 @@ impl Replicator {
     }
 
     fn evict(&self, pass: &mut Pass) -> Result<()> {
+        // Not while a backup copies local files (R04).
+        let Some(_maintenance) = self.objects.try_maintenance() else {
+            return Ok(());
+        };
         let totals = self.store.read(offload::totals)?;
         let pressure = self.objects.admission().is_some_and(|a| !a.is_open())
             && !self.status.backlog_full.load(Ordering::Relaxed);

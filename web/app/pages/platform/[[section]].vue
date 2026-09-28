@@ -28,7 +28,10 @@ useHead({ title: "Platform · Sentinel" });
     <PlatformRegistrations v-if="section === 'registrations'" />
     <PlatformTenants v-else-if="section === 'tenants'" />
     <PlatformPools v-else-if="section === 'pools'" />
-    <PlatformStorage v-else-if="section === 'storage'" />
+    <template v-else-if="section === 'storage'">
+      <PlatformStorage />
+      <PlatformBackups />
+    </template>
     <PlatformPolicy v-else-if="section === 'policy'" />
     <PlatformAudit v-else />
   </SPage>

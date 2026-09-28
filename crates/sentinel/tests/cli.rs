@@ -1054,6 +1054,202 @@ mod linux {
         );
         server.terminate();
     }
+
+    /// R04 through the binary: a running controller with `[backup]` takes a
+    /// backup when asked over the API, `admin backup verify` passes it,
+    /// `admin restore` rebuilds an empty data directory from it, and a
+    /// controller started on that directory serves the same deployment — the
+    /// credential issued before the backup still works.
+    #[cfg(feature = "server")]
+    #[test]
+    fn a_backup_taken_online_restores_onto_a_new_data_directory_that_serves() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("controller");
+        let backups = temp.path().join("backups");
+        let restored = temp.path().join("restored");
+        fs::create_dir_all(&data).unwrap();
+        let admin = |args: &[&str], dir: &std::path::Path| {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+                .arg("admin")
+                .args(args)
+                .args(["--data-dir", dir.to_str().unwrap()])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::io::Write::write_all(
+                child.stdin.as_mut().unwrap(),
+                b"correct horse battery staple",
+            )
+            .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        admin(&["bootstrap", "--username", "root"], &data);
+        admin(&["tenant", "create", "--slug", "acme"], &data);
+        let token = admin(
+            &[
+                "token",
+                "issue",
+                "--user",
+                "root",
+                "--name",
+                "ops",
+                "--scope",
+                "read,platform-admin",
+                "--expires-in",
+                "1h",
+            ],
+            &data,
+        )
+        .trim()
+        .to_owned();
+        let config = temp.path().join("server.toml");
+        fs::write(
+            &config,
+            format!(
+                "listen = '127.0.0.1:0'\napi_listen = '127.0.0.1:0'\n[backup]\ndir = '{}'\ninterval_secs = 3600\nkeep = 3\n",
+                backups.display()
+            ),
+        )
+        .unwrap();
+        let serve = |dir: &std::path::Path| {
+            let mut server = Logged::spawn(&[
+                "server",
+                "--config",
+                config.to_str().unwrap(),
+                "--data-dir",
+                dir.to_str().unwrap(),
+            ]);
+            let api = server.event("api_listening");
+            let base = format!("http://{}", api["fields"]["addr"].as_str().unwrap());
+            (server, base)
+        };
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .build(),
+        );
+        let auth = format!("Bearer {token}");
+        let get = |base: &str, path: &str| -> (u16, serde_json::Value) {
+            let mut response = agent
+                .get(&format!("{base}{path}"))
+                .header("authorization", &auth)
+                .call()
+                .unwrap();
+            let status = response.status().as_u16();
+            let body = response.body_mut().read_to_string().unwrap();
+            (
+                status,
+                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+            )
+        };
+
+        let (mut server, base) = serve(&data);
+        server.event("backups_scheduled");
+        let mut started = agent
+            .post(&format!("{base}/api/v1/admin/backups"))
+            .header("authorization", &auth)
+            .header("content-type", "application/json")
+            .send(b"{}".as_slice())
+            .unwrap();
+        assert_eq!(
+            started.status().as_u16(),
+            202,
+            "{}",
+            started.body_mut().read_to_string().unwrap()
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let listed = loop {
+            let (status, body) = get(&base, "/api/v1/admin/backups");
+            assert_eq!(status, 200, "{body}");
+            if body["backups"].as_array().is_some_and(|b| !b.is_empty())
+                && body["scheduler"]["running"] == false
+            {
+                break body;
+            }
+            assert!(Instant::now() < deadline, "no backup appeared: {body}");
+            thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(listed["configured"], true);
+        assert_eq!(listed["backups"][0]["key_required"], false);
+        assert!(listed["scheduler"]["last_failure"].is_null(), "{listed}");
+        server.terminate();
+
+        let verified: serde_json::Value = serde_json::from_str(
+            &Command::new(env!("CARGO_BIN_EXE_sentinel"))
+                .args([
+                    "admin",
+                    "backup",
+                    "verify",
+                    "--dir",
+                    backups.to_str().unwrap(),
+                ])
+                .output()
+                .map(|o| {
+                    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+                    String::from_utf8(o.stdout).unwrap()
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(verified["ok"], true, "{verified}");
+        assert_eq!(verified["integrity"], "ok");
+
+        let restore = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+            .args([
+                "admin",
+                "restore",
+                "--from",
+                backups.to_str().unwrap(),
+                "--data-dir",
+                restored.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            restore.status.success(),
+            "{}",
+            String::from_utf8_lossy(&restore.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&restore.stdout).unwrap();
+        assert_eq!(report["recovery"]["missing"], 0, "{report}");
+        assert!(
+            report["config_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "controller.key"),
+            "the link identity comes back, so workers keep their pin: {report}"
+        );
+
+        // The restored controller serves the same deployment, with the same
+        // link identity and the credential issued before the backup.
+        let (mut again, base) = serve(&restored);
+        let first = server_fingerprint(&data);
+        assert_eq!(server_fingerprint(&restored), first);
+        let (status, tenants) = get(&base, "/api/v1/admin/tenants");
+        assert_eq!(status, 200, "{tenants}");
+        assert!(
+            tenants["tenants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["slug"] == "acme")
+        );
+        again.event("service_initialized");
+        again.terminate();
+
+        fn server_fingerprint(dir: &std::path::Path) -> Vec<u8> {
+            fs::read(dir.join("controller.crt")).unwrap()
+        }
+    }
 }
 
 /// R01: `admin tenant storage` shows a tenant's policy, effective limits
