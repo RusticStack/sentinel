@@ -28,6 +28,31 @@ pub fn sealed_rows_exist(conn: &Connection) -> Result<bool> {
     )?)
 }
 
+/// The key ids every sealed value was sealed under: what a restore needs
+/// in its key file (R04). Reads every sealed column once; these tables hold
+/// secrets, second factors and source credentials, never bulk data.
+pub fn key_ids(conn: &Connection) -> Result<std::collections::BTreeSet<u32>> {
+    let mut ids = std::collections::BTreeSet::new();
+    for sql in [
+        "SELECT sealed FROM secret_versions",
+        "SELECT sealed_seed FROM mfa_totp",
+        "SELECT credential FROM source_bindings",
+    ] {
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            if let Some(id) = row
+                .get::<_, Option<Vec<u8>>>(0)?
+                .as_deref()
+                .and_then(key_id)
+            {
+                ids.insert(id);
+            }
+        }
+    }
+    Ok(ids)
+}
+
 /// Open the newest row of each sealed table with `key`: a key file that
 /// does not match the restored database fails here, at start, instead of at
 /// first use. Bounded: at most one row per table.

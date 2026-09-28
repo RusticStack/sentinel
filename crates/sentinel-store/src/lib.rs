@@ -13,6 +13,7 @@
 
 pub mod artifacts;
 pub mod auth;
+pub mod backup;
 pub mod checks;
 pub mod codec;
 pub mod dispatch;
@@ -523,6 +524,25 @@ pub enum Shutdown {
 }
 
 impl Store {
+    /// Write a consistent copy of the database to `dest` (R04) with
+    /// `VACUUM INTO` on a connection of its own: in WAL mode that is one
+    /// read transaction on the source, so the writer and every reader keep
+    /// going while it runs, and the copy is the database at one instant.
+    /// `dest` must not exist.
+    pub fn snapshot_into(&self, dest: &Path) -> Result<()> {
+        let dest = dest
+            .to_str()
+            .ok_or(Error::InvalidInput("snapshot path must be UTF-8"))?
+            .to_owned();
+        let conn = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        conn.execute("VACUUM INTO ?1", [dest])?;
+        Ok(())
+    }
+
     /// Bytes the metadata database occupies on disk now: the main file and
     /// its write-ahead log (R01's reserve grows with it).
     pub fn metadata_bytes(&self) -> u64 {

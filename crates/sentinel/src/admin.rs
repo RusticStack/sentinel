@@ -108,6 +108,13 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
         AdminCommand::Source(args) => crate::source_admin::run(args)?,
         AdminCommand::Intake(args) => crate::intake_admin::run(args)?,
         AdminCommand::Objects(args) => objects(args)?,
+        AdminCommand::Backup(args) => backup(args)?,
+        AdminCommand::Restore {
+            from,
+            id,
+            key,
+            data_dir,
+        } => restore(from, id.as_deref(), key.as_deref(), data_dir)?,
         AdminCommand::Tailcat(args) => crate::tailcat_admin::run(args).map_err(fail)?,
         AdminCommand::Bootstrap {
             data,
@@ -286,6 +293,177 @@ pub(crate) fn duration_ms(text: &str, max_ms: i64) -> Result<i64, Error> {
                 max_ms / DAY_MS
             ))
         })
+}
+
+/// The backup `id`, or the newest in `dir`.
+fn backup_id(dir: &std::path::Path, id: Option<&str>) -> Result<String, Error> {
+    match id {
+        Some(id) => Ok(id.to_owned()),
+        None => sentinel_store::backup::list(dir)
+            .map_err(|error| fail(format!("cannot list backups: {error}")))?
+            .pop()
+            .ok_or_else(|| fail(format!("no backup in {}", dir.display()))),
+    }
+}
+
+/// `admin backup create|list|verify|prune` (R04), host-local.
+fn backup(args: &crate::cli::BackupArgs) -> Result<(), Error> {
+    use crate::cli::BackupCommand;
+    use sentinel_store::backup;
+    match &args.command {
+        BackupCommand::Create { data, to } => {
+            if !to.is_absolute() || to.starts_with(&data.data_dir) {
+                return Err(fail(
+                    "--to must be an absolute directory outside the data directory",
+                ));
+            }
+            let store = open(data, true)?;
+            let objects = sentinel_store::objects::Objects::open(&data.data_dir)
+                .map_err(|error| fail(format!("cannot open the object store: {error}")))?;
+            let report = backup::create(
+                &store,
+                &objects,
+                &data.data_dir,
+                to,
+                env!("CARGO_PKG_VERSION"),
+            )
+            .map_err(|error| fail(format!("backup failed: {error}")))?;
+            sentinel::outln!(
+                "{}",
+                serde_json::json!({
+                    "id": report.id,
+                    "took_ms": report.took_ms,
+                    "metadata_bytes": report.metadata_bytes,
+                    "objects": report.objects,
+                    "objects_copied": report.objects_copied,
+                    "object_bytes_copied": report.object_bytes_copied,
+                    "objects_remote_only": report.objects_remote,
+                    "objects_corrupt": report.objects_corrupt,
+                    "manifests": report.manifests,
+                    "log_files_copied": report.log_files_copied,
+                    "log_bytes_copied": report.log_bytes_copied,
+                    "config_files": report.config_files,
+                    "key_ids": report.key_ids,
+                })
+            );
+            if !report.objects_corrupt.is_empty() {
+                return Err(fail(
+                    "some objects failed their digest and were not backed up; run admin objects verify",
+                ));
+            }
+        }
+        BackupCommand::List { dir } => {
+            let ids =
+                backup::list(dir).map_err(|error| fail(format!("cannot list backups: {error}")))?;
+            for id in ids {
+                if let Ok(m) = backup::manifest(dir, &id) {
+                    sentinel::outln!(
+                        "{}",
+                        serde_json::json!({
+                            "id": id,
+                            "schema": m["schema"],
+                            "version": m["version"],
+                            "metadata_bytes": m["metadata"]["bytes"],
+                            "objects": m["objects"]["rows"],
+                            "key_ids": m["key"]["key_ids"],
+                        })
+                    );
+                }
+            }
+        }
+        BackupCommand::Verify { dir, id } => {
+            let id = backup_id(dir, id.as_deref())?;
+            let check = backup::verify(dir, &id)
+                .map_err(|error| fail(format!("cannot verify {id}: {error}")))?;
+            sentinel::outln!(
+                "{}",
+                serde_json::json!({
+                    "id": id,
+                    "ok": check.ok(),
+                    "integrity": check.integrity,
+                    "metadata_matches": check.metadata_matches,
+                    "objects_checked": check.objects_checked,
+                    "objects_remote_only": check.objects_remote,
+                    "manifests_checked": check.manifests_checked,
+                    "missing": check.missing,
+                    "corrupt": check.corrupt,
+                })
+            );
+            if !check.ok() {
+                return Err(fail(format!("backup {id} failed verification")));
+            }
+        }
+        BackupCommand::Prune { dir, keep } => {
+            let pruned = backup::prune(dir, *keep)
+                .map_err(|error| fail(format!("cannot prune: {error}")))?;
+            sentinel::outln!(
+                "{}",
+                serde_json::json!({
+                    "removed_backups": pruned.backups,
+                    "removed_objects": pruned.objects,
+                    "removed_manifests": pruned.manifests,
+                    "removed_log_files": pruned.log_files,
+                })
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `admin restore` (R04): rebuild a data directory from a backup, then open
+/// it as the controller would: migrations, then object recovery.
+fn restore(
+    from: &std::path::Path,
+    id: Option<&str>,
+    key: Option<&std::path::Path>,
+    data_dir: &std::path::Path,
+) -> Result<(), Error> {
+    if !data_dir.is_absolute() || !from.is_absolute() {
+        return Err(fail("--from and --data-dir must be absolute paths"));
+    }
+    let id = backup_id(from, id)?;
+    let started = std::time::Instant::now();
+    let restored = sentinel_store::backup::restore(from, &id, data_dir, key)
+        .map_err(|error| fail(format!("cannot restore {id}: {error}")))?;
+    let copied = started.elapsed();
+    let store = open(
+        &crate::cli::DataDir {
+            data_dir: data_dir.to_path_buf(),
+        },
+        true,
+    )?;
+    let objects = sentinel_store::objects::Objects::open(data_dir)
+        .map_err(|error| fail(format!("cannot open the object store: {error}")))?;
+    let recovery = store
+        .read(|c| objects.recover(c))
+        .map_err(|error| fail(format!("recovery failed: {error}")))?;
+    sentinel::outln!(
+        "{}",
+        serde_json::json!({
+            "id": id,
+            "data_dir": data_dir.display().to_string(),
+            "objects": restored.objects,
+            "objects_remote_only": restored.objects_remote,
+            "manifests": restored.manifests,
+            "log_files": restored.log_files,
+            "config_files": restored.config_files,
+            "key_checked": restored.key_checked,
+            "copy_ms": copied.as_millis() as u64,
+            "total_ms": started.elapsed().as_millis() as u64,
+            "recovery": {
+                "orphans": recovery.orphans.len(),
+                "corrupt": recovery.corrupt.len(),
+                "missing": recovery.missing.len(),
+            },
+        })
+    );
+    if restored.objects_remote > 0 {
+        eprintln!(
+            "{} objects live only in the external S3 copy: configure the same [s3] section to read them",
+            restored.objects_remote
+        );
+    }
+    Ok(())
 }
 
 /// `admin tenant storage`: show a tenant's (or one repository's) storage

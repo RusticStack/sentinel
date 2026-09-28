@@ -85,6 +85,22 @@ export interface LogPage {
   expired_ms?: number;
 }
 
+/** Scheduled backups (R04). */
+export interface Backups {
+  configured: boolean;
+  scheduler?: {
+    target: string;
+    interval_secs: number;
+    keep: number;
+    running: boolean;
+    last_success_ms: number | null;
+    last_failure_ms: number | null;
+    last_failure: string | null;
+    last_backup: { id: string; took_ms: number; objects: number; objects_copied: number; object_bytes_copied: number; log_bytes_copied: number } | null;
+  };
+  backups: { id: string; started_ms: number; took_ms: number; schema: number; version: string; metadata_bytes: number; objects: number; objects_remote_only: number; key_required: boolean; key_ids: number[] }[];
+}
+
 /** A storage policy as set (R01); `null` inherits. */
 export interface StoragePolicy {
   quota_bytes: number | null;

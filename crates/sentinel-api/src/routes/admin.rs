@@ -114,6 +114,8 @@ pub(super) fn route(
             set_storage(state, request, slug, None)
         }
         ("GET", ["api", "v1", "admin", "storage"]) => deployment_storage(state, request),
+        ("GET", ["api", "v1", "admin", "backups"]) => list_backups(state, request),
+        ("POST", ["api", "v1", "admin", "backups"]) => start_backup(state, request),
         ("GET", ["api", "v1", "tenants", slug, "storage"]) => tenant_storage(state, request, slug),
         ("PUT", ["api", "v1", "tenants", slug, "repos", name, "storage"]) => {
             set_storage(state, request, slug, Some(name))
@@ -556,6 +558,53 @@ fn deployment_storage(state: &State, request: &Request) -> Route {
             })
         }),
     }))
+}
+
+/// `GET /admin/backups`: the scheduler's state and every backup in its
+/// target, newest first, each with its manifest's summary (R04).
+fn list_backups(state: &State, request: &Request) -> Route {
+    platform(state, request, false)?;
+    let Some(backups) = state.objects.backups() else {
+        return ok(json!({ "configured": false, "backups": [] }));
+    };
+    let target = backups.target().to_path_buf();
+    let ids = sentinel_store::backup::list(&target).map_err(store_error)?;
+    let listed: Vec<Value> = ids
+        .iter()
+        .rev()
+        .filter_map(|id| sentinel_store::backup::manifest(&target, id).ok())
+        .map(|m| {
+            json!({
+                "id": m["id"],
+                "started_ms": m["started_ms"],
+                "took_ms": m["took_ms"],
+                "schema": m["schema"],
+                "version": m["version"],
+                "metadata_bytes": m["metadata"]["bytes"],
+                "objects": m["objects"]["rows"],
+                "objects_remote_only": m["objects"]["remote_only"],
+                "key_required": m["key"]["required"],
+                "key_ids": m["key"]["key_ids"],
+            })
+        })
+        .collect();
+    ok(json!({ "configured": true, "scheduler": backups.status(), "backups": listed }))
+}
+
+/// `POST /admin/backups`: take a backup now (it runs on the scheduler's
+/// thread) → `202`, or `conflict` while one is running.
+fn start_backup(state: &State, request: &mut Request) -> Route {
+    platform(state, request, true)?;
+    let Some(backups) = state.objects.backups() else {
+        return Err(err(
+            ErrorCode::Conflict,
+            "backups are not configured: set [backup] dir in the controller's configuration",
+        ));
+    };
+    if !backups.trigger() {
+        return Err(err(ErrorCode::Conflict, "a backup is already running"));
+    }
+    Ok(Reply::Json(202, json!({ "started": true }), Vec::new()))
 }
 
 fn registrations(state: &State, request: &Request, query: &str) -> Route {

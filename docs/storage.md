@@ -164,6 +164,10 @@ The controller runs the whole pass — expired uploads and leases, artifact reti
 
 With `[s3]` configured, committed objects and finished logs are also copied to an S3 bucket, verified, and replicated objects may be evicted locally and fetched back verified on read; a backlog past its budget closes admission until it drains. The local write path and every rule above are unchanged. See [s3](s3.md).
 
+## Backup and restore (R04)
+
+Online backups (`VACUUM INTO` on their own connection, with the maintenance lock held so nothing the snapshot names is deleted before it is copied), verification by rehashing, and restore onto an empty data directory with the master key checked, are in [backup](backup.md).
+
 ## Fault boundaries (D07)
 
 Every write path settles one of two ways: bytes durable *and* row committed, or the residue found and swept. `tests/faults.rs` drives the boundaries — a `commit` or `commit_manifest` rolled back after the rename leaves an orphan that `recover` reports and `sweep_orphans` collects past the grace; an upload chunk whose transaction rolled back leaves bytes the resend converges into a verifiable seal; closed admission refuses object bytes while log frames still flow above `floor`; binary frames round-trip byte-identical, oversized frames refuse and the refused sequence becomes a declared gap; the per-attempt log cap refuses with `log size` and the refusal is declared, not silent; a torn segment tail never reaches a tail reader and is cut on reopen; and a lost `end` marker is rebuilt from the sealed segment's end record instead of silently reopening the log. `read_tail` now streams flat logs in bounded chunks instead of loading the whole file.

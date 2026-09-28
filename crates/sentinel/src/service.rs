@@ -113,6 +113,8 @@ struct FileConfig {
     remote_cache: Option<RemoteCacheFile>,
     // Server: the optional external S3 copy of objects and logs (R02).
     s3: Option<S3File>,
+    // Server: scheduled online backups (R04).
+    backup: Option<BackupFile>,
     // Worker: the controller's `tc…` address, as written to its `<data_dir>/tailcat/address`
     // (Q06). Required to dial a controller through the helper.
     tailcat_address: Option<String>,
@@ -198,6 +200,41 @@ impl S3File {
         }
         if self.endpoint.is_empty() || self.region.is_empty() || self.bucket.is_empty() {
             return Err(Error::config("[s3] needs endpoint, region and bucket"));
+        }
+        Ok(())
+    }
+}
+
+/// The `[backup]` section (R04): scheduled online backups into a directory
+/// on another disk or a mounted volume. Server only.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupFile {
+    dir: PathBuf,
+    /// How often; default hourly (the recovery point for metadata).
+    interval_secs: Option<u64>,
+    /// Backups kept; default 24.
+    keep: Option<usize>,
+}
+
+impl BackupFile {
+    fn check(&self, data_dir: &Path) -> Result<(), Error> {
+        if !self.dir.is_absolute() {
+            return Err(Error::config("[backup] dir must be an absolute path"));
+        }
+        if self.dir.starts_with(data_dir) || data_dir.starts_with(&self.dir) {
+            return Err(Error::config(
+                "[backup] dir must be outside data_dir (and not contain it): a backup on the disk it protects protects nothing",
+            ));
+        }
+        if self
+            .interval_secs
+            .is_some_and(|s| !(300..=7 * 86_400).contains(&s))
+        {
+            return Err(Error::config("[backup] interval_secs must be 300..=604800"));
+        }
+        if self.keep.is_some_and(|k| !(1..=1_000).contains(&k)) {
+            return Err(Error::config("[backup] keep must be 1..=1000"));
         }
         Ok(())
     }
@@ -402,6 +439,8 @@ struct Config {
     storage: Storage,
     #[cfg(feature = "server")]
     s3: Option<S3File>,
+    #[cfg(feature = "server")]
+    backup: Option<BackupFile>,
     role: Role,
 }
 
@@ -721,6 +760,12 @@ impl Config {
             }
             s3.check()?;
         }
+        if let Some(backup) = &file.backup {
+            if matches!(role, Role::Worker(_)) {
+                return Err(Error::config("[backup] applies to the server role only"));
+            }
+            backup.check(&data_dir)?;
+        }
         Ok(Self {
             data_dir,
             log_format: args.log_format.or(file.log_format).unwrap_or_default(),
@@ -729,6 +774,8 @@ impl Config {
             storage,
             #[cfg(feature = "server")]
             s3: file.s3,
+            #[cfg(feature = "server")]
+            backup: file.backup,
             role,
         })
     }
@@ -1091,6 +1138,11 @@ enum Running {
         tailcat: Option<TailcatServer>,
         /// The external S3 copy's replicator, when `[s3]` is configured.
         replicator: Option<sentinel::offload::Running>,
+        /// Scheduled backups, when `[backup]` is configured.
+        backups: Option<(
+            Arc<sentinel_store::backup::Scheduler>,
+            std::thread::JoinHandle<()>,
+        )>,
     },
     #[cfg(feature = "worker")]
     Worker {
@@ -1684,6 +1736,26 @@ fn start_server(
         Some(s3) => Some(start_replicator(s3, total, &store, &objects, &logs)?),
         None => None,
     };
+    let backups = match &config.backup {
+        Some(backup) => {
+            let scheduler = sentinel_store::backup::Scheduler::new(
+                Arc::clone(&store),
+                Arc::clone(&objects),
+                config.data_dir.clone(),
+                backup.dir.clone(),
+                Duration::from_secs(backup.interval_secs.unwrap_or(3_600)),
+                backup.keep.unwrap_or(24),
+                env!("CARGO_PKG_VERSION").to_owned(),
+            );
+            objects.set_backups(Arc::clone(&scheduler) as Arc<dyn sentinel_store::backup::Control>);
+            let thread = scheduler
+                .start()
+                .map_err(|error| Error::runtime(format!("cannot start backups: {error}")))?;
+            tracing::info!(event = "backups_scheduled", dir = %backup.dir.display(), interval_secs = backup.interval_secs.unwrap_or(3_600), keep = backup.keep.unwrap_or(24));
+            Some((scheduler, thread))
+        }
+        None => None,
+    };
     let api = sentinel_api::Server::start(sentinel_api::Config {
         listen: api_listen,
         store: Arc::clone(&store),
@@ -1720,6 +1792,7 @@ fn start_server(
         reconcile,
         tailcat,
         replicator,
+        backups,
     })
 }
 
@@ -2357,9 +2430,16 @@ fn initialize_and_wait(
             reconcile,
             tailcat,
             replicator,
+            backups,
         } => {
             api.shutdown();
             maintenance.stop();
+            if let Some((scheduler, thread)) = backups {
+                // A backup under way finishes: its staging directory would
+                // otherwise be left for the next one to clear.
+                scheduler.stop();
+                let _ = thread.join();
+            }
             if let Some(replicator) = replicator {
                 replicator.shutdown();
             }
@@ -2579,6 +2659,24 @@ mod tests {
         assert_eq!(keys().len(), 2, "one tick removes at most one batch");
         assert!(!purge_expired(&store, 2));
         assert_eq!(keys(), ["live"]);
+    }
+
+    #[test]
+    fn backup_settings_keep_backups_off_the_disk_they_protect() {
+        let data = Path::new("/var/lib/sentinel");
+        let parse = |text: &str| toml::from_str::<BackupFile>(text).unwrap();
+        assert!(parse("dir = '/mnt/backup'").check(data).is_ok());
+        for bad in [
+            "dir = 'backup'",
+            "dir = '/var/lib/sentinel/backups'",
+            "dir = '/var/lib'",
+            "dir = '/mnt/backup'\ninterval_secs = 60",
+            "dir = '/mnt/backup'\ninterval_secs = 700000",
+            "dir = '/mnt/backup'\nkeep = 0",
+        ] {
+            assert!(parse(bad).check(data).is_err(), "{bad}");
+        }
+        assert!(toml::from_str::<BackupFile>("dir = '/x'\nextra = 1").is_err());
     }
 
     #[test]

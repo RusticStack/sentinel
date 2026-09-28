@@ -1093,6 +1093,12 @@ impl Inner {
     /// runs on the writer. Every unlink runs on the writer through
     /// [`Objects::unlink`], which re-checks ownership first.
     fn storage_pass(&self, now: UnixMillis) {
+        // A backup in progress holds this for its whole run (R04): nothing
+        // it snapshotted may be deleted before it is copied. The pass
+        // simply waits for the next interval.
+        let Some(_maintenance) = self.objects.try_maintenance() else {
+            return;
+        };
         let objects = Arc::clone(&self.objects);
         if let Ok(doomed) = self.write(move |tx| {
             objects.sweep_uploads(tx, now)?;

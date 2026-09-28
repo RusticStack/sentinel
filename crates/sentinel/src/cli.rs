@@ -182,6 +182,23 @@ pub enum AdminCommand {
     Intake(IntakeArgs),
     /// Reconcile or verify committed objects and manifests against the filesystem
     Objects(ObjectsArgs),
+    /// Take, list, verify and prune backups of a stopped controller
+    Backup(BackupArgs),
+    /// Rebuild a data directory from a backup (the controller must not run)
+    Restore {
+        /// Directory holding the backups
+        #[arg(long, value_name = "DIR")]
+        from: PathBuf,
+        /// Which backup; the newest when omitted
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
+        /// The master key file whose key ids the backup's sealed values need
+        #[arg(long, value_name = "FILE")]
+        key: Option<PathBuf>,
+        /// The empty data directory to rebuild
+        #[arg(long, value_name = "PATH")]
+        data_dir: PathBuf,
+    },
     /// Admit the first super admin; refused once any active super admin exists
     Bootstrap {
         #[command(flatten)]
@@ -370,6 +387,46 @@ pub struct ObjectsArgs {
     pub data: DataDir,
     #[command(subcommand)]
     pub command: ObjectsCommand,
+}
+
+#[derive(Args)]
+pub struct BackupArgs {
+    #[command(subcommand)]
+    pub command: BackupCommand,
+}
+
+#[derive(Subcommand)]
+pub enum BackupCommand {
+    /// Back up a stopped controller's data directory now (a running one
+    /// backs itself up on its `[backup]` schedule or `POST /admin/backups`)
+    Create {
+        #[command(flatten)]
+        data: DataDir,
+        /// Directory to hold the backups (outside the data directory)
+        #[arg(long, value_name = "DIR")]
+        to: PathBuf,
+    },
+    /// List the backups in a directory, oldest first
+    List {
+        #[arg(long, value_name = "DIR")]
+        dir: PathBuf,
+    },
+    /// Rehash a backup end to end: the snapshot's checksum and integrity,
+    /// and every object and manifest it names; exit 2 when anything is wrong
+    Verify {
+        #[arg(long, value_name = "DIR")]
+        dir: PathBuf,
+        /// Which backup; the newest when omitted
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
+    },
+    /// Keep the newest backups and remove the rest and what only they named
+    Prune {
+        #[arg(long, value_name = "DIR")]
+        dir: PathBuf,
+        #[arg(long)]
+        keep: usize,
+    },
 }
 
 #[derive(Subcommand)]
