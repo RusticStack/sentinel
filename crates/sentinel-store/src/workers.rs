@@ -40,6 +40,8 @@ pub struct Worker {
     pub negotiated: Negotiated,
     pub enrolled: UnixMillis,
     pub last_seen: Option<UnixMillis>,
+    /// The software it announced at its last hello (R05); `None` before.
+    pub software: Option<String>,
 }
 
 /// The enrollment secret, shown once. Delivered to the machine out of band.
@@ -216,6 +218,7 @@ pub fn redeem(
         negotiated: presentation.negotiated,
         enrolled: now,
         last_seen: None,
+        software: None,
     }))
 }
 
@@ -257,6 +260,25 @@ pub fn renegotiate(tx: &Transaction<'_>, worker: WorkerId, negotiated: Negotiate
     Ok(())
 }
 
+/// The software string a worker announced, as it is stored: printable
+/// ASCII only, at most 128 bytes; `None` when nothing printable is left.
+pub fn software_label(announced: &str) -> Option<String> {
+    let label: String = announced
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(128)
+        .collect();
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_owned())
+}
+
+/// Record the software a worker announced at this hello (R05).
+pub fn record_software(tx: &Transaction<'_>, worker: WorkerId, software: &str) -> Result<()> {
+    tx.prepare_cached("UPDATE workers SET software = ?2 WHERE id = ?1")?
+        .execute(params![worker.as_bytes(), software])?;
+    Ok(())
+}
+
 /// Resolve a presented certificate fingerprint to a live worker: enrolled,
 /// not revoked, in an active pool. One indexed lookup on the unique key. The
 /// identity the worker generated is the only credential it ever presents.
@@ -264,7 +286,7 @@ pub fn authenticate(conn: &Connection, fingerprint: &Digest) -> Result<Worker> {
     let row = conn
         .prepare_cached(
             "SELECT w.id, w.pool_id, w.name, w.arch, w.capabilities, w.protocol,
-                    w.enrolled_ms, w.last_seen_ms
+                    w.enrolled_ms, w.last_seen_ms, w.software
              FROM workers w JOIN pools p ON p.id = w.pool_id
              WHERE w.fingerprint = ?1 AND w.revoked_ms IS NULL AND p.active = 1",
         )?
@@ -278,6 +300,7 @@ pub fn authenticate(conn: &Connection, fingerprint: &Digest) -> Result<Worker> {
                 r.get::<_, i64>(5)?,
                 r.get::<_, i64>(6)?,
                 r.get::<_, Option<i64>>(7)?,
+                r.get::<_, Option<String>>(8)?,
             ))
         })
         .optional()?
@@ -298,6 +321,7 @@ pub fn authenticate(conn: &Connection, fingerprint: &Digest) -> Result<Worker> {
         },
         enrolled: UnixMillis(row.6),
         last_seen: row.7.map(UnixMillis),
+        software: row.8,
     })
 }
 
@@ -411,7 +435,8 @@ pub fn in_pool(conn: &Connection, authority: Authority, pool: PoolId) -> Result<
         }
     }
     let mut stmt = conn.prepare_cached(
-        "SELECT id, fingerprint, name, arch, capabilities, protocol, enrolled_ms, last_seen_ms
+        "SELECT id, fingerprint, name, arch, capabilities, protocol, enrolled_ms, last_seen_ms,
+                software
          FROM workers WHERE pool_id = ?1 AND revoked_ms IS NULL ORDER BY enrolled_ms, id",
     )?;
     let rows = stmt.query_map([pool.as_bytes()], |r| {
@@ -424,6 +449,7 @@ pub fn in_pool(conn: &Connection, authority: Authority, pool: PoolId) -> Result<
             r.get::<_, i64>(5)?,
             r.get::<_, i64>(6)?,
             r.get::<_, Option<i64>>(7)?,
+            r.get::<_, Option<String>>(8)?,
         ))
     })?;
     rows.map(|row| {
@@ -444,6 +470,7 @@ pub fn in_pool(conn: &Connection, authority: Authority, pool: PoolId) -> Result<
             },
             enrolled: UnixMillis(row.6),
             last_seen: row.7.map(UnixMillis),
+            software: row.8,
         })
     })
     .collect()

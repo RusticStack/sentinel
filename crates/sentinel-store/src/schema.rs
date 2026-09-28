@@ -146,7 +146,32 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (45, include_str!("migrations/045_web_ui.sql")),
     (46, include_str!("migrations/046_retention.sql")),
     (47, include_str!("migrations/047_s3.sql")),
+    (48, include_str!("migrations/048_upgrades.sql")),
 ];
+
+/// The newest schema this build knows.
+pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
+
+/// Migrations an older binary may keep running after (R05): `(version,
+/// readable_by)`, the oldest schema whose binary still operates on the
+/// result. Every migration not listed is readable only by its own version:
+/// a rollback past it needs the pre-migration snapshot or a backup. List a
+/// migration here only when it adds nothing an older binary could break or
+/// be broken by — an index, a column no older statement reads or writes
+/// with a default every older insert satisfies — and say so in
+/// `docs/compatibility.md`.
+pub const READABLE_BY: &[(u32, u32)] = &[(45, 44), (48, 47)];
+
+/// The declared `readable_by` of `version`.
+pub fn readable_by(version: u32) -> u32 {
+    READABLE_BY
+        .iter()
+        .find(|(v, _)| *v == version)
+        .map_or(version, |(_, r)| *r)
+}
+
+/// From this version on, `schema_migrations` records `readable_by`.
+pub const READABLE_BY_SINCE: u32 = 48;
 
 /// Whether `versions` are exactly `1..=N` in order. `migrate` skips every
 /// entry at or below a database's version, so an entry inserted out of

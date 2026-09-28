@@ -45,6 +45,7 @@ pub mod space;
 pub mod status;
 pub mod tenancy;
 pub mod tokens;
+pub mod upgrade;
 pub mod views;
 pub mod workers;
 
@@ -113,6 +114,15 @@ pub enum Error {
     /// a client bug, distinct from a stale compare-and-set `Conflict`.
     IdempotencyMismatch,
     Io(std::io::Error),
+    /// A migration failed (R05): the database stayed at `reached`, the last
+    /// version that committed; `snapshot` is the copy taken before the
+    /// first pending migration, to roll back to.
+    MigrationFailed {
+        from: u32,
+        reached: u32,
+        snapshot: Option<String>,
+        cause: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -139,6 +149,25 @@ impl fmt::Display for Error {
                 f.write_str("idempotency key reused for a different request")
             }
             Self::Io(e) => write!(f, "io: {e}"),
+            Self::MigrationFailed {
+                from,
+                reached,
+                snapshot,
+                cause,
+            } => {
+                write!(
+                    f,
+                    "upgrading the database from schema {from} failed at migration {}: {cause};                      it is at schema {reached}",
+                    reached + 1
+                )?;
+                match snapshot {
+                    Some(path) => write!(
+                        f,
+                        "; to roll back, stop, replace metadata.sqlite with {path} and start the previous release"
+                    ),
+                    None => f.write_str("; restore the last backup to roll back"),
+                }
+            }
         }
     }
 }
@@ -168,6 +197,7 @@ impl Error {
             Self::QuotaExceeded => "quota_exceeded",
             Self::IdempotencyMismatch => "idempotency_mismatch",
             Self::Io(_) => "io",
+            Self::MigrationFailed { .. } => "migration_failed",
         }
     }
 }
@@ -238,6 +268,13 @@ pub fn register_functions(conn: &Connection) -> Result<()> {
 }
 
 /// Apply pending migrations. Idempotent; each version commits separately.
+///
+/// A database newer than this build (a rollback, R05) is opened as it is —
+/// nothing migrated, nothing undone — only when every migration this build
+/// does not know declares it readable by this build's schema
+/// (`schema_migrations.readable_by`); otherwise it is refused as
+/// `unsupported database version`. Returns the database's version, which is
+/// then above [`schema::LATEST`].
 pub fn migrate(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -248,8 +285,20 @@ pub fn migrate(conn: &mut Connection) -> Result<u32> {
         [],
         |r| r.get(0),
     )?;
-    if current > schema::MIGRATIONS.last().map_or(0, |m| m.0) {
-        return Err(Error::Corrupt("unsupported database version"));
+    if current > schema::LATEST {
+        let needs: Option<u32> = conn
+            .query_row(
+                "SELECT MAX(COALESCE(readable_by, version)) FROM schema_migrations
+                 WHERE version > ?1",
+                [schema::LATEST],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        return match needs {
+            Some(needs) if needs <= schema::LATEST => Ok(current),
+            _ => Err(Error::Corrupt("unsupported database version")),
+        };
     }
     for &(version, sql) in schema::MIGRATIONS {
         if version <= current {
@@ -262,10 +311,17 @@ pub fn migrate(conn: &mut Connection) -> Result<u32> {
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(sql)?;
-        tx.execute(
-            "INSERT INTO schema_migrations(version, applied_ms) VALUES (?1, ?2)",
-            (version, sentinel_core::UnixMillis::now().0),
-        )?;
+        if version >= schema::READABLE_BY_SINCE {
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_ms, readable_by) VALUES (?1, ?2, ?3)",
+                (version, sentinel_core::UnixMillis::now().0, schema::readable_by(version)),
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_ms) VALUES (?1, ?2)",
+                (version, sentinel_core::UnixMillis::now().0),
+            )?;
+        }
         tx.commit()?;
         current = version;
     }

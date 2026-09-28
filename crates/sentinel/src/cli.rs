@@ -184,6 +184,13 @@ pub enum AdminCommand {
     Objects(ObjectsArgs),
     /// Take, list, verify and prune backups of a stopped controller
     Backup(BackupArgs),
+    /// Check a stopped controller's data directory against this build before
+    /// upgrading: schema, pending migrations, integrity, room, key and
+    /// worker protocol skew; nothing is changed, exit 2 when something blocks
+    Upgrade {
+        #[command(subcommand)]
+        command: UpgradeCommand,
+    },
     /// Rebuild a data directory from a backup (the controller must not run)
     Restore {
         /// Directory holding the backups
@@ -387,6 +394,15 @@ pub struct ObjectsArgs {
     pub data: DataDir,
     #[command(subcommand)]
     pub command: ObjectsCommand,
+}
+
+#[derive(Subcommand)]
+pub enum UpgradeCommand {
+    /// Report what starting this build on the data directory would do
+    Check {
+        #[command(flatten)]
+        data: DataDir,
+    },
 }
 
 #[derive(Args)]

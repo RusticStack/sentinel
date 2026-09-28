@@ -263,6 +263,8 @@ pub(super) fn workers_view(state: &State, request: &crate::http::Request, query:
                     "arch": format!("{:?}", w.negotiated.arch).to_lowercase(),
                     "connected": connected.contains(&w.id),
                     "last_seen_ms": w.last_seen.map(|t| t.0),
+                    "protocol": w.negotiated.protocol.0,
+                    "software": w.software,
                     "transport": state.controller.transport(w.id).map(|t| super::transport_json(&t)),
                     "draining": load.draining_since.is_some(),
                     "labels": load.labels,

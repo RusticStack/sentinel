@@ -177,6 +177,9 @@ export interface Worker {
   id: string;
   name: string;
   arch: string;
+  /** The negotiated worker protocol and the software it announced (R05). */
+  protocol: number;
+  software: string | null;
   connected: boolean;
   last_seen_ms: number | null;
   transport: { path: string; reconnects: number; bytes_in: number; bytes_out: number; rtt_ns?: number; helper_version?: string } | null;

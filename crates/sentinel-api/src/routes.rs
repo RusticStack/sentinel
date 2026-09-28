@@ -370,6 +370,30 @@ pub(crate) fn route(
     match (method, parts.as_slice()) {
         // Public: whether the deployment offers GitHub sign-in is what a
         // sign-in page shows, not a secret.
+        ("GET", ["api", "v1", "version"]) => {
+            // Any authenticated caller: what an operator or a CLI needs to
+            // judge skew (R05), and nothing the unauthenticated need.
+            identify(state, request, false)?;
+            let schema: i64 = state
+                .store
+                .read(|c| {
+                    Ok(c.query_row(
+                        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .map_err(store_error)?;
+            ok(json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "api": "v1",
+                "schema": { "database": schema, "binary": sentinel_store::schema::LATEST },
+                "worker_protocol": {
+                    "min": sentinel_protocol::negotiate::SUPPORTED_MIN.0,
+                    "max": sentinel_protocol::negotiate::SUPPORTED_MAX.0,
+                },
+            }))
+        }
         ("GET", ["api", "v1", "health"]) => {
             ok(json!({ "ok": true, "github_sign_in": state.github.is_some() }))
         }
