@@ -12,7 +12,7 @@ Sentinel is a performance-first, self-hosted Rust CI engine. Read [README.md](RE
 - Preserve the boundaries in the backlog: separate server/worker processes, tenant ownership, durable transitions, bounded resource usage. Add crates only when useful.
 - Commit with a conventional prefix (`feat:`, `build:`, `docs:`) and a message that describes behavior, not files.
 - **Tests run only on the verification VPS**, never on a workstation or in WSL: every test of any size — a single test binary, the full suites, the web browser test, benchmarks. Local work stops at formatting, `cargo check`/lint and `pnpm -C web typecheck`. The VPS is named in the git-ignored `.env` ([`.env.example`](.env.example)); see [development](docs/development.md#where-tests-run). It is shared with production services: run under `nice`/`ionice` with limited jobs, and when it is heavily loaded skip the run and record the verification as pending — never invent results.
-- Verify a small fix with the tests that cover it (the affected test binary, plus `cargo lint`/`cargo lint-linux`). Run the full suites once, when a piece of work is complete — not after every change — and keep stress runs short. Full runs cost hours.
+- Verify a change with the tests that cover it (the affected test binaries, plus `cargo lint`/`cargo lint-linux`). Run the full suites once per Part of `TODO.md`, when its last task is done — not after every task or change — and keep stress runs short. The test aliases run through [cargo-nextest](https://nexte.st), every test of every binary in parallel: a full `test-cli` plus `test-linux` takes about 4 minutes on the VPS, against about 25 with plain `cargo test`.
 
 ## Commands
 
