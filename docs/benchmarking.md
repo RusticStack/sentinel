@@ -60,6 +60,30 @@ Interpretation, limited to what was measured:
 - Podman writes about 512 blocks per run even for a no-op; storage/cgroup churn is a candidate for later optimization, after profiling.
 - The WSL2 kernel and the `/ is not a shared mount` warning make this a **development reference, not a production qualification**. Repeat the same commands on a dedicated Linux host and append the record before treating any number as a target.
 
+### The same baseline on the verification VPS
+
+Record: [`bench/f05-noop-vps.jsonl`](../bench/f05-noop-vps.jsonl), captured 2026-09-28 15:13 UTC with the same four commands and image.
+
+| Item | Value |
+|---|---|
+| Host | netcup VPS (QEMU guest), AMD EPYC 9645, 12 vCPUs, 31 GiB RAM |
+| Environment | Ubuntu 26.04.1 LTS, kernel `7.0.0-31-generic` |
+| Filesystem | ext4 on `/`, workdir `/home/sentinelbench` |
+| Runtime | Podman 5.7.0, rootless as `sentinelbench`, runc, overlay, cgroup v2, controllers `cpuset cpu io memory hugetlb pids rdma misc dmem` |
+| Source | `420ce8c`, `git_dirty: true` — the uncommitted change was the four store-test fixes committed in `defeb28`; nothing the runner builds or runs |
+| Load | load average 0.97 before and 1.18 after; CPU pressure (`some`, avg60) 0.43 % before, 0.70 % after. The host is shared with production services and another project's CI, which was idle for the run |
+
+| Runtime | Warm state | Limits | Samples | min | median | p95 | max | client max RSS |
+|---|---|---|---|---|---|---|---|---|
+| direct | warm | none | 20 | 0.93 ms | 1.23 ms | 1.62 ms | 1.82 ms | 2.8 MiB |
+| podman | cold (after `podman system prune`, image present) | none | 1 | 445 ms | – | – | – | 45.5 MiB |
+| podman | warm | none | 20 | 396 ms | 428 ms | 464 ms | 465 ms | 46.4 MiB |
+| podman | warm | `--cpus 1 --memory 256m` | 20 | 373 ms | 417 ms | 437 ms | 466 ms | 46.3 MiB |
+
+- A warm container start costs about **420 ms** here, against 250 ms on the WSL2 development machine: the production-shaped host is slower, not faster, for this floor. Process spawn is about 1.2 ms against 0.25 ms. Neither difference is explained by this record (different CPUs, a virtualized guest, and Podman 5.7 against 4.9); profile before attributing it.
+- Limits again make no measurable difference to start cost.
+- An earlier attempt on 2026-09-27 started as the other CI burst (CPU pressure 68 %, load 14; warm median 1.36 s) and was discarded, not recorded: a contended host is not a baseline.
+
 ## K09 before/after: the cache path's own cost
 
 Record: [`bench/k09-before-after.jsonl`](../bench/k09-before-after.jsonl) (first line carries host/kernel/filesystem provenance), driven by [`bench/k09-before-after.sh`](../bench/k09-before-after.sh). Every number is a real attempt through the worker's own path — fresh workspace, pinned local checkout, digest-pinned image, cache restore, rootless Podman steps, publication — not the `bench-noop` process-spawn floor.
