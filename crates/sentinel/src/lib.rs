@@ -73,6 +73,8 @@ pub enum LogLevel {
 pub mod correlation;
 #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]
 pub mod diagnostics;
+#[cfg(all(target_os = "linux", feature = "server"))]
+pub mod offload;
 #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]
 pub mod timing;
 #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]

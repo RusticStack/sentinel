@@ -1,0 +1,25 @@
+[package]
+name = "sentinel-s3"
+description = "Optional external S3 blob adapter: Signature V4 requests, multipart with resume, range reads, abort cleanup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = "0.23"
+# Content-MD5: the transport checksum every S3 implementation verifies,
+# where some ignore the signed SHA-256 payload hash. Not used for security.
+md-5 = "0.11"
+quick-xml = { version = "0.42", default-features = false }
+ring = "0.17"
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[lints]
+workspace = true

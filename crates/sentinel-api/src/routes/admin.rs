@@ -532,6 +532,29 @@ fn deployment_storage(state: &State, request: &Request) -> Route {
         "log_retention_ms": d.log_retention_ms,
         "artifact_retention_ms": d.artifact_retention_ms,
         "run_artifact_bytes": d.run_artifact_bytes,
+        "s3": state.objects.replication().map(|r| {
+            use std::sync::atomic::Ordering::Relaxed;
+            let at = |v: i64| (v > 0).then_some(v);
+            json!({
+                "state": r.state(),
+                "backlog_bytes": r.backlog_bytes.load(Relaxed),
+                "backlog_full": r.backlog_full.load(Relaxed),
+                "oldest_unreplicated_ms": at(r.oldest_unreplicated_ms.load(Relaxed)),
+                "unreplicated_logs": r.unreplicated_logs.load(Relaxed),
+                "local_bytes": r.local_bytes.load(Relaxed),
+                "last_success_ms": at(r.last_success_ms.load(Relaxed)),
+                "last_failure_ms": at(r.last_failure_ms.load(Relaxed)),
+                "consecutive_failures": r.consecutive_failures.load(Relaxed),
+                "last_error": r.last_error.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+                "replicated_objects": r.replicated_objects.load(Relaxed),
+                "replicated_bytes": r.replicated_bytes.load(Relaxed),
+                "replicated_logs": r.replicated_logs.load(Relaxed),
+                "evicted_objects": r.evicted_objects.load(Relaxed),
+                "fetched_objects": r.fetched_objects.load(Relaxed),
+                "deleted_copies": r.deleted_copies.load(Relaxed),
+                "aborted_uploads": r.aborted_uploads.load(Relaxed),
+            })
+        }),
     }))
 }
 

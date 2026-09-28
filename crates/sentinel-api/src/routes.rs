@@ -639,10 +639,29 @@ pub(crate) fn route(
                     dispatch::list_queue(c, tenant, &connected, limit)
                 })
                 .map_err(store_error)?;
+            // While disk admission is closed nothing is placed at all
+            // (D06, R03): a job nothing else holds is waiting on storage,
+            // not ready.
+            let storage = state.objects.admission().filter(|a| !a.is_open()).map(|a| {
+                if a.backlog_full() {
+                    "external_copy_backlog"
+                } else {
+                    "disk_below_watermark"
+                }
+            });
             ok(json!({
-                "jobs": page.jobs.iter().map(queued_json).collect::<Vec<_>>(),
+                "jobs": page.jobs.iter().map(|row| {
+                    let mut job = queued_json(row);
+                    if let Some(detail) = storage
+                        && matches!(row.reason, dispatch::WaitReason::Ready | dispatch::WaitReason::Capacity)
+                    {
+                        job["reason"] = json!({ "code": "storage", "detail": detail });
+                    }
+                    job
+                }).collect::<Vec<_>>(),
                 "total": page.total,
                 "truncated": page.total > page.jobs.len(),
+                "placement_paused": storage,
             }))
         }
         ("POST", ["api", "v1", "workers", worker, "drain"]) => {

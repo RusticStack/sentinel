@@ -76,6 +76,19 @@ listen_port = 7443                 # server: must match `listen`; worker: the lo
 enabled = true                     # default; the controller holds offered objects, the worker fetches/offers them
 budget_bytes = 53687091200         # server only: what the controller's store may hold (≥ 64 MiB); default a tenth of the data file system, 1-50 GiB
 
+# server only: the optional external S3 copy of objects and finished logs ([s3](s3.md)); absent keeps everything on the local disk only
+[s3]
+endpoint = "https://s3.eu-central-1.amazonaws.com"  # http(s)://host[:port], no path
+region = "eu-central-1"
+bucket = "sentinel-ci"
+prefix = "prod/"                   # optional; ends in '/'
+path_style = false                 # true for most self-hosted services
+ca_file = "/etc/sentinel/s3-ca.pem"  # optional, absolute: trust these CAs instead of the Mozilla roots
+credentials_file = "/etc/sentinel/s3.credentials"  # absolute, owner-only: access_key_id, secret_access_key[, session_token]
+part_bytes = 16777216              # 5-512 MiB (default 16 MiB)
+local_bytes = 0                    # replicated objects kept locally up to this; 0 (default) keeps all
+backlog_bytes = 67549713920        # unreplicated bytes past which new artifacts and uploads wait (default a sixteenth of the data file system, 1-64 GiB)
+
 # server only: disk admission, quotas and retention ([retention](retention.md), [storage](storage.md#disk-admission-quotas-and-reclamation-d06))
 [storage]
 reserve_bytes = 16777216000        # held back for metadata and log evidence (≥ 64 MiB); default a 64th of the data file system, 1-16 GiB; never less than twice the metadata database
@@ -90,7 +103,7 @@ attempt_log_bytes = 268435456      # stored log bytes one attempt may produce (1
 sweep_interval_secs = 300          # the maintenance pass runs on its own thread at most this often (5..86400)
 ```
 
-The three common fields are optional in the file; `listen`, `api_listen`, `public_url` and `[storage]` are refused for the worker and the worker keys (`labels`, `disk_bytes`, `spool_reserve_bytes`, `spool_quota_bytes`, `cache_budget_bytes`, `mirror_budget_bytes`, `image_budget_bytes`, `tailcat_address`) for the server, as is `[remote_cache] budget_bytes` for the worker; `[tailcat]` is accepted by both roles; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
+The three common fields are optional in the file; `listen`, `api_listen`, `public_url` and `[storage]` are refused for the worker and the worker keys (`labels`, `disk_bytes`, `spool_reserve_bytes`, `spool_quota_bytes`, `cache_budget_bytes`, `mirror_budget_bytes`, `image_budget_bytes`, `tailcat_address`) for the server, as are `[remote_cache] budget_bytes` and `[s3]` for the worker; `[tailcat]` is accepted by both roles; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
 
 - Server: `/var/lib/sentinel`
 - Worker: `/var/lib/sentinel-worker`

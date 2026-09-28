@@ -519,7 +519,7 @@ Resolve through hardware/workflow evidence:
 3. Optimized cache backend. ~~Byte/retention defaults.~~ Resolved: sized from the data file system and measured on the reference host, with policy per tenant and repository ([retention](docs/retention.md)).
 4. ~~UI stack and measured binary/RSS limits.~~ Resolved: Nuxt web interface, measured in [web interface](docs/web-ui.md#running-it).
 5. Tailcat pin/upgrade policy, wire framing, bulk concurrency.
-6. Key backup, recovery-point/recovery-time goals, and S3-outage policy.
+6. Key backup and recovery-point/recovery-time goals. ~~S3-outage policy.~~ Resolved: a bounded backlog on the controller's disk, then admission closes for new artifacts and uploads until it drains; the optional cache is never replicated ([s3](docs/s3.md#degraded-durability-and-admission-r03)).
 
 These gates do not defer scheduling correctness or multi-host design until after v1.
 

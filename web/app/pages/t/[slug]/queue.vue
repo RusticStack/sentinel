@@ -20,10 +20,16 @@ const REASONS: Record<string, string> = {
   fairness_hold: "held for fairness to other work",
   locality_wait: "waiting for a worker with warm caches",
   ready: "ready: the next placement pass takes it",
+  storage: "new work is paused",
+};
+const STORAGE: Record<string, string> = {
+  disk_below_watermark: "the controller's disk is below its low watermark",
+  external_copy_backlog: "the external S3 copy is behind; it resumes once the backlog drains",
 };
 function explain(r: any) {
   const parts = [REASONS[r.code] ?? words(r.code)];
-  if (r.detail) parts.push(`(${r.detail})`);
+  if (r.code === "storage") parts.push(`: ${STORAGE[r.detail] ?? words(r.detail)}`);
+  else if (r.detail) parts.push(`(${r.detail})`);
   if (r.cpu_short) parts.push(`— short ${cpu(r.cpu_short)}`);
   if (r.memory_short) parts.push(`— short ${fmtBytes(r.memory_short)} memory`);
   if (r.disk_short) parts.push(`— short ${fmtBytes(r.disk_short)} disk`);
@@ -32,7 +38,7 @@ function explain(r: any) {
 
 const { data: repos } = await useRepos(slug);
 const names = computed(() => new Map((repos.value?.repos ?? []).map((r) => [r.id, r.name])));
-const { data: queue, refresh } = await useAsyncData(`queue-${slug}`, () => api<{ jobs: any[]; total: number; truncated: boolean }>(`/api/v1/queue?tenant=${slug}&limit=200`));
+const { data: queue, refresh } = await useAsyncData(`queue-${slug}`, () => api<{ jobs: any[]; total: number; truncated: boolean; placement_paused: string | null }>(`/api/v1/queue?tenant=${slug}&limit=200`));
 usePolling(refresh, 5000);
 
 const columns = [
@@ -47,6 +53,8 @@ const columns = [
       {{ queue?.total ?? 0 }} waiting job{{ queue?.total === 1 ? "" : "s" }}<template v-if="queue?.truncated">; the oldest {{ queue.jobs.length }} are shown</template>.
       Refreshes every 5 s.
     </p>
+    <UAlert v-if="queue?.placement_paused" color="warning" variant="subtle" icon="i-lucide-hard-drive" role="status"
+      title="No new work is being placed" :description="`The controller paused placement: ${STORAGE[queue.placement_paused] ?? words(queue.placement_paused)}.`" />
     <UTable :data="queue?.jobs ?? []" :columns="columns" caption="Waiting jobs" empty="Nothing is waiting." class="rounded-lg border border-default">
       <template #job-cell="{ row }"><code class="text-xs">{{ shortId(row.original.job) }}</code></template>
       <template #run-cell="{ row }"><ULink :to="`/runs/${row.original.run}`" class="text-primary underline">{{ shortId(row.original.run) }}</ULink></template>

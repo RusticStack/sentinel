@@ -1147,3 +1147,66 @@ fn the_maintenance_pass_stamps_expires_and_deletes_finished_logs() {
     assert_eq!(row().0, 0);
     assert_eq!(tenant_logs(), before - bytes as u64);
 }
+
+/// R03: while the external copy's backlog holds admission closed, nothing
+/// is placed — the queue says the job waits on storage, not that it is
+/// ready — and `GET /admin/storage` reports the replicator's state.
+#[test]
+fn a_full_external_copy_backlog_is_what_the_queue_and_the_storage_report_say() {
+    let f = Fixture::new(1);
+    let admission = std::sync::Arc::new(
+        sentinel_store::space::Admission::with_probe(
+            sentinel_store::space::Watermarks {
+                reserve: 1 << 20,
+                low: 1 << 20,
+                high: 2 << 20,
+                floor: 1 << 17,
+            },
+            || Ok(1 << 40),
+        )
+        .unwrap(),
+    );
+    f.objects.set_admission(std::sync::Arc::clone(&admission));
+    let status = std::sync::Arc::new(sentinel_store::replicate::Status::default());
+    f.objects.set_replication(std::sync::Arc::clone(&status));
+    let reasons = || {
+        let (status, body) = get(&f, "/api/v1/queue?tenant=acme", &f.auth);
+        assert_eq!(status, 200, "{body}");
+        body["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["reason"].clone())
+            .collect::<Vec<_>>()
+    };
+    let before = reasons();
+    assert!(!before.is_empty(), "the fixture has waiting jobs");
+    assert!(!before.iter().any(|r| r["code"] == "storage"));
+
+    admission.set_backlog_full(true);
+    status
+        .backlog_full
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let during = reasons();
+    // Jobs held by something else keep their own reason; the one nothing
+    // else holds says storage, and why.
+    for (b, d) in before.iter().zip(&during) {
+        if b["code"] == "ready" || b["code"] == "capacity" {
+            assert_eq!(d["code"], "storage", "{b} -> {d}");
+            assert_eq!(d["detail"], "external_copy_backlog");
+        } else {
+            assert_eq!(b, d);
+        }
+    }
+    let (_, queue) = get(&f, "/api/v1/queue?tenant=acme", &f.auth);
+    assert_eq!(queue["placement_paused"], "external_copy_backlog");
+    let (_, body) = get(&f, "/api/v1/admin/storage", &f.auth);
+    assert_eq!(body["admission_open"], false);
+    assert_eq!(body["s3"]["state"], "degraded");
+    assert_eq!(body["s3"]["backlog_full"], true);
+
+    admission.set_backlog_full(false);
+    assert_eq!(reasons(), before);
+    let (_, queue) = get(&f, "/api/v1/queue?tenant=acme", &f.auth);
+    assert_eq!(queue["placement_paused"], Value::Null);
+}
