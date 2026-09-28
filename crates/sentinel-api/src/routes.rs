@@ -1405,6 +1405,23 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
         .transpose()?;
     let wait = query_param(query, "wait").is_some_and(|v| v == "1" || v == "true");
     let (tenant, run, job) = attempt_log(state, who.principal, attempt)?;
+    // Retention removed this log (R01): say so instead of an empty page
+    // that looks like a log still to come.
+    if let Some(expired) = state
+        .store
+        .read(|c| sentinel_store::retention::log_expired(c, attempt))
+        .map_err(store_error)?
+    {
+        return ok(json!({
+            "attempt": attempt.to_string(),
+            "complete": true,
+            "gaps": [],
+            "next_after": null,
+            "step_done": false,
+            "frames": [],
+            "expired_ms": expired.0,
+        }));
+    }
     let after = match (after, query_param(query, "cursor")) {
         (Some(_), Some(_)) => {
             return Err(err(
@@ -1655,6 +1672,20 @@ fn log_search(state: &State, request: &Request, attempt: &str, query: &str) -> R
     // The previous page's `next_carry`: opaque, hex, checked by the store.
     let carry = query_param(query, "carry");
     let (_, run, job) = attempt_log(state, who.principal, attempt)?;
+    if let Some(expired) = state
+        .store
+        .read(|c| sentinel_store::retention::log_expired(c, attempt))
+        .map_err(store_error)?
+    {
+        return ok(json!({
+            "attempt": attempt.to_string(),
+            "matches": [],
+            "next_after": null,
+            "next_carry": null,
+            "complete": true,
+            "expired_ms": expired.0,
+        }));
+    }
     let search = logs::SearchQuery {
         needle: needle.as_bytes(),
         after,

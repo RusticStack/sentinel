@@ -81,6 +81,56 @@ export interface LogPage {
   next_after: number | null;
   next: string;
   step_done: boolean;
+  /** Set when retention removed this log (R01): when it did. */
+  expired_ms?: number;
+}
+
+/** A storage policy as set (R01); `null` inherits. */
+export interface StoragePolicy {
+  quota_bytes: number | null;
+  log_retention_ms: number | null;
+  artifact_retention_ms: number | null;
+}
+
+export interface StorageEffective {
+  tenant_quota_bytes: number;
+  repo_quota_bytes: number;
+  log_retention_ms: number;
+  artifact_retention_ms: number;
+}
+
+export interface TenantStorage {
+  usage: { object_bytes: number; log_bytes: number };
+  policy: StoragePolicy;
+  effective: StorageEffective;
+  repos: {
+    id: string;
+    name: string;
+    usage: { artifact_bytes: number; log_bytes: number };
+    policy: StoragePolicy;
+    effective: StorageEffective;
+  }[];
+}
+
+export interface DeploymentStorage {
+  filesystem_bytes: number | null;
+  free_bytes: number | null;
+  metadata_bytes: number;
+  admission_open: boolean | null;
+  inflight_bytes: number | null;
+  watermarks: {
+    reserve_bytes: number;
+    configured_reserve_bytes: number;
+    low_watermark_bytes: number;
+    high_watermark_bytes: number;
+    log_floor_bytes: number;
+  } | null;
+  stored_bytes: number;
+  quota_bytes: number;
+  tenant_quota_bytes: number;
+  log_retention_ms: number;
+  artifact_retention_ms: number;
+  run_artifact_bytes: number;
 }
 
 export interface ApiErrorBody { code: string; message: string; details?: Record<string, any> }

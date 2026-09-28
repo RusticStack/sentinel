@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Explanation, Run, Steps } from "~~/shared/types/api";
+import type { Explanation, LogPage, Run, Steps } from "~~/shared/types/api";
 
 // One attempt's log: steps that fold, windowed lines, search, deep links,
 // and live following through the log stream.
@@ -10,12 +10,14 @@ const runId = route.params.id as string;
 const attempt = route.params.attempt as string;
 
 const { data } = await useAsyncData(`log-${attempt}`, async () => {
-  const [run, explain, steps] = await Promise.all([
+  const [run, explain, steps, first] = await Promise.all([
     api<Run>(`/api/v1/runs/${runId}`),
     api<Explanation>(`/api/v1/runs/${runId}/pipeline`).catch(() => null),
     api<Steps>(`/api/v1/attempts/${attempt}/steps`).catch(() => ({ attempt, present: false } as Steps)),
+    // One frame is enough to learn whether retention removed the log.
+    api<LogPage>(`/api/v1/attempts/${attempt}/logs?limit=1`).catch(() => null),
   ]);
-  return { run, explain, steps };
+  return { run, explain, steps, expired: first?.expired_ms ?? null };
 });
 const job = computed(() => data.value?.run.jobs.find((j) => j.attempt === attempt) ?? null);
 const stepList = computed(() => {
@@ -49,7 +51,10 @@ useHead({ title: () => `Log · ${job.value?.name ?? shortId(attempt)} · Sentine
       </span>
     </div>
     <UAlert v-if="refused" color="error" variant="subtle" icon="i-lucide-lock" :title="refused" role="alert" :actions="[{ label: 'Back to your tenants', to: '/' }]" />
-    <ClientOnly>
+    <UAlert v-if="data?.expired" color="neutral" variant="subtle" icon="i-lucide-archive-x" role="status"
+      title="This log was removed by retention"
+      :description="`Its storage policy kept it until ${new Date(data.expired).toUTCString()}. The run's result, its steps and their timings are still here.`" />
+    <ClientOnly v-else>
       <LogPane :attempt="attempt" :run="runId" :steps="stepList" :outcomes="data?.steps.present ? data.steps.steps! : null" :complete="complete" @refused="onRefused" />
       <template #fallback><USkeleton class="h-[70vh] w-full" /></template>
     </ClientOnly>

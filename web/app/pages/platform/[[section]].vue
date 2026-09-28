@@ -11,6 +11,7 @@ const tabs = computed(() => [
   { label: "Registrations", icon: "i-lucide-user-check", to: "/platform/registrations", active: section.value === "registrations" },
   { label: "Tenants", icon: "i-lucide-building-2", to: "/platform/tenants", active: section.value === "tenants" },
   { label: "Pools", icon: "i-lucide-server", to: "/platform/pools", active: section.value === "pools" },
+  { label: "Storage", icon: "i-lucide-hard-drive", to: "/platform/storage", active: section.value === "storage" },
   { label: "Policy", icon: "i-lucide-scale", to: "/platform/policy", active: section.value === "policy" },
   { label: "Audit", icon: "i-lucide-scroll-text", to: "/platform/audit", active: section.value === "audit" },
 ]);
@@ -27,6 +28,7 @@ useHead({ title: "Platform · Sentinel" });
     <PlatformRegistrations v-if="section === 'registrations'" />
     <PlatformTenants v-else-if="section === 'tenants'" />
     <PlatformPools v-else-if="section === 'pools'" />
+    <PlatformStorage v-else-if="section === 'storage'" />
     <PlatformPolicy v-else-if="section === 'policy'" />
     <PlatformAudit v-else />
   </SPage>

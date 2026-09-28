@@ -971,3 +971,179 @@ fn parked_polls_leave_every_handler_for_work() {
     assert_eq!(send(&f, "POST", &cancel, json!({}), &f.auth).0, 200);
     drop(parked);
 }
+
+/// R01: storage policy over the API — the platform sets a tenant's, the
+/// tenant's administration narrows a repository's and reads both with
+/// usage, the deployment reports its disk and limits, and a log retention
+/// removed says so instead of looking like a log still to come.
+#[test]
+fn storage_policy_is_administered_per_level_and_an_expired_log_says_so() {
+    let f = Fixture::new(1);
+    let dana = f.member(f.dana);
+    const DAY: u64 = 86_400;
+    // An operator reads no storage and sets nothing.
+    assert_ne!(get(&f, "/api/v1/tenants/acme/storage", &dana).0, 200);
+    assert_eq!(get(&f, "/api/v1/admin/storage", &dana).0, 403);
+    let (status, _) = send(
+        &f,
+        "PUT",
+        "/api/v1/admin/tenants/acme/storage",
+        json!({ "log_retention_secs": 10 * DAY }),
+        &dana,
+    );
+    assert_eq!(status, 403);
+    let (status, _) = send(
+        &f,
+        "PUT",
+        "/api/v1/tenants/acme/repos/app/storage",
+        json!({ "log_retention_secs": DAY }),
+        &dana,
+    );
+    assert_ne!(status, 200);
+
+    let (status, body) = send(
+        &f,
+        "PUT",
+        "/api/v1/admin/tenants/acme/storage",
+        json!({ "quota_bytes": 1_u64 << 30, "log_retention_secs": 10 * DAY }),
+        &f.auth,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["effective"]["log_retention_ms"], 10 * DAY * 1000);
+    assert_eq!(body["policy"]["artifact_retention_ms"], Value::Null);
+    // A repository never keeps longer than its tenant, nor out of range.
+    for wider in [
+        json!({ "log_retention_secs": 11 * DAY }),
+        json!({ "log_retention_secs": 60 }),
+        json!({ "quota_bytes": 0 }),
+        json!({ "unknown": 1 }),
+    ] {
+        let (status, body) = send(
+            &f,
+            "PUT",
+            "/api/v1/tenants/acme/repos/app/storage",
+            wider.clone(),
+            &f.auth,
+        );
+        assert_eq!(status, 400, "{wider} {body}");
+    }
+    let (status, body) = send(
+        &f,
+        "PUT",
+        "/api/v1/tenants/acme/repos/app/storage",
+        json!({ "log_retention_secs": 2 * DAY, "quota_bytes": 1_u64 << 20 }),
+        &f.auth,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["effective"]["repo_quota_bytes"], 1_u64 << 20);
+
+    let (status, body) = get(&f, "/api/v1/tenants/acme/storage", &f.auth);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["policy"]["quota_bytes"], 1_u64 << 30);
+    let app = body["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "app")
+        .expect("app listed");
+    assert_eq!(app["effective"]["log_retention_ms"], 2 * DAY * 1000);
+    assert!(app["usage"]["log_bytes"].is_u64());
+
+    let (status, body) = get(&f, "/api/v1/admin/storage", &f.auth);
+    assert_eq!(status, 200, "{body}");
+    assert!(body["metadata_bytes"].as_u64().unwrap() > 0);
+    assert!(body["stored_bytes"].is_u64());
+    assert!(body["log_retention_ms"].is_i64() || body["log_retention_ms"].is_u64());
+
+    // Retention removed alpha's log: its page says when, with no frames.
+    let (alpha, _) = f.attempts["alpha"];
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE attempts SET log_expires_ms = 1, log_expired_ms = 2 WHERE id = ?1",
+                [alpha.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (status, body) = get(&f, &format!("/api/v1/attempts/{alpha}/logs"), &f.auth);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["expired_ms"], 2);
+    assert_eq!(body["frames"].as_array().map(Vec::len), Some(0));
+    assert_eq!(body["complete"], true);
+    let (status, body) = get(
+        &f,
+        &format!("/api/v1/attempts/{alpha}/logs/search?q=x"),
+        &f.auth,
+    );
+    assert_eq!((status, &body["expired_ms"]), (200, &json!(2)), "{body}");
+}
+
+/// R01 end to end: the controller's maintenance pass stamps a finished
+/// attempt's log (its bytes count toward the tenant's usage), and once its
+/// deadline passes records it expired, frees the usage and deletes the
+/// files — the database first, the files after.
+#[test]
+fn the_maintenance_pass_stamps_expires_and_deletes_finished_logs() {
+    let f = Fixture::new(1);
+    let (alpha, _) = f.attempts["alpha"];
+    let job = f.jobs["alpha"];
+    let dir = f.logs.attempt_dir(f.diamond, job, alpha);
+    assert!(dir.exists(), "the fixture wrote alpha's log");
+    let row = || {
+        f.store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT log_bytes, log_expires_ms, log_expired_ms FROM attempts WHERE id = ?1",
+                    [alpha.as_bytes().as_slice()],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
+                )?)
+            })
+            .unwrap()
+    };
+    let tenant_logs = || {
+        f.store
+            .read(|c| sentinel_store::retention::tenant_usage(c, f.acme))
+            .unwrap()
+            .log_bytes
+    };
+    let until = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} never happened"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    };
+    f.controller
+        .set_storage_policy(sentinel_link::controller::StoragePolicy { interval_ms: 50 });
+    until("stamping", &|| row().1.is_some());
+    let (bytes, _, expired) = row();
+    assert!(bytes > 0, "the stamp measured the log's files");
+    assert_eq!(expired, None);
+    assert!(tenant_logs() >= bytes as u64);
+    let before = tenant_logs();
+
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE attempts SET log_expires_ms = 1 WHERE id = ?1",
+                [alpha.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    until("expiry", &|| row().2.is_some() && !dir.exists());
+    assert_eq!(row().0, 0);
+    assert_eq!(tenant_logs(), before - bytes as u64);
+}

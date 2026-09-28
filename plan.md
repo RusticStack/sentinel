@@ -516,7 +516,7 @@ Resolve through hardware/workflow evidence:
 
 1. Actual worker CPU/RAM/filesystems/cgroups/RTT and relay host.
 2. Repos blocked by services, matrices, image publishing, deployments, merge queues, forks.
-3. Optimized cache backend and byte/retention defaults.
+3. Optimized cache backend. ~~Byte/retention defaults.~~ Resolved: sized from the data file system and measured on the reference host, with policy per tenant and repository ([retention](docs/retention.md)).
 4. ~~UI stack and measured binary/RSS limits.~~ Resolved: Nuxt web interface, measured in [web interface](docs/web-ui.md#running-it).
 5. Tailcat pin/upgrade policy, wire framing, bulk concurrency.
 6. Key backup, recovery-point/recovery-time goals, and S3-outage policy.

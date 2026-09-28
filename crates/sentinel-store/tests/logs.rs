@@ -451,9 +451,9 @@ fn idle_writers_close_are_capped_and_their_logs_expire() {
         Appended::Stored { through: 2 }
     );
     logs.close_idle(Duration::ZERO);
-    // Nothing is held open any more, so retention reaches every log.
-    let now = sentinel_core::UnixMillis(sentinel_core::UnixMillis::now().0 + 10_000);
-    assert_eq!(logs.sweep_expired(now, 1, 256).unwrap(), 10);
+    // Nothing is held open any more, so the retention sweep reaches every
+    // log the database has released.
+    assert_eq!(logs.sweep_dirs(256, |_| true).unwrap(), 10);
 }
 
 /// P09-11 / P06-11: an API page is bounded in bytes and in decode work,

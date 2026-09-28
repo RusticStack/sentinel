@@ -127,11 +127,14 @@ pub struct TenantRow {
     pub active: bool,
     pub created: UnixMillis,
     pub members: u64,
-    /// Committed and reserved object bytes (`tenant_usage`).
+    /// Committed and reserved object bytes plus stamped log bytes
+    /// (`tenant_usage`).
     pub usage_bytes: u64,
-    /// The tenant's own quota row, if one is set (else the deployment
-    /// default applies).
+    /// The tenant's own storage policy (R01); `None` fields inherit the
+    /// deployment's.
     pub quota_bytes: Option<u64>,
+    pub log_retention_ms: Option<i64>,
+    pub artifact_retention_ms: Option<i64>,
 }
 
 /// Every tenant, by slug, a keyset page after `after`. Platform
@@ -147,9 +150,11 @@ pub fn tenants(
     let mut stmt = conn.prepare_cached(
         "SELECT t.id, t.slug, t.kind, t.active, t.created_ms,
             (SELECT COUNT(*) FROM memberships m WHERE m.tenant_id = t.id),
-            COALESCE((SELECT bytes FROM tenant_usage u WHERE u.tenant_id = t.id), 0),
-            (SELECT quota_bytes FROM tenant_quotas q WHERE q.tenant_id = t.id)
-         FROM tenants t WHERE t.slug > ?1 ORDER BY t.slug LIMIT ?2",
+            COALESCE((SELECT bytes + log_bytes FROM tenant_usage u WHERE u.tenant_id = t.id), 0),
+            p.quota_bytes, p.log_retention_ms, p.artifact_retention_ms
+         FROM tenants t
+         LEFT JOIN storage_policies p ON p.tenant_id = t.id AND p.repo_id = X''
+         WHERE t.slug > ?1 ORDER BY t.slug LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![after.unwrap_or(""), limit], |r| {
         Ok((
@@ -161,10 +166,12 @@ pub fn tenants(
             r.get::<_, i64>(5)?,
             r.get::<_, i64>(6)?,
             r.get::<_, Option<i64>>(7)?,
+            r.get::<_, Option<i64>>(8)?,
+            r.get::<_, Option<i64>>(9)?,
         ))
     })?;
     rows.map(|row| {
-        let (id, slug, kind, active, created, members, usage, quota) = row?;
+        let (id, slug, kind, active, created, members, usage, quota, logs, artifacts) = row?;
         Ok(TenantRow {
             id: TenantId::from_bytes(id).map_err(|_| Error::Corrupt("tenant_id"))?,
             slug,
@@ -174,6 +181,8 @@ pub fn tenants(
             members: u64::try_from(members).unwrap_or(0),
             usage_bytes: u64::try_from(usage).unwrap_or(0),
             quota_bytes: quota.and_then(|q| u64::try_from(q).ok()),
+            log_retention_ms: logs,
+            artifact_retention_ms: artifacts,
         })
     })
     .collect()

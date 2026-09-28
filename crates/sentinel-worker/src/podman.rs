@@ -303,6 +303,73 @@ pub fn image_bytes(image: &str) -> Option<u64> {
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
+/// One image a store holds, as `podman images` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredImage {
+    /// The full image id.
+    pub id: String,
+    /// Bytes podman accounts to it; layers shared between images count for
+    /// each, so a store's sum errs high.
+    pub bytes: u64,
+    /// Containers (running or not) using it: podman refuses to remove those.
+    pub containers: u32,
+    /// Its manifest digest, `sha256:…`.
+    pub digest: String,
+}
+
+/// Every image in `store`, one compact line each (`MAX_LIST_ITEMS` at most).
+pub fn list_images(store: &Store) -> Result<Vec<StoredImage>> {
+    let mut cmd = podman_in(store);
+    cmd.args([
+        "images",
+        "--noheading",
+        "--no-trunc",
+        "--format",
+        "{{.Id}} {{.VirtualSize}} {{.Containers}} {{.Digest}}",
+    ]);
+    let output = process::run(cmd, deadline(Duration::from_secs(30)), "podman images")?;
+    if !output.success() {
+        return Err(Error::Preparation(format!(
+            "image list: {}",
+            output.stderr_excerpt()
+        )));
+    }
+    Ok(parse_images(&output.stdout))
+}
+
+fn parse_images(stdout: &[u8]) -> Vec<StoredImage> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .take(sentinel_protocol::limits::MAX_LIST_ITEMS)
+        .filter_map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            let id = fields.next()?;
+            let bytes = fields.next()?.parse().ok()?;
+            let containers = fields.next()?.parse().ok()?;
+            let digest = fields.next()?;
+            (id.bytes().all(|b| b.is_ascii_hexdigit()) && digest.starts_with("sha256:")).then(
+                || StoredImage {
+                    id: id.to_owned(),
+                    bytes,
+                    containers,
+                    digest: digest.to_owned(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Remove one image by id — never forced, so an image a container still
+/// uses stays (podman refuses). Returns whether it went.
+pub fn remove_image(store: &Store, id: &str) -> bool {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    let mut cmd = podman_in(store);
+    cmd.args(["rmi", "--", id]);
+    process::run(cmd, deadline(Duration::from_secs(60)), "podman rmi").is_ok_and(|o| o.success())
+}
+
 /// Make `image` (a `name@sha256:…` reference) available in `store`.
 /// The returned bool is whether `podman image exists` found the digest
 /// before the pull (`image_present`); the explicit pull still runs with
@@ -926,6 +993,39 @@ pub fn remove_named(name: &str, store: &Store) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R01: the image listing the reclamation pass reads — one compact line
+    /// per image; malformed lines and non-digest ids are skipped, never
+    /// removed by mistake.
+    #[test]
+    fn the_image_listing_parses_and_skips_what_it_cannot_trust() {
+        let out = b"b116e155 4660174 0 sha256:73aa\n\
+            ffff 10 2 sha256:beef\n\
+            not-hex 5 0 sha256:dead\n\
+            abcd twelve 0 sha256:dead\n\
+            abcd 7 0 md5:dead\n\
+            \n";
+        let images = parse_images(out);
+        assert_eq!(
+            images,
+            vec![
+                StoredImage {
+                    id: "b116e155".into(),
+                    bytes: 4_660_174,
+                    containers: 0,
+                    digest: "sha256:73aa".into(),
+                },
+                StoredImage {
+                    id: "ffff".into(),
+                    bytes: 10,
+                    containers: 2,
+                    digest: "sha256:beef".into(),
+                },
+            ]
+        );
+        assert!(!remove_image(&Store::Shared, "not-hex; rm -rf /"));
+        assert!(!remove_image(&Store::Shared, ""));
+    }
 
     /// Ordinary Podman commands remove only the daemon override. Pulls use
     /// an explicit per-attempt auth file and a cleared PATH, so neither

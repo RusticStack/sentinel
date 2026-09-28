@@ -541,9 +541,9 @@ pub struct Objects {
     /// Disk admission; unset admits everything (tests and hosts without
     /// watermarks behave exactly as before D06).
     admission: OnceLock<Arc<Admission>>,
-    /// Quota applied to tenants without a `tenant_quotas` row; 0 means
-    /// unlimited.
-    default_quota: AtomicU64,
+    /// The deployment's storage limits (R01): the default tenant quota, the
+    /// deployment-wide cap and the retention defaults.
+    deployment: Mutex<crate::retention::Deployment>,
 }
 
 impl Objects {
@@ -563,8 +563,13 @@ impl Objects {
             upload_io: std::array::from_fn(|_| Mutex::new(())),
             sweep_cursor: Mutex::new(None),
             admission: OnceLock::new(),
-            default_quota: AtomicU64::new(0),
+            deployment: Mutex::new(crate::retention::Deployment::default()),
         })
+    }
+
+    /// The data directory this store lives under.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Install the disk admission gate; staged writes and uploads charge
@@ -576,31 +581,34 @@ impl Objects {
     pub fn admission(&self) -> Option<&Arc<Admission>> {
         self.admission.get()
     }
-    /// Quota applied to tenants without their own `tenant_quotas` row;
-    /// 0 means unlimited.
+    /// Quota applied to tenants without their own; 0 means unlimited.
     pub fn set_default_quota(&self, bytes: u64) {
-        self.default_quota.store(bytes, Ordering::Relaxed);
+        self.deployment
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .tenant_quota_bytes = bytes;
     }
 
-    /// Committed bytes owed by `tenant`: objects plus the declared length
-    /// of its open uploads.
+    /// Install the deployment's storage limits (R01). Set at startup.
+    pub fn set_deployment(&self, deployment: crate::retention::Deployment) {
+        *self.deployment.lock().unwrap_or_else(|p| p.into_inner()) = deployment;
+    }
+
+    /// The deployment's storage limits.
+    pub fn deployment(&self) -> crate::retention::Deployment {
+        *self.deployment.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Bytes owed by `tenant`: objects, the declared length of its open
+    /// uploads, and its stamped logs.
     pub fn usage(&self, conn: &Connection, tenant: TenantId) -> Result<u64> {
-        Ok(conn
-            .prepare_cached("SELECT bytes FROM tenant_usage WHERE tenant_id = ?1")?
-            .query_row([tenant.as_bytes().as_slice()], |r| r.get::<_, i64>(0))
-            .optional()?
-            .unwrap_or(0) as u64)
+        Ok(crate::retention::tenant_usage(conn, tenant)?.total())
     }
 
-    /// The tenant's quota in bytes: its own row, else the default; 0 means
-    /// unlimited.
+    /// The tenant's quota in bytes: its own policy, else the default; 0
+    /// means unlimited.
     pub fn quota(&self, conn: &Connection, tenant: TenantId) -> Result<u64> {
-        Ok(conn
-            .prepare_cached("SELECT quota_bytes FROM tenant_quotas WHERE tenant_id = ?1")?
-            .query_row([tenant.as_bytes().as_slice()], |r| r.get::<_, i64>(0))
-            .optional()?
-            .map(|q| q as u64)
-            .unwrap_or_else(|| self.default_quota.load(Ordering::Relaxed)))
+        Ok(crate::retention::effective(conn, &self.deployment(), tenant, None)?.tenant_quota_bytes)
     }
 
     /// What the tenant owes against its quota right now: committed usage
@@ -610,24 +618,40 @@ impl Objects {
         Ok(self.usage(conn, tenant)?.saturating_add(inflight))
     }
 
-    /// Set or replace a tenant's quota (admin).
+    /// Set or replace a tenant's quota (admin), keeping the rest of its
+    /// storage policy.
     pub fn set_quota(&self, tx: &Transaction<'_>, tenant: TenantId, bytes: u64) -> Result<()> {
-        if bytes == 0 {
+        if bytes == 0 || bytes > i64::MAX as u64 {
             return Err(Error::InvalidInput("quota"));
         }
         tx.execute(
-            "INSERT INTO tenant_quotas(tenant_id, quota_bytes) VALUES (?1, ?2)
-             ON CONFLICT(tenant_id) DO UPDATE SET quota_bytes = excluded.quota_bytes",
-            params![tenant.as_bytes().as_slice(), bytes as i64],
+            "INSERT INTO storage_policies(tenant_id, repo_id, quota_bytes, updated_ms)
+             VALUES (?1, X'', ?2, ?3)
+             ON CONFLICT(tenant_id, repo_id) DO UPDATE SET
+                 quota_bytes = excluded.quota_bytes, updated_ms = excluded.updated_ms",
+            params![
+                tenant.as_bytes().as_slice(),
+                bytes as i64,
+                UnixMillis::now().0
+            ],
         )?;
         Ok(())
     }
 
-    /// Remove a tenant's quota row — the default applies again.
+    /// Remove a tenant's own quota — the default applies again. The rest of
+    /// its storage policy stays; a policy left empty is removed.
     pub fn clear_quota(&self, tx: &Transaction<'_>, tenant: TenantId) -> Result<()> {
+        let t = tenant.as_bytes().as_slice();
         tx.execute(
-            "DELETE FROM tenant_quotas WHERE tenant_id = ?1",
-            params![tenant.as_bytes().as_slice()],
+            "UPDATE storage_policies SET quota_bytes = NULL, updated_ms = ?2
+             WHERE tenant_id = ?1 AND repo_id = X''",
+            params![t, UnixMillis::now().0],
+        )?;
+        tx.execute(
+            "DELETE FROM storage_policies WHERE tenant_id = ?1 AND repo_id = X''
+             AND quota_bytes IS NULL AND log_retention_ms IS NULL
+             AND artifact_retention_ms IS NULL",
+            params![t],
         )?;
         Ok(())
     }
@@ -970,10 +994,8 @@ impl Objects {
             // counted in-flight, so `owed - len` is what the tenant owns
             // once the charge releases. Upload seals skip the check — they
             // swap a declared reservation for the object, never add usage.
-            let quota = self.quota(tx, staged.tenant)?;
-            if quota > 0 && self.owed(tx, staged.tenant)?.saturating_sub(staged.len) > quota {
-                return Err(Error::QuotaExceeded);
-            }
+            let owned = self.owed(tx, staged.tenant)?.saturating_sub(staged.len);
+            crate::retention::check_tenant(tx, &self.deployment(), staged.tenant, owned, 0)?;
         }
         Ok(changed == 1)
     }
@@ -1583,10 +1605,8 @@ impl Objects {
         }
         // The declared length is reserved in `tenant_usage` the moment the
         // row inserts, so the projected total is what the tenant will owe.
-        let quota = self.quota(tx, tenant)?;
-        if quota > 0 && self.owed(tx, tenant)?.saturating_add(declared_len) > quota {
-            return Err(Error::QuotaExceeded);
-        }
+        let owed = self.owed(tx, tenant)?;
+        crate::retention::check_tenant(tx, &self.deployment(), tenant, owed, declared_len)?;
         if let Some(a) = self.admission.get() {
             a.check(declared_len)?;
         }

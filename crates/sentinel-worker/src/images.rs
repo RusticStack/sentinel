@@ -34,6 +34,12 @@ use crate::{Error, Result, attempt::Cancel, podman};
 /// offers, and each entry is a 71-byte `sha256:…`.
 pub const MAX_HELD: usize = 1024;
 
+/// A digest pulled for use this recently is never reclaimed: its attempt
+/// may be about to create its container.
+pub const IMAGE_KEEP: Duration = Duration::from_secs(600);
+/// Images one reclamation pass removes at most, per store.
+pub const MAX_IMAGE_REMOVALS: usize = 16;
+
 /// How often a follower's wait re-checks its cancel flag.
 const FOLLOW_POLL: Duration = Duration::from_millis(50);
 
@@ -193,6 +199,10 @@ struct State {
     /// References in `pulling` whose leader is a prefetch (K05), not an
     /// attempt: a prefetch yields to attempts' own pulls.
     prefetching: HashSet<PullKey>,
+    /// When each held digest was last pulled for use (R01): the image
+    /// reclamation pass removes the least recently used first. Bounded with
+    /// `held`.
+    used: HashMap<Box<str>, Instant>,
 }
 
 struct Inner {
@@ -253,6 +263,7 @@ impl Images {
                     order: VecDeque::new(),
                     version: 0,
                     prefetching: HashSet::new(),
+                    used: HashMap::new(),
                 }),
                 download: Arc::new(download),
                 anonymous_authfile,
@@ -531,6 +542,10 @@ impl Images {
             return;
         };
         let mut state = self.state();
+        let now = Instant::now();
+        if let Some(used) = state.used.get_mut(digest) {
+            *used = now;
+        }
         if state.held.contains(digest) {
             return;
         }
@@ -538,11 +553,50 @@ impl Images {
             && let Some(oldest) = state.order.pop_front()
         {
             state.held.remove(&oldest);
+            state.used.remove(&oldest);
         }
         let digest: Box<str> = digest.into();
         state.order.push_back(digest.clone());
+        state.used.insert(digest.clone(), now);
         state.held.insert(digest);
         state.version += 1;
+    }
+
+    /// Choose what one reclamation pass removes from a store holding
+    /// `images` so it fits `budget` bytes (R01): only images no container
+    /// uses, never a digest being pulled or used within [`IMAGE_KEEP`] (an
+    /// attempt pulls, then creates its container — the gap is not an
+    /// invitation), least recently used first (a digest this process never
+    /// saw used counts as oldest), at most [`MAX_IMAGE_REMOVALS`].
+    pub fn reclaimable(&self, images: &[podman::StoredImage], budget: u64) -> Vec<String> {
+        let total: u64 = images.iter().map(|i| i.bytes).sum();
+        if total <= budget {
+            return Vec::new();
+        }
+        let state = self.state();
+        let now = Instant::now();
+        let pulling: HashSet<&str> = state
+            .pulling
+            .keys()
+            .filter_map(|k| k.image.split_once('@').map(|(_, d)| d))
+            .collect();
+        let mut candidates: Vec<(&podman::StoredImage, Option<Instant>)> = images
+            .iter()
+            .filter(|i| i.containers == 0 && !pulling.contains(i.digest.as_str()))
+            .map(|i| (i, state.used.get(i.digest.as_str()).copied()))
+            .filter(|(_, used)| used.is_none_or(|t| now.duration_since(t) >= IMAGE_KEEP))
+            .collect();
+        candidates.sort_by_key(|(_, used)| *used);
+        let mut over = total - budget;
+        let mut out = Vec::new();
+        for (image, _) in candidates {
+            if over == 0 || out.len() >= MAX_IMAGE_REMOVALS {
+                break;
+            }
+            over = over.saturating_sub(image.bytes);
+            out.push(image.id.clone());
+        }
+        out
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -607,6 +661,48 @@ mod tests {
 
     fn cancel() -> Cancel {
         Arc::new(AtomicBool::new(false))
+    }
+
+    fn stored(id: &str, bytes: u64, containers: u32, digest: &str) -> podman::StoredImage {
+        podman::StoredImage {
+            id: id.into(),
+            bytes,
+            containers,
+            digest: digest.into(),
+        }
+    }
+
+    /// R01: an image store over its budget gives up the least recently
+    /// used images no container holds, and never one just pulled for use.
+    #[test]
+    fn reclamation_takes_the_least_recently_used_and_spares_what_is_in_use() {
+        let images = Images::new(PathBuf::new());
+        // `recent` was pulled for an attempt a moment ago; `old` an hour ago;
+        // `unknown` never by this process.
+        images.record("r@sha256:recent");
+        images.record("r@sha256:old");
+        images.state().used.insert(
+            "sha256:old".into(),
+            Instant::now()
+                .checked_sub(Duration::from_secs(3_600))
+                .unwrap(),
+        );
+        let store = [
+            stored("aa", 100, 0, "sha256:old"),
+            stored("bb", 200, 1, "sha256:used-by-a-container"),
+            stored("cc", 300, 0, "sha256:recent"),
+            stored("dd", 400, 0, "sha256:unknown"),
+        ];
+        // Under budget: nothing.
+        assert!(images.reclaimable(&store, 1_000).is_empty());
+        // 700 over: the unknown first, then the old — and that is all it may
+        // take, so the store stays over until the others free up.
+        assert_eq!(images.reclaimable(&store, 300), ["dd", "aa"]);
+        // Just past budget: the first candidate is enough.
+        assert_eq!(images.reclaimable(&store, 950), ["dd"]);
+        // A pull re-marks an image as used.
+        images.record("r@sha256:old");
+        assert_eq!(images.reclaimable(&store, 300), ["dd"]);
     }
 
     /// How many followers are parked on `image`'s pull right now.

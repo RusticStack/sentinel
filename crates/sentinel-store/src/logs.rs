@@ -462,19 +462,18 @@ impl LogStore {
         result
     }
 
-    /// Remove attempt directories and legacy flat logs whose newest byte is
-    /// older than `now - retention_ms`. Open writers are never touched; the
-    /// deletion is of durable evidence only. One pass removes at most
-    /// `limit` and looks at run directories in name order until it has
-    /// examined [`SWEEP_BUDGET`] attempt directories, then the next pass
-    /// resumes after the last run it finished — so a pass is bounded
-    /// however many logs are retained. An attempt's age costs one directory
-    /// listing and at most three `stat`s (`end`, `index`, newest segment).
-    pub fn sweep_expired(&self, now: UnixMillis, retention_ms: i64, limit: u32) -> Result<u32> {
-        if retention_ms <= 0 || limit == 0 {
+    /// Remove attempt directories and legacy flat logs that `gone` says
+    /// retention expired or that no attempt names (R01: the deadline lives in
+    /// the database; this sweep only deletes files the database already
+    /// released, and leftovers of a crash between the two). Open writers are
+    /// never touched. One pass removes at most `limit` and looks at run
+    /// directories in name order until it has examined [`SWEEP_BUDGET`]
+    /// attempt directories, then the next pass resumes after the last run it
+    /// finished — so a pass is bounded however many logs are retained.
+    pub fn sweep_dirs(&self, limit: u32, mut gone: impl FnMut(AttemptId) -> bool) -> Result<u32> {
+        if limit == 0 {
             return Ok(0);
         }
-        let cutoff = now.0 - retention_ms;
         let held: std::collections::HashSet<AttemptId> = self
             .open
             .lock()
@@ -503,8 +502,11 @@ impl LogStore {
             if run_path.is_file() {
                 // Legacy flat log: `logs/<attempt>.log` from before D04.
                 seen += 1;
-                if run_path.extension().is_some_and(|e| e == "log")
-                    && mtime_ms(&run_path).is_some_and(|ms| ms < cutoff)
+                if let Some(id) = name
+                    .strip_suffix(".log")
+                    .and_then(|stem| stem.parse::<AttemptId>().ok())
+                    && !held.contains(&id)
+                    && gone(id)
                     && fs::remove_file(&run_path).is_ok()
                 {
                     swept += 1;
@@ -520,12 +522,11 @@ impl LogStore {
                             continue;
                         }
                         seen += 1;
-                        if let Ok(id) = attempt.file_name().to_string_lossy().parse::<AttemptId>()
-                            && held.contains(&id)
-                        {
+                        let Ok(id) = attempt.file_name().to_string_lossy().parse::<AttemptId>()
+                        else {
                             continue;
-                        }
-                        if newest_ms(&dir) < cutoff && fs::remove_dir_all(&dir).is_ok() {
+                        };
+                        if !held.contains(&id) && gone(id) && fs::remove_dir_all(&dir).is_ok() {
                             swept += 1;
                         }
                     }
@@ -541,6 +542,45 @@ impl LogStore {
         }
         *self.sweep_cursor.lock().unwrap_or_else(|p| p.into_inner()) = stopped;
         Ok(swept)
+    }
+
+    /// Bytes an attempt's log occupies on disk now: its segment directory's
+    /// files, or a legacy flat log. Absent counts as zero.
+    pub fn stored_bytes(&self, run: RunId, job: JobId, attempt: AttemptId) -> u64 {
+        let dir = self.attempt_dir(run, job, attempt);
+        match fs::read_dir(&dir) {
+            Ok(read) => read
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum(),
+            Err(_) => fs::metadata(self.dir.join(format!("{attempt}.log"))).map_or(0, |m| m.len()),
+        }
+    }
+
+    /// Delete an attempt's log whose retention the database has expired:
+    /// its writer is dropped first, so a late frame cannot recreate files
+    /// the row no longer accounts for (the scope check refuses it anyway).
+    pub fn remove(&self, run: RunId, job: JobId, attempt: AttemptId) -> Result<()> {
+        self.forget(attempt);
+        let dir = self.attempt_dir(run, job, attempt);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        if let Some(parent) = dir.parent() {
+            let _ = fs::remove_dir(parent);
+            if let Some(run_dir) = parent.parent() {
+                let _ = fs::remove_dir(run_dir);
+            }
+        }
+        match fs::remove_file(self.dir.join(format!("{attempt}.log"))) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The attempt's segment directory.
@@ -1754,30 +1794,6 @@ fn segs(dir: &Path) -> Result<BTreeMap<u32, bool>> {
         }
     }
     Ok(out)
-}
-
-/// A file's mtime in Unix milliseconds.
-fn mtime_ms(path: &Path) -> Option<i64> {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-}
-
-/// When an attempt directory last changed: the newest of its `end` marker,
-/// its `index` and its highest segment — every write lands in one of those
-/// (older segments are sealed and only ever renamed to their `.z` twin).
-fn newest_ms(dir: &Path) -> i64 {
-    let top = segs(dir)
-        .ok()
-        .and_then(|segs| segs.iter().next_back().map(|(n, z)| seg_path(dir, *n, *z)));
-    [Some(dir.join("end")), Some(dir.join("index")), top]
-        .into_iter()
-        .flatten()
-        .filter_map(|p| mtime_ms(&p))
-        .max()
-        .unwrap_or(0)
 }
 
 fn sweep_tmp(dir: &Path) {

@@ -20,7 +20,7 @@ use sentinel_protocol::{
 use sentinel_store::{
     auth as authz, local_auth, lookup, mfa, operations,
     registration::{self, DeploymentPolicy, InstallationBinding, Registration, TenantCreation},
-    sources, tenancy, views,
+    retention, sources, tenancy, views,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -109,6 +109,14 @@ pub(super) fn route(
         ) => suspend(state, request, slug, *action == "suspend"),
         ("PUT" | "DELETE", ["api", "v1", "admin", "tenants", slug, "quota"]) => {
             quota(state, request, slug, method == "PUT")
+        }
+        ("PUT", ["api", "v1", "admin", "tenants", slug, "storage"]) => {
+            set_storage(state, request, slug, None)
+        }
+        ("GET", ["api", "v1", "admin", "storage"]) => deployment_storage(state, request),
+        ("GET", ["api", "v1", "tenants", slug, "storage"]) => tenant_storage(state, request, slug),
+        ("PUT", ["api", "v1", "tenants", slug, "repos", name, "storage"]) => {
+            set_storage(state, request, slug, Some(name))
         }
         ("GET", ["api", "v1", "admin", "registrations"]) => registrations(state, request, query),
         (
@@ -240,6 +248,8 @@ fn list_tenants(state: &State, request: &Request, query: &str) -> Route {
             "usage_bytes": t.usage_bytes,
             "quota_bytes": effective,
             "quota_set": t.quota_bytes.is_some(),
+            "log_retention_ms": t.log_retention_ms,
+            "artifact_retention_ms": t.artifact_retention_ms,
         })).collect::<Vec<_>>(),
         "next": next,
     }))
@@ -352,6 +362,177 @@ fn quota(state: &State, request: &mut Request, slug: &str, set: bool) -> Route {
         })
         .map_err(store_error)?;
     ok(json!({ "quota_bytes": effective, "quota_set": bytes.is_some() }))
+}
+
+/// A storage policy as the API takes it: every field replaces the stored
+/// one, `null` (or absent) inherits (R01).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageBody {
+    #[serde(default)]
+    quota_bytes: Option<u64>,
+    #[serde(default)]
+    log_retention_secs: Option<u64>,
+    #[serde(default)]
+    artifact_retention_secs: Option<u64>,
+}
+
+fn secs_ms(secs: Option<u64>) -> Result<Option<i64>, ApiError> {
+    secs.map(|s| {
+        s.checked_mul(1000)
+            .and_then(|ms| i64::try_from(ms).ok())
+            .filter(|ms| (retention::MIN_RETENTION_MS..=retention::MAX_RETENTION_MS).contains(ms))
+            .ok_or_else(|| {
+                err(
+                    ErrorCode::InvalidRequest,
+                    "retention must be between 1 hour and 366 days",
+                )
+            })
+    })
+    .transpose()
+}
+
+fn storage_policy_json(p: &retention::Policy) -> Value {
+    json!({
+        "quota_bytes": p.quota_bytes,
+        "log_retention_ms": p.log_retention_ms,
+        "artifact_retention_ms": p.artifact_retention_ms,
+    })
+}
+
+fn effective_json(e: &retention::Effective) -> Value {
+    json!({
+        "tenant_quota_bytes": e.tenant_quota_bytes,
+        "repo_quota_bytes": e.repo_quota_bytes,
+        "log_retention_ms": e.log_retention_ms,
+        "artifact_retention_ms": e.artifact_retention_ms,
+    })
+}
+
+/// `PUT /admin/tenants/{slug}/storage` (platform administration) or
+/// `PUT /tenants/{slug}/repos/{name}/storage` (the tenant's
+/// administration): replace a storage policy. Lowered retention applies to
+/// what is already stored; a repository may only narrow its tenant's.
+fn set_storage(state: &State, request: &mut Request, slug: &str, repo: Option<&str>) -> Route {
+    let who = if repo.is_some() {
+        tenant_admin(state, request, true)?
+    } else {
+        platform(state, request, true)?
+    };
+    let body: StorageBody = parse(&body(request)?)?;
+    if body.quota_bytes == Some(0) || body.quota_bytes.is_some_and(|q| q > i64::MAX as u64) {
+        return Err(err(
+            ErrorCode::InvalidRequest,
+            "quota_bytes must be positive",
+        ));
+    }
+    let policy = retention::Policy {
+        quota_bytes: body.quota_bytes,
+        log_retention_ms: secs_ms(body.log_retention_secs)?,
+        artifact_retention_ms: secs_ms(body.artifact_retention_secs)?,
+    };
+    let authority = who.authority();
+    let principal = who.principal;
+    let d = state.objects.deployment();
+    let (slug, repo) = (slug.to_owned(), repo.map(str::to_owned));
+    let (own, effective) = state
+        .store
+        .writer()
+        .write(move |tx| {
+            let (tenant, repo) = match repo {
+                None => (views::tenant_for_platform(tx, authority, &slug)?, None),
+                Some(name) => {
+                    let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
+                    authz::require_tenant_admin(tx, principal, tenant)?;
+                    (tenant, Some(lookup::repo_by_name(tx, tenant, &name)?))
+                }
+            };
+            retention::set(tx, &authority, &d, tenant, repo, policy, UnixMillis::now())?;
+            Ok((
+                retention::policy(tx, tenant, repo)?,
+                retention::effective(tx, &d, tenant, repo)?,
+            ))
+        })
+        .map_err(store_error)?;
+    ok(json!({ "policy": storage_policy_json(&own), "effective": effective_json(&effective) }))
+}
+
+/// `GET /tenants/{slug}/storage`: the tenant's usage, policy and limits,
+/// and every repository's (tenant administration).
+fn tenant_storage(state: &State, request: &Request, slug: &str) -> Route {
+    let who = tenant_admin(state, request, false)?;
+    let principal = who.principal;
+    let d = state.objects.deployment();
+    let slug = slug.to_owned();
+    let (usage, own, effective, repos) = state
+        .store
+        .read(move |c| {
+            let tenant = authz::member_tenant_by_slug(c, principal, &slug)?;
+            authz::require_tenant_admin(c, principal, tenant)?;
+            let repos = retention::repos(c, tenant)?
+                .into_iter()
+                .map(|r| {
+                    let e = retention::effective(c, &d, tenant, Some(r.repo))?;
+                    Ok((r, e))
+                })
+                .collect::<sentinel_store::Result<Vec<_>>>()?;
+            Ok((
+                retention::tenant_usage(c, tenant)?,
+                retention::policy(c, tenant, None)?,
+                retention::effective(c, &d, tenant, None)?,
+                repos,
+            ))
+        })
+        .map_err(store_error)?;
+    ok(json!({
+        "usage": { "object_bytes": usage.object_bytes, "log_bytes": usage.log_bytes },
+        "policy": storage_policy_json(&own),
+        "effective": effective_json(&effective),
+        "repos": repos.iter().map(|(r, e)| json!({
+            "id": r.repo.to_string(),
+            "name": r.name,
+            "usage": { "artifact_bytes": r.usage.artifact_bytes, "log_bytes": r.usage.log_bytes },
+            "policy": storage_policy_json(&r.policy),
+            "effective": effective_json(e),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// `GET /admin/storage`: the deployment's disk and its limits: free and
+/// total bytes, the metadata database, the watermarks and reserve in force,
+/// whether discretionary admission is open, and what every tenant stores.
+fn deployment_storage(state: &State, request: &Request) -> Route {
+    platform(state, request, false)?;
+    let d = state.objects.deployment();
+    let stored = state
+        .store
+        .read(retention::deployment_usage)
+        .map_err(store_error)?;
+    let total = sentinel_store::space::total_bytes(state.objects.root()).ok();
+    let admission = state.objects.admission();
+    ok(json!({
+        "filesystem_bytes": total,
+        "free_bytes": admission.map(|a| a.free()),
+        "metadata_bytes": state.store.metadata_bytes(),
+        "admission_open": admission.map(|a| a.is_open()),
+        "inflight_bytes": admission.map(|a| a.total_inflight()),
+        "watermarks": admission.map(|a| {
+            let m = a.watermarks();
+            json!({
+                "reserve_bytes": a.reserve(),
+                "configured_reserve_bytes": m.reserve,
+                "low_watermark_bytes": m.low,
+                "high_watermark_bytes": m.high,
+                "log_floor_bytes": m.floor,
+            })
+        }),
+        "stored_bytes": stored,
+        "quota_bytes": d.quota_bytes,
+        "tenant_quota_bytes": d.tenant_quota_bytes,
+        "log_retention_ms": d.log_retention_ms,
+        "artifact_retention_ms": d.artifact_retention_ms,
+        "run_artifact_bytes": d.run_artifact_bytes,
+    }))
 }
 
 fn registrations(state: &State, request: &Request, query: &str) -> Route {

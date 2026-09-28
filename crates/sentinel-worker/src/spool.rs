@@ -297,6 +297,32 @@ fn free_bytes(_path: &Path) -> Option<u64> {
     None
 }
 
+/// Total size of the file system holding `path` — what the worker's
+/// default store budgets are sized from (R01).
+#[cfg(target_os = "linux")]
+pub fn filesystem_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `cpath` is NUL-terminated and `stat` is a writable statvfs.
+    if unsafe { libc::statvfs(cpath.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: statvfs returned 0, so it filled the whole structure.
+    let stat = unsafe { stat.assume_init() };
+    let block = if stat.f_frsize != 0 {
+        stat.f_frsize
+    } else {
+        stat.f_bsize
+    };
+    Some(stat.f_blocks.saturating_mul(block))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn filesystem_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 /// How a spool scan ended.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScanEnd {

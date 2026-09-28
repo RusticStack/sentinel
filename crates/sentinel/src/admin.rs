@@ -288,6 +288,116 @@ pub(crate) fn duration_ms(text: &str, max_ms: i64) -> Result<i64, Error> {
         })
 }
 
+/// `admin tenant storage`: show a tenant's (or one repository's) storage
+/// policy, effective limits and usage, or change it. Given settings replace
+/// the stored ones, `--inherit` drops them; the rest are kept. Validation and
+/// re-stamping are the store's (`retention::set`), with the limits the
+/// controller last started with.
+fn tenant_storage(
+    data: &DataDir,
+    tenant: &str,
+    repo: Option<&str>,
+    quota: Option<u64>,
+    log_retention: Option<&str>,
+    artifact_retention: Option<&str>,
+    inherit: &[String],
+) -> Result<(), Error> {
+    use sentinel_store::retention;
+    const MAX_MS: i64 = retention::MAX_RETENTION_MS;
+    let store = open(data, true)?;
+    let (slug, name) = (tenant.to_owned(), repo.map(str::to_owned));
+    let (tenant, repo) = store
+        .read(move |conn| {
+            let tenant = lookup::tenant_by_slug_any(conn, &slug)?;
+            let repo = name
+                .map(|n| lookup::repo_by_name(conn, tenant, &n))
+                .transpose()?;
+            Ok((tenant, repo))
+        })
+        .map_err(|_| fail("no such tenant or repository"))?;
+    let log_ms = log_retention.map(|d| duration_ms(d, MAX_MS)).transpose()?;
+    let artifact_ms = artifact_retention
+        .map(|d| duration_ms(d, MAX_MS))
+        .transpose()?;
+    for name in inherit {
+        if !matches!(
+            name.as_str(),
+            "quota" | "log-retention" | "artifact-retention" | "all"
+        ) {
+            return Err(fail(
+                "--inherit takes quota, log-retention, artifact-retention or all",
+            ));
+        }
+    }
+    let changing =
+        quota.is_some() || log_ms.is_some() || artifact_ms.is_some() || !inherit.is_empty();
+    if changing {
+        let inherit = inherit.to_vec();
+        store
+            .writer()
+            .write(move |tx| {
+                let d = retention::installed(tx)?;
+                let mut policy = retention::policy(tx, tenant, repo)?;
+                for name in &inherit {
+                    match name.as_str() {
+                        "quota" => policy.quota_bytes = None,
+                        "log-retention" => policy.log_retention_ms = None,
+                        "artifact-retention" => policy.artifact_retention_ms = None,
+                        _ => policy = retention::Policy::default(),
+                    }
+                }
+                policy.quota_bytes = quota.or(policy.quota_bytes);
+                policy.log_retention_ms = log_ms.or(policy.log_retention_ms);
+                policy.artifact_retention_ms = artifact_ms.or(policy.artifact_retention_ms);
+                retention::set(
+                    tx,
+                    &Authority::HostLocal,
+                    &d,
+                    tenant,
+                    repo,
+                    policy,
+                    UnixMillis::now(),
+                )
+            })
+            .map_err(|error| fail(format!("cannot set the storage policy: {error}")))?;
+    }
+    let report = store
+        .read(move |conn| {
+            let d = retention::installed(conn)?;
+            let own = retention::policy(conn, tenant, repo)?;
+            let effective = retention::effective(conn, &d, tenant, repo)?;
+            let usage = match repo {
+                Some(repo) => {
+                    let u = retention::repo_usage(conn, tenant, repo)?;
+                    serde_json::json!({"artifact_bytes": u.artifact_bytes, "log_bytes": u.log_bytes})
+                }
+                None => {
+                    let u = retention::tenant_usage(conn, tenant)?;
+                    serde_json::json!({"object_bytes": u.object_bytes, "log_bytes": u.log_bytes})
+                }
+            };
+            Ok(serde_json::json!({
+                "tenant": tenant.to_string(),
+                "repo": repo.map(|r| r.to_string()),
+                "policy": {
+                    "quota_bytes": own.quota_bytes,
+                    "log_retention_ms": own.log_retention_ms,
+                    "artifact_retention_ms": own.artifact_retention_ms,
+                },
+                "effective": {
+                    "tenant_quota_bytes": effective.tenant_quota_bytes,
+                    "repo_quota_bytes": effective.repo_quota_bytes,
+                    "log_retention_ms": effective.log_retention_ms,
+                    "artifact_retention_ms": effective.artifact_retention_ms,
+                },
+                "usage": usage,
+            }))
+        })
+        .map_err(|error| fail(format!("cannot read the storage policy: {error}")))?;
+    sentinel::outln!("{report}");
+    Ok(())
+}
+
 /// Resolve a `usr_` identifier or a local username. Host-local lookups read the
 /// database directly: the operator already has that access, and there is no
 /// session to authorize them with before any credential exists.
@@ -1009,6 +1119,10 @@ fn tenant(args: &TenantArgs, now: UnixMillis) -> Result<(), Error> {
                 .map_err(|_| fail("no tenant with that slug"))?;
             let objects = sentinel_store::objects::Objects::open(&data.data_dir)
                 .map_err(|error| fail(format!("cannot open the object store: {error}")))?;
+            // The default quota the controller last started with (R01).
+            if let Ok(d) = store.read(sentinel_store::retention::installed) {
+                objects.set_deployment(d);
+            }
             match (bytes, clear) {
                 (Some(bytes), _) => {
                     let bytes = *bytes;
@@ -1040,6 +1154,25 @@ fn tenant(args: &TenantArgs, now: UnixMillis) -> Result<(), Error> {
                 }
             }
             return Ok(());
+        }
+        TenantCommand::Storage {
+            data,
+            tenant,
+            repo,
+            quota,
+            log_retention,
+            artifact_retention,
+            inherit,
+        } => {
+            return tenant_storage(
+                data,
+                tenant,
+                repo.as_deref(),
+                *quota,
+                log_retention.as_deref(),
+                artifact_retention.as_deref(),
+                inherit,
+            );
         }
         TenantCommand::Suspend { data, tenant } => (data, tenant, true),
         TenantCommand::Reactivate { data, tenant } => (data, tenant, false),
@@ -1436,10 +1569,10 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
             let report = store
                 .read(|conn| {
                     let mut stmt = conn.prepare(
-                        "SELECT u.tenant_id, u.bytes,
-                                (SELECT quota_bytes FROM tenant_quotas q
-                                 WHERE q.tenant_id = u.tenant_id)
-                         FROM tenant_usage u ORDER BY u.bytes DESC",
+                        "SELECT u.tenant_id, u.bytes + u.log_bytes,
+                                (SELECT quota_bytes FROM storage_policies q
+                                 WHERE q.tenant_id = u.tenant_id AND q.repo_id = X'')
+                         FROM tenant_usage u ORDER BY u.bytes + u.log_bytes DESC",
                     )?;
                     let mut tenants = Vec::new();
                     let mut rows = stmt.query([])?;
@@ -1460,10 +1593,27 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
                 })
                 .map_err(|error| fail(format!("cannot read storage state: {error}")))?;
             let free = sentinel_store::space::free_bytes(&args.data.data_dir).ok();
+            let total = sentinel_store::space::total_bytes(&args.data.data_dir).ok();
+            // What a controller without explicit `[storage]` watermarks
+            // derives from this filesystem (R01); explicit settings in the
+            // controller's configuration override them.
+            let sized = total.map(sentinel_store::space::default_watermarks);
+            let metadata = store.metadata_bytes();
+            let deployment = report.iter().map(|(_, used, _)| used).sum::<u64>();
             sentinel::outln!(
                 "{}",
                 serde_json::json!({
                     "free_bytes": free,
+                    "filesystem_bytes": total,
+                    "metadata_bytes": metadata,
+                    "metadata_reserve_bytes": metadata
+                        .saturating_mul(sentinel_store::space::METADATA_RESERVE_FACTOR),
+                    "sized_watermarks": sized.map(|m| serde_json::json!({
+                        "reserve_bytes": m.reserve,
+                        "low_watermark_bytes": m.low,
+                        "high_watermark_bytes": m.high,
+                    })),
+                    "stored_bytes": deployment,
                     "tenants": report.iter().map(|(t, used, quota)| serde_json::json!({
                         "tenant": t,
                         "used_bytes": used,
