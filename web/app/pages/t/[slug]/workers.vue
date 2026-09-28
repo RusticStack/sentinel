@@ -40,6 +40,7 @@ const columns = [
         <template #worker-cell="{ row }">
           <div class="font-medium">{{ row.original.name }}</div>
           <div class="text-xs text-muted font-mono">{{ row.original.arch }} · {{ shortId(row.original.id) }}</div>
+          <div class="text-xs text-muted">{{ row.original.software ?? "software not reported" }} · protocol {{ row.original.protocol }}</div>
         </template>
         <template #state-cell="{ row }">
           <StateBadge :state="!row.original.connected ? 'offline' : row.original.draining ? 'draining' : 'online'" />

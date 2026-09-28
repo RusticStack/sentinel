@@ -1679,13 +1679,20 @@ impl Admission for Inner {
                 let id = known.id;
                 let renegotiated = (known.negotiated != negotiated).then_some(negotiated);
                 let immediate = (!deferred).then_some(capacity);
-                if renegotiated.is_some() || immediate.is_some() {
+                // What it runs, for skew reports (R05): written only when
+                // it changed, so a reconnect costs no write.
+                let software = workers::software_label(&hello.software)
+                    .filter(|s| known.software.as_deref() != Some(s.as_str()));
+                if renegotiated.is_some() || immediate.is_some() || software.is_some() {
                     self.write(move |tx| {
                         if let Some(negotiated) = renegotiated {
                             workers::renegotiate(tx, id, negotiated)?;
                         }
                         if let Some(capacity) = immediate {
                             dispatch::report_capacity(tx, id, capacity)?;
+                        }
+                        if let Some(software) = &software {
+                            workers::record_software(tx, id, software)?;
                         }
                         Ok(())
                     })
@@ -1717,6 +1724,7 @@ impl Admission for Inner {
             name.to_owned(),
         );
         let immediate_capacity = (!deferred).then_some(capacity);
+        let enrolled_software = workers::software_label(&hello.software);
         self.store
             .writer()
             .write(move |tx| {
@@ -1737,6 +1745,9 @@ impl Admission for Inner {
                 };
                 if let Some(capacity) = immediate_capacity {
                     dispatch::report_capacity(tx, enrolled.id, capacity)?;
+                }
+                if let Some(software) = &enrolled_software {
+                    workers::record_software(tx, enrolled.id, software)?;
                 }
                 Ok(Some(Admitted {
                     worker: enrolled.id,

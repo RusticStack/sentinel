@@ -98,8 +98,18 @@ pub(crate) fn open(data: &DataDir, reporting: bool) -> Result<Store, Error> {
             path.display()
         )));
     }
-    Store::open(&path, Durability::Full)
-        .map_err(|error| fail(format!("cannot open {}: {error}", path.display())))
+    // A new binary's admin command migrates like its server would, with the
+    // same snapshot first (R05).
+    let (store, snapshot) = sentinel_store::upgrade::open_upgrading(&path, Durability::Full)
+        .map_err(|error| fail(format!("cannot open {}: {error}", path.display())))?;
+    if let Some(snapshot) = snapshot {
+        eprintln!(
+            "the database was upgraded to schema {}; the copy from before is {}",
+            sentinel_store::schema::LATEST,
+            snapshot.display()
+        );
+    }
+    Ok(store)
 }
 
 pub fn run(args: AdminArgs) -> Result<(), Error> {
@@ -109,6 +119,9 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
         AdminCommand::Intake(args) => crate::intake_admin::run(args)?,
         AdminCommand::Objects(args) => objects(args)?,
         AdminCommand::Backup(args) => backup(args)?,
+        AdminCommand::Upgrade {
+            command: crate::cli::UpgradeCommand::Check { data },
+        } => upgrade_check(data)?,
         AdminCommand::Restore {
             from,
             id,
@@ -293,6 +306,57 @@ pub(crate) fn duration_ms(text: &str, max_ms: i64) -> Result<i64, Error> {
                 max_ms / DAY_MS
             ))
         })
+}
+
+/// `admin upgrade check` (R05): what starting this build on the data
+/// directory would do, without opening the store (which would migrate).
+fn upgrade_check(data: &DataDir) -> Result<(), Error> {
+    if !data.data_dir.is_absolute() {
+        return Err(fail("data_dir must be an absolute path"));
+    }
+    let report = sentinel_store::upgrade::preflight(&data.data_dir).map_err(|error| {
+        fail(format!(
+            "cannot inspect {}: {error}",
+            data.data_dir.display()
+        ))
+    })?;
+    let i = &report.inspection;
+    sentinel::outln!(
+        "{}",
+        serde_json::json!({
+            "fresh": i.fresh,
+            "schema": { "database": i.database, "binary": i.binary },
+            "pending_migrations": i.pending,
+            "newer_database": i.newer,
+            "newer_needs_schema": i.needs,
+            "integrity": i.integrity,
+            "database_bytes": i.bytes,
+            "free_bytes": report.free_bytes,
+            "needed_bytes": report.needed_bytes,
+            "sealed_values": report.sealed_values,
+            "key_present": report.key_present,
+            "worker_protocol": {
+                "min": sentinel_protocol::negotiate::SUPPORTED_MIN.0,
+                "max": sentinel_protocol::negotiate::SUPPORTED_MAX.0,
+            },
+            "workers": report.workers.iter().map(|w| serde_json::json!({
+                "name": w.name,
+                "protocol": w.protocol,
+                "software": w.software,
+                "last_seen_ms": w.last_seen_ms,
+                "refused_after_upgrade": w.refused,
+            })).collect::<Vec<_>>(),
+            "blocking": report.blocking,
+        })
+    );
+    if report.blocking.is_empty() {
+        Ok(())
+    } else {
+        Err(fail(format!(
+            "{} blocking finding(s)",
+            report.blocking.len()
+        )))
+    }
 }
 
 /// The backup `id`, or the newest in `dir`.

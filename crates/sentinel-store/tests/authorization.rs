@@ -682,8 +682,11 @@ fn migration_preserves_v3_data_and_rejects_future_versions_and_inconsistent_owne
                 .unwrap();
             drop(store);
             let conn = Connection::open(&path).unwrap();
-            conn.execute("INSERT INTO schema_migrations VALUES (999, 1)", [])
-                .unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations(version, applied_ms) VALUES (999, 1)",
+                [],
+            )
+            .unwrap();
             drop(conn);
             assert!(matches!(
                 Store::open(path, Durability::Full),

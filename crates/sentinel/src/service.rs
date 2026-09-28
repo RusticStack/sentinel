@@ -1437,16 +1437,38 @@ fn start_server(
     (remote_cache, remote_cache_budget): (bool, Option<u64>),
 ) -> Result<Running, Error> {
     let path = config.data_dir.join(sentinel_store::METADATA_FILE);
-    let store =
-        sentinel_store::Store::open(&path, sentinel_store::Durability::Full).map_err(|error| {
-            match error {
+    // A pending migration is preceded by a copy of the database (R05), and
+    // a failed one names that copy to roll back to.
+    let (store, snapshot) =
+        sentinel_store::upgrade::open_upgrading(&path, sentinel_store::Durability::Full).map_err(
+            |error| match error {
                 sentinel_store::Error::AlreadyOwned => Error::runtime(format!(
                     "another process owns {}; one controller per data directory",
                     path.display()
                 )),
                 other => Error::runtime(format!("cannot open {}: {other}", path.display())),
-            }
-        })?;
+            },
+        )?;
+    if let Some(snapshot) = &snapshot {
+        tracing::info!(event = "schema_upgraded", schema = sentinel_store::schema::LATEST, snapshot = %snapshot.display(), "the database before this upgrade is kept for a rollback");
+    }
+    let database: u32 = store
+        .read(|c| {
+            Ok(
+                c.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .unwrap_or(0);
+    if database > sentinel_store::schema::LATEST {
+        tracing::warn!(
+            event = "schema_newer",
+            database,
+            binary = sentinel_store::schema::LATEST,
+            "running on a database a newer release migrated; it declares itself readable by this one"
+        );
+    }
     let store = Arc::new(store);
     // Before anything listens: a controller whose sealed values it cannot
     // open must not come up looking healthy (P10S-4).
