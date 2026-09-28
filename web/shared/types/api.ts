@@ -131,6 +131,26 @@ export interface DeploymentStorage {
   log_retention_ms: number;
   artifact_retention_ms: number;
   run_artifact_bytes: number;
+  /** The external S3 copy (R02/R03), when configured. */
+  s3: {
+    state: "healthy" | "degraded" | "unknown";
+    backlog_bytes: number;
+    backlog_full: boolean;
+    oldest_unreplicated_ms: number | null;
+    unreplicated_logs: number;
+    local_bytes: number;
+    last_success_ms: number | null;
+    last_failure_ms: number | null;
+    consecutive_failures: number;
+    last_error: string | null;
+    replicated_objects: number;
+    replicated_bytes: number;
+    replicated_logs: number;
+    evicted_objects: number;
+    fetched_objects: number;
+    deleted_copies: number;
+    aborted_uploads: number;
+  } | null;
 }
 
 export interface ApiErrorBody { code: string; message: string; details?: Record<string, any> }

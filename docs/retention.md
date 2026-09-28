@@ -9,6 +9,7 @@ Every byte Sentinel stores is bounded twice: by **size** (a quota, a budget or a
 | Artifacts | controller objects | run budget, repository quota, tenant quota, deployment cap | the pipeline's `retain`, shortened to the effective artifact retention | artifact sweep, then reference-safe reclaim ([storage](storage.md#disk-admission-quotas-and-reclamation-d06)) |
 | Uploads | controller objects | tenant quota, deployment cap; 4 GiB per session | session TTL ≤ 24 h; aborted rows kept 7 days | upload sweep; aborted-row purge |
 | Attempt logs | controller `logs/` | `attempt_log_bytes` per attempt; counted in repository, tenant and deployment usage | the effective log retention | database-driven expiry, then the directory sweep |
+| External S3 copy ([s3](s3.md)) | the bucket | the backlog budget closes admission; `local_bytes` bounds local copies of replicated objects | follows the local record: deleted after reclamation or log expiry | the replicator |
 | Remote cache store | controller `remote-cache/` | `[remote_cache] budget_bytes`, least recently served first | — | its own reclamation thread, every 10 min |
 | Local cache | worker `cache/` | `cache_budget_bytes`, least recently used, leased entries skipped | 14 days idle | the cache GC after every attempt ([cache](cache.md)) |
 | Git mirrors | worker `mirrors/` | `mirror_budget_bytes`, least recently written, leased mirrors skipped | 14 days idle | the mirror sweep, same cadence ([mirrors](mirrors.md)) |

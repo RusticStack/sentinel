@@ -2582,6 +2582,57 @@ mod tests {
     }
 
     #[test]
+    fn s3_settings_are_validated_before_anything_starts() {
+        let parse = |text: &str| toml::from_str::<S3File>(text);
+        let base = "endpoint = 'https://s3.example.com'
+region = 'eu-1'
+bucket = 'ci'
+credentials_file = '/etc/sentinel/s3'
+";
+        assert!(parse(base).unwrap().check().is_ok());
+        for bad in [
+            "part_bytes = 1048576
+",
+            "part_bytes = 1073741824
+",
+            "backlog_bytes = 0
+",
+        ] {
+            assert!(
+                parse(&format!("{base}{bad}")).unwrap().check().is_err(),
+                "{bad}"
+            );
+        }
+        let relative = base.replace("/etc/sentinel/s3", "s3.credentials");
+        assert!(parse(&relative).unwrap().check().is_err());
+        assert!(
+            parse(&format!(
+                "{base}ca_file = 'ca.pem'
+"
+            ))
+            .unwrap()
+            .check()
+            .is_err()
+        );
+        assert!(
+            parse(&format!(
+                "{base}unknown = 1
+"
+            ))
+            .is_err(),
+            "unknown keys refused"
+        );
+        assert!(
+            parse(
+                "endpoint = 'https://x'
+"
+            )
+            .is_err(),
+            "credentials are required"
+        );
+    }
+
+    #[test]
     fn storage_defaults_and_validation() {
         let resolved = resolve_ok(StorageFile::default());
         // A 64 GiB data filesystem sizes the watermarks exactly as the fixed
