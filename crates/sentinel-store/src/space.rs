@@ -6,10 +6,14 @@
 //! bytes:
 //!
 //! ```text
-//! free < reserve                     log appends refuse; metadata keeps the rest
+//! free < floor                       log appends refuse; metadata keeps the rest
 //! free - reserve < low               discretionary admission closed
 //! free - reserve > high              admission reopens (high >= low)
 //! ```
+//!
+//! `floor` sits inside the reserve. The reserve in force is the configured
+//! one or, once the metadata database has grown, twice its size on disk
+//! (R01: [`Admission::set_metadata_bytes`]), whichever is larger.
 //!
 //! Discretionary writes — object staging, upload chunks, manifest files —
 //! pass through [`Admission::admit`]; the charge tracks bytes promised but
@@ -51,6 +55,63 @@ pub fn free_bytes(path: &Path) -> Result<u64> {
         st.f_bsize
     };
     Ok(st.f_bavail.saturating_mul(block))
+}
+
+/// Total size of the filesystem holding `path`.
+#[cfg(unix)]
+pub fn total_bytes(path: &Path) -> Result<u64> {
+    let st = rustix::fs::statvfs(path).map_err(|e| Error::Io(e.into()))?;
+    let block = if st.f_frsize != 0 {
+        st.f_frsize
+    } else {
+        st.f_bsize
+    };
+    Ok(st.f_blocks.saturating_mul(block))
+}
+
+/// Total size of the volume holding `path`, as the calling user sees it.
+#[cfg(windows)]
+pub fn total_bytes(path: &Path) -> Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut total = std::mem::MaybeUninit::<u64>::uninit();
+    // SAFETY: `wide` is a valid null-terminated UTF-16 string that outlives
+    // the call; `total` points at writable memory the call fills on success.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            total.as_mut_ptr().cast(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: a successful call initialized it.
+    Ok(unsafe { total.assume_init() })
+}
+
+const GIB: u64 = 1 << 30;
+
+/// Default levels for a filesystem of `total` bytes (R01). Fixed levels fit
+/// one disk size badly: 1 GiB of reserve is plenty on 50 GB and a rounding
+/// error on 2 TB, where one busy hour of logs outruns it. The reserve is a
+/// 64th of the disk and the low watermark a 32nd, each clamped (reserve
+/// 1–16 GiB, low 2–32 GiB); high is twice low, the hysteresis band; the log
+/// floor is an eighth of the reserve. On the 1 TB reference host this is a
+/// 15.6 GiB reserve, closing at 31 GiB free above it and reopening at 62.
+pub fn default_watermarks(total: u64) -> Watermarks {
+    let reserve = (total / 64).clamp(GIB, 16 * GIB);
+    let low = (total / 32).clamp(2 * GIB, 32 * GIB);
+    Watermarks {
+        reserve,
+        low,
+        high: low * 2,
+        floor: reserve / 8,
+    }
 }
 
 /// The Windows counterpart: `GetDiskFreeSpaceExW` answers the bytes the
@@ -120,7 +181,16 @@ pub struct Admission {
     /// Per-upload admission charges this process made (`put_chunk` deltas),
     /// released at seal, abort or sweep.
     upload_charges: Mutex<HashMap<UploadId, u64>>,
+    /// The metadata database's size on disk, reported by the maintenance
+    /// pass; the reserve is never less than [`METADATA_RESERVE_FACTOR`]
+    /// times it (R01), so a growing database keeps room to grow and to
+    /// checkpoint.
+    metadata: AtomicU64,
 }
+
+/// The reserve holds at least this many times the metadata database's
+/// current size: room for its write-ahead log, a checkpoint and growth.
+pub const METADATA_RESERVE_FACTOR: u64 = 2;
 
 impl Admission {
     /// Guard the filesystem holding `dir`.
@@ -135,6 +205,7 @@ impl Admission {
             inflight: AtomicU64::new(0),
             tenant_inflight: Mutex::new(HashMap::new()),
             upload_charges: Mutex::new(HashMap::new()),
+            metadata: AtomicU64::new(0),
         })
     }
 
@@ -153,7 +224,24 @@ impl Admission {
             inflight: AtomicU64::new(0),
             tenant_inflight: Mutex::new(HashMap::new()),
             upload_charges: Mutex::new(HashMap::new()),
+            metadata: AtomicU64::new(0),
         })
+    }
+
+    /// Record the metadata database's current size; the effective reserve
+    /// follows it.
+    pub fn set_metadata_bytes(&self, bytes: u64) {
+        self.metadata.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The reserve in force: the configured one, or more once the metadata
+    /// database needs it.
+    pub fn reserve(&self) -> u64 {
+        self.marks.reserve.max(
+            self.metadata
+                .load(Ordering::Relaxed)
+                .saturating_mul(METADATA_RESERVE_FACTOR),
+        )
     }
 
     /// The cached free-space figure, refreshed at most every [`PROBE_TTL`].
@@ -177,7 +265,7 @@ impl Admission {
     /// What a discretionary write may consume: free minus the reserve
     /// minus what admissions already promised.
     fn discretionary(&self, free: u64) -> u64 {
-        free.saturating_sub(self.marks.reserve)
+        free.saturating_sub(self.reserve())
             .saturating_sub(self.inflight.load(Ordering::Relaxed))
     }
 

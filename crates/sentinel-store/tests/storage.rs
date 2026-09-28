@@ -238,17 +238,6 @@ fn age(path: &std::path::Path, by: Duration) {
     file.set_modified(SystemTime::now() - by).unwrap();
 }
 
-fn age_tree(dir: &std::path::Path, by: Duration) {
-    for entry in fs::read_dir(dir).unwrap().flatten() {
-        let path = entry.path();
-        if entry.file_type().unwrap().is_dir() {
-            age_tree(&path, by);
-        } else {
-            age(&path, by);
-        }
-    }
-}
-
 /// The one manifest file the fixture wrote, wherever it sits in the tree.
 fn find_manifest_file(root: &std::path::Path) -> std::path::PathBuf {
     let mut stack = vec![root.join("manifests")];
@@ -886,7 +875,7 @@ fn logs_refuse_frames_below_the_floor_but_keep_the_record_honest() {
 }
 
 #[test]
-fn log_retention_removes_old_attempts_and_spares_open_writers() {
+fn log_sweep_removes_released_logs_and_spares_open_writers() {
     let temp = tempfile::tempdir().unwrap();
     let logs = LogStore::open(temp.path().join("logs")).unwrap();
     let (run, job) = (RunId::new(), JobId::new());
@@ -901,30 +890,13 @@ fn log_retention_removes_old_attempts_and_spares_open_writers() {
     logs.append(run, job, done, &frame).unwrap();
     logs.finish(run, job, done, 1, &[]).unwrap();
     logs.append(run, job, held, &frame).unwrap(); // writer still open
-    let legacy = temp
-        .path()
-        .join("logs")
-        .join(format!("{}.log", sentinel_core::AttemptId::new()));
+    let legacy_id = sentinel_core::AttemptId::new();
+    let legacy = temp.path().join("logs").join(format!("{legacy_id}.log"));
     fs::write(&legacy, b"old flat log").unwrap();
 
-    // Finishing enqueues seg-000000 for compression; the .z twin lands
-    // with a fresh mtime, so wait for it before aging the tree — otherwise
-    // the dir's newest byte is new and the sweep correctly keeps it.
-    let done_dir = logs.attempt_dir(run, job, done);
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !done_dir.join("seg-000000.z").exists() {
-        assert!(std::time::Instant::now() < deadline, "seg never compressed");
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    let retention = 3_600_000i64;
-    let by = Duration::from_millis(retention as u64 + 60_000);
-    age_tree(&done_dir, by);
-    age_tree(&logs.attempt_dir(run, job, held), by);
-    age(&legacy, by);
-
-    let swept = logs
-        .sweep_expired(UnixMillis::now(), retention, 256)
-        .unwrap();
+    // The database decides (R01): every log here is released, the held one
+    // included — an open writer is still never touched.
+    let swept = logs.sweep_dirs(256, |_| true).unwrap();
     assert_eq!(swept, 2);
     assert!(!logs.attempt_dir(run, job, done).exists());
     assert!(!legacy.exists());

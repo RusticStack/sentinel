@@ -1055,3 +1055,128 @@ mod linux {
         server.terminate();
     }
 }
+
+/// R01: `admin tenant storage` shows a tenant's policy, effective limits
+/// and usage, changes the settings it is given, and `--inherit` drops them.
+/// Host-local administration exists only in a server build.
+#[cfg(feature = "server")]
+#[test]
+fn admin_tenant_storage_shows_sets_and_inherits() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("controller");
+    std::fs::create_dir(&data).unwrap();
+    let data = data.to_str().unwrap();
+    let admin = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_sentinel"))
+            .arg("admin")
+            .args(args)
+            .args(["--data-dir", data])
+            .output()
+            .expect("run sentinel")
+    };
+    let json = |output: Output| -> serde_json::Value {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let mut bootstrap = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+        .args([
+            "admin",
+            "bootstrap",
+            "--username",
+            "root",
+            "--data-dir",
+            data,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        bootstrap.stdin.as_mut().unwrap(),
+        b"correct horse battery staple",
+    )
+    .unwrap();
+    drop(bootstrap.stdin.take());
+    let booted = bootstrap.wait_with_output().unwrap();
+    assert!(
+        booted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&booted.stderr)
+    );
+    let created = admin(&["tenant", "create", "--slug", "acme"]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let day = 86_400_000_i64;
+
+    let shown = json(admin(&["tenant", "storage", "--tenant", "acme"]));
+    assert_eq!(shown["policy"]["log_retention_ms"], serde_json::Value::Null);
+    assert_eq!(shown["effective"]["log_retention_ms"], 14 * day);
+    assert_eq!(shown["effective"]["artifact_retention_ms"], 90 * day);
+    assert_eq!(shown["usage"]["log_bytes"], 0);
+
+    let set = json(admin(&[
+        "tenant",
+        "storage",
+        "--tenant",
+        "acme",
+        "--log-retention",
+        "2d",
+        "--quota",
+        "1000",
+    ]));
+    assert_eq!(set["policy"]["log_retention_ms"], 2 * day);
+    assert_eq!(set["policy"]["quota_bytes"], 1000);
+    assert_eq!(set["effective"]["tenant_quota_bytes"], 1000);
+
+    let partly = json(admin(&[
+        "tenant",
+        "storage",
+        "--tenant",
+        "acme",
+        "--inherit",
+        "quota",
+    ]));
+    assert_eq!(partly["policy"]["quota_bytes"], serde_json::Value::Null);
+    assert_eq!(partly["policy"]["log_retention_ms"], 2 * day);
+    let all = json(admin(&[
+        "tenant",
+        "storage",
+        "--tenant",
+        "acme",
+        "--inherit",
+        "all",
+    ]));
+    assert_eq!(all["policy"]["log_retention_ms"], serde_json::Value::Null);
+
+    for refused in [
+        vec!["tenant", "storage", "--tenant", "acme", "--inherit", "logs"],
+        vec![
+            "tenant",
+            "storage",
+            "--tenant",
+            "acme",
+            "--log-retention",
+            "30",
+        ],
+        vec![
+            "tenant",
+            "storage",
+            "--tenant",
+            "acme",
+            "--log-retention",
+            "999d",
+        ],
+        vec!["tenant", "storage", "--tenant", "acme", "--repo", "nope"],
+        vec!["tenant", "storage", "--tenant", "nope"],
+    ] {
+        assert!(!admin(&refused).status.success(), "{refused:?}");
+    }
+}

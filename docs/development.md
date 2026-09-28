@@ -115,12 +115,12 @@ What is installed there (2026-09-27, Ubuntu 26.04, 12 vCPU EPYC, 31 GiB):
 
 | For | Installed |
 |---|---|
-| Rust suites | `build-essential`, `pkg-config`, rustup for root with the pinned 1.97.0 (clippy, rustfmt) |
+| Rust suites | `build-essential`, `pkg-config`, rustup for root with the pinned 1.97.0 (clippy, rustfmt), and `cargo-nextest` (the prebuilt binary from get.nexte.st, in `~/.cargo/bin`) that the `test-*` aliases run |
 | Checkout | `/srv/sentinel`, world-readable; run logs, load snapshots and scripts in `/srv/sentinel-runs` |
 | Web interface and browser test | Ubuntu's `nodejs` (22) and `npm`, `pnpm` 10 (npm global), Chrome for Testing's `chrome-headless-shell` in `/opt/chrome-headless-shell` — Ubuntu ships Chromium only as a snap, whose private `/tmp` does not see the test's profile directory |
 | Executor tests and benchmarks | `podman` 5.7 (rootless, runc, overlay, cgroup v2), `uidmap`, `slirp4netns`; the `sentinelbench` account (subuid/subgid, lingering, `safe.directory` for `/srv/sentinel`) |
 
-Chrome refuses to run as root without `--no-sandbox`; `/opt/chrome-headless-shell/as-root` adds it, so a root run passes `SENTINEL_BROWSER=/opt/chrome-headless-shell/as-root`. Run the suites with `--no-fail-fast` so one pass reports every failing binary. Stop your own processes by PID, never by a pattern: `pkill -f` also matches the SSH command's own shell and the host's other services.
+Chrome refuses to run as root without `--no-sandbox`; `/opt/chrome-headless-shell/as-root` adds it, so a root run passes `SENTINEL_BROWSER=/opt/chrome-headless-shell/as-root`. The `test-*` aliases run through cargo-nextest with `--no-fail-fast`: every test of every binary in parallel, each in its own process, so one pass reports every failure. Measured 2026-09-28 on the 12-vCPU VPS with the build cached: `test-cli` 1,237 tests in 119 s and `test-linux` 1,270 tests in 111 s, where `cargo test` ran the binaries one after another in about 10 and 9 minutes (the per-binary test times sum to 535 s). The workspace has no doctests, which nextest does not run. `tests/browser.rs` has its own `main` and answers nextest's `--list`, `--exact` and `--ignored` like libtest. Stop your own processes by PID, never by a pattern: `pkill -f` also matches the SSH command's own shell and the host's other services.
 
 ### Windows with WSL2 (superseded)
 

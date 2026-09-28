@@ -2680,7 +2680,8 @@ pub fn cache_scope(
 /// or not. A released attempt may still receive retransmitted frames and its
 /// end — the log is evidence, and late bytes only complete the record. The
 /// verdict itself was already decided. A revoked worker's bytes are not
-/// evidence: refused like a stranger's (P08-7).
+/// evidence: refused like a stranger's (P08-7). Nor are bytes for a log
+/// retention already removed (R01): the record is closed, not reopened.
 pub fn attempt_log_scope(
     conn: &Connection,
     worker: WorkerId,
@@ -2690,7 +2691,8 @@ pub fn attempt_log_scope(
         .prepare_cached(
             "SELECT j.run_id, j.id FROM attempts a JOIN jobs j ON j.id = a.job_id
              JOIN workers w ON w.id = a.worker_id
-             WHERE a.id = ?1 AND a.worker_id = ?2 AND w.revoked_ms IS NULL",
+             WHERE a.id = ?1 AND a.worker_id = ?2 AND w.revoked_ms IS NULL
+               AND a.log_expired_ms IS NULL",
         )?
         .query_row(params![attempt.as_bytes(), worker.as_bytes()], |r| {
             Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))

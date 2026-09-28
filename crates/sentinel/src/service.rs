@@ -97,6 +97,11 @@ struct FileConfig {
     // system, and the bytes they may hold together (R01/D06).
     spool_reserve_bytes: Option<u64>,
     spool_quota_bytes: Option<u64>,
+    // Worker: what the disposable stores may hold (R01); unset ones are
+    // sized from the data directory's file system.
+    cache_budget_bytes: Option<u64>,
+    mirror_budget_bytes: Option<u64>,
+    image_budget_bytes: Option<u64>,
     // Worker: keep per-repository object mirrors under the data directory
     // (default on; `false` checks out every attempt directly).
     git_mirrors: Option<bool>,
@@ -134,6 +139,9 @@ struct TailcatFile {
 #[serde(deny_unknown_fields)]
 struct RemoteCacheFile {
     enabled: Option<bool>,
+    /// Server: what the controller's remote cache store may hold (R01);
+    /// unset is sized from the data directory's file system.
+    budget_bytes: Option<u64>,
 }
 
 impl RemoteCacheFile {
@@ -159,15 +167,25 @@ const MAX_LABELS: usize = 16;
 struct StorageFile {
     /// Free bytes held back for metadata and log evidence.
     reserve_bytes: Option<u64>,
-    /// Discretionary writes refuse below this free figure...
+    /// Discretionary writes refuse below this free figure above the
+    /// reserve...
     low_watermark_bytes: Option<u64>,
     /// ...and admit again above this one (hysteresis).
     high_watermark_bytes: Option<u64>,
-    /// Default committed-bytes cap per tenant; 0 is unlimited.
+    /// Cap on everything every tenant stores together; 0 is unlimited.
+    quota_bytes: Option<u64>,
+    /// Default stored-bytes cap per tenant; 0 is unlimited.
     tenant_quota_bytes: Option<u64>,
-    /// Finished attempt logs are kept this long.
+    /// Finished attempt logs are kept this long unless a tenant or
+    /// repository policy says otherwise.
     log_retention_secs: Option<u64>,
-    /// The maintenance pass rides the dispatch loop at most this often.
+    /// Longest artifact retention a pipeline's `retain` may ask for.
+    artifact_retention_secs: Option<u64>,
+    /// Artifact bytes one run may store.
+    run_artifact_bytes: Option<u64>,
+    /// Stored log bytes one attempt may produce.
+    attempt_log_bytes: Option<u64>,
+    /// The maintenance pass runs at most this often.
     sweep_interval_secs: Option<u64>,
 }
 
@@ -176,43 +194,100 @@ struct StorageFile {
 #[cfg(feature = "server")]
 #[derive(Clone, Copy)]
 struct Storage {
-    marks: sentinel_store::space::Watermarks,
-    tenant_quota: u64,
-    log_retention_ms: i64,
+    /// Explicit watermarks; an unset one follows the data filesystem's size
+    /// ([`Storage::marks`]).
+    reserve: Option<u64>,
+    low: Option<u64>,
+    high: Option<u64>,
+    deployment: sentinel_store::retention::Deployment,
+    attempt_log_bytes: u64,
     sweep_interval_ms: i64,
+}
+
+#[cfg(feature = "server")]
+const MIB: u64 = 1 << 20;
+
+#[cfg(feature = "server")]
+impl Storage {
+    /// The watermarks for a data filesystem of `total` bytes: each explicit
+    /// level as configured, each unset one from
+    /// [`sentinel_store::space::default_watermarks`].
+    fn marks(&self, total: u64) -> Result<sentinel_store::space::Watermarks, Error> {
+        let sized = sentinel_store::space::default_watermarks(total);
+        let reserve = self.reserve.unwrap_or(sized.reserve);
+        let low = self.low.unwrap_or(sized.low);
+        let high = self.high.unwrap_or(sized.high.max(low));
+        if reserve < 64 * MIB || low < reserve || high < low {
+            return Err(Error::config(
+                "storage watermarks must satisfy 64 MiB <= reserve_bytes <= low_watermark_bytes <= high_watermark_bytes",
+            ));
+        }
+        Ok(sentinel_store::space::Watermarks {
+            reserve,
+            low,
+            high,
+            // Log evidence keeps the top slice of the reserve so the
+            // metadata database keeps the rest.
+            floor: reserve / 8,
+        })
+    }
 }
 
 #[cfg(feature = "server")]
 impl StorageFile {
     fn resolve(&self) -> Result<Storage, Error> {
-        let reserve = self.reserve_bytes.unwrap_or(1 << 30);
-        let low = self.low_watermark_bytes.unwrap_or(2 << 30);
-        let high = self.high_watermark_bytes.unwrap_or(4 << 30);
+        let defaults = sentinel_store::retention::Deployment::default();
         let log_retention_secs = self.log_retention_secs.unwrap_or(14 * 86_400);
+        let artifact_retention_secs = self.artifact_retention_secs.unwrap_or(90 * 86_400);
         let sweep_interval_secs = self.sweep_interval_secs.unwrap_or(300);
-        if reserve < (64 << 20) || low < reserve || high < low {
+        let run_artifact_bytes = self
+            .run_artifact_bytes
+            .unwrap_or(defaults.run_artifact_bytes);
+        let attempt_log_bytes = self
+            .attempt_log_bytes
+            .unwrap_or(sentinel_store::logs::MAX_LOG_BYTES);
+        if self.reserve_bytes.is_some_and(|r| r < 64 * MIB)
+            || matches!((self.reserve_bytes, self.low_watermark_bytes), (Some(r), Some(l)) if l < r)
+            || matches!((self.low_watermark_bytes, self.high_watermark_bytes), (Some(l), Some(h)) if h < l)
+        {
             return Err(Error::config(
                 "storage watermarks must satisfy 64 MiB <= reserve_bytes <= low_watermark_bytes <= high_watermark_bytes",
             ));
         }
         if !(5..=86_400).contains(&sweep_interval_secs)
-            || !(3_600..=86_400 * 365).contains(&log_retention_secs)
+            || !(3_600..=86_400 * 366).contains(&log_retention_secs)
+            || !(3_600..=86_400 * 366).contains(&artifact_retention_secs)
         {
             return Err(Error::config(
-                "storage sweep_interval_secs must be 5..=86400 and log_retention_secs 3600..=31536000",
+                "storage sweep_interval_secs must be 5..=86400 and log_retention_secs and artifact_retention_secs 3600..=31622400",
             ));
         }
+        if !(MIB..=1 << 40).contains(&run_artifact_bytes)
+            || !(MIB..=4 << 30).contains(&attempt_log_bytes)
+        {
+            return Err(Error::config(
+                "storage run_artifact_bytes must be 1 MiB..=1 TiB and attempt_log_bytes 1 MiB..=4 GiB",
+            ));
+        }
+        if [self.quota_bytes, self.tenant_quota_bytes]
+            .into_iter()
+            .flatten()
+            .any(|q| q > i64::MAX as u64)
+        {
+            return Err(Error::config("storage quotas must fit in 63 bits"));
+        }
         Ok(Storage {
-            marks: sentinel_store::space::Watermarks {
-                reserve,
-                low,
-                high,
-                // Log evidence keeps the top slice of the reserve so the
-                // metadata database keeps the rest.
-                floor: reserve / 8,
+            reserve: self.reserve_bytes,
+            low: self.low_watermark_bytes,
+            high: self.high_watermark_bytes,
+            deployment: sentinel_store::retention::Deployment {
+                quota_bytes: self.quota_bytes.unwrap_or(0),
+                tenant_quota_bytes: self.tenant_quota_bytes.unwrap_or(0),
+                log_retention_ms: (log_retention_secs * 1000) as i64,
+                artifact_retention_ms: (artifact_retention_secs * 1000) as i64,
+                run_artifact_bytes,
             },
-            tenant_quota: self.tenant_quota_bytes.unwrap_or(0),
-            log_retention_ms: (log_retention_secs * 1000) as i64,
+            attempt_log_bytes,
             sweep_interval_ms: (sweep_interval_secs * 1000) as i64,
         })
     }
@@ -237,6 +312,9 @@ struct WorkerLink {
     /// executor's defaults.
     spool_reserve_bytes: Option<u64>,
     spool_quota_bytes: Option<u64>,
+    /// The disposable stores' budgets (cache, mirrors, images); `None`
+    /// sizes one from the data directory's file system.
+    budgets: [Option<u64>; 3],
     /// The helper to run, when the worker dials through Tailcat.
     tailcat: Option<TailcatFile>,
     /// The controller's `tc…` address the helper carries.
@@ -257,6 +335,8 @@ enum Role {
         tailcat: Option<TailcatFile>,
         /// Whether the controller serves remote cache objects (Q08).
         remote_cache: bool,
+        /// What that store may hold; `None` sizes it from the disk.
+        remote_cache_budget: Option<u64>,
     },
     Worker(Option<WorkerLink>),
 }
@@ -354,10 +434,13 @@ impl Config {
                 || file.disk_bytes.is_some()
                 || file.spool_reserve_bytes.is_some()
                 || file.spool_quota_bytes.is_some()
+                || file.cache_budget_bytes.is_some()
+                || file.mirror_budget_bytes.is_some()
+                || file.image_budget_bytes.is_some()
                 || file.tailcat_address.is_some()
             {
                 return Err(Error::config(
-                    "controller, controller_fingerprint, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, disk_bytes, spool_reserve_bytes, spool_quota_bytes and tailcat_address apply to the worker role only",
+                    "controller, controller_fingerprint, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, disk_bytes, spool_reserve_bytes, spool_quota_bytes, cache_budget_bytes, mirror_budget_bytes, image_budget_bytes and tailcat_address apply to the worker role only",
                 ));
             }
             let listen: SocketAddr = file
@@ -414,8 +497,25 @@ impl Config {
                     .as_ref()
                     .map(RemoteCacheFile::on)
                     .unwrap_or(true),
+                remote_cache_budget: match file.remote_cache.as_ref().and_then(|r| r.budget_bytes) {
+                    Some(bytes) if bytes < (64 << 20) => {
+                        return Err(Error::config(
+                            "[remote_cache] budget_bytes must be at least 64 MiB when set",
+                        ));
+                    }
+                    budget => budget,
+                },
             }
         } else {
+            if file
+                .remote_cache
+                .as_ref()
+                .is_some_and(|r| r.budget_bytes.is_some())
+            {
+                return Err(Error::config(
+                    "[remote_cache] budget_bytes applies to the server role only",
+                ));
+            }
             if file.listen.is_some()
                 || file.api_listen.is_some()
                 || file.public_url.is_some()
@@ -482,6 +582,19 @@ impl Config {
                     if file.disk_bytes == Some(0) {
                         return Err(Error::config("disk_bytes must be positive when set"));
                     }
+                    if [
+                        file.cache_budget_bytes,
+                        file.mirror_budget_bytes,
+                        file.image_budget_bytes,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|b| b < (64 << 20))
+                    {
+                        return Err(Error::config(
+                            "cache_budget_bytes, mirror_budget_bytes and image_budget_bytes must be at least 64 MiB when set",
+                        ));
+                    }
                     if file.spool_quota_bytes == Some(0) {
                         return Err(Error::config(
                             "spool_quota_bytes must be positive when set: a zero quota would declare every line of output lost",
@@ -513,6 +626,11 @@ impl Config {
                         disk_bytes: file.disk_bytes,
                         spool_reserve_bytes: file.spool_reserve_bytes,
                         spool_quota_bytes: file.spool_quota_bytes,
+                        budgets: [
+                            file.cache_budget_bytes,
+                            file.mirror_budget_bytes,
+                            file.image_budget_bytes,
+                        ],
                         tailcat: file.tailcat,
                         tailcat_address: file.tailcat_address,
                         remote_cache: file
@@ -1199,7 +1317,7 @@ fn start_server(
     public_url: Option<String>,
     trusted_proxies: Option<&[String]>,
     tailcat: Option<&TailcatFile>,
-    remote_cache: bool,
+    (remote_cache, remote_cache_budget): (bool, Option<u64>),
 ) -> Result<Running, Error> {
     let path = config.data_dir.join(sentinel_store::METADATA_FILE);
     let store =
@@ -1219,14 +1337,37 @@ fn start_server(
     let identity = identity(&config.data_dir, "controller")?;
     let fingerprint = hex32(&identity.fingerprint().0);
     let logs = Arc::new(
-        sentinel_store::logs::LogStore::open(config.data_dir.join(sentinel_store::logs::LOGS_DIR))
-            .map_err(|error| Error::runtime(format!("cannot open the log store: {error}")))?,
+        sentinel_store::logs::LogStore::open_with_limit(
+            config.data_dir.join(sentinel_store::logs::LOGS_DIR),
+            config.storage.attempt_log_bytes,
+        )
+        .map_err(|error| Error::runtime(format!("cannot open the log store: {error}")))?,
     );
     // Disk admission (D06): one gate over the data directory's filesystem
     // shared by objects and logs; staged writes and uploads charge it.
+    // Unset watermarks follow the data filesystem's size (R01).
+    let total = sentinel_store::space::total_bytes(&config.data_dir).unwrap_or(0);
+    let marks = config.storage.marks(total)?;
     let admission = Arc::new(
-        sentinel_store::space::Admission::new(config.data_dir.clone(), config.storage.marks)
+        sentinel_store::space::Admission::new(config.data_dir.clone(), marks)
             .map_err(|error| Error::runtime(format!("invalid storage watermarks: {error}")))?,
+    );
+    admission.set_metadata_bytes(store.metadata_bytes());
+    let deployment = config.storage.deployment;
+    store
+        .writer()
+        .write(move |tx| sentinel_store::retention::install(tx, &deployment))
+        .map_err(|error| Error::runtime(format!("cannot record the storage policy: {error}")))?;
+    tracing::info!(
+        event = "storage_configured",
+        filesystem_bytes = total,
+        reserve_bytes = marks.reserve,
+        low_watermark_bytes = marks.low,
+        high_watermark_bytes = marks.high,
+        quota_bytes = deployment.quota_bytes,
+        tenant_quota_bytes = deployment.tenant_quota_bytes,
+        log_retention_ms = deployment.log_retention_ms,
+        artifact_retention_ms = deployment.artifact_retention_ms,
     );
     logs.set_admission(Arc::clone(&admission));
     // Reconcile the object tree against committed rows before serving:
@@ -1234,7 +1375,7 @@ fn start_server(
     let objects = sentinel_store::objects::Objects::open(&config.data_dir)
         .map_err(|error| Error::runtime(format!("cannot open the object store: {error}")))?;
     objects.set_admission(Arc::clone(&admission));
-    objects.set_default_quota(config.storage.tenant_quota);
+    objects.set_deployment(config.storage.deployment);
     let recovery = store
         .read(|conn| objects.recover(conn))
         .map_err(|error| Error::runtime(format!("cannot recover the object store: {error}")))?;
@@ -1273,7 +1414,6 @@ fn start_server(
     .map_err(|error| Error::runtime(format!("cannot listen on {listen}: {error}")))?;
     let reconciled = controller.reconciled();
     controller.set_storage_policy(sentinel_link::controller::StoragePolicy {
-        log_retention_ms: config.storage.log_retention_ms,
         interval_ms: config.storage.sweep_interval_ms,
     });
     // Remote cache (Q08): the controller holds objects workers offer, so a
@@ -1287,6 +1427,10 @@ fn start_server(
                 root.display()
             ))
         })?;
+        // Unset, the store takes a tenth of the data file system, 1 to
+        // 50 GiB (R01): 50 GiB on the 1 TB reference host, as before.
+        let budget = remote_cache_budget.unwrap_or_else(|| (total / 10).clamp(1 << 30, 50 << 30));
+        controller.set_remote_cache_budget(budget);
         controller.set_remote_cache(root);
     }
     let tailcat = start_tailcat(config, &store, tailcat, listen, controller.handle())?;
@@ -1544,6 +1688,7 @@ mod worker_role {
         worker: sentinel_core::WorkerId,
         git_mirrors: bool,
         spool: (Option<u64>, Option<u64>),
+        budgets: [Option<u64>; 3],
     ) -> Box<dyn LinkExecutor> {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
@@ -1586,6 +1731,9 @@ mod worker_role {
                     sentinel_worker::executor::Notice::CacheSwept(stats) => {
                         tracing::info!(event = "cache_swept", stats = ?stats);
                     }
+                    sentinel_worker::executor::Notice::ImagesReclaimed(removed) => {
+                        tracing::info!(event = "images_reclaimed", removed);
+                    }
                     sentinel_worker::executor::Notice::CostlyCacheHit { attempt, name, costly, stats } => {
                         tracing::warn!(event = "cache_costly_hit", attempt = %attempt, cache = %name, reason = costly.as_str(), copied_bytes = stats.copied_bytes, bytes = stats.bytes, lock_wait_ns = ?stats.lock_wait_ns, clone_ns = ?stats.clone_ns, "nominal hit paid rebuild-scale restore cost (docs/cache.md)");
                     }
@@ -1611,6 +1759,22 @@ mod worker_role {
                         .1
                         .unwrap_or(sentinel_worker::spool::DEFAULT_SPOOL_QUOTA),
                 );
+                // Unset budgets follow the data directory's file system (R01).
+                let sized = sentinel_worker::executor::StorageBudgets::sized(
+                    sentinel_worker::spool::filesystem_bytes(data_dir).unwrap_or(0),
+                );
+                let budgets = sentinel_worker::executor::StorageBudgets {
+                    cache_bytes: budgets[0].unwrap_or(sized.cache_bytes),
+                    mirror_bytes: budgets[1].unwrap_or(sized.mirror_bytes),
+                    image_bytes: budgets[2].unwrap_or(sized.image_bytes),
+                };
+                tracing::info!(
+                    event = "worker_budgets",
+                    cache_bytes = budgets.cache_bytes,
+                    mirror_bytes = budgets.mirror_bytes,
+                    image_bytes = budgets.image_bytes
+                );
+                executor.set_storage_budgets(budgets);
                 let runtime = executor.runtime();
                 let recovered = executor.recovered();
                 tracing::info!(
@@ -1921,6 +2085,7 @@ mod worker_role {
             worker,
             link.git_mirrors,
             (link.spool_reserve_bytes, link.spool_quota_bytes),
+            link.budgets,
         );
         let tunnel = forward.clone();
         let thread = std::thread::Builder::new()
@@ -2015,6 +2180,7 @@ fn initialize_and_wait(
                 trusted_proxies,
                 tailcat,
                 remote_cache,
+                remote_cache_budget,
             } => start_server(
                 config,
                 *listen,
@@ -2022,7 +2188,7 @@ fn initialize_and_wait(
                 public_url.clone(),
                 trusted_proxies.as_deref(),
                 tailcat.as_ref(),
-                *remote_cache,
+                (*remote_cache, *remote_cache_budget),
             ),
             #[cfg(feature = "worker")]
             Role::Worker(Some(link)) => worker_role::start(config, link),
@@ -2222,6 +2388,13 @@ mod tests {
         );
     }
 
+    fn marks_ok(storage: &Storage, total: u64) -> sentinel_store::space::Watermarks {
+        match storage.marks(total) {
+            Ok(marks) => marks,
+            Err(_) => panic!("watermarks must resolve for {total}"),
+        }
+    }
+
     fn resolve_ok(file: StorageFile) -> Storage {
         match file.resolve() {
             Ok(s) => s,
@@ -2274,8 +2447,11 @@ mod tests {
     #[test]
     fn storage_defaults_and_validation() {
         let resolved = resolve_ok(StorageFile::default());
+        // A 64 GiB data filesystem sizes the watermarks exactly as the fixed
+        // pre-R01 defaults did; a 1 TB one scales them up.
+        let marks = marks_ok(&resolved, 64 << 30);
         assert_eq!(
-            resolved.marks,
+            marks,
             sentinel_store::space::Watermarks {
                 reserve: 1 << 30,
                 low: 2 << 30,
@@ -2283,15 +2459,29 @@ mod tests {
                 floor: (1 << 30) / 8,
             }
         );
-        assert_eq!(resolved.tenant_quota, 0);
-        assert_eq!(resolved.log_retention_ms, 14 * 86_400_000);
+        let big = marks_ok(&resolved, 1_000_000_000_000);
+        assert_eq!(big.reserve, 1_000_000_000_000 / 64);
+        assert_eq!(big.low, 1_000_000_000_000 / 32);
+        assert_eq!(big.high, 2 * big.low);
+        // Clamped on tiny and huge disks alike.
+        assert_eq!(marks_ok(&resolved, 1 << 30).reserve, 1 << 30);
+        assert_eq!(marks_ok(&resolved, 1 << 50).reserve, 16 << 30);
+        let d = resolved.deployment;
+        assert_eq!(d.quota_bytes, 0);
+        assert_eq!(d.tenant_quota_bytes, 0);
+        assert_eq!(d.log_retention_ms, 14 * 86_400_000);
+        assert_eq!(d.artifact_retention_ms, 90 * 86_400_000);
+        assert_eq!(d.run_artifact_bytes, 16 << 30);
+        assert_eq!(resolved.attempt_log_bytes, 256 << 20);
         assert_eq!(resolved.sweep_interval_ms, 300_000);
 
-        // reserve under 64 MiB, low under reserve, high under low: refused.
+        // reserve under 64 MiB, low under reserve, high under low: refused
+        // (an explicit level below a sized one only at startup, when the
+        // filesystem's size is known).
         for (reserve, low, high) in [
             (Some(1u64 << 20), None, None),
-            (None, Some((1 << 30) - 1), None),
-            (None, None, Some(1 << 30)),
+            (Some(2 << 30), Some((2 << 30) - 1), None),
+            (None, Some(2 << 30), Some(1 << 30)),
         ] {
             let file = StorageFile {
                 reserve_bytes: reserve,
@@ -2301,32 +2491,68 @@ mod tests {
             };
             assert!(file.resolve().is_err(), "{reserve:?} {low:?} {high:?}");
         }
-        // Sweep and retention bounds.
-        for (sweep, retention) in [
-            (Some(4u64), None),
-            (Some(86_401), None),
-            (None, Some(3_599)),
-            (None, Some(31_536_001)),
-        ] {
-            let file = StorageFile {
-                sweep_interval_secs: sweep,
-                log_retention_secs: retention,
+        let low_under_sized = StorageFile {
+            low_watermark_bytes: Some((1 << 30) - 1),
+            ..Default::default()
+        };
+        assert!(resolve_ok(low_under_sized).marks(64 << 30).is_err());
+        // Sweep, retention and size bounds.
+        for file in [
+            StorageFile {
+                sweep_interval_secs: Some(4),
                 ..Default::default()
-            };
-            assert!(file.resolve().is_err(), "{sweep:?} {retention:?}");
+            },
+            StorageFile {
+                sweep_interval_secs: Some(86_401),
+                ..Default::default()
+            },
+            StorageFile {
+                log_retention_secs: Some(3_599),
+                ..Default::default()
+            },
+            StorageFile {
+                log_retention_secs: Some(31_622_401),
+                ..Default::default()
+            },
+            StorageFile {
+                artifact_retention_secs: Some(3_599),
+                ..Default::default()
+            },
+            StorageFile {
+                run_artifact_bytes: Some(1),
+                ..Default::default()
+            },
+            StorageFile {
+                attempt_log_bytes: Some(5 << 30),
+                ..Default::default()
+            },
+            StorageFile {
+                quota_bytes: Some(u64::MAX),
+                ..Default::default()
+            },
+        ] {
+            assert!(file.resolve().is_err());
         }
         // A full override resolves.
         let file = StorageFile {
             reserve_bytes: Some(1 << 30),
             low_watermark_bytes: Some(2 << 30),
             high_watermark_bytes: Some(3 << 30),
+            quota_bytes: Some(1 << 41),
             tenant_quota_bytes: Some(1 << 40),
             log_retention_secs: Some(7_200),
+            artifact_retention_secs: Some(86_400),
+            run_artifact_bytes: Some(1 << 30),
+            attempt_log_bytes: Some(64 << 20),
             sweep_interval_secs: Some(60),
         };
         let resolved = resolve_ok(file);
-        assert_eq!(resolved.marks.high, 3 << 30);
-        assert_eq!(resolved.tenant_quota, 1 << 40);
-        assert_eq!(resolved.log_retention_ms, 7_200_000);
+        assert_eq!(marks_ok(&resolved, 1 << 50).high, 3 << 30);
+        assert_eq!(resolved.deployment.quota_bytes, 1 << 41);
+        assert_eq!(resolved.deployment.tenant_quota_bytes, 1 << 40);
+        assert_eq!(resolved.deployment.log_retention_ms, 7_200_000);
+        assert_eq!(resolved.deployment.artifact_retention_ms, 86_400_000);
+        assert_eq!(resolved.deployment.run_artifact_bytes, 1 << 30);
+        assert_eq!(resolved.attempt_log_bytes, 64 << 20);
     }
 }

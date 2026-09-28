@@ -86,14 +86,46 @@ fn main() -> ExitCode {
             no_browser_prints_the_url_and_launches_nothing,
         ),
     ];
-    println!("\nrunning {} tests", tests.len());
-    for (name, test) in tests {
+    // Enough of libtest's command line for `cargo test` and cargo-nextest:
+    // `--list` names the tests (none are ignored), and a name filter —
+    // exact with `--exact`, a substring otherwise — picks which run.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    if flag("--list") {
+        if !flag("--ignored") {
+            for (name, _) in tests {
+                println!("{name}: test");
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    if flag("--ignored") {
+        println!("\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored\n");
+        return ExitCode::SUCCESS;
+    }
+    let exact = flag("--exact");
+    let filters: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let chosen: Vec<_> = tests
+        .into_iter()
+        .filter(|(name, _)| {
+            filters.is_empty()
+                || filters
+                    .iter()
+                    .any(|f| if exact { name == f } else { name.contains(f) })
+        })
+        .collect();
+    println!("\nrunning {} tests", chosen.len());
+    for (name, test) in &chosen {
         test();
         println!("test {name} ... ok");
     }
     println!(
         "\ntest result: ok. {} passed; 0 failed; 0 ignored\n",
-        tests.len()
+        chosen.len()
     );
     ExitCode::SUCCESS
 }

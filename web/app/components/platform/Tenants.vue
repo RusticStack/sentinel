@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import type { DeploymentStorage } from "~~/shared/types/api";
+
 const api = useApi();
 const act = useAct();
 const session = useSession();
@@ -8,6 +10,16 @@ const { data, refresh } = await useAsyncData(() => `platform-tenants-${after.val
 const quotas = reactive<Record<string, number | undefined>>({});
 const slug = ref("");
 const confirmSuspend = ref<any | null>(null);
+// The deployment's defaults: what a tenant's blank setting inherits (R01).
+const { data: deployment } = await useAsyncData("platform-storage-defaults",
+  () => api<DeploymentStorage>("/api/v1/admin/storage").catch(() => null));
+const editing = ref<any | null>(null);
+async function saveStorage(t: any, body: Record<string, number | null>) {
+  if (await act(`Storage policy of ${t.slug}`, () => api(`/api/v1/admin/tenants/${t.slug}/storage`, { method: "PUT", body }))) {
+    editing.value = null;
+    await refresh();
+  }
+}
 
 async function setQuota(t: any) {
   const gib = quotas[t.slug];
@@ -59,6 +71,7 @@ const columns = [
         <p class="text-xs text-muted mt-1">{{ row.original.quota_bytes ? `${Math.round((100 * row.original.usage_bytes) / row.original.quota_bytes)}% of ${fmtBytes(row.original.quota_bytes)} used` : "no limit" }}</p>
       </template>
       <template #actions-cell="{ row }">
+        <UButton size="sm" color="neutral" variant="outline" icon="i-lucide-sliders-horizontal" class="mr-2" :aria-label="`Storage policy of ${row.original.slug}`" @click="editing = row.original">Storage</UButton>
         <UButton v-if="row.original.active" size="sm" color="error" variant="soft" icon="i-lucide-pause" :aria-label="`Suspend ${row.original.slug}`" @click="confirmSuspend = row.original">Suspend</UButton>
         <UButton v-else size="sm" icon="i-lucide-play" :aria-label="`Reactivate ${row.original.slug}`" @click="toggle(row.original)">Reactivate</UButton>
       </template>
@@ -76,6 +89,14 @@ const columns = [
     </form>
     <p class="text-sm text-muted">A new organization has no members: add its first administrator from its Tenant admin page.</p>
   </section>
+  <UModal :open="!!editing" :title="`Storage policy · ${editing?.slug}`" description="Blank fields inherit the deployment's configuration." @update:open="(o) => !o && (editing = null)">
+    <template #body>
+      <StoragePolicyForm v-if="editing" :id="`tenant-${editing.slug}`"
+        :policy="{ quota_bytes: editing.quota_set ? editing.quota_bytes : null, log_retention_ms: editing.log_retention_ms ?? null, artifact_retention_ms: editing.artifact_retention_ms ?? null }"
+        :inherited="{ quota_bytes: deployment?.tenant_quota_bytes ?? 0, log_retention_ms: deployment?.log_retention_ms ?? 14 * 86_400_000, artifact_retention_ms: deployment?.artifact_retention_ms ?? 90 * 86_400_000 }"
+        @save="(body) => saveStorage(editing, body)" />
+    </template>
+  </UModal>
   <UModal :open="!!confirmSuspend" :title="`Suspend ${confirmSuspend?.slug}?`" description="Its credentials and invitations are revoked, its jobs are cancelled, and its members lose access at once." @update:open="(o) => !o && (confirmSuspend = null)">
     <template #footer>
       <div class="flex justify-end gap-2 w-full">

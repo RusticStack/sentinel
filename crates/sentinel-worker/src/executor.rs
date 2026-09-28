@@ -88,6 +88,8 @@ pub enum Notice {
     /// A bounded reclamation pass over the cache root removed something —
     /// expired leases, dead staging or generations past retention/budget.
     CacheSwept(sentinel_cache::gc::GcStats),
+    /// The image reclamation pass removed this many images (R01).
+    ImagesReclaimed(usize),
     /// A nominal cache hit paid rebuild-scale restore cost — the K08
     /// costly-hit rule (docs/cache.md) tripped. Diagnostics only; the
     /// attempt's verdict never depends on it.
@@ -464,8 +466,80 @@ pub struct Inner {
     cache_bytes: std::sync::atomic::AtomicU64,
     /// Moves whenever `cache_bytes` changes.
     cache_version: std::sync::atomic::AtomicU64,
+    /// Byte budgets of the disposable stores (R01).
+    budgets: Mutex<StorageBudgets>,
+    /// When the image stores were last reclaimed; the pass lists every
+    /// store, so it runs at most every [`IMAGE_SWEEP_EVERY`].
+    image_swept: Mutex<Option<std::time::Instant>>,
     notify: Box<dyn Fn(Notice) + Send + Sync>,
     recovered: Recovered,
+}
+
+/// How often the image stores are reclaimed at most.
+const IMAGE_SWEEP_EVERY: Duration = Duration::from_secs(60);
+
+/// The worker's disposable stores and what each may hold (R01): the cache,
+/// the Git mirrors and the container images. Everything here is rebuilt on
+/// demand, so each is held to its budget least recently used first and a
+/// store never outgrows it by more than one pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageBudgets {
+    pub cache_bytes: u64,
+    pub mirror_bytes: u64,
+    pub image_bytes: u64,
+}
+
+impl StorageBudgets {
+    /// Budgets for a data filesystem of `total` bytes: a fifth each for the
+    /// cache and the images, a tenth for the mirrors — together half, the
+    /// other half left to workspaces, spools and the host — each clamped
+    /// (cache and mirrors 1–50 GiB, images 2–50 GiB). On the 1 TB reference
+    /// host that is the 50 GiB each the stores had before R01.
+    pub fn sized(total: u64) -> StorageBudgets {
+        const GIB: u64 = 1 << 30;
+        StorageBudgets {
+            cache_bytes: (total / 5).clamp(GIB, 50 * GIB),
+            mirror_bytes: (total / 10).clamp(GIB, 50 * GIB),
+            image_bytes: (total / 5).clamp(2 * GIB, 50 * GIB),
+        }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::StorageBudgets;
+
+    /// R01: the worker's disposable stores are sized from its disk, the
+    /// 1 TB reference host keeping the 50 GiB each they had before.
+    #[test]
+    fn budgets_follow_the_disk_and_stay_clamped() {
+        const GIB: u64 = 1 << 30;
+        let big = StorageBudgets::sized(1_000_000_000_000);
+        assert_eq!(
+            (big.cache_bytes, big.mirror_bytes, big.image_bytes),
+            (50 * GIB, 50 * GIB, 50 * GIB)
+        );
+        let small = StorageBudgets::sized(100 * GIB);
+        assert_eq!(
+            (small.cache_bytes, small.mirror_bytes, small.image_bytes),
+            (20 * GIB, 10 * GIB, 20 * GIB)
+        );
+        let tiny = StorageBudgets::sized(0);
+        assert_eq!(
+            (tiny.cache_bytes, tiny.mirror_bytes, tiny.image_bytes),
+            (GIB, GIB, 2 * GIB)
+        );
+    }
+}
+
+impl Default for StorageBudgets {
+    fn default() -> Self {
+        StorageBudgets {
+            cache_bytes: sentinel_cache::gc::DEFAULT_BUDGET_BYTES,
+            mirror_bytes: crate::checkout::MIRRORS_BUDGET_BYTES,
+            image_bytes: 50 << 30,
+        }
+    }
 }
 
 impl Executor {
@@ -527,6 +601,8 @@ impl Executor {
             gc_lock: Mutex::new(sentinel_cache::gc::Cursor::default()),
             cache_bytes: std::sync::atomic::AtomicU64::new(0),
             cache_version: std::sync::atomic::AtomicU64::new(0),
+            budgets: Mutex::new(StorageBudgets::default()),
+            image_swept: Mutex::new(None),
             recovered,
         }));
         // One bounded reclamation pass at start: what a dead process left —
@@ -561,6 +637,12 @@ impl Executor {
     /// either is declared as gaps in the attempt's log.
     pub fn set_spool_limits(&self, reserve: u64, quota: u64) {
         self.spool.set_limits(reserve, quota);
+    }
+
+    /// The disposable stores' byte budgets (default
+    /// [`StorageBudgets::default`]); the next reclamation pass holds to them.
+    pub fn set_storage_budgets(&self, budgets: StorageBudgets) {
+        *self.budgets.lock().unwrap_or_else(|p| p.into_inner()) = budgets;
     }
 
     /// How long a canceled step gets between `SIGTERM` and the forced stop.
@@ -874,6 +956,32 @@ impl Inner {
         }
     }
 
+    /// Hold every image store to `budget` (R01), at most every
+    /// [`IMAGE_SWEEP_EVERY`]: images no container uses, least recently
+    /// pulled first, never one pulled in the last few minutes or one being
+    /// pulled ([`Images::reclaimable`]). Removal is never forced.
+    fn sweep_images(&self, budget: u64) {
+        {
+            let mut swept = self.image_swept.lock().unwrap_or_else(|p| p.into_inner());
+            if swept.is_some_and(|at| at.elapsed() < IMAGE_SWEEP_EVERY) {
+                return;
+            }
+            *swept = Some(std::time::Instant::now());
+        }
+        let mut removed = 0usize;
+        for store in podman::Store::all(&self.root) {
+            let Ok(images) = podman::list_images(&store) else {
+                continue;
+            };
+            for id in self.images.reclaimable(&images, budget) {
+                removed += usize::from(podman::remove_image(&store, &id));
+            }
+        }
+        if removed > 0 {
+            (self.notify)(Notice::ImagesReclaimed(removed));
+        }
+    }
+
     /// One bounded reclamation pass over the cache root — skipped while
     /// another runs, because the running pass already covers its work.
     /// A pass that touched nothing stays quiet, but every pass ends by
@@ -887,9 +995,10 @@ impl Inner {
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return,
         };
+        let budgets = *self.budgets.lock().unwrap_or_else(|p| p.into_inner());
         let stats = sentinel_cache::gc::resume(
             &self.root.join(sentinel_cache::CACHE_DIR),
-            sentinel_cache::gc::DEFAULT_BUDGET_BYTES,
+            budgets.cache_bytes,
             sentinel_cache::gc::DEFAULT_PASS_WORK,
             &mut cursor,
         );
@@ -897,8 +1006,9 @@ impl Inner {
         // The mirrors share the pass's cadence: bounded, and skipped for
         // any mirror a checkout holds (P07-22).
         if let Some(mirrors) = &self.mirrors {
-            let _ = mirrors.sweep(crate::checkout::MIRRORS_BUDGET_BYTES);
+            let _ = mirrors.sweep(budgets.mirror_bytes);
         }
+        self.sweep_images(budgets.image_bytes);
         if self
             .cache_bytes
             .swap(stats.estimated_bytes, std::sync::atomic::Ordering::Relaxed)

@@ -362,3 +362,62 @@ fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
     assert!(podman::owned(worker).unwrap().is_empty());
     ws.destroy().unwrap();
 }
+
+/// R01: image reclamation against the real runtime, in a private store so
+/// no other test's image is touched — an image a container holds is listed
+/// as in use and `remove_image` (never forced) leaves it; once the container
+/// goes, the image goes.
+#[test]
+fn an_image_a_container_holds_is_never_reclaimed() {
+    if !enabled() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let store = podman::Store::private(&temp.path().join("stores"), [0x5e; 16]).unwrap();
+    let podman::Store::Private { graph, run } = &store else {
+        unreachable!("a private store")
+    };
+    let in_store = |args: &[&str]| {
+        std::process::Command::new("podman")
+            .arg("--root")
+            .arg(graph)
+            .arg("--runroot")
+            .arg(run)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    podman::pull(
+        IMAGE,
+        &authfile(temp.path()),
+        &store,
+        Duration::from_secs(600),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    let listed = podman::list_images(&store).unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let image = listed[0].clone();
+    assert_eq!(format!("docker.io/library/busybox@{}", image.digest), IMAGE);
+    assert!(image.bytes > 0);
+    assert_eq!(image.containers, 0);
+
+    assert!(
+        in_store(&["create", "--name", "r01-holder", IMAGE, "true"])
+            .status
+            .success()
+    );
+    assert_eq!(podman::list_images(&store).unwrap()[0].containers, 1);
+    assert!(!podman::remove_image(&store, &image.id), "in use: kept");
+    assert_eq!(podman::list_images(&store).unwrap().len(), 1);
+
+    assert!(in_store(&["rm", "r01-holder"]).status.success());
+    assert!(podman::remove_image(&store, &image.id));
+    assert!(podman::list_images(&store).unwrap().is_empty());
+    for dir in [graph, run] {
+        let _ = std::process::Command::new("podman")
+            .args(["unshare", "rm", "-rf"])
+            .arg(dir)
+            .output();
+    }
+}

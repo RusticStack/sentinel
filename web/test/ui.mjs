@@ -170,6 +170,8 @@ const PAGES = {
   sync: ["/t/acme/sync", "document.querySelectorAll('main table tbody tr').length >= 1"],
   admin: ["/t/acme/admin", "document.querySelectorAll('main table tbody tr').length >= 2"],
   platform: ["/platform/tenants", "document.querySelectorAll('main table tbody tr').length >= 2"],
+  storage: ["/t/acme/admin/storage", "document.querySelectorAll('main table tbody tr').length >= 1"],
+  disk: ["/platform/storage", "document.body.textContent.includes('Metadata database')"],
 };
 
 await scenario("sign-in", async () => {
@@ -422,7 +424,8 @@ await scenario("an open run page through a busy controller", async () => {
   await sleep(300);
   await go(page, PAGES.run[0], "document.querySelectorAll('.dag .node').length === 4");
   await page.waitFor("document.body.textContent.includes('Updates paused: controller busy')", 20000, "busy notice");
-  check("a busy controller is said, not treated as an error", !(await page.eval("!!document.querySelector('[role=alert]')")));
+  const alerts = await page.eval("[...document.querySelectorAll('[role=alert]')].map((a) => a.textContent.trim().slice(0, 120))");
+  check("a busy controller is said, not treated as an error", alerts.length === 0, alerts);
   await Promise.all(held);
   await page.waitFor("document.body.textContent.includes('Live') && !document.body.textContent.includes('controller busy')", 40000, "live again");
   const rerun = await root("POST", `/api/v1/jobs/${cfg.jobs.zeta}/rerun`, {});
@@ -478,6 +481,22 @@ await scenario("administration with step-up", async () => {
   await sleep(1000);
   const { body } = await root("GET", "/api/v1/tenants/acme/members");
   check("a member's role changes from the members table", body.members.find((m) => m.username === "rui").role === "operator");
+});
+
+await scenario("storage policy", async () => {
+  await go(page, ...PAGES.storage);
+  await page.click('[aria-label="Storage policy of app"]');
+  await page.waitFor("!!document.querySelector('#repo-app-logs')", 8000, "policy form");
+  await page.fill("#repo-app-logs", "2");
+  // A number field commits its value when it loses focus.
+  await page.key("Tab");
+  await page.clickText("[role=dialog] button", "Save");
+  await page.waitFor("!document.querySelector('[role=dialog]')", 8000, "saved");
+  const { body } = await root("GET", "/api/v1/tenants/acme/storage");
+  const app = body.repos.find((r) => r.name === "app");
+  check("a repository's log retention is set from the storage page", app.policy.log_retention_ms === 2 * 86_400_000, app.policy);
+  await go(page, ...PAGES.disk);
+  check("the deployment's disk and stored bytes are shown", await page.eval("document.body.textContent.includes('Stored by tenants') && document.body.textContent.includes('Data filesystem')"));
 });
 
 const scriptErrors = page.errors.filter((e) => !e.startsWith("network:"));

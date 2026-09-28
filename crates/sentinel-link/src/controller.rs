@@ -31,7 +31,7 @@ use sentinel_cache::remote::{Need, Upload};
 use sentinel_core::{
     AttemptId, Event, Fence, JobId, PoolId, RunId, TenantId, UnixMillis, WorkerId,
 };
-use sentinel_protocol::limits::{MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES, MAX_RUN_ARTIFACT_BYTES};
+use sentinel_protocol::limits::{MAX_ARTIFACT_BYTES, MAX_ARTIFACT_ENTRIES};
 use sentinel_protocol::logs::Frame;
 use sentinel_protocol::negotiate::{
     Capabilities, Hello, MAX_PREFETCH_IMAGES, PREFETCH_MIN, PROFILE_MIN, Profile,
@@ -40,7 +40,7 @@ use sentinel_store::{
     Store, artifacts, dispatch,
     logs::LogStore,
     objects::{self, Objects},
-    workers,
+    retention, workers,
 };
 
 use crate::{
@@ -90,6 +90,9 @@ const SPEC_TRIES: u32 = 3;
 const STORAGE_BATCH: i64 = 256;
 /// Directory entries one orphan sweep pass examines at most.
 const ORPHAN_SCAN_BUDGET: u32 = 4096;
+/// Batches of released logs one pass stamps at most (R01): a backlog after
+/// an upgrade or an outage catches up without one pass holding on.
+const LOG_STAMP_ROUNDS: u32 = 16;
 /// How often the maintenance thread checks whether a pass is due.
 const MAINTENANCE_TICK: Duration = Duration::from_millis(250);
 
@@ -97,8 +100,6 @@ const MAINTENANCE_TICK: Duration = Duration::from_millis(250);
 /// pass entirely — no deletions, no quota bookkeeping side effects.
 #[derive(Clone, Copy, Debug)]
 pub struct StoragePolicy {
-    /// Finished attempt logs are kept this long; `<= 0` keeps them.
-    pub log_retention_ms: i64,
     /// The pass runs at most this often, on the storage maintenance thread.
     pub interval_ms: i64,
 }
@@ -364,6 +365,8 @@ struct Inner {
     artifacts: Mutex<ArtifactState>,
     /// Storage maintenance policy and when it last ran (D06).
     storage: Mutex<Option<StoragePolicy>>,
+    /// What the remote cache store is held to (R01).
+    remote_budget: AtomicU64,
     last_storage: AtomicI64,
     /// Set (and notified) at shutdown so the maintenance thread stops
     /// without waiting out its tick.
@@ -1089,7 +1092,7 @@ impl Inner {
     /// entries and resume where they stopped, and none of the file walks
     /// runs on the writer. Every unlink runs on the writer through
     /// [`Objects::unlink`], which re-checks ownership first.
-    fn storage_pass(&self, now: UnixMillis, policy: StoragePolicy) {
+    fn storage_pass(&self, now: UnixMillis) {
         let objects = Arc::clone(&self.objects);
         if let Ok(doomed) = self.write(move |tx| {
             objects.sweep_uploads(tx, now)?;
@@ -1115,9 +1118,65 @@ impl Inner {
             let _ = self.write(move |tx| objects.unlink(tx, &doomed));
         }
         self.logs.close_idle(sentinel_store::logs::WRITER_IDLE);
-        let _ = self
-            .logs
-            .sweep_expired(now, policy.log_retention_ms, STORAGE_BATCH as u32);
+        self.log_retention(now);
+    }
+
+    /// Log retention (R01): stamp released attempts' logs with their stored
+    /// bytes and deadline, expire the ones past it and delete their files,
+    /// then sweep log directories the database no longer accounts for. The
+    /// sizes are read and the files deleted off the writer; the writer only
+    /// records.
+    fn log_retention(&self, now: UnixMillis) {
+        let deployment = self.objects.deployment();
+        if let Some(admission) = self.objects.admission() {
+            admission.set_metadata_bytes(self.store.metadata_bytes());
+        }
+        for _ in 0..LOG_STAMP_ROUNDS {
+            let Ok(rows) = self
+                .store
+                .read(|c| retention::unstamped(c, STORAGE_BATCH as u32))
+            else {
+                break;
+            };
+            let full = rows.len() as i64 == STORAGE_BATCH;
+            if rows.is_empty() {
+                break;
+            }
+            let sized: Vec<_> = rows
+                .into_iter()
+                .map(|r| {
+                    let bytes = self.logs.stored_bytes(r.run, r.job, r.attempt);
+                    (r, bytes)
+                })
+                .collect();
+            if self
+                .write(move |tx| retention::stamp(tx, &deployment, &sized))
+                .is_err()
+                || !full
+            {
+                break;
+            }
+        }
+        if let Ok(due) = self
+            .store
+            .read(|c| retention::expiring(c, now, STORAGE_BATCH as u32))
+            && !due.is_empty()
+            && let Ok(expired) = self.write(move |tx| retention::expire(tx, &due, now))
+        {
+            // The rows say expired; a failed delete leaves files the
+            // directory sweep below collects on a later pass.
+            for log in expired {
+                let _ = self.logs.remove(log.run, log.job, log.attempt);
+            }
+        }
+        let store = &self.store;
+        let _ = self.logs.sweep_dirs(STORAGE_BATCH as u32, |attempt| {
+            store
+                .read(|c| retention::log_gone(c, attempt))
+                .unwrap_or(false)
+        });
+        let _ =
+            self.write(move |tx| retention::purge_aborted_uploads(tx, now, STORAGE_BATCH as u32));
     }
 
     /// The storage maintenance thread: checks the policy every
@@ -1142,7 +1201,7 @@ impl Inner {
             let now = UnixMillis::now();
             if now.0 - self.last_storage.load(Ordering::Relaxed) >= policy.interval_ms {
                 self.last_storage.store(now.0, Ordering::Relaxed);
-                self.storage_pass(now, policy);
+                self.storage_pass(now);
             }
         }
     }
@@ -2044,16 +2103,24 @@ impl SessionHandler for Inner {
             return Verdict(ArtifactCode::Stale);
         }
         // One read snapshot: the attempt's ownership scope, its encoded spec,
-        // whether the artifact already has a row, and the run's budget base.
+        // whether the artifact already has a row, the run's budget base and
+        // whether its repository is still under its own quota (R01).
+        let deployment = self.objects.deployment();
         let scope = self.store.read(|c| {
             let tx = c.unchecked_transaction()?;
             let (tenant, run, job, index) = dispatch::attempt_scope(&tx, worker, attempt)?;
             let spec = dispatch::spec_bytes(&tx, worker, attempt)?;
             let duplicate = artifacts::exists(&tx, attempt, name)?;
             let committed = artifacts::run_bytes(&tx, tenant, run)?;
-            Ok((tenant, run, job, index, spec, duplicate, committed))
+            let repo_full = matches!(
+                retention::check_run_repo(&tx, &deployment, tenant, run, 1),
+                Err(sentinel_store::Error::QuotaExceeded)
+            );
+            Ok((
+                tenant, run, job, index, spec, duplicate, committed, repo_full,
+            ))
         });
-        let Ok((tenant, run, job, index, spec, duplicate, committed)) = scope else {
+        let Ok((tenant, run, job, index, spec, duplicate, committed, repo_full)) = scope else {
             return Verdict(ArtifactCode::Stale);
         };
         if duplicate {
@@ -2072,7 +2139,9 @@ impl SessionHandler for Inner {
             // second begin here means the worker raced its own stream.
             return Verdict(ArtifactCode::Invalid);
         }
-        if committed.saturating_add(*state.runs.get(&run).unwrap_or(&0)) >= MAX_RUN_ARTIFACT_BYTES
+        if committed.saturating_add(*state.runs.get(&run).unwrap_or(&0))
+            >= deployment.run_artifact_bytes
+            || repo_full
             || self.objects.admission().is_some_and(|a| !a.is_open())
         {
             return Verdict(ArtifactCode::TooLarge);
@@ -2133,7 +2202,7 @@ impl SessionHandler for Inner {
                 let mut state = self.artifacts.lock().unwrap_or_else(|p| p.into_inner());
                 let charged = state.runs.entry(f.run).or_default();
                 let fits = committed.saturating_add(*charged).saturating_add(len)
-                    <= MAX_RUN_ARTIFACT_BYTES;
+                    <= self.objects.deployment().run_artifact_bytes;
                 if fits {
                     *charged += len;
                 }
@@ -2638,6 +2707,12 @@ impl Controller {
         *self.inner.storage.lock().unwrap_or_else(|p| p.into_inner()) = Some(policy);
     }
 
+    /// The byte budget the remote cache store is held to (R01; default
+    /// `remote::STORE_BUDGET_BYTES`), from its next reclamation pass on.
+    pub fn set_remote_cache_budget(&self, bytes: u64) {
+        self.inner.remote_budget.store(bytes, Ordering::Relaxed);
+    }
+
     /// Where the controller keeps remote cache objects (Q08), normally
     /// `<data_dir>/remote-cache`. Unset answers every cache need `denied`;
     /// the directory itself is created lazily by the first upload. Setting
@@ -2672,7 +2747,7 @@ impl Controller {
                     if let Some(root) = root {
                         let swept = sentinel_cache::remote::sweep_store(
                             &root,
-                            sentinel_cache::remote::STORE_BUDGET_BYTES,
+                            inner.remote_budget.load(Ordering::Relaxed),
                             sentinel_cache::gc::DEFAULT_PASS_WORK,
                             UnixMillis::now().0,
                         );
@@ -2724,6 +2799,7 @@ impl Controller {
             objects,
             artifacts: Mutex::new(ArtifactState::default()),
             storage: Mutex::new(None),
+            remote_budget: AtomicU64::new(sentinel_cache::remote::STORE_BUDGET_BYTES),
             last_storage: AtomicI64::new(0),
             maintenance: (Mutex::new(false), Condvar::new()),
             remote_cache: Mutex::new(None),

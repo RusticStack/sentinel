@@ -384,7 +384,8 @@ pub enum ObjectsCommand {
     /// artifacts past retention, index manifest references, reclaim
     /// unreferenced objects and sweep orphan files
     Reclaim,
-    /// Report free space, watermarks and per-tenant usage against quota
+    /// Report free space, the metadata database's size, the watermarks this
+    /// filesystem sizes and per-tenant usage against quota
     Status,
 }
 
@@ -531,6 +532,31 @@ pub enum TenantCommand {
         /// Remove the tenant's row so the configured default applies again
         #[arg(long)]
         clear: bool,
+    },
+    /// Show or change a tenant's or repository's storage policy: quota and
+    /// log and artifact retention (unset values inherit)
+    Storage {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long, value_name = "SLUG")]
+        tenant: String,
+        /// One repository of the tenant; its retention can only be shorter
+        /// than the tenant's
+        #[arg(long, value_name = "NAME")]
+        repo: Option<String>,
+        /// Stored-bytes cap
+        #[arg(long, value_name = "BYTES")]
+        quota: Option<u64>,
+        /// How long finished logs are kept, as in 14d
+        #[arg(long, value_name = "DURATION")]
+        log_retention: Option<String>,
+        /// Longest artifact retention a pipeline may ask for, as in 30d
+        #[arg(long, value_name = "DURATION")]
+        artifact_retention: Option<String>,
+        /// Drop the named settings (quota, log-retention, artifact-retention)
+        /// so they inherit again; `all` removes the whole policy
+        #[arg(long, value_name = "SETTING")]
+        inherit: Vec<String>,
     },
 }
 

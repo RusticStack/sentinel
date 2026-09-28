@@ -31,6 +31,7 @@ pub mod poll;
 pub mod provenance;
 pub mod registration;
 pub mod reseal;
+pub mod retention;
 pub mod runs;
 pub mod schema;
 pub mod secrets;
@@ -520,6 +521,18 @@ pub enum Shutdown {
 }
 
 impl Store {
+    /// Bytes the metadata database occupies on disk now: the main file and
+    /// its write-ahead log (R01's reserve grows with it).
+    pub fn metadata_bytes(&self) -> u64 {
+        let mut wal = self.path.clone().into_os_string();
+        wal.push("-wal");
+        [self.path.as_path(), Path::new(&wal)]
+            .into_iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
     /// Open or create the database at `path`, apply migrations, start the writer.
     ///
     /// Fails with [`Error::AlreadyOwned`] if another live process holds the
