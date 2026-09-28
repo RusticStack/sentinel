@@ -111,6 +111,8 @@ struct FileConfig {
     tailcat: Option<TailcatFile>,
     // Q08: whether this process participates in remote cache hydration.
     remote_cache: Option<RemoteCacheFile>,
+    // Server: the optional external S3 copy of objects and logs (R02).
+    s3: Option<S3File>,
     // Worker: the controller's `tc…` address, as written to its `<data_dir>/tailcat/address`
     // (Q06). Required to dial a controller through the helper.
     tailcat_address: Option<String>,
@@ -147,6 +149,57 @@ struct RemoteCacheFile {
 impl RemoteCacheFile {
     fn on(&self) -> bool {
         self.enabled.unwrap_or(true)
+    }
+}
+
+/// The `[s3]` section (R02/R03): the optional external copy of objects and
+/// finished logs. Server only. Kept portable so the CLI build validates it.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct S3File {
+    endpoint: String,
+    region: String,
+    bucket: String,
+    #[serde(default)]
+    prefix: String,
+    #[serde(default)]
+    path_style: bool,
+    ca_file: Option<PathBuf>,
+    credentials_file: PathBuf,
+    /// Part size, and the largest object sent in one request.
+    part_bytes: Option<u64>,
+    /// Local copies of replicated objects kept up to this; unset keeps all.
+    local_bytes: Option<u64>,
+    /// Unreplicated bytes past which new artifacts and uploads are refused.
+    backlog_bytes: Option<u64>,
+}
+
+impl S3File {
+    const MIB: u64 = 1 << 20;
+
+    fn check(&self) -> Result<(), Error> {
+        if !self.credentials_file.is_absolute()
+            || self.ca_file.as_ref().is_some_and(|p| !p.is_absolute())
+        {
+            return Err(Error::config(
+                "[s3] credentials_file and ca_file must be absolute paths",
+            ));
+        }
+        if self
+            .part_bytes
+            .is_some_and(|p| !(5 * Self::MIB..=512 * Self::MIB).contains(&p))
+        {
+            return Err(Error::config("[s3] part_bytes must be 5 MiB..=512 MiB"));
+        }
+        if self.backlog_bytes == Some(0) {
+            return Err(Error::config(
+                "[s3] backlog_bytes must be positive when set: 0 would refuse every artifact",
+            ));
+        }
+        if self.endpoint.is_empty() || self.region.is_empty() || self.bucket.is_empty() {
+            return Err(Error::config("[s3] needs endpoint, region and bucket"));
+        }
+        Ok(())
     }
 }
 
@@ -347,6 +400,8 @@ struct Config {
     log_level: LogLevel,
     #[cfg(feature = "server")]
     storage: Storage,
+    #[cfg(feature = "server")]
+    s3: Option<S3File>,
     role: Role,
 }
 
@@ -660,12 +715,20 @@ impl Config {
         if file.storage.is_some() {
             return Err(Error::config("[storage] applies to the server role only"));
         }
+        if let Some(s3) = &file.s3 {
+            if matches!(role, Role::Worker(_)) {
+                return Err(Error::config("[s3] applies to the server role only"));
+            }
+            s3.check()?;
+        }
         Ok(Self {
             data_dir,
             log_format: args.log_format.or(file.log_format).unwrap_or_default(),
             log_level: args.log_level.or(file.log_level).unwrap_or_default(),
             #[cfg(feature = "server")]
             storage,
+            #[cfg(feature = "server")]
+            s3: file.s3,
             role,
         })
     }
@@ -1026,6 +1089,8 @@ enum Running {
         reconcile: Option<Box<sentinel_checks::Reconcile>>,
         /// The Q06 helper carrying the link port; absent with direct TLS.
         tailcat: Option<TailcatServer>,
+        /// The external S3 copy's replicator, when `[s3]` is configured.
+        replicator: Option<sentinel::offload::Running>,
     },
     #[cfg(feature = "worker")]
     Worker {
@@ -1615,6 +1680,10 @@ fn start_server(
         // The client ID is public; the secret is never logged.
         tracing::info!(event = "github_sign_in_enabled", client_id = %sign_in.client_id);
     }
+    let replicator = match &config.s3 {
+        Some(s3) => Some(start_replicator(s3, total, &store, &objects, &logs)?),
+        None => None,
+    };
     let api = sentinel_api::Server::start(sentinel_api::Config {
         listen: api_listen,
         store: Arc::clone(&store),
@@ -1650,7 +1719,71 @@ fn start_server(
         checks,
         reconcile,
         tailcat,
+        replicator,
     })
+}
+
+/// Build the S3 client from `[s3]`, check it once (a failure is logged and
+/// the replicator starts degraded: local copies are kept until the bucket
+/// answers), install the read-through fetch, and start the replicator.
+#[cfg(feature = "server")]
+fn start_replicator(
+    s3: &S3File,
+    total: u64,
+    store: &Arc<sentinel_store::Store>,
+    objects: &Arc<sentinel_store::objects::Objects>,
+    logs: &Arc<sentinel_store::logs::LogStore>,
+) -> Result<sentinel::offload::Running, Error> {
+    let credentials = sentinel_s3::Credentials::from_file(&s3.credentials_file)
+        .map_err(|error| Error::config(error.to_string()))?;
+    let (connect_timeout, read_timeout) = sentinel_s3::client::default_timeouts();
+    let client = sentinel_s3::Client::new(sentinel_s3::Config {
+        endpoint: s3.endpoint.clone(),
+        region: s3.region.clone(),
+        bucket: s3.bucket.clone(),
+        prefix: s3.prefix.clone(),
+        path_style: s3.path_style,
+        ca_file: s3.ca_file.clone(),
+        credentials,
+        connect_timeout,
+        read_timeout,
+    })
+    .map_err(|error| Error::config(error.to_string()))?;
+    match client.check() {
+        Ok(()) => {
+            tracing::info!(event = "s3_ready", endpoint = %s3.endpoint, bucket = %s3.bucket, prefix = %s3.prefix)
+        }
+        Err(error) => {
+            tracing::warn!(event = "s3_unavailable", endpoint = %s3.endpoint, bucket = %s3.bucket, reason = %error, "starting degraded: local copies are kept until the bucket answers")
+        }
+    }
+    let bucket = Arc::new(sentinel::offload::S3Bucket::new(client));
+    objects.set_remote(Arc::clone(&bucket) as Arc<dyn sentinel_store::objects::Remote>);
+    // Unset, the backlog may hold a sixteenth of the data file system, 1 to
+    // 64 GiB, before new artifacts wait for it (R03).
+    let settings = sentinel_store::replicate::Settings {
+        part_bytes: s3.part_bytes.unwrap_or(16 << 20),
+        local_bytes: s3.local_bytes.unwrap_or(0),
+        backlog_bytes: s3
+            .backlog_bytes
+            .unwrap_or_else(|| (total / 16).clamp(1 << 30, 64 << 30)),
+    };
+    tracing::info!(
+        event = "s3_configured",
+        part_bytes = settings.part_bytes,
+        local_bytes = settings.local_bytes,
+        backlog_bytes = settings.backlog_bytes
+    );
+    let replicator = sentinel_store::replicate::Replicator::new(
+        Arc::clone(store),
+        Arc::clone(objects),
+        Arc::clone(logs),
+        bucket as Arc<dyn sentinel_store::replicate::Bucket>,
+        settings,
+    );
+    objects.set_replication(replicator.status());
+    sentinel::offload::Running::start(replicator)
+        .map_err(|error| Error::runtime(format!("cannot start the S3 replicator: {error}")))
 }
 
 #[cfg(feature = "worker")]
@@ -2223,9 +2356,13 @@ fn initialize_and_wait(
             checks,
             reconcile,
             tailcat,
+            replicator,
         } => {
             api.shutdown();
             maintenance.stop();
+            if let Some(replicator) = replicator {
+                replicator.shutdown();
+            }
             if let Some(tailcat) = tailcat {
                 tailcat.shutdown();
             }

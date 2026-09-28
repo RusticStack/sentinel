@@ -186,6 +186,9 @@ pub struct Admission {
     /// times it (R01), so a growing database keeps room to grow and to
     /// checkpoint.
     metadata: AtomicU64,
+    /// The external copy's backlog is past its budget (R03): discretionary
+    /// admission stays closed until the replicator drains it.
+    backlog_full: AtomicBool,
 }
 
 /// The reserve holds at least this many times the metadata database's
@@ -206,6 +209,7 @@ impl Admission {
             tenant_inflight: Mutex::new(HashMap::new()),
             upload_charges: Mutex::new(HashMap::new()),
             metadata: AtomicU64::new(0),
+            backlog_full: AtomicBool::new(false),
         })
     }
 
@@ -225,7 +229,19 @@ impl Admission {
             tenant_inflight: Mutex::new(HashMap::new()),
             upload_charges: Mutex::new(HashMap::new()),
             metadata: AtomicU64::new(0),
+            backlog_full: AtomicBool::new(false),
         })
+    }
+
+    /// Close (or reopen) discretionary admission for the external copy's
+    /// backlog (R03), whatever the free space says.
+    pub fn set_backlog_full(&self, full: bool) {
+        self.backlog_full.store(full, Ordering::Relaxed);
+    }
+
+    /// Whether the external copy's backlog holds admission closed.
+    pub fn backlog_full(&self) -> bool {
+        self.backlog_full.load(Ordering::Relaxed)
     }
 
     /// Record the metadata database's current size; the effective reserve
@@ -275,6 +291,9 @@ impl Admission {
     }
 
     fn gate(&self, free: u64) -> Result<()> {
+        if self.backlog_full.load(Ordering::Relaxed) {
+            return Err(Error::StorageFull);
+        }
         let avail = self.discretionary(free);
         if self.closed.load(Ordering::Relaxed) {
             if avail <= self.marks.high {

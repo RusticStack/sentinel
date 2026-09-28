@@ -544,6 +544,54 @@ pub struct Objects {
     /// The deployment's storage limits (R01): the default tenant quota, the
     /// deployment-wide cap and the retention defaults.
     deployment: Mutex<crate::retention::Deployment>,
+    /// Where an evicted object's bytes are fetched back from (R02); unset
+    /// when no external copy is configured.
+    remote: OnceLock<Arc<dyn Remote>>,
+    /// Objects fetched back since the maintenance pass last looked: their
+    /// rows are marked local again there, off the read path.
+    rehydrated: Mutex<Vec<(TenantId, Digest)>>,
+    /// The external copy's replicator status, when one runs (R03): what
+    /// the API and metrics report.
+    replication: OnceLock<Arc<crate::replicate::Status>>,
+}
+
+/// The external copy an evicted object is fetched back from (R02). The
+/// implementation streams the object at `key` into `out` and returns the
+/// bytes written; the store verifies length and digest before the file is
+/// placed.
+pub trait Remote: Send + Sync {
+    fn fetch(&self, key: &str, out: &mut dyn Write) -> Result<u64>;
+}
+
+/// The external key of an object: `objects/<tenant>/<hex[0..2]>/<hex>`,
+/// the local layout under `objects/`.
+pub fn remote_key(tenant: TenantId, digest: &Digest) -> String {
+    let hex = digest.to_string();
+    format!("objects/{tenant}/{}/{hex}", &hex[..2])
+}
+
+/// A writer that hashes what passes through it and counts it, refusing to
+/// grow past `limit`.
+struct Hashing<'a> {
+    file: &'a mut File,
+    hasher: blake3::Hasher,
+    len: u64,
+    limit: u64,
+}
+
+impl Write for Hashing<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.len + buf.len() as u64 > self.limit {
+            return Err(std::io::Error::other("remote object longer than its row"));
+        }
+        let n = self.file.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
 }
 
 impl Objects {
@@ -564,12 +612,117 @@ impl Objects {
             sweep_cursor: Mutex::new(None),
             admission: OnceLock::new(),
             deployment: Mutex::new(crate::retention::Deployment::default()),
+            remote: OnceLock::new(),
+            rehydrated: Mutex::new(Vec::new()),
+            replication: OnceLock::new(),
         })
     }
 
     /// The data directory this store lives under.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Publish the replicator's status (R03).
+    pub fn set_replication(&self, status: Arc<crate::replicate::Status>) {
+        let _ = self.replication.set(status);
+    }
+
+    /// The replicator's status, when an external copy is configured.
+    pub fn replication(&self) -> Option<&Arc<crate::replicate::Status>> {
+        self.replication.get()
+    }
+
+    /// Install the external copy evicted objects are fetched back from (R02).
+    pub fn set_remote(&self, remote: Arc<dyn Remote>) {
+        let _ = self.remote.set(remote);
+    }
+
+    /// Open an object's local file, fetching it back from the external copy
+    /// first when it was evicted (R02). The fetch is verified — length and
+    /// digest — before the file is placed, so a corrupt or truncated remote
+    /// copy is `Corrupt`, never served.
+    fn open_local(&self, tenant: TenantId, digest: Digest, len: u64) -> Result<File> {
+        let path = self.object_path(tenant, &digest);
+        match File::open(&path) {
+            Ok(file) => return Ok(file),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(Error::Io(e)),
+            Err(_) => {}
+        }
+        let Some(remote) = self.remote.get() else {
+            return Err(Error::Corrupt("object missing"));
+        };
+        // One fetch per object at a time: the stripe lock is the upload
+        // lock's, keyed by the digest's first byte.
+        let _stripe = self.upload_io[digest.as_bytes()[0] as usize % UPLOAD_STRIPES]
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Ok(file) = File::open(&path) {
+            return Ok(file);
+        }
+        let tmp = self.tmp();
+        let mut staged = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+        let fetched = {
+            let mut out = Hashing {
+                file: &mut staged,
+                hasher: blake3::Hasher::new(),
+                len: 0,
+                limit: len,
+            };
+            let got = remote.fetch(&remote_key(tenant, &digest), &mut out);
+            got.map(|_| (out.len, Digest(*out.hasher.finalize().as_bytes())))
+        };
+        let placed = match fetched {
+            Ok((got, hashed)) if got == len && hashed == digest => (|| {
+                staged.sync_data()?;
+                drop(staged);
+                if let Some(parent) = path.parent() {
+                    self.ensure_dir(parent)?;
+                }
+                fs::rename(&tmp, &path)?;
+                if let Some(parent) = path.parent() {
+                    sync_dir(parent)?;
+                }
+                Ok(())
+            })(),
+            Ok(_) => Err(Error::Corrupt("remote object content")),
+            Err(e) => Err(e),
+        };
+        if placed.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        placed?;
+        self.rehydrated
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((tenant, digest));
+        Ok(File::open(&path)?)
+    }
+
+    /// Objects fetched back since the last call, for the maintenance pass to
+    /// mark local again.
+    pub fn take_rehydrated(&self) -> Vec<(TenantId, Digest)> {
+        std::mem::take(&mut *self.rehydrated.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Remove the local files of objects whose rows were just marked evicted
+    /// (R02), skipping any a reader or stage pins right now — those stay
+    /// local and the caller marks them back. Runs after the eviction commits.
+    /// Returns what it removed.
+    pub fn evict_files(&self, victims: &[(TenantId, Digest)]) -> Vec<(TenantId, Digest)> {
+        let pins = lock_pins(&self.pins);
+        victims
+            .iter()
+            .filter(|key| !pins.contains_key(key))
+            .filter(|(tenant, digest)| {
+                let path = self.object_path(*tenant, digest);
+                match fs::remove_file(&path) {
+                    Ok(()) => true,
+                    Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+                }
+            })
+            .copied()
+            .collect()
     }
 
     /// Install the disk admission gate; staged writes and uploads charge
@@ -1147,11 +1300,7 @@ impl Objects {
         out: &mut impl Write,
     ) -> Result<u64> {
         let meta = self.meta(conn, tenant, digest)?;
-        let mut file =
-            File::open(self.object_path(tenant, &digest)).map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => Error::Corrupt("object missing"),
-                _ => Error::Io(e),
-            })?;
+        let mut file = self.open_local(tenant, digest, meta.len)?;
         let mut hasher = blake3::Hasher::new();
         let mut buf = vec![0u8; CHUNK];
         let mut len = 0u64;
@@ -1366,9 +1515,12 @@ impl Objects {
                 report.staged += 1;
             }
         }
-        // Committed objects: (tenant, digest) -> len.
-        let mut committed: HashMap<(TenantId, Digest), u64> = HashMap::new();
-        let mut rows = conn.prepare("SELECT tenant_id, digest, len FROM objects")?;
+        // Committed objects: (tenant, digest) -> (len, evicted). An evicted
+        // object (R02: its only copy is in S3) is not expected on disk, and a
+        // file for it is one fetched back.
+        let mut committed: HashMap<(TenantId, Digest), (u64, bool)> = HashMap::new();
+        let mut rows =
+            conn.prepare("SELECT tenant_id, digest, len, evicted_ms IS NOT NULL FROM objects")?;
         let mut query = rows.query([])?;
         while let Some(row) = query.next()? {
             let tenant = tenant_from(row.get::<_, Vec<u8>>(0)?)?;
@@ -1376,7 +1528,10 @@ impl Objects {
                 <[u8; 32]>::try_from(row.get::<_, Vec<u8>>(1)?.as_slice())
                     .map_err(|_| Error::Corrupt("object digest"))?,
             );
-            committed.insert((tenant, digest), row.get::<_, i64>(2)? as u64);
+            committed.insert(
+                (tenant, digest),
+                (row.get::<_, i64>(2)? as u64, row.get(3)?),
+            );
         }
         drop(query);
         drop(rows);
@@ -1395,8 +1550,10 @@ impl Objects {
             };
             self.walk_objects(&entry.path(), tenant, &mut committed, &mut report)?;
         }
-        for ((tenant, digest), _) in committed {
-            report.missing.push(self.object_path(tenant, &digest));
+        for ((tenant, digest), (_, evicted)) in committed {
+            if !evicted {
+                report.missing.push(self.object_path(tenant, &digest));
+            }
         }
         self.recover_manifests(conn, &mut report)?;
         // Staging files for resumable uploads: an open row keeps its file;
@@ -1428,7 +1585,7 @@ impl Objects {
         &self,
         dir: &Path,
         tenant: TenantId,
-        committed: &mut HashMap<(TenantId, Digest), u64>,
+        committed: &mut HashMap<(TenantId, Digest), (u64, bool)>,
         report: &mut Recovery,
     ) -> Result<()> {
         for prefix in fs::read_dir(dir)? {
@@ -1448,7 +1605,7 @@ impl Objects {
                 let digest = Digest::parse(&name.to_string_lossy());
                 match (valid_name, digest) {
                     (true, Ok(digest)) => match committed.remove(&(tenant, digest)) {
-                        Some(len) if entry.metadata()?.len() == len => {}
+                        Some((len, _)) if entry.metadata()?.len() == len => {}
                         Some(_) => report.corrupt.push(path),
                         None => report.orphans.push(path),
                     },
@@ -1501,7 +1658,10 @@ impl Objects {
     /// does not do: it catches content rot, not just missing or truncated
     /// files. Bounded by store size — run it as a drill, not per request.
     pub fn verify(&self, conn: &Connection) -> Result<Vec<Corrupt>> {
-        let mut rows = conn.prepare("SELECT tenant_id, digest, len FROM objects")?;
+        // Evicted objects live only in S3; their copy there is checked when
+        // it is fetched back, not here.
+        let mut rows =
+            conn.prepare("SELECT tenant_id, digest, len FROM objects WHERE evicted_ms IS NULL")?;
         let mut query = rows.query([])?;
         let mut listed = Vec::new();
         while let Some(row) = query.next()? {
@@ -1563,10 +1723,7 @@ impl Objects {
         digest: Digest,
     ) -> Result<(Reader, u64)> {
         let meta = self.meta(conn, tenant, digest)?;
-        let file = File::open(self.object_path(tenant, &digest)).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => Error::Corrupt("object missing"),
-            _ => Error::Io(e),
-        })?;
+        let file = self.open_local(tenant, digest, meta.len)?;
         *lock_pins(&self.pins).entry((tenant, digest)).or_insert(0) += 1;
         Ok((
             Reader {

@@ -1182,6 +1182,7 @@ dependencies = [
  "sentinel-link",
  "sentinel-pipeline",
  "sentinel-protocol",
+ "sentinel-s3",
  "sentinel-store",
  "sentinel-worker",
  "serde",

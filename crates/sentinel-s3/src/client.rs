@@ -55,6 +55,10 @@ pub struct MultipartUpload {
     pub initiated: String,
 }
 
+/// One page of unfinished uploads, and the `(key, upload id)` markers the
+/// next page starts after.
+pub type UploadPage = (Vec<MultipartUpload>, Option<(String, String)>);
+
 /// One page of a listing: full keys and sizes, and where the next starts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObjectPage {
@@ -441,7 +445,7 @@ impl Client {
         &self,
         prefix: &str,
         after: Option<(&str, &str)>,
-    ) -> Result<(Vec<MultipartUpload>, Option<(String, String)>)> {
+    ) -> Result<UploadPage> {
         let mut query = vec![("uploads", ""), ("prefix", prefix), ("max-uploads", "1000")];
         if let Some((key, id)) = after {
             query.push(("key-marker", key));
