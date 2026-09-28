@@ -105,6 +105,8 @@ struct FileConfig {
     // Worker: keep per-repository object mirrors under the data directory
     // (default on; `false` checks out every attempt directly).
     git_mirrors: Option<bool>,
+    // Worker: a loopback address answering `GET /metrics` (R06); off when unset.
+    metrics_listen: Option<String>,
     // Server: disk admission watermarks, quotas and retention (D06).
     storage: Option<StorageFile>,
     // Q06: the optional pinned Tailcat helper, for either role.
@@ -411,6 +413,8 @@ struct WorkerLink {
     tailcat_address: Option<String>,
     /// Whether this worker exposes the remote cache to its executor (Q08).
     remote_cache: bool,
+    /// The loopback address of the metrics listener (R06), when enabled.
+    metrics_listen: Option<SocketAddr>,
 }
 
 enum Role {
@@ -532,9 +536,10 @@ impl Config {
                 || file.mirror_budget_bytes.is_some()
                 || file.image_budget_bytes.is_some()
                 || file.tailcat_address.is_some()
+                || file.metrics_listen.is_some()
             {
                 return Err(Error::config(
-                    "controller, controller_fingerprint, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, disk_bytes, spool_reserve_bytes, spool_quota_bytes, cache_budget_bytes, mirror_budget_bytes, image_budget_bytes and tailcat_address apply to the worker role only",
+                    "controller, controller_fingerprint, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, disk_bytes, spool_reserve_bytes, spool_quota_bytes, cache_budget_bytes, mirror_budget_bytes, image_budget_bytes, tailcat_address and metrics_listen apply to the worker role only",
                 ));
             }
             let listen: SocketAddr = file
@@ -633,6 +638,7 @@ impl Config {
                         || file.tailcat.is_some()
                         || file.tailcat_address.is_some()
                         || file.remote_cache.is_some()
+                        || file.metrics_listen.is_some()
                     {
                         return Err(Error::config(
                             "worker link settings need controller and controller_fingerprint",
@@ -703,6 +709,20 @@ impl Config {
                             "tailcat_address needs [tailcat] enabled = true; without the helper the worker dials the controller directly",
                         ));
                     }
+                    let metrics_listen = file
+                        .metrics_listen
+                        .as_deref()
+                        .map(|text| {
+                            text.parse::<SocketAddr>()
+                                .ok()
+                                .filter(|a| a.ip().is_loopback())
+                                .ok_or_else(|| {
+                                    Error::config(
+                                        "metrics_listen must be a loopback address and port, as in 127.0.0.1:9464",
+                                    )
+                                })
+                        })
+                        .transpose()?;
                     if tailcat_on && file.tailcat_address.is_none() {
                         return Err(Error::config(
                             "tailcat_address is required when [tailcat] is enabled: it is the controller's tc… address from its <data_dir>/tailcat/address file",
@@ -732,6 +752,7 @@ impl Config {
                             .as_ref()
                             .map(RemoteCacheFile::on)
                             .unwrap_or(true),
+                        metrics_listen,
                     })
                 }
                 _ => {
@@ -1917,10 +1938,13 @@ mod worker_role {
         git_mirrors: bool,
         spool: (Option<u64>, Option<u64>),
         budgets: [Option<u64>; 3],
+        metrics: Arc<crate::worker_metrics::Metrics>,
     ) -> Box<dyn LinkExecutor> {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
+        let counted = Arc::clone(&metrics);
         let notify = move |notice: sentinel_worker::executor::Notice| {
+            counted.count(&notice);
             tracing::dispatcher::with_default(&dispatch, || {
                 span.in_scope(|| match notice {
                     sentinel_worker::executor::Notice::Started(attempt) => {
@@ -2014,6 +2038,7 @@ mod worker_role {
                     containers_removed = recovered.containers_removed,
                     workspaces_removed = recovered.workspaces_removed
                 );
+                let _ = metrics.executor.set(executor.clone());
                 Box::new(executor)
             }
             Err(error) => {
@@ -2308,13 +2333,28 @@ mod worker_role {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
         let enrollment_file = link.enrollment_file.clone();
+        let metrics = Arc::new(crate::worker_metrics::Metrics::default());
+        let events = Arc::clone(&metrics);
         let executor = executor(
             &config.data_dir,
             worker,
             link.git_mirrors,
             (link.spool_reserve_bytes, link.spool_quota_bytes),
             link.budgets,
+            Arc::clone(&metrics),
         );
+        if let Some(listen) = link.metrics_listen {
+            let bound = crate::worker_metrics::serve(
+                listen,
+                Arc::clone(&metrics),
+                config.data_dir.clone(),
+                disk_free,
+            )
+            .map_err(|error| {
+                Error::runtime(format!("cannot listen for metrics on {listen}: {error}"))
+            })?;
+            tracing::info!(event = "metrics_listening", address = %bound);
+        }
         let tunnel = forward.clone();
         let thread = std::thread::Builder::new()
             .name("sentinel-worker-link".into())
@@ -2329,6 +2369,8 @@ mod worker_role {
                             &grip,
                             &|event| match event {
                                 sentinel_link::worker::Event::Connected { worker, enrolled } => {
+                                    events.connected.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    events.connects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if enrolled && let Some(path) = &enrollment_file {
                                         // Spent: the secret is refused from now on
                                         // anyway, but a spent secret on disk invites
@@ -2338,6 +2380,8 @@ mod worker_role {
                                     tracing::info!(event = "link_connected", worker = %worker, enrolled);
                                 }
                                 sentinel_link::worker::Event::Disconnected(error) => {
+                                    events.connected.store(false, std::sync::atomic::Ordering::Relaxed);
+                                    events.disconnects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(event = "link_lost", error = %error);
                                     // The same forward can take tens of seconds
                                     // to carry a new session after the

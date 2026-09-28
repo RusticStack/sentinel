@@ -461,3 +461,59 @@ fn backup_ids_sort_by_time() {
         Err(Error::InvalidInput(_))
     ));
 }
+
+/// R07: a backup interrupted part-way (its staging directory and a
+/// half-copied object left behind) is never listed, the next backup removes
+/// what it left and succeeds, an object the data directory lost is recorded
+/// instead of failing the backup, and pruning removes the stray part file.
+#[test]
+fn an_interrupted_backup_leaves_nothing_the_next_one_does_not_clean() {
+    let f = fixture();
+    f.put(b"backed up before the interruption");
+    let first = f.backup();
+    // What a kill mid-backup leaves: a staging directory with a partial
+    // snapshot, and an object's `.part` in the shared store.
+    let staging = f.target().join(".20260101T000000Z.partial");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("metadata.sqlite"), b"SQLite format 3\0trunc").unwrap();
+    let stray = f
+        .target()
+        .join("objects")
+        .join(f.tenant.to_string())
+        .join("00")
+        .join("00dead.part");
+    fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    fs::write(&stray, b"half an object").unwrap();
+    assert_eq!(backup::list(&f.target()).unwrap(), vec![first.id.clone()]);
+    assert!(backup::verify(&f.target(), &first.id).unwrap().ok());
+
+    // An object the data directory has since lost.
+    let lost = f.put(b"lost from the data directory");
+    let hex = lost.to_string();
+    fs::remove_file(
+        f.data
+            .join("objects")
+            .join(f.tenant.to_string())
+            .join(&hex[..2])
+            .join(&hex),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(1_100));
+    let second = f.backup();
+    assert_eq!(second.partials_removed, 1);
+    assert!(!staging.exists());
+    assert_eq!(second.objects_missing.len(), 1, "{second:?}");
+    assert!(second.objects_missing[0].ends_with(&hex));
+    let manifest = backup::manifest(&f.target(), &second.id).unwrap();
+    assert_eq!(manifest["objects"]["missing"].as_array().unwrap().len(), 1);
+    let check = backup::verify(&f.target(), &second.id).unwrap();
+    assert_eq!(check.missing.len(), 1, "verification says so too");
+    assert!(check.corrupt.is_empty());
+    assert_eq!(
+        backup::list(&f.target()).unwrap(),
+        vec![first.id.clone(), second.id.clone()]
+    );
+    backup::prune(&f.target(), 2).unwrap();
+    assert!(!stray.exists(), "no kept backup names the part file");
+    assert!(backup::verify(&f.target(), &first.id).unwrap().ok());
+}

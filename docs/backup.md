@@ -45,6 +45,8 @@ keep = 24                      # newest kept, default 24
 
 The first backup runs one interval after start (a restarting controller does not take one per restart); a failed one is recorded and retried at the next interval, never stopping the controller. `POST /admin/backups` takes one now (`409 conflict` while one runs), `GET /admin/backups` lists them with the scheduler's state, and **Platform → Storage → Backups** shows both and has a *Back up now* button ([API](api.md)).
 
+A backup is staged in `DIR/.<id>.partial` and renamed to `DIR/<id>` only after its `backup.json` is durable, so an interrupted one is never listed. The next backup removes every staging directory an interruption left (`partials_removed` in its report). An object the database names but the data directory lost is recorded in `backup.json`'s `objects.missing` and skipped, like one that fails its digest (`objects.corrupt`). The backup still completes, and `admin backup create` exits 2 so it is noticed ([failure drills](resilience.md)).
+
 Offline, beside a stopped controller: `sentinel admin backup create --data-dir DATA --to DIR`. Pruning keeps the newest `keep` and removes every shared object, manifest and log file no kept backup names: `sentinel admin backup prune --dir DIR --keep N`.
 
 ## Verifying

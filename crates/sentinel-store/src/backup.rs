@@ -242,6 +242,11 @@ pub struct Report {
     pub objects_remote: u64,
     /// Objects whose local bytes did not match their digest: not stored.
     pub objects_corrupt: Vec<String>,
+    /// Objects the database names but the data directory no longer holds:
+    /// not stored. The backup carries on without them (R07).
+    pub objects_missing: Vec<String>,
+    /// Staging directories an interrupted backup left, removed first.
+    pub partials_removed: u64,
     pub manifests: u64,
     pub manifests_copied: u64,
     pub log_files_copied: u64,
@@ -270,12 +275,13 @@ pub fn create(
         std::thread::sleep(std::time::Duration::from_millis(1_000));
         id = backup_id(UnixMillis::now());
     }
-    let staging = target.join(format!(".{id}.partial"));
-    if staging.exists() {
-        fs::remove_dir_all(&staging)?;
-    }
-    fs::create_dir_all(&staging)?;
     let _maintenance = objects.hold_maintenance();
+    // An interrupted backup (a crash, a kill, a full target) leaves its
+    // staging directory behind; never listed, it only holds space. One
+    // backup runs at a time, so every staging directory now is stale.
+    let partials_removed = remove_partials(target)?;
+    let staging = target.join(format!(".{id}.partial"));
+    fs::create_dir_all(&staging)?;
 
     // The database at one instant.
     let snapshot_path = staging.join(METADATA);
@@ -291,6 +297,7 @@ pub fn create(
         id: id.clone(),
         metadata_bytes,
         key_ids: crate::reseal::key_ids(&snapshot)?,
+        partials_removed,
         ..Report::default()
     };
 
@@ -305,7 +312,14 @@ pub fn create(
         if fs::metadata(&dst).is_ok_and(|m| m.len() == row.len) {
             continue;
         }
-        let (got, len) = copy_file(&data_dir.join(&row.rel), &dst)?;
+        let (got, len) = match copy_file(&data_dir.join(&row.rel), &dst) {
+            Ok(copied) => copied,
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                report.objects_missing.push(row.rel.display().to_string());
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if got != row.digest || len != row.len {
             let _ = fs::remove_file(&dst);
             report.objects_corrupt.push(row.rel.display().to_string());
@@ -408,6 +422,7 @@ pub fn create(
             "copied": report.objects_copied,
             "bytes_copied": report.object_bytes_copied,
             "corrupt": report.objects_corrupt,
+            "missing": report.objects_missing,
         },
         "manifests": { "rows": report.manifests, "copied": report.manifests_copied },
         "logs": { "files_copied": report.log_files_copied, "bytes_copied": report.log_bytes_copied },
@@ -440,6 +455,26 @@ fn restrict(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn restrict(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+/// Remove the staging directories (`.<id>.partial`) interrupted backups
+/// left in `target`; how many.
+fn remove_partials(target: &Path) -> Result<u64> {
+    let mut removed = 0;
+    for entry in fs::read_dir(target)?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(id) = name
+            .strip_prefix('.')
+            .and_then(|n| n.strip_suffix(".partial"))
+            && valid_id(id)
+            && entry.metadata().is_ok_and(|m| m.is_dir())
+        {
+            fs::remove_dir_all(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// The backups in `target`, oldest first.
@@ -935,6 +970,7 @@ impl Control for Scheduler {
                 "object_bytes_copied": r.object_bytes_copied,
                 "objects_remote": r.objects_remote,
                 "objects_corrupt": r.objects_corrupt.len(),
+                "objects_missing": r.objects_missing.len(),
                 "log_bytes_copied": r.log_bytes_copied,
             })),
             "last_failure_ms": state.last_failure_ms,

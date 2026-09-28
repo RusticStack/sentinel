@@ -116,6 +116,7 @@ pub(super) fn route(
         ("GET", ["api", "v1", "admin", "storage"]) => deployment_storage(state, request),
         ("GET", ["api", "v1", "admin", "backups"]) => list_backups(state, request),
         ("POST", ["api", "v1", "admin", "backups"]) => start_backup(state, request),
+        ("GET", ["api", "v1", "admin", "diagnostics"]) => diagnostics(state, request, query),
         ("GET", ["api", "v1", "tenants", slug, "storage"]) => tenant_storage(state, request, slug),
         ("PUT", ["api", "v1", "tenants", slug, "repos", name, "storage"]) => {
             set_storage(state, request, slug, Some(name))
@@ -548,6 +549,7 @@ fn deployment_storage(state: &State, request: &Request) -> Route {
                 "last_failure_ms": at(r.last_failure_ms.load(Relaxed)),
                 "consecutive_failures": r.consecutive_failures.load(Relaxed),
                 "last_error": r.last_error.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+                "last_local_fault": r.last_local_fault.lock().unwrap_or_else(|p| p.into_inner()).clone(),
                 "replicated_objects": r.replicated_objects.load(Relaxed),
                 "replicated_bytes": r.replicated_bytes.load(Relaxed),
                 "replicated_logs": r.replicated_logs.load(Relaxed),
@@ -555,6 +557,7 @@ fn deployment_storage(state: &State, request: &Request) -> Route {
                 "fetched_objects": r.fetched_objects.load(Relaxed),
                 "deleted_copies": r.deleted_copies.load(Relaxed),
                 "aborted_uploads": r.aborted_uploads.load(Relaxed),
+                "local_faults": r.local_faults.load(Relaxed),
             })
         }),
     }))
@@ -589,6 +592,82 @@ fn list_backups(state: &State, request: &Request) -> Route {
         })
         .collect();
     ok(json!({ "configured": true, "scheduler": backups.status(), "backups": listed }))
+}
+
+/// `GET /admin/diagnostics[?integrity=1]`: the sanitized diagnostic bundle
+/// (R06) — the database's counts and workers ([`sentinel_store::bundle`])
+/// plus this process's runtime state. No names of tenants, repositories or
+/// users, no addresses, paths, endpoints, credentials or log text; safe to
+/// attach to a support request. `integrity=1` adds SQLite's quick check (a
+/// full read of the database).
+fn diagnostics(state: &State, request: &Request, query: &str) -> Route {
+    use std::sync::atomic::Ordering::Relaxed;
+    platform(state, request, false)?;
+    let integrity = query_param(query, "integrity") == Some("1");
+    let now = UnixMillis::now().0;
+    let mut bundle = state
+        .store
+        .read(move |c| sentinel_store::bundle::collect(c, now, integrity))
+        .map_err(store_error)?;
+    let process = sentinel_core::process::figures();
+    let s = state.controller.stats();
+    let ready = match super::ready(state) {
+        Ok(Reply::Json(_, v, _)) => v,
+        _ => Value::Null,
+    };
+    let backups = state.objects.backups().map(|b| {
+        let mut status = b.status();
+        // The target path is the operator's, not the bundle's.
+        if let Some(o) = status.as_object_mut() {
+            o.remove("target");
+        }
+        status
+    });
+    bundle["runtime"] = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "schema_binary": sentinel_store::schema::LATEST,
+        "worker_protocol": [
+            sentinel_protocol::negotiate::SUPPORTED_MIN.0,
+            sentinel_protocol::negotiate::SUPPORTED_MAX.0,
+        ],
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "process": {
+            "resident_bytes": process.resident_bytes,
+            "cpu_seconds": process.cpu_seconds,
+            "open_fds": process.open_fds,
+            "threads": process.threads,
+        },
+        "ready": ready,
+        "workers_connected": state.controller.connected().len(),
+        "link": {
+            "admitted": s.admitted.load(Relaxed),
+            "rejected": s.rejected.load(Relaxed),
+            "lapsed": s.lapsed.load(Relaxed),
+            "expired": s.expired.load(Relaxed),
+            "abandoned": s.abandoned.load(Relaxed),
+            "log_refused": s.log_refused.load(Relaxed),
+            "placement_errors": s.placement_errors.load(Relaxed),
+            "sweep_errors": s.sweep_errors.load(Relaxed),
+        },
+        "http": state.requests.snapshot(),
+        "storage": {
+            "metadata_bytes": state.store.metadata_bytes(),
+            "admission": state.objects.admission().map(|a| json!({
+                "open": a.is_open(),
+                "free_bytes": a.free(),
+                "reserve_bytes": a.reserve(),
+                "backlog_full": a.backlog_full(),
+            })),
+            "external_copy": state.objects.replication().map(|r| json!({
+                "state": r.state(),
+                "backlog_bytes": r.backlog_bytes.load(Relaxed),
+                "consecutive_failures": r.consecutive_failures.load(Relaxed),
+            })),
+            "backups": backups,
+        },
+    });
+    ok(bundle)
 }
 
 /// `POST /admin/backups`: take a backup now (it runs on the scheduler's

@@ -639,6 +639,30 @@ mod linux {
             }
         }
 
+        /// The `n`th record (1-based) whose `event` field is `event`,
+        /// waiting up to `wait`.
+        fn nth_event(&mut self, event: &str, n: usize, wait: Duration) -> serde_json::Value {
+            let deadline = Instant::now() + wait;
+            loop {
+                if let Some(found) = self
+                    .seen
+                    .iter()
+                    .filter(|record| record["fields"]["event"] == event)
+                    .nth(n - 1)
+                {
+                    return found.clone();
+                }
+                let line = self
+                    .lines
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or_else(|_| {
+                        panic!("no {event} #{n} before the deadline: {:?}", self.seen)
+                    });
+                self.seen
+                    .push(serde_json::from_str(&line).expect("complete JSON event"));
+            }
+        }
+
         fn terminate(mut self) {
             assert!(
                 Command::new("kill")
@@ -1249,6 +1273,189 @@ mod linux {
         fn server_fingerprint(dir: &std::path::Path) -> Vec<u8> {
             fs::read(dir.join("controller.crt")).unwrap()
         }
+    }
+
+    /// R07: recovery onto a replacement host. A controller with an enrolled,
+    /// connected worker is lost; its last backup is restored into a fresh
+    /// data directory (the new host's), a controller started there on the
+    /// same link address presents the same identity, and the worker — which
+    /// kept its pin and never re-enrolls — reconnects on its own.
+    #[test]
+    fn a_worker_reconnects_to_a_controller_restored_onto_a_new_host() {
+        if !(cfg!(feature = "server") && cfg!(feature = "worker")) {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let old_host = temp.path().join("old-host");
+        let new_host = temp.path().join("new-host");
+        let backups = temp.path().join("backups");
+        let worker_dir = temp.path().join("worker");
+        fs::create_dir_all(&old_host).unwrap();
+        let admin = |args: &[&str]| {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+                .arg("admin")
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::io::Write::write_all(
+                child.stdin.as_mut().unwrap(),
+                b"correct horse battery staple",
+            )
+            .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let old = old_host.to_str().unwrap();
+        admin(&["bootstrap", "--username", "root", "--data-dir", old]);
+        admin(&["tenant", "create", "--slug", "acme", "--data-dir", old]);
+        admin(&[
+            "pool",
+            "create",
+            "--name",
+            "builders",
+            "--tenant",
+            "acme",
+            "--data-dir",
+            old,
+        ]);
+        let secret = admin(&["worker", "enroll", "--pool", "builders", "--data-dir", old]);
+        let enrollment = temp.path().join("enrollment");
+        fs::write(&enrollment, &secret).unwrap();
+
+        let config = temp.path().join("server.toml");
+        fs::write(
+            &config,
+            "listen = '127.0.0.1:0'\napi_listen = '127.0.0.1:0'",
+        )
+        .unwrap();
+        let mut server = Logged::spawn(&[
+            "server",
+            "--config",
+            config.to_str().unwrap(),
+            "--data-dir",
+            old,
+        ]);
+        let listening = server.event("link_listening");
+        let addr = listening["fields"]["addr"].as_str().unwrap().to_owned();
+        let fingerprint = listening["fields"]["fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let worker_config = temp.path().join("worker.toml");
+        fs::write(
+            &worker_config,
+            format!(
+                "controller = '{addr}'\ncontroller_fingerprint = '{fingerprint}'\nworker_name = 'survivor'\nenrollment_file = '{}'\ncpu_millis = 1000\nmemory_bytes = 1073741824\n",
+                enrollment.display()
+            ),
+        )
+        .unwrap();
+        let mut worker = Logged::spawn(&[
+            "worker",
+            "--config",
+            worker_config.to_str().unwrap(),
+            "--data-dir",
+            worker_dir.to_str().unwrap(),
+        ]);
+        assert_eq!(worker.event("link_connected")["fields"]["enrolled"], true);
+        let id = fs::read_to_string(worker_dir.join("worker.id")).unwrap();
+
+        // The old host goes: the controller stops, the last backup of its
+        // data directory survives elsewhere.
+        server.terminate();
+        worker.nth_event("link_lost", 1, Duration::from_secs(15));
+        let report: serde_json::Value = serde_json::from_str(&admin(&[
+            "backup",
+            "create",
+            "--data-dir",
+            old,
+            "--to",
+            backups.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let backup_id = report["id"].as_str().unwrap().to_owned();
+        let verified = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+            .args([
+                "admin",
+                "backup",
+                "verify",
+                "--dir",
+                backups.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            verified.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verified.stdout)
+        );
+        fs::remove_dir_all(&old_host).unwrap();
+
+        // The new host: restored, then started on the address workers dial.
+        let restore = Command::new(env!("CARGO_BIN_EXE_sentinel"))
+            .args([
+                "admin",
+                "restore",
+                "--from",
+                backups.to_str().unwrap(),
+                "--id",
+                &backup_id,
+                "--data-dir",
+                new_host.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            restore.status.success(),
+            "{}",
+            String::from_utf8_lossy(&restore.stderr)
+        );
+        let new_config = temp.path().join("new-server.toml");
+        fs::write(
+            &new_config,
+            format!("listen = '{addr}'\napi_listen = '127.0.0.1:0'"),
+        )
+        .unwrap();
+        let mut replacement = Logged::spawn(&[
+            "server",
+            "--config",
+            new_config.to_str().unwrap(),
+            "--data-dir",
+            new_host.to_str().unwrap(),
+        ]);
+        let listening = replacement.event("link_listening");
+        assert_eq!(
+            listening["fields"]["fingerprint"],
+            fingerprint.as_str(),
+            "the same identity"
+        );
+
+        // The worker comes back by itself, as the worker it was.
+        let again = worker.nth_event("link_connected", 2, Duration::from_secs(60));
+        assert_eq!(again["fields"]["enrolled"], false, "no second enrollment");
+        assert_eq!(again["fields"]["worker"].as_str().unwrap(), id.trim());
+        worker.terminate();
+        replacement.terminate();
+        let listed = admin(&[
+            "worker",
+            "list",
+            "--pool",
+            "builders",
+            "--data-dir",
+            new_host.to_str().unwrap(),
+        ]);
+        assert!(
+            listed.contains(id.trim()) && listed.contains("survivor"),
+            "{listed}"
+        );
     }
 }
 

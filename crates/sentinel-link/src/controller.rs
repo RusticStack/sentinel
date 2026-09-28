@@ -2997,6 +2997,11 @@ impl Handle {
         self.0.wake();
     }
 
+    /// The link's counters (R06: what `/metrics` reports).
+    pub fn stats(&self) -> &Stats {
+        &self.0.stats
+    }
+
     pub fn connected(&self) -> Vec<WorkerId> {
         self.0
             .fleet

@@ -1310,3 +1310,112 @@ fn an_upload_past_the_object_bound_is_refused_at_begin() {
         Err(Error::InvalidInput("upload length"))
     ));
 }
+
+/// R07: sustained pressure. Eight writers keep staging objects while free
+/// space swings across the watermarks for several seconds, closing and
+/// reopening admission. Every write is admitted or refused `StorageFull`,
+/// never anything else; both happen; what was admitted commits and reads
+/// back; and when it settles, no charge is left in flight and no staging
+/// file is left behind.
+#[test]
+fn admission_flapping_under_sustained_writes_leaks_nothing() {
+    use std::sync::atomic::AtomicBool;
+    let mut fx = fixture();
+    let objects = Arc::new(Objects::open(fx.dir.path()).unwrap());
+    let free = Arc::new(AtomicU64::new(1 << 30));
+    let admission = Arc::new(probed(
+        &free,
+        Watermarks {
+            reserve: 1 << 20,
+            low: 64 << 20,
+            high: 128 << 20,
+            floor: 1 << 20,
+        },
+    ));
+    objects.set_admission(Arc::clone(&admission));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (send, receive) = std::sync::mpsc::channel();
+    let refused = Arc::new(AtomicU64::new(0));
+    let writers: Vec<_> = (0..8u64)
+        .map(|w| {
+            let (objects, stop, send, refused, tenant) = (
+                Arc::clone(&objects),
+                Arc::clone(&stop),
+                send.clone(),
+                Arc::clone(&refused),
+                fx.tenant,
+            );
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    n += 1;
+                    let body = format!("writer {w} object {n} ").repeat(1 + (n % 64) as usize);
+                    match objects.stage(tenant, body.as_bytes(), u64::MAX, Expect::default()) {
+                        Ok(staged) => {
+                            // Half are committed, half abandoned (a failed
+                            // request): both must return their charge.
+                            if n.is_multiple_of(2) {
+                                send.send((staged, body)).unwrap();
+                            }
+                        }
+                        Err(Error::StorageFull) => {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(other) => panic!("unexpected: {other:?}"),
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        })
+        .collect();
+    drop(send);
+    // Free space swings: open, below low, between the marks, above high.
+    let swings = std::thread::spawn({
+        let (free, stop) = (Arc::clone(&free), Arc::clone(&stop));
+        move || {
+            for step in 0..8 {
+                let at = [1 << 30, 32 << 20, 96 << 20, 1 << 30][step % 4];
+                free.store(at, Ordering::Relaxed);
+                std::thread::sleep(TTL);
+            }
+            free.store(1 << 30, Ordering::Relaxed);
+            std::thread::sleep(TTL);
+            stop.store(true, Ordering::Relaxed);
+        }
+    });
+    let mut committed = Vec::new();
+    for (staged, body) in receive {
+        let tx = fx.conn.transaction().unwrap();
+        objects.commit(&tx, &staged).unwrap();
+        tx.commit().unwrap();
+        committed.push((staged.digest(), body));
+        drop(staged);
+    }
+    swings.join().unwrap();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    assert!(
+        refused.load(Ordering::Relaxed) > 0,
+        "admission closed at least once"
+    );
+    assert!(
+        committed.len() > 100,
+        "and writes went through: {}",
+        committed.len()
+    );
+    assert_eq!(admission.total_inflight(), 0, "every charge came back");
+    refresh();
+    assert!(admission.is_open());
+    for (digest, body) in committed.iter().step_by(17) {
+        let mut out = Vec::new();
+        objects
+            .read(&fx.conn, fx.tenant, *digest, &mut out)
+            .unwrap();
+        assert_eq!(&out, body.as_bytes());
+    }
+    let staging_left = fs::read_dir(fx.dir.path().join("incoming"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(staging_left, 0, "no staging file left behind");
+}

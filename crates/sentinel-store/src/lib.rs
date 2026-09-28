@@ -14,6 +14,7 @@
 pub mod artifacts;
 pub mod auth;
 pub mod backup;
+pub mod bundle;
 pub mod checks;
 pub mod codec;
 pub mod dispatch;

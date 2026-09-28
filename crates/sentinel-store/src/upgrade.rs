@@ -157,10 +157,18 @@ pub fn open_upgrading(path: &Path, durability: Durability) -> Result<(Store, Opt
     let mut snapshot = None;
     if !inspection.fresh && !inspection.newer && !inspection.pending.is_empty() {
         let dest = snapshot_path(path, inspection.database);
-        if dest.exists() {
-            std::fs::remove_file(&dest)?;
+        // Written under a temporary name and renamed once durable (R07): a
+        // copy interrupted by a crash or a full disk is never taken for a
+        // complete one, and a rerun starts it again.
+        let mut partial = dest.clone().into_os_string();
+        partial.push(".partial");
+        let partial = PathBuf::from(partial);
+        for stale in [&partial, &dest] {
+            if stale.exists() {
+                std::fs::remove_file(stale)?;
+            }
         }
-        let dest_str = dest
+        let partial_str = partial
             .to_str()
             .ok_or(Error::InvalidInput("database path must be UTF-8"))?
             .to_owned();
@@ -169,9 +177,16 @@ pub fn open_upgrading(path: &Path, durability: Durability) -> Result<(Store, Opt
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
-        conn.execute("VACUUM INTO ?1", [dest_str])?;
+        conn.execute("VACUUM INTO ?1", [partial_str])?;
         drop(conn);
-        std::fs::File::open(&dest)?.sync_all()?;
+        std::fs::File::open(&partial)?.sync_all()?;
+        std::fs::rename(&partial, &dest)?;
+        if let Some(dir) = dest.parent()
+            && let Ok(dir) = std::fs::File::open(dir)
+        {
+            // A directory handle syncs on Unix; elsewhere it is best effort.
+            let _ = dir.sync_all();
+        }
         let all = snapshots(path);
         for (_, old) in all.iter().take(all.len().saturating_sub(SNAPSHOTS_KEPT)) {
             let _ = std::fs::remove_file(old);
