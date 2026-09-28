@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod id;
+pub mod process;
 pub mod state;
 pub mod time;
 

@@ -59,6 +59,8 @@ pub(crate) enum Reply {
     Empty(u16, Vec<Header>),
     Stream(u16, Box<dyn Read + Send>, u64, Vec<Header>),
     Html(u16, String, Vec<Header>),
+    /// Plain text with its own content type (the metrics exposition).
+    Text(u16, &'static str, String),
 }
 pub(crate) type Route = Result<Reply, ApiError>;
 
@@ -114,6 +116,7 @@ pub(crate) fn store_error(e: StoreError) -> ApiError {
 
 /// Serve one request end to end; nothing here panics on client input.
 pub(crate) fn handle(state: &State, request: &mut Request) {
+    let started = std::time::Instant::now();
     let method = request.method().to_owned();
     let url = request.url().to_owned();
     let (full_path, query) = match url.split_once('?') {
@@ -130,7 +133,25 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
             Reply::Json(error.http_status(), json!(error), headers)
         }
     };
+    let status = match &reply {
+        Reply::Json(s, ..)
+        | Reply::JsonText(s, ..)
+        | Reply::Empty(s, ..)
+        | Reply::Stream(s, ..)
+        | Reply::Html(s, ..)
+        | Reply::Text(s, ..) => *s,
+    };
+    // Timed to the answer's start: a streamed body's transfer time is the
+    // client's, not the controller's.
+    state.requests.observe(status, started.elapsed());
     match reply {
+        Reply::Text(status, content_type, body) => {
+            let response = Response::from_string(body)
+                .with_status_code(StatusCode(status))
+                .with_header(header("content-type", content_type))
+                .with_header(header("cache-control", "no-store"));
+            let _ = request.respond(response);
+        }
         Reply::Json(status, body, headers) => {
             let mut response = Response::from_string(body.to_string())
                 .with_status_code(StatusCode(status))
@@ -368,8 +389,21 @@ pub(crate) fn route(
         return reply;
     }
     match (method, parts.as_slice()) {
-        // Public: whether the deployment offers GitHub sign-in is what a
-        // sign-in page shows, not a secret.
+        ("GET", ["metrics"]) | ("GET", ["api", "v1", "metrics"]) => {
+            // Platform administration: a scrape sees the whole deployment.
+            let who = identify(state, request, false)?;
+            auth::require_scope(&who, Scopes::PLATFORM_ADMIN)?;
+            let authority = who.authority();
+            state
+                .store
+                .read(move |c| authority.require_platform(c))
+                .map_err(store_error)?;
+            Ok(Reply::Text(
+                200,
+                "text/plain; version=0.0.4; charset=utf-8",
+                crate::metrics::render(state),
+            ))
+        }
         ("GET", ["api", "v1", "version"]) => {
             // Any authenticated caller: what an operator or a CLI needs to
             // judge skew (R05), and nothing the unauthenticated need.
@@ -394,9 +428,15 @@ pub(crate) fn route(
                 },
             }))
         }
+        // Public: whether the deployment offers GitHub sign-in is what a
+        // sign-in page shows, not a secret. Liveness: nothing is checked.
         ("GET", ["api", "v1", "health"]) => {
             ok(json!({ "ok": true, "github_sign_in": state.github.is_some() }))
         }
+        // Public readiness (R06): can this controller serve — not shutting
+        // down, the store reading and committing — and what is degraded
+        // while it does. Codes only, nothing about tenants or data.
+        ("GET", ["api", "v1", "ready"]) => ready(state),
         ("POST", ["mcp"]) => crate::mcp::post(state, request),
         ("GET", ["mcp"]) => crate::mcp::get(state, request),
         ("DELETE", ["mcp"]) => crate::mcp::delete(state, request),
@@ -1579,6 +1619,55 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
             "text": String::from_utf8_lossy(&f.bytes),
         })).collect::<Vec<_>>(),
     }))
+}
+
+/// Readiness for a load balancer or an orchestrator: `503` while shutting
+/// down or when the store cannot read or commit; otherwise `200` with the
+/// degraded conditions an operator should know about.
+fn ready(state: &State) -> Route {
+    let stopping = state.stop.load(Ordering::Acquire);
+    let reads = state
+        .store
+        .read(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?))
+        .is_ok();
+    let commits = !stopping && state.store.writer().write(|_| Ok(())).is_ok();
+    let mut degraded: Vec<&str> = Vec::new();
+    if let Some(a) = state.objects.admission()
+        && !a.is_open()
+    {
+        degraded.push(if a.backlog_full() {
+            "external_copy_backlog"
+        } else {
+            "disk_below_watermark"
+        });
+    }
+    if state
+        .objects
+        .replication()
+        .is_some_and(|r| r.state() == "degraded")
+    {
+        degraded.push("external_copy");
+    }
+    if state
+        .objects
+        .backups()
+        .is_some_and(|b| !b.status()["last_failure"].is_null())
+    {
+        degraded.push("backup_failing");
+    }
+    if state.controller.connected().is_empty() {
+        degraded.push("no_workers_connected");
+    }
+    let ready = !stopping && reads && commits;
+    Ok(Reply::Json(
+        if ready { 200 } else { 503 },
+        json!({
+            "ready": ready,
+            "checks": { "stopping": stopping, "store_reads": reads, "store_commits": commits },
+            "degraded": degraded,
+        }),
+        Vec::new(),
+    ))
 }
 
 /// `GET /runs/{run}/wait?since=<16 hex>&timeout_ms=1..25000`: answer as

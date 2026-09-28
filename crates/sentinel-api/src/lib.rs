@@ -16,6 +16,7 @@ pub mod auth;
 mod github;
 mod http;
 mod mcp;
+mod metrics;
 mod oauth;
 mod routes;
 mod secret_routes;
@@ -181,6 +182,8 @@ pub(crate) struct State {
     pub trusted_proxies: Vec<TrustedProxy>,
     /// Outbound calls to third parties in flight ([`OUTBOUND`]).
     pub outbound: Outbound,
+    /// What every answered request adds to `/metrics` (R06).
+    pub requests: metrics::Requests,
 }
 
 /// Who holds the parked long-poll slots: at most [`SUBSCRIBERS`] in total
@@ -203,6 +206,16 @@ pub(crate) enum SubscriberRefusal {
 }
 
 impl Subscribers {
+    /// Slots parked right now.
+    pub(crate) fn held(&self) -> usize {
+        self.held
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(_, n)| usize::from(*n))
+            .sum()
+    }
+
     /// Take one slot for `user`, released when the guard drops.
     pub(crate) fn take(&self, user: UserId) -> Result<Subscriber<'_>, SubscriberRefusal> {
         let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
@@ -293,6 +306,7 @@ impl Server {
             github,
             trusted_proxies: config.trusted_proxies,
             outbound: Outbound::default(),
+            requests: metrics::Requests::default(),
         });
         let conns = http::listen(
             listener,

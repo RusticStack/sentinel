@@ -1210,3 +1210,107 @@ fn a_full_external_copy_backlog_is_what_the_queue_and_the_storage_report_say() {
     let (_, queue) = get(&f, "/api/v1/queue?tenant=acme", &f.auth);
     assert_eq!(queue["placement_paused"], Value::Null);
 }
+
+/// R06: `/metrics` is platform administration and counts what it answered,
+/// including refused credentials; `/ready` is public and says what is
+/// degraded; the diagnostic bundle counts without naming.
+#[test]
+fn metrics_readiness_and_the_diagnostic_bundle() {
+    let f = Fixture::new(1);
+    let dana = f.member(f.dana);
+    // Refusals first, so the counters have something to show.
+    assert_eq!(get(&f, "/api/v1/metrics", "Bearer sntl_nope").0, 401);
+    assert_eq!(get(&f, "/metrics", &dana).0, 403);
+    assert_eq!(get(&f, "/api/v1/admin/diagnostics", &dana).0, 403);
+
+    let (status, _, body) = call(&f.base, "GET", "/api/v1/ready", None, &[]);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ready"], true);
+    assert_eq!(body["checks"]["store_commits"], true);
+    let degraded: Vec<&str> = body["degraded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(degraded.contains(&"no_workers_connected"), "{body}");
+
+    let (status, headers, body) = call(
+        &f.base,
+        "GET",
+        "/metrics",
+        None,
+        &[("authorization", &f.auth)],
+    );
+    assert_eq!(status, 200);
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v.starts_with("text/plain; version=0.0.4")),
+        "{headers:?}"
+    );
+    let text = body.as_str().expect("text exposition");
+    let sample = |name: &str| -> f64 {
+        text.lines()
+            .find(|l| l.starts_with(name) && l[name.len()..].starts_with(' '))
+            .and_then(|l| l.rsplit(' ').next()?.parse().ok())
+            .unwrap_or_else(|| panic!("{name} missing:\n{text}"))
+    };
+    assert!(sample("sentinel_auth_refusals_total{reason=\"unauthenticated\"}") >= 1.0);
+    assert!(sample("sentinel_auth_refusals_total{reason=\"forbidden\"}") >= 2.0);
+    assert!(sample("sentinel_http_requests_total{class=\"2xx\"}") >= 1.0);
+    assert!(sample("sentinel_http_request_duration_seconds_count") >= 4.0);
+    assert!(sample("sentinel_storage_metadata_bytes") > 0.0);
+    assert!(text.contains(&format!(
+        "sentinel_build_info{{version=\"{}\",schema=\"{}\"}} 1",
+        env!("CARGO_PKG_VERSION"),
+        sentinel_store::schema::LATEST
+    )));
+    // Every family is declared once, and every sample line parses.
+    let mut families = std::collections::HashSet::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("# TYPE ") {
+            assert!(
+                families.insert(rest.split(' ').next().unwrap().to_owned()),
+                "{line}"
+            );
+        } else if !line.starts_with('#') {
+            let value = line.rsplit(' ').next().unwrap();
+            assert!(value.parse::<f64>().is_ok(), "{line}");
+        }
+    }
+    // Tenants are not labels: a scrape names none.
+    assert!(!text.contains("acme") && !text.contains("beta"), "{text}");
+
+    let (status, bundle) = get(&f, "/api/v1/admin/diagnostics?integrity=1", &f.auth);
+    assert_eq!(status, 200, "{bundle}");
+    assert_eq!(bundle["format"], "sentinel.diagnostics-bundle/1");
+    assert_eq!(bundle["integrity"], "ok");
+    assert_eq!(bundle["schema"], sentinel_store::schema::LATEST);
+    assert!(bundle["counts"]["tenants"].as_i64().unwrap() >= 2);
+    assert!(bundle["counts"]["repos"].as_i64().unwrap() >= 2);
+    // Every count query ran: a failed one would read -1.
+    for (name, n) in bundle["counts"].as_object().unwrap() {
+        if let Some(n) = n.as_i64() {
+            assert!(n >= 0, "{name} = {n}");
+        }
+    }
+    assert_eq!(bundle["workers"][0]["name"], "builder-1");
+    assert_eq!(bundle["runtime"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(bundle["runtime"]["ready"]["ready"], true);
+    assert!(
+        bundle["runtime"]["http"]["unauthenticated"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    // Nothing names a tenant, repository or person.
+    let flat = bundle.to_string();
+    for name in [
+        "\"acme\"", "\"beta\"", "\"app\"", "\"web\"", "Dana", "dana", "Pat", "\"pat\"",
+    ] {
+        assert!(!flat.contains(name), "{name} in {flat}");
+    }
+    let (_, without) = get(&f, "/api/v1/admin/diagnostics", &f.auth);
+    assert_eq!(without["integrity"], "not checked");
+}

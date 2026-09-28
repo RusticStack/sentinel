@@ -56,6 +56,8 @@ struct Fake {
     objects: Mutex<HashMap<String, Stored>>,
     uploads: Mutex<HashMap<String, Upload>>,
     down: AtomicBool,
+    /// Every call is refused as an expired or revoked credential is (403).
+    refused: AtomicBool,
     fail_part: AtomicU32,
     parts_sent: AtomicU32,
     next_id: AtomicU32,
@@ -79,7 +81,13 @@ fn missing() -> BucketError {
 
 impl Fake {
     fn up(&self) -> BucketResult<()> {
-        if self.down.load(Ordering::Relaxed) {
+        if self.refused.load(Ordering::Relaxed) {
+            Err(BucketError {
+                transient: false,
+                not_found: false,
+                message: "AccessDenied: the credential has expired".into(),
+            })
+        } else if self.down.load(Ordering::Relaxed) {
             Err(transient("connection refused"))
         } else {
             Ok(())
@@ -319,14 +327,16 @@ impl Fixture {
     fn totals(&self) -> offload::Totals {
         self.store.read(offload::totals).unwrap()
     }
-    fn local(&self, digest: Digest) -> bool {
+    fn path(&self, digest: Digest) -> std::path::PathBuf {
         self.dir
             .path()
             .join("objects")
             .join(self.tenant.to_string())
             .join(&digest.to_string()[..2])
             .join(digest.to_string())
-            .exists()
+    }
+    fn local(&self, digest: Digest) -> bool {
+        self.path(digest).exists()
     }
     /// A finished attempt with a log, released long enough ago to settle,
     /// and stamped by retention.
@@ -652,4 +662,101 @@ fn abandoned_multipart_uploads_are_aborted() {
     let open: Vec<String> = f.bucket.uploads.lock().unwrap().keys().cloned().collect();
     assert_eq!(open, vec![recent]);
     assert!(f.store.read(offload::recorded_uploads).unwrap().is_empty());
+}
+
+/// R07: a local copy that rotted (single-part and multipart) or vanished is
+/// skipped — never uploaded under its digest's name — and the objects after
+/// it are still replicated; the external copy stays healthy.
+#[test]
+fn a_damaged_or_lost_local_object_is_skipped_and_holds_nothing_back() {
+    let f = fixture();
+    let small = f.put(b"a small object that will rot");
+    let large: Vec<u8> = (0..(3u32 << 20) + 5).map(|i| (i % 253) as u8).collect();
+    let large = f.put(&large);
+    let lost = f.put(b"an object whose file goes away");
+    let healthy = f.put(b"a healthy object after them");
+    for digest in [small, large] {
+        let path = f.path(digest);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes.len() / 2;
+        bytes[at] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+    }
+    std::fs::remove_file(f.path(lost)).unwrap();
+    let r = f.replicator(SETTINGS);
+    let pass = r.pass().expect("local faults do not fail the pass");
+    assert_eq!(pass.replicated, 1);
+    assert_eq!(pass.local_faults, 3);
+    assert_eq!(
+        f.bucket.keys(),
+        vec![objects::remote_key(f.tenant, &healthy)]
+    );
+    assert!(
+        f.bucket.uploads.lock().unwrap().is_empty(),
+        "no multipart started"
+    );
+    assert_eq!(r.status().state(), "healthy");
+    assert_eq!(r.status().local_faults.load(Ordering::Relaxed), 3);
+    assert!(r.status().last_local_fault.lock().unwrap().is_some());
+    // Still owed, and retried each pass without holding the others back.
+    assert_eq!(f.totals().unreplicated_bytes, 28 + (3 << 20) + 5 + 30);
+    let later = f.put(b"committed after the faults");
+    let pass = r.pass().unwrap();
+    assert_eq!((pass.replicated, pass.local_faults), (1, 3));
+    assert!(
+        f.bucket
+            .keys()
+            .contains(&objects::remote_key(f.tenant, &later))
+    );
+}
+
+/// R07: while the bucket is unreachable, reading an evicted object fails
+/// cleanly — no partial file placed — and succeeds once it is back.
+#[test]
+fn an_evicted_object_is_unreadable_during_an_outage_and_readable_after() {
+    let f = fixture();
+    let a = f.put(b"evicted before the outage");
+    f.replicator(SETTINGS).pass().unwrap();
+    f.replicator(Settings {
+        local_bytes: 1,
+        ..SETTINGS
+    })
+    .pass()
+    .unwrap();
+    assert!(!f.local(a));
+    f.bucket.down.store(true, Ordering::Relaxed);
+    assert!(f.read(a).is_err());
+    assert!(!f.local(a), "nothing placed from a failed fetch");
+    let r = f.replicator(SETTINGS);
+    assert!(r.pass().is_err());
+    assert_eq!(r.status().state(), "degraded");
+    f.bucket.down.store(false, Ordering::Relaxed);
+    assert_eq!(f.read(a).unwrap(), b"evicted before the outage");
+    assert!(f.local(a));
+    r.pass().unwrap();
+    assert_eq!(r.status().state(), "healthy");
+}
+
+/// R07: an expired or revoked S3 credential (403) degrades the external
+/// copy with the reason and uploads nothing; a replaced credential lets the
+/// next pass catch up.
+#[test]
+fn a_refused_credential_degrades_the_copy_until_it_is_replaced() {
+    let f = fixture();
+    let a = f.put(b"written while the credential is refused");
+    f.bucket.refused.store(true, Ordering::Relaxed);
+    let r = f.replicator(SETTINGS);
+    for _ in 0..3 {
+        assert!(r.pass().is_err());
+    }
+    assert_eq!(r.status().state(), "degraded");
+    assert_eq!(r.status().consecutive_failures.load(Ordering::Relaxed), 3);
+    let error = r.status().last_error.lock().unwrap().clone().unwrap();
+    assert!(error.contains("AccessDenied"), "{error}");
+    assert!(f.bucket.keys().is_empty());
+    assert!(f.local(a), "nothing evicted while it cannot be copied");
+    f.bucket.refused.store(false, Ordering::Relaxed);
+    assert_eq!(r.pass().unwrap().replicated, 1);
+    assert_eq!(r.status().state(), "healthy");
+    assert_eq!(r.status().consecutive_failures.load(Ordering::Relaxed), 0);
 }

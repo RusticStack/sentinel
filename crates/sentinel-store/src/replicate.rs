@@ -141,7 +141,11 @@ pub struct Status {
     pub fetched_objects: AtomicU64,
     pub deleted_copies: AtomicU64,
     pub aborted_uploads: AtomicU64,
+    /// Objects skipped because the local copy is missing or does not match
+    /// its digest (R07): never uploaded, and never a reason to stop.
+    pub local_faults: AtomicU64,
     pub last_error: Mutex<Option<String>>,
+    pub last_local_fault: Mutex<Option<String>>,
 }
 
 impl Status {
@@ -168,8 +172,23 @@ pub struct Pass {
     pub deleted: u32,
     pub evicted: u32,
     pub aborted: u32,
+    /// Objects skipped for a missing or damaged local copy.
+    pub local_faults: u32,
     /// There is more to do right away (a stage filled its batch).
     pub more: bool,
+}
+
+/// Why one object was not replicated: the bucket (the pass stops and backs
+/// off) or the local copy (that object is skipped; the others go on).
+enum Fault {
+    Local(String),
+    Bucket(BucketError),
+}
+
+impl From<BucketError> for Fault {
+    fn from(e: BucketError) -> Fault {
+        Fault::Bucket(e)
+    }
 }
 
 pub struct Replicator {
@@ -320,9 +339,27 @@ impl Replicator {
             .map_err(|e| e.to_string())?;
         pass.more |= due.len() as u32 == OBJECTS_PER_PASS;
         for object in due {
-            if let Err(e) = self.replicate(&object) {
-                self.failed("replicate", &e);
-                return Err(e.message);
+            match self.replicate(&object) {
+                Ok(()) => {}
+                Err(Fault::Local(why)) => {
+                    // A damaged or lost local copy must never reach the
+                    // bucket, and must not hold every later object back.
+                    self.status.local_faults.fetch_add(1, Ordering::Relaxed);
+                    *self
+                        .status
+                        .last_local_fault
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(format!(
+                        "{}: {why}",
+                        remote_key(object.tenant, &object.digest)
+                    ));
+                    pass.local_faults += 1;
+                    continue;
+                }
+                Err(Fault::Bucket(e)) => {
+                    self.failed("replicate", &e);
+                    return Err(e.message);
+                }
             }
             let now = UnixMillis::now();
             let kept = self
@@ -349,28 +386,50 @@ impl Replicator {
         Ok(())
     }
 
-    /// Upload one object and verify the copy.
-    fn replicate(&self, object: &ObjectRef) -> BucketResult<()> {
-        let local = |e: crate::Error| BucketError {
-            transient: false,
-            not_found: false,
-            message: format!("local object: {e}"),
-        };
+    /// Upload one object and verify the copy. The local bytes are hashed
+    /// before anything is sent: a copy that does not match its digest is a
+    /// [`Fault::Local`], never uploaded under the digest's name.
+    fn replicate(&self, object: &ObjectRef) -> std::result::Result<(), Fault> {
+        let local = |e: &dyn std::fmt::Display| Fault::Local(format!("local object: {e}"));
         let key = remote_key(object.tenant, &object.digest);
         let blake3 = object.digest.to_string();
         let (mut reader, len) = self
             .store
             .read(|c| self.objects.open_read(c, object.tenant, object.digest))
-            .map_err(local)?;
+            .map_err(|e| local(&e))?;
         let mut buffer = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
+        let matches = |hash: blake3::Hash| {
+            crate::objects::Digest::from_bytes(*hash.as_bytes()) == object.digest
+        };
         if len <= self.settings.part_bytes {
             buffer.clear();
             buffer.resize(len as usize, 0);
-            reader
-                .read_exact(&mut buffer)
-                .map_err(|e| local(e.into()))?;
+            reader.read_exact(&mut buffer).map_err(|e| local(&e))?;
+            let mut extra = [0u8; 1];
+            if reader.read(&mut extra).map_err(|e| local(&e))? != 0
+                || !matches(blake3::hash(&buffer))
+            {
+                return Err(Fault::Local("does not match its digest".into()));
+            }
             self.bucket.put(&key, &buffer, Some(&blake3))?;
         } else {
+            // Hash the whole file first: parts a resumed upload already
+            // holds are not read again below.
+            let mut hasher = blake3::Hasher::new();
+            let mut total = 0u64;
+            buffer.clear();
+            buffer.resize(self.settings.part_bytes.min(8 << 20) as usize, 0);
+            loop {
+                let n = reader.read(&mut buffer).map_err(|e| local(&e))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..n]);
+                total += n as u64;
+            }
+            if total != len || !matches(hasher.finalize()) {
+                return Err(Fault::Local("does not match its digest".into()));
+            }
             self.multipart(&key, &blake3, len, &mut reader, &mut buffer)?;
         }
         drop(buffer);
@@ -378,11 +437,11 @@ impl Replicator {
             Some((got, meta)) if got == len && meta.as_deref().is_none_or(|m| m == blake3) => {
                 Ok(())
             }
-            _ => Err(BucketError {
+            _ => Err(Fault::Bucket(BucketError {
                 transient: true,
                 not_found: false,
                 message: "the stored copy does not match the object".into(),
-            }),
+            })),
         }
     }
 

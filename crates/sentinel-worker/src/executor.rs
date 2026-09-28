@@ -898,6 +898,17 @@ impl Inner {
         &self.recovered
     }
 
+    /// Bytes the attempts' log spools hold now (R06).
+    pub fn spool_used(&self) -> u64 {
+        self.spool.used()
+    }
+
+    /// Attempts running or waiting for their spec (R06).
+    pub fn attempts_live(&self) -> usize {
+        let state = self.state();
+        state.live.len() + state.awaiting.len()
+    }
+
     /// Attempts still to be abandoned to the controller.
     pub fn leftovers_pending(&self) -> usize {
         self.state().leftovers.len()

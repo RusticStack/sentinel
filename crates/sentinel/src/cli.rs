@@ -191,6 +191,16 @@ pub enum AdminCommand {
         #[command(subcommand)]
         command: UpgradeCommand,
     },
+    /// Print the sanitized diagnostic bundle of a stopped controller's data
+    /// directory: counts, workers, schema, disk; no names, addresses,
+    /// credentials or log text
+    Diagnostics {
+        #[command(flatten)]
+        data: DataDir,
+        /// Also run SQLite's quick check (reads the whole database)
+        #[arg(long)]
+        integrity: bool,
+    },
     /// Rebuild a data directory from a backup (the controller must not run)
     Restore {
         /// Directory holding the backups

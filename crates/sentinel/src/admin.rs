@@ -122,6 +122,7 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
         AdminCommand::Upgrade {
             command: crate::cli::UpgradeCommand::Check { data },
         } => upgrade_check(data)?,
+        AdminCommand::Diagnostics { data, integrity } => diagnostics(data, *integrity)?,
         AdminCommand::Restore {
             from,
             id,
@@ -308,6 +309,21 @@ pub(crate) fn duration_ms(text: &str, max_ms: i64) -> Result<i64, Error> {
         })
 }
 
+/// `admin diagnostics` (R06): the sanitized bundle, read-only.
+fn diagnostics(data: &DataDir, integrity: bool) -> Result<(), Error> {
+    if !data.data_dir.is_absolute() {
+        return Err(fail("data_dir must be an absolute path"));
+    }
+    let bundle = sentinel_store::bundle::collect_offline(
+        &data.data_dir,
+        sentinel_core::UnixMillis::now().0,
+        integrity,
+    )
+    .map_err(|error| fail(format!("cannot read {}: {error}", data.data_dir.display())))?;
+    sentinel::outln!("{bundle:#}");
+    Ok(())
+}
+
 /// `admin upgrade check` (R05): what starting this build on the data
 /// directory would do, without opening the store (which would migrate).
 fn upgrade_check(data: &DataDir) -> Result<(), Error> {
@@ -403,6 +419,8 @@ fn backup(args: &crate::cli::BackupArgs) -> Result<(), Error> {
                     "object_bytes_copied": report.object_bytes_copied,
                     "objects_remote_only": report.objects_remote,
                     "objects_corrupt": report.objects_corrupt,
+                    "objects_missing": report.objects_missing,
+                    "partials_removed": report.partials_removed,
                     "manifests": report.manifests,
                     "log_files_copied": report.log_files_copied,
                     "log_bytes_copied": report.log_bytes_copied,
@@ -410,9 +428,9 @@ fn backup(args: &crate::cli::BackupArgs) -> Result<(), Error> {
                     "key_ids": report.key_ids,
                 })
             );
-            if !report.objects_corrupt.is_empty() {
+            if !report.objects_corrupt.is_empty() || !report.objects_missing.is_empty() {
                 return Err(fail(
-                    "some objects failed their digest and were not backed up; run admin objects verify",
+                    "some objects were missing or failed their digest and were not backed up; run admin objects verify",
                 ));
             }
         }

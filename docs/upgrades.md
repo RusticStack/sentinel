@@ -21,7 +21,7 @@ Sentinel has four versioned surfaces, each with its own rules ([compatibility](c
 
 ## Upgrading
 
-Stop the controller, replace the binary (and `sentinel-web` with it; [web interface](web-ui.md)), start it. When the database has pending migrations the controller first copies it aside — `metadata.sqlite.v047` for a database at schema 47, `VACUUM INTO` on its own connection — logs `schema_upgraded` with the copy's path, then migrates. The newest two copies are kept. A host-local `admin` command of the new release does exactly the same, so running one first is also an upgrade.
+Stop the controller, replace the binary (and `sentinel-web` with it; [web interface](web-ui.md)), start it. When the database has pending migrations the controller first copies it aside — `metadata.sqlite.v047` for a database at schema 47, `VACUUM INTO` on its own connection, written as `metadata.sqlite.v047.partial` and renamed once durable, so a copy cut short is never taken for one — logs `schema_upgraded` with the copy's path, then migrates. The newest two copies are kept. A host-local `admin` command of the new release does exactly the same, so running one first is also an upgrade.
 
 A migration that fails rolls back its own transaction: the database stays at the last version that committed, never half-way through one, and the controller refuses to start with the reason, the schema it reached and the copy to roll back to:
 

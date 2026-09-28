@@ -17,6 +17,8 @@ mod source_admin;
 mod service;
 #[cfg(all(target_os = "linux", any(feature = "server", feature = "worker")))]
 mod tailcat_admin;
+#[cfg(all(target_os = "linux", feature = "worker"))]
+mod worker_metrics;
 
 use clap::Parser;
 use sentinel::{client, commands::Invocation};

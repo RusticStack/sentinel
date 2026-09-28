@@ -220,3 +220,114 @@ fn a_worker_software_label_is_printable_and_bounded() {
         Some(128)
     );
 }
+
+/// R06: the offline diagnostic bundle of a stopped controller counts rows
+/// without naming tenants or repositories, and never writes.
+#[test]
+fn the_offline_diagnostic_bundle_counts_without_naming() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.sqlite");
+    let store = Store::open(&path, Durability::Full).unwrap();
+    let (tenant, repo, run) = (TenantId::new(), RepoId::new(), RunId::new());
+    store
+        .writer()
+        .write(move |tx| {
+            jobs::insert_tenant(tx, tenant, "secret-tenant", NOW)?;
+            jobs::insert_repo(tx, tenant, repo, "secret-repo", NOW)?;
+            jobs::insert_run(tx, tenant, repo, run, "sha", NOW)?;
+            Ok(())
+        })
+        .unwrap();
+    drop(store);
+    let before = std::fs::read(&path).unwrap();
+    let bundle = sentinel_store::bundle::collect_offline(dir.path(), NOW.0, true).unwrap();
+    assert_eq!(bundle["format"], sentinel_store::bundle::FORMAT);
+    assert_eq!(bundle["integrity"], "ok");
+    assert_eq!(bundle["schema"], schema::LATEST);
+    assert_eq!(bundle["counts"]["tenants"], 1);
+    assert_eq!(bundle["counts"]["repos"], 1);
+    assert_eq!(bundle["counts"]["runs"], 1);
+    for (name, n) in bundle["counts"].as_object().unwrap() {
+        if let Some(n) = n.as_i64() {
+            assert!(n >= 0, "{name} = {n}");
+        }
+    }
+    assert_eq!(bundle["runtime"]["offline"], true);
+    let flat = bundle.to_string();
+    assert!(
+        !flat.contains("secret-tenant") && !flat.contains("secret-repo"),
+        "{flat}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before, "read-only");
+}
+
+/// R07: a controller killed in the middle of a migration — the transaction
+/// open, the schema changed, nothing committed — leaves the database at the
+/// version before it, intact, and the next start migrates it. A copy cut
+/// short by the same kill is never listed as a snapshot and is replaced.
+#[test]
+fn a_process_killed_mid_migration_leaves_the_last_committed_version() {
+    const CHILD: &str = "SENTINEL_R07_MIGRATION_CHILD";
+    if let Ok(path) = std::env::var(CHILD) {
+        // The child: apply the last migration inside a transaction and die
+        // before it commits, as a kill or a power cut would.
+        let mut conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let (v, sql) = schema::MIGRATIONS[schema::LATEST as usize - 1];
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(sql).unwrap();
+        tx.execute(
+            "INSERT INTO schema_migrations VALUES (?1, 1, ?2)",
+            params![v, schema::readable_by(v)],
+        )
+        .unwrap();
+        std::process::abort();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.sqlite");
+    let from = schema::LATEST - 1;
+    let mut conn = database_at(&path, from);
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    let tx = conn.transaction().unwrap();
+    jobs::insert_tenant(&tx, TenantId::new(), "kept", NOW).unwrap();
+    tx.commit().unwrap();
+    drop(conn);
+
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_process_killed_mid_migration_leaves_the_last_committed_version",
+            "--nocapture",
+        ])
+        .env(CHILD, &path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success(), "the child died mid-migration");
+
+    let after = upgrade::inspect(&path).unwrap();
+    assert_eq!(after.database, from, "nothing of the migration committed");
+    assert_eq!(after.integrity, "ok");
+    assert_eq!(after.pending, vec![schema::LATEST]);
+    // The same kill during the copy: a truncated temporary file.
+    let snapshot = upgrade::snapshot_path(&path, from);
+    let mut partial = snapshot.clone().into_os_string();
+    partial.push(".partial");
+    std::fs::write(&partial, b"SQLite format 3\0cut short").unwrap();
+    assert!(
+        upgrade::snapshots(&path).is_empty(),
+        "a partial copy is not a snapshot"
+    );
+
+    let (store, taken) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
+    assert_eq!(taken.as_deref(), Some(snapshot.as_path()));
+    assert!(!std::path::Path::new(&partial).exists());
+    assert_eq!(version(&snapshot), from);
+    let tenants: i64 = store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM tenants", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(tenants, 1, "the committed row survived");
+    drop(store);
+    assert_eq!(version(&path), schema::LATEST);
+}
