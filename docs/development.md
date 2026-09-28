@@ -109,7 +109,7 @@ For file-based configuration, copy the appropriate [server](../examples/server.t
 
 Every test — a single test binary, the full `test-*` suites, the web browser test and benchmarks — runs on the verification VPS, never on a workstation or in WSL (the owner's decision of 2026-09-27: local runs exhaust memory and wear the disk). The host, user and SSH key are in the git-ignored `.env` at the repository root; [`.env.example`](../.env.example) names the variables. Local work stops at `cargo fmt`, `cargo check`/`cargo lint` and `pnpm -C web typecheck`.
 
-Ship the branch as a git bundle (or push it) and run there, as root or the test account, from a checkout on the VPS's own filesystem. The VPS is shared with production services and another project's CI: run under `nice -n 19 ionice -c3` with `CARGO_BUILD_JOBS` limited, check `/proc/pressure/cpu` first, and when the host is heavily loaded skip the run and record the verification as pending. Record the load (`uptime`, CPU pressure) with every benchmark; a contended host is not a baseline.
+Ship the branch as a git bundle (or push it) and run there, as root or the test account, from a checkout on the VPS's own filesystem. The VPS also runs production services (Coolify and its apps; the Lockwell CI runners that used to share it were removed on 2026-09-28): run under `nice -n 19 ionice -c3` with `CARGO_BUILD_JOBS` limited, check `/proc/pressure/cpu` first, and when the host is heavily loaded skip the run and record the verification as pending. Record the load (`uptime`, CPU pressure) with every benchmark; a contended host is not a baseline.
 
 What is installed there (2026-09-27, Ubuntu 26.04, 12 vCPU EPYC, 31 GiB):
 
@@ -120,7 +120,7 @@ What is installed there (2026-09-27, Ubuntu 26.04, 12 vCPU EPYC, 31 GiB):
 | Web interface and browser test | Ubuntu's `nodejs` (22) and `npm`, `pnpm` 10 (npm global), Chrome for Testing's `chrome-headless-shell` in `/opt/chrome-headless-shell` — Ubuntu ships Chromium only as a snap, whose private `/tmp` does not see the test's profile directory |
 | Executor tests and benchmarks | `podman` 5.7 (rootless, runc, overlay, cgroup v2), `uidmap`, `slirp4netns`; the `sentinelbench` account (subuid/subgid, lingering, `safe.directory` for `/srv/sentinel`) |
 
-Chrome refuses to run as root without `--no-sandbox`; `/opt/chrome-headless-shell/as-root` adds it, so a root run passes `SENTINEL_BROWSER=/opt/chrome-headless-shell/as-root`. Run the suites with `--no-fail-fast` so one pass reports every failing binary. Another project's CI runs `cargo test` on the same host: stop your own processes by PID, never by a pattern such as `pkill -f "cargo test"`.
+Chrome refuses to run as root without `--no-sandbox`; `/opt/chrome-headless-shell/as-root` adds it, so a root run passes `SENTINEL_BROWSER=/opt/chrome-headless-shell/as-root`. Run the suites with `--no-fail-fast` so one pass reports every failing binary. Stop your own processes by PID, never by a pattern: `pkill -f` also matches the SSH command's own shell and the host's other services.
 
 ### Windows with WSL2 (superseded)
 
