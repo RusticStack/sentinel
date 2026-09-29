@@ -45,7 +45,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         url = urllib.parse.urlsplit(self.path)
         env = dict(os.environ, GIT_PROJECT_ROOT=sys.argv[1], GIT_HTTP_EXPORT_ALL="1",
                    PATH_INFO=url.path, QUERY_STRING=url.query, REQUEST_METHOD=self.command,
-                   CONTENT_TYPE=self.headers.get("Content-Type", ""), REMOTE_USER="deploy")
+                   CONTENT_TYPE=self.headers.get("Content-Type", ""), REMOTE_USER="deploy",
+                   # Git gzips request bodies over about 1 KiB (a fetch
+                   # negotiating from a populated mirror); without the
+                   # encoding, http-backend reads compressed bytes as
+                   # pkt-lines and fails. GIT_PROTOCOL carries v2.
+                   HTTP_CONTENT_ENCODING=self.headers.get("Content-Encoding", ""),
+                   GIT_PROTOCOL=self.headers.get("Git-Protocol", ""))
         body = self.read_body()
         if len(body) > 1024 * 1024:
             self.send_error(413)
