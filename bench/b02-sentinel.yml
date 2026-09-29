@@ -1,0 +1,38 @@
+# B02: the lockwell-ci contract's `unit` lane as a Sentinel pipeline, committed
+# as .sentinel.yml on the bench source (Lockwell cbe48fc7 with the two SDK
+# trees vendored under sdk-checkouts/ and .goproxy completed, because jobs
+# have no network egress and no extra checkouts yet). Same image, command,
+# environment and caps as the contract; the Go module store and build cache
+# are Sentinel caches (the K07 Go recipe's classes).
+schema: 1
+on: [push]
+jobs:
+  unit:
+    image: docker.io/library/golang:1.27.1-trixie@sha256:7bffdb405cd12940d2980daa49a86ef575ed4525a17ee7d0c9562547357ab46a
+    resources: { cpu: 10, memory: 26GiB }
+    timeout: 30m
+    env:
+      GOTOOLCHAIN: local
+      GOPROXY: file:///workspace/.goproxy,https://proxy.golang.org,direct
+      GOMODCACHE: /cache/gomod
+      GOCACHE: /cache/gocache
+      GOPATH: /workspace/.bench/gopath
+      GOTMPDIR: /workspace/.bench/tmp
+      HOME: /workspace/.bench/home
+      LOCKWELL_SDK_NODE_DIR: /workspace/sdk-checkouts/lockwell-sdk-node
+      LOCKWELL_SDK_JAVA_DIR: /workspace/sdk-checkouts/lockwell-sdk-java
+    cache:
+      - name: gomod
+        class: downloads
+        key: "go-mod-${{ hash_files('go.sum') }}"
+        paths: [/cache/gomod]
+      - name: gocache
+        class: compiler
+        key: "cc-normal-${{ hash_files('go.sum') }}"
+        paths: [/cache/gocache]
+    steps:
+      - id: unit
+        run: |
+          mkdir -p .bench/gopath .bench/tmp .bench/home
+          packages="$(go list ./... | grep -v '/tests/integration$')"
+          go test -count=1 $packages

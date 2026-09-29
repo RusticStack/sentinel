@@ -89,6 +89,47 @@ Interpretation, limited to what was measured:
 - Cold is about 28–31 s slower than warm: compilation plus the module downloads the checked-in proxy lacks. The cold samples depend on the network, and three samples are only indicative.
 - The lane's warm time is the same order as CI's `test` step median of 70 s ([CI baseline](ci-baseline.md)). The sub-minute target cannot be met by the engine alone for this lane.
 
+## B02: the same lane through each executor
+
+The contract's `unit` lane measured through four executors on the reference host, each under the contract's 10 CPUs and 26 GiB, on 2026-09-29. Warm-up runs are excluded. Hosted Blacksmith and Depot runners were **not** measured: there is no account for either, so there is no comparison, and vendor speed-up claims are not Sentinel evidence.
+
+| Executor | What the clock covers | Record |
+|---|---|---|
+| Direct, scoped (B01) | the test command only, in a systemd scope with the caps | [`b01-isolation.jsonl`](../bench/b01-isolation.jsonl) |
+| Podman (B01) | the test command in a container, same caps | same |
+| Woodpecker 3.18.1, `woodpecker-cli exec` | spawn to exit of a one-step local pipeline, with its Docker backend on the bench user's rootless Podman socket and `--backend-docker-limit-*` set to the caps. No clone (the bench root is mounted), and caches are the mounted directories | [`b02-woodpecker.jsonl`](../bench/b02-woodpecker.jsonl) |
+| GitHub self-hosted runner 2.337.0 | per step and per job from the Actions API (1-second resolution). The run was created by a push, and the job repeats `ci.yml`'s `test` job up to its unit step: checkout from github.com, `setup-go` (tool cache, no remote cache), both SDK checkouts at the pinned commits, `go mod download`. The runner ran as a systemd user service with the caps, on Lockwell's repository, labelled only `sentinel-b02` | [`b02-github-runner.jsonl`](../bench/b02-github-runner.jsonl) |
+| Sentinel (`7966853`) | the intake event after a git push, to the run finished (the wait API), and each attempt phase from `GET /attempts/{id}/steps`. The source is served over loopback HTTPS through a bound repository with a sealed credential; the Go module store and build cache are Sentinel caches | [`b02-sentinel.jsonl`](../bench/b02-sentinel.jsonl) |
+
+**Medians (p95), seconds:**
+
+| Executor | warm | small-edit | cold (n=3) |
+|---|---|---|---|
+| Direct, scoped: test | 64.1 (70.7) | 66.7 (71.5) | 97.3 (99.2) |
+| Podman: test | 66.0 (70.0) | 64.8 (67.9) | 92.3 (96.8) |
+| Woodpecker: whole exec | 67.4 (71.4) | 67.4 (75.5) | 94.8 (95.3) |
+| GitHub runner: unit step | 64 (70) | 70 (75) | 91 (97) |
+| GitHub runner: job | 75 (81) | 81 (86) | 106 (114) |
+| GitHub runner: queue before the job | 2 (3) | 2 (3) | 2 (2) |
+| Sentinel: test step | 66.2 (70.3) | 66.1 (71.2) | 95.0 (98.6) |
+| Sentinel: intake to finished | 77.6 (81.3) | 78.0 (83.0) | 105.9 (110.3) |
+
+**Sentinel's phases, warm medians:** intake to run dispatched 4.23 s, checkout 1.77 s, image pull 1.03 s (a registry manifest check; the image is present), container start 0.31 s, test step 66.15 s, finalize 2.95 s (cache publication). That leaves about 1.1 s unaccounted, for placement, the offer and the report. Both caches hit on every warm and small-edit run; cold runs had none (`unavailable`, their entries removed).
+
+Differences the numbers carry:
+
+- **Sources.** The GitHub runner checks out from github.com over the network. Woodpecker and the direct runs use the checkout in place. Sentinel's jobs have no network egress and no extra checkouts yet, so its bench source is Lockwell `cbe48fc7` plus the two SDK trees vendored under `sdk-checkouts/`, `.goproxy` completed from a warm module cache of the same `go.sum`, and the pipeline ([`b02-sentinel.yml`](../bench/b02-sentinel.yml)). The test command, image, caps and SDK bytes are the same. The cold samples therefore differ: Sentinel's read modules from the local proxy, while the others fetched those missing from `.goproxy` over the network.
+- **Users.** Woodpecker and Sentinel run the step as uid 0 inside a rootless container (the bench user outside). Podman in B01 kept the user's own uid, and the GitHub runner and scoped runs ran directly as the bench user.
+- **Clock start.** GitHub's job clock starts at run creation, after GitHub received the push. Sentinel's starts at the intake event, after the push. Woodpecker's has no source step at all.
+
+What the measurements say:
+
+- **The lane is test-bound.** Every executor spends 64–67 s in the same `go test -count=1`, and no engine changes that. The sub-minute target for this lane needs the test time itself to shrink (B07), not only the engine.
+- **Engine overhead is about 11 s for both Sentinel and a healthy self-hosted runner.** Sentinel is not faster than the GitHub runner on this lane today: 77.6 s against 75 s of job plus about 2 s of queue. Woodpecker's exec adds 1–3 s over a bare container because it does no source or cache handling.
+- **Sentinel's overhead, in order of size:** 4.2 s from intake to dispatch (the controller resolves the pipeline at the pushed revision through Git before creating the run), 3.0 s of cache publication in finalize, 1.8 s of checkout, and 1.0 s of registry manifest check per job. These are B04's first targets.
+
+Found on the way: the repository's HTTPS Git test fixture (`fixtures/git_https.py`) did not pass `Content-Encoding` or `Git-Protocol` to `git http-backend`. A fetch from a populated mirror sends a gzipped request over about 1 KiB, and the server hung up. It now passes both. The Lockwell branch `sentinel-bench/b02` carried only the benchmark workflow. Its runner registration was removed after the samples, and the branch is deleted, while the runs stay in the Actions history.
+
 ## Reproducing
 
 1. As root on the reference host, enable lingering for the bench user so it has a systemd user manager: `loginctl enable-linger sentinelbench`.
