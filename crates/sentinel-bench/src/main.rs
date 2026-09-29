@@ -1,5 +1,7 @@
 //! Benchmark runner: runs a fixed workload N times and emits one JSON record.
 //! Durations are monotonic; unmeasured fields are omitted, never zero.
+mod contract;
+
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -14,30 +16,54 @@ use serde::Serialize;
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Fixed workload definition; `noop` is the reproducible baseline
+    /// Fixed workload definition; `noop` is the reproducible baseline.
+    /// Ignored with `--contract`, whose lane is the workload
     #[arg(long, value_enum, default_value_t = Workload::Noop)]
     workload: Workload,
+    /// A frozen benchmark contract (`sentinel.bench-contract/1`, B01): the
+    /// runner measures its `--lane` under `--condition`, and only when the
+    /// host, image and sources match it
+    #[arg(long, requires_all = ["lane", "condition"])]
+    contract: Option<PathBuf>,
+    /// The contract lane to measure
+    #[arg(long, requires = "contract")]
+    lane: Option<String>,
+    /// The contract condition: cold, warm or small-edit
+    #[arg(long, requires = "contract")]
+    condition: Option<String>,
+    /// The bench root the contract's `{root}` names (sources, caches)
+    #[arg(long, requires = "contract")]
+    root: Option<PathBuf>,
+    /// Directories prepended to `PATH` for the direct and scoped runtimes
+    /// (a toolchain copied out of the lane's image, so both run the same
+    /// binaries)
+    #[arg(long)]
+    path_prepend: Vec<PathBuf>,
     /// Execution path under measurement
     #[arg(long, value_enum, default_value_t = Runtime::Direct)]
     runtime: Runtime,
     /// Image reference for the podman runtime; the record stores its digest
     #[arg(long)]
     image: Option<String>,
-    /// Podman `--cpus` limit; absent means unlimited
+    /// CPU limit: podman `--cpus`, or the scoped runtime's `CPUQuota`;
+    /// absent means unlimited (a contract lane defaults to its allocation)
     #[arg(long)]
     cpus: Option<String>,
-    /// Podman `--memory` limit; absent means unlimited
+    /// Memory limit: podman `--memory` (with `--memory-swap` equal, so no
+    /// swap), or the scoped runtime's `MemoryMax` with `MemorySwapMax=0`
     #[arg(long)]
     memory: Option<String>,
-    /// Measured samples after warm-up
-    #[arg(long, default_value_t = 20)]
-    samples: u32,
-    /// Unmeasured runs before sampling
-    #[arg(long, default_value_t = 2)]
-    warmup: u32,
-    /// Operator-declared state of image/runtime caches before the first warm-up run
-    #[arg(long, value_enum)]
-    warm_state: WarmState,
+    /// Measured samples after warm-up (default 20; a contract condition's own)
+    #[arg(long)]
+    samples: Option<u32>,
+    /// Unmeasured runs before sampling (default 2; for a contract lane 0
+    /// when cold, 1 otherwise)
+    #[arg(long)]
+    warmup: Option<u32>,
+    /// Operator-declared state of image/runtime caches before the first
+    /// warm-up run; a contract condition declares its own
+    #[arg(long, value_enum, required_unless_present = "contract")]
+    warm_state: Option<WarmState>,
     /// Free-form label identifying the host/cohort
     #[arg(long)]
     label: Option<String>,
@@ -52,12 +78,19 @@ enum Workload {
     Noop,
     /// Exits with status 3; verifies failure handling of the runner
     NonzeroExit,
+    /// A contract lane (set by `--contract`)
+    #[value(skip)]
+    ContractLane,
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Runtime {
     Direct,
+    /// The workload as a direct process in a systemd user scope holding the
+    /// same CPU and memory caps a container would get: identical isolation
+    /// without a container (B01)
+    Scoped,
     Podman,
 }
 
@@ -83,6 +116,11 @@ struct Record {
     tools: Tools,
     host: Host,
     image: Option<Image>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contract: Option<contract::Stamp>,
+    /// `go version` (or the lane's toolchain) as the measured runtime sees it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    toolchain: Option<String>,
     warmup: u32,
     samples: Vec<Sample>,
     summary: Summary,
@@ -107,7 +145,7 @@ struct Tools {
 }
 
 #[derive(Serialize)]
-struct Host {
+pub(crate) struct Host {
     hostname: Option<String>,
     os: Option<String>,
     kernel: Option<String>,
@@ -171,29 +209,56 @@ fn main() -> ExitCode {
     }
 }
 
+/// What one invocation measures: the argv, its environment and the
+/// unmeasured preparation before each run.
+struct Plan {
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+    dir: Option<PathBuf>,
+    prepare: Option<(String, String)>,
+    samples: u32,
+    warmup: u32,
+    warm_state: WarmState,
+    workload: Workload,
+    stamp: Option<contract::Stamp>,
+    image: Option<Image>,
+    toolchain: Option<String>,
+    limits: Limits,
+}
+
 fn run(cli: Cli) -> Result<(), String> {
-    if cli.samples == 0 {
-        return Err("samples must be at least 1".into());
-    }
-    let argv = workload_argv(&cli)?;
     // Provenance first: a record without its source revision cannot be
     // attributed, so none is written (and nothing is measured) without it.
     let source = source_revision()?;
-    let image = match cli.runtime {
-        Runtime::Podman => cli.image.clone().map(inspect_image),
-        Runtime::Direct => None,
+    let plan = match &cli.contract {
+        Some(path) => contract_plan(&cli, path)?,
+        None => plain_plan(&cli)?,
     };
+    if plan.samples == 0 {
+        return Err("samples must be at least 1".into());
+    }
     let started_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
 
-    for _ in 0..cli.warmup {
-        check_exit(&measure(&argv, 0)?)?;
+    let mut nonce = started_at_unix_ms as u64 * 1000;
+    let mut once = |index: u32| -> Result<Sample, String> {
+        nonce += 1;
+        if let Some((shell, prepare)) = &plan.prepare {
+            prepare_run(
+                shell,
+                &prepare.replace("{sample_nonce}", &nonce.to_string()),
+            )?;
+        }
+        measure(&plan, index)
+    };
+    for _ in 0..plan.warmup {
+        check_exit(&once(0)?)?;
     }
-    let mut samples = Vec::with_capacity(cli.samples as usize);
-    for index in 0..cli.samples {
-        let sample = measure(&argv, index)?;
+    let mut samples = Vec::with_capacity(plan.samples as usize);
+    for index in 0..plan.samples {
+        let sample = once(index)?;
         check_exit(&sample)?;
         samples.push(sample);
     }
@@ -202,27 +267,26 @@ fn run(cli: Cli) -> Result<(), String> {
         schema: "sentinel-bench/1",
         bench_version: env!("CARGO_PKG_VERSION"),
         started_at_unix_ms,
-        label: cli.label,
-        workload: cli.workload,
+        label: cli.label.clone(),
+        workload: plan.workload,
         runtime: cli.runtime,
-        warm_state: cli.warm_state,
-        argv,
-        limits: Limits {
-            cpus: cli.cpus,
-            memory: cli.memory,
-        },
+        warm_state: plan.warm_state,
+        argv: plan.argv.clone(),
+        limits: plan.limits,
         source,
         tools: Tools {
             rustc: Some(env!("SENTINEL_BENCH_RUSTC"))
                 .filter(|v| !v.is_empty())
                 .map(str::to_owned),
-            podman: (cli.runtime == Runtime::Podman)
+            podman: (cli.runtime == Runtime::Podman || cli.contract.is_some())
                 .then(|| command_line(&["podman", "--version"]))
                 .flatten(),
         },
         host: host_info(),
-        image,
-        warmup: cli.warmup,
+        image: plan.image,
+        contract: plan.stamp,
+        toolchain: plan.toolchain,
+        warmup: plan.warmup,
         samples,
         summary,
     };
@@ -250,6 +314,295 @@ fn run(cli: Cli) -> Result<(), String> {
     Ok(())
 }
 
+/// A built-in workload (`noop`, `nonzero-exit`).
+fn plain_plan(cli: &Cli) -> Result<Plan, String> {
+    let inner: Vec<&str> = match (cli.workload, cfg!(windows)) {
+        (Workload::Noop, false) => vec!["true"],
+        (Workload::Noop, true) => vec!["cmd", "/c", "exit 0"],
+        (Workload::NonzeroExit, false) => vec!["sh", "-c", "exit 3"],
+        (Workload::NonzeroExit, true) => vec!["cmd", "/c", "exit 3"],
+        (Workload::ContractLane, _) => return Err("a contract lane needs --contract".into()),
+    };
+    let inner: Vec<String> = inner.into_iter().map(String::from).collect();
+    let limits = Limits {
+        cpus: cli.cpus.clone(),
+        memory: cli.memory.clone(),
+    };
+    let argv = wrap(cli.runtime, cli.image.as_deref(), &limits, &[], None, inner)?;
+    Ok(Plan {
+        argv,
+        env: path_env(cli)?,
+        dir: None,
+        prepare: None,
+        samples: cli.samples.unwrap_or(20),
+        warmup: cli.warmup.unwrap_or(2),
+        warm_state: cli.warm_state.unwrap_or(WarmState::Warm),
+        workload: cli.workload,
+        stamp: None,
+        image: match cli.runtime {
+            Runtime::Podman => cli.image.clone().map(inspect_image),
+            _ => None,
+        },
+        toolchain: None,
+        limits,
+    })
+}
+
+/// A contract lane: checked against the contract before anything runs.
+fn contract_plan(cli: &Cli, path: &Path) -> Result<Plan, String> {
+    let loaded = contract::load(path)?;
+    let c = &loaded.contract;
+    let lane = c.lane(cli.lane.as_deref().unwrap_or_default())?;
+    let condition_id = cli.condition.clone().unwrap_or_default();
+    let condition = c.condition(&condition_id)?;
+    let root = match &cli.root {
+        Some(root) => root.clone(),
+        None => std::env::current_dir().map_err(|e| e.to_string())?,
+    };
+    let root =
+        fs::canonicalize(&root).map_err(|e| format!("bench root {}: {e}", root.display()))?;
+    let root_text = root.display().to_string();
+    let pinned = c
+        .images
+        .get(&lane.image)
+        .ok_or_else(|| format!("lane image `{}` is not pinned", lane.image))?
+        .clone();
+    let image = (cli.runtime == Runtime::Podman).then(|| inspect_image(pinned.clone()));
+    let podman = command_line(&["podman", "--version"]);
+    let found = contract::drift(
+        c,
+        &host_info(),
+        podman.as_deref(),
+        image.as_ref().and_then(|i| i.digest.as_deref()),
+        lane,
+        &root,
+    );
+    if !found.is_empty() {
+        return Err(format!(
+            "the host or inputs differ from contract {} revision {}; nothing measured:\n  {}",
+            c.id,
+            c.revision,
+            found.join("\n  ")
+        ));
+    }
+    if cli.runtime == Runtime::Podman && image.as_ref().is_none_or(|i| i.digest.is_none()) {
+        return Err(format!(
+            "image {pinned} is not present; pull it first (pulls are measured apart)"
+        ));
+    }
+    let pressure = contract::cpu_pressure();
+    if pressure.is_some_and(|p| p >= contract::MAX_START_PRESSURE) {
+        return Err(format!(
+            "CPU pressure (some, avg60) is {:.2} %, at or over {} %: a contended start is not a baseline; nothing measured",
+            pressure.unwrap_or_default(),
+            contract::MAX_START_PRESSURE
+        ));
+    }
+    let limits = Limits {
+        cpus: Some(
+            cli.cpus
+                .clone()
+                .unwrap_or_else(|| c.allocation.total.cpus.clone()),
+        ),
+        memory: Some(
+            cli.memory
+                .clone()
+                .unwrap_or_else(|| c.allocation.total.memory.clone()),
+        ),
+    };
+    let env: Vec<(String, String)> = c.env(lane, &root_text).into_iter().collect();
+    let dir = root.join(
+        &c.sources
+            .first()
+            .ok_or("a contract names at least one source")?
+            .path,
+    );
+    let inner = vec!["sh".to_string(), "-c".into(), lane.run.clone()];
+    let argv = wrap(
+        cli.runtime,
+        Some(&pinned),
+        &limits,
+        &env,
+        Some((&root, &dir)),
+        inner,
+    )?;
+    let mut all_env = env.clone();
+    all_env.extend(path_env(cli)?);
+    let is_cold = condition_id == "cold";
+    let mut plan = Plan {
+        argv,
+        env: all_env,
+        dir: Some(dir),
+        prepare: Some(("sh".into(), c.expand(&condition.prepare, &root_text))),
+        samples: cli.samples.unwrap_or(condition.samples),
+        warmup: cli.warmup.unwrap_or(if is_cold { 0 } else { 1 }),
+        warm_state: if is_cold {
+            WarmState::Cold
+        } else {
+            WarmState::Warm
+        },
+        workload: Workload::ContractLane,
+        stamp: Some(contract::Stamp {
+            id: c.id.clone(),
+            revision: c.revision,
+            blake3: loaded.blake3.clone(),
+            lane: lane.id.clone(),
+            condition: condition_id.clone(),
+            max_record_age_days: c.freshness.max_record_age_days,
+            cpu_pressure_avg60: pressure,
+            sources: c
+                .sources
+                .iter()
+                .map(|s| (s.name.clone(), s.commit.clone()))
+                .collect(),
+            image: Some(pinned),
+        }),
+        image,
+        toolchain: None,
+        limits,
+    };
+    // The toolchain the measured runtime actually runs, asked through the
+    // same wrapper (unmeasured).
+    let probe = Plan {
+        argv: wrap(
+            cli.runtime,
+            plan.stamp.as_ref().and_then(|s| s.image.as_deref()),
+            &plan.limits,
+            &env,
+            Some((&root, plan.dir.as_deref().unwrap_or(&root))),
+            vec!["go".into(), "version".into()],
+        )?,
+        ..Plan {
+            argv: Vec::new(),
+            env: plan.env.clone(),
+            dir: plan.dir.clone(),
+            prepare: None,
+            samples: 0,
+            warmup: 0,
+            warm_state: plan.warm_state,
+            workload: plan.workload,
+            stamp: None,
+            image: None,
+            toolchain: None,
+            limits: Limits {
+                cpus: None,
+                memory: None,
+            },
+        }
+    };
+    plan.toolchain = output_of(&probe);
+    Ok(plan)
+}
+
+/// `PATH` with `--path-prepend` in front, for the direct and scoped runtimes.
+fn path_env(cli: &Cli) -> Result<Vec<(String, String)>, String> {
+    if cli.path_prepend.is_empty() || cli.runtime == Runtime::Podman {
+        return Ok(Vec::new());
+    }
+    let mut parts: Vec<PathBuf> = cli.path_prepend.clone();
+    if let Some(path) = std::env::var_os("PATH") {
+        parts.extend(std::env::split_paths(&path));
+    }
+    let joined = std::env::join_paths(parts).map_err(|e| e.to_string())?;
+    Ok(vec![("PATH".into(), joined.to_string_lossy().into_owned())])
+}
+
+/// The argv that runs `inner` under `runtime` with `limits`. For podman the
+/// bench root is mounted at the same path and the caller's user is kept, so
+/// files, paths and ownership match a direct run.
+fn wrap(
+    runtime: Runtime,
+    image: Option<&str>,
+    limits: &Limits,
+    env: &[(String, String)],
+    mount: Option<(&Path, &Path)>,
+    inner: Vec<String>,
+) -> Result<Vec<String>, String> {
+    Ok(match runtime {
+        Runtime::Direct => inner,
+        Runtime::Scoped => {
+            let mut argv: Vec<String> =
+                ["systemd-run", "--user", "--scope", "--quiet", "--collect"]
+                    .map(String::from)
+                    .to_vec();
+            if let Some(cpus) = &limits.cpus {
+                argv.push("-p".into());
+                argv.push(format!("CPUQuota={}", contract::cpu_quota(cpus)?));
+            }
+            if let Some(memory) = &limits.memory {
+                argv.push("-p".into());
+                argv.push(format!("MemoryMax={}", contract::systemd_memory(memory)));
+                argv.push("-p".into());
+                argv.push("MemorySwapMax=0".into());
+            }
+            argv.push("--".into());
+            argv.extend(inner);
+            argv
+        }
+        Runtime::Podman => {
+            let image = image.ok_or("--image is required for the podman runtime")?;
+            let mut argv = vec!["podman".to_string(), "run".into(), "--rm".into()];
+            if let Some(cpus) = &limits.cpus {
+                argv.push("--cpus".into());
+                argv.push(cpus.clone());
+            }
+            if let Some(memory) = &limits.memory {
+                argv.push("--memory".into());
+                argv.push(memory.clone());
+                argv.push("--memory-swap".into());
+                argv.push(memory.clone());
+            }
+            if let Some((root, dir)) = mount {
+                let root = root.display().to_string();
+                argv.extend([
+                    "--userns=keep-id".into(),
+                    "--network=host".into(),
+                    "-v".into(),
+                    format!("{root}:{root}"),
+                    "-w".into(),
+                    dir.display().to_string(),
+                ]);
+                for (k, v) in env {
+                    argv.push("-e".into());
+                    argv.push(format!("{k}={v}"));
+                }
+            }
+            argv.push(image.to_string());
+            argv.extend(inner);
+            argv
+        }
+    })
+}
+
+/// Run one unmeasured preparation step; its failure stops the record.
+fn prepare_run(shell: &str, script: &str) -> Result<(), String> {
+    let status = Command::new(shell)
+        .args(["-c", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .map_err(|e| format!("cannot run the condition's preparation: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the condition's preparation failed ({status}); no record written"
+        ))
+    }
+}
+
+fn output_of(plan: &Plan) -> Option<String> {
+    let mut command = Command::new(&plan.argv[0]);
+    command.args(&plan.argv[1..]).envs(plan.env.iter().cloned());
+    if let Some(dir) = &plan.dir {
+        command.current_dir(dir);
+    }
+    let out = command.stdin(Stdio::null()).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 fn check_exit(sample: &Sample) -> Result<(), String> {
     match sample.exit_code {
         Some(0) => Ok(()),
@@ -260,40 +613,15 @@ fn check_exit(sample: &Sample) -> Result<(), String> {
     }
 }
 
-fn workload_argv(cli: &Cli) -> Result<Vec<String>, String> {
-    let inner: Vec<&str> = match (cli.workload, cfg!(windows)) {
-        (Workload::Noop, false) => vec!["true"],
-        (Workload::Noop, true) => vec!["cmd", "/c", "exit 0"],
-        (Workload::NonzeroExit, false) => vec!["sh", "-c", "exit 3"],
-        (Workload::NonzeroExit, true) => vec!["cmd", "/c", "exit 3"],
-    };
-    match cli.runtime {
-        Runtime::Direct => Ok(inner.into_iter().map(String::from).collect()),
-        Runtime::Podman => {
-            let image = cli
-                .image
-                .as_deref()
-                .ok_or("--image is required for the podman runtime")?;
-            let mut argv = vec!["podman".to_string(), "run".into(), "--rm".into()];
-            if let Some(cpus) = &cli.cpus {
-                argv.push("--cpus".into());
-                argv.push(cpus.clone());
-            }
-            if let Some(memory) = &cli.memory {
-                argv.push("--memory".into());
-                argv.push(memory.clone());
-            }
-            argv.push(image.to_string());
-            argv.extend(inner.into_iter().map(String::from));
-            Ok(argv)
-        }
+fn measure(plan: &Plan, index: u32) -> Result<Sample, String> {
+    let argv = &plan.argv;
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]).envs(plan.env.iter().cloned());
+    if let Some(dir) = &plan.dir {
+        command.current_dir(dir);
     }
-}
-
-fn measure(argv: &[String], index: u32) -> Result<Sample, String> {
     let start = Instant::now();
-    let mut child = Command::new(&argv[0])
-        .args(&argv[1..])
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -373,7 +701,7 @@ fn source_revision() -> Result<Source, String> {
     })
 }
 
-fn command_line(argv: &[&str]) -> Option<String> {
+pub(crate) fn command_line(argv: &[&str]) -> Option<String> {
     let out = Command::new(argv[0]).args(&argv[1..]).output().ok()?;
     out.status
         .success()

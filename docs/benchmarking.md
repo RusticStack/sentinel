@@ -127,6 +127,10 @@ Interpretation, limited to what was measured:
 - The p95 column is an interpolated percentile; nearest-rank over the same seven samples gives noop-bare 488.5, noop-cache-warm 508.4, incremental-nocache 828.0, incremental-cold 917.4, incremental-warm 838.9 ms.
 - The record holds 38 lines: one `meta` line and 37 attempts, one of which is the single `incremental-prime` run that seeds the warm case — 36 measured case samples plus the prime.
 
+## B01: contracts and identical isolation
+
+Part 14 measures representative checks under frozen contracts. The runner's `--contract`, `--lane`, `--condition` and `--root` options measure a contract lane only when the host and inputs match the contract, and its `scoped` runtime gives a direct process the same CPU and memory caps a container gets. See [benchmark contracts](benchmark-contracts.md) for the contract, the conditions, the identical-isolation comparison and its results.
+
 ## Reproducing
 
 1. Prepare rootless Podman for a non-root user per [Development](development.md#linux-executor-work-f05f07-and-w03-onward) and pull the image by digest.

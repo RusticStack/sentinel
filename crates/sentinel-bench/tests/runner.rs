@@ -157,3 +157,77 @@ fn podman_runtime_requires_image() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--image is required"));
 }
+
+/// B01: a contract whose reference host is not this one is refused before
+/// anything runs, and nothing is written.
+#[test]
+fn a_contract_for_another_host_measures_nothing() {
+    let dir = std::env::temp_dir().join(format!("sentinel-bench-drift-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src/repo")).unwrap();
+    let contract = dir.join("contract.json");
+    std::fs::write(
+        &contract,
+        serde_json::json!({
+            "format": "sentinel.bench-contract/1",
+            "id": "drift-test",
+            "revision": 1,
+            "reference_host": {
+                "cpu_model": "no such processor",
+                "cpus_online": 100_000,
+                "mem_total_kib_min": u64::MAX,
+                "podman": "podman version 0.0.0"
+            },
+            "allocation": { "total": { "cpus": "1", "memory": "256m" } },
+            "sources": [{ "name": "repo", "commit": "0000000000000000000000000000000000000000", "path": "src/repo" }],
+            "images": { "base": "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662" },
+            "freshness": { "max_record_age_days": 30 },
+            "conditions": { "warm": { "prepare": "true", "samples": 1 } },
+            "lanes": [{ "id": "noop", "image": "base", "run": "true" }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = dir.join("out.jsonl");
+    let out = bench()
+        .args([
+            "--lane",
+            "noop",
+            "--condition",
+            "warm",
+            "--runtime",
+            "direct",
+        ])
+        .arg("--contract")
+        .arg(&contract)
+        .arg("--root")
+        .arg(&dir)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        refused_for_provenance(&out)
+            || (stderr.contains("differ from contract drift-test")
+                && stderr.contains("cpu model")
+                && stderr.contains("source repo")),
+        "{stderr}"
+    );
+    assert!(!output.exists(), "nothing measured, nothing written");
+    let unknown = bench()
+        .args(["--lane", "nope", "--condition", "warm"])
+        .arg("--contract")
+        .arg(&contract)
+        .arg("--root")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success());
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(
+        refused_for_provenance(&unknown) || stderr.contains("no lane `nope`"),
+        "{stderr}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
