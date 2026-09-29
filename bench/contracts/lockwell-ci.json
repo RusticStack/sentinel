@@ -1,0 +1,148 @@
+{
+  "format": "sentinel.bench-contract/1",
+  "id": "lockwell-ci",
+  "revision": 1,
+  "frozen": "2026-09-28",
+  "purpose": "The representative required checks Part 14 is measured on: Lockwell's ci.yml lanes at a pinned commit, on the host its GitHub runners used, under the same total allocation those runners had.",
+  "reference_host": {
+    "description": "netcup VPS (QEMU guest) that ran Lockwell's self-hosted runners and runs Sentinel's verification",
+    "cpu_model": "AMD EPYC 9645 96-Core Processor",
+    "cpus_online": 12,
+    "mem_total_kib_min": 31000000,
+    "filesystem": "ext4",
+    "cgroup": "v2, systemd user manager with cpu, memory and pids delegated (loginctl enable-linger)",
+    "podman": "podman version 5.7.0",
+    "user": "sentinelbench"
+  },
+  "allocation": {
+    "total": { "cpus": "10", "memory": "26g" },
+    "note": "The lockwell-ci runner slice's caps (cpu.max 10 CPUs, memory.max 26 GiB). A lane measured alone gets the whole allocation; lanes measured together share it. Every runtime compared gets the same caps: podman --cpus/--memory/--memory-swap, or a systemd user scope with CPUQuota/MemoryMax/MemorySwapMax=0."
+  },
+  "sources": [
+    { "name": "lockwell", "repository": "https://github.com/RusticStack/lockwell", "commit": "cbe48fc712dc510ca77bfa4de7efe8101c7cc521", "path": "src/lockwell", "history": "full" },
+    { "name": "lockwell-sdk-node", "repository": "https://github.com/RusticStack/lockwell-sdk-node", "commit": "bccad4c89ee6d2270cc2a90298e76d244f9285e4", "path": "src/lockwell-sdk-node" },
+    { "name": "lockwell-sdk-java", "repository": "https://github.com/RusticStack/lockwell-sdk-java", "commit": "37c921f6390ff85a8f2e4034a62482cab7c54020", "path": "src/lockwell-sdk-java" }
+  ],
+  "images": {
+    "go": "docker.io/library/golang:1.27.1-trixie@sha256:7bffdb405cd12940d2980daa49a86ef575ed4525a17ee7d0c9562547357ab46a"
+  },
+  "tools": {
+    "go": "go1.27.1 (go.mod; GOTOOLCHAIN=local, never substituted)",
+    "gcc": "14.2.0 (in the go image; the race detector needs cgo)",
+    "staticcheck": "v0.8.1 (Makefile STATICCHECK_VERSION)",
+    "golangci-lint": "v2.13.2 (Makefile GOLANGCI_LINT_VERSION)",
+    "govulncheck": "v1.8.0 (Makefile GOVULNCHECK_VERSION)",
+    "cyclonedx-gomod": "v1.12.0 (Makefile CYCLONEDX_GOMOD_VERSION)"
+  },
+  "environment": {
+    "GOTOOLCHAIN": "local",
+    "GOPROXY": "file://{root}/src/lockwell/.goproxy,https://proxy.golang.org,direct",
+    "GOCACHE": "{root}/cache/gocache",
+    "GOMODCACHE": "{root}/cache/gomodcache",
+    "GOPATH": "{root}/cache/gopath",
+    "GOTMPDIR": "{root}/tmp",
+    "LOCKWELL_SDK_NODE_DIR": "{root}/src/lockwell-sdk-node",
+    "LOCKWELL_SDK_JAVA_DIR": "{root}/src/lockwell-sdk-java",
+    "HOME": "{root}/home"
+  },
+  "freshness": {
+    "rules": [
+      "Every required test executes on every sample: -count=1 is part of each command and no test result is ever reused.",
+      "The race detector, both 30-second fuzz budgets, the integration suite in its own process and every package in the lane stay as they are in ci.yml.",
+      "A sample counts only when the lane exits 0; a failing sample aborts the record.",
+      "A record belongs to one contract revision (the BLAKE3 digest of this file is in the record). Changing a source commit, image digest, tool version, command, allocation or condition procedure makes a new revision; records of another revision are never compared with it.",
+      "Comparisons use records taken on the reference host with CPU pressure (some, avg60) under 5 % at the start; a contended start is discarded, not recorded."
+    ],
+    "max_record_age_days": 30
+  },
+  "conditions": {
+    "cold": {
+      "description": "Sources checked out at the pinned commits, the image present; Go build cache, module cache and tool binaries empty (Go makes its module cache read-only, so it is made writable first). Modules missing from the checked-in .goproxy come from proxy.golang.org, as they do in CI after a miss: a cold sample depends on the network. Image pull is measured separately, never inside a lane.",
+      "prepare": "chmod -R u+w {root}/cache 2>/dev/null; rm -rf {root}/cache/gocache {root}/cache/gomodcache {root}/cache/gopath {root}/tmp && mkdir -p {root}/cache/gocache {root}/cache/gomodcache {root}/cache/gopath {root}/tmp {root}/home && git -C {root}/src/lockwell checkout -q -f {commit:lockwell} && git -C {root}/src/lockwell clean -qfdx",
+      "samples": 3
+    },
+    "warm": {
+      "description": "Unchanged source at the pinned commit; caches kept from the previous sample of the same lane (one unrecorded warm-up primes them). Tests still execute.",
+      "prepare": "mkdir -p {root}/cache/gocache {root}/cache/gomodcache {root}/cache/gopath {root}/tmp {root}/home && git -C {root}/src/lockwell checkout -q -f {commit:lockwell} && git -C {root}/src/lockwell clean -qfdx -e .goproxy",
+      "samples": 10
+    },
+    "small-edit": {
+      "description": "Warm caches, then a fresh small edit per sample: an inert unexported declaration appended to internal/s3/cors.go, different each sample, so the package recompiles and every dependent test binary relinks.",
+      "prepare": "mkdir -p {root}/cache/gocache {root}/cache/gomodcache {root}/cache/gopath {root}/tmp {root}/home && git -C {root}/src/lockwell checkout -q -f {commit:lockwell} && git -C {root}/src/lockwell clean -qfdx -e .goproxy && printf '\\nvar _ = %d // sentinel-bench small edit\\n' {sample_nonce} >> {root}/src/lockwell/internal/s3/cors.go",
+      "samples": 10
+    }
+  },
+  "lanes": [
+    {
+      "id": "unit",
+      "ci_job": "test",
+      "required": true,
+      "image": "go",
+      "run": "packages=\"$(go list ./... | grep -v '/tests/integration$')\" && go test -count=1 $packages"
+    },
+    {
+      "id": "unit-legacy-json",
+      "ci_job": "test",
+      "required": true,
+      "image": "go",
+      "env": { "GOEXPERIMENT": "nojsonv2" },
+      "run": "go test -count=1 ./internal/adminapi ./internal/cluster ./internal/consensus ./internal/kvmeta ./internal/nativeapi ./internal/s3"
+    },
+    {
+      "id": "vet-build",
+      "ci_job": "test",
+      "required": true,
+      "image": "go",
+      "run": "go vet ./... && go build ./cmd/... && go run ./cmd/lockwell --help >/dev/null && go run ./cmd/lockwelld --help >/dev/null"
+    },
+    {
+      "id": "race",
+      "ci_job": "test-race",
+      "required": true,
+      "image": "go",
+      "run": "packages=\"$(go list ./... | grep -v '/tests/integration$')\" && go test -count=1 -race $packages"
+    },
+    {
+      "id": "integration",
+      "ci_job": "integration",
+      "required": true,
+      "image": "go",
+      "run": "go test -count=1 ./tests/integration/..."
+    },
+    {
+      "id": "integration-race",
+      "ci_job": "integration",
+      "required": true,
+      "image": "go",
+      "run": "go test -count=1 -race ./tests/integration/..."
+    },
+    {
+      "id": "gofmt",
+      "ci_job": "lint",
+      "required": true,
+      "image": "go",
+      "run": "test -z \"$(gofmt -l $(git ls-files '*.go'))\""
+    },
+    {
+      "id": "coverage",
+      "ci_job": "coverage",
+      "required": true,
+      "image": "go",
+      "run": "make coverage"
+    },
+    {
+      "id": "fuzz",
+      "ci_job": "fuzz",
+      "required": true,
+      "image": "go",
+      "run": "go test -fuzz=FuzzParseCredential -fuzztime=30s ./internal/auth/... && go test -fuzz=FuzzParseRange -fuzztime=30s ./internal/s3/..."
+    }
+  ],
+  "not_measured": [
+    { "ci_job": "lint (staticcheck, golangci-lint)", "reason": "installs pinned tools from the network on a miss; measured once tools are prebuilt into the image (B04), not before" },
+    { "ci_job": "supply-chain", "reason": "govulncheck reads the live vulnerability database: not reproducible between samples" },
+    { "ci_job": "docker", "reason": "Docker/Compose lifecycle; an optional compatibility lane (lockwell-migration.md), kept external" },
+    { "ci_job": "docs, ui, playwright, s3compat, scripts", "reason": "Node or browser toolchains and advisory steps; measured with B05 and B06" },
+    { "ci_job": "acceptance, chaos, production, release", "reason": "long scopes reported separately, never inside the sub-minute target" }
+  ]
+}

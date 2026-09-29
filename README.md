@@ -70,7 +70,7 @@ See [Compatibility](docs/compatibility.md) for how each schema, blob format, dat
 
 See [Runtime foundations](docs/runtime-foundation.md) for structured diagnostics, correlation IDs, monotonic phase timing, and bounded I/O/CPU execution lanes.
 
-See [Benchmarking](docs/benchmarking.md) for the machine-readable benchmark runner and the no-op rootless-runtime baseline, [CI baseline](docs/ci-baseline.md) for the measured Lockwell CI topology and timings Sentinel must beat, and [feasibility probes](docs/feasibility-probes.md) for the SQLite, Podman, reflink and Tailcat decisions.
+See [Benchmarking](docs/benchmarking.md) for the machine-readable benchmark runner and the no-op rootless-runtime baseline, [CI baseline](docs/ci-baseline.md) for the measured Lockwell CI topology and timings Sentinel must beat, [benchmark contracts](docs/benchmark-contracts.md) for the frozen checks and conditions Part 14 is measured under, and [feasibility probes](docs/feasibility-probes.md) for the SQLite, Podman, reflink and Tailcat decisions.
 
 The new implementation will use a Rust core and its own pipeline format. Part 05 will add provider-independent Git repository connections and manual, generic hook and opt-in polling intake for Gitea, Forgejo, GitLab and bare repositories, with results in Sentinel's UI/API. GitHub is the first native forge integration: GitHub App access and native PR Checks are required in Part 05; other forge-native PR/MR integrations are deferred. See [Git sources and forge boundaries](plan.md#git-sources-and-forge-boundaries). The default deployment will use embedded SQLite and Sentinel-owned local storage, with optional external S3 and Tailcat-connected workers.
 
