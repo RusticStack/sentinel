@@ -1293,3 +1293,45 @@ fn a_polled_ref_observation_becomes_a_real_dispatch() {
     assert_eq!(recorded.new_sha.as_deref(), Some(head.as_str()));
     drop(poller);
 }
+
+/// B03: the jobs a resolution creates are ready from the write that creates
+/// them. `now` is taken before the pipeline fetch; stamping the jobs with it
+/// counted the fetch as queue time (ready→offer read about 150 ms on a small
+/// repository, the fetch's cost, not the dispatcher's).
+#[test]
+fn a_dispatched_job_is_ready_from_its_creation_not_from_resolution_start() {
+    if !prerequisites() {
+        return;
+    }
+    let f = fixture();
+    let accepted = f.accept_push("push-ready", REF, &f.commits[0], &f.commits[1]);
+    let delivery = f.validate(accepted);
+    let before = UnixMillis::now();
+    // Resolution that began seconds ago, as a slow fetch would make it
+    // (within the source access it mints, which a minute would outlive).
+    let outcome = f
+        .resolver
+        .resolve(&delivery, UnixMillis(before.0 - 5_000))
+        .unwrap();
+    let Outcome::Dispatched { run } = outcome else {
+        panic!("expected a dispatch, got {outcome:?}");
+    };
+    let (queued, created): (i64, i64) = f
+        .store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT j.queued_ms, r.created_ms FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.id = ?1",
+                [run.as_bytes().as_slice()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert!(
+        queued >= before.0,
+        "queued_ms {queued} predates the resolution's end"
+    );
+    assert!(
+        created >= before.0,
+        "created_ms {created} predates the resolution's end"
+    );
+}
