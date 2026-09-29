@@ -384,6 +384,32 @@ pub fn pull(
     timeout: Duration,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<bool> {
+    pull_checked(image, authfile, store, timeout, cancel, true)
+}
+
+/// Whether a pull must ask the registry even when the digest is resident
+/// (B03). A credentialed pull must: its authorization is what the registry
+/// decides, now, for this tenant. So must any pull into a tenant's private
+/// store. An anonymous pull into the shared store asks nobody's permission —
+/// the shared store only ever holds what was anonymously pullable, and a
+/// digest names immutable content — so a resident image is used as it is.
+/// Asking anyway cost a registry round trip per job (about 1 s) and, at
+/// Docker Hub's anonymous limit of 100 manifest requests an hour, failed
+/// every job past the hundredth.
+pub fn registry_check_needed(anonymous: bool, store: &Store) -> bool {
+    !(anonymous && *store == Store::Shared)
+}
+
+/// [`pull`], with the registry check skipped for a resident image when
+/// `recheck` is false ([`registry_check_needed`]).
+pub fn pull_checked(
+    image: &str,
+    authfile: &Path,
+    store: &Store,
+    timeout: Duration,
+    cancel: &std::sync::atomic::AtomicBool,
+    recheck: bool,
+) -> Result<bool> {
     if !image.contains("@sha256:") {
         return Err(Error::Preparation("image is not pinned by digest".into()));
     }
@@ -395,6 +421,9 @@ pub fn pull(
         "podman image exists",
     )?
     .success();
+    if present && !recheck {
+        return Ok(true);
+    }
     let cmd = podman_pull_command(image, authfile, store)?;
     // Even a resident digest must pass the registry's current authorization
     // check for this tenant before a container can use it.
@@ -993,6 +1022,21 @@ pub fn remove_named(name: &str, store: &Store) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B03: only an anonymous pull into the shared store may use a resident
+    /// digest without asking the registry; a credential or a private store
+    /// always asks.
+    #[test]
+    fn only_an_anonymous_shared_pull_skips_the_registry_for_a_resident_image() {
+        let private = Store::Private {
+            graph: std::path::PathBuf::from("/g"),
+            run: std::path::PathBuf::from("/r"),
+        };
+        assert!(!registry_check_needed(true, &Store::Shared));
+        assert!(registry_check_needed(false, &Store::Shared));
+        assert!(registry_check_needed(true, &private));
+        assert!(registry_check_needed(false, &private));
+    }
 
     /// R01: the image listing the reclamation pass reads — one compact line
     /// per image; malformed lines and non-digest ids are skipped, never

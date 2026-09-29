@@ -536,14 +536,23 @@ impl Resolver {
         // recorded is the peeled commit the file was actually read at.
         let provenance = plan.provenance(delivery, &binding, &spec, &fetched.commit);
         let dispatched = delivery.clone();
-        let run =
-            match self.store.writer().write(move |tx| {
-                intake::dispatch(tx, &dispatched, &spec, &images, &provenance, now)
-            }) {
-                Ok(run) => run,
-                Err(StoreError::Conflict) => return Ok(Outcome::Skipped),
-                Err(e) => return Err(e),
-            };
+        // The run and its ready jobs exist from this write, not from when
+        // resolution began: `now` predates the pipeline fetch, and stamping
+        // the jobs with it would count the fetch as queue time (B03).
+        let run = match self.store.writer().write(move |tx| {
+            intake::dispatch(
+                tx,
+                &dispatched,
+                &spec,
+                &images,
+                &provenance,
+                UnixMillis::now(),
+            )
+        }) {
+            Ok(run) => run,
+            Err(StoreError::Conflict) => return Ok(Outcome::Skipped),
+            Err(e) => return Err(e),
+        };
         Ok(Outcome::Dispatched { run })
     }
 

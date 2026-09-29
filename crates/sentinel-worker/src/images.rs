@@ -222,7 +222,14 @@ pub struct Images {
 impl Images {
     /// Pulls through podman, which enforces the digest pin itself.
     pub fn new(anonymous_authfile: PathBuf) -> Self {
-        Self::with_authfile_and_download(anonymous_authfile, podman::pull)
+        let anonymous = anonymous_authfile.clone();
+        Self::with_authfile_and_download(
+            anonymous_authfile,
+            move |image, authfile, store, timeout, cancel| {
+                let recheck = podman::registry_check_needed(authfile == anonymous, store);
+                podman::pull_checked(image, authfile, store, timeout, cancel, recheck)
+            },
+        )
     }
 
     /// Create the worker's pull state and its strict empty fallback authfile
