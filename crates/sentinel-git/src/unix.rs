@@ -398,6 +398,28 @@ fn fetch(
     credential: Option<&Credential>,
     deadline: Instant,
 ) -> Result<()> {
+    fetch_with(
+        work,
+        remote,
+        sha,
+        private,
+        credential,
+        &["--depth", "1"],
+        deadline,
+    )
+}
+
+/// [`fetch`] with the given extra arguments before `--` (a depth, a
+/// partial-clone filter).
+fn fetch_with(
+    work: &Path,
+    remote: &str,
+    sha: &str,
+    private: Option<&Private>,
+    credential: Option<&Credential>,
+    extra: &[&str],
+    deadline: Instant,
+) -> Result<()> {
     if remote.starts_with('-') {
         return Err(Error::Preparation("repository looks like an option".into()));
     }
@@ -411,16 +433,9 @@ fn fetch(
         secrets.push(credential.secret.clone());
     }
     transport(&mut fetch, private);
-    fetch.args([
-        "fetch",
-        "-q",
-        "--no-tags",
-        "--depth",
-        "1",
-        "--",
-        remote,
-        sha,
-    ]);
+    fetch.args(["fetch", "-q", "--no-tags"]);
+    fetch.args(extra);
+    fetch.args(["--", remote, sha]);
     let askpass = match credential {
         Some(credential) => Some(Askpass::install(work, credential)?),
         None => None,
@@ -642,11 +657,107 @@ pub fn file_at(
     init(work, deadline)?;
     let private = access.map(|a| Private::install(work, a)).transpose()?;
     let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
-    fetch(work, remote, sha, private.as_ref(), None, deadline)?;
-    drop(private);
+    // B04: the commit and its trees only, then the one blob the pipeline
+    // is. A depth-one fetch of the whole tree cost 3.6 s and 75 MB on
+    // Lockwell for a 1.5 KB file; this costs about 0.3 s and 0.2 MB. The
+    // work repository is a partial clone of `remote` (a promisor remote
+    // named `origin`: without one, a filtered fetch fails its connectivity
+    // check). A server that ignores the filter sends everything and the
+    // blob is simply present; anything else that goes wrong on this path
+    // gets the whole depth-one fetch, as before.
+    let filtered = partial_origin(work, remote, deadline).is_ok()
+        && fetch_with(
+            work,
+            PARTIAL_REMOTE,
+            sha,
+            private.as_ref(),
+            None,
+            &["--depth", "1", "--filter=blob:none"],
+            deadline,
+        )
+        .is_ok();
+    if !filtered {
+        fetch(work, remote, sha, private.as_ref(), None, deadline)?;
+    }
     let commit = fetch_head(work, deadline, &secrets)?;
+    if filtered
+        && let Some(blob) = path_blob(work, &commit, path, deadline, &secrets)?
+        && !object_present(work, &blob, deadline)
+        && fetch_with(
+            work,
+            PARTIAL_REMOTE,
+            &blob,
+            private.as_ref(),
+            None,
+            &["--filter=blob:none"],
+            deadline,
+        )
+        .is_err()
+    {
+        fetch(work, remote, sha, private.as_ref(), None, deadline)?;
+    }
+    drop(private);
     let bytes = read_path(work, &commit, path, max_bytes, deadline, &secrets)?;
     Ok(FetchedFile { commit, bytes })
+}
+
+/// The promisor remote a filtered pipeline read fetches through.
+const PARTIAL_REMOTE: &str = "origin";
+
+/// Make `work` a partial clone of `remote`: a promisor remote
+/// [`PARTIAL_REMOTE`] with a `blob:none` filter. Nothing is fetched here.
+fn partial_origin(work: &Path, remote: &str, deadline: Instant) -> Result<()> {
+    if remote.starts_with('-') {
+        return Err(Error::Preparation("repository looks like an option".into()));
+    }
+    for (key, value) in [
+        ("core.repositoryformatversion", "1"),
+        ("extensions.partialclone", PARTIAL_REMOTE),
+        ("remote.origin.url", remote),
+        ("remote.origin.promisor", "true"),
+        ("remote.origin.partialclonefilter", "blob:none"),
+    ] {
+        let mut config = git(work);
+        config.args(["config", "--", key, value]);
+        step(config, deadline, "git config", &[])?;
+    }
+    Ok(())
+}
+
+/// The object id of the blob at `path` in `commit`, from its trees alone;
+/// `None` when the path is absent or not a regular file (the read that
+/// follows then says `Missing`).
+fn path_blob(
+    work: &Path,
+    commit: &str,
+    path: &str,
+    deadline: Instant,
+    secrets: &[String],
+) -> Result<Option<String>> {
+    let mut tree = git(work);
+    tree.args(["ls-tree", "-z", commit, "--", path]);
+    let output = step(tree, deadline, "git ls-tree", secrets)?;
+    // `<mode> SP <type> SP <oid> TAB <path> NUL`
+    let entry = String::from_utf8_lossy(&output.stdout);
+    let mut fields = entry
+        .split('\t')
+        .next()
+        .unwrap_or_default()
+        .split_ascii_whitespace();
+    Ok(match (fields.next(), fields.next(), fields.next()) {
+        (Some(_), Some("blob"), Some(oid)) if valid_sha(oid) => Some(oid.to_owned()),
+        _ => None,
+    })
+}
+
+/// Whether the object store holds `oid` locally, without a lazy fetch.
+fn object_present(work: &Path, oid: &str, deadline: Instant) -> bool {
+    let mut exists = git(work);
+    // A partial clone would fetch a missing object to answer; the question
+    // is only whether it is here.
+    exists.env("GIT_NO_LAZY_FETCH", "1");
+    exists.args(["cat-file", "-e", oid]);
+    step(exists, deadline, "git cat-file", &[]).is_ok()
 }
 
 /// Fetch `merge_ref` — the tested-merge ref a forge computes for a pull

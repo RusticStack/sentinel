@@ -351,3 +351,38 @@ fn a_source_access_must_match_the_remote_it_is_used_for() {
         Err(Error::Preparation(_))
     ));
 }
+
+/// B04: a server that honours partial-clone filters sends the commit, its
+/// trees and the one blob the pipeline is — never the rest of the tree.
+#[test]
+fn a_filtering_server_sends_only_the_pipeline_blob() {
+    let repo = repository();
+    git(&repo.path, &["config", "uploadpack.allowFilter", "true"]);
+    git(
+        &repo.path,
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    );
+    let big_blob = git(&repo.path, &["rev-parse", &format!("{}:big.yml", repo.big)]);
+    let dir = work(&repo, "filtered");
+    let fetched = file_at(
+        &dir,
+        repo.path.to_str().unwrap(),
+        None,
+        &repo.big,
+        ".sentinel.yml",
+        64 * 1024,
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert_eq!(fetched.commit, repo.big);
+    assert_eq!(fetched.bytes, b"schema: 1 # second\n");
+    let absent = Command::new("git")
+        .args(["cat-file", "-e", &big_blob])
+        .current_dir(&dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        // The work repository is a partial clone: asking must not fetch.
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .status()
+        .unwrap();
+    assert!(!absent.success(), "the 2 MiB blob was never fetched");
+}

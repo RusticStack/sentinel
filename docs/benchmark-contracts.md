@@ -130,6 +130,32 @@ What the measurements say:
 
 Found on the way: the repository's HTTPS Git test fixture (`fixtures/git_https.py`) did not pass `Content-Encoding` or `Git-Protocol` to `git http-backend`. A fetch from a populated mirror sends a gzipped request over about 1 KiB, and the server hung up. It now passes both. The Lockwell branch `sentinel-bench/b02` carried only the benchmark workflow. Its runner registration was removed after the samples, and the branch is deleted, while the runs stay in the Actions history.
 
+## B04: the critical path, profiled and cut
+
+B02's phase record ([`b02-sentinel.jsonl`](../bench/b02-sentinel.jsonl)) is the profile of Sentinel's own path on the contract lane. The test step (64–67 s) is the lane's own work, the same in every executor; it is wait-dominated inside a few Go packages ([CI baseline](ci-baseline.md)) and belongs to B07. Around it, Sentinel spent about 11 s per warm run. In order of size:
+
+| Phase (warm median) | Before | What it was |
+|---|---|---|
+| Intake → dispatch | 4.23 s | resolving `.sentinel.yml` at the pushed commit: a depth-one fetch of the whole tree, 75 MB, to read a 1.5 KB file |
+| Finalize | 2.95 s | publishing the Go caches |
+| Checkout | 1.77 s | the worker's mirrored checkout |
+| Image pull | 1.03 s | a registry manifest request for an image already resident (fixed in [B03](latency-budgets.md#before-and-after-the-two-fixes)) |
+| Container start | 0.31 s | |
+
+**The largest cost, pipeline resolution, is cut.** The controller now reads the pipeline through a partial clone: the commit and its trees (`--filter=blob:none`), then the pipeline's own blob by its id. On this repository that is about 0.3 s and 0.2 MB instead of 3.6 s and 75 MB. A server that ignores the filter sends everything, and a failure anywhere on the partial path falls back to the whole depth-one fetch, so every server still works (`sentinel-git` `file_at`; test `a_filtering_server_sends_only_the_pipeline_blob`). The bench repository's server has `uploadpack.allowFilter` enabled, as GitHub's does. Pull-request resolution through a merge ref still fetches the whole tree; the same change applies there.
+
+**After** ([`b04-pipeline-fetch.jsonl`](../bench/b04-pipeline-fetch.jsonl), 4 warm samples and a warm-up, same lane, host and caps):
+
+| Phase (warm) | Before | After |
+|---|---|---|
+| Intake → dispatch | 4.23 s | 0.48–0.50 s |
+| Image pull | 1.03 s | 0.05–0.07 s |
+| Checkout | 1.77 s | 1.79–1.87 s |
+| Finalize | 2.95 s | 2.77–3.55 s |
+| Everything but the test step | ~11.4 s | ~7.2 s |
+
+Sentinel's overhead on this lane is now about 7 s against a healthy self-hosted runner's 11 s, plus its queue (B02). What remains, in order: cache publication in finalize (about 3 s), checkout (about 1.8 s), then dispatch and reporting (about 1.5 s together). CPU throttling and disk wait inside the test step were not profiled here. The step is capped at the contract's 10 CPUs, and its time is the same in every executor, so neither is an engine cost.
+
 ## Reproducing
 
 1. As root on the reference host, enable lingering for the bench user so it has a systemd user manager: `loginctl enable-linger sentinelbench`.
