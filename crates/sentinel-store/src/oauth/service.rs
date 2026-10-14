@@ -1,20 +1,3 @@
-//! Service-account grants: a tenant administrator issues a bounded,
-//! scoped refresh-token grant to a service principal of that tenant.
-//!
-//! A service grant is an ordinary grant row of kind 3 for the first-party
-//! CLI client, narrowed to the principal's home tenant (and optionally one
-//! repository of it), named by the administrator, and bounded to
-//! [`SERVICE_MIN_MS`]..=[`SERVICE_MAX_MS`]. Issuance writes the grant and
-//! one refresh token (generation 1, whose idle expiry is the grant's); no
-//! access token is minted, since the holder refreshes first. The refresh
-//! token is returned once and only its digest is stored. `tenant:admin` and
-//! `platform:admin` are never issued to a service principal; the insert
-//! trigger refuses them too.
-//!
-//! Revocation goes through [`super::revoke_grant`], which already admits the
-//! owner, a platform administrator, or an administrator of the service
-//! principal's home tenant.
-
 use rusqlite::{Connection, Transaction, params};
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
@@ -33,13 +16,11 @@ use crate::{
     local_auth::{Event, audit},
 };
 
-/// Scopes a service principal can never hold.
+/// Never issued to a service principal; the insert trigger refuses them too.
 const ADMIN_SCOPES: Scopes = Scopes::TENANT_ADMIN.union(Scopes::PLATFORM_ADMIN);
 
-/// At most this many grants are listed per service principal.
 const LIST_LIMIT: i64 = 100;
 
-/// `NotFound` unless `account` is an active service principal of `tenant`.
 fn require_account(conn: &Connection, tenant: TenantId, account: UserId) -> Result<()> {
     let found: bool = conn
         .prepare_cached(
@@ -50,20 +31,6 @@ fn require_account(conn: &Connection, tenant: TenantId, account: UserId) -> Resu
     if found { Ok(()) } else { Err(Error::NotFound) }
 }
 
-/// Issue a service grant; returns its handle, the refresh token (shown
-/// once) and the grant's absolute expiry.
-///
-/// Minting a refresh token that outlives the session which asked for it
-/// needs fresh step-up, re-checked in this transaction: a bearer credential
-/// or an OAuth token can never issue (`StepUpRequired`), and a platform
-/// administrator who does not administer `tenant` also gives a `reason`
-/// ([`Authority::require_tenant_access_change`]).
-///
-/// `Forbidden`: `authority` does not administer `tenant` (a platform
-/// administrator does). `NotFound`: `account` is not an active service
-/// principal of `tenant`, or `repo` is not a repository of it.
-/// `InvalidInput`: empty scopes or an administrative scope, a lifetime
-/// outside [`SERVICE_MIN_MS`]..=[`SERVICE_MAX_MS`], or a bad name.
 #[allow(clippy::too_many_arguments)]
 pub fn issue_service_grant(
     tx: &Transaction<'_>,
@@ -132,12 +99,6 @@ pub fn issue_service_grant(
     Ok((grant, refresh, UnixMillis(expires)))
 }
 
-/// A service principal's grants as metadata (never a token or a digest),
-/// newest first, at most 100; a revoked grant is included until
-/// [`super::purge_expired`] deletes it (the next maintenance tick, at most
-/// about ten minutes, with no retention). `Forbidden` unless
-/// `principal` administers `tenant`; `NotFound` unless `account` is a
-/// service principal of it.
 pub fn service_grants(
     conn: &Connection,
     principal: Principal,
@@ -161,14 +122,6 @@ pub fn service_grants(
     rows.map(|row| grant_record(row?)).collect()
 }
 
-/// Allow (or, with `Permissions::NONE`, withdraw) a service principal of
-/// `tenant` repository actions on a repository of the same tenant.
-/// Widening what a credential-holding principal can reach takes the same
-/// fresh step-up and `reason` rule as [`issue_service_grant`].
-///
-/// `Forbidden`: `authority` does not administer `tenant`. `NotFound`: the
-/// account is not a service principal of `tenant`, or the repository is
-/// not one of its repositories.
 pub fn allow_repo(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -196,7 +149,6 @@ pub fn allow_repo(
 mod tests {
     use rusqlite::Connection;
 
-    /// Listing a service principal's grants walks its index, newest first.
     #[test]
     fn listing_is_an_index_walk() {
         let mut conn = Connection::open_in_memory().unwrap();
