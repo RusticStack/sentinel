@@ -68,7 +68,9 @@ fn code_from(uri: &str) -> String {
         .as_secs();
     (0..1_000_000u32)
         .map(|n| format!("{n:06}"))
-        .find(|code| check(&seed, code, seconds).is_some())
+        // The code of the current step only: the search is slow on a loaded
+        // host, and a code of the previous step would lapse while it ran.
+        .find(|code| check(&seed, code, seconds) == Some(seconds / 30))
         .expect("some code matches")
 }
 

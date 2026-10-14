@@ -465,6 +465,14 @@ fn a_renamed_or_dropped_repository_loses_its_binding() {
     let notices = Arc::new(Mutex::new(Vec::new()));
     let lane = start(&f, Arc::clone(&notices));
     until("the rename revoke", || binding_revoked(&f));
+    // The notice follows the store write, so wait for it rather than race it.
+    until("the revoke notice", || {
+        notices
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| o.contains("revoked"))
+    });
     assert!(
         notices
             .lock()
