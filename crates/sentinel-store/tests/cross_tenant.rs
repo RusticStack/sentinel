@@ -1,8 +1,8 @@
-//! A08: the consolidated cross-tenant sweep. One deployment, two
+//! The consolidated cross-tenant sweep. One deployment, two
 //! organizations and a personal namespace, overlapping memberships, a
 //! tenant-bound service account, unbound installations, invitations raced and
 //! reused, guessed identifiers, cross-tenant queries and cursors, and
-//! last-admin recovery — exercised together rather than per task, because the
+//! last-admin recovery — exercised together rather than per feature, because the
 //! failures worth finding live between the modules.
 
 use std::thread;
@@ -674,7 +674,7 @@ fn everything_above_survives_a_reopen() {
     assert!(store.read(|c| tenancy::epoch(c, acme)).unwrap() >= 1);
 }
 
-/// P03-7 / P09-1: resolving a tenant slug (and a repository name) for a
+/// Resolving a tenant slug (and a repository name) for a
 /// client never tells a non-member whether the tenant exists. A foreign,
 /// a suspended and a missing slug are the same `NotFound`, for principals,
 /// narrowed credentials and the OAuth narrowing alike.

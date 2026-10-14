@@ -1,4 +1,4 @@
-//! W02 store behavior: the ready queue is the database, reservations are
+//! Dispatch store behavior: the ready queue is the database, reservations are
 //! attempts, placement is pool-scoped and capacity-checked, offers lapse back
 //! to the queue under an advanced fence, renewal and reports are fenced, and
 //! a finished job releases its capacity and decides its dependents.
@@ -648,7 +648,7 @@ jobs:
 ";
     // `pull_request` scopes a job's caches to pull-request state. Protected
     // state needs a verified delivery for a ref the binding names exactly
-    // (P07-2; `sentinel-intake/tests/dispatch.rs` covers that path), so a
+    // (`sentinel-intake/tests/dispatch.rs` covers that path), so a
     // push recorded without a delivery, an unknown trigger and no
     // provenance at all — the manual API — are all unprotected.
     for (trigger, trust) in [
@@ -1370,7 +1370,7 @@ jobs:
     assert_eq!(place(&f, w, f.pool, at(3_000)), None);
 }
 
-/// P11D-2 residual: an offer lapses and the requeued job is then canceled
+/// An offer lapses and the requeued job is then canceled
 /// or times out in the queue before any new lease. The lapsed attempt never
 /// ran, so the job's verdict is not its verdict: it stops being current at
 /// the lapse and stays so, and the job no longer shows the lapsed lease.

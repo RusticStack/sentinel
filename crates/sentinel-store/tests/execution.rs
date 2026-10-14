@@ -1,4 +1,4 @@
-//! Execution hardening (Part 04 audit): terminal edges decide dependents,
+//! Execution hardening: terminal edges decide dependents,
 //! a recorded cancel settles an offer that goes back, hand-backs are fenced
 //! and never infrastructure failures, specs wait for a durable
 //! acknowledgement, expiry re-checks the lease, and every hello renegotiates.
@@ -180,7 +180,7 @@ fn run_state(f: &Fixture, run: RunId) -> RunState {
         .unwrap()
 }
 
-/// P04-3: cancelling one unstarted job decides its dependents in the same
+/// Cancelling one unstarted job decides its dependents in the same
 /// transaction; the run finishes instead of waiting forever.
 #[test]
 fn cancelling_an_unstarted_job_skips_its_dependents_and_ends_the_run() {
@@ -201,7 +201,7 @@ fn cancelling_an_unstarted_job_skips_its_dependents_and_ends_the_run() {
     assert_eq!(run_state(&f, run_id), RunState::Terminal(Outcome::Canceled));
 }
 
-/// P04-14: a cancel recorded while the offer is unacknowledged settles the
+/// A cancel recorded while the offer is unacknowledged settles the
 /// job as soon as the offer lapses or is declined; it never waits in the
 /// queue for a placement it cannot get.
 #[test]
@@ -245,7 +245,7 @@ fn a_cancel_recorded_while_offered_ends_the_job_when_the_offer_goes_back() {
     );
 }
 
-/// P04-25 and P04-4: a decline is fenced on the holder, and an acknowledged
+/// A decline is fenced on the holder, and an acknowledged
 /// attempt the worker never started (its spec never arrived) goes back to
 /// the queue: not an infrastructure failure, and not after a lease wait.
 #[test]
@@ -311,7 +311,7 @@ fn a_decline_is_fenced_and_hands_back_an_acknowledged_attempt_that_never_started
     assert_eq!(state(&f, ids[0]), JobState::Preparing);
 }
 
-/// P04-10: nothing that could start work is served before the
+/// Nothing that could start work is served before the
 /// acknowledgement is durable; a cancelled, unstarted attempt is named so
 /// the controller settles it instead of serving it.
 #[test]
@@ -367,7 +367,7 @@ fn the_spec_is_served_only_after_the_acknowledgement() {
     assert_eq!(state(&f, job), JobState::Terminal(Outcome::Canceled));
 }
 
-/// P04-24: a renewal that commits after the sweep read the attempt as due
+/// A renewal that commits after the sweep read the attempt as due
 /// wins; the batch expiry re-checks the lease in its own write.
 #[test]
 fn expiry_rechecks_the_lease_in_its_write() {
@@ -382,7 +382,7 @@ fn expiry_rechecks_the_lease_in_its_write() {
     assert_eq!(due.len(), 1);
     assert_eq!((due[0].0, due[0].2), (attempt, offer.job));
     // The worker renews at its deadline; that write commits only after the
-    // sweep's read (a renewal of an already-passed lease is refused, P08-13).
+    // sweep's read (a renewal of an already-passed lease is refused).
     let deadline = at(late.0 - 1);
     f.store
         .writer()
@@ -424,7 +424,7 @@ fn expiry_rechecks_the_lease_in_its_write() {
     assert_eq!(state_code, dispatch::LogState::Complete as i64);
 }
 
-/// P04-5: a worker's `canceled` with no cancel ever requested is its own
+/// A worker's `canceled` with no cancel ever requested is its own
 /// infrastructure event (a watchdog, a shutdown), never the user's verdict.
 #[test]
 fn a_canceled_report_without_a_request_is_not_recorded_as_a_cancel() {
@@ -555,7 +555,7 @@ fn an_oversized_summary_is_dropped_and_the_pass_stands() {
     assert_eq!(stored, None);
 }
 
-/// P04-2: every hello renegotiates; an upgrade and a rollback are both
+/// Every hello renegotiates; an upgrade and a rollback are both
 /// recorded, a rollback below the profile protocol forgets profile-only
 /// placement facts, and a different architecture is not the same worker.
 #[test]
@@ -614,7 +614,7 @@ fn renegotiation_records_upgrades_and_rollbacks_but_not_a_new_architecture() {
     ));
 }
 
-/// P04-26: a refused enrollment is audited and the audit row commits.
+/// A refused enrollment is audited and the audit row commits.
 #[test]
 fn a_refused_enrollment_is_audited() {
     let f = fixture();

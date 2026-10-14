@@ -1,4 +1,4 @@
-//! G04 store behavior: the Checks outbox coalesces one row per (run, scope),
+//! Checks outbox store behavior: it coalesces one row per (run, scope),
 //! the stable aggregate follows the run, a settled event still owes a
 //! completed check, and publications are retried and guarded against stale
 //! writes.
