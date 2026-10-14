@@ -1,8 +1,3 @@
-//! The append-only record of run control actions (migration 43): who
-//! cancelled or reran what, how they authenticated, and — for an OAuth
-//! access token — which grant and client acted. An agent acting through MCP
-//! is therefore traceable to the grant to revoke.
-//!
 //! Callers write the record in the same writer transaction as the action it
 //! describes, so an action is never committed without its record.
 
@@ -11,7 +6,6 @@ use sentinel_core::{GrantId, TenantId, UnixMillis, UserId};
 
 use crate::{Error, Result};
 
-/// What was done. Stored as its integer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Action {
@@ -20,34 +14,24 @@ pub enum Action {
     RerunJob = 3,
 }
 
-/// How the actor authenticated. Stored as its integer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Actor {
-    /// Host-local administration: the database file's authority, no account.
     HostLocal,
-    /// A `sntl_` API credential.
     Credential(UserId),
-    /// A browser session.
     Session(UserId),
-    /// An OAuth access token of `grant`.
     OAuth(UserId, GrantId),
 }
 
-/// One record, as [`recent`] reads it back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub at: UnixMillis,
     pub action: Action,
-    /// The run or job, as its 16 raw bytes.
     pub target: [u8; 16],
     pub actor: Actor,
-    /// The OAuth client of the grant at the time of the action.
     pub client: Option<String>,
 }
 
-/// Append one record. The OAuth client is copied from the grant inside the
-/// same statement, so grants and clients may be purged later without
-/// losing it.
+/// The OAuth client is copied in the same statement, so it survives grant purges.
 pub fn record(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -80,8 +64,6 @@ pub fn record(
     Ok(())
 }
 
-/// The tenant's newest records, newest first, at most `limit`. Host-local
-/// and test inspection; the API pages through [`page`].
 pub fn recent(conn: &Connection, tenant: TenantId, limit: u32) -> Result<Vec<Record>> {
     Ok(page(conn, tenant, None, limit)?
         .into_iter()
@@ -89,9 +71,6 @@ pub fn recent(conn: &Connection, tenant: TenantId, limit: u32) -> Result<Vec<Rec
         .collect())
 }
 
-/// The tenant's records strictly older than sequence `before` (the newest
-/// without one), newest first, each with its sequence — the next page's
-/// cursor.
 pub fn page(
     conn: &Connection,
     tenant: TenantId,
