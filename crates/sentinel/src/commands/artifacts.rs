@@ -361,7 +361,7 @@ fn transfer(
     Ok(())
 }
 
-/// An attempt's cache records (K08) from its terminal summary.
+/// An attempt's cache records from its terminal summary.
 pub(super) fn cache(client: &Client, output: Output, attempt: &str) -> Result<(), Error> {
     let attempt = segment("attempt", attempt)?;
     let view = client.get(&format!("/api/v1/attempts/{attempt}/summary"))?;

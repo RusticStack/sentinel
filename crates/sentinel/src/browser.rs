@@ -1,4 +1,4 @@
-//! Opening the sign-in URL in the user's browser (O04), one argv element and
+//! Opening the sign-in URL in the user's browser, one argv element and
 //! no shell; the URL is always printed as well, so a headless machine or a
 //! failed launch still lets the user open it by hand.
 //!
