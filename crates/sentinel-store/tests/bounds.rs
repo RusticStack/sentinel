@@ -1,7 +1,3 @@
-//! The store's resource bounds and failure behavior. Stalled work, a panicking
-//! closure, reader saturation, orderly shutdown and single-controller
-//! ownership are each exercised for real, with wall-clock bounds asserted.
-
 use std::{
     sync::{Arc, Barrier},
     thread,
@@ -28,10 +24,6 @@ fn tenant_count(store: &Store) -> i64 {
         .unwrap()
 }
 
-/// A checkpoint does not hold the writer for a reader's whole read: with a
-/// snapshot open that the new commits outrun, the truncate gives up after its
-/// budget and reports a partial result, the writer works right after, and a
-/// checkpoint with no reader in the way completes.
 #[test]
 fn a_checkpoint_blocked_by_a_reader_returns_within_its_budget() {
     let (_dir, store) = store();
@@ -75,7 +67,6 @@ fn one_process_owns_the_database_and_ownership_ends_with_the_store() {
         Store::open(&path, Durability::Normal),
         Err(Error::AlreadyOwned)
     ));
-    // A different database beside it is a different deployment.
     Store::open(dir.path().join("other.sqlite"), Durability::Normal).unwrap();
     assert_eq!(first.shutdown(Duration::from_secs(5)), Shutdown::Drained);
     Store::open(&path, Durability::Normal).unwrap();
@@ -98,7 +89,6 @@ fn a_panicking_write_rolls_back_and_the_writer_keeps_serving() {
         "the partial transaction rolled back"
     );
 
-    // The next write on the same writer works, and so does a checkpoint.
     let tenant = TenantId::new();
     store
         .writer()
@@ -115,7 +105,6 @@ fn a_stalled_write_is_reported_as_ambiguous_not_as_failed() {
     let started = Instant::now();
     let outcome = store.writer().write(move |tx| {
         jobs::insert_tenant(tx, tenant, "slow", UnixMillis(1))?;
-        // A disk that answers eventually, later than anybody should wait.
         thread::sleep(WRITE_WAIT + Duration::from_millis(500));
         Ok(())
     });
@@ -123,7 +112,6 @@ fn a_stalled_write_is_reported_as_ambiguous_not_as_failed() {
     assert!(matches!(outcome, Err(Error::WriteAmbiguous)), "{outcome:?}");
     assert!(waited >= WRITE_WAIT && waited < WRITE_WAIT + Duration::from_secs(2));
 
-    // "Ambiguous" was the truth: the write completes, and a re-read sees it.
     thread::sleep(Duration::from_secs(1));
     assert_eq!(tenant_count(&store), 1);
 }
@@ -151,7 +139,6 @@ fn readers_are_bounded_and_an_exhausted_pool_sheds_within_the_admission_window()
         .collect();
     hold.wait();
 
-    // Every reader is occupied: the next request waits its bound, then sheds.
     let started = Instant::now();
     assert!(matches!(
         tenant_count_result(&store),
@@ -164,7 +151,6 @@ fn readers_are_bounded_and_an_exhausted_pool_sheds_within_the_admission_window()
     for holder in holders {
         holder.join().unwrap();
     }
-    // Freed readers are reused, not reopened: the pool never exceeds the limit.
     assert_eq!(tenant_count(&store), 0);
     let concurrent: Vec<_> = (0..READER_LIMIT * 4)
         .map(|_| {
@@ -187,8 +173,6 @@ fn tenant_count_result(store: &Store) -> Result<i64, Error> {
 #[test]
 fn a_panicking_read_returns_its_connection_to_the_pool() {
     let (_dir, store) = store();
-    // Panic through every pooled connection: each must go back to the pool
-    // before the panic resumes, so `READER_LIMIT` panics cannot drain it.
     for _ in 0..READER_LIMIT + 1 {
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = store.read(|_| -> Result<(), Error> { panic!("read bug") });
@@ -196,7 +180,6 @@ fn a_panicking_read_returns_its_connection_to_the_pool() {
         assert!(panicked.is_err());
     }
     assert_eq!(tenant_count(&store), 0);
-    // And the panic was a panic, not a quiet error.
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = store.read(|_| -> Result<(), Error> { panic!("read bug") });
     }));
@@ -221,9 +204,7 @@ fn shutdown_drains_accepted_work_and_reports_a_stall_honestly() {
     let reopened = Store::open(&path, Durability::Normal).unwrap();
     assert_eq!(tenant_count(&reopened), 1);
 
-    // A write that outlives every bound: the caller learns "ambiguous", the
-    // shutdown learns "stalled", and the work is still never discarded — it
-    // completes once the disk (here, a channel) answers.
+    // Accepted work is never discarded at shutdown: a stalled write still completes once its disk answers.
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let tenant = TenantId::new();
     let outcome = reopened.writer().write(move |tx| {
@@ -237,8 +218,7 @@ fn shutdown_drains_accepted_work_and_reports_a_stall_honestly() {
         Shutdown::Stalled
     );
     release_tx.send(()).unwrap();
-    // A stalled shutdown keeps ownership: the writer thread is still this
-    // process's, so a second controller must not start until it exits.
+    // A stalled shutdown keeps ownership until its writer exits, so a second controller cannot start.
     thread::sleep(Duration::from_millis(300));
     assert!(matches!(
         Store::open(&path, Durability::Normal),

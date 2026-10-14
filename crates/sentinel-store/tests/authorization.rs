@@ -13,7 +13,6 @@ const NOW: UnixMillis = UnixMillis(123);
 fn principal(user: UserId) -> Principal {
     Principal::new(user, P::ALL, None, None)
 }
-/// A caller that has just proven presence: the bar for minting service principals.
 fn stepped(user: UserId) -> auth::Authority {
     auth::Authority::Credential {
         principal: principal(user),
@@ -103,7 +102,6 @@ fn fixture() -> (tempfile::TempDir, Store, Ids) {
                 )?;
             }
             auth::set_repo_grant(tx, principal(i.alice), i.ar, i.bob, P::READ.union(P::RUN))?;
-            // A grant cannot lift Alice above her reader membership in B.
             auth::set_repo_grant(tx, principal(i.bob), i.br, i.alice, P::REPOSITORY)?;
             auth::create_service_account(
                 tx,
@@ -146,7 +144,6 @@ fn roles_intersect_live_memberships_repo_grants_and_credential_scopes() {
             missing(auth::get_repo(c, principal(i.bob), i.ar2));
             auth::require_repo(c, principal(i.alice), i.br, P::READ)?;
             missing(auth::require_repo(c, principal(i.alice), i.br, P::RUN));
-            // Explicit secret delegation is independent of operator status.
             auth::require_repo(c, principal(i.alice), i.br, P::WRITE_SECRETS)?;
             auth::require_repo(c, principal(i.alice), i.personal_repo, P::RUN)?;
             missing(auth::get_repo(c, principal(i.bob), i.personal_repo));
@@ -492,15 +489,13 @@ fn revocation_is_live_and_readding_membership_does_not_restore_old_grants() {
 fn authorization_and_mutation_share_the_writer_transaction() {
     let (_dir, store, i) = fixture();
     let new_repo = RepoId::new();
-    // This simulates a revocation committed while a request was queued. There
-    // is no reusable positive authorization decision from its earlier read.
+    // Authorization is re-checked inside the writer transaction: a revocation may commit after an earlier read.
     store
         .read(|c| auth::require_tenant_admin(c, principal(i.alice), i.a))
         .unwrap();
     store
         .writer()
         .write(move |tx| {
-            // Another administrator first: a tenant's last one keeps the role.
             auth::set_membership(tx, principal(i.root), i.a, i.bob, Role::TenantAdmin)?;
             auth::set_membership(tx, principal(i.root), i.a, i.alice, Role::Reader)
         })
@@ -812,10 +807,7 @@ fn dispatch_and_spec_read_derive_ownership_and_recheck_revoked_permissions() {
         .unwrap();
 }
 
-/// An organization never loses its last administrator by a demotion or a
-/// removal (only the platform could recover it); with a second
-/// administrator either change goes through, and a platform administrator
-/// can always give an administrator-less tenant one.
+// Refuse to demote or remove a tenant's last administrator: only the platform could recover it.
 #[test]
 fn the_last_tenant_administrator_keeps_the_role() {
     let (_dir, store, i) = fixture();
@@ -830,7 +822,6 @@ fn the_last_tenant_administrator_keeps_the_role() {
     ] {
         assert!(matches!(store.writer().write(change), Err(Error::Conflict)));
     }
-    // Still the administrator, and the refusal changed nothing.
     store
         .read(|c| auth::require_tenant_admin(c, principal(i.alice), i.a))
         .unwrap();
@@ -841,7 +832,6 @@ fn the_last_tenant_administrator_keeps_the_role() {
             auth::remove_membership(tx, principal(i.root), i.a, i.alice, NOW)
         })
         .unwrap();
-    // The new last administrator is held the same way.
     assert!(matches!(
         store.writer().write(move |tx| auth::set_membership(
             tx,

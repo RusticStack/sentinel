@@ -1,6 +1,3 @@
-//! Operator-configured email-domain auto-join: who joins, who must not, and
-//! what stays true across restarts, races and configuration changes.
-
 use rusqlite::params;
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
@@ -57,7 +54,6 @@ impl Fixture {
             .secret
     }
 
-    /// An admitted account that claims `address`; nothing is verified yet.
     fn claim(&self, address: &str) -> UserId {
         let invitation = self.admission();
         match registration::register_with(
@@ -86,7 +82,6 @@ impl Fixture {
             .secret
     }
 
-    /// An admitted account whose address is verified through its link.
     fn verified(&self, address: &str) -> UserId {
         let user = self.claim(address);
         let secret = self.link(user);
@@ -116,7 +111,6 @@ impl Fixture {
             .unwrap()
     }
 
-    /// The user's role in the tenant `slug`, 0 for none.
     fn role_in(&self, slug: &str, user: UserId) -> i64 {
         self.store
             .read(|c| {
@@ -216,7 +210,6 @@ fn a_named_organization_is_used_and_an_existing_one_is_joined_not_replaced() {
     f.organization("acme");
     assert!(f.rules("rusticstack.com=acme").is_empty());
     let user = f.verified("ana@rusticstack.com");
-    // The organization already existed: nobody is promoted, nothing is created.
     assert_eq!(f.role_in("acme", user), 1);
     assert_eq!(f.tenants_named("acme"), 1);
     assert_eq!(f.count(Event::NamespaceCreated), 0);
@@ -232,7 +225,6 @@ fn lookalike_domains_never_match() {
         "a@mail.rusticstack.com",
         "a@rusticstack.co",
         "a@notrusticstack.com",
-        // Cyrillic small es in place of the Latin c: a different domain.
         "a@rusti\u{0441}stack.com",
     ] {
         let user = f.verified(lookalike);
@@ -269,8 +261,6 @@ fn an_unverified_address_grants_nothing_at_sign_in_or_when_claimed() {
     let f = fixture();
     assert!(f.rules("rusticstack.com").is_empty());
     let user = f.claim("ana@rusticstack.com");
-    // A claim alone: not at registration, not by asking for a link, not at
-    // sign-in (a username account that merely claims the address).
     let _ = f.link(user);
     assert_eq!(f.memberships_of(user), 0);
     let invitation = f.admission();
@@ -308,7 +298,6 @@ fn a_domain_listed_after_the_address_was_verified_joins_at_the_next_sign_in() {
     assert_eq!(f.memberships_of(user), 0, "recording the rule joins nobody");
     f.sign_in("ana@rusticstack.com");
     assert_eq!(f.role_in(SLUG, user), 3);
-    // Signing in again changes nothing and is not audited again.
     f.sign_in("ana@rusticstack.com");
     assert_eq!(f.role_in(SLUG, user), 3);
     assert_eq!(f.count(Event::DomainAutoJoined), 1);
@@ -348,8 +337,7 @@ fn an_account_waiting_for_approval_joins_only_once_admitted() {
         Admission::Pending(user) => user,
         other => panic!("{other:?}"),
     };
-    // The mailbox is proved, but the operator has not admitted the account:
-    // a domain match is not an approval.
+    // A proven mailbox plus a domain match is not an approval; the operator must still admit the account.
     let secret = f.link(pending);
     assert!(matches!(
         email::confirm(&f.store, &secret, at(20)).unwrap(),
@@ -368,8 +356,6 @@ fn an_account_waiting_for_approval_joins_only_once_admitted() {
 
 #[test]
 fn a_github_backed_organization_is_never_joined_by_domain() {
-    // Backed by a bound installation before the controller starts: the entry
-    // is refused at start, by position, and nobody joins.
     let f = fixture();
     let tenant = f.organization("rusticstack-com");
     f.bind_github(tenant);
@@ -384,7 +370,6 @@ fn a_github_backed_organization_is_never_joined_by_domain() {
     let user = f.verified("ana@rusticstack.com");
     assert_eq!(f.memberships_of(user), 0);
 
-    // Backed by membership source alone.
     let g = fixture();
     g.organization("rusticstack-com");
     g.store
@@ -410,8 +395,7 @@ fn an_organization_converted_after_start_stops_admitting_by_domain() {
     let early = f.verified("ana@rusticstack.com");
     assert_eq!(f.role_in(SLUG, early), 1);
 
-    // Bound to GitHub while the controller runs: the stored rule still names
-    // it, and the joining transaction refuses it.
+    // Converted after start: the stored rule still names the organization, so the joining transaction must refuse it.
     f.bind_github(tenant);
     let late = f.verified("bruno@rusticstack.com");
     assert_eq!(f.role_in(SLUG, late), 0);
@@ -461,7 +445,6 @@ fn a_personal_namespace_or_a_suspended_organization_is_never_joined() {
     );
     let user = f.verified("ana@rusticstack.com");
     assert_eq!(f.memberships_of(user), 0);
-    // The owner's own personal namespace is untouched.
     assert_eq!(f.role_in(SLUG, owner), 3);
 }
 
@@ -502,7 +485,6 @@ fn a_restart_changes_nobodys_access_and_joins_nobody_twice() {
     let admin = f.verified("ana@rusticstack.com");
     let reader = f.verified("bruno@rusticstack.com");
 
-    // The controller records the same rules again at every start.
     assert!(f.rules("rusticstack.com").is_empty());
     f.sign_in("ana@rusticstack.com");
     f.sign_in("bruno@rusticstack.com");
@@ -514,7 +496,6 @@ fn a_restart_changes_nobodys_access_and_joins_nobody_twice() {
     assert_eq!(f.role_in(SLUG, reader), 1);
     assert_eq!(f.count(Event::DomainAutoJoined), 2);
 
-    // And across a real reopen of the database.
     let Fixture { dir, store, .. } = f;
     drop(store);
     let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();

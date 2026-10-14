@@ -1,7 +1,3 @@
-//! Checks outbox store behavior: it coalesces one row per (run, scope),
-//! the stable aggregate follows the run, a settled event still owes a
-//! completed check, and publications are retried and guarded against stale
-//! writes.
 use rusqlite::Connection;
 use sentinel_auth::sealed::Key;
 use sentinel_core::{
@@ -142,8 +138,6 @@ fn spec(remote: &str) -> RunSpec {
     .unwrap()
 }
 
-/// Create a run with manual provenance (which publishes nothing) or event
-/// provenance (which publishes the aggregate and a check per job).
 fn create_run(f: &mut Fixture, repo: RepoId, event: bool) -> (RunId, Vec<JobId>) {
     let run = RunId::new();
     let remote = sources::metadata_trusted(&f.conn, repo)
@@ -178,8 +172,6 @@ fn create_run(f: &mut Fixture, repo: RepoId, event: bool) -> (RunId, Vec<JobId>)
         )
         .unwrap();
     }
-    // As `intake::dispatch` and the API route do: rows appear once provenance
-    // says whether this is an event-driven run.
     checks::record_run(&tx, f.tenant, run, NOW).unwrap();
     tx.commit().unwrap();
     (run, jobs)
@@ -254,7 +246,6 @@ fn a_run_gets_a_stable_aggregate_and_one_check_per_job() {
         assert_eq!(row.status, Status::Queued);
         assert_eq!(row.external_id, format!("sentinel:{run}:{job}"));
     }
-    // A generic repository gets no rows at all.
     let (plain, _) = {
         let generic = f.generic;
         create_run(&mut f, generic, true)
@@ -278,8 +269,6 @@ fn job_transitions_move_their_check_and_the_aggregate() {
         step(&mut f, build, Event::Leased(Fence(1)), NOW.0 + 1),
         JobState::Leased
     );
-    // A leased job is already being handed to a worker, which is what the
-    // run-level aggregate says too.
     assert_eq!(
         publication(&f, run, &build.to_string()).status,
         Status::InProgress
@@ -324,13 +313,10 @@ fn job_transitions_move_their_check_and_the_aggregate() {
     assert_eq!(done.status, Status::Completed);
     assert_eq!(done.conclusion, Some(Conclusion::Success));
     assert_eq!(done.title, "Passed");
-    // The aggregate is still running while `test` is unfinished.
     assert_eq!(
         publication(&f, run, checks::AGGREGATE_SCOPE).status,
         Status::InProgress
     );
-    // The dependency released `test` (as `release_dependents` does on
-    // completion); it then fails for its own reason.
     step(&mut f, test, Event::DependenciesSatisfied, NOW.0 + 5);
     assert_eq!(
         publication(&f, run, &test.to_string()).status,
@@ -381,7 +367,6 @@ fn job_transitions_move_their_check_and_the_aggregate() {
     );
     assert_eq!(aggregate.published_seq, 0);
 
-    // A timeout is its own conclusion; cancellation another.
     let (other, other_jobs) = {
         let repo = f.repo;
         create_run(&mut f, repo, true)
@@ -413,8 +398,6 @@ fn job_transitions_move_their_check_and_the_aggregate() {
     step(&mut f, third_jobs[0], Event::CancelBeforeStart, NOW.0 + 13);
     let cancelled = publication(&f, third, &third_jobs[0].to_string());
     assert_eq!(cancelled.conclusion, Some(Conclusion::Cancelled));
-    // A skipped job is skipped, and the aggregate with every job skipped is
-    // skipped rather than pending.
     let (fourth, fourth_jobs) = {
         let repo = f.repo;
         create_run(&mut f, repo, true)
@@ -443,8 +426,6 @@ fn a_manual_run_never_satisfies_the_required_aggregate() {
         rows.is_empty(),
         "a manual run publishes nothing at all: {rows:?}"
     );
-    // An event-driven run on the same repository does publish, so the rule is
-    // about provenance rather than the repository.
     let (event, event_jobs) = {
         let repo = f.repo;
         create_run(&mut f, repo, true)
@@ -459,8 +440,6 @@ fn a_manual_run_never_satisfies_the_required_aggregate() {
 #[test]
 fn a_settled_event_owes_a_completed_check_unless_nothing_can_be_told() {
     let mut f = fixture();
-    // A refused pull request publishes a neutral aggregate on the head: the
-    // pull-request view reads checks on the head, not the tested merge.
     let merge = "c".repeat(40);
     let tx = f.conn.transaction().unwrap();
     let accepted = intake::accept(
@@ -510,7 +489,6 @@ fn a_settled_event_owes_a_completed_check_unless_nothing_can_be_told() {
         0
     );
     tx.commit().unwrap();
-    // Identity is immutable, through raw SQL too.
     for sql in [
         "UPDATE check_publications SET head_sha = 'ffffffffffffffffffffffffffffffffffffffff'",
         "UPDATE check_publications SET name = 'rewritten'",
@@ -522,7 +500,6 @@ fn a_settled_event_owes_a_completed_check_unless_nothing_can_be_told() {
         );
     }
 
-    // A failure is a failure; a duplicate publishes nothing.
     let mut f2 = fixture();
     let failed = {
         let repo = f2.repo;
@@ -558,7 +535,6 @@ fn a_settled_event_owes_a_completed_check_unless_nothing_can_be_told() {
         Some(Conclusion::Neutral)
     );
 
-    // A generic repository has nobody to tell.
     let plain = {
         let generic = f2.generic;
         accept(&mut f2, generic, "plain", REF)
@@ -566,8 +542,6 @@ fn a_settled_event_owes_a_completed_check_unless_nothing_can_be_told() {
     settle(&mut f2, plain, intake::Resolution::Failed("no_pipeline"));
     assert!(checks::of_delivery(&f2.conn, plain).unwrap().is_none());
 
-    // A binding revoked between acceptance and settlement stops the row, and
-    // a tag object is not a commit a check can attach to.
     let mut f3 = fixture();
     let revoked = {
         let repo = f3.repo;
@@ -604,7 +578,6 @@ fn publications_are_retried_and_never_overwrite_a_newer_generation() {
     assert_eq!(due.len(), 3);
     assert!(due.iter().any(|p| p.id == build.id));
 
-    // A transient failure schedules a bounded retry; the row is due later.
     let tx = f.conn.transaction().unwrap();
     let retry = checks::retry(&tx, build.id, build.seq, NOW, 0).unwrap();
     tx.commit().unwrap();
@@ -628,8 +601,6 @@ fn publications_are_retried_and_never_overwrite_a_newer_generation() {
         3
     );
 
-    // Publishing marks the generation; a write from a stale read changes
-    // nothing once the job has moved on.
     let tx = f.conn.transaction().unwrap();
     assert!(checks::published(&tx, build.id, build.seq, 7, None, NOW).unwrap());
     tx.commit().unwrap();
@@ -653,8 +624,7 @@ fn publications_are_retried_and_never_overwrite_a_newer_generation() {
         "an older generation cannot be marked published"
     );
     tx.commit().unwrap();
-    // The handle is still recorded, so the next attempt updates that run
-    // rather than creating a second one for the same check.
+    // The handle is kept so the next attempt updates this run instead of creating a second check run.
     let raced = publication(&f, run, &jobs[0].to_string());
     assert_eq!(raced.check_run_id, Some(9));
     assert!(
@@ -675,8 +645,6 @@ fn publications_are_retried_and_never_overwrite_a_newer_generation() {
     ));
     tx.rollback().unwrap();
 
-    // A refusal is recorded against one generation and does not stop the
-    // newest from being published (a state change starts fresh).
     let tx = f.conn.transaction().unwrap();
     checks::refused(&tx, newer.id, newer.seq, "no permission", NOW).unwrap();
     tx.commit().unwrap();
@@ -687,7 +655,6 @@ fn publications_are_retried_and_never_overwrite_a_newer_generation() {
             .all(|p| p.id != newer.id),
         "a refused generation is not due"
     );
-    // A stale refusal cannot touch a newer generation.
     let tx = f.conn.transaction().unwrap();
     assert!(matches!(
         checks::refused(&tx, newer.id, newer.seq - 1, "stale refusal", NOW),
@@ -743,8 +710,6 @@ fn attempts_exhaust_into_a_refusal_and_identity_belongs_to_the_target() {
             .all(|p| p.id != build.id)
     );
 
-    // A publication cannot name a run of another repository: the trigger
-    // refuses it before the foreign key is even consulted.
     let accepted = {
         let repo = f.repo;
         accept(&mut f, repo, "owned", REF)
@@ -813,7 +778,6 @@ fn repeating_the_stored_content_keeps_the_generation_and_the_retry_schedule() {
     let build = publication(&f, run, &jobs[0].to_string());
     let tx = f.conn.transaction().unwrap();
     checks::retry(&tx, build.id, build.seq, NOW, 0).unwrap();
-    // The same desired state is recorded again.
     checks::record_job(&tx, f.tenant, jobs[0], UnixMillis(NOW.0 + 5)).unwrap();
     tx.commit().unwrap();
     let again = publication(&f, run, &jobs[0].to_string());
@@ -856,8 +820,7 @@ fn the_remote_run_is_dropped_only_after_a_completed_state_was_delivered() {
     assert_eq!(done.status, Status::Completed);
     assert_eq!(done.check_run_id, Some(77));
 
-    // The completed state never reached GitHub: new content for the row must
-    // keep the live run and its create mark instead of orphaning it.
+    // The completed state never reached GitHub: new content must keep the live run instead of orphaning it.
     f.conn
         .execute(
             "UPDATE check_publications SET title = 'stale' WHERE id = ?1",
@@ -872,7 +835,6 @@ fn the_remote_run_is_dropped_only_after_a_completed_state_was_delivered() {
     assert_eq!(kept.check_run_id, Some(77));
     assert!(kept.create_started_ms.is_some());
 
-    // Once the completed state is delivered, new work needs a fresh run.
     let tx = f.conn.transaction().unwrap();
     assert!(checks::published(&tx, kept.id, kept.seq, 77, None, NOW).unwrap());
     tx.commit().unwrap();
@@ -900,7 +862,6 @@ fn a_deferred_row_keeps_its_attempts_and_a_final_status_outlasts_a_long_outage()
     let build = publication(&f, run, &jobs[0].to_string());
     let tx = f.conn.transaction().unwrap();
     assert!(checks::defer(&tx, build.id, build.seq, NOW, NOW.0 + 120_000).unwrap());
-    // A park never exceeds its cap, whatever the caller asks for.
     assert!(checks::defer(&tx, build.id, build.seq, NOW, i64::MAX).unwrap());
     assert!(!checks::defer(&tx, build.id, build.seq + 1, NOW, NOW.0 + 1).unwrap());
     tx.commit().unwrap();
@@ -914,7 +875,6 @@ fn a_deferred_row_keeps_its_attempts_and_a_final_status_outlasts_a_long_outage()
         .unwrap();
     assert_eq!(parked, (0, NOW.0 + checks::MAX_DEFER_MS));
 
-    // A completed check keeps retrying well past the progress budget.
     f.conn
         .execute(
             "UPDATE check_publications SET status = 'completed', conclusion = 'success'
@@ -950,7 +910,6 @@ fn an_exhausted_final_status_is_rearmed_only_within_the_window() {
         create_run(&mut f, repo, true)
     };
     let build = publication(&f, run, &jobs[0].to_string());
-    // Every row is refused; only the completed one carries the exhausted reason.
     f.conn
         .execute(
             "UPDATE check_publications SET state = 2, reason = 'forbidden', settled_ms = ?1",
