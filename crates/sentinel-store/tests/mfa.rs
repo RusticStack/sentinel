@@ -956,6 +956,217 @@ fn an_account_lockout_refuses_even_a_correct_code_until_it_expires() {
     assert_eq!(failures, 0);
 }
 
+fn failures_of(f: &Fixture) -> i64 {
+    f.store
+        .read(|c| {
+            c.query_row(
+                "SELECT failures FROM mfa_totp WHERE user_id = ?1",
+                rusqlite::params![f.root.as_bytes()],
+                |r| r.get(0),
+            )
+            .map_err(Error::from)
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_password_change_with_a_factor_needs_step_up_and_a_wrong_password_never_counts_against_the_factor()
+ {
+    let f = fixture();
+    let (seed, _) = f.enroll(at(T0 + 10));
+    let policy = Policy::default();
+    let later = at(T0 + 10 + 2 * policy.step_up_ms);
+    let new_password = b"a brand new password";
+
+    // The password alone is the weaker proof: a session that has not stepped
+    // up with the factor is asked to, before the password is even judged.
+    let (cookie, session) = sign_in(&f, later);
+    assert!(matches!(
+        local_auth::change_password(
+            &f.store,
+            &cookie,
+            &session,
+            policy,
+            PASSWORD,
+            new_password,
+            later
+        ),
+        Err(Error::StepUpRequired)
+    ));
+    let code = f.code_for(&seed, later);
+    assert!(
+        mfa::step_up(
+            &f.store,
+            &f.key,
+            &cookie,
+            &session,
+            Proof::Totp(&code),
+            later
+        )
+        .unwrap()
+    );
+
+    // Wrong current passwords count against the session, five revoke it, and
+    // the second factor's own count and lockout stay untouched.
+    let stepped = f
+        .store
+        .read(|c| local_auth::authenticate(c, &cookie, later))
+        .unwrap();
+    for _ in 0..mfa::MAX_STEP_UP_FAILURES {
+        assert!(
+            !local_auth::change_password(
+                &f.store,
+                &cookie,
+                &stepped,
+                policy,
+                b"not it",
+                new_password,
+                later
+            )
+            .unwrap()
+        );
+    }
+    assert!(matches!(
+        f.store
+            .read(|c| local_auth::authenticate(c, &cookie, later)),
+        Err(Error::NotFound)
+    ));
+    assert_eq!(failures_of(&f), 0);
+    assert!(!factor_locked(&f, later));
+
+    // A fresh sign-in that steps up and presents the right password changes
+    // it, and no session of the account survives.
+    let t2 = at(later.0 + 60_000);
+    let (cookie, session) = sign_in(&f, t2);
+    let code = f.code_for(&seed, t2);
+    assert!(mfa::step_up(&f.store, &f.key, &cookie, &session, Proof::Totp(&code), t2).unwrap());
+    let stepped = f
+        .store
+        .read(|c| local_auth::authenticate(c, &cookie, t2))
+        .unwrap();
+    assert!(
+        local_auth::change_password(
+            &f.store,
+            &cookie,
+            &stepped,
+            policy,
+            PASSWORD,
+            new_password,
+            t2
+        )
+        .unwrap()
+    );
+    assert!(matches!(
+        f.store.read(|c| local_auth::authenticate(c, &cookie, t2)),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        local_auth::login(&f.store, "root", new_password, policy, t2).unwrap(),
+        local_auth::Login::Accepted(_)
+    ));
+    let events: Vec<Event> = f
+        .store
+        .read(|c| local_auth::recent_audit(c, 100))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .collect();
+    assert!(events.contains(&Event::PasswordChanged));
+}
+
+#[test]
+fn host_local_enrollment_needs_the_code_marks_the_audit_and_leaves_sessions_alone() {
+    let f = fixture();
+    let now = at(T0 + 10);
+    let enrollment =
+        mfa::begin_enrollment_host_local(&f.store, &f.key, f.root, "Sentinel", "root", now)
+            .unwrap();
+    let seed = seed_from_uri(&enrollment.provisioning_uri);
+
+    // Unconfirmed: nothing about authentication changes, and a wrong code
+    // confirms nothing.
+    assert!(!f.store.read(|c| mfa::enrolled(c, f.root)).unwrap());
+    let wrong = wrong_codes(&seed, now, 1);
+    assert!(matches!(
+        mfa::confirm_enrollment_host_local(&f.store, &f.key, f.root, &wrong[0], now),
+        Err(Error::Forbidden)
+    ));
+    assert!(!f.store.read(|c| mfa::enrolled(c, f.root)).unwrap());
+
+    let code = f.code_for(&seed, now);
+    let codes = mfa::confirm_enrollment_host_local(&f.store, &f.key, f.root, &code, now).unwrap();
+    assert_eq!(codes.len(), 10);
+    assert!(f.store.read(|c| mfa::enrolled(c, f.root)).unwrap());
+    // No session was stamped: the person signs in and steps up themselves.
+    assert!(f.session(now).stepped_up.is_none());
+    // The confirmed code's step is spent, so it cannot step up afterwards.
+    assert!(
+        !mfa::step_up(
+            &f.store,
+            &f.key,
+            &f.cookie,
+            &f.session(now),
+            Proof::Totp(&code),
+            now
+        )
+        .unwrap()
+    );
+    // A confirmed factor is not quietly replaced from the host either.
+    assert!(matches!(
+        mfa::begin_enrollment_host_local(&f.store, &f.key, f.root, "Sentinel", "root", now),
+        Err(Error::Conflict)
+    ));
+
+    // Reissue replaces the set and is audited as host-local.
+    let fresh = mfa::reissue_recovery_codes_host_local(&f.store, f.root, now).unwrap();
+    assert!(
+        !mfa::step_up(
+            &f.store,
+            &f.key,
+            &f.cookie,
+            &f.session(now),
+            Proof::Recovery(codes[0].expose()),
+            now
+        )
+        .unwrap()
+    );
+    assert!(
+        mfa::step_up(
+            &f.store,
+            &f.key,
+            &f.cookie,
+            &f.session(now),
+            Proof::Recovery(fresh[0].expose()),
+            now
+        )
+        .unwrap()
+    );
+    let audit = f.store.read(|c| local_auth::recent_audit(c, 100)).unwrap();
+    for event in [Event::MfaEnrolled, Event::RecoveryCodesIssued] {
+        let row = audit.iter().find(|r| r.event == event).expect("audited");
+        assert!(row.host_local && row.actor.is_none(), "{event:?}");
+    }
+}
+
+#[test]
+fn enrollment_and_reissue_refuse_an_account_that_cannot_hold_a_factor() {
+    let f = fixture();
+    let now = at(T0 + 10);
+    assert!(matches!(
+        mfa::begin_enrollment_host_local(&f.store, &f.key, UserId::new(), "Sentinel", "x", now),
+        Err(Error::NotFound)
+    ));
+    // Reissuing without an enrolled factor is `NotFound`, not an empty set.
+    assert!(matches!(
+        mfa::reissue_recovery_codes_host_local(&f.store, f.root, now),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        mfa::reissue_recovery_codes(&f.store, &f.session(now), Policy::default(), now),
+        Err(Error::StepUpRequired)
+    ));
+}
+
 #[test]
 fn host_local_recovery_clears_the_step_up_lockout() {
     let f = fixture();

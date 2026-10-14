@@ -830,27 +830,46 @@ pub fn logout_all(store: &Store, session: &Session, now: UnixMillis) -> Result<u
     })
 }
 
-/// Self-service password change. Requires the current password, then rotates
-/// every session: a password change must not leave old cookies working.
+/// Self-service password change. Requires the current password, then revokes
+/// every session (the caller's included) and every OAuth grant of the account:
+/// a password change must not leave old cookies or tokens working.
+///
+/// `presented` is the caller's session cookie. An account with a confirmed
+/// second factor also needs a fresh step-up: the password alone is the weaker
+/// proof and must not stand in for the factor, as it cannot for a step-up. A
+/// wrong current password returns `false`, is audited, and counts against the
+/// session like any wrong proof of presence (five revoke it); an account with
+/// no local credential is `NotFound`.
 pub fn change_password(
     store: &Store,
+    presented: &Secret,
     session: &Session,
+    policy: Policy,
     current: &[u8],
     new: &[u8],
     now: UnixMillis,
 ) -> Result<bool> {
     let user = session.user;
-    let stored = store.read(|conn| {
-        conn.prepare_cached("SELECT phc FROM local_credentials WHERE user_id = ?1")?
-            .query_row([user.as_bytes()], |r| r.get::<_, String>(0))
-            .optional()
-            .map_err(Error::from)
+    let (enrolled, stored) = store.read(|conn| {
+        conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM mfa_totp
+                WHERE user_id = ?1 AND confirmed_ms IS NOT NULL),
+                (SELECT phc FROM local_credentials WHERE user_id = ?1)",
+        )?
+        .query_row([user.as_bytes()], |r| {
+            Ok((r.get::<_, bool>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .map_err(Error::from)
     })?;
     let Some(stored) = stored else {
         password::spend_equal_work(current);
         return Err(Error::NotFound);
     };
+    if enrolled {
+        session.require_step_up(policy, now)?;
+    }
     if password::verify(&stored, current) != Verdict::Accepted {
+        crate::mfa::refuse_password(store, presented.digest().0, user, now)?;
         return Ok(false);
     }
     let phc = password::hash(new).map_err(|_| Error::InvalidInput("password"))?;

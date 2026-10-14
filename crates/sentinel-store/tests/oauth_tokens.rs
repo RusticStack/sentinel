@@ -744,8 +744,16 @@ fn password_change_and_recovery_revoke_grants() {
         .read(|c| local_auth::authenticate(c, &issued.session, now))
         .unwrap();
     assert!(
-        local_auth::change_password(&store, &session, b"first password", b"second password", now)
-            .unwrap()
+        local_auth::change_password(
+            &store,
+            &issued.session,
+            &session,
+            policy,
+            b"first password",
+            b"second password",
+            now
+        )
+        .unwrap()
     );
     assert!(revoked(&store, before.grant, i.dev));
 
