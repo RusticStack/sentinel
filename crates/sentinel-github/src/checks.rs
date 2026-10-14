@@ -299,7 +299,7 @@ pub fn find(
 }
 
 /// A legacy identity is shared by every generation, and GitHub silently ignores a PATCH
-/// that reopens an older completed run, so only a live match is adopted.
+/// that reopens an older completed run, so a completed match is adopted only with `any_status`.
 fn select(list: &[Value], external_id: &str, any_status: bool) -> Option<Published> {
     list.iter()
         .find(|run| {
