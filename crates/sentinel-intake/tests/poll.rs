@@ -1,5 +1,5 @@
-//! G07 end-to-end: a remote advertisement becomes a durable `poll` delivery
-//! that the unchanged G02–G03 path validates, resolves and dispatches, while
+//! Polling end to end: a remote advertisement becomes a durable `poll` delivery
+//! that the unchanged intake path validates, resolves and dispatches, while
 //! remote failures back the schedule off and a revoked binding retires the
 //! configuration entirely.
 //!
@@ -248,7 +248,7 @@ fn an_observed_push_becomes_a_delivery_and_dispatches_a_run() {
         (d.old_sha.as_deref(), d.new_sha.as_deref()),
         (Some("a".repeat(40).as_str()), Some("b".repeat(40).as_str()))
     );
-    // That delivery resolves and dispatches through the unchanged G03 path.
+    // That delivery resolves and dispatches through the unchanged intake path.
     let resolver = Resolver::new(
         Arc::clone(&f.store),
         Some(Arc::clone(&f.key)),

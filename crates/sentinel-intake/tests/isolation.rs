@@ -1,4 +1,4 @@
-//! Fault isolation and live policy in the intake and poll lanes (P05 audit):
+//! Fault isolation and live policy in the intake and poll lanes:
 //! a delivery or poll configuration whose binding authorizes nothing any more
 //! settles or backs off on its own and never holds another tenant's work
 //! behind it; the deployment's destination policy is rechecked before any
