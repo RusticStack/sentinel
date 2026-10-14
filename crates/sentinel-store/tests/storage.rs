@@ -1,4 +1,4 @@
-//! D06 disk admission and lifecycle: free-space watermarks with hysteresis,
+//! Disk admission and lifecycle: free-space watermarks with hysteresis,
 //! the metadata reserve and log floor, in-flight charges, tenant quotas and
 //! usage accounting, and the reader/lease-safe reclamation hooks.
 use std::{
@@ -894,7 +894,7 @@ fn log_sweep_removes_released_logs_and_spares_open_writers() {
     let legacy = temp.path().join("logs").join(format!("{legacy_id}.log"));
     fs::write(&legacy, b"old flat log").unwrap();
 
-    // The database decides (R01): every log here is released, the held one
+    // The database decides: every log here is released, the held one
     // included — an open writer is still never touched.
     let swept = logs.sweep_dirs(256, |_| true).unwrap();
     assert_eq!(swept, 2);
@@ -1031,7 +1031,7 @@ fn migration_27_upgrades_a_populated_database() {
             version INTEGER PRIMARY KEY, applied_ms INTEGER NOT NULL)",
     )
     .unwrap();
-    // Stop at 26, then seed the pre-D06 shape by hand.
+    // Stop at 26, then seed the pre-quota shape by hand.
     for &(version, sql) in sentinel_store::schema::MIGRATIONS {
         if version > 26 {
             break;
@@ -1154,7 +1154,7 @@ fn migration_27_upgrades_a_populated_database() {
         .unwrap();
 }
 
-/// P06-9: reclamation reads its candidates through the unreferenced set's
+/// Reclamation reads its candidates through the unreferenced set's
 /// age index — it never walks the objects table — and a referenced object
 /// is not a candidate at all.
 #[test]
@@ -1206,7 +1206,7 @@ fn reclaim_candidates_come_from_the_unreferenced_index() {
     );
 }
 
-/// P06-4: an upload's chunk writes and its seal's full-object hash run
+/// An upload's chunk writes and its seal's full-object hash run
 /// outside the single writer — other durable writes keep committing while
 /// a large seal hashes, and the writer's share of the seal is bookkeeping.
 #[test]
@@ -1293,7 +1293,7 @@ fn a_large_seal_does_not_hold_the_writer() {
     );
 }
 
-/// P06-4: a declared length past the per-upload bound is refused at begin.
+/// A declared length past the per-upload bound is refused at begin.
 #[test]
 fn an_upload_past_the_object_bound_is_refused_at_begin() {
     let mut fx = fixture();
@@ -1311,7 +1311,7 @@ fn an_upload_past_the_object_bound_is_refused_at_begin() {
     ));
 }
 
-/// R07: sustained pressure. Eight writers keep staging objects while free
+/// Sustained pressure. Eight writers keep staging objects while free
 /// space swings across the watermarks for several seconds, closing and
 /// reopening admission. Every write is admitted or refused `StorageFull`,
 /// never anything else; both happen; what was admitted commits and reads

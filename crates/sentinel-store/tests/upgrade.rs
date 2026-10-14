@@ -1,4 +1,4 @@
-//! R05: upgrades — a copy of the database before any migration, a failed
+//! Upgrades: a copy of the database before any migration, a failed
 //! migration leaving the database at its last good version with the copy
 //! named for the rollback, declared rollback compatibility letting an older
 //! build run on a newer database only when every unknown migration says so,
@@ -228,7 +228,7 @@ fn a_worker_software_label_is_printable_and_bounded() {
     );
 }
 
-/// R06: the offline diagnostic bundle of a stopped controller counts rows
+/// The offline diagnostic bundle of a stopped controller counts rows
 /// without naming tenants or repositories, and never writes.
 #[test]
 fn the_offline_diagnostic_bundle_counts_without_naming() {
@@ -268,7 +268,7 @@ fn the_offline_diagnostic_bundle_counts_without_naming() {
     assert_eq!(std::fs::read(&path).unwrap(), before, "read-only");
 }
 
-/// R07: a controller killed in the middle of a migration — the transaction
+/// A controller killed in the middle of a migration — the transaction
 /// open, the schema changed, nothing committed — leaves the database at the
 /// version before it, intact, and the next start migrates it. A copy cut
 /// short by the same kill is never listed as a snapshot and is replaced.

@@ -1,4 +1,4 @@
-//! G01 store behavior: tenant-owned bindings, sealed credentials, rotation and
+//! Store behavior: tenant-owned bindings, sealed credentials, rotation and
 //! revocation with compare-and-set, ref and destination policy, GitHub App
 //! installation lifecycle, and migration that invents no binding.
 use rusqlite::Connection;

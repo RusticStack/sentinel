@@ -1,4 +1,4 @@
-//! C08 verification: duplicate requests, transaction rollback, conflicting
+//! Verification: duplicate requests, transaction rollback, conflicting
 //! updates from concurrent callers, and a real process crash between
 //! acknowledged commits and reopen.
 use std::{
@@ -141,7 +141,6 @@ fn duplicate_requests_execute_once_and_replay_the_same_run() {
 
 #[test]
 fn expired_idempotency_records_are_purged_in_bounded_batches() {
-    // P02-2: every distinct key used to stay forever.
     let dir = tempfile::tempdir().unwrap();
     let (store, tenant, repo) = open(dir.path(), Durability::Normal);
     for i in 0..5 {

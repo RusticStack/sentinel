@@ -1,4 +1,4 @@
-//! A07 behavior: tenant suspension propagating to credentials, invitations,
+//! Tenant suspension propagating to credentials, invitations,
 //! live jobs and long-lived subscriptions; audited membership and grant
 //! changes; pool grants that never cross a tenant boundary.
 
