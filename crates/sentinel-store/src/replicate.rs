@@ -1,32 +1,4 @@
-//! The replicator of the optional external S3 copy, written
-//! against a [`Bucket`] so it is tested without a network. The controller
-//! runs [`Replicator::pass`] on its own thread and backs off while the
-//! bucket is unavailable.
-//!
-//! One pass, every stage bounded:
-//!
-//! 1. objects fetched back on read are marked local again;
-//! 2. S3 copies of reclaimed objects and expired logs are deleted;
-//! 3. committed objects are replicated oldest first — one request up to the
-//!    part size, a multipart upload above it that resumes from the parts the
-//!    bucket already holds after a restart — and each copy is verified by
-//!    `HEAD` (length and the BLAKE3 digest in its metadata) before the row
-//!    records it;
-//! 4. finished logs, settled for [`LOG_SETTLE_MS`], are copied file by file
-//!    and stale keys under their prefix removed;
-//! 5. when the local copies exceed their budget, or the disk's admission is
-//!    closed, replicated objects are evicted oldest first — never one a
-//!    reader or stage pins;
-//! 6. every [`ABORT_SWEEP_EVERY`] passes, multipart uploads the bucket holds
-//!    under the prefix that this deployment is not resuming and that are
-//!    older than [`ABANDONED_UPLOAD_MS`] are aborted, and recorded uploads
-//!    that old are aborted and forgotten;
-//! 7. the backlog is measured, and past its budget the disk admission gate
-//!    closes for new artifacts and uploads until it drains.
-//!
-//! Nothing here ever deletes the only copy of an object: a local file goes
-//! only after its S3 copy was verified, and an S3 copy only after its row is
-//! gone.
+//! Never deletes the only copy: a local file goes only after its S3 copy is verified, and an S3 copy only after its row is gone.
 
 use std::{
     collections::HashSet,
@@ -46,29 +18,19 @@ use crate::{
     offload::{self, Delete, ObjectRef},
 };
 
-/// A released log may still receive a late end; it is copied once settled.
 pub const LOG_SETTLE_MS: i64 = 10 * 60_000;
-/// A multipart upload nobody resumes for this long is abandoned.
 pub const ABANDONED_UPLOAD_MS: i64 = 24 * 3_600_000;
-/// Passes between two sweeps for abandoned multipart uploads.
 pub const ABORT_SWEEP_EVERY: u64 = 720;
-/// Rows each stage takes per pass.
 const OBJECTS_PER_PASS: u32 = 16;
 const LOGS_PER_PASS: u32 = 8;
 const DELETES_PER_PASS: u32 = 64;
 const EVICT_PER_PASS: u32 = 256;
-/// Largest log file copied in one request; segments are 4 MiB, the index
-/// and markers far smaller.
 const MAX_LOG_FILE: u64 = 64 << 20;
 
-/// What went wrong talking to the bucket.
 #[derive(Debug)]
 pub struct BucketError {
-    /// A later retry may succeed (transport, 5xx, throttling).
     pub transient: bool,
-    /// Never contains a credential or a URL.
     pub message: String,
-    /// No such key or upload.
     pub not_found: bool,
 }
 
@@ -80,9 +42,6 @@ impl std::fmt::Display for BucketError {
 
 pub type BucketResult<T> = std::result::Result<T, BucketError>;
 
-/// The bucket operations replication needs; keys are relative to the
-/// configured prefix. The production implementation is `sentinel_s3`'s
-/// client; tests use an in-memory one.
 pub trait Bucket: Send + Sync {
     fn put(&self, key: &str, body: &[u8], blake3: Option<&str>) -> BucketResult<()>;
     fn create_multipart(&self, key: &str, blake3: Option<&str>) -> BucketResult<String>;
@@ -93,36 +52,24 @@ pub trait Bucket: Send + Sync {
         number: u32,
         body: &[u8],
     ) -> BucketResult<String>;
-    /// `(number, etag, len)` of the parts an unfinished upload holds.
     fn list_parts(&self, key: &str, upload: &str) -> BucketResult<Vec<(u32, String, u64)>>;
     fn complete(&self, key: &str, upload: &str, parts: &[(u32, String)]) -> BucketResult<()>;
     fn abort(&self, key: &str, upload: &str) -> BucketResult<()>;
-    /// Length and `blake3` metadata, `None` when absent.
     fn head(&self, key: &str) -> BucketResult<Option<(u64, Option<String>)>>;
     fn get(&self, key: &str, out: &mut dyn Write) -> BucketResult<u64>;
     fn delete(&self, key: &str) -> BucketResult<()>;
-    /// Every key under `prefix` (bounded by the implementation's paging).
     fn list(&self, prefix: &str) -> BucketResult<Vec<String>>;
-    /// Unfinished uploads under the configured prefix: `(key, upload,
-    /// initiated_ms)`; an unreadable initiation time is `None`.
     fn list_uploads(&self) -> BucketResult<Vec<(String, String, Option<i64>)>>;
 }
 
 /// The replicator's settings.
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
-    /// Size of one part, and the largest object sent in one request.
     pub part_bytes: u64,
-    /// Local copies of replicated objects are evicted past this; 0 keeps
-    /// every local copy.
     pub local_bytes: u64,
-    /// Past this many unreplicated bytes the disk admission gate closes for
-    /// new artifacts and uploads; it reopens below nine tenths.
     pub backlog_bytes: u64,
 }
 
-/// What the replicator reports: health for `GET /admin/storage`, the
-/// readiness probe and metrics.
 #[derive(Debug, Default)]
 pub struct Status {
     pub last_success_ms: AtomicI64,
@@ -132,7 +79,6 @@ pub struct Status {
     pub local_bytes: AtomicU64,
     pub oldest_unreplicated_ms: AtomicI64,
     pub unreplicated_logs: AtomicU64,
-    /// The backlog is past its budget and admission is closed for it.
     pub backlog_full: AtomicBool,
     pub replicated_objects: AtomicU64,
     pub replicated_bytes: AtomicU64,
@@ -141,16 +87,12 @@ pub struct Status {
     pub fetched_objects: AtomicU64,
     pub deleted_copies: AtomicU64,
     pub aborted_uploads: AtomicU64,
-    /// Objects skipped because the local copy is missing or does not match
-    /// its digest: never uploaded, and never a reason to stop.
     pub local_faults: AtomicU64,
     pub last_error: Mutex<Option<String>>,
     pub last_local_fault: Mutex<Option<String>>,
 }
 
 impl Status {
-    /// `healthy`, `degraded` (failing, or the backlog past its budget) or
-    /// `unknown` before the first pass.
     pub fn state(&self) -> &'static str {
         if self.backlog_full.load(Ordering::Relaxed)
             || self.consecutive_failures.load(Ordering::Relaxed) > 0
@@ -164,7 +106,6 @@ impl Status {
     }
 }
 
-/// What one pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pass {
     pub replicated: u32,
@@ -172,14 +113,10 @@ pub struct Pass {
     pub deleted: u32,
     pub evicted: u32,
     pub aborted: u32,
-    /// Objects skipped for a missing or damaged local copy.
     pub local_faults: u32,
-    /// There is more to do right away (a stage filled its batch).
     pub more: bool,
 }
 
-/// Why one object was not replicated: the bucket (the pass stops and backs
-/// off) or the local copy (that object is skipped; the others go on).
 enum Fault {
     Local(String),
     Bucket(BucketError),
@@ -200,20 +137,11 @@ pub struct Replicator {
     status: Arc<Status>,
     passes: AtomicU64,
     buffer: Mutex<Vec<u8>>,
-    /// Set by [`Replicator::failed`]: whether the current pass already
-    /// recorded its failure in the status (a stage that stops on a bucket
-    /// error does; one that stops on a store error does not).
     recorded: AtomicBool,
 }
 
-/// The most the replicator's transfer buffer keeps between objects: the
-/// default part size. A larger configured part is freed once its object is
-/// done, so resident memory stays bounded however `part_bytes` is set.
 const RETAINED_BUFFER_BYTES: usize = 16 << 20;
 
-/// Replace `buffer`'s contents with exactly the next `len` bytes of `reader`,
-/// read into spare capacity (no zero-fill pass over a buffer that is about to
-/// be overwritten). A short read is `UnexpectedEof`, as `read_exact` reports.
 fn fill(reader: &mut impl Read, len: u64, buffer: &mut Vec<u8>) -> std::io::Result<()> {
     buffer.clear();
     buffer.reserve(len as usize);
@@ -268,8 +196,6 @@ impl Replicator {
             .unwrap_or_else(|p| p.into_inner()) = Some(format!("{what}: {error}"));
     }
 
-    /// Run one bounded pass. `Err` means the pass stopped at a failure (the
-    /// status says which); the caller backs off.
     pub fn pass(&self) -> std::result::Result<Pass, String> {
         let mut pass = Pass::default();
         self.recorded.store(false, Ordering::Relaxed);
@@ -290,9 +216,7 @@ impl Replicator {
                 Ok(pass)
             }
             Err(why) => {
-                // A store or eviction error stops the pass without touching
-                // the bucket: it still counts, or health would read healthy
-                // while nothing replicates.
+                // Store errors still count as failures, or health would read healthy while nothing replicates.
                 if !self.recorded.load(Ordering::Relaxed) {
                     self.failed("pass", &why);
                 }
@@ -339,11 +263,7 @@ impl Replicator {
         for delete in due {
             let result = match delete {
                 Delete::Object { id, tenant, digest } => {
-                    // The same content may have been committed again since
-                    // this delete was queued (more than one batch of deletes
-                    // can be waiting while the upload stage runs): its key is
-                    // then a live object's copy. The recheck and the dropping
-                    // of the queued delete are one transaction.
+                    // A digest queued for deletion may be committed again meanwhile; the recheck and dropping the delete are one transaction.
                     let live = self
                         .store
                         .writer()
@@ -388,8 +308,6 @@ impl Replicator {
             match self.replicate(&object) {
                 Ok(()) => {}
                 Err(Fault::Local(why)) => {
-                    // A damaged or lost local copy must never reach the
-                    // bucket, and must not hold every later object back.
                     self.status.local_faults.fetch_add(1, Ordering::Relaxed);
                     *self
                         .status
@@ -432,9 +350,7 @@ impl Replicator {
         Ok(())
     }
 
-    /// Upload one object and verify the copy. The local bytes are hashed
-    /// before anything is sent: a copy that does not match its digest is a
-    /// [`Fault::Local`], never uploaded under the digest's name.
+    /// The local bytes are hashed before anything is sent: a copy that does not match its digest is never uploaded under the digest's name.
     fn replicate(&self, object: &ObjectRef) -> std::result::Result<(), Fault> {
         let local = |e: &dyn std::fmt::Display| Fault::Local(format!("local object: {e}"));
         let key = remote_key(object.tenant, &object.digest);
@@ -445,8 +361,6 @@ impl Replicator {
             .map_err(|e| local(&e))?;
         let mut buffer = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
         let outcome = self.upload(&key, &blake3, object, &mut reader, len, &mut buffer);
-        // A configured part size can be hundreds of MiB; the buffer stays
-        // resident between objects only up to the default part size.
         if buffer.capacity() > RETAINED_BUFFER_BYTES {
             *buffer = Vec::new();
         }
@@ -464,8 +378,6 @@ impl Replicator {
         }
     }
 
-    /// Verify the local bytes against the digest and send them, through
-    /// `buffer`. Bytes are read into spare capacity, never zero-filled first.
     fn upload(
         &self,
         key: &str,
@@ -489,8 +401,6 @@ impl Replicator {
             }
             self.bucket.put(key, buffer, Some(blake3))?;
         } else {
-            // Hash the whole file first: parts a resumed upload already
-            // holds are not read again below.
             let mut hasher = blake3::Hasher::new();
             let mut total = 0u64;
             buffer.clear();
@@ -511,8 +421,6 @@ impl Replicator {
         Ok(())
     }
 
-    /// A multipart upload, resumed from what the bucket holds when this
-    /// deployment recorded one for the key.
     fn multipart(
         &self,
         key: &str,
@@ -526,7 +434,6 @@ impl Replicator {
             not_found: false,
             message: format!("metadata: {e}"),
         };
-        // At most 10,000 parts: a larger object gets larger parts.
         let part = self.settings.part_bytes.max(len.div_ceil(10_000));
         let recorded = self.store.read(|c| offload::upload(c, key)).map_err(db)?;
         let mut held = Vec::new();
@@ -602,8 +509,6 @@ impl Replicator {
             let mut sent = HashSet::new();
             let files = match std::fs::read_dir(&dir) {
                 Ok(read) => read.flatten().collect::<Vec<_>>(),
-                // Nothing stored (an attempt that never logged): nothing to
-                // copy, and the row says so.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
                 Err(e) => return Err(format!("log directory: {e}")),
             };
@@ -622,7 +527,6 @@ impl Replicator {
                 }
                 sent.insert(key);
             }
-            // Keys a previous copy of this log left that no longer exist.
             match self.bucket.list(&prefix) {
                 Ok(keys) => {
                     for stale in keys.iter().filter(|k| !sent.contains(*k)) {
@@ -653,7 +557,6 @@ impl Replicator {
     }
 
     fn evict(&self, pass: &mut Pass) -> Result<()> {
-        // Not while a backup copies local files.
         let Some(_maintenance) = self.objects.try_maintenance() else {
             return Ok(());
         };
@@ -743,9 +646,6 @@ impl Replicator {
         Ok(())
     }
 
-    /// Refresh the backlog and local totals; past the backlog budget close
-    /// the disk admission gate for new artifacts and uploads, and reopen it
-    /// below nine tenths.
     fn measure(&self) {
         let Ok(totals) = self.store.read(offload::totals) else {
             return;
@@ -764,8 +664,6 @@ impl Replicator {
         if budget == 0 {
             return;
         }
-        // The gate's own flag is the truth: whatever closed it (this
-        // replicator before a restart, or another), this pass reopens it.
         let admission = self.objects.admission();
         let full = admission.map_or(s.backlog_full.load(Ordering::Relaxed), |a| a.backlog_full());
         let now_full = if full {
@@ -794,7 +692,6 @@ mod tests {
         let mut reader = Cursor::new((0..=255u8).collect::<Vec<_>>());
         fill(&mut reader, 10, &mut buffer).unwrap();
         assert_eq!(buffer, (0..10u8).collect::<Vec<_>>());
-        // The next call continues where the last stopped and drops the old.
         fill(&mut reader, 3, &mut buffer).unwrap();
         assert_eq!(buffer, vec![10, 11, 12]);
         fill(&mut reader, 0, &mut buffer).unwrap();

@@ -1,15 +1,4 @@
-//! Admission: who may obtain an account, who approves it, who may create
-//! a namespace, and who may bind a forge installation to one.
-//!
-//! These are four separate decisions, and this module keeps them separate.
-//! Authenticating — locally or at GitHub — is not admission. Being admitted is
-//! not a tenant. Owning a tenant is not the right to bind somebody's GitHub
-//! installation to it. Installing the App on GitHub is none of the above.
-//!
-//! A pending or rejected account is not `active`, which is the predicate every
-//! authorization query in [`crate::auth`] already joins on. So a pending
-//! account holds no session, no credential and no tenant data by construction,
-//! rather than by each query remembering to ask.
+//! Pending and rejected accounts are not `active`, the predicate every authorization query joins on, so they hold no session or tenant data.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::{password, secret::Secret};
@@ -24,8 +13,6 @@ use crate::{
 };
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
-/// An invitation is a standing admission right, so it expires by default in a
-/// week and may never be open-ended.
 pub const DEFAULT_INVITATION_MS: i64 = 7 * DAY_MS;
 pub const MAX_INVITATION_MS: i64 = 30 * DAY_MS;
 
@@ -33,33 +20,22 @@ pub const MAX_INVITATION_MS: i64 = 30 * DAY_MS;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Registration {
-    /// No new accounts, invitation or not. Existing accounts sign in normally:
-    /// closing registration is not a lockout of the people already admitted.
     Closed = 0,
-    /// Only with an unspent, unexpired invitation. The default.
     InviteOnly = 1,
-    /// Anyone may apply; an application waits as pending until an admin acts.
     ApprovalRequired = 2,
 }
 
-/// Who may create a namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TenantCreation {
-    /// Only a super admin, for organizations and personal namespaces alike.
     SuperAdminOnly = 0,
-    /// An approved account may create its own personal namespace (one each,
-    /// enforced by the schema) and its own organizations, within quotas.
     ApprovedUsers = 1,
 }
 
-/// Who may bind a forge installation to a tenant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum InstallationBinding {
     SuperAdminOnly = 0,
-    /// A tenant admin may bind an installation to the tenant they administer.
-    /// They still cannot bind one to a tenant they do not administer.
     TenantAdmins = 1,
 }
 
@@ -72,8 +48,6 @@ pub struct DeploymentPolicy {
 
 pub use crate::auth::Authority;
 
-/// Read the deployment's admission policy. Cheap single-row read; callers that
-/// need it inside a decision must read it in the same transaction as the write.
 pub fn policy(conn: &Connection) -> Result<DeploymentPolicy> {
     let row = conn
         .prepare_cached(
@@ -106,8 +80,6 @@ pub fn policy(conn: &Connection) -> Result<DeploymentPolicy> {
     })
 }
 
-/// Change the deployment's admission policy. Platform administration with a
-/// recent step-up, audited with the resulting values.
 pub fn set_policy(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -140,14 +112,10 @@ pub fn set_policy(
     )
 }
 
-/// The terms of an invitation, fixed when it is written.
 #[derive(Clone, Copy, Debug)]
 pub struct Terms<'a> {
-    /// Join this tenant on acceptance, with `role`. Both or neither.
     pub tenant: Option<TenantId>,
     pub role: Option<Role>,
-    /// Bind the invitation to one verified external identity, so only the
-    /// person holding that provider account can redeem it.
     pub identity: Option<(&'a str, &'a str)>,
     pub lifetime_ms: i64,
 }
@@ -163,8 +131,6 @@ impl Default for Terms<'_> {
     }
 }
 
-/// An invitation, presented exactly once. The link is delivered out of band;
-/// there is no mandatory mail server, and no way to show the secret again.
 pub struct Invitation {
     pub id: InvitationId,
     pub secret: Secret,
@@ -186,9 +152,6 @@ fn check_terms(terms: &Terms<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Create an invitation. A platform admin may invite to any tenant or to none;
-/// a tenant admin may invite only to the tenant they administer. Both are
-/// checked live, in this transaction.
 pub fn invite(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -198,19 +161,8 @@ pub fn invite(
     invite_to(tx, authority, terms, None, now)
 }
 
-/// Invitations addressed to mailboxes one organization may create per hour:
-/// the ceiling on using an organization's invitation right to send mail.
 const EMAIL_INVITES_PER_HOUR: i64 = 50;
 
-/// An invitation sent by email: `invite` plus the mailbox it
-/// is addressed to. The organization must be app-created: a GitHub-backed
-/// one takes its members from GitHub, so an email invitation is refused for
-/// it (`InvalidInput`), whoever asks. The role is the invitation's term and
-/// the inviter must already be allowed to grant it (they administer the
-/// organization). When this deployment delivers mail and `key` is present
-/// the message is queued in the same transaction; otherwise the caller hands
-/// the secret to the inviter, who passes it on out of band. Accepting needs
-/// the mailbox proved ([`accept_invitation`], [`crate::email::confirm`]).
 pub fn invite_by_email(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -247,8 +199,6 @@ pub fn invite_by_email(
     Ok(Invited { invitation, queued })
 }
 
-/// An email invitation and whether its message was queued for delivery. When
-/// it was not, the secret is the inviter's to hand over.
 pub struct Invited {
     pub invitation: Invitation,
     pub queued: bool,
@@ -289,7 +239,6 @@ fn invite_to(
             return Err(Error::Overloaded);
         }
     }
-    // Membership of a GitHub-backed tenant is never offered by invitation.
     if let Some(tenant) = terms.tenant {
         crate::github_members::require_app_managed(tx, tenant, None)?;
     }
@@ -332,7 +281,6 @@ fn invite_to(
     })
 }
 
-/// The slug of a tenant, for a reply that names the organization joined.
 pub fn tenant_slug(conn: &Connection, tenant: TenantId) -> Result<Option<String>> {
     Ok(conn
         .prepare_cached("SELECT slug FROM tenants WHERE id = ?1")?
@@ -340,8 +288,6 @@ pub fn tenant_slug(conn: &Connection, tenant: TenantId) -> Result<Option<String>
         .optional()?)
 }
 
-/// [`revoke_invitation`] for a route that names the tenant: an invitation of
-/// any other tenant (or none) is `NotFound`, not revoked.
 pub fn revoke_tenant_invitation(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -359,8 +305,6 @@ pub fn revoke_tenant_invitation(
     revoke_invitation(tx, authority, id, now)
 }
 
-/// Revoke an unspent invitation. Platform admins, and the tenant admin of the
-/// tenant it would grant membership of.
 pub fn revoke_invitation(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -392,7 +336,6 @@ pub fn revoke_invitation(
     )
 }
 
-/// Metadata about one invitation. Never carries the redeemable secret.
 #[derive(Debug, PartialEq, Eq)]
 pub struct InvitationRecord {
     pub id: InvitationId,
@@ -402,12 +345,9 @@ pub struct InvitationRecord {
     pub expires: UnixMillis,
     pub redeemed: bool,
     pub revoked: bool,
-    /// The mailbox it is addressed to, if any.
     pub email: Option<String>,
 }
 
-/// List invitations for one tenant, or deployment-wide ones for a platform
-/// admin. Newest first, at most 100.
 pub fn invitations(
     conn: &Connection,
     authority: Authority,
@@ -462,27 +402,19 @@ pub fn invitations(
     .collect()
 }
 
-/// One unspent invitation's terms, as stored.
 pub(crate) struct Usable {
     pub id: InvitationId,
     pub tenant: Option<TenantId>,
     pub role: Option<Role>,
-    /// The verified external identity it is bound to, if any.
     pub identity: Option<(String, String)>,
-    /// The mailbox it is addressed to, if any (canonical).
     pub email: Option<String>,
 }
 
-/// How an invitation is named: by the secret's digest (what a person
-/// presents) or by its identifier (what a verification token carries).
 pub(crate) enum Select {
     Digest([u8; 32]),
     Id(InvitationId),
 }
 
-/// The one statement deciding whether an invitation is redeemable now:
-/// unspent, unrevoked, unexpired, and its creator's authority intact (see
-/// [`usable_invitation`]). `$selector` binds `?1`; `?2` is the instant.
 macro_rules! usable_sql {
     ($selector:literal) => {
         concat!(
@@ -512,12 +444,7 @@ fn decode_role(code: Option<i64>) -> Result<Option<Role>> {
     })
 }
 
-/// An invitation delegates its creator's authority, so it is only as good as
-/// that authority is now: the creator must still be an active super admin, or
-/// still administer the tenant the invitation grants membership of. Removal,
-/// suspension, rejection and demotion therefore void every unspent invitation
-/// the creator minted, with no bookkeeping. Host-local invitations (no
-/// creator) hold the database file's authority.
+/// Usable only while the creator still holds the authority it delegated, so demoting or removing a creator voids their unspent invitations.
 pub(crate) fn usable_invitation(
     conn: &Connection,
     by: Select,
@@ -567,9 +494,6 @@ pub(crate) fn usable_invitation(
     }))
 }
 
-/// Whether a tenant is bound to a GitHub App installation. Such an
-/// organization's membership is GitHub's to confirm, so an email invitation
-/// never applies to it.
 pub fn tenant_is_github_backed(conn: &Connection, tenant: TenantId) -> Result<bool> {
     Ok(conn
         .prepare_cached(
@@ -585,9 +509,6 @@ fn tenant_is_open(conn: &Connection, tenant: TenantId) -> Result<bool> {
     Ok(active && !tenant_is_github_backed(conn, tenant)?)
 }
 
-/// Spend an invitation for `user` and grant its membership, in the caller's
-/// transaction. Returns the tenant joined, if the invitation named one. An
-/// existing membership keeps its role: an invitation never changes one.
 pub(crate) fn redeem(
     tx: &Transaction<'_>,
     invitation: &Usable,
@@ -624,10 +545,6 @@ pub(crate) fn redeem(
     Ok(joined)
 }
 
-/// Redeem an email-bound invitation for the account that just verified
-/// `email`. Nothing happens (`None`) unless the invitation is still usable,
-/// addressed to exactly that verified address, and its organization is still
-/// open and app-created: the link token plus the verified mailbox.
 pub(crate) fn redeem_verified(
     tx: &Transaction<'_>,
     id: InvitationId,
@@ -648,8 +565,6 @@ pub(crate) fn redeem_verified(
     }
     let joined = redeem(tx, &invitation, user, now)?;
     if joined.is_some() {
-        // The invitation was the approval, and its mailbox is now proved: an
-        // account that registered with it waits no longer.
         let admitted = tx.execute(
             "UPDATE users SET status = 1, active = 1 WHERE id = ?1 AND kind = 0 AND status = 0",
             [user.as_bytes()],
@@ -668,31 +583,15 @@ pub(crate) fn redeem_verified(
     Ok(joined)
 }
 
-/// What presenting an invitation as an existing account did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Accepted {
-    /// The account joined the organization.
     Joined(TenantId),
-    /// Redeemed; the invitation named no organization.
     Redeemed,
-    /// The account is already a member; the invitation stays unspent.
     AlreadyMember,
-    /// The invitation is addressed to a mailbox the account has not proved:
-    /// a verification link was queued (or recorded for the operator), and
-    /// proving that address redeems the invitation.
     VerificationSent,
-    /// Unknown, expired, spent, revoked, wrong address, wrong identity, or
-    /// not for this kind of organization. One answer for all of them.
     Unusable,
 }
 
-/// An existing, signed-in account presents an invitation secret.
-///
-/// A link-form invitation (no mailbox) is redeemed on the spot. One addressed
-/// to a mailbox needs that mailbox proved: if the account already holds the
-/// address verified, it joins; otherwise the address is claimed on the account
-/// (unless the account verified another one: change it first) and a
-/// verification link sent, and the join happens when that link is opened.
 pub fn accept_invitation(
     store: &Store,
     user: UserId,
@@ -713,7 +612,6 @@ pub fn accept_invitation(
         if !active {
             return Ok(Accepted::Unusable);
         }
-        // An identity-bound invitation belongs to whoever holds that identity.
         if let Some((provider, subject)) = &invitation.identity {
             let linked: bool = tx
                 .prepare_cached(
@@ -755,12 +653,9 @@ pub fn accept_invitation(
                     None => Accepted::Redeemed,
                 })
             }
-            // Another verified address stays until the account changes it.
             Some((Some(_), true)) => Ok(Accepted::Unusable),
             Some(_) => {
-                // Every outcome of the request answers alike: an address held
-                // verified by another account, or an allowance spent, must not
-                // tell the caller anything about that address.
+                // Every outcome answers alike, so the response reveals nothing about another account's address.
                 crate::email::request(tx, key.as_deref(), user, address, Some(invitation.id), now)?;
                 Ok(Accepted::VerificationSent)
             }
@@ -771,22 +666,16 @@ pub fn accept_invitation(
 
 /// How someone proposes to authenticate once admitted.
 pub enum Applicant<'a> {
-    /// A local account: username plus a password, hashed before any write.
     Local {
         display_name: &'a str,
         username: &'a str,
         password: &'a [u8],
     },
-    /// A local account identified by its email address and a password. The
-    /// address is a claim until verified; the account also gets a generated
-    /// username, so every local account has one. An invitation addressed to
-    /// that mailbox is redeemed only when the address is verified.
     Email {
         display_name: &'a str,
         email: &'a str,
         password: &'a [u8],
     },
-    /// An already-verified external identity.
     External {
         display_name: &'a str,
         provider: &'a str,
@@ -804,30 +693,21 @@ impl Applicant<'_> {
     }
 }
 
-/// Why an application produced no account. One response covers all of them at
-/// the boundary; the distinction is for the operator's audit trail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     RegistrationClosed,
     InvitationRequired,
-    /// Unknown, expired, spent, revoked, bound to a different identity, or
-    /// addressed to a different mailbox.
     InvitationUnusable,
-    /// That username, email address or external identity already belongs to
-    /// an account.
     AlreadyRegistered,
 }
 
 #[derive(Debug)]
 pub enum Admission {
-    /// The account exists and may sign in now.
     Admitted(UserId),
-    /// The account exists, is not active, and holds nothing until an admin acts.
     Pending(UserId),
     Refused(Refusal),
 }
 
-/// Apply for an account, with no mail delivery (see [`register_with`]).
 pub fn register(
     store: &Store,
     applicant: Applicant<'_>,
@@ -837,9 +717,6 @@ pub fn register(
     register_with(store, applicant, invitation, None, now)
 }
 
-/// A username for an account that registered by address: `user-` and twelve
-/// hex digits of a fresh identifier. Not secret and not meant to be typed;
-/// the address is the login identifier.
 pub(crate) fn generated_username(user: UserId) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut name = String::with_capacity(17);
@@ -851,20 +728,6 @@ pub(crate) fn generated_username(user: UserId) -> String {
     name
 }
 
-/// Apply for an account.
-///
-/// Policy is read inside the writing transaction, so a policy change that
-/// commits while an application is in flight decides it. Password hashing
-/// happens before that transaction, never inside the writer. `key` (the
-/// deployment master key) lets an address registration queue its
-/// verification mail in the same transaction; without it the operator mints
-/// the link with the host-local CLI.
-///
-/// An [`Applicant::Email`] whose address another account already verified is
-/// refused as [`Refusal::AlreadyRegistered`]; callers answer exactly as they do
-/// for a new address. An invitation addressed to a mailbox is not spent here:
-/// it rides on the verification token and is redeemed, with its membership,
-/// when that address is proved.
 pub fn register_with(
     store: &Store,
     applicant: Applicant<'_>,
@@ -900,22 +763,17 @@ pub fn register_with(
     };
     let presented = invitation.map(Secret::digest);
     let outcome = store.writer().write(move |tx| {
-        // Policy is read here, not before, so a change that commits while an
-        // application is in flight is the one that decides it.
+        // Read inside the writer so a policy change committed in flight decides this application.
         let policy = policy(tx)?;
         if policy.registration == Registration::Closed {
             return refuse(tx, Refusal::RegistrationClosed);
         }
 
-        // An invitation decides both admission and membership. One without a
-        // mailbox is spent in this transaction (a lost race creates nothing);
-        // one addressed to a mailbox waits for that address to be verified.
         let (redeemed, deferred) = match presented {
             Some(digest) => {
                 let Some(found) = usable_invitation(tx, Select::Digest(digest.0), now)? else {
                     return refuse(tx, Refusal::InvitationUnusable);
                 };
-                // A bound invitation belongs to one verified identity.
                 if let Some((bound_provider, bound_subject)) = &found.identity
                     && (provider.as_ref() != Some(bound_provider)
                         || subject.as_ref() != Some(bound_subject))
@@ -942,7 +800,6 @@ pub fn register_with(
                         }
                         (None, Some(found.id))
                     }
-                    // Addressed to a mailbox this applicant is not proving.
                     Addressed::ToSomeoneElse => {
                         return refuse(tx, Refusal::InvitationUnusable);
                     }
@@ -956,9 +813,6 @@ pub fn register_with(
             }
         };
 
-        // Refuse a taken login before writing anything. The unique indexes are
-        // still the decision under a race; that path rolls the whole attempt
-        // back rather than leaving an account with no way to sign in.
         let taken: bool = match (&username, &provider, &subject, &email) {
             (Some(username), _, _, _) => tx
                 .prepare_cached(
@@ -983,11 +837,6 @@ pub fn register_with(
             return refuse(tx, Refusal::AlreadyRegistered);
         }
 
-        // A link-form invitation is itself the approval; without one, an
-        // application under `ApprovalRequired` waits. One addressed to a
-        // mailbox admits only when that mailbox is proved
-        // ([`redeem_verified`]), so a leaked link alone yields no active
-        // account.
         let approved = redeemed.is_some();
         let user = UserId::new();
         tx.execute(
@@ -1017,8 +866,6 @@ pub fn register_with(
         if let Err(Error::Sqlite(rusqlite::Error::SqliteFailure(code, _))) = &claimed
             && code.code == rusqlite::ErrorCode::ConstraintViolation
         {
-            // Somebody claimed it between the check and this insert. Roll the
-            // whole transaction back: no account, no spent invitation.
             return Err(Error::Conflict);
         }
         claimed?;
@@ -1039,9 +886,6 @@ pub fn register_with(
             None,
         )?;
         if let Some(address) = &email {
-            // A brand-new account is under every allowance; whatever the
-            // outcome (queued, or left for the operator's CLI) the
-            // registration stands.
             crate::email::request(tx, key.as_deref(), user, address, deferred, now)?;
         }
         Ok(if approved {
@@ -1051,8 +895,6 @@ pub fn register_with(
         })
     });
     match outcome {
-        // The racing claim rolled its transaction back, so the refusal is
-        // recorded on its own.
         Err(Error::Conflict) => store
             .writer()
             .write(move |tx| refuse(tx, Refusal::AlreadyRegistered)),
@@ -1060,8 +902,6 @@ pub fn register_with(
     }
 }
 
-/// Record why an application produced nothing. Every call site reaches this
-/// before writing an account, so the audit line is the only effect.
 fn refuse(tx: &Transaction<'_>, reason: Refusal) -> Result<Admission> {
     audit(
         tx,
@@ -1074,8 +914,6 @@ fn refuse(tx: &Transaction<'_>, reason: Refusal) -> Result<Admission> {
     Ok(Admission::Refused(reason))
 }
 
-/// Approve a pending account: it becomes active and can sign in with whatever
-/// credential it registered. Platform administration only, and audited.
 pub fn approve(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -1101,14 +939,7 @@ pub fn approve(
     )
 }
 
-/// Reject an account. A rejected account is inactive and stays on record, so
-/// its username and identity remain claimed and cannot be re-applied for.
-///
-/// Refusing a pending application is platform administration. Rejecting an
-/// account that was already approved takes away a live account for good (a
-/// rejected account can be neither approved nor reactivated), so it needs the
-/// same recent step-up as deactivating one with `set_active`: an unstepped
-/// credential must not be able to do permanently what it cannot do reversibly.
+/// Rejecting an approved account is irreversible, so it needs the same step-up as deactivation.
 pub fn reject(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -1132,7 +963,6 @@ pub fn reject(
     if changed == 0 {
         return Err(Error::NotFound);
     }
-    // An account that was approved before may hold live credentials.
     crate::local_auth::revoke_all(tx, user, now)?;
     crate::tokens::revoke_all_for_user(tx, user, now)?;
     crate::oauth::revoke_all_for_user(tx, user, crate::oauth::reason::ACCOUNT, now)?;
@@ -1153,7 +983,6 @@ pub struct Application {
     pub applied: UnixMillis,
 }
 
-/// Pending applications, oldest first. Platform administration only.
 pub fn pending(conn: &Connection, authority: Authority, limit: u16) -> Result<Vec<Application>> {
     if !(1..=100).contains(&limit) {
         return Err(Error::InvalidInput("page size"));
@@ -1181,11 +1010,6 @@ pub fn pending(conn: &Connection, authority: Authority, limit: u16) -> Result<Ve
     .collect()
 }
 
-/// Create a personal namespace for the caller, when policy allows it.
-///
-/// A separate decision from being admitted: under `SuperAdminOnly` an approved
-/// account still cannot create one. The schema allows a person at most one, and
-/// the owner's tenant-admin membership is created in the same transaction.
 pub fn create_personal_namespace(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -1198,8 +1022,6 @@ pub fn create_personal_namespace(
         if policy(tx)?.tenant_creation != TenantCreation::ApprovedUsers {
             return Err(Error::Forbidden);
         }
-        // Scoped credentials act inside one tenant; creating another is outside
-        // what they are acting under.
         if principal.tenant.is_some() || principal.repo.is_some() {
             return Err(Error::Forbidden);
         }
@@ -1222,11 +1044,6 @@ pub fn create_personal_namespace(
     )
 }
 
-/// Record that a forge installation exists, without trusting it.
-///
-/// Trusted intake, called by webhook/App handling, not by a client. A
-/// recorded installation is unbound and inactive: it grants nothing until an
-/// authorized binding exists. Idempotent, because deliveries repeat.
 pub fn record_installation(
     tx: &Transaction<'_>,
     provider: &str,
@@ -1256,12 +1073,6 @@ pub fn record_installation(
     InstallationId::from_bytes(stored).map_err(|_| Error::Corrupt("installation id"))
 }
 
-/// Bind an installation to a tenant: the decision that makes it usable.
-///
-/// Requires administration of *that* tenant (or platform administration), plus
-/// the deployment's installation-binding policy. An installation already bound
-/// elsewhere must be unbound first, so a repository's owner never changes
-/// underneath running work.
 pub fn bind_installation(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -1286,7 +1097,6 @@ pub fn bind_installation(
         ],
     )?;
     if bound == 0 {
-        // Absent, or already bound: both are "you cannot bind this".
         return Err(Error::Conflict);
     }
     audit(
@@ -1299,8 +1109,6 @@ pub fn bind_installation(
     )
 }
 
-/// Release a binding. Same authority as making it; the installation returns to
-/// the known-but-inactive state rather than disappearing.
 pub fn unbind_installation(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -1322,7 +1130,6 @@ pub fn unbind_installation(
         "UPDATE installations SET tenant_id = NULL, bound_by = NULL, bound_ms = NULL WHERE id = ?1",
         [installation.as_bytes()],
     )?;
-    // The organization is no longer the tenant's source of members.
     crate::github_members::installation_released(
         tx,
         TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?,
@@ -1345,13 +1152,9 @@ pub struct InstallationRecord {
     pub provider: String,
     pub external_id: String,
     pub account_login: String,
-    /// `None` means known but unbound: it authorizes nothing.
     pub tenant: Option<TenantId>,
 }
 
-/// Host-local binding: the caller already holds the database file. The
-/// installation and the tenant both still have to exist and be usable, so a
-/// guessed identifier fails loudly instead of creating a dead binding.
 pub fn bind_installation_trusted(
     tx: &Transaction<'_>,
     installation: InstallationId,
@@ -1377,9 +1180,6 @@ pub fn bind_installation_trusted(
     audit(tx, Event::InstallationBound, None, None, true, None)
 }
 
-/// The tenant an installation is bound to, if any. Trusted internal lookup for
-/// intake: a webhook has no principal to authorize with, and an unbound
-/// installation must resolve to nothing rather than to a guess.
 pub fn installation_tenant(
     conn: &Connection,
     provider: &str,
@@ -1401,8 +1201,6 @@ pub fn installation_tenant(
     }
 }
 
-/// Installations visible to a platform admin: bound and unbound alike, because
-/// the unbound ones are exactly what an operator needs to see.
 pub fn installations(
     conn: &Connection,
     principal: Principal,
@@ -1441,7 +1239,6 @@ pub fn installations(
     .collect()
 }
 
-/// Delete invitations that can no longer be redeemed, in bounded batches.
 pub fn purge_expired_invitations(store: &Store, now: UnixMillis, limit: u32) -> Result<usize> {
     store.writer().write(move |tx| {
         let removed = tx.execute(

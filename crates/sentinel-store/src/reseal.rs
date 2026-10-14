@@ -1,11 +1,4 @@
-//! Every sealed column in one place: whether any exists (a controller must
-//! not start without its key when one does), whether the loaded key opens
-//! them, and moving them to the active key so retired keys can be dropped.
-//!
-//! Sealed values live in `secret_versions.sealed` (revoked versions
-//! included), `mfa_totp.sealed_seed` and `source_bindings.credential`. Each
-//! row's context is derived from its own columns, exactly as the writer that
-//! sealed it derived it.
+//! Each row's context is derived from its own columns, exactly as the writer that sealed it derived it.
 
 use std::sync::Arc;
 
@@ -15,10 +8,8 @@ use sentinel_core::{RepoId, TenantId, UserId};
 
 use crate::{Error, Result, Store};
 
-/// Rows each writer transaction reseals: bounded writer hold time.
 pub const BATCH: u32 = 256;
 
-/// Whether any sealed value is stored. Three indexed `EXISTS` probes.
 pub fn sealed_rows_exist(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM secret_versions) OR EXISTS(SELECT 1 FROM mfa_totp)
@@ -28,9 +19,6 @@ pub fn sealed_rows_exist(conn: &Connection) -> Result<bool> {
     )?)
 }
 
-/// The key ids every sealed value was sealed under: what a restore needs
-/// in its key file. Reads every sealed column once; these tables hold
-/// secrets, second factors and source credentials, never bulk data.
 pub fn key_ids(conn: &Connection) -> Result<std::collections::BTreeSet<u32>> {
     let mut ids = std::collections::BTreeSet::new();
     for sql in [
@@ -53,9 +41,6 @@ pub fn key_ids(conn: &Connection) -> Result<std::collections::BTreeSet<u32>> {
     Ok(ids)
 }
 
-/// Open the newest row of each sealed table with `key`: a key file that
-/// does not match the restored database fails here, at start, instead of at
-/// first use. Bounded: at most one row per table.
 pub fn verify_key(conn: &Connection, key: &Key) -> Result<()> {
     let secret: Option<Row> = conn
         .query_row(
@@ -104,9 +89,6 @@ fn opens(key: &Key, context: &[u8], sealed: &[u8], what: &'static str) -> Result
     Ok(())
 }
 
-/// How many stored values name a key other than `key`'s active one. Zero
-/// is the precondition for retiring every other key. A full scan: offline
-/// administration only.
 pub fn stale(conn: &Connection, key: &Key) -> Result<u64> {
     let active = key.active_id().to_be_bytes();
     let count = |sql: &str| -> Result<u64> {
@@ -126,18 +108,12 @@ pub fn stale(conn: &Connection, key: &Key) -> Result<u64> {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Progress {
-    /// Rows looked at.
     pub examined: u64,
-    /// Rows rewritten under the active key.
     pub resealed: u64,
 }
 
-/// Move every sealed value to the active key, [`BATCH`] rows per writer
-/// transaction. Offline (the caller holds the database ownership lock).
-/// Resumable: a crash between batches leaves some rows on the old key and
-/// some on the new; running again skips the rows already moved without
-/// decrypting them. A row that does not open is `Corrupt` and stops the run,
-/// since retiring its key would lose it.
+/// Resumable: rows already on the active key are skipped without decrypting.
+/// A row that does not open stops the run, since retiring its key would lose it.
 pub fn reseal_all(store: &Store, key: Arc<Key>) -> Result<Progress> {
     let mut progress = Progress::default();
     let mut after = ([0u8; 16], 0i64);
@@ -208,7 +184,6 @@ fn source_context(repo: [u8; 16], tenant: [u8; 16], version: i64) -> Result<[u8;
     Ok(crate::sources::context(tenant, repo, version))
 }
 
-/// Whether a stored value already uses the active key (no decryption).
 fn current(key: &Key, sealed: &[u8]) -> bool {
     sealed.first() == Some(&2) && key_id(sealed) == Some(key.active_id())
 }
