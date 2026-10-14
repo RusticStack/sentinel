@@ -18,7 +18,10 @@ use sentinel_core::{
     Actor, AttemptId, DependencyPolicy, Event, FailureClass, Fence, JobId, JobState, Outcome,
     PoolId, RepoId, RunId, TenantId, UnixMillis, WorkerId, dependency_decision,
 };
-use sentinel_pipeline::schema::ArtifactWhen;
+use sentinel_pipeline::{
+    expr::{Context, DependencySummary, HashFilesError, Lookup, Phase, Value},
+    schema::ArtifactWhen,
+};
 use sentinel_protocol::{limits::MAX_LIST_ITEMS, summary::MAX_SUMMARY_BYTES};
 
 use crate::{
@@ -2075,6 +2078,11 @@ pub fn cancel_run(
     now: UnixMillis,
 ) -> Result<usize> {
     let mut count = 0;
+    // The run-level desired state: what `cancelled()` answers in a job
+    // condition and what keeps a cancelled run from fetching its source.
+    // A rerun of one of its jobs clears it (`runs::rerun_job`).
+    tx.prepare_cached("UPDATE runs SET cancel_requested = 1 WHERE id = ?1 AND tenant_id = ?2")?
+        .execute(params![run.as_bytes(), tenant.as_bytes()])?;
     for (job, state) in runs::run_jobs(tx, tenant, run)? {
         if !state.is_terminal() && cancel_one(tx, tenant, job, now)? != Cancelled::AlreadyTerminal {
             count += 1;
@@ -2728,54 +2736,274 @@ pub fn spec_bytes(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Re
 }
 
 /// Decide every blocked job of the run whose dependencies have all finished:
-/// queue it, or skip it when a dependency rules it out. Reads the spec once,
-/// and only when the run still has a blocked job.
+/// queue it, skip it when a dependency or its `if` rules it out, or fail it
+/// when its `if` cannot be evaluated. Reads the spec once, and only when the
+/// run still has a blocked job.
+///
+/// A job without `if` follows `on_success`: it is skipped as soon as one
+/// dependency did not succeed and queued once every one did (a skipped
+/// dependency counts as success only when it was skipped by its own
+/// condition; one skipped because something upstream failed counts as a
+/// failure, so a failure can never be bypassed through a skipped job). A job
+/// with an `if` waits until every dependency is terminal, because
+/// `always()` and `failure()` need the whole picture, and then the condition
+/// decides; unless it calls `success()`, `failure()` or `always()` itself it
+/// also requires `success()`. See docs/pipeline-schema.md (job conditions).
 pub fn release_dependents(
     tx: &Transaction<'_>,
     tenant: TenantId,
     run: RunId,
     now: UnixMillis,
 ) -> Result<usize> {
-    let states = runs::run_jobs(tx, tenant, run)?;
+    let mut states = runs::run_jobs(tx, tenant, run)?;
     if !states.iter().any(|(_, s)| *s == JobState::Blocked) {
         return Ok(0);
     }
     let spec = runs::get_run_spec(tx, tenant, run)?;
+    let mut by_failure = failure_skips(&states, &spec)?;
+    let mut facts: Option<RunFacts> = None;
     let mut released = 0;
-    for (index, (job, state)) in states.iter().enumerate() {
-        if *state != JobState::Blocked {
+    // Dependencies precede their dependents, and each decision is written
+    // back to `states`, so a whole chain resolves in this one pass: a job
+    // skipped here is already skipped when the job behind it is decided.
+    for index in 0..states.len() {
+        let (job, state) = states[index];
+        if state != JobState::Blocked {
             continue;
         }
+        let effective = |need: u16| effective_state(&states, &by_failure, usize::from(need));
         let Some(compiled) = spec.pipeline.jobs.get(index) else {
             return Err(Error::Corrupt("run_specs.spec"));
         };
-        let mut decision = Some(true);
-        for need in &compiled.needs {
-            let upstream = states
-                .get(usize::from(*need))
-                .map(|(_, s)| *s)
-                .ok_or(Error::Corrupt("run_specs.spec"))?;
-            match dependency_decision(DependencyPolicy::OnSuccess, upstream) {
-                Some(true) => {}
-                Some(false) => {
-                    decision = Some(false);
-                    break;
+        if compiled
+            .needs
+            .iter()
+            .any(|need| usize::from(*need) >= index)
+        {
+            return Err(Error::Corrupt("run_specs.spec"));
+        }
+        let event = match &compiled.spec.condition {
+            None => {
+                let mut decision = Some(true);
+                for need in &compiled.needs {
+                    match dependency_decision(DependencyPolicy::OnSuccess, effective(*need)) {
+                        Some(true) => {}
+                        Some(false) => {
+                            decision = Some(false);
+                            break;
+                        }
+                        None => {
+                            decision = None;
+                            break;
+                        }
+                    }
                 }
-                None => {
-                    decision = None;
-                    break;
+                match decision {
+                    Some(true) => Event::DependenciesSatisfied,
+                    Some(false) => Event::Skip,
+                    None => continue,
                 }
             }
-        }
-        let event = match decision {
-            Some(true) => Event::DependenciesSatisfied,
-            Some(false) => Event::Skip,
-            None => continue,
+            Some(condition) => {
+                let mut summary = DependencySummary {
+                    all_succeeded: true,
+                    any_failed: false,
+                };
+                let mut results = Vec::with_capacity(compiled.needs.len());
+                let mut waiting = false;
+                for need in &compiled.needs {
+                    let JobState::Terminal(counted) = effective(*need) else {
+                        waiting = true;
+                        break;
+                    };
+                    let need = usize::from(*need);
+                    let JobState::Terminal(actual) = states[need].1 else {
+                        return Err(Error::Corrupt("run_specs.spec"));
+                    };
+                    summary.all_succeeded &= counted.is_success();
+                    summary.any_failed |= !counted.is_success();
+                    results.push((spec.pipeline.jobs[need].name.as_str(), actual));
+                }
+                if waiting {
+                    continue;
+                }
+                if facts.is_none() {
+                    facts = Some(run_facts(tx, tenant, run)?);
+                }
+                let Some(facts) = facts.as_ref() else {
+                    return Err(Error::Corrupt("run facts"));
+                };
+                if !condition.uses_status_function() && (!summary.all_succeeded || facts.cancelled)
+                {
+                    Event::Skip
+                } else {
+                    let context = ScheduleContext {
+                        facts,
+                        sha: &spec.source.sha,
+                        run,
+                        job,
+                        job_name: &compiled.name,
+                        summary,
+                        results,
+                    };
+                    match condition.eval(&context).map(|v| v.as_condition()) {
+                        Ok(Some(true)) => Event::DependenciesSatisfied,
+                        Ok(Some(false)) => Event::Skip,
+                        // The compiler types every condition, so this is a
+                        // spec from before it did, or a corrupted one. The
+                        // job fails visibly rather than running or skipping
+                        // on a guess.
+                        Ok(None) | Err(_) => Event::ConditionFailed,
+                    }
+                }
+            }
         };
-        jobs::transition(tx, tenant, *job, Actor::Controller, event, now)?;
+        let next = jobs::transition(tx, tenant, job, Actor::Controller, event, now)?;
+        let ended_by_failure = next == JobState::Terminal(Outcome::Skipped)
+            && compiled.needs.iter().any(|need| {
+                matches!(
+                    effective_state(&states, &by_failure, usize::from(*need)),
+                    JobState::Terminal(o) if !o.is_success()
+                )
+            });
+        states[index].1 = next;
+        by_failure[index] = ended_by_failure;
         released += 1;
     }
     Ok(released)
+}
+
+/// A job's state as its dependents count it: a skip caused by a failure
+/// upstream is a failure, anything else is what it is.
+fn effective_state(states: &[(JobId, JobState)], by_failure: &[bool], index: usize) -> JobState {
+    if by_failure[index] {
+        JobState::Terminal(Outcome::Failed)
+    } else {
+        states[index].1
+    }
+}
+
+/// Which jobs are skipped because something upstream did not succeed, as
+/// opposed to by their own condition. A job is such a skip when it is
+/// skipped and a dependency ended without success or is itself such a skip.
+/// Dependencies precede their dependents in the spec, so one pass suffices.
+fn failure_skips(
+    states: &[(JobId, JobState)],
+    spec: &sentinel_pipeline::RunSpec,
+) -> Result<Vec<bool>> {
+    let mut blocked = vec![false; states.len()];
+    for (index, (_, state)) in states.iter().enumerate() {
+        if *state != JobState::Terminal(Outcome::Skipped) {
+            continue;
+        }
+        let compiled = spec
+            .pipeline
+            .jobs
+            .get(index)
+            .ok_or(Error::Corrupt("run_specs.spec"))?;
+        let mut by_failure = false;
+        for need in &compiled.needs {
+            let need = usize::from(*need);
+            if need >= index {
+                return Err(Error::Corrupt("run_specs.spec"));
+            }
+            by_failure |=
+                blocked[need] || matches!(states[need].1, JobState::Terminal(o) if !o.is_success());
+        }
+        blocked[index] = by_failure;
+    }
+    Ok(blocked)
+}
+
+/// The run-level facts a job condition may read: the repository, whether
+/// cancellation is desired for the run, and the event that triggered it.
+struct RunFacts {
+    repo: RepoId,
+    repo_name: String,
+    cancelled: bool,
+    event: crate::provenance::EventFacts,
+}
+
+fn run_facts(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunFacts> {
+    let (repo, repo_name, cancelled): ([u8; 16], String, i64) = conn
+        .prepare_cached(
+            "SELECT r.repo_id, p.name, r.cancel_requested FROM runs r
+             JOIN repos p ON p.id = r.repo_id AND p.tenant_id = r.tenant_id
+             WHERE r.id = ?1 AND r.tenant_id = ?2",
+        )?
+        .query_row(params![run.as_bytes(), tenant.as_bytes()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    Ok(RunFacts {
+        repo: RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?,
+        repo_name,
+        cancelled: cancelled != 0,
+        event: crate::provenance::event_facts(conn, run)?,
+    })
+}
+
+/// The schedule-phase expression context: what a job's `if` sees once every
+/// dependency is terminal. It answers the same paths as the worker's
+/// context for the same run, so a job and its steps read one event.
+struct ScheduleContext<'a> {
+    facts: &'a RunFacts,
+    sha: &'a str,
+    run: RunId,
+    job: JobId,
+    job_name: &'a str,
+    summary: DependencySummary,
+    /// `(dependency job name, outcome)` for every `needs` entry.
+    results: Vec<(&'a str, Outcome)>,
+}
+
+impl Context for ScheduleContext<'_> {
+    fn phase(&self) -> Phase {
+        Phase::Schedule
+    }
+
+    fn lookup(&self, path: &[String]) -> Lookup {
+        let key: Vec<&str> = path.iter().map(String::as_str).collect();
+        let event = &self.facts.event;
+        Lookup::Value(match key.as_slice() {
+            ["event", "sha"] => Value::Str(self.sha.to_owned()),
+            ["event", "name"] => Value::Str(event.name.clone()),
+            ["event", "ref"] => Value::Str(event.ref_name.clone()),
+            ["event", "key"] => Value::Str(event.key.clone()),
+            ["event", "base_ref"] => match &event.base_ref {
+                Some(base) => Value::Str(base.clone()),
+                None => Value::Null,
+            },
+            ["event", "pr_number"] => match event.pr_number {
+                Some(number) => Value::Int(number as i64),
+                None => Value::Null,
+            },
+            ["repo", "id"] => Value::Str(self.facts.repo.to_string()),
+            ["repo", "name"] => Value::Str(self.facts.repo_name.clone()),
+            ["run", "id"] => Value::Str(self.run.to_string()),
+            ["job", "id"] => Value::Str(self.job.to_string()),
+            ["job", "name"] => Value::Str(self.job_name.to_owned()),
+            ["needs", name, "result"] => match self.results.iter().find(|(n, _)| n == name) {
+                Some((_, outcome)) => Value::Str(outcome.as_str().to_owned()),
+                None => return Lookup::Unresolved,
+            },
+            _ => return Lookup::Unresolved,
+        })
+    }
+
+    fn dependency_summary(&self) -> Option<DependencySummary> {
+        Some(self.summary)
+    }
+
+    fn cancelled(&self) -> Option<bool> {
+        Some(self.facts.cancelled)
+    }
+
+    fn hash_files(&self, _patterns: &[&str]) -> std::result::Result<String, HashFilesError> {
+        // `hash_files` resolves on the worker; a job condition cannot use it.
+        Err(HashFilesError::UnsupportedPlatform)
+    }
 }
 
 /// Why a job is not running, as the plan's structured reason.

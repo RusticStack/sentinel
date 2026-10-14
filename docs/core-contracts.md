@@ -37,6 +37,7 @@ Outcomes, in aggregation precedence from lowest to highest: `passed`, `skipped`,
 |---|---|---|---|
 | `DependenciesSatisfied` | controller | blocked | queued |
 | `Skip` | controller | blocked, queued | skipped |
+| `ConditionFailed` | controller | blocked | infra_failed (class `preparation`) |
 | `CancelBeforeStart` | controller | blocked, queued | canceled |
 | `QueueTimedOut` | controller | blocked, queued | timed_out |
 | `Leased(fence)` | controller | queued | leased (fence must increase) |
@@ -50,6 +51,11 @@ Outcomes, in aggregation precedence from lowest to highest: `passed`, `skipped`,
 | `WorkerLost` | controller, reconciler | leased … finalizing | infra_failed |
 | `Reconciled` | reconciler | leased … finalizing | infra_failed |
 | `Rerun` | controller | any terminal, cancel not requested | queued (fence unchanged) |
+
+`ConditionFailed` ends a blocked job whose `if` could not be evaluated when its dependencies finished; the compiler types every condition, so it is reachable only from a run spec stored before conditions were typed or from a corrupt one, and it exists so that case is a visible failure instead of a silent skip or a silent run.
+
+A rerun is more than the `Rerun` edge on the one job. The store operation that applies it also clears the run's `cancel_requested` flag and returns every `skipped` job downstream of the rerun job (following skipped jobs only, and leaving any job with cancellation desired alone) to `blocked`, so the schedule decision is made again against the new attempt; jobs that ran keep their results. That revival is a controller-only store write guarded by state and cancel flag, not a `JobControl` edge, in the same way as the GitHub check-run rerequest. See [pipeline schema](pipeline-schema.md#run-specification-c05).
+
 
 Anything else is rejected without changing state: `Forbidden` (wrong actor), `StaleFence`, `Invalid` (no such edge), or `AlreadyTerminal` (terminal states absorb every event except a controller `Rerun`, which lets callers treat duplicate completions as idempotent acknowledgements). `OfferLapsed` returns an unacknowledged lease to the queue without rewinding the fence, so the lapsed attempt's worker is stale in every direction and the next lease strictly advances. `Rerun` is the only exit from terminal: it re-queues the job under the same compiled spec without touching the fence, so the next lease advances it and a late report from the previous attempt is stale. A cancelled job cannot be rerun. The tests enumerate every state, event and actor combination and assert the machine never panics and never mutates on error.
 
@@ -70,11 +76,13 @@ Each class maps to exactly one outcome, so storage can never hold a contradictor
 
 Cancellation is durable desired state on the job (`cancel_requested`), set once and never cleared by a cancel path; the single exception is a GitHub check-run rerequest, which deliberately starts a cancelled job over and resets the flag with it ([checks](checks.md#rerequests-and-lifecycle-reconciliation-g05)). If the job is `blocked` or `queued`, the controller finishes it immediately with `CancelBeforeStart` and decides its dependents. If it is leased but never started, it ends `canceled` (`OfferLapsed` then `CancelBeforeStart`, both controller edges) the moment the offer goes back. If a worker owns it, the flag is delivered on the session; the worker terminates the process group gracefully, then forcibly after the grace period, and reports `Failed(Canceled)` with its fence. If the worker never reports, lease expiry produces `infra_failed` and the flag still prevents any rerun from starting. Superseded runs, tenant suspension and operator cancel all use this one path.
 
+The run row also carries `cancel_requested`, set when the whole run is cancelled (`cancel_run`, which supersession uses, and tenant suspension) and not by cancelling a single job. It is what `cancelled()` answers in a job condition, what the API and web interface show as "cancel requested", and one of the conditions under which an attempt may fetch its source. A rerun of one of its jobs, or a GitHub check-run rerequest, clears it: both resume the run.
+
 ## Run aggregation and dependencies
 
 Run state is derived, never stored as truth: recomputed from the job rows in the transaction that changed a job. It is `pending` until any job is worker-owned, `active` while any job is unfinished, and terminal once every job is terminal, taking the highest-precedence outcome; a run whose jobs were all skipped is `skipped`.
 
-Dependency policies: `on_success` (default) starts when the upstream passed or was skipped, `always` starts on any outcome except canceled, `on_failure` starts on failed, timed out or infra-failed. A non-terminal upstream means keep waiting; a false decision skips the dependent.
+Dependency policies: `on_success` (default) starts when the upstream passed or was skipped, `always` starts on any outcome except canceled, `on_failure` starts on failed, timed out or infra-failed. A non-terminal upstream means keep waiting; a false decision skips the dependent. The controller applies them at the schedule phase (`release_dependents`): a job with no `if` is `on_success`, and a job's `if` is evaluated there, with `always()` and `failure()` expressing the other two policies and an `if` that calls no status function also requiring `success()` ([job conditions](pipeline-schema.md#expressions-c06)). A skipped upstream satisfies `on_success` only when it was skipped by its own condition; one skipped because something upstream failed counts as a failure for its dependents, so a failure is never bypassed through a skipped job. Because a rerun returns such skips to `blocked` (above), a run whose failed job was rerun and passed is `active` until its revived dependents finish and is never `passed` while a required job has not run.
 
 ## Timestamps
 

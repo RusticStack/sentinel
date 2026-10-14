@@ -168,8 +168,10 @@ rerequest must match both the stored check-run handle and its `external_id`,
 and a suite rerequest matches the stored suite ID, with a legacy `NULL` suite
 still resolving when the run is otherwise eligible. Only a terminal,
 non-superseded run of the still-bound repository reruns, as a full immutable
-DAG reset — attempts, fences and image pins are preserved, jobs return to
-queued/blocked, and fresh check desired state is recorded in the same
+DAG reset — attempts, fences and image pins are preserved, the run's own
+cancel flag clears with the jobs', jobs return to
+queued/blocked (a job with an `if` is blocked and decided again against the
+run's event), and fresh check desired state is recorded in the same
 transaction. Because the reset follows a completed generation, every stored
 handle is cleared (above), so the rerequest surfaces as **new** check runs —
 and a second rerequest sent against the old, superseded check-run handle no

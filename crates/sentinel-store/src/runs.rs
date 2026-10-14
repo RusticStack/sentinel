@@ -104,7 +104,11 @@ pub fn create_run(
                 )?;
             }
         }
-        if job.needs.is_empty() {
+        // A job with an `if` starts blocked even with nothing to wait for: its
+        // condition reads the run's event, which is recorded after this
+        // transaction creates the run, so the caller releases it once that
+        // exists (`dispatch::release_dependents`).
+        if job.needs.is_empty() && job.spec.condition.is_none() {
             jobs::transition(
                 tx,
                 tenant,
@@ -487,5 +491,77 @@ pub fn rerun_job(
     // check (plus the aggregate's) must show the new work — a fresh check
     // run, since a completed one cannot be reopened.
     crate::checks::record_job(tx, tenant, job, now)?;
+    revive_skipped_dependents(tx, tenant, job, now)?;
     Ok(next)
+}
+
+/// The rest of a rerun: every job downstream of `job` that ended `Skipped`
+/// goes back to `Blocked`, so it is decided again against the new attempt
+/// instead of staying skipped for a failure that no longer stands. Only a
+/// chain of skipped jobs is followed — a dependent that ran keeps its result
+/// — and a job with cancellation desired is left alone. The run's own cancel
+/// flag is cleared: a rerun resumes the run.
+///
+/// Jobs are in dependency order (every dependency has a smaller index), so
+/// one forward pass finds the whole skipped chain.
+fn revive_skipped_dependents(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    job: JobId,
+    now: UnixMillis,
+) -> Result<()> {
+    let run: [u8; 16] = tx
+        .prepare_cached("SELECT run_id FROM jobs WHERE id = ?1 AND tenant_id = ?2")?
+        .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| r.get(0))?;
+    let run = RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?;
+    tx.prepare_cached(
+        "UPDATE runs SET cancel_requested = 0
+         WHERE id = ?1 AND tenant_id = ?2 AND cancel_requested = 1",
+    )?
+    .execute(params![run.as_bytes(), tenant.as_bytes()])?;
+    let states = run_jobs(tx, tenant, run)?;
+    let Some(origin) = states.iter().position(|(id, _)| *id == job) else {
+        return Err(Error::Corrupt("run jobs"));
+    };
+    let skipped = JobState::Terminal(sentinel_core::Outcome::Skipped);
+    if !states[origin + 1..].iter().any(|(_, s)| *s == skipped) {
+        return Ok(());
+    }
+    let spec = get_run_spec(tx, tenant, run)?;
+    let mut reached = vec![false; states.len()];
+    reached[origin] = true;
+    let mut revive = tx.prepare_cached(
+        "UPDATE jobs SET state_code = ?1, failure_class = NULL, queued_ms = NULL,
+            leased_ms = NULL, preparing_ms = NULL, running_ms = NULL, finalizing_ms = NULL,
+            terminal_ms = NULL
+         WHERE id = ?2 AND tenant_id = ?3 AND state_code = ?4 AND cancel_requested = 0",
+    )?;
+    for index in origin + 1..states.len() {
+        if states[index].1 != skipped {
+            continue;
+        }
+        let compiled = spec
+            .pipeline
+            .jobs
+            .get(index)
+            .ok_or(Error::Corrupt("run_specs.spec"))?;
+        if !compiled
+            .needs
+            .iter()
+            .any(|need| reached.get(usize::from(*need)).copied().unwrap_or(false))
+        {
+            continue;
+        }
+        let changed = revive.execute(params![
+            encode_state(JobState::Blocked),
+            states[index].0.as_bytes(),
+            tenant.as_bytes(),
+            encode_state(skipped),
+        ])?;
+        if changed == 1 {
+            reached[index] = true;
+            crate::checks::record_job(tx, tenant, states[index].0, now)?;
+        }
+    }
+    Ok(())
 }
