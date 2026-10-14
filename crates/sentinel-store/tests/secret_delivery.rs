@@ -106,7 +106,9 @@ fn fixture_at(protocol: u16) -> Fixture {
                     Capacity {
                         cpu_millis: 4_000,
                         memory_bytes: 8 << 30,
-                        disk_bytes: 0,
+                        // A profile-protocol worker states the scratch disk it
+                        // offers, and zero means none (docs/compatibility.md).
+                        disk_bytes: 1 << 40,
                     },
                 )?;
 

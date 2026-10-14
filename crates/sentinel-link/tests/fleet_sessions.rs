@@ -18,7 +18,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sentinel_auth::secret::Secret;
 use sentinel_core::{
     AttemptId, JobId, PoolId, RepoId, RunId, TenantId, UnixMillis, UserId, WorkerId,
     auth::{Namespace, Permissions as P, Principal},
@@ -31,13 +30,15 @@ use sentinel_link::{
     tls,
 };
 use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
-use sentinel_protocol::negotiate::{Arch, Capabilities, Hello, Profile, ProtocolVersion};
+use sentinel_protocol::negotiate::{
+    Arch, Capabilities, Hello, Negotiated, Profile, ProtocolVersion,
+};
 use sentinel_store::{
     Durability, Store,
     auth::{self, Authority, NamespaceKind, provisioning},
     runs,
     tenancy::{self, PoolKind},
-    workers,
+    workers::{self, Presentation},
 };
 
 const SESSIONS: usize = 100;
@@ -161,15 +162,48 @@ impl Deployment {
         self.controller.as_ref().unwrap()
     }
 
-    fn enrollment(&self) -> Secret {
+    /// Enroll every identity in the store, as an operator provisioning a
+    /// fleet would. The link rate-limits enrollments over the wire (a few
+    /// per source, twenty a minute overall; docs/worker-link.md), so a
+    /// hundred workers arriving at once over loopback cannot all enroll
+    /// through it; this test is about sessions, and each worker connects as
+    /// the known identity it is.
+    fn enroll_all(&self, workers: &[(WorkerId, Identity)]) {
         let pool = self.pool;
+        let enrolled: Vec<_> = workers
+            .iter()
+            .map(|(id, identity)| (*id, identity.fingerprint()))
+            .collect();
         self.store
             .writer()
             .write(move |tx| {
-                workers::issue_enrollment(tx, Authority::HostLocal, pool, 60_000, UnixMillis::now())
+                for (index, (worker, fingerprint)) in enrolled.iter().enumerate() {
+                    let issued = workers::issue_enrollment(
+                        tx,
+                        Authority::HostLocal,
+                        pool,
+                        60_000,
+                        UnixMillis::now(),
+                    )?;
+                    workers::enroll(
+                        tx,
+                        &issued.secret,
+                        Presentation {
+                            worker: *worker,
+                            fingerprint: *fingerprint,
+                            name: &format!("session-{index}"),
+                            negotiated: Negotiated {
+                                protocol: ProtocolVersion(7),
+                                capabilities: Capabilities::REQUIRED,
+                                arch: Arch::X86_64,
+                            },
+                        },
+                        UnixMillis::now(),
+                    )?;
+                }
+                Ok(())
             })
-            .unwrap()
-            .secret
+            .unwrap();
     }
 
     /// Create the burst: several runs because a pipeline is capped at 64 jobs.
@@ -259,31 +293,29 @@ fn eventually(what: &str, within: Duration, mut predicate: impl FnMut() -> bool)
 fn one_hundred_sessions_connect_and_take_their_share_of_the_burst() {
     let mut d = deployment();
     let stop = Arc::new(AtomicBool::new(false));
-    let enrollments: Vec<Secret> = (0..SESSIONS).map(|_| d.enrollment()).collect();
+    let fleet: Vec<(WorkerId, Identity)> = (0..SESSIONS)
+        .map(|index| {
+            (
+                WorkerId::new(),
+                Identity::generate(&format!("session-{index}")).unwrap(),
+            )
+        })
+        .collect();
+    d.enroll_all(&fleet);
     let mut sims: Vec<Arc<Sim>> = Vec::with_capacity(SESSIONS);
     let mut ids: Vec<WorkerId> = Vec::with_capacity(SESSIONS);
     let mut threads = Vec::with_capacity(SESSIONS);
     let addr = d.controller().local_addr();
     let fingerprint = d.controller().fingerprint();
     let connected_at = Instant::now();
-    for (index, secret) in enrollments.into_iter().enumerate() {
-        let id = WorkerId::new();
+    for (index, (id, identity)) in fleet.into_iter().enumerate() {
         let sim = Sim::new();
         ids.push(id);
         sims.push(Arc::clone(&sim));
         let stop = Arc::clone(&stop);
         threads.push(thread::spawn(move || -> Result<(), Error> {
-            let identity = Identity::generate(&format!("session-{index}")).unwrap();
             let config = tls::client_config(identity, fingerprint).unwrap();
-            let mut link = session::connect(
-                addr,
-                config,
-                id,
-                "fleet",
-                hello(),
-                Some(&secret),
-                capacity(),
-            )?;
+            let mut link = session::connect(addr, config, id, "fleet", hello(), None, capacity())?;
             // Protocol 7: the profile carries what a hello cannot.
             link.send_profile(&profile(index))?;
             link.run(&*sim, || stop.load(Ordering::Relaxed))

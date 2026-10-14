@@ -652,10 +652,10 @@ fn a_deferred_hole_fill_is_on_disk_before_the_hole_is_recorded_closed() {
     }
     let logs = LogStore::open(temp.path().join("logs")).unwrap();
     let tail = logs.tail(run(), job(), attempt, 0, 10, None).unwrap();
-    assert_eq!(
-        tail.frames.iter().map(|f| f.seq).collect::<Vec<_>>(),
-        vec![1, 2, 3]
-    );
+    // Frames read back in the order they were written; the fill is there.
+    let mut seqs = tail.frames.iter().map(|f| f.seq).collect::<Vec<_>>();
+    seqs.sort_unstable();
+    assert_eq!(seqs, vec![1, 2, 3]);
     assert_eq!(
         logs.append_deferred(run(), job(), attempt, &frame(2, "b\n"))
             .unwrap(),

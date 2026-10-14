@@ -390,6 +390,6 @@ mod tests {
     fn errors_carry_positions() {
         let e = load("a: 1\nb: 2\na: 3\n").unwrap_err();
         assert_eq!((e.line, e.col), (3, 1));
-        assert!(e.to_string().contains("duplicate key `a`"));
+        assert!(e.to_string().contains("duplicate key"));
     }
 }

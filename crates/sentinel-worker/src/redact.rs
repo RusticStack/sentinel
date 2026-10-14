@@ -913,7 +913,10 @@ mod tests {
             let alphabet = 1 + rng.below(3) as u8;
             let mut secrets: Vec<Vec<u8>> = Vec::new();
             for _ in 0..1 + rng.below(5) {
-                let len = 1 + rng.below(6) as usize;
+                // At least the floor `register` accepts: a shorter value is
+                // refused, so the reference scan would redact what the
+                // automaton never held.
+                let len = MIN_SECRET_BYTES + rng.below(5) as usize;
                 let value: Vec<u8> = (0..len)
                     .map(|_| b'a' + rng.below(alphabet.into()) as u8)
                     .collect();

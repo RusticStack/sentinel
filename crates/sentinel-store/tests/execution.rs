@@ -525,6 +525,15 @@ fn an_oversized_summary_is_dropped_and_the_pass_stands() {
         .store
         .writer()
         .write(move |tx| {
+            // A pass is reported from finalization, after the worker has
+            // walked the earlier states; only the last report has a summary.
+            for (ms, event) in [
+                (2_210, Event::PreparationStarted),
+                (2_220, Event::StepsStarted),
+                (2_230, Event::FinalizationStarted),
+            ] {
+                dispatch::report(tx, w, attempt, fence, event, None, at(ms), None)?;
+            }
             dispatch::report(
                 tx,
                 w,
