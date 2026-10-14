@@ -1,4 +1,4 @@
-//! Part 10 audit (secrets cluster): delegation boundaries, the named
+//! Secrets: delegation boundaries, the named
 //! binding/allowlist/revocation surface, listing plans, idempotency-key
 //! reuse, and resealing every sealed column under a new key.
 
@@ -135,7 +135,7 @@ fn put_with(
     })
 }
 
-/// P10S-12: the three delegation boundaries S02 promises, each a plain
+/// The three delegation boundaries, each a plain
 /// `NotFound`: a repo-A writer cannot write repo B of the same tenant, cannot
 /// write or allowlist at tenant scope, and a principal narrowed to repo A
 /// cannot reach repo B even with every permission.
@@ -181,7 +181,7 @@ fn a_delegated_writer_stays_inside_its_repository_and_narrowing() {
     ));
 }
 
-/// P10S-2 store surface: bind by name, list, idempotent unbind, allowlist
+/// Store surface: bind by name, list, idempotent unbind, allowlist
 /// listing and idempotent single-version revocation.
 #[test]
 fn bindings_allowlists_and_revocations_are_idempotent_by_name() {
@@ -285,7 +285,7 @@ fn bindings_allowlists_and_revocations_are_idempotent_by_name() {
     );
 }
 
-/// P10S-11: each listing scope is served by its own partial index, and a
+/// Each listing scope is served by its own partial index, and a
 /// page of one scope never contains the other scope's names.
 #[test]
 fn each_listing_scope_walks_only_its_own_index() {
@@ -335,7 +335,7 @@ fn each_listing_scope_walks_only_its_own_index() {
     );
 }
 
-/// P10C-9: reusing a secret-write idempotency key for a different request
+/// Reusing a secret-write idempotency key for a different request
 /// is `IdempotencyMismatch`, distinct from a stale-version `Conflict`.
 #[test]
 fn a_reused_idempotency_key_is_a_mismatch_not_a_conflict() {
@@ -369,7 +369,7 @@ fn a_reused_idempotency_key_is_a_mismatch_not_a_conflict() {
     ));
 }
 
-/// P10S-5: after a rotation, `reseal_all` moves every sealed column (active
+/// After a rotation, `reseal_all` moves every sealed column (active
 /// and revoked secret versions, a confirmed second-factor seed, a source
 /// credential) to the active key; a second run changes nothing, retiring
 /// the old keys leaves every row readable, and the triggers still refuse

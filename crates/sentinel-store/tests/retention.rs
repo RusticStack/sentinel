@@ -1,4 +1,4 @@
-//! R01: storage quotas and retention at deployment, tenant, repository and
+//! Storage quotas and retention at deployment, tenant, repository and
 //! run level — policies that only narrow downwards, database-driven log
 //! expiry with usage accounting, retention changes applied to what is
 //! already stored, and the aborted-upload purge.

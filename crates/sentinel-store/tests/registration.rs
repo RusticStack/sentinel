@@ -1,4 +1,4 @@
-//! A05 behavior: registration policy, one-use expiring invitations,
+//! Registration policy, one-use expiring invitations,
 //! pending/approved/rejected accounts, and the separate decisions of creating a
 //! tenant and binding a forge installation to it.
 

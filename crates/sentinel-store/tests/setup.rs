@@ -4,11 +4,11 @@
 use rusqlite::params;
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
-    TenantId, UnixMillis,
     auth::{Permissions as P, Principal, Role},
+    TenantId, UnixMillis,
 };
 use sentinel_store::{
-    Durability, Error, Store, email,
+    email,
     local_auth::{self, Login, Policy},
     organizations,
     registration::{
@@ -16,6 +16,7 @@ use sentinel_store::{
         TenantCreation, Terms,
     },
     setup::{self, Setup},
+    Durability, Error, Store,
 };
 
 const PASSWORD: &[u8] = b"a long enough administrator password";
@@ -436,8 +437,6 @@ fn a_race_with_the_cli_bootstrap_leaves_one_administrator() {
     assert_eq!(count(&store, "SELECT COUNT(*) FROM bootstrap"), 1);
     assert_eq!(count(&store, "SELECT COUNT(*) FROM users"), 1);
 }
-
-// ------------------------------------------------------ self-service orgs
 
 struct World {
     _dir: tempfile::TempDir,
