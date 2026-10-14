@@ -3447,7 +3447,18 @@ credentials_file = '/etc/sentinel/s3'
         for bad_from in bad {
             let file = mail(&format!("{key}from = '{bad_from}'"));
             let error = file.resolve(&no_env).unwrap_err();
-            assert!(bad_from.is_empty() || !error.message.contains(bad_from));
+            // The refusal is one of two fixed sentences, which themselves
+            // show an example address, so test for exactly those rather than
+            // for the value being a substring of the message.
+            assert!(
+                [
+                    "the sender must be `ci@example.com` or `Sentinel <ci@example.com>`",
+                    "the sender must be `addr@example.com` or `Name <addr@example.com>`",
+                ]
+                .contains(&error.message.as_str()),
+                "{}",
+                error.message
+            );
         }
         // A typo in the section is not ignored, and neither is an old key.
         assert!(toml::from_str::<MailFile>("hots = 'x'").is_err());
