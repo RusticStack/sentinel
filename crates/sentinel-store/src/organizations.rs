@@ -215,10 +215,14 @@ pub struct Settings {
     /// When GitHub last confirmed the caller's own membership; `None` for a
     /// membership managed here (or none).
     pub github_confirmed_ms: Option<i64>,
-    /// The caller's queued GitHub check, when one is waiting: how many passes
+    /// The caller's scheduled GitHub check, when one exists: how many passes
     /// in a row GitHub could not answer (rate limit, outage, missing App
-    /// permission). Zero for a check that is merely due.
+    /// permission); zero for one that is merely scheduled.
     pub github_check_failures: Option<u32>,
+    /// When that check is next due (a settled member keeps a row for the
+    /// periodic re-confirmation, so only a due time at or before now means
+    /// a check is waiting).
+    pub github_check_next_ms: Option<i64>,
 }
 
 /// The settings of the tenant `slug` for `principal`, with the same uniform
@@ -227,7 +231,7 @@ pub struct Settings {
 pub fn settings(conn: &Connection, principal: Principal, slug: &str) -> Result<Settings> {
     let tenant = crate::auth::member_tenant_by_slug(conn, principal, slug)?;
     // Both left joins are primary-key probes of the caller's own rows.
-    let (slug, kind, source, created_ms, role, bound, confirmed, failures): (
+    let (slug, kind, source, created_ms, role, bound, confirmed, failures, next): (
         String,
         i64,
         i64,
@@ -236,12 +240,13 @@ pub fn settings(conn: &Connection, principal: Principal, slug: &str) -> Result<S
         bool,
         Option<i64>,
         Option<i64>,
+        Option<i64>,
     ) = conn
         .prepare_cached(
             "SELECT t.slug, t.kind, t.membership_source, t.created_ms, m.role,
                     EXISTS(SELECT 1 FROM installations i
                            WHERE i.tenant_id = t.id AND i.provider = 'github'),
-                    m.synced_ms, c.attempts
+                    m.synced_ms, c.attempts, c.next_ms
              FROM tenants t
              LEFT JOIN memberships m ON m.tenant_id = t.id AND m.user_id = ?2
              LEFT JOIN github_member_checks c ON c.tenant_id = t.id AND c.user_id = ?2
@@ -257,10 +262,12 @@ pub fn settings(conn: &Connection, principal: Principal, slug: &str) -> Result<S
                 r.get(5)?,
                 r.get(6)?,
                 r.get(7)?,
+                r.get(8)?,
             ))
         })?;
     Ok(Settings {
         github_confirmed_ms: confirmed,
+        github_check_next_ms: next,
         github_check_failures: failures.map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
         tenant,
         slug,

@@ -681,6 +681,7 @@ fn settings_report_github_backing_apart_from_a_bound_installation() {
     // Nothing confirmed and nothing queued yet.
     assert_eq!(settings.github_confirmed_ms, None);
     assert_eq!(settings.github_check_failures, None);
+    assert_eq!(settings.github_check_next_ms, None);
 }
 
 #[test]
@@ -717,6 +718,7 @@ fn settings_report_only_the_callers_own_github_standing() {
         .unwrap();
     assert_eq!(settings.github_confirmed_ms, Some(5000));
     assert_eq!(settings.github_check_failures, Some(3));
+    assert_eq!(settings.github_check_next_ms, Some(0));
     // A queued check is no membership: Bob still cannot see the tenant.
     assert!(matches!(
         w.store.read(|c| organizations::settings(c, bob, "acme")),

@@ -441,14 +441,15 @@ fn settings(state: &State, request: &mut Request, slug: &str) -> Route {
         && let Value::Object(map) = &mut value
     {
         // The caller's own standing with GitHub, never anyone else's: when
-        // GitHub last confirmed it, whether a check is queued, and how many
+        // GitHub last confirmed it, whether a check is due now, and how many
         // passes in a row GitHub could not answer (unknown keeps what exists
         // for the grace period and grants nothing new).
+        let now = UnixMillis::now().0;
         map.insert(
             "github_sync".into(),
             json!({
                 "confirmed_ms": found.github_confirmed_ms,
-                "check_queued": found.github_check_failures.is_some(),
+                "check_due": found.github_check_next_ms.is_some_and(|next| next <= now),
                 "unanswered": found.github_check_failures.unwrap_or(0),
             }),
         );
