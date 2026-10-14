@@ -1,16 +1,5 @@
 #!/usr/bin/env bash
-# K02 probe driver: per-file FICLONE reflink vs whole-tree btrfs snapshot vs
-# explicit copy, on a loop-mounted btrfs image plus an ext4 baseline.
-#
-# Mode order must not decide the result: the first mode to read the source
-# warms its page cache for every later one. So each mode runs in every round,
-# the order is shuffled per round (shuf), the caches are dropped immediately
-# before each mode, and every record names its round, position in the round
-# and whether the drop succeeded (it needs root; "false" means that record's
-# cache state is unknown). Compare modes across rounds, not within one.
-#
-# Run as root inside WSL from the repo root:
-#   PROBE=target/wsl/release/sentinel-probes bash bench/k02-cache-clone.sh
+# Mode order must not decide the result: caches are dropped before each mode and modes are shuffled per round. Compare across rounds, not within one.
 set -uo pipefail
 PROBE="${PROBE:-$PWD/target/wsl/release/sentinel-probes}"
 OUT="${OUT:-bench/k02-cache-clone.jsonl}"
@@ -22,9 +11,7 @@ LARGE="${LARGE:-4}"; LARGE_BYTES="${LARGE_BYTES:-67108864}"
 ROUNDS="${ROUNDS:-5}"
 
 record() { sed "s/^{/{\"fs\":\"$1\",/" >> "$OUT"; }
-# Flush, then empty the page, dentry and inode caches; prints true or false.
 drop_caches() { sync; if echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; then echo true; else echo false; fi; }
-# Prefix a clone record with where it ran in the sequence.
 placed() { sed "s/^{/{\"fs\":\"$1\",\"round\":$2,\"position\":$3,\"caches_dropped\":$4,/" >> "$OUT"; }
 
 mkdir -p "$(dirname "$IMG")" "$MNT" "$EXT4"
@@ -42,7 +29,7 @@ for fs in ext4 btrfs; do
   src="$base/src"
   gen=(--dest "$src" --files "$FILES" --bytes-per-file "$BYTES"
        --large-files "$LARGE" --large-bytes "$LARGE_BYTES")
-  # A snapshot source must be a subvolume; ext4 has no such thing.
+  # A snapshot source must be a subvolume, which ext4 cannot provide.
   [ "$fs" = btrfs ] && gen+=(--subvolume)
   $PROBE generate "${gen[@]}" | record "$fs"
   for round in $(seq 1 "$ROUNDS"); do

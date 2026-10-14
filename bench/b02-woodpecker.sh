@@ -1,19 +1,11 @@
 #!/usr/bin/env bash
-# B02: the lockwell-ci contract's `unit` lane through Woodpecker's own
-# executor (`woodpecker-cli exec`, Docker backend) on the bench user's
-# rootless Podman socket, under the contract's caps. As the bench user,
-# after bench/b01-setup.sh prepared ROOT:
-#   bench/b02-woodpecker.sh CONTRACT ROOT WOODPECKER_CLI CONDITION SAMPLES WARMUP OUT
-# Each run: wait for CPU pressure (avg60) under 2 %, run the contract's
-# preparation for CONDITION (unmeasured), then time the whole exec, spawn to
-# exit, with the monotonic clock. One JSON line per run is appended to OUT.
+# Preparation runs before the timer starts, so only the exec is measured.
 set -euo pipefail
 CONTRACT=$1 ROOT=$(cd "$2" && pwd) CLI=$3 CONDITION=$4 SAMPLES=$5 WARMUP=$6 OUT=$7
 LANE=unit
 SOCK=unix:///run/user/$(id -u)/podman/podman.sock
 PIPELINE="$ROOT/woodpecker-$LANE.yaml"
 
-# The pipeline and the preparation, from the contract.
 python3 - "$CONTRACT" "$ROOT" "$LANE" "$CONDITION" "$PIPELINE" "$ROOT/prepare.sh" <<'PY'
 import json, sys
 contract, root, lane_id, condition, pipeline, prepare = sys.argv[1:]

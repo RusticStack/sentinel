@@ -1,11 +1,5 @@
 #!/usr/bin/env bash
-# F07 probe driver: SQLite commit/dispatch and directory cloning on each filesystem.
-# Expects the sentinel-probes release binary as $PROBE and mount points for ext4/xfs/btrfs.
-#
-# Clone modes run in every round in a shuffled order with the caches dropped
-# before each (see bench/k02-cache-clone.sh): the first mode to read the
-# source would otherwise warm it for the rest. Records carry round, position
-# and whether the drop succeeded (it needs root).
+# Caches are dropped before each clone and modes are shuffled per round: the first mode to read the source would warm it.
 set -uo pipefail
 PROBE="${PROBE:-/root/sentinel-probes}"
 OUT="${OUT:-/root/f07-storage.jsonl}"; : > "$OUT"
@@ -14,7 +8,6 @@ ROUNDS="${ROUNDS:-3}"
 for fs in xfs btrfs; do mountpoint -q /mnt/f07-$fs || mount -o loop /srv/f07/$fs.img /mnt/f07-$fs || exit 1; done
 df -T /root /mnt/f07-xfs /mnt/f07-btrfs | tail -3
 declare -A FS=([ext4]=/root/f07-ext4 [xfs]=/mnt/f07-xfs/f07 [btrfs]=/mnt/f07-btrfs/f07)
-# Flush, then empty the page, dentry and inode caches; prints true or false.
 drop_caches() { sync; if echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; then echo true; else echo false; fi; }
 
 for fs in ext4 xfs btrfs; do

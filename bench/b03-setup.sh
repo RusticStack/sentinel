@@ -1,14 +1,4 @@
 #!/usr/bin/env bash
-# B03: a Sentinel deployment for the latency budgets, as the bench user on
-# the reference host: a controller and a worker, and a small repository bound
-# over loopback HTTPS whose branches each carry one measurement's pipeline
-# (bench/b03-latency.py pushes to them and posts the intake events).
-#
-#   bench/b03-setup.sh setup KIT ROOT
-#   bench/b03-setup.sh start KIT ROOT
-#   bench/b03-setup.sh stop  KIT ROOT
-#
-# KIT holds `sentinel` (release, both roles) and git_https.py.
 set -euo pipefail
 MODE=$1 KIT=$2 ROOT=$3
 BIN="$KIT/sentinel"
@@ -50,26 +40,21 @@ setup)
       pipeline "$2" > work/.sentinel.yml
       git -C work add .sentinel.yml && git "${ident[@]}" -C work commit -q -m "$1"
     }
-    # Budget 4: the first user process prints the wall clock (ns).
     branch first '    steps:
       - id: first
         run: date +%s%N'
-    # Budget 6: a line every 100 ms, each carrying its own capture time.
     branch logs '    steps:
       - id: lines
         run: for i in $(seq 1 100); do echo "t=$(date +%s%N)"; sleep 0.1; done'
-    # Budget 7: a step that ends on SIGTERM; the cancel is timed.
     branch cancel '    steps:
       - id: wait
         run: exec sleep 600'
-    # Budget 8: 100 MiB of output, then a Go test failure, as go test -json.
     branch failure '    steps:
       - id: test
         run: |
           head -c 104857600 /dev/zero | tr "\\0" "x" | fold -w 511
           printf "%s\\n" "{\"Action\":\"run\",\"Package\":\"example/b03\",\"Test\":\"TestBudget\"}" "{\"Action\":\"output\",\"Package\":\"example/b03\",\"Test\":\"TestBudget\",\"Output\":\"    b03_test.go:7: the needle: want 1, got 2\\n\"}" "{\"Action\":\"fail\",\"Package\":\"example/b03\",\"Test\":\"TestBudget\",\"Elapsed\":0.01}"
           exit 1'
-    # Budget 5: a fixed published fixture, 1,000 files of 64 KiB (64 MiB).
     branch cache '    cache:
       - name: fixture
         class: dependencies

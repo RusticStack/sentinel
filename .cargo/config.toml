@@ -1,10 +1,7 @@
-# Run from the repository root. No host-specific target, linker, or credentials.
 [alias]
 fmt-check = "fmt --all -- --check"
 lint = "clippy --locked --workspace --all-targets -- -D warnings"
-# Tests run through cargo-nextest: every test of every binary in parallel
-# (a plain `cargo test` runs the binaries one after another). The workspace
-# has no doctests; add `cargo test --doc` here if that changes.
+# Tests use cargo-nextest, which runs test binaries in parallel (cargo test does not).
 test-cli = "nextest run --locked --workspace --no-fail-fast"
 release-cli = "build --locked --workspace --release"
 
@@ -15,12 +12,9 @@ test-worker = "nextest run --locked --workspace --no-fail-fast --features worker
 test-linux = "nextest run --locked --workspace --no-fail-fast --all-features"
 release-linux = "build --locked --workspace --release --all-features"
 
-# Arguments appended by the caller are Sentinel arguments (the -- is included).
 dev-server = "run --locked --package sentinel --features server -- server"
 dev-worker = "run --locked --package sentinel --features worker -- worker"
 
-# Benchmark runner (release profile); append runner arguments directly.
 bench-noop = "run --locked --package sentinel-bench --release --"
 
-# Feasibility probes (release profile); append probe subcommand and arguments.
 probe = "run --locked --package sentinel-probes --release --"
