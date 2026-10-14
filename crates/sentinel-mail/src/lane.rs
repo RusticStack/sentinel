@@ -1,20 +1,4 @@
-//! The mail lane: one bounded thread draining the outbox.
-//!
-//! It reads a batch of due messages, opens each (the body is sealed with the
-//! master key), hands it to the transport, and writes the outcome back in a
-//! short transaction. It never holds the writer while the service is on the
-//! network, and it never sends from a request handler: a handler only writes
-//! the row.
-//!
-//! The lane does not poll. It sleeps on the store's commit notifier and a
-//! deadline at the earliest pending message's retry time. A transient failure
-//! (unreachable, throttling or failing) schedules the message again with
-//! doubling backoff under the row's attempt budget and pauses the pass, so a
-//! dead service costs one connection attempt per pause rather than one per
-//! queued message. A refusal of the message itself is recorded and not
-//! retried. A message the lane cannot open (its key was retired) is given up.
-//! Maintenance (expiring undelivered rows, deleting week-old settled rows and
-//! tokens) runs from here, on its own cadence.
+//! Drains the outbox. A transient failure pauses the pass, so a dead service costs one connection attempt per pause, not one per message.
 
 use std::{
     sync::{
@@ -34,9 +18,6 @@ use sentinel_store::{
 
 use crate::{Failure, Mail, Transport};
 
-/// How the lane paces itself: 16 messages per pass, a 10 s safety re-read
-/// (the net for a write the notifier cannot see), failure backoff from one
-/// second to a minute, maintenance every ten minutes.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub batch: u16,
@@ -58,8 +39,6 @@ impl Default for Config {
     }
 }
 
-/// One message the lane settled or rescheduled, for the caller's
-/// diagnostics. It never names the recipient.
 #[derive(Clone, Debug)]
 pub struct Notice {
     pub id: MailId,
@@ -67,7 +46,6 @@ pub struct Notice {
     pub outcome: String,
 }
 
-/// One pass's results.
 #[derive(Clone, Debug, Default)]
 pub struct Batch {
     pub delivered: usize,
@@ -76,13 +54,10 @@ pub struct Batch {
     pub entries: Vec<Notice>,
 }
 
-/// The least time between two reads of the outbox that commits (not the
-/// clock) asked for.
 const COMMIT_GAP: Duration = Duration::from_millis(50);
 
 type Settled = (Mutex<bool>, Condvar);
 
-/// A running lane; dropping it stops and joins the thread.
 pub struct Lane {
     store: Arc<Store>,
     stop: Arc<AtomicBool>,
@@ -123,8 +98,6 @@ impl Drop for Lane {
         let (lock, cv) = &*self.settled;
         *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
         cv.notify_all();
-        // The lane may be parked on the commit notifier rather than the
-        // condvar above.
         self.store.changes().nudge();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -132,10 +105,8 @@ impl Drop for Lane {
     }
 }
 
-/// What the write-back of one message's outcome meant.
 enum Written {
     Done(String),
-    /// The row moved on (settled by another path): nothing to record.
     Moved,
 }
 
@@ -177,8 +148,6 @@ fn run(
             failures = 0;
             let deadline = wake_at(store, config, polled, maintained);
             store.changes().wait_past(seen, deadline);
-            // Unrelated commits wake the lane too: coalesce them, so a storm
-            // of other writes costs at most one indexed read per interval.
             if let Some(rest) = COMMIT_GAP.min(config.idle).checked_sub(polled.elapsed()) {
                 wait(settled, rest);
             }
@@ -205,7 +174,6 @@ fn run(
                     now,
                 };
                 let sent = transport.send(&mail);
-                // The body carries a one-time link.
                 wipe_string(&mut message.body);
                 let at = UnixMillis::now();
                 match sent {
@@ -293,9 +261,6 @@ fn settle_refused(
     }
 }
 
-/// When an idle lane must read the outbox again without a commit: at the
-/// earliest pending message's retry time, at its next maintenance, and never
-/// later than `idle` from `from`.
 fn wake_at(store: &Store, config: &Config, from: Instant, maintained: Option<Instant>) -> Instant {
     let mut ceiling = from + config.idle;
     if let Some(at) = maintained {
@@ -317,7 +282,6 @@ fn backoff(config: &Config, failures: u32) -> Duration {
         .min(config.max_backoff)
 }
 
-/// Wait until the timeout, or until the lane is asked to stop.
 fn wait(settled: &Settled, timeout: Duration) {
     let (lock, cv) = settled;
     let settled = lock.lock().unwrap_or_else(|p| p.into_inner());
