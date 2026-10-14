@@ -163,7 +163,88 @@ pub struct Stats {
     pub prefetch_hints: AtomicU64,
     /// Live sessions closed because their worker was revoked (P08-7).
     pub revoked_sessions: AtomicU64,
+    /// Worker acknowledgements and reports whose store write failed for a
+    /// transient reason and were kept to be applied by a later pass instead
+    /// of being dropped as stale.
+    pub deferred_worker_messages: AtomicU64,
+    /// Deferred worker messages given up on: older than
+    /// [`DEFERRED_MAX_AGE`] or past [`MAX_DEFERRED`]. The attempt's lease
+    /// then settles it, as for any report that never arrived.
+    pub deferred_dropped: AtomicU64,
 }
+
+/// A worker message the store could not take yet. The summary is shared, so
+/// a retry never copies it.
+#[derive(Clone)]
+enum Deferred {
+    Ack,
+    Report {
+        event: Event,
+        summary: Option<Arc<Vec<u8>>>,
+    },
+}
+
+#[derive(Clone)]
+struct DeferredMessage {
+    id: u64,
+    worker: WorkerId,
+    attempt: AttemptId,
+    fence: Fence,
+    what: Deferred,
+    since: Instant,
+}
+
+/// The messages waiting for the store, oldest first. Pure bookkeeping: what
+/// to retry and what it protects is decided by [`Inner`].
+#[derive(Default)]
+struct DeferredQueue {
+    items: VecDeque<DeferredMessage>,
+}
+
+impl DeferredQueue {
+    /// Whether a message of `attempt` is waiting: a newer one queues behind it.
+    fn holds(&self, attempt: AttemptId) -> bool {
+        self.items.iter().any(|m| m.attempt == attempt)
+    }
+
+    /// Keep `message` behind the others; `false` when the queue is full and
+    /// the message was dropped.
+    fn push(&mut self, message: DeferredMessage) -> bool {
+        if self.items.len() >= MAX_DEFERRED {
+            return false;
+        }
+        self.items.push_back(message);
+        true
+    }
+
+    /// The oldest message, left in place while it is applied.
+    fn head(&self) -> Option<DeferredMessage> {
+        self.items.front().cloned()
+    }
+
+    /// The head is settled (applied, stale or given up on).
+    fn settle(&mut self, id: u64) {
+        if self.items.front().is_some_and(|m| m.id == id) {
+            self.items.pop_front();
+        }
+    }
+
+    /// Attempts with a verdict waiting.
+    fn awaiting_reports(&self) -> HashSet<AttemptId> {
+        self.items
+            .iter()
+            .filter(|m| matches!(m.what, Deferred::Report { .. }))
+            .map(|m| m.attempt)
+            .collect()
+    }
+}
+
+/// Worker messages kept for retry at most; each holds at most one attempt
+/// summary, so the memory is bounded by this times `MAX_SUMMARY_BYTES`.
+const MAX_DEFERRED: usize = 256;
+/// How long a message is retried. Past this the store has been unusable far
+/// longer than a lease, and the lease expiry owns the attempt.
+const DEFERRED_MAX_AGE: Duration = Duration::from_secs(300);
 
 struct Peer {
     sender: Sender,
@@ -415,6 +496,12 @@ struct Inner {
     /// When the prefetch pass last read the queue: it runs at most once
     /// per `PREFETCH_INTERVAL`, however often the dispatcher wakes.
     prefetch_at: Mutex<Option<Instant>>,
+    /// Acknowledgements and reports the store refused transiently, oldest
+    /// first, retried at the head of every dispatch pass (and protected from
+    /// lease expiry meanwhile). Per attempt the order is the arrival order,
+    /// so a report never overtakes the acknowledgement before it.
+    deferred: Mutex<DeferredQueue>,
+    next_deferred: AtomicU64,
 }
 
 /// Placement and sweep failures are logged at most this often per kind.
@@ -785,12 +872,26 @@ impl Inner {
     /// that moved first (renewed, acknowledged, released) is skipped; any
     /// other store failure is counted and logged (P08-15).
     fn dispatch_pass(&self) {
+        // Verdicts and acknowledgements the store refused earlier go first,
+        // so a passed job is settled before its lease is looked at.
+        self.retry_deferred();
         let now = UnixMillis::steady();
         // Leases that ran out and attempts that outran their job's timeout
         // by the grace: infra-failed, capacity back, never replayed. One
         // write for the whole batch, each lease re-checked inside it; the
         // log-end answer is read here, so the writer never waits on log I/O.
-        match self.store.read(|c| dispatch::expired_scoped(c, now)) {
+        // An attempt whose verdict is still waiting for the store is left
+        // alone: its worker finished and can no longer renew the lease.
+        match self
+            .store
+            .read(|c| dispatch::expired_scoped(c, now))
+            .map(|mut due| {
+                let waiting = self.awaiting_report();
+                if !waiting.is_empty() {
+                    due.retain(|(attempt, _, _)| !waiting.contains(attempt));
+                }
+                due
+            }) {
             Ok(due) if !due.is_empty() => {
                 let ends: Vec<(AttemptId, bool)> = due
                     .iter()
@@ -1384,6 +1485,159 @@ impl Inner {
         }
     }
 
+    /// A worker's acknowledgement or report. The store either takes it, or
+    /// says it is stale (fence, holder, terminal duplicate: nothing changes,
+    /// and a stale message is dropped), or fails for a reason that says
+    /// nothing about the message — writer unavailable, a write of unknown
+    /// outcome, overload. Only the last is kept: the worker sent its verdict
+    /// once and is done with the attempt, so dropping it would leave a passed
+    /// job to be failed by its lease. A message behind another one of the
+    /// same attempt waits its turn, so a report never overtakes the
+    /// acknowledgement before it.
+    fn receive(&self, worker: WorkerId, attempt: AttemptId, fence: Fence, what: Deferred) {
+        let message = DeferredMessage {
+            id: self.next_deferred.fetch_add(1, Ordering::Relaxed),
+            worker,
+            attempt,
+            fence,
+            what,
+            since: Instant::now(),
+        };
+        let queued = self
+            .deferred
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .holds(attempt);
+        if queued {
+            self.defer(message);
+            return;
+        }
+        match self.apply(&message) {
+            Ok(()) => {}
+            Err(e) if e.is_transient() => {
+                self.failed(false, "worker_message", &e);
+                self.defer(message);
+            }
+            Err(_) => self.stale(&message.what),
+        }
+    }
+
+    /// Commit one worker message. `Ok` once it took effect; the counters and
+    /// the capacity wake of a terminal report follow it here, wherever it is
+    /// applied from.
+    fn apply(&self, m: &DeferredMessage) -> sentinel_store::Result<()> {
+        let (worker, attempt, fence) = (m.worker, m.attempt, m.fence);
+        match &m.what {
+            Deferred::Ack => {
+                self.write_store(move |tx| {
+                    dispatch::acknowledge(tx, worker, attempt, fence, UnixMillis::steady())
+                })?;
+                self.stats.acknowledged.fetch_add(1, Ordering::Relaxed);
+            }
+            Deferred::Report { event, summary } => {
+                let event = *event;
+                let summary = summary.clone();
+                // Whether the log ended is asked here, before the writer is
+                // taken, so a terminal report never waits behind another
+                // attempt's log fsync on the single writer thread.
+                let ended = matches!(event, Event::Passed | Event::Failed(_))
+                    && self.log_has_end(worker, attempt);
+                let state = self.write_store(move |tx| {
+                    let state = dispatch::report(
+                        tx,
+                        worker,
+                        attempt,
+                        fence,
+                        event,
+                        summary.as_deref().map(Vec::as_slice),
+                        UnixMillis::steady(),
+                        None,
+                    )?;
+                    if ended && state.is_terminal() {
+                        dispatch::log_ended(tx, attempt)?;
+                    }
+                    Ok(state)
+                })?;
+                self.stats.reports.fetch_add(1, Ordering::Relaxed);
+                if state.is_terminal() {
+                    self.released(worker, attempt);
+                    // Capacity came back and dependents may be queued.
+                    self.wake();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A message the store refused as stale: stale reports are counted, a
+    /// stale acknowledgement changes nothing.
+    fn stale(&self, what: &Deferred) {
+        if matches!(what, Deferred::Report { .. }) {
+            self.stats.stale_reports.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn defer(&self, message: DeferredMessage) {
+        let kept = self
+            .deferred
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(message);
+        let counter = if kept {
+            &self.stats.deferred_worker_messages
+        } else {
+            &self.stats.deferred_dropped
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Apply the deferred messages in arrival order, until the queue is empty
+    /// or the store fails transiently again (then the rest waits for the next
+    /// pass instead of hammering an unavailable writer). A message stays in
+    /// the queue while it is applied, so one that arrives for the same
+    /// attempt meanwhile queues behind it. Runs at the head of a dispatch
+    /// pass, before the expiry sweep reads the leases.
+    fn retry_deferred(&self) {
+        loop {
+            let head = self
+                .deferred
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .head();
+            let Some(message) = head else {
+                return;
+            };
+            let outcome = if message.since.elapsed() >= DEFERRED_MAX_AGE {
+                self.stats.deferred_dropped.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            } else {
+                self.apply(&message)
+            };
+            match outcome {
+                Err(e) if e.is_transient() => {
+                    self.failed(false, "worker_message", &e);
+                    return;
+                }
+                Err(_) => self.stale(&message.what),
+                Ok(()) => {}
+            }
+            self.deferred
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .settle(message.id);
+        }
+    }
+
+    /// Attempts whose terminal verdict the controller holds but the store has
+    /// not taken yet: the expiry sweep must not fail them for a lease their
+    /// worker can no longer renew.
+    fn awaiting_report(&self) -> HashSet<AttemptId> {
+        self.deferred
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .awaiting_reports()
+    }
+
     /// Record the settled outcome of a declared artifact: `state`, the
     /// committed manifest version when captured, and the charged bytes.
     /// A store fault changes nothing the verdict reports.
@@ -1908,13 +2162,10 @@ impl SessionHandler for Inner {
     }
 
     fn acknowledged(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {
-        let acked = self
-            .write(move |tx| dispatch::acknowledge(tx, worker, attempt, fence, UnixMillis::steady()));
-        if acked.is_ok() {
-            self.stats.acknowledged.fetch_add(1, Ordering::Relaxed);
-        }
         // A stale acknowledgement changes nothing; the worker learns the
-        // attempt is not its own from the stop list on its next beat.
+        // attempt is not its own from the stop list on its next beat. One the
+        // store could not take is kept and retried ([`Inner::receive`]).
+        self.receive(worker, attempt, fence, Deferred::Ack);
     }
 
     fn reported(
@@ -1925,42 +2176,15 @@ impl SessionHandler for Inner {
         event: Event,
         summary: Option<Vec<u8>>,
     ) {
-        // Whether the log ended is asked here, before the writer is taken,
-        // so a terminal report never waits behind another attempt's log
-        // fsync on the single writer thread.
-        let ended =
-            matches!(event, Event::Passed | Event::Failed(_)) && self.log_has_end(worker, attempt);
-        let finished = self.write(move |tx| {
-            let state = dispatch::report(
-                tx,
-                worker,
-                attempt,
-                fence,
+        self.receive(
+            worker,
+            attempt,
+            fence,
+            Deferred::Report {
                 event,
-                summary.as_deref(),
-                UnixMillis::steady(),
-                None,
-            )?;
-            if ended && state.is_terminal() {
-                dispatch::log_ended(tx, attempt)?;
-            }
-            Ok(state)
-        });
-        match finished {
-            Ok(state) => {
-                self.stats.reports.fetch_add(1, Ordering::Relaxed);
-                if state.is_terminal() {
-                    self.released(worker, attempt);
-                    // Capacity came back and dependents may be queued.
-                    self.wake();
-                }
-            }
-            // Stale fence, unknown attempt or a terminal duplicate: the
-            // machine refused it and nothing changed.
-            Err(_) => {
-                self.stats.stale_reports.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+                summary: summary.map(Arc::new),
+            },
+        );
     }
 
     fn abandoned(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {
@@ -2158,8 +2382,8 @@ impl SessionHandler for Inner {
     /// or an acknowledged attempt it never started because the spec never
     /// arrived (P04-4). Either goes back to the queue, or ends `canceled`.
     fn declined(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {
-        if let Ok(state) =
-            self.write(move |tx| dispatch::decline(tx, worker, attempt, fence, UnixMillis::steady()))
+        if let Ok(state) = self
+            .write(move |tx| dispatch::decline(tx, worker, attempt, fence, UnixMillis::steady()))
         {
             self.stats.lapsed.fetch_add(1, Ordering::Relaxed);
             self.stats.handed_back.fetch_add(1, Ordering::Relaxed);
@@ -2625,7 +2849,8 @@ fn resolve_spec(
         // And the lease that authorized this delivery must still be live.
         let (tenant, repo) = (binding.tenant, binding.repo);
         store.read(move |conn| {
-            if sources::attempt_repo(conn, worker, attempt, UnixMillis::steady())? != (tenant, repo) {
+            if sources::attempt_repo(conn, worker, attempt, UnixMillis::steady())? != (tenant, repo)
+            {
                 return Err(StoreError::Forbidden);
             }
             Ok(())
@@ -2896,6 +3121,8 @@ impl Controller {
             revocations: Mutex::new((-1, -1)),
             warned: [AtomicI64::new(i64::MIN), AtomicI64::new(i64::MIN)],
             prefetch_at: Mutex::new(None),
+            deferred: Mutex::new(DeferredQueue::default()),
+            next_deferred: AtomicU64::new(0),
         });
         let _ = inner.me.set(Arc::downgrade(&inner));
         let acceptor = {
@@ -3417,6 +3644,53 @@ mod tests {
         // Another pool's worker is never "elsewhere", and a lone worker has
         // nothing to prefer.
         assert_eq!(reach.elsewhere(2, other), None);
+    }
+
+    fn message(id: u64, attempt: AttemptId, what: Deferred) -> DeferredMessage {
+        DeferredMessage {
+            id,
+            worker: WorkerId::new(),
+            attempt,
+            fence: Fence(1),
+            what,
+            since: Instant::now(),
+        }
+    }
+
+    fn report() -> Deferred {
+        Deferred::Report {
+            event: Event::Passed,
+            summary: None,
+        }
+    }
+
+    /// A verdict the store refused is kept, in arrival order and behind the
+    /// acknowledgement before it; it protects its attempt from expiry until
+    /// it is settled, and a full queue refuses instead of growing.
+    #[test]
+    fn deferred_messages_keep_their_order_protect_their_attempt_and_are_bounded() {
+        let (a, b) = (AttemptId::new(), AttemptId::new());
+        let mut queue = DeferredQueue::default();
+        assert!(queue.push(message(1, a, Deferred::Ack)));
+        // The ack alone does not stand in for a verdict.
+        assert!(queue.holds(a) && !queue.holds(b));
+        assert!(queue.awaiting_reports().is_empty());
+        assert!(queue.push(message(2, a, report())));
+        assert!(queue.push(message(3, b, report())));
+        assert_eq!(queue.awaiting_reports(), HashSet::from([a, b]));
+        // Oldest first, and only the head settles.
+        assert_eq!(queue.head().map(|m| m.id), Some(1));
+        queue.settle(2);
+        assert_eq!(queue.head().map(|m| m.id), Some(1));
+        queue.settle(1);
+        assert_eq!(queue.head().map(|m| m.id), Some(2));
+        queue.settle(2);
+        queue.settle(3);
+        assert!(queue.head().is_none() && !queue.holds(a));
+        for id in 0..MAX_DEFERRED as u64 {
+            assert!(queue.push(message(id, AttemptId::new(), report())));
+        }
+        assert!(!queue.push(message(u64::MAX, a, report())));
     }
 
     fn ranked(cpu_millis: i64, load_ns: i64, cache_bytes: i64) -> Ranked {

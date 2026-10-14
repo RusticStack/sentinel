@@ -474,7 +474,16 @@ fn an_oversized_summary_is_dropped_and_the_pass_stands() {
         .store
         .writer()
         .write(move |tx| {
-            dispatch::report(tx, w, attempt, fence, Event::Passed, Some(&big), at(2_300), None)
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::Passed,
+                Some(&big),
+                at(2_300),
+                None,
+            )
         })
         .unwrap();
     assert_eq!(next, JobState::Terminal(Outcome::Passed));

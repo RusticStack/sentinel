@@ -768,3 +768,40 @@ impl Store {
         })
     }
 }
+
+#[cfg(test)]
+mod transient_tests {
+    use super::Error;
+
+    /// Only failures that say nothing about the request are retryable: a
+    /// verdict on the row (stale, refused, corrupt) never becomes one.
+    #[test]
+    fn only_unavailability_is_transient() {
+        for error in [
+            Error::WriterUnavailable,
+            Error::WriteAmbiguous,
+            Error::Overloaded,
+        ] {
+            assert!(error.is_transient(), "{}", error.kind());
+        }
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(Error::Sqlite(busy).is_transient());
+        let constraint = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            None,
+        );
+        for error in [
+            Error::Conflict,
+            Error::NotFound,
+            Error::Forbidden,
+            Error::WriterPanicked,
+            Error::Corrupt("x"),
+            Error::Sqlite(constraint),
+        ] {
+            assert!(!error.is_transient(), "{}", error.kind());
+        }
+    }
+}
