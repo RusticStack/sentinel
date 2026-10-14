@@ -651,7 +651,12 @@ pub fn verify_host_local(
 /// Make `email` the account's verified address and clear every other
 /// account's unverified claim to it. The caller checked nobody else holds it
 /// verified.
-fn claim_verified(tx: &Transaction<'_>, user: UserId, email: &str, now: UnixMillis) -> Result<()> {
+pub(crate) fn claim_verified(
+    tx: &Transaction<'_>,
+    user: UserId,
+    email: &str,
+    now: UnixMillis,
+) -> Result<()> {
     tx.execute(
         "UPDATE users SET email = NULL WHERE email = ?1 AND id != ?2
          AND email_verified_ms IS NULL",

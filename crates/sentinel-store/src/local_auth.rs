@@ -511,6 +511,8 @@ pub fn bootstrap(
             "INSERT INTO bootstrap(id, completed_ms, user_id) VALUES (1, ?1, ?2)",
             params![now.0, user.as_bytes()],
         )?;
+        // The latch is closed for the wizard too: its token dies with it.
+        tx.execute("DELETE FROM setup_token", [])?;
         audit(
             tx,
             Event::Bootstrap,
@@ -523,7 +525,7 @@ pub fn bootstrap(
     })
 }
 
-fn bootstrap_complete(conn: &Connection) -> Result<bool> {
+pub(crate) fn bootstrap_complete(conn: &Connection) -> Result<bool> {
     let complete: bool = conn
         .prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM bootstrap)

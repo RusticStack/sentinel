@@ -840,7 +840,7 @@ pub fn register(
 /// A username for an account that registered by address: `user-` and twelve
 /// hex digits of a fresh identifier. Not secret and not meant to be typed;
 /// the address is the login identifier.
-fn generated_username(user: UserId) -> String {
+pub(crate) fn generated_username(user: UserId) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut name = String::with_capacity(17);
     name.push_str("user-");
