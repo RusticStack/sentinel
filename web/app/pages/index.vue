@@ -1,9 +1,5 @@
 <script setup lang="ts">
-// Home: the last tenant used (remembered in a cookie so the server can
-// redirect before drawing anything), else the first one. A round trip that
-// left the interface (GitHub sign-in, linking GitHub) ends here with a full
-// page load; its pending return, a cookie, wins over the tenant on the
-// server-side render as well as in the browser.
+// A return left pending by a round trip out of the interface (e.g. GitHub sign-in) wins over the last tenant, even on the server render.
 const session = useSession();
 const last = useCookie<string | null>("sentinel-tenant", { sameSite: "lax", maxAge: 60 * 60 * 24 * 365 });
 const back = useCookie<string | null>(RETURN_COOKIE, { sameSite: "lax", path: "/", maxAge: RETURN_SECONDS });

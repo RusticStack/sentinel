@@ -1,16 +1,7 @@
 <script setup lang="ts">
-// First-run setup, shown only while the controller says it is open (no
-// administrator exists yet; the route middleware sends everyone away once
-// it is closed). It is gated by the one-time token the controller wrote on
-// its host, so the first visitor to reach the port gets nothing.
-//
-// The answers are kept in this tab's session storage as the person goes, so
-// a refresh resumes where they were — except the setup token and the
-// passwords, which live in this page's memory only and are asked for again.
-// Everything is sent in one request at the end; the controller creates the
-// administrator, the policy, the instance settings and the optional
-// namespaces in one commit and signs the administrator in. An authenticator
-// is then offered (not forced), and a last screen says what to do next.
+// Gated by the one-time setup token, so the first visitor to reach the port gets nothing.
+// Answers are kept in session storage; the setup token and passwords stay in memory and are asked again on resume.
+// Everything is sent in one request; the controller creates it all in one commit.
 import type { RegistrationChoice, TenantCreationChoice, WizardDraft } from "~/utils/onboarding";
 
 definePageMeta({ layout: "auth" });
@@ -21,13 +12,11 @@ const setupStatus = useSetupStatus();
 
 const STEPS = ["Setup token", "Administrator", "Who can join", "Instance", "Email", "Namespaces", "Review"] as const;
 const LAST_DRAFT_STEP = STEPS.length - 1;
-const SECURE = STEPS.length; // after setup: the authenticator
+const SECURE = STEPS.length;
 const DONE = STEPS.length + 1;
 
 const draft = reactive<WizardDraft>(emptyDraft());
 const step = ref(0);
-// Where a resumed wizard was; the steps whose secrets were not kept are
-// asked again on the way back to it.
 const resumeAt = ref(0);
 const resumed = ref(false);
 const token = ref("");
@@ -109,8 +98,6 @@ function next() {
   if (p) return;
   const target = step.value + 1;
   if (resumeAt.value > target) {
-    // Back to where a resumed wizard was, through the password if it was
-    // not kept.
     if (step.value === 0 && !password.value) { step.value = 1; return; }
     step.value = resumeAt.value;
     resumeAt.value = 0;
@@ -125,7 +112,6 @@ function back() {
 function goTo(at: number) {
   stepError.value = "";
   resumeAt.value = 0;
-  // A secret that was not kept is asked first.
   step.value = !isSetupToken(token.value) ? 0 : at > 1 && !password.value ? 1 : at;
 }
 
@@ -143,9 +129,6 @@ const regLabel = computed(() => REGISTRATIONS.find((r) => r.value === draft.regi
 const creationLabel = computed(() => CREATIONS.find((c) => c.value === draft.tenantCreation)?.label ?? draft.tenantCreation);
 
 
-// Whether the controller has a Resend key and sender (`GET /setup`); `null`
-// until known. Read again each time the step opens, so a controller set up
-// meanwhile is seen without a reload.
 const mailConfigured = ref<boolean | null>(null);
 async function readMailConfigured() {
   try {
@@ -153,7 +136,6 @@ async function readMailConfigured() {
     if (status.open === false) return setupGone();
     mailConfigured.value = status.mail_configured === true;
   } catch {
-    // Unknown: the test itself says whether mail is configured.
   }
 }
 watch(step, (at) => {
@@ -162,7 +144,6 @@ watch(step, (at) => {
   readMailConfigured();
 });
 
-/** The controller's environment lines, each with its own copy button. */
 const MAIL_LINES = [
   "SENTINEL_RESEND_API_KEY_FILE=/etc/sentinel/resend-key",
   "SENTINEL_EMAIL_FROM=Sentinel <sentinel@example.com>",
@@ -230,9 +211,6 @@ const emailSummary = computed(() => {
   return "Not tested (optional)";
 });
 
-/// The controller refuses a request whose `Origin` is not its configured
-/// `public_url` — on a fresh deployment, usually a mismatch between the
-/// address in the browser and that setting.
 const ORIGIN_REFUSED = "The controller refused this page's address. Open Sentinel at the address the controller is configured with (its public_url), or set public_url to the address you are using and restart the controller.";
 
 const finishing = ref(false);
@@ -334,14 +312,12 @@ const firstNamespace = computed(() => completed.value?.organization ?? completed
       </div>
     </template>
 
-    <!-- Completed elsewhere meanwhile. -->
     <template v-if="gone">
       <p class="text-sm">Someone finished setting up this instance (from another browser or on the host) before this wizard did. Nothing from this wizard was saved.</p>
       <UButton to="/login" label="Go to sign-in" block />
     </template>
 
     <form v-else-if="step <= LAST_DRAFT_STEP" class="space-y-5" novalidate :aria-label="STEPS[step]" @submit.prevent="step === LAST_DRAFT_STEP ? finish() : next()">
-      <!-- 1. Setup token -->
       <template v-if="step === 0">
         <UAlert v-if="resumed" color="info" variant="subtle" icon="i-lucide-history" role="status" title="Picking up where you left off."
           description="Your answers were kept in this tab. For safety the setup token and passwords were not: enter them again." />
@@ -356,7 +332,6 @@ const firstNamespace = computed(() => completed.value?.organization ?? completed
         </UFormField>
       </template>
 
-      <!-- 2. Administrator -->
       <template v-else-if="step === 1">
         <p class="text-sm">This account administers the whole instance. Its address is trusted as confirmed, so it can sign in right away.</p>
         <UFormField label="Email address" name="email" required>
@@ -375,14 +350,12 @@ const firstNamespace = computed(() => completed.value?.organization ?? completed
         </UFormField>
       </template>
 
-      <!-- 3. Who can join -->
       <template v-else-if="step === 2">
         <URadioGroup v-model="draft.registration" :items="REGISTRATIONS" legend="Who can create an account" variant="card" :ui="{ fieldset: 'gap-2' }" />
         <URadioGroup v-model="draft.tenantCreation" :items="CREATIONS" legend="Who can create organizations" variant="card" :ui="{ fieldset: 'gap-2' }" />
         <p class="text-xs text-muted">Both can be changed later under Platform → Policy. Whatever you choose, people only ever see the organizations they belong to.</p>
       </template>
 
-      <!-- 4. Instance -->
       <template v-else-if="step === 3">
         <UFormField label="Instance name" name="instance_name" required hint="Up to 64 characters">
           <UInput id="instance-name" v-model="draft.instanceName" maxlength="64" required autofocus class="w-full" />
@@ -393,7 +366,6 @@ const firstNamespace = computed(() => completed.value?.organization ?? completed
         <p class="text-xs text-muted">Links in emails and GitHub keep using the controller's configured <code>public_url</code>; keep the two the same.</p>
       </template>
 
-      <!-- 5. Email -->
       <template v-else-if="step === 4">
         <p class="text-sm">Optional. Sentinel can email confirmation links and invitations through Resend. Without it, nobody is locked out: you hand links over yourself.</p>
         <template v-if="mailConfigured === false">
@@ -428,7 +400,6 @@ const firstNamespace = computed(() => completed.value?.organization ?? completed
         <p class="text-xs text-muted">A failed test does not stop setup: you can finish now and configure email later.</p>
       </template>
 
-      <!-- 6. Namespaces -->
       <template v-else-if="step === 5">
         <p class="text-sm">Optional. Names are 2 to 63 lowercase letters, digits and hyphens, and are part of addresses (<code>/t/name</code>).</p>
         <UFormField label="Your personal namespace" name="personal" hint="Optional" description="A space only you belong to.">
@@ -439,7 +410,6 @@ const firstNamespace = computed(() => completed.value?.organization ?? completed
         </UFormField>
       </template>
 
-      <!-- 7. Review -->
       <template v-else-if="step === 6">
         <p class="text-sm">Nothing is created until you finish. Then everything below is created at once.</p>
         <dl class="divide-y divide-default rounded-lg border border-default text-sm">
@@ -471,7 +441,6 @@ const firstNamespace = computed(() => completed.value?.organization ?? completed
       </div>
     </form>
 
-    <!-- After setup: an authenticator, offered. -->
     <template v-else-if="step === SECURE">
       <UAlert color="success" variant="subtle" icon="i-lucide-circle-check" role="status" title="Setup is complete and you are signed in." />
       <TotpEnroll :has-password="true" :password="password" :username="draft.email" @done="leaveSecure">
@@ -484,7 +453,6 @@ const firstNamespace = computed(() => completed.value?.organization ?? completed
       </TotpEnroll>
     </template>
 
-    <!-- Done. -->
     <template v-else>
       <p class="text-sm">Here is what to do next:</p>
       <ul class="space-y-2 text-sm">

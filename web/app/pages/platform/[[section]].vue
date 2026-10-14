@@ -1,8 +1,5 @@
 <script setup lang="ts">
-// Platform administration: registrations, tenants and their quotas,
-// worker pools, admission policy and the audit trail. Suspension and
-// policy changes need a fresh second factor; the page asks for it
-// when the controller does.
+// Step-up prompts come from the controller's refusals, not from this page.
 const route = useRoute();
 const session = useSession();
 if (!session.me.value?.super_admin) throw createError({ statusCode: 404, statusMessage: "Not found" });
