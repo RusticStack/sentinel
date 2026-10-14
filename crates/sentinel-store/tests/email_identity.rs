@@ -146,7 +146,7 @@ impl Fixture {
 
     fn events(&self) -> Vec<Event> {
         self.store
-            .read(|conn| local_auth::recent_audit(conn, 200))
+            .read(|conn| local_auth::recent_audit(conn, 100))
             .unwrap()
             .into_iter()
             .map(|r| r.event)

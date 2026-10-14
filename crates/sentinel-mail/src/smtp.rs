@@ -810,7 +810,7 @@ mod tests {
 
     #[test]
     fn starttls_is_required_when_chosen_and_never_downgraded() {
-        let mut starttls = config(0);
+        let mut starttls = config(1);
         starttls.tls = Tls::StartTls;
         let (port, relay) = relay(vec![("EHLO", "250 relay\r\n")]);
         starttls.port = port;
