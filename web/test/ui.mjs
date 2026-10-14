@@ -116,6 +116,7 @@ const OVERFLOW = `(() => ({ scroll: document.documentElement.scrollWidth, width:
 
 const FOCUS_RING = `(() => { const el = document.activeElement; if (!el || el === document.body) return null;
   const r = el.getBoundingClientRect();
+  // The ring may be drawn by the element or by its ::before/::after.
   const drawn = (st) => (st.outlineStyle !== "none" && parseFloat(st.outlineWidth) > 0) || (st.boxShadow && st.boxShadow !== "none");
   const ring = [null, "::before", "::after"].some((pseudo) => drawn(getComputedStyle(el, pseudo)));
   return { tag: el.tagName, text: (el.getAttribute("aria-label") || el.textContent || el.value || "").trim().slice(0, 40),
@@ -328,7 +329,6 @@ await scenario("keyboard", async () => {
   await page.key("ArrowDown");
   check("log: arrow keys scroll by line", (await page.eval("document.querySelector('#log-view').scrollTop")) === 2 * lineH);
   await page.key("End");
-  // One sample at the bottom is not enough: a late re-measure can move the end after it.
   const atEnd = "(() => { const v = document.querySelector('#log-view'); return v.scrollTop + v.clientHeight >= v.scrollHeight - 1; })()";
   let rested = 0;
   for (let i = 0; i < 40 && rested < 3; i++) {
@@ -538,7 +538,6 @@ await scenario("storage policy", async () => {
   await page.click('[aria-label="Storage policy of app"]');
   await page.waitFor("!!document.querySelector('#repo-app-logs')", 8000, "policy form");
   await page.fill("#repo-app-logs", "2");
-  // A number field commits its value when it loses focus.
   await page.key("Tab");
   await page.clickText("[role=dialog] button", "Save");
   await page.waitFor("!document.querySelector('[role=dialog]')", 8000, "saved");
