@@ -2,85 +2,46 @@
 
 A purpose-built, fully open-source, self-hosted CI engine designed from scratch for maximum performance: fast PR feedback, local-first caching, efficient multi-machine scheduling, and readable diagnostics for humans and coding agents.
 
-**Status: early development; Parts 00–13 are implemented; Part 14 (same-hardware optimization and pilots) is in progress.** Part 13 adds retention, optional S3, online backup with a measured restore drill, versioned upgrades and metrics; Part 12 adds the human web interface ([web interface](docs/web-ui.md), [backup](docs/backup.md), [upgrades](docs/upgrades.md)). Part 11 adds versioned, bounded diagnostics and MCP over stdio and OAuth-protected Streamable HTTP, including supported client registration and metadata discovery. Part 10 adds sealed tenant/repository secret versions, delegated CLI management and atomic env-file import, explicit job/step bindings, protocol-10 fenced delivery, environment and file injection, redaction, cleanup/recovery, and per-tenant private-registry authorization. See [Diagnostics](docs/diagnostics.md), [MCP](docs/mcp.md), [Secrets](docs/secrets.md), and [TODO.md](TODO.md) for contracts and verification evidence. **See [plan.md](plan.md)** for architecture, milestones, performance targets, and release criteria. The [Parts 01–02 audit](docs/parts-01-02-audit.md) records the execution-integration gates it found and how each was closed.
+**Status: early development.** Parts 00–13 of [TODO.md](TODO.md) are implemented; Part 14 (same-hardware optimization and pilots) is in progress and Part 15 (release) has not started. [TODO.md](TODO.md) is the execution tracker with per-task evidence and open work; [plan.md](plan.md) is the design reference (architecture, milestones, performance targets, release criteria). The performance targets are not measured Sentinel results.
 
-Start development from [TODO.md](TODO.md): ordered work packages, stable task IDs, dependencies, the first runnable server/worker slice, and verification gates.
+The ambition is **sub-minute warm PR checks on hardware that previously took five minutes or more**; see [performance research](docs/performance-research.md).
 
-**Supported platforms:** Linux runs everything (the server, the worker and the CLI); Windows runs the CLI. macOS is not supported. The [platform matrix](docs/rust-foundation.md#platform-and-feature-matrix) lists the target triples.
+## What it is
 
-See [Rust foundation](docs/rust-foundation.md) for the pinned toolchain, build commands, platform/feature matrix, and dependency boundaries.
+- A Rust core with its own pipeline format ([`.sentinel.yml`](docs/pipeline-schema.md)), one `sentinel` binary with a CLI, a controller (`server`) and a Linux executor (`worker`), and an optional Node web interface ([web interface](docs/web-ui.md)).
+- Embedded SQLite metadata and Sentinel-owned local storage, with optional external S3 and Tailcat-connected workers.
+- One deployment hosts several organizations and personal namespaces, with super-admin registration controls, OAuth-authenticated CLI and MCP, CLI-managed secrets, and tenant-scoped workers and data.
+- Provider-independent Git repositories (manual, generic hook and opt-in polling intake) work with Gitea, Forgejo, GitLab and bare repositories. GitHub is the one native forge integration (GitHub App, native PR Checks); other forge-native PR/MR integrations are deferred ([plan](plan.md#git-sources-and-forge-boundaries)).
+- [Lockwell](docs/lockwell-migration.md) is a representative workload whose CI adapts to Sentinel; it does not dictate the architecture.
 
-See [CLI and configuration](docs/configuration.md) to validate configuration, start the separate Linux processes, and shut them down.
+**Platforms:** Linux runs everything (server, worker, CLI); Windows runs the CLI; macOS is not supported ([platform matrix](docs/rust-foundation.md#platform-and-feature-matrix)).
 
-For contributor prerequisites, daily check/build commands, and a local two-process setup, see [Development](docs/development.md).
+## Quick start
 
-See [Core contracts](docs/core-contracts.md) for typed identifiers, the fenced job/run state machine, failure classes and cancellation.
+Needs the pinned Rust toolchain (`rust-toolchain.toml`). Full prerequisites are in [Development](docs/development.md).
 
-See [Storage](docs/storage.md) for the SQLite metadata store, the engine decision, and the durable single-writer acknowledgement policy.
+```sh
+cargo run -p sentinel -- pipeline validate <file>   # offline check of a .sentinel.yml, any platform
+cargo dev-server --data-dir "$PWD/data/controller"         # Linux terminal one
+cargo dev-worker --data-dir "$PWD/data/worker"             # Linux terminal two
+```
 
-See [Authorization](docs/authorization.md) for namespaces, human/service identities, memberships, explicit repo grants and live scoped queries.
+Aliases live in `.cargo/config.toml`; the command table is in [AGENTS.md](AGENTS.md). First administrator setup is described under [operator first run](docs/development.md#operator-first-run).
 
-See [Local authentication](docs/local-authentication.md) for host-local first-admin bootstrap, Argon2id passwords, opaque sessions, cookie/CSRF policy and audited recovery.
+## Documentation
 
-See [API credentials](docs/api-credentials.md) for the scoped, expiring bearer credentials that authenticate the CLI and API before OAuth.
+Contributors start with [AGENTS.md](AGENTS.md) and [Development](docs/development.md). Each contract lives in one topical document under [`docs/`](docs/):
 
-See [GitHub sign-in](docs/github-sign-in.md) for the authorization-code flow, verified identity linking and what separates proof from admission.
-
-See [Admission](docs/admission.md) for registration policy, invitations, pending accounts, and the separate decisions of creating a tenant and binding a forge installation.
-
-See the [Part 03 audit](docs/part-03-audit.md) for what was re-read, what was found and fixed, and what is deliberately left as is.
-
-See the [Parts 00–09 audit](docs/parts-00-09-audit.md) for the full re-audit of every task through Part 09: each finding with its fix, commit and regression test, what was kept by design, what moved to a later task, and the verification evidence.
-
-See the [Parts 09–11 audit](docs/parts-09-11-audit.md) for the second re-audit of the OAuth server and CLI, secret management and delivery, and diagnostics and MCP: every finding with its outcome, commit and test, how the five fix branches were merged, the leftovers and flaky tests closed afterwards, and the final verification. X07 (real MCP clients) remains open.
-
-See [Vertical slice](docs/vertical-slice.md) for what Part 04 was exercised against and what held.
-
-See [API](docs/api.md) for the one authenticated surface the CLI, the page and later agents share.
-
-See [Sources](docs/sources.md) for tenant-owned repository bindings, sealed HTTPS/SSH deploy credentials delivered per acknowledged attempt, checkout trust, and GitHub App associations with scoped short-lived tokens.
-
-See [Intake](docs/intake.md) for the durable event path: repository hook secrets, raw-body GitHub webhook signatures, deduplicated deliveries acknowledged after commit, the bounded resolution lane, and the spooling `post-receive` relay.
-
-See [Checks](docs/checks.md) for durable GitHub aggregate and per-job feedback, retry and rate-limit handling, publication identity, and run links.
-
-See [Reconciliation](docs/reconciliation.md) for what a controller or worker restart settles, and how nothing that may have run is replayed.
-
-See [Cancellation](docs/cancellation.md) for cancel as desired state, graceful then forced termination, timeouts, and lease expiry.
-
-See [Logs](docs/logs.md) for how step output reaches the controller: redacted, spooled, windowed, acknowledged after fsync, never lost in silence.
-
-See [Executor](docs/executor.md) for what a job runs in: a fresh workspace, the pinned commit, a rootless container with the job's limits and every capability dropped, and the attempt lifecycle reported under its fence.
-
-See [Worker link](docs/worker-link.md) for one-time worker enrollment, worker-generated TLS identities pinned in both directions, heartbeat sessions that renew leases, and the wake-driven dispatch loop: the ready queue is the database, a reservation is an attempt, offers are fenced and acknowledged or lapse back to the queue.
-
-See [Tenancy](docs/tenancy.md) for tenant suspension, what it revokes and cancels, the authorization epoch that long-lived streams re-check, and pool grants.
-
-See [Step-up](docs/step-up.md) for second factors, sealed TOTP seeds, recovery codes, and the step-up that gates changes to who can authenticate.
-
-See [Sealed storage](docs/sealed-storage.md) for the versioned encryption format, ownership binding, and offline master-key rotation and restore.
-
-See [Scoped secrets](docs/secrets.md) for tenant and repository secret records, explicit job and step bindings, allowlists, precedence, and audit metadata.
-
-See [Protocol contracts](docs/protocol.md) for structured errors, idempotency, event cursors, size limits and worker capability negotiation.
-
-See [Pipeline schema](docs/pipeline-schema.md) for the strict, bounded `.sentinel.yml` format and its deterministic compiler.
-
-See [Compatibility](docs/compatibility.md) for how each schema, blob format, database migration and protocol version may change.
-
-See [Runtime foundations](docs/runtime-foundation.md) for structured diagnostics, correlation IDs, monotonic phase timing, and bounded I/O/CPU execution lanes.
-
-See [Benchmarking](docs/benchmarking.md) for the machine-readable benchmark runner and the no-op rootless-runtime baseline, [CI baseline](docs/ci-baseline.md) for the measured Lockwell CI topology and timings Sentinel must beat, [benchmark contracts](docs/benchmark-contracts.md) for the frozen checks and conditions Part 14 is measured under, and [feasibility probes](docs/feasibility-probes.md) for the SQLite, Podman, reflink and Tailcat decisions.
-
-The implementation uses a Rust core and its own pipeline format. Part 05 added provider-independent Git repository connections and manual, generic hook and opt-in polling intake for Gitea, Forgejo, GitLab and bare repositories, with results in Sentinel's UI/API. GitHub is the first native forge integration: GitHub App access and native PR Checks; other forge-native PR/MR integrations are deferred. See [Git sources and forge boundaries](plan.md#git-sources-and-forge-boundaries). The default deployment uses embedded SQLite and Sentinel-owned local storage, with optional external S3 and Tailcat-connected workers.
-
-One deployment supports multiple organizations and personal namespaces, super-admin registration controls, OAuth-authenticated CLI/MCP, CLI-managed secrets, and tenant-scoped workers/data. [Lockwell](docs/lockwell-migration.md) is a representative workload whose CI adapts to Sentinel; it does not dictate the engine's architecture.
-
-The performance ambition is **sub-minute warm PR checks on the same hardware that previously took five minutes or more**. See [performance research](docs/performance-research.md) for Blacksmith/Depot mechanisms, actual Lockwell timings, caching design, and the measurement plan. See [OAuth and secrets](docs/auth-and-secrets.md) for human/agent access. Targets are not yet measured Sentinel results.
+- Foundations: [Rust foundation](docs/rust-foundation.md), [configuration and CLI](docs/configuration.md), [runtime foundations](docs/runtime-foundation.md), [core contracts](docs/core-contracts.md), [protocol](docs/protocol.md), [compatibility](docs/compatibility.md), [storage](docs/storage.md).
+- Identity: [authorization](docs/authorization.md), [local authentication](docs/local-authentication.md), [API credentials](docs/api-credentials.md), [GitHub sign-in](docs/github-sign-in.md), [admission](docs/admission.md), [tenancy](docs/tenancy.md), [step-up](docs/step-up.md), [sealed storage](docs/sealed-storage.md), [scoped secrets](docs/secrets.md), [OAuth and secrets](docs/auth-and-secrets.md).
+- Sources and feedback: [sources](docs/sources.md), [intake](docs/intake.md), [checks](docs/checks.md), [pipeline schema](docs/pipeline-schema.md).
+- Execution: [executor](docs/executor.md), [worker link](docs/worker-link.md), [logs](docs/logs.md), [cancellation](docs/cancellation.md), [reconciliation](docs/reconciliation.md).
+- Interfaces: [API](docs/api.md), [CLI](docs/cli.md), [MCP](docs/mcp.md), [diagnostics](docs/diagnostics.md), [web interface](docs/web-ui.md).
+- Performance: [benchmarking](docs/benchmarking.md), [CI baseline](docs/ci-baseline.md), [benchmark contracts](docs/benchmark-contracts.md), [feasibility probes](docs/feasibility-probes.md), [performance research](docs/performance-research.md).
 
 ## Legacy dashboard
 
-The original Deno/Fresh GitHub Actions runner dashboard and its full history are preserved on [`legacy`](https://github.com/RusticStack/sentinel/tree/legacy). This `main` branch begins the from-scratch replacement.
+The original Deno/Fresh GitHub Actions runner dashboard and its history are preserved on [`legacy`](https://github.com/RusticStack/sentinel/tree/legacy). This `main` branch is the from-scratch replacement.
 
 ## License
 
