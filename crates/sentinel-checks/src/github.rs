@@ -30,6 +30,12 @@ struct CachedToken {
     expires_ms: i64,
 }
 
+impl Drop for CachedToken {
+    fn drop(&mut self) {
+        sentinel_auth::secret::wipe_string(&mut self.secret);
+    }
+}
+
 pub struct GithubChecks {
     store: Arc<Store>,
     app: Arc<App>,
@@ -80,7 +86,7 @@ impl GithubChecks {
         {
             return Ok(cached.secret.clone());
         }
-        let token = self
+        let mut token = self
             .app
             .checks_token(installation, account, forge_repo, remote, now.0)
             .map_err(|error| match error {
@@ -110,7 +116,7 @@ impl GithubChecks {
                 secret: token.secret.clone(),
             },
         );
-        Ok(token.secret)
+        Ok(std::mem::take(&mut token.secret))
     }
 
     fn details_url(&self, run: Option<sentinel_core::RunId>) -> Option<String> {

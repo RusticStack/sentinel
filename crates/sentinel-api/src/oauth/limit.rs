@@ -220,7 +220,7 @@ pub(crate) fn client_key(
     trusted: &[TrustedProxy],
 ) -> u128 {
     let peer = peer.map(canonical);
-    let via_proxy = peer.is_some_and(|ip| trusted.iter().any(|proxy| proxy.contains(ip)));
+    let via_proxy = peer.is_some_and(|ip| is_proxy(ip, trusted));
     let client = match (via_proxy, forwarded_for) {
         (true, Some(header)) => header
             .rsplit(',')
@@ -236,6 +236,11 @@ pub(crate) fn client_key(
         // The /64 prefix, tagged so it can never equal an IPv4 key.
         Some(IpAddr::V6(v6)) => (u128::from(v6) & !0xffff_ffff_ffff_ffff) | 1,
     }
+}
+
+/// Whether `peer` is inside a configured reverse-proxy network.
+pub(crate) fn is_proxy(peer: IpAddr, trusted: &[TrustedProxy]) -> bool {
+    trusted.iter().any(|proxy| proxy.contains(canonical(peer)))
 }
 
 /// IPv4-mapped IPv6 addresses count as the IPv4 address they carry.

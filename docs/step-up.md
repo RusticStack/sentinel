@@ -1,6 +1,6 @@
 # Second factors, step-up and session administration (A06)
 
-Implemented in `sentinel-auth::mfa` and `sentinel-auth::sealed`, `sentinel-store::mfa`, the `Authority` type in `sentinel-store::auth`, and `sentinel admin key|mfa|session`, with append-only metadata migrations **9**, **10** (per-session failure limit) and **31** (per-account second-factor lockout).
+Implemented in `sentinel-auth::mfa` and `sentinel-auth::sealed`, `sentinel-store::mfa`, the `Authority` type in `sentinel-store::auth`, and `sentinel admin key|mfa|session`, with append-only metadata migrations **9**, **10** (per-session failure limit) and **32** (per-account second-factor lockout).
 
 A session proves who you are. **Step-up** proves you are still there, just now, with something more than a cookie — before a change that alters who can authenticate at all. It is freshness, not authority: `Authority::require_privileged` demands both a recent stamp and a live platform-admin check, in the same transaction as the change.
 

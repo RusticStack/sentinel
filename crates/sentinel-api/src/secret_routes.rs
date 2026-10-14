@@ -66,7 +66,7 @@ pub(crate) fn route(
 struct WipeBytes(Vec<u8>);
 impl Drop for WipeBytes {
     fn drop(&mut self) {
-        self.0.fill(0);
+        sentinel_auth::secret::wipe(&mut self.0);
     }
 }
 
@@ -74,7 +74,7 @@ struct WipeRecords(Vec<(String, Vec<u8>)>);
 impl Drop for WipeRecords {
     fn drop(&mut self) {
         for (_, value) in &mut self.0 {
-            value.fill(0);
+            sentinel_auth::secret::wipe(value);
         }
     }
 }
@@ -522,9 +522,9 @@ fn import(state: &State, request: &mut Request, slug: &str, query: &str) -> Rout
                 &key,
                 now,
             )?;
-            bytes.0.fill(0);
+            sentinel_auth::secret::wipe(&mut bytes.0);
             for (_, value) in &mut records.0 {
-                value.fill(0);
+                sentinel_auth::secret::wipe(value);
             }
             let response = json!({
                 "tenant": tenant.to_string(),

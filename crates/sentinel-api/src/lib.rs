@@ -15,6 +15,7 @@
 pub mod auth;
 mod github;
 mod http;
+mod login_guard;
 mod mcp;
 mod metrics;
 mod oauth;
@@ -42,6 +43,15 @@ pub const WORKERS: usize = 8;
 /// Connections held at once (one reader thread each); further handshakes
 /// wait in the listener backlog.
 pub const CONNECTIONS: usize = 64;
+/// Connections one peer address (an IPv6 /64 as one) may hold at once; the
+/// next is closed at accept. A configured reverse proxy ([`TrustedProxy`]) is
+/// exempt: it stands for many clients, which the admission budgets key apart.
+pub const CONNECTIONS_PER_PEER: usize = 16;
+/// Unauthenticated request bodies (login, webhooks, OAuth forms) read at
+/// once. They are read without a handler permit, under this small pool and
+/// a ten-second deadline, so slow bodies queue behind each other and never
+/// take a permit from real work.
+pub const PUBLIC_BODIES: usize = 4;
 /// How long a `wait=1` log poll holds before answering with nothing new.
 pub const LOG_WAIT: Duration = Duration::from_secs(25);
 /// Upload/download bodies in flight at once (D02), counted until the last
@@ -75,16 +85,16 @@ const _: () = assert!(
     RESERVED_HANDLERS >= 2,
     "keep handler permits for control requests"
 );
-/// Handler permits that outbound calls to third parties may hold at once:
+/// Handler permits each kind of outbound call to a third party may hold at once:
 /// GitHub sign-in's code exchange (up to two ten-second calls) and Client ID
-/// Metadata Document fetches (two seconds) draw on this one budget. A
+/// Metadata Document fetches (two seconds) each have a budget of this size, so a signed-in account filling the fetch budget never makes GitHub sign-in busy. A
 /// request past it is answered "busy, retry" at once, never queued, so with
 /// [`TRANSFERS`] (parked polls hold none) a handler always remains for logins,
 /// token refreshes, health checks and run reads — however slow the third
 /// party, and however many anonymous or signed-in callers ask.
 pub const OUTBOUND: usize = 1;
 const _: () = assert!(
-    WORKERS - TRANSFERS - OUTBOUND >= 1,
+    WORKERS - TRANSFERS - 2 * OUTBOUND >= 1,
     "keep a handler permit for control requests"
 );
 
@@ -180,8 +190,13 @@ pub(crate) struct State {
     pub github: Option<github::Github>,
     /// Networks whose `X-Forwarded-For` is believed ([`Config::trusted_proxies`]).
     pub trusted_proxies: Vec<TrustedProxy>,
-    /// Outbound calls to third parties in flight ([`OUTBOUND`]).
-    pub outbound: Outbound,
+    /// Client ID Metadata Document fetches in flight ([`OUTBOUND`]).
+    pub fetches: Outbound,
+    /// Per client and account password-guessing locks.
+    pub logins: login_guard::LoginGuard,
+    /// GitHub sign-in code exchanges in flight, a budget of their own: a
+    /// signed-in user making metadata fetches cannot starve sign-in.
+    pub exchanges: Outbound,
     /// What every answered request adds to `/metrics` (R06).
     pub requests: metrics::Requests,
 }
@@ -289,6 +304,7 @@ impl Server {
                 )
             })?;
         let stop = Arc::new(AtomicBool::new(false));
+        let proxies = config.trusted_proxies.clone();
         let state = Arc::new(State {
             store: config.store,
             logs: config.logs,
@@ -305,7 +321,9 @@ impl Server {
             mcp_sessions: mcp::Sessions::default(),
             github,
             trusted_proxies: config.trusted_proxies,
-            outbound: Outbound::default(),
+            fetches: Outbound::default(),
+            logins: login_guard::LoginGuard::default(),
+            exchanges: Outbound::default(),
             requests: metrics::Requests::default(),
         });
         let conns = http::listen(
@@ -313,6 +331,7 @@ impl Server {
             Arc::new(move |request| routes::handle(&state, request)),
             stop,
             http::Tune::DEFAULT,
+            proxies,
         )?;
         Ok(Server {
             addr,

@@ -18,11 +18,7 @@
 //! not be computable from the database alone, or a stored digest of a value
 //! would let a stolen database confirm guesses of that value offline.
 
-use std::{
-    fs::File,
-    io::{Read, Write},
-    path::Path,
-};
+use std::{io::Write, path::Path};
 
 use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305, XNonce,
@@ -411,71 +407,27 @@ impl Key {
 }
 
 /// Open the key file once and judge the opened handle, so the file checked
-/// is the file read (P10S-9). On Unix the open refuses a symbolic link, and
-/// the handle must be a regular file owned by this user with no group or
-/// other access. The buffer is sized up front: no reallocation leaves an
-/// unwiped copy of key material behind.
+/// is the file read (P10S-9): see [`crate::secret_file`]. The buffer is
+/// sized up front: no reallocation leaves an unwiped copy of key material
+/// behind.
 fn read_key_file(path: &Path) -> Result<KeyBytes, SealError> {
-    let mut file = open_key_file(path)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| SealError::Key("unreadable key file"))?;
-    if !metadata.is_file() {
-        return Err(SealError::Key("key path is not a regular file"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.mode() & 0o077 != 0 {
-            return Err(SealError::Key("key file must be owner-only"));
-        }
-        if metadata.uid() != rustix::process::geteuid().as_raw() {
-            return Err(SealError::Key("key file must be owned by this user"));
-        }
-    }
-    if metadata.len() > MAX_KEY_FILE as u64 {
-        return Err(SealError::Key("invalid key file"));
-    }
-    let mut bytes = KeyBytes(Vec::with_capacity(MAX_KEY_FILE + 1));
-    (&mut file)
-        .take(MAX_KEY_FILE as u64 + 1)
-        .read_to_end(&mut bytes.0)
-        .map_err(|_| SealError::Key("unreadable key file"))?;
-    if bytes.0.len() > MAX_KEY_FILE {
-        return Err(SealError::Key("invalid key file"));
-    }
-    Ok(bytes)
-}
-
-#[cfg(unix)]
-fn open_key_file(path: &Path) -> Result<File, SealError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-        .open(path)
-        .map_err(|error| {
-            if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
-                SealError::Key("key path is not a regular file")
-            } else {
-                SealError::Key("unreadable key file")
-            }
+    use crate::secret_file::{self, Refusal};
+    let mut file = secret_file::open(path).map_err(|refusal| {
+        SealError::Key(match refusal {
+            Refusal::NotRegular => "key path is not a regular file",
+            Refusal::Unreadable => "unreadable key file",
+            Refusal::GroupOrOtherAccess => "key file must be owner-only",
+            Refusal::WrongOwner => "key file must be owned by this user",
         })
-}
-
-/// Windows is a development platform only: refuse a link by name, then
-/// judge the opened handle as on Unix.
-#[cfg(not(unix))]
-fn open_key_file(path: &Path) -> Result<File, SealError> {
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|_| SealError::Key("unreadable key file"))?;
-    if !metadata.file_type().is_file() {
-        return Err(SealError::Key("key path is not a regular file"));
+    })?;
+    match secret_file::read(&mut file, MAX_KEY_FILE) {
+        Ok(Some(bytes)) => Ok(KeyBytes(bytes)),
+        Ok(None) => Err(SealError::Key("invalid key file")),
+        Err(_) => Err(SealError::Key("unreadable key file")),
     }
-    File::open(path).map_err(|_| SealError::Key("unreadable key file"))
 }
 
-/// `master.key` → `master.key-<id>-pending`, beside the key.
+/// `master.key` →`master.key-<id>-pending`, beside the key.
 fn pending_path(path: &Path, id: u32) -> std::path::PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_owned();
     name.push(format!("-{id}-pending"));
@@ -525,7 +477,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn sync_parent(path: &Path) -> std::io::Result<()> {
-    File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()
+    std::fs::File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()
 }
 
 #[cfg(not(unix))]

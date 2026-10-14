@@ -32,8 +32,8 @@
 //!
 //! Both routes are admitted per client ([`crate::oauth::limit`]). The code
 //! exchange and the identity read are outbound calls of up to ten seconds
-//! each, so they draw on the deployment's [`crate::OUTBOUND`] budget (shared
-//! with CIMD metadata fetches); a callback past it is told to
+//! each, so they draw on their own [`crate::OUTBOUND`] budget (not shared
+//! with CIMD metadata fetches, which cannot make sign-in busy); a callback past it is told to
 //! reload, with its state still unspent.
 
 use std::{
@@ -316,7 +316,7 @@ fn callback(state: &State, github: &Github, request: &Request, query: &str) -> R
     }
     // Taken before the state is spent, so a busy answer leaves it pending
     // and a reload of this same URL completes.
-    let Some(_slot) = state.outbound.take() else {
+    let Some(_slot) = state.exchanges.take() else {
         return busy_page(
             503,
             "Sentinel is busy signing someone else in. Reload this page in a moment.",

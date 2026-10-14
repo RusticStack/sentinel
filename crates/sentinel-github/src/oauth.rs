@@ -184,16 +184,25 @@ impl App {
 }
 
 /// Read an OAuth client secret from an operator-controlled file: a regular
-/// file of at most 4 KiB, with one trailing newline dropped so an ordinary
-/// text file works. Nothing else is trimmed, because a secret is bytes. The
-/// error names the file's role, never its content.
+/// file of at most 4 KiB, opened without following a link and checked on the
+/// open handle to be owned by this user and closed to group and others (as
+/// the master key is, [`sentinel_auth::secret_file`]), with one trailing
+/// newline dropped so an ordinary text file works. Nothing else is trimmed,
+/// because a secret is bytes. The error names the file's role, never its
+/// content.
 pub fn read_secret(path: &Path) -> Result<String> {
-    let metadata = std::fs::metadata(path).map_err(|_| Error::Config("client secret file"))?;
-    if !metadata.is_file() || metadata.len() > 4096 {
-        return Err(Error::Config("client secret file"));
-    }
-    let mut secret =
-        std::fs::read_to_string(path).map_err(|_| Error::Config("client secret file"))?;
+    const FILE: Error = Error::Config("client secret file");
+    let mut file = sentinel_auth::secret_file::open(path).map_err(|_| FILE)?;
+    let bytes = sentinel_auth::secret_file::read(&mut file, 4096)
+        .map_err(|_| FILE)?
+        .ok_or(FILE)?;
+    // The buffer moves into the string unchanged; on invalid UTF-8 the
+    // bytes come back out of the error to be wiped.
+    let mut secret = String::from_utf8(bytes).map_err(|e| {
+        let mut bytes = e.into_bytes();
+        sentinel_auth::secret::wipe(&mut bytes);
+        FILE
+    })?;
     if secret.ends_with('\n') {
         secret.pop();
         if secret.ends_with('\r') {
@@ -594,6 +603,23 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("client-secret");
         std::fs::write(&path, "shhh-client-secret\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Group- or world-readable, or reached through a link: refused.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                App::load("Iv1.abc", &path, "https://ci.example/cb").unwrap_err(),
+                Error::Config("client secret file")
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let link = dir.join("client-secret-link");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert_eq!(
+                App::load("Iv1.abc", &link, "https://ci.example/cb").unwrap_err(),
+                Error::Config("client secret file")
+            );
+        }
         let app = App::load(
             "Iv1.0123456789abcdef",
             &path,

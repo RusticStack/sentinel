@@ -69,6 +69,15 @@ impl core::fmt::Debug for Token {
     }
 }
 
+impl Drop for Token {
+    /// The installation token is wiped when it is released (best effort: the
+    /// copies the HTTP layer and the parsed response made are outside it).
+    /// Take the secret out with `mem::take` to keep it past the token.
+    fn drop(&mut self) {
+        sentinel_auth::secret::wipe_string(&mut self.secret);
+    }
+}
+
 impl App {
     /// GitHub's downloaded PKCS#1 PEM or unencrypted PKCS#8 PEM. Keep the
     /// protected key file outside SQLite and replace/restart for key rotation.

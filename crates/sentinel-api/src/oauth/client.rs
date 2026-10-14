@@ -263,7 +263,11 @@ fn valid_redirect_uri(value: &str) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
     };
-    if url.username() != ""
+    // The parser strips tabs and line breaks and lowercases the host: only
+    // the canonical spelling is stored, so what is matched later and what
+    // is put in a `Location` header is exactly what was validated.
+    if url.as_str() != value
+        || url.username() != ""
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
@@ -347,7 +351,7 @@ fn public_ipv6(ip: Ipv6Addr) -> bool {
 }
 
 /// Whole-request bound of one metadata fetch, DNS included. A fetch holds a
-/// handler permit this long at most, under the deployment's shared
+/// handler permit this long at most, under the metadata fetch
 /// [`crate::OUTBOUND`] budget; a request past the budget is told to retry.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -546,7 +550,7 @@ pub(crate) fn resolve(
             });
     }
     admit(state, request, Budget::Metadata)?;
-    let Some(_slot) = state.outbound.take() else {
+    let Some(_slot) = state.fetches.take() else {
         return Err(busy(
             "Sentinel is checking another application's details. Try again in a moment.",
         ));
@@ -648,13 +652,20 @@ pub(crate) fn register(state: &State, request: &mut Request) -> Route {
             "Content-Type must be application/json",
         );
     }
-    let bytes = match routes::body_limit(request, 16 << 10) {
+    let bytes = match routes::public_body_limit(request, 16 << 10) {
         Ok(bytes) => bytes,
         Err(error) if error.code == sentinel_protocol::error::ErrorCode::PayloadTooLarge => {
             return Ok(error_status(
                 413,
                 OAuthErrorCode::InvalidClientMetadata,
                 "client metadata exceeds the configured limit",
+            ));
+        }
+        Err(error) if error.code == sentinel_protocol::error::ErrorCode::RateLimited => {
+            return Ok(error_status(
+                503,
+                OAuthErrorCode::TemporarilyUnavailable,
+                "too many requests; retry shortly",
             ));
         }
         Err(_) => {
@@ -833,6 +844,11 @@ mod tests {
             "https://client.example/callback?next=other",
             "https://client.example/callback#fragment",
             "file:///tmp/callback",
+            // The URL parser would strip these or rewrite the host.
+            "https://client.example/call\tback",
+            "https://client.example/call\nback",
+            "https://client.example/callback\r",
+            "https://Client.Example/callback",
         ] {
             assert!(!valid_redirect_uri(denied), "{denied}");
         }

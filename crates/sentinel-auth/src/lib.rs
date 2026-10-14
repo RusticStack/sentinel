@@ -10,4 +10,5 @@ pub mod oauth;
 pub mod password;
 pub mod sealed;
 pub mod secret;
+pub mod secret_file;
 pub mod token;

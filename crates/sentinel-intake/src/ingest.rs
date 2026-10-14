@@ -73,9 +73,8 @@ pub fn generic(
     body: &[u8],
     now: UnixMillis,
 ) -> Result<Ingested, Error> {
-    let update: RefUpdate =
-        serde_json::from_slice(body).map_err(|_| Error::InvalidRequest("body"))?;
-    update.validate().map_err(Error::InvalidRequest)?;
+    // Authenticate before looking at the body: an unauthenticated caller
+    // gets no JSON parsing, and no validation oracle, for its bytes.
     let secret = intake::hook_token_parse(presented).ok_or(Error::Unauthenticated)?;
     let target = store
         .read(|c| intake::authenticate(c, &secret))
@@ -86,6 +85,9 @@ pub fn generic(
         // indistinguishable refusal.
         _ => return Err(Error::Unauthenticated),
     }
+    let update: RefUpdate =
+        serde_json::from_slice(body).map_err(|_| Error::InvalidRequest("body"))?;
+    update.validate().map_err(Error::InvalidRequest)?;
     accept(
         store,
         repo,
