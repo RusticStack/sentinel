@@ -13,6 +13,10 @@ export default defineNuxtConfig({
   // Self-hosted and possibly offline: no web fonts fetched at build time,
   // icons bundled from the local Lucide set instead of the Iconify API.
   ui: { fonts: false, theme: { colors: ["primary", "neutral", "success", "warning", "error", "info"] } },
+  // Nuxt UI turns this on: switching the colour mode would then append a
+  // `<style>` element that disables transitions, which the hash-only
+  // `style-src` refuses. Off, the switch simply animates colours.
+  colorMode: { disableTransition: false },
   icon: {
     // Inline `<svg>` elements, not CSS classes: the default `css` mode adds a
     // `<style>` element at run time for each icon first drawn in the browser,

@@ -2,6 +2,10 @@
 // inlines a few scripts and styles whose text changes per build and per
 // request (the runtime config, the colour-mode script, critical CSS), so
 // each inline block is allowed by its SHA-256 instead of `unsafe-inline`.
+// Style elements that a library creates in the browser (vaul-vue's drawer
+// rules, which Nuxt UI bundles) cannot be hashed ahead of time, so each
+// response also carries a fresh nonce for `style-src` alone, published in
+// the `csp-nonce` meta tag that vaul-vue reads; scripts never get a nonce.
 // Only rendered pages get it: the controller's own pages, reached through
 // the proxy, keep the policy the controller sets.
 const SCRIPT = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
@@ -30,6 +34,10 @@ async function inline(parts: string[], pattern: RegExp, group: number, skip?: Re
   return out;
 }
 
+function nonce(): string {
+  return btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
+}
+
 export default defineNitroPlugin((nitro) => {
   if (import.meta.dev) return; // Vite's hot reload needs inline code and sockets
   nitro.hooks.hook("render:html", async (html, { event }) => {
@@ -38,10 +46,12 @@ export default defineNitroPlugin((nitro) => {
     const styles = await inline(parts, STYLE, 1);
     // Style attributes (progress-bar widths) cannot be hashed, so they alone
     // may be inline; script and style elements stay hash-only.
+    const styleNonce = nonce();
+    html.head.push(`<meta property="csp-nonce" content="${styleNonce}">`);
     const policy = [
       "default-src 'self'",
       `script-src 'self' ${[...scripts].join(" ")}`.trim(),
-      `style-src 'self' ${[...styles].join(" ")}`.trim(),
+      `style-src 'self' 'nonce-${styleNonce}' ${[...styles].join(" ")}`.trim(),
       "style-src-attr 'unsafe-inline'",
       "img-src 'self' data:",
       "font-src 'self' data:",
