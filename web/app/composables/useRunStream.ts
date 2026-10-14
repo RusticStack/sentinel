@@ -1,9 +1,6 @@
 import type { Run } from "~~/shared/types/api";
 
-/// Keep `run` current from this server's run stream while the page is
-/// open: a `run` event per change, `status` when the controller is busy or
-/// unreachable, `refused` when access is gone (the page then says so and
-/// the tenant list is re-read). EventSource reconnects by itself.
+// EventSource reconnects by itself; do not add a manual retry.
 export function useRunStream(id: string, run: Ref<Run | null | undefined>) {
   const status = ref<"live" | "busy" | "reconnecting" | "lost" | "finished" | "refused">("live");
   const refused = ref<string | null>(null);

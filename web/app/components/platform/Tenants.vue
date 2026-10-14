@@ -10,7 +10,6 @@ const { data, refresh } = await useAsyncData(() => `platform-tenants-${after.val
 const quotas = reactive<Record<string, number | undefined>>({});
 const slug = ref("");
 const confirmSuspend = ref<any | null>(null);
-// The deployment's defaults: what a tenant's blank setting inherits.
 const { data: deployment } = await useAsyncData("platform-storage-defaults",
   () => api<DeploymentStorage>("/api/v1/admin/storage").catch(() => null));
 const editing = ref<any | null>(null);

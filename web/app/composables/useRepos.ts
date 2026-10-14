@@ -1,6 +1,3 @@
-/// A tenant's repositories the caller may read, by name (a stable order;
-/// the first is the default wherever one is needed). One cached request per
-/// tenant, shared by every view that lists them.
 export function useRepos(slug: MaybeRefOrGetter<string>) {
   const api = useApi();
   return useAsyncData(
