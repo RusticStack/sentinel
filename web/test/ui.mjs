@@ -536,6 +536,12 @@ await scenario("account security", async () => {
   check("enrollment shows a QR code and the key", true);
   check("the one-time-code field asks for autofill", await acct.eval("document.querySelector('#totp-confirm').autocomplete === 'one-time-code'"));
   const key = await acct.eval("document.querySelector('#totp-key').textContent");
+  // A wrong code first (one of the five a session may get wrong).
+  const wrong = totp(key) === "000000" ? "111111" : "000000";
+  await acct.fill("#totp-confirm", wrong);
+  await acct.key("Enter");
+  await acct.waitFor("[...document.querySelectorAll('main [role=alert]')].some((a) => a.textContent.includes('not accepted'))", 8000, "wrong code refused");
+  check("a wrong confirmation code is refused and said, and the setup stays open", await acct.eval("!!document.querySelector('#totp-key')"));
   await acct.fill("#totp-confirm", totp(key));
   await acct.key("Enter");
   const codesShown = `[...document.querySelectorAll('[role=dialog] li')].length === 10`;
@@ -552,6 +558,12 @@ await scenario("account security", async () => {
   check("the page shows the authenticator on and the codes left", true);
   const overflow = await acct.eval(OVERFLOW);
   check("the account page fits a phone", overflow.scroll <= overflow.width, overflow);
+  await acct.fill("#pw-current", "not the password");
+  await acct.fill("#pw-new", "a fresh password for rui");
+  await acct.fill("#pw-again", "a fresh password for rui");
+  await acct.key("Enter");
+  await acct.waitFor("[...document.querySelectorAll('main [role=alert]')].some((a) => a.textContent.includes('current password was not accepted'))", 8000, "wrong current password");
+  check("a wrong current password is refused and said, and the session stays", await acct.eval("location.pathname === '/account'"));
   await acct.fill("#pw-current", cfg.password);
   await acct.fill("#pw-new", "a fresh password for rui");
   await acct.fill("#pw-again", "a fresh password for rui");
