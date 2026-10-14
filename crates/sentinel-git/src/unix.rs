@@ -21,7 +21,7 @@ use sentinel_core::UnixMillis;
 use sentinel_pipeline::PinnedSource;
 use sentinel_protocol::source::{Access, Credential as SourceCredential};
 
-use crate::{Error, Merge, Result};
+use crate::{Error, Merge, Result, destination};
 
 /// A whole checkout — every Git invocation together — must finish in this.
 pub const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -201,11 +201,21 @@ pub struct FetchedFile {
     pub bytes: Vec<u8>,
 }
 
+/// The `HOME` (and `XDG_CONFIG_HOME`) every Git helper sees: a directory
+/// that does not exist. Git then finds no `~/.gitconfig` or
+/// `~/.config/git/config` on *any* version, so nothing a repository
+/// committed (a `.gitconfig` at the workspace root, which a workspace-as-HOME
+/// would have exposed to every later Git command) and nothing from the host
+/// account can configure it. `GIT_CONFIG_GLOBAL=/dev/null` is only honored
+/// from Git 2.32; this holds without it.
+const NO_HOME: &str = "/nonexistent-sentinel-git-home";
+
 pub(crate) fn git(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", dir)
+        .env("HOME", NO_HOME)
+        .env("XDG_CONFIG_HOME", NO_HOME)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -396,6 +406,7 @@ fn fetch(
     sha: &str,
     private: Option<&Private>,
     credential: Option<&Credential>,
+    pin: Option<&str>,
     deadline: Instant,
 ) -> Result<()> {
     fetch_with(
@@ -404,19 +415,24 @@ fn fetch(
         sha,
         private,
         credential,
+        pin,
         &["--depth", "1"],
         deadline,
     )
 }
 
 /// [`fetch`] with the given extra arguments before `--` (a depth, a
-/// partial-clone filter).
+/// partial-clone filter). `pin` is the `http.curloptResolve` value that
+/// restricts a manual remote's connection to the addresses already judged
+/// public ([`destination::pin`]).
+#[allow(clippy::too_many_arguments)]
 fn fetch_with(
     work: &Path,
     remote: &str,
     sha: &str,
     private: Option<&Private>,
     credential: Option<&Credential>,
+    pin: Option<&str>,
     extra: &[&str],
     deadline: Instant,
 ) -> Result<()> {
@@ -433,6 +449,9 @@ fn fetch_with(
         secrets.push(credential.secret.clone());
     }
     transport(&mut fetch, private);
+    if let Some(pin) = pin {
+        fetch.arg("-c").arg(format!("http.curloptResolve={pin}"));
+    }
     fetch.args(["fetch", "-q", "--no-tags"]);
     fetch.args(extra);
     fetch.args(["--", remote, sha]);
@@ -593,14 +612,30 @@ fn checkout_inner(
     let pre_ns = elapsed_ns(pre_started);
 
     let fetch_started = Instant::now();
-    fetch(
+    // An unbound remote — one a client named — is judged and pinned before
+    // Git connects (`destination`); its failures carry no Git diagnostic, so
+    // the worker's reach into its own network is not an oracle. A bound
+    // remote is the binding's, already approved against the allowlist.
+    let manual = access.is_none() && source.repo.starts_with("https://");
+    let pin = if access.is_none() {
+        destination::pin(&source.repo, deadline)?
+    } else {
+        None
+    };
+    match fetch(
         workspace,
         &source.repo,
         &source.sha,
         private.as_ref(),
         credential,
+        pin.as_deref(),
         deadline,
-    )?;
+    ) {
+        Err(Error::Preparation(_)) if manual => {
+            return Err(Error::Preparation(destination::UNREACHABLE.into()));
+        }
+        fetched => fetched?,
+    }
     drop(private);
     let fetch_ns = elapsed_ns(fetch_started);
 
@@ -672,12 +707,13 @@ pub fn file_at(
             sha,
             private.as_ref(),
             None,
+            None,
             &["--depth", "1", "--filter=blob:none"],
             deadline,
         )
         .is_ok();
     if !filtered {
-        fetch(work, remote, sha, private.as_ref(), None, deadline)?;
+        fetch(work, remote, sha, private.as_ref(), None, None, deadline)?;
     }
     let commit = fetch_head(work, deadline, &secrets)?;
     if filtered
@@ -689,12 +725,13 @@ pub fn file_at(
             &blob,
             private.as_ref(),
             None,
+            None,
             &["--filter=blob:none"],
             deadline,
         )
         .is_err()
     {
-        fetch(work, remote, sha, private.as_ref(), None, deadline)?;
+        fetch(work, remote, sha, private.as_ref(), None, None, deadline)?;
     }
     drop(private);
     let bytes = read_path(work, &commit, path, max_bytes, deadline, &secrets)?;
@@ -1183,6 +1220,37 @@ impl Drop for Askpass {
 #[cfg(test)]
 mod tests {
     use super::merge_ref_missing;
+
+    /// A `.gitconfig` a repository committed at its root never configures
+    /// Git, and Git's home is not the workspace: it names no directory that
+    /// exists, so no Git version can read a global config from it.
+    #[test]
+    fn a_committed_gitconfig_cannot_configure_git() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(
+            work.path().join(".gitconfig"),
+            "[user]\n\tname = planted\n[core]\n\tfsmonitor = false\n",
+        )
+        .unwrap();
+        let cmd = super::git(work.path());
+        let home = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "HOME")
+            .and_then(|(_, v)| v)
+            .unwrap()
+            .to_owned();
+        assert!(!std::path::Path::new(&home).exists());
+        assert!(!std::path::Path::new(&home).starts_with(work.path()));
+        let mut read = super::git(work.path());
+        read.args(["config", "--global", "--list"]);
+        let out = super::run(
+            read,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            "git config",
+        )
+        .unwrap();
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("planted"));
+    }
 
     /// A helper's exit wakes its wait at once, with no poll tick: parked
     /// for a minute, the wait does not return while the child lives (a

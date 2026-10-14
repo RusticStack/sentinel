@@ -2,7 +2,8 @@
 //! worker's exact-revision checkout.
 //!
 //! One discipline, one implementation: nothing from the host's Git
-//! configuration is consulted (`GIT_CONFIG_GLOBAL=/dev/null`,
+//! configuration is consulted (`HOME` names no directory,
+//! `GIT_CONFIG_GLOBAL=/dev/null`,
 //! `GIT_CONFIG_NOSYSTEM=1`), Git can never prompt, every invocation runs in
 //! its own process group under one deadline (past it the group is killed),
 //! credentials reach Git through owner-only helper files that are removed as
@@ -19,6 +20,9 @@
 //! Unix only: elsewhere every entry point refuses with
 //! [`Error::UnsupportedPlatform`], because the helper discipline (process
 //! groups, owner-only modes, `/dev/null`) is not portable.
+
+#[cfg(unix)]
+mod destination;
 
 #[cfg(unix)]
 mod unix;
