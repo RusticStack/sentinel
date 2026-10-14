@@ -30,6 +30,10 @@ export interface Member {
   kind: "person" | "service";
   role: Role;
   active: boolean;
+  /** `github` when the membership is derived from the person's linked GitHub account. */
+  source?: "app" | "github";
+  /** When GitHub last confirmed a derived membership. */
+  synced_ms?: number | null;
 }
 
 /** An OAuth grant as metadata (never a token). */
