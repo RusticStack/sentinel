@@ -43,9 +43,8 @@ fn map(error: sentinel_git::Error) -> Error {
         sentinel_git::Error::Preparation(what) => Error::Preparation(what),
         sentinel_git::Error::Mirror(what) => Error::Preparation(format!("git mirror: {what}")),
         sentinel_git::Error::Missing => Error::Preparation("revision is not present".into()),
-        // The worker checks out an already-verified revision; a merge result
-        // here means the pinned merge was never for this head — treat it as
-        // unusable source.
+        // The revision was verified before dispatch; a merge error here
+        // means the pinned merge was never for this head.
         sentinel_git::Error::Merge => {
             Error::Preparation("the pinned merge is not for this head".into())
         }
@@ -87,9 +86,9 @@ pub fn checkout_authorized(
 /// exactly as it would the direct one; `lease` names the reader lease while
 /// the worktree is materialized — the attempt id.
 ///
-/// `Error::Mirror` and `Error::Io` from the mirror mean the store could not
-/// serve — never that the revision is wrong — so the workspace is emptied
-/// and the direct path runs with the reason recorded. Anything else
+/// A mirror, IO or timeout error means the store could not serve — not that
+/// the revision is wrong — so the workspace is emptied and the direct path
+/// runs with the reason recorded (see [`through_mirror`]). Anything else
 /// propagates unchanged.
 pub fn checkout_mirrored(
     workspace: &Path,
@@ -100,9 +99,9 @@ pub fn checkout_mirrored(
     lease: &str,
     timeout: Duration,
 ) -> Result<Outcome> {
-    // A mirror serves only the bound repository whose binding filled it
-    // (P07-17): a manual run names its own remote — possibly a local path
-    // to another repository's store — so it never reads or feeds a mirror.
+    // A mirror serves only the bound repository whose binding filled it: a
+    // manual run names its own remote — possibly a local path to another
+    // repository's store — so it never reads or feeds a mirror.
     match (mirrors, access) {
         (Some(mirrors), Some(access)) => through_mirror(
             workspace,
@@ -125,8 +124,8 @@ pub fn checkout_mirrored(
 /// when it runs into trouble, and a failure that is about the mirror — lock
 /// wait, IO, a damaged store, or its share of the deadline spent (a cold
 /// full-history fetch of a large repository) — falls back to the depth-1
-/// direct fetch within what is *left* of `timeout`, never a fresh one
-/// (P07-18). `access: None` is the manual mirror mode, which the worker
+/// direct fetch within what is *left* of `timeout`, never a fresh one.
+/// `access: None` is the manual mirror mode, which the worker
 /// never uses ([`checkout_mirrored`]); tests exercise the routing with it.
 #[doc(hidden)]
 pub fn through_mirror(
