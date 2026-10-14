@@ -13,7 +13,7 @@ browser ──https──▶ reverse proxy ──▶ sentinel-web (Node, :3000) 
                                      └─ /api/v1/**, /oauth/**, /auth/github/**, /.well-known/**, /device, /mcp: proxied unchanged
 ```
 
-- **One origin.** `server/middleware/proxy.ts` passes the controller's routes through with their cookies, redirects and bodies (streamed), adding `X-Forwarded-For`; the controller counts unauthenticated budgets per client and trusts that header from loopback only ([configuration](configuration.md)). The controller's `public_url` is the origin browsers use — the web interface's — because sign-in checks `Origin` against it, and GitHub check links (`{public_url}/runs/<id>`) point at it.
+- **One origin.** `server/middleware/proxy.ts` passes the controller's routes through with their cookies, redirects and bodies. Request bodies are streamed, never buffered, under a hard ceiling that matches the controller's own (1 MiB for the API, 8 MiB for an upload chunk, 4 MiB for the GitHub webhook, 2 MiB for MCP): a larger declared length is refused with 413 before anything is relayed, and a body that grows past it, or an upload the browser aborts, fails the request (413 or 502) instead of reaching the controller as a shorter body. A path is allowlisted exactly as it will be sent: backslashes, encoded dots, slashes or percent signs, control characters and `.`/`..`/empty segments that could reach a controller route are refused with 400 rather than normalized. The proxy replaces `X-Forwarded-For` with one address (below); a client's own header is dropped. See [client addresses](#client-addresses). The controller's `public_url` is the origin browsers use — the web interface's — because sign-in checks `Origin` against it, and GitHub check links (`{public_url}/runs/<id>`) point at it.
 - **Server rendering.** The first request for a page runs on the server with the browser's cookie (`useRequestFetch`): a signed-out visitor is sent to `/login?next=…` before anything is drawn, and a signed-in one receives the page with its data. The browser then hydrates and navigates client-side. The server and the first browser render are identical (the browser test asserts no hydration mismatch): times render as UTC clock time until mounted, and a page's render clock travels in its payload.
 - **Live updates.** A page that shows something still changing opens one `EventSource` to `sentinel-web`, which holds the controller's long poll on the browser's behalf and pushes each change:
   - `/_stream/run/<run>`: `run` (the whole run document, on every version change), `status` (`live`, `busy`, `reconnecting`), `refused` (the controller's error — the session ended or access was removed; the page says so and the tenant list is re-read), `finished`.
@@ -53,8 +53,8 @@ Actions go through one helper (`useAct`): a toast for the outcome; on `forbidden
 
 - The browser holds only the controller's `__Host-sentinel_session` cookie (`Secure`, `HttpOnly`, `SameSite=Strict`) and the session's CSRF secret, kept in `localStorage` (handed over by the login response or the GitHub finish page) and sent as `x-sentinel-csrf` on mutations; server-side rendering only reads.
 - `sentinel-web` validates identifiers before they go into an upstream URL, forwards the caller's credentials unchanged and never logs them; it has no credential of its own, so it can do nothing the browser's session cannot.
-- Pages carry `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`; build assets are content-named and served `immutable`, gzip or brotli precompressed.
-- The OAuth consent and device pages and GitHub sign-in stay the controller's own server-rendered pages, under their strict policy, reached through the proxy.
+- Pages carry `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, a `Permissions-Policy` that turns off the sensors, camera, microphone, payment and USB, and a `Content-Security-Policy` (`server/plugins/csp.ts`): same-origin for everything, no objects, `base-uri 'none'`, `frame-ancestors 'none'`, and scripts and style elements only from the origin or by the SHA-256 of each inline block Nuxt rendered into that response (no `unsafe-inline`); only style attributes, such as bar widths, may be inline. The policy is not set in `nuxt dev`, whose hot reload needs inline code; the controller's own pages keep their policy. The post-sign-in `next` destination must be a path on this origin (`app/utils/redirect.ts`); `//host`, backslash and absolute URLs fall back to `/`.
+- Build assets are content-named and served `immutable`, gzip or brotli precompressed.- The OAuth consent and device pages and GitHub sign-in stay the controller's own server-rendered pages, under their strict policy, reached through the proxy.
 
 ## Running it
 
@@ -74,7 +74,16 @@ NUXT_SENTINEL_API=http://127.0.0.1:7080 HOST=127.0.0.1 PORT=3000 node web/.outpu
 | Setting | Meaning |
 |---|---|
 | `NUXT_SENTINEL_API` | the controller's `api_listen`, reached from this process (default `http://127.0.0.1:7080`) |
+| `NUXT_CLIENT_IP_HEADER` | the header the reverse proxy sets to the real client address (`x-forwarded-for`, `x-real-ip`); empty by default, which trusts no header (see below) |
 | `HOST`, `PORT` | where `sentinel-web` listens (default `0.0.0.0:3000`; bind loopback behind a proxy) |
+
+### Client addresses
+
+Three hops each see a different peer: the browser reaches the reverse proxy, the reverse proxy reaches `sentinel-web`, and `sentinel-web` reaches the controller from loopback. The controller rate-limits unauthenticated requests per client and, for a peer in its `trusted_proxies` (loopback by default, which `sentinel-web` is), keys on the last address of `X-Forwarded-For` ([configuration](configuration.md)). So `sentinel-web` must send the real client there, as the only entry:
+
+- **Default (`NUXT_CLIENT_IP_HEADER` empty):** the client is the socket peer, the reverse proxy, and no header is read. This is safe, because no client can choose its bucket, but every client behind the proxy shares one allowance.
+- **Behind a proxy you control:** set `NUXT_CLIENT_IP_HEADER` to the header that proxy sets, with the proxy overwriting or appending to it so its own entry is last (`x-forwarded-for`, or a single-valued `x-real-ip`). Only the last entry is used, and only when it is a valid address; otherwise the peer is used. Bind `sentinel-web` to loopback or a private interface that only the proxy reaches, because a client that reached it directly could set the header itself.
+- A client's own `X-Forwarded-For`, `X-Real-IP`, `Forwarded` and `X-Forwarded-Host/Proto` never reach the controller.
 
 The reverse proxy terminates TLS and sends everything for the public origin to `sentinel-web`; the controller's `public_url` is that origin ([configuration](configuration.md)). [`examples/sentinel-web.service`](../examples/sentinel-web.service) is a systemd unit.
 

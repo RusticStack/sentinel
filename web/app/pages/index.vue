@@ -7,7 +7,8 @@ if (import.meta.client) {
   // Back from GitHub sign-in: continue where the person was going.
   let back: string | null = null;
   try { back = sessionStorage.getItem("sentinel-return"); sessionStorage.removeItem("sentinel-return"); } catch { /* ignore */ }
-  if (back && back.startsWith("/") && back !== "/") await navigateTo(back, { replace: true });
+  const dest = sameOriginPath(back);
+  if (dest !== "/") await navigateTo(dest, { replace: true });
 }
 const target = session.tenants.value.find((t) => t.slug === last.value) ?? session.tenants.value[0];
 if (target) await navigateTo(`/t/${target.slug}`, { replace: true });

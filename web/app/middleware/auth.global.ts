@@ -5,7 +5,7 @@ export default defineNuxtRouteMiddleware(async (to) => {
   const session = useSession();
   const me = await session.load();
   if (to.path === "/login") {
-    if (me) return navigateTo(typeof to.query.next === "string" && to.query.next.startsWith("/") ? to.query.next : "/");
+    if (me) return navigateTo(sameOriginPath(to.query.next));
     return;
   }
   if (!me) return navigateTo({ path: "/login", query: to.fullPath === "/" ? {} : { next: to.fullPath } });
