@@ -1,4 +1,4 @@
-//! D03 worker-side capture: policy selection, confined resolution and the
+//! Worker-side artifact capture: policy selection, confined resolution and the
 //! streamed publication protocol, against a scripted `Sink` that records
 //! every call and answers on cue.
 

@@ -1,4 +1,4 @@
-//! W03 checkout and workspace behavior on Linux with a local repository:
+//! Checkout and workspace behavior on Linux with a local repository:
 //! the pinned commit is what ends up checked out even when it is not the
 //! branch head; an unknown revision, a hung fetch and a dirty workspace are
 //! refused; the askpass helper never leaves the secret behind.
@@ -261,10 +261,8 @@ fn unknown_revisions_and_hung_fetches_are_preparation_failures() {
 
 #[test]
 fn ssh_deploy_keys_use_pinned_host_trust_and_leave_no_private_files() {
-    // A real sshd is a host prerequisite, like rootless Podman: without one
-    // the SSH transport cannot be exercised, and that is recorded rather
-    // than faked. Use a full sshd path (e.g. a distribution build extracted
-    // under target/source-fixtures) and run the test when it is available.
+    // A real sshd is a host prerequisite, like rootless Podman: `SENTINEL_TEST_SSHD`
+    // or a build under target/source-fixtures; without one the test skips.
     let sshd = std::env::var("SENTINEL_TEST_SSHD").unwrap_or_else(|_| {
         let local = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -322,9 +320,7 @@ fn ssh_deploy_keys_use_pinned_host_trust_and_leave_no_private_files() {
         let _ = fs::remove_dir_all(&root);
         return;
     }
-    // A root sshd still needs its privilege-separation account and directory.
-    // Prepare them (as the host root) when the fixture runs; without them the
-    // transport cannot be exercised and that is recorded, not faked.
+    // A root sshd still needs its privilege-separation directory.
     let privsep = std::path::Path::new("/run/sshd");
     if !privsep.exists() && fs::create_dir(privsep).is_err() {
         eprintln!("SSH checkout verification requires /run/sshd; skipping");

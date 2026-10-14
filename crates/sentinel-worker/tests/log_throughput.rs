@@ -1,4 +1,4 @@
-//! Measurements for the worker's log path and helper waits (P04-19), not
+//! Measurements for the worker's log path and helper waits, not
 //! pass/fail tests: run with `--ignored --nocapture` and read the numbers.
 //!
 //! * `log_path_throughput`: 64 MiB of step output in 8 KiB chunks through

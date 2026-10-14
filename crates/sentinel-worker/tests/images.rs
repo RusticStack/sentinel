@@ -1,4 +1,4 @@
-//! K05: preparation overlaps the image pull with the checkout, pulls are
+//! Preparation overlaps the image pull with the checkout, pulls are
 //! single-flight per `name@sha256:…` across attempts, and helpers keep the
 //! worker's registry authorization. The slot mechanics live behind a stub
 //! download so nothing here needs a registry; `images`'s own tests cover

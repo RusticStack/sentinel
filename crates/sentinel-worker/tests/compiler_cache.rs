@@ -1,4 +1,4 @@
-//! K06 compiler-state persistence against a real container: a
+//! Compiler-state persistence against a real container: a
 //! `class: compiler` entry mounted writable inside the environment keeps
 //! serving across small source edits, and the tool inside the namespace —
 //! `fixtures/compiler/fakecc.sh`, a content-keyed compiler stand-in —

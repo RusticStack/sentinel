@@ -1,13 +1,12 @@
-//! The real executor under faults the Part 04 audit found untested, each
-//! against a live controller and rootless Podman (`SENTINEL_PODMAN_TESTS=1`
+//! The real executor under faults, each against a live controller and rootless Podman (`SENTINEL_PODMAN_TESTS=1`
 //! as the worker account, like `end_to_end.rs`):
 //!
-//! - P04-5: the worker's clock ahead of the controller's must not end live
+//! - Clock skew: the worker's clock ahead of the controller's must not end live
 //!   work — the lease is measured on the worker's own monotonic clock.
-//! - P04-15: a cancel that arrives while a step's `podman exec` is still
+//! - Early cancel: a cancel that arrives while a step's `podman exec` is still
 //!   starting finds nothing to signal; the next heartbeat's cancel must try
 //!   again instead of being dropped for the rest of the step.
-//! - P04-27: a stop order must not run `podman rm -f` on the heartbeat
+//! - Slow stop: a stop order must not run `podman rm -f` on the heartbeat
 //!   thread, where a slow removal would hold the next heartbeat.
 //! - Duplicate offers: an offer of an attempt the executor already awaits
 //!   or runs is acknowledged again and never starts it a second time.
@@ -259,12 +258,10 @@ fn one_job(steps: &str) -> String {
     )
 }
 
-/// P04-5. The controller renews to its own `now + LEASE_MS`; a worker
-/// whose clock runs a minute ahead reads that deadline as already past.
-/// Before the fix the watchdog compared the two clocks, ended the attempt
-/// within a second and it was recorded as a cancel nobody asked for. Now
-/// the lease is measured from the heartbeat on the worker's monotonic
-/// clock: the job runs to its end and passes.
+/// The controller renews to its own `now + LEASE_MS`; a worker whose clock
+/// runs a minute ahead would read that deadline as already past. The lease
+/// is measured from the heartbeat on the worker's monotonic clock instead:
+/// the job runs to its end and passes.
 #[test]
 fn a_worker_clock_a_minute_ahead_never_ends_live_work() {
     if !podman_enabled() {
@@ -291,12 +288,10 @@ fn a_worker_clock_a_minute_ahead_never_ends_live_work() {
     live.stop();
 }
 
-/// P04-15. The cancel lands while the step's `podman exec` is held in the
-/// shim: the container has no step process to signal, so the first cancel
-/// finds nothing (`Gone`). Before the fix that answer left the attempt
-/// marked "canceling" and every later cancel was ignored — the step then
-/// started and ran to its own end. Now the next heartbeat's cancel tries
-/// again and ends the step.
+/// The cancel lands while the step's `podman exec` is held in the shim: the
+/// container has no step process to signal, so the first cancel finds
+/// nothing (`Gone`). The next heartbeat's cancel must try again and end the
+/// step, not be ignored.
 #[test]
 fn a_cancel_that_finds_the_step_still_starting_is_tried_again() {
     if !podman_enabled() {
@@ -347,12 +342,11 @@ fn a_cancel_that_finds_the_step_still_starting_is_tried_again() {
     live.stop();
 }
 
-/// P04-27. The controller stops counting an attempt as held (here it is
-/// abandoned under the worker's fence); the next heartbeat's answer orders
-/// the worker to stop it. The container's removal is slow (the shim sleeps
-/// 3 s before `podman rm`). Before the fix `stop` ran the removal inline on
-/// the heartbeat thread; now it returns at once, the removal happens off
-/// that thread, and the session stays up.
+/// The controller stops counting an attempt as held (here it is abandoned
+/// under the worker's fence); the next heartbeat's answer orders the worker
+/// to stop it. The container's removal is slow (the shim sleeps 3 s before
+/// `podman rm`): `stop` must return at once, the removal happen off the
+/// heartbeat thread, and the session stay up.
 #[test]
 fn a_stop_order_never_holds_the_heartbeat_thread() {
     if !podman_enabled() {
@@ -399,11 +393,10 @@ fn a_stop_order_never_holds_the_heartbeat_thread() {
 /// by itself, but a later session (after a reconnect) asks the executor,
 /// which must know the attempt as its own: acknowledge it again and change
 /// nothing. The duplicate arrives twice here — while the attempt awaits its
-/// spec (held back by the probe) and while its step runs. Before the fix a
-/// running attempt was taken as a new offer: it was held twice (running and
-/// awaiting a spec), its spec was asked for again and it was started a
-/// second time, which failed on its own workspace and ended the job
-/// `infra_failed`.
+/// spec (held back by the probe) and while its step runs. A duplicate must
+/// never be taken as a new offer: that would hold the attempt twice, ask
+/// for its spec again and start it a second time, which fails on its own
+/// workspace and ends the job `infra_failed`.
 #[test]
 fn a_repeated_offer_is_acknowledged_again_and_never_started_twice() {
     if !podman_enabled() {
