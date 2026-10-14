@@ -650,7 +650,7 @@ fn rpc_error(id: Option<Value>, code: i32, message: &str, status: u16) -> Reply 
 mod tests {
     use super::*;
 
-    /// P11-5: one account cannot take the table from everyone else; its
+    /// One account cannot take the table from everyone else; its
     /// seventeenth session replaces its least recently used one.
     #[test]
     fn mcp_sessions_are_capped_per_user_with_lru_eviction() {

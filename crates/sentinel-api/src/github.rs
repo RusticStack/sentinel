@@ -1,7 +1,7 @@
-//! GitHub web sign-in over HTTP (U07): the A04 verified flow
-//! (`sentinel_github::oauth`, `sentinel_store::sign_in`) behind two routes,
-//! so the OAuth consent page, the device page and the first page can sign in
-//! an account that exists only through GitHub.
+//! GitHub web sign-in over HTTP: the verified flow (`sentinel_github::oauth`,
+//! `sentinel_store::sign_in`) behind the `/auth/github/*` routes, so the OAuth
+//! consent page, the device page and the first page can sign in an account
+//! that exists only through GitHub.
 //!
 //! - `GET /auth/github/start?return_to=<path>` records a single-use state with
 //!   its destination, sets the browser's half as the `__Host-sentinel_signin`
@@ -14,7 +14,7 @@
 //!   immutable account ID and resolves it only through a linked identity of
 //!   an active account. Nothing is matched by login or email.
 //!
-//! A successful callback issues nothing yet. It is a navigation GitHub
+//! A successful callback issues no session itself. It is a navigation GitHub
 //! started, and a browser never sends the `SameSite=Strict` session cookie
 //! on it, so the session this browser already holds cannot be seen there.
 //! The callback parks a hand-off — the resolved account, keyed by the digest
@@ -22,8 +22,8 @@
 //! [`HANDOFF_TTL`] — and answers a small page that moves the browser on to
 //! `GET /auth/github/finish`. That navigation is started by a Sentinel page,
 //! so it is same-origin and carries the Strict cookie: `finish` revokes the
-//! session the browser held and issues the new one in one transaction
-//! (P09S-10), then answers the page that moves on to the destination, where
+//! session the browser held and issues the new one in one transaction, then
+//! answers the page that moves on to the destination, where
 //! the consent page mints its form token from the new session's CSRF digest.
 //! `finish` refuses a request a browser marks as not same-origin
 //! (`Sec-Fetch-Site`), so another site cannot complete it without the old
@@ -41,8 +41,8 @@
 //! The routes are admitted per client ([`crate::oauth::limit`]). The code
 //! exchange and the identity read are outbound calls of up to ten seconds
 //! each, so they draw on their own [`crate::OUTBOUND`] budget (not shared
-//! with CIMD metadata fetches, which cannot make sign-in busy); a callback past it is told to
-//! reload, with its state still unspent.
+//! with CIMD metadata fetches, which cannot make sign-in busy); a callback
+//! past it is told to reload, with its state still unspent.
 
 use std::{
     collections::VecDeque,

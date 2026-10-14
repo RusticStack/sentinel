@@ -4,8 +4,8 @@
 //! route work — so request concurrency is `handlers`, reader threads are
 //! `connections`, and nothing else spawns. A long poll gives its handler
 //! permit back while it is parked ([`Request::yield_handler`]): waiting is
-//! not work, and its own subscriber budget bounds it. Heads and client bodies are
-//! deadline-bounded; a stalled write fails its syscall instead of holding
+//! not work, and its own subscriber budget bounds it. Heads and client bodies
+//! are deadline-bounded; a stalled write fails its syscall instead of holding
 //! a handler permit forever. Responses always carry an explicit
 //! `content-length` (routes know their lengths) or close the connection.
 //!
@@ -45,8 +45,8 @@ pub(crate) struct Tune {
     /// Total time allowed for one client body.
     pub body_time: Duration,
     /// Unauthenticated bodies read at once, each under no handler permit
-    /// ([`Request::public_body`]); slow ones queue behind each other here (one slot per client key),
-    /// never behind real work.
+    /// ([`Request::public_body`]); slow ones queue behind each other here (one
+    /// slot per client key), never behind real work.
     pub public_bodies: usize,
     /// Total time one unauthenticated body may take, waiting for its
     /// reader slot included.
@@ -1207,9 +1207,8 @@ pub(crate) fn listen(
     exempt: Vec<TrustedProxy>,
 ) -> io::Result<Conns> {
     // A blocking accept: the acceptor wakes when a connection arrives (and
-    // on shutdown, when `Conns::shutdown` connects to it), instead of
-    // sleeping `poll` between nonblocking attempts — which delayed every new
-    // connection by up to a whole poll.
+    // on shutdown, when `Conns::close` connects to it), so no connection
+    // waits out a `poll` sleep.
     listener.set_nonblocking(false)?;
     let wake = listener.local_addr()?;
     let (sockets, permits) = (
@@ -1757,8 +1756,8 @@ mod tests {
     }
 
     /// A new connection is accepted when it arrives, not at the next poll:
-    /// with a 100 ms poll (the production value) the old nonblocking accept
-    /// made the median connect-to-response time about 100 ms.
+    /// with a 100 ms poll (the production value) a polling accept would put
+    /// the median connect-to-response time near 100 ms.
     #[test]
     fn a_new_connection_is_served_without_waiting_for_a_poll() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
