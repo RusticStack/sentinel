@@ -1,19 +1,3 @@
-//! Rootless Podman containers for one attempt each.
-//!
-//! The enforceable baseline applied to every container:
-//! `--cpus`, `--memory` with swap capped at the same value, `--pids-limit`,
-//! `--network none`, a read-only root filesystem with a tmpfs `/tmp`, every
-//! capability dropped, `no-new-privileges`, and the user namespace rootless
-//! Podman gives (uid 0 inside is the worker user outside). The writable bind
-//! mounts are the workspace and the attempt's private cache views —
-//! nothing shared, nothing of the host beyond them. There is no Docker
-//! socket, no privileged flag and nothing a pipeline can set to loosen any
-//! of this.
-//!
-//! Ownership is tracked by labels: every container is `sentinel-<attempt>`
-//! and carries `io.sentinel.worker` and `io.sentinel.attempt`, so what this
-//! worker owns can be listed from the runtime after a restart.
-
 use std::{
     path::Path,
     process::Command,
@@ -27,25 +11,14 @@ use crate::{Error, Result, process};
 
 pub const IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 pub const CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(60);
-/// Graceful stop budget before SIGKILL; the keepalive process exits on TERM.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
-/// Default process budget per container: enough for any build, small enough
-/// that a fork bomb ends inside its cgroup.
 pub const DEFAULT_PIDS_LIMIT: u32 = 4096;
-/// How long past its steps' budget a container's keepalive outlives them:
-/// room for the secret-clearing passes, artifact capture and the graceful
-/// stop that precede the attempt's own teardown. Past it the keepalive ends
-/// by itself, and with it the container's whole PID namespace.
 pub const KEEPALIVE_SLACK_SECS: u64 = 5 * 60;
-/// The keepalive's bound when the caller names none: the pipeline's longest
-/// allowed job timeout plus [`KEEPALIVE_SLACK_SECS`].
 pub const KEEPALIVE_MAX_SECS: u64 = 24 * 60 * 60 + KEEPALIVE_SLACK_SECS;
-/// Where the workspace is mounted inside every container.
 pub const WORKSPACE_MOUNT: &str = "/workspace";
 pub const LABEL_WORKER: &str = "io.sentinel.worker";
 pub const LABEL_ATTEMPT: &str = "io.sentinel.attempt";
 
-/// The runtime as probed at start. Rootless is required, not preferred.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Runtime {
     pub version: String,
@@ -54,33 +27,19 @@ pub struct Runtime {
     pub cgroup_manager: String,
 }
 
-/// Where an image and the containers made from it live.
-///
-/// containers/image reuses a layer already present in the store it pulls
-/// into without fetching it from the source registry: an authorized pull
-/// is checked per manifest, not per layer. A tenant that replays another
-/// tenant's manifest and config from a registry of its own would then get
-/// that tenant's private layers out of a shared store. So an image pulled
-/// with a tenant's `registry_auth` goes to that tenant's own store, and the
-/// shared store only ever receives anonymously pulled — public — layers.
+// Credentialed pulls go to the tenant's own store: containers/image reuses resident layers without asking the registry, so a shared store would leak one tenant's private layers to another.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Store {
-    /// The worker account's default rootless store.
     Shared,
-    /// One tenant's private store: `--root`/`--runroot` on every command.
     Private {
         graph: std::path::PathBuf,
         run: std::path::PathBuf,
     },
 }
 
-/// Private stores live under `<data_dir>/image-stores/<tenant>/graph`,
-/// their run roots under the worker's runtime directory.
 pub const STORES_DIR: &str = "image-stores";
 
 impl Store {
-    /// `tenant`'s private store under the worker data directory `root`,
-    /// created owner-only on first use.
     pub fn private(root: &Path, tenant: [u8; 16]) -> Result<Store> {
         let name: String = tenant.iter().map(|b| format!("{b:02x}")).collect();
         let graph = root.join(STORES_DIR).join(&name).join("graph");
@@ -96,9 +55,6 @@ impl Store {
         Ok(store)
     }
 
-    /// The shared store and every private one this data directory holds —
-    /// what restart reconciliation lists containers in. Bounded by
-    /// `MAX_LIST_ITEMS` stores.
     pub fn all(root: &Path) -> Vec<Store> {
         let mut stores = vec![Store::Shared];
         if let Ok(entries) = std::fs::read_dir(root.join(STORES_DIR)) {
@@ -130,10 +86,6 @@ impl Store {
     }
 }
 
-/// A private store's run root. Podman refuses one longer than 50 bytes, so
-/// it is a short name keyed by the graph root, in the runtime directory
-/// (tmpfs, cleared at boot like any run root) or, without one, `/tmp` —
-/// created owner-only and refused if someone else's.
 fn run_root(graph: &Path) -> std::path::PathBuf {
     use std::os::unix::ffi::OsStrExt;
     let key = blake3::hash(graph.as_os_str().as_bytes()).to_hex();
@@ -142,9 +94,6 @@ fn run_root(graph: &Path) -> std::path::PathBuf {
         .join(format!("sentinel-sr-{}", &key[..12]))
 }
 
-/// Create `dir` and its missing parents owner-only; an existing directory
-/// that is a symlink, not a directory, not this user's or open to others
-/// is refused.
 fn private_dirs(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     std::fs::DirBuilder::new()
@@ -162,8 +111,6 @@ fn private_dirs(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `DOCKER_HOST` is removed so a stray daemon address cannot redirect a
-/// rootless operation. The pull path also removes auth-file overrides.
 fn podman() -> Command {
     let mut cmd = Command::new("podman");
     cmd.env_remove("DOCKER_HOST");
@@ -171,16 +118,12 @@ fn podman() -> Command {
     cmd
 }
 
-/// [`podman`] against `store`.
 fn podman_in(store: &Store) -> Command {
     let mut cmd = podman();
     store.apply(&mut cmd);
     cmd
 }
 
-/// Find the executable before `pull` clears PATH. The containers/image
-/// credential-helper lookup uses PATH, so leaving it populated would let a
-/// host-wide helper authorize a tenant's pull outside its scoped auth file.
 fn podman_executable() -> Result<std::path::PathBuf> {
     let Some(path) = std::env::var_os("PATH") else {
         return Err(Error::Preparation(
@@ -209,10 +152,8 @@ fn podman_executable() -> Result<std::path::PathBuf> {
     ))
 }
 
-/// A pull is authorized solely by its explicit auth file. Keeping external
-/// credential-helper binaries off the subprocess PATH prevents worker-wide
-/// helper credentials from overriding the tenant-scoped file.
 fn podman_for_pull() -> Result<Command> {
+    // Resolved before PATH is cleared: the credential-helper lookup uses PATH, so a host-wide helper could authorize a tenant's pull.
     let mut cmd = Command::new(podman_executable()?);
     cmd.env_remove("DOCKER_HOST");
     cmd.env_remove("REGISTRY_AUTH_FILE");
@@ -234,8 +175,6 @@ fn deadline(timeout: Duration) -> Instant {
     Instant::now() + timeout
 }
 
-/// Ask the runtime what it is; refuse anything but rootless Podman on
-/// cgroup v2, because the limits above are only known to hold there.
 pub fn probe() -> Result<Runtime> {
     let mut cmd = podman();
     cmd.args([
@@ -277,8 +216,6 @@ pub fn probe() -> Result<Runtime> {
     })
 }
 
-/// Where the image store keeps its layers (`GraphRoot`): the filesystem a
-/// prefetch's disk reserve is measured on.
 pub fn graph_root() -> Result<std::path::PathBuf> {
     let mut cmd = podman();
     cmd.args(["info", "--format", "{{.Store.GraphRoot}}"]);
@@ -294,8 +231,6 @@ pub fn graph_root() -> Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(root))
 }
 
-/// Bytes `image` takes in the local store (`podman image inspect`'s
-/// `Size`), `None` when it is not there or cannot be read.
 pub fn image_bytes(image: &str) -> Option<u64> {
     let mut cmd = podman();
     cmd.args(["image", "inspect", "--format", "{{.Size}}", "--", image]);
@@ -311,21 +246,14 @@ pub fn image_bytes(image: &str) -> Option<u64> {
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
-/// One image a store holds, as `podman images` reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredImage {
-    /// The full image id.
     pub id: String,
-    /// Bytes podman accounts to it; layers shared between images count for
-    /// each, so a store's sum errs high.
     pub bytes: u64,
-    /// Containers (running or not) using it: podman refuses to remove those.
     pub containers: u32,
-    /// Its manifest digest, `sha256:…`.
     pub digest: String,
 }
 
-/// Every image in `store`, one compact line each (`MAX_LIST_ITEMS` at most).
 pub fn list_images(store: &Store) -> Result<Vec<StoredImage>> {
     let mut cmd = podman_in(store);
     cmd.args([
@@ -367,8 +295,6 @@ fn parse_images(stdout: &[u8]) -> Vec<StoredImage> {
         .collect()
 }
 
-/// Remove one image by id — never forced, so an image a container still
-/// uses stays (podman refuses). Returns whether it went.
 pub fn remove_image(store: &Store, id: &str) -> bool {
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return false;
@@ -378,13 +304,6 @@ pub fn remove_image(store: &Store, id: &str) -> bool {
     process::run(cmd, deadline(Duration::from_secs(60)), "podman rmi").is_ok_and(|o| o.success())
 }
 
-/// Make `image` (a `name@sha256:…` reference) available in `store`.
-/// The returned bool is whether `podman image exists` found the digest
-/// before the pull (`image_present`); the explicit pull still runs with
-/// the attempt's auth file so a resident manifest cannot bypass
-/// authorization. Resident *layers* are reused by the runtime without a
-/// fetch, which is why a credentialed pull goes to the tenant's private
-/// [`Store`]. `cancel` kills a pull under way.
 pub fn pull(
     image: &str,
     authfile: &Path,
@@ -395,21 +314,10 @@ pub fn pull(
     pull_checked(image, authfile, store, timeout, cancel, true)
 }
 
-/// Whether a pull must ask the registry even when the digest is resident.
-/// A credentialed pull must: its authorization is what the registry
-/// decides, now, for this tenant. So must any pull into a tenant's private
-/// store. An anonymous pull into the shared store asks nobody's permission —
-/// the shared store only ever holds what was anonymously pullable, and a
-/// digest names immutable content — so a resident image is used as it is.
-/// Asking anyway cost a registry round trip per job (about 1 s) and, at
-/// Docker Hub's anonymous limit of 100 manifest requests an hour, failed
-/// every job past the hundredth.
 pub fn registry_check_needed(anonymous: bool, store: &Store) -> bool {
     !(anonymous && *store == Store::Shared)
 }
 
-/// [`pull`], with the registry check skipped for a resident image when
-/// `recheck` is false ([`registry_check_needed`]).
 pub fn pull_checked(
     image: &str,
     authfile: &Path,
@@ -433,8 +341,6 @@ pub fn pull_checked(
         return Ok(true);
     }
     let cmd = podman_pull_command(image, authfile, store)?;
-    // Even a resident digest must pass the registry's current authorization
-    // check for this tenant before a container can use it.
     let output = process::run_canceled(cmd, deadline(timeout), "podman pull", None, Some(cancel))?;
     if output.success() {
         Ok(present)
@@ -446,27 +352,16 @@ pub fn pull_checked(
     }
 }
 
-/// The job's budget, from its compiled resources.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub cpu_millis: u32,
     pub memory_bytes: u64,
     pub pids: u32,
-    /// The job's declared scratch disk. Podman cannot meter a bind mount's
-    /// total, so it bounds what it can: no single file a step writes may
-    /// exceed it (`--ulimit fsize`). The total is the worker's admission
-    /// check. `0` sets no file-size limit.
     pub disk_bytes: u64,
-    /// How long the container may live — the job's timeout plus
-    /// [`KEEPALIVE_SLACK_SECS`] — after which its keepalive exits and the
-    /// kernel takes every process in the container with it, so a worker
-    /// that died without tearing the attempt down leaves nothing running
-    /// past its budget. `0` means [`KEEPALIVE_MAX_SECS`].
     pub lifetime_secs: u64,
 }
 
 impl Limits {
-    /// The keepalive's bound in seconds.
     fn keepalive_secs(&self) -> u64 {
         match self.lifetime_secs {
             0 => KEEPALIVE_MAX_SECS,
@@ -475,52 +370,32 @@ impl Limits {
     }
 }
 
-/// The container's main process: counts `n` seconds down (argument one) and
-/// exits, or exits at once on `TERM`/`INT`. A bounded loop in POSIX `sh`
-/// rather than `podman create --timeout`, which not every Podman supports.
 const KEEPALIVE: &str =
     "trap 'exit 0' TERM INT; n=$1; while [ \"$n\" -gt 0 ]; do sleep 1; n=$((n-1)); done";
 
-/// One extra writable bind mount: `host` appears at `container`. Cache
-/// entries that declare an absolute path use it — the workspace
-/// mount already covers every relative path, so nothing else asks.
 #[derive(Clone, Debug)]
 pub struct Mount {
-    /// The host directory bound in; must exist.
     pub host: std::path::PathBuf,
-    /// The absolute path the container sees (`/cache`, …).
     pub container: String,
-    /// Secret mounts are read-only; cache mount views remain writable.
     pub read_only: bool,
 }
 
-/// One running container, created with the limits and torn down whole.
 #[derive(Debug)]
 pub struct Container {
     name: String,
     attempt: AttemptId,
-    /// The container's cgroup on the host (`/sys/fs/cgroup<path>`), read
-    /// after start so its counters can be inspected without placing a
-    /// process inside a cgroup that may already be at its limit.
     cgroup: Option<std::path::PathBuf>,
-    /// Host pid of the container's keepalive, spared by a graceful stop.
     init_pid: Option<i32>,
-    /// The store the container (and its image) lives in.
     store: Store,
 }
 
-/// How a termination ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Terminated {
-    /// Every step process left within the grace period after `SIGTERM`.
     Graceful,
-    /// The grace period passed; the container was stopped and removed.
     Forced,
-    /// Nothing was running any more.
     Gone,
 }
 
-/// Inspect a container by name: (host pid of its init, host cgroup path).
 fn inspect_named(name: &str, store: &Store) -> Result<(Option<i32>, Option<std::path::PathBuf>)> {
     let mut inspect = podman_in(store);
     inspect.args([
@@ -551,16 +426,10 @@ fn inspect_named(name: &str, store: &Store) -> Result<(Option<i32>, Option<std::
     Ok((pid, cgroup))
 }
 
-/// Host pids of every process in the container's cgroup — and in every
-/// cgroup nested under it, where a runtime may place the exec'd step —
-/// except its init. The walk is bounded in depth and in directories.
 fn step_pids(cgroup: &std::path::Path, init: Option<i32>) -> Vec<i32> {
     cgroup_pids(cgroup, init).0
 }
 
-/// [`step_pids`], and whether the walk saw the whole tree: `false` when a
-/// bound cut it short or a `cgroup.procs` could not be read, so a caller
-/// that must know the container is empty can refuse to trust the list.
 fn cgroup_pids(cgroup: &std::path::Path, init: Option<i32>) -> (Vec<i32>, bool) {
     const MAX_DEPTH: usize = 8;
     const MAX_CGROUPS: usize = 256;
@@ -576,8 +445,6 @@ fn cgroup_pids(cgroup: &std::path::Path, init: Option<i32>) -> (Vec<i32>, bool) 
                     .filter_map(|l| l.trim().parse::<i32>().ok())
                     .filter(|pid| Some(*pid) != init),
             ),
-            // A cgroup removed under the walk — or the whole container's,
-            // once it is gone — has no processes.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => complete = false,
         }
@@ -603,29 +470,19 @@ fn cgroup_pids(cgroup: &std::path::Path, init: Option<i32>) -> (Vec<i32>, bool) 
     (pids, complete)
 }
 
-/// Whether `pid` has exited and only waits to be reaped (or is gone): a
-/// zombie holds no memory, environment or open file any more.
 fn exited(pid: i32) -> bool {
     let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else {
         return true;
     };
-    // `pid (comm) S …`: the state follows the last `)`, as comm may hold one.
+    // The state follows the last ')', as comm may contain one.
     let Some(close) = stat.iter().rposition(|b| *b == b')') else {
         return false;
     };
     matches!(stat.get(close + 2), Some(b'Z' | b'X'))
 }
 
-/// How long clearing a container of stray processes may take before the
-/// secret step it guards is refused.
 pub const CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Graceful then forced termination of a container by name: `SIGTERM`
-/// to every step process in the container's cgroup — the keepalive is
-/// spared so the container stays up for the signal to be handled — then,
-/// if any is still there after `grace`, `podman stop -t 0` and removal.
-/// Rootless: the processes are the worker account's, so the signal needs
-/// no privilege.
 pub fn terminate_named(name: &str, store: &Store, grace: Duration) -> Result<Terminated> {
     let (init, cgroup) = match inspect_named(name, store) {
         Ok(found) => found,
@@ -635,12 +492,6 @@ pub fn terminate_named(name: &str, store: &Store, grace: Duration) -> Result<Ter
         remove_named(name, store)?;
         return Ok(Terminated::Forced);
     };
-    // Frozen while listing and signalling, so no listed process can exit and
-    // have its pid reused by an unrelated process before the signal lands.
-    // The signal stays pending on a frozen task and is delivered at the
-    // thaw, which happens before the grace wait (a frozen task would never
-    // handle it). Where the freezer cannot be used the signal goes out
-    // unfrozen, to a pid that may just have exited.
     let frozen = freeze(&cgroup, true, Instant::now() + CLEAR_TIMEOUT);
     let pids = step_pids(&cgroup, init);
     for pid in &pids {
@@ -668,16 +519,11 @@ pub fn terminate_named(name: &str, store: &Store, grace: Duration) -> Result<Ter
     Ok(Terminated::Forced)
 }
 
-/// How one step's process ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Exit {
-    /// Exit status; `None` when the process was killed by a signal.
     pub code: Option<i32>,
-    /// The signal number when killed, decoded from Podman's `128 + n`.
     pub signal: Option<i32>,
-    /// The step ran past its timeout and the container was stopped.
     pub timed_out: bool,
-    /// Bounded tails of the process's output.
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
@@ -691,9 +537,6 @@ impl Drop for Exit {
 }
 
 impl Exit {
-    /// The last non-empty stderr line, printable characters only, **not
-    /// redacted**: a step's own failure detail goes through the attempt's
-    /// [`crate::attempt::Output::excerpt`] instead.
     pub fn stderr_excerpt(&self) -> String {
         crate::redact::excerpt(&self.stderr)
     }
@@ -704,11 +547,6 @@ impl Container {
         &self.name
     }
 
-    /// Create and start the attempt's container with `workspace` mounted at
-    /// `/workspace` and a keepalive as its main process. Steps then run in
-    /// it with [`Container::exec`]; the image must provide `/bin/sh`.
-    /// `mounts` are extra writable binds (cache paths declared absolute);
-    /// a mount whose `container` is not absolute makes `create` fail.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         worker: WorkerId,
@@ -748,15 +586,8 @@ impl Container {
                 "ALL",
                 "--security-opt",
                 "no-new-privileges",
-                // No core dumps: a crashing step would otherwise
-                // hand its memory — delivered secrets included — to the
-                // host's core handler. Soft and hard, so nothing inside
-                // can raise it back.
                 "--ulimit",
                 "core=0:0",
-                // The container's own main process is the keepalive, whatever
-                // the image's ENTRYPOINT says: left alone, an image
-                // entrypoint would take the keepalive for its arguments.
                 "--entrypoint",
                 "/bin/sh",
                 "--workdir",
@@ -811,19 +642,10 @@ impl Container {
         Ok(container)
     }
 
-    /// Run one step inside the container: its argv, its environment (the
-    /// worker's `extra` last so a pipeline cannot spoof it), its working
-    /// directory under the workspace, its timeout. A timeout stops the
-    /// whole container: steps are sequential and the attempt is over.
     pub fn exec(&self, step: &StepCommand, extra: &[(String, String)]) -> Result<Exit> {
         self.exec_streaming(step, extra, None)
     }
 
-    /// [`Container::exec`] with the step's output streamed to `sink` as it
-    /// is produced, in addition to the bounded tails. Secret environment
-    /// values never pass through here: Podman would write them into the
-    /// exec session's spec on disk. The attempt delivers them in
-    /// a file on the step's private mount instead and wraps `argv`.
     pub fn exec_streaming(
         &self,
         step: &StepCommand,
@@ -843,8 +665,6 @@ impl Container {
         let timeout = Duration::from_secs(step.timeout_secs.max(1));
         match process::run_with(cmd, deadline(timeout), "step", sink) {
             Ok(mut output) => Ok(Exit {
-                // Podman reports a signal death as 128 + n; 125–127 are the
-                // client's own failures, which we surface as-is.
                 signal: output.code.filter(|c| *c > 128).map(|c| c - 128),
                 code: output.code.filter(|c| *c <= 128),
                 timed_out: false,
@@ -852,8 +672,6 @@ impl Container {
                 stderr: std::mem::take(&mut output.stderr),
             }),
             Err(Error::Timeout(_)) => {
-                // The step is over either way; a stop that fails here is
-                // settled by the teardown's forced removal.
                 let _ = self.stop(Duration::ZERO);
                 Ok(Exit {
                     code: None,
@@ -867,11 +685,6 @@ impl Container {
         }
     }
 
-    /// The cgroup's OOM-kill counter, compared before and after a failed
-    /// step to tell a memory kill from any other death by `SIGKILL`. Read
-    /// from the host's view of the cgroup: after an OOM the pages that
-    /// caused it (a tmpfs, say) stay charged, and a process exec'd inside
-    /// to read the counter could be the next victim.
     pub fn oom_kills(&self) -> Result<u64> {
         let text = match &self.cgroup {
             Some(dir) => std::fs::read_to_string(dir.join("memory.events"))?,
@@ -901,8 +714,6 @@ impl Container {
             .unwrap_or(0))
     }
 
-    /// `podman stop`: TERM to the container's processes, KILL after `grace`.
-    /// A stop the runtime refused or that timed out is an error.
     pub fn stop(&self, grace: Duration) -> Result<()> {
         let mut cmd = podman_in(&self.store);
         cmd.args(["stop", "-t"])
@@ -933,10 +744,6 @@ impl Container {
         }
     }
 
-    /// Stop and remove. Nothing of the attempt survives in the runtime:
-    /// the removal (`rm -f`, which kills what is left) runs even when the
-    /// graceful stop failed or timed out, and the first failure is what is
-    /// returned.
     pub fn destroy(self) -> Result<()> {
         let stopped = self.stop(Duration::from_secs(2));
         let removed = self.remove();
@@ -951,21 +758,7 @@ impl Container {
         &self.store
     }
 
-    /// Kill every process in the container but its keepalive, and wait
-    /// until none is left. All steps run as one user in one PID
-    /// namespace, so a process an earlier step left running — a daemon, a
-    /// `setsid` watcher — could read a later step's environment through
-    /// `/proc` or its files under the secret mount. The attempt clears the
-    /// container before it materializes a step's secrets and again when
-    /// that step ends, which is what makes secrets step-scoped.
-    ///
-    /// Host-side, no exec: the cgroup is frozen so nothing can fork or exit
-    /// (and free its pid for reuse) between listing and signalling, every
-    /// process but the keepalive gets `SIGKILL` — which reaches frozen tasks
-    /// — and the cgroup is thawed. A process that already exited and only
-    /// awaits its reaper counts as gone. Refused (fail closed) when the
-    /// cgroup is not visible, the tree is past the walk's bounds, or the
-    /// container is not empty within [`CLEAR_TIMEOUT`].
+    // All steps share one PID namespace, so a leftover process could read a later step's secrets through /proc.
     pub fn clear_strays(&self) -> Result<usize> {
         let cgroup = self.cgroup.as_ref().ok_or_else(|| {
             Error::Runtime("the container's cgroup is not visible; secrets are refused".into())
@@ -1007,8 +800,6 @@ impl Container {
     }
 }
 
-/// Freeze (or thaw) a cgroup v2 subtree and wait until the kernel says it
-/// is; `false` when the freezer could not be used or did not settle.
 fn freeze(cgroup: &Path, on: bool, until: Instant) -> bool {
     if std::fs::write(cgroup.join("cgroup.freeze"), if on { "1" } else { "0" }).is_err() {
         return false;
@@ -1027,14 +818,10 @@ fn freeze(cgroup: &Path, on: bool, until: Instant) -> bool {
     }
 }
 
-/// Every container this worker created in the shared store that the
-/// runtime still knows about, running or not.
 pub fn owned(worker: WorkerId) -> Result<Vec<(AttemptId, String)>> {
     owned_in(worker, &Store::Shared)
 }
 
-/// [`owned`] in `store` — the ownership record restart reconciliation reads,
-/// asked of every store the data directory holds.
 pub fn owned_in(worker: WorkerId, store: &Store) -> Result<Vec<(AttemptId, String)>> {
     let mut cmd = podman_in(store);
     cmd.args(["ps", "-a", "--filter"])
@@ -1060,8 +847,6 @@ pub fn owned_in(worker: WorkerId, store: &Store) -> Result<Vec<(AttemptId, Strin
         .collect())
 }
 
-/// Remove a container by name from `store`, whatever its state: the
-/// reaper's tool.
 pub fn remove_named(name: &str, store: &Store) -> Result<()> {
     Container {
         name: name.to_owned(),
@@ -1077,9 +862,6 @@ pub fn remove_named(name: &str, store: &Store) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Only an anonymous pull into the shared store may use a resident
-    /// digest without asking the registry; a credential or a private store
-    /// always asks.
     #[test]
     fn only_an_anonymous_shared_pull_skips_the_registry_for_a_resident_image() {
         let private = Store::Private {
@@ -1092,9 +874,6 @@ mod tests {
         assert!(registry_check_needed(false, &private));
     }
 
-    /// The image listing the reclamation pass reads — one compact line
-    /// per image; malformed lines and non-digest ids are skipped, never
-    /// removed by mistake.
     #[test]
     fn the_image_listing_parses_and_skips_what_it_cannot_trust() {
         let out = b"b116e155 4660174 0 sha256:73aa\n\
@@ -1125,10 +904,6 @@ mod tests {
         assert!(!remove_image(&Store::Shared, ""));
     }
 
-    /// Ordinary Podman commands remove only the daemon override. Pulls use
-    /// an explicit per-attempt auth file and a cleared PATH, so neither
-    /// environment auth overrides nor host credential helpers can provide
-    /// worker-wide credentials.
     #[test]
     fn ordinary_podman_commands_remove_daemon_override() {
         let cmd = podman();
@@ -1157,7 +932,6 @@ mod tests {
             Path::new("/worker/tenant/auth.json"),
             &Store::Shared,
         ) else {
-            // Portable checks need not have Podman installed.
             return;
         };
         let env: std::collections::HashMap<_, _> = cmd
@@ -1178,14 +952,9 @@ mod tests {
         );
         assert!(args.iter().any(|arg| arg == "pull"));
         assert!(!args.iter().any(|arg| arg.starts_with("--policy")));
-        // The shared store takes no store flags.
         assert!(!args.iter().any(|arg| arg == "--root" || arg == "--runroot"));
     }
 
-    /// A credentialed pull and every later command on its
-    /// container name the tenant's private store, whose graph root lives
-    /// under the data directory and whose run root under the runtime one;
-    /// two tenants never share one.
     #[test]
     fn a_private_store_is_per_tenant_and_named_on_every_command() {
         let temp = tempfile::tempdir().unwrap();
@@ -1221,14 +990,11 @@ mod tests {
             let pull = args(&pull);
             assert_eq!(&pull[..4], exec.as_slice(), "global flags precede `pull`");
         }
-        // Reconciliation finds both private stores and the shared one.
         let all = Store::all(temp.path());
         assert_eq!(all.len(), 3);
         assert!(all.contains(&Store::Shared) && all.contains(&a) && all.contains(&b));
     }
 
-    /// The worker's own registry login must not be able to provide a pull
-    /// credential after PATH has been cleared.
     #[test]
     fn pull_command_resolves_podman_before_clearing_path() {
         if let Ok(cmd) =

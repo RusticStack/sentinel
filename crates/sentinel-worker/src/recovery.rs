@@ -1,18 +1,3 @@
-//! Worker restart reconciliation: what the previous process left
-//! behind, settled before a single new offer is taken.
-//!
-//! An attempt in progress is recorded on disk the moment it is spawned —
-//! `<data_dir>/attempts/<attempt>` holding its fence — and removed when
-//! its report has gone out. On start, every marker still there is an
-//! attempt whose end this process never saw. Its container is removed
-//! (it must not keep running unobserved), its workspace destroyed (a
-//! fresh attempt gets a fresh one), and its spool is kept: whatever it
-//! printed is still delivered and closed. Once the session is up the
-//! attempt is **abandoned** to the controller, which reconciles it as an
-//! infrastructure failure — the steps are never run again, because whether
-//! they had side effects is unknown. Containers the runtime still holds
-//! under this worker's label without a marker are stale and reaped too.
-
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -26,30 +11,21 @@ use crate::{Result, podman, spool::Spool, workspace};
 pub const ATTEMPTS_DIR: &str = "attempts";
 const SECRET_DELIVERY_DIR: &str = "secret-delivery";
 
-/// A marker an earlier process left: the attempt and its fence, plus
-/// whether its log end had already gone out before the end report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Marker {
     pub attempt: AttemptId,
     pub fence: Fence,
-    /// `complete` had the log's end out (acked under protocol 5, sent on
-    /// earlier protocols) when the marker outlived the spool — a crash in
-    /// that window is a completed delivery, not a loss.
     pub ended: bool,
 }
 
-/// One attempt the previous process did not finish.
 #[derive(Debug)]
 pub struct Leftover {
     pub attempt: AttemptId,
     pub fence: Fence,
-    /// Whether a spool with unsent frames exists for it.
     pub spooled: bool,
-    /// Whether its log end was already delivered when no spool remains.
     pub ended: bool,
 }
 
-/// What the reconciliation found and did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Recovered {
     pub leftovers: Vec<(AttemptId, Fence)>,
@@ -61,9 +37,7 @@ fn marker_path(root: &Path, attempt: AttemptId) -> PathBuf {
     root.join(ATTEMPTS_DIR).join(attempt.to_string())
 }
 
-/// Record that this process holds `attempt` under `fence`. Synced — the
-/// file and the directory entries leading to it: a marker lost to a power
-/// cut would leave a spool recovery discards as already reported.
+// Synced to disk: a marker lost to a power cut would make recovery discard a spool that was never reported.
 pub fn mark(root: &Path, attempt: AttemptId, fence: Fence) -> Result<()> {
     let dir = root.join(ATTEMPTS_DIR);
     crate::private_dir_all(&dir)?;
@@ -74,17 +48,11 @@ pub fn mark(root: &Path, attempt: AttemptId, fence: Fence) -> Result<()> {
         .open(marker_path(root, attempt))?;
     marker.write_all(format!("{}\n", fence.0).as_bytes())?;
     marker.sync_data()?;
-    // The marker's entry, then `attempts` in the data directory: the second
-    // is a no-op commit once the directory exists durably.
     crate::sync_dir(&dir)?;
     crate::sync_dir(root)?;
     Ok(())
 }
 
-/// The log's end went out as far as this protocol can prove: `LogEndAck`
-/// under protocol 5, handed to the session on earlier ones. If the marker
-/// then outlives the spool — removal raced a crash — recovery reports a
-/// completed delivery rather than a loss.
 pub fn mark_ended(root: &Path, attempt: AttemptId) {
     if let Ok(mut marker) = OpenOptions::new()
         .append(true)
@@ -95,12 +63,10 @@ pub fn mark_ended(root: &Path, attempt: AttemptId) {
     }
 }
 
-/// The attempt's end has been reported: nothing to reconcile for it.
 pub fn unmark(root: &Path, attempt: AttemptId) {
     let _ = fs::remove_file(marker_path(root, attempt));
 }
 
-/// Markers left by an earlier process, with their fences.
 pub fn leftovers(root: &Path) -> Result<Vec<Marker>> {
     let dir = root.join(ATTEMPTS_DIR);
     let mut found = Vec::new();
@@ -135,18 +101,9 @@ pub fn leftovers(root: &Path) -> Result<Vec<Marker>> {
     Ok(found)
 }
 
-/// Settle the disk and the runtime: remove every container this worker
-/// owns, destroy every workspace, and return the attempts that still have
-/// to be abandoned to the controller (their spools are kept for delivery).
-///
-/// Reaping is not best-effort: if the runtime cannot list what this worker
-/// owns, or a container of it cannot be removed, recovery fails and the
-/// executor does not start. Abandoning attempts whose containers may still
-/// be running would let unobserved steps go on after the controller
-/// recorded them reconciled.
+// Reaping must not be best-effort: abandoning an attempt whose container still runs would let unobserved steps continue.
 pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover>)> {
     let mut done = Recovered::default();
-    // Every store: the shared one and each tenant's private one.
     for store in podman::Store::all(root) {
         for (_, name) in podman::owned_in(worker, &store)? {
             podman::remove_named(&name, &store)?;
@@ -160,12 +117,9 @@ pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover
         if workspace::remove_tree(&path).is_ok() {
             done.workspaces_removed += 1;
         }
-        // The askpass helper of a checkout that was under way, if any.
         let _ = fs::remove_dir_all(path.with_extension("askpass"));
     }
     reap_secret_directories(root)?;
-    // The same for a mirror fetch the previous process died inside: its
-    // credential helper is a `<repo>.askpass` sibling of the mirror.
     if let Ok(entries) = fs::read_dir(root.join(sentinel_git::mirror::MIRRORS_DIR)) {
         for entry in entries.flatten() {
             if entry
@@ -188,9 +142,6 @@ pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover
             ended: marker.ended,
         });
     }
-    // A spool without a marker belongs to an attempt whose end was reported
-    // (the marker went first) but whose spool removal did not complete: the
-    // controller has its end record or never will; nothing to send.
     for attempt in spooled {
         if !markers.iter().any(|m| m.attempt == attempt)
             && let Ok(spool) = Spool::open(root, attempt)
@@ -202,11 +153,8 @@ pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover
     Ok((done, pending))
 }
 
-/// Secret scratch is outside workspace and artifact roots. A process crash
-/// skips RAII cleanup, so remove its attempt trees before accepting work.
+// A crash skips RAII cleanup, so secret scratch is removed before any work is accepted.
 fn reap_secret_directories(root: &Path) -> Result<()> {
-    // Where an older worker staged them (the data directory), then where
-    // this one does (the runtime directory).
     reap_secret_dir(&root.join(SECRET_DELIVERY_DIR))?;
     reap_secret_dir(&crate::attempt::secret_root(root))
 }
@@ -253,7 +201,6 @@ mod tests {
         fs::write(attempt.join("files/token"), b"secret-value").unwrap();
         fs::write(root.join(SECRET_DELIVERY_DIR).join("orphan"), b"orphan").unwrap();
 
-        // Where this worker stages them now, too.
         let staged = crate::attempt::secret_root(&root).join("live-attempt");
         fs::create_dir_all(staged.join("env")).unwrap();
         fs::write(staged.join("env/step-0.sh"), b"export T='v'\n").unwrap();
