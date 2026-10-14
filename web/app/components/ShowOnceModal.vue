@@ -1,8 +1,5 @@
 <script setup lang="ts">
-// A secret the controller hands over once — recovery codes, a service
-// grant's refresh token. It is shown in this dialog only (no toast, no
-// storage, no URL), can be copied or downloaded, and the dialog closes only
-// after the person says it is saved; then the values leave the page.
+// Secrets stay in this dialog only: no toast, storage or URL, and they are cleared once the person confirms saving.
 const props = defineProps<{ title: string; description: string; secrets: string[]; filename: string; note?: string }>();
 const emit = defineEmits<{ close: [] }>();
 const values = ref<string[]>([...props.secrets]);

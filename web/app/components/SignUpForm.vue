@@ -1,9 +1,5 @@
 <script setup lang="ts">
-// Sign-up by email address and password, shared by the sign-up page and the
-// invitation page (which passes its invitation along). Every outcome the
-// controller accepts reads the same, whether the address is new or already
-// has an account: the reply never tells which. The password lives in this
-// form only and is cleared once sent.
+// Every outcome reads the same whether the address is new or already has an account.
 const props = defineProps<{ invitation?: string | null }>();
 const emit = defineEmits<{ accepted: [{ email: string; verification: "email" | "operator" }] }>();
 const api = useApi();

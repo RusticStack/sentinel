@@ -1,9 +1,6 @@
 <script setup lang="ts">
 import type { JobTimestamps } from "~~/shared/types/api";
 
-// A job's phases from its timestamps — waiting, preparing, running,
-// finalizing — as a bar scaled to the run's longest job, with the numbers
-// spelled out. A phase never reached is absent.
 const props = defineProps<{ t: JobTimestamps; scale: number; now: number }>();
 
 const phases = computed(() => phasesOf(props.t, props.now));

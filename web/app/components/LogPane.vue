@@ -1,8 +1,7 @@
 <script setup lang="ts">
 import type { LogPage, StepRecord } from "~~/shared/types/api";
 
-// The log viewer mounted in the page (browser only: it measures and
-// scrolls the DOM). Deep links (`?step=&seq=&q=`) open at their line.
+// Browser only: the viewer measures and scrolls the DOM.
 const props = defineProps<{
   attempt: string;
   run: string;

@@ -6,13 +6,7 @@
   --font-mono: ui-monospace, "Cascadia Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
 }
 
-/* Text contrast (WCAG AA, 4.5:1, measured by the browser test): the
-   default light palette uses 500 shades, which on white are about 2.7:1 for
-   sky and green. Light mode uses 700 shades for every semantic colour (text,
-   subtle badges, solid buttons with white text) — 800 for green and amber,
-   whose 700 is 4.3:1 on their own tinted badge — and a darker muted grey; dark
-   mode keeps the 400 shades, which already pass. `html:root` outranks the
-   variables Nuxt UI injects at run time. */
+/* Light mode uses 700 shades for WCAG AA text contrast (500 fails on white); html:root outranks the variables Nuxt UI injects at run time. */
 html:root {
   --ui-primary: var(--ui-color-primary-700);
   --ui-secondary: var(--ui-color-secondary-700);
@@ -34,12 +28,9 @@ html.dark:root {
   --ui-text-dimmed: var(--ui-color-neutral-400);
 }
 
-/* `hidden` wins over any display a rule gives an element (the log's pooled
-   rows are flex rows that hide when out of view). */
+/* `hidden` must beat the display the pooled log rows set. */
 [hidden] { display: none !important; }
 
-/* The log viewer: a fixed-height viewport over a spacer as tall as every
-   row; only the rows in view (plus overscan) exist as elements. */
 .log-view {
   position: relative;
   height: 70vh;
@@ -78,12 +69,9 @@ html.dark:root {
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
 .skip-link { position: absolute; left: 8px; top: -48px; z-index: 100; }
-/* A heading takes focus programmatically after navigation (for screen
-   readers); it is not a control and draws no ring. */
 h1[tabindex="-1"]:focus { outline: none; }
 .skip-link:focus { top: 8px; }
 
-/* Job graph. */
 .dag .edge { fill: none; stroke: var(--ui-border-accented); stroke-width: 1.5; }
 .dag .node rect { fill: var(--ui-bg); stroke: currentColor; stroke-width: 1.5; }
 .dag .node text { fill: var(--ui-text); font-size: 12px; }

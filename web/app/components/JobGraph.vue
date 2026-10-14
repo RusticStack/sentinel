@@ -1,10 +1,6 @@
 <script setup lang="ts">
 import type { Explanation, JobStatus } from "~~/shared/types/api";
 
-// The run's jobs as a graph: a job sits one column right of its deepest
-// dependency, in compiled order within a column. Each node links to its
-// log; the jobs table below carries the same facts for anyone not reading
-// the picture.
 const props = defineProps<{ explain: Explanation; jobs: JobStatus[]; run: string }>();
 const W = 176, H = 42, GX = 56, GY = 14, PAD = 12;
 

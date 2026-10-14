@@ -1,12 +1,7 @@
 <script setup lang="ts">
 import type { Invitation, NamespaceSettings } from "~~/shared/types/api";
 
-// Email invitations to an app-created organization: invite by address with
-// a role (Reader unless chosen) and a lifetime, list them (never a secret),
-// revoke an unspent one. A GitHub-managed organization (or one with a GitHub
-// App installed) takes no email invitations, and a personal namespace has
-// no one to invite: both say so instead of offering the form. When this
-// deployment sends no mail, the one-time link is shown once to pass on.
+// A GitHub-managed organization, or one with a GitHub App installed, takes no email invitations.
 const props = defineProps<{ slug: string; settings: NamespaceSettings | null }>();
 const api = useApi();
 const act = useAct();
