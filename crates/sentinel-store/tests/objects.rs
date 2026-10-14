@@ -1,4 +1,4 @@
-//! D01 tenant-scoped immutable objects and versioned manifests: the
+//! Tenant-scoped immutable objects and versioned manifests: the
 //! stage/commit order, verified reads, manifest versioning and reference
 //! checks, and recovery's orphan/corrupt/missing reconciliation.
 use std::io::Write;
@@ -312,8 +312,8 @@ fn manifests_and_objects_are_immutable() {
         .unwrap();
     tx.commit().unwrap();
     // Updates stay sealed: identity columns cannot be rewritten. Deletes are
-    // no longer blocked — D06 reclamation removes rows through its own
-    // guarded path, never through an update.
+    // not blocked: reclamation removes rows through its own guarded path,
+    // never through an update.
     for sql in [
         "UPDATE objects SET len = 0",
         "UPDATE manifests SET version = 9",
@@ -458,8 +458,6 @@ fn corrupt_manifest_file_is_detected_on_read() {
     ));
     let _ = objects::MAX_MANIFEST_ENTRIES;
 }
-
-// ---- D02: resumable uploads, tracked readers, verified materialization ----
 
 impl Fixture {
     fn begin(

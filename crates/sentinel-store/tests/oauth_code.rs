@@ -1,4 +1,4 @@
-//! O01 durable half: consent choices, approval (every term re-checked in
+//! Durable half: consent choices, approval (every term re-checked in
 //! the writer), and the single-use, PKCE-bound code exchange with replay
 //! revocation.
 
