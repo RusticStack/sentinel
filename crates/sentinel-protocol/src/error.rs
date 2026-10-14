@@ -1,6 +1,4 @@
-//! Structured API errors. The wire shape is versioned by `schema`; codes are
-//! stable strings that clients switch on, HTTP status is derived, and the
-//! message is for humans only. Never put payload echoes or secrets in `message`.
+//! Never put payload echoes or secrets in `message`.
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -11,43 +9,22 @@ pub const ERROR_SCHEMA: &str = "sentinel.error/1";
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum ErrorCode {
-    /// Malformed or semantically invalid request.
     InvalidRequest = 0,
-    /// Missing or invalid credentials.
     Unauthenticated = 1,
-    /// Authenticated but not permitted for this tenant/resource.
     Forbidden = 2,
-    /// Also returned for resources owned by other tenants.
+    /// Also returned for other tenants' resources, so their existence is not leaked.
     NotFound = 3,
-    /// State changed concurrently or a transition is not allowed from the current state.
     Conflict = 4,
-    /// Same idempotency key reused with a different request body.
     IdempotencyMismatch = 5,
-    /// Body, frame or field exceeds a protocol limit.
     PayloadTooLarge = 6,
-    /// Client exceeded its rate or the writer queue is full; retry with back-off.
     RateLimited = 7,
-    /// Protocol version or capability set cannot be served.
     UnsupportedVersion = 8,
-    /// Cursor is malformed, expired, or belongs to another tenant/stream.
     InvalidCursor = 9,
-    /// Unexpected server failure; the request ID identifies the log record.
     Internal = 10,
-    /// The write was refused because disk space is below the watermarks;
-    /// retry once the controller has headroom again.
     StorageFull = 11,
-    /// The tenant reached its storage quota; reclaim space or raise it.
     QuotaExceeded = 12,
-    /// The controller stopped waiting for a write that is still queued or
-    /// running and may yet commit. Not retryable as is: repeating an unkeyed
-    /// mutation can apply it twice. Re-read the resource, or repeat the
-    /// request with the same `Idempotency-Key`
-    /// (`details.retry_with_idempotency_key`).
+    /// Not retryable as is: repeating an unkeyed mutation can apply it twice.
     OutcomeUnknown = 13,
-    /// A code this build does not know, sent by a newer server. Never sent
-    /// by this build: it keeps the error document parseable across additive
-    /// codes, which the contract requires of clients. The answer's HTTP
-    /// status and `retryable` field are authoritative for it.
     #[serde(other)]
     Unknown = 255,
 }
@@ -91,14 +68,11 @@ impl ErrorCode {
         }
     }
 
-    /// Whether an identical retry can succeed without the client changing anything.
     pub const fn retryable(self) -> bool {
         matches!(self, Self::RateLimited | Self::Internal | Self::StorageFull)
     }
 }
 
-/// One error response. `details` carries machine-readable, non-sensitive
-/// context (field names, limits, supported ranges), never user payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiError {
     pub schema: ErrorSchema,
@@ -111,8 +85,6 @@ pub struct ApiError {
     pub details: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
-/// Zero-sized marker that serializes as [`ERROR_SCHEMA`] and only
-/// deserializes from it, so a newer or foreign error shape is a parse error.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ErrorSchema;
 
@@ -198,7 +170,6 @@ mod tests {
         assert_eq!(ErrorCode::UnsupportedVersion.http_status(), 426);
         assert!(ErrorCode::RateLimited.retryable());
         assert!(!ErrorCode::Conflict.retryable());
-        // Disk-full is transient and retryable; quota is the tenant's to resolve.
         assert_eq!(ErrorCode::StorageFull.http_status(), 507);
         assert!(ErrorCode::StorageFull.retryable());
         assert_eq!(ErrorCode::QuotaExceeded.http_status(), 403);
@@ -209,8 +180,6 @@ mod tests {
 
     #[test]
     fn an_ambiguous_write_is_unavailable_and_never_blindly_retryable() {
-        // The write may still commit, so an identical unkeyed retry
-        // could apply it twice; the code must not invite one.
         assert_eq!(ErrorCode::OutcomeUnknown.http_status(), 503);
         assert!(!ErrorCode::OutcomeUnknown.retryable());
         let json = serde_json::to_string(&ApiError::new(ErrorCode::OutcomeUnknown, "x")).unwrap();

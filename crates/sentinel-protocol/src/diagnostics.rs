@@ -1,6 +1,4 @@
-//! Versioned diagnostic reports shared by report producers, the API, CLI and
-//! MCP. Reports are evidence only: the fenced attempt transition and command
-//! exit summary remain the authority for whether a job passed or failed.
+//! Reports are evidence only; the attempt transition alone decides pass or fail.
 
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, str::FromStr};
@@ -20,14 +18,6 @@ pub const MAX_DIAGNOSTIC_LABEL_BYTES: usize = 256;
 pub const MAX_DIAGNOSTIC_PATH_BYTES: usize = 4 * 1024;
 pub const MAX_EVIDENCE_FRAME_OFFSET: u32 = 1 << 20;
 
-/// Custom report input, collected from a report file an attempt published
-/// (see docs/diagnostics.md). Provenance, scope and evidence freshness are
-/// supplied by the server after it binds this input to an authorized
-/// attempt; a repository cannot claim that its own report is fresh or
-/// complete. Input decoding is strict: this object and every nested object
-/// reject unknown fields ([`strict`]). The shared nested types themselves
-/// accept unknown fields so that v1 readers of server-authored reports stay
-/// compatible with additive fields (docs/compatibility.md).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "strict::ReportInput")]
 pub struct ReportInput {
@@ -36,8 +26,6 @@ pub struct ReportInput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// A report after the server has attached trusted collection metadata.
-/// Server-authored: readers ignore fields they do not know.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticReport {
     pub schema_version: u16,
@@ -48,8 +36,6 @@ pub struct DiagnosticReport {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Producer {
-    /// Stable producer name, for example `go test`, `rustc`, or a repository
-    /// adapter name. It is display metadata and never selects control flow.
     pub name: String,
     pub version: Option<String>,
 }
@@ -59,15 +45,11 @@ pub struct Provenance {
     pub producer: Producer,
     pub format: ReportFormat,
     pub collected_from: CollectionSource,
-    /// Canonical typed IDs are strings here so the JSON schema remains
-    /// transport friendly. The API validates them against the owning rows.
     pub run_id: String,
     pub job_id: String,
     pub attempt_id: String,
     pub step: Option<StepReference>,
-    /// SHA-256 of the exact bounded input bytes, lowercase hexadecimal.
     pub input_sha256: String,
-    /// Version of Sentinel's parser, distinct from the tool's version.
     pub parser_version: String,
 }
 
@@ -90,9 +72,7 @@ pub enum CollectionSource {
     CustomUpload,
 }
 
-/// Describes the trust and completeness of evidence, never the command
-/// result. `Fresh` is assigned only when the server binds evidence to the
-/// current fenced attempt; clients cannot set this value in `ReportInput`.
+/// Assigned only by the server when evidence binds to the current fenced attempt; never client-supplied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceFreshness {
@@ -123,9 +103,6 @@ pub enum Severity {
     Success,
 }
 
-/// Wire representation of the core failure classes. The exhaustive
-/// conversion makes additions to the state-machine taxonomy a compile error
-/// here until the diagnostic contract is deliberately updated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureClass {
@@ -165,7 +142,6 @@ impl From<sentinel_core::FailureClass> for FailureClass {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceReference {
-    /// Repository-relative UTF-8 path using `/` separators.
     pub path: String,
     pub line: Option<u32>,
     pub column: Option<u32>,
@@ -182,9 +158,7 @@ pub struct TestReference {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepReference {
-    /// Zero-based position in the compiled pipeline.
     pub index: u32,
-    /// Compiled step key, when available. The API checks it against the run.
     pub key: Option<String>,
 }
 
@@ -195,8 +169,6 @@ pub enum EvidenceStream {
     Stderr,
 }
 
-/// A half-open byte range in one step's log stream. Frame sequence and
-/// payload offsets remain meaningful across log segmentation and paging.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceReference {
     pub step_index: u32,
@@ -211,10 +183,7 @@ pub struct FramePosition {
     pub payload_offset: u32,
 }
 
-/// Strict decoding mirrors for [`ReportInput`]: identical shapes with
-/// `deny_unknown_fields` on every object, converted field by field. Report
-/// producers are untrusted, so an unknown field (for example a client trying
-/// to assert `freshness`) is a decode error rather than silently ignored.
+/// Report producers are untrusted, so an unknown field is a decode error, never ignored.
 mod strict {
     use serde::Deserialize;
 
@@ -363,7 +332,6 @@ pub enum ValidationError {
 }
 
 impl ReportInput {
-    /// Validate semantic bounds after a byte-bounded JSON decode.
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.schema_version != REPORT_SCHEMA_VERSION {
             return Err(ValidationError::UnsupportedVersion);
@@ -377,7 +345,6 @@ impl ReportInput {
 }
 
 impl DiagnosticReport {
-    /// Validate a server-produced report before storage or response.
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.schema_version != REPORT_SCHEMA_VERSION {
             return Err(ValidationError::UnsupportedVersion);
@@ -420,9 +387,6 @@ fn validate_diagnostics(values: &[Diagnostic]) -> Result<(), ValidationError> {
 }
 
 impl Diagnostic {
-    /// Validate one diagnostic's bounds, so a collector can drop just the
-    /// offending diagnostic and count it; [`DiagnosticReport::validate`]
-    /// still refuses a whole report that contains one.
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.message.is_empty() {
             return Err(ValidationError::EmptyMessage);
@@ -475,10 +439,7 @@ impl Diagnostic {
     }
 }
 
-/// Display-safe diagnostic or excerpt text: every control character other
-/// than newline and tab becomes U+FFFD, so a response carries no terminal
-/// escape or NUL, and no character escapes to six JSON bytes. Borrowed when
-/// nothing needed replacing.
+/// Keeps newline and tab; every other control character becomes U+FFFD, so responses carry no terminal escapes.
 pub fn display_text(text: &str) -> Cow<'_, str> {
     let unsafe_char = |ch: char| ch.is_control() && ch != '\n' && ch != '\t';
     let Some(first) = text.find(unsafe_char) else {
@@ -695,7 +656,6 @@ mod tests {
             shown,
             "\u{fffd}[31mred\u{fffd}[0m\u{fffd}\u{fffd}\nnext\u{fffd}\u{fffd}"
         );
-        // Every replacement costs three JSON bytes, never six.
         let json = serde_json::to_string(&shown).unwrap();
         assert!(!json.contains("\\u00"));
     }

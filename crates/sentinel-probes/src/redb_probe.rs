@@ -1,7 +1,4 @@
-//! Same dispatch workload as the SQLite probe, on redb (pure-Rust, ACID,
-//! copy-on-write B-tree). Jobs live in one table keyed by id; the ready
-//! queue is a second table keyed by (priority, created_seq) so the pick is a
-//! `first()` on an ordered index, matching the SQLite partial index.
+//! Same workload as the SQLite probe; the ready queue is keyed by (priority, created_seq) so dispatch is an ordered first().
 use std::{fs, path::PathBuf, time::Instant};
 
 use redb::{
@@ -66,7 +63,6 @@ pub fn run(args: RedbArgs) -> Result<String, String> {
         tx.commit().map_err(|x| e(x.into()))?;
     }
 
-    // Enqueue: one durable transaction per job.
     let mut enqueue = Vec::with_capacity(args.jobs as usize);
     for i in 0..args.jobs {
         let t = Instant::now();
@@ -84,7 +80,6 @@ pub fn run(args: RedbArgs) -> Result<String, String> {
         enqueue.push(ns(t));
     }
 
-    // Backlog: one batch of lower-priority rows.
     let t = Instant::now();
     {
         let mut tx = db.begin_write().map_err(|x| e(x.into()))?;
@@ -104,7 +99,6 @@ pub fn run(args: RedbArgs) -> Result<String, String> {
     }
     let backlog_rows_per_s = args.backlog * 1_000_000_000 / ns(t).max(1);
 
-    // Dispatch: first ready key, move job to leased with fence, remove index entry.
     let mut dispatch = Vec::with_capacity(args.jobs as usize);
     let mut query = Vec::with_capacity(args.jobs as usize);
     for i in 0..args.jobs {

@@ -1,45 +1,21 @@
-//! Cache classification shared by the pipeline schema, the worker link and
-//! the worker-local cache store: which validity rule a declared `cache:`
-//! entry follows, and which trust boundary a job's cache state lives behind.
-//! See `docs/cache.md` for the design.
-
 use serde::{Deserialize, Serialize};
 
-/// What a `cache:` entry stores. Each class has its own validity rule —
-/// the layout, manifests and miss reasons treat them separately so a
-/// permissive class never loosens an exact one (docs/cache.md).
-///
-/// Wire form is one byte (`to_u8`); serde/JSON and `.sentinel.yml` use the
-/// lowercase name.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum Class {
-    /// Tool-addressed blob stores (package registry responses, fetched
-    /// archives): the tool validates content by its own digest/protocol, so
-    /// entries survive lockfile edits and may use prefix/restore keys.
     Downloads = 0,
-    /// Exact materializations of a dependency set: usable only under a
-    /// complete compatibility key. The default — the safest reading of a
-    /// declaration that names no class.
     #[default]
     Dependencies = 1,
-    /// Compiler intermediates in a stable toolchain/platform namespace;
-    /// the compiler owns input-level invalidation, so entries persist
-    /// across source and lockfile edits.
     Compiler = 2,
 }
 
 impl Class {
-    /// Every value, in wire-code order.
     pub const ALL: [Class; 3] = [Self::Downloads, Self::Dependencies, Self::Compiler];
 
-    /// The wire code.
     pub const fn to_u8(self) -> u8 {
         self as u8
     }
-    /// Decode a wire code; `None` for anything this build does not know —
-    /// callers reject rather than guess a class.
     pub const fn from_u8(code: u8) -> Option<Class> {
         match code {
             0 => Some(Self::Downloads),
@@ -48,7 +24,6 @@ impl Class {
             _ => None,
         }
     }
-    /// The lowercase name used in `.sentinel.yml`, JSON and the scope path.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Downloads => "downloads",
@@ -56,8 +31,6 @@ impl Class {
             Self::Compiler => "compiler",
         }
     }
-    /// Parse an `as_str` name; `None` for anything else so the caller can
-    /// report the accepted values instead of echoing the bad one.
     pub fn of_name(name: &str) -> Option<Class> {
         Self::ALL.iter().copied().find(|c| c.as_str() == name)
     }
@@ -69,44 +42,22 @@ impl std::fmt::Display for Class {
     }
 }
 
-/// The trust boundary a job's cache scopes live behind.
-///
-/// [`Trust::derive`] (docs/cache.md) keys trust to who could have produced the
-/// run's content, not merely to its event name: only a `push`/`tag` from
-/// verified intake for a ref the repository's binding names exactly is
-/// `Protected`; a `pull_request` run is `PullRequest`; everything else
-/// (manual API runs, pushes to wildcard-admitted refs, unbound repositories,
-/// no recorded provenance) is `Unprotected`. Each class reads and writes only
-/// its own scope, so neither untrusted class can plant state a protected
-/// build restores.
-///
-/// Wire form is one byte (`to_u8`); serde/JSON uses the snake_case name.
+/// Each class reads and writes only its own scope, so an untrusted class cannot
+/// plant state that a protected build restores.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum Trust {
-    /// Verified pushes and tags to a ref the binding names exactly: the
-    /// protected cache scope.
     Protected = 0,
-    /// Pull-request runs. Also the default when a wire did not carry the
-    /// class — the safer reading, since it can never touch protected state.
     #[default]
     PullRequest = 1,
-    /// Runs whose content an insider chose without the protected ref's
-    /// review: manual runs, pushes to wildcard-admitted refs, unbound
-    /// repositories. Protocol 8; an older worker is sent `PullRequest`.
+    /// Protocol 8; an older worker is sent `PullRequest`.
     Unprotected = 2,
 }
 
 impl Trust {
-    /// Every value, in wire-code order.
     pub const ALL: [Trust; 3] = [Self::Protected, Self::PullRequest, Self::Unprotected];
 
-    /// The trust class of a run. `event` is the recorded trigger;
-    /// `verified_intake` says the run came from an authenticated delivery
-    /// (a webhook or ref poll), not the API; `protected_ref` says the
-    /// repository's live binding names the run's ref exactly, without a
-    /// wildcard.
     pub fn derive(event: &str, verified_intake: bool, protected_ref: bool) -> Trust {
         match event {
             "pull_request" => Trust::PullRequest,
@@ -115,9 +66,6 @@ impl Trust {
         }
     }
 
-    /// The class to send a peer that negotiated `protocol`: before 8 there
-    /// is no `Unprotected`, and such a job is scoped to `PullRequest` — the
-    /// class that can never touch protected state.
     pub const fn for_protocol(self, protocol: u16) -> Trust {
         match self {
             Self::Unprotected if protocol < 8 => Self::PullRequest,
@@ -125,9 +73,6 @@ impl Trust {
         }
     }
 
-    /// Whether a transfer naming `requested` is within a job of class
-    /// `self`: the same class, or the `PullRequest` an older worker was
-    /// told to use for an unprotected job.
     pub const fn admits(self, requested: Trust) -> bool {
         matches!(
             (self, requested),
@@ -137,13 +82,9 @@ impl Trust {
         )
     }
 
-    /// The wire code.
     pub const fn to_u8(self) -> u8 {
         self as u8
     }
-    /// Decode a wire code; `None` for anything this build does not know —
-    /// a trust byte that cannot be decoded is a protocol error, never a
-    /// guess, since guessing `Protected` would cross the boundary.
     pub const fn from_u8(code: u8) -> Option<Trust> {
         match code {
             0 => Some(Self::Protected),
@@ -152,7 +93,6 @@ impl Trust {
             _ => None,
         }
     }
-    /// The lowercase name used in JSON and the scope path.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Protected => "protected",
@@ -160,7 +100,6 @@ impl Trust {
             Self::Unprotected => "unprotected",
         }
     }
-    /// Parse an `as_str` name.
     pub fn of_name(name: &str) -> Option<Trust> {
         Self::ALL.iter().copied().find(|t| t.as_str() == name)
     }
@@ -205,9 +144,6 @@ mod tests {
         assert_eq!(Trust::default(), Trust::PullRequest);
     }
 
-    /// Protected state is written only by verified pushes/tags to a ref the
-    /// binding names exactly; manual runs, wildcard-admitted refs and unknown
-    /// events never are.
     #[test]
     fn only_verified_protected_refs_are_protected() {
         assert_eq!(Trust::derive("push", true, true), Trust::Protected);
