@@ -1,16 +1,3 @@
-//! Worker enrollment, identity and liveness.
-//!
-//! A worker is admitted the way a person is: by a one-time, expiring secret an
-//! operator hands to the machine, redeemed exactly once. What the redemption
-//! binds is an identity the *worker* generated — the fingerprint of its own
-//! TLS certificate — to the *pool the operator chose*. From then on the
-//! controller knows the worker by that fingerprint alone; no private material
-//! is ever stored, and the worker cannot choose or change its pool.
-//!
-//! Sessions are authenticated by presenting that certificate over TLS
-//! (`sentinel-link`); this module answers whether the fingerprint is a live,
-//! unrevoked worker of an active pool, and records that it was seen.
-
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::secret::{Digest, Secret};
 use sentinel_core::{PoolId, TokenId, UnixMillis, UserId, WorkerId};
@@ -23,14 +10,10 @@ use crate::{
 };
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
-/// Enrollment is a bootstrap step, not a standing right: an hour by default.
 pub const DEFAULT_ENROLLMENT_MS: i64 = 60 * 60 * 1000;
 pub const MAX_ENROLLMENT_MS: i64 = DAY_MS;
-/// Liveness is recorded at most this often per worker, so a heartbeat every
-/// few seconds costs the writer one row update per minute, not per beat.
 pub const SEEN_RECORD_INTERVAL_MS: i64 = 60 * 1000;
 
-/// A worker's stored identity: everything the controller knows about it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Worker {
     pub id: WorkerId,
@@ -40,11 +23,9 @@ pub struct Worker {
     pub negotiated: Negotiated,
     pub enrolled: UnixMillis,
     pub last_seen: Option<UnixMillis>,
-    /// The software it announced at its last hello; `None` before.
     pub software: Option<String>,
 }
 
-/// The enrollment secret, shown once. Delivered to the machine out of band.
 pub struct Enrollment {
     pub id: TokenId,
     pub secret: Secret,
@@ -52,8 +33,6 @@ pub struct Enrollment {
     pub expires: UnixMillis,
 }
 
-/// Issue an enrollment for one pool. Platform administration: pools are the
-/// platform's capacity, and admitting a machine to one is a platform decision.
 pub fn issue_enrollment(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -102,7 +81,6 @@ pub fn issue_enrollment(
     })
 }
 
-/// Withdraw an unspent enrollment.
 pub fn revoke_enrollment(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -121,8 +99,6 @@ pub fn revoke_enrollment(
     Ok(())
 }
 
-/// What a worker says about itself at enrollment. Everything here is bounded;
-/// the negotiated set is what the controller accepted, not what was claimed.
 #[derive(Clone, Debug)]
 pub struct Presentation<'a> {
     pub worker: WorkerId,
@@ -131,13 +107,6 @@ pub struct Presentation<'a> {
     pub negotiated: Negotiated,
 }
 
-/// Redeem an enrollment: single use, before expiry, binding the presented
-/// identity to the enrollment's pool. The worker chose its identifier and its
-/// key; the operator chose the pool; nothing else is negotiable here.
-///
-/// An unknown, spent, expired or dead-pool secret is `NotFound`. Its
-/// `WorkerEnrollmentRefused` audit row only survives when the caller commits
-/// anyway — use [`redeem`], which does, from anything that must keep it.
 pub fn enroll(
     tx: &Transaction<'_>,
     presented: &Secret,
@@ -147,9 +116,7 @@ pub fn enroll(
     redeem(tx, presented, presentation, now)?.ok_or(Error::NotFound)
 }
 
-/// [`enroll`] with the refusal as a value: `Ok(None)` means the secret was
-/// refused and the audit row is written, so a caller that commits keeps the
-/// record of the failed attempt (a rolled-back `Err` would erase it).
+// Refusal is Ok(None), not Err: an Err would roll back the audit row a committing caller must keep.
 pub fn redeem(
     tx: &Transaction<'_>,
     presented: &Secret,
@@ -190,8 +157,7 @@ pub fn redeem(
             now.0
         ],
     );
-    // A reused identifier or fingerprint is a second machine claiming to be
-    // the first: refuse, and leave the enrollment unspent for the real one.
+    // Leave the enrollment unspent on a conflict so the real machine can still redeem it.
     if let Err(rusqlite::Error::SqliteFailure(code, _)) = &inserted
         && code.code == rusqlite::ErrorCode::ConstraintViolation
     {
@@ -222,13 +188,7 @@ pub fn redeem(
     }))
 }
 
-/// Record what this hello negotiated for an enrolled worker. Negotiation
-/// happens on every hello, not only at enrollment: an upgraded worker gets
-/// the newer protocol and a rolled-back one the older, never a version it
-/// cannot speak. The architecture is part of the identity — a different one
-/// is `Conflict`. Dropping below the profile protocol clears the placement
-/// facts only a profile reports (labels, warm images, disk), so a worker that
-/// can no longer report them is not matched on stale ones.
+// Negotiation runs on every hello; dropping below the profile protocol clears the placement facts (labels, images, disk) that an old worker cannot report, so stale ones never match.
 pub fn renegotiate(tx: &Transaction<'_>, worker: WorkerId, negotiated: Negotiated) -> Result<()> {
     let profiled = negotiated.protocol.0 >= sentinel_protocol::negotiate::PROFILE_MIN.0;
     let changed = tx
@@ -261,8 +221,6 @@ pub fn renegotiate(tx: &Transaction<'_>, worker: WorkerId, negotiated: Negotiate
     Ok(())
 }
 
-/// The software string a worker announced, as it is stored: printable
-/// ASCII only, at most 128 bytes; `None` when nothing printable is left.
 pub fn software_label(announced: &str) -> Option<String> {
     let label: String = announced
         .chars()
@@ -273,16 +231,12 @@ pub fn software_label(announced: &str) -> Option<String> {
     (!label.is_empty()).then(|| label.to_owned())
 }
 
-/// Record the software a worker announced at this hello.
 pub fn record_software(tx: &Transaction<'_>, worker: WorkerId, software: &str) -> Result<()> {
     tx.prepare_cached("UPDATE workers SET software = ?2 WHERE id = ?1")?
         .execute(params![worker.as_bytes(), software])?;
     Ok(())
 }
 
-/// Resolve a presented certificate fingerprint to a live worker: enrolled,
-/// not revoked, in an active pool. One indexed lookup on the unique key. The
-/// identity the worker generated is the only credential it ever presents.
 pub fn authenticate(conn: &Connection, fingerprint: &Digest) -> Result<Worker> {
     let row = conn
         .prepare_cached(
@@ -326,15 +280,12 @@ pub fn authenticate(conn: &Connection, fingerprint: &Digest) -> Result<Worker> {
     })
 }
 
-/// Whether recording liveness is worth a write yet.
 pub fn seen_due(worker: &Worker, now: UnixMillis) -> bool {
     worker
         .last_seen
         .is_none_or(|last| now.0.saturating_sub(last.0) >= SEEN_RECORD_INTERVAL_MS)
 }
 
-/// Record a heartbeat. A revoked worker's heartbeat records nothing, and the
-/// session that carried it will be refused on its next authentication.
 pub fn seen(tx: &Transaction<'_>, worker: WorkerId, now: UnixMillis) -> Result<()> {
     tx.execute(
         "UPDATE workers SET last_seen_ms = ?2 WHERE id = ?1 AND revoked_ms IS NULL
@@ -344,9 +295,6 @@ pub fn seen(tx: &Transaction<'_>, worker: WorkerId, now: UnixMillis) -> Result<(
     Ok(())
 }
 
-/// Revoke a worker. Its current session is refused at its next authentication
-/// and it can never enroll again under the same identity. Leases and attempts
-/// it held are not touched here.
 pub fn revoke(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -371,10 +319,6 @@ pub fn revoke(
     )
 }
 
-/// Drain a worker: it finishes the attempts it holds and takes no new
-/// offers. Durable and idempotent — re-draining keeps the first timestamp,
-/// so the moment the operator asked is not rewritten by a retry. A revoked
-/// worker has no drain to record: `NotFound`, the same as an unknown one.
 pub fn drain(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -393,13 +337,8 @@ pub fn drain(
     Ok(())
 }
 
-/// Return a drained worker to service: it takes offers again under the
-/// capacity it last reported. The attempts it kept finish on their own;
-/// undraining never revives a revoked worker.
 pub fn undrain(tx: &Transaction<'_>, authority: Authority, worker: WorkerId) -> Result<()> {
     authority.require_platform(tx)?;
-    // A worker that was not draining is already undrained: idempotent, but
-    // still only a live worker answers.
     let changed = tx.execute(
         "UPDATE workers SET drain_ms = NULL WHERE id = ?1 AND revoked_ms IS NULL AND drain_ms IS NOT NULL",
         [worker.as_bytes()],
@@ -415,8 +354,6 @@ pub fn undrain(tx: &Transaction<'_>, authority: Authority, worker: WorkerId) -> 
     Ok(())
 }
 
-/// Live workers of a pool, for the scheduler and the operator. Platform
-/// administration, or membership of a tenant the pool admits.
 pub fn in_pool(conn: &Connection, authority: Authority, pool: PoolId) -> Result<Vec<Worker>> {
     if authority.require_platform(conn).is_err() {
         let principal = authority.principal().ok_or(Error::NotFound)?;
@@ -492,10 +429,6 @@ fn parse_arch(text: &str) -> Option<Arch> {
     }
 }
 
-/// Whether a worker has been revoked. An unknown worker is not revoked: it
-/// may simply not have enrolled yet. One primary-key probe; read-only, for
-/// callers that tie another credential to a worker (the controller's Tailcat
-/// allow list) and must withdraw it when the worker is revoked.
 pub fn revoked(conn: &Connection, worker: WorkerId) -> Result<bool> {
     Ok(conn
         .prepare_cached("SELECT revoked_ms IS NOT NULL FROM workers WHERE id = ?1")?

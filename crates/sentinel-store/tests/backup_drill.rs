@@ -1,13 +1,4 @@
-//! The recovery drill, measured: a deployment with 20,000 runs of
-//! metadata, 2 GiB of artifacts in 2,048 objects plus 1,000 small ones and
-//! 200 finished logs of about 4 MiB is backed up online, backed up again (nothing
-//! changed), verified, and restored onto an empty data directory that is
-//! then opened and recovered as a controller would. Prints one JSON record.
-//!
-//! Ignored by default: `cargo nextest run --release -p sentinel-store --test
-//! backup_drill --run-ignored only --no-capture` on the verification VPS,
-//! with `SENTINEL_DRILL_DIR` on the disk under test. The record goes in
-//! `bench/r04-backup-drill.jsonl` ([backup](../../../docs/backup.md)).
+//! Ignored by default: run on the verification VPS with SENTINEL_DRILL_DIR on the disk under test.
 
 use std::{sync::Arc, time::Instant};
 
@@ -34,7 +25,7 @@ const RUNS: u32 = 20_000;
 const BIG: u32 = 2_048;
 const SMALL: u32 = 1_000;
 const LOGS: u32 = 200;
-/// 128 frames of 31 KiB, near the 32 KiB frame cap: about 4 MiB a log.
+// Each frame stays under the 32 KiB frame cap.
 const LOG_FRAMES: u64 = 128;
 
 fn bytes(seed: u64, len: usize) -> Vec<u8> {
@@ -124,7 +115,6 @@ fn drill() {
         })
         .unwrap();
 
-    // Metadata: 20,000 runs of one job each, a thousand per transaction.
     let spec = RunSpec::new(
         PinnedSource::new("https://github.com/o/r.git", "0123456789abcdef0123456789abcdef01234567", Some("main")).unwrap(),
         compile_str("schema: 1\non: [push]\njobs:\n  build:\n    image: alpine:3\n    steps: [{ id: s, run: 'true' }]\n").unwrap(),
@@ -149,7 +139,6 @@ fn drill() {
             })
             .unwrap();
     }
-    // 200 placed, finished attempts with 4 MiB logs each.
     let line = bytes(7, 31 * 1024 - 1);
     for _ in 0..LOGS {
         let offer = store
@@ -186,7 +175,6 @@ fn drill() {
         logs.finish(run, offer.job, offer.attempt, LOG_FRAMES, &[])
             .unwrap();
     }
-    // Objects: 2 GiB in 1 MiB artifacts, and 1,000 small ones.
     for i in 0..BIG + SMALL {
         let body = bytes(u64::from(i) + 1, if i < BIG { 1 << 20 } else { 4 << 10 });
         let staged = objects
@@ -198,7 +186,6 @@ fn drill() {
             .write(move |tx| o.commit(tx, &staged))
             .unwrap();
     }
-    // Let the log compressor finish before measuring.
     std::thread::sleep(std::time::Duration::from_secs(5));
     let metadata_bytes = store.metadata_bytes();
 

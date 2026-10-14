@@ -1,7 +1,3 @@
-//! The commit notifier that long polls park on, the keyset run pagination
-//! behind `run list --all`, the allocation-free run version, and the bounded
-//! literal log search.
-
 use std::{
     collections::HashSet,
     sync::{
@@ -39,15 +35,11 @@ fn repo(store: &Store) -> (TenantId, RepoId) {
     (tenant, repo)
 }
 
-/// A write that changes no row is not news: the generation — which every
-/// parked run watch wakes on — stays put. A write that changes one still
-/// advances it.
 #[test]
 fn a_write_that_changes_nothing_does_not_advance_the_generation() {
     let (_dir, store) = store();
     let _ = repo(&store);
     let before = store.changes().generation();
-    // `resolve_due` with nothing due changes no row.
     let settled = store
         .writer()
         .write(|tx| sentinel_store::intake::resolve_due(tx, UnixMillis(5), 64))
@@ -91,7 +83,6 @@ fn a_parked_waiter_wakes_on_the_next_commit() {
     assert_eq!(next, seen + 1);
     assert!(started.elapsed() >= Duration::from_millis(100));
     assert!(started.elapsed() < Duration::from_secs(5));
-    // A write that fails bumps nothing: its transaction rolled back.
     let before = store.changes().generation();
     assert!(
         store
@@ -100,7 +91,6 @@ fn a_parked_waiter_wakes_on_the_next_commit() {
             .is_err()
     );
     assert_eq!(store.changes().generation(), before);
-    // Already past: no parking at all.
     let started = Instant::now();
     assert_eq!(
         store
@@ -127,10 +117,7 @@ fn a_waiter_times_out_at_its_deadline() {
     assert!(waited < Duration::from_secs(3), "{waited:?}");
 }
 
-/// A thousand commit/wait handshakes: each waiter reads the generation, the
-/// writer commits once it knows the waiter is about to park, and the waiter
-/// must see that commit with no deadline to rescue it. A lost wakeup shows
-/// up as a waiter stuck until its (far) deadline.
+// A lost wakeup shows up as a waiter stuck until its far deadline.
 #[test]
 fn no_wakeup_is_lost_across_a_thousand_commit_wait_cycles() {
     let (_dir, store) = store();
@@ -160,7 +147,6 @@ fn no_wakeup_is_lost_across_a_thousand_commit_wait_cycles() {
     for _ in 0..CYCLES {
         let seen = store.changes().generation();
         armed.wait();
-        // The commit races this park: before it, during it, or after it.
         let next = store
             .changes()
             .wait_past(seen, Instant::now() + Duration::from_secs(30));
@@ -168,9 +154,7 @@ fn no_wakeup_is_lost_across_a_thousand_commit_wait_cycles() {
     }
     writer.join().unwrap();
     assert!(done.load(Ordering::Acquire));
-    // Every cycle ended on a wakeup, not on the 30 s deadline.
     assert!(started.elapsed() < Duration::from_secs(60));
-    // Concurrent waiters all wake on one commit.
     let seen = store.changes().generation();
     let waiters: Vec<_> = (0..8)
         .map(|_| {
@@ -196,7 +180,6 @@ fn no_wakeup_is_lost_across_a_thousand_commit_wait_cycles() {
 fn run_pages_are_stable_across_equal_timestamps_and_new_runs() {
     let (_dir, store) = store();
     let (tenant, repo) = repo(&store);
-    // 25 runs, many sharing one millisecond.
     let runs: Vec<RunId> = (0..25).map(|_| RunId::new()).collect();
     let seeded = runs.clone();
     store
@@ -224,8 +207,6 @@ fn run_pages_are_stable_across_equal_timestamps_and_new_runs() {
             .unwrap();
         pages += 1;
         if pages == 2 {
-            // A run arriving mid-listing is newer than the cursor: it
-            // never shifts a later page.
             store
                 .writer()
                 .write(move |tx| {
@@ -243,7 +224,6 @@ fn run_pages_are_stable_across_equal_timestamps_and_new_runs() {
             None => break,
         }
     }
-    // 25 runs in pages of 7: four pages, the last one short and final.
     assert_eq!(pages, 4);
     assert_eq!(listed.len(), 25);
     let unique: HashSet<_> = listed.iter().collect();
@@ -256,12 +236,10 @@ fn run_pages_are_stable_across_equal_timestamps_and_new_runs() {
         listed.iter().map(|(_, id)| *id).collect::<HashSet<_>>(),
         expected
     );
-    // An exact final page says so without an empty follow-up.
     let page = store
         .read(|c| status::runs_page(c, tenant, repo, None, 26))
         .unwrap();
     assert_eq!((page.runs.len(), page.next), (26, None));
-    // A cursor from another repository is not a cursor here.
     let (other_tenant, other_repo) = (TenantId::new(), RepoId::new());
     let foreign = RunId::new();
     store
@@ -313,8 +291,6 @@ fn run_pages_are_index_ranges() {
 
 #[test]
 fn the_run_version_recheck_reads_an_index_range_without_a_sort() {
-    // A parked waiter re-checks up to 100 times a second under
-    // commit load; each re-check must not build a temporary B-tree.
     let (_dir, store) = store();
     store
         .read(|conn| {
@@ -375,8 +351,6 @@ fn log_search_finds_literals_across_segments_within_its_byte_bound() {
     let dir = tempfile::tempdir().unwrap();
     let logs = LogStore::open(dir.path().join("logs")).unwrap();
     let (run, job, attempt) = (RunId::new(), JobId::new(), AttemptId::new());
-    // ~10 MiB in 32 KiB frames: three 4 MiB segments. Every 32nd frame
-    // carries the needle on a line of its own.
     let filler = "x".repeat(1023) + "\n";
     let mut seq = 0u64;
     for i in 0..320u32 {
@@ -411,7 +385,6 @@ fn log_search_finds_literals_across_segments_within_its_byte_bound() {
         budget,
         carry: None,
     };
-    // One request under a 1 MiB budget stops early and says where to resume.
     let first = logs
         .search(run, job, attempt, query(0, 100, 1 << 20))
         .unwrap();
@@ -425,7 +398,6 @@ fn log_search_finds_literals_across_segments_within_its_byte_bound() {
     assert_eq!(first.matches[0].seq, 1);
     assert_eq!(first.matches[0].text, b"error: needle 0");
     assert_eq!(first.matches[0].stream, Stream::Stderr);
-    // Resuming walks every segment and finds every match exactly once.
     let mut found = first.matches;
     let mut after = resume;
     let mut requests = 1;
@@ -441,7 +413,6 @@ fn log_search_finds_literals_across_segments_within_its_byte_bound() {
                 after = next;
             }
             None => {
-                // Not finished yet: nothing more can be promised.
                 assert!(!page.complete);
                 break;
             }
@@ -452,13 +423,11 @@ fn log_search_finds_literals_across_segments_within_its_byte_bound() {
     assert_eq!(seqs, (0..10).map(|k| 1 + 32 * k).collect::<Vec<_>>());
     assert_eq!(found[9].text, b"error: needle 288");
     assert_eq!(found[9].step, 1);
-    // The match limit also stops a request, between frames.
     let limited = logs
         .search(run, job, attempt, query(0, 2, u64::MAX))
         .unwrap();
     assert_eq!(limited.matches.len(), 2);
     assert_eq!(limited.next_after, Some(33));
-    // Once finished, a scan to the end is complete.
     logs.finish(run, job, attempt, seq, &[]).unwrap();
     let whole = logs
         .search(run, job, attempt, query(280, 100, u64::MAX))
@@ -493,10 +462,6 @@ fn log_search_finds_a_literal_split_across_two_frames_of_one_stream() {
     let dir = tempfile::tempdir().unwrap();
     let logs = LogStore::open(dir.path().join("logs")).unwrap();
     let (run, job, attempt) = (RunId::new(), JobId::new(), AttemptId::new());
-    // (step, stream, bytes): "needle" split "nee|dle" across stdout frames
-    // with a stderr frame in between; a split across a step change; a
-    // split spanning three frames; and a line matched in its first frame
-    // that must not be reported again when its continuation arrives.
     let frames: [(u32, Stream, &[u8]); 10] = [
         (0, Stream::Stdout, b"first line\nerror: nee"),
         (0, Stream::Stderr, b"noise\n"),
@@ -551,12 +516,10 @@ fn log_search_finds_a_literal_split_across_two_frames_of_one_stream() {
             (9, 1, Stream::Stderr, "a needle, then nee".to_owned()),
         ]
     );
-    // A request resuming between the halves still finds the split: the
-    // frames before `after` are decoded anyway and seed the carry.
+    // A resume between the halves still finds the split: skipped frames are decoded and seed the carry.
     let resumed = search(2);
     assert_eq!(resumed.matches[0].seq, 3);
     assert_eq!(resumed.matches[0].text, b"needle here");
-    // Resuming after the second of three pieces: both skipped pieces seed it.
     let resumed = search(7);
     let seqs: Vec<u64> = resumed.matches.iter().map(|m| m.seq).collect();
     assert_eq!(seqs, [8, 9]);

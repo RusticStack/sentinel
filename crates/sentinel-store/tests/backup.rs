@@ -1,9 +1,3 @@
-//! An online backup of a store that keeps writing, verified end to end
-//! and restored onto an empty data directory — objects, manifests, logs and
-//! the controller's files byte for byte, the master key required and checked
-//! when sealed values exist — corruption and loss caught by verification,
-//! the maintenance lock held for the whole run, and pruning keeping exactly
-//! what the kept backups name.
 use std::{fs, sync::Arc, time::Duration};
 
 use sentinel_auth::sealed::Key;
@@ -37,8 +31,6 @@ fn fixture() -> Fixture {
     let logs = LogStore::open(data.join("logs")).unwrap();
     let key = data.join("master.key");
     Key::create(&key).unwrap();
-    // A super admin with a second factor: a sealed value the backup's
-    // restore needs the key for.
     let now = UnixMillis::now();
     local_auth::bootstrap(&store, "root", "Root", PASSWORD, now).unwrap();
     let issued = match local_auth::login(&store, "root", PASSWORD, Policy::default(), now).unwrap()
@@ -59,7 +51,6 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let tenant = session.principal().tenant.unwrap_or_else(|| {
-        // The bootstrapped account's personal namespace, or a new one.
         let tenant = sentinel_core::TenantId::new();
         let principal = session.principal();
         store
@@ -125,9 +116,6 @@ impl Fixture {
             })
             .unwrap();
     }
-    /// A real run, job and attempt (placed on an enrolled worker), whose
-    /// log is written and finished: a restore brings back the logs of
-    /// attempts its snapshot knows.
     fn log(&self) -> (RunId, JobId, AttemptId) {
         use sentinel_auth::secret::Secret;
         use sentinel_pipeline::{PinnedSource, RunSpec, compile_str};
@@ -247,7 +235,6 @@ fn an_online_backup_verifies_and_restores_byte_for_byte_with_its_key() {
     f.manifest(digest, body.len() as u64);
     let (run, job, attempt) = f.log();
 
-    // Writes keep landing while the backup runs.
     let writer = {
         let store = Arc::clone(&f.store);
         std::thread::spawn(move || {
@@ -286,13 +273,11 @@ fn an_online_backup_verifies_and_restores_byte_for_byte_with_its_key() {
     assert!(check.ok(), "{check:?}");
     assert_eq!((check.objects_checked, check.manifests_checked), (1, 1));
 
-    // A second backup copies nothing it already holds.
     std::thread::sleep(Duration::from_millis(1_100));
     let again = f.backup();
     assert_eq!(again.objects_copied, 0);
     assert_eq!(again.manifests_copied, 0);
 
-    // Restore: refused without the key, and with another key.
     let fresh = f.dir.path().join("restored");
     let refused = backup::restore(&f.target(), &report.id, &fresh, None);
     assert!(
@@ -309,8 +294,6 @@ fn an_online_backup_verifies_and_restores_byte_for_byte_with_its_key() {
     assert!(restored.config_files.contains(&"controller.crt".to_owned()));
     assert_eq!(fs::read(fresh.join("controller.key")).unwrap(), b"private");
 
-    // The restored directory is a working store: the object reads back
-    // verified, the log reads, and a second restore onto it is refused.
     let store = Store::open(fresh.join("metadata.sqlite"), Durability::Normal).unwrap();
     let objects = Objects::open(&fresh).unwrap();
     let mut out = Vec::new();
@@ -349,7 +332,6 @@ fn verification_catches_rot_and_loss() {
     let check = backup::verify(&f.target(), &report.id).unwrap();
     assert!(!check.ok());
     assert_eq!(check.corrupt.len(), 1);
-    // A restore refuses a corrupt object rather than placing it.
     let fresh = f.dir.path().join("restored");
     assert!(matches!(
         backup::restore(&f.target(), &report.id, &fresh, Some(&f.key)),
@@ -363,7 +345,6 @@ fn verification_catches_rot_and_loss() {
             .len(),
         1
     );
-    // A tampered snapshot fails its checksum.
     let snapshot = f.target().join(&report.id).join("metadata.sqlite");
     let mut db = fs::read(&snapshot).unwrap();
     let last = db.len() - 1;
@@ -406,7 +387,6 @@ fn pruning_keeps_the_newest_and_exactly_what_they_name() {
     let f = fixture();
     let first = f.put(b"only in the first backup");
     let one = f.backup();
-    // The object leaves the store; later backups no longer name it.
     let tenant = f.tenant;
     f.store
         .writer()
@@ -462,17 +442,11 @@ fn backup_ids_sort_by_time() {
     ));
 }
 
-/// A backup interrupted part-way (its staging directory and a
-/// half-copied object left behind) is never listed, the next backup removes
-/// what it left and succeeds, an object the data directory lost is recorded
-/// instead of failing the backup, and pruning removes the stray part file.
 #[test]
 fn an_interrupted_backup_leaves_nothing_the_next_one_does_not_clean() {
     let f = fixture();
     f.put(b"backed up before the interruption");
     let first = f.backup();
-    // What a kill mid-backup leaves: a staging directory with a partial
-    // snapshot, and an object's `.part` in the shared store.
     let staging = f.target().join(".20260101T000000Z.partial");
     fs::create_dir_all(&staging).unwrap();
     fs::write(staging.join("metadata.sqlite"), b"SQLite format 3\0trunc").unwrap();
@@ -487,7 +461,6 @@ fn an_interrupted_backup_leaves_nothing_the_next_one_does_not_clean() {
     assert_eq!(backup::list(&f.target()).unwrap(), vec![first.id.clone()]);
     assert!(backup::verify(&f.target(), &first.id).unwrap().ok());
 
-    // An object the data directory has since lost.
     let lost = f.put(b"lost from the data directory");
     let hex = lost.to_string();
     fs::remove_file(
@@ -518,9 +491,7 @@ fn an_interrupted_backup_leaves_nothing_the_next_one_does_not_clean() {
     assert!(backup::verify(&f.target(), &first.id).unwrap().ok());
 }
 
-/// A shared copy an earlier backup left is reused only while it still hashes
-/// to its digest: rot that keeps the length is replaced, not named by every
-/// later backup.
+// A shared copy is reused only while it still hashes to its digest; same-length rot is replaced.
 #[test]
 fn a_rotted_shared_copy_is_replaced_not_reused() {
     let f = fixture();
@@ -537,7 +508,6 @@ fn a_rotted_shared_copy_is_replaced_not_reused() {
     let mut bytes = fs::read(&shared).unwrap();
     bytes[0] ^= 1;
     fs::write(&shared, &bytes).unwrap();
-    // Same length, wrong content: only a rehash notices.
     std::thread::sleep(Duration::from_millis(1_100));
     let second = f.backup();
     assert_eq!(second.objects_recopied, 1, "{second:?}");
@@ -555,8 +525,7 @@ fn a_rotted_shared_copy_is_replaced_not_reused() {
     );
 }
 
-/// `prune` waits for a create in another process: the shared files a running
-/// create has copied are named by no kept backup yet.
+// prune waits for a create in another process, whose copied shared files no kept backup names yet.
 #[test]
 fn pruning_waits_for_a_running_backup_instead_of_deleting_its_files() {
     let f = fixture();
@@ -564,7 +533,6 @@ fn pruning_waits_for_a_running_backup_instead_of_deleting_its_files() {
     f.backup();
     std::thread::sleep(Duration::from_millis(1_100));
     f.backup();
-    // Another process's create holds the writer lock on the directory.
     let holder = fs::OpenOptions::new()
         .write(true)
         .open(f.target().join(".lock"))

@@ -1,8 +1,4 @@
-//! Read models for the human web interface: tenant members, the deployment's
-//! tenants and pools, the audit trails a page at a time, GitHub
-//! synchronization lag and a worker's load. Every function checks its
-//! own authority first, so a route cannot forget to; a tenant the caller may
-//! not see is `NotFound`, exactly like one that does not exist.
+//! Every function checks its own authority first, so a route cannot forget to; a tenant the caller may not see is NotFound.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sentinel_core::{
@@ -19,7 +15,6 @@ use crate::{
     tenancy::PoolKind,
 };
 
-/// Largest page any listing here returns.
 pub const MAX_PAGE: u16 = 100;
 
 fn page(limit: u16) -> Result<i64> {
@@ -42,25 +37,17 @@ fn role(code: u8) -> Result<Role> {
     })
 }
 
-/// One member of a tenant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Member {
     pub user: UserId,
     pub display_name: String,
-    /// The local sign-in name, when the account has a password.
     pub username: Option<String>,
-    /// A service principal confined to this tenant, not a person.
     pub service: bool,
     pub role: Role,
     pub active: bool,
-    /// When GitHub last confirmed the membership; `Some` means it is derived
-    /// from GitHub (a GitHub-backed tenant), `None` that it is managed here.
     pub synced: Option<UnixMillis>,
 }
 
-/// A tenant's members in user-id order, a keyset page after `after`.
-/// Tenant administration (or platform administration) is required: the
-/// member list says who can reach the tenant's code.
 pub fn members(
     conn: &Connection,
     principal: Principal,
@@ -104,9 +91,6 @@ pub fn members(
     .collect()
 }
 
-/// The account with this local sign-in name, if any: how an administrator
-/// names a person to add. Existence is not secret from a tenant admin, who
-/// can invite anyone.
 pub fn user_by_username(conn: &Connection, username: &str) -> Result<Option<UserId>> {
     conn.prepare_cached("SELECT user_id FROM local_credentials WHERE username = ?1")?
         .query_row([username], |r| r.get::<_, [u8; 16]>(0))
@@ -115,7 +99,6 @@ pub fn user_by_username(conn: &Connection, username: &str) -> Result<Option<User
         .transpose()
 }
 
-/// A `usr_…` id as given, or else the account with that local sign-in name.
 pub fn resolve_user(conn: &Connection, text: &str) -> Result<UserId> {
     if let Ok(user) = text.parse::<UserId>() {
         return Ok(user);
@@ -123,7 +106,6 @@ pub fn resolve_user(conn: &Connection, text: &str) -> Result<UserId> {
     user_by_username(conn, text)?.ok_or(Error::NotFound)
 }
 
-/// One tenant of the deployment, as platform administration lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TenantRow {
     pub id: TenantId,
@@ -132,18 +114,12 @@ pub struct TenantRow {
     pub active: bool,
     pub created: UnixMillis,
     pub members: u64,
-    /// Committed and reserved object bytes plus stamped log bytes
-    /// (`tenant_usage`).
     pub usage_bytes: u64,
-    /// The tenant's own storage policy; `None` fields inherit the
-    /// deployment's.
     pub quota_bytes: Option<u64>,
     pub log_retention_ms: Option<i64>,
     pub artifact_retention_ms: Option<i64>,
 }
 
-/// Every tenant, by slug, a keyset page after `after`. Platform
-/// administration only.
 pub fn tenants(
     conn: &Connection,
     authority: Authority,
@@ -193,8 +169,6 @@ pub fn tenants(
     .collect()
 }
 
-/// A tenant by slug whatever its state, for platform administration (a
-/// suspended tenant must still be reachable to reactivate it).
 pub fn tenant_for_platform(
     conn: &Connection,
     authority: Authority,
@@ -204,23 +178,17 @@ pub fn tenant_for_platform(
     crate::lookup::tenant_by_slug_any(conn, slug)
 }
 
-/// One worker pool of the deployment, with who may use it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolRow {
     pub id: PoolId,
     pub name: String,
     pub kind: PoolKind,
-    /// The owner's slug for a dedicated pool.
     pub owner: Option<String>,
     pub active: bool,
-    /// Slugs of the tenants granted a shared pool, by slug.
     pub grants: Vec<String>,
-    /// Enrolled, unrevoked workers.
     pub workers: u64,
 }
 
-/// Every pool, by name. Platform administration only; bounded by the
-/// deployment's pool count, which only a platform administrator can grow.
 pub fn pools(conn: &Connection, authority: Authority) -> Result<Vec<PoolRow>> {
     authority.require_platform(conn)?;
     let mut stmt = conn.prepare_cached(
@@ -275,8 +243,6 @@ pub fn pools(conn: &Connection, authority: Authority) -> Result<Vec<PoolRow>> {
     Ok(out)
 }
 
-/// The deployment's authentication and administration audit, newest first,
-/// strictly before sequence `before`. Platform administration only.
 pub fn audit(
     conn: &Connection,
     authority: Authority,
@@ -287,8 +253,6 @@ pub fn audit(
     local_auth::audit_page(conn, before, limit)
 }
 
-/// A tenant's run control audit (cancel, rerun) with sequence numbers,
-/// newest first, strictly before `before`. Tenant administration.
 pub fn operations(
     conn: &Connection,
     principal: Principal,
@@ -300,31 +264,19 @@ pub fn operations(
     operations::page(conn, tenant, before, u32::from(limit.clamp(1, MAX_PAGE)))
 }
 
-/// A repository's GitHub synchronization: what is waiting to be published,
-/// what GitHub refused, and when it last accepted something; plus the
-/// deliveries not yet turned into runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoSync {
     pub repo: RepoId,
     pub name: String,
-    /// Check publications not yet delivered.
     pub pending: u64,
-    /// The oldest pending publication's last change: its lag started then.
     pub oldest_pending_ms: Option<i64>,
-    /// Publications refused permanently since `since_ms`.
     pub refused: u64,
     pub last_refused_ms: Option<i64>,
-    /// The newest successful publication.
     pub last_published_ms: Option<i64>,
-    /// Webhook or generic deliveries received but not yet resolved.
     pub open_deliveries: u64,
     pub oldest_delivery_ms: Option<i64>,
 }
 
-/// [`RepoSync`] for up to `limit` repositories of `tenant` the caller may
-/// read, in id order after `after`. Each figure is one probe of an index
-/// over rows in that state only (migration 45), so the cost is per
-/// repository, never per publication ever made.
 pub fn sync(
     conn: &Connection,
     principal: Principal,
@@ -377,30 +329,19 @@ pub fn sync(
     Ok(out)
 }
 
-/// What a worker reported and what is held on it now. Reservations are
-/// totals: which tenant's attempts hold a shared worker is not another
-/// tenant's business.
+// Reservations are totals so one tenant's attempts on a shared worker stay hidden from other tenants.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerLoad {
-    /// Reported capacity; `disk_bytes` 0 means not reported.
     pub capacity: Capacity,
-    /// Capacity left after every reservation on the same host.
     pub free: Capacity,
-    /// Attempts this worker holds, and what they reserve.
     pub held_attempts: u64,
     pub held: Capacity,
     pub labels: Vec<String>,
-    /// Set while draining: when the drain began.
     pub draining_since: Option<i64>,
-    /// Warm cache bytes the worker last reported.
     pub cache_bytes: Option<u64>,
-    /// Workers sharing this worker's host (itself included), when the host
-    /// is known.
     pub host_workers: Option<u64>,
 }
 
-/// [`WorkerLoad`] of one worker. The caller has already authorized the
-/// worker's pool ([`crate::workers::in_pool`]).
 pub fn worker_load(conn: &Connection, worker: WorkerId) -> Result<WorkerLoad> {
     let row = conn
         .prepare_cached(
