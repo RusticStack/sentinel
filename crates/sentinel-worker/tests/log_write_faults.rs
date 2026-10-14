@@ -1,9 +1,4 @@
-//! A write the kernel cuts short, on both ends of the log path: the
-//! controller's log store and the worker's spool. `RLIMIT_FSIZE` makes the
-//! kernel accept part of a write and refuse the rest (`EFBIG`), which is
-//! what a file system filling up mid-record does — without root and without
-//! filling a disk. The limit is process-wide, so this binary holds exactly
-//! one test.
+//! The limit is process-wide, so this binary holds exactly one test.
 
 #![cfg(target_os = "linux")]
 
@@ -12,7 +7,6 @@ use sentinel_protocol::logs::{Frame, Stream};
 use sentinel_store::logs::{Appended, LogStore};
 use sentinel_worker::spool::{Refusal, Spool};
 
-/// Cap the size of any file this process writes; restored on drop.
 struct FileSizeLimit(libc::rlimit);
 
 impl FileSizeLimit {
@@ -82,9 +76,7 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// A frame whose write was cut short is never acknowledged, and the frames
-/// after it are never written behind its remains: the resend of it and
-/// everything after read back exactly.
+/// A cut-short frame is never acknowledged and never has frames written behind it.
 #[test]
 fn a_short_write_never_strands_a_record_in_the_log_or_the_spool() {
     let temp = tempfile::tempdir().unwrap();
@@ -99,11 +91,9 @@ fn a_short_write_never_strands_a_record_in_the_log_or_the_spool() {
     }
     let written = segment_len(&logs);
     {
-        // Room for half of the next record.
         let _limit = FileSizeLimit::set(written + 60);
         assert!(store.append(run, job, attempt, &frame(4, 100)).is_err());
     }
-    // The worker never saw an acknowledgement for 4: it resends it.
     for seq in 4..=5 {
         assert!(matches!(
             store.append(run, job, attempt, &frame(seq, 100)).unwrap(),
@@ -119,8 +109,6 @@ fn a_short_write_never_strands_a_record_in_the_log_or_the_spool() {
     );
     assert!(tail.gaps.is_empty());
 
-    // The spool: the cut frame's sequence is declared, never reused, and
-    // later frames stay decodable across a reopen.
     let worker = temp.path().join("worker");
     let spooled = AttemptId::new();
     let mut spool = Spool::open(&worker, spooled).unwrap();

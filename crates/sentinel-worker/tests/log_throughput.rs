@@ -1,13 +1,4 @@
-//! Measurements for the worker's log path and helper waits, not
-//! pass/fail tests: run with `--ignored --nocapture` and read the numbers.
-//!
-//! * `log_path_throughput`: 64 MiB of step output in 8 KiB chunks through
-//!   `LogPipe::write` — redaction, spool, send — over a real loopback TLS
-//!   session to a stand-in controller that acknowledges every frame at once
-//!   (no controller disk in the way), until the last frame is acknowledged;
-//!   then the same volume with no session (spool only).
-//! * `helper_wait_latency`: 100 helper runs (`podman rm -f` answered by an
-//!   `exit 0` shim), the cost a real attempt pays per podman/git call.
+//! Measurements, not pass/fail tests: run with `--ignored --nocapture`.
 
 #![cfg(target_os = "linux")]
 

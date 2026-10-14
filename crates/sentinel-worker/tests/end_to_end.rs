@@ -1,11 +1,3 @@
-//! End to end: a controller with a store, a worker with the real
-//! executor over loopback TLS, a local repository and a busybox image by
-//! digest. A run is enqueued; the worker enrolls, takes the offer, fetches
-//! the spec, checks out the pinned commit, runs the steps in a rootless
-//! container and reports; the controller records `Passed` (or the failure
-//! class), releases the capacity and leaves nothing behind. Gated like the
-//! Podman test: `SENTINEL_PODMAN_TESTS=1` as a rootless Podman account.
-
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -132,7 +124,6 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
-    // A repository with one commit the pipeline will inspect.
     let repo = temp.path().join("origin");
     fs::create_dir(&repo).unwrap();
     git(&repo, &["init", "-q", "--initial-branch=main"]);
@@ -237,15 +228,12 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
         .unwrap()
         .secret;
 
-    // Worker with the real executor.
     let worker_dir = temp.path().join("worker");
     fs::create_dir(&worker_dir).unwrap();
     let notices = Arc::new(Mutex::new(Vec::<String>::new()));
     let log = Arc::clone(&notices);
     let worker_id = WorkerId::new();
-    // The inspect-job redaction fixture prints a synthetic value. Register it
-    // before each attempt so the test covers redaction from its first output;
-    // `secret_use` below exercises the separate secret delivery path.
+    // Registered before each attempt, so redaction covers its first output.
     let registrar: Arc<std::sync::OnceLock<Executor>> = Arc::new(std::sync::OnceLock::new());
     let hook = Arc::clone(&registrar);
     let executor = Executor::start(
@@ -263,7 +251,6 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
     )
     .unwrap();
     let _ = registrar.set(executor.clone());
-    // Cancelled steps get two seconds between TERM and the forced stop.
     executor.set_cancel_grace(Duration::from_secs(2));
     let handle = Arc::new(Handle::new());
     let (worker_cert, worker_key) = (temp.path().join("w.crt"), temp.path().join("w.key"));
@@ -289,8 +276,6 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
                 memory_bytes: 4 << 30,
             },
             profile: sentinel_protocol::negotiate::Profile {
-                // A profile-protocol worker states its scratch disk; zero offers none,
-                // and every job declares some.
                 disk_bytes: 64 << 30,
                 ..sentinel_protocol::negotiate::Profile::default()
             },
@@ -314,8 +299,6 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
         controller.connected() == vec![worker_id]
     });
 
-    // A run: one job that reads the checkout and writes into the workspace,
-    // then one that fails on purpose.
     let yaml = format!(
         "schema: 1
 on: [push]
@@ -441,7 +424,6 @@ jobs:
             .read(|c| sentinel_store::jobs::get_job(c, tenant, job))
             .unwrap()
     };
-    // Compiled order is dependencies first, then by name.
     let compiled = spec_names(&yaml);
     let by_name = |name: &str| ids[compiled.iter().position(|n| n == name).unwrap()];
     let (broken, inspect, secret_use, gated, unknown, oom, slow, polite, stubborn) = (
@@ -505,8 +487,6 @@ jobs:
         failed.failure_class,
         Some(sentinel_core::FailureClass::CommandFailed)
     );
-    // `sh -e`: the first failing command ends the step with its status and
-    // the following step never starts; the summary says so per step.
     let summary_of = |job| {
         let attempt = store
             .read(|c| dispatch::latest_attempt(c, tenant, job))
@@ -533,9 +513,6 @@ jobs:
     assert!(broken_summary.steps[0].duration_ns.is_some());
     assert!(broken_summary.steps[1].duration_ns.is_none());
     assert!(broken_summary.detail.contains("step 0 exited with 1"));
-    // The log reached the controller through the spool and the window,
-    // redacted before it left the worker, complete, in order, with the
-    // streams told apart, and the spool is gone.
     let inspect_attempt = store
         .read(|c| dispatch::latest_attempt(c, tenant, inspect))
         .unwrap()
@@ -601,10 +578,6 @@ jobs:
         .unwrap();
     assert_eq!(use_version, 1);
 
-    // Conditions: a false `if` skips; dependency results, hash_files on the
-    // checkout, event.sha and success() resolve on the worker; a context
-    // evaluation the worker cannot complete is a preparation failure, never a
-    // default.
     eventually("gated passed", || {
         state(gated).state == JobState::Terminal(Outcome::Passed)
     });
@@ -625,8 +598,6 @@ jobs:
     );
     assert!(summary_of(unknown).detail.contains("step 1 `if`"));
 
-    // The memory limit is an OOM, not a plain signal; the job timeout bounds
-    // the steps and is a timeout, not a failed command.
     eventually("oom failed", || {
         state(oom).state == JobState::Terminal(Outcome::Failed)
     });
@@ -646,10 +617,6 @@ jobs:
     assert_eq!(slow_summary.steps[0].outcome, StepOutcome::TimedOut);
     assert_eq!(slow_summary.steps[1].outcome, StepOutcome::NotRun);
     assert!(slow_summary.steps[0].duration_ns.unwrap() < 10_000_000_000);
-    // Cancellation: recorded on the controller, delivered on the next beat,
-    // carried out gracefully — `polite` dies from TERM within the grace —
-    // or forced: `stubborn` ignores TERM and is killed when the grace runs
-    // out. Both report `Canceled`, both containers are gone.
     let started = |job| {
         let attempt = store
             .read(|c| dispatch::latest_attempt(c, tenant, job))
@@ -706,15 +673,12 @@ jobs:
         podman::owned(worker_id).unwrap().is_empty()
     });
 
-    // Every phase was stamped by the worker's reports, in order.
     let stamps = state(inspect).timestamps;
     assert!(stamps.leased <= stamps.preparing);
     assert!(stamps.preparing <= stamps.running);
     assert!(stamps.running <= stamps.finalizing);
     assert!(stamps.finalizing <= stamps.terminal);
     assert!(stamps.preparing.is_some() && stamps.finalizing.is_some());
-    // Nine jobs, each a full lifecycle of four reports (a preparation
-    // failure inside the steps phase still passes through every phase).
     let reports = controller
         .stats()
         .reports
@@ -728,7 +692,6 @@ jobs:
         0
     );
 
-    // Capacity is released, nothing is left in the runtime or on disk.
     eventually("capacity released", || {
         store
             .read(|c| dispatch::free_capacity(c, worker_id))
@@ -739,7 +702,6 @@ jobs:
     assert!(executor.state_is_idle());
     assert!(podman::owned(worker_id).unwrap().is_empty());
     assert!(Workspace::leftovers(&worker_dir).unwrap().is_empty());
-    // Every spool was acknowledged, closed and removed.
     assert!(
         sentinel_worker::spool::Spool::leftovers(&worker_dir)
             .unwrap()
@@ -756,10 +718,6 @@ jobs:
     handle.stop();
     link_thread.join().unwrap().unwrap();
 
-    // Restart reconciliation: the previous worker process crashed with an
-    // attempt in flight — a marker with its fence, a running container, a
-    // workspace mid-checkout and a spool with output the controller never
-    // received. Built by hand here, exactly as the executor leaves them.
     let orphan_yaml = format!(
         "schema: 1\non: [push]\njobs:\n  orphan:\n    image: {IMAGE}@{DIGEST}\n    steps: [{{ id: s, run: 'true' }}]\n"
     );
@@ -829,8 +787,6 @@ jobs:
     }
     assert_eq!(podman::owned(worker_id).unwrap().len(), 1);
 
-    // The new process: settles the disk and the runtime before it takes a
-    // single offer, then hands the leftover to the controller once connected.
     let notices2 = Arc::new(Mutex::new(Vec::<String>::new()));
     let log2 = Arc::clone(&notices2);
     let executor2 = Executor::start(
@@ -870,8 +826,6 @@ jobs:
                 memory_bytes: 4 << 30,
             },
             profile: sentinel_protocol::negotiate::Profile {
-                // A profile-protocol worker states its scratch disk; zero offers none,
-                // and every job declares some.
                 disk_bytes: 64 << 30,
                 ..sentinel_protocol::negotiate::Profile::default()
             },
@@ -888,10 +842,7 @@ jobs:
         state(orphan).failure_class,
         Some(sentinel_core::FailureClass::Reconciled)
     );
-    // What it printed before the crash reached the controller and the log
-    // is closed — ending in a gap, since whatever the attempt printed after
-    // its last durable frame is unknown; the spool and the marker are gone;
-    // nothing was re-run.
+    // The gap is the output printed after the last durable frame, which the controller never received.
     let tail = logs.tail(orphan_run, orphan, attempt, 0, 10, None).unwrap();
     assert!(tail.complete);
     assert_eq!(tail.frames.len(), 1);

@@ -1,41 +1,3 @@
-//! Crash consistency of the worker's log spool and the controller's log
-//! store: what an acknowledgement, a sync or a declared end
-//! promises must survive a power loss at any point, and whatever a crash
-//! leaves must reopen and converge to the log an uninterrupted run
-//! produces.
-//!
-//! One deterministic workload drives the real code — `recovery::mark`, a
-//! capped `Spool` (appends, syncs, acknowledgements, refused frames and the
-//! persisted end) and a `LogStore` (appends, a jump and its fill, a
-//! finished log with declared gaps, a log large enough to seal and compress
-//! a segment, a store reopen and a live log that never ends). After every
-//! operation returns, the workload records it as done; the promises a
-//! prefix of done operations makes are then checked against the state a
-//! crash left, with the same real code reopening it.
-//!
-//! Two ways to crash it, both opt-in because they need tools a plain
-//! `cargo test` host does not have:
-//!
-//! - `posix_crash_states` (`SENTINEL_CRASH_TESTS=1`, needs `strace`) runs
-//!   the workload once under `strace`, replays every recorded file-system
-//!   call into a model with POSIX-strict persistence — file data is durable
-//!   only after an `fsync`/`fdatasync` of that file, a directory entry only
-//!   after an `fsync` of its directory — and after every call checks five
-//!   crash states: nothing unsynced survived; every namespace change
-//!   survived but only synced data; unsynced appends survived half-torn;
-//!   unsynced growth survived as zeros (the size reached the disk, the data
-//!   did not); everything survived (a process crash). Journaling file
-//!   systems persist more than this model, so it catches ordering mistakes
-//!   they hide.
-//! - `power_cut_on_dm_flakey` (`SENTINEL_POWER_LOSS_TESTS=1`, as root, with
-//!   `dm-flakey`, `losetup`, `mkfs.ext4` and `mkfs.xfs`) runs the workload on
-//!   a real ext4 and a real XFS over a `dm-flakey` device and cuts power
-//!   after chosen operations by switching the device to `drop_writes`
-//!   (suspended without freezing the file system, so nothing is flushed):
-//!   every write the kernel had not completed to the device is lost, as in
-//!   a power cut. The file system is then unmounted, restored and mounted
-//!   again, and the same checks run on what the disk kept.
-
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -53,7 +15,6 @@ use sentinel_protocol::logs::{Frame, Stream};
 use sentinel_store::logs::{LogStore, Tail};
 use sentinel_worker::{recovery, spool::Spool};
 
-/// A fixed, valid (version 4) identifier from one byte.
 fn id(n: u8) -> [u8; 16] {
     let mut bytes = [n; 16];
     bytes[6] = 0x40 | (n & 0x0f);
@@ -66,13 +27,11 @@ fn worker_attempt() -> AttemptId {
 }
 
 const WORKER_FENCE: Fence = Fence(7);
-/// Twelve 14-byte spool frames (32 bytes encoded) fit, the thirteenth does not.
 const SPOOL_CAP: u64 = 12 * 32 + 10;
 /// Frames of the log that seals a segment: 130 × 32 KiB passes 4 MiB.
 const BIG_FRAMES: u64 = 130;
 const BIG_FRAME: usize = 32 << 10;
 
-/// The controller logs the workload writes: `(run, job, attempt)`.
 fn logs() -> [(RunId, JobId, AttemptId); 3] {
     [
         (
@@ -95,16 +54,13 @@ fn logs() -> [(RunId, JobId, AttemptId); 3] {
 
 #[derive(Clone, Debug)]
 enum Op {
-    /// `recovery::mark` of the worker attempt.
     Mark,
     SpoolOpen,
     SpoolAppend(Vec<u8>),
     SpoolSync,
     SpoolAck(u64),
-    /// `persist_end`: the end a `LogEnd` would declare.
     SpoolEnd,
     StoreOpen,
-    /// Drop the store and open it again, as a controller restart would.
     StoreReopen,
     StoreAppend {
         log: usize,
@@ -122,7 +78,6 @@ fn big_frame(seq: u64) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(BIG_FRAME);
     let mut x = seq.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     while bytes.len() < BIG_FRAME {
-        // Mostly text, a little noise: compresses, but not to nothing.
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
@@ -146,7 +101,6 @@ fn plan() -> Vec<Op> {
     }
     ops.push(Op::SpoolSync);
     ops.push(Op::SpoolAck(8));
-    // 11 and 12 fit; 13 opens a refused range, 14 extends it.
     for n in 11..=14 {
         ops.push(Op::SpoolAppend(line(n)));
     }
@@ -155,8 +109,6 @@ fn plan() -> Vec<Op> {
 
     ops.push(Op::StoreOpen);
     let small = |seq: u64| format!("log line {seq}\n").into_bytes();
-    // A jump (hole 4..=5), its partial fill, and an end declaring a gap
-    // and an unstored tail.
     for seq in [1, 2, 3, 6, 4, 7] {
         ops.push(Op::StoreAppend {
             log: 0,
@@ -192,16 +144,13 @@ fn plan() -> Vec<Op> {
     ops
 }
 
-/// What an operation returned, as far as its promises go.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Outcome {
     None,
-    /// The sequence the append spent, and whether it was stored.
     Appended {
         seq: u64,
         stored: bool,
     },
-    /// The spool's last sequence and gaps when a sync or end returned.
     Synced {
         last_seq: u64,
         gaps: Vec<(u64, u64)>,
@@ -296,16 +245,10 @@ fn apply(root: &Path, live: &mut Live, op: &Op) -> Outcome {
     }
 }
 
-/// The directories an operator (or the service's start-up) creates before
-/// either role writes anything: the controller's and the worker's data
-/// directories. Their own entries are not the log path's to make durable.
 fn prepare(root: &Path) {
     fs::create_dir_all(root.join("worker")).unwrap();
 }
 
-/// Run the plan under `root` (already [`prepare`]d), calling `done(i,
-/// outcome)` once operation `i` has returned; stop early when it answers
-/// false. Everything the workload holds is dropped before this returns.
 fn run_workload(root: &Path, ops: &[Op], mut done: impl FnMut(usize, &Outcome) -> bool) {
     let mut live = Live {
         spool: None,
@@ -319,12 +262,10 @@ fn run_workload(root: &Path, ops: &[Op], mut done: impl FnMut(usize, &Outcome) -
     }
 }
 
-/// The uninterrupted run: every outcome, and the final logs a reopen shows.
 struct Golden {
     ops: Vec<Op>,
     outcomes: Vec<Outcome>,
     tails: Vec<Tail>,
-    /// Every stored spool frame by sequence.
     spool_frames: BTreeMap<u64, Vec<u8>>,
 }
 
@@ -352,7 +293,6 @@ fn golden() -> Golden {
             spool_frames.insert(*seq, bytes.clone());
         }
     }
-    // The uninterrupted run itself must be what the plan intends.
     assert!(tails[0].complete && tails[1].complete && !tails[2].complete);
     assert_eq!(tails[0].gaps, vec![(5, 5), (8, 9)]);
     assert_eq!(tails[1].frames.len() as u64, BIG_FRAMES);
@@ -365,21 +305,14 @@ fn golden() -> Golden {
     }
 }
 
-/// What the first `done` operations promised.
 #[derive(Default, Debug)]
 struct Promises {
     marker: bool,
-    /// Stored spool frames at or below this are durable.
     spool_synced: u64,
-    /// Spent (refused) spool sequences that must read back as gaps.
     spool_declared: BTreeSet<u64>,
-    /// The end declared: exact last sequence and gaps.
     spool_end: Option<(u64, Vec<(u64, u64)>)>,
-    /// The highest acknowledgement handed to the spool, counting an
-    /// operation in flight at the crash.
     spool_acked_at_most: u64,
     store_open: bool,
-    /// Per log: sequences acknowledged as stored.
     stored: Vec<BTreeSet<u64>>,
     ended: Vec<bool>,
 }
@@ -394,7 +327,6 @@ fn promises(golden: &Golden, done: usize) -> Promises {
     let mut last_refused: Option<u64> = None;
     for (i, (op, outcome)) in golden.ops.iter().zip(&golden.outcomes).enumerate() {
         if i == done {
-            // The operation in flight may have moved the cursor already.
             if let Op::SpoolAck(seq) = op {
                 p.spool_acked_at_most = p.spool_acked_at_most.max(*seq);
             }
@@ -404,8 +336,6 @@ fn promises(golden: &Golden, done: usize) -> Promises {
             (Op::Mark, _) => p.marker = true,
             (Op::SpoolAppend(_), Outcome::Appended { seq, stored }) => {
                 if !stored {
-                    // A new refused range is persisted when it opens; its
-                    // growth with the next sync.
                     if last_refused != Some(seq - 1) {
                         p.spool_declared.insert(*seq);
                     } else {
@@ -437,9 +367,6 @@ fn in_gaps(gaps: &[(u64, u64)], seq: u64) -> bool {
     gaps.iter().any(|(from, to)| (*from..=*to).contains(&seq))
 }
 
-/// Check the state a crash left under `root` against what the first
-/// `done` operations promised; then drive every log to its end and check
-/// it converges to the uninterrupted run. Returns every violation.
 fn verify(root: &Path, done: usize, golden: &Golden) -> Vec<String> {
     let p = promises(golden, done);
     let mut bad = Vec::new();
@@ -566,8 +493,6 @@ fn verify_store(root: &Path, p: &Promises, golden: &Golden, bad: &mut Vec<String
                     ));
                 }
                 if tail.complete && !p.ended[log] && want.complete {
-                    // An end durable before its call returned is allowed; a
-                    // different one is not.
                     if tail.gaps != want.gaps {
                         bad.push(format!("log {log}: an end with other gaps appeared"));
                     }
@@ -581,8 +506,6 @@ fn verify_store(root: &Path, p: &Promises, golden: &Golden, bad: &mut Vec<String
                 }
             }
         }
-        // Convergence: the worker resends everything it holds and ends the
-        // log again; the result must be the uninterrupted run's.
         for (op, _) in golden.ops.iter().zip(&golden.outcomes) {
             match op {
                 Op::StoreAppend { log: l, seq, bytes } if *l == log => {
@@ -625,9 +548,6 @@ fn verify_store(root: &Path, p: &Promises, golden: &Golden, bad: &mut Vec<String
     }
 }
 
-/// The traced workload: runs the plan under `$CRASH_ROOT`, writing each
-/// done operation's index to `$CRASH_JOURNAL` — the trace orders those
-/// writes against the file-system calls.
 #[test]
 #[ignore = "run by posix_crash_states under strace"]
 fn record_crash_workload() {
@@ -652,8 +572,6 @@ enum Node {
     File {
         data: Vec<u8>,
         durable: Vec<u8>,
-        /// Bumped on every change of `data` / `durable`: a crash state is
-        /// keyed by these, never by hashing contents.
         version: u64,
         durable_version: u64,
     },
@@ -670,7 +588,6 @@ struct Handle {
     append: bool,
 }
 
-/// A file system that persists only what POSIX promises.
 struct Model {
     root: PathBuf,
     nodes: Vec<Node>,
@@ -680,16 +597,10 @@ struct Model {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Crash {
-    /// Only what was synced: data by file fsyncs, entries by directory fsyncs.
     Synced,
-    /// Every namespace change, only synced data.
     Namespace,
-    /// Every namespace change; unsynced appends half there (a torn tail).
     Torn,
-    /// Every namespace change; unsynced growth there as zeros — the size
-    /// reached the disk (another file's journal commit), the data did not.
     Zeroed,
-    /// Everything issued: a process crash.
     Issued,
 }
 
@@ -714,8 +625,6 @@ impl Model {
         }
     }
 
-    /// Take in the directories that exist before the trace starts, as
-    /// durable: they were there before anything was promised.
     fn seed(&mut self) {
         let mut pending = vec![(self.root.clone(), 0usize)];
         while let Some((path, node)) = pending.pop() {
@@ -739,7 +648,6 @@ impl Model {
         }
     }
 
-    /// The path relative to the model root, or `None` outside it.
     fn rel(&self, path: &str) -> Option<Vec<String>> {
         let rest = Path::new(path).strip_prefix(&self.root).ok()?;
         Some(
@@ -921,10 +829,6 @@ impl Model {
         self.unlink(dir, &name);
     }
 
-    /// The files and directories a crash of this kind leaves, keyed by
-    /// relative path: `None` for a directory, otherwise the file's content
-    /// as `(node, version, torn length)` — cheap to hash, resolved when
-    /// materialized.
     fn state(&self, crash: Crash) -> BTreeMap<String, Option<(usize, u64, usize)>> {
         let mut out = BTreeMap::new();
         let mut pending = vec![(String::new(), 0usize)];
@@ -975,7 +879,6 @@ impl Model {
         out
     }
 
-    /// Write a crash state out as a real directory tree under `into`.
     fn materialize(
         &self,
         crash: Crash,
@@ -1009,14 +912,12 @@ impl Model {
     }
 }
 
-/// One traced call, as `strace -y -xx` prints it.
 struct Call {
     name: String,
     args: Vec<String>,
     ret: String,
 }
 
-/// Split `a, "b, c", [d, e], f` at top-level commas.
 fn split_args(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let (mut depth, mut quoted, mut start) = (0i32, false, 0usize);
@@ -1048,7 +949,6 @@ fn parse_call(line: &str) -> Option<Call> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return None;
     }
-    // A resumed call pads before its result: `)            = 6<…>`.
     let eq = line.rfind(" = ")?;
     let head = line[..eq].trim_end().strip_suffix(')')?;
     Some(Call {
@@ -1058,8 +958,6 @@ fn parse_call(line: &str) -> Option<Call> {
     })
 }
 
-/// `\x2f\x74` → bytes: `-xx` escapes every byte of strings and of the
-/// paths `-y` prints.
 fn unescape(inner: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(inner.len() / 4);
     let bytes = inner.as_bytes();
@@ -1072,12 +970,10 @@ fn unescape(inner: &str) -> Vec<u8> {
     out
 }
 
-/// The `-xx` form of a path, to find it in a raw line.
 fn escaped(path: &str) -> String {
     path.bytes().map(|b| format!("\\x{b:02x}")).collect()
 }
 
-/// `"\x2f\x74"` → bytes; a truncated string (`"…"...`) is a harness error.
 fn unhex(arg: &str) -> Vec<u8> {
     assert!(!arg.ends_with("..."), "strace truncated a buffer: raise -s");
     let inner = arg
@@ -1087,7 +983,6 @@ fn unhex(arg: &str) -> Vec<u8> {
     unescape(inner)
 }
 
-/// `5<\x2f\x61>` → (5, "/a"); `AT_FDCWD<…>` → (-100, …).
 fn fd_path(arg: &str) -> (i64, String) {
     let (fd, rest) = arg.split_once('<').unwrap_or((arg, ""));
     let fd = if fd == "AT_FDCWD" {
@@ -1099,7 +994,6 @@ fn fd_path(arg: &str) -> (i64, String) {
     (fd, String::from_utf8(unescape(path)).unwrap())
 }
 
-/// A path argument relative to a directory descriptor's path.
 fn resolve(dir: &str, path: &[u8]) -> String {
     let path = String::from_utf8(path.to_vec()).unwrap();
     if path.starts_with('/') {
@@ -1113,8 +1007,6 @@ fn ok(ret: &str) -> bool {
     !ret.starts_with('-')
 }
 
-/// Every call of the trace, in completion order, with the journal's done
-/// counts interleaved.
 enum Event {
     Call(Call),
     Done(usize),
@@ -1153,7 +1045,6 @@ fn read_trace(trace: &Path, journal: &Path) -> Vec<Event> {
     events
 }
 
-/// Apply one call to the model; calls outside the root change nothing.
 fn replay(model: &mut Model, call: &Call) {
     if !ok(&call.ret) {
         return;
@@ -1305,10 +1196,6 @@ fn posix_crash_states() {
         "the journal did not record the whole run"
     );
 
-    // Replay; after every call, write out each distinct crash state (its
-    // contents are the model's at that moment) and hand it to a checker.
-    // Scratch lives in RAM when it can: the checks resend a 4 MiB log with
-    // an fsync per frame, which tmpfs makes free.
     let scratch = tempfile::Builder::new()
         .prefix("sentinel-crash")
         .tempdir_in(if Path::new("/dev/shm").is_dir() {
@@ -1444,8 +1331,7 @@ impl Flakey {
         }
     }
 
-    /// Swap the table. `--nolockfs`: the mounted file system is not frozen,
-    /// so nothing it holds in memory is flushed first.
+    /// `--nolockfs` leaves the mount unfrozen, so no pending write is flushed before the cut.
     fn load(&self, drop: bool) {
         sh("dmsetup", &["suspend", "--nolockfs", &self.name]);
         sh(
@@ -1473,8 +1359,6 @@ fn power_cut_on_dm_flakey() {
     }
     let golden = golden();
     let total = golden.ops.len();
-    // Every operation of the spool and the small logs, then every eighth
-    // of the large one and everything after it.
     let big_start = golden
         .ops
         .iter()
