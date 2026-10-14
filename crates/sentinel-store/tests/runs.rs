@@ -251,7 +251,7 @@ fn rerun_refuses_running_and_cancelled_jobs() {
 
 #[test]
 fn a_stored_run_spec_cannot_be_rewritten_even_by_raw_sql() {
-    // P02-7: every attempt and rerun executes this blob; it is written once.
+    // Every attempt and rerun executes this blob; it is written once.
     let f = fx();
     let (tenant, repo, run) = (f.tenant, f.repo, RunId::new());
     let s = spec();

@@ -1,4 +1,4 @@
-//! R02/R03: the replicator against an in-memory bucket with fault
+//! The replicator against an in-memory bucket with fault
 //! injection — verified copies, multipart resume after an interruption,
 //! eviction and verified read-through, deletes that follow reclamation and
 //! log expiry, the backlog closing admission during an outage and reopening
@@ -664,7 +664,7 @@ fn abandoned_multipart_uploads_are_aborted() {
     assert!(f.store.read(offload::recorded_uploads).unwrap().is_empty());
 }
 
-/// R07: a local copy that rotted (single-part and multipart) or vanished is
+/// A local copy that rotted (single-part and multipart) or vanished is
 /// skipped — never uploaded under its digest's name — and the objects after
 /// it are still replicated; the external copy stays healthy.
 #[test]
@@ -710,7 +710,7 @@ fn a_damaged_or_lost_local_object_is_skipped_and_holds_nothing_back() {
     );
 }
 
-/// R07: while the bucket is unreachable, reading an evicted object fails
+/// While the bucket is unreachable, reading an evicted object fails
 /// cleanly — no partial file placed — and succeeds once it is back.
 #[test]
 fn an_evicted_object_is_unreadable_during_an_outage_and_readable_after() {
@@ -737,7 +737,7 @@ fn an_evicted_object_is_unreadable_during_an_outage_and_readable_after() {
     assert_eq!(r.status().state(), "healthy");
 }
 
-/// R07: an expired or revoked S3 credential (403) degrades the external
+/// An expired or revoked S3 credential (403) degrades the external
 /// copy with the reason and uploads nothing; a replaced credential lets the
 /// next pass catch up.
 #[test]

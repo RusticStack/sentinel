@@ -1,4 +1,4 @@
-//! G07 durable polling: opt-in configuration under tenant authority, the
+//! Durable polling: opt-in configuration under tenant authority, the
 //! baseline-then-diff admission protocol, deterministic delivery identities
 //! that make a retried observation a no-op, creation/move/deletion
 //! transitions, and lifecycle cleanup on rebind and revoke.

@@ -437,8 +437,6 @@ fn a_race_with_the_cli_bootstrap_leaves_one_administrator() {
     assert_eq!(count(&store, "SELECT COUNT(*) FROM users"), 1);
 }
 
-// ------------------------------------------------------ self-service orgs
-
 struct World {
     _dir: tempfile::TempDir,
     store: Store,

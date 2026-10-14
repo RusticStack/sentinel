@@ -396,7 +396,7 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
         }),
         Err(Error::NotFound)
     ));
-    // P10S-6: through `deliver`, the refusal itself is audited (one `use`
+    // Through `deliver`, the refusal itself is audited (one `use`
     // row with result `missing`, the attempt, step and version), while the
     // refused preparation's own `use` rows (OCI_AUTH resolved before TOKEN
     // failed) are rolled back.
@@ -513,7 +513,7 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
     );
 }
 
-/// P10D-6: the capability bit alone does not make a worker able to receive
+/// The capability bit alone does not make a worker able to receive
 /// secrets — a session that sets it on protocol 9 is never placed a job
 /// that needs them (it could only fail it).
 #[test]
@@ -571,9 +571,9 @@ fn refuse(f: &Fixture, offer: &dispatch::Offer) -> Option<secrets::Refusal> {
     refusal
 }
 
-/// P10D-7: a declared secret that cannot be delivered is explained by
+/// A declared secret that cannot be delivered is explained by
 /// name and reason — never by value — and the refused use is audited
-/// exactly once (by the delivery, P10S-6), not again by the explanation.
+/// exactly once (by the delivery), not again by the explanation.
 #[test]
 fn a_refused_delivery_is_explained_and_audited() {
     // Revoked current version.
