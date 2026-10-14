@@ -62,8 +62,7 @@ time = { version = "0.3", features = ["formatting"] }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 sentinel-worker = { path = "../sentinel-worker" }
 
-# The browser opener test plays the opener it launches, so it has its own
-# `main` instead of the libtest harness.
+# The browser opener test plays the opener it launches, so it needs its own main.
 [[test]]
 name = "browser"
 path = "tests/browser.rs"

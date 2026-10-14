@@ -1,12 +1,6 @@
 #!/bin/sh
-# Start the S3-compatible services the compatibility tests (R02/R03) run
-# against, each in rootful Podman on loopback, and write their endpoints to
-# $ROOT/endpoints: one line per service,
-#   name endpoint region bucket path_style credentials_file
-# `sh endpoints.sh up` (re)starts them; `sh endpoints.sh down` removes them.
-# Test infrastructure only: Sentinel itself depends on none of these. Images
-# are pinned by digest (MinIO withdrew its public images and downloads in
-# 2025, so it is not among them).
+# Each line of $ROOT/endpoints: name endpoint region bucket path_style credentials_file.
+# Images are pinned by digest; MinIO is absent because it withdrew its public images in 2025.
 set -eu
 ROOT=${SENTINEL_S3_ROOT:-/srv/sentinel-s3}
 GARAGE=docker.io/dxflrs/garage@sha256:0d7c74fc8ca6fef68a5a941c0e7558c8b1e92ba3588fa7505400e1350456c796        # v2.4.1
