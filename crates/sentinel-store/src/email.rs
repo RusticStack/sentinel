@@ -11,10 +11,10 @@
 //! Tokens are stored as digests, like every other secret. A message that has to
 //! carry a link is a different matter: the link exists in readable form from the
 //! moment it is minted until the mail lane has handed it to Resend. That
-//! window is the outbox row, whose body is sealed with the deployment master key
-//! and deleted as soon as the row settles. Without a Resend key (or without a master
-//! key) nothing is queued and the link is minted on demand by the host-local
-//! CLI, so a self-hosted operator is never locked out.
+//! window is the outbox row, whose body is sealed with the deployment master
+//! key and deleted as soon as the row settles. Without a Resend key (or without
+//! a master key) nothing is queued and the link is minted on demand by the
+//! host-local CLI, so a self-hosted operator is never locked out.
 //!
 //! Nothing here sends mail, and no request handler waits on the network: the
 //! transaction that mints a token also writes the outbox row, and
@@ -83,8 +83,6 @@ impl Kind {
     }
 }
 
-// ---------------------------------------------------------------- addresses
-
 /// Characters RFC 5322 allows unquoted in a local part, besides the dot.
 const fn atext(b: u8) -> bool {
     b.is_ascii_alphanumeric()
@@ -151,8 +149,8 @@ pub fn normalize_domain(input: &str) -> Result<String> {
 
 /// The canonical form of an address: `local@domain` with the local part lower
 /// cased (mail systems treat it case-insensitively, and so does this) and the
-/// domain per [`normalize_domain`]. The local part is ASCII: internationalized local parts are not
-/// accepted, so an address that needs it is refused rather than mangled. At most
+/// domain per [`normalize_domain`]. The local part is ASCII: an address that
+/// needs an internationalized one is refused rather than mangled. At most
 /// [`MAX_EMAIL_BYTES`]. Diagnostics never echo the input.
 pub fn normalize(input: &str) -> Result<String> {
     let bad = || Error::InvalidInput("email address");
@@ -193,8 +191,6 @@ pub fn domain_of(normalized: &str) -> &str {
         .rsplit_once('@')
         .map_or(normalized, |(_, domain)| domain)
 }
-
-// ----------------------------------------------------------------- delivery
 
 /// The public base URL links are built on, when this deployment delivers mail.
 pub(crate) fn delivery_url(conn: &Connection) -> Result<Option<String>> {
@@ -344,8 +340,6 @@ pub(crate) fn invitation_message(
         body,
     )
 }
-
-// ------------------------------------------------------------ verification
 
 /// What asking for a verification link did. Callers that must not reveal
 /// whether an address is known answer the same for every variant but
@@ -585,8 +579,8 @@ pub struct IssuedLink {
 /// account is already proving, or `email` when the operator names one (which
 /// becomes the account's unverified claim, or the pending replacement of a
 /// verified address). Platform administration (the database file's
-/// authority), audited as host-local, and it voids the account's earlier
-/// links. The secret is shown once; the link is
+/// authority), audited as host-local; it voids the account's earlier links.
+/// The secret is shown once; the link is
 /// `<public_url>/verify-email#token=<secret>`. `Conflict` when another
 /// account already verified the address.
 pub fn issue_link(
@@ -760,8 +754,6 @@ pub fn account_email(conn: &Connection, user: UserId) -> Result<Option<(String, 
         .and_then(|(email, verified)| email.map(|email| (email, verified))))
 }
 
-// ------------------------------------------------------------------ outbox
-
 /// One message the lane should deliver.
 #[derive(Clone, Debug)]
 pub struct Pending {
@@ -835,8 +827,8 @@ pub fn next_due_ms(conn: &Connection) -> Result<Option<i64>> {
         .optional()?)
 }
 
-/// Milliseconds to wait before attempt `attempts` (1-based): doubling from
-/// thirty seconds, capped at fifteen minutes.
+/// Milliseconds to wait after failed attempt number `attempts` (1-based): one
+/// minute for the first, doubling, capped at fifteen minutes.
 pub fn backoff_ms(attempts: u32) -> i64 {
     (30_000i64 << attempts.min(10)).min(15 * 60 * 1000)
 }
