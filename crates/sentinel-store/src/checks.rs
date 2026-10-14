@@ -1,45 +1,22 @@
-//! The GitHub Checks outbox.
-//!
-//! One durable row per check: the stable required aggregate `sentinel / ci`
-//! and one `sentinel / <job>` per compiled job, plus a completed aggregate for
-//! an event that was understood but could not run. The row holds the *desired*
-//! state, coalesced: a job that moves queued → running → passed bumps `seq`
-//! three times, and a publisher that read an older generation can never
-//! overwrite the newer one because its guarded write names the sequence it
-//! read.
-//!
-//! Nothing here depends on GitHub: the row is provider-independent, generic
-//! Git runs create no rows, and dispatch never waits on a publication.
+//! Rows hold coalesced desired state; the seq guard keeps a publisher that read an older generation from overwriting a newer one.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{CheckId, DeliveryId, JobId, RepoId, RunId, TenantId, UnixMillis};
 
 use crate::{Error, Result};
 
-/// The stable required check's scope and name. Job scopes are job IDs.
 pub const AGGREGATE_SCOPE: &str = "aggregate";
 pub const AGGREGATE_NAME: &str = "sentinel / ci";
-/// Per-job check names; the aggregate above is the required one.
 pub const JOB_PREFIX: &str = "sentinel / ";
-/// External IDs let a rerequest find the run a check belongs to.
 pub const EXTERNAL_PREFIX: &str = "sentinel:";
 
-/// Attempts a progress check (queued, in progress) may spend before it is
-/// refused: a stale intermediate state is not worth chasing through an outage.
 pub const MAX_ATTEMPTS: u32 = 8;
-/// Attempts a completed check may spend. The final status is what a required
-/// check gates merges on, so it rides out an outage of hours (see
-/// `TERMINAL_MAX_BACKOFF_MS`) before it is refused with reason `attempts`.
 pub const MAX_TERMINAL_ATTEMPTS: u32 = 40;
 const BASE_BACKOFF_MS: i64 = 1_000;
 const MAX_BACKOFF_MS: i64 = 5 * 60 * 1000;
-/// Back-off ceiling for a completed check: fifteen minutes.
 const TERMINAL_MAX_BACKOFF_MS: i64 = 15 * 60 * 1000;
-/// Longest a row is parked by [`defer`] (a throttle or a quarantine).
 pub const MAX_DEFER_MS: i64 = 60 * 60 * 1000;
-/// How far back [`rearm_exhausted`] looks for a check that spent its budget.
 pub const REARM_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-/// Most rows one [`rearm_exhausted`] call re-pends.
 pub const REARM_LIMIT: u32 = 1_000;
 
 macro_rules! columns {
@@ -51,14 +28,10 @@ macro_rules! columns {
 }
 const COLUMNS: &str = columns!();
 
-/// A check's desired status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
-    /// The newest generation still has to be delivered.
     Pending,
-    /// The newest generation was delivered.
     Published,
-    /// One generation was refused permanently; `reason` says why.
     Refused,
 }
 
@@ -81,7 +54,6 @@ impl State {
     }
 }
 
-/// A check's desired status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Queued,
@@ -108,8 +80,6 @@ impl Status {
     }
 }
 
-/// A completed check's conclusion, in GitHub's vocabulary (the publisher
-/// validates the text against its own enum before sending).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Conclusion {
     Success,
@@ -144,8 +114,6 @@ impl Conclusion {
         })
     }
 
-    /// The conclusion a settled event gets. `None` means nothing is published:
-    /// the event was a duplicate, superseded, or a deletion with no commit.
     fn of_reason(reason: &str) -> Option<Conclusion> {
         Some(match reason {
             "ref_deleted" | "duplicate" | "superseded" => return None,
@@ -166,7 +134,6 @@ impl Conclusion {
     }
 }
 
-/// One publication as a publisher reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Publication {
     pub id: CheckId,
@@ -183,37 +150,20 @@ pub struct Publication {
     pub title: String,
     pub summary: String,
     pub check_run_id: Option<i64>,
-    /// The check suite the run landed in, recorded from the forge's answer;
-    /// a `check_suite` rerequest resolves runs through it.
     pub check_suite_id: Option<i64>,
-    /// When a create was last attempted, set durably before the request. Its
-    /// presence means an earlier create may have landed: a later attempt must
-    /// adopt by `external_id` instead of blindly creating another check run.
     pub create_started_ms: Option<i64>,
-    /// The generation whose create is outstanding or produced the current
-    /// handle: it names the run on GitHub ([`Publication::create_identity`]).
-    /// `None` on a row created before migration 33, whose run carries the
-    /// bare `external_id`.
     pub create_seq: Option<i64>,
     pub seq: i64,
     pub published_seq: i64,
-    /// Where the outbox stands: due, delivered, or refused with `reason`.
     pub state: State,
     pub reason: Option<String>,
 }
 
-/// The `external_id` a create for generation `seq` sends: the row's stable
-/// id plus the generation, so every create names exactly one GitHub run and
-/// a lost answer can be adopted by exact match whatever status the run was
-/// created with. `parse_control` and rerequest matching accept it (it keeps
-/// the `sentinel:` prefix and stays well under 128 bytes).
 pub fn create_identity(external_id: &str, seq: i64) -> String {
     format!("{external_id}:{seq}")
 }
 
 impl Publication {
-    /// The identity the run behind this row was (or is being) created with:
-    /// what an update keeps sending and what an adoption lookup matches.
     pub fn created_identity(&self) -> String {
         match self.create_seq {
             Some(seq) => create_identity(&self.external_id, seq),
@@ -222,33 +172,24 @@ impl Publication {
     }
 }
 
-/// What a retry did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Retry {
-    Scheduled {
-        attempts: u32,
-        next_attempt_ms: i64,
-    },
-    /// The attempt budget is spent; the row is refused with that reason.
+    Scheduled { attempts: u32, next_attempt_ms: i64 },
     Exhausted,
 }
 
-/// Milliseconds to wait before attempt `attempts` (1-based): doubling from one
-/// second, capped at five minutes.
 pub fn backoff_ms(attempts: u32) -> i64 {
     BASE_BACKOFF_MS
         .saturating_mul(1i64 << attempts.min(20))
         .min(MAX_BACKOFF_MS)
 }
 
-/// The same doubling for a completed check, capped at fifteen minutes.
 fn terminal_backoff_ms(attempts: u32) -> i64 {
     BASE_BACKOFF_MS
         .saturating_mul(1i64 << attempts.min(20))
         .min(TERMINAL_MAX_BACKOFF_MS)
 }
 
-/// What one job's state means to a forge.
 fn job_content(
     state: sentinel_core::JobState,
     class: Option<sentinel_core::FailureClass>,
@@ -304,8 +245,6 @@ fn job_content(
     }
 }
 
-/// What the run as a whole means to a forge, from the job states in one
-/// pass (no collection): the state and every count come from the same walk.
 fn aggregate_content(
     states: impl Iterator<Item = sentinel_core::JobState>,
 ) -> Result<(Status, Option<Conclusion>, &'static str, String)> {
@@ -356,8 +295,6 @@ fn aggregate_content(
     })
 }
 
-/// The registry facts a publication needs: which repository it belongs to,
-/// what the checked-out revision is, and whether a forge is associated at all.
 struct RunFacts {
     repo: RepoId,
     head_sha: String,
@@ -379,9 +316,7 @@ fn run_facts(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Option<R
     let Some((head_sha, repo, forge, trigger)) = row else {
         return Ok(None);
     };
-    // Only event-driven runs publish: a manual run's inline pipeline is a
-    // diagnostic and never satisfies the repository's required aggregate, so
-    // it creates no rows at all. Generic repositories have no forge to tell.
+    // A manual run's inline pipeline is diagnostic and must never satisfy the required aggregate.
     let event_driven = matches!(trigger.as_deref(), Some("push" | "tag" | "pull_request"));
     if forge == 0 || !event_driven {
         return Ok(None);
@@ -392,7 +327,6 @@ fn run_facts(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Option<R
     }))
 }
 
-/// One desired check state to coalesce into the outbox.
 struct Draft<'a> {
     tenant: TenantId,
     repo: RepoId,
@@ -408,28 +342,9 @@ struct Draft<'a> {
     summary: String,
 }
 
-/// One statement: create the row or coalesce the newest desired state into it.
-///
-/// A draft that repeats the stored content (same status, conclusion, title and
-/// summary) changes nothing: the generation, the retry schedule and the
-/// delivery cursor stay put, so a re-record cannot restart a backing-off row
-/// or re-send what GitHub already has. The one exception is a refused row: a
-/// fresh event for it re-arms it.
-///
-/// A new generation resets the cursor to pending and clears any previous
-/// refusal or retry schedule. A generation that follows a *delivered*
-/// `completed` one also drops the check-run handle: that remote run is
-/// terminal and GitHub silently keeps a completed run completed, so new work
-/// needs a fresh run — and the create mark goes with it, so that fresh run is
-/// created under its own identity instead of adopting the terminal one. A
-/// completed generation that was never delivered keeps its handle: the remote
-/// run is still the live one, and dropping the handle would orphan it and
-/// create a duplicate.
+/// A generation after a delivered completed one drops the stale run handle: GitHub keeps a completed run completed.
 fn upsert(tx: &Transaction<'_>, draft: Draft<'_>, now: UnixMillis) -> Result<()> {
     let id = CheckId::new();
-    // Cached: this runs inside the writer transaction on every job
-    // transition, and the statement is long enough that re-preparing it
-    // would cost more than the row it writes.
     tx.prepare_cached(
         "INSERT INTO check_publications(id, tenant_id, repo_id, run_id, delivery_id, scope, name,
             head_sha, external_id, status, conclusion, title, summary, seq, state, created_ms, updated_ms)
@@ -481,9 +396,6 @@ fn external_id(run: RunId, scope: &str) -> String {
     format!("{EXTERNAL_PREFIX}{run}:{scope}")
 }
 
-/// Record the initial checks for a newly created run: every compiled job as
-/// `queued` and, unless the run is manual, the stable aggregate. Manual runs
-/// are namespaced so they can never satisfy the required aggregate.
 pub fn record_run(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -531,7 +443,6 @@ pub fn record_run(
     Ok(written)
 }
 
-/// The name of one job's check: `sentinel / <job>`.
 pub fn qualified_name(job: &str) -> String {
     let mut name = String::with_capacity(JOB_PREFIX.len() + job.len());
     name.push_str(JOB_PREFIX);
@@ -539,9 +450,6 @@ pub fn qualified_name(job: &str) -> String {
     name
 }
 
-/// Recompute the stable aggregate from the run's job rows and coalesce it.
-/// The caller read the run's `facts` already (one join per transition, not
-/// two); the job states are folded straight off the cursor, never collected.
 fn record_aggregate(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -552,8 +460,6 @@ fn record_aggregate(
     let mut stmt =
         tx.prepare_cached("SELECT state_code FROM jobs WHERE run_id = ?1 AND tenant_id = ?2")?;
     let mut rows = stmt.query(params![run.as_bytes(), tenant.as_bytes()])?;
-    // A failed read or an undecodable code ends the walk; it is reported
-    // below, before the truncated walk could be mistaken for a short run.
     let mut fault = None;
     let content =
         aggregate_content(std::iter::from_fn(|| match rows.next() {
@@ -597,9 +503,6 @@ fn record_aggregate(
     Ok(1)
 }
 
-/// Record one job's newest state and refresh the aggregate. This is called
-/// from the state machine's single transition point, so no way of ending a job
-/// can skip it.
 pub fn record_job(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -619,8 +522,6 @@ pub fn record_job(
         return Err(Error::Corrupt("job"));
     };
     let run = RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?;
-    // A generic repository gets no rows at all, and a revoked binding stops
-    // new rows: this is the single place the association is read.
     let Some(facts) = run_facts(tx, tenant, run)? else {
         return Ok(());
     };
@@ -655,8 +556,6 @@ pub fn record_job(
     Ok(())
 }
 
-/// Record one completed check for an event that was understood but produced no
-/// run, so a required aggregate never stays pending.
 pub fn record_delivery(
     tx: &Transaction<'_>,
     delivery: DeliveryId,
@@ -674,8 +573,6 @@ pub fn record_delivery(
     let Some(conclusion) = Conclusion::of_reason(reason) else {
         return Ok(());
     };
-    // A pull-request delivery's check belongs on its head: the pull-request
-    // view reads checks on the head commit, not the tested merge.
     let row: Option<Row> = tx
         .prepare_cached(
             "SELECT d.tenant_id, d.repo_id, COALESCE(p.head_sha, d.new_sha), d.ref_name,
@@ -702,8 +599,6 @@ pub fn record_delivery(
     if forge != Some(1) || revoked == Some(1) {
         return Ok(());
     }
-    // A tag's revision is a tag object, not a commit a check can attach to;
-    // a dispatched tag run publishes from the peeled commit instead.
     if ref_name
         .as_deref()
         .is_some_and(|r| r.starts_with("refs/tags/"))
@@ -766,11 +661,7 @@ pub fn record_delivery(
     )
 }
 
-/// Publications whose newest generation has not been delivered yet and whose
-/// next attempt is due, oldest first.
 pub fn due(conn: &Connection, now: UnixMillis, limit: u16) -> Result<Vec<Publication>> {
-    // A literal statement: the lane runs this on every wake, and formatting
-    // it each time would allocate a string only to find it in the cache.
     let mut stmt = conn.prepare_cached(concat!(
         "SELECT ",
         columns!(),
@@ -783,11 +674,6 @@ pub fn due(conn: &Connection, now: UnixMillis, limit: u16) -> Result<Vec<Publica
     rows.map(|row| decode(row?)).collect()
 }
 
-/// When the earliest pending publication becomes due, as wall-clock
-/// milliseconds: `Some(0)` for one due already, `None` when nothing is
-/// pending. One read of the head of the `check_publications_due` index, so a
-/// lane that found nothing due can sleep exactly until the next backoff
-/// expires instead of polling for it.
 pub fn next_due_ms(conn: &Connection) -> Result<Option<i64>> {
     Ok(conn
         .prepare_cached(
@@ -799,7 +685,6 @@ pub fn next_due_ms(conn: &Connection) -> Result<Option<i64>> {
         .optional()?)
 }
 
-/// One publication by ID, whatever its state.
 pub fn get(conn: &Connection, id: CheckId) -> Result<Option<Publication>> {
     let row = conn
         .prepare_cached(&format!(
@@ -810,7 +695,6 @@ pub fn get(conn: &Connection, id: CheckId) -> Result<Option<Publication>> {
     row.map(decode).transpose()
 }
 
-/// One run's publications, in scope order, for tests and operators.
 pub fn of_run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<Publication>> {
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {COLUMNS} FROM check_publications
@@ -820,7 +704,6 @@ pub fn of_run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<Pub
     rows.map(|row| decode(row?)).collect()
 }
 
-/// One delivery's publication, if it has one.
 pub fn of_delivery(conn: &Connection, delivery: DeliveryId) -> Result<Option<Publication>> {
     let row = conn
         .prepare_cached(&format!(
@@ -937,14 +820,7 @@ fn decode(row: Fields) -> Result<Publication> {
     })
 }
 
-/// Mark, durably and before the request, that a create was attempted for this
-/// generation. A crash between GitHub accepting the create and the handle
-/// being recorded then still reconciles through the `external_id` lookup
-/// rather than creating a second check run. The mark records the generation
-/// the create is for, which is the identity the request carries
-/// ([`create_identity`]). It sticks across generations until the row's run
-/// goes terminal: once a create may have landed, every later create looks
-/// first. `Conflict` means the generation moved — re-read and start over.
+/// Durably marked before a create request, so a retry adopts by external_id instead of creating a second run.
 pub fn create_started(tx: &Transaction<'_>, id: CheckId, seq: i64, now: UnixMillis) -> Result<()> {
     let changed = tx.execute(
         "UPDATE check_publications SET create_started_ms = ?3, create_seq = ?2, updated_ms = ?3
@@ -957,15 +833,6 @@ pub fn create_started(tx: &Transaction<'_>, id: CheckId, seq: i64, now: UnixMill
     Ok(())
 }
 
-/// Record the run's numeric handle and, when the generation is still the one
-/// the publisher read, mark it current. The handle is recorded either way: a
-/// create that raced a newer generation must not be repeated, or GitHub would
-/// grow a second check run for the same check. The suite the run landed in is
-/// recorded the same way so a `check_suite` rerequest can resolve it.
-///
-/// Returns whether the *current* generation was marked (the stale-write
-/// protection). `false` is not an error: the newer generation stays pending
-/// and the next attempt updates the run whose handle was just recorded.
 pub fn published(
     tx: &Transaction<'_>,
     id: CheckId,
@@ -988,9 +855,6 @@ pub fn published(
     Ok(changed == 1)
 }
 
-/// Make an attempt that failed transiently due again under the shared budget.
-/// A completed check has the longer budget and back-off ceiling
-/// ([`MAX_TERMINAL_ATTEMPTS`]); every other status gets [`MAX_ATTEMPTS`].
 pub fn retry(
     tx: &Transaction<'_>,
     id: CheckId,
@@ -1037,10 +901,6 @@ pub fn retry(
     })
 }
 
-/// Park a pending row until `until_ms` without spending an attempt: a rate
-/// limit says nothing about the row, so it must not eat the retry budget.
-/// The park is capped at [`MAX_DEFER_MS`]. Returns whether the row was still
-/// the pending generation `seq`; a moved or settled row needs no park.
 pub fn defer(
     tx: &Transaction<'_>,
     id: CheckId,
@@ -1057,15 +917,6 @@ pub fn defer(
     Ok(changed == 1)
 }
 
-/// Put completed checks that spent their whole budget back in the queue.
-///
-/// A check refused with reason `attempts` is a final status that never
-/// reached GitHub; once the outage that caused it is over, nothing else would
-/// ever deliver it. The delivery lane calls this once per start: rows settled
-/// within [`REARM_WINDOW_MS`], at most `limit`, get a fresh budget, so the
-/// path is bounded by restarts, the window and the limit: a permanently
-/// failing row is retried once per start, never forever. Returns how many
-/// rows were re-armed.
 pub fn rearm_exhausted(tx: &Transaction<'_>, now: UnixMillis, limit: u32) -> Result<usize> {
     Ok(tx.execute(
         "UPDATE check_publications SET state = 0, reason = NULL, attempts = 0,
@@ -1079,8 +930,6 @@ pub fn rearm_exhausted(tx: &Transaction<'_>, now: UnixMillis, limit: u32) -> Res
     )?)
 }
 
-/// Give up on one generation: the row records why, and a later generation (a
-/// state change) starts fresh.
 pub fn refused(
     tx: &Transaction<'_>,
     id: CheckId,
@@ -1088,8 +937,6 @@ pub fn refused(
     reason: &str,
     now: UnixMillis,
 ) -> Result<()> {
-    // The column requires 1..=128 characters: a blank reason would fail the
-    // CHECK and leave the row pending at the head of the queue.
     let mut reason: String = reason
         .chars()
         .filter(|c| !c.is_control())

@@ -1,13 +1,4 @@
-//! The sanitized diagnostic bundle: what a support request needs about
-//! a deployment and nothing it must not carry.
-//!
-//! In it: versions and schema, SQLite's quick check, row counts by state,
-//! each worker's operator-given name, protocol, software, age and drain,
-//! queue age, check publication backlog, and the last day's audit events as
-//! counts by event code. Never in it: user names, email addresses, tenant
-//! or repository names, IP addresses, credentials or their digests, secret
-//! names, log contents, pipeline text or URLs. Tenants and repositories are
-//! counted, not named.
+//! Never carries user names, emails, tenant or repository names, addresses, credentials, secret names, logs or pipeline text: counts only.
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -20,9 +11,7 @@ fn count(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1)
 }
 
-/// The database half of the bundle: everything a stopped controller's data
-/// directory can tell. `integrity` runs `PRAGMA quick_check`, a full read
-/// of the database — seconds for a large one; ask for it knowingly.
+/// `integrity` runs `PRAGMA quick_check`, a full read that takes seconds on a large database.
 pub fn collect(conn: &Connection, now_ms: i64, integrity: bool) -> Result<Value> {
     let schema: i64 = count(
         conn,
@@ -131,9 +120,6 @@ pub fn collect(conn: &Connection, now_ms: i64, integrity: bool) -> Result<Value>
     }))
 }
 
-/// The bundle of a stopped controller's data directory, opened read-only
-/// (it never migrates): [`collect`] plus the disk and the binary's own
-/// versions. `sentinel admin diagnostics` prints it.
 pub fn collect_offline(data_dir: &std::path::Path, now_ms: i64, integrity: bool) -> Result<Value> {
     use rusqlite::OpenFlags;
     let path = data_dir.join(crate::METADATA_FILE);

@@ -1,11 +1,6 @@
-//! Persisted encodings of core types. Kept separate so the database column
-//! format is one place to audit and the enums in `sentinel-core` stay free of
-//! storage knowledge.
 use sentinel_core::{FailureClass, JobState, Outcome};
 
-/// Non-terminal states use their discriminant (0..=5); terminal states are
-/// `TERMINAL_BASE + outcome` so the ready-queue partial index can test
-/// `state_code = 1` and a range check `>= 16` selects everything terminal.
+// The ready-queue partial index tests `state_code = READY`, and `>= TERMINAL_BASE` selects every terminal row.
 pub const TERMINAL_BASE: i64 = 16;
 pub const READY: i64 = 1;
 

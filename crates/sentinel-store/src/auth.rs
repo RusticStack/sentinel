@@ -1,6 +1,4 @@
-//! Live identity and repository authorization. Use these operations at client
-//! boundaries; `jobs`/`runs` and raw SQL remain trusted controller primitives.
-//! Mutations check authority inside the SAME writer transaction as the change.
+//! Mutations check authority inside the same writer transaction as the change.
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::secret::Digest;
 use sentinel_core::{
@@ -10,9 +8,6 @@ use sentinel_core::{
 
 use crate::{Error, Result};
 
-/// Static predicate shared by get/list/require. Every lookup starts from the
-/// actual repo owner and intersects credential scope, active identities,
-/// membership ceiling and repo grant. Super-admin is deliberately absent.
 macro_rules! repo_query {
     ($projection:literal, $tail:literal) => {
         repo_query!($projection, "", $tail)
@@ -41,8 +36,7 @@ fn repo_scope(principal: Principal, required: Permissions) -> Result<()> {
     Ok(())
 }
 
-/// No bearer capability is returned: this is a decision for the current
-/// transaction/snapshot only. Do not retain it across a mutation boundary.
+/// Valid only for the current transaction or snapshot; never retain it across a mutation.
 pub fn require_repo(
     conn: &Connection,
     principal: Principal,
@@ -67,9 +61,6 @@ pub fn require_repo(
     TenantId::from_bytes(bytes).map_err(|_| Error::Corrupt("tenant_id"))
 }
 
-/// [`require_repo`] that also returns the owning tenant's slug. The same
-/// statement already joins `tenants` for its liveness predicate, so the slug
-/// is one more projected column, not another lookup.
 pub fn require_repo_slug(
     conn: &Connection,
     principal: Principal,
@@ -97,8 +88,6 @@ pub fn require_repo_slug(
     ))
 }
 
-/// Client dispatch entry point: derive the tenant from the authorized repository
-/// in this writer transaction. A client cannot supply a different run owner.
 pub fn create_run(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -108,22 +97,14 @@ pub fn create_run(
     now: UnixMillis,
 ) -> Result<Vec<sentinel_core::JobId>> {
     let tenant = require_repo(tx, principal, repo, Permissions::RUN)?;
-    // Only after authorization, so an outsider learns nothing about the
-    // repository's binding from the refusal.
+    // Only after authorization, so a refusal reveals nothing about the repository's binding.
     crate::sources::validate_manual(tx, repo, &spec.source)?;
     let jobs = crate::runs::create_run(tx, tenant, repo, run, spec, now)?;
-    // A manual dispatch records no provenance: a group template over
-    // `event.*` resolves to the manual event facts here instead of waiting
-    // for an event that will never arrive.
     crate::runs::apply_concurrency(tx, tenant, run, now)?;
-    // Jobs with an `if` start blocked; their conditions read the event,
-    // which is settled now.
     crate::dispatch::release_dependents(tx, tenant, run, now)?;
     Ok(jobs)
 }
 
-/// Check access and load the immutable blob in ONE read snapshot/query, joining
-/// run -> repository ownership rather than accepting a tenant from the caller.
 pub fn get_run_spec(
     conn: &Connection,
     principal: Principal,
@@ -192,8 +173,6 @@ pub fn get_repo(conn: &Connection, principal: Principal, repo: RepoId) -> Result
     decode_repo(row)
 }
 
-/// Keyset pagination; tenant and `after` are filters, never authority. Changing
-/// either cannot expose a row without the live predicate. At most 100 records.
 pub fn list_repos(
     conn: &Connection,
     principal: Principal,
@@ -226,47 +205,22 @@ pub fn list_repos(
     rows.map(|r| decode_repo(r?)).collect()
 }
 
-/// Who is making an administrative decision.
-///
-/// Platform administration has two legitimate sources, and the audit trail must
-/// tell them apart: a credential that proves a super admin is acting, and an
-/// operator on the controller's own host, whose authority is the database file
-/// itself. The host-local variant exists so `sentinel admin` does not have to
-/// fabricate a `Principal` for somebody who never authenticated.
-///
-/// Step-up freshness is freshness, not authority: privileged changes
-/// require both it and a live platform-admin check. A browser session carries
-/// its token digest so freshness is **read again inside the writer
-/// transaction** of the change ([`Authority::require_fresh`]) rather than
-/// trusted from a flag computed when the request was identified: a session
-/// revoked, or whose window closed, in between is refused at the mutation.
+/// Freshness is re-read inside the writer transaction, so a session revoked mid-request is refused at the mutation.
 #[derive(Clone, Copy, Debug)]
 pub enum Authority {
-    /// An authenticated caller whose step-up is a precomputed fact. Platform
-    /// administration is checked live. A bearer credential is always
-    /// unstepped; the stepped form is for tests and trusted callers that have
-    /// verified a proof themselves.
     Credential {
         principal: Principal,
         stepped_up: bool,
     },
-    /// A browser session: its step-up stamp is re-read from the `sessions`
-    /// row in the transaction that makes the change.
     Session {
         principal: Principal,
         token: Digest,
-        /// `Policy::step_up_ms`: how long a stamp stays fresh.
         step_up_ms: i64,
     },
-    /// A process that can already open this database, as with bootstrap and
-    /// recovery. There is no network path to this variant, and no step-up can
-    /// be stronger than holding the file.
     HostLocal,
 }
 
 impl Authority {
-    /// A credential that has not proven presence: enough for routine
-    /// administration, not for changes to who can authenticate.
     pub const fn credential(principal: Principal) -> Self {
         Self::Credential {
             principal,
@@ -274,9 +228,6 @@ impl Authority {
         }
     }
 
-    /// A browser session, with its step-up freshness evaluated against policy
-    /// now. Prefer [`Authority::live_session`] where the session token is at
-    /// hand: it re-checks inside the transaction.
     pub fn session(
         session: &crate::local_auth::Session,
         policy: crate::local_auth::Policy,
@@ -288,8 +239,6 @@ impl Authority {
         }
     }
 
-    /// A browser session identified by its token digest; freshness is judged
-    /// against the session row at the point of each privileged change.
     pub const fn live_session(
         principal: Principal,
         token: Digest,
@@ -302,7 +251,6 @@ impl Authority {
         }
     }
 
-    /// Require platform administration.
     pub fn require_platform(&self, conn: &Connection) -> Result<()> {
         match self {
             Authority::Credential { principal, .. } | Authority::Session { principal, .. } => {
@@ -312,11 +260,6 @@ impl Authority {
         }
     }
 
-    /// Require recent proof of presence, judged now. For a browser session
-    /// this is one primary-key probe of its row inside `conn`'s transaction:
-    /// a revoked or expired session, an un-stamped one, and a stamp outside
-    /// the window (or in the future) are all `StepUpRequired`. A bearer
-    /// credential never has it; host-local needs none.
     pub fn require_fresh(&self, conn: &Connection) -> Result<()> {
         match self {
             Authority::HostLocal
@@ -346,29 +289,11 @@ impl Authority {
         }
     }
 
-    /// Require platform administration **and** recent proof of presence: the
-    /// bar for changing who can authenticate, or as whom.
     pub fn require_privileged(&self, conn: &Connection) -> Result<()> {
         self.require_platform(conn)?;
         self.require_fresh(conn)
     }
 
-    /// Live administration of `tenant` for a change that grants access.
-    ///
-    /// The administration check is [`require_tenant_admin`]. On top of it:
-    ///
-    /// - `strict` demands fresh step-up of everyone (issuing credentials);
-    /// - a platform administrator who is **not** an administrator-member of
-    ///   the tenant reaches it by platform scope alone, which carries no
-    ///   ambient data access (see [`require_object_read`]): that path always
-    ///   demands fresh step-up and an explicit `reason` (1..=100 characters)
-    ///   and is recorded as [`crate::local_auth::Event::PlatformOverride`].
-    ///
-    /// Refusals are ordered so a caller without administration learns nothing
-    /// (`Forbidden`) and a caller without proof is asked for it
-    /// (`StepUpRequired`) before the reason is judged. A host-local authority
-    /// is refused: it has no principal to attribute, and host-local
-    /// provisioning uses the trusted primitives.
     pub fn require_tenant_access_change(
         &self,
         tx: &Transaction<'_>,
@@ -472,11 +397,6 @@ pub fn require_tenant_admin(
     }
 }
 
-/// Tenant-scoped object transfer authority. The tenant comes from the
-/// resource row or the namespace lookup — never trusted from the request.
-/// `write` distinguishes upload sessions (membership at operator role or
-/// above, plus the RUN bit) from object downloads (any live member). A
-/// caller without the relationship sees `NotFound`, never the difference.
 pub fn require_tenant_member(
     conn: &Connection,
     principal: Principal,
@@ -519,20 +439,6 @@ pub fn require_tenant_member(
     }
 }
 
-/// Object download authority. Bytes are repository evidence, so a
-/// digest is readable only through something that already grants it:
-///
-/// - an **artifact**: some manifest edge to `(tenant, digest)` belongs to an
-///   artifact of a run whose repository the caller may `READ` — the same
-///   predicate as the run's artifact listing (one join from the
-///   `manifest_refs_object` index; the job id is the manifest name's
-///   prefix, `job_<uuid>/<artifact>`);
-/// - a **resumable upload** committed in the tenant, for a member at
-///   operator role or above holding `RUN` — who could have uploaded it.
-///
-/// Super admin carries no ambient data access here: platform scope is not
-/// a membership. Anything else is `NotFound`, the same as a missing digest,
-/// so the route is no existence oracle.
 pub fn require_object_read(
     conn: &Connection,
     principal: Principal,
@@ -601,8 +507,6 @@ pub enum NamespaceKind {
     Personal(UserId),
 }
 
-/// Tenant creation is platform admission, not a side effect of sign-in. A
-/// personal owner receives its required admin membership atomically.
 pub fn create_namespace(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -615,9 +519,6 @@ pub fn create_namespace(
     insert_namespace(tx, tenant, slug, kind, now)
 }
 
-/// The insertion itself, without an authorization decision. Trusted internal:
-/// `create_namespace` above requires platform administration, and
-/// [`crate::registration`] applies the deployment's tenant-creation policy.
 pub(crate) fn insert_namespace(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -647,8 +548,6 @@ pub struct TenantNamespace {
     pub personal: bool,
 }
 
-/// Namespace resolution itself requires membership (or explicitly scoped
-/// platform administration); an installation/slug never admits a caller.
 pub fn get_namespace(
     conn: &Connection,
     principal: Principal,
@@ -683,14 +582,6 @@ pub fn get_namespace(
     })
 }
 
-/// Resolve a tenant slug for a client route, answering `NotFound` alike for
-/// an absent tenant, a suspended one, and one the caller has no live
-/// relationship with, so a slug in a URL never confirms that a namespace
-/// exists. Unlike [`get_namespace`] it also admits a credential narrowed to
-/// one repository of that tenant, whose routes still narrow further.
-///
-/// One key probe on `tenants(slug)` plus key joins; it replaces the
-/// host-local [`crate::lookup::tenant_by_slug`] at no extra cost.
 pub fn member_tenant_by_slug(
     conn: &Connection,
     principal: Principal,
@@ -724,13 +615,6 @@ pub fn member_tenant_by_slug(
     TenantId::from_bytes(bytes).map_err(|_| Error::Corrupt("tenant_id"))
 }
 
-/// Resolve the tenant (by slug) and, optionally, a repository (by name)
-/// that a person may narrow an OAuth grant to: an active tenant they are a
-/// member of, and a repository of it they can see (tenant admins see every
-/// repository; other members the ones granted to them). Anything else —
-/// absent, suspended, foreign, or invisible — is the same `NotFound`, so
-/// the consent and device pages cannot be used to learn which names exist
-/// elsewhere. One statement.
 pub fn narrowing_by_name(
     conn: &Connection,
     user: UserId,
@@ -763,12 +647,6 @@ pub fn narrowing_by_name(
     }
 }
 
-/// Refuse (`Conflict`) to take the administrator role from `user` when they
-/// are the tenant's last administrator: an organization that loses its last
-/// admin can only be recovered by the platform. A personal namespace's owner
-/// is already held by the schema. A tenant that has no administrator (one a
-/// platform administrator created bare) is not blocked: the change being
-/// made is how it gets one.
 fn keep_an_admin(tx: &Transaction<'_>, tenant: TenantId, user: UserId) -> Result<()> {
     let last: bool = tx
         .prepare_cached(
@@ -784,12 +662,6 @@ fn keep_an_admin(tx: &Transaction<'_>, tenant: TenantId, user: UserId) -> Result
     Ok(())
 }
 
-/// Name a person in `tenant`: a `usr_…` id as given, or else the **existing
-/// member** with that local sign-in name. A name is never resolved outside the
-/// tenant, so an administrator cannot probe which sign-in names exist
-/// deployment-wide: a non-member's name and an unknown name are the same
-/// `NotFound`. Adding someone who is not yet a member takes their (unguessable)
-/// id, which has to come from the person.
 pub fn resolve_member(conn: &Connection, tenant: TenantId, text: &str) -> Result<UserId> {
     if let Ok(user) = text.parse::<UserId>() {
         return Ok(user);
@@ -808,11 +680,6 @@ pub fn resolve_member(conn: &Connection, tenant: TenantId, text: &str) -> Result
     UserId::from_bytes(bytes).map_err(|_| Error::Corrupt("user_id"))
 }
 
-/// Set or change a member's role. A downgrade takes effect on the next query;
-/// the tenant's authorization epoch moves so anything long-lived re-checks.
-///
-/// This `Principal` form carries no step-up policy: it is for trusted
-/// provisioning and fixtures. Client routes use [`set_membership_as`].
 pub fn set_membership(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -824,10 +691,6 @@ pub fn set_membership(
     apply_membership(tx, principal, tenant, user, role)
 }
 
-/// [`set_membership`] for a client route. A platform administrator who is not
-/// an administrator of the tenant changes membership only with fresh step-up
-/// and an audited `reason` ([`Authority::require_tenant_access_change`]); a
-/// tenant administrator needs neither.
 pub fn set_membership_as(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -847,8 +710,6 @@ fn apply_membership(
     user: UserId,
     role: Role,
 ) -> Result<()> {
-    // In a GitHub-backed tenant GitHub decides who is a member and in which
-    // role: no administrator adds a person or changes a role by hand.
     crate::github_members::require_app_managed(tx, tenant, Some(user))?;
     if role != Role::TenantAdmin {
         keep_an_admin(tx, tenant, user)?;
@@ -870,8 +731,6 @@ fn apply_membership(
     }
     crate::tenancy::bump_epoch(tx, tenant)?;
     if !was_member {
-        // No invitation or acceptance precedes this: record that the person
-        // was added by someone else, apart from the role change below.
         crate::local_auth::audit(
             tx,
             crate::local_auth::Event::MemberAdded,
@@ -895,9 +754,6 @@ fn apply_membership(
     )
 }
 
-/// Remove a member. Grants cascade away, so removing and re-adding membership
-/// cannot resurrect them; credentials narrowed to this tenant are revoked in
-/// the same transaction, because nothing they could reach remains.
 pub fn remove_membership(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -906,8 +762,6 @@ pub fn remove_membership(
     now: UnixMillis,
 ) -> Result<()> {
     require_tenant_admin(tx, principal, tenant)?;
-    // A derived member the administrator removed would be restored by the next
-    // check: leaving is done in GitHub, and the answer follows from there.
     crate::github_members::require_app_managed(tx, tenant, Some(user))?;
     keep_an_admin(tx, tenant, user)?;
     let removed = tx.execute(
@@ -934,8 +788,6 @@ pub fn remove_membership(
     )
 }
 
-/// Resolve a namespace the principal is a member of (or, with platform scope,
-/// administers) by its identifier. Same predicate as [`get_namespace`].
 pub fn get_namespace_by_id(
     conn: &Connection,
     principal: Principal,
@@ -983,9 +835,6 @@ pub fn create_repo(
     crate::jobs::insert_repo(tx, tenant, repo, name, now)
 }
 
-/// The insertion itself, without an authorization decision: the host-local
-/// CLI path and trusted provisioning use it, the client path goes through
-/// [`create_repo`] below.
 pub fn create_repo_trusted(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -997,11 +846,6 @@ pub fn create_repo_trusted(
     crate::jobs::insert_repo(tx, tenant, repo, name, now)
 }
 
-/// Grant/revoke repository actions; NONE deletes a grant. Membership is a
-/// ceiling: a reader with a RUN bit still cannot run. Secrets are independent.
-///
-/// This `Principal` form carries no step-up policy: it is for trusted
-/// provisioning and fixtures. Client routes use [`set_repo_grant_as`].
 pub fn set_repo_grant(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -1014,9 +858,6 @@ pub fn set_repo_grant(
     apply_repo_grant(tx, principal, tenant, repo, user, permissions)
 }
 
-/// [`set_repo_grant`] for a client route: the same step-up and `reason` rule
-/// as [`set_membership_as`] for a platform administrator who does not
-/// administer the tenant.
 pub fn set_repo_grant_as(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -1039,7 +880,6 @@ fn not_found_if_forbidden(error: Error) -> Error {
     }
 }
 
-/// The tenant that owns `repo`, after the permission bits are checked.
 fn grant_target(tx: &Transaction<'_>, repo: RepoId, permissions: Permissions) -> Result<TenantId> {
     if !Permissions::REPOSITORY.contains(permissions) {
         return Err(Error::InvalidInput("repository permissions"));
@@ -1055,7 +895,6 @@ fn grant_target(tx: &Transaction<'_>, repo: RepoId, permissions: Permissions) ->
     TenantId::from_bytes(bytes).map_err(|_| Error::Corrupt("tenant_id"))
 }
 
-/// Write the grant for an already-authorized change.
 pub(crate) fn apply_repo_grant(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -1064,9 +903,7 @@ pub(crate) fn apply_repo_grant(
     user: UserId,
     permissions: Permissions,
 ) -> Result<()> {
-    // Repository access of a GitHub-backed tenant's people is derived from
-    // GitHub's per-repository permission; a hand-written grant would be a way
-    // above what the person holds there. Service accounts stay app-managed.
+    // A hand-written grant would give a GitHub-backed member more than GitHub grants them.
     crate::github_members::require_app_managed(tx, tenant, Some(user))?;
     if permissions == Permissions::NONE {
         tx.execute(
@@ -1089,10 +926,6 @@ pub(crate) fn apply_repo_grant(
     )
 }
 
-/// Create a service principal confined to `tenant`. Minting a principal that
-/// can later hold credentials needs fresh step-up
-/// ([`Authority::require_tenant_access_change`], strict), and a platform
-/// administrator who does not administer the tenant also gives a `reason`.
 #[allow(clippy::too_many_arguments)]
 pub fn create_service_account(
     tx: &Transaction<'_>,
@@ -1131,8 +964,6 @@ fn bounded_text(value: &str, max: usize, field: &'static str) -> Result<()> {
     Ok(())
 }
 
-/// Trusted admission/authentication persistence primitives. No HTTP/CLI route
-/// may expose these directly.
 pub mod provisioning {
     use super::*;
 
@@ -1151,11 +982,6 @@ pub mod provisioning {
         Ok(())
     }
 
-    /// Provider is a configured issuer key; subject is the verified immutable
-    /// provider user ID, not a login, email or display name. Never relink on
-    /// conflict. A pending account may hold a link — holding one is not using
-    /// one, since sign-in still requires an active account — but a rejected
-    /// account may not acquire one.
     pub fn link_verified_identity(
         tx: &Transaction<'_>,
         user: UserId,

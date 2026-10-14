@@ -1,7 +1,4 @@
-//! The named endpoint compatibility matrix: every case against
-//! every S3 service listed in `$SENTINEL_S3_ENDPOINTS` (written by
-//! `tests/endpoints.sh`; see [docs/s3.md](../../../docs/s3.md)). Without the
-//! variable it reports that it was skipped, never a false pass.
+//! Without `SENTINEL_S3_ENDPOINTS` the test reports that it was skipped, never a false pass.
 
 use std::io::Read;
 
@@ -133,7 +130,6 @@ fn multipart_resume(e: &Endpoint, prefix: &str) -> Result<(), String> {
     let e1 = c
         .upload_part(&key, &id, 1, &first)
         .map_err(|x| x.to_string())?;
-    // A restart: a fresh client learns what the upload already holds.
     let c = client(e, prefix, None);
     let held = c.list_parts(&key, &id).map_err(|x| x.to_string())?;
     check(
@@ -258,10 +254,7 @@ fn compatibility_matrix() {
         eprintln!("skipped: set SENTINEL_S3_ENDPOINTS (tests/endpoints.sh writes it)");
         return;
     };
-    // (name, case, required): an optional case records what the service
-    // does without failing the matrix — only `Content-MD5` is relied on for
-    // transport integrity, the signed payload hash is a second check some
-    // services skip.
+    // Optional cases are recorded without failing: some services skip the signed payload hash.
     let cases: [(&str, Case, bool); 6] = [
         ("roundtrip", roundtrip, true),
         ("multipart_resume", multipart_resume, true),
