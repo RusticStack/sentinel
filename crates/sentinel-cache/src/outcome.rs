@@ -1,55 +1,27 @@
-//! The explainable vocabulary every lookup answers with. A miss is data,
-//! not an error: corrupt, incompatible or absent state all mean "build as
-//! if there were no cache", and the `Miss` variant is the whole reason —
-//! for logs, the `sentinel.cache` report and tests alike.
-
 use crate::manifest::Manifest;
 
-/// Why an entry could not serve. The order `compatible` checks is the
-/// order these read: the outermost broken boundary is the reason.
+/// Checked in declaration order by `compatible`: the outermost broken boundary is the reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Miss {
-    /// Nothing where the entry or generation should be: no directory, no
-    /// `current` pointer, no manifest file.
     Absent,
-    /// Bytes existed but could not be trusted: short head, bad magic,
-    /// undecodable body, unreadable file, oversize manifest.
     Corrupt,
-    /// The manifest version is one this build does not know.
     UnsupportedVersion,
-    /// The generation was never sealed — an interrupted write.
     Unsealed,
-    /// The manifest was written for a different cache class.
     WrongClass,
-    /// The manifest records a different tenant.
     WrongTenant,
-    /// The manifest records a different repository.
     WrongRepo,
-    /// The manifest was sealed under the other trust class.
     WrongTrust,
-    /// The manifest was sealed on another `os-arch`.
     WrongPlatform,
-    /// The manifest was sealed under another toolchain digest.
     WrongToolchain,
-    /// The manifest names a different cache entry.
     WrongName,
-    /// The rendered key differs — or, for `downloads`, is not under the
-    /// stored key's prefix.
     WrongKey,
-    /// The class's own inputs differ: lockfile digest, installer, flags,
-    /// ABI tag or tool identity.
     Incompatible,
-    /// The manifest decoded but is semantically wrong: bad IDs, an
-    /// invalid name, a `compat` payload from another class.
     Invalid,
-    /// The entry could not be read this time: a transient filesystem or
-    /// lease failure on the restore path. Distinct from `Corrupt` —
-    /// the bytes may be fine, the store was not — and worth retrying.
+    /// Not `Corrupt`: the bytes may be fine, so a retry is worthwhile.
     Unavailable,
 }
 
 impl Miss {
-    /// The stable lowercase spelling for logs and reports.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Absent => "absent",
@@ -77,18 +49,13 @@ impl std::fmt::Display for Miss {
     }
 }
 
-/// A lookup that can serve: the verified manifest plus the payload size it
-/// recorded, so reports can say how much a hit is worth.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hit {
     pub manifest: Manifest,
-    /// Total payload bytes (`files` blob total at seal time).
     pub bytes: u64,
 }
 
-/// What a lookup found — always total, never an error. The hit boxes its
-/// manifest so a miss stays small and the lookup path never carries a
-/// payload it did not earn.
+/// Boxed so a miss stays small; a hit payload is only carried when it is served.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Hit(Box<Hit>),
@@ -107,8 +74,6 @@ mod tests {
 
     #[test]
     fn every_reason_has_a_stable_name() {
-        // The strings are the report vocabulary; renaming them is a
-        // docs/compatibility.md change.
         let all = [
             (Miss::Absent, "absent"),
             (Miss::Corrupt, "corrupt"),
