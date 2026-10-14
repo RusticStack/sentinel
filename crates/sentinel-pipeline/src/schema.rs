@@ -608,14 +608,11 @@ fn condition(path: &str, node: &Node) -> Result<Expr> {
             SchemaErrorKind::Invalid(format!("invalid expression {e}")),
         )
     })?;
-    if let Expr::Lit(v) = &e
-        && v.as_condition().is_none()
-    {
-        return Err(err(
-            path,
-            SchemaErrorKind::Invalid("condition must be a boolean expression".into()),
-        ));
-    }
+    // Typed once here: a condition that can fail with a type error at
+    // evaluation time (a comparison across types, `!` over a string, a
+    // non-boolean result) is rejected before it can run.
+    e.check_condition()
+        .map_err(|m| err(path, SchemaErrorKind::Invalid(m.into())))?;
     Ok(e)
 }
 
