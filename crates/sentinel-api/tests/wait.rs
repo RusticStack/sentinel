@@ -1,9 +1,3 @@
-//! Over real HTTP on loopback: the run wait long poll
-//! on the store's commit notifier and its subscriber cap (shared with
-//! `logs?wait=1`), the bounded literal log search, the per-attempt cache
-//! summary behind `cache:read`, and keyset pagination of a repository's
-//! runs. The harness is the minimal one from `oauth_core.rs`.
-
 use std::{
     sync::Arc,
     thread,
@@ -40,7 +34,6 @@ struct Deployment {
     _controller: Controller,
     server: Option<sentinel_api::Server>,
     base: String,
-    /// `Bearer sntl_…` for root with every permission.
     auth: String,
     root: UserId,
     tenant: TenantId,
@@ -118,7 +111,6 @@ fn deployment() -> Deployment {
     }
 }
 
-/// One request against `base`: status and JSON body.
 fn call(base: &str, method: &str, path: &str, auth: &str) -> (u16, Value) {
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
@@ -184,8 +176,6 @@ fn mcp(
     (status, headers, body)
 }
 
-/// A second person administering `acme` (so every repository is visible),
-/// with their own read credential: `Bearer sntl_…`.
 fn second_user(d: &Deployment, name: &'static str) -> String {
     let (root, tenant) = (d.root, d.tenant);
     let user = UserId::new();
@@ -202,7 +192,6 @@ fn second_user(d: &Deployment, name: &'static str) -> String {
     format!("Bearer {}", sentinel_auth::token::format(&granted.secret))
 }
 
-/// Park a run wait on `run` past `version` for 2.5 s as `auth`.
 fn park(d: &Deployment, run: RunId, version: &str, auth: &str) -> thread::JoinHandle<(u16, Value)> {
     let (base, auth, version) = (d.base.clone(), auth.to_owned(), version.to_owned());
     thread::spawn(move || {
@@ -223,7 +212,6 @@ jobs:
     steps: [{ id: s, run: 'true' }]
 ";
 
-/// Dispatch a one-job run; its id and its job's id.
 fn dispatch(d: &Deployment) -> (RunId, JobId) {
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
@@ -248,7 +236,6 @@ fn dispatch(d: &Deployment) -> (RunId, JobId) {
     )
 }
 
-/// Lease the job to a made-up worker, the way the dispatcher would.
 fn lease(d: &Deployment, job: JobId) -> (WorkerId, AttemptId, Fence) {
     let tenant = d.tenant;
     d.store
@@ -263,9 +250,6 @@ fn lease(d: &Deployment, job: JobId) -> (WorkerId, AttemptId, Fence) {
         .unwrap()
 }
 
-/// A worker the store knows: its own dedicated pool of the tenant and a
-/// host-local enrollment. Acknowledgements and reports come only from a
-/// registered, unrevoked worker.
 fn enrolled_worker(
     tx: &sentinel_store::Transaction<'_>,
     tenant: TenantId,
@@ -307,7 +291,6 @@ fn enrolled_worker(
     Ok(worker)
 }
 
-/// The worker's side of a passing attempt, with its terminal summary.
 fn pass(d: &Deployment, lease: (WorkerId, AttemptId, Fence), summary: Vec<u8>) {
     let (worker, attempt, fence) = lease;
     d.store
@@ -342,7 +325,6 @@ fn version_of(body: &Value) -> String {
 fn a_wait_returns_as_soon_as_the_run_changes_and_parks_while_it_does_not() {
     let d = deployment();
     let (run, job) = dispatch(&d);
-    // Without `since`: the current run at once.
     let started = Instant::now();
     let (status, first) = get(&d, &format!("/api/v1/runs/{run}/wait"));
     assert_eq!(status, 200, "{first}");
@@ -351,7 +333,6 @@ fn a_wait_returns_as_soon_as_the_run_changes_and_parks_while_it_does_not() {
     assert_eq!(first["finished"], false);
     assert_eq!(first["run"]["id"], run.to_string());
     let version = version_of(&first);
-    // A different `since` answers at once.
     let started = Instant::now();
     let (_, other) = get(
         &d,
@@ -362,7 +343,6 @@ fn a_wait_returns_as_soon_as_the_run_changes_and_parks_while_it_does_not() {
         (other["changed"].as_bool(), other["version"].as_str()),
         (Some(true), Some(version.as_str()))
     );
-    // The current `since` parks until the deadline and reports no change.
     let started = Instant::now();
     let (status, same) = get(
         &d,
@@ -374,7 +354,6 @@ fn a_wait_returns_as_soon_as_the_run_changes_and_parks_while_it_does_not() {
     assert_eq!(same["version"], version.as_str());
     assert!(waited >= Duration::from_millis(390), "{waited:?}");
     assert!(waited < Duration::from_secs(3), "{waited:?}");
-    // A commit that changes nothing visible about the run keeps it parked.
     let store = Arc::clone(&d.store);
     let unrelated = thread::spawn(move || {
         thread::sleep(Duration::from_millis(100));
@@ -389,7 +368,6 @@ fn a_wait_returns_as_soon_as_the_run_changes_and_parks_while_it_does_not() {
     );
     unrelated.join().unwrap();
     assert_eq!(same["changed"], false);
-    // A parked wait returns as soon as the job finishes.
     let (base, auth) = (d.base.clone(), d.auth.clone());
     let canceller = thread::spawn(move || {
         thread::sleep(Duration::from_millis(300));
@@ -409,7 +387,6 @@ fn a_wait_returns_as_soon_as_the_run_changes_and_parks_while_it_does_not() {
     assert_eq!(done["changed"], true);
     assert_eq!(done["finished"], true);
     assert_eq!(done["run"]["state"], "canceled");
-    // Finished: even the current `since` answers at once.
     let finished = version_of(&done);
     let started = Instant::now();
     let (_, again) = get(
@@ -421,7 +398,6 @@ fn a_wait_returns_as_soon_as_the_run_changes_and_parks_while_it_does_not() {
         (again["changed"].as_bool(), again["finished"].as_bool()),
         (Some(false), Some(true))
     );
-    // Refusals: malformed `since`, out-of-range `timeout_ms`, unknown run.
     for query in [
         "since=xyz",
         "since=00000000000000000",
@@ -443,7 +419,6 @@ fn a_wait_returns_as_soon_as_the_run_changes_and_parks_while_it_does_not() {
 fn a_parked_subscriber_past_the_cap_is_rate_limited_and_log_follows_share_it() {
     let d = deployment();
     let (run, job) = dispatch(&d);
-    // An attempt with one stored frame, so a follow past it would park.
     let (_, attempt, _) = lease(&d, job);
     d.logs
         .append(
@@ -460,8 +435,6 @@ fn a_parked_subscriber_past_the_cap_is_rate_limited_and_log_follows_share_it() {
         .unwrap();
     let (_, first) = get(&d, &format!("/api/v1/runs/{run}/wait"));
     let version = version_of(&first);
-    // Every slot parked, by as many other users as it takes (each within
-    // its share): the cap is global, not per user.
     const NAMES: [&str; 8] = [
         "holder-0", "holder-1", "holder-2", "holder-3", "holder-4", "holder-5", "holder-6",
         "holder-7",
@@ -489,10 +462,8 @@ fn a_parked_subscriber_past_the_cap_is_rate_limited_and_log_follows_share_it() {
         "{body}"
     );
     assert_eq!(body["details"]["retry_after_ms"], 1000);
-    // A wait that would answer at once needs no slot.
     let (status, _) = get(&d, &format!("/api/v1/runs/{run}/wait"));
     assert_eq!(status, 200);
-    // A log follow that would park shares the same slots.
     let (status, body) = get(
         &d,
         &format!("/api/v1/attempts/{attempt}/logs?after=1&wait=1"),
@@ -511,7 +482,6 @@ fn a_parked_subscriber_past_the_cap_is_rate_limited_and_log_follows_share_it() {
         let (status, body) = waiter.join().unwrap();
         assert_eq!((status, body["changed"].as_bool()), (200, Some(false)));
     }
-    // The slots came back.
     let (status, _) = get(
         &d,
         &format!("/api/v1/runs/{run}/wait?since={version}&timeout_ms=50"),
@@ -519,17 +489,12 @@ fn a_parked_subscriber_past_the_cap_is_rate_limited_and_log_follows_share_it() {
     assert_eq!(status, 200);
 }
 
-/// One user cannot hold every parked slot. Past its share its next
-/// parking poll is refused at once, while another user's still parks; the
-/// share comes back when a poll ends.
 #[test]
 fn one_user_cannot_take_every_subscriber_slot() {
     let d = deployment();
     let (run, _) = dispatch(&d);
     let (_, first) = get(&d, &format!("/api/v1/runs/{run}/wait"));
     let version = version_of(&first);
-    // One more parking poll than the user's share, all at once: exactly one
-    // is refused, at once, and its answer proves the others are parked.
     let (tx, rx) = std::sync::mpsc::channel();
     let greedy: Vec<_> = (0..=sentinel_api::SUBSCRIBERS_PER_USER)
         .map(|_| {
@@ -553,7 +518,6 @@ fn one_user_cannot_take_every_subscriber_slot() {
         "{body}"
     );
     assert_eq!(body["details"]["retry_after_ms"], 1000);
-    // Someone else still parks: the poll waits out its timeout.
     let other = second_user(&d, "other");
     let started = Instant::now();
     let (status, body) = call(
@@ -579,7 +543,6 @@ fn one_user_cannot_take_every_subscriber_slot() {
             "{body}"
         );
     }
-    // The greedy user's share came back.
     let (status, _) = get(
         &d,
         &format!("/api/v1/runs/{run}/wait?since={version}&timeout_ms=50"),
@@ -592,13 +555,11 @@ fn log_search_finds_literals_across_segments_within_the_byte_bound() {
     let d = deployment();
     let (run, job) = dispatch(&d);
     let (_, attempt, _) = lease(&d, job);
-    // ~5 MiB in 32 KiB frames (two segments); a matching line every 32nd.
     let filler = "y".repeat(1023) + "\n";
     let frames = 160u64;
     for seq in 1..=frames {
         let mut text = filler.repeat(31);
         if seq % 32 == 1 {
-            // Exactly 32 KiB like every other frame, so the bound is exact.
             let line = format!("found the needle here {seq}\n");
             text.push_str(&"y".repeat(1023 - line.len()));
             text.push('\n');
@@ -626,7 +587,6 @@ fn log_search_finds_literals_across_segments_within_the_byte_bound() {
             &format!("/api/v1/attempts/{attempt}/logs/search?{query}"),
         )
     };
-    // `q` is percent-decoded: the space is part of the literal.
     let (status, first) = search("q=needle%20here");
     assert_eq!(status, 200, "{first}");
     let next = first["next_after"]
@@ -652,20 +612,17 @@ fn log_search_finds_literals_across_segments_within_the_byte_bound() {
     assert_eq!(seqs(&rest), vec![129]);
     assert!(rest["next_after"].is_null());
     assert_eq!(rest["complete"], false, "the log is still being written");
-    // The match limit stops a request too.
     let (_, limited) = search("q=needle&limit=2");
     assert_eq!(
         (seqs(&limited), limited["next_after"].as_u64()),
         (vec![1, 33], Some(33))
     );
-    // Finished and scanned to the end: complete.
     d.logs.finish(run, job, attempt, frames, &[]).unwrap();
     let (_, done) = search("q=needle&after=120");
     assert_eq!(
         (seqs(&done), done["complete"].as_bool()),
         (vec![129], Some(true))
     );
-    // Refusals.
     for query in [
         "",
         "q=",
@@ -692,8 +649,6 @@ fn log_search_pages_find_a_literal_split_across_a_sealed_segment_once() {
     let d = deployment();
     let (run, job) = dispatch(&d);
     let (_, attempt, _) = lease(&d, job);
-    // Records of exactly 32 KiB: segment 0 holds frames 1..=128, and the
-    // 4 MiB scan bound stops the first request at the same frame.
     let payload = (32 << 10) - sentinel_protocol::logs::FRAME_HEADER_BYTES;
     let frame = |tail: &str, head: &str| {
         let mut text = head.to_owned();
@@ -739,7 +694,6 @@ fn log_search_pages_find_a_literal_split_across_a_sealed_segment_once() {
     let carry = first["next_carry"]
         .as_str()
         .expect("a carry with next_after");
-    // Resuming with the carry finds the split exactly once and completes.
     let (_, second) = search(&format!("after=128&carry={carry}"));
     assert_eq!(
         second["matches"],
@@ -753,10 +707,8 @@ fn log_search_pages_find_a_literal_split_across_a_sealed_segment_once() {
         ),
         (&Value::Null, &Value::Null, &json!(true))
     );
-    // One request covering both sides reports it the same, once.
     let (_, whole) = search("after=100");
     assert_eq!(whole["matches"], second["matches"]);
-    // A carry is bound to its `after` and needle.
     for query in [
         format!("after=127&carry={carry}"),
         "after=128&carry=zz".to_owned(),
@@ -968,14 +920,11 @@ fn failure_view_parses_attempt_logs_with_stable_evidence_and_a_hard_budget() {
         &d.auth,
     );
     assert_eq!(status, 200);
-    // Between the rerun and the next lease the job is queued under
-    // the old fence; the failed attempt must not report that as its own.
     let (status, requeued) = get(&d, &path);
     assert_eq!(status, 200, "{requeued}");
     assert_eq!(requeued["authoritative"]["current_attempt"], false);
     assert_eq!(requeued["authoritative"]["job_state"], Value::Null);
     assert_eq!(requeued["authoritative"]["failure_class"], Value::Null);
-    // The attempt's own evidence is unchanged.
     assert_eq!(requeued["failed_step"]["id"], "test");
     assert_eq!(
         requeued["reports"][0]["report"]["diagnostics"][0]["test"]["name"],
@@ -1003,8 +952,6 @@ fn failure_view_parses_attempt_logs_with_stable_evidence_and_a_hard_budget() {
     assert_eq!(historical["authoritative"]["job_state"], Value::Null);
 }
 
-/// Acknowledge `leased` and report steps started, as a worker does before
-/// any output exists.
 fn start(d: &Deployment, leased: (WorkerId, AttemptId, Fence)) {
     let (worker, attempt, fence) = leased;
     d.store
@@ -1020,7 +967,6 @@ fn start(d: &Deployment, leased: (WorkerId, AttemptId, Fence)) {
         .unwrap();
 }
 
-/// Settle a started attempt with `event` and a summary of `steps`.
 fn settle(
     d: &Deployment,
     leased: (WorkerId, AttemptId, Fence),
@@ -1063,8 +1009,6 @@ fn step_record(index: u32, id: &str, outcome: StepOutcome) -> StepRecord {
     }
 }
 
-/// A frame of Go test JSON for `test`: the events on their own lines, then
-/// plain noise lines up to exactly `MAX_LOG_FRAME_BYTES`.
 fn go_failure_frame(test: &str, output: &str) -> Vec<u8> {
     let mut bytes = b"\n".to_vec();
     for event in [
@@ -1079,7 +1023,6 @@ fn go_failure_frame(test: &str, output: &str) -> Vec<u8> {
     bytes
 }
 
-/// Fill to one full frame with 128-byte plain-text lines.
 fn pad_with_noise(bytes: &mut Vec<u8>) {
     let full = sentinel_protocol::limits::MAX_LOG_FRAME_BYTES;
     while bytes.len() < full {
@@ -1089,8 +1032,6 @@ fn pad_with_noise(bytes: &mut Vec<u8>) {
     }
 }
 
-/// An OAuth access token for a registered MCP client with `scopes`, and an
-/// initialized MCP session: `(authorization, session id)`.
 fn mcp_session(d: &Deployment, client_id: &'static str, scopes: Scopes) -> (String, String) {
     sentinel_store::oauth::register_mcp_client(
         &d.store,
@@ -1162,7 +1103,6 @@ fn mcp_session(d: &Deployment, client_id: &'static str, scopes: Scopes) -> (Stri
     (authorization, session)
 }
 
-/// One MCP `tools/call`; the structured result.
 fn mcp_tool(d: &Deployment, session: &(String, String), name: &str, arguments: Value) -> Value {
     let (status, _, body) = mcp(
         d,
@@ -1184,7 +1124,6 @@ fn mcp_tool(d: &Deployment, session: &(String, String), name: &str, arguments: V
     body["result"]["structuredContent"].clone()
 }
 
-/// Every diagnostic of a failure view whose test is `name`.
 fn diagnostics_for<'a>(view: &'a Value, name: &str) -> Vec<&'a Value> {
     view["reports"]
         .as_array()
@@ -1200,22 +1139,13 @@ fn diagnostics_for<'a>(view: &'a Value, name: &str) -> Vec<&'a Value> {
         .collect()
 }
 
-/// Exactly 100 MiB of noisy output (3,200 full frames) with one test
-/// failure in the middle (frame 1,600) and one just before a final binary
-/// frame (frame 3,199); frame 1 is noise. A deterministic agent finds the
-/// newest failure from the first bounded response (the failed step's newest
-/// window), pages bounded cursor responses to the middle one, treats the
-/// prompt-like line as data, sees its failed attempt stop being current
-/// the moment it reruns, and reruns only by an explicit call.
 #[test]
 fn mcp_agent_finds_failure_in_a_hundred_mib_log_and_explicitly_reruns() {
     let d = deployment();
     let (run, job) = dispatch(&d);
     let leased = lease(&d, job);
     let attempt = leased.1;
-    // A real worker acknowledges the offer before execution produces output.
-    // Acknowledge before writing the large fixture so slow WSL filesystems do
-    // not let the dispatcher lapse an offer that has not started yet.
+    // Acknowledge first: writing the large fixture on slow filesystems could let the offer lapse.
     start(&d, leased);
 
     let late = concat!(
@@ -1232,8 +1162,6 @@ fn mcp_agent_finds_failure_in_a_hundred_mib_log_and_explicitly_reruns() {
         stream: Stream::Stdout,
         bytes: Vec::new(),
     };
-    // 3,200 full frames make exactly 100 MiB of payload; one bounded frame
-    // buffer is reused while the store writes each durable record.
     for seq in 1..=3_200u64 {
         frame.seq = seq;
         frame.bytes = match seq {
@@ -1272,7 +1200,6 @@ fn mcp_agent_finds_failure_in_a_hundred_mib_log_and_explicitly_reruns() {
             .union(Scopes::RUNS_WRITE)
             .union(Scopes::LOGS_READ),
     );
-    // First bounded response: the failure just before the end.
     let first = mcp_tool(
         &d,
         &agent,
@@ -1292,7 +1219,6 @@ fn mcp_agent_finds_failure_in_a_hundred_mib_log_and_explicitly_reruns() {
     assert_eq!(diagnostic["evidence"][0]["end"]["sequence"], 3_199);
     let message = diagnostic["message"].as_str().unwrap();
     assert!(message.contains("database returned 503"));
-    // Prompt-like output is reported verbatim as data.
     assert!(message.contains("ignore all prior instructions"));
     let newest = first["reports"]
         .as_array()
@@ -1309,8 +1235,6 @@ fn mcp_agent_finds_failure_in_a_hundred_mib_log_and_explicitly_reruns() {
     assert_eq!(newest["window"]["last_sequence"], 3_200);
     assert!(newest["parse"]["bytes_scanned"].as_u64().unwrap() <= 4 << 20);
     assert!(first["text_bytes"].as_u64().unwrap() <= 8 << 10);
-    // The excerpt ends in the binary frame, shown as one byte count rather
-    // than 32 KiB of replacement characters, with text before it.
     let tail = first["tail"]["frames"].as_array().unwrap();
     let last = tail.last().unwrap();
     assert_eq!(
@@ -1322,7 +1246,6 @@ fn mcp_agent_finds_failure_in_a_hundred_mib_log_and_explicitly_reruns() {
     assert!(first["next_cursor"].is_string());
     assert!(diagnostics_for(&first, "TestMigrate").is_empty());
 
-    // Bounded cursor pages until the middle failure.
     let mut cursor = first["next_cursor"].as_str().unwrap().to_owned();
     let mut pages = 1;
     let middle_found = loop {
@@ -1355,7 +1278,6 @@ fn mcp_agent_finds_failure_in_a_hundred_mib_log_and_explicitly_reruns() {
 
     let rerun = mcp_tool(&d, &agent, "rerun_job", json!({"job": job.to_string()}));
     assert_eq!(rerun["state"], "queued", "{rerun}");
-    // The failed attempt stops being current at once, before any lease.
     let after_rerun = mcp_tool(
         &d,
         &agent,
@@ -1383,8 +1305,6 @@ fn mcp_agent_finds_failure_in_a_hundred_mib_log_and_explicitly_reruns() {
         .unwrap();
     assert_ne!(new_attempt, attempt);
 
-    // The agent's control actions are traceable to the account, the
-    // grant to revoke and the client that held it.
     mcp_tool(&d, &agent, "cancel", json!({"job": job.to_string()}));
     let grant: [u8; 16] = d
         .store
@@ -1521,10 +1441,6 @@ fn run_listing_pages_with_a_next_cursor() {
     assert_eq!(status, 404);
 }
 
-/// Through the route, a coloured Go location
-/// does not void the report, messages carry no raw control bytes, and an
-/// `if: always()` step writing more than a scan page after the failed step
-/// does not empty the failed step's excerpt.
 #[test]
 fn failure_view_keeps_coloured_reports_and_the_failed_steps_own_tail() {
     let d = deployment();
@@ -1558,7 +1474,6 @@ fn failure_view_keeps_coloured_reports_and_the_failed_steps_own_tail() {
             .unwrap();
     }
     let failed_last = seq;
-    // The cleanup step writes more than one 4 MiB scan page.
     let mut cleanup = Vec::new();
     pad_with_noise(&mut cleanup);
     for _ in 0..140 {
@@ -1607,10 +1522,6 @@ fn failure_view_keeps_coloured_reports_and_the_failed_steps_own_tail() {
     assert_eq!(tail.last().unwrap()["sequence"], failed_last);
 }
 
-/// Report files the attempt published as artifacts are collected
-/// as advisory evidence; truncated, malformed, mis-bound or verdict-claiming
-/// reports stay visible as incomplete data and never change the verdict or
-/// the job row. A credential without `artifacts:read` does not see them.
 #[test]
 fn artifact_reports_are_advisory_evidence_and_never_change_the_verdict() {
     use sentinel_store::{
@@ -1705,7 +1616,6 @@ fn artifact_reports_are_advisory_evidence_and_never_change_the_verdict() {
             .map(|_| ())
         })
         .unwrap();
-    // The command passed; the reports claim otherwise.
     settle(
         &d,
         leased,
@@ -1757,14 +1667,12 @@ fn artifact_reports_are_advisory_evidence_and_never_change_the_verdict() {
             .unwrap()
             .is_empty()
     );
-    // The job row is untouched by any of it.
     let row = d
         .store
         .read(move |c| jobs::get_job(c, tenant, job))
         .unwrap();
     assert_eq!(row.state.as_str(), "passed");
 
-    // MCP credentials carry no artifacts:read: the files stay unread.
     let agent = mcp_session(&d, "x08-reports", Scopes::LOGS_READ);
     let view = mcp_tool(
         &d,

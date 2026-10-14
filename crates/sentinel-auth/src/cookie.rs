@@ -1,40 +1,16 @@
-//! Browser session transport policy: cookie attributes and CSRF checking.
-//!
-//! These are the exact bytes and the exact decision every `sentinel-api`
-//! handler uses (login, logout, session mutations, and the OAuth consent and
-//! device forms), so the policy is written and tested once instead of being
-//! reinvented per route.
-
 use crate::secret::{Digest, Secret, digest_eq};
 
-/// Host-only cookies: no `Domain`, so a sibling hostname cannot set or read
-/// them. `__Host-` additionally requires `Secure` and `Path=/` in conforming
-/// browsers.
+/// Host-only (no `Domain`): a sibling hostname cannot set or read it.
 pub const SESSION_COOKIE: &str = "__Host-sentinel_session";
 
-/// Carries the pending sign-in state during an external authorization round
-/// trip, so a callback must present the browser's own half of it.
-/// Issued with [`issue_sign_in`], never [`issue`]: the callback arrives as a
-/// cross-site navigation from the provider, which a `Strict` cookie misses.
 pub const SIGN_IN_COOKIE: &str = "__Host-sentinel_signin";
 
-/// The header carrying the session's CSRF secret. A header cannot be set by a
-/// cross-site form post, and `SameSite=Strict` keeps the cookie off those requests.
 pub const CSRF_HEADER: &str = "x-sentinel-csrf";
 
-/// `Strict` rather than `Lax`: Sentinel has no cross-site entry flow that must
-/// arrive already authenticated, and top-level GET navigation mutates nothing.
 const ATTRIBUTES: &str = "; Path=/; Secure; HttpOnly; SameSite=Strict";
 
-/// The pending sign-in cookie's attributes. `Lax`, because the provider's
-/// redirect back is a top-level cross-site `GET` and a `Strict` cookie is not
-/// sent on it. That is the only request `Lax` adds, and the cookie grants
-/// nothing by itself: it is half of a single-use state whose other half is the
-/// callback's `state` parameter, and it never authenticates a request.
 const SIGN_IN_ATTRIBUTES: &str = "; Path=/; Secure; HttpOnly; SameSite=Lax";
 
-/// `Set-Cookie` value issuing `secret` under `name` for `max_age_secs`. The
-/// secret appears here and nowhere else; the caller must not log the result.
 pub fn issue(name: &str, secret: &Secret, max_age_secs: u32) -> String {
     let mut header = String::with_capacity(name.len() + Secret::TEXT_LEN + 64);
     header.push_str(name);
@@ -46,9 +22,6 @@ pub fn issue(name: &str, secret: &Secret, max_age_secs: u32) -> String {
     header
 }
 
-/// `Set-Cookie` value issuing the pending sign-in state ([`SIGN_IN_COOKIE`])
-/// for `max_age_secs`, with `SameSite=Lax` so the provider's redirect back
-/// carries it. The caller must not log the result.
 pub fn issue_sign_in(secret: &Secret, max_age_secs: u32) -> String {
     let mut header = String::with_capacity(SIGN_IN_COOKIE.len() + Secret::TEXT_LEN + 64);
     header.push_str(SIGN_IN_COOKIE);
@@ -60,15 +33,11 @@ pub fn issue_sign_in(secret: &Secret, max_age_secs: u32) -> String {
     header
 }
 
-/// `Set-Cookie` value that removes a cookie. Used on logout, on every rejected
-/// session, and on a completed sign-in, so a spent secret is not presented again.
 pub fn clear(name: &str) -> String {
     format!("{name}={ATTRIBUTES}; Max-Age=0")
 }
 
-/// Read one named secret out of a `Cookie` header. Returns `None` for a
-/// missing, duplicated or malformed value rather than trying the first match:
-/// two cookies of one name mean something is injecting them.
+/// Returns `None` on a duplicate name: two cookies of one name mean something is injecting them.
 pub fn read(name: &str, header: &str) -> Option<Secret> {
     let mut found = None;
     for pair in header.split(';') {
@@ -87,8 +56,6 @@ pub fn read(name: &str, header: &str) -> Option<Secret> {
     Secret::parse(found?)
 }
 
-/// Whether a state-changing request carries this session's CSRF secret.
-/// Safe methods are the caller's business; this is the check, not the routing.
 #[must_use]
 pub fn csrf_accepted(expected: &Digest, presented_header: Option<&str>) -> bool {
     let Some(secret) = presented_header.and_then(Secret::parse) else {
@@ -97,8 +64,6 @@ pub fn csrf_accepted(expected: &Digest, presented_header: Option<&str>) -> bool 
     digest_eq(&secret.digest(), expected)
 }
 
-/// A fresh per-process key for [`form_token`]. Restarting the process
-/// invalidates open forms, which is the intended bound on their life.
 #[must_use]
 pub fn form_key() -> [u8; 32] {
     let mut key = [0u8; 32];
@@ -106,13 +71,8 @@ pub fn form_key() -> [u8; 32] {
     key
 }
 
-/// Text length of a [`form_token`]: 32 bytes as hex.
 pub const FORM_TOKEN_LEN: usize = 64;
 
-/// The anti-forgery token an HTML form (OAuth consent, device approval)
-/// carries: `BLAKE3-keyed(key, session CSRF digest)` as hex. Bound to the
-/// session that rendered the page and to the process key, so it is useless
-/// for another session and needs no stored state.
 #[must_use]
 pub fn form_token(key: &[u8; 32], csrf: &Digest) -> String {
     let mut out = String::with_capacity(FORM_TOKEN_LEN);
@@ -120,8 +80,7 @@ pub fn form_token(key: &[u8; 32], csrf: &Digest) -> String {
     out
 }
 
-/// Whether a submitted form token is the one [`form_token`] renders for this
-/// key and session. Constant time over the full length.
+/// Compares in constant time over the full length, so timing reveals nothing about the token.
 #[must_use]
 pub fn form_token_accepted(key: &[u8; 32], csrf: &Digest, presented: Option<&str>) -> bool {
     let Some(presented) = presented.filter(|p| p.len() == FORM_TOKEN_LEN) else {

@@ -1,30 +1,16 @@
-//! OAuth token text forms, PKCE (RFC 7636), device user codes and the
-//! loopback redirect rule. Pure: nothing here reads a clock, a database or a
-//! request, and no token material is formatted through `Debug`/`Display`.
-//!
-//! Every token is the same 256-bit opaque [`Secret`] a session or an API
-//! credential is, behind a kind-specific prefix. Only the digest is stored.
-//! The prefixes exist so each kind is refused wherever another is expected
-//! before any database work: a refresh token, an authorization code or a
-//! device code presented as a bearer is not a bearer, and none of them has
-//! the 69-character shape of a `sntl_` credential.
+//! Prefixes make each token kind refused wherever another is expected, before any database work.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest as _, Sha256};
 
 use crate::{secret::Secret, token};
 
-/// The kinds of OAuth token text. The prefix is part of the compatibility
-/// surface: changing one invalidates tokens already in clients' hands.
+/// Changing a prefix invalidates tokens already in clients' hands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// `sntl_at_`: presented as `Authorization: Bearer`.
     Access,
-    /// `sntl_rt_`: presented only to the token and revocation endpoints.
     Refresh,
-    /// `sntl_ac_`: an authorization code, delivered to a loopback redirect.
     Code,
-    /// `sntl_dc_`: a device code, held by the polling client only.
     Device,
 }
 
@@ -44,10 +30,8 @@ pub const REFRESH_PREFIX: &str = "sntl_rt_";
 pub const CODE_PREFIX: &str = "sntl_ac_";
 pub const DEVICE_PREFIX: &str = "sntl_dc_";
 
-/// Full text length of every OAuth token: an 8-byte prefix and 64 hex.
 pub const TEXT_LEN: usize = 8 + Secret::TEXT_LEN;
 
-/// Render for the one response that issues it. The caller must not log it.
 #[must_use]
 pub fn format(kind: Kind, secret: &Secret) -> String {
     let mut text = String::with_capacity(TEXT_LEN);
@@ -56,8 +40,6 @@ pub fn format(kind: Kind, secret: &Secret) -> String {
     text
 }
 
-/// Accept a presented token of exactly this kind: prefix, length and
-/// lower-case hex body, checked before any lookup.
 #[must_use]
 pub fn parse(kind: Kind, text: &str) -> Option<Secret> {
     if text.len() != TEXT_LEN {
@@ -66,17 +48,11 @@ pub fn parse(kind: Kind, text: &str) -> Option<Secret> {
     Secret::parse(text.strip_prefix(kind.prefix())?)
 }
 
-/// What an `Authorization: Bearer` header may carry.
 pub enum Bearer {
-    /// A `sntl_` API credential.
     Credential(Secret),
-    /// A `sntl_at_` OAuth access token.
     Access(Secret),
 }
 
-/// Classify an `Authorization` header value. Refresh tokens, codes, device
-/// codes, bare hex and foreign tokens (`gho_…`, `ghp_…`, `github_pat_…`)
-/// are `None`, decided by length and prefix alone.
 #[must_use]
 pub fn bearer(header: &str) -> Option<Bearer> {
     let (scheme, value) = header.split_once(' ')?;
@@ -91,18 +67,12 @@ pub fn bearer(header: &str) -> Option<Bearer> {
     }
 }
 
-/// The device-flow user code alphabet: consonants only, no vowels (no words)
-/// and no look-alikes. 20 symbols, 8 of them: about 34.6 bits.
 pub const USER_CODE_ALPHABET: &[u8; 20] = b"BCDFGHJKLMNPQRSTVWXZ";
-/// Canonical user code length, without the display dash.
 pub const USER_CODE_LEN: usize = 8;
 
-/// A fresh user code in canonical form (8 characters, no dash). Sampling
-/// rejects bytes past the largest multiple of 20, so every symbol is
-/// equally likely.
 #[must_use]
 pub fn user_code() -> String {
-    const LIMIT: u8 = 240; // 12 * 20
+    const LIMIT: u8 = 240;
     let mut out = String::with_capacity(USER_CODE_LEN);
     let mut pool = [0u8; 16];
     while out.len() < USER_CODE_LEN {
@@ -116,8 +86,6 @@ pub fn user_code() -> String {
     out
 }
 
-/// A user code as typed by a person: case-insensitive, dashes and spaces
-/// ignored. Anything outside the alphabet, or the wrong length, is `None`.
 #[must_use]
 pub fn normalize_user_code(text: &str) -> Option<String> {
     if text.len() > 32 {
@@ -137,12 +105,9 @@ pub fn normalize_user_code(text: &str) -> Option<String> {
     (out.len() == USER_CODE_LEN).then_some(out)
 }
 
-/// The display form `XXXX-XXXX` of a canonical user code.
 #[must_use]
 pub fn display_user_code(canonical: &str) -> String {
     let mut out = String::with_capacity(USER_CODE_LEN + 1);
-    // A character boundary, not a byte count: a non-canonical input must
-    // never panic here.
     let (a, b) = canonical.split_at(canonical.floor_char_boundary(4));
     out.push_str(a);
     out.push('-');
@@ -150,14 +115,11 @@ pub fn display_user_code(canonical: &str) -> String {
     out
 }
 
-/// PKCE with the S256 method only (RFC 7636); `plain` is not offered.
 pub mod pkce {
     use super::*;
 
-    /// Challenge text length: base64url of a SHA-256 digest, unpadded.
     pub const CHALLENGE_LEN: usize = 43;
 
-    /// A fresh verifier: 32 random bytes as 43 base64url characters.
     #[must_use]
     pub fn verifier() -> String {
         let mut bytes = [0u8; 32];
@@ -173,7 +135,6 @@ pub mod pkce {
         debug_assert_eq!(written, CHALLENGE_LEN);
     }
 
-    /// `BASE64URL(SHA256(verifier))`, unpadded.
     #[must_use]
     pub fn challenge(verifier: &str) -> String {
         let mut out = [0u8; CHALLENGE_LEN];
@@ -181,8 +142,6 @@ pub mod pkce {
         String::from_utf8_lossy(&out).into_owned()
     }
 
-    /// Whether `verifier` is a well-formed RFC 7636 verifier (43–128 of
-    /// `ALPHA / DIGIT / "-" / "." / "_" / "~"`).
     #[must_use]
     pub fn verifier_valid(verifier: &str) -> bool {
         (43..=128).contains(&verifier.len())
@@ -191,7 +150,6 @@ pub mod pkce {
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
     }
 
-    /// Whether a challenge is shaped like an S256 challenge.
     #[must_use]
     pub fn challenge_valid(challenge: &str) -> bool {
         challenge.len() == CHALLENGE_LEN
@@ -200,8 +158,6 @@ pub mod pkce {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     }
 
-    /// Check a presented verifier against a stored challenge in constant
-    /// time. Malformed verifiers and challenges are refused outright.
     #[must_use]
     pub fn verify(verifier: &str, challenge: &str) -> bool {
         if !verifier_valid(verifier) || !challenge_valid(challenge) {
@@ -217,10 +173,7 @@ pub mod pkce {
     }
 }
 
-/// The port of an acceptable loopback redirect URI (RFC 8252 §7.3), or
-/// `None`. Only `http://127.0.0.1:PORT<path>` and `http://[::1]:PORT<path>`
-/// with an explicit port 1–65535 and exactly `required_path`: no
-/// `localhost` (it can resolve elsewhere), no userinfo, query or fragment.
+/// Accepts only `127.0.0.1` or `[::1]` with an explicit port: `localhost` can resolve elsewhere.
 #[must_use]
 pub fn loopback_redirect(uri: &str, required_path: &str) -> Option<u16> {
     let rest = uri.strip_prefix("http://")?;
@@ -235,15 +188,6 @@ pub fn loopback_redirect(uri: &str, required_path: &str) -> Option<u16> {
     port.parse::<u16>().ok().filter(|p| *p != 0)
 }
 
-/// The port-free form of a **registered** loopback redirect URI, which is
-/// how it is stored and matched (RFC 8252 §7.3: "any port … at the time of
-/// the request"; §8.3 discourages but does not forbid `localhost`).
-///
-/// Accepts `http://` then exactly `127.0.0.1`, `[::1]` or `localhost`, an
-/// optional port 1–65535 without leading zeros, and an optional path of
-/// printable ASCII with no query, fragment, userinfo or markup characters.
-/// Answers `http://HOST/PATH` (an empty path is `/`). The host is kept:
-/// `localhost` never matches `127.0.0.1`.
 #[must_use]
 pub fn loopback_redirect_key(uri: &str) -> Option<String> {
     let rest = uri.strip_prefix("http://")?;
@@ -405,7 +349,6 @@ mod tests {
     #[test]
     fn plain_short_and_illegal_verifiers_are_refused() {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        // `plain`: the challenge is the verifier itself.
         assert!(!pkce::verify(verifier, verifier));
         let short = &verifier[..42];
         assert!(!pkce::verify(short, &pkce::challenge(short)));
@@ -425,7 +368,6 @@ mod tests {
 
     #[test]
     fn displaying_a_non_canonical_code_never_splits_a_character() {
-        // Byte 4 falls inside the second `é`: the split moves to a boundary.
         assert_eq!(display_user_code("aéé"), "aé-é");
         assert_eq!(display_user_code("€€"), "€-€");
         assert_eq!(display_user_code(""), "-");

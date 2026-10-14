@@ -1,17 +1,4 @@
-//! The web interface in a real browser: a seeded controller, the
-//! built web interface (`web/.output`, Nuxt) in front of it as it is
-//! deployed, a job still writing its log, and `web/test/ui.mjs` driving a
-//! headless Chromium-family browser over the DevTools protocol — keyboard
-//! and screen-reader structure, contrast in both colour schemes, narrow and
-//! wide layouts, a role change and a membership removal while pages are
-//! open, a dropped connection and a busy controller during live updates,
-//! and the DOM and heap bounds on a large log.
-//!
-//! Needs Node (22+), the web interface built (`pnpm -C web install && pnpm
-//! -C web build`) and Edge, Chrome or Chromium, so it is ignored by default:
-//! `cargo test -p sentinel-api --test web_browser -- --ignored --nocapture`.
-//! `SENTINEL_BROWSER` and `SENTINEL_NODE` override the executables;
-//! `SENTINEL_UI_OUT` keeps screenshots and measurements.
+//! Needs Node 22+, a built web interface and Edge, Chrome or Chromium: run with --ignored.
 
 #[path = "support/web_fixture.rs"]
 mod fixture;
@@ -42,8 +29,6 @@ fn node() -> String {
     std::env::var("SENTINEL_NODE").unwrap_or_else(|_| "node".into())
 }
 
-/// A free loopback port for the web interface, chosen before the
-/// controller starts so the controller can name it as its public origin.
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -52,8 +37,6 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// The built web interface serving `port` in front of `api`; stopped when
-/// dropped.
 struct Web(Child);
 
 impl Web {
@@ -91,8 +74,6 @@ impl Drop for Web {
     }
 }
 
-/// Keep appending to the running job's log until stopped: one numbered
-/// line every 150 ms, as a job printing slowly does.
 fn keep_writing(f: &Arc<Fixture>, stop: &Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
     let (f, stop) = (Arc::clone(f), Arc::clone(stop));
     std::thread::spawn(move || {
@@ -126,10 +107,6 @@ fn config(f: &Fixture, base: &str, web: &str, out: &std::path::Path) -> serde_js
     })
 }
 
-/// A controller and the web interface in front of it: the fixture, the
-/// web process, its address, and the origin browsers use — `origin_port`
-/// when a relay the test controls sits in front (to cut the network), else
-/// the web interface itself.
 fn deployment(bulk_mib: usize, relayed: bool) -> (Arc<Fixture>, Web, String, String) {
     let port = free_port();
     let web_addr = format!("http://127.0.0.1:{port}");
@@ -139,9 +116,6 @@ fn deployment(bulk_mib: usize, relayed: bool) -> (Arc<Fixture>, Web, String, Str
         web_addr.clone()
     };
     let f = Arc::new(Fixture::serving(bulk_mib, Some(origin.clone())));
-    // The fixture admits Pat under approval-required and leaves that policy
-    // set; the browser test's sign-up page expects the default, invitation
-    // only. Pat's application stays pending.
     f.store
         .writer()
         .write(|tx| {
@@ -188,8 +162,6 @@ fn the_web_interface_in_a_real_browser() {
     assert!(status.success(), "ui.mjs failed: {status}");
 }
 
-/// Serve the seeded controller and the web interface for a person to look
-/// at: `SENTINEL_SERVE_SECS` (default 600) seconds, a live log included.
 #[test]
 #[ignore = "manual: serves the fixture until the time runs out"]
 fn serve_the_fixture() {
