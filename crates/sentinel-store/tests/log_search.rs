@@ -1,6 +1,6 @@
-//! Log search across every boundary a literal can straddle (frames, a sealed segment, the byte-budget cut between two
-//! requests and an arbitrary `after`. Paged requests that pass the returned
-//! carry find exactly what one unbounded request finds — once each.
+//! Log search across every boundary a literal can straddle: frames, a sealed segment, the byte-budget cut between
+//! two requests and an arbitrary `after`. Paged requests that pass the returned carry find exactly what one
+//! unbounded request finds, once each.
 
 use sentinel_core::{AttemptId, JobId, RunId};
 use sentinel_protocol::logs::{FRAME_HEADER_BYTES, Frame, Stream};
