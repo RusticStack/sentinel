@@ -1,8 +1,6 @@
 <script setup lang="ts">
 import type { Backups } from "~~/shared/types/api";
 
-// Scheduled online backups: where they go, the last result, every
-// backup kept, and one now on request.
 const api = useApi();
 const act = useAct();
 const { data, refresh } = await useAsyncData("platform-backups", () => api<Backups>("/api/v1/admin/backups"));

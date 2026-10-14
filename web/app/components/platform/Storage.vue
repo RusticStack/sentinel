@@ -1,9 +1,6 @@
 <script setup lang="ts">
 import type { DeploymentStorage } from "~~/shared/types/api";
 
-// The deployment's disk: free space against the watermarks, the
-// metadata database and the reserve it holds, and what every tenant stores
-// against the deployment's own limits.
 const api = useApi();
 const { data } = await useAsyncData("platform-storage", () => api<DeploymentStorage>("/api/v1/admin/storage"));
 const DAY = 86_400_000;

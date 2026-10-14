@@ -2,8 +2,6 @@
 import type { NamespaceSettings } from "~~/shared/types/api";
 
 const props = defineProps<{ slug: string; settings?: NamespaceSettings | null }>();
-// People are added by hand only to an organization managed here; GitHub
-// decides a GitHub-managed one's members, and a personal namespace has one.
 const githubManaged = computed(() => props.settings?.membership === "github");
 const personal = computed(() => props.settings?.kind === "personal");
 const api = useApi();

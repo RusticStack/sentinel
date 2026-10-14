@@ -1,6 +1,5 @@
 <script setup lang="ts">
-// Secret metadata only: names, versions, state and bindings. Values are
-// write-only (`sentinel secrets set`) and never read back by anything.
+// Values are write-only and never read back: this view lists metadata only.
 const props = defineProps<{ slug: string }>();
 const api = useApi();
 const act = useAct();

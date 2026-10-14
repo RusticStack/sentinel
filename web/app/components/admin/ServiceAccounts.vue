@@ -1,10 +1,7 @@
 <script setup lang="ts">
 import type { Grant, Member } from "~~/shared/types/api";
 
-// Service accounts: principals confined to this tenant that never sign
-// in. Creating one, giving it repository access and issuing it a credential
-// are step-up changes for everyone (the dialog asks, then the change is
-// retried); the refresh token is shown once and never again.
+// The refresh token is shown once and never again.
 const props = defineProps<{ slug: string }>();
 const api = useApi();
 const act = useAct();
@@ -41,7 +38,6 @@ async function create() {
   }
 }
 
-// Per account: the repository-access form, the issue form and the listed grants.
 const access = reactive<Record<string, { repo: string; access: string[] }>>({});
 const issue = reactive<Record<string, { name: string; scope: string[]; repo: string; lifetime: number }>>({});
 const grants = reactive<Record<string, Grant[] | undefined>>({});

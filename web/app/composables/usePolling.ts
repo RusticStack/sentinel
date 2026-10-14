@@ -1,4 +1,3 @@
-/// Refresh `refresh` every `ms` while the page is open and the tab visible.
 export function usePolling(refresh: () => Promise<unknown>, ms: number) {
   let timer: ReturnType<typeof setInterval> | undefined;
   onMounted(() => {

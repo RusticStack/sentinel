@@ -1,10 +1,7 @@
 import type { Me, TenantChoice } from "~~/shared/types/api";
 import type { EndReason } from "./useApi";
 
-/// Who is signed in and the tenants they belong to. Loaded once per page
-/// load (on the server for the first render), and re-read whenever the
-/// controller refuses something: roles and memberships change under an
-/// open session, and the interface follows the controller, not its memory.
+// Tenants are re-read on refusal: roles and memberships change under an open session.
 export function useSession() {
   const me = useState<Me | null>("me", () => null);
   const tenants = useState<TenantChoice[]>("tenants", () => []);
@@ -34,14 +31,11 @@ export function useSession() {
     }
   }
 
-  /// The session ended under the open page: sign in again and come back.
   const ended = (reason: EndReason = "expired") => end(reason);
 
-  /// End the session; `next` is where a fresh sign-in continues (the
-  /// account page asks for one before a GitHub-only account enrolls).
   async function signOut(next?: string) {
     me.value = null; // a refused logout is not a session that "expired"
-    try { await api("/api/v1/logout", { method: "POST", body: {} }); } catch { /* ended anyway */ }
+    try { await api("/api/v1/logout", { method: "POST", body: {} }); } catch {}
     setCsrfToken(null);
     tenants.value = [];
     await navigateTo({ path: "/login", query: next ? { next } : {} });
