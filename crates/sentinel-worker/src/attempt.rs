@@ -478,7 +478,7 @@ pub trait Output: Send + Sync {
         text
     }
     /// The bounded excerpt of a failed step's stderr tail for its verdict
-    /// detail, redacted before it is decoded, cut to a line and shortened
+    /// detail, redacted before it is decoded, cut to a line and shortened.
     /// The default redacts nothing.
     fn excerpt(&self, stderr: &[u8]) -> String {
         crate::redact::excerpt(stderr)
