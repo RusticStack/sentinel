@@ -77,7 +77,13 @@ async function signIn(page, user) {
 
 async function go(page, path, ready, timeout = 20000) {
   await page.goto(cfg.base + path);
-  await page.waitFor(ready, timeout, `${path} ready`);
+  try {
+    await page.waitFor(ready, timeout, `${path} ready`);
+  } catch (error) {
+    // Say what the page showed, so a timeout is a finding rather than a guess.
+    const shown = await page.eval("JSON.stringify({ at: location.pathname, rows: document.querySelectorAll('main table tbody tr').length, alerts: [...document.querySelectorAll('[role=alert]')].map((a) => a.textContent.trim().slice(0, 120)), text: document.body.innerText.replace(/\\s+/g, ' ').slice(0, 400) })").catch(() => "(page unreadable)");
+    throw new Error(`${error.message}; the page showed ${shown}`);
+  }
 }
 
 const clickText = (selector, text) => `(() => { const el = [...document.querySelectorAll(${JSON.stringify(selector)})].find((e) => e.textContent.trim().includes(${JSON.stringify(text)})); if (!el) return false; el.click(); return true; })()`;
