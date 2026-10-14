@@ -1,4 +1,4 @@
-//! Named sign-in profiles (O04): `profiles.json` (schema
+//! Named sign-in profiles: `profiles.json` (schema
 //! `sentinel.profiles/1`, no secrets) in the configuration directory, the
 //! credential blob in the OS store or an owner-only file ([`crate::keystore`]),
 //! and access-token refresh serialized across processes by a lock file.
@@ -112,7 +112,7 @@ impl Profile {
     /// Signed in before OS-store keys named their configuration directory:
     /// the credential sits under the per-user [`keystore::key`], which
     /// every configuration directory with this profile name and issuer
-    /// shares (P09C-8).
+    /// shares.
     pub fn is_legacy(&self) -> bool {
         self.store == Backend::Os && self.key.is_none()
     }
@@ -408,7 +408,7 @@ impl Config {
     /// ([`Profile::is_legacy`]), before signing out of it or replacing it:
     /// only this profile's own grant may be revoked or deleted, since
     /// another configuration directory may have signed in under the same
-    /// entry since (P09C-8). A credential stored by this build names its
+    /// entry since. A credential stored by this build names its
     /// grant; an older one is asked about with `/api/v1/me` while its access
     /// token lasts, else by spending its refresh token, whose answer names
     /// the grant (another directory's successor is then put back for it).
@@ -663,7 +663,7 @@ impl Handle {
     }
 
     /// Move a legacy profile's refreshed credential to its directory-scoped
-    /// key (P09C-8), under the profile lock. The successor is first written
+    /// key, under the profile lock. The successor is first written
     /// back to the shared entry, so a failure below loses nothing. If the
     /// refresh named another grant, the entry held another directory's
     /// sign-in: it keeps its successor there, and this profile is signed
@@ -741,7 +741,7 @@ impl Handle {
         // A legacy entry is shared with other configuration directories,
         // whose profile locks are their own: this one serializes the refresh
         // of the entry itself, so no two directories present its refresh
-        // token at once (P09C-8). The loser re-reads below and finds the
+        // token at once. The loser re-reads below and finds the
         // winner's successor, or the entry moved and itself signed out.
         #[cfg(windows)]
         let _legacy = if self.legacy() {

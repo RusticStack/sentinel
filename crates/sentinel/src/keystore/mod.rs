@@ -1,4 +1,4 @@
-//! Credential storage for profiles (O04): Windows Credential Manager or an
+//! Credential storage for profiles: Windows Credential Manager or an
 //! owner-only file under the configuration directory, chosen by platform or
 //! `SENTINEL_CREDENTIAL_STORE=file|os`.
 //!
@@ -40,8 +40,8 @@ impl Backend {
     }
 }
 
-/// Whether this build has an OS credential store: Windows only. Linux Secret
-/// Service is deferred, so Linux uses the file store.
+/// Whether this build has an OS credential store: Windows only; other
+/// platforms use the file store.
 pub const OS_AVAILABLE: bool = cfg!(windows);
 
 /// The backend for a new sign-in: `SENTINEL_CREDENTIAL_STORE` when set,
