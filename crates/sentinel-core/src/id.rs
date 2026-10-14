@@ -124,25 +124,25 @@ identifier!(
     "wrk"
 );
 identifier!(
-    /// Handle for one issued API credential (A03). Names the record so it can
+    /// Handle for one issued API credential. Names the record so it can
     /// be listed and revoked; it is not the secret and authenticates nothing.
     TokenId,
     "tok"
 );
 identifier!(
-    /// A worker pool (A07): dedicated to one tenant, or shared under explicit
-    /// grants. Workers enroll into a pool (W01); tenants are placed on it (W02).
+    /// A worker pool: dedicated to one tenant, or shared under explicit
+    /// grants. Workers enroll into a pool; tenants are placed on it.
     PoolId,
     "pol"
 );
 identifier!(
-    /// Handle for one browser session (A06), so an account can list and revoke
+    /// Handle for one browser session, so an account can list and revoke
     /// its sessions by name. The cookie secret is separate and never shown.
     SessionId,
     "ses"
 );
 identifier!(
-    /// Handle for one invitation (A05). Names the record for listing and
+    /// Handle for one invitation. Names the record for listing and
     /// revocation; the redeemable secret is separate and stored only as a digest.
     InvitationId,
     "inv"
@@ -154,36 +154,36 @@ identifier!(
     "mal"
 );
 identifier!(
-    /// One forge App installation known to this deployment (A05). Existing is
+    /// One forge App installation known to this deployment. Existing is
     /// not being trusted: an installation is inactive until bound to a tenant.
     InstallationId,
     "ins"
 );
 identifier!(
-    /// One authenticated webhook/ref-update delivery (G02). Names the record so
+    /// One authenticated webhook/ref-update delivery. Names the record so
     /// an operator can trace it; the provider's own delivery ID is the dedup key.
     DeliveryId,
     "dlv"
 );
 identifier!(
-    /// One durable check publication (G04): the outbox row that tracks what
+    /// One durable check publication: the outbox row that tracks what
     /// GitHub was told about a run, a job or a refused event.
     CheckId,
     "chk"
 );
 identifier!(
-    /// One resumable object upload session (D02). Names the durable staging
+    /// One resumable object upload session. Names the durable staging
     /// record so a client can resume or abort it; it is not an object.
     UploadId,
     "upl"
 );
 identifier!(
-    /// One published (or reported absent) artifact of an attempt (D03).
+    /// One published (or reported absent) artifact of an attempt.
     ArtifactId,
     "arf"
 );
 identifier!(
-    /// One OAuth grant (O02): a refresh-token family issued through the
+    /// One OAuth grant: a refresh-token family issued through the
     /// browser or device flow, or a service-account grant. Names the record so
     /// it can be listed and revoked; it is not a token and authenticates nothing.
     GrantId,

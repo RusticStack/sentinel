@@ -7,9 +7,9 @@
 //! execution timeouts, idempotency TTL) are not provenance: they read
 //! [`UnixMillis::steady`], a process clock that advances with the monotonic
 //! clock and is anchored to the wall clock once, at its first read. The values
-//! it yields are stored in the same columns as before and stay comparable
-//! across a restart (the next process anchors to the wall clock again), but a
-//! wall-clock step while the process runs can never expire or extend a lease.
+//! it yields stay comparable across a restart (the next process anchors to the
+//! wall clock again), but a wall-clock step while the process runs can never
+//! expire or extend a lease.
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
