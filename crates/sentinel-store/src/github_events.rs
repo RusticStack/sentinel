@@ -210,13 +210,20 @@ fn rerequest(
             return Err(Error::Corrupt("run jobs"));
         }
         // A full immutable DAG rerun preserves attempts, fences and image pins.
-        for ((job, _), compiled) in jobs.iter().zip(&spec.pipeline.jobs) {
+        // Each reset is compare-and-set on the terminal state just read, so a
+        // job that moved in between is never overwritten.
+        for ((job, seen), compiled) in jobs.iter().zip(&spec.pipeline.jobs) {
             let state = if compiled.needs.is_empty() {
                 JobState::Queued
             } else {
                 JobState::Blocked
             };
-            tx.execute("UPDATE jobs SET state_code=?1,cancel_requested=0,failure_class=NULL,queued_ms=?2,leased_ms=NULL,preparing_ms=NULL,running_ms=NULL,finalizing_ms=NULL,terminal_ms=NULL WHERE id=?3",params![crate::codec::encode_state(state),if compiled.needs.is_empty(){Some(now.0)}else{None},job.as_bytes()])?;
+            let reset = tx.execute("UPDATE jobs SET state_code=?1,cancel_requested=0,failure_class=NULL,queued_ms=?2,leased_ms=NULL,preparing_ms=NULL,running_ms=NULL,finalizing_ms=NULL,terminal_ms=NULL WHERE id=?3 AND state_code=?4",params![crate::codec::encode_state(state),if compiled.needs.is_empty(){Some(now.0)}else{None},job.as_bytes(),crate::codec::encode_state(*seen)])?;
+            if reset != 1 {
+                // The single writer read these states in this very
+                // transaction: a miss means the row is not what it was.
+                return Err(Error::Corrupt("run job state"));
+            }
         }
         checks::record_run(tx, tenant, run, now)?;
         reran = true;
@@ -252,16 +259,28 @@ pub struct Refresh {
 pub fn due(conn: &Connection, now: UnixMillis) -> Result<Option<Refresh>> {
     Ok(conn.query_row("SELECT id,kind,seq,attempts FROM github_refresh WHERE next_ms<=?1 ORDER BY next_ms,id LIMIT 1",[now.0],|r|Ok(Refresh{id:r.get(0)?,kind:r.get(1)?,seq:r.get(2)?,attempts:r.get(3)?})).optional()?)
 }
+/// Failed passes after which a row is quarantined: it waits an hour between
+/// attempts instead of the five-minute back-off ceiling.
+pub const QUARANTINE_AFTER: u32 = 12;
+const QUARANTINE_MS: i64 = 60 * 60 * 1000;
+
+/// Park the row under the sequence fence. `retry` counts a failed pass and
+/// backs off (doubling to five minutes, then an hour once the row has failed
+/// [`QUARANTINE_AFTER`] times); otherwise the attempts reset and the row owes
+/// the next periodic pass. Every outcome moves `next_ms` into the future: a
+/// row is never left due, so a poison row cannot spin the lane.
 pub fn settled(tx: &Transaction<'_>, work: &Refresh, now: UnixMillis, retry: bool) -> Result<()> {
     let attempts = if retry {
         work.attempts.saturating_add(1)
     } else {
         0
     };
-    let delay = if retry {
-        checks::backoff_ms(attempts)
-    } else {
+    let delay = if !retry {
         300_000
+    } else if attempts >= QUARANTINE_AFTER {
+        QUARANTINE_MS
+    } else {
+        checks::backoff_ms(attempts)
     };
     tx.execute(
         "UPDATE github_refresh SET attempts=?3,next_ms=?4 WHERE id=?1 AND seq=?2",
@@ -303,60 +322,74 @@ pub struct RepoTarget {
     pub installation: [u8; 16],
     pub installation_external: u64,
     pub account: u64,
+    /// The binding's version when it was read: a revocation computed from this
+    /// read applies only while the binding still has it.
+    pub version: i64,
 }
 
 pub fn repo_target(conn: &Connection, id: &[u8; 16]) -> Result<Option<RepoTarget>> {
-    type Row = ([u8; 16], i64, Vec<u8>, [u8; 16], String, i64);
-    let row:Option<Row>=conn.query_row("SELECT b.repo_id,b.forge_repo_id,b.binding,i.id,i.external_id,i.account_id FROM source_bindings b JOIN installations i ON i.id=b.installation_id WHERE b.repo_id=?1 AND b.revoked=0",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
-    row.map(|(repo, forge, binding, installation, external, account)| {
-        let binding: sentinel_protocol::source::Binding =
-            serde_json::from_slice(&binding).map_err(|_| Error::Corrupt("source binding"))?;
-        Ok(RepoTarget {
-            repo: RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?,
-            forge_repo: u64::try_from(forge).map_err(|_| Error::Corrupt("forge repo"))?,
-            remote: binding.remote,
-            installation,
-            installation_external: external
-                .parse()
-                .map_err(|_| Error::Corrupt("installation id"))?,
-            account: u64::try_from(account).map_err(|_| Error::Corrupt("account"))?,
-        })
-    })
+    type Row = ([u8; 16], i64, Vec<u8>, [u8; 16], String, i64, i64);
+    let row:Option<Row>=conn.query_row("SELECT b.repo_id,b.forge_repo_id,b.binding,i.id,i.external_id,i.account_id,b.version FROM source_bindings b JOIN installations i ON i.id=b.installation_id WHERE b.repo_id=?1 AND b.revoked=0",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
+    row.map(
+        |(repo, forge, binding, installation, external, account, version)| {
+            let binding: sentinel_protocol::source::Binding =
+                serde_json::from_slice(&binding).map_err(|_| Error::Corrupt("source binding"))?;
+            Ok(RepoTarget {
+                repo: RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?,
+                forge_repo: u64::try_from(forge).map_err(|_| Error::Corrupt("forge repo"))?,
+                remote: binding.remote,
+                installation,
+                installation_external: external
+                    .parse()
+                    .map_err(|_| Error::Corrupt("installation id"))?,
+                account: u64::try_from(account).map_err(|_| Error::Corrupt("account"))?,
+                version,
+            })
+        },
+    )
     .transpose()
 }
 
 /// The repositories one installation's bindings name, with the approved
-/// remote each must still match: (repo, forge repository id, remote).
+/// remote each must still match, and the version each binding had when read:
+/// (repo, forge repository id, remote, version). Read this *before* asking
+/// GitHub for the repository list, so a binding created in between is never
+/// judged against a list that predates it.
 pub fn bound_repositories(
     conn: &Connection,
     installation: &[u8; 16],
-) -> Result<Vec<(RepoId, u64, String)>> {
-    let mut stmt=conn.prepare_cached("SELECT repo_id,forge_repo_id,binding FROM source_bindings WHERE installation_id=?1 AND revoked=0")?;
+) -> Result<Vec<(RepoId, u64, String, i64)>> {
+    let mut stmt=conn.prepare_cached("SELECT repo_id,forge_repo_id,binding,version FROM source_bindings WHERE installation_id=?1 AND revoked=0")?;
     let rows = stmt.query_map([installation], |r| {
         Ok((
             r.get::<_, [u8; 16]>(0)?,
             r.get::<_, i64>(1)?,
             r.get::<_, Vec<u8>>(2)?,
+            r.get::<_, i64>(3)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (repo, forge, binding) = row?;
+        let (repo, forge, binding, version) = row?;
         let binding: sentinel_protocol::source::Binding =
             serde_json::from_slice(&binding).map_err(|_| Error::Corrupt("source binding"))?;
         out.push((
             RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?,
             u64::try_from(forge).map_err(|_| Error::Corrupt("forge repo"))?,
             binding.remote,
+            version,
         ));
     }
     Ok(out)
 }
 
 /// One binding revoked: the row stays, its credential is destroyed and the
-/// version moves so a sealed copy can never be re-opened for new work.
-fn revoke_binding(tx: &Transaction<'_>, repo: RepoId) -> Result<()> {
-    tx.execute("UPDATE source_bindings SET revoked=1,credential=x'',version=version+1 WHERE repo_id=?1 AND revoked=0",[repo.as_bytes()])?;
+/// version moves so a sealed copy can never be re-opened for new work. The
+/// revocation is fenced on the `version` the verdict was computed from: a
+/// binding that was changed or re-created since keeps its new state, and the
+/// next periodic pass judges it afresh.
+fn revoke_binding(tx: &Transaction<'_>, repo: RepoId, version: i64) -> Result<()> {
+    tx.execute("UPDATE source_bindings SET revoked=1,credential=x'',version=version+1 WHERE repo_id=?1 AND version=?2 AND revoked=0",params![repo.as_bytes(),version])?;
     Ok(())
 }
 
@@ -369,12 +402,12 @@ pub fn apply_installation(
     tx: &Transaction<'_>,
     work: &Refresh,
     snapshot: sources_forge::Snapshot<'_>,
-    revoked: &[RepoId],
+    revoked: &[(RepoId, i64)],
     now: UnixMillis,
 ) -> Result<()> {
     sources_forge::refresh(tx, snapshot, now)?;
-    for repo in revoked {
-        revoke_binding(tx, *repo)?;
+    for (repo, version) in revoked {
+        revoke_binding(tx, *repo, *version)?;
     }
     settled(tx, work, now, false)
 }
@@ -395,11 +428,12 @@ pub fn apply_repository(
     tx: &Transaction<'_>,
     work: &Refresh,
     repo: RepoId,
+    version: i64,
     revoke: bool,
     now: UnixMillis,
 ) -> Result<()> {
     if revoke {
-        revoke_binding(tx, repo)?;
+        revoke_binding(tx, repo, version)?;
     }
     settled(tx, work, now, false)
 }

@@ -72,12 +72,55 @@ fn io(context: &str, error: std::io::Error) -> Error {
     ))
 }
 
-/// Copy `src` to `dst` through a temporary file, fsynced and renamed, and
-/// return the BLAKE3 digest and length of what was copied.
+/// Remember `from` and every ancestor up to `root` as holding a new directory
+/// entry that still has to be fsynced.
+fn note_dirs(dirty: &mut BTreeSet<PathBuf>, from: &Path, root: &Path) {
+    let mut dir = from;
+    loop {
+        // An ancestor chain is always noted whole, so a hit ends the walk.
+        if dirty.contains(dir) {
+            return;
+        }
+        dirty.insert(dir.to_path_buf());
+        match dir.parent() {
+            Some(parent) if dir != root && parent.starts_with(root) => dir = parent,
+            _ => return,
+        }
+    }
+}
+
+/// Make the renames of a batch of copies durable: one directory fsync each,
+/// however many files landed in it.
+fn sync_dirs(dirty: &BTreeSet<PathBuf>) -> Result<()> {
+    for dir in dirty {
+        sync_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// [`copy_file_into`] for a single file: its directory is synced at once.
 fn copy_file(src: &Path, dst: &Path) -> Result<(Digest, u64)> {
+    let mut dirty = BTreeSet::new();
+    let copied = copy_file_into(src, dst, dst.parent().unwrap_or(dst), &mut dirty)?;
+    sync_dirs(&dirty)?;
+    Ok(copied)
+}
+
+/// Copy `src` to `dst` through a temporary file, fsynced and renamed, and
+/// return the BLAKE3 digest and length of what was copied. The directories
+/// the rename touched (up to `root`) are added to `dirty`; the caller syncs
+/// them with [`sync_dirs`] before it relies on the copy, so a batch pays one
+/// directory fsync per directory rather than one per file.
+fn copy_file_into(
+    src: &Path,
+    dst: &Path,
+    root: &Path,
+    dirty: &mut BTreeSet<PathBuf>,
+) -> Result<(Digest, u64)> {
     let mut input = File::open(src).map_err(|e| io(&src.display().to_string(), e))?;
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
+        note_dirs(dirty, parent, root);
     }
     let tmp = dst.with_extension("part");
     let mut out = OpenOptions::new()
@@ -101,6 +144,30 @@ fn copy_file(src: &Path, dst: &Path) -> Result<(Digest, u64)> {
     drop(out);
     fs::rename(&tmp, dst)?;
     Ok((Digest::from_bytes(*hasher.finalize().as_bytes()), len))
+}
+
+/// The lock file in a backup directory that serializes the writers of the
+/// shared files. [`create`] copies new objects into the shared store *before*
+/// its backup directory exists, so a [`prune`] from another process (a
+/// host-local tool beside the scheduler) would see them named by no kept
+/// backup and delete them from under it.
+const LOCK: &str = ".lock";
+
+/// Take the exclusive writer lock on `target`, waiting for another process's
+/// create or prune to finish. The lock is held until the returned file is
+/// dropped. A file system without advisory locks (`Unsupported`) runs
+/// unlocked, as before: the host's own coordination is then all there is.
+fn lock_target(target: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(target.join(LOCK))?;
+    match file.lock() {
+        Ok(()) => Ok(file),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(file),
+        Err(e) => Err(io("backup lock", e)),
+    }
 }
 
 fn hash_file(path: &Path) -> Result<(Digest, u64)> {
@@ -238,6 +305,12 @@ pub struct Report {
     pub objects: u64,
     pub objects_copied: u64,
     pub object_bytes_copied: u64,
+    /// Objects whose shared copy from an earlier backup no longer matched its
+    /// digest (counted in `objects_copied` too): replaced from the data
+    /// directory.
+    pub objects_recopied: u64,
+    /// The same for manifest versions.
+    pub manifests_recopied: u64,
     /// Evicted objects only the external S3 copy holds.
     pub objects_remote: u64,
     /// Objects whose local bytes did not match their digest: not stored.
@@ -269,6 +342,9 @@ pub fn create(
 ) -> Result<Report> {
     let started = UnixMillis::now();
     fs::create_dir_all(target)?;
+    // Before anything is copied and until the backup directory is in place:
+    // a concurrent prune must not see the shared files as unreferenced.
+    let _writer = lock_target(target)?;
     let mut id = backup_id(started);
     if target.join(&id).exists() {
         // Two backups in one second: the later waits its turn.
@@ -302,6 +378,8 @@ pub fn create(
     };
 
     // Objects, rehashed as they are copied; the shared store keeps one copy.
+    // Directory entries of the whole batch are synced once, below.
+    let mut dirty = BTreeSet::new();
     for row in object_rows(&snapshot)? {
         report.objects += 1;
         if row.remote_only {
@@ -309,10 +387,16 @@ pub fn create(
             continue;
         }
         let dst = target.join(&row.rel);
+        // A copy an earlier backup left is reused only if it still hashes to
+        // the row's digest: a length match proves nothing about rot, and a
+        // reused rotted file would be named by every later backup.
         if fs::metadata(&dst).is_ok_and(|m| m.len() == row.len) {
-            continue;
+            if hash_file(&dst).is_ok_and(|(d, len)| d == row.digest && len == row.len) {
+                continue;
+            }
+            report.objects_recopied += 1;
         }
-        let (got, len) = match copy_file(&data_dir.join(&row.rel), &dst) {
+        let (got, len) = match copy_file_into(&data_dir.join(&row.rel), &dst, target, &mut dirty) {
             Ok(copied) => copied,
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 report.objects_missing.push(row.rel.display().to_string());
@@ -328,13 +412,22 @@ pub fn create(
         report.objects_copied += 1;
         report.object_bytes_copied += len;
     }
-    for (rel, _) in manifest_rows(&snapshot)? {
+    for (rel, want) in manifest_rows(&snapshot)? {
         report.manifests += 1;
         let dst = target.join(&rel);
         if dst.exists() {
-            continue;
+            if hash_file(&dst).is_ok_and(|(d, _)| d == want) {
+                continue;
+            }
+            report.manifests_recopied += 1;
         }
-        copy_file(&data_dir.join(&rel), &dst)?;
+        let (got, _) = copy_file_into(&data_dir.join(&rel), &dst, target, &mut dirty)?;
+        if got != want {
+            // Unlike an object, a manifest version has no meaningful backup
+            // without it: refuse rather than store a damaged one.
+            let _ = fs::remove_file(&dst);
+            return Err(Error::Corrupt("manifest content"));
+        }
         report.manifests_copied += 1;
     }
     drop(snapshot);
@@ -368,7 +461,7 @@ pub fn create(
                 }
                 // A live log may move while it is read; what is copied is
                 // what the next backup refreshes.
-                match copy_file(&path, &dst) {
+                match copy_file_into(&path, &dst, target, &mut dirty) {
                     Ok((_, len)) => {
                         report.log_files_copied += 1;
                         report.log_bytes_copied += len;
@@ -379,6 +472,9 @@ pub fn create(
             }
         }
     }
+
+    // Every shared file's rename is durable before a backup names it.
+    sync_dirs(&dirty)?;
 
     // The controller's own files; never the master key.
     let config = staging.join(CONFIG_DIR);
@@ -421,10 +517,11 @@ pub fn create(
             "remote_only": report.objects_remote,
             "copied": report.objects_copied,
             "bytes_copied": report.object_bytes_copied,
+            "recopied": report.objects_recopied,
             "corrupt": report.objects_corrupt,
             "missing": report.objects_missing,
         },
-        "manifests": { "rows": report.manifests, "copied": report.manifests_copied },
+        "manifests": { "rows": report.manifests, "copied": report.manifests_copied, "recopied": report.manifests_recopied },
         "logs": { "files_copied": report.log_files_copied, "bytes_copied": report.log_bytes_copied },
         "config": report.config_files,
         "key": {
@@ -626,19 +723,33 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
         key_checked: loaded.is_some(),
         ..Restored::default()
     };
+    // The restored files' directory entries are synced once, before the
+    // database lands: a half-restored directory is never taken for a
+    // controller's, and a crash after the restore reports success loses none.
+    let mut dirty = BTreeSet::new();
     for row in object_rows(&snapshot)? {
         if row.remote_only {
             out.objects_remote += 1;
             continue;
         }
-        let (d, len) = copy_file(&target.join(&row.rel), &data_dir.join(&row.rel))?;
+        let (d, len) = copy_file_into(
+            &target.join(&row.rel),
+            &data_dir.join(&row.rel),
+            data_dir,
+            &mut dirty,
+        )?;
         if d != row.digest || len != row.len {
             return Err(Error::Corrupt("backup object content"));
         }
         out.objects += 1;
     }
     for (rel, want) in manifest_rows(&snapshot)? {
-        let (d, _) = copy_file(&target.join(&rel), &data_dir.join(&rel))?;
+        let (d, _) = copy_file_into(
+            &target.join(&rel),
+            &data_dir.join(&rel),
+            data_dir,
+            &mut dirty,
+        )?;
         if d != want {
             return Err(Error::Corrupt("backup manifest content"));
         }
@@ -665,7 +776,7 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
                     let rel = path
                         .strip_prefix(target)
                         .map_err(|_| Error::Corrupt("log path"))?;
-                    copy_file(&path, &data_dir.join(rel))?;
+                    copy_file_into(&path, &data_dir.join(rel), data_dir, &mut dirty)?;
                     out.log_files += 1;
                 }
             }
@@ -695,6 +806,7 @@ pub fn restore(target: &Path, id: &str, data_dir: &Path, key: Option<&Path>) -> 
         copy_file(path, &dst)?;
         restrict(&dst)?;
     }
+    sync_dirs(&dirty)?;
     // The database last: until it lands, a half-restored directory is not
     // mistaken for a controller's.
     let (d, _) = copy_file(&dir.join(METADATA), &data_dir.join(METADATA))?;
@@ -720,6 +832,14 @@ pub fn prune(target: &Path, keep: usize) -> Result<Pruned> {
     if keep == 0 {
         return Err(Error::InvalidInput("keep at least one backup"));
     }
+    // A create in another process holds this while it copies shared files no
+    // kept backup names yet; pruning waits for it rather than deleting them.
+    // A directory that does not exist has nothing to prune and nothing to lock.
+    let _writer = match lock_target(target) {
+        Ok(lock) => Some(lock),
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
     let ids = list(target)?;
     let mut out = Pruned::default();
     let cut = ids.len().saturating_sub(keep);

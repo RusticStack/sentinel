@@ -200,6 +200,10 @@ pub struct Replicator {
     status: Arc<Status>,
     passes: AtomicU64,
     buffer: Mutex<Vec<u8>>,
+    /// Set by [`Replicator::failed`]: whether the current pass already
+    /// recorded its failure in the status (a stage that stops on a bucket
+    /// error does; one that stops on a store error does not).
+    recorded: AtomicBool,
 }
 
 fn now_ms() -> i64 {
@@ -223,6 +227,7 @@ impl Replicator {
             status: Arc::new(Status::default()),
             passes: AtomicU64::new(0),
             buffer: Mutex::new(Vec::new()),
+            recorded: AtomicBool::new(false),
         }
     }
 
@@ -231,6 +236,7 @@ impl Replicator {
     }
 
     fn failed(&self, what: &str, error: &dyn std::fmt::Display) {
+        self.recorded.store(true, Ordering::Relaxed);
         self.status
             .consecutive_failures
             .fetch_add(1, Ordering::Relaxed);
@@ -248,6 +254,7 @@ impl Replicator {
     /// status says which); the caller backs off.
     pub fn pass(&self) -> std::result::Result<Pass, String> {
         let mut pass = Pass::default();
+        self.recorded.store(false, Ordering::Relaxed);
         let outcome = self.stages(&mut pass);
         self.measure();
         self.passes.fetch_add(1, Ordering::Relaxed);
@@ -264,7 +271,15 @@ impl Replicator {
                     .unwrap_or_else(|p| p.into_inner()) = None;
                 Ok(pass)
             }
-            Err(why) => Err(why),
+            Err(why) => {
+                // A store or eviction error stops the pass without touching
+                // the bucket: it still counts, or health would read healthy
+                // while nothing replicates.
+                if !self.recorded.load(Ordering::Relaxed) {
+                    self.failed("pass", &why);
+                }
+                Err(why)
+            }
         }
     }
 
@@ -305,7 +320,20 @@ impl Replicator {
         pass.more |= due.len() as u32 == DELETES_PER_PASS;
         for delete in due {
             let result = match delete {
-                Delete::Object { tenant, digest, .. } => {
+                Delete::Object { id, tenant, digest } => {
+                    // The same content may have been committed again since
+                    // this delete was queued (more than one batch of deletes
+                    // can be waiting while the upload stage runs): its key is
+                    // then a live object's copy. The recheck and the dropping
+                    // of the queued delete are one transaction.
+                    let live = self
+                        .store
+                        .writer()
+                        .write(move |tx| offload::keep_if_live(tx, id, tenant, &digest))
+                        .map_err(|e| e.to_string())?;
+                    if live {
+                        continue;
+                    }
                     self.bucket.delete(&remote_key(tenant, &digest))
                 }
                 Delete::Log {

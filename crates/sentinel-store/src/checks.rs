@@ -24,9 +24,23 @@ pub const JOB_PREFIX: &str = "sentinel / ";
 /// External IDs let a rerequest (G05) find the run a check belongs to.
 pub const EXTERNAL_PREFIX: &str = "sentinel:";
 
+/// Attempts a progress check (queued, in progress) may spend before it is
+/// refused: a stale intermediate state is not worth chasing through an outage.
 pub const MAX_ATTEMPTS: u32 = 8;
+/// Attempts a completed check may spend. The final status is what a required
+/// check gates merges on, so it rides out an outage of hours (see
+/// `TERMINAL_MAX_BACKOFF_MS`) before it is refused with reason `attempts`.
+pub const MAX_TERMINAL_ATTEMPTS: u32 = 40;
 const BASE_BACKOFF_MS: i64 = 1_000;
 const MAX_BACKOFF_MS: i64 = 5 * 60 * 1000;
+/// Back-off ceiling for a completed check: fifteen minutes.
+const TERMINAL_MAX_BACKOFF_MS: i64 = 15 * 60 * 1000;
+/// Longest a row is parked by [`defer`] (a throttle or a quarantine).
+pub const MAX_DEFER_MS: i64 = 60 * 60 * 1000;
+/// How far back [`rearm_exhausted`] looks for a check that spent its budget.
+pub const REARM_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// Most rows one [`rearm_exhausted`] call re-pends.
+pub const REARM_LIMIT: u32 = 1_000;
 
 const COLUMNS: &str = "id, tenant_id, repo_id, run_id, delivery_id, scope, name, head_sha,
     external_id, status, conclusion, title, summary, check_run_id, seq, published_seq, state, reason,
@@ -222,6 +236,13 @@ pub fn backoff_ms(attempts: u32) -> i64 {
         .min(MAX_BACKOFF_MS)
 }
 
+/// The same doubling for a completed check, capped at fifteen minutes.
+fn terminal_backoff_ms(attempts: u32) -> i64 {
+    BASE_BACKOFF_MS
+        .saturating_mul(1i64 << attempts.min(20))
+        .min(TERMINAL_MAX_BACKOFF_MS)
+}
+
 /// What one job's state means to a forge.
 fn job_content(
     state: sentinel_core::JobState,
@@ -383,12 +404,22 @@ struct Draft<'a> {
 }
 
 /// One statement: create the row or coalesce the newest desired state into it.
+///
+/// A draft that repeats the stored content (same status, conclusion, title and
+/// summary) changes nothing: the generation, the retry schedule and the
+/// delivery cursor stay put, so a re-record cannot restart a backing-off row
+/// or re-send what GitHub already has. The one exception is a refused row: a
+/// fresh event for it re-arms it.
+///
 /// A new generation resets the cursor to pending and clears any previous
-/// refusal or retry schedule. A generation that follows a `completed` one
-/// also drops the check-run handle: the remote run is terminal and GitHub
-/// silently keeps a completed run completed, so new work needs a fresh run —
-/// and the create mark goes with it, so that fresh run is created under its
-/// own identity instead of adopting the terminal one.
+/// refusal or retry schedule. A generation that follows a *delivered*
+/// `completed` one also drops the check-run handle: that remote run is
+/// terminal and GitHub silently keeps a completed run completed, so new work
+/// needs a fresh run — and the create mark goes with it, so that fresh run is
+/// created under its own identity instead of adopting the terminal one. A
+/// completed generation that was never delivered keeps its handle: the remote
+/// run is still the live one, and dropping the handle would orphan it and
+/// create a duplicate.
 fn upsert(tx: &Transaction<'_>, draft: Draft<'_>, now: UnixMillis) -> Result<()> {
     let id = CheckId::new();
     tx.execute(
@@ -399,13 +430,24 @@ fn upsert(tx: &Transaction<'_>, draft: Draft<'_>, now: UnixMillis) -> Result<()>
             status = excluded.status, conclusion = excluded.conclusion,
             title = excluded.title, summary = excluded.summary,
             check_run_id = CASE WHEN check_publications.status = 'completed'
+                AND check_publications.state = 1
+                AND check_publications.published_seq = check_publications.seq
                 THEN NULL ELSE check_publications.check_run_id END,
             create_started_ms = CASE WHEN check_publications.status = 'completed'
+                AND check_publications.state = 1
+                AND check_publications.published_seq = check_publications.seq
                 THEN NULL ELSE check_publications.create_started_ms END,
             create_seq = CASE WHEN check_publications.status = 'completed'
+                AND check_publications.state = 1
+                AND check_publications.published_seq = check_publications.seq
                 THEN NULL ELSE check_publications.create_seq END,
-             seq = check_publications.seq + 1, state = 0, reason = NULL, attempts = 0,
-            next_attempt_ms = NULL, settled_ms = NULL, updated_ms = excluded.updated_ms",
+            seq = check_publications.seq + 1, state = 0, reason = NULL, attempts = 0,
+            next_attempt_ms = NULL, settled_ms = NULL, updated_ms = excluded.updated_ms
+         WHERE check_publications.state = 2
+            OR check_publications.status IS NOT excluded.status
+            OR check_publications.conclusion IS NOT excluded.conclusion
+            OR check_publications.title IS NOT excluded.title
+            OR check_publications.summary IS NOT excluded.summary",
         params![
             id.as_bytes(),
             draft.tenant.as_bytes(),
@@ -910,6 +952,8 @@ pub fn published(
 }
 
 /// Make an attempt that failed transiently due again under the shared budget.
+/// A completed check has the longer budget and back-off ceiling
+/// ([`MAX_TERMINAL_ATTEMPTS`]); every other status gets [`MAX_ATTEMPTS`].
 pub fn retry(
     tx: &Transaction<'_>,
     id: CheckId,
@@ -917,17 +961,30 @@ pub fn retry(
     now: UnixMillis,
     delay_ms: i64,
 ) -> Result<Retry> {
-    let attempts: i64 = tx
-        .prepare_cached("SELECT attempts FROM check_publications WHERE id = ?1 AND seq = ?2")?
-        .query_row(params![id.as_bytes(), seq], |r| r.get(0))
+    let (attempts, status): (i64, String) = tx
+        .prepare_cached(
+            "SELECT attempts, status FROM check_publications WHERE id = ?1 AND seq = ?2",
+        )?
+        .query_row(params![id.as_bytes(), seq], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?
         .ok_or(Error::Conflict)?;
+    let terminal = status == Status::Completed.as_str();
+    let (budget, ceiling) = if terminal {
+        (MAX_TERMINAL_ATTEMPTS, TERMINAL_MAX_BACKOFF_MS)
+    } else {
+        (MAX_ATTEMPTS, MAX_BACKOFF_MS)
+    };
     let next = u32::try_from(attempts.saturating_add(1)).unwrap_or(u32::MAX);
-    if next >= MAX_ATTEMPTS {
+    if next >= budget {
         refused(tx, id, seq, "attempts", now)?;
         return Ok(Retry::Exhausted);
     }
-    let wait = backoff_ms(next).max(delay_ms.clamp(0, MAX_BACKOFF_MS));
+    let base = if terminal {
+        terminal_backoff_ms(next)
+    } else {
+        backoff_ms(next)
+    };
+    let wait = base.max(delay_ms.clamp(0, ceiling));
     let next_attempt_ms = now.0.saturating_add(wait);
     let changed = tx.execute(
         "UPDATE check_publications SET attempts = ?3, next_attempt_ms = ?4, updated_ms = ?5
@@ -943,6 +1000,48 @@ pub fn retry(
     })
 }
 
+/// Park a pending row until `until_ms` without spending an attempt: a rate
+/// limit says nothing about the row, so it must not eat the retry budget.
+/// The park is capped at [`MAX_DEFER_MS`]. Returns whether the row was still
+/// the pending generation `seq`; a moved or settled row needs no park.
+pub fn defer(
+    tx: &Transaction<'_>,
+    id: CheckId,
+    seq: i64,
+    now: UnixMillis,
+    until_ms: i64,
+) -> Result<bool> {
+    let until = until_ms.min(now.0.saturating_add(MAX_DEFER_MS));
+    let changed = tx.execute(
+        "UPDATE check_publications SET next_attempt_ms = ?3, updated_ms = ?4
+         WHERE id = ?1 AND seq = ?2 AND state = 0",
+        params![id.as_bytes(), seq, until, now.0],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Put completed checks that spent their whole budget back in the queue.
+///
+/// A check refused with reason `attempts` is a final status that never
+/// reached GitHub; once the outage that caused it is over, nothing else would
+/// ever deliver it. The delivery lane calls this once per start: rows settled
+/// within [`REARM_WINDOW_MS`], at most `limit`, get a fresh budget, so the
+/// path is bounded by restarts, the window and the limit: a permanently
+/// failing row is retried once per start, never forever. Returns how many
+/// rows were re-armed.
+pub fn rearm_exhausted(tx: &Transaction<'_>, now: UnixMillis, limit: u32) -> Result<usize> {
+    Ok(tx.execute(
+        "UPDATE check_publications SET state = 0, reason = NULL, attempts = 0,
+            next_attempt_ms = NULL, settled_ms = NULL, updated_ms = ?1
+         WHERE id IN (
+            SELECT id FROM check_publications
+            WHERE state = 2 AND reason = 'attempts' AND status = 'completed'
+              AND settled_ms >= ?2
+            ORDER BY settled_ms DESC LIMIT ?3)",
+        params![now.0, now.0.saturating_sub(REARM_WINDOW_MS), limit],
+    )?)
+}
+
 /// Give up on one generation: the row records why, and a later generation (a
 /// state change) starts fresh.
 pub fn refused(
@@ -952,11 +1051,18 @@ pub fn refused(
     reason: &str,
     now: UnixMillis,
 ) -> Result<()> {
-    let reason: String = reason
+    // The column requires 1..=128 characters: a blank reason would fail the
+    // CHECK and leave the row pending at the head of the queue.
+    let mut reason: String = reason
         .chars()
         .filter(|c| !c.is_control())
         .take(120)
-        .collect();
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    if reason.is_empty() {
+        reason.push_str("refused");
+    }
     let changed = tx.execute(
         "UPDATE check_publications SET state = 2, reason = ?3, next_attempt_ms = NULL,
             settled_ms = ?4, updated_ms = ?4

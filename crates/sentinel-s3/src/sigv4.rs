@@ -101,6 +101,20 @@ pub fn canonical_query(query: &[(&str, &str)]) -> String {
         .join("&")
 }
 
+/// A header value as the canonical request carries it: trimmed, and every run
+/// of internal whitespace collapsed to one space, as the service does before it
+/// recomputes the signature. (The header itself is sent unchanged.)
+fn canonical_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for word in value.split_ascii_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
+}
+
 /// The `Authorization` header value for `request`, signed at `amz_date`
 /// (`20130524T000000Z`) in `region` with the given credentials.
 pub fn authorization(
@@ -113,7 +127,7 @@ pub fn authorization(
     let mut headers: Vec<(&str, String)> = request
         .headers
         .iter()
-        .map(|(k, v)| (*k, v.trim().to_owned()))
+        .map(|(k, v)| (*k, canonical_value(v)))
         .collect();
     headers.sort_by(|a, b| a.0.cmp(b.0));
     let signed: Vec<&str> = headers.iter().map(|(k, _)| *k).collect();
@@ -188,6 +202,38 @@ mod tests {
              SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
              Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
         );
+    }
+
+    #[test]
+    fn header_values_are_trimmed_and_internal_whitespace_runs_collapse() {
+        assert_eq!(canonical_value("  a   b\t c  "), "a b c");
+        assert_eq!(canonical_value("plain"), "plain");
+        assert_eq!(canonical_value("   "), "");
+        // Signing "a   b" and "a b" is the same canonical request, which is
+        // what the service computes from either spelling.
+        let sign = |value: &str| {
+            let headers = [
+                ("host", "examplebucket.s3.amazonaws.com"),
+                ("x-amz-content-sha256", EMPTY_SHA256),
+                ("x-amz-date", "20130524T000000Z"),
+                ("x-amz-meta-note", value),
+            ];
+            authorization(
+                &Request {
+                    method: "PUT",
+                    path: "/test.txt",
+                    query: &[],
+                    headers: &headers,
+                    payload_sha256: EMPTY_SHA256,
+                },
+                "20130524T000000Z",
+                "us-east-1",
+                "AKIAIOSFODNN7EXAMPLE",
+                b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            )
+        };
+        assert_eq!(sign("a   b"), sign("a b"));
+        assert_ne!(sign("a b"), sign("ab"));
     }
 
     #[test]

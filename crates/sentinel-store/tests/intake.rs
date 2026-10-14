@@ -1191,3 +1191,33 @@ fn a_store_fault_during_validation_retries_instead_of_suspending() {
     assert_eq!(row.attempts, 1, "{row:?}");
     assert!(row.reason.is_none(), "{row:?}");
 }
+
+/// A SQLite constraint failure while settling one delivery undoes only that
+/// delivery's writes: it is retried on its own schedule and the rest of the
+/// batch still settles, instead of the whole pass rolling back and failing on
+/// the same row forever.
+#[test]
+fn a_constraint_failure_in_one_delivery_does_not_abort_the_batch() {
+    let mut f = fixture();
+    let poison = accept(&mut f, "poison", REF, SHA_A, SHA_B).id();
+    let healthy = accept(&mut f, "healthy", "refs/heads/other", SHA_A, SHA_B).id();
+    f.conn
+        .execute_batch(
+            "CREATE TRIGGER poison_settle BEFORE UPDATE ON webhook_deliveries
+             WHEN NEW.state != OLD.state AND OLD.external_id = 'poison'
+             BEGIN SELECT RAISE(ABORT, 'poison'); END;",
+        )
+        .unwrap();
+    let tx = f.conn.transaction().unwrap();
+    let settled = intake::resolve_due(&tx, NOW, 10).unwrap();
+    tx.commit().unwrap();
+    assert!(
+        settled.iter().any(|(id, _)| *id == healthy),
+        "the healthy delivery settles: {settled:?}"
+    );
+    assert!(settled.iter().all(|(id, _)| *id != poison), "{settled:?}");
+    assert_ne!(fetch(&f, healthy).state, State::Pending);
+    let row = fetch(&f, poison);
+    assert_eq!(row.state, State::Pending, "{row:?}");
+    assert_eq!(row.attempts, 1, "the row is on its own retry schedule");
+}
