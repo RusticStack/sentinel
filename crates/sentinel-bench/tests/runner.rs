@@ -4,8 +4,7 @@ fn bench() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sentinel-bench"))
 }
 
-/// Linux git cannot read a worktree that Windows git created; there the runner must refuse
-/// to measure rather than write a record without its source.
+/// False where git cannot read the checkout (a Windows-created worktree seen from Linux).
 fn source_readable() -> bool {
     Command::new("git")
         .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
