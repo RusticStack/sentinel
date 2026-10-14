@@ -734,6 +734,13 @@ pub struct JobContext {
     pub trust: Trust,
 }
 
+/// How long a worker honors a delivered source access, counted from the
+/// moment it arrives: the whole checkout deadline (ten minutes, covering a
+/// mirror lock wait or timeout followed by the direct fallback) plus two
+/// minutes before the checkout starts. The access lives only in the
+/// attempt's in-memory context, which the fence and lease already bound.
+pub const SOURCE_ACCESS_WINDOW_MS: i64 = 12 * 60 * 1000;
+
 const fn outcome_code(outcome: Outcome) -> u8 {
     match outcome {
         Outcome::Passed => 0,
@@ -3987,9 +3994,16 @@ fn handle_bulk_message(
         }
         ServerMessage::Source { attempt, access } => {
             let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-            if !access.validate(UnixMillis::now().0) {
+            // The controller's `expires_ms` is its own wall clock: comparing
+            // it with this host's would tear the link down on every bound
+            // spec when the two clocks differ by more than the access's life.
+            // Validity is instead measured from receipt, on this host's
+            // clock, for the window one checkout (mirror attempt, then the
+            // direct fallback) can take.
+            if !access.well_formed() {
                 return Err(Error::Protocol("source access"));
             }
+            let access = access.rebased(UnixMillis::now().0, SOURCE_ACCESS_WINDOW_MS);
             let context = state
                 .contexts
                 .get_mut(&attempt)
