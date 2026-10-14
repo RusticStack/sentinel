@@ -1,6 +1,6 @@
-//! Read models for the human web interface (U02, U04, U05): tenant members,
-//! the deployment's tenants and pools, the audit trails a page by page,
-//! GitHub synchronization lag and a worker's load. Every function checks its
+//! Read models for the human web interface: tenant members, the deployment's
+//! tenants and pools, the audit trails a page at a time, GitHub
+//! synchronization lag and a worker's load. Every function checks its
 //! own authority first, so a route cannot forget to; a tenant the caller may
 //! not see is `NotFound`, exactly like one that does not exist.
 
@@ -135,7 +135,7 @@ pub struct TenantRow {
     /// Committed and reserved object bytes plus stamped log bytes
     /// (`tenant_usage`).
     pub usage_bytes: u64,
-    /// The tenant's own storage policy (R01); `None` fields inherit the
+    /// The tenant's own storage policy; `None` fields inherit the
     /// deployment's.
     pub quota_bytes: Option<u64>,
     pub log_retention_ms: Option<i64>,

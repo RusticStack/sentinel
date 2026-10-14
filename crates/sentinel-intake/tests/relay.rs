@@ -1,4 +1,4 @@
-//! G02 relay example: a real `git push` runs `examples/hooks/post-receive`,
+//! Relay example: a real `git push` runs `examples/hooks/post-receive`,
 //! which spools each ref update and submits it over loopback HTTP. The stub
 //! server records what arrived, including the Authorization header and the
 //! exact JSON body.
@@ -83,7 +83,6 @@ impl Stub {
         format!("http://{}/api/v1/intake/{repo}", self.addr)
     }
 
-    /// Wait until at least `count` requests have arrived.
     fn wait(&self, count: usize, timeout: Duration) -> Vec<Request> {
         let deadline = Instant::now() + timeout;
         loop {

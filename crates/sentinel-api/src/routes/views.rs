@@ -1,5 +1,5 @@
 //! Read routes behind the web interface's run, worker and synchronization
-//! views (U02, U04). Each is the same authenticate → scope → store
+//! views. Each is the same authenticate → scope → store
 //! predicate path as every other route; nothing here is page-only.
 
 use sentinel_core::{

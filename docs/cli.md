@@ -1,4 +1,4 @@
-# Developer CLI (Part 09, O04–O07)
+# Developer CLI
 
 `sentinel` is one binary: the offline `pipeline` commands, the host-local `admin` commands and the Linux `server`/`worker` roles, plus the networked commands that talk to a controller's [API](api.md) with an [OAuth](oauth.md) grant or a static credential. This page is the contract for the networked half.
 
@@ -6,11 +6,11 @@
 |---|---|
 | `sentinel auth login\|status\|logout` | sign in (browser or `--device`), inspect, sign out ([below](#authentication-and-profiles)) |
 | `sentinel context use\|show` | the profile's default tenant |
-| `sentinel run dispatch\|status\|list\|cancel\|wait`, `status`, `wait`, `job`, `log`, `workers`, `queue`, `artifact`, `cache` | the O05 command surface ([below](#commands)) |
+| `sentinel run dispatch\|status\|list\|cancel\|wait`, `status`, `wait`, `job`, `log`, `workers`, `queue`, `artifact`, `cache` | the networked command surface ([below](#commands)) |
 | `sentinel service-account create\|allow\|grant\|grants\|revoke` | service principals and their grants ([below](#service-accounts)) |
 | `sentinel mcp` | local stdio MCP server using the shared credential profile ([MCP](mcp.md)) |
 | `sentinel doctor` | configuration and connectivity checks with fixes ([below](#doctor)) |
-| `sentinel api …` | the W08 commands with a static credential ([below](#legacy-sentinel-api)) |
+| `sentinel api …` | the `sentinel api` commands with a static credential ([below](#legacy-sentinel-api)) |
 
 ## The shared client
 
@@ -49,7 +49,7 @@ Stable; scripts and agents switch on them (`sentinel::client::Exit`).
 
 Retries: a `rate_limited`, `storage_full`, `internal` or `outcome_unknown` answer, a proxy's 502/503/504 and a transport failure are retried up to three attempts with back-off (200 ms, then 400 ms, or a `retry-after` header's seconds when the answer carries one, at most 2 s) when the request is safe to repeat — GET, PUT, DELETE, and a POST that carries an `Idempotency-Key`, which the controller replays instead of executing again. A POST without a key is never repeated, since the outcome of a busy write can be unknown. The controller names its own back-off in the error document rather than a header: a `rate_limited` answer with `details.retry_after_ms` (a store too busy to check the credential, or every long-poll slot taken) is retried like any other overload, but only after that back-off plus up to half of it again of jitter, so refused clients spread out; every command and every `sentinel mcp` tool call rides out a brief overload this way. A named back-off is honored up to 30 s (a larger or overflowing value is cut to 30 s). After the three attempts, `wait` and `log show --follow` keep waiting the same way; any other command exits 6.
 
-A closed standard output — the reader of a pipe exited, as `sentinel run list --all --output ndjson | head -1` does — ends the command at once, quietly, with **exit 0**: nothing failed on Sentinel's side and there is no one left to tell. (It used to panic with exit 101.) Any other failure to write standard output (for example a full disk behind a redirect) is reported and exits 1. Files the CLI reads — pipelines, token and grant files, the admin password on standard input — are bounded by the bytes actually read, so a device such as `/dev/zero` or an endless pipe is refused at the limit instead of exhausting memory.
+A closed standard output — the reader of a pipe exited, as `sentinel run list --all --output ndjson | head -1` does — ends the command at once, quietly, with **exit 0**: nothing failed on Sentinel's side and there is no one left to tell. Any other failure to write standard output (for example a full disk behind a redirect) is reported and exits 1. Files the CLI reads — pipelines, token and grant files, the admin password on standard input — are bounded by the bytes actually read, so a device such as `/dev/zero` or an endless pipe is refused at the limit instead of exhausting memory.
 
 ## Authentication and profiles
 
@@ -107,65 +107,28 @@ The credential is one JSON blob per profile, `{"refresh":"sntl_rt_…","access":
 
 | Store | Where | Default on |
 |---|---|---|
-| `os` | Windows Credential Manager (`CRED_TYPE_GENERIC`, `CRED_PERSIST_LOCAL_MACHINE`, target = the key). The key is `sentinel:{issuer}:{profile}:{d}`, `{d}` the first 16 hex digits of BLAKE3 over the configuration directory's canonical path, recorded in the profile as `key` at sign-in: the OS store is per user, so without `{d}` two configuration directories (a project's, a CI runner's, a test's) with the same profile for the same server would share one credential under two different refresh locks. Profiles signed in before keys named their directory have no `key` and use the shared `sentinel:{issuer}:{profile}`; their next refresh moves them (below) | Windows Every Credential Manager call of this logon session's Sentinel processes takes a shared named mutex first: with several processes writing at once, `CredReadW` was measured answering not-found for an entry just written and never deleted (15 of 20 four-process probes lost a read; 0 of 8 with the mutex), which would make a parallel CLI report "not signed in". |
+| `os` | Windows Credential Manager (`CRED_TYPE_GENERIC`, `CRED_PERSIST_LOCAL_MACHINE`, target = the key; see below) | Windows |
 | `file` | `credentials/<profile>.json` in the configuration directory | Linux (Secret Service is not implemented) |
+
+The OS store's key is `sentinel:{issuer}:{profile}:{d}`, `{d}` the first 16 hex digits of BLAKE3 over the configuration directory's canonical path, recorded in the profile as `key` at sign-in: the OS store is per user, so without `{d}` two configuration directories (a project's, a CI runner's, a test's) with the same profile for the same server would share one credential under two different refresh locks. Profiles without a `key` use the shared `sentinel:{issuer}:{profile}`; their next refresh moves them (below). Every Credential Manager call of this logon session's Sentinel processes takes a shared named mutex first: with several processes writing at once, `CredReadW` was measured answering not-found for an entry just written and never deleted (15 of 20 four-process probes lost a read; 0 of 8 with the mutex), which would make a parallel CLI report "not signed in".
 
 `SENTINEL_CREDENTIAL_STORE=file|os` forces the store for a new sign-in. When the OS store fails, the credential goes to the file store with a notice on stderr, and the profile records `"store": "file"`; a profile is only ever read from the store it records. On Unix every directory Sentinel creates is `0700` and every file `0600`; a configuration directory, `profiles.json`, credentials directory or credential file that another user can reach (`mode & 0o077`) or that another user owns is refused (exit 2) with the `chmod`/`chown` that fixes it. On Windows every directory Sentinel creates, and the credentials directory before every credential write, gets a protected DACL granting only the current user and SYSTEM (inherited by the files inside) — the equivalent of `0700`, wherever `SENTINEL_CONFIG_DIR` points, not only under the per-user `%APPDATA%`. Every directory and file that already exists — the configuration directory (even one someone else made), `profiles.json`, the credentials directory and its files — is checked on its open handle like on Unix: it must be owned by the current user, SYSTEM or Administrators, and its DACL may allow no one else; otherwise it is refused (exit 2) with the `icacls` commands that fix it (and `sentinel doctor` reports the same). A credentials directory made by an older Sentinel is brought to owner-only before a credential write. Because `profiles.json` decides where refresh tokens are sent and which OS-store entry is read or deleted, a profile whose `issuer` is not its normalized `server`, or whose `key` is not this profile's own scoped key, is refused (exit 2) before any request.
 
-A stored credential records the grant its tokens belong to. A legacy profile (OS store, no `key`) shares its entry with every configuration directory that has the same profile name and server. Its next refresh, under the profile lock, writes the successor back to the shared entry, then — when the token endpoint names this profile's grant — copies it to the directory's scoped key, records the key in `profiles.json` and deletes the shared entry (another directory that shared this very grant is then signed out rather than left to replay a spent refresh token). When the answer names another grant, the entry held another directory's newer sign-in: it keeps that successor and this profile is signed out (exit 3). Sign-in and `auth logout` revoke and delete a shared entry only when it holds the profile's own grant (asked of `/api/v1/me`, or learned from a refresh); another directory's is left alone, and a logout that cannot tell exits 6 without deleting anything. Because profile locks live in each directory, the refresh of a legacy entry also takes a lock named after the entry itself (a named mutex in this logon session, derived from the entry's key; the OS releases it if its holder dies), so two directories never present its refresh token at the same moment: the second waits, then finds the entry moved and is signed out (exit 3) instead of replaying the spent token (P09C-8). Credential files are replaced atomically and `fsync`ed (file and directory) before the rename, so a crash never loses a rotated refresh token that was reported stored.
+A stored credential records the grant its tokens belong to. A legacy profile (OS store, no `key`) shares its entry with every configuration directory that has the same profile name and server. Its next refresh, under the profile lock, writes the successor back to the shared entry, then — when the token endpoint names this profile's grant — copies it to the directory's scoped key, records the key in `profiles.json` and deletes the shared entry (another directory that shared this very grant is then signed out rather than left to replay a spent refresh token). When the answer names another grant, the entry held another directory's newer sign-in: it keeps that successor and this profile is signed out (exit 3). Sign-in and `auth logout` revoke and delete a shared entry only when it holds the profile's own grant (asked of `/api/v1/me`, or learned from a refresh); another directory's is left alone, and a logout that cannot tell exits 6 without deleting anything. Because profile locks live in each directory, the refresh of a legacy entry also takes a lock named after the entry itself (a named mutex in this logon session, derived from the entry's key; the OS releases it if its holder dies), so two directories never present its refresh token at the same moment: the second waits, then finds the entry moved and is signed out (exit 3) instead of replaying the spent token. Credential files are replaced atomically and `fsync`ed (file and directory) before the rename, so a crash never loses a rotated refresh token that was reported stored.
 
 ### Refresh and the profile lock
 
 A profile's access token is used from memory while more than 30 s of it remain. Otherwise the command takes `locks/<profile>.lock` — an OS file lock (`File::try_lock`, polled with back-off for at most 30 s, then exit 6) — re-reads the stored credential, and uses it as is when another process refreshed meanwhile; only if not does it spend the refresh token (`grant_type=refresh_token` at `{issuer}/oauth/token`) and store the successor before releasing the lock. After a `401`, `force_refresh(rejected)` does the same but reuses the stored token only if it differs from the rejected one. So concurrent commands on one machine present each refresh token once, which the server's rotation requires ([OAuth](oauth.md#refresh-and-rotation)); two machines sharing one profile's credential would trip replay detection and revoke the grant. A refused refresh (`invalid_grant`, expired sign-in) is exit 3 naming `sentinel auth login --server … --profile …`; an unreachable token endpoint is exit 6. A busy one (`temporarily_unavailable`) is retried once after the server's one-second `retry-after` — safe, because a refused refresh spent nothing and a rotation that committed anyway is recovered by the second presentation within the grace window — and exit 6 if it is still busy. The API itself never answers `401` for an overloaded store ([OAuth](oauth.md#access-tokens-on-the-api)), so overload does not make the client spend its refresh token.
 
-Tests: `crates/sentinel/tests/profile.rs` (portable, a scripted fake OAuth server on loopback, temporary `SENTINEL_CONFIG_DIR`, file store): profile round trip with no `sntl_` in `profiles.json`; Git-work-tree refusal; Unix modes and the loose/foreign refusals; eight concurrent callers on a nearly expired profile observe exactly one refresh; `force_refresh` with a stale rejected token reuses the newer one; refused and unreachable refreshes; the loopback listener's state, `iss`, repeated-parameter, denial, oversized-head, other-path and timeout cases, and a wrong-`state` callback, another login's denial and an idle connection neither ending nor holding up the wait; device polling timing under `slow_down`, denial and expiry; browser login end to end through the binary (PKCE verified by the fake); device login printing the user code but no token; grant import; issuer mismatch and foreign-origin endpoints refused; logout online, offline (exit 1) and `--all --forget`; status offline/online/mismatch/signed-out; `context use/show`; a profile named `profiles` signing in without waiting on itself; a busy token endpoint retried once; a tampered `issuer` or `key` in `profiles.json` refused before any request; and on Windows a pre-existing configuration directory others can modify refused (and reported by `doctor`) until the named `icacls` fix is run, a legacy shared Credential Manager entry moved to its directory's key or left to the directory whose grant it holds, a real Credential Manager round trip under a unique key with cleanup, two configuration directories holding independent credentials for the same profile and server, and the file store owner-only (`icacls`) outside `%APPDATA%`. Every CLI output is scanned for token material.
+Tests: `crates/sentinel/tests/profile.rs` (portable; a scripted fake OAuth server on loopback, a temporary `SENTINEL_CONFIG_DIR`, the file store; Windows-only cases cover ACL refusals and the Credential Manager). Every CLI output is scanned for token material.
 
-## Implementing a command
+## Error and exit contract
 
-The module layout the command units fill in (all in the `sentinel` library, so integration tests can call them):
-
-```rust
-// client.rs (Units A and F only)
-#[repr(u8)] pub enum Exit { Ok = 0, Remote = 1, Usage = 2, Auth = 3, NotFound = 4, Conflict = 5, Busy = 6, Timeout = 7, RunFailed = 8 }
-pub struct Error { pub message: String, pub exit: Exit, pub api: Option<serde_json::Value> } // new, usage, remote, document
-#[derive(clap::Args)] pub struct ClientArgs { profile, server, token_file, output: Output, json: bool } // global flags
-impl ClientArgs { pub fn output(&self) -> Output }       // --json wins; also sets how failures are reported
-pub enum Output { Text, Json, Ndjson }
-pub struct Client;
-impl Client {
-  pub fn connect(args: &ClientArgs) -> Result<Client, Error>;          // precedence and mismatch; no network
-  pub fn with_token(server: &str, token: &str) -> Result<Client, Error>; // legacy `api`: server as given
-  pub fn get(&self, path: &str) -> Result<Value, Error>;
-  pub fn post(&self, path: &str, body: &Value, idempotency: Option<&str>) -> Result<Value, Error>;
-  pub fn put(&self, path: &str, body: &Value) -> Result<Value, Error>;
-  pub fn delete(&self, path: &str) -> Result<Value, Error>;
-  pub fn download(&self, path: &str, range: Option<(u64, u64)>) -> Result<Download, Error>; // range = [start, end)
-  pub fn server(&self) -> &str; pub fn default_tenant(&self) -> Option<&str>; pub fn agent(&self) -> &ureq::Agent;
-}
-pub type Download = (u16, Option<u64>, Box<dyn std::io::Read>);  // status 200/206, content-length, body
-pub fn emit(output: Output, value: &Value, text: impl FnOnce() -> String);      // text / pretty JSON / one line
-pub fn emit_item(output: Output, value: &Value, text: impl FnOnce() -> String); // text / one JSON line per item
-pub fn report(error: &Error);                          // stderr: `error: …`, or one sentinel.error/1 line
-pub fn normalize_server(url: &str) -> Result<String, Error>;
-// profile.rs (Unit D)
-pub struct Handle;  pub fn resolve(name: Option<&str>) -> Result<Option<Handle>, client::Error>;
-impl Handle { pub fn name(&self) -> &str; pub fn server(&self) -> &str; pub fn tenant(&self) -> Option<&str>;
-  pub fn access_token(&self, agent: &ureq::Agent) -> Result<String, client::Error>;
-  pub fn force_refresh(&self, agent: &ureq::Agent, rejected: &str) -> Result<String, client::Error>; }
-// entry points `cli.rs`/`main.rs` call; each module may reshape its Args freely
-auth_cmd::{AuthArgs, ContextArgs, run(AuthArgs), run_context(ContextArgs)}          // Unit D
-service_accounts::{ServiceAccountArgs, run(ServiceAccountArgs)}                    // Unit C
-commands::{RunArgs, StatusArgs, WaitArgs, JobArgs, LogArgs, WorkersArgs, QueueArgs,
-           ArtifactArgs, CacheArgs, Invocation, run(Invocation)}                  // Unit E (commands/)
-doctor::{DoctorArgs, run(DoctorArgs)}                                              // Unit F
-// pre-declared empty modules for Unit D: keystore/ (mod.rs), loopback.rs, browser.rs
-```
-
-Every `run` returns `Result<(), client::Error>`; `main.rs` reports the error in the command's output mode and exits with `error.exit as u8`. A command should call `args.client.output()` (or `Client::connect`) before it can fail, so a failure is reported in the mode the user asked for.
+Every command returns `Result<(), client::Error>`; `main.rs` reports the error in the command's output mode and exits with `error.exit as u8`. A command calls `args.client.output()` (or `Client::connect`) before it can fail, so a failure is reported in the mode the user asked for.
 
 ## Service accounts
 
-For a tenant administrator (the credential needs `tenant:admin`; see [OAuth](oauth.md#service-account-grants-o06)). **`create`, `allow` and `grant` mint or widen credentials, which needs a browser session that has stepped up ([step-up](step-up.md#issuing-credentials)); a CLI profile authenticates with an OAuth token or `sntl_` credential, which can never step up, so these three are refused with `forbidden` and `details.step_up` until a step-up-capable client (the web interface) offers them.** `grants` and `revoke` are unchanged. A tenant administrator's token with `tenant:admin` can still list and revoke the grants it governs. `--tenant SLUG` defaults to the profile's context (`sentinel context use`); without either the command exits 2 before any request. Tenant, account, repository and grant arguments must be plain path segments (`A-Z a-z 0-9 - . _ ~`), checked locally.
+For a tenant administrator (the credential needs `tenant:admin`; see [OAuth](oauth.md#service-account-grants)). **`create`, `allow` and `grant` mint or widen credentials, which needs a browser session that has stepped up ([step-up](step-up.md#issuing-credentials)); a CLI profile authenticates with an OAuth token or `sntl_` credential, which can never step up, so these three are refused with `forbidden` and `details.step_up` until a step-up-capable client (the web interface) offers them.** A tenant administrator's token with `tenant:admin` can still list and revoke the grants it governs. `--tenant SLUG` defaults to the profile's context (`sentinel context use`); without either the command exits 2 before any request. Tenant, account, repository and grant arguments must be plain path segments (`A-Z a-z 0-9 - . _ ~`), checked locally.
 
 | Command | Does |
 |---|---|
@@ -221,7 +184,7 @@ Every command below takes the [shared client flags](#the-shared-client). `--tena
 
 **`log search`** follows the server's bounded scans: each request reads at most 4 MiB of log, so a 256 MiB log is at most 64 short requests, resumed at `next_after` with the server's `next_carry`. A literal split across frames of the same step and stream is found exactly once (reported with the frame it ends in), including across a sealed segment and across the cut between two requests; text mode says on stderr when the log is still being written (later lines were not searched) or when `--limit` cut the matches.
 
-**`cache`** reports per-attempt records only (K08 `cache:` entries of that attempt); there is no tenant-wide cache browser.
+**`cache`** reports per-attempt records only (the `cache:` entries of that attempt); there is no tenant-wide cache browser.
 
 **`secret`** takes `--tenant` (or the profile context) and, where it applies, `--repo`. A repository name is any 1–128 bytes without control characters (`RusticStack/app` included) and is percent-encoded into the query. `set` reads bytes from a protected regular file, redirected stdin, or a hidden terminal prompt; it never accepts a value argument, and a stray argument (`secret set TOKEN hunter2`, `--value=…`) is refused with a fixed message that does not repeat it (exit 2). File/stdin values preserve bytes (a trailing newline is part of the value). The prompt reads raw terminal input without echo and removes only its line ending; it accepts one line of at most 65,536 bytes and refuses, rather than truncates, a longer value or a paste of several lines — use `--file` or `--stdin` for those. Ctrl+C cancels and restores the terminal; on Windows, input still pending after the line is discarded, so pasted lines never reach the shell or its history. A terminal that is not a console (mintty/MSYS without winpty) is refused with the same advice. Values are 1–65,536 bytes. Input files must be regular, non-link, owner-only files: Unix checks owner and mode (fix: `chmod 600`); Windows requires the owner to be the current user or SYSTEM and a DACL granting access only to them (fix: `icacls "FILE" /setowner "%USERNAME%"` then `icacls "FILE" /inheritance:r /grant:r "%USERNAME%:F"`; any deny entry is refused too). Input errors and controller errors never print file contents. `set --if-version 0` creates, and a positive version rotates; without the flag, `set` reads metadata then uses compare-and-set. `rotate` and `delete` require an explicit version. Text and JSON contain metadata only.
 
@@ -235,7 +198,7 @@ Every command below takes the [shared client flags](#the-shared-client). `--tena
 
 ## Legacy `sentinel api`
 
-The W08 commands keep their flags and output (`me`, `run`, `status`, `runs`, `cancel`, `rerun`, `logs`, `workers`, `queue`, `drain`, `undrain`; see [API](api.md#the-cli)) and now run on the shared client: `--token-file`, `--token` or `SENTINEL_TOKEN` may hold an `sntl_` credential or an `sntl_at_` access token, the server is taken as given (a trailing `/` dropped), and exits follow the table above — so `conflict` now exits 5 and a busy or unreachable controller 6, where both used to be 1.
+The `sentinel api` commands (`me`, `run`, `status`, `runs`, `cancel`, `rerun`, `logs`, `workers`, `queue`, `drain`, `undrain`; see [API](api.md#the-cli)) run on the shared client: `--token-file`, `--token` or `SENTINEL_TOKEN` may hold an `sntl_` credential or an `sntl_at_` access token, the server is taken as given (a trailing `/` dropped), and exits follow the table above — so `conflict` exits 5 and a busy or unreachable controller 6.
 
 ## Output
 
@@ -288,7 +251,7 @@ Text mode prints one `ok`/`FAIL`/`skip` line per check and a `fix:` line under e
 
 ## Verification
 
-`crates/sentinel/tests/client.rs` (portable, a fake HTTP server on loopback): each `sentinel.error/1` code and a proxy's non-JSON answer map to their exit; busy answers are retried three times before exit 6; an unreachable controller exits 6; `--json` failures are one error document on stderr with stdout empty; a malformed credential is exit 2 with nothing sent; a static credential needs a Sentinel shape and a loopback-or-https server, and connecting sends nothing. `crates/sentinel/tests/oauth_e2e.rs` (O07, portable — Windows natively and Linux) runs the real binary against an in-process controller with a temporary `SENTINEL_CONFIG_DIR` and the file store, and scans every stdout and stderr for token material (`sntl_…` followed by 16 or more hex digits, or any `sntl_dc_`):
+`crates/sentinel/tests/client.rs` (portable, a fake HTTP server on loopback): each `sentinel.error/1` code and a proxy's non-JSON answer map to their exit; busy answers are retried three times before exit 6; an unreachable controller exits 6; `--json` failures are one error document on stderr with stdout empty; a malformed credential is exit 2 with nothing sent; a static credential needs a Sentinel shape and a loopback-or-https server, and connecting sends nothing. `crates/sentinel/tests/oauth_e2e.rs` (portable: Windows natively and Linux) runs the real binary against an in-process controller with a temporary `SENTINEL_CONFIG_DIR` and the file store, and scans every stdout and stderr for token material (`sntl_…` followed by 16 or more hex digits, or any `sntl_dc_`):
 
 - browser login with `--no-browser` (the test reads the URL from stderr, consents with a password session and follows the `303` to the CLI's loopback listener), then `auth status --json` and `run list`;
 - device login approved on `/device`;

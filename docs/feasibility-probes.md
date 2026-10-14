@@ -1,6 +1,6 @@
-# Feasibility probes (F07)
+# Feasibility probes
 
-Bounded experiments run 2026-09-13 to settle four design questions before the vertical slice. Host: `DOOMBRINGER`, Ubuntu 24.04 on WSL2 (kernel `6.18.33.2-microsoft-standard-WSL2`, i7-13700KF, 24 logical CPUs), native ext4 root plus loop-mounted XFS (`reflink=1`) and Btrfs fixtures. WSL2 is a development reference; repeat on a dedicated Linux host before relying on absolute numbers. Raw records and scripts are under [`bench/`](../bench/). The reusable code lives in [`crates/sentinel-probes`](../crates/sentinel-probes) (`cargo probe <subcommand>`).
+Bounded experiments run 2026-09-13 that settled the design questions below. Host: `DOOMBRINGER`, Ubuntu 24.04 on WSL2 (kernel `6.18.33.2-microsoft-standard-WSL2`, i7-13700KF, 24 logical CPUs), native ext4 root plus loop-mounted XFS (`reflink=1`) and Btrfs fixtures. WSL2 is a development reference; repeat on a dedicated Linux host before relying on absolute numbers. Raw records and scripts are under [`bench/`](../bench/). The reusable code lives in [`crates/sentinel-probes`](../crates/sentinel-probes) (`cargo probe <subcommand>`).
 
 ## 1. SQLite commit and dispatch
 
@@ -36,7 +36,7 @@ Findings and decision:
 | `podman stop -t 1` on a sleeping process | PASS: 1.24 s wall, SIGTERM then SIGKILL |
 | Bind-mounted workspace | Host-owned dir appears as `0:0` inside; files created inside are owned by the host user |
 
-Not covered: the first probe versions produced false PASS/FAIL results for memory (a killed subshell still let the outer shell echo); the committed script is the corrected one. `io` and `cpuset` controllers are not delegated in this rootless setup, so I/O weight and pinning are unavailable without host configuration. **Decision: rootless Podman with per-job `--cpus`, `--memory`/`--memory-swap`, `--pids-limit`, `--network none` by default, read-only rootfs plus tmpfs/bind workspaces, all capabilities dropped, is confirmed enforceable and is the W03 executor baseline.** Verify controller delegation in the worker's preflight, since it depends on the host's systemd configuration.
+Not covered: the `io` and `cpuset` controllers are not delegated in this rootless setup, so I/O weight and pinning are unavailable without host configuration. **Decision: rootless Podman with per-job `--cpus`, `--memory`/`--memory-swap`, `--pids-limit`, `--network none` by default, read-only rootfs plus tmpfs/bind workspaces, all capabilities dropped, is confirmed enforceable and is the [executor](executor.md) baseline.** Verify controller delegation in the worker's preflight, since it depends on the host's systemd configuration.
 
 ## 3. Reflink versus safe copy
 
@@ -54,13 +54,13 @@ Not covered: the first probe versions produced false PASS/FAIL results for memor
 | Btrfs | explicit read/write | 1.80 s | 65 µs / 535 µs | 0.08 s |
 | Btrfs | `std::fs::copy` | 0.25 s | 10 µs / 39 µs | 0.86 s |
 
-**Order-confounded.** The caches were dropped once, before the first clone, and the modes then ran in a fixed order (reflink, `copy`, `fs-copy`): the first mode read a cold source and every later mode a source its predecessor had just pulled into the page cache. The wall times and every ratio in this table (and the read-back column, which depends on what the clone left cached) therefore mix the mode with its position, and were taken once per cell with no spread. They stay as the record of what ran; treat the ranking as indicative, not as a measured ratio. `bench/f07-storage.sh` now runs each mode in every round (`ROUNDS`, default 3) in a `shuf`fled order with the caches dropped before each, and tags each clone record with `round`, `position` and `caches_dropped` (`false` when the drop was not permitted, so that record's cache state is unknown). Re-measure on the VPS with it before quoting any ratio; none has been re-taken yet.
+**Order-confounded.** The caches were dropped once, before the first clone, and the modes then ran in a fixed order (reflink, `copy`, `fs-copy`): the first mode read a cold source and every later mode a source its predecessor had just pulled into the page cache. The wall times and every ratio in this table (and the read-back column, which depends on what the clone left cached) therefore mix the mode with its position, and were taken once per cell with no spread. They stay as the record of what ran; treat the ranking as indicative, not as a measured ratio. `bench/f07-storage.sh` runs each mode in every round (`ROUNDS`, default 3) in a `shuf`fled order with the caches dropped before each, and tags each clone record with `round`, `position` and `caches_dropped` (`false` when the drop was not permitted, so that record's cache state is unknown). The committed table predates that script; re-measure with it before quoting any ratio.
 
 Findings and decision:
 
 - Reflink clones are about 15 µs per file regardless of size, so a 20k-file cache tree attaches in ~0.3 s and shares blocks. On XFS and Btrfs `std::fs::copy` (`copy_file_range`) already reflinks transparently, which is why it matches `FICLONE`; on ext4 it still copies bytes but stays fast for small files through the kernel path.
 - The safe copy costs 1–2 s for 312 MiB of small files: acceptable as a fallback but 3–6x a reflink, and it grows with bytes rather than file count.
-- **First-touch cost is real and separate:** reading a fresh reflink clone took 0.7–1.1 s because its pages were not in cache, while the byte copy's pages were. Cache attachment time must never be reported as cache readiness; the runtime contract already says so.
+- **First-touch cost is real and separate:** reading a fresh reflink clone took 0.7–1.1 s because its pages were not in cache, while the byte copy's pages were. Cache attachment time must never be reported as cache readiness; the [cache](cache.md) contract already says so.
 - Per-file cost dominates for small files, so any clone backend will be `O(files)`; whole-tree snapshots (Btrfs subvolume, LVM) are the only way below that and remain a later, measured option.
 - **Decision: implement cache materialisation as `FICLONE` per file with an explicit read/write fallback, detected per filesystem at worker start; recommend XFS with `reflink=1` or Btrfs for worker cache volumes and document ext4 as the slow-but-correct path.**
 
@@ -82,9 +82,9 @@ Findings and decision:
 
 - Unattended operation works: keys persist, addresses are stable, and the allow-list restricts peers at the tunnel layer. Bootstrap needs the DERP relay reachable once; direct UDP then takes over.
 - The helper adds roughly 250 µs per round trip and caps bulk throughput around 36 MB/s on this host (userspace WireGuard, single host). That is fine for control traffic and log streaming; large artifact or cache transfers over Tailcat should be avoided or measured separately on real WAN paths.
-- A client-side `forward` does not survive a server restart. **Decision: the worker adapter must own the helper process, health-check the forwarded port, and restart the helper on failure; the Sentinel session layer reconnects with fenced leases as already planned. Pin v0.6.0 by checksum; treat the address and key files as credentials.** NAT traversal across real networks and an operator-owned DERP remain untested and are listed as W01 work.
+- A client-side `forward` does not survive a server restart. **Decision: the worker adapter must own the helper process, health-check the forwarded port, and restart the helper on failure; the Sentinel session layer reconnects with fenced leases as already planned. Pin v0.6.0 by checksum; treat the address and key files as credentials.** NAT traversal across real networks and an operator-owned DERP remain untested.
 
-## 5. Whole-tree snapshot versus per-file clone (K02)
+## 5. Whole-tree snapshot versus per-file clone
 
 `bench/k02-cache-clone.sh` as root on the same WSL2 host: a loop-mounted 8 GiB btrfs image (`truncate` → `mkfs.btrfs` → `mount -o loop`, no sudo needed) plus the native ext4 root. The fixture is a realistic cache tree — 20,000 files of 16 KiB plus four 64 MiB large files, 568 MiB total — generated by `sentinel-probes generate --subvolume` (a snapshot source must be a subvolume, so the btrfs fixture was created as one). Record: [`bench/k02-cache-clone.jsonl`](../bench/k02-cache-clone.jsonl).
 
@@ -97,15 +97,15 @@ Findings and decision:
 | btrfs | explicit copy | 3.73 s | 5,361 | 126 µs / 878 µs | 0.18 s |
 | btrfs | `btrfs subvolume snapshot` | 0.01 s | 2,096,411 | — (one syscall) | 1.55 s |
 
-**Order-confounded.** Same defect as section 3: one cache drop after generating the fixture, then a fixed order (reflink, `copy`, `snapshot`) with one run per cell. Reflink alone started on a cold source; the byte copy and the snapshot found it cached by the time they ran, which flatters both against reflink and makes the "40x" and "370x" below order-dependent, not measurements of the modes. `bench/k02-cache-clone.sh` now runs `ROUNDS` (default 5) rounds, shuffles the mode order per round, drops the caches before each mode and tags every record with `round`, `position` and `caches_dropped`; the committed `bench/k02-cache-clone.jsonl` predates that and is unchanged, and no re-run exists yet (the decision below rests on the per-file cost being small in absolute terms, which the confound does not overturn; the ratios are not evidence).
+**Order-confounded.** Same defect as section 3: one cache drop after generating the fixture, then a fixed order (reflink, `copy`, `snapshot`) with one run per cell. Reflink alone started on a cold source; the byte copy and the snapshot found it cached by the time they ran, which flatters both against reflink and makes the "40x" and "370x" below order-dependent, not measurements of the modes. `bench/k02-cache-clone.sh` runs `ROUNDS` (default 5) rounds, shuffles the mode order per round, drops the caches before each mode and tags every record with `round`, `position` and `caches_dropped`; the committed `bench/k02-cache-clone.jsonl` predates that and has no re-run (the decision below rests on the per-file cost being small in absolute terms, which the confound does not overturn; the ratios are not evidence).
 
 Findings and decision:
 
 - The snapshot is ~40x the per-file reflink and ~370x the byte copy at this shape — one `btrfs subvolume snapshot` syscall replaces the whole walk, so its cost is O(1) in files where the others are O(files).
-- Adopting it is not a backend flag, it is a layout commitment: the source of a snapshot must itself be a btrfs subvolume, so every generation's `payload/<i>` would have to be created as a subvolume by publish (K03), GC would need `btrfs subvolume delete` instead of `rm -rf`, and the on-disk layout would differ between btrfs and every other filesystem.
+- Adopting it is not a backend flag, it is a layout commitment: the source of a snapshot must itself be a btrfs subvolume, so every generation's `payload/<i>` would have to be created as a subvolume by publish, GC would need `btrfs subvolume delete` instead of `rm -rf`, and the on-disk layout would differ between btrfs and every other filesystem.
 - The win also only exists on btrfs: XFS — the other recommended cache filesystem — has reflinks but no subvolume snapshots, and ext4 has neither. A snapshot backend therefore *adds* a second layout without removing the per-file path every other filesystem still needs.
 - **Decision: keep per-file `FICLONE` with the explicit copy fallback.** The measured per-file cost (~12 µs, 0.38 s for 20k files) is already small against any job that restores a cache; the snapshot's 40x margin does not justify a filesystem-specific store layout. Revisit only if restore time is ever shown to dominate short jobs — the subvolume layout is the documented escape hatch, and `--mode snapshot` stays in the probe for exactly that re-measurement.
 
-## Retained and discarded
+## What remains
 
-Kept: the `sentinel-probes` crate (SQLite and clone code paths will become the writer and cache-materialisation implementations), the three shell probes and their result records. Discarded: nothing else was built. Loop-mounted fixtures and the `sentinelbench` account remain on the development machine only.
+The `sentinel-probes` crate (SQLite and clone code paths), the three shell probes and their result records. Loop-mounted fixtures and the `sentinelbench` account exist on the development machine only.

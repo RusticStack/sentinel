@@ -80,7 +80,7 @@ struct FileConfig {
     // Server: where workers connect, and where the API answers.
     listen: Option<String>,
     api_listen: Option<String>,
-    // Server: the deployment-facing base URL, which is the OAuth issuer (O02).
+    // Server: the deployment-facing base URL, which is the OAuth issuer.
     public_url: Option<String>,
     // Server: the reverse proxy's networks, whose X-Forwarded-For the
     // unauthenticated admission budgets believe. Absent means loopback only.
@@ -95,16 +95,16 @@ struct FileConfig {
     enrollment_file: Option<PathBuf>,
     cpu_millis: Option<u64>,
     memory_bytes: Option<u64>,
-    // Worker: what the scheduler may select this machine by (Q01) and the
+    // Worker: what the scheduler may select this machine by and the
     // scratch disk it offers jobs. Labels default to none; disk defaults to
     // the free space of the data directory at start.
     labels: Option<Vec<String>>,
     disk_bytes: Option<u64>,
     // Worker: free space the log spools leave on the data directory's file
-    // system, and the bytes they may hold together (R01/D06).
+    // system, and the bytes they may hold together.
     spool_reserve_bytes: Option<u64>,
     spool_quota_bytes: Option<u64>,
-    // Worker: what the disposable stores may hold (R01); unset ones are
+    // Worker: what the disposable stores may hold; unset ones are
     // sized from the data directory's file system.
     cache_budget_bytes: Option<u64>,
     mirror_budget_bytes: Option<u64>,
@@ -112,27 +112,27 @@ struct FileConfig {
     // Worker: keep per-repository object mirrors under the data directory
     // (default on; `false` checks out every attempt directly).
     git_mirrors: Option<bool>,
-    // Worker: a loopback address answering `GET /metrics` (R06); off when unset.
+    // Worker: a loopback address answering `GET /metrics`; off when unset.
     metrics_listen: Option<String>,
-    // Server: disk admission watermarks, quotas and retention (D06).
+    // Server: disk admission watermarks, quotas and retention.
     storage: Option<StorageFile>,
-    // Q06: the optional pinned Tailcat helper, for either role.
+    // The optional pinned Tailcat helper, for either role.
     tailcat: Option<TailcatFile>,
-    // Q08: whether this process participates in remote cache hydration.
+    // Whether this process participates in remote cache hydration.
     remote_cache: Option<RemoteCacheFile>,
-    // Server: the optional external S3 copy of objects and logs (R02).
+    // Server: the optional external S3 copy of objects and logs.
     s3: Option<S3File>,
-    // Server: scheduled online backups (R04).
+    // Server: scheduled online backups.
     backup: Option<BackupFile>,
     // Server: optional Resend delivery of verification and invitation mail;
     // `SENTINEL_RESEND_API_KEY_FILE` and `SENTINEL_EMAIL_FROM` override these keys.
     mail: Option<MailFile>,
-    // Worker: the controller's `tc…` address, as written to its `<data_dir>/tailcat/address`
-    // (Q06). Required to dial a controller through the helper.
+    // Worker: the controller's `tc…` address, as written to its `<data_dir>/tailcat/address`.
+    // Required to dial a controller through the helper.
     tailcat_address: Option<String>,
 }
 
-/// The `[tailcat]` section (Q06), resolved into the helper's own
+/// The `[tailcat]` section, resolved into the helper's own
 /// `sentinel_link::tailcat::TailcatConfig` in the role that runs it. Kept as
 /// a plain mirror here so the portable CLI build — which links no link crate
 /// — can still validate the section.
@@ -147,7 +147,7 @@ struct TailcatFile {
     listen_port: Option<u16>,
 }
 
-/// The `[remote_cache]` section (Q08): whether this process participates in
+/// The `[remote_cache]` section: whether this process participates in
 /// remote cache hydration. The controller holds objects workers offer so
 /// another worker can hydrate them; the worker fetches and offers. Local
 /// cache hits never traverse the link either way.
@@ -155,7 +155,7 @@ struct TailcatFile {
 #[serde(deny_unknown_fields)]
 struct RemoteCacheFile {
     enabled: Option<bool>,
-    /// Server: what the controller's remote cache store may hold (R01);
+    /// Server: what the controller's remote cache store may hold;
     /// unset is sized from the data directory's file system.
     budget_bytes: Option<u64>,
 }
@@ -166,7 +166,7 @@ impl RemoteCacheFile {
     }
 }
 
-/// The `[s3]` section (R02/R03): the optional external copy of objects and
+/// The `[s3]` section: the optional external copy of objects and
 /// finished logs. Server only. Kept portable so the CLI build validates it.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -284,7 +284,7 @@ impl MailFile {
     }
 }
 
-/// The `[backup]` section (R04): scheduled online backups into a directory
+/// The `[backup]` section: scheduled online backups into a directory
 /// on another disk or a mounted volume. Server only.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -490,9 +490,9 @@ struct WorkerLink {
     tailcat: Option<TailcatFile>,
     /// The controller's `tc…` address the helper carries.
     tailcat_address: Option<String>,
-    /// Whether this worker exposes the remote cache to its executor (Q08).
+    /// Whether this worker exposes the remote cache to its executor.
     remote_cache: bool,
-    /// The loopback address of the metrics listener (R06), when enabled.
+    /// The loopback address of the metrics listener, when enabled.
     metrics_listen: Option<SocketAddr>,
 }
 
@@ -507,9 +507,9 @@ enum Role {
         public_url: Option<String>,
         /// Validated `trusted_proxies` entries; `None` means loopback only.
         trusted_proxies: Option<Vec<String>>,
-        /// The helper the server runs for its link port (Q06), when enabled.
+        /// The helper the server runs for its link port, when enabled.
         tailcat: Option<TailcatFile>,
-        /// Whether the controller serves remote cache objects (Q08).
+        /// Whether the controller serves remote cache objects.
         remote_cache: bool,
         /// What that store may hold; `None` sizes it from the disk.
         remote_cache_budget: Option<u64>,
@@ -996,7 +996,7 @@ fn read_config(path: &Path) -> Result<String, Error> {
 }
 
 /// Keep the process's memory out of core dumps and away from same-user
-/// debuggers (P10D-9): the controller opens sealed secret values and the
+/// debuggers: the controller opens sealed secret values and the
 /// worker holds delivered ones, and buffers that held them are wiped only
 /// where Sentinel owns them — not in every copy a library or allocator
 /// made. `RLIMIT_CORE` 0 (soft and hard) also covers every helper this
@@ -1102,7 +1102,7 @@ pub fn run(role: &str, args: ServiceArgs) -> Result<(), Error> {
     result
 }
 
-/// The helper configuration of an enabled `[tailcat]` section (Q06); `None`
+/// The helper configuration of an enabled `[tailcat]` section; `None`
 /// leaves the link on direct TLS. `listen_port` is the role's default for the
 /// port the helper carries.
 fn helper_config(
@@ -1326,7 +1326,7 @@ enum Running {
         mail: Option<Box<sentinel_mail::Lane>>,
         /// The GitHub-backed membership lane draining `github_member_checks`.
         members: Option<Box<sentinel_checks::Members>>,
-        /// The Q06 helper carrying the link port; absent with direct TLS.
+        /// The Tailcat helper carrying the link port; absent with direct TLS.
         tailcat: Option<TailcatServer>,
         /// The external S3 copy's replicator, when `[s3]` is configured.
         replicator: Option<sentinel::offload::Running>,
@@ -1340,7 +1340,7 @@ enum Running {
     Worker {
         handle: Arc<sentinel_link::worker::Handle>,
         thread: std::thread::JoinHandle<()>,
-        /// The Q06 helper the worker dials through; absent with direct TLS.
+        /// The Tailcat helper the worker dials through; absent with direct TLS.
         /// Shared with the link thread, which replaces it when sessions over
         /// it keep failing.
         tailcat: Option<Arc<sentinel_link::tailcat::Forward>>,
@@ -1349,12 +1349,12 @@ enum Running {
     },
 }
 
-/// Q06 for the server: run the helper that carries the link port, keep its
+/// Run the helper that carries the link port, keep its
 /// `tc…` address in the owner-only `<data_dir>/tailcat/address` (the operator
 /// hands that exact string to workers as `tailcat_address`; the log names only
 /// the file), and keep the admitted node keys current from
 /// `<data_dir>/tailcat-allow` minus every key whose worker is revoked. `None`
-/// means direct TLS, unchanged.
+/// means direct TLS.
 #[cfg(feature = "server")]
 struct TailcatServer {
     server: Arc<sentinel_link::tailcat::Server>,
@@ -1646,7 +1646,7 @@ fn start_server(
     (remote_cache, remote_cache_budget): (bool, Option<u64>),
 ) -> Result<Running, Error> {
     let path = config.data_dir.join(sentinel_store::METADATA_FILE);
-    // A pending migration is preceded by a copy of the database (R05), and
+    // A pending migration is preceded by a copy of the database, and
     // a failed one names that copy to roll back to.
     let (store, snapshot) =
         sentinel_store::upgrade::open_upgrading(&path, sentinel_store::Durability::Full).map_err(
@@ -1680,7 +1680,7 @@ fn start_server(
     }
     let store = Arc::new(store);
     // Before anything listens: a controller whose sealed values it cannot
-    // open must not come up looking healthy (P10S-4).
+    // open must not come up looking healthy.
     let key = master_key(&config.data_dir, &store)?;
     let identity = identity(&config.data_dir, "controller")?;
     let fingerprint = hex32(&identity.fingerprint().0);
@@ -1691,9 +1691,9 @@ fn start_server(
         )
         .map_err(|error| Error::runtime(format!("cannot open the log store: {error}")))?,
     );
-    // Disk admission (D06): one gate over the data directory's filesystem
+    // Disk admission: one gate over the data directory's filesystem
     // shared by objects and logs; staged writes and uploads charge it.
-    // Unset watermarks follow the data filesystem's size (R01).
+    // Unset watermarks follow the data filesystem's size.
     let total = sentinel_store::space::total_bytes(&config.data_dir).unwrap_or(0);
     let marks = config.storage.marks(total)?;
     let admission = Arc::new(
@@ -1764,7 +1764,7 @@ fn start_server(
     controller.set_storage_policy(sentinel_link::controller::StoragePolicy {
         interval_ms: config.storage.sweep_interval_ms,
     });
-    // Remote cache (Q08): the controller holds objects workers offer, so a
+    // Remote cache: the controller holds objects workers offer, so a
     // second worker can hydrate them without the WAN. The directory is
     // created here for operators; uploads create it lazily anyway.
     if remote_cache {
@@ -1776,7 +1776,7 @@ fn start_server(
             ))
         })?;
         // Unset, the store takes a tenth of the data file system, 1 to
-        // 50 GiB (R01): 50 GiB on the 1 TB reference host, as before.
+        // 50 GiB: 50 GiB on a 1 TB host.
         let budget = remote_cache_budget.unwrap_or_else(|| (total / 10).clamp(1 << 30, 50 << 30));
         controller.set_remote_cache_budget(budget);
         controller.set_remote_cache(root);
@@ -1846,7 +1846,7 @@ fn start_server(
             });
         },
     );
-    // The opt-in ref poller (G07): nothing is configured until an operator
+    // The opt-in ref poller: nothing is configured until an operator
     // opts a repository in, but the lane runs so a new configuration takes
     // effect without a restart. Its deliveries ride the intake lane above.
     let poll_dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -2308,7 +2308,7 @@ fn start_replicator(
     let bucket = Arc::new(sentinel::offload::S3Bucket::new(client));
     objects.set_remote(Arc::clone(&bucket) as Arc<dyn sentinel_store::objects::Remote>);
     // Unset, the backlog may hold a sixteenth of the data file system, 1 to
-    // 64 GiB, before new artifacts wait for it (R03).
+    // 64 GiB, before new artifacts wait for it.
     let settings = sentinel_store::replicate::Settings {
         part_bytes: s3.part_bytes.unwrap_or(16 << 20),
         local_bytes: s3.local_bytes.unwrap_or(0),
@@ -2449,7 +2449,7 @@ mod worker_role {
                         .1
                         .unwrap_or(sentinel_worker::spool::DEFAULT_SPOOL_QUOTA),
                 );
-                // Unset budgets follow the data directory's file system (R01).
+                // Unset budgets follow the data directory's file system.
                 let sized = sentinel_worker::executor::StorageBudgets::sized(
                     sentinel_worker::spool::filesystem_bytes(data_dir).unwrap_or(0),
                 );
@@ -2549,7 +2549,7 @@ mod worker_role {
     }
 
     /// CPU busy time in nanoseconds over a short window: the worker's load
-    /// input to placement (Q03). 0 when unmeasurable (not Linux, or
+    /// input to placement. 0 when unmeasurable (not Linux, or
     /// /proc/stat unreadable), never a claim of idleness.
     #[cfg(target_os = "linux")]
     fn load_ns() -> u64 {
@@ -2589,8 +2589,8 @@ mod worker_role {
 
     /// The protocol-7 profile: what the scheduler may select this machine by
     /// and what it can offer jobs. `images`/`cache_bytes` start empty here
-    /// and are filled per session from the executor's own record (P07-6,
-    /// `Executor::availability`): the held image keys and the cache store's
+    /// and are filled per session from the executor's own record
+    /// (`Executor::availability`): the held image keys and the cache store's
     /// estimated bytes, refreshed from protocol 8 whenever they change.
     fn profile(link: &WorkerLink, data_dir: &Path) -> sentinel_protocol::negotiate::Profile {
         sentinel_protocol::negotiate::Profile {
@@ -2605,7 +2605,7 @@ mod worker_role {
         }
     }
 
-    /// Q06: run the helper the worker dials through, when it is enabled.
+    /// Run the helper the worker dials through, when it is enabled.
     /// Returns the address the link must dial, the transport telemetry the
     /// helper already measured, and the helper itself to shut down later.
     fn tailcat(
@@ -2757,7 +2757,7 @@ mod worker_role {
             tailcat = forward.is_some()
         );
         let handle = Arc::new(sentinel_link::worker::Handle::new());
-        // Q07: with a helper, every session starts from — and every
+        // With a helper, every session starts from — and every
         // telemetry resend refreshes — the path and latency the helper's
         // latest probe measured, not the probe at process start.
         if let Some(forward) = &forward {
@@ -3009,7 +3009,7 @@ fn initialize_and_wait(
 
 #[cfg(all(test, target_os = "linux"))]
 mod hardening_tests {
-    /// P10D-9: a service process ends up with no core limit it could raise
+    /// A service process ends up with no core limit it could raise
     /// and not dumpable. Checked in a forked child so the test binary's own
     /// flags are left alone.
     #[test]
@@ -3145,7 +3145,6 @@ mod tests {
 
     #[test]
     fn the_maintenance_tick_purges_idempotency_records_a_batch_at_a_time() {
-        // P02-2: the tick used to leave every idempotency record forever.
         let dir = tempfile::tempdir().unwrap();
         let store = sentinel_store::Store::open(
             dir.path().join("m.sqlite"),
@@ -3257,8 +3256,7 @@ credentials_file = '/etc/sentinel/s3'
     #[test]
     fn storage_defaults_and_validation() {
         let resolved = resolve_ok(StorageFile::default());
-        // A 64 GiB data filesystem sizes the watermarks exactly as the fixed
-        // pre-R01 defaults did; a 1 TB one scales them up.
+        // A 64 GiB data filesystem sizes the watermarks to 1, 2 and 4 GiB; a 1 TB one scales them up.
         let marks = marks_ok(&resolved, 64 << 30);
         assert_eq!(
             marks,

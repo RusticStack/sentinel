@@ -102,7 +102,7 @@ pub enum Compat {
     Compiler { flags: String },
 }
 
-/// One file inside a generation, relative to its directory — what K02
+/// One file inside a generation, relative to its directory — what restore
 /// clones and verifies.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -136,7 +136,7 @@ pub struct Manifest {
     pub bytes: u64,
     /// Entry count of the `files` blob.
     pub files: u32,
-    /// BLAKE3 of the `files` blob — the anchor K02 verifies before
+    /// BLAKE3 of the `files` blob — the anchor restore verifies before
     /// materializing.
     pub files_digest: [u8; 32],
 }
@@ -159,7 +159,7 @@ pub(crate) fn key_stem(key: &str) -> &str {
 }
 
 impl Manifest {
-    /// The unsealed manifest for a generation still being written; K02
+    /// The unsealed manifest for a generation still being written; the publisher
     /// fills `bytes`/`files`/`files_digest` from the blob it produced and
     /// calls `seal` last.
     pub fn writing(scope: &Scope, key: &str, compat: Compat) -> Manifest {
@@ -356,7 +356,7 @@ pub fn read(generation_dir: &Path) -> Outcome {
 }
 
 /// Read the manifest, then apply the request's boundary and class rule —
-/// the full lookup. The `current` pointer and generation choice are K03's;
+/// the full lookup. The `current` pointer and generation choice are the caller's;
 /// this answers "may this generation dir serve this request".
 pub fn lookup(generation_dir: &Path, want: &Request<'_>) -> Outcome {
     match read(generation_dir) {
@@ -775,7 +775,7 @@ mod tests {
                 "prefix len {len}"
             );
         }
-        // A path that escapes the generation must never reach K02.
+        // A path that escapes the generation must never reach materialization.
         let mut bad = blob.clone();
         bad.entries[0].path = "../outside".to_string();
         assert_eq!(FilesBlob::decode(&bad.encode()), Err(Miss::Invalid));

@@ -1,8 +1,8 @@
-# Local authentication (A02)
+# Local authentication
 
 Implemented in `sentinel-auth` (password hashing, opaque secrets, cookie/CSRF policy), `sentinel-store::local_auth` (bootstrap, credentials, sessions, audit) and the host-local `sentinel admin` command, with append-only metadata migration **5**.
 
-This is authentication only. Admission is [A01's authorization layer](authorization.md): a validated session produces a `Principal`, and every repository, tenant and platform decision is still a live membership/grant check. [API credentials](api-credentials.md) (A03) and [GitHub sign-in](github-sign-in.md) (A04) are the other sources of that `Principal`. Registration and invitations are [A05](admission.md); second factors, step-up and session administration are [A06](step-up.md).
+This is authentication only. Admission is the [authorization layer](authorization.md): a validated session produces a `Principal`, and every repository, tenant and platform decision is still a live membership/grant check. [API credentials](api-credentials.md) and [GitHub sign-in](github-sign-in.md) are the other sources of that `Principal`. Registration and invitations are in [admission](admission.md); second factors, step-up and session administration are in [step-up](step-up.md).
 
 ## First-admin bootstrap
 
@@ -43,7 +43,7 @@ Opaque 256-bit secrets from the OS CSPRNG, stored only as their BLAKE3 digest. A
 - Sliding the idle deadline is a write, so it happens only after `refresh_after_ms` (5 min) of the window is spent, and never past the absolute deadline. A session pinned to its absolute deadline is never refreshed again. The API slides it as part of authenticating a request (`sentinel-api::auth::identify`, best effort: a refresh the writer cannot take right now does not fail the request), so an active user stays signed in until the absolute deadline. The cookie's `Max-Age` is the absolute lifetime, not the idle window: the browser keeps the cookie as long as the session could live, and the server decides when it has gone idle.
 - Login issues a new session; it does not reuse one. Logout revokes one session, logout-all revokes every live session of the account, and a password change, super-admin demotion or suspension revokes them in the same transaction as the change. Whenever every live session of an account is revoked this way, the service grants that account minted since its oldest unrevoked session began are revoked in the same transaction, and revoking one session by name revokes those minted since it began, so a credential a hijacked session minted does not outlive the response ([step-up](step-up.md#service-credentials-minted-by-a-session)). The database refuses to un-revoke a session, to move its absolute deadline or to change its user, CSRF secret or creation time.
 - `purge_expired` deletes revoked and expired rows in bounded batches; it is maintenance, not the expiry mechanism.
-- A session's `Principal` carries repository bits plus `TENANT_ADMIN`, and `PLATFORM_ADMIN` only for an actual super admin. It is not a capability: `auth` still verifies membership and grants per tenant, per query. A06 adds step-up before privileged policy changes use the platform bit.
+- A session's `Principal` carries repository bits plus `TENANT_ADMIN`, and `PLATFORM_ADMIN` only for an actual super admin. It is not a capability: `auth` still verifies membership and grants per tenant, per query. Privileged policy changes that use the platform bit also require [step-up](step-up.md).
 
 ## Cookies and CSRF
 
@@ -85,12 +85,8 @@ Measured on `DOOMBRINGER` (i7-13700KF, Ubuntu 24.04 WSL2, ext4), release build, 
 
 Verification dominates by design, and the three login outcomes cost the same order of magnitude, which is the point of the placeholder record. Session validation is what every authenticated request pays: one primary-key probe and one key join, guarded by a query-plan test that rejects table scans and temporary sort trees. Sliding an idle deadline is the only write a read-only request can trigger, and only after five minutes.
 
-**Not recorded in the repo:** no `bench/` record or harness holds these means, so their sample count and spread are unknown and they cannot be reproduced from what is committed. Re-measure on the verification VPS and commit the record before citing them.
-
-WSL2 is a development reference, not a production qualification.
+No `bench/` record or harness holds these means, so their sample count and spread are unknown and they cannot be reproduced from what is committed. WSL2 is a development reference, not a production qualification.
 
 ## Verification
 
 `crates/sentinel-store/tests/local_auth.rs` covers bootstrap admitting exactly one admin and then refusing itself (latch and pre-existing admin alike), password acceptance and rejection, unknown and wrongly-cased usernames, forged cookies, the database holding no usable cookie value, idle and absolute expiry with refresh bounded by the absolute deadline, logout and logout-all, refusal to un-revoke by raw SQL, lockout and its expiry (a single failure after an ended window counts one, not a new lockout), host-local recovery resetting and revoking, password change requiring the current password and rotating sessions, last-super-admin protection through the API and through raw `UPDATE`/`DELETE`, suspension invalidating live cookies at once, credentials refused for service principals, administration requiring explicit platform scope rather than a session alone, append-only audit carrying no credential material, and bounded purging. `sentinel-auth` unit tests cover hashing, rehash detection, input bounds, secret round-tripping and rejection, cookie attributes, ambiguous cookie headers and CSRF binding. Over HTTP, `crates/sentinel-api/tests/api.rs` covers login refusing a `text/plain` (or untyped) body and a foreign `Origin` without setting a cookie (`login_refuses_a_text_plain_body`, `login_refuses_a_foreign_origin`) and an active session outliving its first idle deadline, with the cookie's `Max-Age` at the absolute lifetime (`an_active_session_outlives_its_first_idle_deadline`).
-
-See [TODO.md](../TODO.md) for commands and results.

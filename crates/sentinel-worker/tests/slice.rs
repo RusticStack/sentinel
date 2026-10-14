@@ -1,4 +1,4 @@
-//! W09: the vertical slice through the real components — a controller with
+//! The vertical slice through the real components — a controller with
 //! its store, log store and API; a worker with the real executor; rootless
 //! Podman — under the things that go wrong: a cancel that lands during
 //! preparation, the network dropping under a running job, the controller
@@ -165,7 +165,7 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
         return;
     }
     // The slice dispatches from a repository on disk; a deployment refuses
-    // local manual sources (P05-10), so this process opts in explicitly.
+    // local manual sources, so this process opts in explicitly.
     sentinel_store::sources::permit_any_manual_source_for_tests();
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("origin");

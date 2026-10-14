@@ -1,4 +1,4 @@
-//! G04 delivery: the outbox lane drains through the GitHub publisher against a
+//! Delivery: the outbox lane drains through the GitHub publisher against a
 //! loopback stub — creation, updates and conclusions, adoption after an
 //! ambiguous create, rate-limit pauses, a refreshed token, permanent refusals,
 //! the revoked-binding path, and a settled delivery's completed check.
@@ -856,8 +856,8 @@ fn an_ambiguous_create_is_adopted_instead_of_duplicated() {
 
 #[test]
 fn adoption_finds_its_run_past_a_large_first_page() {
-    // A commit with many reruns: the listing is larger than one bounded
-    // answer used to accept, and our run is on the second page.
+    // A commit with many reruns: the listing is larger than one page, and
+    // our run is on the second.
     let mut f = fixture(None);
     let (run, build) = event_run(&mut f);
     let external = format!("sentinel:{run}:{build}");

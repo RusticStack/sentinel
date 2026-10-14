@@ -44,7 +44,7 @@ The fingerprint is not cryptographic: only the caller can collide it, against th
 
 Each event stream (run events, an attempt's log frames, a tenant's audit feed) is numbered by a dense per-stream `Seq` assigned by the writer in commit order, so resuming is one indexed range scan. A `Cursor` is an opaque fixed-size token: 42 bytes (version, tenant, stream kind, stream ID, sequence) encoded as `c1` plus 84 lowercase hex characters. Parsing takes the caller's tenant and rejects a cursor issued for another tenant; that rejection is reported to the client as `invalid_cursor`, indistinguishable from a malformed one. Pages report `next` (absent when exhausted) separately from `complete`, which tells log readers whether upstream truncation or gaps occurred.
 
-**On the wire.** The attempt-log route (`GET /attempts/{id}/logs`) and the failure-context route accept `cursor` and the log route answers its `next` as a `c1` cursor, bound to the tenant and attempt ([API](api.md#routes)); the plain frame sequence (`after=<seq>`) remains an alternative position. The run list still pages by the last run's ID (`before=run_…`, answered as `next`), which is route-level query syntax, not the versioned `c1` contract; a route that adopts `Cursor` will say so in [API](api.md) and [compatibility](compatibility.md).
+**On the wire.** The attempt-log route (`GET /attempts/{id}/logs`) and the failure-context route accept `cursor` and the log route answers its `next` as a `c1` cursor, bound to the tenant and attempt ([API](api.md#routes)); the plain frame sequence (`after=<seq>`) is an alternative position. The run list pages by the last run's ID (`before=run_…`, answered as `next`), which is route-level query syntax, not the versioned `c1` contract.
 
 ## Size limits
 
@@ -90,21 +90,20 @@ A session opens with `Hello { protocol_min, protocol_max, capabilities, arch, so
 | 8 | `HANDOFF_ANSWER`: the worker answers a Tailcat hand-off close before it replaces its forward, and replaces it on every clean close ([worker link](worker-link.md)) |
 | 9 | `SECRET_DELIVERY`: the worker accepts bounded secret bundles for acknowledged, fenced attempts |
 
-Bits 0 to 3 are required (the set the F07 probe proved enforceable); a hello without them is rejected. Rejections are typed and final for that hello: `unsupported_version` names the supported range and whether the worker is the side that must upgrade, `missing_capabilities` names the missing bits, `invalid_range` flags `protocol_min > protocol_max`. A worker must not retry an unchanged rejected hello. `software` is a diagnostic string only and never a compatibility input.
+Bits 0 to 3 are required (the set the feasibility probe proved enforceable); a hello without them is rejected. Rejections are typed and final for that hello: `unsupported_version` names the supported range and whether the worker is the side that must upgrade, `missing_capabilities` names the missing bits, `invalid_range` flags `protocol_min > protocol_max`. A worker must not retry an unchanged rejected hello. `software` is a diagnostic string only and never a compatibility input.
 
 ## Protocol 7 additions
 
-Protocol 7 is additive: every pre-existing message keeps its shape and enum
-index, and a worker and controller that negotiate 6 exchange exactly what
-they did before.
+Protocol 7 is additive: every earlier message keeps its shape and enum
+index, and a session that negotiates 6 exchanges the same messages as before.
 
 | Message | Direction | Purpose |
 |---|---|---|
 | `Profile` | worker → controller | The scheduling profile (labels ≤ 16, `host_id`, `disk_bytes`, `availability { images, cache_bytes, load_ns }`), sent immediately after `Welcome` when the session negotiated 7 |
 | `BulkHello { worker }` | worker → controller | Opens the second (bulk) connection of a session; attached only when a live control session presents the same certificate |
-| `Transport` | worker → controller | Q07 telemetry: path, RTT, reconnects, helper version, byte counters; sent after `Profile` and refreshed every 12 beats |
-| `CacheNeed(Need)`, `CacheOffer(Upload)`, `CachePush(Push)`, `CachePushEnd(End)` | worker → controller | Q08 remote-cache fetch (with resume offset and prefix digest) and offer/push |
-| `CacheGrant(Grant)`, `CacheChunk(Chunk)`, `CacheEnd(End)`, `CacheRefused(Refused)` | controller → worker | Q08 transfer answers; `End` is terminal both ways |
+| `Transport` | worker → controller | Telemetry: path, RTT, reconnects, helper version, byte counters; sent after `Profile` and refreshed every 12 beats |
+| `CacheNeed(Need)`, `CacheOffer(Upload)`, `CachePush(Push)`, `CachePushEnd(End)` | worker → controller | Remote-cache fetch (with resume offset and prefix digest) and offer/push |
+| `CacheGrant(Grant)`, `CacheChunk(Chunk)`, `CacheEnd(End)`, `CacheRefused(Refused)` | controller → worker | Transfer answers; `End` is terminal both ways |
 
 The profile is a message rather than new `Hello` fields because postcard is
 not self-describing: a struct decodes exactly the field list its reader
@@ -118,11 +117,11 @@ Bulk classes (logs, specs, artifacts, cache) travel on the worker's second
 connection when it is up and are still accepted on the control connection as
 a fallback; control classes (heartbeat, offers, reports) are refused there.
 Each connection has its own rustls state behind its own lock, so bulk traffic
-cannot delay a beat. See [worker link](worker-link.md#control-and-bulk-protocol-7-q05).
+cannot delay a beat. See [worker link](worker-link.md#control-and-bulk-protocol-7).
 
 ## Protocol 10 secret delivery
 
-Protocol 10 appends `SecretBegin { attempt, fence, length }` and `SecretChunk { attempt, fence, seq, last, bytes }`. The controller sends them only after the worker's durable offer acknowledgement and ties every chunk to that attempt and offer fence. A bundle is at most 1 MiB, each value at most 64 KiB, and chunks are at most 48 KiB. The worker accepts only the ordered bounded transfer and checks that its targets exactly match the stored run spec before any filesystem or container work. Values are carried in a sensitive frame whose debug output is redacted. The owned secret buffers (`SecretBytes`, delivery values, the redactor's values and automata, the worker's staged files) are wiped when dropped; copies made inside libraries and allocators — encode buffers that grew by reallocation, rustls' record buffers, the JSON parse of registry auth — are not, so wiping is best effort. Controller and worker processes therefore run with `RLIMIT_CORE` 0 and are not dumpable (`PR_SET_DUMPABLE` 0), and job containers get a hard core limit of 0, so no core dump carries a delivered value (P10D-9). `SECRET_DELIVERY` is required for placement of a job that declares environment, file or registry-auth secrets; older workers continue to run jobs that do not require delivery.
+Protocol 10 appends `SecretBegin { attempt, fence, length }` and `SecretChunk { attempt, fence, seq, last, bytes }`. The controller sends them only after the worker's durable offer acknowledgement and ties every chunk to that attempt and offer fence. A bundle is at most 1 MiB, each value at most 64 KiB, and chunks are at most 48 KiB. The worker accepts only the ordered bounded transfer and checks that its targets exactly match the stored run spec before any filesystem or container work. Values are carried in a sensitive frame whose debug output is redacted. The owned secret buffers (`SecretBytes`, delivery values, the redactor's values and automata, the worker's staged files) are wiped when dropped; copies made inside libraries and allocators — encode buffers that grew by reallocation, rustls' record buffers, the JSON parse of registry auth — are not, so wiping is best effort. Controller and worker processes therefore run with `RLIMIT_CORE` 0 and are not dumpable (`PR_SET_DUMPABLE` 0), and job containers get a hard core limit of 0, so no core dump carries a delivered value. `SECRET_DELIVERY` is required for placement of a job that declares environment, file or registry-auth secrets; older workers continue to run jobs that do not require delivery.
 
 ## Versioning policy
 
@@ -130,4 +129,4 @@ The protocol version bumps on any incompatible change to messages, framing or se
 
 ## Verification
 
-Unit tests: error wire shape and foreign-schema rejection, status and retry mapping, idempotency key bounds and size, fingerprint stability, decision table, cursor round trip with tenant binding and malformed/uppercase/version/kind rejection, sequence saturation, page-size clamping, declared-length checks, version selection with unknown-bit masking, mismatch direction, missing-capability naming, and `Hello`/`Rejected` JSON stability, plus the protocol-7 profile's bounds (`Profile::invalid`) and its postcard round trip (with `serde(default)` on the JSON shape). All pass on Windows and Linux.
+Unit tests: error wire shape and foreign-schema rejection, status and retry mapping, idempotency key bounds and size, fingerprint stability, decision table, cursor round trip with tenant binding and malformed/uppercase/version/kind rejection, sequence saturation, page-size clamping, declared-length checks, version selection with unknown-bit masking, mismatch direction, missing-capability naming, and `Hello`/`Rejected` JSON stability, plus the protocol-7 profile's bounds (`Profile::invalid`) and its postcard round trip (with `serde(default)` on the JSON shape).

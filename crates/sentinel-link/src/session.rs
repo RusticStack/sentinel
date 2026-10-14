@@ -101,13 +101,13 @@ pub const MAX_CACHE_CHUNK_BYTES: usize = 48 * 1024;
 /// connection holds open are bounded the same way.
 const MAX_CACHE_TRANSFERS: usize = 4;
 /// An upload that has not moved for this long is dropped with its staging
-/// file and entry lock (P08-C5): a worker that went quiet mid-offer never
+/// file and entry lock: a worker that went quiet mid-offer never
 /// pins an entry for the life of its connection.
 const UPLOAD_IDLE: Duration = Duration::from_secs(60);
 /// Control beats between transport telemetry refreshes.
 const TRANSPORT_BEATS: u64 = 12;
 
-/// How the worker reached the controller (Q07). `Unknown` is the honest
+/// How the worker reached the controller. `Unknown` is the honest
 /// answer when nothing measured the path — no helper running, or one that has
 /// not reported — never a guess that a relay is in use.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +120,7 @@ pub enum Path {
     Relay,
 }
 
-/// What the worker's process can say about its transport (Q07). Assembled by
+/// What the worker's process can say about its transport. Assembled by
 /// the worker's process layer when a helper probe exists; every field that
 /// nothing measured stays absent, never a zero claim: `path` is `Unknown`,
 /// `rtt_ns`/`helper_version` are `None`.
@@ -141,7 +141,7 @@ pub struct TransportStats {
     pub bytes_in: u64,
 }
 
-/// A live source of the process's transport measurements (Q07): the worker
+/// A live source of the process's transport measurements: the worker
 /// process hands one to the link so each session starts from — and each
 /// telemetry resend refreshes — what the Tailcat helper last measured,
 /// rather than what it measured once at process start.
@@ -264,22 +264,22 @@ pub enum ClientMessage {
     BulkHello {
         worker: [u8; 16],
     },
-    /// Protocol 7 (Q07). How the worker reached the controller.
+    /// Protocol 7. How the worker reached the controller.
     Transport(TransportStats),
-    /// Protocol 7 (Q08). The worker needs a cache object; answered by
+    /// Protocol 7. The worker needs a cache object; answered by
     /// `CacheGrant`, `CacheChunk`s and `CacheEnd`, or by `CacheRefused`.
     /// Resuming an interrupted transfer is the same need with a non-zero
     /// `offset` (and the matching `have` digest), never a separate message.
     CacheNeed(Need),
-    /// Protocol 7 (Q08). The worker offers an object it holds so the
+    /// Protocol 7. The worker offers an object it holds so the
     /// controller can keep it for the fleet; answered by `CacheGrant`
     /// (stream it), `CacheEnd` (already stored) or `CacheRefused`.
     CacheOffer(Upload),
-    /// Protocol 7 (Q08). One pushed chunk of an open offer.
+    /// Protocol 7. One pushed chunk of an open offer.
     CachePush(Push),
-    /// Protocol 7 (Q08). The offer's stream is complete.
+    /// Protocol 7. The offer's stream is complete.
     CachePushEnd(End),
-    /// Protocol 8 (P08-C2). The worker abandoned the attempt's transfer —
+    /// Protocol 8. The worker abandoned the attempt's transfer —
     /// a fetch past its budget or a failed offer: the controller stops the
     /// serve (answering `CacheRefused` with `aborted` as its terminal) or
     /// drops the upload's staging. Appended last: postcard encodes variants
@@ -306,7 +306,7 @@ const LOG_VARIANT: u32 = 6;
 /// `ClientMessage::CachePush` from a borrowed chunk: the same postcard
 /// bytes as the owned message (variant index, then `Push`'s fields in
 /// order), so an offer sends each chunk straight from its read buffer
-/// instead of copying it into an owned `Vec` first (P08-C8).
+/// instead of copying it into an owned `Vec` first.
 struct PushRef<'a> {
     attempt: &'a [u8; 16],
     offset: u64,
@@ -497,21 +497,21 @@ pub enum ServerMessage {
     /// workers get `Context` and default to the pull-request scope.
     /// Appended last: postcard encodes enum variants positionally.
     Context2(WireContext2),
-    /// Protocol 7 (Q08). The accepted start of a cache transfer: the offset
+    /// Protocol 7. The accepted start of a cache transfer: the offset
     /// the stream resumes from and the whole object's digest. For a
     /// `CacheOffer` the controller already stores, there is no grant: it
     /// answers `CacheEnd` with no bytes.
     CacheGrant(Grant),
-    /// Protocol 7 (Q08). One chunk of a granted transfer, in order, with the
+    /// Protocol 7. One chunk of a granted transfer, in order, with the
     /// running digest of the stream through it.
     CacheChunk(Chunk),
-    /// Protocol 7 (Q08). Terminal both ways: the fetch is complete, or an
+    /// Protocol 7. Terminal both ways: the fetch is complete, or an
     /// offer was stored. Appended last: postcard encodes variants positionally.
     CacheEnd(End),
-    /// Protocol 7 (Q08). The transfer is refused; `code` is the cache
+    /// Protocol 7. The transfer is refused; `code` is the cache
     /// owner's stable refusal code.
     CacheRefused(Refused),
-    /// Protocol 9 (K05). The image references (`name@sha256:…`) this
+    /// Protocol 9. The image references (`name@sha256:…`) this
     /// worker should pull ahead of an offer: ready jobs it could be placed
     /// but does not hold warm. The whole wanted set, replacing the last one
     /// — a reference that is gone from it is stale and its prefetch stops.
@@ -606,7 +606,6 @@ pub enum ArtifactCode {
 }
 
 impl ArtifactCode {
-    /// The wire code.
     pub fn to_u8(self) -> u8 {
         match self {
             Self::Stored => 0,
@@ -974,8 +973,8 @@ impl Offer {
 
 /// Why a hello was refused. A worker must not retry an unchanged hello.
 ///
-/// Wire-flat on purpose: C03's `Rejected` is an internally tagged enum for its
-/// JSON API form, which postcard cannot encode, so it is mirrored here.
+/// Wire-flat on purpose: `Rejected` is an internally tagged enum for its JSON
+/// form, which postcard cannot encode, so it is mirrored here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Rejection {
     /// No protocol version in common. `upgrade_worker` says which side is behind.
@@ -1180,9 +1179,9 @@ pub trait SessionHandler: Send + Sync {
     fn profiled(&self, _worker: WorkerId, _profile: &Profile, _capacity: Capacity) -> Result<()> {
         Ok(())
     }
-    /// Protocol 7 (Q07). The worker's latest transport telemetry.
+    /// Protocol 7. The worker's latest transport telemetry.
     fn transport(&self, _worker: WorkerId, _stats: &TransportStats) {}
-    /// Protocol 7 (Q08). Authorizes a cache download. `Some(root)` means the
+    /// Protocol 7. Authorizes a cache download. `Some(root)` means the
     /// fence and cache scope checked out and the session may serve the need
     /// from the controller's store under `root`; `None` refuses. The
     /// authorization rule is the fenced attempt: it must be held by the
@@ -1191,7 +1190,7 @@ pub trait SessionHandler: Send + Sync {
     fn cache_need(&self, _worker: WorkerId, _need: &Need) -> Option<PathBuf> {
         None
     }
-    /// Protocol 7 (Q08). Authorizes an upload the same way. `Some(root)`
+    /// Protocol 7. Authorizes an upload the same way. `Some(root)`
     /// seeds the object under `root` and the session holds the receiving
     /// state for the offer's push frames; `None` refuses.
     fn cache_offer(&self, _worker: WorkerId, _upload: &Upload) -> Option<PathBuf> {
@@ -1205,7 +1204,7 @@ struct Shared {
     conn: Mutex<rustls::Connection>,
     sock: TcpStream,
     /// Frame bytes written to / socket bytes read from this connection. What
-    /// Q07 telemetry reports is measured here, never estimated.
+    /// transport telemetry reports is measured here, never estimated.
     out: AtomicU64,
     in_: AtomicU64,
     /// Set by [`Sender::close_notify`]: the connection is ending on purpose,
@@ -1435,7 +1434,6 @@ pub struct Receiver {
 }
 
 impl Receiver {
-    /// Parse one frame out of the plaintext buffer, if a whole one is there.
     fn take_frame<M: for<'de> Deserialize<'de> + SensitiveFrame>(&mut self) -> Result<Option<M>> {
         if self.plain.len() < 4 {
             return Ok(None);
@@ -1642,7 +1640,7 @@ impl CacheAnswer {
 
 /// Answers one transfer may have queued before its caller reads them; a
 /// transfer whose caller falls further behind (disk or hashing slower than
-/// the link) is abandoned rather than buffered without bound (P08-C9).
+/// the link) is abandoned rather than buffered without bound.
 const ANSWER_QUEUE: usize = 64;
 
 /// One attempt's place in the router.
@@ -1652,7 +1650,7 @@ enum Slot {
     /// The caller gave up before the transfer's terminal answer: what the
     /// controller still sends for it is swallowed here until that terminal
     /// arrives, and a new transfer of the attempt is `busy` meanwhile — the
-    /// stale tail can never be routed into it (P08-C3).
+    /// stale tail can never be routed into it.
     Draining,
 }
 
@@ -1721,7 +1719,7 @@ impl CacheRouter {
     }
 }
 
-/// The worker's [`sentinel_cache::remote::Remote`] over the link (Q08):
+/// The worker's [`sentinel_cache::remote::Remote`] over the link:
 /// requests go out on the bulk connection when one is attached and on the
 /// control connection otherwise, and the session reader routes the answers
 /// back to the call that is waiting for them. Cheap to clone a reference to;
@@ -1804,11 +1802,10 @@ impl LinkRemote {
             .retain(|attempt, _| held.contains(attempt));
     }
 
-    /// Tell the controller this worker abandoned the attempt's transfer
-    /// (P08-C2): a serve stops at its next chunk instead of streaming the
-    /// rest of the bundle into a dropped channel, and an upload releases its
-    /// staging and lock. Best effort, protocol 8 only; the draining slot
-    /// swallows whatever is already in flight.
+    /// Tell the controller this worker abandoned the attempt's transfer: a
+    /// serve stops at its next chunk, and an upload releases its staging and
+    /// lock. Best effort, protocol 8 only; the draining slot swallows whatever
+    /// is already in flight.
     fn cancel(&self, attempt: AttemptId) {
         if self.protocol >= CACHE_CANCEL_MIN.0 {
             let _ = self.send(&ClientMessage::CacheCancel {
@@ -1833,7 +1830,6 @@ impl LinkRemote {
         self.bulk.lock().unwrap_or_else(|p| p.into_inner()).route
     }
 
-    /// The bulk connection is up: bulk-class traffic moves to it.
     fn attach_bulk(&self, bulk: Sender) {
         let mut slot = self.bulk.lock().unwrap_or_else(|p| p.into_inner());
         slot.retire();
@@ -1850,15 +1846,14 @@ impl LinkRemote {
         }
     }
 
-    /// Bytes out/in over every bulk connection this session has had (Q07's
-    /// throughput counts the bulk traffic, not only control).
+    /// Bytes out/in over every bulk connection this session has had, so
+    /// throughput counts the bulk traffic, not only control.
     fn bulk_bytes(&self) -> (u64, u64) {
         let slot = self.bulk.lock().unwrap_or_else(|p| p.into_inner());
         let (out, in_) = slot.sender.as_ref().map_or((0, 0), Sender::bytes);
         (slot.done.0 + out, slot.done.1 + in_)
     }
 
-    /// Route one received cache answer to its waiting transfer.
     fn answer(&self, attempt: AttemptId, answer: CacheAnswer) {
         self.router.route(attempt, answer);
     }
@@ -1963,7 +1958,7 @@ impl sentinel_cache::remote::Remote for LinkRemote {
         let mut buffer = vec![0u8; MAX_CACHE_CHUNK_BYTES];
         let mut sent = 0u64;
         // Hashed as it goes out when the digest is stated at the end: the
-        // one read that sends the stream also names it (P08-C8).
+        // one read that sends the stream also names it.
         let mut hasher = at_end.then(blake3::Hasher::new);
         loop {
             if Instant::now() >= deadline {
@@ -2318,7 +2313,6 @@ fn accept_watched(
     let mut conn = rustls::Connection::Server(
         ServerConnection::new(config).map_err(|e| Error::Tls(e.to_string()))?,
     );
-    // Drive the handshake so the peer certificate is available.
     let handshaken = handshake(&mut conn, &socket, deadline, watched);
     if let (Err(Error::Closed), Some((arrival, within))) = (&handshaken, arrival) {
         let (tx, rx) = split(conn, socket)?;
@@ -2423,7 +2417,6 @@ pub struct BulkSession {
 }
 
 impl BulkSession {
-    /// The half the controller pushes bulk answers through.
     pub fn sender(&self) -> Sender {
         self.tx.clone()
     }
@@ -2458,12 +2451,10 @@ impl BulkSession {
 }
 
 impl WorkerSession {
-    /// The half the dispatcher pushes offers through.
     pub fn sender(&self) -> Sender {
         self.tx.clone()
     }
 
-    /// The capacity the worker reported in its hello.
     pub fn capacity(&self) -> Capacity {
         self.capacity
     }
@@ -2544,13 +2535,13 @@ fn serve_connection(
     // `CacheOffer` opened, fed by its `CachePush` frames until `CachePushEnd`,
     // with the time it last moved. Bounded per connection, and one idle
     // past `UPLOAD_IDLE` is dropped — its staging file and entry lock with
-    // it (P08-C5).
+    // it.
     let mut uploads: HashMap<AttemptId, (sentinel_cache::remote::Receiving, Instant)> =
         HashMap::new();
     // Downloads this connection is streaming right now, bounded so a worker
     // cannot make the controller spawn threads without limit.
     let transfers = Arc::new(AtomicUsize::new(0));
-    // The cancel flag of each download in flight (protocol 8, P08-C2).
+    // The cancel flag of each download in flight (protocol 8).
     let serving: Arc<Mutex<HashMap<AttemptId, Arc<AtomicBool>>>> = Arc::default();
     // Log frames written but not yet acknowledged: one `fsync` per attempt
     // covers the whole burst the receiver already holds, so the durability
@@ -2637,8 +2628,7 @@ fn serve_connection(
                 if handler.spec_requested(worker, id, tx.clone(), protocol) {
                     continue;
                 }
-                // The synchronous fallback (a handler that resolves inline)
-                // still owes the protocol gate.
+                // The synchronous fallback still owes the protocol gate.
                 if protocol < 3 {
                     tx.send(&ServerMessage::NoSpec { attempt })?;
                     continue;
@@ -2876,8 +2866,8 @@ fn serve_connection(
                 if protocol < PROFILE_MIN.0 {
                     return Err(Error::Protocol("profile needs protocol 7"));
                 }
-                // From protocol 8 a later profile is an availability refresh
-                // (P07-6): the worker re-reports what it holds as it changes.
+                // From protocol 8 a later profile is an availability refresh:
+                // the worker re-reports what it holds as it changes.
                 if *profiled && protocol < CACHE_CANCEL_MIN.0 {
                     return Err(Error::Protocol("second profile"));
                 }
@@ -3077,7 +3067,7 @@ impl Drop for TransferPermit {
     }
 }
 
-/// Stream one authorized download (Q08) off the session thread: grant,
+/// Stream one authorized download off the session thread: grant,
 /// ordered chunks, end — or, once the worker cancelled it (protocol 8),
 /// `CacheRefused` with `aborted` as the terminal at the next chunk. One
 /// chunk buffer serves the whole transfer. The chunk size is checked here
@@ -3211,7 +3201,7 @@ pub struct Link {
     /// The session's remote side: the live bulk attachment and the cache
     /// transfer router. Shared with the reader threads.
     remote: Arc<LinkRemote>,
-    /// Process telemetry to refresh on the control connection (Q07).
+    /// Process telemetry to refresh on the control connection.
     transport: Option<TransportStats>,
     /// Where the process's own transport measurements come from (the Tailcat
     /// helper's latest probe): read at every telemetry resend, so a path
@@ -3221,7 +3211,7 @@ pub struct Link {
     /// When the last heartbeat left: what the lease the pong renews is
     /// measured from, monotonically.
     ping_sent: Instant,
-    /// Whether [`Reporter::remote_cache`] hands the executor a handle (Q08):
+    /// Whether [`Reporter::remote_cache`] hands the executor a handle:
     /// off by configuration, every remote lookup is a local miss.
     remote_cache: bool,
     /// The profile this session reported last (protocol 7), the base a
@@ -3345,7 +3335,7 @@ pub struct Reporter {
     /// Protocol 7: the session's remote side, which owns the live bulk
     /// attachment. `None` below protocol 7, where everything is control.
     bulk: Option<Arc<LinkRemote>>,
-    /// Whether the remote cache is exposed to the executor at all (Q08):
+    /// Whether the remote cache is exposed to the executor at all:
     /// protocol 7 and not disabled by configuration.
     remote_cache: bool,
     protocol: u16,
@@ -3369,7 +3359,7 @@ impl Reporter {
         self.bulk.as_ref().map(|r| r.route()).unwrap_or_default()
     }
 
-    /// Protocol 7 (Q08). The session's remote cache: fetch and offer objects
+    /// Protocol 7. The session's remote cache: fetch and offer objects
     /// over the link. `None` below protocol 7 or when the operator disabled
     /// remote cache in this process's configuration; the executor must then
     /// treat every remote lookup as a local miss, never as a failure.
@@ -3552,7 +3542,7 @@ impl Reporter {
 }
 
 /// What a worker does with the offers and orders it receives. Implemented by
-/// the executor (W03); the link owns dedup, acknowledgement and renewal.
+/// the worker's executor; the link owns dedup, acknowledgement and renewal.
 pub trait Executor: Send + Sync {
     /// Called after the acknowledgement is on the wire.
     fn accepted(&self, _attempt: AttemptId) {}
@@ -3598,7 +3588,7 @@ pub trait Executor: Send + Sync {
         }
     }
     /// The fence of an attempt this executor accepted and still waits to
-    /// start (P10D-3). A secret transfer is bound to the fence of the offer
+    /// start. A secret transfer is bound to the fence of the offer
     /// the worker acknowledged, which may have arrived on an earlier
     /// session than the one the spec now answers on. The default knows
     /// none: only fences offered on the current session are accepted.
@@ -3626,7 +3616,7 @@ pub trait Executor: Send + Sync {
     fn artifact_granted(&self, _attempt: AttemptId, _name: &str) {}
     /// The artifact's terminal answer; the publication is over either way.
     fn artifact_verdict(&self, _attempt: AttemptId, _name: &str, _code: ArtifactCode) {}
-    /// K08/P07-6: what this worker holds right now for placement — resident
+    /// What this worker holds right now for placement — resident
     /// image keys and cache bytes — with a version that moves whenever it
     /// changes. The session reports it in the profile it opens with and,
     /// from protocol 8, refreshes the profile when the version moves.
@@ -3634,7 +3624,7 @@ pub trait Executor: Send + Sync {
     fn availability(&self) -> Option<(u64, sentinel_protocol::negotiate::Availability)> {
         None
     }
-    /// K05 (protocol 9): the controller's current prefetch hint — image
+    /// Protocol 9: the controller's current prefetch hint — image
     /// references (`name@sha256:…`) of queued work this worker could be
     /// placed. The whole wanted set: it replaces the previous one, and a
     /// prefetch of a reference no longer in it is stale. Bounded by the
@@ -3670,7 +3660,7 @@ impl Link {
         self.availability_sent = version;
     }
 
-    /// Protocol 8 (P07-6): resend the profile when the executor's
+    /// Protocol 8: resend the profile when the executor's
     /// availability changed since it was last reported — at most once per
     /// heartbeat, and only when something moved.
     fn refresh_profile(&mut self, executor: &dyn Executor) -> Result<()> {
@@ -3697,7 +3687,7 @@ impl Link {
         Ok(())
     }
 
-    /// Protocol 7 (Q07): report transport telemetry and keep refreshing it
+    /// Protocol 7: report transport telemetry and keep refreshing it
     /// (round-trip time and byte counters) every `TRANSPORT_BEATS` beats. A
     /// no-op on an older session.
     pub fn report_transport(&mut self, stats: &TransportStats) -> Result<()> {
@@ -3708,19 +3698,19 @@ impl Link {
         self.tx.send(&ClientMessage::Transport(stats.clone()))
     }
 
-    /// Protocol 7 (Q07): where refreshed path telemetry comes from; read
+    /// Protocol 7: where refreshed path telemetry comes from; read
     /// each time the telemetry is resent.
     pub fn set_transport_source(&mut self, source: TransportSource) {
         self.transport_source = Some(source);
     }
 
     /// Frame bytes written to / socket bytes read from the control
-    /// connection (Q07).
+    /// connection.
     pub fn bytes(&self) -> (u64, u64) {
         self.tx.bytes()
     }
 
-    /// Whether this session exposes the remote cache to the executor (Q08).
+    /// Whether this session exposes the remote cache to the executor.
     /// Disabled, [`Reporter::remote_cache`] answers `None` and the executor
     /// treats every remote lookup as a local miss — the link still carries
     /// whatever the other side asks for, since that is their decision.
@@ -4292,14 +4282,14 @@ struct Inbound {
     secret_bytes: usize,
     /// Attempts whose secret transfer named a fence this worker does not
     /// hold them under: the transfer and its spec are dropped, never used
-    /// and never a reason to end the link (P10D-3). Bounded like `contexts`,
+    /// and never a reason to end the link. Bounded like `contexts`,
     /// whose entry each one needs.
     discarded: std::collections::HashSet<AttemptId>,
 }
 
 /// Whether a secret transfer's `fence` is the one this worker accepted the
 /// attempt under — offered on this session, or on an earlier one and still
-/// awaiting its spec here (P10D-3).
+/// awaiting its spec here.
 fn fence_held(
     remote: &LinkRemote,
     executor: &dyn Executor,
@@ -4328,7 +4318,6 @@ pub fn host_id() -> [u8; 16] {
     out
 }
 
-/// Bind a listener for tests and the controller alike.
 pub fn listen(addr: SocketAddr) -> Result<TcpListener> {
     Ok(TcpListener::bind(addr)?)
 }
@@ -4371,7 +4360,7 @@ mod tests {
         (tx, accept.join().unwrap())
     }
 
-    /// Q07: the transport's byte totals count the bulk connection too, and
+    /// The transport's byte totals count the bulk connection too, and
     /// keep counting across a bulk redial instead of restarting from zero.
     #[test]
     fn transport_bytes_count_every_bulk_connection_of_the_session() {
@@ -4459,7 +4448,7 @@ mod tests {
         ));
     }
 
-    /// P04-17: a peer that stops reading cannot hold a sender forever. The
+    /// A peer that stops reading cannot hold a sender forever. The
     /// write times out, the send fails and the connection is torn down so
     /// its reader ends too.
     #[test]
@@ -4539,7 +4528,7 @@ mod tests {
         (split(conn, socket).unwrap().0, peer)
     }
 
-    /// Finding 4: a dispatcher push to a peer that stopped reading waits at
+    /// A dispatcher push to a peer that stopped reading waits at
     /// most the dispatch bound (not the 15 s write timeout), fails, and
     /// tears the connection down so the next push fails at once.
     #[test]
@@ -4578,7 +4567,7 @@ mod tests {
         drop(peer);
     }
 
-    /// Finding 4: while another thread holds the connection, a bounded send
+    /// While another thread holds the connection, a bounded send
     /// is refused as busy without waiting and without closing; the push
     /// works once the connection is free again.
     #[test]
@@ -4640,7 +4629,7 @@ mod tests {
         }
     }
 
-    /// P07-2: an unprotected job reaches a protocol-8 worker as itself and
+    /// An unprotected job reaches a protocol-8 worker as itself and
     /// an older one as the pull-request scope — never as protected.
     #[test]
     fn unprotected_jobs_downgrade_for_older_peers() {
@@ -4833,7 +4822,7 @@ mod tests {
         ]
     }
 
-    /// P10D-3: a session that replaced the one the offer was acknowledged
+    /// A session that replaced the one the offer was acknowledged
     /// on knows no fence of its own, yet the spec answering the re-asked
     /// request carries its secret bundle through — bound to the fence the
     /// executor accepted. A transfer under any other fence is dropped with

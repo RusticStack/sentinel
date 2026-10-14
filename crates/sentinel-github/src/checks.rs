@@ -1,4 +1,4 @@
-//! The Checks API, as much of it as G04 needs: create one check run, update
+//! The Checks API, as much of it as Sentinel needs: create one check run, update
 //! it, and find one we already created after an ambiguous timeout.
 //!
 //! Statuses and conclusions are GitHub's own text, validated here rather than
@@ -100,7 +100,7 @@ pub struct Check {
 
 /// A check run GitHub accepted: the numeric id the update path needs, and
 /// the suite it landed in when the response carried one — that suite id is
-/// what a `check_suite` rerequest names (G05).
+/// what a `check_suite` rerequest names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Published {
     pub check_run_id: i64,

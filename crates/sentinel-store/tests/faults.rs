@@ -1,4 +1,4 @@
-//! D07 fault boundaries: a crash can land between any file write and the
+//! Fault boundaries: a crash can land between any file write and the
 //! transaction that accounts for it, a disk can fill mid-stream, a log can
 //! be torn at any byte, and a tenant can ask for another tenant's bytes.
 //! Every boundary must settle into one of two states — committed and
@@ -504,7 +504,7 @@ fn foreign_tenant_bytes_are_indistinguishable_from_absent() {
     assert_eq!(out, b"alice's bytes");
 }
 
-/// P06-1 (b): an aged orphan adopted by a dedup stage is not swept between
+/// An aged orphan adopted by a dedup stage is not swept between
 /// the stage and its commit.
 #[test]
 fn the_orphan_sweep_never_takes_a_file_a_stage_adopted() {
@@ -550,7 +550,7 @@ fn the_orphan_sweep_never_takes_a_file_a_stage_adopted() {
     assert_eq!(fx.objects.sweep_orphans(&mut fx.conn, 64).unwrap(), 0);
 }
 
-/// P06-1 (c): reclamation commits a row delete, then the same bytes are
+/// Reclamation commits a row delete, then the same bytes are
 /// staged again before the unlink runs — the unlink keeps the file.
 #[test]
 fn a_reclaim_unlink_spares_bytes_staged_again_meanwhile() {

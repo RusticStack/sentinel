@@ -1,4 +1,4 @@
-//! The two authenticated ingest paths, shared by the HTTP API and any future
+//! The two authenticated ingest paths, shared by the HTTP API and any other
 //! transport. Both end in one store transaction: accept, or refuse explicitly.
 
 use sentinel_core::{DeliveryId, RepoId, UnixMillis};

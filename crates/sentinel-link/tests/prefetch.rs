@@ -1,4 +1,4 @@
-//! K05 bounded image prefetch over the real link: a controller and worker
+//! Bounded image prefetch over the real link: a controller and worker
 //! processes on loopback TLS, recorder executors whose "pull" is a short
 //! sleep that then reports the image warm, exactly as the worker's
 //! `Images` record does after a real pull.

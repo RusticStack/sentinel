@@ -510,7 +510,7 @@ fn lookup(
 /// Keyset pagination by name. No ciphertext or value-derived fingerprint is
 /// read, even temporarily. At most 100 metadata records per call. A tenant
 /// page and a repository page each walk only their own partial index, never
-/// the other scope's names (P10S-11).
+/// the other scope's names.
 pub fn list(
     conn: &Connection,
     principal: Principal,
@@ -975,7 +975,7 @@ fn tenant_name_exists_repo(conn: &Connection, repo: RepoId, name: &str) -> Resul
 }
 
 /// Why resolution refused a target, carried out of a failed preparation so
-/// the refusal can be audited (P10S-6). IDs only; never a value.
+/// the refusal can be audited. IDs only; never a value.
 struct Refused {
     secret: Option<SecretId>,
     version: u64,
@@ -1240,7 +1240,7 @@ impl Drop for Wiped {
 }
 
 /// Encode into a buffer sized once, so no reallocation frees an unwiped
-/// copy of already-serialized values (P10S-8).
+/// copy of already-serialized values.
 fn encode_bundle(
     bundle: &sentinel_protocol::secrets::DeliveryBundle,
 ) -> Result<sentinel_protocol::secrets::SecretBytes> {
@@ -1494,7 +1494,7 @@ fn declared_targets(
 }
 
 /// Why a declared secret could not be delivered to an acknowledged
-/// attempt, value-free (P10D-7): what the attempt's failure detail says.
+/// attempt, value-free: what the attempt's failure detail says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {
     /// The fence the attempt is held under, for the failure report.
@@ -1507,7 +1507,7 @@ pub struct Refusal {
 /// resolved, and why — checked in the same order preparation resolves
 /// them. `None` when the attempt is not acknowledged here or every declared
 /// name resolves (the refusal was something else). Read-only: the refused
-/// use was already audited by the [`deliver`] that failed (P10S-6), once;
+/// use was already audited by the [`deliver`] that failed, once;
 /// this only names it for the attempt's failure detail, in the writer
 /// transaction that then settles the attempt.
 pub fn refuse_delivery(

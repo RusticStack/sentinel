@@ -13,7 +13,7 @@ use crate::secret::{Digest, Secret, digest_eq};
 pub const SESSION_COOKIE: &str = "__Host-sentinel_session";
 
 /// Carries the pending sign-in state during an external authorization round
-/// trip, so a callback must present the browser's own half of it (A04).
+/// trip, so a callback must present the browser's own half of it.
 /// Issued with [`issue_sign_in`], never [`issue`]: the callback arrives as a
 /// cross-site navigation from the provider, which a `Strict` cookie misses.
 pub const SIGN_IN_COOKIE: &str = "__Host-sentinel_signin";

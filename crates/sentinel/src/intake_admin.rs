@@ -1,4 +1,4 @@
-//! Host-local inspection of durable event intake (G02).
+//! Host-local inspection of durable event intake.
 //!
 //! Deliveries are tenant-owned rows; the operator opening the database reads
 //! them the way they read any other record. Listing is metadata only, and
@@ -17,7 +17,7 @@ use crate::{
 };
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
-/// Longest retention the command accepts. Retention policy itself is Part 13.
+/// Longest retention the command accepts.
 const MAX_RETENTION_MS: i64 = 366 * DAY_MS;
 
 pub fn run(args: &IntakeArgs) -> Result<(), Error> {
@@ -52,7 +52,6 @@ pub fn run(args: &IntakeArgs) -> Result<(), Error> {
                         "attempts": d.attempts,
                         "received_ms": d.received.0,
                         "settled_ms": d.settled.map(|t| t.0),
-                        // The run a dispatched delivery produced (G03).
                         "run": d.run.map(|run| run.to_string()),
                     })
                 })
@@ -73,8 +72,6 @@ pub fn run(args: &IntakeArgs) -> Result<(), Error> {
                 .writer()
                 .write(move |tx| {
                     let purged = intake::purge_settled(tx, before, limit)?;
-                    // Control-event receipts are retired under the same
-                    // bound (never younger than their replay window).
                     let receipts =
                         github_events::purge_receipts(tx, before, UnixMillis::now(), limit)?;
                     Ok((purged, receipts))

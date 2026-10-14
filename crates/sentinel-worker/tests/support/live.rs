@@ -358,9 +358,8 @@ impl Live {
 
 /// A test that fails ends while its attempts may still run: the process
 /// exits before their threads tear their containers down, and no later
-/// worker start reconciles a test's one-off worker id (W07 does, for a
-/// real worker). Force-remove them here, so a failing test leaves nothing
-/// running behind it.
+/// worker start reconciles a test's one-off worker id. Force-remove them
+/// here, so a failing test leaves nothing running behind it.
 impl Drop for Live {
     fn drop(&mut self) {
         if self.settled {

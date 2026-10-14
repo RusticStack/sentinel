@@ -1,10 +1,10 @@
-//! The whole A04 path in one place: a browser is sent to GitHub, comes back
+//! The whole GitHub sign-in path in one place: a browser is sent to GitHub, comes back
 //! with a code and a state, the code is exchanged for a verified account ID,
 //! and that ID decides whether a Sentinel session exists.
 //!
 //! `sentinel-github` cannot depend on `sentinel-store` (it is the provider
 //! adapter, not the identity store), so this test lives here and drives both
-//! crates the way the eventual W08 route will.
+//! crates the way the web route does.
 
 use std::{
     io::{BufRead, BufReader, Read, Write},

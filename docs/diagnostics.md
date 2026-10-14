@@ -1,4 +1,4 @@
-# Structured diagnostics (X01–X03)
+# Structured diagnostics
 
 The `sentinel.diagnostics/1` report is bounded, versioned evidence for a run
 attempt. It gives the CLI, web page, and MCP stable source, test, step, and log
@@ -122,7 +122,7 @@ Errors at the end of a large log (a Go `fail` after its output, a compiler
 error after the dependency builds) are therefore found by the first
 request; an error in the middle of a log larger than two windows is found by
 paging `next_cursor` or with the literal-search route. The newest window is
-also the excerpt's source. Legacy pre-D04 flat logs have no sparse index, so
+also the excerpt's source. Legacy flat logs (from before segmented logs) have no sparse index, so
 their excerpt begins at the available scan position and pages forward. A
 parser window that does not cover the selected stream is `incomplete`, even
 when the log itself has a durable end marker. Explicit `after`/`cursor`
@@ -163,7 +163,7 @@ are collected only for a credential holding `artifacts:read` as well as
 `{status: "scope_required", scope: "artifacts:read"}`. Remote MCP
 credentials never carry `artifacts:read`.
 
-## Parser behavior (X02)
+## Parser behavior
 
 `sentinel-protocol::diagnostics` exposes streaming-by-record parsers for
 newline-delimited Go test JSON and rustc compiler JSON (bare `rustc

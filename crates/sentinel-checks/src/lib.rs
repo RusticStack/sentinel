@@ -1,4 +1,4 @@
-//! Durable external check delivery (G04).
+//! Durable external check delivery.
 //!
 //! The store owns the outbox rows ([`sentinel_store::checks`]); this crate owns
 //! delivery. [`Lane`] drains due rows through a [`Publisher`], which turns a

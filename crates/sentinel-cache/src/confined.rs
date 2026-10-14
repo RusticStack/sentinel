@@ -1,4 +1,4 @@
-//! Confined reads of a tree a job controlled (P07-1).
+//! Confined reads of a tree a job controlled.
 //!
 //! Publication walks the declared cache paths of a workspace the job had
 //! write access to. Every resolution here is anchored at a directory the

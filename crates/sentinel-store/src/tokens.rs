@@ -1,11 +1,9 @@
 //! Scoped, expiring API credentials.
 //!
-//! This is the authenticated entry point for the CLI and API before browser
-//! OAuth exists (A03). It is not a development bypass: a credential produces
-//! the same [`Principal`] a session does, and every tenant, repository and
-//! administrative decision remains a live check in [`crate::auth`]. There is no
-//! code path that skips authentication, and none that returns `Permissions::ALL`
-//! because a request looked local.
+//! A credential produces the same [`Principal`] a session does, and every
+//! tenant, repository and administrative decision remains a live check in
+//! [`crate::auth`]. No code path skips authentication or returns
+//! `Permissions::ALL` because a request looked local.
 //!
 //! A credential is a 256-bit opaque secret stored only as its BLAKE3 digest,
 //! carrying an explicit scope and a mandatory expiry. It is shown exactly once,

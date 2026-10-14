@@ -1,4 +1,4 @@
-//! One attempt's log pipe (W05): redact, spool, send within the window,
+//! One attempt's log pipe: redact, spool, send within the window,
 //! advance on acknowledgement, and close with the end marker.
 //!
 //! Output from the step's reader threads is redacted and appended to the
@@ -512,7 +512,7 @@ mod tests {
         frames.iter().map(|(_, t)| t.as_str()).collect()
     }
 
-    /// P04-12: a value registered into a live attempt redacts its output
+    /// A value registered into a live attempt redacts its output
     /// from then on, and only that attempt's.
     #[test]
     fn registration_is_per_attempt_and_takes_effect_while_it_runs() {
@@ -539,7 +539,7 @@ mod tests {
         );
     }
 
-    /// P10D-2: the excerpt a failed step's detail carries comes from the
+    /// The excerpt a failed step's detail carries comes from the
     /// attempt's redactor, applied to the raw stderr tail before any
     /// transformation — a multi-line file value printed to stderr leaves
     /// no line of it in the detail, and a tail that filled its ring drops
@@ -575,7 +575,7 @@ mod tests {
         assert_eq!(text(&spooled(&pipe)), "before *** after\n");
     }
 
-    /// P04-21: bytes held back as a possible secret prefix are released as
+    /// Bytes held back as a possible secret prefix are released as
     /// the step that printed them when it ends, never as another step's
     /// (or as no step at all).
     #[test]

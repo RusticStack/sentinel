@@ -1,12 +1,12 @@
-//! The worker-phase expression context (W04): what a step's `if` and a
-//! cache key can see once the pinned checkout exists.
+//! The worker-phase expression context: what a step's `if` and a cache key
+//! can see once the pinned checkout exists.
 //!
 //! Every value comes from the controller's `JobContext` or the run spec;
 //! `hash_files` reads the attempt's private workspace. The event facts
-//! (`event.name|ref|base_ref|key|pr_number`) are recorded as the run's
-//! provenance (G03); a field the event does not carry answers `null`, and a
-//! field the run does not hold answers `Unresolved` so the attempt fails
-//! preparation naming it rather than defaulting it.
+//! (`event.name|ref|base_ref|key|pr_number`) come from the job's event. A
+//! field the event does not carry answers `null`, and a field the run does
+//! not hold answers `Unresolved` so the attempt fails preparation naming it
+//! rather than defaulting it.
 
 use std::path::{Path, PathBuf};
 

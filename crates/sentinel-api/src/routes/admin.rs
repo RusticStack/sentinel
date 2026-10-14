@@ -1,7 +1,7 @@
-//! Administration over the API (U05): the platform's registrations,
+//! Administration over the API: the platform's registrations,
 //! tenants, quotas, pools, policy and audit (`platform:admin`), a tenant's
 //! members, repositories and run control audit (`tenant:admin`), and the
-//! session step-up that privileged platform changes require (A06).
+//! session step-up that privileged platform changes require.
 //!
 //! Every mutation goes through the same store functions the host-local
 //! `sentinel admin` commands use, with the caller's own authority instead
@@ -170,7 +170,7 @@ struct StepUpBody {
 }
 
 /// `POST /api/v1/step-up {method, code}`: a browser session proves presence
-/// again (A06) — a TOTP code, an unused recovery code, or the password for
+/// again — a TOTP code, an unused recovery code, or the password for
 /// an account without TOTP — and is stamped for the policy's window. Only a
 /// session can step up; a wrong proof is one `forbidden` whatever was wrong,
 /// and the store counts failures against the session and the factor.
@@ -371,7 +371,7 @@ fn quota(state: &State, request: &mut Request, slug: &str, set: bool) -> Route {
 }
 
 /// A storage policy as the API takes it: every field replaces the stored
-/// one, `null` (or absent) inherits (R01).
+/// one, `null` (or absent) inherits.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StorageBody {
@@ -571,7 +571,7 @@ fn deployment_storage(state: &State, request: &Request) -> Route {
 }
 
 /// `GET /admin/backups`: the scheduler's state and every backup in its
-/// target, newest first, each with its manifest's summary (R04).
+/// target, newest first, each with its manifest's summary.
 fn list_backups(state: &State, request: &Request) -> Route {
     platform(state, request, false)?;
     let Some(backups) = state.objects.backups() else {
@@ -602,7 +602,7 @@ fn list_backups(state: &State, request: &Request) -> Route {
 }
 
 /// `GET /admin/diagnostics[?integrity=1]`: the sanitized diagnostic bundle
-/// (R06) — the database's counts and workers ([`sentinel_store::bundle`])
+/// — the database's counts and workers ([`sentinel_store::bundle`])
 /// plus this process's runtime state. No names of tenants, repositories or
 /// users, no addresses, paths, endpoints, credentials or log text; safe to
 /// attach to a support request. `integrity=1` adds SQLite's quick check (a

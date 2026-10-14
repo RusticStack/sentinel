@@ -4,7 +4,7 @@
 #   bench/b01-measure.sh KIT OUT
 # KIT holds sentinel-bench and contracts/; OUT is the JSONL file appended to.
 #
-# 1. The Part 01 no-op floor, extended: a direct process, then the same
+# 1. The no-op floor: a direct process, then the same
 #    process in a systemd scope and in a container under identical caps
 #    (1 CPU / 256 MiB, then the contract's 10 CPUs / 26 GiB).
 # 2. The contract's `unit` lane (Lockwell's ci.yml `test` unit step) cold,

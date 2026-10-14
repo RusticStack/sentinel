@@ -1,7 +1,7 @@
 //! The container runtime failing under the worker, with `podman` replaced
 //! on `PATH` by a shim: teardown still removes a container whose graceful
-//! stop failed (P04-6), and recovery refuses to abandon attempts when it
-//! cannot list or remove what the previous process left running (P04-7).
+//! stop failed, and recovery refuses to abandon attempts when it
+//! cannot list or remove what the previous process left running.
 //!
 //! The shim's behavior is switched per container name or worker id by
 //! files in its directory, so the tests here run in parallel safely.

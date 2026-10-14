@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { Grant, Member } from "~~/shared/types/api";
 
-// Service accounts (O06): principals confined to this tenant that never sign
+// Service accounts: principals confined to this tenant that never sign
 // in. Creating one, giving it repository access and issuing it a credential
 // are step-up changes for everyone (the dialog asks, then the change is
 // retried); the refresh token is shown once and never again.

@@ -1,21 +1,21 @@
-//! Part 10 delivery boundaries against rootless Podman and a real private
+//! Delivery boundaries against rootless Podman and a real private
 //! registry (`SENTINEL_PODMAN_TESTS=1` as the worker account, like
 //! `end_to_end.rs`; the registry is a local `registry:2` with htpasswd
 //! authentication, pulled from Docker Hub on first use):
 //!
-//! - P10D-1: a process an earlier step left running (a `setsid` watcher
+//! - A process an earlier step left running (a `setsid` watcher
 //!   scanning `/proc/*/environ` and the secret mounts) records nothing of a
 //!   later step's environment or files.
-//! - P10D-4: an image that runs as a non-root user reads its file target.
-//! - P10D-5 / S07: a private image is pulled with the tenant's
+//! - An image that runs as a non-root user reads its file target.
+//! - A private image is pulled with the tenant's
 //!   `registry_auth` into the tenant's own store — the shared store never
 //!   gets it; once resident there, an anonymous pull is still refused; and
 //!   another tenant replaying its manifest and config from a registry of
 //!   its own gets no layer.
-//! - P10D-7: an undeliverable secret fails the attempt with a value-free
+//! - An undeliverable secret fails the attempt with a value-free
 //!   detail naming it.
-//! - P10D-8: a 65,000-byte environment value reaches the step.
-//! - P10D-9: the step cannot raise its core-dump limit.
+//! - A 65,000-byte environment value reaches the step.
+//! - The step cannot raise its core-dump limit.
 //!
 //! One test function: the registry configuration is a process environment
 //! variable, set once before any runtime process starts.
@@ -311,7 +311,7 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
     let _ = podman_cmd(&["rmi", "-f", &tag]);
     assert!(!exists_in(&Store::Shared, &private));
 
-    // ── P10D-5 / S07 at the runtime boundary ──────────────────────────
+    // Private image pulls at the runtime boundary.
     let stores = scratch.path().join("stores");
     let tenant_a = Store::private(&stores, [0xaa; 16]).unwrap();
     let tenant_b = Store::private(&stores, [0xbb; 16]).unwrap();
@@ -379,7 +379,7 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
     drop_store(&tenant_a);
     drop_store(&tenant_b);
 
-    // ── P10D-1: clearing a container, measured ────────────────────────
+    // Clearing a container, measured.
     let ws = tempfile::tempdir().unwrap();
     podman::pull(
         &format!("{IMAGE}@{DIGEST}"),
@@ -436,7 +436,7 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
     eprintln!("clear_strays with 3 strays plus the keepalive's sleep: {timings:?}");
     let _ = container.destroy();
 
-    // ── The executor: secrets over the link into real steps ───────────
+    // The executor: secrets over the link into real steps.
     let key_path = scratch.path().join("master.key");
     Key::create(&key_path).unwrap();
     let key = Arc::new(Key::load(&key_path).unwrap());
@@ -488,7 +488,8 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
             })
             .unwrap();
     }
-    // P10D-1, P10D-8, P10D-9 on the shared busybox; P10D-7 beside it.
+    // Leftover-process isolation, the large environment value and the core-dump limit
+    // on the shared busybox; the undeliverable secret beside it.
     let watcher = "nohup setsid sh -c 'while :; do for p in /proc/[0-9]*; do tr \"\\000\" \"\\n\" < $p/environ 2>/dev/null | grep -e ^TOKEN= -e ^BIG= >> /tmp/stolen; done; cat /run/sentinel-secrets/tls/cert.pem /run/sentinel-env/*.sh >> /tmp/stolen 2>/dev/null; sleep 0.05; done' </dev/null >/dev/null 2>&1 & sleep 0.3";
     let yaml = format!(
         "schema: 1
@@ -536,7 +537,7 @@ jobs:
     );
     assert_eq!(detail(&live, job("unbound")), "secret NEVER_BOUND: unbound");
 
-    // P10D-4 and P10D-5 through the executor: the private image, pulled
+    // The non-root user and the private pull through the executor: the private image, pulled
     // with the tenant's registry auth into its own store, run as nobody.
     let yaml = format!(
         "schema: 1

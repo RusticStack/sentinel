@@ -1,4 +1,4 @@
-//! The worker's optional metrics listener (R06): `metrics_listen` in the
+//! The worker's optional metrics listener: `metrics_listen` in the
 //! worker's configuration names a loopback address, and `GET /metrics` there
 //! answers the Prometheus text format. Loopback only, so a node exporter or
 //! an agent on the same machine scrapes it; the figures name no tenant,

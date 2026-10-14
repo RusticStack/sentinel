@@ -1,4 +1,4 @@
-//! Worker execution (W03): a fresh workspace per attempt, an exact-revision
+//! Worker execution: a fresh workspace per attempt, an exact-revision
 //! checkout, a rootless Podman container with the job's limits and no
 //! privileges, and the attempt lifecycle that reports through the link.
 //!
@@ -6,7 +6,7 @@
 //! implements containers or Git transport itself. Every helper runs in its
 //! own process group under a deadline, so a hung fetch or pull is killed as
 //! a group, and every container carries the worker's labels so what this
-//! process owns can be listed and reaped after a crash (W07).
+//! process owns can be listed and reaped after a crash.
 //!
 //! Linux only: on other targets the crate is empty, like the resolver.
 
@@ -104,9 +104,8 @@ pub(crate) fn sync_dir(_dir: &std::path::Path) -> std::io::Result<()> {
 /// workspaces, spools, attempt markers, mirrors and caches hold checkouts,
 /// logs and secrets-adjacent bytes no other account has a reason to read.
 /// A directory that already exists and belongs to this user is tightened to
-/// owner-only too (an earlier version created them with the umask's mode);
-/// one that is someone else's, or a symlink an operator pointed at another
-/// disk, is left as it is.
+/// owner-only too; one that is someone else's, or a symlink an operator
+/// pointed at another disk, is left as it is.
 pub(crate) fn private_dir_all(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -130,8 +129,8 @@ pub(crate) fn private_dir_all(dir: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// Where the worker keeps short-lived private state that should never
-/// reach persistent disk — delivered secrets, private stores' run roots
-/// (P10D-8): `$XDG_RUNTIME_DIR/sentinel-<key>` when that variable names an
+/// reach persistent disk — delivered secrets, private stores' run roots:
+/// `$XDG_RUNTIME_DIR/sentinel-<key>` when that variable names an
 /// absolute, owner-only directory of this user (a tmpfs on systemd hosts),
 /// keyed by the data directory so two workers of one account never share
 /// it; `<data_dir>/run` otherwise. Only the path is computed here; users

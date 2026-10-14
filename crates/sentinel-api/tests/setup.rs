@@ -398,8 +398,6 @@ fn the_mail_test_sends_through_the_configured_sender_and_reports_failures_briefl
     assert!(f.store.read(setup::is_open).unwrap());
 }
 
-// ------------------------------------------------------------ organizations
-
 fn allow_creation(f: &Fixture, creation: TenantCreation) {
     f.store
         .writer()

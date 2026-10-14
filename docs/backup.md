@@ -1,4 +1,4 @@
-# Backup and restore (R04)
+# Backup and restore
 
 A controller's state is its data directory: the metadata database, the object and manifest trees, attempt logs, and a handful of files of its own. A **backup** is a consistent copy of all of it — except the master key — taken while the controller runs; a **restore** rebuilds a data directory from one, on the same host or a replacement.
 
@@ -40,7 +40,7 @@ Online, on a schedule ([configuration](configuration.md)):
 [backup]
 dir = "/mnt/backup/sentinel"   # absolute, outside the data directory — another disk or a mounted volume
 interval_secs = 3600           # 300 .. 604800, default hourly
-keep = 24                      # newest kept, default 24
+keep = 24                      # newest kept, 1 .. 1000, default 24
 ```
 
 The first backup runs one interval after start (a restarting controller does not take one per restart); a failed one is recorded and retried at the next interval, never stopping the controller. `POST /admin/backups` takes one now (`409 conflict` while one runs), `GET /admin/backups` lists them with the scheduler's state, and **Platform → Storage → Backups** shows both and has a *Back up now* button ([API](api.md)).
@@ -49,7 +49,7 @@ A backup is staged in `DIR/.<id>.partial` and renamed to `DIR/<id>` only after i
 
 Offline, beside a stopped controller: `sentinel admin backup create --data-dir DATA --to DIR`. Pruning keeps the newest `keep` and removes every shared object, manifest and log file no kept backup names: `sentinel admin backup prune --dir DIR --keep N`.
 
-**Writers are serialized.** `create` copies new shared files before its backup directory exists, so a `prune` from another process (the host-local tool beside the running scheduler) would find them named by no kept backup. Both take an exclusive advisory lock on `DIR/.lock` — `create` from before its first copy until its directory is in place, `prune` for its whole run — and wait for each other. A file system without advisory locks runs unlocked, as before.
+**Writers are serialized.** `create` copies new shared files before its backup directory exists, so a `prune` from another process (the host-local tool beside the running scheduler) would find them named by no kept backup. Both take an exclusive advisory lock on `DIR/.lock` — `create` from before its first copy until its directory is in place, `prune` for its whole run — and wait for each other. A file system without advisory locks runs unlocked.
 
 **Durability of the copies.** Every shared file is copied through a temporary file that is fsynced and renamed, and the directories those renames touched are fsynced (once per directory, not per file) before the backup names them and before `backup.json` is written; a restore does the same before the database lands, so a power loss after either reports success cannot lose a directory entry.
 
@@ -59,7 +59,7 @@ Offline, beside a stopped controller: `sentinel admin backup create --data-dir D
 
 ## Restoring
 
-On the same host after data loss, or on a replacement host (R07):
+On the same host after data loss, or on a replacement host:
 
 ```sh
 sentinel admin restore --from /mnt/backup/sentinel [--id 20260928T170000Z] \
@@ -69,7 +69,7 @@ sentinel server --config /etc/sentinel/server.toml
 
 The target data directory must hold no database. Every object and manifest is rehashed as it is copied (a mismatch stops the restore, `Corrupt`); the snapshot's checksum is checked first; with sealed values the key is checked against them before anything is written; the database lands last, so a half-restored directory is never mistaken for a controller's. The command then opens the store as the controller would — migrations for an older backup, object recovery — and reports what it restored and found. Objects evicted to S3 come back through the external copy's read-through once the same `[s3]` section is configured.
 
-Because `controller.key` and `controller.crt` are restored, **workers keep their pinned fingerprint** and reconnect without re-enrollment; API credentials, OAuth clients and sessions issued before the backup keep working. What happened after the backup is lost: runs and their logs since then, and anything else written since. Workers reconnect and reconcile against the restored controller ([reconciliation](reconciliation.md)); R07 exercises a restore onto a replacement host with workers attached.
+Because `controller.key` and `controller.crt` are restored, **workers keep their pinned fingerprint** and reconnect without re-enrollment; API credentials, OAuth clients and sessions issued before the backup keep working. What happened after the backup is lost: runs and their logs since then, and anything else written since. Workers reconnect and reconcile against the restored controller ([reconciliation](reconciliation.md)).
 
 ## Recovery objectives
 
@@ -92,7 +92,7 @@ Measured on the verification VPS (12 vCPU AMD EPYC 9645, ext4 on a virtio disk),
 
 So recovery time is about **6 seconds per GiB** of backed-up data on the reference disk, and the database's share is negligible: at that rate 100 GiB restores in about 10 minutes, and a controller start after it takes seconds. The objective adopted from this measurement is **RTO ≤ 15 minutes for up to 100 GiB** (an extrapolation of a linear, I/O-bound copy; re-measure on the deployment's own disks with the drill). The drill ran with CPU pressure under 1 %; the data had just been written, so part of it was likely still in the page cache — a cold restore from a slower backup volume takes longer, which is what the margin is for.
 
-## Verification
+## Tests
 
 - `crates/sentinel-store/tests/backup.rs`: an online backup taken while 200 writes land verifies and restores byte for byte — objects rehashed, the manifest, a finished log, the controller's files — with the key refused when absent or wrong and checked when right; a second backup copies nothing it holds; the restored directory opens, recovers with nothing missing and reads the object and the log. Verification catches a flipped byte in an object (and a restore refuses it), a deleted object and a tampered snapshot. A backup waits for the maintenance lock and releases it. Pruning keeps the newest and removes exactly the objects only pruned backups named. A shared copy that rotted in place with its length intact is replaced by the next backup, and a prune waits for a running create's writer lock instead of deleting its files.
 - `crates/sentinel/tests/cli.rs::a_backup_taken_online_restores_onto_a_new_data_directory_that_serves`: a running controller with `[backup]` takes a backup when `POST /admin/backups` asks, `admin backup verify` passes it, `admin restore` rebuilds an empty directory, and a controller started there serves the same tenant with the same link certificate and the credential issued before the backup.

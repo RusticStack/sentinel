@@ -1,4 +1,4 @@
-//! G01 host-local surface: a bootstrapped operator creates a repository and
+//! Host-local surface: a bootstrapped operator creates a repository and
 //! binds a source through `sentinel admin source` with nothing but the
 //! database file, and the metadata output never contains the credential.
 #![cfg(all(target_os = "linux", feature = "server"))]

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { StoragePolicy } from "~~/shared/types/api";
 
-// One storage policy (R01): a quota and two retentions, each left blank to
+// One storage policy: a quota and two retentions, each left blank to
 // inherit. `inherited` shows what blank means here — the tenant's value for
 // a repository, the deployment's for a tenant.
 const props = defineProps<{

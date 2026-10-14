@@ -1,5 +1,5 @@
-//! A04 behavior: single-use sign-in state, verified identity linking, sign-in
-//! by immutable provider subject, and the separation of proof from admission.
+//! Single-use sign-in state, verified identity linking, sign-in by immutable
+//! provider subject, and the separation of proof from admission.
 
 use sentinel_auth::secret::Secret;
 use sentinel_core::{

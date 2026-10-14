@@ -188,7 +188,7 @@ fn check_meta(_path: &Path, _meta: &fs::Metadata, _dir: bool) -> Result<(), Erro
     Ok(())
 }
 
-/// The Windows equivalent of the Unix owner and mode check (P09C-3): the
+/// The Windows equivalent of the Unix owner and mode check: the
 /// object must be owned by this user (or SYSTEM, or Administrators) and its
 /// DACL may allow no one else, whether Sentinel created it or it existed
 /// before. A refusal names the `icacls` commands that fix it.
@@ -617,7 +617,7 @@ mod acl {
                 || (policy == Policy::Private && sids.admins.is(sid))
         };
         // The owner holds implicit WRITE_DAC whatever the DACL says, so both
-        // policies judge it (P10C-8).
+        // policies judge it.
         if owner.is_null() || !accepted(owner) {
             let who = if owner.is_null() {
                 "nobody".to_owned()

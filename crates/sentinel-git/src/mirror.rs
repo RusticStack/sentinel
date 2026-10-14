@@ -1,4 +1,4 @@
-//! Worker-local Git object mirrors (K04).
+//! Worker-local Git object mirrors.
 //!
 //! One bare mirror per repository id lives at `<data_dir>/mirrors/<repo-id>/`.
 //! Attempts share it under three rules:
@@ -20,7 +20,7 @@
 //!   directory's filesystem supports it — probed once at [`Mirrors::open`]
 //!   — else a plain copy of a small store, and for a larger one a depth-1
 //!   fetch of the pinned commit out of the mirror, which writes one tree's
-//!   objects instead of the whole history (P07-20). Nothing in the job's
+//!   objects instead of the whole history. Nothing in the job's
 //!   `.git` shares an inode with the mirror, so a job cannot rewrite
 //!   shared objects, and no `alternates` file ever points outside the
 //!   workspace.
@@ -92,7 +92,7 @@ const WAIT_POLL: Duration = Duration::from_millis(25);
 /// lease can never lapse while its materialization is still allowed to run.
 const LEASE_MARGIN: Duration = Duration::from_secs(60);
 /// The remote a mirror was built from, recorded inside it: a mirror serves
-/// only the binding that filled it (P07-17).
+/// only the binding that filled it.
 const REMOTE_FILE: &str = "sentinel-remote";
 /// Default budget for all mirrors together (`Mirrors::sweep`).
 pub const MIRRORS_BUDGET_BYTES: u64 = 50 << 30;
@@ -272,7 +272,7 @@ impl Mirrors {
         self.ensure(&dir, &suspect, &leases, &source.repo, deadline)?;
         let private = access.map(|a| Private::install(&dir, a)).transpose()?;
         let mut secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
-        // A manual credential is redacted like a bound one (P07-25).
+        // A manual credential is redacted like a bound one.
         if let Some(credential) = credential
             && !credential.secret.is_empty()
         {
@@ -313,10 +313,10 @@ impl Mirrors {
                 materialize_ns: elapsed_ns(materialize_started),
             }),
             Err(e) => {
-                // Only damage to the store itself marks it for a rebuild
-                // (P07-21): a deadline, a full workspace or a checkout error
-                // on a healthy store says nothing about the mirror, and a
-                // rebuild would refetch the whole history for nothing.
+                // Only damage to the store itself marks it for a rebuild: a
+                // deadline, a full workspace or a checkout error on a healthy
+                // store says nothing about the mirror, and a rebuild would
+                // refetch the whole history for nothing.
                 let damaged = !matches!(e, Error::Timeout(_) | Error::TooLarge(_))
                     && !self.healthy(&dir, Instant::now() + Duration::from_secs(30));
                 let e = if damaged {
@@ -396,7 +396,7 @@ impl Mirrors {
             Ok(output) => trim(&output.stdout) == "true",
             Err(_) => false,
         };
-        // Every ref tip must still read as an object (P07-19): a corrupt or
+        // Every ref tip must still read as an object: a corrupt or
         // truncated pack under a tip is store damage — rebuilt once — not
         // the remote's answer. One object read per ref, no history walk.
         let mut tips = git(dir);
@@ -416,7 +416,7 @@ impl Mirrors {
         remote: &str,
         deadline: Instant,
     ) -> Result<()> {
-        // A mirror serves only the remote that filled it (P07-17): a binding
+        // A mirror serves only the remote that filled it: a binding
         // that now names another remote starts from an empty store, so no
         // object of the old one can reach a workspace of the new one.
         let recorded = fs::read_to_string(dir.join(REMOTE_FILE)).ok();
@@ -513,7 +513,7 @@ impl Mirrors {
             Ok(()) => return self.verify(dir, &source.sha, ctx.deadline),
             Err(e) if event_ref.is_none() => return Err(e),
             // Narrower wants help only when the server refused one of the
-            // wants themselves (P07-26); an authentication, network or
+            // wants themselves; an authentication, network or
             // store failure would only be asked twice more.
             Err(e) if !want_refused(&e) => return Err(e),
             Err(_) => {}
@@ -630,7 +630,7 @@ impl Mirrors {
         if let Ok(entries) = fs::read_dir(&pack_dir) {
             for entry in entries.flatten() {
                 // A killed fetch's `tmp_pack_*` counts like a pack: it is
-                // disk the next GC reclaims (P07-22).
+                // disk the next GC reclaims.
                 let name = entry.file_name();
                 if name.as_bytes().ends_with(b".pack") || name.as_bytes().starts_with(b"tmp_") {
                     packs += 1;
@@ -690,7 +690,7 @@ impl Mirrors {
                     continue;
                 }
                 // A declared expiry is the reader's own deadline plus a
-                // margin (P07-23): it holds however long that is.
+                // margin: it holds however long that is.
                 Some(_) => {
                     live = true;
                     continue;
@@ -729,7 +729,7 @@ impl Mirrors {
         }
         fs::create_dir_all(leases)?;
         // The lease lasts as long as its reader may run, plus a margin — the
-        // reader's own deadline, never a fixed wall-clock guess (P07-23).
+        // reader's own deadline, never a fixed wall-clock guess.
         let remaining = deadline.saturating_duration_since(Instant::now());
         let expiry = UnixMillis::now().0 + (remaining + LEASE_MARGIN).as_millis() as i64;
         let tmp = leases.join(format!(".{name}.tmp"));
@@ -748,7 +748,7 @@ impl Mirrors {
 
     /// Populate `workspace` (empty) with `commit` out of the mirror: a
     /// private object store, then `checkout --detach` and a final HEAD
-    /// verification. The store is built the cheapest measured way (P07-20):
+    /// verification. The store is built the cheapest measured way:
     ///
     /// - reflink the whole store when the filesystem proved capable — cost
     ///   per file, not per byte, and GC keeps the file count small;
@@ -804,8 +804,8 @@ impl Mirrors {
     /// workspace (`--depth 1`, protocol v2 over a local path): Git packs
     /// only the objects the checkout reaches, and the workspace indexes its
     /// own pack — private inodes, no `alternates`, and bytes proportional
-    /// to the tree rather than to every revision the mirror ever fetched
-    /// (P07-20). The mirror is only read: upload-pack runs against it
+    /// to the tree rather than to every revision the mirror ever fetched.
+    /// The mirror is only read: upload-pack runs against it
     /// under this attempt's reader lease, which keeps GC from pruning it.
     fn fetch_pinned(
         mirror: &Path,
@@ -925,7 +925,7 @@ impl Mirrors {
 
 /// Whether a failed fetch is the server refusing one of the wants — an
 /// unadvertised SHA, or a ref that is gone — the only failures a narrower
-/// want can get past (P07-26).
+/// want can get past.
 fn want_refused(error: &Error) -> bool {
     let Error::Preparation(text) = error else {
         return false;
@@ -957,7 +957,7 @@ pub struct MirrorSweep {
 }
 
 impl Mirrors {
-    /// Bound the mirrors' disk (P07-22): stale `tmp_*` leftovers of killed
+    /// Bound the mirrors' disk: stale `tmp_*` leftovers of killed
     /// fetches go, a mirror no writer touched for [`MIRROR_IDLE`] goes, and
     /// while the rest exceed `budget_bytes` the least recently written
     /// mirrors go. Every removal happens under that mirror's writer lock
@@ -1118,8 +1118,7 @@ fn reflink_supported(root: &Path) -> Result<bool> {
     }
     let _clean = Clean(&src, &dst);
     // `FICLONE` needs its source open for reading: a write-only source is
-    // `EBADF` on every filesystem, which once made this probe answer "no
-    // reflink" even on XFS and Btrfs.
+    // `EBADF` on every filesystem.
     let mut from = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1139,10 +1138,8 @@ mod tests {
     use super::*;
 
     /// The probe answers what the filesystem does: it agrees with a clone
-    /// made the way materialization makes one (a read-only source). Before
-    /// the fix the probe's source was write-only, so it said "no" on XFS
-    /// and Btrfs too. Point `TMPDIR` at a reflink filesystem to see the
-    /// `true` side; on ext4 or tmpfs both answers are `false`.
+    /// made the way materialization makes one (a read-only source).
+    /// Point `TMPDIR` at a reflink filesystem to see the `true` side; on ext4 or tmpfs both answers are `false`.
     #[test]
     fn the_reflink_probe_agrees_with_a_real_clone() {
         let dir = tempfile::tempdir().unwrap();
@@ -1152,7 +1149,7 @@ mod tests {
         assert_eq!(reflink_supported(dir.path()).unwrap(), real);
     }
 
-    /// P07-26: only a server refusing a want earns the narrower retries;
+    /// Only a server refusing a want earns the narrower retries;
     /// an authentication, network or local failure is final.
     #[test]
     fn only_a_refused_want_is_retried_narrower() {

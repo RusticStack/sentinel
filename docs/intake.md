@@ -1,6 +1,6 @@
-# Event intake: ref updates, webhooks and durable resolution (G02/G03)
+# Event intake: ref updates, webhooks and durable resolution
 
-Part 05 starts two ways: a person or agent dispatches a pinned pipeline through
+A run starts two ways: a person or agent dispatches a pinned pipeline through
 the [API](api.md), or a repository tells Sentinel that something changed. This
 document is the second path. Intake is deliberately small: authenticate, bound,
 store, acknowledge, and let a bounded lane resolve off the request path. No
@@ -82,8 +82,8 @@ provenance is a fact on record rather than an inference.
 Trust is decided from those facts, and only those facts:
 
 - the head repository must be the repository the binding points at; a
-  different head repository is `ignored:fork_pr` — hostile fork execution is a
-  later feature, never a default;
+  different head repository is `ignored:fork_pr` — hostile fork execution is never a
+  default;
 - an App association is required: a pull request for a repository bound
   without one is `failed:no_forge_association`;
 - the payload's `merge_commit_sha` is a hint, never authority — GitHub may not
@@ -147,15 +147,15 @@ cron/systemd timer. It never resolves a pipeline and never waits for CI:
 install -m 0755 examples/hooks/post-receive /srv/git/app.git/hooks/post-receive
 install -m 0600 examples/hooks/sentinel-hook.env.example /srv/git/app.git/hooks/sentinel-hook.env
 # edit the URL and the secret, then a systemd timer or cron runs:
-/ srv/git/app.git/hooks/post-receive --flush
+/srv/git/app.git/hooks/post-receive --flush
 ```
 
 Uploading the hook to a host is an administrator's decision; Sentinel does not
 install hooks into repositories. Providers with their own webhooks (Gitea,
 Forgejo, GitLab) translate into the same generic route; native payloads are not
-accepted here, and G08 verifies those fixtures.
+accepted here.
 
-## Ref polling (G07)
+## Ref polling
 
 Repositories whose forge has no delivery mechanism — or where installing a
 hook is not an option — can opt into bounded `git ls-remote` polling:
@@ -245,8 +245,7 @@ under its own retry schedule (`retried:store_fault`, same attempt budget) and
 the pass continues, so one delivery can never hold every other tenant's work
 behind it. Each validation runs under its own savepoint, so a constraint or
 decode failure from SQLite while resolving or settling one delivery undoes only
-that delivery's writes and parks it the same way, instead of rolling back the
-whole batch and failing on the same delivery forever; a busy, full or failing
+that delivery's writes and parks it the same way; a busy, full or failing
 database still fails the pass. Only a store that cannot even record that backs
 the lane off, from 1 s to 30 s.
 
@@ -286,7 +285,7 @@ The compiled `on:` policy decides whether the event is one this pipeline wants
 | `ignored:fork_pr`, `ignored:merge_unavailable` | Pull-request trust refusals (above). |
 | `failed:no_pipeline` | The bound pipeline path does not exist at the revision. |
 | `failed:pipeline_invalid` | It exists but does not load, decode or compile; the reason is logged. |
-| `failed:image_unpinned` | A job's image is not digest-pinned; execution admission (K05) cannot resolve tags yet. |
+| `failed:image_unpinned` | A job's image is not digest-pinned; execution admission does not resolve tags. |
 | `failed:no_forge_association`, `failed:pr_metadata` | A pull request arrived without the association or terms that prove it. |
 | `failed:source_unavailable` | No usable credential exists for the binding. |
 | `retried:source_unreachable`, `retried:github_unavailable` | A transient fetch or provider fault; the delivery stays open and the same attempt budget applies. |

@@ -73,7 +73,7 @@ fn pipeline_validate_reports_path_and_exit_code() {
     assert!(String::from_utf8_lossy(&missing.stderr).contains("cannot read"));
 }
 
-/// P02-4: a character device reports length 0, so only a bound on the read
+/// A character device reports length 0, so only a bound on the read
 /// itself stops `/dev/zero` (valid UTF-8, no end) from exhausting memory.
 #[cfg(unix)]
 #[test]
@@ -101,8 +101,8 @@ fn pipeline_validate_bounds_the_read_of_an_endless_device() {
     assert_eq!(document["code"], "invalid_pipeline", "{document}");
 }
 
-/// P09-13: a reader that has gone (`| head -1`) used to make every write
-/// panic with exit 101. Now the command stops quietly with exit 0.
+/// A reader that has gone (`| head -1`) ends the command quietly with exit 0
+/// instead of a write panic (exit 101).
 #[test]
 fn a_closed_stdout_ends_the_command_quietly_with_exit_zero() {
     let file = fixture("valid/full.yml");
@@ -734,7 +734,7 @@ mod linux {
         }
     }
 
-    /// The whole W02 path through the real binaries: an operator prepares a
+    /// The whole path through the real binaries: an operator prepares a
     /// pool and an enrollment on the controller's host, the server listens,
     /// the worker enrolls on its first hello, and both stop cleanly.
     #[test]
@@ -943,7 +943,7 @@ mod linux {
         assert!(listed.contains("builder-1"));
     }
 
-    /// O07 against the real binary pair: `sentinel server` with a
+    /// The real binary pair: `sentinel server` with a
     /// bootstrapped password account, and `sentinel auth login --device`
     /// approved on the server's `/device` page with a password session.
     /// Afterwards `auth status` verifies the grant, `doctor` passes every
@@ -1130,7 +1130,7 @@ mod linux {
         server.terminate();
     }
 
-    /// R04 through the binary: a running controller with `[backup]` takes a
+    /// Through the binary: a running controller with `[backup]` takes a
     /// backup when asked over the API, `admin backup verify` passes it,
     /// `admin restore` rebuilds an empty data directory from it, and a
     /// controller started on that directory serves the same deployment — the
@@ -1326,7 +1326,7 @@ mod linux {
         }
     }
 
-    /// R07: recovery onto a replacement host. A controller with an enrolled,
+    /// Recovery onto a replacement host. A controller with an enrolled,
     /// connected worker is lost; its last backup is restored into a fresh
     /// data directory (the new host's), a controller started there on the
     /// same link address presents the same identity, and the worker — which
@@ -1510,7 +1510,7 @@ mod linux {
     }
 }
 
-/// R01: `admin tenant storage` shows a tenant's policy, effective limits
+/// `admin tenant storage` shows a tenant's policy, effective limits
 /// and usage, changes the settings it is given, and `--inherit` drops them.
 /// Host-local administration exists only in a server build.
 #[cfg(feature = "server")]

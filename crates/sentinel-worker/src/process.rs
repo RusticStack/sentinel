@@ -22,7 +22,7 @@ use sentinel_protocol::logs::Stream;
 
 use crate::{Error, Result};
 
-/// Where a helper's output streams as it is produced (W05). Called from the
+/// Where a helper's output streams as it is produced. Called from the
 /// reader threads with chunks of at most `CHUNK_BYTES`; must not block
 /// for long, since the child's pipe fills behind it.
 pub type Sink = Arc<dyn Fn(Stream, &[u8]) + Send + Sync>;
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(short.into_bytes(), b"abcdef");
     }
 
-    /// P04-16: a cancel kills a running helper's whole group at once
+    /// A cancel kills a running helper's whole group at once
     /// instead of letting it run to its deadline.
     #[test]
     fn a_cancel_kills_a_running_helper() {
@@ -289,8 +289,7 @@ mod tests {
     /// deadline is minutes away. That the wake is the exit itself and not a
     /// poll tick is `sentinel_git`'s `a_childs_exit_wakes_a_parked_wait`,
     /// asserted here for the very watch `run` builds. Decided by events, not
-    /// by timing (the paired-timing test this replaces swung by ±2.9 s under
-    /// load).
+    /// by timing.
     #[test]
     fn a_quick_helper_is_not_held_by_a_poll_interval() {
         let dir = tempfile::tempdir().unwrap();

@@ -1,4 +1,4 @@
-//! W03 isolation with real rootless Podman. Runs only with
+//! Isolation with real rootless Podman. Runs only with
 //! `SENTINEL_PODMAN_TESTS=1` as an account with rootless Podman (see
 //! docs/development.md); otherwise it reports that it was skipped, never a
 //! false pass.
@@ -255,10 +255,9 @@ fn procs(cgroup: &std::path::Path) -> Vec<i32> {
         .collect()
 }
 
-/// P04-15. A runtime may run an exec'd step in a cgroup nested under the
-/// container's own, which then holds only the keepalive. A cancel decides
-/// from the cgroup tree whether a step is running: reading the container's
-/// cgroup alone, it found nothing, answered `Gone`, and the step ran on.
+/// A runtime may run an exec'd step in a cgroup nested under the
+/// container's own, which then holds only the keepalive, so a cancel must
+/// decide from the whole cgroup tree whether a step is running.
 /// Here the step is moved two levels down a real nested cgroup (cgroup v2,
 /// delegated to the rootless account); termination must find it there,
 /// signal it and see it leave — and once the nested cgroups are empty,
@@ -367,7 +366,7 @@ fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
     ws.destroy().unwrap();
 }
 
-/// R01: image reclamation against the real runtime, in a private store so
+/// Image reclamation against the real runtime, in a private store so
 /// no other test's image is touched — an image a container holds is listed
 /// as in use and `remove_image` (never forced) leaves it; once the container
 /// goes, the image goes.

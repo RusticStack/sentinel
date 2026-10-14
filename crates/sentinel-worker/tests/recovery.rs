@@ -1,4 +1,4 @@
-//! W07 worker-side reconciliation against an empty container runtime (a
+//! Worker-side reconciliation against an empty container runtime (a
 //! shim that owns nothing): markers
 //! record attempts in flight with their fence, leftover workspaces are
 //! destroyed, a spool without a marker is discarded, a spool with one is
@@ -19,7 +19,7 @@ use sentinel_worker::{
     workspace::Workspace,
 };
 
-/// A `podman` on `PATH` that owns nothing: recovery now requires a runtime
+/// A `podman` on `PATH` that owns nothing: recovery requires a runtime
 /// that answers (it refuses to guess), and these cases are about the disk.
 fn empty_runtime() {
     use std::os::unix::fs::PermissionsExt;
@@ -64,7 +64,7 @@ fn leftovers_are_settled_on_disk_and_kept_for_the_controller() {
     recovery::mark(root, finished, Fence(1)).unwrap();
     recovery::unmark(root, finished);
     Spool::open(root, finished).unwrap();
-    // `unmarked`: only a workspace, from before the marker was written.
+    // `unmarked`: only a workspace; the marker was never written.
     Workspace::create(root, unmarked).unwrap();
 
     assert_eq!(

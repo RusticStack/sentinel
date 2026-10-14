@@ -1,5 +1,5 @@
-//! The controller's HTTP API (W08): the one surface the CLI, the web page
-//! and later MCP share. Plain HTTP/1.1 on a bounded set of connection
+//! The controller's HTTP API: the one surface the CLI, the web page and MCP
+//! share. Plain HTTP/1.1 on a bounded set of connection
 //! threads and handler permits; TLS is the reverse proxy's job (the
 //! session cookie is `__Host-`, which a browser accepts from `localhost`
 //! or over HTTPS only).
@@ -10,7 +10,7 @@
 //! without the predicate that says the caller may. Errors are
 //! `sentinel.error/1` under `/api/v1` and RFC 6749 under `/oauth`;
 //! mutations take an `Idempotency-Key`; bodies are bounded before they are
-//! read. The OAuth authorization server (O01–O06) lives in [`oauth`].
+//! read. The OAuth authorization server lives in [`oauth`].
 
 pub mod auth;
 mod github;
@@ -54,20 +54,20 @@ pub const CONNECTIONS_PER_PEER: usize = 16;
 pub const PUBLIC_BODIES: usize = 4;
 /// How long a `wait=1` log poll holds before answering with nothing new.
 pub const LOG_WAIT: Duration = Duration::from_secs(25);
-/// Upload/download bodies in flight at once (D02), counted until the last
+/// Upload/download bodies in flight at once, counted until the last
 /// byte is written — a download's slot travels with its streamed body.
 /// Beyond this the API answers `rate_limited` rather than queue unbounded
 /// transfer work.
 pub const TRANSFERS: usize = 3;
 /// Long-poll subscribers parked at once — run waits and `wait=1` log polls
-/// together, including every live view of the web interface (U03/U04).
+/// together, including every live view of the web interface.
 /// A parked poll holds its connection but gives its handler permit back
 /// while it waits, so parked polls never starve requests doing work.
 /// Beyond it a poll is `rate_limited` with `details.retry_after_ms`.
 pub const SUBSCRIBERS: usize = 32;
 /// Of those, how many one user (a person or a service account, whatever
 /// credential it presents) may hold at once: a single credential looping
-/// parked polls can never take every slot from everyone else (P09-12).
+/// parked polls can never take every slot from everyone else.
 pub const SUBSCRIBERS_PER_USER: usize = 8;
 const _: () = assert!(
     SUBSCRIBERS_PER_USER >= 1 && SUBSCRIBERS_PER_USER < SUBSCRIBERS,
@@ -87,8 +87,9 @@ const _: () = assert!(
 );
 /// Handler permits each kind of outbound call to a third party may hold at once:
 /// GitHub sign-in's code exchange (up to two ten-second calls) and Client ID
-/// Metadata Document fetches (two seconds) each have a budget of this size, so a signed-in account filling the fetch budget never makes GitHub sign-in busy. A
-/// request past it is answered "busy, retry" at once, never queued, so with
+/// Metadata Document fetches (two seconds) each have a budget of this size, so
+/// a signed-in account filling the fetch budget never makes GitHub sign-in
+/// busy. A request past it is answered "busy, retry" at once, never queued, so with
 /// [`TRANSFERS`] (parked polls hold none) a handler always remains for logins,
 /// token refreshes, health checks and run reads — however slow the third
 /// party, and however many anonymous or signed-in callers ask.
@@ -154,7 +155,7 @@ pub struct Config {
     /// slash). It is the OAuth issuer; without it the issuer is
     /// `http://{bound address}`, which is right only for direct loopback use.
     pub public_url: Option<String>,
-    /// GitHub web sign-in (U07). Without it the `/auth/github/*` routes do
+    /// GitHub web sign-in. Without it the `/auth/github/*` routes do
     /// not exist and no page offers the button.
     pub github_sign_in: Option<GithubSignIn>,
     /// The reverse proxy's networks: only a request from one of these is
@@ -227,7 +228,7 @@ pub(crate) struct State {
     /// GitHub sign-in code exchanges in flight, a budget of their own: a
     /// signed-in user making metadata fetches cannot starve sign-in.
     pub exchanges: Outbound,
-    /// What every answered request adds to `/metrics` (R06).
+    /// What every answered request adds to `/metrics`.
     pub requests: metrics::Requests,
 }
 
@@ -398,7 +399,7 @@ impl Server {
 mod tests {
     use super::*;
 
-    /// P09S-1 / P11-2: however many requests want an outbound call at once
+    /// However many requests want an outbound call at once
     /// (a CIMD fetch or a GitHub exchange), at most [`OUTBOUND`] hold a
     /// handler on a third party; the rest are refused without waiting, and
     /// a slot is returned when its call ends, even by unwinding.

@@ -1,7 +1,5 @@
-//! K09 — adversarial verification of the guarantees K01–K08 made. Where an
-//! earlier task's own tests already cover a case the deliverable says to
-//! reference it; what lives here is the part that needed concurrency,
-//! eviction pressure, tampering or a full disk to prove:
+//! Adversarial tests of the cache store's guarantees: the cases that need
+//! concurrency, eviction pressure, tampering or a full disk to prove:
 //!
 //! - parallel restores against a republishing writer under live GC
 //!   pressure — every clone is exactly one generation's bytes, a sealed
@@ -10,7 +8,7 @@
 //! - a writer canceled mid-stage promotes nothing and leaves nothing a
 //!   sweep cannot reap — and the next publish is clean;
 //! - a held lease is never undercut by budget eviction while an
-//!   unleashed sibling loses its spare, and once released the pin's
+//!   unleased sibling loses its spare, and once released the pin's
 //!   generation goes;
 //! - tampered on-disk state — a rewritten `files` blob, a flipped
 //!   manifest byte, a garbage `current`, a planted or missing payload
@@ -220,10 +218,6 @@ fn far_future() -> i64 {
     now_ms() + (2 * lease::MAX_TTL.as_millis() as i64)
 }
 
-// ---------------------------------------------------------------------
-// (1) Concurrent clone/write isolation.
-// ---------------------------------------------------------------------
-
 /// Eight readers clone the same entry's `current` in a loop while a
 /// writer republishes it and a sweeper evicts under a near-zero budget —
 /// the worst legal pile-up the store can see. Every clone must read as
@@ -381,10 +375,6 @@ fn concurrent_clones_during_republishing_are_never_torn() {
     }
 }
 
-// ---------------------------------------------------------------------
-// (2) Canceled writers.
-// ---------------------------------------------------------------------
-
 /// A cancel that lands inside materialization — after the walk, with
 /// payload files already staged — promotes nothing, moves no `current`
 /// and leaves no staged tree behind. The remains a dead writer *would*
@@ -477,12 +467,8 @@ fn a_writer_canceled_mid_stage_promotes_nothing_and_the_store_recovers() {
     verify_generation(&entry, &gen_b);
 }
 
-// ---------------------------------------------------------------------
-// (3) Eviction during active use.
-// ---------------------------------------------------------------------
-
 /// Budget eviction under a live pin: the leased entry keeps both its
-/// generations while the unleashed sibling loses its spare; once the
+/// generations while the unleased sibling loses its spare; once the
 /// holder drops the pin, the next sweep takes it. A lease pins the whole
 /// entry — a reader mid-clone or a writer mid-publish is never undercut.
 #[test]
@@ -566,10 +552,6 @@ fn eviction_during_active_use_never_undercuts_a_lease() {
     assert!(entry1.join(current_gen(&entry1).unwrap()).is_dir());
     assert!(entry2.join(current_gen(&entry2).unwrap()).is_dir());
 }
-
-// ---------------------------------------------------------------------
-// (4) Tampered state.
-// ---------------------------------------------------------------------
 
 /// Every tamper a disk, a crash or an adversary can leave is a typed
 /// miss — never a panic, never a wrong serve — and a republish heals the
@@ -691,10 +673,6 @@ fn tampered_state_is_a_typed_miss_and_republish_heals() {
     );
     verify_generation(&entry, &gen_b);
 }
-
-// ---------------------------------------------------------------------
-// (5) Trust change.
-// ---------------------------------------------------------------------
 
 /// The trust boundary holds in both directions: a `protected` generation
 /// can never serve a pull-request restore — not through the scope path
@@ -825,10 +803,6 @@ fn copy_tree(src: &Path, dst: &Path) {
     }
 }
 
-// ---------------------------------------------------------------------
-// (7) Concurrent writers on one entry.
-// ---------------------------------------------------------------------
-
 /// The `writing/.lock` marker serializes writers: held by hand it makes
 /// every commit `busy`; raced for real, exactly one publish stages at a
 /// time — the loser skips, never blocks and never interleaves.
@@ -926,10 +900,6 @@ fn parallel_writers_are_serialized_and_never_double_promote() {
         verify_generation(&entry, &name);
     }
 }
-
-// ---------------------------------------------------------------------
-// (6) Disk pressure — a real full filesystem.
-// ---------------------------------------------------------------------
 
 /// `ENOSPC` mid-publish is a clean failure: no generation promotes,
 /// `current` never moves and the staged tree is gone — the entry stays

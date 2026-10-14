@@ -1,6 +1,5 @@
 //! An account's own security over the API: second-factor enrollment, recovery
-//! codes, password change and the state the web interface shows for them
-//! (A06, A04).
+//! codes, password change and the state the web interface shows for them.
 //!
 //! Every route here is for a **browser session** with its CSRF header. A bearer
 //! credential or OAuth token — whatever scopes it carries — cannot enroll a

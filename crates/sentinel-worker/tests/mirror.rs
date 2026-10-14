@@ -1,4 +1,4 @@
-//! K04 checkout routing on Linux: with a mirrors handle the checkout goes
+//! Checkout routing on Linux: with a mirrors handle the checkout goes
 //! through the repository's local mirror and says so; a mirror that cannot
 //! serve falls back to the direct fetch with the reason on record; the
 //! remote's own answer never retries.
@@ -189,7 +189,7 @@ fn an_absent_commit_is_a_preparation_failure_not_a_fallback() {
     ws.destroy().unwrap();
 }
 
-/// P07-17: a manual run names its own remote — here a local path, which
+/// A manual run names its own remote — here a local path, which
 /// could as well be another repository's mirror — so it never goes through
 /// (or fills) a mirror: the route is direct and no store is created.
 #[test]
@@ -216,7 +216,7 @@ fn a_manual_run_never_reads_or_feeds_a_mirror() {
     ws.destroy().unwrap();
 }
 
-/// P07-18: when the mirror cannot serve, the direct fallback runs within
+/// When the mirror cannot serve, the direct fallback runs within
 /// what is left of the one deadline — never a fresh one.
 #[test]
 fn a_fallback_spends_the_remaining_deadline_not_a_new_one() {

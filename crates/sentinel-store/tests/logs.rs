@@ -1,4 +1,4 @@
-//! D04 log store behavior: frames are acknowledged only once written and
+//! Log store behavior: frames are acknowledged only once written and
 //! synced, in sequence; a resend is accepted without a second copy; a
 //! sequence jump records a hole and a resend inside a hole fills it; the
 //! end marker completes the log with merged gaps — declared, observed and
@@ -188,8 +188,7 @@ fn torn_tails_are_cut_on_reopen() {
 
 /// A power cut can persist a segment's new size without the data written
 /// into it: the unacknowledged tail reads back as zeros. It is cut like a
-/// torn record — readers and the writer go on — where before the fix the
-/// whole log was reported corrupt. Garbage that is not zeros still is.
+/// torn record, and readers and the writer go on. Garbage that is not zeros still is.
 #[test]
 fn a_zeroed_tail_from_a_power_cut_is_cut_but_garbage_is_corrupt() {
     let temp = tempfile::tempdir().unwrap();
@@ -327,7 +326,7 @@ fn pre_d04_flat_logs_still_read() {
     let temp = tempfile::tempdir().unwrap();
     let logs = LogStore::open(temp.path().join("logs")).unwrap();
     let attempt = AttemptId::new();
-    // A W05-era flat log: frames then the end record, whole-file.
+    // A flat log: frames then the end record, whole-file.
     let mut bytes = Vec::new();
     Record::Frame(frame(1, "old\n")).encode(&mut bytes).unwrap();
     Record::End {
@@ -386,7 +385,7 @@ fn an_attempt_log_is_capped() {
     assert_eq!(tail.gaps, vec![(fits + 1, fits + 1)]);
 }
 
-/// P06-5: a hole whose neighbours sit in a sealed segment survives a
+/// A hole whose neighbours sit in a sealed segment survives a
 /// restart: a later fill is stored (not acked as a duplicate), and a finish
 /// without the fill still declares it.
 #[test]
@@ -428,7 +427,7 @@ fn a_hole_in_a_sealed_segment_survives_a_reopen() {
     }
 }
 
-/// P06-3: writers of attempts that never finish are closed when idle and
+/// Writers of attempts that never finish are closed when idle and
 /// capped in number; their logs then fall under retention, and a late frame
 /// reopens the log from disk exactly.
 #[test]
@@ -456,7 +455,7 @@ fn idle_writers_close_are_capped_and_their_logs_expire() {
     assert_eq!(logs.sweep_dirs(256, |_| true).unwrap(), 10);
 }
 
-/// P09-11 / P06-11: an API page is bounded in bytes and in decode work,
+/// An API page is bounded in bytes and in decode work,
 /// says where to continue, and a step filter over a finished step says so.
 #[test]
 fn pages_are_bounded_and_a_finished_step_is_reported() {
@@ -510,7 +509,7 @@ fn pages_are_bounded_and_a_finished_step_is_reported() {
     );
 }
 
-/// P11D-6: the newest window of a failed step survives a later
+/// The newest window of a failed step survives a later
 /// `if: always()` step that wrote more than a window, and a log without an
 /// end marker or live writer reports its real last frame, not the last
 /// sparse-index checkpoint.

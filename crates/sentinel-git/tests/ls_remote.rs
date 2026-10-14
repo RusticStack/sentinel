@@ -1,4 +1,4 @@
-//! G07 ref discovery over a real remote: `git ls-remote` advertises heads
+//! Ref discovery over a real remote: `git ls-remote` advertises heads
 //! and tags, annotated tags arrive with their peeled commit, and the result
 //! and its budgets are bounded.
 #![cfg(unix)]

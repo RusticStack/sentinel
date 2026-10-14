@@ -1,6 +1,6 @@
-//! Read models for status (W08): a run with its jobs, and recent runs of a
-//! repository. Controller row operations — authorization is the caller's,
-//! through `auth::require_repo` on the run's repository.
+//! Read models for status: a run with its jobs, and recent runs of a
+//! repository. Authorization is the caller's, through `auth::require_repo` on
+//! the run's repository.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sentinel_core::{
@@ -55,18 +55,14 @@ pub struct AttemptJobStatus {
     pub failure_class: Option<FailureClass>,
 }
 
-/// Read the job state only when `attempt` still owns the job. This is an
-/// indexed join over the requested attempt and does not build the run-wide
-/// status vector for a failure lookup.
+/// Read the job state only when `attempt` still owns the job, with an indexed
+/// join over that attempt (no run-wide status vector).
 ///
 /// Only a lease advances the fence, so fence equality alone would let an
-/// attempt keep "owning" a job that was requeued under it. A requeued job no
-/// longer belongs to its last attempt: a rerun (or a push re-trigger)
-/// clears `leased_ms`, which only the next lease sets again — so a later
-/// cancel or queue timeout of the requeued job is not the old attempt's
-/// verdict either. A lapsed or declined offer (`dispatch::give_back`) clears
-/// it too, so a job canceled or timed out in the queue after a lapse is not
-/// the lapsed attempt's verdict.
+/// attempt keep "owning" a job that was requeued under it. A rerun, a push
+/// re-trigger, or a lapsed or declined offer (`dispatch::give_back`) clears
+/// `leased_ms`, which only the next lease sets again; a later cancel or queue
+/// timeout of the requeued job is therefore not the old attempt's verdict.
 pub fn attempt_job_status(
     conn: &Connection,
     tenant: TenantId,
@@ -237,11 +233,10 @@ pub struct RunPage {
 
 /// Keyset pagination over `runs_by_repo`, newest first: at most `limit`
 /// runs strictly older than `before` in `(created_ms, id)` order, so pages
-/// stay stable when runs share a millisecond and when new runs arrive
-/// between requests. `before` must be a run of this repository, else
-/// `NotFound` (a foreign run's timestamp is not revealed). One row past
-/// the page is read to tell whether a next page exists, so the last page
-/// never needs an empty follow-up request.
+/// stay stable when runs share a millisecond or new runs arrive. `before`
+/// must be a run of this repository, else `NotFound` (a foreign run's
+/// timestamp is not revealed). One extra row is read to tell whether a next
+/// page exists.
 pub fn runs_page(
     conn: &Connection,
     tenant: TenantId,
@@ -288,9 +283,8 @@ pub fn runs_page(
     }
     let more = out.len() > usize::from(limit);
     out.truncate(usize::from(limit));
-    // One grouped read for every listed run's job states — the `IN`
-    // subquery is the same page, materialized once — rather than a
-    // `run_state` query per row.
+    // One grouped read for every listed run's job states; the `IN` subquery
+    // is the same page, materialized once.
     let mut states: std::collections::HashMap<[u8; 16], Vec<JobState>> =
         std::collections::HashMap::with_capacity(out.len());
     if !out.is_empty() {
@@ -546,10 +540,9 @@ pub const PAGE_JOBS_SQL: &str = "SELECT run_id, state_code FROM jobs WHERE run_i
 /// A run's change version for long polls: 64-bit FNV-1a over the run's
 /// cancel flag and, for every job in id order (the order `jobs_by_run` already
 /// delivers, so no sort), its id, state code, fence, cancel flag and newest
-/// attempt's log state. Any state change a
-/// status reader can see changes it (with FNV's collision odds). Computed
-/// straight off the rows — no allocation — so a parked poll can re-check
-/// cheaply after every commit.
+/// attempt's log state. Any state change a status reader can see changes it
+/// (with FNV's collision odds). Computed straight off the rows without
+/// allocating, so a parked poll can re-check after every commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunVersion {
     pub version: u64,

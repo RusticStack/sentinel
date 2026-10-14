@@ -30,7 +30,6 @@ window.makeFrames = makeFrames;
 
 const LINE_H = 18;
 
-// ------------------------------------------------------------- naive ----
 function naiveCandidate(root) {
   const view = document.createElement("pre");
   view.className = "log-view";
@@ -54,7 +53,6 @@ function naiveCandidate(root) {
   };
 }
 
-// ------------------------------------------------------------ preact ----
 function preactCandidate(root) {
   const { h, render } = window.preact;
   const { useState, useEffect, useRef } = window.preactHooks;
@@ -88,7 +86,6 @@ function preactCandidate(root) {
   };
 }
 
-// --------------------------------------------------------------- vue ----
 function vueCandidate(root) {
   const { createApp, h, ref, shallowRef, onMounted } = window.Vue;
   const lines = shallowRef([]);
@@ -125,7 +122,6 @@ function vueCandidate(root) {
   };
 }
 
-// ---------------------------------------------------------- sentinel ----
 function sentinelCandidate(root) {
   let frames = [];
   // The viewer's API, answered from memory with the API's page bounds

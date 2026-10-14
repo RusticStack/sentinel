@@ -1,4 +1,4 @@
-//! Q07 live evidence: the pinned helper over a real NAT boundary.
+//! Live evidence: the pinned helper over a real NAT boundary.
 //!
 //! These tests need the real `tailcat` binary, Podman and the tools named
 //! below; they are `#[ignore]`d by default and run on a Linux host with:
@@ -1328,9 +1328,8 @@ const HANDOFF_NOTICED: Duration = Duration::from_millis(500);
 /// 3.30-4.63 s, the restarted helper's own start).
 const HANDOFF_OUTAGE: Duration = Duration::from_millis(5_500);
 /// The same through a lossy moment, whose close only the old helper's
-/// resend delivers (measured over 44 changes: 4.6-7.0 s, where a helper
-/// that went at 600 ms left the direct worker to its heartbeat deadline,
-/// 17.7-20.5 s).
+/// resend delivers (measured over 44 changes: 4.6-7.0 s; a helper that went
+/// at 600 ms left the direct worker to its heartbeat deadline, 17.7-20.5 s).
 const LOSSY_OUTAGE: Duration = Duration::from_secs(9);
 
 /// How an allow-list change meets the worker.
@@ -1493,10 +1492,8 @@ const LOSS: Duration = Duration::from_millis(800);
 /// dropped for [`LOSS`], from `engage` on. The kernel ends the loss: the
 /// drop matches an nft set element that expires after [`LOSS`], so neither
 /// a hand-off in progress nor a slow `nft` or `iptables` call can stretch
-/// it. (Removing an `iptables` rule from a timer thread did: the "800 ms"
-/// held for 0.85-4.1 s, and a close resent after it was lifted reached the
-/// worker after the old helper had gone.) `lift` waits out the window and
-/// removes the table.
+/// it (an `iptables` rule removed from a timer thread held for 0.85-4.1 s).
+/// `lift` waits out the window and removes the table.
 struct NetnsLoss {
     pid: String,
     until: Instant,

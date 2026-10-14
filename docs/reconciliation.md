@@ -1,4 +1,4 @@
-# Crash and restart reconciliation (W07)
+# Crash and restart reconciliation
 
 Implemented in `sentinel-store::dispatch` (`reconcile_startup`, `abandon`), `Controller::start` (which runs the former before admitting anyone), `sentinel-worker::recovery` with the attempt markers the executor keeps, and the `Abandon` message of the [worker link](worker-link.md).
 
@@ -36,9 +36,9 @@ The spool keeps what it needs across the restart: gaps it declared (a bound, a f
 
 A leftover spool is delivered through `LogPipe::recover`. If it holds its end record, the attempt had finished its output and the same end is sent again. If it does not, the crash cut the attempt short: whatever it printed after its last durable frame — unsynced frames a power cut took, output of a step the dead process could no longer read — is unknown. Its end therefore declares one more sequence as a gap, past everything stored, declared or acknowledged (an acknowledgement answering the resend can move that point past frames the controller holds and the worker lost), and the end is written into the spool before it is sent, so a second crash re-sends exactly it. The log of a reconciled attempt ends in a gap; it never reads as complete over lost output.
 
-## What is not here yet
+## Limits
 
-Resumable *artifact* uploads and cache publication are D-tasks; the spool is the only upload today, and it resumes from its cursor. Reconciliation of a controller's own half-written objects is a D-task with the object store. A worker whose data directory was lost has nothing to reconcile with: its held attempts expire on the controller.
+The spool is the only resumable upload, and it resumes from its cursor; artifact uploads and cache publication do not resume. A worker whose data directory was lost has nothing to reconcile with: its held attempts expire on the controller.
 
 ## Verification
 
@@ -48,7 +48,7 @@ Resumable *artifact* uploads and cache publication are D-tasks; the spool is the
 
 `crates/sentinel-worker/tests/crash_consistency.rs` checks the marker and the spool (with the controller's log store) after a crash at every point of a recorded run under a POSIX-strict persistence model, and after real power cuts on ext4 and XFS over `dm-flakey` ([logs](logs.md#bounds)). Before the directory syncs above, the model lost the marker, the whole spool after it synced, and the controller's `logs` directory.
 
-`crates/sentinel-worker/tests/recovery.rs` (any Linux, against a `podman` shim that owns nothing): markers record fences; recovery destroys workspaces and an askpass helper, discards the spool without a marker, keeps the marked attempt's spool with its frames and returns it as pending — and a marker without a spool reports `ended` exactly when `mark_ended` ran, so a lost spool is never reported delivered (D07).
+`crates/sentinel-worker/tests/recovery.rs` (any Linux, against a `podman` shim that owns nothing): markers record fences; recovery destroys workspaces and an askpass helper, discards the spool without a marker, keeps the marked attempt's spool with its frames and returns it as pending — and a marker without a spool reports `ended` exactly when `mark_ended` ran, so a lost spool is never reported delivered.
 
 `crates/sentinel-link/tests/link.rs`: over the link, an abandonment under the wrong fence is counted stale and changes nothing; under the right one the job is `infra_failed`.
 

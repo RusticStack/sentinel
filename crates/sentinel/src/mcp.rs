@@ -513,9 +513,9 @@ mod tests {
         assert!(!invalid.to_string().contains("jobs: []"));
     }
 
-    /// P11-8: `arguments` is optional in MCP. A tool with no required
-    /// argument is not refused as invalid params, and the shared mapper's
-    /// own checks answer, exactly as over Streamable HTTP.
+    /// `arguments` is optional in MCP: a tool with no required argument is
+    /// not refused as invalid params, and the shared mapper's own checks
+    /// answer, exactly as over Streamable HTTP.
     #[test]
     fn stdio_tools_call_without_arguments_uses_defaults() {
         let client = Client::with_token("http://127.0.0.1:1", &test_token()).unwrap();

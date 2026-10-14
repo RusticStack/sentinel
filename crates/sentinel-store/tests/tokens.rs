@@ -1,5 +1,5 @@
-//! A03 behavior: host-local provisioning, scoped and expiring credentials,
-//! hashed secrets, delegation limits, revocation and reuse of the A01 layer.
+//! Host-local provisioning, scoped and expiring credentials, hashed secrets,
+//! delegation limits, revocation and reuse of the live authorization layer.
 
 use sentinel_auth::{secret::Secret, token};
 use sentinel_core::{
@@ -117,7 +117,7 @@ fn a_host_local_credential_authenticates_through_the_ordinary_authorization_laye
     assert!(principal.permissions.contains(P::RUN));
     assert!(!principal.permissions.contains(P::WRITE_SECRETS));
 
-    // The credential is not authority by itself: A01 decides, live.
+    // The credential is not authority by itself: live authorization decides.
     store
         .read(|conn| auth::require_repo(conn, principal, i.repo, P::RUN))
         .unwrap();

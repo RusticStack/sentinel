@@ -1,4 +1,4 @@
-//! G03 resolution over a real repository served on loopback HTTPS: policy,
+//! Resolution over a real repository served on loopback HTTPS: policy,
 //! exact provenance, duplicate/reordered events, the explicit outcomes, tag
 //! peeling, and the pull-request trust rules. The pull-request happy path
 //! uses an injected fetcher because a GitHub-App-bound remote is not
@@ -607,7 +607,7 @@ fn out_of_order_pushes_never_dispatch_behind_or_cancel_the_tip() {
     );
 }
 
-/// P07-2: a verified push is protected cache state only when the binding
+/// A verified push is protected cache state only when the binding
 /// names its ref exactly. Admitted through the fixture's `refs/heads/*`
 /// wildcard, anyone with push rights to any branch could produce it, so it
 /// is `unprotected`; once the binding names `refs/heads/main` itself, the
@@ -1188,9 +1188,9 @@ fn a_revoked_binding_settles_with_a_reason() {
     assert_eq!(row.reason.as_deref(), Some("binding_revoked"));
 }
 
-/// G07 over the real remote: `git ls-remote` against the loopback server
+/// Polling over the real remote: `git ls-remote` against the loopback server
 /// discovers the baseline, a pushed commit becomes a `poll` delivery, and it
-/// resolves through the same G03 path a hook delivery takes.
+/// resolves through the same path a hook delivery takes.
 #[test]
 fn a_polled_ref_observation_becomes_a_real_dispatch() {
     if !prerequisites() {
@@ -1294,10 +1294,9 @@ fn a_polled_ref_observation_becomes_a_real_dispatch() {
     drop(poller);
 }
 
-/// B03: the jobs a resolution creates are ready from the write that creates
-/// them. `now` is taken before the pipeline fetch; stamping the jobs with it
-/// counted the fetch as queue time (ready→offer read about 150 ms on a small
-/// repository, the fetch's cost, not the dispatcher's).
+/// The jobs a resolution creates are ready from the write that creates them.
+/// `now` is taken before the pipeline fetch; stamping the jobs with it would
+/// count the fetch as queue time.
 #[test]
 fn a_dispatched_job_is_ready_from_its_creation_not_from_resolution_start() {
     if !prerequisites() {

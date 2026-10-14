@@ -1,4 +1,4 @@
-//! G02 end to end, without HTTP: the two authenticated ingest paths store
+//! Intake end to end, without HTTP: the two authenticated ingest paths store
 //! deduplicated, tenant-owned deliveries, and the bounded lane resolves them
 //! on a wake or on its idle tick.
 use std::{

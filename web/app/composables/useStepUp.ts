@@ -6,7 +6,7 @@ export class StepUpDeclined extends Error {
   constructor() { super("step-up declined"); }
 }
 
-/// Whether a refusal asks for a recent second factor (A06): issuing service
+/// Whether a refusal asks for a recent second factor: issuing service
 /// credentials, platform-administrator overrides, reissuing recovery codes,
 /// linking an identity, a password change with a factor enrolled.
 export const needsStepUp = (e: unknown): e is ApiError => e instanceof ApiError && e.code === "forbidden" && !!e.details.step_up;

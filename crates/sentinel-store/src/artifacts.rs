@@ -1,4 +1,4 @@
-//! Artifact records (D03): one row per declared artifact per attempt,
+//! Artifact records: one row per declared artifact per attempt,
 //! written by the controller when the worker's publication settles.
 //!
 //! A `captured` row names the manifest version committed earlier in the same
@@ -6,7 +6,7 @@
 //! artifact is never half-published. `absent` records a declaration that
 //! matched no files, `failed` one whose capture or transfer broke — both
 //! keep the run's outcome explainable instead of silently missing.
-//! Retention is the declared `retain` rendered as a deadline; D06's
+//! Retention is the declared `retain` rendered as a deadline;
 //! [`sweep_expired`] retires rows past it, deleting the artifact row and
 //! its manifest version in one transaction.
 //!

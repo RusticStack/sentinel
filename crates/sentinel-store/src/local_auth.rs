@@ -359,7 +359,7 @@ impl Session {
     /// A browser session acts as its human, not above them: repository bits plus
     /// tenant administration, which `auth` still verifies against live
     /// membership per tenant. Platform administration is present only for an
-    /// actual super admin; A06 adds step-up before privileged policy changes.
+    /// actual super admin.
     pub fn principal(&self) -> Principal {
         let mut permissions = Permissions::REPOSITORY.union(Permissions::TENANT_ADMIN);
         if self.super_admin {
@@ -995,8 +995,9 @@ pub fn change_password(
 }
 
 /// Host-local recovery: reset a local password, clear the login and
-/// second-factor lockouts and revoke the account's sessions and OAuth grants. Authorized by access to the database file itself, so
-/// a locked-out operator is never permanently shut out, and every use is
+/// second-factor lockouts and revoke the account's sessions and OAuth grants.
+/// Authorized by access to the database file itself, so a locked-out
+/// operator is never permanently shut out, and every use is
 /// recorded as host-local in the audit table.
 pub fn recover(
     store: &Store,
@@ -1034,7 +1035,7 @@ pub fn recover(
 }
 
 /// Provision a local credential for an existing human account. Trusted
-/// administration, not a registration route: A05 owns invitations and approval.
+/// administration, not a registration route.
 /// Giving an account a password changes how it can authenticate, so it needs
 /// the same recent step-up as any other change to authentication.
 pub fn provision_credential(

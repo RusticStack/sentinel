@@ -1,4 +1,4 @@
-//! Q09: a three-worker fleet of mixed capacity over real TLS against a real
+//! A three-worker fleet of mixed capacity over real TLS against a real
 //! `Controller`. A burst from two tenants is placed by capacity, a forced
 //! partition is survived without duplicate execution, a stale fence changes
 //! nothing, and a drained worker takes no new offers while keeping the work
@@ -884,10 +884,9 @@ fn identical_fleet(
     (ids, recorders, processes)
 }
 
-/// P08-6: the sweep used to fill one worker to capacity before asking the
-/// next, so a burst of three quarter-core jobs landed on whichever idle
-/// worker came first while two identical peers idled. Placement now goes in
-/// rounds ranked by commitment and measured load: each worker gets one.
+/// Placement goes in rounds ranked by commitment and measured load, so a
+/// burst of three quarter-core jobs lands one on each of three identical idle
+/// workers rather than all on whichever came first.
 #[test]
 fn a_burst_spreads_over_identical_workers() {
     let mut d = deployment();
@@ -925,7 +924,7 @@ fn a_burst_spreads_over_identical_workers() {
     );
 }
 
-/// P08-7: revocation is written by another process (the host-local admin
+/// Revocation is written by another process (the host-local admin
 /// command); the controller notices within a reconciliation pass, closes the
 /// revoked worker's live session, and fences what it held — the
 /// acknowledged attempt ends `Reconciled` rather than renewing forever — and
@@ -1000,8 +999,7 @@ fn noise_of(n: usize) -> String {
     yaml
 }
 
-/// P08-15: a store error in placement used to be dropped silently, so a
-/// fleet that stopped placing left no evidence. Break the schema under a
+/// A store error in placement leaves evidence. Break the schema under a
 /// running controller: the failure is counted (and logged by kind), the
 /// loop keeps running, and nothing is offered.
 #[test]
@@ -1036,8 +1034,7 @@ fn a_failing_placement_is_counted_not_swallowed() {
     );
 }
 
-/// T2 (Q07): transport telemetry used to be measured once at process start
-/// and replayed on every session. With a live source on the worker handle
+/// Transport telemetry follows a live source. With one on the worker handle
 /// (the Tailcat helper's latest probe), each session reports what the helper
 /// last measured — here a relayed path, then, after the helper re-measures
 /// and the session reconnects, a direct one — and the controller exposes it

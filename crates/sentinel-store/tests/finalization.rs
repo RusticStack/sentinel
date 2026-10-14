@@ -1,4 +1,4 @@
-//! D05 finalization behavior: terminal publication records the attempt's
+//! Finalization behavior: terminal publication records the attempt's
 //! data status in the same transaction — `log_state` says whether the log's
 //! end marker was durable, every due artifact has a row (due-but-missing
 //! gets `failed`), and a reported `Passed` cannot stand over a required

@@ -1,10 +1,10 @@
-//! The worker's durable log spool (W05): `<data_dir>/spool/<attempt>/frames`
+//! The worker's durable log spool: `<data_dir>/spool/<attempt>/frames`
 //! holds every frame until the controller has acknowledged it; `cursor`
 //! holds the highest acknowledged sequence.
 //!
 //! Output goes to disk first and to the link second, so a slow or absent
 //! controller costs disk, never memory, and a worker restart resumes from
-//! the cursor (W07). The spool is bounded three ways: per attempt past
+//! the cursor. The spool is bounded three ways: per attempt past
 //! `MAX_SPOOL_BYTES`, per worker past the spool quota all attempts share,
 //! and by the data directory's free space, which the spool never takes
 //! below a reserve ([`SpoolSpace`]). Output that is refused — by any of
@@ -298,7 +298,7 @@ pub(crate) fn free_bytes(_path: &Path) -> Option<u64> {
 }
 
 /// Total size of the file system holding `path` — what the worker's
-/// default store budgets are sized from (R01).
+/// default store budgets are sized from.
 #[cfg(target_os = "linux")]
 pub fn filesystem_bytes(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
@@ -861,7 +861,7 @@ impl Spool {
         }
     }
 
-    /// Attempts with a spool on disk, for W07.
+    /// Attempts with a spool on disk.
     pub fn leftovers(root: &Path) -> Result<Vec<AttemptId>> {
         let parent = root.join(SPOOL_DIR);
         let mut found = Vec::new();
@@ -957,14 +957,12 @@ mod tests {
         assert!(spool.append(0, Stream::Stdout, b"cc").unwrap().is_none());
         assert!(spool.append(1, Stream::Stderr, b"dd").unwrap().is_none());
         assert_eq!(spool.gaps(), &[(3, 4)]);
-        // The refused sequences are gone for good — resends and the end
-        // marker both tell the truth about what the spool holds.
         assert_eq!(spool.last_seq(), 4);
         assert_eq!(spool.unacked(0, 10).unwrap().len(), 2);
         // A range's growth is durable with the next sync, like the frames.
         spool.sync().unwrap();
         drop(spool);
-        // P04-22: a restart keeps the declared tail — a truncated log is
+        // A restart keeps the declared tail — a truncated log is
         // never delivered as complete — and never reuses its sequences.
         let mut reopened = Spool::open_with_limit(temp.path(), attempt, 59).unwrap();
         assert_eq!(reopened.gaps(), &[(3, 4)]);
@@ -1029,10 +1027,9 @@ mod tests {
         (space, free, calls)
     }
 
-    /// R01/D06: a disk down to the spool reserve refuses output as declared
-    /// gaps — the step keeps running, nothing is lost in silence — at one
-    /// probe per back-off however much is printed, and output is stored
-    /// again once space returns. Admitted appends probe once per grant.
+    /// A disk at the spool reserve refuses output as declared gaps, probing
+    /// once per back-off however much is printed; output is stored again
+    /// once space returns. Admitted appends probe once per grant.
     #[test]
     fn a_disk_at_its_reserve_refuses_into_declared_gaps_and_recovers() {
         let temp = tempfile::tempdir().unwrap();
@@ -1045,7 +1042,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one probe per grant");
         assert_eq!(space.used(), 1_000 * 22);
 
-        // Below the reserve: refused, declared, and the step goes on.
         free.store((1 << 20) + 10, Ordering::SeqCst);
         space.set_limits(1 << 20, u64::MAX);
         let before = calls.load(Ordering::SeqCst);

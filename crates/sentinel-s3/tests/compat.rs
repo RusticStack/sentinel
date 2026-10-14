@@ -1,4 +1,4 @@
-//! The named endpoint compatibility matrix (R02/R03): every case against
+//! The named endpoint compatibility matrix: every case against
 //! every S3 service listed in `$SENTINEL_S3_ENDPOINTS` (written by
 //! `tests/endpoints.sh`; see [docs/s3.md](../../../docs/s3.md)). Without the
 //! variable it reports that it was skipped, never a false pass.

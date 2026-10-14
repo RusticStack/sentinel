@@ -1,5 +1,5 @@
 //! The controller's side of the link: listen, admit, keep the fleet, place
-//! work and push offers (W02).
+//! work and push offers.
 //!
 //! Two threads own the loop. The acceptor takes connections and hands each
 //! to a session thread that authenticates it against the store, registers
@@ -57,7 +57,7 @@ use crate::{
 /// How long the dispatcher sleeps without a wake before re-checking the
 /// queue and sweeping unacknowledged offers. A safety net, not the clock.
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
-/// The prefetch pass (K05) reads the queue at most this often: a hint is
+/// The prefetch pass reads the queue at most this often: a hint is
 /// advisory, so a burst of wakes never becomes a burst of reads.
 pub const PREFETCH_INTERVAL: Duration = Duration::from_millis(500);
 const _: () = assert!(
@@ -68,15 +68,12 @@ const _: () = assert!(
 /// Lower when the process's descriptor limit cannot carry this many (two
 /// descriptors each; see [`admission::session_cap`]).
 pub const MAX_SESSIONS: usize = 1024;
-/// Connections that have not finished their handshake and hello yet. A
-/// separate cap, with two refinements ([`admission::Pending`]): one source
-/// address may hold only a few of the slots, and the last quarter is a
-/// reserve for sources that have authenticated a worker before, so a flood
-/// of unknown addresses, each held for at most the handshake deadline,
-/// cannot lock the known fleet's reconnects out. The decision is made before
-/// TLS, from the address alone, and the known set lives in memory: after a
-/// controller restart every source is a stranger until its worker has
-/// authenticated once.
+/// Connections that have not finished their handshake and hello yet, a cap
+/// separate from [`MAX_SESSIONS`]; [`admission::Pending`] holds one source to
+/// a few slots and reserves the last quarter for sources that have
+/// authenticated a worker before. The decision is made before TLS, from the
+/// address alone, and the known set lives in memory: after a controller
+/// restart every source is a stranger until its worker has authenticated once.
 pub const MAX_PENDING: usize = 256;
 /// Spec resolutions running at once. Each may make GitHub round trips to
 /// mint a source token, so they run off the session threads, bounded.
@@ -96,13 +93,13 @@ const SPEC_TRIES: u32 = 3;
 const STORAGE_BATCH: i64 = 256;
 /// Directory entries one orphan sweep pass examines at most.
 const ORPHAN_SCAN_BUDGET: u32 = 4096;
-/// Batches of released logs one pass stamps at most (R01): a backlog after
+/// Batches of released logs one pass stamps at most: a backlog after
 /// an upgrade or an outage catches up without one pass holding on.
 const LOG_STAMP_ROUNDS: u32 = 16;
 /// How often the maintenance thread checks whether a pass is due.
 const MAINTENANCE_TICK: Duration = Duration::from_millis(250);
 
-/// How the controller runs storage maintenance (D06). Unset disables the
+/// How the controller runs storage maintenance. Unset disables the
 /// pass entirely — no deletions, no quota bookkeeping side effects.
 #[derive(Clone, Copy, Debug)]
 pub struct StoragePolicy {
@@ -152,7 +149,7 @@ pub struct Stats {
     pub handed_back: AtomicU64,
     /// Placement transactions (or the reads that precede them) the store
     /// failed. Each failure is also logged, by error kind only, at most once
-    /// a minute (P08-15): a fleet that stops placing leaves evidence.
+    /// a minute: a fleet that stops placing leaves evidence.
     pub placement_errors: AtomicU64,
     /// Expiry, queue-timeout, offer-lapse and revocation sweeps the store
     /// failed, counted and logged the same way. A sweep that found its row
@@ -160,10 +157,10 @@ pub struct Stats {
     /// worker acknowledgement or report the store refused transiently counts
     /// here too (stage `worker_message`), then waits for retry.
     pub sweep_errors: AtomicU64,
-    /// Prefetch hints sent (protocol 9, K05): one per session whose wanted
+    /// Prefetch hints sent (protocol 9): one per session whose wanted
     /// set changed.
     pub prefetch_hints: AtomicU64,
-    /// Live sessions closed because their worker was revoked (P08-7).
+    /// Live sessions closed because their worker was revoked.
     pub revoked_sessions: AtomicU64,
     /// Worker acknowledgements and reports whose store write failed for a
     /// transient reason and were kept to be applied by a later pass instead
@@ -380,7 +377,7 @@ struct Peer {
     disk_bytes: AtomicI64,
     /// The measured load its protocol-7 profile reported: CPU busy
     /// nanoseconds over the worker's sampling window, across all cores; 0
-    /// when unmeasured. Read by the dispatch sweep's ranking (Q03).
+    /// when unmeasured. Read by the dispatch sweep's ranking.
     load_ns: AtomicI64,
     /// Warm cache bytes its profile reported; 0 when unmeasured.
     cache_bytes: AtomicI64,
@@ -392,7 +389,7 @@ struct Peer {
     /// The session's negotiated protocol: bulk traffic and the profile are
     /// gated on it.
     protocol: u16,
-    /// The latest transport telemetry the worker reported (Q07).
+    /// The latest transport telemetry the worker reported.
     transport: Mutex<Option<TransportStats>>,
     /// Attempts verified as held by this worker for log frames, mapped to
     /// their (run, job) so the store path costs one read per attempt
@@ -459,7 +456,7 @@ struct SpecRequest {
     protocol: u16,
 }
 
-/// The bounded spec queue (P04-4): at most [`SPEC_RESOLVERS`] resolutions
+/// The bounded spec queue: at most [`SPEC_RESOLVERS`] resolutions
 /// run at once, the rest wait here in arrival order instead of being
 /// refused. A request already waiting or running for the same attempt is
 /// not queued twice, and a worker can have no more waiting than it may
@@ -568,15 +565,15 @@ struct Inner {
     logs: Arc<LogStore>,
     objects: Arc<Objects>,
     artifacts: Mutex<ArtifactState>,
-    /// Storage maintenance policy and when it last ran (D06).
+    /// Storage maintenance policy and when it last ran.
     storage: Mutex<Option<StoragePolicy>>,
-    /// What the remote cache store is held to (R01).
+    /// What the remote cache store is held to.
     remote_budget: AtomicU64,
     last_storage: AtomicI64,
     /// Set (and notified) at shutdown so the maintenance thread stops
     /// without waiting out its tick.
     maintenance: (Mutex<bool>, Condvar),
-    /// Where the controller keeps remote cache objects (Q08); `None` answers
+    /// Where the controller keeps remote cache objects; `None` answers
     /// every cache need as a miss.
     remote_cache: Mutex<Option<std::path::PathBuf>>,
     config: Arc<rustls::ServerConfig>,
@@ -628,7 +625,7 @@ const WARN_INTERVAL_MS: i64 = 60_000;
 /// first), then its measured load per reported millicore (the host's own
 /// busy time — work that is not ours counts too), then more warm cache
 /// first, then the smaller worker (best fit: the large worker's room stays
-/// for the jobs only it can run, Q10), then its id for a total order.
+/// for the jobs only it can run), then its id for a total order.
 fn rank(size: Ranked, held_millis: i64) -> (i64, i64, i64, i64, i64) {
     let cpu = size.cpu_millis.max(1);
     (
@@ -896,7 +893,7 @@ impl Inner {
         }
         self.stats.sessions_ended.fetch_add(1, Ordering::Relaxed);
         // Its unacknowledged offers lapse in the sweep; acknowledged leases
-        // run to expiry (W06), so a brief reconnect keeps its work.
+        // run to expiry, so a brief reconnect keeps its work.
     }
 
     /// Attach and serve a bulk connection: only the same certificate that
@@ -988,7 +985,7 @@ impl Inner {
     /// rounds ([`Inner::placement_pass`]). Storage maintenance runs on its
     /// own thread ([`Inner::maintenance_loop`]), never here. A sweep row
     /// that moved first (renewed, acknowledged, released) is skipped; any
-    /// other store failure is counted and logged (P08-15).
+    /// other store failure is counted and logged.
     fn dispatch_pass(&self) {
         // Verdicts and acknowledgements the store refused earlier go first,
         // so a passed job is settled before its lease is looked at.
@@ -1050,7 +1047,7 @@ impl Inner {
         self.prefetch_pass();
     }
 
-    /// K05: tell each idle or underused protocol-9 worker which images the
+    /// Tell each idle or underused protocol-9 worker which images the
     /// work still queued after placement needs and it does not hold
     /// (`dispatch::prefetch_hints` decides eligibility, fan-out and
     /// bounds). A session is sent a hint only when its wanted set changed
@@ -1113,7 +1110,7 @@ impl Inner {
     /// fingerprint of the revoked set; when it moved, every connected
     /// session of a revoked worker is closed and everything a revoked worker
     /// holds is fenced — acknowledged attempts `Reconciled`, offers lapsed —
-    /// within one reconciliation interval of the revocation (P08-7). The
+    /// within one reconciliation interval of the revocation. The
     /// store already refuses such a worker's acknowledgements, renewals,
     /// reports, logs, publications and cache transfers from the moment the
     /// row says revoked.
@@ -1171,10 +1168,9 @@ impl Inner {
     /// worker with nothing to take leaves the pass, and rounds repeat until
     /// none is left or each worker holds [`dispatch::MAX_HELD_ATTEMPTS`].
     /// A burst therefore spreads over the fleet by commitment and measured
-    /// load instead of filling whichever worker comes first (Q03, P08-6),
-    /// and the writer sees one round trip per round rather than one per
-    /// worker. Nothing is read or written when no job is ready at all
-    /// (P08-14).
+    /// load instead of filling whichever worker comes first, and the
+    /// writer sees one round trip per round rather than one per worker.
+    /// Nothing is read or written when no job is ready at all.
     fn placement_pass(&self) {
         // Below the low watermark, no new work is placed: a job that cannot
         // store its output must not consume capacity discovering that.
@@ -1205,8 +1201,8 @@ impl Inner {
             Ok(held) => held,
             Err(e) => return self.failed(true, "held", &e),
         };
-        // A stable index per worker for `Reach`; the order is the Q10 best
-        // fit, which is also `rank`'s tie-break.
+        // A stable index per worker for `Reach`; the order is the best
+        // fit (smallest first), which is also `rank`'s tie-break.
         peers.sort_unstable_by_key(|(worker, p)| (p.cpu_millis, p.memory_bytes, *worker));
         let reach = Reach::of(peers.iter().map(|(_, p)| (p.pool, p.size())));
         let mut active: Vec<usize> = (0..peers.len()).collect();
@@ -1327,7 +1323,7 @@ impl Inner {
         }
     }
 
-    /// Storage maintenance (D06): retire expired uploads and leases, expire
+    /// Storage maintenance: retire expired uploads and leases, expire
     /// artifact rows past their declared retention (their manifest versions
     /// retire with them, releasing object references), index un-indexed
     /// manifests, reclaim unreferenced objects, then sweep orphan files,
@@ -1338,7 +1334,7 @@ impl Inner {
     /// runs on the writer. Every unlink runs on the writer through
     /// [`Objects::unlink`], which re-checks ownership first.
     fn storage_pass(&self, now: UnixMillis) {
-        // A backup in progress holds this for its whole run (R04): nothing
+        // A backup in progress holds this for its whole run: nothing
         // it snapshotted may be deleted before it is copied. The pass
         // simply waits for the next interval.
         let Some(_maintenance) = self.objects.try_maintenance() else {
@@ -1372,7 +1368,7 @@ impl Inner {
         self.log_retention(now);
     }
 
-    /// Log retention (R01): stamp released attempts' logs with their stored
+    /// Log retention: stamp released attempts' logs with their stored
     /// bytes and deadline, expire the ones past it and delete their files,
     /// then sweep log directories the database no longer accounts for. The
     /// sizes are read and the files deleted off the writer; the writer only
@@ -1481,13 +1477,13 @@ impl Inner {
 /// How often the controller's remote-cache store is reclaimed.
 pub const REMOTE_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
-/// How long after its release an attempt may still offer what it sealed
-/// (P07-7): the worker's offer budget plus slack for publication and the
-/// terminal report's round trip.
+/// How long after its release an attempt may still offer what it sealed: the
+/// worker's offer budget plus slack for publication and the terminal
+/// report's round trip.
 pub const OFFER_WINDOW_MS: i64 = 10 * 60 * 1000;
 
 impl Inner {
-    /// Protocol 7 (Q08). The shared remote-cache gate: `attempt` is owned
+    /// The shared remote-cache gate: `attempt` is owned
     /// by `worker` (held, or released since `released_since` for an offer)
     /// and the transfer names exactly the job's tenant and repository and a
     /// trust class the job's admits. `Some(root)` to serve from; a refusal
@@ -1589,7 +1585,7 @@ impl Inner {
     }
 
     /// The attempt was released: its open log writer and cached scope go
-    /// with it, so neither grows with uptime (P04-23).
+    /// with it, so neither grows with uptime.
     fn released(&self, worker: WorkerId, attempt: AttemptId) {
         self.logs.forget(attempt);
         if let Some(peer) = self.peer(worker) {
@@ -1914,9 +1910,9 @@ impl Inner {
     /// A spec refused for good because a declared secret cannot be
     /// delivered — revoked, deleted, unbound, ambiguous — is settled here
     /// as the preparation failure it is, with a value-free detail naming
-    /// the secret and why (P10D-7); the refused use was audited once by the
-    /// `secrets::deliver` that refused it (P10S-6). The worker's own `Failed` report after `NoSpec` is then
-    /// stale and changes nothing. Any other refusal is left to that report.
+    /// the secret and why; the refused use was audited once by the
+    /// `secrets::deliver` that refused it. The worker's own `Failed` report
+    /// after `NoSpec` is then stale and changes nothing. Any other refusal is left to that report.
     fn refuse_secrets(&self, request: &SpecRequest) {
         let (worker, attempt) = (request.worker, request.attempt);
         let settled = self.write(move |tx| {
@@ -1959,7 +1955,7 @@ impl Inner {
     /// fault is retried a few times and then left unanswered: the worker
     /// asks again, and hands the attempt back if it never gets it, so a
     /// fault never turns into an infrastructure failure of a job that did
-    /// not run (P04-4).
+    /// not run.
     fn serve_spec(&self, request: &SpecRequest) {
         let (worker, attempt) = (request.worker, request.attempt);
         match self.spec_gate(request) {
@@ -2072,7 +2068,7 @@ impl Admission for Inner {
                 let id = known.id;
                 let renegotiated = (known.negotiated != negotiated).then_some(negotiated);
                 let immediate = (!deferred).then_some(capacity);
-                // What it runs, for skew reports (R05): written only when
+                // What it runs, for skew reports: written only when
                 // it changed, so a reconnect costs no write.
                 let software = workers::software_label(&hello.software)
                     .filter(|s| known.software.as_deref() != Some(s.as_str()));
@@ -2364,7 +2360,7 @@ impl SessionHandler for Inner {
         Ok(())
     }
 
-    /// Protocol 7 (Q07). The worker's latest transport telemetry, kept on
+    /// Protocol 7. The worker's latest transport telemetry, kept on
     /// its session for operators and diagnostics.
     fn transport(&self, worker: WorkerId, stats: &TransportStats) {
         if let Some(peer) = self.peer(worker) {
@@ -2372,7 +2368,7 @@ impl SessionHandler for Inner {
         }
     }
 
-    /// Protocol 7 (Q08). Authorizes a download: the fenced attempt must be
+    /// Protocol 7. Authorizes a download: the fenced attempt must be
     /// held by the worker, and the need's tenant, repo and trust class must
     /// equal the attempt's — the worker never names a boundary it does not
     /// hold. The controller's remote-cache root is returned to serve from;
@@ -2386,10 +2382,10 @@ impl SessionHandler for Inner {
         )
     }
 
-    /// Protocol 7 (Q08). Authorizes an upload under the same boundary rule
+    /// Protocol 7. Authorizes an upload under the same boundary rule
     /// as a download before any bytes are staged — except that the attempt
     /// may already be released: a worker offers what it sealed only after
-    /// its terminal report (P07-7), so the same worker's attempt released
+    /// its terminal report, so the same worker's attempt released
     /// within [`OFFER_WINDOW_MS`] still names its boundary.
     fn cache_offer(&self, worker: WorkerId, upload: &Upload) -> Option<std::path::PathBuf> {
         let since = UnixMillis(UnixMillis::steady().0 - OFFER_WINDOW_MS);
@@ -2487,10 +2483,10 @@ impl SessionHandler for Inner {
         }
     }
 
-    /// Fenced on the declining worker (P04-25): only the holder of the
+    /// Fenced on the declining worker: only the holder of the
     /// offer, under its fence, can give it back — an unacknowledged offer,
     /// or an acknowledged attempt it never started because the spec never
-    /// arrived (P04-4). Either goes back to the queue, or ends `canceled`.
+    /// arrived. Either goes back to the queue, or ends `canceled`.
     fn declined(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {
         if let Ok(state) = self
             .write(move |tx| dispatch::decline(tx, worker, attempt, fence, UnixMillis::steady()))
@@ -2514,7 +2510,7 @@ impl SessionHandler for Inner {
         }
         // One read snapshot: the attempt's ownership scope, its encoded spec,
         // whether the artifact already has a row, the run's budget base and
-        // whether its repository is still under its own quota (R01).
+        // whether its repository is still under its own quota.
         let deployment = self.objects.deployment();
         let scope = self.store.read(|c| {
             let tx = c.unchecked_transaction()?;
@@ -3113,21 +3109,21 @@ impl Controller {
         );
     }
 
-    /// Enable storage maintenance (D06). Unset keeps every byte forever.
+    /// Enable storage maintenance. Unset keeps every byte forever.
     pub fn set_storage_policy(&self, policy: StoragePolicy) {
         *self.inner.storage.lock().unwrap_or_else(|p| p.into_inner()) = Some(policy);
     }
 
-    /// The byte budget the remote cache store is held to (R01; default
+    /// The byte budget the remote cache store is held to (default
     /// `remote::STORE_BUDGET_BYTES`), from its next reclamation pass on.
     pub fn set_remote_cache_budget(&self, bytes: u64) {
         self.inner.remote_budget.store(bytes, Ordering::Relaxed);
     }
 
-    /// Where the controller keeps remote cache objects (Q08), normally
+    /// Where the controller keeps remote cache objects, normally
     /// `<data_dir>/remote-cache`. Unset answers every cache need `denied`;
     /// the directory itself is created lazily by the first upload. Setting
-    /// it starts the store's reclamation (P08-C4): one bounded
+    /// it starts the store's reclamation: one bounded
     /// `remote::sweep_store` pass now and every [`REMOTE_SWEEP_INTERVAL`] —
     /// one bundle per entry, abandoned uploads removed, and the store held
     /// to `remote::STORE_BUDGET_BYTES`, least recently served first.
@@ -3414,7 +3410,7 @@ impl Handle {
         self.0.wake();
     }
 
-    /// The link's counters (R06: what `/metrics` reports).
+    /// The link's counters, as `/metrics` reports them.
     pub fn stats(&self) -> &Stats {
         &self.0.stats
     }
@@ -3429,7 +3425,7 @@ impl Handle {
             .collect()
     }
 
-    /// The latest transport telemetry the worker reported (Q07): direct or
+    /// The latest transport telemetry the worker reported: direct or
     /// relayed path, round-trip time, reconnects, helper version and byte
     /// counters. `None` until a protocol-7 worker reports one.
     pub fn transport(&self, worker: WorkerId) -> Option<TransportStats> {
@@ -4022,7 +4018,7 @@ mod tests {
         }
     }
 
-    /// Q03's ranking, in its order of precedence: commitment, then measured
+    /// The ranking, in its order of precedence: commitment, then measured
     /// load per core, then warm cache, then the smaller worker.
     #[test]
     fn the_sweep_ranks_workers_by_commitment_then_load_then_cache_then_size() {
@@ -4037,11 +4033,11 @@ mod tests {
         assert!(rank(ranked(16_000, 200_000_000, 0), 0) < rank(ranked(8_000, 200_000_000, 0), 0));
         // Equal load: more warm cache first.
         assert!(rank(ranked(8_000, 0, 1 << 30), 0) < rank(idle, 0));
-        // Everything equal: the smaller worker (Q10's best fit).
+        // Everything equal: the smaller worker (best fit).
         assert!(rank(ranked(2_500, 0, 0), 0) < rank(idle, 0));
     }
 
-    /// P04-4: a burst of spec requests past the resolver bound is queued and
+    /// A burst of spec requests past the resolver bound is queued and
     /// every one is served, never refused; duplicates are not queued twice,
     /// and a worker cannot queue more than it may hold.
     #[test]

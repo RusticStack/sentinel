@@ -1,6 +1,6 @@
-//! The worker link (W01): a worker-generated TLS identity, mutually
-//! authenticated persistent sessions pinned in both directions, bounded
-//! framing, hello/negotiation and heartbeat.
+//! The worker link: a worker-generated TLS identity, mutually authenticated
+//! persistent sessions pinned in both directions, bounded framing,
+//! hello/negotiation and heartbeat.
 //!
 //! There is no certificate authority. A worker generates its own certificate;
 //! the controller learns its fingerprint at enrollment and afterwards accepts
@@ -8,17 +8,17 @@
 //! fingerprint with its enrollment and accepts exactly that server. Identity is
 //! a key you hold, not a name somebody vouched for.
 //!
-//! W02 adds the dispatch loop on top: a `controller` (behind the feature of
-//! that name, which brings in the store) that listens, admits, places work
-//! and pushes fenced offers; and a `worker` loop that reconnects with
-//! back-off, answers offers and renews its leases on every heartbeat.
+//! The dispatch loop sits on top: a `controller` (behind the feature of that
+//! name, which brings in the store) that listens, admits, places work and
+//! pushes fenced offers; and a `worker` loop that reconnects with back-off,
+//! answers offers and renews its leases on every heartbeat.
 //!
-//! Protocol 7 splits an established session in two: the control connection
-//! keeps heartbeats, offers and reports, and a second bulk connection (same
-//! identity, opened with `BulkHello`) carries logs, spec chunks, artifacts
-//! and cache transfers, each behind its own lock. The optional `tailcat`
-//! module runs the pinned helper for the Q06 transport; without it the link
-//! uses direct TLS exactly as before.
+//! An established session has two connections of one identity: the control
+//! connection keeps heartbeats, offers and reports, and a bulk connection
+//! (opened with `BulkHello`) carries logs, spec chunks, artifacts and cache
+//! transfers, each behind its own lock. The `tailcat` module runs the pinned
+//! helper for the optional NAT-traversing transport; without it the link uses
+//! direct TLS.
 
 #[cfg(feature = "controller")]
 mod admission;

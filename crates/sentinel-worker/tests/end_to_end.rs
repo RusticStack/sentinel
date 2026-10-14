@@ -1,4 +1,4 @@
-//! W03 end to end: a controller with a store, a worker with the real
+//! End to end: a controller with a store, a worker with the real
 //! executor over loopback TLS, a local repository and a busybox image by
 //! digest. A run is enqueued; the worker enrolls, takes the offer, fetches
 //! the spec, checks out the pinned commit, runs the steps in a rootless
@@ -141,7 +141,6 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
     git(&repo, &["commit", "-q", "-m", "one"]);
     let sha = git(&repo, &["rev-parse", "HEAD"]);
 
-    // Controller.
     let store =
         Arc::new(Store::open(temp.path().join("metadata.sqlite"), Durability::Normal).unwrap());
     let (root, tenant, repo_id, pool) =
@@ -246,7 +245,7 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
     let worker_id = WorkerId::new();
     // The inspect-job redaction fixture prints a synthetic value. Register it
     // before each attempt so the test covers redaction from its first output;
-    // `secret_use` below exercises the separate S05 delivery path.
+    // `secret_use` below exercises the separate secret delivery path.
     let registrar: Arc<std::sync::OnceLock<Executor>> = Arc::new(std::sync::OnceLock::new());
     let hook = Arc::clone(&registrar);
     let executor = Executor::start(

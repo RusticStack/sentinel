@@ -52,7 +52,7 @@ fn sealed_database(data: &std::path::Path) {
         .unwrap();
 }
 
-/// P10S-4: the controller reads only `<data_dir>/master.key`; with sealed
+/// The controller reads only `<data_dir>/master.key`; with sealed
 /// values stored and that key missing or not matching, it exits 2 before
 /// listening instead of starting and failing each secret at first use.
 #[test]
@@ -78,7 +78,7 @@ fn the_server_refuses_to_start_without_the_key_its_sealed_values_need() {
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("does not open"));
 }
 
-/// P10S-5: rotate, reseal and retire through the operator's commands leave
+/// Rotate, reseal and retire through the operator's commands leave
 /// a one-key file that still opens every stored value.
 #[test]
 fn admin_reseal_then_retire_leaves_one_key_that_opens_everything() {

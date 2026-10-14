@@ -1,7 +1,7 @@
 //! Typed `.sentinel.yml` schema version 1 and its strict decoder. Every key
 //! is known, every value is typed and bounded, and every error names the
 //! path that produced it. Expressions (`${{ … }}`) are kept as opaque
-//! strings here; their grammar is C06.
+//! strings here; their grammar lives in the `expr` module.
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -384,8 +384,8 @@ fn string_list(path: &str, node: &Node, max: usize, item_max: usize) -> Result<V
 ///   manual: true
 /// ```
 ///
-/// The mapping form is the widening: every filter is optional, and an empty
-/// filter (`push: {}` or `push:`) means every branch of that kind.
+/// In the mapping form every filter is optional, and an empty filter
+/// (`push: {}` or `push:`) means every branch of that kind.
 fn parse_triggers(path: &str, node: &Node) -> Result<Triggers> {
     let mut triggers = Triggers::default();
     match node {
@@ -1423,7 +1423,7 @@ mod tests {
                 "schema: 1\non: [push]\njobs:\n  a:\n    image: busybox\n    resources: {{ cpu: \"{cpu}\" }}\n    steps:\n      - id: s\n        run: echo\n"
             )
         };
-        // `éé0` puts byte 3 inside the second `é`.
+        // The two-character fraction is 4 bytes; byte 3 is inside the second char.
         assert!(crate::compile_str(&doc("1.éé")).is_err());
         assert!(crate::compile_str(&doc("0.€")).is_err());
         assert!(crate::compile_str(&doc("0.5")).is_ok());
@@ -1473,8 +1473,7 @@ jobs:
 
     #[test]
     fn cache_class_parses_or_defaults() {
-        // Absent `class` is `dependencies`: the exact rule is the only one
-        // that is never wrong to assume.
+        // Absent `class` is `dependencies`.
         let default =
             cache_of("      - name: c\n        key: k\n        paths: [target]\n").unwrap();
         assert_eq!(default.class, Class::Dependencies);

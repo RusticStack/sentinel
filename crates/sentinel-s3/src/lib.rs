@@ -1,4 +1,4 @@
-//! The optional external S3 blob adapter (R02): a small, synchronous client
+//! The optional external S3 blob adapter: a small, synchronous client
 //! for the S3 operations Sentinel's storage needs, signed with Signature V4
 //! over the same rustls/ring stack as the rest of the controller. No SDK,
 //! no async runtime, no MinIO dependency — any endpoint that speaks the S3

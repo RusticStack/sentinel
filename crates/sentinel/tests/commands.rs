@@ -1,4 +1,4 @@
-//! The O05 commands end to end, portable: the real `sentinel` binary with a
+//! The commands end to end, portable: the real `sentinel` binary with a
 //! static credential against an in-process controller API on loopback.
 //! Listing pages stream as NDJSON, `wait` exits 0/8/7, an artifact entry
 //! downloads with its digest checked, `not_found` and `conflict` keep their
@@ -195,7 +195,7 @@ fn lease(d: &Deployment, job: JobId) -> (WorkerId, AttemptId, Fence) {
 
 /// A worker the store knows: its own dedicated pool of the tenant and a
 /// host-local enrollment. Acknowledgements and reports come only from a
-/// registered, unrevoked worker (P08-7).
+/// registered, unrevoked worker.
 fn enrolled_worker(
     tx: &sentinel_store::Transaction<'_>,
     tenant: TenantId,
@@ -671,7 +671,7 @@ fn wait_rides_out_rate_limited_answers_instead_of_failing() {
     // Other long polls hold every subscriber slot for about 2 s.
     let (_, answer) = plain_get(&format!("{}/api/v1/runs/{busy}/wait", d.base), &d.token);
     let version = answer["version"].as_str().unwrap().to_owned();
-    // Other users hold them, each within its per-user share (P09-12).
+    // Other users hold them, each within its per-user share.
     const NAMES: [&str; 8] = [
         "holder-0", "holder-1", "holder-2", "holder-3", "holder-4", "holder-5", "holder-6",
         "holder-7",
@@ -690,7 +690,7 @@ fn wait_rides_out_rate_limited_answers_instead_of_failing() {
         .collect();
     thread::sleep(Duration::from_millis(300));
     // Every slot is taken: a parking poll now is refused, so the CLI below
-    // really meets `rate_limited` (P09-18) rather than parking at once.
+    // really meets `rate_limited` rather than parking at once.
     let (_, now) = plain_get(&format!("{}/api/v1/runs/{run}/wait", d.base), &d.token);
     let (status, refused) = plain_get(
         &format!(
@@ -723,7 +723,7 @@ fn wait_rides_out_rate_limited_answers_instead_of_failing() {
     assert_eq!(code(&out), 8, "finished, not busy: {}", stderr(&out));
 }
 
-/// P09-11: `log show` over a log far larger than the client's 10 MiB body
+/// `log show` over a log far larger than the client's 10 MiB body
 /// limit — full 32 KiB frames — prints every frame: the server bounds each
 /// page in bytes and the CLI follows `next_after`.
 #[test]
@@ -765,7 +765,7 @@ fn log_show_reads_a_log_of_full_frames_past_the_client_body_limit() {
     assert_eq!(seqs, (1..=frames).collect::<Vec<_>>());
 }
 
-/// P09C-6: `log show --output json` holds its document whole, so it is
+/// `log show --output json` holds its document whole, so it is
 /// bounded by bytes (16 MiB of frame text) as well as by frames, and a cut
 /// document says where to continue.
 #[test]
@@ -805,7 +805,7 @@ fn log_show_json_stops_at_its_byte_budget_with_a_continuation() {
     assert_eq!(stdout(&out).lines().count(), frames as usize);
 }
 
-/// P09-16: when the match cap falls inside one frame's matches, the resume
+/// When the match cap falls inside one frame's matches, the resume
 /// point is before that frame, so its remaining matches are not skipped.
 #[test]
 fn log_search_cut_inside_a_frame_resumes_before_it() {

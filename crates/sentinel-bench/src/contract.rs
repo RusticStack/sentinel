@@ -1,4 +1,4 @@
-//! Frozen benchmark contracts (B01, `sentinel.bench-contract/1`): what a
+//! Frozen benchmark contracts (`sentinel.bench-contract/1`): what a
 //! representative check is, on which host, with which sources, images,
 //! tools, allocation and cold/warm/small-edit procedure. The runner measures
 //! a contract lane only when the host and inputs match the contract, and

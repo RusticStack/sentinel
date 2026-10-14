@@ -1,5 +1,5 @@
-//! U07 over real HTTP on loopback: GitHub web sign-in through the browser
-//! pages, against the A04 flow's GitHub-shaped fake
+//! GitHub web sign-in over real HTTP on loopback, through the browser
+//! pages, against the GitHub-shaped fake
 //! (`sentinel_github::fake`), with this test playing the browser — a cookie
 //! jar, following the pages' links and the `303`s the way a browser does.
 //!
@@ -999,7 +999,7 @@ fn a_github_sign_in_replaces_the_browsers_previous_session() {
     assert_eq!(sessions_of(&d, octo), 0);
 }
 
-/// P09S-10: the previous session is revoked in a real browser. GitHub's
+/// The previous session is revoked in a real browser. GitHub's
 /// redirect back is cross-site, so the Strict session cookie is not sent to
 /// the callback, which therefore issues and revokes nothing; the same-origin
 /// hop its page starts does carry it, and that hop ends the old session and
@@ -1370,7 +1370,7 @@ fn a_github_only_account_enrolls_a_second_factor_and_can_then_step_up() {
     let recovery = body["recovery_codes"][0].as_str().unwrap().to_owned();
 
     // A later GitHub sign-in is a cold session; the recovery code steps it
-    // up, which a GitHub-only account could not do before.
+    // up.
     let (later, later_csrf) = sign_in(&d);
     let (status, body) = api_post(
         &d,

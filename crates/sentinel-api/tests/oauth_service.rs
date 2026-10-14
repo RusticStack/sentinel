@@ -1,4 +1,4 @@
-//! O06 over real HTTP on loopback: a tenant administrator creates a service
+//! Service-account grants over real HTTP on loopback: a tenant administrator creates a service
 //! account, allows it a repository and issues it a grant; the agent refreshes
 //! and reads runs; the grant is listed as metadata and revoked, after which
 //! its refresh token is `invalid_grant`. Plus the refusals: non-admins,
@@ -676,7 +676,7 @@ fn a_narrow_token_manages_only_its_own_grant() {
 }
 
 /// A tenant the caller has no part in is the same `not_found` as one that
-/// does not exist, on every service-account route (P02-9: routes resolve
+/// does not exist, on every service-account route (routes resolve
 /// slugs through the membership-checked lookup).
 #[test]
 fn a_foreign_tenant_is_not_found_like_a_missing_one() {

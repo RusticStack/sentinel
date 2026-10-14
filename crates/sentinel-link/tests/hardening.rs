@@ -1,4 +1,4 @@
-//! Part 04 audit hardening of the link: a retryable refusal is retried, a
+//! Hardening of the link: a retryable refusal is retried, a
 //! reconnect renegotiates and is recorded, a welcome outside the hello's
 //! range is refused, a transient log fault is never a permanent refusal,
 //! an idle bulk connection lives as long as its session, and peers that
@@ -225,7 +225,7 @@ fn stand_in(
     (addr, fingerprint, bulk_ended)
 }
 
-/// P04-1: `Unavailable` is the controller's "try again later". The worker
+/// `Unavailable` is the controller's "try again later". The worker
 /// backs off and retries it; it does not stop for good.
 #[test]
 fn an_unavailable_refusal_is_retried_and_the_worker_connects() {
@@ -323,7 +323,7 @@ fn an_unavailable_refusal_is_retried_and_the_worker_connects() {
     ));
 }
 
-/// P04-2: a welcome at a version the hello did not offer is refused by the
+/// a welcome at a version the hello did not offer is refused by the
 /// worker instead of failing on its first frame.
 #[test]
 fn a_welcome_outside_the_hellos_range_is_refused() {
@@ -353,7 +353,7 @@ fn a_welcome_outside_the_hellos_range_is_refused() {
     assert!(matches!(refused, Error::Protocol(_)), "{refused}");
 }
 
-/// P04-11: a transient controller fault on a log frame closes the
+/// a transient controller fault on a log frame closes the
 /// connection so the worker resends; it is never answered `LogRefused`,
 /// which would end the attempt's log for good.
 #[test]
@@ -407,7 +407,7 @@ fn a_transient_log_fault_closes_the_connection_instead_of_refusing() {
     assert_eq!(handler.logs.load(Ordering::SeqCst), 1);
 }
 
-/// P04-13: bulk has no heartbeat of its own; while its control session is
+/// bulk has no heartbeat of its own; while its control session is
 /// alive an idle bulk connection is kept past the heartbeat deadline, and
 /// it ends once the control session does.
 #[test]
@@ -531,7 +531,7 @@ impl Deployment {
     }
 }
 
-/// P04-2: every hello renegotiates. A worker enrolled at protocol 6 that
+/// every hello renegotiates. A worker enrolled at protocol 6 that
 /// reconnects offering 7 is welcomed at 7 and records it (so its profile —
 /// and with it its disk — reaches placement); rolled back to 5 it is
 /// welcomed at 5, never at a version it cannot speak.
@@ -580,7 +580,7 @@ fn a_reconnecting_worker_is_renegotiated_and_recorded() {
     assert_eq!(stored(&d), ProtocolVersion(5));
 }
 
-/// P04-9: connections that never finish their handshake hold a slot of the
+/// connections that never finish their handshake hold a slot of the
 /// small pre-admission cap for at most the handshake deadline — a byte
 /// dripped now and then does not extend it — and an enrolled worker gets
 /// in once they are cut.

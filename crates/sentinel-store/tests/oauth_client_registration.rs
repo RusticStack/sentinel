@@ -1,4 +1,4 @@
-//! X06 registered OAuth clients are bounded public MCP clients, independent
+//! Registered OAuth clients are bounded public MCP clients, independent
 //! from human/service identities and their grants.
 
 use sentinel_auth::oauth::pkce;
@@ -247,7 +247,7 @@ fn grant_for(store: &Store, user: UserId, client: &str, now: UnixMillis) {
     .unwrap();
 }
 
-/// P09S-2 / P11-1: a flood fills the enabled-registration cap, but it can
+/// A flood fills the enabled-registration cap, but it can
 /// neither lock onboarding out for good nor displace a client in use.
 /// Maintenance reclaims what never obtained a grant, and no SQL is needed.
 #[test]

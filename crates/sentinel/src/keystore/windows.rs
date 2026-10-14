@@ -1,6 +1,7 @@
 //! Windows Credential Manager backend: one `CRED_TYPE_GENERIC` credential per
 //! profile, persisted `CRED_PERSIST_LOCAL_MACHINE` (this user, this machine,
-//! not roamed), keyed by `sentinel:{issuer}:{profile}`.
+//! not roamed), keyed by the key the profile recorded ([`super::key`],
+//! [`super::scoped_key`]).
 
 use std::{io, ptr};
 
@@ -115,7 +116,7 @@ pub fn delete(key: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Held while a legacy shared entry is refreshed (P09C-8): the entry is
+/// Held while a legacy shared entry is refreshed: the entry is
 /// shared by every configuration directory of this user, while profile
 /// locks live in each directory, so two directories could otherwise both
 /// present its refresh token at once. A named mutex in this logon

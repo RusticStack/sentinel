@@ -1,4 +1,4 @@
-//! Durable event intake and resolution (G02/G03).
+//! Durable event intake and resolution.
 //!
 //! Two authenticated shapes feed one store: a generic relay submits a
 //! ref-update document under a repository hook secret, and GitHub delivers a
@@ -10,7 +10,7 @@
 //! deliveries against their source binding and then, through the [`Resolver`],
 //! mint source access, reads the pipeline from the policy-selected pinned
 //! revision, compiles it and creates one immutable run — or settles an
-//! explicit outcome an operator and G04's Checks publisher can read.
+//! explicit outcome an operator and the Checks publisher can read.
 pub mod ingest;
 pub mod lane;
 pub mod poll;

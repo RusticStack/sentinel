@@ -39,7 +39,7 @@ const TAG_LEN: usize = 16;
 /// retained retry record, never a ciphertext.
 const FINGERPRINT_CONTEXT: &str = "sentinel 2026-09-26 stored request fingerprint v1";
 
-/// Unambiguous ownership context for future tenant or repository secrets.
+/// Unambiguous ownership context for tenant or repository secrets.
 /// The caller validates the name and supplies the durable secret version.
 pub fn secret_context(
     tenant: &[u8; 16],
@@ -407,7 +407,7 @@ impl Key {
 }
 
 /// Open the key file once and judge the opened handle, so the file checked
-/// is the file read (P10S-9): see [`crate::secret_file`]. The buffer is
+/// is the file read: see [`crate::secret_file`]. The buffer is
 /// sized up front: no reallocation leaves an unwiped copy of key material
 /// behind.
 fn read_key_file(path: &Path) -> Result<KeyBytes, SealError> {
@@ -436,7 +436,7 @@ fn pending_path(path: &Path, id: u32) -> std::path::PathBuf {
 
 /// A staged key file is never active and staging runs under the database
 /// ownership lock, so one left by an interrupted rotation is removed rather
-/// than blocking every later rotation (P10S-10).
+/// than blocking every later rotation.
 fn clear_pending(staged: &Path) -> Result<(), SealError> {
     match std::fs::remove_file(staged) {
         Ok(()) => Ok(()),
@@ -680,7 +680,7 @@ mod tests {
         }
     }
 
-    /// P10S-10: an interrupted rotation leaves `master.key-N-pending`; the
+    /// An interrupted rotation leaves `master.key-N-pending`; the
     /// next rotation replaces it instead of failing for good.
     #[test]
     fn a_stale_pending_key_file_does_not_block_rotation() {
@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(Key::load(&path).unwrap().active_id(), 2);
     }
 
-    /// P10S-5: after every ciphertext is resealed, retiring keeps only the
+    /// After every ciphertext is resealed, retiring keeps only the
     /// active key: old ciphertext no longer opens, resealed ciphertext does,
     /// and rotation is available again however many times it ran before.
     #[test]
@@ -739,7 +739,7 @@ mod tests {
         assert!(Key::rotate(&path, &dir.path().join("after-retire")).is_ok());
     }
 
-    /// P10S-1: the stored fingerprint is a MAC under a subkey of the master
+    /// The stored fingerprint is a MAC under a subkey of the master
     /// key, so it differs across keys and cannot be recomputed from the
     /// request alone.
     #[test]

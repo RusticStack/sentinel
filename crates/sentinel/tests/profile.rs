@@ -1,5 +1,5 @@
-//! Profiles, credential storage and the `sentinel auth`/`context` commands
-//! (O04), portable. The OAuth server is a scripted fake on loopback that
+//! Profiles, credential storage and the `sentinel auth`/`context` commands,
+//! portable. The OAuth server is a scripted fake on loopback that
 //! speaks the fixed wire contract (`sentinel_protocol::oauth`); every test
 //! uses its own `SENTINEL_CONFIG_DIR` and the file store, except the one
 //! Windows Credential Manager test. Nothing the CLI prints may contain
@@ -45,8 +45,6 @@ const SCOPES: [&str; 10] = [
 fn token(prefix: &str, n: u64) -> String {
     format!("{prefix}{n:064x}")
 }
-
-// ---------------------------------------------------------------- fake server
 
 #[derive(Clone, Debug)]
 struct Req {
@@ -241,8 +239,6 @@ fn oauth_server(token_endpoint: impl Fn(&Req) -> (u16, String) + Send + Sync + '
     )
 }
 
-// ------------------------------------------------------------------- helpers
-
 fn config(dir: &tempfile::TempDir) -> Config {
     Config::at(dir.path().join("cfg")).unwrap()
 }
@@ -330,8 +326,6 @@ fn assert_no_tokens(output: &Output) {
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
-
-// --------------------------------------------------------------------- tests
 
 #[test]
 fn a_profile_round_trips_and_profiles_json_holds_no_secret() {
@@ -562,7 +556,7 @@ fn a_refused_refresh_is_exit_3_with_the_login_command() {
     assert_eq!(handle.access_token(&agent()).unwrap_err().exit, Exit::Busy);
 }
 
-/// P09-2: a refresh that meets a busy authorization server retries once
+/// A refresh that meets a busy authorization server retries once
 /// after the server's `retry-after`, instead of failing the command.
 #[test]
 fn a_busy_token_endpoint_is_retried_once() {
@@ -638,7 +632,7 @@ fn the_loopback_listener_checks_state_and_issuer_and_ignores_other_paths() {
     assert!(favicon.contains("404"), "{favicon}");
     assert!(ok.contains("200"), "{ok}");
 
-    // P09C-4: a callback with another `state` (a stray process or a web
+    // A callback with another `state` (a stray process or a web
     // page that found the port), a denial for another login, and an idle
     // connection that never sends a head: each answered or left, none ends
     // the wait or holds it up, and this login's callback then wins at once.
@@ -1213,7 +1207,7 @@ fn context_use_sets_the_profile_default_tenant() {
     assert_eq!(output.status.code(), Some(2));
 }
 
-/// P09-10: outside `%APPDATA%` the file store must still be owner-only. A
+/// Outside `%APPDATA%` the file store must still be owner-only. A
 /// directory under the temporary directory inherits a broad ACL; after a
 /// credential write the `credentials` directory and its file grant only
 /// this user and SYSTEM, with inheritance cut.
@@ -1369,7 +1363,7 @@ fn windows_credential_manager_stores_reads_and_deletes() {
     assert_eq!(config.read_credentials("default", &entry).unwrap(), None);
 }
 
-/// P09C-3: `profiles.json` decides where refresh tokens go (`issuer`) and
+/// `profiles.json` decides where refresh tokens go (`issuer`) and
 /// which OS-store entry is read and deleted (`key`). An entry no sign-in
 /// could have written is refused before anything is sent or deleted.
 #[test]
@@ -1424,7 +1418,7 @@ fn a_tampered_profile_is_refused_before_any_request() {
     assert_eq!(handle.access_token(&agent()).unwrap(), token("sntl_at_", 2));
 }
 
-/// P09C-3: on Windows a configuration directory that existed before —
+/// On Windows a configuration directory that existed before —
 /// here one another account can modify — is refused (exit 2) the way Unix
 /// refuses a loose mode, `doctor` reports it, and the `icacls` command the
 /// refusal names fixes it.
@@ -1484,7 +1478,7 @@ fn windows_a_preexisting_configuration_directory_others_can_modify_is_refused() 
     assert_eq!(report["checks"][0]["ok"], true, "{}", stderr(&output));
 }
 
-/// P09C-8: profiles signed in before OS-store keys named their directory
+/// Profiles signed in before OS-store keys named their directory
 /// share one Credential Manager entry per profile name and issuer. The
 /// next refresh moves this directory's credential to its own key; an entry
 /// that turns out to hold another directory's sign-in is left to it.
@@ -1596,7 +1590,7 @@ fn windows_a_legacy_shared_entry_moves_to_its_directory_or_is_left_to_its_owner(
     );
 }
 
-/// P09C-8 residual: two configuration directories refresh the same legacy
+/// Two configuration directories refresh the same legacy
 /// shared entry at the same moment. The token endpoint holds the first
 /// refresh until a second one arrives (or a second has passed), so without
 /// serialization both directories present the same refresh token. With the

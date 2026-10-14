@@ -1,4 +1,4 @@
-//! The device authorization flow over HTTP (O03, RFC 8628): `POST
+//! The device authorization flow over HTTP (RFC 8628): `POST
 //! /oauth/device_authorization`, the device-code branch of the token
 //! endpoint with its in-memory `slow_down` limiter, and the `GET`/`POST
 //! /device` approval page ([`page`], in `device/page.rs`).

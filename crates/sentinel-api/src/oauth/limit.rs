@@ -1,4 +1,4 @@
-//! Admission for the unauthenticated OAuth endpoints (O02/O03): bounded,
+//! Admission for the unauthenticated OAuth endpoints: bounded,
 //! and fair enough that one client cannot take every other client's turn.
 //!
 //! Each [`Budget`] is a [`Limiter`]: a per-client bucket in a bounded map,
@@ -271,8 +271,8 @@ mod tests {
         assert!(bucket.take(start + Duration::from_secs(60), RATE));
     }
 
-    /// The old bucket credited whole milliseconds and then reset its clock,
-    /// so arrivals under a millisecond apart never refilled it.
+    /// Arrivals under a millisecond apart still refill the bucket: nothing is
+    /// lost to whole-millisecond rounding.
     #[test]
     fn sub_millisecond_arrivals_still_refill_at_the_rate() {
         let start = Instant::now();
@@ -333,7 +333,7 @@ mod tests {
         assert_eq!(key(mapped, None), key(public, None));
     }
 
-    /// P09S-9: a neighbour on a private network reaching the listener
+    /// A neighbour on a private network reaching the listener
     /// directly is not the proxy, and cannot mint keys through the header.
     #[test]
     fn private_peers_are_proxies_only_when_configured() {

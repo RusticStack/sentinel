@@ -1,14 +1,12 @@
-//! Tenant suspension, revocation propagation and pool grants (A07).
+//! Tenant suspension, revocation propagation and pool grants.
 //!
-//! Revoking authority is only half a decision; the other half is what happens
-//! to the work and the connections that already hold it. This module makes
-//! both halves one transaction: suspending a tenant stops intake by flipping
-//! the flag every predicate already joins on, revokes the credentials scoped to
-//! it, requests cancellation of its live jobs, and bumps the tenant's
+//! Suspending a tenant is one transaction: it stops intake by flipping the
+//! flag every predicate joins on, revokes the credentials scoped to the
+//! tenant, requests cancellation of its live jobs, and bumps the tenant's
 //! authorization epoch so anything long-lived re-authorizes.
 //!
-//! Retained evidence — runs, logs, artifacts — is not touched: suspension is a
-//! stop, not a deletion, and later retention policy (Part 13) decides the rest.
+//! Retained evidence (runs, logs, artifacts) is not touched: suspension is a
+//! stop, not a deletion.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{
@@ -48,7 +46,7 @@ pub(crate) fn bump_epoch(tx: &Transaction<'_>, tenant: TenantId) -> Result<()> {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Suspension {
     /// Credentials scoped to the tenant, including every service account's:
-    /// API credentials and OAuth grants (O02) alike.
+    /// API credentials and OAuth grants alike.
     pub tokens_revoked: usize,
     /// Unspent invitations into the tenant.
     pub invitations_revoked: usize,
@@ -176,9 +174,8 @@ pub fn reactivate(
 }
 
 /// Create an organization namespace. Platform administration; the first
-/// tenant of a deployment has to come from somewhere before any route exists,
-/// and that somewhere is the host-local operator. Audited, unlike A01's
-/// unaudited primitive, which this supersedes for administrative use.
+/// tenant of a deployment comes from the host-local operator before any route
+/// exists. Audited.
 pub fn create_organization(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -213,7 +210,7 @@ pub enum PoolKind {
 }
 
 /// Register a pool. Platform administration: pools are capacity, and capacity
-/// is the platform's to allocate. Worker enrollment into a pool is W01.
+/// is the platform's to allocate.
 pub fn create_pool(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -317,7 +314,7 @@ pub fn revoke_pool_grant(
 
 /// Whether this tenant's work may be placed on this pool, right now. One
 /// statement: the tenant must be active, the pool active, and the tenant
-/// either the pool's owner or explicitly granted. The scheduler (W02) asks
+/// either the pool's owner or explicitly granted. The scheduler asks
 /// this per placement; it is not cached.
 pub fn require_pool_access(conn: &Connection, tenant: TenantId, pool: PoolId) -> Result<()> {
     let allowed: bool = conn

@@ -1,4 +1,4 @@
-//! K02 — job-private writable clones of immutable generations.
+//! Job-private writable clones of immutable generations.
 //! Capability-detected reflink (`FICLONE`) with a safe byte-copy fallback;
 //! never writable hardlinks. See `docs/cache.md`.
 //!
@@ -339,7 +339,7 @@ mod tests {
         out
     }
 
-    /// A payload the way K03 writes one: nested files with distinct bytes,
+    /// A payload the way publish writes one: nested files with distinct bytes,
     /// an executable, and symlinks (one dangling, one escaping the tree).
     fn generation() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();

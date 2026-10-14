@@ -1,4 +1,4 @@
-//! O01 over real HTTP on loopback, driving a "browser" with a session
+//! The authorization-code flow over real HTTP on loopback, driving a "browser" with a session
 //! cookie: sign-in without a session, error pages that never redirect to an
 //! untrusted client, RFC 6749 error redirects with `state` and `iss`, the
 //! consent form's anti-forgery checks, deny and approve, the single-use
@@ -518,7 +518,7 @@ fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
         "{challenge}"
     );
 
-    // P11-7: the scope a tool needs is the route's, not a guess from the
+    // The scope a tool needs is the route's, not a guess from the
     // path. A tenant named like a secrets route needs only runs:read.
     let secrets_named = mcp_request(
         &d,
@@ -1637,7 +1637,7 @@ fn registered_clients(d: &Deployment) -> i64 {
         .unwrap()
 }
 
-/// P11-1: dynamic registration exists only while instance policy allows
+/// Dynamic registration exists only while instance policy allows
 /// it, and the metadata advertises exactly what the policy allows.
 #[test]
 fn dynamic_registration_is_off_by_default_and_not_advertised() {
@@ -1723,7 +1723,7 @@ fn dynamic_registration_is_off_by_default_and_not_advertised() {
     assert_eq!(registered_clients(&d), 0);
 }
 
-/// P11-3 / P09S-5 / P09S-6: a standard native-client registration — the
+/// A standard native-client registration — the
 /// RFC 7591 default grant, an echoed advertised grant, `localhost` and a
 /// port-free loopback redirect — is accepted, and the loopback redirect
 /// then works on whatever port the client bound (RFC 8252 §7.3).
@@ -1795,7 +1795,7 @@ fn standard_native_registrations_are_accepted_and_match_any_loopback_port() {
     }
 }
 
-/// P09S-3 (RFC 9700 §4.11.2): before anyone signs in, a request for a
+/// RFC 9700 §4.11.2: before anyone signs in, a request for a
 /// registered client is never answered with a redirect, however malformed;
 /// the same request from a signed-in account gets the RFC 6749 redirect.
 #[test]
@@ -1826,7 +1826,7 @@ fn a_registered_clients_errors_redirect_only_after_sign_in() {
     assert_eq!(param(&back, "state"), Some(STATE));
 }
 
-/// P09S-7: a CIMD client is reachable only through its metadata URL, never
+/// A CIMD client is reachable only through its metadata URL, never
 /// through the internal key that would skip the document's freshness check.
 #[test]
 fn a_metadata_document_client_is_not_addressable_by_its_internal_key() {
@@ -1865,7 +1865,7 @@ fn a_metadata_document_client_is_not_addressable_by_its_internal_key() {
     assert!(page.text().contains("not registered"));
 }
 
-/// P09S-1 / P11-2: an anonymous flood of authorization requests naming
+/// An anonymous flood of authorization requests naming
 /// metadata documents on hosts it controls makes the server fetch nothing
 /// and store nothing, and the API keeps answering at once.
 #[test]
@@ -1921,7 +1921,7 @@ fn anonymous_metadata_document_requests_neither_fetch_nor_hold_the_api() {
     );
 }
 
-/// P11-10: an expired MCP token is refused as `invalid_token`, with the
+/// An expired MCP token is refused as `invalid_token`, with the
 /// MCP resource's metadata, so the client refreshes.
 #[test]
 fn an_expired_mcp_token_gets_the_invalid_token_challenge() {

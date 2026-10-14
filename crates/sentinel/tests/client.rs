@@ -66,8 +66,7 @@ impl Drop for Fake {
 
 /// Read one request head (and any declared body), count it, answer, close.
 /// The count happens-before the response is written: a client that has read
-/// the answer to its last attempt always finds that attempt counted (it
-/// used to be counted after the write, so a fast client could look first).
+/// the answer to its last attempt always finds that attempt counted.
 fn answer(stream: TcpStream, status: u16, body: &str, seen: &AtomicUsize) {
     let mut reader = BufReader::new(&stream);
     let mut length = 0usize;
@@ -260,7 +259,7 @@ fn a_static_credential_is_checked_before_any_request() {
 
 #[test]
 fn a_closed_stdout_ends_a_networked_command_quietly_with_exit_zero() {
-    // P09-13: `… --output ndjson | head -1` used to end in a panic (exit 101).
+    // `… --output ndjson | head -1` used to end in a panic (exit 101).
     let dir = tempfile::tempdir().unwrap();
     let token = token_file(&dir);
     let fake = Fake::start(200, r#"{"user":"usr_x","via":"bearer"}"#);
@@ -294,7 +293,7 @@ fn an_unknown_write_outcome_is_repeated_only_under_its_idempotency_key() {
         ..ClientArgs::default()
     };
     let body = r#"{"schema":"sentinel.error/1","code":"outcome_unknown","message":"canned","retryable":false,"details":{"retry_with_idempotency_key":true}}"#;
-    // P02-1: the first write may still commit, so an unkeyed POST is sent once.
+    // The first write may still commit, so an unkeyed POST is sent once.
     let fake = Fake::start(503, body);
     let client = Client::connect(&args(&fake.url)).unwrap();
     let error = client
@@ -321,10 +320,10 @@ const NAMED_BACKOFF: &str = r#"{"schema":"sentinel.error/1","code":"rate_limited
 
 #[test]
 fn a_named_server_backoff_is_honored_then_retried() {
-    // P09C-2: a store too busy to check the credential answers
+    // A store too busy to check the credential answers
     // `rate_limited` with `retry_after_ms`, like a refused long poll. It is
     // an overload like any other, so a request safe to repeat is retried —
-    // but only after the server's own back-off (P09-15), plus jitter.
+    // but only after the server's own back-off, plus jitter.
     let dir = tempfile::tempdir().unwrap();
     let fake = Fake::start(429, NAMED_BACKOFF);
     let client = Client::connect(&ClientArgs {
@@ -359,7 +358,7 @@ fn a_named_server_backoff_is_honored_then_retried() {
     assert_eq!(once.requests(), 1);
 }
 
-/// P09C-2 through MCP: a tool call meets the same overload and is retried
+/// Through MCP: a tool call meets the same overload and is retried
 /// by the shared client before the tool reports it.
 #[test]
 fn an_mcp_tool_call_retries_a_named_backoff() {
@@ -465,8 +464,6 @@ fn worker_listings_show_each_workers_transport_and_json_stays_the_server_documen
     let raw: serde_json::Value = serde_json::from_str(&legacy(&["--json"])).unwrap();
     assert_eq!(raw, server);
 }
-
-// ------------------------------------------------- scripted server (paced)
 
 /// One request as the scripted server saw it.
 #[derive(Clone, Debug)]
@@ -698,7 +695,7 @@ fn parts(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// P09C-1: a transfer that takes far longer than the whole-call bound (60 s
+/// A transfer that takes far longer than the whole-call bound (60 s
 /// in production, 1 s here) still completes while bytes keep arriving:
 /// downloads are bounded per wait for the network, not as a whole.
 #[test]
@@ -736,7 +733,7 @@ fn a_slow_download_longer_than_the_call_bound_completes() {
     assert!(parts(dir.path()).is_empty());
 }
 
-/// P09C-1: a transfer that stalls mid-body resumes with a `Range` request
+/// A transfer that stalls mid-body resumes with a `Range` request
 /// for the rest, and the digest of the whole still decides.
 #[test]
 fn a_stalled_download_resumes_from_its_partial_file() {
@@ -775,7 +772,7 @@ fn a_stalled_download_resumes_from_its_partial_file() {
     assert!(parts(dir.path()).is_empty());
 }
 
-/// P09C-1: a transfer that stops making progress exits 6 and keeps what it
+/// A transfer that stops making progress exits 6 and keeps what it
 /// has; running the command again continues after those bytes instead of
 /// starting over.
 #[test]
@@ -831,7 +828,7 @@ fn an_interrupted_download_keeps_its_bytes_and_the_next_run_resumes() {
     assert!(parts(dir.path()).is_empty());
 }
 
-/// P09C-7: an answer that says `finished` next to a view of a live run
+/// An answer that says `finished` next to a view of a live run
 /// (a rerun committed between the server's two reads) is progress, not
 /// the end; `wait` goes on and judges the run it finally sees.
 #[test]

@@ -1,4 +1,4 @@
-//! The carrier between restore (K02) and publish (K03): what one declared
+//! The carrier between restore and publish: what one declared
 //! `cache:` entry became for one attempt. Preparation fills one per
 //! declaration; finalization reads them to publish the job's writes.
 //! Both directions share the derivations here — a write must record
@@ -30,7 +30,7 @@ pub const UNKNOWN_TENANT: TenantId = match TenantId::from_bytes([
 };
 
 /// The worker's cache store is `<data_dir>/cache` — restore reads it,
-/// publish (K03) writes it, and the reflink probe runs against it so the
+/// publish writes it, and the reflink probe runs against it so the
 /// `Capabilities::REFLINK` bit and the clone backend agree.
 pub const ROOT_DIR: &str = "cache";
 
@@ -46,7 +46,7 @@ pub const MAX_KEY_BYTES: usize = 1024;
 pub const PRIVATE_DIR: &str = ".sentinel-cache";
 
 /// The `Compat` a bare `cache:` declaration carries (docs/cache.md).
-/// Recipes (K07) pin real tool/installer values; for a bare declaration
+/// Recipes pin real tool/installer values; for a bare declaration
 /// the name is the tool identity, the rendered key is the exact
 /// materialization input and the compiler namespaces modes internally —
 /// the pins record the shape without information a caller could vary.
@@ -62,13 +62,10 @@ pub fn declared_compat(decl: &Cache, key: &str, platform: Platform) -> Compat {
             flags: String::new(),
             abi: platform.component(),
         },
-        // K06: a bare `class: compiler` declaration's namespace is the key
-        // stem alone — `entry_key` already gives each stem its own entry
-        // directory (and `current` pointer) and `compatible` re-verifies
-        // the stem inside it, so recording `key_stem(key)` here would only
-        // ever duplicate the check the manifest just ran. `flags` stays
-        // empty as the reserved channel a recipe fills with a rendered
-        // namespace token when it wants a pin tighter than the stem.
+        // A bare compiler declaration's namespace is the key stem alone:
+        // `entry_key` gives each stem its own entry directory and `compatible`
+        // re-verifies the stem inside it. `flags` is the channel a recipe
+        // fills with a namespace token for a pin tighter than the stem.
         Class::Compiler => Compat::Compiler {
             flags: String::new(),
         },
@@ -114,18 +111,15 @@ pub struct Attached {
     /// Released with the `Attached`.
     pub lease: Option<Lease>,
     /// Restore- and commit-path measurements for the availability
-    /// summaries (K08); `None` where a phase never ran — a miss never
+    /// summaries; `None` where a phase never ran — a miss never
     /// clones, and an unworthy verdict never commits.
     pub stats: Stats,
 }
 
-/// The wall-time bound on a nominal hit's wait-plus-clone (K08), part of
-/// the costly-hit rule `docs/cache.md` states. A healthy restore — a
-/// per-file `FICLONE` pass, or a warm copy of a dependency payload at
-/// even 100 MiB/s — is nowhere near it; five seconds is deliberately
-/// generous so only a restore that plausibly cost more than rebuilding
-/// the dependency is flagged, and flagged is all it ever is: a diagnostic,
-/// never a verdict.
+/// The wall-time bound on a nominal hit's wait-plus-clone, part of the
+/// costly-hit rule `docs/cache.md` states. Deliberately generous (a warm copy
+/// at even 100 MiB/s is far under it) so only a restore that plausibly cost
+/// more than rebuilding is flagged; the flag is a diagnostic, never a verdict.
 pub const COSTLY_HIT_NS: u64 = 5_000_000_000;
 
 /// Which costly-hit clause a nominal hit tripped (docs/cache.md).
@@ -148,8 +142,8 @@ impl Costly {
     }
 }
 
-/// What a commit did with the job's writable views (K03), recorded for
-/// the summary's per-entry record (K08).
+/// What a commit did with the job's writable views, recorded for the
+/// summary's per-entry record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Committed {
     /// A new generation was sealed: `staged_bytes` of payload, of which
@@ -167,7 +161,7 @@ pub enum Committed {
 }
 
 impl Attached {
-    /// The K08 costly-hit rule evaluated on a finished restore: `Some`
+    /// The costly-hit rule evaluated on a finished restore: `Some`
     /// when a nominal hit paid rebuild-scale cost — a reflink root that
     /// ended up copying every payload byte, or a wait-plus-clone past
     /// [`COSTLY_HIT_NS`]. `None` on a miss and on a plausible hit.
@@ -197,7 +191,7 @@ pub struct Target {
     pub declared: String,
     /// The worker-owned directory `dir` lies beneath — the attempt's
     /// workspace. Publication opens this anchor itself and resolves `dir`
-    /// beneath it without following a symlink at any component (P07-1):
+    /// beneath it without following a symlink at any component:
     /// everything below the anchor is content a job could rewrite.
     pub root: PathBuf,
     /// The host directory holding the job's writable view. Relative
@@ -226,8 +220,7 @@ pub struct Stats {
     pub clone_ns: Option<u64>,
     /// The bounded first-read sample after a hit's clone materialized —
     /// one ≤4 KiB read of the largest listed file per target. Cold-extent
-    /// cost the clone's wall time hides (the K02 probe showed it is
-    /// real); absent when no regular file was listed to sample.
+    /// cost the clone's wall time hides; absent when no regular file was listed to sample.
     pub first_touch_ns: Option<u64>,
     /// Files and payload bytes materialized.
     pub files: u64,
@@ -236,7 +229,7 @@ pub struct Stats {
     pub copied_bytes: u64,
     /// The backend the clone used.
     pub reflink: bool,
-    /// Remote hydration's wall time (Q08); `None` when no transfer ran —
+    /// Remote hydration's wall time; `None` when no transfer ran —
     /// a local hit never networks, so the duration stays absent.
     pub remote_ns: Option<u64>,
     /// Payload bytes the remote transfer delivered this attempt (a count,
@@ -314,7 +307,7 @@ mod tests {
         }))
     }
 
-    /// The K08 rule (docs/cache.md): a nominal hit that paid a full copy
+    /// The costly-hit rule (docs/cache.md): a nominal hit that paid a full copy
     /// on a reflink root, or waited and cloned past the bound, is flagged
     /// — a miss never is, and neither is a plausible restore.
     #[test]

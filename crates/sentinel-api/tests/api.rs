@@ -1,4 +1,4 @@
-//! W08 over real HTTP on loopback: authentication by bearer credential and
+//! The controller API over real HTTP on loopback: authentication by bearer credential and
 //! by session cookie (with CSRF on mutations), structured errors, dispatch
 //! with idempotency, status, cancel, rerun, log tail/follow through the
 //! same files the controller writes, and worker status.
@@ -455,7 +455,7 @@ fn secret_http_writes_are_versioned_idempotent_and_metadata_only() {
         ("idempotency-key", "create-access-token"),
     ];
     let (status, conflict) = call_bytes(&d, "PUT", path, b"different-secret", &auth, &changed);
-    // P10C-9: key reuse is the client's bug, not someone else's rotation.
+    // Key reuse is the client's bug, not someone else's rotation.
     assert_eq!(status, 422);
     assert_eq!(conflict["code"], "idempotency_mismatch");
     assert!(
@@ -1696,7 +1696,7 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
         (status, body["ignored"].as_str()),
         (200, Some("unsupported_event"))
     );
-    // A pull request is intake now: the base branch is the policy ref and the
+    // A pull request is intake: the base branch is the policy ref and the
     // tested merge is what it stands for. Only the actions that mean new work
     // are stored; others are acknowledged and ignored.
     let pr = pr_payload("opened", GITHUB_REPO_ID, Some(&"e".repeat(40)));
@@ -1942,8 +1942,6 @@ fn intake_routes_authenticate_deduplicate_and_report_explicitly() {
     );
     assert_eq!((status, again["duplicate"].as_bool()), (202, Some(true)));
 }
-
-// ---- D02: resumable uploads and authorized range downloads ----
 
 /// Raw bytes in and out plus Content-Range, for the transfer routes.
 fn raw(
@@ -2543,8 +2541,8 @@ fn artifact_routes_are_authorized_and_scoped() {
     );
     assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
 
-    // P06-6: the bytes follow repository authorization. The admin reads
-    // them; a tenant reader without a grant on the repository cannot — the
+    // The bytes follow repository authorization. The admin reads them; a
+    // tenant reader without a grant on the repository cannot — the
     // digest answers exactly as an unknown one would — until granted.
     let digest = entries[0]["digest"].as_str().unwrap().to_owned();
     let object = format!("/api/v1/tenants/acme/objects/{digest}");
@@ -2696,7 +2694,7 @@ fn stalled_get(d: &Deployment, path: &str, auth: &str) -> std::net::TcpStream {
     socket
 }
 
-/// P06-2 and P09-12: a download holds its transfer slot until its body is
+/// A download holds its transfer slot until its body is
 /// written, and with every transfer slot held by stalled downloads and every
 /// subscriber slot by parked waits, control requests still find a handler.
 #[test]
@@ -2806,7 +2804,7 @@ fn downloads_hold_their_slot_and_control_requests_keep_handlers() {
     assert_eq!(status, 206);
 }
 
-/// P06-13: a whole-object download is rehashed while it streams; bytes that
+/// A whole-object download is rehashed while it streams; bytes that
 /// rotted on disk end the body short instead of arriving complete.
 #[test]
 fn a_rotted_object_is_never_served_whole() {
@@ -2855,7 +2853,7 @@ fn a_rotted_object_is_never_served_whole() {
     assert_eq!(status, 206);
 }
 
-/// P06-12: touching an expired upload retires it — durably, not inside the
+/// Touching an expired upload retires it — durably, not inside the
 /// refused request's rolled-back transaction.
 #[test]
 fn touching_an_expired_upload_retires_it() {
@@ -2900,7 +2898,7 @@ fn touching_an_expired_upload_retires_it() {
     );
 }
 
-/// P02-3 and P09-11: the log route refuses a malformed position instead of
+/// The log route refuses a malformed position instead of
 /// restarting at zero, pages carry the versioned `c1` cursor bound to the
 /// tenant and attempt, and a page of full frames is bounded in bytes.
 #[test]
@@ -3146,7 +3144,7 @@ fn login_refuses_a_foreign_origin() {
     assert_eq!(status, 200);
 }
 
-/// P03-7 / P02-9: an existing tenant the caller has no part in lists as the
+/// An existing tenant the caller has no part in lists as the
 /// same `not_found` as a tenant that does not exist, never as an empty page.
 #[test]
 fn a_foreign_tenant_slug_lists_as_not_found() {
@@ -3214,7 +3212,7 @@ fn a_foreign_tenant_slug_lists_as_not_found() {
     assert_eq!(foreign, missing);
 }
 
-/// P03-5: using a session slides its idle deadline, so an active session
+/// Using a session slides its idle deadline, so an active session
 /// outlives the idle window it started with; the cookie lives as long as
 /// the session's absolute bound.
 #[test]
@@ -3228,8 +3226,7 @@ fn an_active_session_outlives_its_first_idle_deadline() {
     // Scheduled from the deadlines the server recorded, on the same wall
     // clock it checks them against, never from when this thread sent a
     // request: a request the loaded server handles late then moves the
-    // deadline it is asserted against with it (the old fixed 14.7 s probe
-    // sat 700 ms after a deadline that a late 8 s request pushed past it).
+    // deadline it is asserted against with it.
     let deadlines = || -> (i64, i64) {
         d.store
             .read(|c| {
@@ -3345,7 +3342,7 @@ fn status_code(reply: (u16, serde_json::Value)) -> (u16, String) {
     (reply.0, reply.1["code"].as_str().unwrap_or("").to_owned())
 }
 
-/// P10S-3: for every secret route and every request shape (valid, bad page,
+/// For every secret route and every request shape (valid, bad page,
 /// empty body, bad If-Match), a foreign tenant answers exactly as a missing
 /// one, and a repository the caller cannot see exactly as a missing one.
 #[test]
@@ -3450,7 +3447,7 @@ fn a_foreign_tenant_or_repo_is_not_found_on_every_secret_route() {
     }
 }
 
-/// P10S-2: allowlists, bindings, unbinding, binding listing and single
+/// Allowlists, bindings, unbinding, binding listing and single
 /// version revocation are served over HTTP under their scopes, idempotently,
 /// and refuse another tenant, another repository and a read-only scope.
 #[test]
@@ -3710,7 +3707,7 @@ fn secret_bindings_allowlists_and_revocation_are_served_over_http() {
     assert_eq!((status, denied["allowed"].as_bool()), (200, Some(false)));
 }
 
-/// P10C-6: a repository name that needs percent-encoding (the docs'
+/// A repository name that needs percent-encoding (the docs'
 /// `RusticStack/app`) is decoded once by the server.
 #[test]
 fn a_repository_name_with_a_slash_is_addressed_by_its_decoded_name() {
@@ -3767,7 +3764,7 @@ fn a_repository_name_with_a_slash_is_addressed_by_its_decoded_name() {
     );
 }
 
-/// P10S-1: the retry record keeps a keyed MAC, not the unkeyed FNV-1a of
+/// The retry record keeps a keyed MAC, not the unkeyed FNV-1a of
 /// scope, name, version and value that a database copy could brute-force.
 #[test]
 fn the_stored_retry_fingerprint_is_not_an_unkeyed_digest_of_the_value() {
@@ -3934,7 +3931,7 @@ fn mcp_post(
     (status, headers, body)
 }
 
-/// P10S-2 on MCP: an agent sees which secret each job and step of an
+/// On MCP, an agent sees which secret each job and step of an
 /// `owner/name` repository receives, and from which scope — never a value —
 /// with `secrets:metadata`; without it the call is the scope challenge.
 #[test]

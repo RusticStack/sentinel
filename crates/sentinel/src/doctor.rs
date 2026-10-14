@@ -1,4 +1,4 @@
-//! `sentinel doctor` (O06): diagnose how this machine signs in to a
+//! `sentinel doctor`: diagnose how this machine signs in to a
 //! controller. Seven checks, in order — the configuration directory, the
 //! profile, reachability, the issuer, the credential store, the access token
 //! and a refresh — each with the exact command that fixes a failure. Nothing
@@ -201,7 +201,6 @@ fn check_agent() -> ureq::Agent {
 pub fn diagnose(args: &ClientArgs) -> Report {
     let mut report = Report::default();
 
-    // 1. The configuration directory: locatable, outside Git, owner-only.
     let Some(config) = config_dir(&mut report) else {
         report.skip(
             &[
@@ -217,7 +216,6 @@ pub fn diagnose(args: &ClientArgs) -> Report {
         return report;
     };
 
-    // 2. The profile, and that an explicit server is its server.
     let Some((name, entry)) = profile(&mut report, &config, args) else {
         report.skip(
             &[
@@ -235,17 +233,15 @@ pub fn diagnose(args: &ClientArgs) -> Report {
     report.server = Some(entry.server.clone());
     let agent = check_agent();
 
-    // 3. Reachability.
     health(&mut report, &agent, &name, &entry);
-    // 4. The issuer, once the server answers.
+    // The issuer is checked only once the server answers.
     if report.failed("health") {
         report.skip(&["issuer"], "health");
     } else {
         issuer(&mut report, &agent, &name, &entry);
     }
-    // 5. The credential store is local: always checked.
+    // The credential store is local, so it is always checked.
     let stored = credential_store(&mut report, &config, &name, &entry).is_some();
-    // 6 and 7. The access token, then a refresh.
     match ["health", "issuer", "credential_store"]
         .into_iter()
         .find(|c| report.failed(c))

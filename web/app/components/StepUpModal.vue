@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// Confirm it's you (A06): a code from the authenticator app, a recovery
+// Confirm it's you: a code from the authenticator app, a recovery
 // code, or the password for an account without TOTP; the session is
 // stamped for the policy window and the action that asked is retried.
 // The proof lives in this component only and is cleared after every try.
