@@ -450,7 +450,7 @@ impl Spool {
     /// the per-attempt cap `max`.
     pub fn open_in(space: &Arc<SpoolSpace>, attempt: AttemptId, max: u64) -> Result<Spool> {
         let dir = space.root.join(SPOOL_DIR).join(attempt.to_string());
-        fs::create_dir_all(&dir)?;
+        crate::private_dir_all(&dir)?;
         // Read/write rather than append: a torn tail is truncated on open,
         // which an append-only handle refuses on some platforms; every
         // write seeks to the end first.

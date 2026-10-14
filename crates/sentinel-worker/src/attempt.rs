@@ -200,7 +200,16 @@ impl Drop for StepSecrets {
 }
 
 fn create_private_dir(path: &Path, allow_existing: bool) -> Result<()> {
-    match fs::create_dir(path) {
+    // Created owner-only in one step, so a directory that will hold secrets
+    // is never visible with the umask's mode, not even briefly; the chmod
+    // below settles one that already existed.
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
         Ok(()) => {}
         Err(error) if allow_existing && error.kind() == std::io::ErrorKind::AlreadyExists => {
             let meta = fs::symlink_metadata(path)?;

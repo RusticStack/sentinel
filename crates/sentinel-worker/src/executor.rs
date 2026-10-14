@@ -554,7 +554,19 @@ impl Executor {
         git_mirrors: bool,
     ) -> Result<Executor> {
         let runtime = podman::probe()?;
-        std::fs::create_dir_all(root.join(crate::workspace::WORKSPACES_DIR))?;
+        // Everything the worker keeps under the data directory is
+        // owner-only, created so before the stores that own them open
+        // (`sentinel-git` and `sentinel-cache` create with the umask's mode
+        // what they find missing).
+        for dir in [
+            crate::workspace::WORKSPACES_DIR,
+            crate::checkout::MIRRORS_DIR,
+            sentinel_cache::attach::ROOT_DIR,
+            crate::spool::SPOOL_DIR,
+            recovery::ATTEMPTS_DIR,
+        ] {
+            crate::private_dir_all(&root.join(dir))?;
+        }
         let mirrors = if git_mirrors {
             match crate::checkout::Mirrors::open(&root.join(crate::checkout::MIRRORS_DIR)) {
                 Ok(mirrors) => Some(mirrors),
