@@ -1,4 +1,4 @@
-// U06: the web interface in a real browser, against a seeded controller and
+// The web interface in a real browser, against a seeded controller and
 // the built Nuxt server in front of it (crates/sentinel-api/tests/
 // web_browser.rs starts both and passes the config). Every check prints
 // PASS/FAIL; measurements go to <out>/ui-metrics.json and screenshots to
@@ -88,7 +88,6 @@ async function go(page, path, ready, timeout = 20000) {
 
 const clickText = (selector, text) => `(() => { const el = [...document.querySelectorAll(${JSON.stringify(selector)})].find((e) => e.textContent.trim().includes(${JSON.stringify(text)})); if (!el) return false; el.click(); return true; })()`;
 
-// ------------------------------------------------------------ in-page ----
 
 /// WCAG contrast of every element's own visible text against the colour
 /// behind it (alpha-blended up the ancestors). SVG text, visually hidden
@@ -162,7 +161,6 @@ async function axAudit(page, label, signedOut) {
   check(`${label}: one level-one heading`, h1 === 1, h1);
 }
 
-// -------------------------------------------------------------- tests ----
 
 const browser = await launch();
 const page = await browser.newPage({ width: 1280, height: 860 });

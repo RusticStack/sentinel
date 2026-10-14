@@ -1,4 +1,4 @@
-// The log viewer (U03): one attempt's log as steps that fold, each loaded on
+// The log viewer: one attempt's log as steps that fold, each loaded on
 // demand through `?step=` pages; a live attempt is followed through this
 // server's event stream, resumed after the last frame held. Only the rows in
 // view (plus a small overscan) exist as elements, whatever the log's

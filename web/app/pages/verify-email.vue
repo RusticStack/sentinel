@@ -57,7 +57,6 @@ async function confirm() {
   }
 }
 
-// --- "I never got it" ---------------------------------------------------
 
 const email = ref(session.me.value?.email && !session.me.value.email_verified ? session.me.value.email : "");
 const resending = ref(false);

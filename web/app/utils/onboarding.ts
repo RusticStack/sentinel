@@ -122,7 +122,6 @@ export function baseUrlProblem(text: string): string | null {
   return null;
 }
 
-// --- The first-run wizard's resumable state --------------------------------
 
 export type RegistrationChoice = "closed" | "invite-only" | "approval-required";
 export type TenantCreationChoice = "super-admin-only" | "approved-users";
@@ -198,7 +197,6 @@ export function parseDraft(text: string | null, maxStep: number): WizardDraft {
   return out;
 }
 
-// --- A member's standing in a GitHub-backed organization --------------------
 
 export interface GitHubSync { confirmed_ms: number | null; check_due: boolean; unanswered: number }
 
