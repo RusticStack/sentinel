@@ -124,6 +124,9 @@ struct FileConfig {
     s3: Option<S3File>,
     // Server: scheduled online backups (R04).
     backup: Option<BackupFile>,
+    // Server: optional SMTP delivery of verification and invitation mail;
+    // `SENTINEL_SMTP_*` in the environment override these keys.
+    mail: Option<MailFile>,
     // Worker: the controller's `tc…` address, as written to its `<data_dir>/tailcat/address`
     // (Q06). Required to dial a controller through the helper.
     tailcat_address: Option<String>,
@@ -211,6 +214,133 @@ impl S3File {
             return Err(Error::config("[s3] needs endpoint, region and bucket"));
         }
         Ok(())
+    }
+}
+
+/// The `[mail]` section: optional SMTP submission for verification and
+/// invitation mail. Server only. Each key has an environment override
+/// (`SENTINEL_SMTP_HOST`, `_PORT`, `_TLS`, `_CREDENTIALS_FILE`, `_FROM`),
+/// which wins, so a container deployment needs no configuration file for it.
+/// Without a host nothing is delivered and the host-local `sentinel admin`
+/// mints links on demand. The relay's password lives in `credentials_file`
+/// (`username = …` / `password = …`, owner-only), never in this file or the
+/// environment. Kept portable so the CLI build validates it.
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailFile {
+    host: Option<String>,
+    port: Option<u16>,
+    /// `starttls` (default), `implicit` or `none` (a relay on this host).
+    tls: Option<String>,
+    credentials_file: Option<PathBuf>,
+    /// The sender address, such as `ci@example.com`.
+    from: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MailTls {
+    StartTls,
+    Implicit,
+    Plain,
+}
+
+/// A validated SMTP configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MailSettings {
+    host: String,
+    port: u16,
+    tls: MailTls,
+    credentials_file: Option<PathBuf>,
+    from: String,
+}
+
+impl MailFile {
+    /// Merge the section with the environment (which wins) and validate. No
+    /// error echoes a value. `Ok(None)` when no host is configured; any other
+    /// key without a host is an error rather than a silently ignored setting.
+    fn resolve(self, env: &dyn Fn(&str) -> Option<String>) -> Result<Option<MailSettings>, Error> {
+        let set = |name: &str| env(name).filter(|value| !value.is_empty());
+        let host = set("SENTINEL_SMTP_HOST").or(self.host);
+        let port_env = set("SENTINEL_SMTP_PORT");
+        let tls = set("SENTINEL_SMTP_TLS").or(self.tls);
+        let credentials = set("SENTINEL_SMTP_CREDENTIALS_FILE")
+            .map(PathBuf::from)
+            .or(self.credentials_file);
+        let from = set("SENTINEL_SMTP_FROM").or(self.from);
+        let Some(host) = host else {
+            if port_env.is_some()
+                || self.port.is_some()
+                || tls.is_some()
+                || credentials.is_some()
+                || from.is_some()
+            {
+                return Err(Error::config(
+                    "SMTP settings need a host ([mail] host or SENTINEL_SMTP_HOST)",
+                ));
+            }
+            return Ok(None);
+        };
+        let host_ok = host.len() <= 253
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'));
+        if !host_ok {
+            return Err(Error::config(
+                "[mail] host must be a host name or IP address",
+            ));
+        }
+        let tls = match tls.as_deref() {
+            None | Some("starttls") => MailTls::StartTls,
+            Some("implicit") => MailTls::Implicit,
+            Some("none") => MailTls::Plain,
+            Some(_) => {
+                return Err(Error::config(
+                    "[mail] tls must be \"starttls\", \"implicit\" or \"none\"",
+                ));
+            }
+        };
+        let port = match port_env {
+            Some(text) => text
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or_else(|| Error::config("SENTINEL_SMTP_PORT must be 1-65535"))?,
+            None => match (self.port, tls) {
+                (Some(0), _) => return Err(Error::config("[mail] port must be 1-65535")),
+                (Some(port), _) => port,
+                (None, MailTls::Implicit) => 465,
+                (None, MailTls::StartTls) => 587,
+                (None, MailTls::Plain) => 25,
+            },
+        };
+        let from = from.ok_or_else(|| Error::config("[mail] needs a from address"))?;
+        let from_ok = from.len() <= 254
+            && from.matches('@').count() == 1
+            && !from.starts_with('@')
+            && !from.ends_with('@')
+            && !from.chars().any(|c| c.is_control() || c.is_whitespace());
+        if !from_ok {
+            return Err(Error::config(
+                "[mail] from must be a plain address such as ci@example.com",
+            ));
+        }
+        if credentials.as_ref().is_some_and(|path| !path.is_absolute()) {
+            return Err(Error::config(
+                "[mail] credentials_file must be an absolute path",
+            ));
+        }
+        if tls == MailTls::Plain && credentials.is_some() {
+            return Err(Error::config(
+                "[mail] tls = \"none\" takes no credentials: they are sent only inside TLS",
+            ));
+        }
+        Ok(Some(MailSettings {
+            host,
+            port,
+            tls,
+            credentials_file: credentials,
+            from,
+        }))
     }
 }
 
@@ -457,6 +587,8 @@ struct Config {
     s3: Option<S3File>,
     #[cfg(feature = "server")]
     backup: Option<BackupFile>,
+    #[cfg(feature = "server")]
+    mail: Option<MailSettings>,
     role: Role,
 }
 
@@ -817,6 +949,28 @@ impl Config {
             }
             backup.check(&data_dir)?;
         }
+        let mail = match &role {
+            Role::Server { public_url, .. } => {
+                let mail = file
+                    .mail
+                    .unwrap_or_default()
+                    .resolve(&|name| std::env::var(name).ok())?;
+                if mail.is_some() && public_url.is_none() {
+                    return Err(Error::config(
+                        "SMTP needs public_url: the links in messages are built on it",
+                    ));
+                }
+                mail
+            }
+            Role::Worker(_) => {
+                if file.mail.is_some() {
+                    return Err(Error::config("[mail] applies to the server role only"));
+                }
+                None
+            }
+        };
+        #[cfg(not(feature = "server"))]
+        let _ = mail;
         Ok(Self {
             data_dir,
             log_format: args.log_format.or(file.log_format).unwrap_or_default(),
@@ -827,6 +981,8 @@ impl Config {
             s3: file.s3,
             #[cfg(feature = "server")]
             backup: file.backup,
+            #[cfg(feature = "server")]
+            mail,
             role,
         })
     }
@@ -1212,6 +1368,8 @@ enum Running {
         checks: Option<Box<sentinel_checks::Lane>>,
         /// The lifecycle reconcile lane draining `github_refresh`.
         reconcile: Option<Box<sentinel_checks::Reconcile>>,
+        /// The mail lane, when SMTP is configured.
+        mail: Option<Box<sentinel_mail::Lane>>,
         /// The Q06 helper carrying the link port; absent with direct TLS.
         tailcat: Option<TailcatServer>,
         /// The external S3 copy's replicator, when `[s3]` is configured.
@@ -1866,6 +2024,9 @@ fn start_server(
         }
         None => None,
     };
+    // Before the API serves: a request that mints a link queues its message
+    // only when a lane will drain it, which the store row records.
+    let mail = start_mail(&config, public_url.as_deref(), &store, key.as_ref())?;
     let api = sentinel_api::Server::start(sentinel_api::Config {
         listen: api_listen,
         store: Arc::clone(&store),
@@ -1900,10 +2061,102 @@ fn start_server(
         poll: Box::new(poll),
         checks,
         reconcile,
+        mail,
         tailcat,
         replicator,
         backups,
     })
+}
+
+/// Start the mail lane when SMTP is configured, and record in the store
+/// whether this deployment delivers mail. Without SMTP, or without the master
+/// key that seals a queued message's link, nothing is queued: a request that
+/// needs a link still succeeds, and the operator mints one with
+/// `sentinel admin account email-link` or `invite create --email`. A
+/// configuration that cannot work (an unreadable credentials file, a refused
+/// setting) stops the start like any other configuration error.
+#[cfg(feature = "server")]
+fn start_mail(
+    config: &Config,
+    public_url: Option<&str>,
+    store: &Arc<sentinel_store::Store>,
+    key: Option<&Arc<sentinel_auth::sealed::Key>>,
+) -> Result<Option<Box<sentinel_mail::Lane>>, Error> {
+    let record = |enabled: bool| {
+        sentinel_store::email::set_delivery(
+            store,
+            enabled,
+            public_url,
+            sentinel_core::UnixMillis::now(),
+        )
+        .map_err(|error| Error::runtime(format!("cannot record mail delivery: {error}")))
+    };
+    let Some(mail) = &config.mail else {
+        record(false)?;
+        tracing::info!(
+            event = "mail_disabled",
+            "no SMTP configured: verification and invitation links are minted with `sentinel admin`"
+        );
+        return Ok(None);
+    };
+    let Some(key) = key else {
+        record(false)?;
+        tracing::warn!(
+            event = "mail_disabled",
+            "SMTP is configured but there is no master key to seal queued messages; create one with `sentinel admin key create`"
+        );
+        return Ok(None);
+    };
+    let credentials = mail
+        .credentials_file
+        .as_deref()
+        .map(sentinel_mail::Credentials::from_file)
+        .transpose()
+        .map_err(|reason| Error::config(format!("[mail] {reason}")))?;
+    let tls = match mail.tls {
+        MailTls::StartTls => sentinel_mail::Tls::StartTls,
+        MailTls::Implicit => sentinel_mail::Tls::Implicit,
+        MailTls::Plain => sentinel_mail::Tls::Plain,
+    };
+    let smtp_config =
+        sentinel_mail::Config::new(mail.host.clone(), mail.port, tls, credentials, &mail.from)
+            .map_err(|reason| Error::config(format!("[mail] {reason}")))?;
+    let smtp = sentinel_mail::Smtp::new(smtp_config)
+        .map_err(|reason| Error::config(format!("[mail] {reason}")))?;
+    record(true)?;
+    tracing::info!(
+        event = "mail_enabled",
+        host = %mail.host,
+        port = mail.port,
+        authenticated = mail.credentials_file.is_some()
+    );
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    Ok(Some(Box::new(sentinel_mail::Lane::start(
+        Arc::clone(store),
+        Arc::clone(key),
+        Box::new(smtp),
+        sentinel_mail::LaneConfig::default(),
+        move |batch| {
+            tracing::dispatcher::with_default(&dispatch, || {
+                if batch.abandoned > 0 {
+                    tracing::warn!(
+                        event = "mail_abandoned",
+                        abandoned = batch.abandoned,
+                        "messages were given up on"
+                    );
+                }
+                // Never the recipient: only the message's own identifier.
+                for entry in &batch.entries {
+                    tracing::info!(
+                        event = "mail_settled",
+                        mail = %entry.id,
+                        kind = entry.kind,
+                        outcome = %entry.outcome
+                    );
+                }
+            });
+        },
+    ))))
 }
 
 /// Build the S3 client from `[s3]`, check it once (a failure is logged and
@@ -2575,6 +2828,7 @@ fn initialize_and_wait(
             poll,
             checks,
             reconcile,
+            mail,
             tailcat,
             replicator,
             backups,
@@ -2595,6 +2849,7 @@ fn initialize_and_wait(
             }
             drop(reconcile);
             drop(checks);
+            drop(mail);
             drop(poll);
             drop(lane);
             let sessions_drained = controller.shutdown(LINK_SHUTDOWN);

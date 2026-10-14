@@ -1180,6 +1180,7 @@ dependencies = [
  "sentinel-github",
  "sentinel-intake",
  "sentinel-link",
+ "sentinel-mail",
  "sentinel-pipeline",
  "sentinel-protocol",
  "sentinel-s3",
