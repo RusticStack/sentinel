@@ -1,21 +1,4 @@
-//! Image pulls through the worker's own content store.
-//!
-//! Concurrent attempts needing the same `name@sha256:…` reference share
-//! one in-flight pull: the first caller leads it, the rest wait for its
-//! outcome — bounded by their own deadline and stopped early by their
-//! cancel flag — instead of running competing copies of the same
-//! download. The pull checks `podman image exists`, then runs
-//! `podman pull -q --authfile …` even for a resident digest to recheck the
-//! attempt's registry authority. A finished pull leaves no slot behind,
-//! so a failure retries fresh on the next attempt, and a slot whose leader
-//! vanished before publishing is dropped by the first follower whose
-//! deadline passes.
-//!
-//! Every confirmed pull records the digest in a bounded held set — what a
-//! later part advertises for locality-aware placement. The set is
-//! learned from pull outcomes alone, never scanned: a restarted worker
-//! starts empty and relearns on the next pull, whose `image exists`
-//! check is the same authority.
+//! Every pull runs `podman pull` even for a resident digest, to recheck the attempt's registry authority.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -29,23 +12,14 @@ use std::{
 
 use crate::{Error, Result, attempt::Cancel, podman};
 
-/// How many digests the held record keeps before the oldest learned is
-/// evicted — far more distinct images than a worker cycles between
-/// offers, and each entry is a 71-byte `sha256:…`.
 pub const MAX_HELD: usize = 1024;
 
-/// A digest pulled for use this recently is never reclaimed: its attempt
-/// may be about to create its container.
+/// Recently pulled digests are never reclaimed: an attempt may be about to create its container.
 pub const IMAGE_KEEP: Duration = Duration::from_secs(600);
-/// Images one reclamation pass removes at most, per store.
 pub const MAX_IMAGE_REMOVALS: usize = 16;
 
-/// How often a follower's wait re-checks its cancel flag.
 const FOLLOW_POLL: Duration = Duration::from_millis(50);
 
-/// What performs the pull: `podman::pull` in production, a stub in tests.
-/// The bool reports whether the image was present before the authorization
-/// pull; it does not mean that the pull was skipped.
 type Download =
     Arc<dyn Fn(&str, &Path, &podman::Store, Duration, &AtomicBool) -> Result<bool> + Send + Sync>;
 
@@ -54,8 +28,6 @@ struct PullKey {
     image: Box<str>,
     tenant: Option<[u8; 16]>,
     credential: [u8; 32],
-    /// Where the image lands: a credentialed pull goes to the tenant's
-    /// private store.
     store: podman::Store,
 }
 
@@ -70,8 +42,6 @@ impl PullKey {
     }
 }
 
-/// An empty, worker-owned OCI auth file makes an anonymous pull explicit.
-/// Pulls also clear external credential helpers and auth-file overrides.
 pub fn prepare_anonymous_authfile(root: &Path) -> Result<PathBuf> {
     use std::io::Write;
     let root_metadata = std::fs::symlink_metadata(root)?;
@@ -138,18 +108,13 @@ fn restrict_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// One in-flight pull: the outcome the leader publishes exactly once.
-/// `Ok` carries the leader's present/downloaded answer to every follower.
 #[derive(Default)]
 struct Pull {
     result: Mutex<Option<std::result::Result<bool, Shared>>>,
     done: Condvar,
-    /// Followers parked on this pull, so the count is observable.
     waiters: AtomicUsize,
 }
 
-/// A leader's error as a follower can own it: `io::Error` does not
-/// clone, so its kind and message are carried instead.
 #[derive(Clone, Debug)]
 enum Shared {
     Preparation(String),
@@ -157,8 +122,6 @@ enum Shared {
     Timeout(&'static str),
     Workspace(String),
     Io(std::io::ErrorKind, String),
-    /// The leader's own attempt was cancelled and its pull killed: nothing
-    /// about the image was learned, so a follower pulls for itself.
     Abandoned,
 }
 
@@ -186,22 +149,11 @@ impl Shared {
 }
 
 struct State {
-    /// References with a pull in flight. A slot leaves the map as its
-    /// outcome is published, so it never outlives its use.
     pulling: HashMap<PullKey, Arc<Pull>>,
-    /// Digests (`sha256:…`) confirmed in the local store.
     held: HashSet<Box<str>>,
-    /// The `held` digests oldest-first, for eviction past [`MAX_HELD`].
     order: VecDeque<Box<str>>,
-    /// Moves every time `held` gains a digest: the placement feed resends
-    /// only when it changed.
     version: u64,
-    /// References in `pulling` whose leader is a prefetch, not an
-    /// attempt: a prefetch yields to attempts' own pulls.
     prefetching: HashSet<PullKey>,
-    /// When each held digest was last pulled for use: the image
-    /// reclamation pass removes the least recently used first. Bounded with
-    /// `held`.
     used: HashMap<Box<str>, Instant>,
 }
 
@@ -211,16 +163,12 @@ struct Inner {
     anonymous_authfile: PathBuf,
 }
 
-/// The worker's image-pull state: one per process, cheap to clone —
-/// the executor holds one and every attempt's [`crate::attempt::Job`]
-/// carries a clone of it.
 #[derive(Clone)]
 pub struct Images {
     inner: Arc<Inner>,
 }
 
 impl Images {
-    /// Pulls through podman, which enforces the digest pin itself.
     pub fn new(anonymous_authfile: PathBuf) -> Self {
         let anonymous = anonymous_authfile.clone();
         Self::with_authfile_and_download(
@@ -232,8 +180,6 @@ impl Images {
         )
     }
 
-    /// Create the worker's pull state and its strict empty fallback authfile
-    /// below its private data directory.
     pub fn for_worker_data_dir(root: &Path) -> Result<Self> {
         Ok(Self::new(prepare_anonymous_authfile(root)?))
     }
@@ -242,9 +188,6 @@ impl Images {
         &self.inner.anonymous_authfile
     }
 
-    /// A pull backend other than podman's — the test seam. The closure's
-    /// `Ok(bool)` is `podman::pull`'s contract: `true` when the store
-    /// already held the image.
     #[doc(hidden)]
     pub fn with_download(
         download: impl Fn(&str, &Path, &podman::Store, Duration, &AtomicBool) -> Result<bool>
@@ -278,32 +221,13 @@ impl Images {
         }
     }
 
-    /// Make `image` — the exact `name@sha256:…` reference handed to the
-    /// pull — available in the local store, sharing the in-flight pull
-    /// for it if there is one. The leader's outcome is what every waiter
-    /// gets: `Ok(true)` when `image exists` found it before the scoped
-    /// authorization pull, `Ok(false)` when it was absent, and on failure
-    /// the same typed error (`Preparation` for a refused or
-    /// failed pull, `Timeout` past the deadline, `Io` for a helper that
-    /// would not start).
-    ///
-    /// A follower's wait is bounded by `timeout` and ends early on
-    /// `cancel`; the pull it watched may still complete for the others.
-    /// The leader's pull is killed on its own attempt's `cancel`; its
-    /// followers are then told to pull for themselves, never handed a
-    /// cancellation that was not theirs.
     pub fn pull(&self, image: &str, timeout: Duration, cancel: &Cancel) -> Result<bool> {
         validate_pinned_reference(image)?;
         let key = PullKey::anonymous(image);
         self.pull_keyed(key, image, &self.inner.anonymous_authfile, timeout, cancel)
     }
 
-    /// Pull using an attempt's own registry authority into `store` — the
-    /// tenant's private one for a credentialed pull. The single-flight key
-    /// includes tenant, a secret-value fingerprint and the store: neither
-    /// another tenant nor a rotated credential can inherit a successful
-    /// auth check. Only a shared-store pull joins the held record: it is
-    /// what any tenant's attempt may find resident.
+    /// The key includes tenant, credential and store, so no tenant or rotated credential inherits another's auth check.
     #[allow(clippy::too_many_arguments)]
     pub fn pull_for_tenant(
         &self,
@@ -360,12 +284,8 @@ impl Images {
         let mut result = slot.result.lock().unwrap_or_else(|p| p.into_inner());
         loop {
             if let Some(outcome) = result.clone() {
-                // The lock is dropped before `record` so the slot mutex is
-                // never held across the state one.
                 drop(result);
                 if matches!(outcome, Err(Shared::Abandoned)) {
-                    // The leader was cancelled, not this attempt: lead (or
-                    // follow) a fresh pull within what is left of the wait.
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     return self.pull_keyed(key.clone(), image, authfile, remaining, cancel);
                 }
@@ -379,9 +299,6 @@ impl Images {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                // A leader this late cannot still be pulling — its own
-                // deadline passed — so the slot is stale (a panic skips
-                // the publish). Drop it so the next attempt pulls fresh.
                 let mut state = self.state();
                 if state
                     .pulling
@@ -400,8 +317,6 @@ impl Images {
         }
     }
 
-    /// Run the download for `slot` and publish its outcome to every
-    /// follower, then retire the slot.
     fn lead(
         &self,
         key: &PullKey,
@@ -415,14 +330,11 @@ impl Images {
         if outcome.is_ok() && key.store == podman::Store::Shared {
             self.record(image);
         }
-        // A pull killed because its leader was cancelled says nothing about
-        // the image: followers are told to pull for themselves.
+        // A pull killed by its leader's cancel says nothing about the image: followers pull for themselves.
         let shared = match &outcome {
             Err(_) if cancel.load(Ordering::Acquire) => Err(Shared::Abandoned),
             other => other.as_ref().copied().map_err(Shared::of),
         };
-        // Publish before the slot leaves the map: a caller between the
-        // two still follows this pull rather than leading a second one.
         *slot.result.lock().unwrap_or_else(|p| p.into_inner()) = Some(shared);
         slot.done.notify_all();
         let mut state = self.state();
@@ -431,13 +343,6 @@ impl Images {
         outcome
     }
 
-    /// Lead a pull of `image` ahead of any attempt needing it, or do
-    /// nothing (`None`) when the store is known to hold its digest or a
-    /// pull of it is already in flight. An attempt that then needs the
-    /// image follows this pull like any other and shares its download;
-    /// `cancel` kills it — the prefetcher sets it only for a stale hint
-    /// with no follower, and a follower of a cancelled prefetch pulls for
-    /// itself. `image` must be a `name@sha256:…` reference.
     pub fn prefetch(
         &self,
         image: &str,
@@ -467,7 +372,6 @@ impl Images {
         ))
     }
 
-    /// Pulls in flight that an attempt leads — what a prefetch yields to.
     pub fn attempt_pulls(&self) -> usize {
         let state = self.state();
         state
@@ -477,9 +381,6 @@ impl Images {
             .count()
     }
 
-    /// Attempts parked on `image`'s in-flight pull: a prefetch with a
-    /// follower is no longer only a guess, and is never cancelled as
-    /// stale.
     pub fn followers(&self, image: &str) -> usize {
         self.state()
             .pulling
@@ -489,16 +390,10 @@ impl Images {
             .sum()
     }
 
-    /// Whether `digest` — the `sha256:…` half of a pulled reference — is
-    /// in the held record. Advisory for placement: `pull` still verifies
-    /// against the store on every call.
     pub fn holds(&self, digest: &str) -> bool {
         self.state().held.contains(digest)
     }
 
-    /// What this worker's store is known to hold, sorted for a stable
-    /// wire form. Bounded by [`MAX_HELD`]; learned lazily from pull
-    /// outcomes, so a restarted worker's is empty until the first pull.
     pub fn held(&self) -> Vec<String> {
         let mut held: Vec<String> = self
             .state()
@@ -510,14 +405,10 @@ impl Images {
         held
     }
 
-    /// Moves every time the held record gains a digest.
     pub fn version(&self) -> u64 {
         self.state().version
     }
 
-    /// The newest `max` held digests as placement keys — the first 8 bytes
-    /// of each `sha256:` digest, what the profile's `Availability::images`
-    /// carries. A digest that is not `sha256:<hex>` has no key.
     pub fn held_keys(&self, max: usize) -> Vec<[u8; 8]> {
         let state = self.state();
         state
@@ -537,13 +428,10 @@ impl Images {
             .collect()
     }
 
-    /// Pulls in flight right now; never more than the attempt bound.
     pub fn in_flight(&self) -> usize {
         self.state().pulling.len()
     }
 
-    /// The pull landed: the digest half of `name@sha256:…` joins the held
-    /// record, evicting the oldest learned past [`MAX_HELD`].
     fn record(&self, image: &str) {
         let Some((_, digest)) = image.split_once('@') else {
             return;
@@ -569,12 +457,6 @@ impl Images {
         state.version += 1;
     }
 
-    /// Choose what one reclamation pass removes from a store holding
-    /// `images` so it fits `budget` bytes: only images no container
-    /// uses, never a digest being pulled or used within [`IMAGE_KEEP`] (an
-    /// attempt pulls, then creates its container — the gap is not an
-    /// invitation), least recently used first (a digest this process never
-    /// saw used counts as oldest), at most [`MAX_IMAGE_REMOVALS`].
     pub fn reclaimable(&self, images: &[podman::StoredImage], budget: u64) -> Vec<String> {
         let total: u64 = images.iter().map(|i| i.bytes).sum();
         if total <= budget {
@@ -679,13 +561,9 @@ mod tests {
         }
     }
 
-    /// An image store over its budget gives up the least recently
-    /// used images no container holds, and never one just pulled for use.
     #[test]
     fn reclamation_takes_the_least_recently_used_and_spares_what_is_in_use() {
         let images = Images::new(PathBuf::new());
-        // `recent` was pulled for an attempt a moment ago; `old` an hour ago;
-        // `unknown` never by this process.
         images.record("r@sha256:recent");
         images.record("r@sha256:old");
         images.state().used.insert(
@@ -700,19 +578,13 @@ mod tests {
             stored("cc", 300, 0, "sha256:recent"),
             stored("dd", 400, 0, "sha256:unknown"),
         ];
-        // Under budget: nothing.
         assert!(images.reclaimable(&store, 1_000).is_empty());
-        // 700 over: the unknown first, then the old — and that is all it may
-        // take, so the store stays over until the others free up.
         assert_eq!(images.reclaimable(&store, 300), ["dd", "aa"]);
-        // Just past budget: the first candidate is enough.
         assert_eq!(images.reclaimable(&store, 950), ["dd"]);
-        // A pull re-marks an image as used.
         images.record("r@sha256:old");
         assert_eq!(images.reclaimable(&store, 300), ["dd"]);
     }
 
-    /// How many followers are parked on `image`'s pull right now.
     fn waiters(images: &Images, image: &str) -> usize {
         images
             .state()
@@ -730,15 +602,10 @@ mod tests {
         }
     }
 
-    /// A download that counts its calls, reports each entry on `entered`
-    /// and finishes with `outcome` when `release` is tripped.
     struct Stub {
         calls: Arc<AtomicUsize>,
         entered: mpsc::Sender<()>,
         release: Arc<Barrier>,
-        /// `Err("…")` maps to `Error::Timeout` — one typed error is enough
-        /// to prove the leader's outcome is what followers get; `Ok`
-        /// carries the exists/downloaded bool.
         outcome: std::result::Result<bool, &'static str>,
     }
 
@@ -782,14 +649,10 @@ mod tests {
                 thread::spawn(move || images.pull(IMAGE, Duration::from_secs(30), &cancel))
             })
             .collect();
-        // The leader is inside the download; every follower is parked on
-        // the slot before it is allowed to finish.
         entered.recv_timeout(Duration::from_secs(10)).unwrap();
         parked(&images, IMAGE, 4);
         stub.release.wait();
         for caller in callers {
-            // The leader's exists/downloaded answer is what every
-            // follower gets: this stub downloaded.
             assert!(!caller.join().unwrap().unwrap());
         }
         assert_eq!(
@@ -885,8 +748,6 @@ mod tests {
         }
         assert_eq!(images.in_flight(), 0);
         assert!(!images.holds(DIGEST), "a failed pull records nothing");
-        // The slot is gone: the next pull leads a fresh download rather
-        // than replaying the failure.
         let retry = {
             let (images, cancel) = (images.clone(), cancel());
             thread::spawn(move || images.pull(IMAGE, Duration::from_secs(30), &cancel))
@@ -918,8 +779,6 @@ mod tests {
         };
         parked(&images, IMAGE, 1);
         flag.store(true, Ordering::Release);
-        // The canceled follower leaves promptly — well before the pull it
-        // was watching ends.
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || tx.send(follower.join().unwrap()).unwrap());
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
@@ -949,9 +808,6 @@ mod tests {
         images
             .pull(IMAGE, Duration::from_secs(30), &cancel())
             .unwrap();
-        // Back-to-back pulls each run their own check: sharing covers the
-        // in-flight window, not forever — `podman image exists` is the
-        // cheap authority for an image already held.
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(images.in_flight(), 0);
         assert_eq!(images.held(), vec![DIGEST.to_string()]);
@@ -974,7 +830,6 @@ mod tests {
 
     #[test]
     fn the_wrapped_pull_still_refuses_an_unpinned_reference() {
-        // The real backend retains the same check as a second boundary.
         let images = Images::new(PathBuf::new());
         match images.pull(
             "example.test/image:latest",

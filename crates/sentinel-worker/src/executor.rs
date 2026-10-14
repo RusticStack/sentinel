@@ -1,21 +1,3 @@
-//! The link's `Executor`, backed by real attempts on threads.
-//!
-//! An offer is taken when the runtime is usable and the worker holds fewer
-//! than its bound of attempts; the spec is then asked for over the link and
-//! the attempt starts once it arrives. Reports go out on the live session
-//! from the attempt's own thread, in order; when there is no session they
-//! queue in memory and are replayed at the next attach. A `stop` from the controller flips the attempt's cancel flag and
-//! ends its container; it is not reported, because the controller already
-//! counts the attempt as gone. The lease watchdog ends every attempt the
-//! same way once the lease it measured (monotonically, from the heartbeat
-//! that renewed it) has run out, and nothing it ended is reported either.
-//!
-//! A spec that does not arrive is asked for again every [`SPEC_RETRY`]; one
-//! refused for good fails the attempt at once as `Preparation`; and an
-//! attempt that still has none after [`SPEC_DEADLINE`] is handed back — it
-//! never started, so the controller requeues it rather than recording a
-//! failure.
-
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -44,78 +26,45 @@ use crate::{
     spool::{DEFAULT_SPOOL_QUOTA, DEFAULT_SPOOL_RESERVE, Refused, SpoolSpace},
 };
 
-/// What happened, for the process's diagnostics.
 #[derive(Debug)]
 pub enum Notice {
     Started(AttemptId),
     Finished(AttemptId, Verdict),
     SpecRefused(AttemptId),
-    /// The spec never arrived within [`SPEC_DEADLINE`]: the attempt was
-    /// handed back to the controller unstarted.
     HandedBack(AttemptId),
     Stopped(AttemptId),
-    /// A cancel order was carried out; `forced` when the grace ran out.
     Canceled {
         attempt: AttemptId,
         forced: bool,
     },
-    /// The lease deadline passed with no renewal: every attempt was ended
-    /// without a report, because the controller has already expired them.
     LeaseLost(Vec<AttemptId>),
-    /// A leftover of the previous process was handed to the controller:
-    /// its spool delivered (or refused) and the attempt abandoned.
     Abandoned {
         attempt: AttemptId,
         log_delivered: bool,
     },
-    /// The mirrors root could not be opened at start; every checkout runs
-    /// direct for the life of this process. The reason is bounded.
     MirrorsUnavailable(String),
-    /// An attempt's spool refused output — its cap, the worker's spool
-    /// quota, the free-space reserve, a failed write — and declared it as
-    /// gaps in the log. Emitted once, when the attempt finishes.
     SpoolRefused {
         attempt: AttemptId,
         refused: Refused,
     },
-    /// A declared cache's publication settled during finalization —
-    /// sealed, skipped or failed; the attempt's verdict never depends on it.
     CachePublished {
         attempt: AttemptId,
         note: CacheNote,
     },
-    /// A bounded reclamation pass over the cache root removed something —
-    /// expired leases, dead staging or generations past retention/budget.
     CacheSwept(sentinel_cache::gc::GcStats),
-    /// The image reclamation pass removed this many images.
     ImagesReclaimed(usize),
-    /// A nominal cache hit paid rebuild-scale restore cost — the
-    /// costly-hit rule (docs/cache.md) tripped. Diagnostics only; the
-    /// attempt's verdict never depends on it.
     CostlyCacheHit {
         attempt: AttemptId,
-        /// The declared cache's name.
         name: String,
-        /// Which clause tripped (`copied_all`/`slow`).
         costly: sentinel_cache::Costly,
-        /// The restore's measured stats — the evidence.
         stats: sentinel_cache::Stats,
     },
-    /// The worker's compact availability snapshot, emitted after each
-    /// bounded cache sweep — at start and after every attempt's finalization,
-    /// never on a timer.
     Availability(Availability),
-    /// An offer was refused because the data directory's file system is
-    /// below the admission floor ([`admission_floor`]); the controller
-    /// places it elsewhere or waits.
     OfferRefused {
         attempt: AttemptId,
         free_bytes: u64,
         floor_bytes: u64,
     },
-    /// [`Executor::shutdown`] finished: `ended` attempts were torn down
-    /// without a report, `left` were still being torn down at the deadline,
-    /// `handed_back` offers still waiting for a spec were returned.
     ShutDown {
         ended: usize,
         left: usize,
@@ -123,83 +72,46 @@ pub enum Notice {
     },
 }
 
-/// The free space the data directory's file system must keep for a new
-/// attempt to be admitted, for a file system of `total` bytes: one eighth,
-/// at least 512 MiB and at most 2 GiB — the reserve the worker's advertised
-/// scratch disk already leaves for logs, metadata and artifacts.
 pub fn admission_floor(total: u64) -> u64 {
     (total / 8).clamp(512 << 20, 2 << 30)
 }
 
-/// Whether `free` bytes meet `floor`. A file system that could not be
-/// measured is admitted: an unmeasured disk is not a full one.
 fn admits(free: Option<u64>, floor: u64) -> bool {
     free.is_none_or(|free| free >= floor)
 }
 
-/// The snapshot [`Notice::Availability`] carries — bounded, learned from
-/// pull outcomes and the sweep's own walk; never a store scan.
 #[derive(Clone, Debug)]
 pub struct Availability {
-    /// Image digests the local store is known to hold — sorted, bounded
-    /// by `images::MAX_HELD`.
     pub images_held: Vec<String>,
-    /// Image pulls in flight right now.
     pub images_in_flight: usize,
-    /// Cache entry directories the sweep saw.
     pub cache_entries: u64,
-    /// Generation directories the sweep saw.
     pub cache_generations: u64,
-    /// Payload bytes the store holds now — what the pass saw less what it
-    /// freed (`bytes_freed`).
     pub cache_bytes: u64,
-    /// The pass hit its work bound — the occupancy counts are partial.
     pub truncated: bool,
 }
 
-/// TERM-to-KILL grace for a cancel when the process sets none.
 pub const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(30);
-/// Subtracted from the lease the worker measured: it acts before the
-/// controller could have expired the attempt, never after.
 pub const LEASE_GUARD: Duration = Duration::from_secs(5);
-/// The lease a renewal grants, as the worker protocol fixes it.
 const LEASE: Duration = Duration::from_millis(sentinel_protocol::limits::LEASE_MS as u64);
-/// How often the lease watchdog looks.
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
-/// How long a spec request goes unanswered before it is asked again.
 pub const SPEC_RETRY: Duration = Duration::from_secs(10);
-/// A terminal report the controller has not confirmed (by no longer counting
-/// the attempt as held) is sent again after this long, and every this often.
 const REPORT_RESEND: Duration = Duration::from_secs(5);
-/// A terminal report is kept until the controller confirms it for at most
-/// this long; the controller's lease has settled the attempt by then.
 const REPORT_KEEP: Duration = Duration::from_secs(600);
-/// How long an acknowledged attempt waits for its spec before it is handed
-/// back to the controller unstarted.
 pub const SPEC_DEADLINE: Duration = Duration::from_secs(60);
 
 struct Live {
     cancel: Cancel,
     logs: Arc<LogPipe>,
-    /// A cancel order is already being carried out.
     canceling: bool,
-    /// The lease watchdog ended it: the controller has (or will have)
-    /// settled it by expiry, so nothing about it is reported.
     lost: bool,
-    /// The store its container lives in: what a stop, cancel or
-    /// lease loss removes it from.
     store: podman::Store,
 }
 
-/// An offer taken and waiting for its spec.
 struct Awaiting {
     offer: Offer,
-    /// When the spec was first asked for, and last.
     since: Instant,
     asked: Instant,
-    /// It is being handed back; a spec arriving now is not used.
     declining: bool,
-    /// Values registered before the attempt started, for its redactor.
     secrets: Vec<sentinel_protocol::secrets::SecretBytes>,
 }
 
@@ -215,8 +127,6 @@ fn valid_delivery(
     if !bundle.valid() {
         return false;
     }
-    // A value the redactor refuses (shorter than MIN_SECRET_BYTES) must not
-    // reach a job unredacted: the attempt fails as Preparation instead.
     if bundle
         .values
         .iter()
@@ -279,9 +189,7 @@ fn valid_delivery(
                 let Some(auth) = auth.as_object() else {
                     return false;
                 };
-                // Credential helpers and Docker config extensions can invoke
-                // worker-side helpers or introduce unrelated auth sources.
-                // The protocol accepts only the tenant's explicit auth map.
+                // Credential helpers and Docker config extensions could run helpers or add auth sources, so only the explicit auths map is accepted.
                 if auth.len() != 1 || !auth.get("auths").is_some_and(serde_json::Value::is_object) {
                     return false;
                 }
@@ -345,7 +253,6 @@ mod secret_delivery_tests {
         let auth = br#"{"auths":{"ghcr.io":{"auth":"dG9rZW4="}}}"#;
         assert!(valid_delivery(&spec, 0, &bundle(b"token", auth, true)));
         assert!(!valid_delivery(&spec, 0, &bundle(b"token", auth, false)));
-        // A value the redactor would refuse is never delivered.
         assert!(!valid_delivery(&spec, 0, &bundle(b"123", auth, true)));
         assert!(!valid_delivery(
             &spec,
@@ -388,11 +295,6 @@ mod secret_delivery_tests {
     }
 }
 
-/// A terminal verdict that was handed to the link. The link answers nothing,
-/// so the only confirmation is the controller no longer counting the attempt
-/// as held (its heartbeat answer names the attempt in `stop`). Until then the
-/// attempt stays in the heartbeat's held list, which keeps its lease renewed
-/// while the controller's store is slow, and the verdict is sent again.
 struct Unconfirmed {
     fence: Fence,
     event: Event,
@@ -401,15 +303,10 @@ struct Unconfirmed {
     sent: Instant,
 }
 
-/// Drop the verdicts kept for [`REPORT_KEEP`] at `now`: the controller's
-/// lease has settled those attempts by then.
 fn forget_unconfirmed(unconfirmed: &mut HashMap<AttemptId, Unconfirmed>, now: Instant) {
     unconfirmed.retain(|_, u| now.saturating_duration_since(u.first) < REPORT_KEEP);
 }
 
-/// The verdicts to send again at `now`: those last sent [`REPORT_RESEND`] ago
-/// or more, marked as sent now. Each stays unconfirmed (and so held, renewing
-/// its lease) until the controller stops counting the attempt.
 fn due_resends(
     unconfirmed: &mut HashMap<AttemptId, Unconfirmed>,
     now: Instant,
@@ -426,35 +323,20 @@ fn due_resends(
 
 struct State {
     reporter: Option<Reporter>,
-    /// Terminal verdicts sent and not yet confirmed, by attempt.
     unconfirmed: HashMap<AttemptId, Unconfirmed>,
-    /// Offers taken and waiting for their spec.
     awaiting: HashMap<AttemptId, Awaiting>,
     live: HashMap<AttemptId, Live>,
-    /// Reports that found no session, in order, with the summary of a
-    /// terminal one.
     pending: Vec<(AttemptId, Fence, Event, Option<Vec<u8>>)>,
-    /// Monotonic deadline: the lease the last renewal granted, measured
-    /// from the heartbeat that asked for it, minus the guard.
     lease_deadline: Option<Instant>,
     cancel_grace: Duration,
     prepare_hold: Duration,
-    /// Attempts of the previous process still to abandon, once a session is up.
     leftovers: Vec<Leftover>,
-    /// Leftover spools being delivered, so their acknowledgements route.
     recovering: HashMap<AttemptId, Arc<LogPipe>>,
-    /// Artifact reply waiters, one per attempt: the link admits one
-    /// in-flight publication per attempt and the attempt thread captures
-    /// its artifacts sequentially.
     artifact_waits: HashMap<AttemptId, Arc<Watch>>,
-    /// [`Executor::shutdown`] has begun: no offer is taken any more.
     draining: bool,
 }
 
-/// The controller's next artifact answer, shared with the attempt thread.
-/// `gate` makes the check-and-send of each in-flight frame atomic against
-/// a verdict resolving the watch: a frame can never be sent after the
-/// controller has closed the artifact.
+/// The gate makes each frame's check-and-send atomic against a verdict closing the artifact.
 #[derive(Default)]
 struct Watch {
     reply: Mutex<Option<Reply>>,
@@ -462,8 +344,6 @@ struct Watch {
     gate: Mutex<()>,
 }
 
-/// What a watch can carry: the grant that opens a stream, or the terminal
-/// verdict that closes it.
 #[derive(Clone, Copy)]
 enum Reply {
     Granted,
@@ -471,16 +351,13 @@ enum Reply {
 }
 
 impl Watch {
-    /// The latest answer wins; a verdict can always follow a grant.
     fn resolve(&self, reply: Reply) {
         *self.reply.lock().unwrap_or_else(|p| p.into_inner()) = Some(reply);
         self.cv.notify_all();
     }
-    /// The current answer without consuming it.
     fn peek(&self) -> Option<Reply> {
         *self.reply.lock().unwrap_or_else(|p| p.into_inner())
     }
-    /// Wait for the first answer — `Granted` or a verdict.
     fn wait_reply(&self, timeout: Duration) -> Option<Reply> {
         let slot = self.reply.lock().unwrap_or_else(|p| p.into_inner());
         let (slot, waited) = self
@@ -492,7 +369,6 @@ impl Watch {
         }
         *slot
     }
-    /// Wait for the terminal verdict only; a stale `Granted` is not it.
     fn wait_done(&self, timeout: Duration) -> Option<ArtifactCode> {
         let deadline = Instant::now() + timeout;
         let mut slot = self.reply.lock().unwrap_or_else(|p| p.into_inner());
@@ -513,7 +389,6 @@ impl Watch {
     }
 }
 
-/// The executor handle the link holds; cheap to clone, one runtime behind it.
 #[derive(Clone)]
 pub struct Executor(Arc<Inner>);
 
@@ -528,54 +403,26 @@ pub struct Inner {
     root: PathBuf,
     worker: sentinel_core::WorkerId,
     runtime: podman::Runtime,
-    /// One in-flight pull per image reference across every attempt, and
-    /// the record of what the local store holds.
     images: Images,
-    /// Background pulls of what the controller's hints name, through
-    /// `images`, within their own bounds.
     prefetch: crate::prefetch::Prefetcher,
-    /// The worker-local object mirrors, opened once here so the reflink
-    /// probe and the root are settled for the process's life. `None` —
-    /// configured off, or open failed — runs every checkout direct.
     mirrors: Option<crate::checkout::Mirrors>,
-    /// The disk every attempt's spool shares: a quota and a free-space
-    /// reserve on the data directory.
     spool: Arc<SpoolSpace>,
-    /// Free bytes the data directory's file system must keep for an offer
-    /// to be taken ([`admission_floor`]).
     admission_floor: std::sync::atomic::AtomicU64,
-    /// When a low-disk refusal was last reported ([`REFUSAL_NOTICE_EVERY`]).
     refusal_noted: Mutex<Option<Instant>>,
     state: Mutex<State>,
-    /// One cache reclamation pass at a time; a second caller skips rather
-    /// than waits, because the running pass already covers its work. The
-    /// lock holds the resume cursor, so bounded passes cover the whole
-    /// tree across attempts.
     gc_lock: Mutex<sentinel_cache::gc::Cursor>,
-    /// The cache store's payload bytes as the last pass estimated them —
-    /// the availability the link reports to placement.
     cache_bytes: std::sync::atomic::AtomicU64,
-    /// Moves whenever `cache_bytes` changes.
     cache_version: std::sync::atomic::AtomicU64,
-    /// Byte budgets of the disposable stores.
     budgets: Mutex<StorageBudgets>,
-    /// When the image stores were last reclaimed; the pass lists every
-    /// store, so it runs at most every [`IMAGE_SWEEP_EVERY`].
     image_swept: Mutex<Option<std::time::Instant>>,
     notify: Box<dyn Fn(Notice) + Send + Sync>,
     recovered: Recovered,
 }
 
-/// How often a refused offer is reported at most.
 const REFUSAL_NOTICE_EVERY: Duration = Duration::from_secs(30);
 
-/// How often the image stores are reclaimed at most.
 const IMAGE_SWEEP_EVERY: Duration = Duration::from_secs(60);
 
-/// The worker's disposable stores and what each may hold: the cache,
-/// the Git mirrors and the container images. Everything here is rebuilt on
-/// demand, so each is held to its budget least recently used first and a
-/// store never outgrows it by more than one pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageBudgets {
     pub cache_bytes: u64,
@@ -584,10 +431,6 @@ pub struct StorageBudgets {
 }
 
 impl StorageBudgets {
-    /// Budgets for a data filesystem of `total` bytes: a fifth each for the
-    /// cache and the images, a tenth for the mirrors — together half, the
-    /// other half left to workspaces, spools and the host — each clamped
-    /// (cache and mirrors 1–50 GiB, images 2–50 GiB).
     pub fn sized(total: u64) -> StorageBudgets {
         const GIB: u64 = 1 << 30;
         StorageBudgets {
@@ -602,8 +445,6 @@ impl StorageBudgets {
 mod budget_tests {
     use super::StorageBudgets;
 
-    /// The disposable stores are sized from the disk and clamped; a 1 TB
-    /// disk reaches 50 GiB each.
     #[test]
     fn budgets_follow_the_disk_and_stay_clamped() {
         const GIB: u64 = 1 << 30;
@@ -629,8 +470,6 @@ mod budget_tests {
 mod admission_tests {
     use super::{admission_floor, admits};
 
-    /// A disk below the floor refuses the offer, one at it or above takes
-    /// it, and a disk that could not be measured is not taken for full.
     #[test]
     fn a_low_disk_refuses_and_an_unmeasured_one_does_not() {
         const GIB: u64 = 1 << 30;
@@ -641,8 +480,6 @@ mod admission_tests {
         assert!(admits(None, GIB));
     }
 
-    /// The floor is the profile's reserve rule: an eighth of the file
-    /// system, kept between 512 MiB and 2 GiB.
     #[test]
     fn the_floor_is_an_eighth_of_the_disk_within_bounds() {
         const MIB: u64 = 1 << 20;
@@ -665,10 +502,6 @@ impl Default for StorageBudgets {
 }
 
 impl Executor {
-    /// Probe the runtime and prepare the data directory. Refuses to exist
-    /// without rootless Podman: an executor that cannot isolate is not one.
-    /// `git_mirrors` is the operator's escape hatch; when on, a mirror root
-    /// that cannot be opened is reported once and checkouts run direct.
     pub fn start(
         root: PathBuf,
         worker: sentinel_core::WorkerId,
@@ -676,10 +509,6 @@ impl Executor {
         git_mirrors: bool,
     ) -> Result<Executor> {
         let runtime = podman::probe()?;
-        // Everything the worker keeps under the data directory is
-        // owner-only, created so before the stores that own them open
-        // (`sentinel-git` and `sentinel-cache` create with the umask's mode
-        // what they find missing).
         for dir in [
             crate::workspace::WORKSPACES_DIR,
             crate::checkout::MIRRORS_DIR,
@@ -700,9 +529,6 @@ impl Executor {
         } else {
             None
         };
-        // Before any offer: what the previous process left is settled on
-        // disk and in the runtime; what it owed the controller waits for
-        // the session.
         let (recovered, leftovers) = recovery::recover(&root, worker)?;
         let images = Images::for_worker_data_dir(&root)?;
         let prefetch = crate::prefetch::Prefetcher::new(
@@ -744,10 +570,6 @@ impl Executor {
             image_swept: Mutex::new(None),
             recovered,
         }));
-        // One bounded reclamation pass at start: what a dead process left —
-        // expired leases, a torn staging dir, generations a crashed publish
-        // abandoned — collects here rather than under a running job. Off
-        // this thread, so a large store cannot hold executor start.
         let watched = Arc::downgrade(&executor.0);
         let _ = thread::Builder::new()
             .name("sentinel-cache-gc".into())
@@ -770,33 +592,15 @@ impl Executor {
         Ok(executor)
     }
 
-    /// The free space every spool leaves on the data directory's file
-    /// system, and the bytes all of them may hold together (defaults
-    /// `DEFAULT_SPOOL_RESERVE` and `DEFAULT_SPOOL_QUOTA`). Output past
-    /// either is declared as gaps in the attempt's log.
     pub fn set_spool_limits(&self, reserve: u64, quota: u64) {
         self.spool.set_limits(reserve, quota);
     }
 
-    /// The free space the data directory's file system must keep for an
-    /// offer to be taken (default [`admission_floor`] of the file system's
-    /// size). Below it every offer is refused, so the controller places the
-    /// job elsewhere instead of this disk filling under it.
     pub fn set_admission_floor(&self, bytes: u64) {
         self.admission_floor
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// End the worker's attempts for good, before the process exits: no
-    /// offer is taken any more, offers still waiting for their spec are
-    /// handed back to the controller (it requeues them), and every running
-    /// attempt is stopped — its container removed with whatever it was
-    /// running, its workspace and secrets torn down by its own thread — and
-    /// nothing is reported for it, as for a lost lease: the controller
-    /// settles it by expiry, and a report would pass a shutdown off as a
-    /// cancel nobody asked for. Waits at most `grace` for the teardowns.
-    /// Call it while the session is still up, so the hand-backs reach the
-    /// controller.
     pub fn shutdown(&self, grace: Duration) {
         let (waiting, live, reporter) = {
             let mut state = self.state();
@@ -829,8 +633,6 @@ impl Executor {
         for (_, cancel, _) in &live {
             cancel.store(true, Ordering::Release);
         }
-        // Containers go together: each removal can take seconds, and the
-        // attempts' own teardowns wait behind them.
         thread::scope(|scope| {
             for (attempt, _, store) in &live {
                 scope.spawn(move || {
@@ -853,28 +655,18 @@ impl Executor {
         });
     }
 
-    /// The disposable stores' byte budgets (default
-    /// [`StorageBudgets::default`]); the next reclamation pass holds to them.
     pub fn set_storage_budgets(&self, budgets: StorageBudgets) {
         *self.budgets.lock().unwrap_or_else(|p| p.into_inner()) = budgets;
     }
 
-    /// How long a canceled step gets between `SIGTERM` and the forced stop.
     pub fn set_cancel_grace(&self, grace: Duration) {
         self.state().cancel_grace = grace;
     }
 
-    /// Hold every attempt between checkout and image pull; a test aid for
-    /// cancellation during preparation. Zero (the default) holds nothing.
     pub fn set_prepare_hold(&self, hold: Duration) {
         self.state().prepare_hold = hold;
     }
 
-    /// Redact `value` from `attempt`'s output — only that attempt's, from
-    /// now on, for its lifetime; it goes with the attempt. A value
-    /// registered before the attempt starts applies from its first byte.
-    /// Returns whether it was accepted: `false` for an empty value or an
-    /// attempt not held here.
     pub fn register_secret(&self, attempt: AttemptId, value: &[u8]) -> bool {
         if value.is_empty() {
             return false;
@@ -968,9 +760,6 @@ impl Executor {
         {
             let mut state = self.state();
             if state.draining {
-                // A spec that arrived as the shutdown began: nothing was
-                // started, and the controller settles the attempt by
-                // expiry like every other one the shutdown left.
                 return;
             }
             state.live.insert(
@@ -999,15 +788,11 @@ impl Executor {
             prepare_hold: self.state().prepare_hold,
             secret_bundle,
         };
-        // Deterministic: preparation derives the same store.
         let store = attempt::store_for(&self.root, &job).unwrap_or(podman::Store::Shared);
         if let Some(live) = self.state().live.get_mut(&offer.attempt) {
             live.store = store.clone();
         }
-        // On disk before anything runs: a crash from here on leaves a
-        // marker the next process reconciles. If the marker cannot be
-        // written the attempt must not start — a crash would leave a
-        // spool with no marker, which recovery discards as reported.
+        // A crash after this point must leave a marker for recovery, so an unwritable marker means the attempt must not start.
         if recovery::mark(&self.root, offer.attempt, offer.fence).is_err() {
             self.state().live.remove(&offer.attempt);
             self.send(
@@ -1026,10 +811,7 @@ impl Executor {
                 let pipe = Arc::clone(&logs);
                 let output: Arc<dyn attempt::Output> = logs;
                 let sink: &dyn artifacts::Sink = &*executor;
-                // A panic anywhere in the attempt must not leave it held,
-                // renewed and running until the controller's backstop: tear
-                // down what it may have left and report it as a runtime
-                // failure, like any other thing the runtime could not do.
+                // A panic must not leave the attempt held and renewed: tear it down and report a runtime failure.
                 let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     attempt::run(&executor.root, &mut job, &*executor, output, sink, &cancel)
                 }));
@@ -1044,8 +826,6 @@ impl Executor {
                                 .join(crate::workspace::WORKSPACES_DIR)
                                 .join(attempt.to_string()),
                         );
-                        // What it printed before the panic is delivered and
-                        // the log closed, so the spool goes too.
                         if attempt::Output::complete(&*pipe) {
                             recovery::mark_ended(&executor.root, attempt);
                         }
@@ -1065,9 +845,6 @@ impl Executor {
                     let mut state = executor.state();
                     state.live.remove(&job.attempt);
                     state.artifact_waits.remove(&job.attempt);
-                    // The marker outlives the report: if the terminal event
-                    // is still waiting for a session, a crash now must be
-                    // reconciled, not forgotten.
                     !state.pending.iter().any(|p| p.0 == job.attempt)
                 };
                 if delivered {
@@ -1081,13 +858,9 @@ impl Executor {
                     });
                 }
                 (executor.notify)(Notice::Finished(job.attempt, verdict));
-                // Finalization is where the store grows: one bounded pass
-                // now keeps publication's remains from accumulating.
                 executor.sweep_caches();
             });
         if spawned.is_err() {
-            // Nothing ran: the marker goes, the attempt is reported as the
-            // runtime failing to start it.
             self.state().live.remove(&offer.attempt);
             recovery::unmark(&self.root, offer.attempt);
             self.send(
@@ -1105,52 +878,40 @@ impl Inner {
         &self.runtime
     }
 
-    /// The worker's image pulls and what its store is known to hold.
     pub fn images(&self) -> &Images {
         &self.images
     }
 
-    /// The background prefetcher the controller's hints drive.
     pub fn prefetcher(&self) -> &crate::prefetch::Prefetcher {
         &self.prefetch
     }
 
-    /// What starting this executor found of the previous process.
     pub fn recovered(&self) -> &Recovered {
         &self.recovered
     }
 
-    /// Bytes the attempts' log spools hold now.
     pub fn spool_used(&self) -> u64 {
         self.spool.used()
     }
 
-    /// Attempts running or waiting for their spec.
     pub fn attempts_live(&self) -> usize {
         let state = self.state();
         state.live.len() + state.awaiting.len()
     }
 
-    /// Attempts still to be abandoned to the controller.
     pub fn leftovers_pending(&self) -> usize {
         self.state().leftovers.len()
     }
 
-    /// No attempt running or waiting for its spec.
     pub fn state_is_idle(&self) -> bool {
         let state = self.state();
         state.live.is_empty() && state.awaiting.is_empty()
     }
 
-    /// Reports that found no session and wait for the next one.
     pub fn pending_reports(&self) -> usize {
         self.state().pending.len()
     }
 
-    /// Hand the previous process's attempts to the controller: the spool's
-    /// frames and end first (the attempt is still held, so they are
-    /// accepted — or refused if its lease already expired), then the
-    /// abandonment under the fence, then the marker goes.
     fn abandon_leftovers(&self, leftovers: Vec<Leftover>, reporter: Reporter) {
         for leftover in leftovers {
             let delivered = if leftover.spooled {
@@ -1163,8 +924,6 @@ impl Inner {
                         let ok = attempt::Output::complete(&*pipe);
                         self.state().recovering.remove(&leftover.attempt);
                         if ok {
-                            // The spool is gone now; a crash before the
-                            // abandon lands must still call this delivered.
                             recovery::mark_ended(&self.root, leftover.attempt);
                         }
                         ok
@@ -1172,12 +931,9 @@ impl Inner {
                     Err(_) => false,
                 }
             } else {
-                // No spool: either its end was already durable when it went
-                // (`ended`), or the frames are genuinely gone — say which.
                 leftover.ended
             };
             if reporter.abandon(leftover.attempt, leftover.fence).is_err() {
-                // Session gone: keep it for the next attach.
                 self.state().leftovers.push(leftover);
                 return;
             }
@@ -1189,10 +945,6 @@ impl Inner {
         }
     }
 
-    /// Hold every image store to `budget`, at most every
-    /// [`IMAGE_SWEEP_EVERY`]: images no container uses, least recently
-    /// pulled first, never one pulled in the last few minutes or one being
-    /// pulled ([`Images::reclaimable`]). Removal is never forced.
     fn sweep_images(&self, budget: u64) {
         {
             let mut swept = self.image_swept.lock().unwrap_or_else(|p| p.into_inner());
@@ -1215,11 +967,6 @@ impl Inner {
         }
     }
 
-    /// One bounded reclamation pass over the cache root — skipped while
-    /// another runs, because the running pass already covers its work.
-    /// A pass that touched nothing stays quiet, but every pass ends by
-    /// emitting the availability snapshot, so the occupancy the pass already
-    /// computed never costs a second walk.
     fn sweep_caches(&self) {
         let mut cursor = match self.gc_lock.try_lock() {
             Ok(guard) => guard,
@@ -1234,8 +981,6 @@ impl Inner {
             &mut cursor,
         );
         drop(cursor);
-        // The mirrors share the pass's cadence: bounded, and skipped for
-        // any mirror a checkout holds.
         if let Some(mirrors) = &self.mirrors {
             let _ = mirrors.sweep(budgets.mirror_bytes);
         }
@@ -1261,12 +1006,6 @@ impl Inner {
         }
     }
 
-    /// The lease watchdog: once the lease the last renewal granted —
-    /// measured on this machine's monotonic clock from the heartbeat that
-    /// asked for it, less the guard — has run out, no attempt here is ours
-    /// any more. End them all, forced, and report nothing: the controller
-    /// settles them by expiry, and a report would be stale, or worse,
-    /// recorded as a cancel nobody asked for.
     fn watch_lease(&self) {
         let lost: Vec<(AttemptId, Cancel, podman::Store)> = {
             let mut state = self.state();
@@ -1296,10 +1035,6 @@ impl Inner {
         ));
     }
 
-    /// Spec requests that went unanswered are asked again; an attempt with
-    /// no spec past [`SPEC_DEADLINE`] is handed back to the controller. It
-    /// stays held (and renewed) until the hand-back is on the wire, and a
-    /// spec that arrives meanwhile is not used.
     fn watch_specs(&self) {
         let (reporter, ask, give_back) = {
             let mut state = self.state();
@@ -1333,7 +1068,6 @@ impl Inner {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// The log pipe of a live or recovering attempt.
     fn pipe(&self, attempt: AttemptId) -> Option<Arc<LogPipe>> {
         let state = self.state();
         state
@@ -1346,8 +1080,6 @@ impl Inner {
     fn send(&self, attempt: AttemptId, fence: Fence, event: Event, summary: Option<Vec<u8>>) {
         let mut state = self.state();
         if state.live.get(&attempt).is_some_and(|live| live.lost) {
-            // Ended by the lease watchdog: the controller settles it by
-            // expiry; nothing is reported, not even the forced verdict.
             return;
         }
         let sent = match (&state.reporter, &summary) {
@@ -1375,9 +1107,6 @@ impl Inner {
         }
     }
 
-    /// Send again the terminal verdicts the controller has not confirmed for
-    /// [`REPORT_RESEND`]; forget those kept for [`REPORT_KEEP`]. A duplicate
-    /// of an applied verdict is stale at the controller and changes nothing.
     fn resend_unconfirmed(&self) {
         let (reporter, due) = {
             let mut state = self.state();
@@ -1396,9 +1125,6 @@ impl Inner {
         }
     }
 
-    /// One in-flight artifact frame under the send gate: refuses once the
-    /// stream is closed, and a dead wire resolves the watch `Store` so the
-    /// capture settles without another wait.
     fn stream(
         &self,
         attempt: AttemptId,
@@ -1430,13 +1156,9 @@ impl Report for Inner {
     fn finish(&self, attempt: AttemptId, fence: Fence, event: Event, summary: Vec<u8>) {
         self.send(attempt, fence, event, Some(summary));
     }
-    /// Cache notes are process diagnostics, not wire traffic: the
-    /// controller's summary format is not theirs to ride.
     fn cache_note(&self, attempt: AttemptId, note: CacheNote) {
         (self.notify)(Notice::CachePublished { attempt, note });
     }
-    /// The costly-hit flag is the same kind of diagnostic — the summary's
-    /// per-entry record carries the flag; the notice carries the numbers.
     fn costly_hit(
         &self,
         attempt: AttemptId,
@@ -1451,10 +1173,6 @@ impl Report for Inner {
             stats: *stats,
         });
     }
-    /// The session's remote-cache transport, when the link offers one. It is
-    /// session state, not attempt state: a reconnect replaces the reporter
-    /// and with it this handle, and an attempt holding the old one simply
-    /// drops its offers.
     fn remote(&self) -> Option<std::sync::Arc<dyn sentinel_cache::remote::Remote>> {
         self.state()
             .reporter
@@ -1592,11 +1310,6 @@ impl artifacts::Sink for Inner {
 }
 
 impl LinkExecutor for Executor {
-    /// The image keys the local store is known to hold (newest
-    /// first, bounded by the wire's list limit) and the cache store's bytes
-    /// as the last sweep estimated them. Both come from state the worker
-    /// already keeps — no store scan, no podman call; the version moves
-    /// when either changes, so the link resends only then.
     fn availability(&self) -> Option<(u64, sentinel_protocol::negotiate::Availability)> {
         let version = self.images.version().wrapping_add(
             self.cache_version
@@ -1614,16 +1327,12 @@ impl LinkExecutor for Executor {
         ))
     }
 
-    /// The controller's latest hint replaces the wanted set; pulls
-    /// run in the background within the prefetcher's bounds.
     fn prefetch(&self, images: &[String]) {
         self.prefetch.hint(images);
     }
 
     fn offered(&self, offer: &Offer) -> bool {
         let state = self.state();
-        // An attempt already taken — a repeated offer, in this session or
-        // an earlier one — is acknowledged again, never started twice.
         if state.live.contains_key(&offer.attempt) || state.awaiting.contains_key(&offer.attempt) {
             return true;
         }
@@ -1633,16 +1342,12 @@ impl LinkExecutor for Executor {
         {
             return false;
         }
-        // The disk is checked without the state lock: a `statvfs` is a
-        // syscall, and offers are the dispatcher's, one at a time.
         drop(state);
         let floor = self
             .admission_floor
             .load(std::sync::atomic::Ordering::Relaxed);
         let free = crate::spool::free_bytes(&self.root);
         if !admits(free, floor) {
-            // Said at most once per [`REFUSAL_NOTICE_EVERY`]: the
-            // controller offers again every pass while the disk stays low.
             let mut noted = self.refusal_noted.lock().unwrap_or_else(|p| p.into_inner());
             if noted.is_none_or(|at| at.elapsed() >= REFUSAL_NOTICE_EVERY) {
                 *noted = Some(Instant::now());
@@ -1663,8 +1368,6 @@ impl LinkExecutor for Executor {
             return false;
         }
         let now = Instant::now();
-        // Until the first renewal, the offer's own lease bounds the work:
-        // it was granted no earlier than it arrived.
         if state.lease_deadline.is_none() {
             state.lease_deadline = Some(now + LEASE.saturating_sub(LEASE_GUARD));
         }
@@ -1708,15 +1411,10 @@ impl LinkExecutor for Executor {
             (live, only)
         };
         if confirmed_only {
-            // The controller settled a verdict the worker had sent: the
-            // confirmation it waited for, not an attempt being stopped.
             return;
         }
         if let Some((cancel, store)) = live {
             cancel.store(true, Ordering::Release);
-            // End the container now, off this thread — it is the session's
-            // heartbeat thread, and a removal can take seconds; the attempt
-            // thread finalizes what is left and exits.
             let spawned = thread::Builder::new()
                 .name(format!("sentinel-stop-{attempt}"))
                 .spawn({
@@ -1744,8 +1442,7 @@ impl LinkExecutor for Executor {
                 _ => return,
             }
         };
-        // Desired state first, so a step that ends by itself meanwhile is
-        // still reported as canceled; then the signals, off this thread.
+        // Desired state is set first, so a step that ends by itself meanwhile is still reported as canceled.
         cancel.store(true, Ordering::Release);
         let executor = Arc::clone(&self.0);
         let spawned = thread::Builder::new()
@@ -1758,11 +1455,6 @@ impl LinkExecutor for Executor {
                         let forced = matches!(outcome, Ok(podman::Terminated::Forced));
                         (executor.notify)(Notice::Canceled { attempt, forced });
                     }
-                    // Nothing was signalled — an exec still starting, a
-                    // runtime that could not be asked — while the attempt
-                    // may still be running a step: let the cancel the next
-                    // heartbeat repeats try again rather than dropping it
-                    // for the rest of the step.
                     Ok(podman::Terminated::Gone) | Err(_) => {
                         if let Some(live) = executor.state().live.get_mut(&attempt) {
                             live.canceling = false;
@@ -1792,15 +1484,9 @@ impl LinkExecutor for Executor {
         self.renewed_at(until, Instant::now());
     }
 
-    /// The controller renewed to `now + LEASE` after the heartbeat left at
-    /// `sent`, so on this machine the lease lasts at least until
-    /// `sent + LEASE`. The controller's wall-clock deadline is never
-    /// compared with this machine's clock: skew between the two hosts can
-    /// neither kill live work early nor let it run past its expiry.
+    /// Monotonic time only: wall-clock skew between the hosts must neither kill live work early nor let it outlive its expiry.
     fn renewed_at(&self, _until: UnixMillis, sent: Instant) {
         self.state().lease_deadline = Some(sent + LEASE.saturating_sub(LEASE_GUARD));
-        // Every answered heartbeat is the moment to look again at verdicts
-        // the controller has not confirmed.
         self.resend_unconfirmed();
     }
 
@@ -1820,13 +1506,8 @@ impl LinkExecutor for Executor {
         for pipe in pipes {
             pipe.attached(reporter.clone());
         }
-        // Leftovers of the previous process: deliver what they printed,
-        // close the log, then abandon them — off this thread, since the
-        // delivery waits for acknowledgements.
         let leftovers = std::mem::take(&mut self.state().leftovers);
         if !leftovers.is_empty() {
-            // Handed through a slot so a failed spawn re-queues them for
-            // the next attach instead of waiting for a process restart.
             let slot = Arc::new(Mutex::new(Some(leftovers)));
             let hand = Arc::clone(&slot);
             let executor = Arc::clone(&self.0);
@@ -1860,8 +1541,6 @@ impl LinkExecutor for Executor {
                 recovery::unmark(&self.root, attempt);
             }
         }
-        // Specs asked for on a lost session: ask again (hand-backs under
-        // way go out with the next watchdog look).
         let awaiting: Vec<AttemptId> = {
             let mut state = self.state();
             let now = Instant::now();
@@ -1904,8 +1583,6 @@ impl LinkExecutor for Executor {
         for pipe in pipes {
             pipe.detached();
         }
-        // Any capture waiting on a controller reply is told the link is
-        // gone; nothing was committed, so the artifact fails to publish.
         for watch in watches {
             watch.resolve(Reply::Done(ArtifactCode::Store));
         }
@@ -1914,8 +1591,6 @@ impl LinkExecutor for Executor {
     fn artifact_granted(&self, attempt: AttemptId, _name: &str) {
         let watch = self.state().artifact_waits.get(&attempt).cloned();
         if let Some(watch) = watch {
-            // Resolve under the send gate: an `ArtifactFile` either ships
-            // before this grant is seen or sees it first — never both.
             let _gate = watch.gate.lock().unwrap_or_else(|p| p.into_inner());
             watch.resolve(Reply::Granted);
         }
@@ -1966,8 +1641,6 @@ impl LinkExecutor for Executor {
         self.accept_spec(attempt, context, bytes, secrets);
     }
 
-    /// The offer this worker acknowledged, whichever session it came on,
-    /// binds the secret transfer that answers its spec request.
     fn fence_of(&self, attempt: AttemptId) -> Option<Fence> {
         self.state()
             .awaiting
@@ -1976,10 +1649,6 @@ impl LinkExecutor for Executor {
             .map(|waiting| waiting.offer.fence)
     }
 
-    /// A definitive refusal: the attempt is settled at once as the
-    /// preparation failure it is, never left for the lease to expire. When
-    /// the controller already settled it (cancelled, or not this worker's)
-    /// the report is refused as stale and changes nothing.
     fn no_spec(&self, attempt: AttemptId) {
         let Some(waiting) = self.state().awaiting.remove(&attempt) else {
             return;
@@ -1998,7 +1667,6 @@ impl LinkExecutor for Executor {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Ask every live attempt to stop; their threads finalize on their own.
         for live in self.state().live.values() {
             live.cancel.store(true, Ordering::Release);
         }
@@ -2015,11 +1683,6 @@ mod tests {
     use super::*;
     use sentinel_core::{FailureClass, JobState, Outcome};
 
-    /// A step panics the attempt thread (a test-only hook in `attempt::run`)
-    /// while its container runs and its output is spooled. The panic is
-    /// contained: the container and the workspace are removed, what the
-    /// attempt printed reaches the controller and the log is closed, and it
-    /// is reported as a runtime failure — nothing is left held.
     #[test]
     fn a_panicking_attempt_is_torn_down_and_reported() {
         if !podman_enabled() {
@@ -2077,11 +1740,6 @@ mod tests {
         live.stop();
     }
 
-    /// A graceful shutdown ends what the worker was running: the
-    /// container (and the `sleep` in it) is removed, the workspace and
-    /// marker are gone, nothing stays held, and the job is not reported as
-    /// finished or canceled by a worker that is leaving — the controller
-    /// settles it by expiry.
     #[test]
     fn a_shutdown_ends_the_running_attempt_without_reporting_it() {
         if !podman_enabled() {
@@ -2127,17 +1785,12 @@ mod tests {
         }
     }
 
-    /// A sent verdict the controller has not confirmed is sent again every
-    /// `REPORT_RESEND`, summary included, and never sooner; each resend
-    /// restarts the interval, so a controller whose store is down is asked
-    /// at a steady pace and not on every heartbeat.
     #[test]
     fn an_unconfirmed_verdict_is_resent_on_its_interval_with_its_summary() {
         let (a, b) = (AttemptId::new(), AttemptId::new());
         let t0 = Instant::now();
         let mut map = HashMap::new();
         map.insert(a, unconfirmed(t0, Some(b"summary".to_vec())));
-        // `b` was sent later, so it is not due when `a` is.
         map.insert(b, unconfirmed(t0 + Duration::from_secs(3), None));
         assert!(due_resends(&mut map, t0 + REPORT_RESEND - Duration::from_millis(1)).is_empty());
         let due = due_resends(&mut map, t0 + REPORT_RESEND);
@@ -2147,7 +1800,6 @@ mod tests {
             (*attempt, *fence, *event, summary.as_deref()),
             (a, Fence(3), Event::Passed, Some(&b"summary"[..]))
         );
-        // Marked sent: not due again until another interval has passed.
         assert!(due_resends(&mut map, t0 + REPORT_RESEND + Duration::from_secs(1)).is_empty());
         let later = due_resends(&mut map, t0 + REPORT_RESEND * 2);
         let mut got: Vec<_> = later.iter().map(|d| d.0).collect();
@@ -2155,13 +1807,9 @@ mod tests {
         let mut want = vec![a, b];
         want.sort_by_key(|id| id.as_bytes().to_vec());
         assert_eq!(got, want);
-        // Resending keeps the verdict held: it is only ever removed by the
-        // controller's confirmation or by age.
         assert_eq!(map.len(), 2);
     }
 
-    /// A verdict is kept until the controller confirms it, up to
-    /// `REPORT_KEEP`: past that the lease has settled the attempt.
     #[test]
     fn an_unconfirmed_verdict_is_kept_until_its_keep_window_ends() {
         let a = AttemptId::new();
