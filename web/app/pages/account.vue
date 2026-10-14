@@ -1,11 +1,7 @@
 <script setup lang="ts">
 import type { Security } from "~~/shared/types/api";
 
-// The signed-in person's own security: an authenticator app (enroll with a
-// QR code or the key, confirm with a code, recovery codes shown once and
-// reissued under step-up), the password, and linked identities. Secrets
-// (the seed, codes, passwords) live in this page's memory only, are
-// cleared as soon as they have served, and never reach storage or a URL.
+// Secrets (seed, codes, passwords) stay in this page's memory, are cleared once used and never reach storage or a URL.
 useHead({ title: "Account security · Sentinel" });
 const api = useApi();
 const session = useSession();
@@ -88,9 +84,7 @@ async function changePassword() {
   }
 }
 
-// A new address is a claim until its link is opened; the confirmed one stays
-// the account's until then. Every answer reads the same whether or not
-// another account holds the address.
+// Every answer reads the same whether or not another account holds the address.
 
 const newEmail = ref("");
 const emailNote = ref<"sent-email" | "sent-operator" | null>(null);
@@ -149,7 +143,6 @@ async function linkGitHub() {
   try {
     const started = await withStepUp(() => api<{ authorize_url: string }>("/api/v1/identities/github/link", { method: "POST", body: {} }));
     if (!/^https:\/\//.test(started.authorize_url)) throw new ApiError(0, { code: "invalid_response", message: "the controller gave an unexpected address" });
-    // The round trip ends on `/`, which continues here.
     rememberReturn("/account");
     await navigateTo(started.authorize_url, { external: true });
   } catch (e) {
@@ -171,7 +164,6 @@ onBeforeUnmount(clearPasswords);
         :description="loadError.message" role="alert" :actions="[{ label: 'Try again', onClick: () => { refresh(); } }]" />
 
       <template v-else-if="security">
-        <!-- Authenticator app -->
         <UCard as="section" aria-labelledby="mfa-h">
           <template #header>
             <div class="flex flex-wrap items-center justify-between gap-2">
@@ -198,7 +190,6 @@ onBeforeUnmount(clearPasswords);
           <TotpEnroll v-else :has-password="security.password" :pending="security.mfa.pending" :username="session.me.value?.username" @done="refresh()" @cancel="refresh()" />
         </UCard>
 
-        <!-- Email address -->
         <UCard as="section" aria-labelledby="email-h">
           <template #header>
             <div class="flex flex-wrap items-center justify-between gap-2">
@@ -230,7 +221,6 @@ onBeforeUnmount(clearPasswords);
           </div>
         </UCard>
 
-        <!-- Password -->
         <UCard as="section" aria-labelledby="password-h">
           <template #header>
             <h2 id="password-h" class="text-base font-semibold flex items-center gap-2"><UIcon name="i-lucide-key-round" />Password</h2>
@@ -253,7 +243,6 @@ onBeforeUnmount(clearPasswords);
           <p v-else class="text-sm text-muted">Your account has no local password: you sign in with GitHub.</p>
         </UCard>
 
-        <!-- Linked identities -->
         <UCard as="section" aria-labelledby="identities-h">
           <template #header>
             <h2 id="identities-h" class="text-base font-semibold flex items-center gap-2"><UIcon name="i-lucide-link" />Linked identities</h2>

@@ -1,7 +1,5 @@
 <script setup lang="ts">
-// Sign-up by email. Whether it is open, needs an invitation or waits for an
-// administrator is the deployment's policy, which the controller applies and
-// the form explains when it refuses.
+// Open, invitation-only or approval-based sign-up is the controller's policy; the form only shows its refusals.
 definePageMeta({ layout: "auth" });
 useHead({ title: "Create an account · Sentinel" });
 const sent = ref<{ email: string; verification: "email" | "operator" } | null>(null);

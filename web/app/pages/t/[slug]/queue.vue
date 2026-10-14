@@ -1,6 +1,4 @@
 <script setup lang="ts">
-// Why waiting jobs wait: the scheduler's reason for each, oldest first,
-// with the missing quantities spelled out.
 const route = useRoute();
 const api = useApi();
 const slug = route.params.slug as string;

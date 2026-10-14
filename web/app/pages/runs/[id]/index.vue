@@ -2,8 +2,6 @@
 import type { Explanation, Run } from "~~/shared/types/api";
 import { phasesOf } from "~/components/PhaseBar.vue";
 
-// One run: its graph, each job's phases, cancel and rerun, why failed jobs
-// failed, cache outcomes and artifacts — kept current by the run stream.
 const route = useRoute();
 const api = useApi();
 const act = useAct();
@@ -12,7 +10,6 @@ const id = route.params.id as string;
 const { data: run, error } = await useAsyncData(`run-${id}`, () => api<Run>(`/api/v1/runs/${id}`));
 if (error.value) throw createError({ statusCode: error.value instanceof ApiError && error.value.status ? error.value.status : 500, statusMessage: error.value.message, fatal: false });
 const { data: explain } = await useAsyncData(`explain-${id}`, () => api<Explanation>(`/api/v1/runs/${id}/pipeline`).catch(() => null));
-// The owning tenant's slug (for downloads and navigation) and repository.
 const { data: arts } = await useAsyncData(`arts-${id}`, () => api<{ tenant: string; artifacts: any[] }>(`/api/v1/runs/${id}/artifacts`).catch(() => null));
 const slug = computed(() => arts.value?.tenant ?? null);
 const { data: repos } = await useRepos(() => slug.value ?? "");
@@ -22,8 +19,7 @@ if (slug.value) useState("tenant").value = slug.value;
 useHead({ title: () => `Run ${shortId(id)} · Sentinel` });
 const { status, refused } = useRunStream(id, run);
 
-// The render's clock travels with the page, so the browser's first render
-// matches the server's; it ticks once mounted.
+// The clock travels with the page so the server and browser first renders match.
 const now = useState(`now-${id}`, () => Date.now());
 let ticker: ReturnType<typeof setInterval> | undefined;
 onMounted(() => { ticker = setInterval(() => (now.value = Date.now()), 1000); });

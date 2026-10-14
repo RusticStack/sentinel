@@ -1,9 +1,6 @@
 <script setup lang="ts">
 import type { RunSummary } from "~~/shared/types/api";
 
-// A repository's runs, newest first, narrowed by ref, pull request or
-// commit prefix — each filter an index range on the controller. The first
-// page refreshes itself while open.
 const route = useRoute();
 const router = useRouter();
 const api = useApi();

@@ -1,8 +1,5 @@
 <script setup lang="ts">
-// Sentinel has no self-service password reset: a reset link by email would
-// make the mailbox a second password for every account, including the
-// administrator's. Resetting is the operator's host-local `sentinel admin
-// recover`. The page says so and asks for nothing, so it reveals nothing.
+// No email reset: a reset link would make the mailbox a second password for every account, including administrators'.
 definePageMeta({ layout: "auth" });
 useHead({ title: "Forgot your password · Sentinel" });
 </script>

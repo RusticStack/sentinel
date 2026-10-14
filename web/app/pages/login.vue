@@ -5,12 +5,10 @@ useHead({ title: "Sign in · Sentinel" });
 const route = useRoute();
 const api = useApi();
 
-// GitHub sign-in is offered only when the controller has it configured.
 const { data: health } = await useAsyncData("health", () => api<{ github_sign_in?: boolean }>("/api/v1/health"));
 const github = computed(() => !!health.value?.github_sign_in);
 
 const next = computed(() => sameOriginPath(route.query.next));
-// Why sign-in is asked for again, when the interface sent the person here.
 const notice = computed(() => {
   switch (route.query.reason) {
     case "expired": return { title: "Your session ended", description: "Sign in again to continue where you were." };

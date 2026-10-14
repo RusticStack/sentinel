@@ -1,13 +1,5 @@
 <script setup lang="ts">
-// Where an invitation link lands (`/invitations/accept#token=sntl_…`). The
-// secret is in the fragment, so no server sees it; the page reads it once
-// in the browser and removes it from the address bar. Nothing about the
-// invitation is shown before the controller accepts it: there is no route
-// that reveals an invitation without spending it, so the organization's
-// name appears only once the person has joined. A signed-out visitor signs
-// in or signs up here, keeping the secret in this page's memory; only the
-// GitHub sign-in round trip parks it in this tab's session storage, for ten
-// minutes at most, and it is removed as soon as it is read back.
+// The token sits in the URL fragment, which no server sees; the page reads it once and clears the address bar.
 definePageMeta({ layout: "auth" });
 useHead({ title: "Accept an invitation · Sentinel" });
 const api = useApi();
@@ -26,7 +18,6 @@ const { waiting, start: wait } = useRetryWait();
 
 const { data: health } = await useAsyncData("health", () => api<{ github_sign_in?: boolean }>("/api/v1/health"));
 
-/// Take the parked secret back, removing it whatever it holds.
 function unstash(): string | null {
   try {
     const raw = sessionStorage.getItem(INVITATION_STASH);
@@ -38,12 +29,9 @@ function unstash(): string | null {
 }
 
 onMounted(() => {
-  // Read (and so remove) the stash on every visit, even when the link's
-  // fragment brings a secret of its own and wins.
+  // Remove the stash on every visit, even when the fragment brings its own token.
   const parked = unstash();
   token.value = fragmentToken(location.hash, "invitation") ?? parked;
-  // Back here by another way than `/` (signing in as someone else): the
-  // return marker has served.
   rememberReturn(null);
   if (location.hash) history.replaceState(history.state, "", location.pathname + location.search);
   phase.value = token.value ? "ready" : "missing";
@@ -83,8 +71,6 @@ async function accept() {
   }
 }
 
-/// Park the secret for a round trip that leaves the page (GitHub sign-in,
-/// signing in as someone else), to come back here.
 function stash() {
   try {
     if (token.value) sessionStorage.setItem(INVITATION_STASH, stashInvitation(token.value, Date.now()));
@@ -135,7 +121,6 @@ const title = computed(() => {
         <p>This page needs the full link from your invitation email. Open the link again, or copy all of it into the address bar; it ends with <code>#token=…</code>.</p>
       </template>
 
-      <!-- Signed in: accept as this account. -->
       <template v-else-if="(phase === 'ready' || phase === 'accepting') && session.me.value">
         <p>You have an invitation to join an organization on Sentinel. Accept it as <strong class="break-all">{{ who }}</strong>.</p>
         <p class="text-muted">An invitation sent to an email address can only be used by the account that holds that address, once it is confirmed.</p>
@@ -146,7 +131,6 @@ const title = computed(() => {
         </div>
       </template>
 
-      <!-- Signed out: sign in or sign up here, keeping the link. -->
       <template v-else-if="phase === 'ready' && !signedUp">
         <p>You have an invitation to join an organization on Sentinel. Sign in, or create an account with the address the invitation was sent to.</p>
         <div role="group" aria-label="How to continue" class="grid grid-cols-2 gap-1 rounded-lg bg-elevated p-1">

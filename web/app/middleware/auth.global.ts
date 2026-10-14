@@ -1,12 +1,6 @@
-// Every page but the public ones needs a session. The first render happens
-// on the server with the browser's cookie, so a signed-out visitor is sent
-// to sign-in before any page is drawn. While first-run setup is open (no
-// administrator exists yet) sign-in leads to the setup wizard; once it is
-// closed the wizard is never reachable again.
+// The first render runs on the server with the browser's cookie, so a signed-out visitor is redirected before any page draws.
 
-/** Pages a signed-out visitor may open. */
 const PUBLIC = new Set(["/login", "/register", "/verify-email", "/forgot-password", "/setup", "/invitations/accept"]);
-/** Public pages that make no sense once signed in. */
 const SIGNED_OUT_ONLY = new Set(["/login", "/register"]);
 
 export default defineNuxtRouteMiddleware(async (to) => {
