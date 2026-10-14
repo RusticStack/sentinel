@@ -315,7 +315,7 @@ Stdio uses the CLI's locally provisioned credential source; it does not run an H
 
 ### Human UI
 
-A Nuxt 4 server (Vue, TypeScript, Nuxt UI) beside the controller renders pages as the signed-in person, streams live run and log updates as server-sent events (the controller's long polls, held on the browser's behalf) and proxies the controller's routes as one origin. The stack was chosen after measuring the accessible live-log view four ways: windowing is what matters, and the windowed renderings are within noise of each other ([web interface](docs/web-ui.md#stack-choice-u01)).
+A Nuxt 4 server (Vue, TypeScript, Nuxt UI) beside the controller renders pages as the signed-in person, streams live run and log updates as server-sent events (the controller's long polls, held on the browser's behalf) and proxies the controller's routes as one origin. The stack was chosen after measuring the accessible live-log view four ways: windowing is what matters, and the windowed renderings are within noise of each other ([web interface](docs/web-ui.md#stack-choice)).
 
 - Runs by installation/repo/branch/PR/SHA, queue/execute timings, cache effectiveness.
 - Failure summary first, file/test evidence links, job DAG, step timelines.
@@ -481,7 +481,7 @@ Open questions, to resolve through hardware and workflow evidence:
 3. The optimized cache backend (btrfs/ZFS snapshots against reflinks and safe copies).
 4. Tailcat pin and upgrade policy, wire framing and bulk concurrency.
 
-Decided with evidence: retention and byte defaults ([retention](docs/retention.md)); the Nuxt web interface ([web interface](docs/web-ui.md)); backup recovery goals of RPO <= 1 hour and RTO <= 15 minutes for up to 100 GiB ([backup](docs/backup.md)); the S3-outage policy of a bounded backlog on the controller's disk, then closed admission for new artifacts and uploads ([s3](docs/s3.md#degraded-durability-and-admission-r03)).
+Decided with evidence: retention and byte defaults ([retention](docs/retention.md)); the Nuxt web interface ([web interface](docs/web-ui.md)); backup recovery goals of RPO <= 1 hour and RTO <= 15 minutes for up to 100 GiB ([backup](docs/backup.md)); the S3-outage policy of a bounded backlog on the controller's disk, then closed admission for new artifacts and uploads ([s3](docs/s3.md#degraded-durability-and-admission)).
 
 These gates do not defer scheduling correctness or multi-host design until after v1.
 

@@ -27,7 +27,7 @@ A cancel that lands during preparation ends the attempt as `canceled` too, with 
 
 ## Timeouts
 
-- **Execution:** the worker's, per step and bounded by the job's budget ([executor](executor.md#steps-w04)); `ExecutionTimeout`, `timed_out`.
+- **Execution:** the worker's, per step and bounded by the job's budget ([executor](executor.md#steps)); `ExecutionTimeout`, `timed_out`.
 - **Controller backstop:** an attempt still acknowledged past `acked + job.timeout + EXECUTION_GRACE_MS` (10 min) is treated like an expired lease — the worker is renewing but not enforcing, and that is an infrastructure failure, not the repository's.
 - **Queue:** a job `queued` for longer than `QUEUE_TIMEOUT_MS` (6 h, server policy) is `QueueTimedOut` → `timed_out`, and its dependents are decided (skipped) in the same transaction. Swept every dispatch pass over the `jobs_queued_since` partial index.
 

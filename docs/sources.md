@@ -230,7 +230,7 @@ the newest event deliveries and `admin intake purge --older-than 7d` retires
 settled ones ([intake](intake.md)). The `post-receive` hook and its relay live
 in `examples/hooks/`, and `admin source poll` opts a bound repository into
 `git ls-remote` observation where no hook can be installed
-([intake](intake.md#ref-polling-g07)). A GitHub App installation is bound with
+([intake](intake.md#ref-polling)). A GitHub App installation is bound with
 `admin source bind-installation`; its webhook secret is the operator's to set
 in `<data_dir>/github-webhook.json`.
 

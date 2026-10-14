@@ -33,7 +33,7 @@ What comes back is a `Principal`, and it is authorized exactly like a session's:
 | Tenant admin | A service principal of that tenant |
 | Any account | Itself, never wider than the scope it is already acting under |
 
-Over the API a bearer-style credential for a service principal is an OAuth **service grant** instead ([OAuth](oauth.md#service-account-grants-o06)): `POST /tenants/{slug}/service-accounts/{usr}/grants`, which needs a browser session that has stepped up within the policy window ([step-up](step-up.md#issuing-credentials)); a bearer or OAuth token cannot issue one.
+Over the API a bearer-style credential for a service principal is an OAuth **service grant** instead ([OAuth](oauth.md#service-account-grants)): `POST /tenants/{slug}/service-accounts/{usr}/grants`, which needs a browser session that has stepped up within the policy window ([step-up](step-up.md#issuing-credentials)); a bearer or OAuth token cannot issue one.
 
 Delegation only narrows: a request for more than the caller holds is refused before identity is considered, so an over-wide request fails the same way for every caller. Platform scope additionally requires the target account to be a super admin, enforced by the API and by a database trigger; a service principal can never carry it, and its credential is confined to its home tenant.
 

@@ -32,12 +32,12 @@ Aliases live in `.cargo/config.toml`; the command table is in [AGENTS.md](AGENTS
 
 Contributors start with [AGENTS.md](AGENTS.md) and [Development](docs/development.md). Each contract lives in one topical document under [`docs/`](docs/):
 
-- Foundations: [Rust foundation](docs/rust-foundation.md), [configuration and CLI](docs/configuration.md), [runtime foundations](docs/runtime-foundation.md), [core contracts](docs/core-contracts.md), [protocol](docs/protocol.md), [compatibility](docs/compatibility.md), [storage](docs/storage.md).
-- Identity: [authorization](docs/authorization.md), [local authentication](docs/local-authentication.md), [API credentials](docs/api-credentials.md), [GitHub sign-in](docs/github-sign-in.md), [admission](docs/admission.md), [tenancy](docs/tenancy.md), [step-up](docs/step-up.md), [sealed storage](docs/sealed-storage.md), [scoped secrets](docs/secrets.md), [OAuth and secrets](docs/auth-and-secrets.md).
-- Sources and feedback: [sources](docs/sources.md), [intake](docs/intake.md), [checks](docs/checks.md), [pipeline schema](docs/pipeline-schema.md).
-- Execution: [executor](docs/executor.md), [worker link](docs/worker-link.md), [logs](docs/logs.md), [cancellation](docs/cancellation.md), [reconciliation](docs/reconciliation.md).
-- Interfaces: [API](docs/api.md), [CLI](docs/cli.md), [MCP](docs/mcp.md), [diagnostics](docs/diagnostics.md), [web interface](docs/web-ui.md).
-- Performance: [benchmarking](docs/benchmarking.md), [CI baseline](docs/ci-baseline.md), [benchmark contracts](docs/benchmark-contracts.md), [feasibility probes](docs/feasibility-probes.md), [performance research](docs/performance-research.md).
+- Foundations: [Rust foundation](docs/rust-foundation.md), [configuration and CLI](docs/configuration.md), [runtime foundations](docs/runtime-foundation.md), [core contracts](docs/core-contracts.md), [protocol](docs/protocol.md), [compatibility](docs/compatibility.md), [storage](docs/storage.md), [backup](docs/backup.md), [retention](docs/retention.md), [upgrades](docs/upgrades.md), [resilience](docs/resilience.md).
+- Identity: [authorization](docs/authorization.md), [local authentication](docs/local-authentication.md), [API credentials](docs/api-credentials.md), [GitHub sign-in](docs/github-sign-in.md), [admission](docs/admission.md), [tenancy](docs/tenancy.md), [step-up](docs/step-up.md), [sealed storage](docs/sealed-storage.md), [scoped secrets](docs/secrets.md), [OAuth and secrets](docs/auth-and-secrets.md), [OAuth](docs/oauth.md).
+- Sources and feedback: [sources](docs/sources.md), [intake](docs/intake.md), [checks](docs/checks.md), [pipeline schema](docs/pipeline-schema.md), [recipes](docs/recipes.md), [hash_files](docs/hash-files.md).
+- Execution: [executor](docs/executor.md), [worker link](docs/worker-link.md), [logs](docs/logs.md), [cancellation](docs/cancellation.md), [reconciliation](docs/reconciliation.md), [vertical slice](docs/vertical-slice.md).
+- Interfaces: [API](docs/api.md), [CLI](docs/cli.md), [MCP](docs/mcp.md), [monitoring](docs/monitoring.md), [diagnostics](docs/diagnostics.md), [web interface](docs/web-ui.md).
+- Performance: [benchmarking](docs/benchmarking.md), [CI baseline](docs/ci-baseline.md), [benchmark contracts](docs/benchmark-contracts.md), [latency budgets](docs/latency-budgets.md), [feasibility probes](docs/feasibility-probes.md), [performance research](docs/performance-research.md).
 
 ## Legacy dashboard
 

@@ -68,7 +68,7 @@ A tenant with `membership_source = 1` takes its people from GitHub ([GitHub sign
 
 Migration 4 adds users, immutable external identity links, memberships, repo grants, namespace type/owner and active flags. Grants have composite foreign keys to both owning repo and membership. Service-account shape and membership ceilings have database checks/triggers as well as API validation.
 
-Earlier parent foreign keys did not enforce equal tenant IDs ([Parts 01–02 audit](parts-01-02-audit.md)). Migration 4 adds ownership triggers for existing runs/jobs/attempts/specs/idempotency references and forbids changing a repo/run/job's owning tenant. This preserves old tables/blobs and fails inconsistent upgrades atomically instead of assigning an arbitrary owner. Unknown newer database versions are rejected. Normal controller updates still use the existing fenced transition contracts.
+Earlier parent foreign keys did not enforce equal tenant IDs (Parts 01–02 audit). Migration 4 adds ownership triggers for existing runs/jobs/attempts/specs/idempotency references and forbids changing a repo/run/job's owning tenant. This preserves old tables/blobs and fails inconsistent upgrades atomically instead of assigning an arbitrary owner. Unknown newer database versions are rejected. Normal controller updates still use the existing fenced transition contracts.
 
 ## Cost and bounds
 

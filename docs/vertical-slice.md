@@ -28,7 +28,7 @@ A cancel that lands during preparation is classified `canceled`, not a preparati
 
 ## What is not covered
 
-The slice runs the components in one process with real containers, not the two binaries; the binaries are exercised by `crates/sentinel/tests/cli.rs` (enrollment, the API, clean signals) but not under these failures. A stale lease and a lease-guard expiry on the worker are proven at the store and unit level, not with a 30 s wait in the slice. Load, Tailcat and relayed paths, slow or full disks and a real network partition need hardware and network environments that are not available ([parts-01-02-audit](parts-01-02-audit.md)).
+The slice runs the components in one process with real containers, not the two binaries; the binaries are exercised by `crates/sentinel/tests/cli.rs` (enrollment, the API, clean signals) but not under these failures. A stale lease and a lease-guard expiry on the worker are proven at the store and unit level, not with a 30 s wait in the slice. Load, Tailcat and relayed paths, slow or full disks and a real network partition need hardware and network environments that are not available (parts-01-02-audit).
 
 ## Verification
 

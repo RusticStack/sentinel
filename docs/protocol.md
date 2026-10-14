@@ -117,7 +117,7 @@ Bulk classes (logs, specs, artifacts, cache) travel on the worker's second
 connection when it is up and are still accepted on the control connection as
 a fallback; control classes (heartbeat, offers, reports) are refused there.
 Each connection has its own rustls state behind its own lock, so bulk traffic
-cannot delay a beat. See [worker link](worker-link.md#control-and-bulk-protocol-7-q05).
+cannot delay a beat. See [worker link](worker-link.md#control-and-bulk-protocol-7).
 
 ## Protocol 10 secret delivery
 

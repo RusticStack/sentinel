@@ -141,7 +141,7 @@ Part 14 measures representative checks under frozen contracts. The runner's `--c
 
 ## Reproducing
 
-1. Prepare rootless Podman for a non-root user per [Development](development.md#linux-executor-work-f05f07-and-w03-onward) and pull the image by digest.
+1. Prepare rootless Podman for a non-root user per [Development](development.md#linux-executor-work) and pull the image by digest.
 2. Build with `cargo release-linux` (or `cargo build --release -p sentinel-bench`) and copy `sentinel-bench` to a native-filesystem directory owned by that user.
 3. As that user, run the direct baseline, then `podman system prune -f`, one `--warm-state cold --warmup 0 --samples 1` run, then warm runs with and without limits, all with `--output` to one file.
 4. Commit the record under `bench/` and summarize it here with the host identity and any caveats.
