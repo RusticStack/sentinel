@@ -1,4 +1,4 @@
-//! Q08 — remote cache hydration: portable, checksummed, resumable
+//! Remote cache hydration: portable, checksummed, resumable
 //! transfer of sealed generations through the controller. See
 //! `docs/cache.md`.
 //!
@@ -404,7 +404,7 @@ pub struct Policy<'a> {
     /// controller fences against (`dispatch::cache_scope`).
     pub attempt: [u8; 16],
     /// When every hydration of this attempt must be done — resuming,
-    /// transferring and installing alike (P08-C6). One deadline per job,
+    /// transferring and installing alike. One deadline per job,
     /// fixed before its first restore ([`Policy::deadline_for`]), so N
     /// caches share one budget instead of each taking their own.
     pub deadline: Instant,
@@ -454,7 +454,7 @@ const TRANSFER_MISS: Miss = Miss::Unavailable;
 /// is demultiplexed as it arrives — head, manifest and listing checked
 /// against *this* request before a payload byte is written, every payload
 /// file written once, straight into the staging generation, and verified
-/// against its listing entry as it completes (P08-C8). The local listing
+/// against its listing entry as it completes. The local listing
 /// checks run once more before a byte reaches the job — corrupt or
 /// wrong-scope content can never serve.
 pub(crate) fn hydrate(
@@ -510,7 +510,7 @@ pub(crate) fn hydrate(
     attached.stats.remote_ns = Some(ns(started));
     attached.stats.remote_bytes = sink.received;
     // Where the transfer really resumed: the controller's granted offset,
-    // not the one this side asked for (P08-C7).
+    // not the one this side asked for.
     attached.stats.remote_from = sink.grant.map(|g| g.offset).filter(|o| *o > 0);
     let halt = sink.halt;
     let drop_stage = || {
@@ -527,8 +527,8 @@ pub(crate) fn hydrate(
             return Hydro::Nothing;
         }
         // Refused for now (`denied`, `busy`): the local lookup's own reason
-        // is the honest answer, and a valid staged prefix stays for later
-        // (P08-C7); an empty one is no resume point.
+        // is the honest answer, and a valid staged prefix stays for later;
+        // an empty one is no resume point.
         Err(Refusal::Denied) | Err(Refusal::Busy) => {
             let empty = sink.offset == 0;
             drop(sink);
@@ -1228,10 +1228,10 @@ impl Sink for Stager {
         if elapsed >= RATE_SAMPLE.as_nanos() && self.received > 0 {
             // `remaining / rate > left`, i.e. `remaining * elapsed >
             // left * received`, in `u128` — never an integer ns-per-byte
-            // that truncates to zero on a fast link (P08-C7). The install
+            // that truncates to zero on a fast link. The install
             // only copies the payload into the job's view when there is no
-            // reflink; that copy is estimated at the measured rate too
-            // (P08-C6). The stream itself is written once, as it arrives.
+            // reflink; that copy is estimated at the measured rate too. The
+            // stream itself is written once, as it arrives.
             let install = if self.copies { self.total } else { 0 };
             let remaining = u128::from(self.total - self.offset) + u128::from(install);
             let left = self.deadline.saturating_duration_since(now).as_nanos();
@@ -1288,7 +1288,7 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
 /// it), so an offer can never change a verdict.
 ///
 /// A controller that takes the digest at the end (protocol 9) gets the
-/// stream read once and hashed as it is sent (P08-C8); an older one needs
+/// stream read once and hashed as it is sent; an older one needs
 /// the digest up front, which costs a hashing pass over the generation
 /// before the bytes go out.
 pub fn offer_generation(
@@ -1668,7 +1668,7 @@ impl Serving {
         // is always correct. Proving a prefix costs a hash of it, so a
         // claimed prefix past `MAX_RESUME_HASH` is not proven at all — a
         // cold restart — and a worker's `have` can never make the
-        // controller hash gigabytes per request (P08-C8).
+        // controller hash gigabytes per request.
         let requested = need.offset.min(total);
         let (offset, prefix, hasher) = if requested == 0 || requested > MAX_RESUME_HASH {
             (0, empty_digest(), blake3::Hasher::new())
@@ -1719,7 +1719,7 @@ impl Serving {
 
     /// [`Serving::next_chunk`] into a caller-held chunk, reusing its byte
     /// buffer — a serve loop allocates one buffer per transfer, not one
-    /// per 48 KiB frame (P08-C8). `false` means the stream is complete.
+    /// per 48 KiB frame. `false` means the stream is complete.
     pub fn next_chunk_into(&mut self, chunk: &mut Chunk) -> Result<bool, Refusal> {
         if self.offset >= self.plan.total {
             return Ok(false);
@@ -1769,7 +1769,7 @@ pub struct Receiving {
 
 impl Drop for Receiving {
     /// An upload abandoned mid-stream — a refused chunk, a cancel, an idle
-    /// or lost session — takes its staging file with it (P08-C5); the lock
+    /// or lost session — takes its staging file with it; the lock
     /// goes with `_lock`.
     fn drop(&mut self) {
         if !self.done {
@@ -1797,8 +1797,8 @@ impl Receiving {
             return Ok(None);
         }
         // The store shares its disk with SQLite and the object store: an
-        // upload that would not leave the reserve free is refused up front
-        // (P08-C4), never discovered as ENOSPC halfway through.
+        // upload that would not leave the reserve free is refused up front,
+        // never discovered as ENOSPC halfway through.
         if let Some((free, total)) = store_space(store_root)
             && free
                 < upload
@@ -1874,7 +1874,7 @@ impl Receiving {
     }
 
     /// Verify the completed stream, promote it into the entry and make it
-    /// `current`, then drop the bundle it superseded (P08-C4): an entry
+    /// `current`, then drop the bundle it superseded: an entry
     /// keeps one bundle. Until this returns `Ok`, nothing of the transfer
     /// is visible to a serve; a failed end removes the staging file.
     pub fn end(&mut self, digest: [u8; 32]) -> Result<(), Refusal> {
@@ -1945,7 +1945,7 @@ pub struct StoreSweep {
     pub errors: u64,
 }
 
-/// One reclamation pass over the controller's remote-cache store (P08-C4):
+/// One reclamation pass over the controller's remote-cache store:
 /// an entry keeps only its `current` bundle, upload staging older than
 /// [`STALE_UPLOAD`] goes, and while the kept bundles exceed
 /// `budget_bytes` whole entries are evicted least recently served first

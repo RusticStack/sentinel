@@ -1,4 +1,4 @@
-//! K02 — the read path: resolve an entry's `current` generation, verify
+//! The read path: resolve an entry's `current` generation, verify
 //! its manifest against the request, pin it with a lease and clone it
 //! into the job's private view. Every failure is an `Outcome::Miss`.
 //!
@@ -6,8 +6,8 @@
 //!
 //! 1. The key is already rendered (the caller evaluated `hash_files`
 //!    against the fresh checkout); the scope and compat inputs are
-//!    derived through `attach`'s shared functions so publish (K03)
-//!    derives the same entry.
+//!    derived through `attach`'s shared functions so publish derives
+//!    the same entry.
 //! 2. `entry/current` names the live generation — a bounded read whose
 //!    content is the `gen-*` directory name. An entry that has one is
 //!    pinned (`Lease::acquire`) and the pointer read again under the pin,
@@ -49,7 +49,7 @@ use crate::{
 /// fits in 32 bytes; 128 is generous headroom, never unbounded.
 const MAX_CURRENT_BYTES: u64 = 128;
 
-/// The first-read sample size (K08): one small read of a representative
+/// The first-read sample size: one small read of a representative
 /// file per target — enough to fault a cold extent, never enough to
 /// matter.
 const FIRST_TOUCH_BYTES: usize = 4 * 1024;
@@ -90,7 +90,7 @@ pub fn restore(
     restore_remote(env, decl, key, scope, owner, None)
 }
 
-/// [`restore`] with the remote path (Q08, [`crate::remote`]) available
+/// [`restore`] with the remote path ([`crate::remote`]) available
 /// for a local miss. A local hit never consults `remote`: hydration is
 /// strictly a miss path. When a transfer was attempted and did not
 /// serve, the miss is the transfer's own — `unavailable` for a bounded
@@ -136,7 +136,7 @@ pub fn restore_remote(
         .scope
         .entry_dir(env.cache_root, entry_key(decl.class, &attached.key));
     // An entry with no `current` is the common miss and takes no pin. One
-    // that has one is pinned *before* its pointer is trusted (P07-8): the
+    // that has one is pinned *before* its pointer is trusted: the
     // pointer is read again under the lease, so the generation it names
     // cannot be reclaimed between the read and the clone — a sweep that
     // raced the first read is an ordinary miss, never a `corrupt` one.
@@ -178,7 +178,7 @@ pub fn restore_remote(
     attached.stats.lookup_ns = Some(lookup_ns);
     let (name, gen_dir, hit, lease) = match (found, lease) {
         // A local hit never touches the network: the miss path below is
-        // the only place remote hydration is consulted (Q08).
+        // the only place remote hydration is consulted.
         (Ok((name, dir, Outcome::Hit(hit))), Some(lease)) => (name, dir, hit, lease),
         // A hit is only ever read under a pin; without one it cannot serve.
         (Ok((_, _, Outcome::Hit(_))), None) => {
@@ -221,7 +221,7 @@ pub fn restore_remote(
     ) {
         Ok(blob) => {
             attached.stats.clone_ns = Some(ns(started));
-            // K08: the first-touch sample is timed separately — cold-extent
+            // The first-touch sample is timed separately — cold-extent
             // read cost is not the clone's wall time.
             attached.stats.first_touch_ns = first_touch(&blob, &attached.targets);
             // The entry was used: reclamation evicts least recently used.
@@ -378,13 +378,13 @@ fn check_payload_tree(src: &Path, listed: &HashMap<&str, &FileEntry>) -> Result<
 /// here — `decode` already checked each path is relative, and a clone
 /// input is checked twice rather than trusted once — and the tree must
 /// match it exactly: the listing is the payload's whole authority, so a
-/// planted or missing file is `Corrupt`, never served (K09). Payload
+/// planted or missing file is `Corrupt`, never served. Payload
 /// bytes are not re-hashed: that would defeat the reflink path
 /// (docs/cache.md). `Ok` carries the verified listing so the caller can
 /// run the bounded first-touch sample after it has stamped `clone_ns` —
-/// the sample's cost must not land inside the clone's wall time (K08).
+/// the sample's cost must not land inside the clone's wall time.
 ///
-/// `pub(crate)` for the remote path (Q08): a hydrated generation is
+/// `pub(crate)` for the remote path: a hydrated generation is
 /// materialized by this exact code, so a served clone and a hydrated one
 /// can never differ in their checks.
 pub(crate) fn materialize(
@@ -411,7 +411,7 @@ pub(crate) fn materialize(
         }
     }
     // Every payload tree is checked against its listing before any is
-    // cloned (P07-8): a generation broken at index 1 must not leave index
+    // cloned: a generation broken at index 1 must not leave index
     // 0's bytes in the job's view under a "miss".
     let mut sources = Vec::with_capacity(targets.len());
     for (index, listed) in listed.iter().enumerate() {
@@ -466,7 +466,7 @@ pub(crate) fn materialize(
 /// One bounded first-read sample per target after a hit's clone
 /// materialized: open the largest listed file and read its first
 /// [`FIRST_TOUCH_BYTES`]. A clone's cost is per file, but the first real
-/// read is what faults a cold extent — the K02 probe showed that cost is
+/// read is what faults a cold extent — a measured probe showed that cost is
 /// real, so it is measured separately rather than folded into `clone_ns`.
 /// `None` when the listing held no file to sample; a file that will not
 /// open is simply not measured, never a miss.
@@ -515,7 +515,7 @@ fn target(env: &Context<'_>, name: &str, index: usize, declared: &str) -> (Targe
     // An absolute path reaches the container as a bind-mount spec, where
     // `:` separates fields and `,` options: such a path could only ever
     // fail `podman create` — and so the attempt — so it is refused here as
-    // the explainable miss a cache-path error must be (P07-16).
+    // the explainable miss a cache-path error must be.
     let unmountable = declared.starts_with('/') && declared.contains([':', ',']);
     if !valid_cache_path(declared) || unmountable {
         return (
@@ -1067,7 +1067,7 @@ mod tests {
         );
     }
 
-    /// P07-8: a generation broken at a later index is a miss that leaves
+    /// A generation broken at a later index is a miss that leaves
     /// *every* target empty — index 0 is never cloned first — and the
     /// pin is released with the miss.
     #[test]
@@ -1103,7 +1103,7 @@ mod tests {
         }
     }
 
-    /// P07-16: an absolute path the bind-mount spec cannot carry is an
+    /// An absolute path the bind-mount spec cannot carry is an
     /// explainable `invalid` miss, and it is never offered as a mount.
     #[test]
     fn an_unmountable_absolute_path_is_refused() {

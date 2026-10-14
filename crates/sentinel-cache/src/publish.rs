@@ -1,4 +1,4 @@
-//! K03 — the write path: what a finished attempt leaves behind. One
+//! The write path: what a finished attempt leaves behind. One
 //! writer per entry stages the job's private views under
 //! `<entry>/writing/gen-*`, seals the generation with its manifest, then
 //! promotes it by same-directory rename and swaps `current` atomically —
@@ -14,14 +14,14 @@
 //! is resolved beneath the worker-owned workspace anchor without following
 //! a symlink at any component, and every file is reopened by descriptor
 //! with `O_NOFOLLOW` — a job cannot redirect publication at host files by
-//! planting or racing a link (P07-1). An entry whose restore was refused
+//! planting or racing a link. An entry whose restore was refused
 //! (`invalid`) or whose key never rendered publishes nothing.
 //!
 //! Publication is bounded in bytes as well as files: a generation over
 //! [`MAX_GENERATION_BYTES`] of logical payload is refused before a byte is
 //! staged, a filesystem without room for the copy plus a reserve is
 //! refused the same way, and a sparse file is copied hole-for-hole so a
-//! mostly-empty file never amplifies into dense writes (P07-5).
+//! mostly-empty file never amplifies into dense writes.
 //!
 //! Incremental reuse rides the source generation the job cloned from: a
 //! file whose digest matches the source's listing is staged by hardlink
@@ -60,7 +60,7 @@ pub const CACHE_PUBLISH_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 /// store's byte budget (`gc::DEFAULT_BUDGET_BYTES`). Checked against the
 /// planned sizes before anything is staged, so neither an honest cache
 /// far over budget nor a sparse file claiming terabytes can drive the
-/// worker's disk (P07-5).
+/// worker's disk.
 pub const MAX_GENERATION_BYTES: u64 = crate::gc::DEFAULT_BUDGET_BYTES / 4;
 
 /// Free space a publish always leaves on the store's filesystem beyond
@@ -234,25 +234,22 @@ pub fn commit(
     if cancel() || Instant::now() >= deadline {
         return Ok(Published::Skipped(SkipReason::Canceled));
     }
-    // The same derivation restore uses — publish and restore must name
-    // the same entry or the two never meet.
+    // Must be the derivation restore uses, or the two never meet.
     let entry = attached
         .scope
         .entry_dir(cache_root, entry_key(attached.scope.class, &attached.key));
-    // One writer per entry: `create_new` never waits — a live marker is
-    // `Busy`, and a marker older than the lease bound is a dead writer's,
-    // reaped in place so a crash can never wedge the entry.
-    // The commit pins its entry like a reader does: reclamation never takes
-    // an entry — its source generation included — out from under a writer,
-    // hit or miss.
+    // One writer per entry: `create_new` never waits; a live marker is
+    // `Busy`, and one older than the lease bound is a dead writer's, reaped
+    // in place so a crash never wedges the entry.
+    // The commit also pins its entry like a reader, so reclamation never
+    // removes it (source generation included) under a writer.
     //
-    // Collection takes an unpinned entry out of the tree by renaming it
-    // aside, then judges it again and puts it back when a pin landed in
-    // between. A pin taken inside that window moves with the entry, and a
-    // lock taken while the entry is away makes a fresh entry directory the
-    // put-back cannot replace: the pin would then guard nothing here. So
-    // the pin is checked in place once the lock is held, and taken again
-    // when it went with the old directory.
+    // Collection renames an unpinned entry aside, judges it again and puts
+    // it back if a pin landed meanwhile. A pin taken in that window moves
+    // with the entry, and a lock taken while it is away creates a fresh
+    // entry directory the put-back cannot replace, leaving the pin guarding
+    // nothing. So the pin is checked in place once the lock is held and
+    // retaken when it went with the old directory.
     let mut turns = 3;
     let (_pin, _lock) = loop {
         let pin = Lease::acquire(&entry, "publish", crate::lease::DEFAULT_TTL)?;
@@ -288,9 +285,8 @@ pub fn commit(
         Err(Stop::Failed(e)) => Err(e),
     };
     if !matches!(out, Ok(Published::Sealed { .. })) {
-        // A skipped or failed commit leaves no half-built generation:
-        // promotion never ran, and whatever was staged is removed now
-        // rather than left for a stale-`writing/` pass.
+        // Promotion never ran; remove the staging rather than leave it for
+        // a stale-`writing/` pass.
         let _ = fs::remove_dir_all(&staging);
     }
     out
@@ -393,15 +389,14 @@ fn stage(
     deadline: Instant,
     cancel: &dyn Fn() -> bool,
 ) -> Result<Published, Stop> {
-    // The generation this job's view was cloned from, if its listing can
-    // still be read — the reuse source. A missing or corrupt one simply
-    // means no reuse.
+    // The generation the job's view was cloned from is the reuse source; a
+    // missing or corrupt listing means no reuse.
     let source = attached
         .generation
         .as_deref()
         .filter(|name| {
-            // Defensive: a generation name is a single safe component —
-            // anything else is ignored rather than joined into a lookup.
+            // A generation name is one safe component; anything else is
+            // ignored, never joined into a path.
             name.starts_with("gen-") && !name.contains(['/', '\\']) && !name.contains("..")
         })
         .and_then(|name| {
@@ -428,10 +423,9 @@ fn stage(
     if plan.planned.is_empty() {
         return Ok(Published::Skipped(SkipReason::Empty));
     }
-    // Cheapest correct skip: when every planned file already exists in the
-    // source generation's listing — same path, size, digest and mode, and
-    // the listing has no extras — the bytes are published already and a
-    // new generation would differ only in its seal time.
+    // Cheapest correct skip: every planned file matches the source listing
+    // (path, size, digest, mode) and the listing has no extras, so a new
+    // generation would differ only in its seal time.
     if plan.unchanged
         && let Some((_, blob)) = &source
         && blob.entries.len() == plan.planned.len()
@@ -439,9 +433,7 @@ fn stage(
         return Ok(Published::Skipped(SkipReason::Unchanged));
     }
     plan.check(deadline, cancel)?;
-    // Room for what will be copied, plus the reserve every other user of
-    // the disk keeps — checked before a byte lands, never discovered by an
-    // ENOSPC halfway through.
+    // Checked before a byte lands, never discovered as ENOSPC halfway.
     if let Some((free, total)) = free_bytes(entry)
         && free < plan.copy_bytes().saturating_add(reserve(total))
     {
@@ -456,8 +448,7 @@ fn stage(
         cancel,
     )?;
     if entries.is_empty() {
-        // Everything vanished between plan and stage — as empty as if the
-        // targets had never produced a file.
+        // Everything vanished between plan and stage.
         return Ok(Published::Skipped(SkipReason::Empty));
     }
     // Writers sort by path so reads and the manifest digest are stable.
@@ -475,10 +466,9 @@ fn stage(
     manifest.seal(now);
     write_synced(&staging.join(scope::MANIFEST_NAME), &manifest.encode())?;
     sync_dir(staging)?;
-    // Promotion: the sealed generation lands inside the entry first and
-    // is durable; only then does `current` learn its name. A reader that
-    // resolves `current` sees either the old generation or this one —
-    // never a directory still being written.
+    // Promotion: the sealed generation is durable inside the entry before
+    // `current` learns its name, so a reader sees the old generation or
+    // this one, never one still being written.
     fs::rename(staging, entry.join(generation))?;
     sync_dir(entry)?;
     let tmp = entry.join(CURRENT_TMP);

@@ -1,4 +1,4 @@
-//! Reclamation behavior (K03): leases pin entries, stale staging is
+//! Reclamation behavior: leases pin entries, stale staging is
 //! collected, retention keeps `current` plus one spare, and the byte
 //! budget evicts oldest-first — all through `gc::sweep_at` so the clock
 //! can be moved without waiting out `MAX_TTL`.
@@ -124,7 +124,7 @@ fn an_active_lease_keeps_every_generation() {
     assert_eq!(stats.leases_active, 1);
     assert_eq!(stats.generations_removed, 0);
     assert_eq!(gens(&entry).len(), 3);
-    // K08: a pinned entry still reports its occupancy — the availability
+    // A pinned entry still reports its occupancy — the availability
     // snapshot sees the whole store, removals or not.
     assert_eq!(stats.generations_seen, 3);
     assert_eq!(stats.payload_bytes, 300);
@@ -228,7 +228,7 @@ fn over_budget_evicts_oldest_first_across_entries() {
     assert_eq!(stats.bytes_freed, 1200);
 
     // With a tighter budget the spares go first, then whole entries least
-    // recently used first (P07-3): e2 was last used before e1, so it goes
+    // recently used first: e2 was last used before e1, so it goes
     // and e1's current — enough to fit 700 bytes — stays.
     make_gen(&e1, &s1, "deps-aa", "gen-500-00000005", 600);
     set_current(&e1, "gen-500-00000005");
@@ -251,7 +251,7 @@ fn age_current(entry: &Path, ms: u64) {
         .unwrap();
 }
 
-/// P07-3: the currents of stale keys are reclaimable — twenty entries
+/// The currents of stale keys are reclaimable — twenty entries
 /// over a tiny budget all go, and an entry idle past `IDLE_TTL` goes
 /// whole even under budget; a pinned one never does.
 #[test]
@@ -293,7 +293,7 @@ fn budget_evicts_idle_currents_lru_and_ttl_removes_idle_entries() {
     );
 }
 
-/// P07-4: with a cursor, passes truncated by the work bound resume where
+/// With a cursor, passes truncated by the work bound resume where
 /// the previous one stopped — together they visit every entry — and each
 /// truncated pass still enforces the budget.
 #[test]

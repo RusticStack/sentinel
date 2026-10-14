@@ -1,4 +1,4 @@
-//! Compiler-state persistence (K06): a `class: compiler` entry is a
+//! Compiler-state persistence: a `class: compiler` entry is a
 //! stable toolchain namespace — the tool inside owns per-input
 //! invalidation while Sentinel pins where the state lives and always
 //! hands the job a writable view.
@@ -91,7 +91,7 @@ fn decl(paths: &[&str]) -> Cache {
     }
 }
 
-/// The `Compat` a bare compiler declaration derives (K06): `flags` stays
+/// The `Compat` a bare compiler declaration derives: `flags` stays
 /// empty — the key stem is the whole namespace.
 fn compat(d: &Cache, key: &str, platform: Platform) -> Compat {
     let compat = attach::declared_compat(d, key, platform);
@@ -531,7 +531,7 @@ fn tampered_or_incomplete_state_is_a_typed_miss() {
     assert_eq!(miss(&a), Miss::Unsealed);
 }
 
-/// The K06 mechanism end to end: cold miss, warm hit after a small edit,
+/// The compiler-state mechanism end to end: cold miss, warm hit after a small edit,
 /// the tool rebuilding only the changed input, and a second publication
 /// the next attempt still serves. `current` keeps naming the newest
 /// generation inside one stem — the tool's per-input keys are what make
