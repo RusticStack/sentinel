@@ -1,14 +1,4 @@
-//! `GET /attempts/{att}/failure`: one bounded failure view. The
-//! worker's fenced attempt outcome is the verdict; parsed reports and log
-//! excerpts are evidence attached to it and never feed a transition.
-//!
-//! Evidence comes from three bounded windows: the indexed scan page (from
-//! the start, or from `after`/`cursor`), the failed step's newest window
-//! (sought through the sparse index, so an error at the end of a 100 MiB
-//! log is parsed without reading the head twice), and report files the
-//! attempt published as artifacts (`*.junit.xml`, `TEST-*.xml`,
-//! `*.sentinel-diagnostics.json`), which need `artifacts:read` because
-//! artifact bytes are not redacted.
+//! Report files need `artifacts:read` because artifact bytes are not redacted.
 
 use std::io::Read;
 
@@ -40,23 +30,16 @@ use super::{
     stream_name,
 };
 
-/// Defaults and hard ceilings. Text is budgeted before encoding and the
-/// final compact JSON is checked as well.
 const DEFAULT_BUDGET: usize = 8 << 10;
 const MAX_BUDGET: usize = 64 << 10;
 const MAX_DIAGNOSTICS: usize = 20;
 const SCAN_FRAMES: usize = 1_024;
 const TAIL_FRAMES: usize = 128;
 const PAGE_BYTES: u64 = 4 << 20;
-/// Decode bound of the newest-window read. The sparse index starts it at
-/// most one checkpoint interval (≤ 2 MiB) and one segment before the
-/// window, so only a damaged index can make it reach this.
+/// Decode bound: the sparse index starts the read within one checkpoint, so only a damaged index reaches it.
 const NEWEST_SCAN_BYTES: u64 = 16 << 20;
-/// Captured artifacts of the attempt inspected for report files, and
-/// report files read, per request.
 const MAX_REPORT_ARTIFACTS: usize = 8;
 const MAX_REPORT_FILES: usize = 4;
-/// Bytes of one JUnit report file read; a longer file parses as truncated.
 const JUNIT_READ_BYTES: u64 = 4 << 20;
 
 pub(super) fn attempt_failure(
@@ -118,9 +101,7 @@ pub(super) fn attempt_failure(
         .transpose()
         .map_err(|_| err(ErrorCode::Internal, "stored summary unreadable"))?;
     let summary = summary.unwrap_or_default();
-    // Job status only describes the attempt that still owns the job. Older
-    // (or requeued) attempts keep their own summary and logs, but never
-    // inherit a later attempt's state.
+    // Job status describes only the attempt that still owns the job; older attempts must not inherit it.
     let current_attempt = attempt_status.current;
     let step = summary.steps.iter().find(|record| {
         matches!(
@@ -161,8 +142,6 @@ pub(super) fn attempt_failure(
         ),
         (None, None) => None,
     };
-    // The scan page runs forward from the start (or the caller's position)
-    // so a parser sees an early compiler/test error with its context.
     let page_after = after.unwrap_or(0);
     let failure_step = step.map(|record| record.index);
     let scan = failure_log_page(
@@ -179,10 +158,6 @@ pub(super) fn attempt_failure(
         failure_step,
     )?;
     let scan_cut = scan.next_after.is_some();
-    // When the scan did not reach the end, the failed step's newest window
-    // is the excerpt's source and, on a first request, a second parser
-    // window: errors usually come last (a Go `fail` after its output, a
-    // compiler error after the dependency builds).
     let newest = if scan_cut || (page_after > 0 && scan.frames.is_empty()) {
         newest_log_page(state, run, job, attempt, failure_step)?
     } else {
@@ -219,8 +194,6 @@ pub(super) fn attempt_failure(
                 attempt,
                 step_index: failure_step.or_else(|| newest.frames.last().map(|frame| frame.step)),
                 step_reference,
-                // A window that starts past the step's first frame never
-                // covers the whole stream.
                 complete: false,
             },
         );
@@ -233,8 +206,6 @@ pub(super) fn attempt_failure(
         json!({ "status": "scope_required", "scope": "artifacts:read" })
     };
 
-    // Budget: failures and errors first, across every report, then the
-    // rest; each report keeps its own order.
     let mut remaining = budget;
     let mut included = 0usize;
     let mut truncated = page_after > 0 || scan_cut;
@@ -309,9 +280,6 @@ pub(super) fn attempt_failure(
         report_values.push(value);
     }
 
-    // Excerpt: the newest frames of the failed step, newest first until
-    // the budget is spent. Binary frames cost no text budget; each run of
-    // them is one `binary` entry with its byte count.
     let log_view = newest.as_ref().unwrap_or(&scan);
     let source = &log_view.frames;
     let shown_from = source.len().saturating_sub(TAIL_FRAMES);
@@ -456,9 +424,6 @@ fn failure_log_page(
         .map_err(store_error)
 }
 
-/// The newest page of `step` (of the whole log without one) through the
-/// sparse index. `None` for a flat log, which has no index; its
-/// excerpt stays on the scan page and pages forward with the cursor.
 fn newest_log_page(
     state: &State,
     run: RunId,
@@ -486,16 +451,13 @@ fn newest_log_page(
 #[derive(Default)]
 struct Reports {
     items: Vec<FailureReport>,
-    /// Diagnostics of reports that could not be emitted at all.
     omitted: u64,
 }
 
 struct FailureReport {
     report: DiagnosticReport,
     parse: ParseCounts,
-    /// First and last frame sequence of a log-parsed input.
     window: Option<(u64, u64)>,
-    /// `(artifact name, file path)` of a collected report file.
     artifact: Option<(String, String)>,
 }
 
@@ -507,9 +469,6 @@ struct ParseCounts {
 }
 
 impl Reports {
-    /// Keep every valid diagnostic of a parse, dropping (and counting as
-    /// malformed) only the ones that fail the contract's bounds, then add
-    /// the report. A report never disappears silently.
     #[allow(clippy::too_many_arguments)]
     fn push(
         &mut self,
@@ -552,8 +511,6 @@ impl Reports {
                 window,
                 artifact,
             }),
-            // Provenance is server-built; if it ever failed, the loss is
-            // still counted rather than silent.
             Err(_) => {
                 self.omitted = self
                     .omitted
@@ -585,8 +542,6 @@ struct Chunk {
     seq: u64,
 }
 
-/// Parse each stream of `frames` past `after` (and of the scope's step)
-/// with the detected format.
 fn log_reports(out: &mut Reports, frames: &[Frame], after: u64, scope: LogScope) {
     let mut inputs = [Stream::Stdout, Stream::Stderr].map(|stream| LogInput {
         stream,
@@ -690,10 +645,6 @@ fn log_reports(out: &mut Reports, frames: &[Frame], after: u64, scope: LogScope)
     }
 }
 
-/// Which parser a stream needs, from its first recognizable record. Lines
-/// longer than a parser record are skipped unparsed, and a probe decodes
-/// into a borrowed shape that ignores every other field, so detection
-/// allocates nothing per value however large the line.
 fn detect_diagnostic_format(input: &[u8]) -> Option<ReportFormat> {
     #[derive(Deserialize)]
     struct Probe<'a> {
@@ -753,7 +704,6 @@ fn frame_position(chunks: &[Chunk], offset: usize) -> Option<FramePosition> {
 #[derive(Default)]
 struct ReportFiles {
     files: Vec<ReportFile>,
-    /// Report files past [`MAX_REPORT_FILES`] or whose object was gone.
     skipped: u64,
 }
 
@@ -765,10 +715,6 @@ struct ReportFile {
     len: u64,
 }
 
-/// The report-shaped files of the attempt's captured artifacts, opened for
-/// reading while the read snapshot proves they belong to it. Bounded by
-/// artifact and file counts; an artifact whose manifest or object has since
-/// been reclaimed is skipped and counted, never an error.
 fn report_files(
     state: &State,
     c: &Connection,
@@ -815,9 +761,6 @@ fn report_files(
     Ok(out)
 }
 
-/// The report-file naming convention (docs/diagnostics.md): JUnit XML as
-/// `junit.xml`, `*.junit.xml` or Maven's `TEST-*.xml`; Sentinel custom
-/// reports as `sentinel-diagnostics.json` or `*.sentinel-diagnostics.json`.
 fn report_file_format(path: &str) -> Option<ReportFormat> {
     let name = path.rsplit('/').next()?;
     if name == "junit.xml"
@@ -832,11 +775,7 @@ fn report_file_format(path: &str) -> Option<ReportFormat> {
     }
 }
 
-/// Parse the collected report files. They are repository-authored claims:
-/// `advisory` at best, `incomplete` when anything was cut or malformed, and
-/// never the verdict. A custom diagnostic's step must name a step of this
-/// attempt (index and id), and its evidence must point at one; otherwise
-/// the reference is removed and counted as malformed.
+/// Report files are repository-authored claims, so they are advisory and never the verdict.
 fn file_reports(
     out: &mut Reports,
     files: ReportFiles,
@@ -936,8 +875,6 @@ fn file_reports(
     }
 }
 
-/// A report that could not be read or decoded: no diagnostics, one
-/// malformed record, and never a payload echo.
 fn unreadable(format: ReportFormat) -> ParseResult {
     ParseResult {
         format,
@@ -1062,8 +999,6 @@ fn diagnostic_text_len(diagnostic: &Diagnostic) -> usize {
             .map_or(0, String::len)
 }
 
-/// A run of adjacent binary frames of one step and stream, shown as one
-/// entry: sequence range and byte count, no text.
 struct BinaryRun {
     first: u64,
     last: u64,
@@ -1086,9 +1021,6 @@ impl BinaryRun {
     }
 }
 
-/// Whether a frame is mostly not text: more than one byte in eight is
-/// invalid UTF-8, NUL, or a C0 control other than tab, newline, carriage
-/// return and escape (terminal colour is text).
 fn looks_binary(bytes: &[u8]) -> bool {
     let controls = |text: &str| {
         text.bytes()
@@ -1115,8 +1047,6 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bad.saturating_mul(8) > bytes.len()
 }
 
-/// The newest `budget` bytes of a frame as display text (controls other
-/// than newline and tab replaced, as in diagnostics) and whether it was cut.
 fn bounded_log_suffix(bytes: &[u8], budget: usize) -> (String, bool) {
     if budget == 0 {
         return (String::new(), !bytes.is_empty());
@@ -1143,7 +1073,6 @@ fn step_outcome_name(outcome: StepOutcome) -> &'static str {
     }
 }
 
-/// Compact JSON length without building the bytes.
 fn json_len(value: &Value) -> usize {
     struct Count(usize);
     impl std::io::Write for Count {
@@ -1160,11 +1089,7 @@ fn json_len(value: &Value) -> usize {
     count.0
 }
 
-/// JSON escaping and metadata count toward the hard body ceiling, even when
-/// text has already used the requested excerpt budget. Each removed item's
-/// size is measured once and subtracted: the oldest excerpt frames go
-/// first, then the last reports' last diagnostics. The body is measured
-/// again only per round (counters can gain a digit), not per item.
+/// Measured once per removed item and re-measured per round: serializing the body per item would be quadratic.
 fn cap_failure_json(body: &mut Value) {
     let mut size = json_len(body);
     while size > MAX_BUDGET {
@@ -1321,7 +1246,6 @@ mod tests {
         cap_failure_json(&mut body);
         let size = json_len(&body);
         assert!(size <= MAX_BUDGET, "{size}");
-        // Only what had to go went: the result sits just under the cap.
         assert!(size > MAX_BUDGET - 1_100, "{size}");
         assert_eq!(body["truncated"], true);
         assert_eq!(body["tail"]["frames"].as_array().unwrap().len(), 0);

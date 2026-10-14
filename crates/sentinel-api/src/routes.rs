@@ -1,8 +1,3 @@
-//! Route handling: one function per route, all through the same
-//! authenticate → authorize → store → JSON path, with `sentinel.error/1`
-//! for every refusal. Nothing here reads a tenant's rows without the
-//! `auth` predicate that says the caller may.
-
 use std::{
     io::{Read, Seek, SeekFrom},
     sync::{
@@ -50,26 +45,18 @@ mod setup;
 mod views;
 use failure::attempt_failure;
 
-/// What a route answers: a JSON body, a bounded stream from the object
-/// store, or an HTML page (OAuth consent and device pages, and `303`
-/// redirects with an empty body and a `location`). Streams carry an
-/// explicit length so the response is never chunked. HTML replies always
-/// carry the page security headers ([`crate::oauth::html`]).
 pub(crate) enum Reply {
     Json(u16, Value, Vec<Header>),
-    /// A JSON document encoded once by a bounded protocol endpoint.
     JsonText(u16, String, Vec<Header>),
     Empty(u16, Vec<Header>),
     Stream(u16, Box<dyn Read + Send>, u64, Vec<Header>),
     Html(u16, String, Vec<Header>),
-    /// Plain text with its own content type (the metrics exposition).
     Text(u16, &'static str, String),
 }
 pub(crate) type Route = Result<Reply, ApiError>;
 
 const JSON: &str = "application/json";
 
-/// Largest password-login body: a login name and a password, nothing more.
 const MAX_LOGIN_BODY_BYTES: usize = 16 << 10;
 
 pub(crate) fn header(name: &str, value: &str) -> Header {
@@ -84,7 +71,6 @@ pub(crate) fn err(code: ErrorCode, message: impl Into<String>) -> ApiError {
     ApiError::new(code, message)
 }
 
-/// The store's refusals as the API's.
 pub(crate) fn store_error(e: StoreError) -> ApiError {
     match e {
         StoreError::NotFound => err(ErrorCode::NotFound, "not found"),
@@ -103,8 +89,7 @@ pub(crate) fn store_error(e: StoreError) -> ApiError {
         StoreError::WriterUnavailable | StoreError::Overloaded => {
             err(ErrorCode::RateLimited, "controller busy; retry")
         }
-        // The write is still queued or running and may yet commit: an
-        // identical unkeyed retry could apply it twice.
+        // The write may still commit; an identical unkeyed retry could apply it twice.
         StoreError::WriteAmbiguous => err(
             ErrorCode::OutcomeUnknown,
             "the write may still commit; re-read before retrying",
@@ -120,7 +105,6 @@ pub(crate) fn store_error(e: StoreError) -> ApiError {
     }
 }
 
-/// Serve one request end to end; nothing here panics on client input.
 pub(crate) fn handle(state: &State, request: &mut Request) {
     let started = std::time::Instant::now();
     let method = request.method().to_owned();
@@ -129,7 +113,6 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
         Some((p, q)) => (p.to_owned(), q.to_owned()),
         None => (url.clone(), String::new()),
     };
-    // A proxy that forwards a path-carrying issuer's paths unstripped.
     let path = state.oauth.local_path(&full_path);
     let outcome = route(state, request, &method, path, &query);
     let reply = match outcome {
@@ -147,8 +130,6 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
         | Reply::Html(s, ..)
         | Reply::Text(s, ..) => *s,
     };
-    // Timed to the answer's start: a streamed body's transfer time is the
-    // client's, not the controller's.
     state.requests.observe(status, started.elapsed());
     match reply {
         Reply::Text(status, content_type, body) => {
@@ -217,11 +198,6 @@ pub(crate) fn handle(state: &State, request: &mut Request) {
     }
 }
 
-/// The `WWW-Authenticate` challenge of an `/api/v1` refusal (RFC 6750 §3,
-/// RFC 9728 §5.1): every `401` names the protected-resource metadata, plus
-/// `error="invalid_token"` when a token was presented; a scope refusal
-/// names the missing scope. The GitHub and intake hooks have their own
-/// secrets and are not OAuth resources.
 fn challenge(state: &State, request: &Request, path: &str, error: &ApiError) -> Vec<Header> {
     if path == "/mcp" {
         return match error.code {
@@ -285,8 +261,6 @@ fn challenge(state: &State, request: &Request, path: &str, error: &ApiError) -> 
     }
 }
 
-/// Who a run control action is recorded as ([`operations`]): the account,
-/// how it authenticated and, for an OAuth token, the grant.
 fn actor(who: &Identity) -> operations::Actor {
     match (who.via, who.grant) {
         (Via::OAuth, Some(grant)) => operations::Actor::OAuth(who.user, grant),
@@ -303,12 +277,10 @@ pub(crate) fn header_value<'a>(request: &'a Request, name: &'static str) -> Opti
         .map(|h| h.value.as_str())
 }
 
-/// Read a JSON body within the protocol limit.
 pub(crate) fn body(request: &mut Request) -> Result<Vec<u8>, ApiError> {
     body_limit(request, MAX_API_BODY_BYTES)
 }
 
-/// Read a body within a route-specific limit, before anything is buffered.
 pub(crate) fn body_limit(request: &mut Request, limit: usize) -> Result<Vec<u8>, ApiError> {
     if request.body_length().is_some_and(|n| n > limit) {
         return Err(
@@ -329,10 +301,6 @@ pub(crate) fn body_limit(request: &mut Request, limit: usize) -> Result<Vec<u8>,
     Ok(bytes)
 }
 
-/// [`body_limit`] for a route with no credential yet: the body is read
-/// without a handler permit, under the small public-body pool and its
-/// tight deadline ([`Request::public_body`]), so a slow sender cannot take
-/// a permit from real work. Past the pool's wait the answer is `rate_limited`.
 pub(crate) fn public_body_limit(request: &mut Request, limit: usize) -> Result<Vec<u8>, ApiError> {
     request.public_body(limit).map_err(|e| match e {
         BodyErr::TooLarge => {
@@ -378,8 +346,7 @@ pub(crate) fn identify(
             "sign in or present a credential",
         ),
         Refusal::Csrf => err(ErrorCode::Forbidden, "missing or wrong CSRF header"),
-        // Never `401`: the credential was not judged, and an OAuth client
-        // answers `401` by spending its refresh token.
+        // Never `401`: an OAuth client answers `401` by spending its refresh token.
         Refusal::Busy => err(ErrorCode::RateLimited, "controller busy; retry")
             .with_detail("retry_after_ms", 1000),
         Refusal::Fault => err(ErrorCode::Internal, "controller fault"),
@@ -403,8 +370,6 @@ pub(crate) fn route(
     query: &str,
 ) -> Route {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    // The OAuth authorization server owns `/.well-known/*`, `/oauth/*`,
-    // `/device`, `/api/v1/grants*` and `/api/v1/tenants/*/service-accounts*`.
     if let Some(reply) = crate::oauth::route(state, request, method, &parts, query) {
         return reply;
     }
@@ -425,7 +390,6 @@ pub(crate) fn route(
     }
     match (method, parts.as_slice()) {
         ("GET", ["metrics"]) | ("GET", ["api", "v1", "metrics"]) => {
-            // Platform administration: a scrape sees the whole deployment.
             let who = identify(state, request, false)?;
             auth::require_scope(&who, Scopes::PLATFORM_ADMIN)?;
             let authority = who.authority();
@@ -440,8 +404,6 @@ pub(crate) fn route(
             ))
         }
         ("GET", ["api", "v1", "version"]) => {
-            // Any authenticated caller: what an operator or a CLI needs to
-            // judge skew, and nothing the unauthenticated need.
             identify(state, request, false)?;
             let schema: i64 = state
                 .store
@@ -463,14 +425,9 @@ pub(crate) fn route(
                 },
             }))
         }
-        // Public: whether the deployment offers GitHub sign-in is what a
-        // sign-in page shows, not a secret. Liveness: nothing is checked.
         ("GET", ["api", "v1", "health"]) => {
             ok(json!({ "ok": true, "github_sign_in": state.github.is_some() }))
         }
-        // Public readiness: can this controller serve — not shutting
-        // down, the store reading and committing — and what is degraded
-        // while it does. Codes only, nothing about tenants or data.
         ("GET", ["api", "v1", "ready"]) => ready(state),
         ("POST", ["mcp"]) => crate::mcp::post(state, request),
         ("GET", ["mcp"]) => crate::mcp::get(state, request),
@@ -523,12 +480,8 @@ pub(crate) fn route(
             let (repos, stale) = state
                 .store
                 .read(|c| {
-                    // Membership-checked, so a foreign tenant is the same
-                    // `not_found` as an absent one, never an empty list.
                     let tenant = authz::member_tenant_by_slug(c, who.principal, &slug)?;
                     let repos = authz::list_repos(c, who.principal, tenant, None, 100)?;
-                    // Opening a GitHub-backed tenant whose membership was last
-                    // confirmed a while ago asks the lane for a fresh check.
                     let stale = sentinel_store::github_members::touch(
                         c,
                         tenant,
@@ -540,8 +493,6 @@ pub(crate) fn route(
                 })
                 .map_err(store_error)?;
             if stale {
-                // Best effort and rate limited in the store: opening a tenant
-                // never fails or waits because GitHub is slow.
                 let user = who.principal.user;
                 let _ = state
                     .store
@@ -752,11 +703,7 @@ pub(crate) fn route(
                 .ok_or_else(|| err(ErrorCode::InvalidRequest, "tenant query parameter required"))?
                 .to_owned();
             let limit = page_size(query_param(query, "limit").and_then(|v| v.parse().ok()));
-            // Placement is decided per transaction against the live session
-            // set, so the explanation must use the same set.
             let connected = state.controller.connected();
-            // The limit goes into the query: only the jobs shown are read and
-            // explained, and `total` is an index count.
             let page = state
                 .store
                 .read(|c| {
@@ -765,8 +712,6 @@ pub(crate) fn route(
                     dispatch::list_queue(c, tenant, &connected, limit)
                 })
                 .map_err(store_error)?;
-            // While disk admission is closed nothing is placed at all: a job
-            // nothing else holds is waiting on storage, not ready.
             let storage = state.objects.admission().filter(|a| !a.is_open()).map(|a| {
                 if a.backlog_full() {
                     "external_copy_backlog"
@@ -826,15 +771,12 @@ fn intake_error(error: ingest::Error) -> ApiError {
     }
 }
 
-/// A header value copied out of the request before its body is read, bounded
-/// so a hostile client cannot make the controller buffer unbounded headers.
 fn bounded_header(request: &Request, name: &'static str, max: usize) -> Option<String> {
     header_value(request, name)
         .filter(|value| value.len() <= max)
         .map(str::to_owned)
 }
 
-/// The `Bearer` value of an Authorization header, scheme case-insensitive.
 fn authorization_value(header: &str) -> Option<&str> {
     let (scheme, value) = header.split_once(' ')?;
     scheme
@@ -848,10 +790,6 @@ fn wake_intake(state: &State, duplicate: bool) {
     }
 }
 
-/// GitHub App webhooks: signature over the raw body, then the shared intake.
-/// Once the signature verifies, everything GitHub may legitimately send is
-/// answered 2xx — an unbound repository is a normal state, and an error would
-/// make GitHub disable the hook and hide future real events.
 fn github_hook(state: &State, request: &mut Request) -> Route {
     let Some(secret) = state.github_webhook_secret.as_deref() else {
         return Err(err(ErrorCode::NotFound, "no such route"));
@@ -875,8 +813,6 @@ fn github_hook(state: &State, request: &mut Request) -> Route {
         ingest::Github::Pong => ok(json!({ "pong": true })),
         ingest::Github::Ignored(why) => ok(json!({ "ignored": why })),
         ingest::Github::Controlled { outcome, duplicate } => {
-            // A rerequest re-queued terminal jobs inside the same receipt
-            // transaction; the dispatcher still needs its wake.
             if outcome == "rerequested" && !duplicate {
                 state.controller.wake();
             }
@@ -893,7 +829,6 @@ fn github_hook(state: &State, request: &mut Request) -> Route {
     }
 }
 
-/// Generic ref-update intake: a repository hook secret over the raw body.
 fn generic_intake(state: &State, request: &mut Request, repo: &str) -> Route {
     let repo: RepoId = id(repo, "repository")?;
     let presented = bounded_header(request, "authorization", 128)
@@ -993,10 +928,7 @@ struct LoginBody {
 }
 
 fn login(state: &State, request: &mut Request) -> Route {
-    // Login CSRF: a cross-site form can post `text/plain` (whose body can be
-    // shaped to parse as JSON) but not `application/json` without a CORS
-    // preflight this server never grants; and a browser's `Origin`, when
-    // sent, must be this deployment's.
+    // Login CSRF: a cross-site form cannot send application/json without a CORS preflight.
     let json_body = header_value(request, "content-type").is_some_and(|value| {
         value
             .split(';')
@@ -1015,8 +947,6 @@ fn login(state: &State, request: &mut Request) -> Route {
             "sign-in from another site is refused",
         ));
     }
-    // Every attempt costs a password hash (an unknown name included) and a
-    // writer transaction: admit the client before reading or hashing.
     if !crate::oauth::admitted(state, request, crate::oauth::Budget::Login) {
         return Err(err(
             ErrorCode::RateLimited,
@@ -1026,9 +956,6 @@ fn login(state: &State, request: &mut Request) -> Route {
     }
     let bytes = public_body_limit(request, MAX_LOGIN_BODY_BYTES)?;
     let creds: LoginBody = parse(&bytes)?;
-    // One client's lockout against an account never locks anyone else out.
-    // An email address is one account whatever its case or IDN spelling, so
-    // the guard keys on the canonical form.
     let identifier = if creds.username.contains('@') {
         sentinel_store::email::normalize(&creds.username).unwrap_or_else(|_| creds.username.clone())
     } else {
@@ -1043,8 +970,6 @@ fn login(state: &State, request: &mut Request) -> Route {
     if !state.logins.allowed(client, &creds.username, now) {
         return Err(err(ErrorCode::Unauthenticated, "sign-in refused"));
     }
-    // The store's account-wide lock is the ceiling for many clients
-    // together: it takes more failures than one client may make.
     let account_policy = local_auth::Policy {
         max_failures: state
             .sessions
@@ -1073,7 +998,6 @@ fn login(state: &State, request: &mut Request) -> Route {
                 vec![header("set-cookie", &set_cookie)],
             ))
         }
-        // One answer for every non-accepted outcome; the audit trail has the detail.
         local_auth::Login::Rejected | local_auth::Login::Locked { .. } => {
             state.logins.failed(
                 client,
@@ -1098,9 +1022,7 @@ fn logout(state: &State, request: &mut Request) -> Route {
     if let Some(secret) =
         header_value(request, "cookie").and_then(|h| cookie::read(cookie::SESSION_COOKIE, h))
     {
-        // The session row must go before the client is told it logged out:
-        // a failed delete leaves the secret valid, so the error surfaces
-        // rather than letting `ok` stand over a live session.
+        // The session row must go before the client is told it logged out.
         local_auth::logout(&state.store, &secret, UnixMillis::now()).map_err(store_error)?;
     }
     Ok(Reply::Json(
@@ -1110,12 +1032,6 @@ fn logout(state: &State, request: &mut Request) -> Route {
     ))
 }
 
-/// Drain or undrain one worker: it keeps the attempts it already holds, takes
-/// no new offers, and stays visible in its pool, so the work it would have
-/// taken is explained by `GET /queue` rather than disappearing. Platform
-/// administration, like everything else that changes a pool's capacity, and
-/// checked against the live platform-admin rows rather than the credential's
-/// expired claims.
 fn worker_drain(state: &State, request: &mut Request, worker: &str, drain: bool) -> Route {
     let who = identify(state, request, true)?;
     auth::require_scope(&who, Scopes::PLATFORM_ADMIN)?;
@@ -1137,16 +1053,10 @@ fn worker_drain(state: &State, request: &mut Request, worker: &str, drain: bool)
             }
         })
         .map_err(store_error)?;
-    // Placement is decided per transaction from the worker's stored drain
-    // state, so a change to it is what the dispatcher's next pass must see.
     state.controller.wake();
     ok(json!({ "worker": worker.to_string(), "draining": drain }))
 }
 
-/// A connected worker's transport telemetry, as it last reported it.
-/// Unmeasured fields are absent, never zero: `path` is `unknown` until a
-/// probe measured it, `rtt_ns` and `helper_version` are left out until set.
-/// Nothing here is a credential: no address or key is ever reported.
 fn transport_json(t: &sentinel_link::session::TransportStats) -> Value {
     let mut out = json!({
         "path": match t.path {
@@ -1167,9 +1077,6 @@ fn transport_json(t: &sentinel_link::session::TransportStats) -> Value {
     out
 }
 
-/// One waiting job as the API explains it: how long it has been waiting and
-/// what it is waiting for. A queued job and a job blocked on its dependencies
-/// are the same question to a person staring at a stuck pipeline.
 fn queued_json(row: &dispatch::QueuedJob) -> Value {
     json!({
         "job": row.job.to_string(),
@@ -1180,12 +1087,6 @@ fn queued_json(row: &dispatch::QueuedJob) -> Value {
     })
 }
 
-/// The scheduler's reason as a code plus whatever says what is missing, each
-/// quantity as its own numeric field. Every reason the store has is named
-/// here. The enum belongs to the store and is non-exhaustive, so a
-/// reason added there before this match names it falls to the guard, which
-/// still reports its own name and fields instead of an "unknown" the client
-/// cannot act on.
 fn wait_reason_json(reason: dispatch::WaitReason) -> Value {
     use dispatch::WaitReason as R;
     match reason {
@@ -1213,10 +1114,6 @@ fn wait_reason_json(reason: dispatch::WaitReason) -> Value {
     }
 }
 
-/// The guard's rendering of a reason's `Debug` text: `Name { a: 1, b: 2 }`
-/// becomes `{"code":"name","a":1,"b":2}`, `Name(x)` puts `x` in `detail`,
-/// and `Name` is the code alone. Reasons are `Copy`, so their fields are
-/// numbers, flags or static text, which this reads back as such.
 fn debug_reason_json(text: &str) -> Value {
     let end = text.find([' ', '(']).unwrap_or(text.len());
     let (name, rest) = text.split_at(end);
@@ -1234,8 +1131,6 @@ fn debug_reason_json(text: &str) -> Value {
     out
 }
 
-/// One `Debug` field value as JSON: an integer or a flag as itself, quoted
-/// text without its quotes, anything else as written.
 fn debug_value(value: &str) -> Value {
     if let Ok(n) = value.parse::<i64>() {
         return json!(n);
@@ -1255,8 +1150,6 @@ fn debug_value(value: &str) -> Value {
     }
 }
 
-/// `DiskShort` -> `disk_short`: the variant's own name in the shape the rest
-/// of the API writes enum values in.
 fn reason_code(variant: &str) -> String {
     let mut out = String::with_capacity(variant.len() + 4);
     for (index, ch) in variant.char_indices() {
@@ -1286,9 +1179,6 @@ struct DispatchBody {
     source: SourceBody,
 }
 
-/// Dispatch: compile the pipeline, pin the source, create the run and its
-/// jobs under the caller's `run` grant, resolve every digest-pinned image,
-/// and wake the dispatcher. Idempotent under `Idempotency-Key`.
 fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) -> Route {
     let who = identify(state, request, true)?;
     auth::require_scope(&who, Scopes::RUNS_WRITE)?;
@@ -1311,10 +1201,6 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
     }
     let compiled = compile_str(&dispatch.pipeline)
         .map_err(|e| err(ErrorCode::InvalidRequest, format!("pipeline: {e}")))?;
-    // A caller-authored pipeline never receives secrets: the grant to run
-    // jobs is not a grant to read what is bound to the repository, so refuse
-    // up front rather than fail the job later. Delivery enforces the same
-    // rule for any run recorded as manual.
     if compiled.jobs.iter().any(|job| {
         job.spec.registry_auth.is_some()
             || job
@@ -1338,8 +1224,6 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
     .map_err(|e| err(ErrorCode::InvalidRequest, format!("source: {e:?}")))?;
     let spec = RunSpec::new(source, compiled)
         .map_err(|e| err(ErrorCode::InvalidRequest, format!("spec: {e:?}")))?;
-    // Every image must be pinned by digest: the worker pulls exactly those
-    // bytes, and no resolver exists yet for a tag.
     let images = runs::pinned_images(&spec).map_err(|error| match error {
         StoreError::InvalidInput(_) => err(ErrorCode::InvalidRequest, "image reference"),
         _ => err(
@@ -1364,9 +1248,6 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
                 principal: &principal_text,
                 route: "runs.create",
             };
-            // Job and idempotency timestamps are deadline-clock values: the
-            // queue timeout and the key's TTL are decided against them. The
-            // provenance and check rows below stay wall-clock.
             let now = UnixMillis::now();
             let steady = UnixMillis::steady();
             if let Some(key) = key {
@@ -1382,9 +1263,6 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
             for (job, (digest, platform)) in jobs.iter().zip(&images) {
                 runs::resolve_image(tx, tenant, *job, digest, platform)?;
             }
-            // The explicit manual mode is a separately identified provenance:
-            // no delivery and no provider, and the submitted pipeline was the
-            // authority rather than a bound path at a selected revision.
             provenance::insert(
                 tx,
                 &provenance::Provenance {
@@ -1407,9 +1285,7 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
                 run,
                 now,
             )?;
-            // A manual run publishes nothing: its inline pipeline is a
-            // diagnostic and must never satisfy the required aggregate. The
-            // call is explicit so the rule lives in one place.
+            // A manual run publishes nothing: it must never satisfy the required aggregate.
             checks::record_run(tx, tenant, run, now)?;
             if let Some(key) = key {
                 idempotency::complete(tx, scope, key, run)?;
@@ -1444,12 +1320,6 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
     }
 }
 
-/// A held transfer slot; dropping it frees the slot for the next
-/// request. It owns its counter, so a download's slot can travel with the
-/// body the connection streams after the route returned. The bounds exist
-/// so bounded-heap processes never queue unbounded transfer work and long
-/// polls and slow bodies never take the handler permits
-/// [`crate::RESERVED_HANDLERS`] keeps for everything else.
 struct Slot(Arc<AtomicUsize>);
 
 impl Drop for Slot {
@@ -1476,25 +1346,11 @@ fn slot(state: &State) -> Result<Slot, ApiError> {
         .ok_or_else(|| err(ErrorCode::RateLimited, "transfer slots exhausted; retry"))
 }
 
-/// What a refused subscriber is told to wait before trying again.
 const SUBSCRIBER_RETRY_MS: u64 = 1_000;
-/// The longest a run wait parks (`timeout_ms` bound and default), the same
-/// bound as a `wait=1` log poll.
 const MAX_WAIT_MS: u64 = LOG_WAIT.as_millis() as u64;
-/// A parked wait re-reads the run at most this often however fast commits
-/// arrive: every commit in the store bumps the notifier, so a busy
-/// controller would otherwise cost one status read per commit per waiter.
 const RECHECK: std::time::Duration = std::time::Duration::from_millis(10);
-/// How often a parked wait looks at the shutdown flag.
 const STOP_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// A parked poll's standing, kept current: whenever the tenant's
-/// authorization epoch moves (a membership, role or grant change, a
-/// suspension) the poll re-authorizes before it keeps waiting, so a person
-/// removed from a tenant stops receiving its runs and logs at once rather
-/// than when the poll's 25 s run out; and a poll whose client hung up ends,
-/// giving its subscriber slot back. Checked at most every [`STOP_SLICE`]:
-/// one primary-key read and one `peek` per parked poll per slice.
 struct Standing {
     tenant: sentinel_core::TenantId,
     epoch: i64,
@@ -1525,7 +1381,6 @@ impl Standing {
         }
         self.checked = std::time::Instant::now();
         if request.peer_gone() {
-            // Nobody reads the answer; it only has to end the park.
             return Err(err(ErrorCode::InvalidRequest, "the client went away"));
         }
         let tenant = self.tenant;
@@ -1541,9 +1396,6 @@ impl Standing {
     }
 }
 
-/// A parked long poll's slot for `user`: refused `rate_limited` (with
-/// `details.retry_after_ms`) when every slot is parked or this user already
-/// holds its [`crate::SUBSCRIBERS_PER_USER`].
 fn subscriber(state: &State, user: UserId) -> Result<crate::Subscriber<'_>, ApiError> {
     state.subscribers.take(user).map_err(|refusal| {
         let message = match refusal {
@@ -1556,8 +1408,6 @@ fn subscriber(state: &State, user: UserId) -> Result<crate::Subscriber<'_>, ApiE
     })
 }
 
-/// An attempt's tenant, run and job, after the caller's `read` on its
-/// repository.
 fn attempt_log(
     state: &State,
     principal: Principal,
@@ -1575,20 +1425,8 @@ fn attempt_log(
         .map_err(store_error)
 }
 
-/// How often a parked log poll may re-read its attempt, however fast that
-/// attempt appends.
 const LOG_RECHECK: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// `GET /attempts/{att}/logs?after|cursor&limit&step&wait=1`: frames past a
-/// position. `after` is a sequence number; `cursor` is the versioned
-/// tenant- and attempt-bound `c1` form of the same position (the answer's
-/// `next`). A page carries at most `limit` frames and
-/// [`logs::PAGE_BYTES`] of payload and decodes at most
-/// [`logs::PAGE_SCAN_BYTES`]; a page cut short says where to continue in
-/// `next_after`/`next`. `wait=1` parks — on the log store's append
-/// notifier, re-reading only when this attempt's stored frontier moved —
-/// until something arrives, the log completes, the step has finished, or
-/// the deadline.
 fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::LOGS_READ)?;
@@ -1615,8 +1453,6 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
         .transpose()?;
     let wait = query_param(query, "wait").is_some_and(|v| v == "1" || v == "true");
     let (tenant, run, job) = attempt_log(state, who.principal, attempt)?;
-    // Retention removed this log: say so instead of an empty page
-    // that looks like a log still to come.
     if let Some(expired) = state
         .store
         .read(|c| sentinel_store::retention::log_expired(c, attempt))
@@ -1641,7 +1477,6 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
         }
         (Some(after), None) => after,
         (None, Some(text)) => {
-            // Malformed, another tenant's, another stream's: one answer.
             let cursor = Cursor::parse(text, tenant)
                 .ok()
                 .filter(|c| c.kind == StreamKind::AttemptLog && c.stream == *attempt.as_bytes())
@@ -1660,22 +1495,17 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
             .logs
             .tail_page(run, job, attempt, after, page, step)
             .or_else(|e| match e {
-                // Fall back to a flat log file from before per-attempt storage.
                 StoreError::NotFound => state.logs.tail_legacy_page(attempt, after, page, step),
                 e => Err(e),
             })
             .map_err(store_error)
     };
     let changes = state.logs.changes();
-    // The generation and the frontier are taken before the read: an append
-    // landing after them moves one or both, so the park below never sleeps
-    // through a frame the read missed.
+    // Take the generation and frontier before the read, so a park never misses a frame.
     let mut seen = changes.generation();
     let mut frontier = state.logs.frontier(attempt);
     let mut tail = read()?;
     let deadline = std::time::Instant::now() + LOG_WAIT;
-    // Parking holds a handler permit: the poll takes one of the
-    // SUBSCRIBERS slots it shares with run waits before it parks.
     let mut parked: Option<crate::Subscriber<'_>> = None;
     let mut checked = std::time::Instant::now();
     let mut standing: Option<Standing> = None;
@@ -1688,7 +1518,6 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
         if parked.is_none() {
             parked = Some(subscriber(state, who.principal.user)?);
             standing = Some(Standing::new(state, tenant)?);
-            // Waiting is not work: the handler permit goes back.
             request.yield_handler();
         }
         if let Some(standing) = standing.as_mut() {
@@ -1705,8 +1534,6 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
             continue;
         }
         seen = next;
-        // Every append in the store wakes the poll; only this attempt's
-        // moving frontier (or its writer closing) is worth a read.
         let moved = state.logs.frontier(attempt);
         if moved == frontier {
             continue;
@@ -1721,7 +1548,6 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
         checked = std::time::Instant::now();
     }
     drop(parked);
-    // Where the next page starts: past the last frame this one covered.
     let position = tail
         .next_after
         .or_else(|| tail.frames.last().map(|f| f.seq))
@@ -1748,9 +1574,6 @@ fn attempt_logs(state: &State, request: &mut Request, attempt: &str, query: &str
     }))
 }
 
-/// Readiness for a load balancer or an orchestrator: `503` while shutting
-/// down or when the store cannot read or commit; otherwise `200` with the
-/// degraded conditions an operator should know about.
 fn ready(state: &State) -> Route {
     let stopping = state.stop.load(Ordering::Acquire);
     let reads = state
@@ -1797,11 +1620,6 @@ fn ready(state: &State) -> Route {
     ))
 }
 
-/// `GET /runs/{run}/wait?since=<16 hex>&timeout_ms=1..25000`: answer as
-/// soon as the run's version differs from `since` (at once without one) or
-/// the run is finished; otherwise park on the store's commit notifier until
-/// something commits, re-reading only the allocation-free version, until
-/// the deadline or shutdown. The answer always carries the current run.
 fn run_wait(state: &State, request: &mut Request, run: &str, query: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::RUNS_READ)?;
@@ -1837,9 +1655,6 @@ fn run_wait(state: &State, request: &mut Request, run: &str, query: &str) -> Rou
             .read(|c| status::run_version(c, tenant, run))
             .map_err(store_error)
     };
-    // The generation is read before the version: a commit landing between
-    // the two moves the generation past `seen`, so the park below returns
-    // at once instead of missing it.
     let mut seen = changes.generation();
     let mut current = version()?;
     let mut checked = std::time::Instant::now();
@@ -1849,7 +1664,6 @@ fn run_wait(state: &State, request: &mut Request, run: &str, query: &str) -> Rou
         if parked.is_none() {
             parked = Some(subscriber(state, who.principal.user)?);
             standing = Some(Standing::new(state, tenant)?);
-            // Waiting is not work: the handler permit goes back.
             request.yield_handler();
         }
         if let Some(standing) = standing.as_mut() {
@@ -1875,9 +1689,6 @@ fn run_wait(state: &State, request: &mut Request, run: &str, query: &str) -> Rou
         checked = std::time::Instant::now();
     }
     drop(parked);
-    // The answer's version and `finished` are taken again from the same
-    // snapshot as the view, so a rerun committing after the loop's last
-    // check can never pair `finished: true` with a live run.
     let (current, view) = state
         .store
         .read(|c| {
@@ -1896,10 +1707,6 @@ fn run_wait(state: &State, request: &mut Request, run: &str, query: &str) -> Rou
     }))
 }
 
-/// `GET /attempts/{att}/logs/search?q=…&after&limit&carry`: a bounded
-/// literal scan ([`sentinel_store::logs::LogStore::search`]). `q` is
-/// percent-decoded (`+` is a space), 1..=256 bytes; `carry` is the previous
-/// page's `next_carry`, which keeps a literal split across the cut found.
 fn log_search(state: &State, request: &Request, attempt: &str, query: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::LOGS_READ)?;
@@ -1928,7 +1735,6 @@ fn log_search(state: &State, request: &Request, attempt: &str, query: &str) -> R
             .map_err(|_| err(ErrorCode::InvalidRequest, "malformed after"))?,
     };
     let limit = page_size(query_param(query, "limit").and_then(|v| v.parse().ok()));
-    // The previous page's `next_carry`: opaque, hex, checked by the store.
     let carry = query_param(query, "carry");
     let (_, run, job) = attempt_log(state, who.principal, attempt)?;
     if let Some(expired) = state
@@ -1974,7 +1780,6 @@ fn log_search(state: &State, request: &Request, attempt: &str, query: &str) -> R
     }))
 }
 
-/// Longest `q` a log search accepts, in bytes.
 const MAX_SEARCH_TEXT: usize = logs::MAX_NEEDLE;
 
 fn stream_name(stream: sentinel_protocol::logs::Stream) -> &'static str {
@@ -1984,8 +1789,6 @@ fn stream_name(stream: sentinel_protocol::logs::Stream) -> &'static str {
     }
 }
 
-/// `GET /attempts/{att}/summary`: the cache records the attempt's
-/// terminal report carried, or `{present:false}` before there is one.
 fn attempt_summary(state: &State, request: &Request, attempt: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::CACHE_READ)?;
@@ -2022,8 +1825,6 @@ struct UploadBody {
     ttl_ms: Option<i64>,
 }
 
-/// Resolve an upload's owning tenant and require the caller's live
-/// membership of it. Foreign and missing ids answer identically.
 fn upload_tenant(
     state: &State,
     principal: Principal,
@@ -2040,7 +1841,6 @@ fn upload_tenant(
         .map_err(store_error)
 }
 
-/// One artifact row as JSON; the detail route adds `manifest` on top.
 fn artifact_json(row: &artifacts::Row) -> Value {
     json!({
         "id": row.id.to_string(),
@@ -2072,7 +1872,6 @@ fn upload_json(upload: UploadId, status: &sentinel_store::objects::UploadStatus)
     })
 }
 
-/// Begin a resumable upload against a tenant the caller operates in.
 fn upload_begin(state: &State, request: &mut Request, slug: &str) -> Route {
     let who = identify(state, request, true)?;
     auth::require_scope(&who, Scopes::RUNS_WRITE)?;
@@ -2107,7 +1906,6 @@ fn upload_begin(state: &State, request: &mut Request, slug: &str) -> Route {
     Ok(Reply::Json(201, upload_json(upload, &status), Vec::new()))
 }
 
-/// Where a resumable upload stands; the client's resume plan.
 fn upload_status(state: &State, request: &mut Request, upload: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::RUNS_WRITE)?;
@@ -2120,9 +1918,6 @@ fn upload_status(state: &State, request: &mut Request, upload: &str) -> Route {
     ok(upload_json(upload, &status))
 }
 
-/// One chunk: `PUT /api/v1/uploads/<upl>?offset=N` with a raw body. The
-/// bytes are written and synced outside the store's writer; the writer
-/// only records the range.
 fn upload_chunk(state: &State, request: &mut Request, upload: &str, query: &str) -> Route {
     let who = identify(state, request, true)?;
     auth::require_scope(&who, Scopes::RUNS_WRITE)?;
@@ -2158,9 +1953,7 @@ fn upload_chunk(state: &State, request: &mut Request, upload: &str, query: &str)
     ok(json!({ "upload": upload.to_string(), "received": received }))
 }
 
-/// A session touched past its expiry is retired in its own transaction —
-/// then the request is refused. Retiring inside the refused request's
-/// transaction would roll back with it.
+/// Retire in its own transaction: inside the refused request's, it would roll back.
 fn retire_expired(state: &State, tenant: sentinel_core::TenantId, upload: UploadId) -> ApiError {
     let objects = Arc::clone(&state.objects);
     if let Ok(true) = state
@@ -2173,10 +1966,6 @@ fn retire_expired(state: &State, tenant: sentinel_core::TenantId, upload: Upload
     err(ErrorCode::InvalidRequest, "invalid upload expired")
 }
 
-/// Seal: the ranges must tile the declared length and match the digest.
-/// Hashing and the rename run outside the writer (holding a transfer slot:
-/// a seal reads the whole object); the writer flips the row and inserts
-/// the object.
 fn upload_commit(state: &State, request: &mut Request, upload: &str) -> Route {
     let who = identify(state, request, true)?;
     auth::require_scope(&who, Scopes::RUNS_WRITE)?;
@@ -2201,7 +1990,6 @@ fn upload_commit(state: &State, request: &mut Request, upload: &str) -> Route {
     ok(json!({ "upload": upload.to_string(), "digest": digest.to_string() }))
 }
 
-/// Give up an open upload and drop its staged bytes.
 fn upload_abort(state: &State, request: &mut Request, upload: &str) -> Route {
     let who = identify(state, request, true)?;
     auth::require_scope(&who, Scopes::RUNS_WRITE)?;
@@ -2216,8 +2004,6 @@ fn upload_abort(state: &State, request: &mut Request, upload: &str) -> Route {
     ok(json!({ "upload": upload.to_string(), "aborted": true }))
 }
 
-/// `Range: bytes=a-b`, `bytes=a-` or `bytes=-n` to a `[start, end)` pair.
-/// Multiple ranges are refused rather than served partially.
 fn byte_range(spec: &str, len: u64) -> Result<(u64, u64), ApiError> {
     let invalid = || err(ErrorCode::InvalidRequest, "unsatisfiable range");
     let spec = spec.strip_prefix("bytes=").ok_or_else(invalid)?;
@@ -2253,13 +2039,6 @@ fn byte_range(spec: &str, len: u64) -> Result<(u64, u64), ApiError> {
     Ok((start, end))
 }
 
-/// Stream a committed object, whole or a `Range`. The bytes are repository
-/// evidence: the caller must be able to read an artifact that references
-/// them, or be an operator of the tenant it was uploaded to
-/// ([`authz::require_object_read`]). The reader registration keeps the file
-/// un-reclaimable and the transfer slot stays held until the body has been
-/// written. A whole-object body is rehashed while it streams and cut short
-/// before its last byte if it does not match its digest.
 fn object_download(state: &State, request: &mut Request, slug: &str, digest: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::ARTIFACTS_READ)?;
@@ -2315,8 +2094,6 @@ fn object_download(state: &State, request: &mut Request, slug: &str, digest: &st
     }
 }
 
-/// A streamed range body that holds its transfer slot until dropped —
-/// after the connection wrote it, not when the route returned.
 struct Held<R> {
     inner: R,
     _slot: Slot,
@@ -2328,10 +2105,6 @@ impl<R: Read> Read for Held<R> {
     }
 }
 
-/// A whole-object body: holds its slot like [`Held`] and rehashes as it
-/// streams. The read that would deliver the final byte first finishes the
-/// hash; on a mismatch (or a file shorter than its row) it fails instead,
-/// so a client sees a truncated body rather than complete wrong bytes.
 struct Verified {
     inner: sentinel_store::objects::Reader,
     left: u64,
@@ -2373,7 +2146,6 @@ mod tests {
 
     #[test]
     fn only_a_write_that_may_commit_is_reported_as_outcome_unknown() {
-        // Nothing was attempted, or a read was refused: an identical retry is safe.
         for refused in [StoreError::WriterUnavailable, StoreError::Overloaded] {
             let e = store_error(refused);
             assert_eq!(
@@ -2381,7 +2153,6 @@ mod tests {
                 (ErrorCode::RateLimited, 429, true)
             );
         }
-        // The write may still commit, so no blind retry is invited.
         let e = store_error(StoreError::WriteAmbiguous);
         assert_eq!(
             (e.code, e.http_status(), e.retryable),
@@ -2395,8 +2166,6 @@ mod tests {
         );
     }
 
-    /// Every quantity a reason carries is its own numeric field: a client
-    /// reads `disk_short` as bytes, never parses a `detail` string.
     #[test]
     fn queue_reasons_carry_their_quantities_as_numeric_fields() {
         use dispatch::WaitReason as R;
@@ -2430,8 +2199,6 @@ mod tests {
         }
     }
 
-    /// The guard for a reason the API does not name yet keeps its fields
-    /// structured, whether the variant has named fields, a tuple or none.
     #[test]
     fn an_unnamed_reason_still_reports_structured_fields() {
         assert_eq!(
@@ -2448,8 +2215,6 @@ mod tests {
         );
     }
 
-    /// What a worker never measured stays out of the answer (AGENTS.md:
-    /// unmeasured is absent, never zero).
     #[test]
     fn transport_telemetry_leaves_unmeasured_fields_out() {
         use sentinel_link::session::{Path, TransportStats};

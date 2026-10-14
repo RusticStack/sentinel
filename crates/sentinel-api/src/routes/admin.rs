@@ -1,14 +1,3 @@
-//! Administration over the API: the platform's registrations,
-//! tenants, quotas, pools, policy and audit (`platform:admin`), a tenant's
-//! members, repositories and run control audit (`tenant:admin`), and the
-//! session step-up that privileged platform changes require.
-//!
-//! Every mutation goes through the same store functions the host-local
-//! `sentinel admin` commands use, with the caller's own authority instead
-//! of the host's: platform rows are checked live, a privileged change needs
-//! a session stepped up within the policy window, and nothing ever returns
-//! a stored secret.
-
 use sentinel_core::{
     PoolId, RepoId, TenantId, UnixMillis, UserId,
     auth::{Namespace, Permissions, Role, Scopes},
@@ -28,8 +17,7 @@ use serde_json::{Value, json};
 use super::{Reply, Route, body, err, id, identify, ok, parse, query_param, store_error};
 use crate::{State, auth, auth::Identity, http::Request};
 
-/// A platform administrator: the scope, then the live platform rows (not
-/// the credential's claims), so a revoked super admin is refused at once.
+/// Checks live platform rows, not the credential's claims, so a revoked super admin is refused at once.
 fn platform(state: &State, request: &Request, mutation: bool) -> Result<Identity, ApiError> {
     let who = identify(state, request, mutation)?;
     auth::require_scope(&who, Scopes::PLATFORM_ADMIN)?;
@@ -83,8 +71,6 @@ fn parse_role(text: &str) -> Result<Role, ApiError> {
     }
 }
 
-/// Route one request under `/api/v1/admin/…`, `/api/v1/step-up` or the
-/// tenant administration paths; `None` when the path is not one of them.
 pub(super) fn route(
     state: &State,
     request: &mut Request,
@@ -164,16 +150,10 @@ pub(super) fn route(
 
 #[derive(Deserialize)]
 struct StepUpBody {
-    /// `totp`, `recovery` or `password` (the last only without TOTP).
     method: String,
     code: String,
 }
 
-/// `POST /api/v1/step-up {method, code}`: a browser session proves presence
-/// again — a TOTP code, an unused recovery code, or the password for
-/// an account without TOTP — and is stamped for the policy's window. Only a
-/// session can step up; a wrong proof is one `forbidden` whatever was wrong,
-/// and the store counts failures against the session and the factor.
 fn step_up(state: &State, request: &mut Request) -> Route {
     let who = identify(state, request, true)?;
     if who.via != auth::Via::Session {
@@ -233,7 +213,6 @@ fn list_tenants(state: &State, request: &Request, query: &str) -> Route {
             let rows = views::tenants(c, who.authority(), after.as_deref(), limit)?;
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
-                // The effective quota: the tenant's own row or the default.
                 let effective = state.objects.quota(c, row.id)?;
                 out.push((row, effective));
             }
@@ -266,9 +245,6 @@ struct CreateTenant {
     slug: String,
 }
 
-/// `POST /admin/tenants {slug}`: a new organization tenant (audited). It has
-/// no members yet; a platform administrator adds its first admin through
-/// the members route.
 fn create_tenant(state: &State, request: &mut Request) -> Route {
     let who = platform(state, request, true)?;
     let body: CreateTenant = parse(&body(request)?)?;
@@ -290,7 +266,6 @@ fn create_tenant(state: &State, request: &mut Request) -> Route {
             tenancy::create_organization(tx, authority, tenant, parsed, UnixMillis::now())
         })
         .map_err(|e| match e {
-            // The slug is unique: an existing tenant is a conflict, not a fault.
             sentinel_store::Error::Sqlite(_) => err(ErrorCode::Conflict, "slug already taken"),
             e => store_error(e),
         })?;
@@ -301,9 +276,6 @@ fn create_tenant(state: &State, request: &mut Request) -> Route {
     ))
 }
 
-/// Suspend or reactivate a tenant: privileged (a fresh step-up), audited,
-/// and a suspension revokes the tenant's credentials and invitations and
-/// cancels its jobs in the same transaction.
 fn suspend(state: &State, request: &mut Request, slug: &str, suspend: bool) -> Route {
     let who = platform(state, request, true)?;
     let authority = who.authority();
@@ -339,8 +311,6 @@ struct QuotaBody {
     bytes: u64,
 }
 
-/// `PUT /admin/tenants/{slug}/quota {bytes}` sets the tenant's storage quota;
-/// `DELETE` returns it to the deployment default.
 fn quota(state: &State, request: &mut Request, slug: &str, set: bool) -> Route {
     let who = platform(state, request, true)?;
     let bytes = if set {
@@ -370,8 +340,6 @@ fn quota(state: &State, request: &mut Request, slug: &str, set: bool) -> Route {
     ok(json!({ "quota_bytes": effective, "quota_set": bytes.is_some() }))
 }
 
-/// A storage policy as the API takes it: every field replaces the stored
-/// one, `null` (or absent) inherits.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StorageBody {
@@ -415,10 +383,6 @@ fn effective_json(e: &retention::Effective) -> Value {
     })
 }
 
-/// `PUT /admin/tenants/{slug}/storage` (platform administration) or
-/// `PUT /tenants/{slug}/repos/{name}/storage` (the tenant's
-/// administration): replace a storage policy. Lowered retention applies to
-/// what is already stored; a repository may only narrow its tenant's.
 fn set_storage(state: &State, request: &mut Request, slug: &str, repo: Option<&str>) -> Route {
     let who = if repo.is_some() {
         tenant_admin(state, request, true)?
@@ -461,14 +425,11 @@ fn set_storage(state: &State, request: &mut Request, slug: &str, repo: Option<&s
             ))
         })
         .map_err(store_error)?;
-    // The rest of the re-stamping, a bounded write at a time: the writer
-    // serves other requests between batches.
+    // Re-stamping runs a bounded write at a time, so the writer serves other requests between batches.
     retention::finish_reapply(&state.store, &d, tenant, repo, rest).map_err(store_error)?;
     ok(json!({ "policy": storage_policy_json(&own), "effective": effective_json(&effective) }))
 }
 
-/// `GET /tenants/{slug}/storage`: the tenant's usage, policy and limits,
-/// and every repository's (tenant administration).
 fn tenant_storage(state: &State, request: &Request, slug: &str) -> Route {
     let who = tenant_admin(state, request, false)?;
     let principal = who.principal;
@@ -508,9 +469,6 @@ fn tenant_storage(state: &State, request: &Request, slug: &str) -> Route {
     }))
 }
 
-/// `GET /admin/storage`: the deployment's disk and its limits: free and
-/// total bytes, the metadata database, the watermarks and reserve in force,
-/// whether discretionary admission is open, and what every tenant stores.
 fn deployment_storage(state: &State, request: &Request) -> Route {
     platform(state, request, false)?;
     let d = state.objects.deployment();
@@ -570,8 +528,6 @@ fn deployment_storage(state: &State, request: &Request) -> Route {
     }))
 }
 
-/// `GET /admin/backups`: the scheduler's state and every backup in its
-/// target, newest first, each with its manifest's summary.
 fn list_backups(state: &State, request: &Request) -> Route {
     platform(state, request, false)?;
     let Some(backups) = state.objects.backups() else {
@@ -601,12 +557,6 @@ fn list_backups(state: &State, request: &Request) -> Route {
     ok(json!({ "configured": true, "scheduler": backups.status(), "backups": listed }))
 }
 
-/// `GET /admin/diagnostics[?integrity=1]`: the sanitized diagnostic bundle
-/// — the database's counts and workers ([`sentinel_store::bundle`])
-/// plus this process's runtime state. No names of tenants, repositories or
-/// users, no addresses, paths, endpoints, credentials or log text; safe to
-/// attach to a support request. `integrity=1` adds SQLite's quick check (a
-/// full read of the database).
 fn diagnostics(state: &State, request: &Request, query: &str) -> Route {
     use std::sync::atomic::Ordering::Relaxed;
     platform(state, request, false)?;
@@ -624,7 +574,6 @@ fn diagnostics(state: &State, request: &Request, query: &str) -> Route {
     };
     let backups = state.objects.backups().map(|b| {
         let mut status = b.status();
-        // The target path is the operator's, not the bundle's.
         if let Some(o) = status.as_object_mut() {
             o.remove("target");
         }
@@ -677,8 +626,6 @@ fn diagnostics(state: &State, request: &Request, query: &str) -> Route {
     ok(bundle)
 }
 
-/// `POST /admin/backups`: take a backup now (it runs on the scheduler's
-/// thread) → `202`, or `conflict` while one is running.
 fn start_backup(state: &State, request: &mut Request) -> Route {
     platform(state, request, true)?;
     let Some(backups) = state.objects.backups() else {
@@ -709,9 +656,6 @@ fn registrations(state: &State, request: &Request, query: &str) -> Route {
     }))
 }
 
-/// Approve or reject a pending application. Rejecting an account that was
-/// already approved is privileged (it ends a live account) and needs a
-/// fresh step-up; the store decides which case applies.
 fn decide(state: &State, request: &mut Request, user: &str, approve: bool) -> Route {
     let who = platform(state, request, true)?;
     let user: UserId = id(user, "user")?;
@@ -765,7 +709,6 @@ struct PolicyBody {
     installation_binding: String,
 }
 
-/// `PUT /admin/policy`: the deployment's admission policy. Privileged.
 fn set_policy(state: &State, request: &mut Request) -> Route {
     let who = platform(state, request, true)?;
     let body: PolicyBody = parse(&body(request)?)?;
@@ -819,9 +762,7 @@ fn list_pools(state: &State, request: &Request) -> Route {
 #[derive(Deserialize)]
 struct PoolBody {
     name: String,
-    /// `shared` or `dedicated`.
     kind: String,
-    /// The owning tenant's slug for a dedicated pool.
     #[serde(default)]
     tenant: Option<String>,
 }
@@ -949,20 +890,12 @@ fn members(state: &State, request: &Request, slug: &str, query: &str) -> Route {
 
 #[derive(Deserialize)]
 struct BackingBody {
-    /// `github` or `app`.
     source: String,
-    /// Why, for a platform administrator who does not administer the tenant.
     #[serde(default)]
     reason: Option<String>,
 }
 
-/// `PUT /tenants/{slug}/membership-source {source, reason?}` makes an
-/// organization tenant GitHub-backed (`github`) or app-managed again (`app`).
-/// Tenant administration with fresh step-up. Converting needs an installation
-/// of a GitHub organization bound to the tenant (`conflict` otherwise), and
-/// removes everyone GitHub does not confirm for their linked account, so the
-/// administrator making the change must have linked GitHub first
-/// (`invalid_request`).
+/// Converting removes members GitHub does not confirm, so the admin must have linked GitHub first.
 fn set_backing(state: &State, request: &mut Request, slug: &str) -> Route {
     let who = tenant_admin(state, request, true)?;
     let body: BackingBody = parse(&body(request)?)?;
@@ -1006,19 +939,10 @@ fn set_backing(state: &State, request: &mut Request, slug: &str) -> Route {
 #[derive(Deserialize)]
 struct MemberBody {
     role: String,
-    /// Why, for a platform administrator who does not administer the tenant.
     #[serde(default)]
     reason: Option<String>,
 }
 
-/// `PUT /tenants/{slug}/members/{user} {role, reason?}` adds or changes a
-/// member; `DELETE` removes one (revoking credentials narrowed to the
-/// tenant). The user is a `usr_…` id, or the local sign-in name of an
-/// **existing member**: a name is never resolved outside the tenant, so the
-/// route is no oracle for which accounts exist, and adding a new member takes
-/// the id the person gave. A platform administrator who does not administer
-/// the tenant needs a stepped-up session and a `reason` (audited). Taking the
-/// admin role from the tenant's last administrator is `conflict`.
 fn set_member(state: &State, request: &mut Request, slug: &str, user: &str, put: bool) -> Route {
     let who = tenant_admin(state, request, true)?;
     let (role, reason) = if put {
@@ -1034,7 +958,7 @@ fn set_member(state: &State, request: &mut Request, slug: &str, user: &str, put:
         .writer()
         .write(move |tx| {
             let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
-            // Administration first: only an administrator may name a person.
+            // Check administration before resolving the name: resolving first would reveal which accounts exist.
             authz::require_tenant_admin(tx, principal, tenant)?;
             let user = authz::resolve_member(tx, tenant, &user)?;
             match role {
@@ -1063,9 +987,7 @@ struct RepoBody {
     name: String,
 }
 
-/// `POST /tenants/{slug}/repos {name}`: a repository record under the
-/// tenant (tenant admin). Its source binding and hook secrets are set
-/// host-locally, where their credentials never cross the API.
+/// Hook secrets are set host-locally, so their credentials never cross the API.
 fn create_repo(state: &State, request: &mut Request, slug: &str) -> Route {
     let who = tenant_admin(state, request, true)?;
     let body: RepoBody = parse(&body(request)?)?;
@@ -1104,10 +1026,6 @@ fn create_repo(state: &State, request: &mut Request, slug: &str) -> Route {
     ))
 }
 
-/// `GET /tenants/{slug}/repos/{name}/source`: the repository's source
-/// binding as metadata — remote, allowed refs, pipeline path, whether trust
-/// roots are pinned, version, revocation, forge association. The binding
-/// holds no credential; credentials are sealed elsewhere and never read.
 fn source(state: &State, request: &Request, slug: &str, name: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::RUNS_READ)?;
@@ -1119,7 +1037,6 @@ fn source(state: &State, request: &Request, slug: &str, name: &str) -> Route {
             let repo = lookup::repo_by_name(c, tenant, &name)?;
             match sources::metadata(c, who.principal, repo) {
                 Ok(meta) => Ok(Some(meta)),
-                // An authorized repository without a binding yet.
                 Err(sentinel_store::Error::NotFound) => {
                     authz::require_repo(c, who.principal, repo, Permissions::READ)?;
                     Ok(None)
@@ -1145,18 +1062,11 @@ fn source(state: &State, request: &Request, slug: &str, name: &str) -> Route {
 
 #[derive(Deserialize)]
 struct GrantBody {
-    /// Any of `read`, `run`, `secrets`; empty withdraws the grant.
     access: Vec<String>,
-    /// Why, for a platform administrator who does not administer the tenant.
     #[serde(default)]
     reason: Option<String>,
 }
 
-/// `PUT /tenants/{slug}/repos/{name}/grants/{user} {access, reason?}`: a
-/// member's repository access (the user is a `usr_…` id or a member's local
-/// sign-in name). Membership stays the ceiling: a reader granted `run` still
-/// cannot run. A platform administrator who does not administer the tenant
-/// needs a stepped-up session and a `reason` (audited).
 fn repo_grant(state: &State, request: &mut Request, slug: &str, name: &str, user: &str) -> Route {
     let who = tenant_admin(state, request, true)?;
     let body: GrantBody = parse(&body(request)?)?;
@@ -1183,7 +1093,6 @@ fn repo_grant(state: &State, request: &mut Request, slug: &str, name: &str, user
         .write(move |tx| {
             let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
             let repo = lookup::repo_by_name(tx, tenant, &name)?;
-            // Administration first: only an administrator may name a person.
             authz::require_tenant_admin(tx, principal, tenant).map_err(|e| match e {
                 sentinel_store::Error::Forbidden => sentinel_store::Error::NotFound,
                 other => other,
@@ -1243,7 +1152,6 @@ fn tenant_audit(state: &State, request: &Request, slug: &str, query: &str) -> Ro
     }))
 }
 
-/// Whether the caller's account has TOTP: what the step-up dialog asks for.
 pub(super) fn mfa_enrolled(state: &State, user: UserId) -> Result<bool, ApiError> {
     state
         .store
