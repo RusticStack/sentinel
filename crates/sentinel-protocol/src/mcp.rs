@@ -726,7 +726,7 @@ mod tests {
             .clone()
     }
 
-    /// P11-9: clients choose confirmation prompts from these hints.
+    /// Clients choose confirmation prompts from these hints.
     #[test]
     fn tool_annotations_describe_each_tool_precisely() {
         for tool in tool_definitions() {
@@ -747,7 +747,7 @@ mod tests {
         assert_eq!(hints("cancel"), (false, true, true));
     }
 
-    /// P10S-2 / P10C-6 on MCP: bindings are listed metadata-only through
+    /// Bindings are listed metadata-only through
     /// the secret-bindings route, and secret tools address an
     /// `owner/name` repository by its form-encoded name.
     #[test]

@@ -198,8 +198,7 @@ mod tests {
         assert_eq!(ErrorCode::UnsupportedVersion.http_status(), 426);
         assert!(ErrorCode::RateLimited.retryable());
         assert!(!ErrorCode::Conflict.retryable());
-        // D06 storage admissions: the disk-full refusal is transient and
-        // retryable; the quota refusal is the tenant's to resolve.
+        // Disk-full is transient and retryable; quota is the tenant's to resolve.
         assert_eq!(ErrorCode::StorageFull.http_status(), 507);
         assert!(ErrorCode::StorageFull.retryable());
         assert_eq!(ErrorCode::QuotaExceeded.http_status(), 403);
@@ -210,7 +209,7 @@ mod tests {
 
     #[test]
     fn an_ambiguous_write_is_unavailable_and_never_blindly_retryable() {
-        // P02-1: the write may still commit, so an identical unkeyed retry
+        // The write may still commit, so an identical unkeyed retry
         // could apply it twice; the code must not invite one.
         assert_eq!(ErrorCode::OutcomeUnknown.http_status(), 503);
         assert!(!ErrorCode::OutcomeUnknown.retryable());

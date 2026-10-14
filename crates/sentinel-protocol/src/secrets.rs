@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn a_bare_carriage_return_is_refused_with_its_line() {
-        // Old Mac line endings used to merge `B` into `A`'s value.
+        // A bare CR must not merge `B` into `A`'s value.
         let error = parse_env_file(b"A=1\rB=2\r").unwrap_err();
         assert_eq!(
             error,
