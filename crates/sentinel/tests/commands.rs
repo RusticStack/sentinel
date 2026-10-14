@@ -1,9 +1,3 @@
-//! The commands end to end, portable: the real `sentinel` binary with a
-//! static credential against an in-process controller API on loopback.
-//! Listing pages stream as NDJSON, `wait` exits 0/8/7, an artifact entry
-//! downloads with its digest checked, `not_found` and `conflict` keep their
-//! exits, and JSON-mode failures touch stderr only.
-
 use std::{
     collections::HashSet,
     process::{Command, Output},
@@ -115,8 +109,6 @@ fn deployment() -> Deployment {
     }
 }
 
-/// Run the CLI with the deployment's static credential; nothing from the
-/// caller's environment or profiles leaks in.
 fn cli(d: &Deployment, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sentinel"))
         .env("SENTINEL_TOKEN", &d.token)
@@ -148,7 +140,6 @@ jobs:
     steps: [{ id: s, run: 'true' }]
 ";
 
-/// Dispatch a one-job run through the CLI itself.
 fn dispatch_run(d: &Deployment) -> (RunId, JobId) {
     let file = d.dir.path().join("pipeline.yml");
     std::fs::write(&file, PIPELINE).unwrap();
@@ -193,9 +184,6 @@ fn lease(d: &Deployment, job: JobId) -> (WorkerId, AttemptId, Fence) {
         .unwrap()
 }
 
-/// A worker the store knows: its own dedicated pool of the tenant and a
-/// host-local enrollment. Acknowledgements and reports come only from a
-/// registered, unrevoked worker.
 fn enrolled_worker(
     tx: &sentinel_store::Transaction<'_>,
     tenant: TenantId,
@@ -297,7 +285,6 @@ fn run_list_streams_every_page_as_ndjson_and_json_carries_the_cursor() {
         .map(|r| r["created_ms"].as_i64().unwrap())
         .collect();
     assert!(created.windows(2).all(|w| w[0] >= w[1]), "newest first");
-    // JSON: one document, bounded by --limit, with the cursor to continue.
     let out = cli(
         &d,
         &[
@@ -317,7 +304,6 @@ fn run_list_streams_every_page_as_ndjson_and_json_carries_the_cursor() {
         ],
     );
     assert_eq!(stdout(&out).lines().count(), 517);
-    // Text names the cursor on stderr when more remain; stdout is the list.
     let out = cli(
         &d,
         &[
@@ -326,7 +312,6 @@ fn run_list_streams_every_page_as_ndjson_and_json_carries_the_cursor() {
     );
     assert_eq!(stdout(&out).lines().count(), 2);
     assert!(stderr(&out).contains("--before run_"), "{}", stderr(&out));
-    // A tenant is required when no profile context supplies one.
     let out = cli(&d, &["run", "list", "--repo", "app"]);
     assert_eq!(code(&out), 2);
     assert!(stderr(&out).contains("--tenant"), "{}", stderr(&out));
@@ -335,7 +320,6 @@ fn run_list_streams_every_page_as_ndjson_and_json_carries_the_cursor() {
 #[test]
 fn wait_exits_zero_when_the_run_passes_eight_when_it_does_not_and_seven_at_the_deadline() {
     let d = deployment();
-    // Passes while the CLI is parked on the wait route.
     let (run, job) = dispatch_run(&d);
     let leased = lease(&d, job);
     let store = Arc::clone(&d.store);
@@ -344,7 +328,6 @@ fn wait_exits_zero_when_the_run_passes_eight_when_it_does_not_and_seven_at_the_d
         pass(&store, leased);
     });
     let started = Instant::now();
-    // Bounded, so a run that never passes fails the test instead of hanging it.
     let out = cli(
         &d,
         &[
@@ -368,7 +351,6 @@ fn wait_exits_zero_when_the_run_passes_eight_when_it_does_not_and_seven_at_the_d
     assert_eq!(changes.last().unwrap()["run"]["state"], "passed");
     assert!(stderr(&out).is_empty());
 
-    // Finished without passing: exit 8, the run on stdout, the reason on stderr.
     let (run, job) = dispatch_run(&d);
     let out = cli(&d, &["job", "cancel", &job.to_string()]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
@@ -379,7 +361,6 @@ fn wait_exits_zero_when_the_run_passes_eight_when_it_does_not_and_seven_at_the_d
     let error: Value = serde_json::from_str(stderr(&out).trim()).unwrap();
     assert_eq!(error["code"], "client_run_failed");
 
-    // Still queued at the deadline: exit 7.
     let (run, _) = dispatch_run(&d);
     let started = Instant::now();
     let out = cli(&d, &["wait", &run.to_string(), "--timeout", "1500ms"]);
@@ -448,8 +429,6 @@ fn an_artifact_entry_downloads_with_its_length_and_digest_checked() {
         .collect();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], artifact.to_string());
-    // The answers name the owning tenant, so a download needs no --tenant
-    // (this CLI has neither the flag nor a profile context below).
     let out = cli(&d, &["artifact", "list", &run.to_string(), "--json"]);
     let listed: Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(listed["tenant"], "acme");
@@ -486,7 +465,6 @@ fn an_artifact_entry_downloads_with_its_length_and_digest_checked() {
     assert_eq!(result["digest"], digest.as_str());
     assert_eq!(result["len"], 300_000);
     assert!(!d.dir.path().join("report.bin.sentinel-part").exists());
-    // An entry the manifest does not list is not found, and nothing is written.
     let missing = d.dir.path().join("missing.bin");
     let out = cli(
         &d,
@@ -505,7 +483,6 @@ fn an_artifact_entry_downloads_with_its_length_and_digest_checked() {
     );
     assert_eq!(code(&out), 4, "{}", stderr(&out));
     assert!(!missing.exists());
-    // The cache summary of an attempt without one says so.
     let out = cli(&d, &["cache", "show", &attempt.to_string(), "--json"]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let summary: Value = serde_json::from_str(&stdout(&out)).unwrap();
@@ -538,7 +515,6 @@ fn not_found_and_conflict_keep_their_exits_and_json_failures_touch_stderr_only()
         (error["schema"].as_str(), error["code"].as_str()),
         (Some("sentinel.error/1"), Some("not_found"))
     );
-    // Rerunning a cancelled job is a conflict: exit 5.
     let (_, job) = dispatch_run(&d);
     assert_eq!(code(&cli(&d, &["job", "cancel", &job.to_string()])), 0);
     let out = cli(
@@ -549,13 +525,11 @@ fn not_found_and_conflict_keep_their_exits_and_json_failures_touch_stderr_only()
     assert!(stdout(&out).is_empty());
     let error: Value = serde_json::from_str(stderr(&out).trim()).unwrap();
     assert_eq!(error["code"], "conflict");
-    // A value that would change the request path is refused locally.
     let out = cli(&d, &["status", "run_x/../../me", "--json"]);
     assert_eq!(code(&out), 2);
     assert!(stdout(&out).is_empty());
     let error: Value = serde_json::from_str(stderr(&out).trim()).unwrap();
     assert_eq!(error["code"], "client_usage");
-    // Log search over an attempt with no log yet is not found.
     let out = cli(
         &d,
         &[
@@ -590,7 +564,6 @@ fn pipeline_explain_json_failures_are_one_error_document_on_stderr() {
         .unwrap();
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let _: Value = serde_json::from_str(stdout(&out).trim()).unwrap();
-    // `--output json` is the same mode, for validate as well as explain.
     let pipeline = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_sentinel"))
             .arg("pipeline")
@@ -614,7 +587,6 @@ fn pipeline_explain_json_failures_are_one_error_document_on_stderr() {
     assert!(stdout(&out).is_empty());
     let error: Value = serde_json::from_str(stderr(&out).trim()).unwrap();
     assert_eq!(error["code"], "invalid_pipeline");
-    // Text validate prints nothing on success; ndjson is not an offline mode.
     let out = pipeline(&["validate", good.to_str().unwrap()]);
     assert_eq!((code(&out), stdout(&out).as_str()), (0, ""));
     assert_eq!(
@@ -645,8 +617,6 @@ fn plain_get(url: &str, token: &str) -> (u16, Value) {
     (status, body)
 }
 
-/// Another person administering `acme` (so every repository is visible),
-/// with their own read credential (the raw `sntl_…` text).
 fn other_user(d: &Deployment, name: &'static str) -> String {
     let (root, tenant) = (d.root, d.tenant);
     let user = UserId::new();
@@ -668,10 +638,8 @@ fn wait_rides_out_rate_limited_answers_instead_of_failing() {
     let d = deployment();
     let (busy, _) = dispatch_run(&d);
     let (run, job) = dispatch_run(&d);
-    // Other long polls hold every subscriber slot for about 2 s.
     let (_, answer) = plain_get(&format!("{}/api/v1/runs/{busy}/wait", d.base), &d.token);
     let version = answer["version"].as_str().unwrap().to_owned();
-    // Other users hold them, each within its per-user share.
     const NAMES: [&str; 8] = [
         "holder-0", "holder-1", "holder-2", "holder-3", "holder-4", "holder-5", "holder-6",
         "holder-7",
@@ -689,8 +657,6 @@ fn wait_rides_out_rate_limited_answers_instead_of_failing() {
         })
         .collect();
     thread::sleep(Duration::from_millis(300));
-    // Every slot is taken: a parking poll now is refused, so the CLI below
-    // really meets `rate_limited` rather than parking at once.
     let (_, now) = plain_get(&format!("{}/api/v1/runs/{run}/wait", d.base), &d.token);
     let (status, refused) = plain_get(
         &format!(
@@ -703,7 +669,6 @@ fn wait_rides_out_rate_limited_answers_instead_of_failing() {
     assert_eq!(status, 429, "{refused}");
     assert_eq!(refused["code"], "rate_limited");
     assert!(refused["details"]["retry_after_ms"].as_u64().is_some());
-    // The job is cancelled while the CLI's parking polls are being refused.
     let (store, tenant) = (Arc::clone(&d.store), d.tenant);
     let canceller = thread::spawn(move || {
         thread::sleep(Duration::from_millis(500));
@@ -712,9 +677,6 @@ fn wait_rides_out_rate_limited_answers_instead_of_failing() {
             .write(move |tx| dispatch::cancel(tx, tenant, job, UnixMillis::now()).map(|_| ()))
             .unwrap();
     });
-    // The first poll answers at once (no `since`); the next must park and
-    // is refused while the holders last, past the client's own three
-    // attempts — `wait` backs off with jitter and polls again.
     let out = cli(&d, &["wait", &run.to_string(), "--timeout", "20s"]);
     canceller.join().unwrap();
     for holder in holders {
@@ -723,15 +685,12 @@ fn wait_rides_out_rate_limited_answers_instead_of_failing() {
     assert_eq!(code(&out), 8, "finished, not busy: {}", stderr(&out));
 }
 
-/// `log show` over a log far larger than the client's 10 MiB body
-/// limit — full 32 KiB frames — prints every frame: the server bounds each
-/// page in bytes and the CLI follows `next_after`.
 #[test]
 fn log_show_reads_a_log_of_full_frames_past_the_client_body_limit() {
     let d = deployment();
     let (run, job) = dispatch_run(&d);
     let (_, attempt, _) = lease(&d, job);
-    let frames = 400u64; // 12.5 MiB of payload
+    let frames = 400u64;
     for seq in 1..=frames {
         let mut bytes = vec![b'q'; 32 * 1024];
         bytes[..8].copy_from_slice(format!("{seq:07}\n").as_bytes());
@@ -765,15 +724,12 @@ fn log_show_reads_a_log_of_full_frames_past_the_client_body_limit() {
     assert_eq!(seqs, (1..=frames).collect::<Vec<_>>());
 }
 
-/// `log show --output json` holds its document whole, so it is
-/// bounded by bytes (16 MiB of frame text) as well as by frames, and a cut
-/// document says where to continue.
 #[test]
 fn log_show_json_stops_at_its_byte_budget_with_a_continuation() {
     let d = deployment();
     let (run, job) = dispatch_run(&d);
     let (_, attempt, _) = lease(&d, job);
-    let frames = 520u64; // 16.25 MiB of 32 KiB frames
+    let frames = 520u64;
     for seq in 1..=frames {
         d.logs
             .append(
@@ -797,7 +753,6 @@ fn log_show_json_stops_at_its_byte_budget_with_a_continuation() {
     assert_eq!(shown.len(), 512, "16 MiB of 32 KiB frames");
     assert_eq!(doc["complete"], false);
     assert_eq!(doc["next_after"], 512);
-    // NDJSON streams the whole log.
     let out = cli(
         &d,
         &["log", "show", &attempt.to_string(), "--output", "ndjson"],
@@ -805,8 +760,7 @@ fn log_show_json_stops_at_its_byte_budget_with_a_continuation() {
     assert_eq!(stdout(&out).lines().count(), frames as usize);
 }
 
-/// When the match cap falls inside one frame's matches, the resume
-/// point is before that frame, so its remaining matches are not skipped.
+/// A cut inside a frame resumes before it, so that frame's later matches are not skipped.
 #[test]
 fn log_search_cut_inside_a_frame_resumes_before_it() {
     let d = deployment();

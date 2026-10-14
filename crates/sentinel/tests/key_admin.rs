@@ -1,4 +1,3 @@
-//! Offline key rotation goes through the operator's actual command surface.
 #![cfg(all(target_os = "linux", feature = "server"))]
 
 use std::process::Command;
@@ -12,8 +11,6 @@ fn sentinel(args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
-/// A database holding one sealed value (a confirmed second-factor seed)
-/// under the data directory's `master.key`.
 fn sealed_database(data: &std::path::Path) {
     let created = sentinel(&[
         "admin",
@@ -52,9 +49,7 @@ fn sealed_database(data: &std::path::Path) {
         .unwrap();
 }
 
-/// The controller reads only `<data_dir>/master.key`; with sealed
-/// values stored and that key missing or not matching, it exits 2 before
-/// listening instead of starting and failing each secret at first use.
+/// Refused before listening, rather than failing each sealed secret at first use.
 #[test]
 fn the_server_refuses_to_start_without_the_key_its_sealed_values_need() {
     let root = tempfile::tempdir().unwrap();
@@ -67,7 +62,6 @@ fn the_server_refuses_to_start_without_the_key_its_sealed_values_need() {
     assert_eq!(missing.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&missing.stderr).contains("master.key is missing"));
 
-    // A different key (a mismatched restore) is refused the same way.
     assert!(
         sentinel(&["admin", "key", "create", "--data-dir", data_arg])
             .status
@@ -78,8 +72,6 @@ fn the_server_refuses_to_start_without_the_key_its_sealed_values_need() {
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("does not open"));
 }
 
-/// Rotate, reseal and retire through the operator's commands leave
-/// a one-key file that still opens every stored value.
 #[test]
 fn admin_reseal_then_retire_leaves_one_key_that_opens_everything() {
     let root = tempfile::tempdir().unwrap();
