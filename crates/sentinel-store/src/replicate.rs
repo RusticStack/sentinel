@@ -62,7 +62,6 @@ pub trait Bucket: Send + Sync {
     fn list_uploads(&self) -> BucketResult<Vec<(String, String, Option<i64>)>>;
 }
 
-/// The replicator's settings.
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
     pub part_bytes: u64,

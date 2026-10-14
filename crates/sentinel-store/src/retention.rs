@@ -10,7 +10,7 @@ use crate::{Error, Result, auth::Authority};
 
 const DAY_MS: i64 = 24 * 3_600_000;
 
-/// Shortest and longest retention a policy may set.
+pub const MIN_RETENTION_MS: i64 = 3_600_000;
 pub const MAX_RETENTION_MS: i64 = 366 * DAY_MS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +93,6 @@ pub fn policy(conn: &Connection, tenant: TenantId, repo: Option<RepoId>) -> Resu
         .unwrap_or_default())
 }
 
-/// What applies to `tenant`, or to one repository of it.
 pub fn effective(
     conn: &Connection,
     d: &Deployment,
@@ -364,7 +363,6 @@ pub fn tenant_usage(conn: &Connection, tenant: TenantId) -> Result<Usage> {
         .unwrap_or_default())
 }
 
-/// Everything every tenant stores.
 pub fn deployment_usage(conn: &Connection) -> Result<u64> {
     let total: i64 = conn
         .prepare_cached("SELECT COALESCE(SUM(bytes + log_bytes), 0) FROM tenant_usage")?

@@ -16,7 +16,6 @@ const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 pub const DEFAULT_INVITATION_MS: i64 = 7 * DAY_MS;
 pub const MAX_INVITATION_MS: i64 = 30 * DAY_MS;
 
-/// How a new account may come into existence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Registration {
@@ -664,7 +663,6 @@ pub fn accept_invitation(
     })
 }
 
-/// How someone proposes to authenticate once admitted.
 pub enum Applicant<'a> {
     Local {
         display_name: &'a str,
