@@ -55,8 +55,11 @@ acknowledged the same way: `{"ignored": "unsupported_event"}`.
 
 ### Control events
 
-Five further signed events — `check_run`/`check_suite` rerequests,
-`installation`, `installation_repositories` and `repository` lifecycle changes
+Further signed events — `check_run`/`check_suite` rerequests,
+`installation`, `installation_repositories` and `repository` lifecycle changes,
+and the membership events `organization` (`member_added`, `member_removed`),
+`membership`, `member` and `team` that keep a GitHub-backed organization's
+members in sync ([GitHub sign-in](github-sign-in.md#github-backed-organizations))
 — are **control**, not intake: they keep only bounded identifiers, are
 receipted in `github_events` by delivery ID and content digest (a replay
 replays the recorded outcome; a changed body is a `conflict`), and answer

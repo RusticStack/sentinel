@@ -213,7 +213,18 @@ sentinel admin source bind-installation   --data-dir "$DATA" --actor usr_... \
   --installation ins_... --tenant tnt_...
 sentinel admin source remove-installation --data-dir "$DATA" --actor usr_... \
   --installation ins_...
+# Make an organization tenant GitHub-backed (members = whoever GitHub confirms
+# for their linked account), or app-managed again with --off
+sentinel admin source github-backing --data-dir "$DATA" --actor usr_... \
+  --tenant tnt_... [--off]
 ```
+
+A tenant whose installation is a GitHub **organization** can be made
+GitHub-backed: its members and their per-repository access then come from
+GitHub rather than from invitations
+([GitHub sign-in](github-sign-in.md#github-backed-organizations)). That needs
+the organization permission **Members: read** on the App and the
+`organization`, `membership`, `member` and `team` webhook events.
 
 `sentinel admin intake list --data-dir "$DATA" --repo rep_… [--state …]` shows
 the newest event deliveries and `admin intake purge --older-than 7d` retires

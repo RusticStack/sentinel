@@ -512,15 +512,35 @@ pub(crate) fn route(
             let who = identify(state, request, false)?;
             auth::require_scope(&who, Scopes::RUNS_READ)?;
             let slug = (*slug).to_owned();
-            let repos = state
+            let now = UnixMillis::now();
+            let (repos, stale) = state
                 .store
                 .read(|c| {
                     // Membership-checked, so a foreign tenant is the same
                     // `not_found` as an absent one, never an empty list.
                     let tenant = authz::member_tenant_by_slug(c, who.principal, &slug)?;
-                    authz::list_repos(c, who.principal, tenant, None, 100)
+                    let repos = authz::list_repos(c, who.principal, tenant, None, 100)?;
+                    // Opening a GitHub-backed tenant whose membership was last
+                    // confirmed a while ago asks the lane for a fresh check.
+                    let stale = sentinel_store::github_members::touch(
+                        c,
+                        tenant,
+                        who.principal.user,
+                        sentinel_store::github_members::OPEN_TTL_MS,
+                        now,
+                    )?;
+                    Ok((repos, stale))
                 })
                 .map_err(store_error)?;
+            if stale {
+                // Best effort and rate limited in the store: opening a tenant
+                // never fails or waits because GitHub is slow.
+                let user = who.principal.user;
+                let _ = state
+                    .store
+                    .writer()
+                    .write(move |tx| sentinel_store::github_members::enqueue_user(tx, user, now));
+            }
             ok(json!({
                 "repos": repos.iter().map(|r| json!({ "id": r.id.to_string(), "name": r.name })).collect::<Vec<_>>()
             }))

@@ -73,12 +73,21 @@ struct AppConfig {
     /// Another GitHub API endpoint (Enterprise, or a test stub). Absent means
     /// `https://api.github.com`.
     api_url: Option<String>,
+    /// Seconds between confirmations of a GitHub-backed organization's
+    /// member (60 to 86,400; default 3,600).
+    member_recheck_secs: Option<u64>,
+    /// Seconds an unconfirmed member of a GitHub-backed organization keeps
+    /// access while GitHub cannot be asked (300 to 2,592,000, and at least
+    /// twice the recheck interval; default 86,400).
+    member_grace_secs: Option<u64>,
 }
 
 /// The App plus the deployment-facing settings beside it.
 pub struct GithubApp {
     pub app: Arc<sentinel_github::app::App>,
     pub public_url: Option<String>,
+    /// Pacing and grace of the GitHub-backed membership lane.
+    pub members: sentinel_checks::members::Config,
 }
 
 /// An absolute `http(s)` base URL with no query, fragment or credentials.
@@ -122,9 +131,23 @@ pub fn load_app(root: &Path) -> Result<Option<GithubApp>, Error> {
             .map_err(|_| fail("invalid GitHub API endpoint"))?;
     }
     let public_url = config.public_url.as_deref().map(public_url).transpose()?;
+    let mut members = sentinel_checks::members::Config::default();
+    let recheck = config.member_recheck_secs.unwrap_or(3_600);
+    let grace = config.member_grace_secs.unwrap_or(86_400);
+    if !(60..=86_400).contains(&recheck)
+        || !(300..=2_592_000).contains(&grace)
+        || grace < recheck.saturating_mul(2)
+    {
+        return Err(fail(
+            "member_recheck_secs must be 60 to 86400 and member_grace_secs 300 to 2592000, at least twice the recheck interval",
+        ));
+    }
+    members.timing.recheck_ms = (recheck * 1_000) as i64;
+    members.timing.grace_ms = (grace * 1_000) as i64;
     Ok(Some(GithubApp {
         app: Arc::new(app),
         public_url,
+        members,
     }))
 }
 
@@ -445,6 +468,17 @@ pub fn run(args: &SourceArgs) -> Result<(), Error> {
                 .write(move |tx| registration::bind_installation_trusted(tx, id, tenant, now))
                 .map_err(denied)?;
             sentinel::outln!("{}", serde_json::json!({"bound":true}));
+        }
+        SourceCommand::GithubBacking { tenant: t, off } => {
+            let tenant = tenant(t)?;
+            let github = !*off;
+            store
+                .writer()
+                .write(move |tx| {
+                    sentinel_store::github_members::set_backing_trusted(tx, tenant, github, now)
+                })
+                .map_err(denied)?;
+            sentinel::outln!("{}", serde_json::json!({"github_backed":github}));
         }
         SourceCommand::RemoveInstallation { installation: i } => {
             let id = installation(i)?;

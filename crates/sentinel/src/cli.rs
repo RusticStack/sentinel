@@ -367,6 +367,15 @@ pub enum SourceCommand {
         #[arg(long)]
         installation: String,
     },
+    /// Make an organization tenant GitHub-backed (its members are whoever GitHub
+    /// confirms for their linked GitHub account), or app-managed again with --off
+    GithubBacking {
+        #[arg(long)]
+        tenant: String,
+        /// Return the tenant to invitation/administrator membership
+        #[arg(long)]
+        off: bool,
+    },
 }
 
 #[derive(Args)]

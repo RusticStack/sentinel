@@ -145,6 +145,9 @@ pub(super) fn route(
         ("PUT" | "DELETE", ["api", "v1", "tenants", slug, "members", user]) => {
             set_member(state, request, slug, user, method == "PUT")
         }
+        ("PUT", ["api", "v1", "tenants", slug, "membership-source"]) => {
+            set_backing(state, request, slug)
+        }
         ("POST", ["api", "v1", "tenants", slug, "repos"]) => create_repo(state, request, slug),
         ("GET", ["api", "v1", "tenants", slug, "repos", name, "source"]) => {
             source(state, request, slug, name)
@@ -937,9 +940,67 @@ fn members(state: &State, request: &Request, slug: &str, query: &str) -> Route {
             "kind": if m.service { "service" } else { "person" },
             "role": role_name(m.role),
             "active": m.active,
+            "source": if m.synced.is_some() { "github" } else { "app" },
+            "synced_ms": m.synced.map(|t| t.0),
         })).collect::<Vec<_>>(),
         "next": next,
     }))
+}
+
+#[derive(Deserialize)]
+struct BackingBody {
+    /// `github` or `app`.
+    source: String,
+    /// Why, for a platform administrator who does not administer the tenant.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `PUT /tenants/{slug}/membership-source {source, reason?}` makes an
+/// organization tenant GitHub-backed (`github`) or app-managed again (`app`).
+/// Tenant administration with fresh step-up. Converting needs an installation
+/// of a GitHub organization bound to the tenant (`conflict` otherwise), and
+/// removes everyone GitHub does not confirm for their linked account, so the
+/// administrator making the change must have linked GitHub first
+/// (`invalid_request`).
+fn set_backing(state: &State, request: &mut Request, slug: &str) -> Route {
+    let who = tenant_admin(state, request, true)?;
+    let body: BackingBody = parse(&body(request)?)?;
+    let github = match body.source.as_str() {
+        "github" => true,
+        "app" => false,
+        _ => {
+            return Err(err(
+                ErrorCode::InvalidRequest,
+                "source must be github or app",
+            ));
+        }
+    };
+    let (slug, reason, authority) = (slug.to_owned(), body.reason, who.authority());
+    let principal = who.principal;
+    state
+        .store
+        .writer()
+        .write(move |tx| {
+            let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
+            authz::require_tenant_admin(tx, principal, tenant)?;
+            sentinel_store::github_members::set_backing(
+                tx,
+                authority,
+                tenant,
+                github,
+                reason.as_deref(),
+                UnixMillis::now(),
+            )
+        })
+        .map_err(|e| match e {
+            sentinel_store::Error::Conflict => err(
+                ErrorCode::Conflict,
+                "bind an installation of a GitHub organization to the tenant first",
+            ),
+            e => store_error(e),
+        })?;
+    ok(json!({ "source": body.source }))
 }
 
 #[derive(Deserialize)]

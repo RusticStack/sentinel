@@ -190,7 +190,9 @@ store's job fence refuses the report before any check row moves.
 
 GitHub sends control events on the same signed webhook: `check_run` and
 `check_suite` `rerequested`, `installation` lifecycle, `installation_repositories`
-grants, and `repository` identity changes. They are not deliveries and never
+grants, `repository` identity changes and, for a GitHub-backed organization,
+the membership events `organization`, `membership`, `member` and `team`
+([GitHub sign-in](github-sign-in.md#github-backed-organizations)). They are not deliveries and never
 queue a ref update: each is receipted in `github_events` (keyed by delivery ID
 with a SHA-256 digest over the event name and raw body), answered `200
 {"controlled": <outcome>}`, and a replay answers the recorded outcome while a

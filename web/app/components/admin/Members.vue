@@ -43,15 +43,18 @@ const columns = [{ id: "member", header: "Member" }, { accessorKey: "kind", head
         <div class="font-medium">{{ row.original.username || row.original.display_name }}</div>
         <div class="text-xs text-muted font-mono">{{ shortId(row.original.user) }}</div>
         <UBadge v-if="!row.original.active" color="warning" variant="subtle" label="inactive" size="sm" />
+        <UBadge v-if="row.original.source === 'github'" color="neutral" variant="subtle" label="from GitHub" size="sm" />
       </template>
       <template #role-cell="{ row }">
         <USelect :model-value="row.original.role" :items="row.original.kind === 'service' ? ROLES.filter((r) => r.value !== 'admin') : ROLES"
+          :disabled="row.original.source === 'github'"
           :aria-label="`Role of ${row.original.username || row.original.display_name}`" class="w-36" @update:model-value="(v: string) => setRole(row.original, v)" />
       </template>
       <template #actions-cell="{ row }">
-        <UButton size="sm" color="error" variant="ghost" icon="i-lucide-user-minus" :aria-label="`Remove ${row.original.username || row.original.display_name}`" @click="confirmRemove = row.original">
+        <UButton v-if="row.original.source !== 'github'" size="sm" color="error" variant="ghost" icon="i-lucide-user-minus" :aria-label="`Remove ${row.original.username || row.original.display_name}`" @click="confirmRemove = row.original">
           Remove
         </UButton>
+        <span v-else class="text-xs text-muted">Managed on GitHub</span>
       </template>
     </UTable>
     <p v-if="data?.next" class="text-sm text-muted">Only the first 100 members are shown.</p>

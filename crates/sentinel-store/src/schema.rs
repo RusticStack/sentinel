@@ -149,6 +149,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (48, include_str!("migrations/048_upgrades.sql")),
     (49, include_str!("migrations/049_reapply_indexes.sql")),
     (50, include_str!("migrations/050_email_identity.sql")),
+    (51, include_str!("migrations/051_github_membership.sql")),
 ];
 
 /// The newest schema this build knows.

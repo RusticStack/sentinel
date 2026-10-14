@@ -25,6 +25,14 @@ pub enum Event {
         installation: u64,
         repository: u64,
     },
+    /// Organization membership or access changed ([`crate::github_members`]):
+    /// `user` is the numeric GitHub account id concerned, `None` for the whole
+    /// organization; `removed` is a signed `member_removed`.
+    Members {
+        installation: u64,
+        user: Option<u64>,
+        removed: bool,
+    },
 }
 
 /// Only the signature-verified adapter calls this. Positive events enqueue a
@@ -57,7 +65,8 @@ pub fn accept(
         Event::Rerequest { installation, .. }
         | Event::Installation { installation, .. }
         | Event::Repositories { installation, .. }
-        | Event::Repository { installation, .. } => *installation,
+        | Event::Repository { installation, .. }
+        | Event::Members { installation, .. } => *installation,
     };
     let installed: Option<[u8; 16]> = tx
         .query_row(
@@ -115,6 +124,7 @@ pub fn accept(
                 tx.execute("UPDATE source_bindings SET revoked=1,credential=x'',version=version+1 WHERE installation_id=?1 AND forge_repo_id=?2 AND revoked=0",params![id.as_bytes(),repository])?;
                 "repository_rebind_required".into()
             }
+            Event::Members { user, removed, .. } => members(tx, id, *user, *removed, now)?,
         }
     } else {
         "unbound_installation".into()
@@ -124,6 +134,46 @@ pub fn accept(
         params![delivery, digest, outcome, now.0],
     )?;
     Ok((outcome, false))
+}
+
+/// A membership event for a bound installation. Only a tenant that is
+/// GitHub-backed by *this* installation is touched; everything positive is a
+/// hint that schedules a check, and a signed removal also revokes at once.
+fn members(
+    tx: &Transaction<'_>,
+    installation: InstallationId,
+    user: Option<u64>,
+    removed: bool,
+    now: UnixMillis,
+) -> Result<String> {
+    let tenant: Option<[u8; 16]> = tx
+        .query_row(
+            "SELECT i.tenant_id FROM installations i JOIN tenants t ON t.id = i.tenant_id
+             WHERE i.id = ?1 AND i.account_personal = 0 AND t.membership_source = 1",
+            [installation.as_bytes()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(tenant) = tenant else {
+        return Ok("not_github_backed".into());
+    };
+    let tenant =
+        sentinel_core::TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant"))?;
+    match user {
+        Some(user) if removed => {
+            let revoked = crate::github_members::member_removed(tx, tenant, user, now)?;
+            Ok(if revoked {
+                "member_removed"
+            } else {
+                "member_removed_no_access"
+            }
+            .into())
+        }
+        user => {
+            crate::github_members::hint(tx, tenant, user, now)?;
+            Ok("membership_check_pending".into())
+        }
+    }
 }
 
 /// Receipts younger than this are kept whatever retention an operator asks

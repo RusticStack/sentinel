@@ -1370,6 +1370,8 @@ enum Running {
         reconcile: Option<Box<sentinel_checks::Reconcile>>,
         /// The mail lane, when SMTP is configured.
         mail: Option<Box<sentinel_mail::Lane>>,
+        /// The GitHub-backed membership lane draining `github_member_checks`.
+        members: Option<Box<sentinel_checks::Members>>,
         /// The Q06 helper carrying the link port; absent with direct TLS.
         tailcat: Option<TailcatServer>,
         /// The external S3 copy's replicator, when `[s3]` is configured.
@@ -1928,6 +1930,7 @@ fn start_server(
     // `github_refresh` work — webhook hints and the periodic pass — and is
     // also where a lost check answer gets found again by external ID.
     let mut reconcile = None;
+    let mut members = None;
     let checks = match &app {
         Some(app) => {
             tracing::info!(
@@ -1947,6 +1950,20 @@ fn start_server(
                             kind = notice.kind,
                             outcome = %notice.outcome
                         );
+                    });
+                },
+            )));
+            // GitHub-backed organizations: who is a member, and in which
+            // repositories, is whatever GitHub confirms for the person's
+            // linked account. The lane only observes; the store decides.
+            let members_dispatch = tracing::dispatcher::get_default(Clone::clone);
+            members = Some(Box::new(sentinel_checks::Members::start(
+                Arc::clone(&store),
+                Arc::clone(&app.app),
+                app.members,
+                move |notice| {
+                    tracing::dispatcher::with_default(&members_dispatch, || {
+                        tracing::info!(event = "github_members_checked", outcome = %notice.outcome);
                     });
                 },
             )));
@@ -2066,6 +2083,7 @@ fn start_server(
         checks,
         reconcile,
         mail,
+        members,
         tailcat,
         replicator,
         backups,
@@ -2833,6 +2851,7 @@ fn initialize_and_wait(
             checks,
             reconcile,
             mail,
+            members,
             tailcat,
             replicator,
             backups,
@@ -2851,6 +2870,7 @@ fn initialize_and_wait(
             if let Some(tailcat) = tailcat {
                 tailcat.shutdown();
             }
+            drop(members);
             drop(reconcile);
             drop(checks);
             drop(mail);
