@@ -1,4 +1,31 @@
 #!/usr/bin/env python3
+"""B03: measure the plan's latency budgets on a real controller and worker.
+
+    python3 bench/b03-latency.py ROOT OUT --source CHECKOUT [--binary SENTINEL]
+                                 [--first N] [--logs N] [--cancel N]
+                                 [--failure N] [--queries N] [--cache N]
+
+ROOT is a deployment bench/b03-setup.sh started. Every sample is a real push
+to one of the fixture's branches and a real intake event; nothing is
+simulated. Clocks: the worker, controller and this driver share one host,
+so wall-clock differences between them are meaningful at millisecond
+resolution (the store's timestamps are milliseconds). One JSON line per
+sample is appended to OUT; a summary goes to stderr.
+
+Budgets (plan.md section 12):
+  intake_ack         POST /intake -> 202, client-timed (every sample)
+  ready_to_offer     attempts.offered_ms - jobs.queued_ms, idle capacity
+  offer_to_ack       attempts.acked_ms - attempts.offered_ms
+  ready_to_first     the first user process's own clock - jobs.queued_ms
+  intake_to_ready    jobs.queued_ms - the wall clock just before the intake POST
+                     (the pipeline resolution the queued_ms re-stamp excludes
+                     from every other budget; first samples only)
+  intake_to_first    the first user process's clock - the same POST time
+  log_visible        a line's capture time -> received by a follow client
+  cancel_to_end      POST cancel -> the job terminal (wait API)
+  failure_query      GET /attempts/{id}/failure on a 100 MiB log
+  cache_prepare      lookup + lock wait + clone of a fixed 64 MiB fixture
+"""
 import argparse
 import json
 import math
@@ -52,6 +79,7 @@ class Deployment:
                               capture_output=True, text=True).stdout.strip()
 
     def push(self, branch):
+        """A fresh commit on `branch`, pushed; the intake event, timed."""
         self.git("checkout", "-q", branch)
         old = subprocess.run(["git", "-C", self.bare, "rev-parse", f"refs/heads/{branch}"],
                              check=True, capture_output=True, text=True).stdout.strip()
@@ -70,6 +98,7 @@ class Deployment:
         return delivery, ack_ns, posted_ns
 
     def run_of(self, delivery, limit_s=60):
+        """The run the intake lane dispatched for `delivery` (server log)."""
         log = os.path.join(self.root, "server.log")
         deadline = time.monotonic() + limit_s
         while time.monotonic() < deadline:
@@ -102,6 +131,7 @@ class Deployment:
         raise SystemExit(f"run {run} never reached {states}")
 
     def stamps(self, run):
+        """queued_ms, offered_ms, acked_ms of the run's (only) job."""
         con = sqlite3.connect(f"file:{self.db}?mode=ro", uri=True, timeout=10)
         try:
             row = con.execute(
@@ -116,6 +146,7 @@ class Deployment:
 
 
 def run_bytes(run):
+    """`run_<uuid>` as the 16 bytes the store keys it by."""
     return bytes.fromhex(run.removeprefix("run_").replace("-", ""))
 
 
@@ -140,6 +171,10 @@ def field(path, key):
 
 
 def stamp(source, binary):
+    """What the sentinel under test was built from and where it ran, copied
+    into every record. `source` is the checkout the deployment's binary was
+    built from (git is asked there, not trusted from a name); `binary` is
+    hashed so a rebuilt kit that no longer matches the checkout shows."""
     def git(*args):
         r = subprocess.run(["git", "-C", source, *args], capture_output=True, text=True)
         return r.stdout.strip() if r.returncode == 0 else None

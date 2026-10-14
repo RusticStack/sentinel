@@ -18,7 +18,6 @@ REPO = "RusticStack/lockwell"
 BRANCH = "sentinel-bench/b02"
 
 
-# GitHub timestamps have one-second resolution; do not read sub-second precision into them.
 def ts(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() if value else None
 
