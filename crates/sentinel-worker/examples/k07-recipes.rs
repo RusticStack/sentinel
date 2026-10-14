@@ -1,4 +1,4 @@
-//! K07 recipe-measurement driver (bench/k07-recipes.sh): run ONE real
+//! Recipe-measurement driver (bench/k07-recipes.sh): run ONE real
 //! attempt of a recipe pipeline through the worker's own path — workspace,
 //! pinned checkout, digest-pinned image pull, cache restore, rootless
 //! Podman execution of every declared step, and cache publication — then
@@ -37,7 +37,6 @@ mod imp {
         podman,
     };
 
-    /// A Report that keeps the cache diagnostics the attempt emitted.
     #[derive(Default)]
     struct Notes {
         cache: Mutex<Vec<CacheNote>>,

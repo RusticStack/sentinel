@@ -4,8 +4,7 @@
 //! than its bound of attempts; the spec is then asked for over the link and
 //! the attempt starts once it arrives. Reports go out on the live session
 //! from the attempt's own thread, in order; when there is no session they
-//! queue in memory and are replayed at the next attach (a durable spool is
-//! W05). A `stop` from the controller flips the attempt's cancel flag and
+//! queue in memory and are replayed at the next attach. A `stop` from the controller flips the attempt's cancel flag and
 //! ends its container; it is not reported, because the controller already
 //! counts the attempt as gone. The lease watchdog ends every attempt the
 //! same way once the lease it measured (monotonically, from the heartbeat
@@ -88,9 +87,9 @@ pub enum Notice {
     /// A bounded reclamation pass over the cache root removed something —
     /// expired leases, dead staging or generations past retention/budget.
     CacheSwept(sentinel_cache::gc::GcStats),
-    /// The image reclamation pass removed this many images (R01).
+    /// The image reclamation pass removed this many images.
     ImagesReclaimed(usize),
-    /// A nominal cache hit paid rebuild-scale restore cost — the K08
+    /// A nominal cache hit paid rebuild-scale restore cost — the
     /// costly-hit rule (docs/cache.md) tripped. Diagnostics only; the
     /// attempt's verdict never depends on it.
     CostlyCacheHit {
@@ -102,9 +101,9 @@ pub enum Notice {
         /// The restore's measured stats — the evidence.
         stats: sentinel_cache::Stats,
     },
-    /// The worker's compact availability snapshot (K08), emitted after
-    /// each bounded cache sweep — at start and after every attempt's
-    /// finalization, never on a timer. Part 08's placement consumes it.
+    /// The worker's compact availability snapshot, emitted after each
+    /// bounded cache sweep — at start and after every attempt's finalization,
+    /// never on a timer.
     Availability(Availability),
     /// An offer was refused because the data directory's file system is
     /// below the admission floor ([`admission_floor`]); the controller
@@ -187,7 +186,7 @@ struct Live {
     /// The lease watchdog ended it: the controller has (or will have)
     /// settled it by expiry, so nothing about it is reported.
     lost: bool,
-    /// The store its container lives in (P10D-5): what a stop, cancel or
+    /// The store its container lives in: what a stop, cancel or
     /// lease loss removes it from.
     store: podman::Store,
 }
@@ -532,7 +531,7 @@ pub struct Inner {
     /// One in-flight pull per image reference across every attempt, and
     /// the record of what the local store holds.
     images: Images,
-    /// K05: background pulls of what the controller's hints name, through
+    /// Background pulls of what the controller's hints name, through
     /// `images`, within their own bounds.
     prefetch: crate::prefetch::Prefetcher,
     /// The worker-local object mirrors, opened once here so the reflink
@@ -551,14 +550,14 @@ pub struct Inner {
     /// One cache reclamation pass at a time; a second caller skips rather
     /// than waits, because the running pass already covers its work. The
     /// lock holds the resume cursor, so bounded passes cover the whole
-    /// tree across attempts (P07-4).
+    /// tree across attempts.
     gc_lock: Mutex<sentinel_cache::gc::Cursor>,
     /// The cache store's payload bytes as the last pass estimated them —
-    /// the availability the link reports to placement (K08).
+    /// the availability the link reports to placement.
     cache_bytes: std::sync::atomic::AtomicU64,
     /// Moves whenever `cache_bytes` changes.
     cache_version: std::sync::atomic::AtomicU64,
-    /// Byte budgets of the disposable stores (R01).
+    /// Byte budgets of the disposable stores.
     budgets: Mutex<StorageBudgets>,
     /// When the image stores were last reclaimed; the pass lists every
     /// store, so it runs at most every [`IMAGE_SWEEP_EVERY`].
@@ -573,7 +572,7 @@ const REFUSAL_NOTICE_EVERY: Duration = Duration::from_secs(30);
 /// How often the image stores are reclaimed at most.
 const IMAGE_SWEEP_EVERY: Duration = Duration::from_secs(60);
 
-/// The worker's disposable stores and what each may hold (R01): the cache,
+/// The worker's disposable stores and what each may hold: the cache,
 /// the Git mirrors and the container images. Everything here is rebuilt on
 /// demand, so each is held to its budget least recently used first and a
 /// store never outgrows it by more than one pass.
@@ -588,8 +587,7 @@ impl StorageBudgets {
     /// Budgets for a data filesystem of `total` bytes: a fifth each for the
     /// cache and the images, a tenth for the mirrors — together half, the
     /// other half left to workspaces, spools and the host — each clamped
-    /// (cache and mirrors 1–50 GiB, images 2–50 GiB). On the 1 TB reference
-    /// host that is the 50 GiB each the stores had before R01.
+    /// (cache and mirrors 1–50 GiB, images 2–50 GiB).
     pub fn sized(total: u64) -> StorageBudgets {
         const GIB: u64 = 1 << 30;
         StorageBudgets {
@@ -604,8 +602,8 @@ impl StorageBudgets {
 mod budget_tests {
     use super::StorageBudgets;
 
-    /// R01: the worker's disposable stores are sized from its disk, the
-    /// 1 TB reference host keeping the 50 GiB each they had before.
+    /// The disposable stores are sized from the disk and clamped; a 1 TB
+    /// disk reaches 50 GiB each.
     #[test]
     fn budgets_follow_the_disk_and_stay_clamped() {
         const GIB: u64 = 1 << 30;
@@ -1107,13 +1105,12 @@ impl Inner {
         &self.runtime
     }
 
-    /// The worker's image pulls and what its store is known to hold —
-    /// the locality record a later part advertises to placement.
+    /// The worker's image pulls and what its store is known to hold.
     pub fn images(&self) -> &Images {
         &self.images
     }
 
-    /// The background prefetcher the controller's hints drive (K05).
+    /// The background prefetcher the controller's hints drive.
     pub fn prefetcher(&self) -> &crate::prefetch::Prefetcher {
         &self.prefetch
     }
@@ -1123,12 +1120,12 @@ impl Inner {
         &self.recovered
     }
 
-    /// Bytes the attempts' log spools hold now (R06).
+    /// Bytes the attempts' log spools hold now.
     pub fn spool_used(&self) -> u64 {
         self.spool.used()
     }
 
-    /// Attempts running or waiting for their spec (R06).
+    /// Attempts running or waiting for their spec.
     pub fn attempts_live(&self) -> usize {
         let state = self.state();
         state.live.len() + state.awaiting.len()
@@ -1192,7 +1189,7 @@ impl Inner {
         }
     }
 
-    /// Hold every image store to `budget` (R01), at most every
+    /// Hold every image store to `budget`, at most every
     /// [`IMAGE_SWEEP_EVERY`]: images no container uses, least recently
     /// pulled first, never one pulled in the last few minutes or one being
     /// pulled ([`Images::reclaimable`]). Removal is never forced.
@@ -1221,10 +1218,8 @@ impl Inner {
     /// One bounded reclamation pass over the cache root — skipped while
     /// another runs, because the running pass already covers its work.
     /// A pass that touched nothing stays quiet, but every pass ends by
-    /// emitting the K08 availability snapshot: the sweep is the bounded
-    /// cadence (start plus post-attempt) that Part 08's placement feed
-    /// rides, so the occupancy it already computed costs a second walk
-    /// never.
+    /// emitting the availability snapshot, so the occupancy the pass already
+    /// computed never costs a second walk.
     fn sweep_caches(&self) {
         let mut cursor = match self.gc_lock.try_lock() {
             Ok(guard) => guard,
@@ -1240,7 +1235,7 @@ impl Inner {
         );
         drop(cursor);
         // The mirrors share the pass's cadence: bounded, and skipped for
-        // any mirror a checkout holds (P07-22).
+        // any mirror a checkout holds.
         if let Some(mirrors) = &self.mirrors {
             let _ = mirrors.sweep(budgets.mirror_bytes);
         }
@@ -1456,10 +1451,10 @@ impl Report for Inner {
             stats: *stats,
         });
     }
-    /// Q08: the session's remote-cache transport, when the link offers
-    /// one. It is session state, not attempt state — a reconnect that
-    /// replaces the reporter replaces this handle with it, and an
-    /// attempt holding the old one simply drops its offers.
+    /// The session's remote-cache transport, when the link offers one. It is
+    /// session state, not attempt state: a reconnect replaces the reporter
+    /// and with it this handle, and an attempt holding the old one simply
+    /// drops its offers.
     fn remote(&self) -> Option<std::sync::Arc<dyn sentinel_cache::remote::Remote>> {
         self.state()
             .reporter
@@ -1597,7 +1592,7 @@ impl artifacts::Sink for Inner {
 }
 
 impl LinkExecutor for Executor {
-    /// P07-6: the image keys the local store is known to hold (newest
+    /// The image keys the local store is known to hold (newest
     /// first, bounded by the wire's list limit) and the cache store's bytes
     /// as the last sweep estimated them. Both come from state the worker
     /// already keeps — no store scan, no podman call; the version moves
@@ -1619,7 +1614,7 @@ impl LinkExecutor for Executor {
         ))
     }
 
-    /// K05: the controller's latest hint replaces the wanted set; pulls
+    /// The controller's latest hint replaces the wanted set; pulls
     /// run in the background within the prefetcher's bounds.
     fn prefetch(&self, images: &[String]) {
         self.prefetch.hint(images);
@@ -1971,8 +1966,8 @@ impl LinkExecutor for Executor {
         self.accept_spec(attempt, context, bytes, secrets);
     }
 
-    /// P10D-3: the offer this worker acknowledged, whichever session it
-    /// came on, binds the secret transfer that answers its spec request.
+    /// The offer this worker acknowledged, whichever session it came on,
+    /// binds the secret transfer that answers its spec request.
     fn fence_of(&self, attempt: AttemptId) -> Option<Fence> {
         self.state()
             .awaiting
@@ -2020,14 +2015,11 @@ mod tests {
     use super::*;
     use sentinel_core::{FailureClass, JobState, Outcome};
 
-    /// P04-30. A step panics the attempt thread (a test-only hook in
-    /// `attempt::run`) while its container runs and its output is spooled.
-    /// Before the fix nothing caught it: the attempt stayed held and renewed
-    /// until the controller's backstop, the container and the workspace
-    /// until the next restart. Now the panic is contained: the container
-    /// and the workspace are removed, what the attempt printed reaches the
-    /// controller and the log is closed, and it is reported as the runtime
-    /// failure it is — nothing is left held.
+    /// A step panics the attempt thread (a test-only hook in `attempt::run`)
+    /// while its container runs and its output is spooled. The panic is
+    /// contained: the container and the workspace are removed, what the
+    /// attempt printed reaches the controller and the log is closed, and it
+    /// is reported as a runtime failure — nothing is left held.
     #[test]
     fn a_panicking_attempt_is_torn_down_and_reported() {
         if !podman_enabled() {

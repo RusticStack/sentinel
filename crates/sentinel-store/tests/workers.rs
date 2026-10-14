@@ -1,4 +1,4 @@
-//! W01 store behavior: enrollment is one-time, expiring, pool-bound and
+//! Worker store behavior: enrollment is one-time, expiring, pool-bound and
 //! platform-issued; a worker's identity and pool are fixed; liveness is
 //! recorded at a bounded cadence; revocation is final.
 
@@ -283,8 +283,8 @@ fn a_worker_is_known_by_fingerprint_bound_to_its_pool_and_revocable() {
         Err(Error::NotFound)
     ));
 
-    // Revocation: refused from now on, not repeatable, and a suspended pool's
-    // tenant hides its workers too.
+    // Revocation: platform-only, refused from now on, not repeatable, and the
+    // worker leaves the pool listing.
     let refused = f
         .store
         .writer()
@@ -339,7 +339,7 @@ fn a_worker_is_known_by_fingerprint_bound_to_its_pool_and_revocable() {
         })
         .unwrap();
     // The pool itself is still active, so the worker still authenticates; it
-    // is placement that the suspended tenant loses (A07). That is deliberate:
+    // is placement that the suspended tenant loses. That is deliberate:
     // a dedicated pool's machines stay enrolled through a suspension.
     assert!(f.store.read(|c| workers::authenticate(c, &fp2)).is_ok());
 }

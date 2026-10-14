@@ -1,4 +1,4 @@
-//! Artifact capture (D03): resolve a job's declared artifacts against the
+//! Artifact capture: resolve a job's declared artifacts against the
 //! live workspace and publish them over the link before finalization tears
 //! anything down.
 //!
@@ -110,7 +110,6 @@ pub fn capture(workspace: &Path, decl: &Artifact, sink: &dyn Sink, attempt: Atte
     use std::os::unix::fs::MetadataExt;
 
     if !sink.capable() {
-        // The session cannot carry artifacts at all; nothing is recorded.
         return Outcome::Failed;
     }
     let patterns: Vec<&str> = decl.paths.iter().map(String::as_str).collect();
@@ -123,12 +122,9 @@ pub fn capture(workspace: &Path, decl: &Artifact, sink: &dyn Sink, attempt: Atte
         Err(HashFilesError::NoMatch) => {
             return match sink.absent(attempt, &decl.name, 0) {
                 ArtifactCode::Absent => Outcome::Absent,
-                // The record could not be delivered; nothing is published
-                // and nothing claims otherwise.
                 _ => Outcome::Failed,
             };
         }
-        // A pattern, traversal or limit failure is a capture failure.
         Err(_) => {
             let _ = sink.absent(attempt, &decl.name, 1);
             return Outcome::Failed;
@@ -174,8 +170,8 @@ pub fn capture(workspace: &Path, decl: &Artifact, sink: &dyn Sink, attempt: Atte
             let read = match file.read(&mut buf[..take]) {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Ok(0) | Err(_) => {
-                    // Shrank beneath us, or the read failed: either way the
-                    // declared length can no longer be proven.
+                    // Shrank beneath us or the read failed: the declared length
+                    // can no longer be proven.
                     io_failed = true;
                     break;
                 }
