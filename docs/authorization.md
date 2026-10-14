@@ -34,6 +34,8 @@ Repository permission bits are `READ` (1), `RUN` (2), `WRITE_SECRETS` (4). Admin
 
 Secret-write delegation is independent: an operator's run grant never grants it implicitly. An explicit secret-write grant may be given to a reader or operator; no role has a plaintext secret read-back operation. The secret APIs/storage remain S01 and later.
 
+A `run` grant (or an MCP `runs:write` token) can submit a pipeline of its own, so it never reaches secrets: a manually dispatched run is refused every secret and the API refuses a manual pipeline that declares one ([secrets](secrets.md#who-may-cause-a-delivery)). Only runs built from the repository's own pipeline at a bound revision receive them.
+
 ## Queries and mutations
 
 `get_repo`, `list_repos`, `require_repo` and `get_run_spec` share one static SQL authorization predicate. They join repository ownership to current users, tenants, memberships and grants. Supplied tenant/repo scopes are only narrowing filters. Neither a guessed ID nor a different CLI-selected tenant can grant access.

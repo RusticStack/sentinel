@@ -11,6 +11,7 @@ use sentinel_store::{
     Durability, Error, Store,
     auth::{self, Authority, NamespaceKind, provisioning},
     dispatch::{self, Capacity},
+    provenance::{self, Provenance},
     runs,
     secrets::{self, Binding, Scope},
     tenancy::{self, PoolKind},
@@ -165,7 +166,18 @@ fn fixture_at(protocol: u16) -> Fixture {
     }
 }
 
+/// A run as intake records it: a push whose pipeline came from the bound
+/// repository, the only provenance that may receive secrets.
 fn create_run(f: &Fixture, now: UnixMillis) -> (RunId, sentinel_core::JobId) {
+    create_run_as(f, now, Some("push"))
+}
+
+/// A run with the given recorded trigger; `None` records no provenance.
+fn create_run_as(
+    f: &Fixture,
+    now: UnixMillis,
+    trigger: Option<&'static str>,
+) -> (RunId, sentinel_core::JobId) {
     let spec = RunSpec::new(
         PinnedSource::new("https://example.test/acme/app.git", SHA, Some("main")).unwrap(),
         compile_str(YAML).unwrap(),
@@ -178,6 +190,30 @@ fn create_run(f: &Fixture, now: UnixMillis) -> (RunId, sentinel_core::JobId) {
         .write(move |tx| {
             let jobs = runs::create_run(tx, tenant, repo, run, &spec, now)?;
             runs::resolve_image(tx, tenant, jobs[0], DIGEST, "linux/amd64")?;
+            if let Some(trigger) = trigger {
+                provenance::insert(
+                    tx,
+                    &Provenance {
+                        tenant,
+                        repo,
+                        trigger: trigger.into(),
+                        delivery: None,
+                        provider: None,
+                        ref_name: Some("refs/heads/main".into()),
+                        old_sha: None,
+                        new_sha: Some(SHA.into()),
+                        head_sha: None,
+                        base_sha: None,
+                        merge_sha: None,
+                        pipeline_sha: SHA.into(),
+                        pipeline_path: (trigger != "manual").then(|| ".sentinel.yml".into()),
+                        pipeline_digest: [0; 16],
+                        pr_number: None,
+                    },
+                    run,
+                    now,
+                )?;
+            }
             Ok(jobs)
         })
         .unwrap();
@@ -586,4 +622,39 @@ fn a_refused_delivery_is_explained_and_audited() {
     let audit = use_audit(&f, offer.attempt);
     assert!(!audit.is_empty());
     assert!(audit.iter().all(|(_, result)| result == "ok"), "{audit:?}");
+}
+
+/// A caller-authored pipeline holds a `run` grant, not the right to read the
+/// repository's secrets: bindings match any job and step, so a manual run
+/// (or one with no recorded provenance) is refused every declared secret,
+/// the refusal is audited as `denied` and explained without a value.
+#[test]
+fn manual_and_unclassified_runs_never_receive_secrets() {
+    for trigger in [Some("manual"), None] {
+        let f = fixture();
+        create_run_as(&f, UnixMillis(2_000), trigger);
+        let offer = next_offer(&f, UnixMillis(2_100));
+        acknowledge(&f, &offer, UnixMillis(2_120));
+        let (worker, attempt) = (f.worker, offer.attempt);
+        let delivered =
+            secrets::deliver(&f.store, f.key.clone(), worker, attempt, UnixMillis(2_135));
+        assert!(
+            matches!(delivered, Err(Error::Forbidden)),
+            "{trigger:?}: delivered to a caller-authored run"
+        );
+        let refusal = f
+            .store
+            .writer()
+            .write(move |tx| secrets::refuse_delivery(tx, worker, attempt))
+            .unwrap()
+            .expect("an explanation");
+        assert_eq!(
+            refusal.detail, "secret OCI_AUTH: withheld from a manual run",
+            "{trigger:?}"
+        );
+        assert_eq!(
+            use_audit(&f, attempt),
+            [("OCI_AUTH".to_owned(), "denied".to_owned())]
+        );
+    }
 }

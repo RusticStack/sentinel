@@ -1207,6 +1207,25 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
     }
     let compiled = compile_str(&dispatch.pipeline)
         .map_err(|e| err(ErrorCode::InvalidRequest, format!("pipeline: {e}")))?;
+    // A caller-authored pipeline never receives secrets: the grant to run
+    // jobs is not a grant to read what is bound to the repository, so refuse
+    // up front rather than fail the job later. Delivery enforces the same
+    // rule for any run recorded as manual.
+    if compiled.jobs.iter().any(|job| {
+        job.spec.registry_auth.is_some()
+            || job
+                .spec
+                .steps
+                .iter()
+                .any(|step| !step.secrets.is_empty() || !step.secret_files.is_empty())
+    }) {
+        return Err(err(
+            ErrorCode::Forbidden,
+            "a manually dispatched pipeline cannot use secrets; \
+             push the pipeline to a bound revision",
+        )
+        .with_detail("reason", "manual_run_secrets"));
+    }
     let source = PinnedSource::new(
         &dispatch.source.repo,
         &dispatch.source.sha,

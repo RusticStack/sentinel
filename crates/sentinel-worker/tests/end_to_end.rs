@@ -402,6 +402,28 @@ jobs:
         .writer()
         .write(move |tx| {
             let ids = runs::create_run(tx, tenant, repo_id, run, &spec, UnixMillis::now())?;
+            sentinel_store::provenance::insert(
+                tx,
+                &sentinel_store::provenance::Provenance {
+                    tenant,
+                    repo: repo_id,
+                    trigger: "push".into(),
+                    delivery: None,
+                    provider: None,
+                    ref_name: Some("refs/heads/main".into()),
+                    old_sha: None,
+                    new_sha: None,
+                    head_sha: None,
+                    base_sha: None,
+                    merge_sha: None,
+                    pipeline_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                    pipeline_path: Some(".sentinel.yml".into()),
+                    pipeline_digest: [0; 16],
+                    pr_number: None,
+                },
+                run,
+                UnixMillis::now(),
+            )?;
             for job in &ids {
                 runs::resolve_image(tx, tenant, *job, DIGEST, "linux/amd64")?;
             }
