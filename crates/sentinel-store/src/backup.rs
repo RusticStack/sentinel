@@ -1,5 +1,4 @@
 //! Objects and manifests are immutable and the maintenance lock is held until the last copy, so no named file can be reclaimed mid-backup.
-//!
 //! ```text
 //! <target>/objects/…              committed objects, content-addressed (shared)
 //! <target>/manifests/…            manifest versions, immutable (shared)
