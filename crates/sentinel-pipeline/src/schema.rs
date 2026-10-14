@@ -698,29 +698,34 @@ fn resources(path: &str, node: Option<&Node>, policy: &ResourcePolicy) -> Result
         r.cpu_millis = match cpu {
             Node::Int(n) if *n > 0 && *n <= 1024 => (*n as u32) * 1000,
             Node::Str(s) => {
-                // Allow fractional cores as strings, e.g. "0.5".
+                // Allow fractional cores as strings, e.g. "0.5". Plain ASCII
+                // digits only: `u32::from_str` would also accept a leading
+                // `+`, and a longer fraction would be silently truncated.
                 let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
-                let w: u32 = whole.parse().ok().filter(|w| *w <= 1024).ok_or_else(|| {
-                    err(
-                        &child,
-                        SchemaErrorKind::Invalid("expected cores, e.g. 4 or \"0.5\"".into()),
-                    )
-                })?;
-                let f: u32 = if frac.is_empty() {
+                let digits = |t: &str| t.bytes().all(|b| b.is_ascii_digit());
+                let w: u32 = Some(whole)
+                    .filter(|w| !w.is_empty() && digits(w))
+                    .and_then(|w| w.parse().ok())
+                    .filter(|w| *w <= 1024)
+                    .ok_or_else(|| {
+                        err(
+                            &child,
+                            SchemaErrorKind::Invalid("expected cores, e.g. 4 or \"0.5\"".into()),
+                        )
+                    })?;
+                let f: u32 = if frac.is_empty() && !s.ends_with('.') {
                     0
+                } else if !frac.is_empty() && frac.len() <= 3 && digits(frac) {
+                    // Right-pad to millicores: "5" is 500, "05" is 50.
+                    let value: u32 = frac.parse().unwrap_or(0);
+                    value * 10u32.pow(3 - frac.len() as u32)
                 } else {
-                    let padded = format!("{frac:0<3}");
-                    // `get`, not indexing: a multibyte character in the
-                    // fraction must be a schema error, never a panic.
-                    padded
-                        .get(..3)
-                        .and_then(|digits| digits.parse().ok())
-                        .ok_or_else(|| {
-                            err(
-                                &child,
-                                SchemaErrorKind::Invalid("at most millicore precision".into()),
-                            )
-                        })?
+                    return Err(err(
+                        &child,
+                        SchemaErrorKind::Invalid(
+                            "at most millicore precision (three decimals)".into(),
+                        ),
+                    ));
                 };
                 w * 1000 + f
             }
@@ -1425,6 +1430,41 @@ mod tests {
         assert!(crate::compile_str(&doc("1.éé")).is_err());
         assert!(crate::compile_str(&doc("0.€")).is_err());
         assert!(crate::compile_str(&doc("0.5")).is_ok());
+    }
+
+    #[test]
+    fn core_strings_are_plain_digits_with_at_most_millicore_precision() {
+        let cpu_millis = |cpu: &str| {
+            let doc = format!(
+                "schema: 1
+on: [push]
+jobs:
+  a:
+    image: busybox
+    resources: {{ cpu: \"{cpu}\" }}
+    steps:
+      - id: s
+        run: echo
+"
+            );
+            crate::compile_str(&doc).map(|p| p.jobs[0].spec.resources.cpu_millis)
+        };
+        for (text, millis) in [
+            ("4", 4000),
+            ("0.5", 500),
+            ("0.25", 250),
+            ("1.05", 1050),
+            ("2.500", 2500),
+        ] {
+            assert_eq!(cpu_millis(text).unwrap(), millis, "{text}");
+        }
+        // A sign is not a digit; a longer fraction would be truncated, not
+        // honoured; an empty side is malformed.
+        for text in [
+            "+4", "0.+5", "0.5555", "0.2501", "1.", ".5", "-1", "0.5 ", "1_0",
+        ] {
+            assert!(cpu_millis(text).is_err(), "{text}");
+        }
     }
 
     fn cache_of(text: &str) -> std::result::Result<Cache, crate::Error> {
