@@ -55,7 +55,10 @@ pub enum OrgRole {
 pub enum Answer<T> {
     Known(T),
     Absent,
-    Unknown { retry_after_s: Option<i64> },
+    Unknown {
+        /// GitHub's own "later", in seconds, when it sent one.
+        retry_after_s: Option<i64>,
+    },
 }
 
 impl<T> Answer<T> {
@@ -108,7 +111,6 @@ impl core::fmt::Debug for Token {
 }
 
 impl Drop for Token {
-    /// Best effort: copies made by the HTTP layer and the parsed reply are not wiped.
     fn drop(&mut self) {
         sentinel_auth::secret::wipe_string(&mut self.secret);
     }

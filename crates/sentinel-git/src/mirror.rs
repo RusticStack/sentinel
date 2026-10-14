@@ -31,6 +31,7 @@ pub const GC_MAX_LOOSE: usize = 4096;
 const MAX_OBJECT_FILES: u64 = 2_000_000;
 const COPY_MAX_BYTES: u64 = 48 << 20;
 const WAIT_POLL: Duration = Duration::from_millis(25);
+const LEASE_MARGIN: Duration = Duration::from_secs(60);
 const REMOTE_FILE: &str = "sentinel-remote";
 pub const MIRRORS_BUDGET_BYTES: u64 = 50 << 30;
 pub const MIRROR_IDLE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
