@@ -1,4 +1,4 @@
-//! Placement, reservations, offers and leases (W02).
+//! Placement, reservations, offers and leases.
 //!
 //! The ready queue is the `jobs_ready` partial index: a job is queued when its
 //! row says so, and nothing in memory has to be rebuilt after a restart. A
@@ -56,10 +56,10 @@ const SWEEP_LIMIT: usize = 256;
 
 /// A job at or above this CPU (millicores) reserves a path: capacity that
 /// would leave the worker unable to run a waiting large job is not spent on
-/// smaller work while that job waits (Q02).
+/// smaller work while that job waits.
 pub const LARGE_JOB_CPU: i64 = 8_000;
 /// The fraction of a host's reported millicpu kept free for pull-request
-/// feedback while one of its jobs waits: a quarter (plan §2).
+/// feedback while one of its jobs waits: a quarter.
 pub const PR_RESERVE_DIVISOR: i64 = 4;
 /// How long a job may wait for a worker with its image warm before any
 /// eligible worker may take it. Bounded so locality never strands a job.
@@ -120,10 +120,9 @@ pub struct Capacity {
 }
 
 /// Record what a worker has, as it reported at its hello. Replaces the
-/// previous report: the measurement is the worker's, made each session.
-/// The disk is replaced like CPU and memory: the figure of the latest hello or
-/// profile, zero when that session measured none. Protocol 6 and older workers
-/// report no disk and are not held to one (see [`Capacity`]).
+/// previous report, disk included: zero when that session measured none.
+/// Protocol 6 and older workers report no disk and are not held to one (see
+/// [`Capacity`]).
 pub fn report_capacity(tx: &Transaction<'_>, worker: WorkerId, capacity: Capacity) -> Result<()> {
     if capacity.cpu_millis < 0 || capacity.memory_bytes < 0 || capacity.disk_bytes < 0 {
         return Err(Error::InvalidInput("capacity"));
@@ -414,7 +413,7 @@ type WorkerFactsRow = (
 );
 
 /// Whether a worker can receive a secret bundle: the capability bit **and**
-/// a negotiated protocol that carries it (P10D-6). A session that sets the
+/// a negotiated protocol that carries it. A session that sets the
 /// bit on an older protocol would be placed a job it can only fail.
 fn secret_capable(capabilities: i64, protocol: i64) -> bool {
     protocol >= 10
@@ -476,9 +475,9 @@ fn worker_facts(conn: &Connection, worker: WorkerId) -> Result<Option<(WorkerId,
 }
 
 /// Every worker of a pool the tenant may use: the candidate set the queue
-/// explanation reads. Pool access is A07's rule — tenant active, pool
-/// active, owner or explicitly granted — evaluated per call so suspension
-/// and withdrawal stop the next transaction.
+/// explanation reads. Pool access — tenant active, pool active, owner or
+/// explicitly granted — is evaluated per call so suspension and withdrawal
+/// stop the next transaction.
 fn pool_workers(conn: &Connection, tenant: TenantId) -> Result<Vec<(WorkerId, WorkerFacts)>> {
     let mut stmt = conn.prepare_cached(
         "SELECT w.id, w.pool_id, w.arch, w.labels, w.drain_ms IS NOT NULL, w.disk_bytes,
@@ -535,7 +534,7 @@ fn pool_workers(conn: &Connection, tenant: TenantId) -> Result<Vec<(WorkerId, Wo
 /// A ready job `j` that fits the bounds `:arch`, `:cpu`, `:memory`,
 /// `:disk_reported`/`:disk` and carries only labels in `:labels`. Labels are
 /// tested here, before any `LIMIT`, so a page of label-mismatched jobs can
-/// never hide a fitting one (P08-4); the unlabeled case never calls the
+/// never hide a fitting one; the unlabeled case never calls the
 /// function.
 macro_rules! eligible_sql {
     () => {
@@ -553,7 +552,7 @@ macro_rules! eligible_sql {
 /// (tenant, repository, group) has a job a worker owns (`Leased` through
 /// `Finalizing`), and no *older* run — by `(created_ms, id)`, a total order —
 /// has any live job. A queued run therefore waits only for runs ahead of it,
-/// so two queued runs of a serializing group never block each other (P08-1).
+/// so two queued runs of a serializing group never block each other.
 /// `16` is `TERMINAL_BASE` and `2` is `Leased` (asserted below).
 macro_rules! group_free_sql {
     () => {
@@ -603,7 +602,7 @@ const MAX_PAGES: usize = 8;
 /// placement would leave less than that job's CPU free is excluded (the
 /// large-job path), as is a non-PR job that would leave less than the PR
 /// reserve free. `:exclusive = 1` keeps only jobs beyond what any other
-/// connected worker of the pool can hold (`:far_*`, Q10).
+/// connected worker of the pool can hold (`:far_*`).
 macro_rules! candidates_sql {
     ($from:literal, $only:literal) => {
         concat!(
@@ -638,7 +637,7 @@ const CANDIDATES_SQL: &str = candidates_sql!("jobs j INDEXED BY jobs_ready_repo"
 /// [`CANDIDATES_SQL`] over ready pull-request jobs only, for a worker whose
 /// free room is at or inside the PR reserve: no other job can pass the
 /// reserve there, and walking the stream's whole ready index to reject each
-/// one was the cost of every such placement.
+/// one would cost every such placement.
 const PR_CANDIDATES_SQL: &str =
     candidates_sql!("jobs j INDEXED BY jobs_ready_pr", "j.pull_request = 1 AND ");
 
@@ -703,7 +702,7 @@ struct Stream {
     /// queued_ms)`: the tenant executing least goes first, then within it the
     /// repository executing least, then the one whose head job has waited
     /// longest (aging). A repository with a thousand-job backlog therefore
-    /// takes turns with its siblings instead of draining first (P08-5).
+    /// takes turns with its siblings instead of draining first.
     key: (i64, i64, i64, i64),
 }
 
@@ -764,7 +763,7 @@ fn streams(conn: &Connection, tenants: &[TenantId]) -> Result<Vec<Stream>> {
 /// Both count only jobs *this worker could run* — its pool admits the
 /// tenant, and the job's architecture, labels, resources and group allow it
 /// here — so a job in another pool, or one no worker here can ever run,
-/// reserves nothing (P08-2).
+/// reserves nothing.
 #[derive(Clone, Copy, Debug, Default)]
 struct Fairness {
     /// `(cpu_millis, queued_ms)` of the largest such job at or above
@@ -800,7 +799,7 @@ const _: () = assert!(
 /// A pull-request job this worker could run is waiting. Driven from
 /// `jobs_ready_pr`, which holds ready pull-request jobs and nothing else, so
 /// the common case — none waiting — is one empty index probe regardless of
-/// queue depth or pull-request history (P08-9).
+/// queue depth or pull-request history.
 const PR_WAITING_SQL: &str = concat!(
     "SELECT EXISTS(SELECT 1 FROM jobs j INDEXED BY jobs_ready_pr ",
     pool_access_sql!(),
@@ -837,7 +836,7 @@ fn waiting_fairness(conn: &Connection, pool: PoolId, facts: &WorkerFacts) -> Res
         large,
         // A quarter of this worker's own report, which is the whole host's
         // (several identities on one machine each measure that machine —
-        // summing them would reserve the host once per identity, P08-3).
+        // summing them would reserve the host once per identity).
         pr_reserve: if pr {
             facts.cpu_millis / PR_RESERVE_DIVISOR
         } else {
@@ -874,8 +873,8 @@ struct LocalityWorker {
     /// When the earliest attempt it holds must have ended: its offer plus
     /// its job's timeout. `None` when it holds nothing. This is an upper
     /// bound on completion, never the lease deadline — renewal keeps a lease
-    /// inside the locality window forever, which made every busy warm worker
-    /// look about to free (P08-6).
+    /// inside the locality window forever, so every busy warm worker would
+    /// look about to free.
     frees_by: Option<i64>,
 }
 
@@ -962,8 +961,6 @@ fn locality_hold(view: &[LocalityWorker], exclude: WorkerId, pick: &Pick, now: U
             && worker.frees_by.is_none_or(|until| until <= bound)
     })
 }
-
-// ——— bounded image prefetch (K05, B04) ———————————————————————————
 
 /// Image references one worker is hinted at most.
 pub const MAX_PREFETCH_HINTS: usize = 4;
@@ -1060,7 +1057,7 @@ fn prefetch_head(conn: &Connection) -> Result<Vec<PrefetchJob>> {
     Ok(out.into_iter().map(|(_, job)| job).collect())
 }
 
-/// A07's pool access, asked once per (tenant, pool) a pass meets.
+/// Pool access, asked once per (tenant, pool) a pass meets.
 fn pool_admits(conn: &Connection, tenant: TenantId, pool: PoolId) -> Result<bool> {
     Ok(conn
         .prepare_cached(
@@ -1073,7 +1070,7 @@ fn pool_admits(conn: &Connection, tenant: TenantId, pool: PoolId) -> Result<bool
         .query_row(params![tenant.as_bytes(), pool.as_bytes()], |r| r.get(0))?)
 }
 
-/// What each of `workers` should prefetch now (K05): image references of
+/// What each of `workers` should prefetch now: image references of
 /// ready jobs at the head of the queue that it could run and does not hold
 /// warm, at most [`MAX_PREFETCH_HINTS`] per worker and [`PREFETCH_FANOUT`]
 /// workers per image. Every worker named gets an entry — an empty one means
@@ -1081,12 +1078,11 @@ fn pool_admits(conn: &Connection, tenant: TenantId, pool: PoolId) -> Result<bool
 ///
 /// Only an idle or underused worker is hinted: one whose held attempts take
 /// less than its reported CPU. The job must be one the worker could be
-/// placed: its tenant may use the worker's pool (A07: tenant active, pool
+/// placed: its tenant may use the worker's pool (tenant active, pool
 /// active, owner or granted), and its architecture, labels, CPU, memory and
 /// disk fit the worker's reported capacity — so a worker is only ever told
 /// to pull what it would pull anyway for an eligible job, under the same
-/// worker-wide registry authority (tenant-scoped registry credentials are
-/// S05). A draining or revoked worker gets nothing. Within a pool, the
+/// worker-wide registry authority. A draining or revoked worker gets nothing. Within a pool, the
 /// most idle workers are hinted first: they are the likeliest next hosts.
 ///
 /// Reads only: the head of `jobs_ready` (bounded by [`PREFETCH_SCAN`]), one
@@ -1217,8 +1213,7 @@ impl LocalityCache {
 /// large job keeps its reserved remainder, and a job whose image is warm
 /// elsewhere waits only inside [`LOCALITY_WAIT_MS`].
 ///
-/// Pool access is A07's rule, evaluated here per placement rather than
-/// cached: the tenant active, the pool active, the tenant its owner or
+/// Pool access is evaluated here per placement rather than cached: the tenant active, the pool active, the tenant its owner or
 /// explicitly granted. Suspended tenants and withdrawn grants stop placing
 /// at their next transaction.
 pub fn place(
@@ -1237,9 +1232,9 @@ pub fn place(
 /// then not part of its admission). A ready job that exceeds `elsewhere` in
 /// any resource can run on no other connected worker, so this worker offers
 /// it first, ahead of the fair order: spending the room on work a smaller
-/// worker could take would strand it until this worker's work finishes (Q10).
+/// worker could take would strand it until this worker's work finishes.
 /// Only the order changes; every hold still applies, and a job that does not
-/// fit the free capacity now is not reserved for (that is Q02's large-job
+/// fit the free capacity now is not reserved for (that is the large-job
 /// path). The exclusive pass runs only when this worker's free room exceeds
 /// `elsewhere` somewhere — otherwise no fitting job can be exclusive. `None`
 /// is plain [`place`].
@@ -1452,7 +1447,7 @@ impl Placement<'_, '_> {
 
 /// Whether any job is ready at all: the dispatcher's one probe before it
 /// asks every connected worker, so a wake with an empty queue costs one
-/// index seek instead of a writer transaction per worker (P08-14).
+/// index seek instead of a writer transaction per worker.
 pub fn any_ready(conn: &Connection) -> Result<bool> {
     Ok(conn
         .prepare_cached(
@@ -1560,7 +1555,7 @@ pub fn acknowledge(
     now: UnixMillis,
 ) -> Result<UnixMillis> {
     // A revoked worker's acknowledgement is refused like a stranger's: its
-    // offers are fenced the moment it is revoked (P08-7).
+    // offers are fenced the moment it is revoked.
     tx.prepare_cached(
         "UPDATE attempts SET acked_ms = ?4
          WHERE id = ?1 AND worker_id = ?2 AND fence = ?3 AND acked_ms IS NULL AND released_ms IS NULL
@@ -1632,11 +1627,9 @@ fn give_back(
         return Err(Error::Conflict);
     }
     let mut next = jobs::transition(tx, tenant, job, Actor::Controller, Event::OfferLapsed, now)?;
-    // The durable requeue marker (P11D-2 residual): the job is no longer
-    // leased, so its lease stamp goes with the offer, as a rerun clears it.
-    // Only the next lease stamps it again (under a new fence), so a cancel
-    // or queue timeout before then is never the lapsed attempt's verdict,
-    // and the job's `leased_ms` no longer shows a lease that lapsed.
+    // The lease stamp goes with the offer, as a rerun clears it; only the next
+    // lease (under a new fence) stamps it again, so a cancel or queue timeout
+    // before then is never the lapsed attempt's verdict.
     tx.prepare_cached("UPDATE jobs SET leased_ms = NULL WHERE id = ?1 AND tenant_id = ?2")?
         .execute(params![job.as_bytes(), tenant.as_bytes()])?;
     tx.prepare_cached("UPDATE attempts SET released_ms = ?2 WHERE id = ?1")?
@@ -1664,7 +1657,7 @@ fn give_back(
 /// returns to the queue — nothing ran, so this is not an execution and not
 /// an infrastructure failure — or ends `canceled` when that is desired. A
 /// revoked worker's hand-back is refused like a stranger's; the revocation
-/// sweep settles what it held (P08-7).
+/// sweep settles what it held.
 pub fn decline(
     tx: &Transaction<'_>,
     worker: WorkerId,
@@ -1708,7 +1701,7 @@ pub enum SpecGate {
 }
 
 /// Whether the spec of `attempt` may go to `worker` now. One indexed read.
-/// A revoked worker holds nothing: its spec requests are `NotHeld` (P08-7).
+/// A revoked worker holds nothing: its spec requests are `NotHeld`.
 pub fn spec_gate(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Result<SpecGate> {
     let row: Option<(bool, i64, bool, i64)> = conn
         .prepare_cached(
@@ -1812,8 +1805,8 @@ pub fn held_by(conn: &Connection, worker: WorkerId) -> Result<Vec<Held>> {
 /// lapsed, finished, or never its — which the worker must stop at once.
 ///
 /// A lease that has already passed is not renewed: it is expired, whatever
-/// the worker says, and the expiry sweep settles it (P08-13). A revoked
-/// worker renews nothing — `Forbidden`, which ends its session (P08-7).
+/// the worker says, and the expiry sweep settles it. A revoked
+/// worker renews nothing — `Forbidden`, which ends its session.
 pub fn renew(
     tx: &Transaction<'_>,
     worker: WorkerId,
@@ -2183,7 +2176,7 @@ pub fn expired_scoped(
 /// transaction as the transition: a renewal that committed after the sweep
 /// read the attempt as due (a worker reconnecting at its deadline) wins, and
 /// the attempt is `Conflict` here rather than failed under a worker that was
-/// just granted more time — and renewal refuses a passed lease (P08-13), so a
+/// just granted more time — and renewal refuses a passed lease, so a
 /// lapsed one cannot be revived to dodge this.
 pub fn expire(
     tx: &Transaction<'_>,
@@ -2423,8 +2416,8 @@ pub fn report(
     now: UnixMillis,
     logs: Option<&LogStore>,
 ) -> Result<JobState> {
-    // A revoked worker reports nothing: its verdicts are not evidence
-    // (P08-7). The attempt is settled `Reconciled` by the dispatcher instead.
+    // A revoked worker reports nothing: its verdicts are not evidence. The
+    // attempt is settled `Reconciled` by the dispatcher instead.
     let cancel_requested: Option<bool> = tx
         .prepare_cached(
             "SELECT j.cancel_requested FROM attempts a JOIN jobs j ON j.id = a.job_id
@@ -2519,12 +2512,11 @@ type ContextRow = (
     i64,
 );
 
-/// Context for an attempt the (unrevoked) worker holds and has acknowledged — nothing
-/// that could start work leaves before the acknowledgement is durable, so
-/// an offer that lapses for a lost ack write never also runs (P04-10). One
-/// statement for the identity
-/// row, one for the run's job states; the spec (already sent to the worker)
-/// names the dependencies.
+/// Context for an attempt the (unrevoked) worker holds and has acknowledged:
+/// nothing that could start work leaves before the acknowledgement is durable,
+/// so an offer that lapses for a lost ack write never also runs. One
+/// statement for the identity row, one for the run's job states; the spec
+/// (already sent to the worker) names the dependencies.
 pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Result<JobContext> {
     let row: Option<ContextRow> = conn
         .prepare_cached(
@@ -2597,7 +2589,7 @@ pub fn job_context(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> R
 
 /// Whether the attempt is reserved on `worker`, not yet released, and the
 /// worker is not revoked: the gate for artifact publication and cache
-/// transfers. A revoked worker holds nothing (P08-7).
+/// transfers. A revoked worker holds nothing.
 pub fn is_held(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Result<bool> {
     Ok(conn
         .prepare_cached(
@@ -2653,14 +2645,13 @@ pub fn attempt_scope(
 }
 
 /// The cache boundary of an attempt `worker` owns — its tenant, repository
-/// and trust class — for remote-cache authorization (Q08). A fetch passes
+/// and trust class — for remote-cache authorization. A fetch passes
 /// `released_since: None`: the attempt must still be held. An offer passes
 /// the oldest release it accepts: a worker offers what it sealed only after
-/// its terminal report released the attempt (P07-7), so a recently
-/// released attempt of the same worker still names its boundary.
-/// `NotFound` for a foreign, unknown or long-released attempt, or a revoked
-/// worker (P08-7). One indexed
-/// row plus the trust probe — none of `job_context`'s spec work.
+/// its terminal report released the attempt, so a recently released attempt
+/// of the same worker still names its boundary. `NotFound` for a foreign,
+/// unknown or long-released attempt, or a revoked worker. One indexed row
+/// plus the trust probe — none of `job_context`'s spec work.
 pub fn cache_scope(
     conn: &Connection,
     worker: WorkerId,
@@ -2698,8 +2689,8 @@ pub fn cache_scope(
 /// or not. A released attempt may still receive retransmitted frames and its
 /// end — the log is evidence, and late bytes only complete the record. The
 /// verdict itself was already decided. A revoked worker's bytes are not
-/// evidence: refused like a stranger's (P08-7). Nor are bytes for a log
-/// retention already removed (R01): the record is closed, not reopened.
+/// evidence: refused like a stranger's. Nor are bytes for a log
+/// retention already removed: the record is closed, not reopened.
 pub fn attempt_log_scope(
     conn: &Connection,
     worker: WorkerId,
@@ -2732,7 +2723,7 @@ pub fn attempt_log_scope(
 }
 
 /// The encoded run spec of an attempt the worker holds and has
-/// acknowledged, exactly as stored. Never for a revoked worker (P08-7).
+/// acknowledged, exactly as stored. Never for a revoked worker.
 pub fn spec_bytes(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Result<Vec<u8>> {
     conn.prepare_cached(
         "SELECT s.spec FROM attempts a JOIN jobs j ON j.id = a.job_id
@@ -2876,9 +2867,9 @@ fn release_dependents_with(
                         Ok(Some(true)) => Event::DependenciesSatisfied,
                         Ok(Some(false)) => Event::Skip,
                         // The compiler types every condition, so this is a
-                        // spec from before it did, or a corrupted one. The
-                        // job fails visibly rather than running or skipping
-                        // on a guess.
+                        // stored spec it did not type, or a corrupted one.
+                        // The job fails visibly rather than running or
+                        // skipping on a guess.
                         Ok(None) | Err(_) => Event::ConditionFailed,
                     }
                 }
@@ -3072,7 +3063,7 @@ pub enum WaitReason {
     /// constraint and reservation allows it there. The next dispatch pass
     /// places it, unless work ahead of it in the fair order takes that room
     /// first. Reported instead of `Capacity`, which would claim the worker
-    /// is full when it is not (P08-4).
+    /// is full when it is not.
     Ready,
 }
 
@@ -3418,7 +3409,7 @@ impl<'c> Explainer<'c> {
 /// `limit` of them, each with the live reason it has not started, and the
 /// total waiting. The limit is applied in the query, before any reason is
 /// computed, and everything a reason reads that is not the job's own row is
-/// read once per call (P08-8): the cost is `limit` explanations over one
+/// read once per call: the cost is `limit` explanations over one
 /// worker scan, not the tenant's whole queue times the fleet. `connected` is
 /// the controller's live session set, the one fact the database does not
 /// hold.
@@ -3673,9 +3664,8 @@ mod tests {
     }
 
     /// What each statement actually does against a 2,000-job queue with no
-    /// pull-request or large job waiting — the common case, and the one
-    /// where the shipped PR probe walked the whole ready queue (P08-9):
-    /// zero full-scan steps and zero sorts. SQLite's own counters, not a
+    /// pull-request or large job waiting — the common case: zero full-scan
+    /// steps and zero sorts. SQLite's own counters, not a
     /// plan: a bound parameter that changed the runtime plan would show here.
     #[test]
     fn placement_statements_never_scan_the_queue_at_runtime() {
