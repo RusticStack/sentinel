@@ -101,6 +101,8 @@ Never on the request path. A sign-in, a link, a signed webhook or the periodic p
 3. `GET /orgs/{org}/memberships/{login}`. The reply must name the **same account id and the same organization id** as were asked about; anything else (a renamed login whose old name now belongs to someone else, a transferred organization) proves nothing.
 4. For a plain member, `GET /repos/{owner}/{name}/collaborators/{login}/permission` for the next 25 bound repositories, again requiring the same account id.
 
+Each pass commits under the queue row's sequence fence: if a signed event, a sign-in or an administrator asked for a check while the pass was on the wire, the pass is `superseded` and writes nothing — its observation may predate the event, and applying it could undo a removal — and the row is due again at once. A suspended tenant's members are still checked, so their clocks stay honest and expiry keeps working.
+
 A 404 for the membership is believed only after the installation snapshot is fetched again and still reports the same organization (id and login): a renamed organization answers 404 for everybody under its old name and must not remove anyone.
 
 ### Unknown is not absent
@@ -114,8 +116,9 @@ Configuration (`<data_dir>/github-app.json`, [configuration](configuration.md)):
 | Trigger | Effect |
 |---|---|
 | sign-in, any method (`issue_session`), and a new link | queue a check of the person in every GitHub-backed tenant, at most 256, skipped for a pair checked within the last 60 s |
+| a member opening the tenant (`GET /tenants/{slug}/repos`) whose last confirmation is older than five minutes | queue a check, best effort: the request is served from the current rows and never waits for GitHub; the 60 s per-pair floor above applies |
 | `organization` `member_removed` (signed) | the linked account's derived access is **removed at once** (membership, grants, tenant-scoped API credentials, OAuth grants, epoch bump) and a check is queued so a stale or replayed delivery heals |
-| `organization` `member_added`/`member_invited`, `membership`, `member` | queue a check of that account; nothing is granted from the body |
+| `organization` `member_added`, `membership`, `member` | queue a check of that account; nothing is granted from the body |
 | `team` changes | queue a check of everyone in the tenant |
 | periodic pass | every derived member is re-confirmed each recheck interval |
 | unlinking GitHub | every derived membership of the person ends in the same transaction as the unlink; app-managed memberships stay; leaving one organization on GitHub affects only that organization's access |

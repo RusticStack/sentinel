@@ -315,10 +315,9 @@ pub fn parse_control(event: &str, body: &[u8]) -> Result<Option<Control>> {
                 repository: number(&v["repository"]["id"])?,
             })
         }
-        // Organization membership: a person joined, was invited or left.
-        "organization"
-            if matches!(action, "member_added" | "member_removed" | "member_invited") =>
-        {
+        // Organization membership: a person joined or left. An invitation
+        // (`member_invited`, which carries no `membership`) is not membership.
+        "organization" if matches!(action, "member_added" | "member_removed") => {
             Some(Control::Members {
                 installation,
                 user: Some(number(&v["membership"]["user"]["id"])?),
@@ -685,11 +684,7 @@ mod tests {
                 "organization": {"id": 73},
             })
         };
-        for (action, removed) in [
-            ("member_removed", true),
-            ("member_added", false),
-            ("member_invited", false),
-        ] {
+        for (action, removed) in [("member_removed", true), ("member_added", false)] {
             let parsed = parse_control(
                 "organization",
                 &serde_json::to_vec(&organization(action)).unwrap(),

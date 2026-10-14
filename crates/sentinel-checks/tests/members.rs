@@ -656,9 +656,18 @@ fn rate_limits_server_errors_and_a_missing_permission_keep_access_and_grant_noth
         assert_eq!(f.pass(), "kept: unreachable", "{failure:?}");
         assert_eq!(f.role(), Some(2), "{failure:?}");
         assert_eq!(f.grant(), Some(3), "{failure:?}");
-        // Wait out any pause GitHub asked for before the next probe.
+        // GitHub recovers: a pause it asked for ends within a second and the
+        // very next check confirms the member again.
         f.stub.with(|w| w.fail_memberships = None);
-        thread::sleep(Duration::from_millis(2_500));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while f.pass() != "confirmed" {
+            assert!(
+                Instant::now() < deadline,
+                "never recovered from {failure:?}"
+            );
+            thread::sleep(Duration::from_millis(250));
+        }
+        assert_eq!(f.role(), Some(2), "{failure:?}");
     }
 }
 

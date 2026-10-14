@@ -723,6 +723,134 @@ fn an_answer_about_a_different_github_account_is_discarded() {
 }
 
 #[test]
+fn an_observation_older_than_a_signed_event_is_superseded_and_writes_nothing() {
+    let f = fixture();
+    f.back();
+    let nora = f.person("nora", Some("1616"));
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(1616), at(20)))
+        .unwrap();
+    f.apply(
+        nora,
+        observed(1616, Membership::Active(OrgRole::Member), vec![]),
+        false,
+        30,
+    )
+    .unwrap();
+    assert!(f.can_see_tenant(nora));
+
+    // The lane read the pair, asked GitHub (still a member) and is about to
+    // commit; meanwhile a signed removal lands.
+    let stale_check = f.check(nora).unwrap();
+    let removal = Event::Members {
+        installation: 42,
+        user: Some(1616),
+        removed: true,
+    };
+    f.store
+        .writer()
+        .write(move |tx| github_events::accept(tx, "delivery-s", &[9u8; 32], &removal, at(40)))
+        .unwrap();
+    assert_eq!(f.membership(nora), None);
+
+    // Committing the older observation must not undo the removal, and the
+    // same holds for an "unreachable" outcome computed from the older read.
+    let observation = observed(1616, Membership::Active(OrgRole::Member), vec![]);
+    let outcome = f
+        .store
+        .writer()
+        .write(move |tx| {
+            github_members::apply(tx, &stale_check, false, &observation, TIMING, at(41))
+        })
+        .unwrap();
+    assert_eq!(outcome, "superseded");
+    assert_eq!(
+        f.membership(nora),
+        None,
+        "the removal stands until a fresh check"
+    );
+    let outcome = f
+        .store
+        .writer()
+        .write(move |tx| github_members::unreachable(tx, &stale_check, TIMING, at(42), None))
+        .unwrap();
+    assert_eq!(outcome, "superseded");
+    assert!(f.check(nora).is_some(), "the fresh check is still queued");
+}
+
+#[test]
+fn opening_a_backed_tenant_with_a_stale_confirmation_asks_for_a_check() {
+    let f = fixture();
+    f.back();
+    let owen = f.person("owen", Some("1717"));
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(1717), at(20)))
+        .unwrap();
+    f.apply(
+        owen,
+        observed(1717, Membership::Active(OrgRole::Member), vec![]),
+        false,
+        1_000,
+    )
+    .unwrap();
+    let ttl = github_members::OPEN_TTL_MS;
+    let stale = |now: i64| {
+        f.store
+            .read(move |c| github_members::touch(c, tenant, owen, ttl, at(now)))
+            .unwrap()
+    };
+    assert!(
+        !stale(1_000 + ttl - 1),
+        "a fresh confirmation asks for nothing"
+    );
+    assert!(stale(1_000 + ttl), "an old one does");
+    // A person who is not a member never triggers a check by looking.
+    let stranger = f.person("stranger", Some("1818"));
+    assert!(
+        !f.store
+            .read(move |c| github_members::touch(c, tenant, stranger, ttl, at(10 * ttl)))
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_suspended_tenants_members_keep_honest_clocks() {
+    let f = fixture();
+    f.back();
+    let pia = f.person("pia", Some("1919"));
+    let (admin, tenant) = (f.admin, f.tenant);
+    f.store
+        .writer()
+        .write(move |tx| github_members::hint(tx, tenant, Some(1919), at(20)))
+        .unwrap();
+    f.apply(
+        pia,
+        observed(1919, Membership::Active(OrgRole::Member), vec![]),
+        false,
+        30,
+    )
+    .unwrap();
+    f.store
+        .writer()
+        .write(move |tx| {
+            sentinel_store::tenancy::suspend(tx, stepped(admin), tenant, at(40)).map(|_| ())
+        })
+        .unwrap();
+    // The pair is still checkable while the tenant is suspended: dropping it
+    // would leave the member with no clock and nothing to expire her.
+    let check = f.check(pia).unwrap();
+    let target = f
+        .store
+        .read(move |c| github_members::target(c, &check))
+        .unwrap();
+    assert!(target.is_some());
+}
+
+#[test]
 fn a_renamed_login_keeps_access_and_the_numeric_id_is_the_only_key() {
     let f = fixture();
     f.back();

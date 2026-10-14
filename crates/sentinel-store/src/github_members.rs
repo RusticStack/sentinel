@@ -304,6 +304,7 @@ fn apply_backing(
 pub(crate) fn installation_released(
     tx: &Transaction<'_>,
     tenant: TenantId,
+    actor: Option<UserId>,
     now: UnixMillis,
 ) -> Result<()> {
     let still_backed: bool = tx
@@ -315,7 +316,29 @@ pub(crate) fn installation_released(
     if still_backed {
         return Ok(());
     }
-    apply_backing(tx, tenant, false, None, false, now)
+    apply_backing(tx, tenant, false, actor, false, now)
+}
+
+/// How stale a derived membership's last confirmation may be before a member
+/// opening the tenant asks for a fresh check ([`touch`]).
+pub const OPEN_TTL_MS: i64 = 5 * 60 * 1000;
+
+/// Whether a request for this pair arrived after the pass read its row: a
+/// signed webhook, a sign-in or an administrator bumped `seq`, or the row is
+/// gone (an unlink, a conversion back). A superseded pass writes nothing — its
+/// observation may predate the event that superseded it, so applying it could
+/// undo a removal — and the row it left behind is due again at once.
+fn superseded(tx: &Transaction<'_>, check: &Check) -> Result<bool> {
+    let current: Option<i64> = tx
+        .prepare_cached(
+            "SELECT seq FROM github_member_checks WHERE tenant_id = ?1 AND user_id = ?2",
+        )?
+        .query_row(
+            params![check.tenant.as_bytes(), check.user.as_bytes()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(current != Some(check.seq))
 }
 
 /// Ask for a check of one person in every GitHub-backed tenant, as a sign-in
@@ -606,7 +629,7 @@ pub fn target(conn: &Connection, check: &Check) -> Result<Option<Target>> {
                     (i.suspended = 1 OR i.permissions_valid = 0)
              FROM installations i JOIN tenants t ON t.id = i.tenant_id
              WHERE i.tenant_id = ?1 AND i.provider = ?2 AND i.account_personal = 0
-               AND i.account_id IS NOT NULL AND t.membership_source = 1 AND t.active = 1
+               AND i.account_id IS NOT NULL AND t.membership_source = 1
              ORDER BY i.bound_ms, i.id LIMIT 1",
         )?
         .query_row(params![check.tenant.as_bytes(), PROVIDER], |r| {
@@ -726,6 +749,9 @@ pub fn apply(
     if !is_github_backed(tx, check.tenant)? {
         drop_row(tx, check)?;
         return Ok("not github-backed");
+    }
+    if superseded(tx, check)? {
+        return Ok("superseded");
     }
     let linked: Option<String> = tx
         .prepare_cached(
@@ -1094,6 +1120,9 @@ pub fn unreachable(
     if !is_github_backed(tx, check.tenant)? {
         drop_row(tx, check)?;
         return Ok("not github-backed");
+    }
+    if superseded(tx, check)? {
+        return Ok("superseded");
     }
     let synced: Option<Option<i64>> = tx
         .prepare_cached("SELECT synced_ms FROM memberships WHERE tenant_id = ?1 AND user_id = ?2")?

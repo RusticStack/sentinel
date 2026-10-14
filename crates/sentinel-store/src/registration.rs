@@ -854,6 +854,7 @@ pub fn unbind_installation(
     crate::github_members::installation_released(
         tx,
         TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?,
+        Some(principal.user),
         now,
     )?;
     audit(
