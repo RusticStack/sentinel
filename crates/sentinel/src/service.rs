@@ -426,6 +426,9 @@ struct WorkerLink {
     metrics_listen: Option<SocketAddr>,
 }
 
+// One value per process, built once at start: the size difference between the
+// roles costs nothing, and boxing either side only moves the lint.
+#[allow(clippy::large_enum_variant)]
 enum Role {
     Server {
         listen: SocketAddr,
@@ -441,7 +444,7 @@ enum Role {
         /// What that store may hold; `None` sizes it from the disk.
         remote_cache_budget: Option<u64>,
     },
-    Worker(Option<Box<WorkerLink>>),
+    Worker(Option<WorkerLink>),
 }
 
 struct Config {
@@ -788,7 +791,7 @@ impl Config {
                     ));
                 }
             };
-            Role::Worker(link.map(Box::new))
+            Role::Worker(link)
         };
         #[cfg(feature = "server")]
         let storage = match (&role, file.storage) {
