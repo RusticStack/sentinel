@@ -21,6 +21,15 @@ test("ambiguous paths that could reach the controller are refused", () => {
   assert.equal(classifyProxyPath("/t/../login", "GET").kind, "pass");
 });
 
+test("encoded query strings on proxied paths are not ambiguous", () => {
+  for (const p of [
+    "/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcb",
+    "/auth/github/callback?next=%2Ft%2Facme",
+    "/api/v1/runs?q=100%25&dir=a%5Cb&p=%2E%2E%2Fx",
+  ]) assert.equal(classifyProxyPath(p, "GET").kind, "proxy", p);
+  assert.equal(classifyProxyPath("/api/v1/%2e%2e/metrics?a=%2F", "GET").kind, "reject");
+});
+
 test("body ceilings follow the controller's limits", () => {
   assert.equal(classifyProxyPath("/api/v1/runs", "POST").limit, 1 << 20);
   assert.equal(classifyProxyPath("/api/v1/uploads/upl_1?offset=0", "PUT").limit, 8 << 20);
