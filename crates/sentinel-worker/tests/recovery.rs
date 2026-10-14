@@ -1,9 +1,3 @@
-//! Worker-side reconciliation against an empty container runtime (a
-//! shim that owns nothing): markers
-//! record attempts in flight with their fence, leftover workspaces are
-//! destroyed, a spool without a marker is discarded, a spool with one is
-//! kept for delivery, and the result names what was found.
-
 #![cfg(target_os = "linux")]
 
 #[path = "support/shim_dir.rs"]
@@ -19,8 +13,7 @@ use sentinel_worker::{
     workspace::Workspace,
 };
 
-/// A `podman` on `PATH` that owns nothing: recovery requires a runtime
-/// that answers (it refuses to guess), and these cases are about the disk.
+/// Recovery refuses to guess when the runtime cannot answer, so these cases need one that does.
 fn empty_runtime() {
     use std::os::unix::fs::PermissionsExt;
     static SHIM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -59,12 +52,9 @@ fn leftovers_are_settled_on_disk_and_kept_for_the_controller() {
         .unwrap();
     spool.sync().unwrap();
     drop(spool);
-    // `finished`: its report went out (marker removed) but the spool removal
-    // did not complete.
     recovery::mark(root, finished, Fence(1)).unwrap();
     recovery::unmark(root, finished);
     Spool::open(root, finished).unwrap();
-    // `unmarked`: only a workspace; the marker was never written.
     Workspace::create(root, unmarked).unwrap();
 
     assert_eq!(
@@ -96,14 +86,11 @@ fn leftovers_are_settled_on_disk_and_kept_for_the_controller() {
         ),
         (running, Fence(3), true, false)
     );
-    // The running attempt's spool survives with its frames; the finished
-    // attempt's spool is gone.
     assert_eq!(Spool::leftovers(root).unwrap(), vec![running]);
     let mut spool = Spool::open(root, running).unwrap();
     let frames = spool.unacked(0, 10).unwrap();
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].bytes, b"before the crash\n");
-    // Nothing left to reconcile once the marker is gone.
     recovery::unmark(root, running);
     assert!(recovery::leftovers(root).unwrap().is_empty());
 }
@@ -114,19 +101,14 @@ fn a_marker_without_a_spool_reports_whether_the_end_was_delivered() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let (lost, done, gone) = (AttemptId::new(), AttemptId::new(), AttemptId::new());
-    // `lost`: marker, frames spooled, then the spool itself is lost —
-    // recovery must not call that delivered.
     recovery::mark(root, lost, Fence(7)).unwrap();
     let mut spool = Spool::open(root, lost).unwrap();
     spool.append(0, Stream::Stdout, b"work\n").unwrap();
     spool.sync().unwrap();
     drop(spool);
     fs::remove_dir_all(root.join("spool").join(lost.to_string())).unwrap();
-    // `done`: the end went out and the spool was removed, then the crash
-    // took the marker removal — a completed delivery, not a loss.
     recovery::mark(root, done, Fence(8)).unwrap();
     recovery::mark_ended(root, done);
-    // `gone`: marker only, mid-run — nothing was ever spooled.
     recovery::mark(root, gone, Fence(9)).unwrap();
 
     let markers = recovery::leftovers(root).unwrap();

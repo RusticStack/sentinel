@@ -1,8 +1,3 @@
-//! Isolation with real rootless Podman. Runs only with
-//! `SENTINEL_PODMAN_TESTS=1` as an account with rootless Podman (see
-//! docs/development.md); otherwise it reports that it was skipped, never a
-//! false pass.
-
 #![cfg(target_os = "linux")]
 
 use std::{fs, time::Duration};
@@ -28,8 +23,6 @@ fn enabled() -> bool {
     false
 }
 
-/// A resident digest still contacts its registry under the scoped auth file;
-/// `true` reports that it was present before this authorization check.
 #[test]
 fn a_present_image_still_checks_registry_authorization() {
     if !enabled() {
@@ -45,7 +38,6 @@ fn a_present_image_still_checks_registry_authorization() {
         &std::sync::atomic::AtomicBool::new(false),
     )
     .unwrap();
-    // The image was resident, but this pull still authorizes with the file.
     assert!(
         podman::pull(
             IMAGE,
@@ -121,9 +113,6 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
         vec![(attempt, container.name().to_owned())]
     );
 
-    // Limits as seen from inside the cgroup, capabilities all dropped, no
-    // network but loopback, root filesystem read-only, /tmp and the
-    // workspace writable, and the workspace file visible on the host.
     let exit = container
         .exec(
             &sh(
@@ -176,14 +165,11 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
     );
     let exit = container.exec(&sh("kill -9 $$", 30), &[]).unwrap();
     assert_eq!((exit.code, exit.signal), (None, Some(9)));
-    // `sh -e`: the first failing command ends the script with its status.
     let exit = container
         .exec(&sh("echo before; false; echo after", 30), &[])
         .unwrap();
     assert_eq!(exit.code, Some(1));
     assert_eq!(String::from_utf8_lossy(&exit.stdout).trim(), "before");
-    // A missing command inside the shell is the command's failure (127 with
-    // the shell's message), not the runtime's (`Error:` from Podman).
     let exit = container
         .exec(&sh("no-such-command-here", 30), &[])
         .unwrap();
@@ -202,7 +188,6 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
         "{}",
         exit.stderr_excerpt()
     );
-    // The cgroup's OOM counter is readable and starts at zero.
     assert_eq!(container.oom_kills().unwrap(), 0);
     // The pipeline's environment cannot override the worker's context.
     let mut cmd = sh("echo $SENTINEL_ATTEMPT", 30);
@@ -212,7 +197,6 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&exit.stdout).trim(), "real");
 
-    // A step past its timeout stops the container; nothing runs after it.
     let exit = container.exec(&sh("sleep 30", 1), &[]).unwrap();
     assert!(exit.timed_out);
     let after = container.exec(&sh("true", 5), &[]).unwrap();
@@ -223,7 +207,6 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
     ws.destroy().unwrap();
 }
 
-/// The container's cgroup on the host, as Podman reports it.
 fn host_cgroup(name: &str) -> std::path::PathBuf {
     let output = std::process::Command::new("podman")
         .args(["inspect", "--format", "{{.State.CgroupPath}}", "--", name])
@@ -234,9 +217,6 @@ fn host_cgroup(name: &str) -> std::path::PathBuf {
     std::path::Path::new("/sys/fs/cgroup").join(path.trim().trim_start_matches('/'))
 }
 
-/// Removes the container when a failed assertion unwinds past it, which
-/// also ends a step still running in it — a scoped thread blocked in that
-/// step would otherwise hold the failure until the step's timeout.
 struct RemoveOnFailure(String);
 
 impl Drop for RemoveOnFailure {
@@ -255,13 +235,7 @@ fn procs(cgroup: &std::path::Path) -> Vec<i32> {
         .collect()
 }
 
-/// A runtime may run an exec'd step in a cgroup nested under the
-/// container's own, which then holds only the keepalive, so a cancel must
-/// decide from the whole cgroup tree whether a step is running.
-/// Here the step is moved two levels down a real nested cgroup (cgroup v2,
-/// delegated to the rootless account); termination must find it there,
-/// signal it and see it leave — and once the nested cgroups are empty,
-/// report that nothing is running.
+/// A runtime may nest an exec'd step in a child cgroup, so cancel must search the whole tree.
 #[test]
 fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
     if !enabled() {
@@ -313,7 +287,6 @@ fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
             };
             container.exec(&sleep, &[]).unwrap()
         });
-        // The step's host pid, once the runtime has exec'd `sleep` in it.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let pid = loop {
             let found = procs(&cgroup).into_iter().find(|pid| {
@@ -349,7 +322,6 @@ fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
         step.join().unwrap()
     });
     assert_eq!((exit.code, exit.signal), (None, Some(15)), "{exit:?}");
-    // The nested cgroups are still there, empty: nothing runs any more.
     assert!(cgroup.join("step").join("inner").exists());
     assert_eq!(
         podman::terminate_named(
@@ -366,10 +338,6 @@ fn a_step_in_a_nested_cgroup_is_found_and_terminated() {
     ws.destroy().unwrap();
 }
 
-/// Image reclamation against the real runtime, in a private store so
-/// no other test's image is touched — an image a container holds is listed
-/// as in use and `remove_image` (never forced) leaves it; once the container
-/// goes, the image goes.
 #[test]
 fn an_image_a_container_holds_is_never_reclaimed() {
     if !enabled() {

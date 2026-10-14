@@ -1,24 +1,4 @@
-//! Delivery boundaries against rootless Podman and a real private
-//! registry (`SENTINEL_PODMAN_TESTS=1` as the worker account, like
-//! `end_to_end.rs`; the registry is a local `registry:2` with htpasswd
-//! authentication, pulled from Docker Hub on first use):
-//!
-//! - A process an earlier step left running (a `setsid` watcher
-//!   scanning `/proc/*/environ` and the secret mounts) records nothing of a
-//!   later step's environment or files.
-//! - An image that runs as a non-root user reads its file target.
-//! - A private image is pulled with the tenant's
-//!   `registry_auth` into the tenant's own store — the shared store never
-//!   gets it; once resident there, an anonymous pull is still refused; and
-//!   another tenant replaying its manifest and config from a registry of
-//!   its own gets no layer.
-//! - An undeliverable secret fails the attempt with a value-free
-//!   detail naming it.
-//! - A 65,000-byte environment value reaches the step.
-//! - The step cannot raise its core-dump limit.
-//!
-//! One test function: the registry configuration is a process environment
-//! variable, set once before any runtime process starts.
+//! One test function: the registry configuration is a process environment variable, set once before any runtime starts.
 
 #![cfg(target_os = "linux")]
 
@@ -52,9 +32,7 @@ use sentinel_worker::{
     podman::{self, Container, Limits, Store},
 };
 
-/// `sentinel:registry-test-pass`, bcrypt, as registry:2's htpasswd wants.
 const HTPASSWD: &str = "sentinel:$2b$05$FLtrX1HxgXf8j22jKC6xTuhjawXxqgbQWPCCfhsil94PyJI/CFU1G\n";
-/// base64 of `sentinel:registry-test-pass`.
 const BASIC: &str = "c2VudGluZWw6cmVnaXN0cnktdGVzdC1wYXNz";
 const REGISTRY_IMAGE: &str = "docker.io/library/registry:2";
 
@@ -72,12 +50,8 @@ fn podman_ok(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
-/// What the replaying registry serves: manifest media type and bytes, config
-/// digest and bytes.
 type Served = (String, Vec<u8>, String, Vec<u8>);
 
-/// A registry that serves one tenant's manifest and config — and nothing
-/// else — the way a tenant replaying another's metadata would.
 struct Replay {
     port: u16,
     served: Arc<Mutex<Option<Served>>>,
@@ -136,7 +110,6 @@ impl Replay {
     }
 }
 
-/// The local authenticated registry, removed with its images on drop.
 struct Registry {
     name: String,
     port: u16,
@@ -189,7 +162,6 @@ fn start_registry(dir: &Path) -> Registry {
     registry
 }
 
-/// `podman --root … --runroot …` for a private store.
 fn store_args(store: &Store) -> Vec<String> {
     match store {
         Store::Shared => Vec::new(),
@@ -255,7 +227,6 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
     let replay = Replay::start();
     let registry = start_registry(&scratch.path().join("registry"));
     let port = registry.port;
-    // Plain HTTP for the two local registries only.
     let conf = scratch.path().join("registries.conf");
     fs::write(
         &conf,
@@ -272,7 +243,6 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
     // binary holds this one test.
     unsafe { std::env::set_var("CONTAINERS_REGISTRIES_CONF", &conf) };
 
-    // A private image with a layer of its own, running as `nobody`.
     let marker = format!("tenant-a-private-{}", AttemptId::new());
     let build = scratch.path().join("build");
     fs::create_dir_all(&build).unwrap();
@@ -307,11 +277,9 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
     ]);
     let private_digest = fs::read_to_string(&digest_file).unwrap().trim().to_owned();
     let private = format!("127.0.0.1:{port}/acme/private@{private_digest}");
-    // Only the registry holds it now.
     let _ = podman_cmd(&["rmi", "-f", &tag]);
     assert!(!exists_in(&Store::Shared, &private));
 
-    // Private image pulls at the runtime boundary.
     let stores = scratch.path().join("stores");
     let tenant_a = Store::private(&stores, [0xaa; 16]).unwrap();
     let tenant_b = Store::private(&stores, [0xbb; 16]).unwrap();
@@ -332,14 +300,12 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
         !exists_in(&Store::Shared, &private),
         "never in the shared store"
     );
-    // Resident in the tenant's store, and still the registry decides.
     match pull(&private, &anonymous, &tenant_a) {
         Err(sentinel_worker::Error::Preparation(ref why)) => {
             assert!(why.starts_with("image pull"), "{why}")
         }
         other => panic!("a resident private image served an anonymous pull: {other:?}"),
     }
-    // Tenant B replays A's manifest and config from a registry of its own.
     let manifest_url =
         format!("http://127.0.0.1:{port}/v2/acme/private/manifests/{private_digest}");
     let mut response = ureq::get(&manifest_url)
@@ -379,7 +345,6 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
     drop_store(&tenant_a);
     drop_store(&tenant_b);
 
-    // Clearing a container, measured.
     let ws = tempfile::tempdir().unwrap();
     podman::pull(
         &format!("{IMAGE}@{DIGEST}"),
@@ -426,7 +391,6 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
         let killed = container.clear_strays().unwrap();
         timings.push(started.elapsed());
         assert!(killed >= 3, "killed {killed}");
-        // No stray is left, and the container still runs steps.
         let exit = container
             .exec(&step("ps -o args | grep -c '[s]leep 0.05'; true"), &[])
             .unwrap();
@@ -436,7 +400,6 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
     eprintln!("clear_strays with 3 strays plus the keepalive's sleep: {timings:?}");
     let _ = container.destroy();
 
-    // The executor: secrets over the link into real steps.
     let key_path = scratch.path().join("master.key");
     Key::create(&key_path).unwrap();
     let key = Arc::new(Key::load(&key_path).unwrap());
@@ -488,8 +451,6 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
             })
             .unwrap();
     }
-    // Leftover-process isolation, the large environment value and the core-dump limit
-    // on the shared busybox; the undeliverable secret beside it.
     let watcher = "nohup setsid sh -c 'while :; do for p in /proc/[0-9]*; do tr \"\\000\" \"\\n\" < $p/environ 2>/dev/null | grep -e ^TOKEN= -e ^BIG= >> /tmp/stolen; done; cat /run/sentinel-secrets/tls/cert.pem /run/sentinel-env/*.sh >> /tmp/stolen 2>/dev/null; sleep 0.05; done' </dev/null >/dev/null 2>&1 & sleep 0.3";
     let yaml = format!(
         "schema: 1
@@ -537,8 +498,6 @@ jobs:
     );
     assert_eq!(detail(&live, job("unbound")), "secret NEVER_BOUND: unbound");
 
-    // The non-root user and the private pull through the executor: the private image, pulled
-    // with the tenant's registry auth into its own store, run as nobody.
     let yaml = format!(
         "schema: 1
 on: [push]
@@ -573,7 +532,6 @@ jobs:
     drop_store(&tenant_store);
     let runtime = sentinel_worker::runtime_dir(&live.worker_dir);
     live.stop();
-    // The worker's runtime directory lives outside the test's temp dir.
     let _ = fs::remove_dir_all(runtime);
     drop(registry);
 }

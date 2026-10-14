@@ -1,21 +1,3 @@
-//! The real executor under faults, each against a live controller and rootless Podman (`SENTINEL_PODMAN_TESTS=1`
-//! as the worker account, like `end_to_end.rs`):
-//!
-//! - Clock skew: the worker's clock ahead of the controller's must not end live
-//!   work — the lease is measured on the worker's own monotonic clock.
-//! - Early cancel: a cancel that arrives while a step's `podman exec` is still
-//!   starting finds nothing to signal; the next heartbeat's cancel must try
-//!   again instead of being dropped for the rest of the step.
-//! - Slow stop: a stop order must not run `podman rm -f` on the heartbeat
-//!   thread, where a slow removal would hold the next heartbeat.
-//! - Duplicate offers: an offer of an attempt the executor already awaits
-//!   or runs is acknowledged again and never starts it a second time.
-//!
-//! `podman` is wrapped on `PATH` by a shim that passes every call to the
-//! real binary, but can hold a step's `exec` or slow a removal on request,
-//! and counts container creations.
-//! The shim is process-wide, so the tests here run one at a time.
-
 #![cfg(target_os = "linux")]
 
 #[path = "support/live.rs"]
@@ -64,7 +46,6 @@ esac
 exec REAL "$@"
 "#;
 
-/// The shim directory, first on `PATH` for this whole binary.
 fn shim() -> &'static PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -92,21 +73,15 @@ fn shim() -> &'static PathBuf {
     })
 }
 
-/// A spec delivery the probe held back.
 type HeldSpec = (AttemptId, JobContext, Vec<u8>);
 
-/// The real executor, seen through the link: a skewed clock on renewals,
-/// a record of the offers and of the cancel and stop orders and how long a
-/// stop held the heartbeat thread, and specs held back on request.
 struct Probe {
     inner: Executor,
-    /// Milliseconds the worker's wall clock is ahead of the controller's.
     skew_ms: i64,
     offers: Mutex<Vec<Offer>>,
     cancels: AtomicUsize,
     stops: Mutex<Vec<Duration>>,
     notices: Arc<Mutex<Vec<String>>>,
-    /// `Some` while specs are held back: what arrived meanwhile.
     held_specs: Mutex<Option<Vec<HeldSpec>>>,
 }
 
@@ -150,7 +125,6 @@ impl Probe {
             .count()
     }
 
-    /// Hold back every spec from now on, leaving its attempt awaiting.
     fn hold_specs(&self) {
         *self.held_specs.lock().unwrap() = Some(Vec::new());
     }
@@ -159,7 +133,6 @@ impl Probe {
         self.held_specs.lock().unwrap().as_ref().map_or(0, Vec::len)
     }
 
-    /// Deliver the specs held back, in arrival order, and stop holding.
     fn release_specs(&self) {
         let held = self.held_specs.lock().unwrap().take().unwrap_or_default();
         for (attempt, context, bytes) in held {
@@ -167,10 +140,6 @@ impl Probe {
         }
     }
 
-    /// The offer again, as a later session delivers it: that session has
-    /// not seen the attempt, so it asks the executor, acknowledges when
-    /// told to take it and then reports it accepted. Returns whether the
-    /// offer was acknowledged.
     fn offer_again(&self, offer: &Offer) -> bool {
         let take = self.inner.offered(offer);
         if take {
@@ -204,9 +173,6 @@ impl LinkExecutor for Probe {
         self.inner.renewed(UnixMillis(until.0 - self.skew_ms));
     }
     fn renewed_at(&self, until: UnixMillis, sent: Instant) {
-        // What a worker whose clock runs `skew_ms` ahead sees: the
-        // controller's deadline, read on the worker's clock, is that much
-        // nearer.
         self.inner
             .renewed_at(UnixMillis(until.0 - self.skew_ms), sent);
     }
@@ -258,10 +224,7 @@ fn one_job(steps: &str) -> String {
     )
 }
 
-/// The controller renews to its own `now + LEASE_MS`; a worker whose clock
-/// runs a minute ahead would read that deadline as already past. The lease
-/// is measured from the heartbeat on the worker's monotonic clock instead:
-/// the job runs to its end and passes.
+/// Lease expiry is measured on the worker's monotonic clock, so a skewed wall clock cannot end live work.
 #[test]
 fn a_worker_clock_a_minute_ahead_never_ends_live_work() {
     if !podman_enabled() {
@@ -270,7 +233,6 @@ fn a_worker_clock_a_minute_ahead_never_ends_live_work() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     shim();
     let (live, probe) = Live::start(|dir, worker| Probe::start(dir, worker, 60_000));
-    // Longer than a lease, so the job lives through several renewals.
     let (_, jobs) = live.enqueue(&one_job(
         "      - id: wait\n        run: 'sleep 40; echo done'\n",
     ));
@@ -288,10 +250,6 @@ fn a_worker_clock_a_minute_ahead_never_ends_live_work() {
     live.stop();
 }
 
-/// The cancel lands while the step's `podman exec` is held in the shim: the
-/// container has no step process to signal, so the first cancel finds
-/// nothing (`Gone`). The next heartbeat's cancel must try again and end the
-/// step, not be ignored.
 #[test]
 fn a_cancel_that_finds_the_step_still_starting_is_tried_again() {
     if !podman_enabled() {
@@ -315,8 +273,6 @@ fn a_cancel_that_finds_the_step_still_starting_is_tried_again() {
         .writer()
         .write(move |tx| dispatch::cancel(tx, tenant, job, UnixMillis::now()))
         .unwrap();
-    // Two heartbeats carry the cancel while the exec is still held: the
-    // first found nothing to signal, the second must not be ignored.
     eventually("the cancel repeated", Duration::from_secs(30), || {
         probe.cancels.load(Ordering::SeqCst) >= 3
     });
@@ -342,11 +298,6 @@ fn a_cancel_that_finds_the_step_still_starting_is_tried_again() {
     live.stop();
 }
 
-/// The controller stops counting an attempt as held (here it is abandoned
-/// under the worker's fence); the next heartbeat's answer orders the worker
-/// to stop it. The container's removal is slow (the shim sleeps 3 s before
-/// `podman rm`): `stop` must return at once, the removal happen off the
-/// heartbeat thread, and the session stay up.
 #[test]
 fn a_stop_order_never_holds_the_heartbeat_thread() {
     if !podman_enabled() {
@@ -383,20 +334,12 @@ fn a_stop_order_never_holds_the_heartbeat_thread() {
         podman::owned(worker).unwrap().is_empty()
     });
     fs::remove_file(&slow).unwrap();
-    // The session never dropped for it.
     assert_eq!(live.controller().connected(), vec![worker]);
     assert!(probe.noticed("Stopped"));
     live.stop();
 }
 
-/// Duplicate offers. A session acknowledges an attempt it has already seen
-/// by itself, but a later session (after a reconnect) asks the executor,
-/// which must know the attempt as its own: acknowledge it again and change
-/// nothing. The duplicate arrives twice here — while the attempt awaits its
-/// spec (held back by the probe) and while its step runs. A duplicate must
-/// never be taken as a new offer: that would hold the attempt twice, ask
-/// for its spec again and start it a second time, which fails on its own
-/// workspace and ends the job `infra_failed`.
+/// A duplicate offer must never start the attempt again: its workspace already exists.
 #[test]
 fn a_repeated_offer_is_acknowledged_again_and_never_started_twice() {
     if !podman_enabled() {
@@ -417,7 +360,6 @@ fn a_repeated_offer_is_acknowledged_again_and_never_started_twice() {
     let offer = probe.offers.lock().unwrap()[0].clone();
     assert_eq!(Some(offer.attempt), live.attempt(job));
 
-    // Awaiting its spec.
     assert!(
         probe.offer_again(&offer),
         "awaiting: not acknowledged again"
@@ -425,7 +367,6 @@ fn a_repeated_offer_is_acknowledged_again_and_never_started_twice() {
     assert_eq!(probe.inner.held(), vec![offer.attempt]);
     probe.release_specs();
 
-    // Running its step.
     eventually("the step started", Duration::from_secs(120), || {
         live.printed(run, job, "started")
     });
@@ -444,7 +385,6 @@ fn a_repeated_offer_is_acknowledged_again_and_never_started_twice() {
     );
     assert!(live.printed(run, job, "done"));
     assert_eq!(live.attempt(job), Some(offer.attempt), "no second attempt");
-    // Started once, finished once, one container.
     assert_eq!(
         (probe.notices_of("Started("), probe.notices_of("Finished(")),
         (1, 1),
