@@ -1,4 +1,4 @@
-//! `sentinel service-account create|allow|grant|grants|revoke` (O06): a
+//! `sentinel service-account create|allow|grant|grants|revoke`: a
 //! tenant administrator creates service principals, allows them
 //! repositories, and issues grants whose refresh token goes to stdout once
 //! (metadata to stderr) for `sentinel auth login --grant-file`.

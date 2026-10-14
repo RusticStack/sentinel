@@ -5,7 +5,7 @@
 //! `ping` with it proves the controller admits it; the old key is retired from
 //! the allow list afterwards. A controller's new key is staged and served by a
 //! second helper beside the active one until workers have its address; commit
-//! then switches. Revocation is unchanged: every allow-list line names its
+//! then switches. Revocation: every allow-list line names its
 //! worker, so revoking a rotating worker withdraws both of its keys.
 //!
 //! Authority is the operating system's, as for every admin command: the
