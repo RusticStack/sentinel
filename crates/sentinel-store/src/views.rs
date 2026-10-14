@@ -53,6 +53,9 @@ pub struct Member {
     pub service: bool,
     pub role: Role,
     pub active: bool,
+    /// When GitHub last confirmed the membership; `Some` means it is derived
+    /// from GitHub (a GitHub-backed tenant), `None` that it is managed here.
+    pub synced: Option<UnixMillis>,
 }
 
 /// A tenant's members in user-id order, a keyset page after `after`.
@@ -68,7 +71,7 @@ pub fn members(
     auth::require_tenant_admin(conn, principal, tenant)?;
     let limit = page(limit)?;
     let mut stmt = conn.prepare_cached(
-        "SELECT m.user_id, u.display_name, c.username, u.kind, m.role, u.active
+        "SELECT m.user_id, u.display_name, c.username, u.kind, m.role, u.active, m.synced_ms
          FROM memberships m JOIN users u ON u.id = m.user_id
          LEFT JOIN local_credentials c ON c.user_id = m.user_id
          WHERE m.tenant_id = ?1 AND m.user_id > ?2
@@ -83,10 +86,11 @@ pub fn members(
             r.get::<_, i64>(3)?,
             r.get::<_, u8>(4)?,
             r.get::<_, bool>(5)?,
+            r.get::<_, Option<i64>>(6)?,
         ))
     })?;
     rows.map(|row| {
-        let (user, display_name, username, kind, code, active) = row?;
+        let (user, display_name, username, kind, code, active, synced) = row?;
         Ok(Member {
             user: user_id(user)?,
             display_name,
@@ -94,6 +98,7 @@ pub fn members(
             service: kind == 1,
             role: role(code)?,
             active,
+            synced: synced.map(UnixMillis),
         })
     })
     .collect()

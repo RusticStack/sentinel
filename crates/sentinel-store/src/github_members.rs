@@ -1006,6 +1006,12 @@ const fn role_label(role: Role) -> &'static str {
     }
 }
 
+/// Drop a pair whose target no longer exists (the tenant stopped being
+/// GitHub-backed), fenced by the sequence the pass read.
+pub fn finish(tx: &Transaction<'_>, check: &Check) -> Result<()> {
+    drop_row(tx, check)
+}
+
 fn drop_row(tx: &Transaction<'_>, check: &Check) -> Result<()> {
     tx.execute(
         "DELETE FROM github_member_checks WHERE tenant_id = ?1 AND user_id = ?2 AND seq = ?3",
