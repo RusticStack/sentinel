@@ -312,7 +312,7 @@ fn camp(
     Camp {
         user,
         username,
-        bearer: bearer_of(store, user, P::ALL),
+        bearer: bearer_of(store, user, P::REPOSITORY.union(P::TENANT_ADMIN)),
         org,
         home,
         target: Target {

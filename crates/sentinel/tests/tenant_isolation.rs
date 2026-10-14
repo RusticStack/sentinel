@@ -168,8 +168,17 @@ fn deployment() -> Deployment {
 }
 
 fn api(d: &Deployment, token: &PathBuf, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_sentinel"))
-        .arg("api")
+    // `--json` belongs to `sentinel api`, before the subcommand.
+    let (json, args) = match args.split_last() {
+        Some((&"--json", rest)) => (true, rest),
+        _ => (false, args),
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sentinel"));
+    command.arg("api");
+    if json {
+        command.arg("--json");
+    }
+    command
         .arg("--server")
         .arg(&d.base)
         .arg("--token-file")
