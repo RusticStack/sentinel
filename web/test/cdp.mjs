@@ -115,6 +115,11 @@ export class Page {
   async goto(url) {
     await this.send("Page.navigate", { url });
     await this.waitFor("document.readyState === 'complete'", 15000);
+    // A Nuxt page is server-rendered before it is interactive: a form filled
+    // and submitted in that gap is submitted natively (a reload, nothing
+    // signed in), so wait until Vue has taken the page over. Other pages
+    // have no such app and pass at once.
+    await this.waitFor("(() => { try { return typeof window.useNuxtApp !== 'function' || !window.useNuxtApp().isHydrating; } catch (e) { return true; } })()", 15000, "hydration");
   }
   /// Evaluate an expression (awaiting a promise) and return its value.
   async eval(expression) {
