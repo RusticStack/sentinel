@@ -18,7 +18,6 @@ const { data: security, error: loadError, refresh, status } = await useAsyncData
 const github = computed(() => security.value?.identities.find((i) => i.provider === "github") ?? null);
 const isoDate = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
-// --- Authenticator app -------------------------------------------------
 
 const reissuing = ref(false);
 
@@ -44,7 +43,6 @@ async function reissue() {
   }
 }
 
-// --- Password ----------------------------------------------------------
 
 const current = ref("");
 const fresh = ref("");
@@ -90,7 +88,6 @@ async function changePassword() {
   }
 }
 
-// --- Email address -----------------------------------------------------
 // A new address is a claim until its link is opened; the confirmed one stays
 // the account's until then. Every answer reads the same whether or not
 // another account holds the address.
@@ -144,7 +141,6 @@ async function resendEmail() {
   }
 }
 
-// --- Linked identities -------------------------------------------------
 
 const linking = ref(false);
 async function linkGitHub() {
