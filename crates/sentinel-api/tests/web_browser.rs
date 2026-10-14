@@ -139,6 +139,23 @@ fn deployment(bulk_mib: usize, relayed: bool) -> (Arc<Fixture>, Web, String, Str
         web_addr.clone()
     };
     let f = Arc::new(Fixture::serving(bulk_mib, Some(origin.clone())));
+    // The fixture admits Pat under approval-required and leaves that policy
+    // set; the browser test's sign-up page expects the default, invitation
+    // only. Pat's application stays pending.
+    f.store
+        .writer()
+        .write(|tx| {
+            sentinel_store::registration::set_policy(
+                tx,
+                sentinel_store::auth::Authority::HostLocal,
+                sentinel_store::registration::DeploymentPolicy {
+                    registration: sentinel_store::registration::Registration::InviteOnly,
+                    ..sentinel_store::registration::policy(tx)?
+                },
+                sentinel_core::UnixMillis::now(),
+            )
+        })
+        .unwrap();
     let web = Web::start(port, &f.base);
     (f, web, web_addr, origin)
 }
