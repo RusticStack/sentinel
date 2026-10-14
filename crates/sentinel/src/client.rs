@@ -1,4 +1,4 @@
-//! The shared API client every networked command uses (O04–O06): where the
+//! The shared API client every networked command uses: where the
 //! controller is, which credential to present, how answers become output,
 //! and how failures become stable exit codes.
 //!
@@ -453,7 +453,7 @@ fn agent() -> ureq::Agent {
 
 /// The agent for object downloads: no whole-call bound, but every wait for
 /// the network — connecting, sending, the answer's head, each read of the
-/// body — is bounded by [`TRANSFER_IDLE`] (P09C-1). ureq bounds phases, and
+/// body — is bounded by [`TRANSFER_IDLE`]. ureq bounds phases, and
 /// its body phase covers the whole body, so the per-read bound is imposed
 /// on the transport itself ([`idle::Idle`]).
 fn transfer_agent() -> ureq::Agent {
@@ -1244,7 +1244,7 @@ mod tests {
 
     #[test]
     fn a_named_backoff_is_capped_and_jittered_without_overflow() {
-        // P09C-10: `retry_after_ms` near u64::MAX used to overflow.
+        // `retry_after_ms` near u64::MAX must not overflow.
         let cap = MAX_SERVER_BACKOFF.as_millis() as u64;
         for (named, low, high) in [
             (0, 0, 0),

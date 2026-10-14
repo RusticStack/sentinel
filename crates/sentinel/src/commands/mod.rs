@@ -1,4 +1,4 @@
-//! The O05 command surface over [`crate::client::Client`]: `run`, `status`,
+//! The command surface over [`crate::client::Client`]: `run`, `status`,
 //! `wait`, `job`, `log`, `workers`, `queue`, `artifact` and `cache`, with
 //! text, JSON and NDJSON output, pagination and the stable exit codes
 //! (`docs/cli.md`).
@@ -255,7 +255,7 @@ pub enum CacheCommand {
     Show { attempt: String },
 }
 
-/// One of the O05 top-level commands, as parsed.
+/// One of the top-level commands, as parsed.
 #[derive(Debug)]
 pub enum Invocation {
     Run(RunArgs),
@@ -704,7 +704,7 @@ mod tests {
         };
         let wait = busy_backoff(&limited).unwrap();
         assert!(wait >= Duration::from_millis(1000) && wait <= Duration::from_millis(1501));
-        // P09C-10: a huge named back-off is capped, and never overflows.
+        // A huge named back-off is capped, and never overflows.
         let huge = Error {
             api: Some(serde_json::json!({
                 "code": "rate_limited", "details": { "retry_after_ms": u64::MAX }

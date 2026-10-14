@@ -191,7 +191,7 @@ pub(super) fn wait(
             }
         }
         // `finished` must describe the view it came with: a server that
-        // judged `finished` and read the view separately (before P09C-7) can
+        // judged `finished` and read the view separately can
         // pair it with a view taken after a rerun made the run live again.
         // Such an answer is progress, not the end.
         if answer["finished"] == true && settled(&answer["run"]) {

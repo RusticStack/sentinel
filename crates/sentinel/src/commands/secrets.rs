@@ -185,7 +185,7 @@ fn validate_name(name: &str) -> Result<(), Error> {
 
 /// The store's rule for repository names: 1–128 bytes, no control
 /// characters. Anything else (`/` included, as in `RusticStack/app`) is
-/// percent-encoded into the query rather than refused (P10C-6).
+/// percent-encoded into the query rather than refused.
 fn validate_repo(repo: &str) -> Result<(), Error> {
     if repo.is_empty() || repo.len() > MAX_REPO_NAME || repo.chars().any(char::is_control) {
         return Err(Error::usage(
@@ -850,7 +850,7 @@ const PROMPT_MULTILINE: &str =
 
 /// The hidden prompt's line editor, fed raw terminal input. It never
 /// truncates: a value longer than the limit, a paste with more than one
-/// line, Ctrl+C and Ctrl+D on an empty line are refusals (P10C-3). The
+/// line, Ctrl+C and Ctrl+D on an empty line are refusals. The
 /// buffer is wiped when dropped.
 struct PromptLine {
     bytes: WipeBytes,
@@ -1172,7 +1172,7 @@ mod tests {
         assert!(read_stdin(&big[..]).is_err());
     }
 
-    /// P10C-3: the prompt strips one terminator (LF, CR or CRLF), edits
+    /// The prompt strips one terminator (LF, CR or CRLF), edits
     /// with backspace, and refuses instead of truncating: more than the
     /// limit, a second pasted line, Ctrl+C, and Ctrl+D or Enter on an
     /// empty line.
@@ -1275,7 +1275,7 @@ mod tests {
         }
     }
 
-    /// P10C-8: a file that inherits a broader ACL (the temp directory's
+    /// A file that inherits a broader ACL (the temp directory's
     /// Administrators and others) is refused with the `icacls` fix.
     #[cfg(windows)]
     #[test]
