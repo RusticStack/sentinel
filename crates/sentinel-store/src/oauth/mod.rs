@@ -843,7 +843,6 @@ const AUTHENTICATE_ACCESS: &str = "SELECT g.id, g.user_id, a.scopes & g.scopes, 
      AND g.revoked_ms IS NULL AND g.expires_ms > ?2 AND g.audience = 1 AND g.resource = ?3
      AND u.active = 1 AND (u.kind = 0 OR u.service_tenant_id = g.tenant_id)";
 
-/// Existing API clients may omit `resource`; an MCP grant never may.
 pub(crate) fn resource_matches(granted: Audience, requested: Option<Audience>) -> bool {
     match requested {
         Some(requested) => granted == requested,
