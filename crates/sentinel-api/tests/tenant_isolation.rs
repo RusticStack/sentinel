@@ -854,7 +854,10 @@ fn nothing_the_other_camp_tried_changed_anything() {
             t.org, t.repo
         ));
         assert_eq!(
-            (secret["version"].as_u64(), secret["active"].as_bool()),
+            (
+                secret["secret"]["version"].as_u64(),
+                secret["secret"]["active"].as_bool()
+            ),
             (Some(1), Some(true)),
             "{secret}"
         );
@@ -1003,7 +1006,7 @@ fn a_credential_narrowed_to_one_tenant_cannot_reach_the_same_peoples_other_tenan
             Grant {
                 user: d.owner.user,
                 name: "narrow",
-                permissions: P::ALL,
+                permissions: P::REPOSITORY.union(P::TENANT_ADMIN),
                 tenant: Some(tenant),
                 repo: None,
                 lifetime_ms: 600_000,
@@ -1262,8 +1265,7 @@ fn an_invitation_link_presented_by_two_people_at_once_joins_exactly_one() {
             )
         })
         .unwrap();
-    let mut token = String::new();
-    link.secret.expose(&mut token);
+    let token = sentinel_auth::token::format(&link.secret);
     let barrier = Barrier::new(2);
     let answers: Vec<(u16, Value)> = thread::scope(|scope| {
         let handles: Vec<_> = sessions
