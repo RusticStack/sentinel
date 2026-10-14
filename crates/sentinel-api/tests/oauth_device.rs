@@ -1,4 +1,4 @@
-//! O03 over real HTTP on loopback: `POST /oauth/device_authorization`, the
+//! The device flow over real HTTP on loopback: `POST /oauth/device_authorization`, the
 //! device-code grant with `authorization_pending`, `slow_down` (and a
 //! growing interval), `access_denied`, `expired_token` and single
 //! redemption, the pending cap, and the `/device` approval page with its
@@ -721,7 +721,7 @@ fn five_wrong_user_codes_lock_the_account_out_for_a_while() {
     assert_no_device_code(&[&posted, &locked, &locked_post], &s.device_code);
 }
 
-/// P09-1: narrowing an approval to a tenant or repository the account has
+/// Narrowing an approval to a tenant or repository the account has
 /// no part in answers exactly as narrowing to one that does not exist, and
 /// each such answer counts toward the wrong-code lockout.
 #[test]
