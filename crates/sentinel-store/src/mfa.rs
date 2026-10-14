@@ -1,16 +1,4 @@
-//! Second factors and step-up.
-//!
-//! A session proves who you are. Step-up proves you are *still there*, just
-//! now, with something more than a cookie — before a change that would alter
-//! who can authenticate at all: the registration policy, the super-admin set,
-//! account suspension, or the second factor itself.
-//!
-//! The stamp is freshness, not authority: `Authority::require_privileged` still
-//! checks platform administration live, in the same transaction as the change.
-//!
-//! Verification (Argon2 for a password proof) never runs inside the writer, and
-//! the TOTP seed is sealed under a key outside the database, so a stolen
-//! `metadata.sqlite` yields nothing that can mint codes.
+//! Argon2 and TOTP checks run outside the writer; the seed is sealed under a key outside the database.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sentinel_auth::{
@@ -26,21 +14,11 @@ use crate::{
     local_auth::{Event, Policy, Session, audit},
 };
 
-/// Failed step-ups a session may accumulate before it is revoked. Small: a
-/// six-digit code has three valid values per window, and a session that keeps
-/// guessing is not the person it was issued to.
 pub const MAX_STEP_UP_FAILURES: i64 = 5;
 
-/// Consecutive wrong second-factor proofs (TOTP or recovery code) an
-/// account may accumulate across all of its sessions before every proof is
-/// refused for [`FACTOR_LOCKOUT_MS`]. The per-session limit alone does not
-/// hold anyone who knows the password: they sign in again and keep guessing.
 pub const MAX_FACTOR_FAILURES: i64 = 10;
-/// How long an account's second factor stays refused after the limit.
 pub const FACTOR_LOCKOUT_MS: i64 = 15 * 60 * 1000;
 
-/// Context binding a sealed seed to the account it belongs to, so a seed row
-/// copied onto another account cannot be opened.
 pub(crate) fn context(user: UserId) -> Vec<u8> {
     let mut context = Vec::with_capacity(21);
     context.extend_from_slice(b"totp:");
@@ -48,17 +26,10 @@ pub(crate) fn context(user: UserId) -> Vec<u8> {
     context
 }
 
-/// What an enrolling person needs, shown exactly once. The URI carries the
-/// seed, so it is never logged, stored in the clear, or shown again.
 pub struct Enrollment {
     pub provisioning_uri: String,
 }
 
-/// Begin enrolling a second factor for the session's own account.
-///
-/// Writes an unconfirmed registration. Until a code proves the app holds the
-/// same seed, nothing about authentication changes — an abandoned enrollment
-/// cannot lock anybody out.
 pub fn begin_enrollment(
     store: &Store,
     key: &Key,
@@ -70,10 +41,6 @@ pub fn begin_enrollment(
     begin(store, key, session.user, issuer, account, now)
 }
 
-/// Host-local enrollment start: the operator who holds the database file sits
-/// at the host with the person's device, so no session is involved. The same
-/// unconfirmed registration as [`begin_enrollment`]; the confirmation is
-/// audited as host-local ([`confirm_enrollment_host_local`]).
 pub fn begin_enrollment_host_local(
     store: &Store,
     key: &Key,
@@ -104,17 +71,12 @@ fn begin(
             .query_row([user.as_bytes()], |r| r.get(0))
             .optional()?;
         match confirmed {
-            // Replacing a confirmed factor goes through `disable` under
-            // step-up, so a stolen session cannot quietly re-enroll its own.
             Some(Some(_)) => return Err(Error::Conflict),
-            // An unconfirmed attempt is simply superseded.
             Some(None) => {
                 tx.execute("DELETE FROM mfa_totp WHERE user_id = ?1", [user.as_bytes()])?;
             }
             None => {}
         }
-        // The insert trigger refuses anything but an active human account:
-        // an unknown or suspended one is the same `NotFound` as no account.
         tx.execute(
             "INSERT INTO mfa_totp(user_id, sealed_seed, created_ms) VALUES (?1, ?2, ?3)",
             params![user.as_bytes(), sealed, now.0],
@@ -132,10 +94,6 @@ fn begin(
     Ok(Enrollment { provisioning_uri })
 }
 
-/// Confirm enrollment with a code from the app, and issue the recovery codes.
-///
-/// Returns them once; only their digests are kept. Confirming also stamps the
-/// session as stepped up, because proving a factor is exactly what step-up is.
 pub fn confirm_enrollment(
     store: &Store,
     key: &Key,
@@ -154,10 +112,6 @@ pub fn confirm_enrollment(
     )
 }
 
-/// Host-local confirmation of an enrollment [`begin_enrollment_host_local`]
-/// started: the code proves the app holds the seed, the recovery codes are
-/// returned once, and the audit row is marked host-local. No session is
-/// stamped; the person signs in and steps up with the new factor.
 pub fn confirm_enrollment_host_local(
     store: &Store,
     key: &Key,
@@ -186,11 +140,6 @@ fn confirm(
     })?;
     let seed = open_seed(key, user, &sealed)?;
     let Some(step) = mfa::check(&seed, code, unix_seconds(now)) else {
-        // A pending enrollment has no expiry, and a correct code yields the
-        // recovery codes, so a cookie guessing at it is counted like any
-        // wrong proof: five revoke the session. The factor itself is not yet
-        // confirmed, so its account lockout is not involved. Host-local has
-        // no session to count against.
         if let Some(digest) = stamp_session {
             refuse(store, digest, user, now)?;
         }
@@ -251,25 +200,17 @@ fn replace_recovery_codes(
     Ok(())
 }
 
-/// TOTP counts whole seconds; the rest of the store counts milliseconds.
 fn unix_seconds(now: UnixMillis) -> u64 {
     now.0.max(0) as u64 / 1000
 }
 
-/// How a person proves they are still present.
 pub enum Proof<'a> {
-    /// A code from the enrolled authenticator app.
     Totp(&'a str),
-    /// One of the recovery codes, spent on use.
     Recovery(&'a str),
-    /// The account's own password. Accepted **only** when no second factor is
-    /// enrolled: otherwise it would let the weaker proof stand in for the
-    /// stronger one, which is the opposite of stepping up.
+    /// Accepted only when no second factor is enrolled, so a weaker proof cannot stand in for a stronger one.
     Password(&'a [u8]),
 }
 
-/// Prove presence and stamp the session. Returns `false` for a wrong proof
-/// rather than an error: the caller renders one response either way.
 pub fn step_up(
     store: &Store,
     key: &Key,
@@ -298,9 +239,7 @@ pub fn step_up(
             let Some(step) = mfa::check(&seed, code, unix_seconds(now)) else {
                 return refuse(store, digest.0, user, now);
             };
-            // RFC 6238 leaves one-use to the caller: a step already accepted is
-            // refused, so a code seen over a shoulder is worthless. A locked
-            // factor accepts nothing, a correct code included.
+            // A step already accepted is refused, so a code seen over a shoulder cannot be replayed.
             store.writer().write(move |tx| {
                 let fresh = tx.execute(
                     "UPDATE mfa_totp SET last_step = ?2 WHERE user_id = ?1
@@ -315,7 +254,6 @@ pub fn step_up(
                 return refuse(store, digest.0, user, now);
             };
             store.writer().write(move |tx| {
-                // A locked factor spends no recovery code.
                 let spent = tx.execute(
                     "UPDATE mfa_recovery_codes SET used_ms = ?3
                      WHERE code_digest = ?1 AND user_id = ?2 AND used_ms IS NULL
@@ -337,7 +275,6 @@ pub fn step_up(
             })?
         }
         Proof::Password(password_bytes) => {
-            // Only when there is no stronger factor to present.
             let stored: Option<(bool, Option<String>)> = store.read(|conn| {
                 conn.prepare_cached(
                     "SELECT EXISTS(SELECT 1 FROM mfa_totp
@@ -364,7 +301,6 @@ pub fn step_up(
     }
     store.writer().write(move |tx| {
         stamp(tx, digest.0, now)?;
-        // A proof that succeeds is what the account count was guarding.
         tx.prepare_cached("UPDATE mfa_totp SET failures = 0 WHERE user_id = ?1 AND failures != 0")?
             .execute([user.as_bytes()])?;
         audit(tx, Event::SteppedUp, Some(user), Some(user), false, None)
@@ -372,8 +308,6 @@ pub fn step_up(
     Ok(true)
 }
 
-/// Clear an account's second-factor lockout and count. Host-local, like
-/// password recovery (which calls it too).
 pub(crate) fn clear_factor_lockout(tx: &rusqlite::Transaction<'_>, user: UserId) -> Result<()> {
     tx.prepare_cached(
         "UPDATE mfa_totp SET failures = 0, locked_until_ms = 0
@@ -383,20 +317,10 @@ pub(crate) fn clear_factor_lockout(tx: &rusqlite::Transaction<'_>, user: UserId)
     Ok(())
 }
 
-/// Record a failed proof against the session that presented it, and against
-/// the account's second factor. Past the session limit the session is
-/// revoked outright: the cookie holder has shown they cannot prove presence,
-/// so the cookie stops proving identity too. Past the account limit the
-/// factor refuses every proof for [`FACTOR_LOCKOUT_MS`] and every session of
-/// the account is revoked, so signing in again buys no further guesses.
 fn refuse(store: &Store, digest: [u8; 32], user: UserId, now: UnixMillis) -> Result<bool> {
     refuse_counting(store, digest, user, now, true)
 }
 
-/// A wrong *password* presented to change the password: it counts against
-/// the session (five revoke it) and is audited, but not against the second
-/// factor. The password is not the factor, and counting it would let a stolen
-/// cookie lock the account's real factor out.
 pub(crate) fn refuse_password(
     store: &Store,
     digest: [u8; 32],
@@ -422,9 +346,6 @@ fn refuse_counting(
             .query_row([digest], |r| r.get(0))
             .optional()?;
         audit(tx, Event::StepUpFailed, Some(user), Some(user), false, None)?;
-        // The account count. While locked it stands still (the window is not
-        // extended by further tries); an ended window restarts it at this
-        // failure, as the login lockout does. No row: no factor enrolled.
         let until = now.0.saturating_add(FACTOR_LOCKOUT_MS);
         let locked_now: Option<bool> = tx
             .prepare_cached(
@@ -479,8 +400,6 @@ fn refuse_counting(
     })
 }
 
-/// Stamp presence and forgive earlier failures: the proof just given is what
-/// the counter was protecting.
 fn stamp(tx: &rusqlite::Transaction<'_>, digest: [u8; 32], now: UnixMillis) -> Result<()> {
     tx.execute(
         "UPDATE sessions SET stepped_up_ms = ?2, step_up_failures = 0
@@ -491,7 +410,6 @@ fn stamp(tx: &rusqlite::Transaction<'_>, digest: [u8; 32], now: UnixMillis) -> R
     Ok(())
 }
 
-/// Whether an account has a confirmed second factor.
 pub fn enrolled(conn: &Connection, user: UserId) -> Result<bool> {
     let enrolled: bool = conn
         .prepare_cached(
@@ -501,8 +419,6 @@ pub fn enrolled(conn: &Connection, user: UserId) -> Result<bool> {
     Ok(enrolled)
 }
 
-/// Whether an enrollment was begun and not yet confirmed. The URI is never
-/// shown twice, so a client can only offer to start over (which supersedes it).
 pub fn enrollment_pending(conn: &Connection, user: UserId) -> Result<bool> {
     let pending: bool = conn
         .prepare_cached(
@@ -512,8 +428,6 @@ pub fn enrollment_pending(conn: &Connection, user: UserId) -> Result<bool> {
     Ok(pending)
 }
 
-/// How many unspent recovery codes remain. Metadata: the codes themselves are
-/// unrecoverable once shown.
 pub fn recovery_codes_remaining(conn: &Connection, user: UserId) -> Result<usize> {
     let remaining: i64 = conn
         .prepare_cached(
@@ -523,8 +437,6 @@ pub fn recovery_codes_remaining(conn: &Connection, user: UserId) -> Result<usize
     Ok(remaining.max(0) as usize)
 }
 
-/// Issue a fresh set of recovery codes, invalidating the previous set. Requires
-/// a stepped-up session: the codes are a second factor in their own right.
 pub fn reissue_recovery_codes(
     store: &Store,
     session: &Session,
@@ -535,8 +447,6 @@ pub fn reissue_recovery_codes(
     reissue(store, session.user, false, now)
 }
 
-/// Host-local reissue, for an operator at the host: the old set is replaced
-/// and the new one shown once. Audited as host-local.
 pub fn reissue_recovery_codes_host_local(
     store: &Store,
     user: UserId,
@@ -570,17 +480,12 @@ fn reissue(
     Ok(codes)
 }
 
-/// Remove the account's own second factor. Requires a stepped-up session, so a
-/// stolen cookie alone cannot strip the protection it is meant to defeat.
 pub fn disable(store: &Store, session: &Session, policy: Policy, now: UnixMillis) -> Result<()> {
     session.require_step_up(policy, now)?;
     let user = session.user;
     store.writer().write(move |tx| remove(tx, user, None, now))
 }
 
-/// Host-local removal, for an operator whose authenticator device is gone and
-/// whose recovery codes are spent. Authorized by access to the database file,
-/// like bootstrap and password recovery, and audited as host-local.
 pub fn disable_host_local(store: &Store, user: UserId, now: UnixMillis) -> Result<()> {
     store
         .writer()
@@ -601,8 +506,6 @@ fn remove(
         "DELETE FROM mfa_recovery_codes WHERE user_id = ?1",
         [user.as_bytes()],
     )?;
-    // Every session loses its step-up freshness: removing a factor must not
-    // leave a window in which privileged changes are still available.
     tx.execute(
         "UPDATE sessions SET revoked_ms = ?2 WHERE user_id = ?1 AND revoked_ms IS NULL",
         params![user.as_bytes(), now.0],

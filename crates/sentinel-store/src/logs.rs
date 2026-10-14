@@ -1,35 +1,4 @@
-//! The controller's durable log store: one directory per
-//! attempt under `<logs>/<run>/<job>/<attempt>/` holding an append stream
-//! split into segments.
-//!
-//! **Layout.** `seg-NNNNNN` files hold `sentinel-protocol::logs` records;
-//! the last one is the active segment, sealed at `SEGMENT_BYTES` and
-//! compressed on a background thread to `seg-NNNNNN.z` (`SNLZ` | format
-//! u16 | codec u8 | zlib stream). `index` (`SNLI` | format u16) holds
-//! sparse 41-byte entries — checkpoints by sequence, step, line count,
-//! wall time and cumulative bytes, written on a segment's first frame, on
-//! every step change and every `INDEX_EVERY` frames, plus a seal record
-//! per closed segment. `end` (`SNLE` | format u16 | last_seq u64 | gaps)
-//! is the completeness boundary, renamed into place and fsynced only
-//! after the end record is durable in the stream.
-//!
-//! **Acknowledgement boundary.** A frame is acknowledged to the worker
-//! only after it has been written *and* `fdatasync`ed; the worker may
-//! then drop it from its spool. A repeat of a stored sequence (a resend
-//! after a lost session) is accepted and not written twice. A sequence
-//! jump records a hole rather than refusing the stream, and a resent
-//! frame landing inside a hole is stored as a fill; holes merge into the
-//! end marker's gap list, so a gap can never be silent. A `last_seq`
-//! beyond what was stored is a truncation — the unwritten tail joins the
-//! gaps. Readers report incomplete logs and declared gaps.
-//!
-//! **Recovery.** Index entries past the last fsynced seal record are
-//! provisional; on open they are discarded and regenerated while the
-//! uncovered segments are decoded. A torn record tail on the active
-//! segment is cut, a torn index tail is cut at the last complete entry,
-//! and a missing index is rebuilt by decoding every segment. The `end`
-//! marker is written atomically, so it is complete or absent — an end
-//! record in the stream without the marker is repaired on open.
+//! A frame is acknowledged only after it is written and fdatasynced; the worker may then drop it from its spool.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -51,20 +20,13 @@ use sentinel_protocol::logs::{FRAME_HEADER_BYTES, Frame, Record, RecordError};
 use crate::{Error, Result, objects::sync_dir, space::Admission};
 
 pub const LOGS_DIR: &str = "logs";
-/// Bytes an attempt's log may hold; past it frames are refused as
-/// `Publication` failures rather than filling the disk.
 pub const MAX_LOG_BYTES: u64 = 256 << 20;
-/// Segment size target: the active segment seals once the next record
-/// would pass this, then compresses in the background.
 const SEGMENT_BYTES: u64 = 4 << 20;
-/// Frames between index checkpoints inside a segment.
 const INDEX_EVERY: u32 = 64;
-/// Gap ranges a stored end marker may carry; wider hole sets coalesce.
 const MAX_MARKER_GAPS: usize = 1024;
 
 const INDEX_MAGIC: &[u8; 4] = b"SNLI";
 const INDEX_FORMAT: u16 = 1;
-/// `kind u8 | seq u64 | seg u32 | step u32 | line u64 | bytes u64 | ms i64`.
 const INDEX_ENTRY_BYTES: usize = 41;
 const KIND_CHECKPOINT: u8 = 1;
 const KIND_SEAL: u8 = 2;
@@ -76,25 +38,14 @@ const CODEC_ZLIB: u8 = 1;
 const END_MAGIC: &[u8; 4] = b"SNLE";
 const END_FORMAT: u16 = 1;
 
-/// The persisted hole list of a live log: `SNLH` | format u16 | count u32 |
-/// `(from u64, to u64)` per hole, replaced atomically on every change.
 const HOLES_MAGIC: &[u8; 4] = b"SNLH";
 const HOLES_FORMAT: u16 = 1;
-/// Distinct holes one live log may track; a stream fragmenting past this is
-/// refused rather than growing the list (and its sidecar) without bound.
 pub const MAX_HOLES: usize = 4096;
 
-/// Writers held at once before the least recently used idle one closes.
 pub const MAX_OPEN_WRITERS: usize = 1024;
-/// A writer unused this long is closed by the maintenance pass
-/// ([`LogStore::close_idle`]); the next frame reopens it from disk.
 pub const WRITER_IDLE: Duration = Duration::from_secs(600);
-/// Attempt directories one retention pass examines at most.
 const SWEEP_BUDGET: u32 = 4096;
 
-/// One sparse index entry. A checkpoint describes the frame that caused
-/// it (`line`/`bytes` are cumulative *including* that frame); a seal
-/// records a closed segment's totals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Entry {
     kind: u8,
@@ -139,51 +90,26 @@ impl Entry {
     }
 }
 
-/// An attempt's open writer: the active segment, its index and the
-/// running totals the size cap and checkpoints need.
 struct Open {
     dir: PathBuf,
-    /// The segment being appended to.
     seg: u32,
-    /// The active segment's writer; `None` until its first frame.
     file: Option<File>,
-    /// Bytes in the active segment.
     seg_len: u64,
-    /// The index file, appended provisionally and fsynced at seals.
     index: File,
-    /// Bytes of the index that decode cleanly — the valid tail. A failed
-    /// append is truncated back here so later entries never sit behind a
-    /// torn one; `u64::MAX` means the index is abandoned until reopen
-    /// rebuilds it.
     index_len: u64,
-    /// Highest stored sequence.
     last_seq: u64,
-    /// Ranges below `last_seq` that were never stored, sorted and
-    /// disjoint; fills shrink it. Mirrored in the `holes` sidecar.
     holes: Vec<(u64, u64)>,
-    /// `holes` changed and the sidecar does not have it yet.
     holes_dirty: bool,
-    /// Stored record bytes across all segments: the size cap.
     len: u64,
-    /// Stored newline count across all segments.
     lines: u64,
-    /// The last stored frame's step.
     step: u32,
-    /// Frames advancing the frontier since the last checkpoint.
     since_index: u32,
-    /// The active segment has its first checkpoint.
     seg_checkpointed: bool,
-    /// The end marker's `last_seq` once the log is finished.
     ended: Option<u64>,
-    /// Encode scratch, reused across frames.
     scratch: Vec<u8>,
-    /// The active segment holds frames written but not yet `fsync`ed
-    /// (`append_deferred`). Nothing is acknowledged over them until
-    /// [`sync_dirty`] has made them durable.
     dirty: bool,
 }
 
-/// Sealed segments waiting to be compressed, drained by one thread.
 struct Compressor {
     queue: Mutex<VecDeque<PathBuf>>,
     wake: Condvar,
@@ -213,57 +139,29 @@ impl Compressor {
                     queue = self.wake.wait(queue).unwrap_or_else(|p| p.into_inner());
                 }
             };
-            // A failure leaves the plain segment readable; it is retried
-            // on the next process start, never in a loop here.
             let _ = compress(&path);
         }
     }
 }
 
-/// One attempt's writer slot. The map lock only finds the slot; the frame's
-/// write and `fdatasync` happen under the slot's own lock, so attempts never
-/// wait on each other's flushes. `None` until first use (and after a failed
-/// open), so opening an attempt — a bounded decode — also runs outside the
-/// map lock.
 struct Slot {
     open: Mutex<Option<Open>>,
-    /// Store-clock milliseconds of the last use; the idle sweep reads it
-    /// without taking `open`.
     touched: AtomicU64,
 }
 
-/// Append and read attempt logs. Cheap to share: a short map lock to find
-/// an attempt's writer, a lock per writer for its I/O, one directory per
-/// attempt, one compressor thread.
 pub struct LogStore {
     dir: PathBuf,
     open: Mutex<HashMap<AttemptId, Arc<Slot>>>,
-    /// The store clock `Slot::touched` counts from.
     epoch: Instant,
-    /// Writers held at once; past it the least recently used idle one
-    /// closes. Two descriptors and one frame of scratch each.
     max_open: usize,
-    /// Bumped after every stored frame and finish; `wait=1` log polls park
-    /// on it instead of re-reading on a timer.
     changes: Arc<LogChanges>,
     compressor: Arc<Compressor>,
     worker: Mutex<Option<JoinHandle<()>>>,
-    /// Disk admission; unset admits every append.
     admission: OnceLock<Arc<Admission>>,
-    /// Stored bytes one attempt's log may occupy — `MAX_LOG_BYTES`
-    /// normally, lower under `open_with_limit`.
     max_bytes: u64,
-    /// Where the bounded retention sweep resumes: the last run directory
-    /// it finished.
     sweep_cursor: Mutex<Option<String>>,
 }
 
-/// The log-append notifier: a generation bumped after every durable append
-/// or finish, and a parking place for long polls. Same no-lost-wakeup
-/// discipline as the store's commit notifier: a waiter registers before it
-/// reads the generation under the lock; the bumper reads `waiters` after
-/// bumping and notifies under the lock. The append path pays one atomic
-/// add and one load; the lock only while someone is parked.
 #[derive(Debug, Default)]
 pub struct LogChanges {
     generation: AtomicU64,
@@ -277,8 +175,6 @@ impl LogChanges {
         self.generation.load(Ordering::SeqCst)
     }
 
-    /// Park until the generation differs from `seen` or `deadline` passes;
-    /// returns the generation then.
     pub fn wait_past(&self, seen: u64, deadline: Instant) -> u64 {
         self.waiters.fetch_add(1, Ordering::SeqCst);
         let mut guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -312,12 +208,9 @@ impl LogChanges {
     }
 }
 
-/// What appending a frame did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Appended {
-    /// Written and synced; acknowledge through this sequence.
     Stored { through: u64 },
-    /// Already stored (a resend); acknowledge through the stored sequence.
     Duplicate { through: u64 },
 }
 
@@ -326,14 +219,10 @@ impl LogStore {
         Self::open_with_limit(dir, MAX_LOG_BYTES)
     }
 
-    /// `open` under a caller-set per-attempt byte cap — the same contract
-    /// where the default is too generous (and for tests).
     pub fn open_with_limit(dir: impl Into<PathBuf>, max_bytes: u64) -> Result<LogStore> {
         let dir = dir.into();
         if !dir.is_dir() {
             fs::create_dir_all(&dir)?;
-            // Every acknowledgement below promises a path through this
-            // directory: its own entry must be durable first.
             if let Some(parent) = dir.parent() {
                 sync_dir(parent)?;
             }
@@ -365,21 +254,16 @@ impl LogStore {
         Ok(store)
     }
 
-    /// Hold at most `max` writers open at once (at least one); the default
-    /// is [`MAX_OPEN_WRITERS`].
     #[must_use]
     pub fn with_max_open(mut self, max: usize) -> LogStore {
         self.max_open = max.max(1);
         self
     }
 
-    /// Install the disk admission gate; appends refuse once free space
-    /// falls below the log floor. Set once at startup.
     pub fn set_admission(&self, admission: Arc<Admission>) {
         let _ = self.admission.set(admission);
     }
 
-    /// The append notifier long polls park on.
     pub fn changes(&self) -> &LogChanges {
         &self.changes
     }
@@ -388,33 +272,21 @@ impl LogStore {
         self.epoch.elapsed().as_millis() as u64
     }
 
-    /// Writers held open right now.
     pub fn open_writers(&self) -> usize {
         self.open.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
-    /// Close writers unused for `idle`: attempts whose worker was lost,
-    /// whose lease lapsed or whose flush timed out never send `LogEnd`, and
-    /// their writers must not hold descriptors and scratch for the life of
-    /// the process — or keep their logs out of retention. A later frame or
-    /// end reopens the log from disk, which folds its state back exactly.
-    /// A writer some request is using right now is never closed. Returns how
-    /// many closed.
     pub fn close_idle(&self, idle: Duration) -> usize {
         let cutoff = self.now_ms().saturating_sub(idle.as_millis() as u64);
         let mut map = self.open.lock().unwrap_or_else(|p| p.into_inner());
         let before = map.len();
-        // Only the map holds an idle slot's Arc: nobody can be inside it,
-        // and nobody can clone it without this lock.
+        // Only the map holds an idle slot's Arc, so nobody can be inside it or clone it without the map lock.
         map.retain(|_, slot| {
             Arc::strong_count(slot) > 1 || slot.touched.load(Ordering::Relaxed) > cutoff
         });
         before - map.len()
     }
 
-    /// The attempt's slot, created on first use. At the cap, the least
-    /// recently used slot nobody is using closes first — so descriptors and
-    /// memory stay bounded however many attempts never finish.
     fn slot(&self, attempt: AttemptId) -> Arc<Slot> {
         let now = self.now_ms();
         let mut map = self.open.lock().unwrap_or_else(|p| p.into_inner());
@@ -440,9 +312,6 @@ impl LogStore {
         slot
     }
 
-    /// Run `f` on the attempt's writer, opening (or reopening after a
-    /// restart or an idle close) it from disk first. Only this attempt's
-    /// lock is held while `f` does its I/O.
     fn with_writer<T>(
         &self,
         run: RunId,
@@ -457,23 +326,11 @@ impl LogStore {
         }
         let result = f(guard.as_mut().expect("opened above"));
         if matches!(result, Err(Error::Io(_))) {
-            // A write or sync that failed may have left part of a record in
-            // the segment, and the writer's offsets no longer match the
-            // file. Drop it: the next call reopens from disk, which cuts the
-            // torn record — a later frame is never written behind one.
             *guard = None;
         }
         result
     }
 
-    /// Remove attempt directories and legacy flat logs that `gone` says
-    /// retention expired or that no attempt names (the deadline lives in
-    /// the database; this sweep only deletes files the database already
-    /// released, and leftovers of a crash between the two). Open writers are
-    /// never touched. One pass removes at most `limit` and looks at run
-    /// directories in name order until it has examined [`SWEEP_BUDGET`]
-    /// attempt directories, then the next pass resumes after the last run it
-    /// finished — so a pass is bounded however many logs are retained.
     pub fn sweep_dirs(&self, limit: u32, mut gone: impl FnMut(AttemptId) -> bool) -> Result<u32> {
         if limit == 0 {
             return Ok(0);
@@ -504,7 +361,6 @@ impl LogStore {
         let mut stopped = None;
         for (name, run_path) in runs {
             if run_path.is_file() {
-                // Legacy flat log: `logs/<attempt>.log`.
                 seen += 1;
                 if let Some(id) = name
                     .strip_suffix(".log")
@@ -534,7 +390,6 @@ impl LogStore {
                             swept += 1;
                         }
                     }
-                    // Prune an emptied job directory; a live one refuses.
                     let _ = fs::remove_dir(job.path());
                 }
                 let _ = fs::remove_dir(&run_path);
@@ -548,8 +403,6 @@ impl LogStore {
         Ok(swept)
     }
 
-    /// Bytes an attempt's log occupies on disk now: its segment directory's
-    /// files, or a legacy flat log. Absent counts as zero.
     pub fn stored_bytes(&self, run: RunId, job: JobId, attempt: AttemptId) -> u64 {
         let dir = self.attempt_dir(run, job, attempt);
         match fs::read_dir(&dir) {
@@ -563,9 +416,6 @@ impl LogStore {
         }
     }
 
-    /// Delete an attempt's log whose retention the database has expired:
-    /// its writer is dropped first, so a late frame cannot recreate files
-    /// the row no longer accounts for (the scope check refuses it anyway).
     pub fn remove(&self, run: RunId, job: JobId, attempt: AttemptId) -> Result<()> {
         self.forget(attempt);
         let dir = self.attempt_dir(run, job, attempt);
@@ -587,7 +437,6 @@ impl LogStore {
         }
     }
 
-    /// The attempt's segment directory.
     pub fn attempt_dir(&self, run: RunId, job: JobId, attempt: AttemptId) -> PathBuf {
         self.dir
             .join(run.to_string())
@@ -595,10 +444,6 @@ impl LogStore {
             .join(attempt.to_string())
     }
 
-    /// Whether the attempt's `end` marker is durable — the in-memory writer
-    /// knows once `finish` has synced it; a writer this process never opened
-    /// is answered by the marker file itself. A rename the writer has not yet
-    /// synced still answers `false`: the marker is not yet the durable truth.
     pub fn has_end(&self, run: RunId, job: JobId, attempt: AttemptId) -> bool {
         let slot = self
             .open
@@ -614,11 +459,6 @@ impl LogStore {
         end_marker(&self.attempt_dir(run, job, attempt)).is_some()
     }
 
-    /// Close the writer of an attempt that was released without its log
-    /// ending (lease expiry, abandonment, a lost worker): its file handles
-    /// and scratch go now instead of at process exit, and the log becomes
-    /// eligible for retention. A later retransmission simply reopens it
-    /// from disk. Returns whether a writer was open.
     pub fn forget(&self, attempt: AttemptId) -> bool {
         self.open
             .lock()
@@ -627,9 +467,6 @@ impl LogStore {
             .is_some()
     }
 
-    /// Recover interrupted compressions: plain segments whose successor
-    /// or `.z` twin exists, or whose log ended, are sealed — queue them
-    /// and drop stale compressor temporaries.
     fn sweep(&self) {
         let Ok(runs) = fs::read_dir(&self.dir) else {
             return;
@@ -655,8 +492,6 @@ impl LogStore {
                     let top = segs.keys().next_back().copied();
                     for (n, compressed) in &segs {
                         if *compressed {
-                            // Compression finished; the plain twin is a
-                            // crash leftover of the rename/delete pair.
                             let plain = seg_path(&dir, *n, false);
                             if plain.exists() {
                                 let _ = fs::remove_file(plain);
@@ -670,16 +505,8 @@ impl LogStore {
         }
     }
 
-    /// Open (or reopen after a restart or an idle close) the attempt's
-    /// writer, folding the segments the index does not cover back into
-    /// memory and the persisted holes of the ones it does.
     fn open_attempt(&self, run: RunId, job: JobId, attempt: AttemptId) -> Result<Open> {
         let dir = self.attempt_dir(run, job, attempt);
-        // The attempt directory and its job and run parents: make each
-        // entry durable before any frame in it is acknowledged. Also when
-        // the directories already exist — a process that crashed between
-        // creating and syncing them left entries a power cut can still take.
-        // Once per writer open; syncing an unchanged directory is cheap.
         fs::create_dir_all(&dir)?;
         let mut at = dir.as_path();
         while let Some(parent) = at.parent() {
@@ -725,8 +552,6 @@ impl LogStore {
             dirty: false,
         };
         if w.ended.is_some() {
-            // Complete on disk: nothing to fold. Leftover plain segments
-            // from an interrupted finish still get compressed.
             for (n, compressed) in &segs {
                 if !compressed {
                     self.compressor.enqueue(seg_path(&w.dir, *n, false));
@@ -734,13 +559,8 @@ impl LogStore {
             }
             return Ok(w);
         }
-        // Holes are known only from jumps; those inside sealed segments are
-        // not re-decoded, so the persisted list is their record. Holes of
-        // the uncovered segments are re-derived below either way.
         let persisted = read_holes(&w.dir);
         w.holes.clone_from(&persisted);
-        // Durable base: totals through the last seal record. Entries past
-        // it are provisional and regenerated from the segments they name.
         let index_bytes = fs::read(&index_path).unwrap_or_default();
         let valid = index_bytes.len() >= 6
             && index_bytes[..4] == *INDEX_MAGIC
@@ -765,7 +585,6 @@ impl LogStore {
         if valid {
             w.index.set_len(keep as u64)?;
         } else {
-            // Missing or undecodable header: rebuild from the stream.
             w.index.set_len(0)?;
             w.index.write_all(INDEX_MAGIC)?;
             w.index.write_all(&INDEX_FORMAT.to_le_bytes())?;
@@ -784,8 +603,6 @@ impl LogStore {
                 }
                 continue;
             }
-            // Decode the segments the index does not cover, folding state
-            // and re-emitting their checkpoints.
             let mut decoder = seg_decoder(&w.dir, n, compressed)?;
             let mut advanced = false;
             let mut ended = false;
@@ -807,8 +624,6 @@ impl LogStore {
             let complete_len = decoder.complete;
             let path = seg_path(&w.dir, n, false);
             if ended || top != Some(n) {
-                // A sealed segment: emit its seal record, cut a possible
-                // torn tail, and queue it for compression.
                 seal_entry(&w, n, &mut pending);
                 OpenOptions::new()
                     .write(true)
@@ -816,16 +631,13 @@ impl LogStore {
                     .set_len(complete_len)?;
                 queue.push(path);
             } else {
-                // The active segment: cut the torn tail and keep writing.
                 let mut file = OpenOptions::new()
                     .write(true)
                     .read(true)
                     .truncate(false)
                     .open(&path)?;
                 file.set_len(complete_len)?;
-                // Frames a dropped writer left unsynced are acknowledged as
-                // duplicates when the worker resends them: make everything
-                // that survived durable before this writer serves anyone.
+                // Unsynced frames from a dropped writer are acked as duplicates on resend; sync survivors before serving.
                 file.sync_data()?;
                 file.seek(SeekFrom::End(0))?;
                 w.seg = n;
@@ -834,10 +646,6 @@ impl LogStore {
                 w.file = Some(file);
             }
         }
-        // A finished log whose marker was lost: `finish` sealed the end
-        // record into what is then the last segment, and a covered top
-        // means nothing followed that seal. Decode it once — bounded by
-        // SEGMENT_BYTES — so a lost marker cannot silently reopen the log.
         if w.ended.is_none()
             && let Some(n) = top
             && covered == Some(n)
@@ -850,18 +658,12 @@ impl LogStore {
                 }
             }
         }
-        // Holes re-derived from uncovered segments reach the sidecar at the
-        // latest with the seal that covers them.
         w.holes.retain(|(from, _)| *from <= w.last_seq);
         w.holes_dirty = w.holes != persisted;
         if let Some(last) = w.ended {
-            // The stream carries the end record but the marker never
-            // landed: repair it so completeness is one file read.
             write_end_marker(&w.dir, last, &merged_gaps(&w, last, &[]))?;
             w.file = None;
         } else if w.file.is_none() {
-            // Everything on disk is sealed (or nothing exists): appends
-            // continue in a fresh segment after the last one seen.
             w.seg = top.map_or(0, |n| n + 1);
         }
         if !pending.is_empty() {
@@ -874,11 +676,6 @@ impl LogStore {
         Ok(w)
     }
 
-    /// Append one frame: synced, then acknowledged. A jump records a hole;
-    /// a frame landing in a hole is stored as a fill. Either change to the
-    /// hole list is persisted (the `holes` sidecar) before the frame is
-    /// acknowledged, so a restart cannot forget a hole whose frames sit in
-    /// a sealed segment.
     pub fn append(
         &self,
         run: RunId,
@@ -893,11 +690,6 @@ impl LogStore {
         Ok(appended)
     }
 
-    /// [`append`](Self::append) without the per-frame `fsync`, for a caller
-    /// that acknowledges in windows: `Stored` frames are written and
-    /// readable but **not durable** — the caller must [`sync`](Self::sync)
-    /// the attempt before acknowledging any of them. `Duplicate` is always
-    /// durable (a dirty segment is synced before it is answered).
     pub fn append_deferred(
         &self,
         run: RunId,
@@ -912,12 +704,6 @@ impl LogStore {
         Ok(appended)
     }
 
-    /// Make every frame `append_deferred` stored for the attempt durable.
-    /// An attempt with no open writer is an error, never a quiet success:
-    /// its unsynced frames (if any) are unaccounted for, so nothing may be
-    /// acknowledged over them — the caller's peer resends, and the reopened
-    /// writer syncs what survived before answering. A failed sync drops the
-    /// writer so the next call reopens from disk.
     pub fn sync(&self, attempt: AttemptId) -> Result<()> {
         let slot = self
             .open
@@ -941,21 +727,14 @@ impl LogStore {
         if w.ended.is_some() {
             return Err(Error::Conflict);
         }
-        // A hole change whose sidecar write failed is persisted before
-        // anything is acknowledged again — a resend of that very frame
-        // would otherwise be acked as a duplicate over a forgettable hole.
+        // Persist hole changes before any resend is acked as a duplicate over a forgettable hole.
         persist_holes(w)?;
         if frame.seq <= w.last_seq && !in_hole(&w.holes, frame.seq) {
-            // The earlier copy may still be unsynced: the duplicate answer
-            // is an acknowledgement.
             sync_dirty(w)?;
             return Ok(Appended::Duplicate {
                 through: w.last_seq,
             });
         }
-        // Evidence keeps its reserve: a frame refused for space is reported
-        // as refused, never silently dropped — and never recorded as a hole,
-        // since nothing was stored.
         if let Some(a) = self.admission.get()
             && !a.headroom()
         {
@@ -989,25 +768,19 @@ impl LogStore {
                     .truncate(false)
                     .open(seg_path(&w.dir, w.seg, false))?,
             );
-            // The acknowledgement below promises the frame survives a power
-            // loss; a segment file whose directory entry is not durable yet
-            // could vanish with it. Once per segment.
+            // A segment's directory entry must be durable before a frame in it is acknowledged.
             sync_dir(&w.dir)?;
         }
         let file = w.file.as_mut().expect("opened above");
         let written = file.write_all(&w.scratch).and_then(|()| {
             if durable {
-                // Covers every deferred frame written before this one too.
                 file.sync_data()
             } else {
                 Ok(())
             }
         });
         if let Err(e) = written {
-            // Never acknowledged, so never kept: a short write (ENOSPC, a
-            // file size limit) or a failed sync must not leave a record for
-            // the next frame to land behind. `with_writer` reopens from
-            // disk, which cuts whatever this could not.
+            // Never acknowledged: truncate back so a later frame never lands behind a torn record.
             let _ = file.set_len(w.seg_len);
             return Err(e.into());
         }
@@ -1017,13 +790,9 @@ impl LogStore {
         w.len += record_len;
         w.lines += frame.bytes.iter().filter(|b| **b == b'\n').count() as u64;
         if frame.seq <= w.last_seq {
-            // A fill: stored but never indexed — index entries must stay
-            // in sequence order for the tail seek.
             fill_hole(&mut w.holes, frame.seq);
             w.holes_dirty = true;
         } else {
-            // The hole opens only once the frame past it is durable: a
-            // failed write leaves neither.
             if frame.seq > w.last_seq + 1 {
                 add_hole(&mut w.holes, w.last_seq + 1, frame.seq - 1);
                 w.holes_dirty = true;
@@ -1043,11 +812,7 @@ impl LogStore {
         })
     }
 
-    /// Close the active segment: seal record into the index, fsync, and
-    /// queue the segment for compression.
     fn seal(&self, w: &mut Open) -> Result<()> {
-        // The seal record makes the segment "covered": its holes must be in
-        // the sidecar before reopen stops re-deriving them.
         persist_holes(w)?;
         let mut entry = Vec::with_capacity(INDEX_ENTRY_BYTES);
         seal_entry(w, w.seg, &mut entry);
@@ -1065,9 +830,6 @@ impl LogStore {
         Ok(())
     }
 
-    /// The worker will send nothing more: write the end record, seal the
-    /// segment, and land the marker. `last_seq` may pass what was stored —
-    /// the unwritten tail is declared as a gap, never refused.
     pub fn finish(
         &self,
         run: RunId,
@@ -1114,9 +876,6 @@ impl LogStore {
             w.ended = Some(last_seq);
             Ok(true)
         })?;
-        // A finished log needs no writer: its descriptors and scratch go
-        // now. Anyone still holding the slot sees `ended`; a later open
-        // reads the marker.
         self.open
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1127,9 +886,6 @@ impl LogStore {
         Ok(())
     }
 
-    /// Read records with sequence greater than `after`, at most `limit`
-    /// frames, filtered to `step` when given. The sparse index seeks the
-    /// segment holding `after`, so a tail never re-reads the head.
     pub fn tail(
         &self,
         run: RunId,
@@ -1142,7 +898,6 @@ impl LogStore {
         read_dir(&self.attempt_dir(run, job, attempt), after, limit, step)
     }
 
-    /// [`LogStore::tail`] under a [`Page`] ([`read_page`]).
     pub fn tail_page(
         &self,
         run: RunId,
@@ -1155,8 +910,6 @@ impl LogStore {
         read_page(&self.attempt_dir(run, job, attempt), after, page, step)
     }
 
-    /// [`read_newest`] for an attempt: the newest frames of `step` (of the
-    /// whole log without one) under `page`.
     pub fn newest_page(
         &self,
         run: RunId,
@@ -1168,10 +921,6 @@ impl LogStore {
         read_newest(&self.attempt_dir(run, job, attempt), page, step)
     }
 
-    /// The attempt's stored frontier as its live writer knows it — no
-    /// I/O: `None` when this process holds no writer for it. A long poll
-    /// compares it across wakes so appends to *other* attempts cost it
-    /// nothing.
     pub fn frontier(&self, attempt: AttemptId) -> Option<(u64, bool)> {
         let slot = self
             .open
@@ -1183,13 +932,6 @@ impl LogStore {
         guard.as_ref().map(|w| (w.last_seq, w.ended.is_some()))
     }
 
-    /// The newest sequence stored for an attempt. Open writers answer from
-    /// memory and completed logs from the durable end marker. A log with
-    /// neither (its worker was lost, or the controller restarted) is read
-    /// from its final sparse-index entry forward: frames past the last
-    /// checkpoint are decoded — at most `INDEX_EVERY - 1` frames in the
-    /// segment that entry names and any later one — so the answer is the
-    /// real end, not the checkpoint.
     pub fn last_seq(&self, run: RunId, job: JobId, attempt: AttemptId) -> Result<Option<u64>> {
         if let Some((seq, _)) = self.frontier(attempt) {
             return Ok(Some(seq));
@@ -1247,9 +989,6 @@ impl LogStore {
         Ok(Some(last))
     }
 
-    /// Legacy flat logs (`<logs>/<attempt>.log`), kept readable. The read
-    /// streams in bounded chunks like a segmented log; the step filter
-    /// applies during the scan so foreign frames never eat the limit.
     pub fn tail_legacy(
         &self,
         attempt: AttemptId,
@@ -1260,9 +999,6 @@ impl LogStore {
         read_tail(&self.dir.join(format!("{attempt}.log")), after, limit, step)
     }
 
-    /// [`LogStore::tail_legacy`] with a returned-bytes bound: frames stop
-    /// collecting at `page.bytes` (with `next_after`) while the scan still
-    /// streams to the end marker for completeness.
     pub fn tail_legacy_page(
         &self,
         attempt: AttemptId,
@@ -1273,18 +1009,6 @@ impl LogStore {
         read_tail_page(&self.dir.join(format!("{attempt}.log")), after, page, step)
     }
 
-    /// Find a literal byte string in an attempt's log: frames with
-    /// sequence greater than `after`, scanned in stored order with one
-    /// precompiled `memmem` finder and no per-frame allocation beyond the
-    /// decode, until `limit` matching lines or `budget` payload bytes.
-    ///
-    /// A literal split across consecutive frames of the same step and
-    /// stream is found exactly once, reported with the frame it ends in,
-    /// whatever separates the pieces: a frame boundary, a sealed segment,
-    /// other frames, or the cut between two requests. The scanner keeps
-    /// each stream's open line as its last `needle.len() - 1` bytes; a
-    /// request that stops early returns that state as [`Search::carry`],
-    /// and the next request resumes from it ([`SearchQuery::carry`]).
     pub fn search(
         &self,
         run: RunId,
@@ -1296,7 +1020,6 @@ impl LogStore {
         search_dir(&self.attempt_dir(run, job, attempt), &mut scanner)
     }
 
-    /// [`LogStore::search`] over a legacy flat log.
     pub fn search_legacy(&self, attempt: AttemptId, query: SearchQuery<'_>) -> Result<Search> {
         let mut scanner = Scanner::new(query)?;
         let file = match File::open(self.dir.join(format!("{attempt}.log"))) {
@@ -1328,83 +1051,47 @@ impl LogStore {
     }
 }
 
-/// Bytes of frame payload one search request scans at most; a bigger log
-/// takes several requests, each resuming at the previous `next_after`.
 pub const SEARCH_SCAN_BYTES: u64 = 4 << 20;
-/// A match's reported text: its line, cut to this many bytes around it.
 pub const MATCH_TEXT_BYTES: usize = 512;
-/// Longest needle whose split across two frames is still found; the API
-/// accepts no longer one. A longer needle matches within one frame only.
 pub const MAX_NEEDLE: usize = 256;
-/// Context kept before a match inside one frame.
 const LEAD: usize = MATCH_TEXT_BYTES / 4;
-/// Look-behind one stream keeps: the most of a split needle that can
-/// precede the frame it ends in.
 const LOOK_BEHIND: usize = MAX_NEEDLE - 1;
 
-/// The resume state's layout (hex on the wire): `format u8 | after u64 |
-/// needle length u16`, then per stream `flags u8 | step u32 | len u8 |
-/// len bytes`. Fixed upper size, so parsing never allocates.
 const CARRY_FORMAT: u8 = 1;
 const CARRY_OPEN: u8 = 1;
 const CARRY_REPORTED: u8 = 2;
 const CARRY_STREAM_BYTES: usize = 1 + 4 + 1;
 const CARRY_MAX_BYTES: usize = 1 + 8 + 2 + 2 * (CARRY_STREAM_BYTES + LOOK_BEHIND);
-/// Longest [`Search::carry`] text.
 pub const MAX_CARRY_TEXT: usize = 2 * CARRY_MAX_BYTES;
 
-/// A bounded literal search: frames past `after`, at most `limit` matching
-/// lines and `budget` scanned payload bytes (normally [`SEARCH_SCAN_BYTES`]).
 #[derive(Clone, Copy, Debug)]
 pub struct SearchQuery<'a> {
     pub needle: &'a [u8],
     pub after: u64,
     pub limit: usize,
     pub budget: u64,
-    /// The [`Search::carry`] returned with `after` as `next_after`, for the
-    /// same needle. Without it the state is rebuilt from the frames before
-    /// `after` in the segment that holds it (the sealed one when `after`
-    /// ends it), which misses a line begun earlier than that.
     pub carry: Option<&'a str>,
 }
 
-/// One matching line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Match {
     pub seq: u64,
     pub step: u32,
     pub stream: sentinel_protocol::logs::Stream,
-    /// The line holding the match (without its newline), at most
-    /// [`MATCH_TEXT_BYTES`] around the first match on it. A match that
-    /// began in an earlier frame starts at the match.
     pub text: Vec<u8>,
 }
 
-/// What one bounded search found. `next_after` is set when the scan
-/// stopped at the match limit or the byte budget before the end of what is
-/// stored: pass it as the next request's `after`, with `carry`. `complete`
-/// means the log is finished and the scan reached its end, so nothing more
-/// can match. Neither set: the scan reached the end of a log still being
-/// written.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Search {
     pub matches: Vec<Match>,
     pub next_after: Option<u64>,
-    /// Set with `next_after`: each stream's open line (at most
-    /// `needle.len() - 1` bytes) and whether it was already reported, as
-    /// at most [`MAX_CARRY_TEXT`] hex characters.
     pub carry: Option<String>,
     pub complete: bool,
 }
 
-/// One stream's open line: the latest frame of the stream ended inside a
-/// line of `step`. Only its last `needle.len() - 1` bytes are kept — all a
-/// needle split across the next frame boundary can need. Fixed-size: no
-/// allocation per frame.
 #[derive(Clone, Copy)]
 struct Carry {
     open: bool,
-    /// The open line already produced a match (one report per line).
     reported: bool,
     step: u32,
     len: usize,
@@ -1420,12 +1107,10 @@ impl Carry {
         buf: [0; LOOK_BEHIND],
     };
 
-    /// Whether `frame` continues this open line.
     const fn continues(&self, frame: &Frame) -> bool {
         self.open && self.step == frame.step
     }
 
-    /// Start a new line (or none) from `bytes`, which hold no newline.
     fn restart(&mut self, bytes: &[u8], reported: bool, keep: usize) {
         self.open = !bytes.is_empty();
         self.reported = reported;
@@ -1433,8 +1118,6 @@ impl Carry {
         self.extend(bytes, keep);
     }
 
-    /// Continue the open line with `bytes` (no newline), keeping its last
-    /// `keep` bytes.
     fn extend(&mut self, bytes: &[u8], keep: usize) {
         if bytes.len() >= keep {
             self.buf[..keep].copy_from_slice(&bytes[bytes.len() - keep..]);
@@ -1448,26 +1131,17 @@ impl Carry {
     }
 }
 
-/// The per-request scan state: the finder is built once per request.
 struct Scanner<'n> {
     finder: memchr::memmem::Finder<'n>,
     needle: usize,
-    /// Look-behind kept per stream: `needle - 1`, at most [`LOOK_BEHIND`].
     keep: usize,
-    /// Frames at or below this were scanned by earlier requests; it moves
-    /// with the scan and becomes `next_after`.
     after: u64,
     limit: usize,
     budget: u64,
     scanned: u64,
-    /// The carry came with the query: frames at or below `after` are
-    /// skipped outright instead of replayed.
     seeded: bool,
-    /// A frame past the query's `after` was scanned; earlier frames at or
-    /// below the moving `after` are late fills, not replay.
     started: bool,
     out: Search,
-    /// Indexed by stream (stdout, stderr).
     carry: [Carry; 2],
 }
 
@@ -1495,12 +1169,6 @@ impl<'n> Scanner<'n> {
         Ok(scanner)
     }
 
-    /// Scan one decoded frame; `false` once the request's bound is reached
-    /// (with `next_after` and `carry` set). Both bounds are checked between
-    /// frames, so one frame's matching lines are never split across
-    /// responses, and a frame that would take the scan past `budget` waits
-    /// for the next request (the first frame always scans, so every request
-    /// progresses).
     fn frame(&mut self, frame: &Frame) -> bool {
         if frame.seq <= self.after {
             if !self.seeded && !self.started {
@@ -1519,7 +1187,6 @@ impl<'n> Scanner<'n> {
         self.started = true;
         let bytes = &frame.bytes[..];
         let mut from = self.across(frame);
-        // Whether the frame's last (unfinished) line has been reported.
         let mut tail_reported = from > bytes.len();
         while from < bytes.len()
             && let Some(at) = self.finder.find(&bytes[from..])
@@ -1536,7 +1203,6 @@ impl<'n> Scanner<'n> {
                 text: bytes[start..end].to_vec(),
             });
             tail_reported = line_end == bytes.len();
-            // One report per line; the next match starts past it.
             from = line_end + 1;
         }
         self.remember(frame, tail_reported);
@@ -1545,18 +1211,12 @@ impl<'n> Scanner<'n> {
         true
     }
 
-    /// The scan ended without a bound stopping it.
     fn finish(&mut self, complete: bool) -> Search {
         let mut out = std::mem::take(&mut self.out);
         out.complete = complete && out.next_after.is_none();
         out
     }
 
-    /// Where the in-frame scan starts, after handling the stream's open
-    /// line: past the frame's first line when that line continues one
-    /// already reported, or when a match starting in the carried bytes ends
-    /// in it (reported here); 0 otherwise. Past the frame's end means its
-    /// last line is reported.
     fn across(&mut self, frame: &Frame) -> usize {
         let carry = &self.carry[frame.stream as usize - 1];
         if !carry.continues(frame) {
@@ -1584,9 +1244,6 @@ impl<'n> Scanner<'n> {
         first_line + 1
     }
 
-    /// Where a match that starts in `carry`'s bytes and ends in `line` (the
-    /// next frame's first line) starts, if there is one. Each side is
-    /// shorter than the needle, so any match in their join crosses.
     fn cross(&self, carry: &Carry, line: &[u8]) -> Option<usize> {
         let n = self.needle;
         if !(2..=MAX_NEEDLE).contains(&n) || carry.len == 0 || line.is_empty() {
@@ -1599,9 +1256,6 @@ impl<'n> Scanner<'n> {
         self.finder.find(&window[..carry.len + head])
     }
 
-    /// Rebuild the carry from a frame an earlier request scanned: only
-    /// whether its last line holds a match matters, so only that line is
-    /// searched. Equivalent to [`Scanner::frame`]'s state change.
     fn replay(&mut self, frame: &Frame) {
         let bytes = &frame.bytes[..];
         let carry = &self.carry[frame.stream as usize - 1];
@@ -1617,7 +1271,6 @@ impl<'n> Scanner<'n> {
         self.remember(frame, tail_reported);
     }
 
-    /// Keep the frame's unfinished last line as its stream's carry.
     fn remember(&mut self, frame: &Frame, tail_reported: bool) {
         let keep = self.keep;
         let carry = &mut self.carry[frame.stream as usize - 1];
@@ -1633,7 +1286,6 @@ impl<'n> Scanner<'n> {
         carry.step = frame.step;
     }
 
-    /// The resume state after the last scanned frame, as hex.
     fn carry_text(&self) -> String {
         let mut raw = [0u8; CARRY_MAX_BYTES];
         raw[0] = CARRY_FORMAT;
@@ -1658,8 +1310,6 @@ impl<'n> Scanner<'n> {
         text
     }
 
-    /// Load the resume state [`Scanner::carry_text`] wrote; `None` when it
-    /// is malformed or belongs to another `after` or needle length.
     fn seed(&mut self, text: &[u8]) -> Option<()> {
         if !text.len().is_multiple_of(2) || text.len() > MAX_CARRY_TEXT {
             return None;
@@ -1710,7 +1360,6 @@ const fn hex_digit(c: u8) -> Option<u8> {
     }
 }
 
-/// `end`, moved back over a `\r` that ends the line.
 fn trim_cr(bytes: &[u8], start: usize, end: usize) -> usize {
     if end > start && bytes[end - 1] == b'\r' {
         end - 1
@@ -1719,11 +1368,6 @@ fn trim_cr(bytes: &[u8], start: usize, end: usize) -> usize {
     }
 }
 
-/// Where a scan for frames past `after` starts: the last checkpoint at or
-/// before `after` names the segment (a seal entry's coverage ends with its
-/// segment, so the next frames sit in the one after). With `replay`, a
-/// seal names its own segment instead, so the frames that end at `after`
-/// are decoded too.
 fn seek_start(entries: &[Entry], after: u64, replay: bool) -> u32 {
     let mut start = 0u32;
     for entry in entries {
@@ -1784,29 +1428,18 @@ pub struct Tail {
     pub frames: Vec<Frame>,
     pub complete: bool,
     pub gaps: Vec<(u64, u64)>,
-    /// Set when a [`Page`] bound cut the read before the end of what is
-    /// stored: the next read's `after`. `None` means the read reached the
-    /// end (of the log, or of what is stored so far).
     pub next_after: Option<u64>,
-    /// With a step filter: the log has moved on to a later step, so no new
-    /// frame of this step will arrive — a long poll has nothing to wait for.
     pub step_done: bool,
 }
 
-/// The bounds of one tail read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Page {
-    /// Frames returned at most.
     pub limit: usize,
-    /// Payload bytes returned at most (the first frame always fits).
     pub bytes: u64,
-    /// Payload bytes decoded past `after` at most, filtered-out frames
-    /// included.
     pub scan: u64,
 }
 
 impl Page {
-    /// Only a frame count: the unbounded reader's shape.
     #[must_use]
     pub const fn frames(limit: usize) -> Page {
         Page {
@@ -1817,13 +1450,7 @@ impl Page {
     }
 }
 
-/// Payload bytes one API log page returns at most. JSON escaping can grow
-/// a byte to six (``), so a page stays under ~6 MiB on the wire —
-/// inside common client body limits (the CLI's is 10 MiB).
 pub const PAGE_BYTES: u64 = 1 << 20;
-/// Payload bytes one API log page decodes past `after` at most: a step
-/// filter over a long log answers with `next_after` instead of decoding to
-/// the end in one request.
 pub const PAGE_SCAN_BYTES: u64 = 16 << 20;
 
 fn seg_path(dir: &Path, seg: u32, compressed: bool) -> PathBuf {
@@ -1834,8 +1461,6 @@ fn seg_path(dir: &Path, seg: u32, compressed: bool) -> PathBuf {
     }
 }
 
-/// Segment number → compressed, in order. A `.z` twin wins over the
-/// plain name: the rename was durable, the plain file is a leftover.
 fn segs(dir: &Path) -> Result<BTreeMap<u32, bool>> {
     let mut out = BTreeMap::new();
     let read = match fs::read_dir(dir) {
@@ -1876,7 +1501,6 @@ fn sweep_tmp(dir: &Path) {
     }
 }
 
-/// The durable completeness marker, decoded: `(last_seq, gaps)`.
 fn end_marker(dir: &Path) -> Option<(u64, Vec<(u64, u64)>)> {
     let bytes = fs::read(dir.join("end")).ok()?;
     if bytes.len() < 18
@@ -1902,8 +1526,6 @@ fn end_marker(dir: &Path) -> Option<(u64, Vec<(u64, u64)>)> {
     Some((last_seq, gaps))
 }
 
-/// The marker lands atomically: tmp, fsync, rename, fsync the directory.
-/// Either complete or absent — never torn.
 fn write_end_marker(dir: &Path, last_seq: u64, gaps: &[(u64, u64)]) -> Result<()> {
     let mut bytes = Vec::with_capacity(18 + gaps.len() * 16);
     bytes.extend_from_slice(END_MAGIC);
@@ -1924,7 +1546,6 @@ fn write_end_marker(dir: &Path, last_seq: u64, gaps: &[(u64, u64)]) -> Result<()
     sync_dir(dir)
 }
 
-/// `fsync` the active segment when deferred frames are waiting on it.
 fn sync_dirty(w: &mut Open) -> Result<()> {
     if w.dirty {
         if let Some(file) = w.file.as_ref() {
@@ -1935,11 +1556,6 @@ fn sync_dirty(w: &mut Open) -> Result<()> {
     Ok(())
 }
 
-/// Land the hole list if it changed: tmp, fsync, rename, directory
-/// fsync — complete or absent, like the end marker. Rare: only jumps and
-/// fills change it. Deferred frames are made durable first: a fill is
-/// recorded as closed only once its frame is on disk, or a power loss
-/// would leave a closed hole whose resend is answered as a duplicate.
 fn persist_holes(w: &mut Open) -> Result<()> {
     if !w.holes_dirty {
         return Ok(());
@@ -1965,8 +1581,6 @@ fn persist_holes(w: &mut Open) -> Result<()> {
     Ok(())
 }
 
-/// The persisted hole list; absent or undecodable reads as none (a log
-/// written before the sidecar existed re-derives what it can).
 fn read_holes(dir: &Path) -> Vec<(u64, u64)> {
     let Ok(bytes) = fs::read(dir.join("holes")) else {
         return Vec::new();
@@ -1990,8 +1604,6 @@ fn read_holes(dir: &Path) -> Vec<(u64, u64)> {
     holes
 }
 
-/// Index file → entries, validated against magic and format. A torn tail
-/// entry is ignored; a bad header reports corrupt so the caller rebuilds.
 fn read_index(bytes: &[u8]) -> Result<Vec<Entry>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
@@ -2011,10 +1623,6 @@ fn read_index(bytes: &[u8]) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
-/// Append `bytes` at the index's valid tail. A failed write is truncated
-/// back to `index_len` so a torn entry never hides what follows it; if the
-/// repair itself fails the index is abandoned — readers decode less, never
-/// more, and reopen rebuilds from the segments.
 fn index_write(w: &mut Open, bytes: &[u8]) -> Result<()> {
     if w.index_len == u64::MAX {
         return Err(Error::Corrupt("log index"));
@@ -2035,10 +1643,6 @@ fn index_write(w: &mut Open, bytes: &[u8]) -> Result<()> {
     }
 }
 
-/// A checkpoint for the frame just stored (`line`/`bytes` include it).
-/// Provisional: no fsync here — the seal fsyncs; a crash loses these and
-/// the reopen regenerates them from the segment itself. A failed write
-/// leaves no torn entry (`index_write` repairs), so ignoring it is safe.
 fn checkpoint(w: &mut Open) {
     let entry = Entry {
         kind: KIND_CHECKPOINT,
@@ -2052,7 +1656,6 @@ fn checkpoint(w: &mut Open) {
     let _ = index_write(w, &entry.bytes());
 }
 
-/// A seal record for segment `seg` carrying the running totals.
 fn seal_entry(w: &Open, seg: u32, out: &mut Vec<u8>) {
     let entry = Entry {
         kind: KIND_SEAL,
@@ -2066,11 +1669,6 @@ fn seal_entry(w: &Open, seg: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&entry.bytes());
 }
 
-/// Fold one decoded frame into reopen state: hole bookkeeping, counters,
-/// and the same checkpoint triggers a live append would hit (`first` is
-/// true until this segment's first frontier-advancing frame). Returns
-/// whether the frame advanced the frontier; fills are folded into the
-/// counters but never indexed, keeping entries in sequence order.
 fn fold_frame(w: &mut Open, seg: u32, frame: &Frame, first: bool, pending: &mut Vec<u8>) -> bool {
     if frame.seq > w.last_seq + 1 {
         add_hole(&mut w.holes, w.last_seq + 1, frame.seq - 1);
@@ -2115,8 +1713,6 @@ fn in_hole(holes: &[(u64, u64)], seq: u64) -> bool {
         .is_ok()
 }
 
-/// Insert `(from..=to)` into the sorted disjoint hole list, merging
-/// overlaps and neighbours.
 fn add_hole(holes: &mut Vec<(u64, u64)>, from: u64, to: u64) {
     if from > to {
         return;
@@ -2131,7 +1727,6 @@ fn add_hole(holes: &mut Vec<(u64, u64)>, from: u64, to: u64) {
     holes.splice(start..end, [(from, to)]);
 }
 
-/// A stored frame arrived for a declared hole: narrow or drop it.
 fn fill_hole(holes: &mut Vec<(u64, u64)>, seq: u64) {
     let Ok(at) = holes.binary_search_by(|(from, to)| {
         if seq < *from {
@@ -2163,11 +1758,6 @@ fn merge_holes(holes: &mut Vec<(u64, u64)>, gaps: &[(u64, u64)]) {
     }
 }
 
-/// The marker's gap list: observed holes, the worker's declaration, and
-/// the never-stored tail when `last_seq` passes what was written. A
-/// pathological stream producing more than `MAX_MARKER_GAPS` ranges
-/// coalesces the closest pair repeatedly; the widened range may span
-/// delivered sequences, but the frames themselves stay readable.
 fn merged_gaps(w: &Open, last_seq: u64, declared: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let mut gaps = w.holes.clone();
     merge_holes(&mut gaps, declared);
@@ -2187,14 +1777,10 @@ fn merged_gaps(w: &Open, last_seq: u64, declared: &[(u64, u64)]) -> Vec<(u64, u6
     gaps
 }
 
-/// Incremental `Record` decode over a reader: the buffer refills until a
-/// record completes or the stream ends mid-record — a torn tail.
 struct Decoder {
     reader: Box<dyn Read>,
     buf: Vec<u8>,
-    /// Bytes consumed so far: where the complete prefix ends.
     complete: u64,
-    /// An uncompressed segment, whose tail a power cut can leave zeroed.
     plain: bool,
 }
 
@@ -2207,12 +1793,6 @@ impl Decoder {
                     self.complete += used as u64;
                     return Ok(Some(record));
                 }
-                // A power cut can persist a file's new size before the data
-                // written into it (a journal commit for another file carries
-                // the size): the unsynced tail then reads back as zeros. It
-                // was never acknowledged — an fsync would have written it —
-                // so it ends the stream like a torn record. Anything else
-                // that does not decode is corruption.
                 Err(RecordError::Invalid) => {
                     return if self.plain && self.rest_is_zero()? {
                         Ok(None)
@@ -2232,8 +1812,6 @@ impl Decoder {
         }
     }
 
-    /// Whether everything from the current position to the end is zero.
-    /// Only a stream that failed to decode pays for it.
     fn rest_is_zero(&mut self) -> Result<bool> {
         if self.buf.iter().any(|b| *b != 0) {
             return Ok(false);
@@ -2277,17 +1855,9 @@ fn seg_decoder(dir: &Path, seg: u32, compressed: bool) -> Result<Decoder> {
     })
 }
 
-/// Open a segment [`segs`] listed, or `None` when it is gone — the reader
-/// stops there. A plain segment the compressor replaced between the
-/// listing and the open is read from its `.z` twin: the rename lands
-/// before the plain file goes. On Windows a plain file whose delete is
-/// still pending (another handle — a concurrent reader, a scanner — held
-/// it open when the compressor removed it) refuses the open with
-/// `PermissionDenied` (or, from some paths, `ERROR_DELETE_PENDING`), not
-/// `NotFound`; the twin is already there, so it is read the same way.
+/// On Windows a plain segment still delete-pending refuses open with PermissionDenied; read its .z twin.
 fn listed_seg_decoder(dir: &Path, seg: u32, compressed: bool) -> Result<Option<Decoder>> {
     use std::io::ErrorKind;
-    /// `ERROR_DELETE_PENDING`, which `std` files as `Uncategorized`.
     const DELETE_PENDING: i32 = 303;
     let replaced = |e: &std::io::Error| {
         e.kind() == ErrorKind::NotFound
@@ -2313,8 +1883,6 @@ fn listed_seg_decoder(dir: &Path, seg: u32, compressed: bool) -> Result<Option<D
     }
 }
 
-/// Compress a sealed segment in place: `seg-N` → `seg-N.z` through a
-/// temporary, fsync, rename, directory fsync, then the plain file goes.
 fn compress(path: &Path) -> Result<()> {
     let tmp = path.with_extension("z.tmp");
     let done = path.with_extension("z");
@@ -2343,18 +1911,10 @@ fn compress(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read an attempt directory: frames with `seq > after` (filtered to
-/// `step` when given), completeness, and the gap list. Unbounded but for
-/// `limit`; the API reads through [`read_page`].
 pub fn read_dir(dir: &Path, after: u64, limit: usize, step: Option<u32>) -> Result<Tail> {
     read_page(dir, after, Page::frames(limit), step)
 }
 
-/// [`read_dir`] under a [`Page`]: at most `limit` frames and `bytes` of
-/// their payload (the first frame always fits, so every page progresses),
-/// and at most `scan` bytes of payload decoded past `after` — a step filter
-/// over a long log stops there too instead of decoding to the end. A page
-/// cut by any bound carries [`Tail::next_after`].
 pub fn read_page(dir: &Path, after: u64, page: Page, step: Option<u32>) -> Result<Tail> {
     let segs = segs(dir)?;
     let marker = end_marker(dir);
@@ -2363,10 +1923,6 @@ pub fn read_page(dir: &Path, after: u64, page: Page, step: Option<u32>) -> Resul
     }
     let index_bytes = fs::read(dir.join("index")).unwrap_or_default();
     let entries = read_index(&index_bytes).unwrap_or_default();
-    // Seek ([`seek_start`]). Fills always carry a sequence below every
-    // later checkpoint and land in a segment at or after the one holding
-    // the frontier they fill under, so no earlier segment can hold a frame
-    // past `after` — a step filter needs no earlier start either.
     let start = seek_start(&entries, after, false);
     let mut tail = Tail {
         frames: Vec::new(),
@@ -2375,13 +1931,8 @@ pub fn read_page(dir: &Path, after: u64, page: Page, step: Option<u32>) -> Resul
         next_after: None,
         step_done: step.is_some_and(|want| step_moved_on(&entries, want)),
     };
-    // Decode-observed holes are only reliable when every earlier segment
-    // was decoded: a fill arriving before a mid-stream start makes a jump
-    // whose "missing" frames sit in the segments the seek skipped.
     let from_start = start == segs.keys().next().copied().unwrap_or(0);
     let mut prev_seq = 0u64;
-    // The highest sequence past `after` this page consumed (returned or
-    // passed over by the filter): where a cut page resumes.
     let mut consumed = after;
     let (mut taken, mut scanned) = (0u64, 0u64);
     'decode: for (n, compressed) in segs.range(start..) {
@@ -2395,7 +1946,6 @@ pub fn read_page(dir: &Path, after: u64, page: Page, step: Option<u32>) -> Resul
                         if prev_seq > 0 && frame.seq > prev_seq + 1 {
                             add_hole(&mut tail.gaps, prev_seq + 1, frame.seq - 1);
                         } else if frame.seq <= prev_seq {
-                            // An out-of-order fill narrows the hole it landed in.
                             fill_hole(&mut tail.gaps, frame.seq);
                         }
                     }
@@ -2405,8 +1955,6 @@ pub fn read_page(dir: &Path, after: u64, page: Page, step: Option<u32>) -> Resul
                     }
                     let len = frame.bytes.len() as u64;
                     let wanted = step.is_none_or(|s| frame.step == s);
-                    // Every bound is checked between frames and needs some
-                    // progress first, so a page is never empty for a bound.
                     let full = wanted
                         && (tail.frames.len() >= page.limit
                             || (!tail.frames.is_empty() && taken.saturating_add(len) > page.bytes));
@@ -2434,26 +1982,11 @@ pub fn read_page(dir: &Path, after: u64, page: Page, step: Option<u32>) -> Resul
     }
     match marker {
         Some((_, gaps)) => merge_holes(&mut tail.gaps, &gaps),
-        // A live log: the holes its writer has persisted so far, including
-        // those inside segments this page did not decode.
         None => merge_holes(&mut tail.gaps, &read_holes(dir)),
     }
     Ok(tail)
 }
 
-/// The newest frames of `step` (of the whole log without one): at most
-/// `page.limit` frames and `page.bytes` of payload (the newest frame always
-/// fits), in stored order, whatever came after the step — a later
-/// `if: always()` step writing more than a page does not push the step's own
-/// output out of the window. The sparse index picks the start: the step ends
-/// at the first checkpoint of another step after its last checkpoint, and
-/// the read begins at the latest entry with at least a page of frames or
-/// bytes before that end, so the head is never decoded. A rolling window
-/// keeps memory at one page while the decoder runs to the real end — the
-/// frames past the last checkpoint included. At most `page.scan` payload
-/// bytes are decoded; a read cut by it (only a missing or damaged index
-/// makes the window that long) carries [`Tail::next_after`], meaning the
-/// frames are not the newest.
 pub fn read_newest(dir: &Path, page: Page, step: Option<u32>) -> Result<Tail> {
     let segs = segs(dir)?;
     let marker = end_marker(dir);
@@ -2469,8 +2002,6 @@ pub fn read_newest(dir: &Path, page: Page, step: Option<u32>) -> Result<Tail> {
         next_after: None,
         step_done: step.is_some_and(|want| step_moved_on(&entries, want)),
     };
-    // `until`: the last sequence of the step, when a later step followed it;
-    // `end`: the first entry past it, whose cumulative bytes bound the step.
     let mut until = u64::MAX;
     let mut end: Option<&Entry> = entries.last();
     if let Some(want) = step {
@@ -2487,8 +2018,6 @@ pub fn read_newest(dir: &Path, page: Page, step: Option<u32>) -> Result<Tail> {
                     end = Some(next);
                 }
             }
-            // Every step change is checkpointed: with an index, a step
-            // without an entry wrote nothing (a fill aside).
             None if !entries.is_empty() => {
                 merge_newest_gaps(dir, marker, &mut tail);
                 return Ok(tail);
@@ -2523,7 +2052,6 @@ pub fn read_newest(dir: &Path, page: Page, step: Option<u32>) -> Result<Tail> {
                         continue;
                     }
                     if frame.seq > until {
-                        // The next step began: nothing newer of this one.
                         break 'decode;
                     }
                     let len = frame.bytes.len() as u64;
@@ -2566,10 +2094,6 @@ fn merge_newest_gaps(dir: &Path, marker: Option<(u64, Vec<(u64, u64)>)>, tail: &
     }
 }
 
-/// Whether the log has moved past step `want`: some checkpoint names a
-/// later step after the last checkpoint of `want` (none at all when the step
-/// never ran). Steps run in order and every step change is checkpointed, so
-/// a finished step gets no new frames — only a resent fill could still land.
 fn step_moved_on(entries: &[Entry], want: u32) -> bool {
     let last_want = entries
         .iter()
@@ -2580,15 +2104,10 @@ fn step_moved_on(entries: &[Entry], want: u32) -> bool {
     entries.iter().any(|e| e.step > want && e.seq > last_want)
 }
 
-/// The flat-file reader, kept for legacy logs and for
-/// spool-shaped fixtures. Bounded however long the file: frames collect to
-/// `limit` while the scan keeps streaming to the end marker.
 pub fn read_tail(path: &Path, after: u64, limit: usize, step: Option<u32>) -> Result<Tail> {
     read_tail_page(path, after, Page::frames(limit), step)
 }
 
-/// [`read_tail`] under a page's frame and byte bounds (a flat file is read
-/// from its start either way, so `scan` does not apply).
 pub fn read_tail_page(path: &Path, after: u64, page: Page, step: Option<u32>) -> Result<Tail> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -2653,13 +2172,6 @@ mod windows_tests {
 
     use super::*;
 
-    /// Create `path` and leave it delete-pending: marked for deletion by a
-    /// handle that stays open, so the name is still listed and every open
-    /// is refused until the returned handle closes. `std`'s `remove_file`
-    /// and `DeleteFileW` cannot build this state: both use POSIX delete
-    /// semantics, which unlink the name at once. The classic disposition
-    /// (`FileDispositionInfo`) is what a removal falls back to when POSIX
-    /// semantics are unavailable, and what leaves the name behind.
     fn delete_pending(path: &Path) -> File {
         const GENERIC_WRITE: u32 = 0x4000_0000;
         let file = OpenOptions::new()
@@ -2685,12 +2197,6 @@ mod windows_tests {
         file
     }
 
-    /// The compressor renames `seg-N.z` into place and then removes the
-    /// plain `seg-N`. A reader that listed the directory before the rename
-    /// opens the plain file; when another handle held it at the removal,
-    /// Windows keeps it listed but delete-pending and refuses the open with
-    /// access denied. The reader must read the twin, not fail the read —
-    /// and with no twin, the refusal is an error, never an early end.
     #[test]
     fn a_plain_segment_pending_delete_is_read_from_its_compressed_twin() {
         let temp = tempfile::tempdir().unwrap();
@@ -2725,7 +2231,6 @@ mod windows_tests {
         let refused = File::open(&plain).unwrap_err();
         assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
 
-        // What a reader that listed only the plain segment does next.
         let mut decoder = listed_seg_decoder(&dir, 0, false)
             .unwrap()
             .expect("the twin is read");
