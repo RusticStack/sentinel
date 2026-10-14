@@ -638,3 +638,73 @@ fn sign_up_with_an_email_invitation_for_another_address_is_refused() {
     assert_eq!(status, 202, "{body}");
     assert_eq!(accounts_claiming(&f, "guest@example.com"), 1);
 }
+
+#[test]
+fn a_platform_administrator_outside_an_organization_cannot_invite_without_proof() {
+    use sentinel_core::{
+        TenantId,
+        auth::{Namespace, Permissions, Principal},
+    };
+    use sentinel_store::auth::{self as authz, NamespaceKind};
+
+    let f = Fixture::new(1);
+    let (root, gamma) = (f.root, TenantId::new());
+    f.store
+        .writer()
+        .write(move |tx| {
+            // An organization root administers by platform scope alone.
+            authz::create_namespace(
+                tx,
+                Principal::new(root, Permissions::ALL, None, None),
+                gamma,
+                Namespace::parse("gamma").unwrap(),
+                NamespaceKind::Organization,
+                UnixMillis::now(),
+            )
+        })
+        .unwrap();
+
+    // A bearer credential never holds step-up: refused with or without a reason.
+    for body in [
+        json!({ "email": "mine@example.com", "role": "admin" }),
+        json!({ "email": "mine@example.com", "role": "admin", "reason": "support case" }),
+    ] {
+        let (status, reply) = as_root(&f, "POST", "/api/v1/tenants/gamma/invitations", Some(body));
+        assert_eq!(status, 403, "{reply}");
+    }
+    let (_, listing) = as_root(&f, "GET", "/api/v1/tenants/gamma/invitations", None);
+    assert!(
+        listing["invitations"].as_array().unwrap().is_empty(),
+        "no invitation was created"
+    );
+}
+
+#[test]
+fn asking_for_an_address_answers_alike_past_the_link_allowance() {
+    let f = Fixture::new(1);
+    verify_address(&f, f.dana, "dana@example.com");
+    let rui = session(&f, "rui");
+    // More requests for an unclaimed address than the per-account link
+    // allowance (within the per-client burst of 8): still `202`, like the
+    // address another account verified, so the allowance is no oracle.
+    let mut replies = Vec::new();
+    for _ in 0..(email::RESENDS_PER_WINDOW + 2) {
+        let (status, _) = send(
+            &f,
+            "POST",
+            "/api/v1/me/email",
+            Some(json!({ "email": "free@example.com" })),
+            &rui,
+        );
+        replies.push(status);
+    }
+    let (status, _) = send(
+        &f,
+        "POST",
+        "/api/v1/me/email",
+        Some(json!({ "email": "dana@example.com" })),
+        &rui,
+    );
+    replies.push(status);
+    assert!(replies.iter().all(|s| *s == 202), "{replies:?}");
+}

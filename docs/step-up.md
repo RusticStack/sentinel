@@ -18,7 +18,7 @@ A session proves who you are. **Step-up** proves you are still there, just now, 
 | Removing your own second factor, reissuing recovery codes | `mfa::disable`, `mfa::reissue_recovery_codes`, over `POST /mfa/recovery-codes` |
 | Changing your password, **when a second factor is enrolled** (always with the current password) | `local_auth::change_password`, over `POST /password` |
 | Creating a service account, allowing it a repository, issuing it a grant — from **anyone**, tenant administrators included | `auth::create_service_account`, `oauth::service::allow_repo`, `oauth::service::issue_service_grant` |
-| Changing a tenant's memberships or repository grants as a platform administrator who is **not** an administrator of that tenant (also needs a reason) | `auth::set_membership_as`, `auth::set_repo_grant_as` |
+| Creating or revoking an email invitation, or changing a tenant's memberships or repository grants, as a platform administrator who is **not** an administrator of that tenant (also needs a reason) | `auth::set_membership_as`, `auth::set_repo_grant_as` |
 
 Routine administration — approving applications, rejecting a *pending* application, inviting, revoking credentials, binding installations, and a tenant administrator changing their own tenant's members and repository grants — needs platform (or tenant) administration but not step-up. Rejecting reads the account's status in the same transaction: pending is platform administration, approved needs step-up as `set_active` does, so an unstepped credential cannot permanently do what it cannot do reversibly. `Authority::HostLocal` needs no step-up either: holding the database file is already stronger than any proof a session can offer, and every host-local action is audited as such.
 

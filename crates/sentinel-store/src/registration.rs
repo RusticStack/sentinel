@@ -675,8 +675,6 @@ pub enum Accepted {
     /// a verification link was queued (or recorded for the operator), and
     /// proving that address redeems the invitation.
     VerificationSent,
-    /// The account's resend allowance is spent; try later.
-    Throttled,
     /// Unknown, expired, spent, revoked, wrong address, wrong identity, or
     /// not for this kind of organization. One answer for all of them.
     Unusable,
@@ -753,13 +751,13 @@ pub fn accept_invitation(
             }
             // Another verified address stays until the account changes it.
             Some((Some(_), true)) => Ok(Accepted::Unusable),
-            Some(_) => Ok(
-                match crate::email::request(tx, key.as_deref(), user, address, Some(invitation.id), now)? {
-                    crate::email::Requested::Throttled => Accepted::Throttled,
-                    crate::email::Requested::Suppressed => Accepted::Unusable,
-                    _ => Accepted::VerificationSent,
-                },
-            ),
+            Some(_) => {
+                // Every outcome of the request answers alike: an address held
+                // verified by another account, or an allowance spent, must not
+                // tell the caller anything about that address.
+                crate::email::request(tx, key.as_deref(), user, address, Some(invitation.id), now)?;
+                Ok(Accepted::VerificationSent)
+            }
             None => Ok(Accepted::Unusable),
         }
     })

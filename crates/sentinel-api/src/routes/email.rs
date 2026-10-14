@@ -260,15 +260,14 @@ fn set_email(state: &State, request: &mut Request) -> Route {
         return Err(store_error(StoreError::StepUpRequired));
     }
     let key = state.secret_key.clone();
-    let requested = state
+    state
         .store
         .writer()
         .write(move |tx| email::request(tx, key.as_deref(), user, &address, None, now))
         .map_err(store_error)?;
-    match requested {
-        email::Requested::Throttled => Err(rate_limited()),
-        _ => accepted(state),
-    }
+    // One answer for a claimed, suppressed or throttled address: nothing here
+    // may reveal whether another account holds it.
+    accepted(state)
 }
 
 /// `POST /api/v1/me/email/resend` (browser session): send the link again for
@@ -329,7 +328,6 @@ fn accept(state: &State, request: &mut Request) -> Route {
             json!({ "status": "verification_sent", "verification": delivery_mode(state) }),
             Vec::new(),
         )),
-        Accepted::Throttled => Err(rate_limited()),
         Accepted::Unusable => Err(unusable()),
     }
 }
@@ -374,6 +372,19 @@ struct InviteBody {
     /// Defaults to seven days; at most thirty.
     #[serde(default)]
     expires_in_secs: Option<u64>,
+    /// Required (1..=100 characters) with fresh step-up when the caller
+    /// reaches the organization by platform scope alone.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Optional body of the invitation revocation: only the platform-override
+/// `reason`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeBody {
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// `POST /api/v1/tenants/{slug}/invitations {email, role?, expires_in_secs?}`
@@ -401,7 +412,7 @@ fn invite(state: &State, request: &mut Request, slug: &str) -> Route {
             })?,
     };
     let (slug, address) = (slug.to_owned(), body.email);
-    let (principal, authority) = (who.principal, who.authority());
+    let (principal, authority, reason) = (who.principal, who.authority(), body.reason);
     let key = state.secret_key.clone();
     let now = UnixMillis::now();
     let invited = state
@@ -409,6 +420,10 @@ fn invite(state: &State, request: &mut Request, slug: &str) -> Route {
         .writer()
         .write(move |tx| {
             let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
+            // A platform administrator who is not an administrator-member
+            // needs fresh step-up and an audited reason, as for any other
+            // access-granting change.
+            authority.require_tenant_access_change(tx, tenant, false, reason.as_deref())?;
             registration::invite_by_email(
                 tx,
                 authority,
@@ -475,6 +490,12 @@ fn list_invitations(state: &State, request: &Request, slug: &str) -> Route {
 fn revoke_invitation(state: &State, request: &mut Request, slug: &str, invitation: &str) -> Route {
     let who = tenant_admin(state, request, true)?;
     let invitation: InvitationId = id(invitation, "invitation")?;
+    let bytes = super::body_limit(request, MAX_BODY_BYTES)?;
+    let reason = if bytes.is_empty() {
+        None
+    } else {
+        parse::<RevokeBody>(&bytes)?.reason
+    };
     let (slug, authority, principal) = (slug.to_owned(), who.authority(), who.principal);
     let now = UnixMillis::now();
     state
@@ -482,6 +503,7 @@ fn revoke_invitation(state: &State, request: &mut Request, slug: &str, invitatio
         .writer()
         .write(move |tx| {
             let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
+            authority.require_tenant_access_change(tx, tenant, false, reason.as_deref())?;
             registration::revoke_tenant_invitation(tx, authority, tenant, invitation, now)
         })
         .map_err(store_error)?;
