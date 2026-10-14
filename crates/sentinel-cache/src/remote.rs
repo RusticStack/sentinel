@@ -11,8 +11,8 @@
 //! caused it, never at the end of a long transfer.
 //!
 //! The worker-side driver ([`hydrate`]) runs only on a local miss. It
-//! resumes the partial at `<entry>/writing/remote.part` when one is
-//! there, aborts as `unavailable` when the estimated remaining transfer
+//! resumes the staged partial under `<entry>/writing/remote.stage` when
+//! one is there, aborts as `unavailable` when the estimated remaining transfer
 //! exceeds the budget (`min(5 s, job timeout / 4)`, docs/cache.md), and
 //! installs what it received by building a staging generation and
 //! renaming it into the entry — the same atomic promotion a publication
@@ -68,7 +68,7 @@ pub const BUDGET_MAX: Duration = Duration::from_secs(5);
 /// what it may name.
 pub const MAX_BUNDLE_BYTES: u64 = 64 << 30;
 /// One wire chunk carries at most this many bytes; the receiver's own
-/// bound, above what the link frames today.
+/// bound.
 pub const MAX_CHUNK_BYTES: usize = 1 << 20;
 /// A serve hands the link one chunk per call: 48 KiB, because the bulk
 /// frame carries exactly one chunk and a split chunk could not carry the
@@ -82,15 +82,16 @@ pub const OFFER_BUDGET: Duration = Duration::from_secs(30);
 /// can hold.
 const RATE_SAMPLE: Duration = Duration::from_millis(250);
 /// The staging generation a hydration streams into and resumes: one per
-/// entry, written and resumed only under `writing/.lock`, promoted into
-/// the entry by rename once complete.
+/// entry, used only under `writing/.lock`, renamed into the entry once
+/// complete.
 const STAGE_NAME: &str = "remote.stage";
 /// Inside the staging generation: the head, manifest and listing while
 /// they are still arriving. Replaced by the generation's own `manifest`
 /// and `files` once whole.
 const PREFIX_NAME: &str = "prefix.part";
-/// The single-file partial hydrations resumed from before the stream was
-/// staged in place; an upgraded worker drops it and restarts cold.
+/// The single-file partial of the older on-disk layout; it cannot be
+/// resumed into a staging generation, so it is deleted and the transfer
+/// restarts cold.
 const LEGACY_PART: &str = "remote.part";
 /// The longest prefix a serve hashes to prove a resume point; beyond it
 /// the transfer restarts cold. A hydration budget of at most 5 s never
@@ -232,7 +233,7 @@ impl Upload {
 /// The controller's grant, controller → worker: where the transfer starts
 /// and what it must add up to. For a fetch, `offset`/`prefix` are the
 /// accepted resume point and the digest of the stream through it; for an
-/// offer, they describe the controller's partial (offset 0 today).
+/// offer, they describe the controller's partial (always offset 0).
 /// `digest` is the whole bundle either way — the value the terminal
 /// [`End`] must name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -463,8 +464,7 @@ pub(crate) fn hydrate(
     owner: &str,
     policy: Policy<'_>,
 ) -> Hydro {
-    // The clock is the job's: it started before the first restore and
-    // covers resuming the staged prefix, the transfer and the install.
+    // The deadline is the job's, not this hydration's.
     let deadline = policy.deadline;
     let started = Instant::now();
     if started >= deadline {
@@ -483,8 +483,6 @@ pub(crate) fn hydrate(
         return Hydro::Nothing;
     };
     let writing = entry.join(scope::WRITING_NAME);
-    // A single-file partial from before streaming installs cannot be
-    // resumed into a staging generation: it restarts cold.
     let _ = fs::remove_file(writing.join(LEGACY_PART));
     let stage = writing.join(STAGE_NAME);
     let request = Req {
@@ -519,8 +517,7 @@ pub(crate) fn hydrate(
 
     match fetched {
         Ok(()) => {}
-        // The controller has no bundle for the entry: whatever was staged
-        // can never complete, so it goes.
+        // Nothing staged can ever complete.
         Err(Refusal::NoBundle) => {
             drop(sink);
             drop_stage();
@@ -562,9 +559,7 @@ pub(crate) fn hydrate(
     });
     let layout = sink.finished();
     let (true, Some(layout)) = (complete, layout) else {
-        // A transport that "succeeded" without a plan, or bytes that are
-        // not the stream that was promised: staging that can never verify
-        // is worse than none.
+        // No plan, or bytes that are not the promised stream.
         drop_stage();
         return Hydro::Refused(Miss::Corrupt);
     };
@@ -574,9 +569,7 @@ pub(crate) fn hydrate(
         // and the next attempt installs it without a byte on the wire.
         return Hydro::Refused(TRANSFER_MISS);
     }
-    // The local listing checks run again over the staged tree, then the
-    // clone into the job's private view — the materialization a local hit
-    // gets, from the generation this transfer just staged.
+    // Same materialization a local hit gets, from the staged generation.
     attached.stats.reflink = env.backend == crate::clone::Backend::Reflink;
     let blob = match restore::materialize(
         &stage,
@@ -593,9 +586,8 @@ pub(crate) fn hydrate(
     };
     attached.stats.first_touch_ns = restore::first_touch(&blob, &attached.targets);
     let generation = scope::gen_name(layout.manifest.sealed_ms as i64, lease::rand_u32());
-    // Promotion is best-effort: the served bytes are already verified and
-    // materialized, so a store failure here is a lost local copy, not a
-    // lost restore — and staging that did not land is not kept either.
+    // Best-effort: the bytes are already verified and materialized, so a
+    // failure here only loses the local copy.
     if promote(&entry, &stage, &generation).is_err() {
         drop_stage();
     }
@@ -1142,9 +1134,9 @@ impl Sink for Stager {
             return Err(Refusal::Aborted);
         }
         if grant.offset < self.offset {
-            // Its bundle does not extend what is staged. A controller
-            // restarts cold (offset 0); any other point is not a prefix a
-            // staging generation can be cut back to.
+            // The controller's bundle does not extend what is staged: it must
+            // restart cold; a staging generation cannot be cut back to any
+            // other point.
             if grant.offset != 0 {
                 self.halt = Some(Halt::Corrupt);
                 return Err(Refusal::Aborted);
@@ -1226,12 +1218,10 @@ impl Sink for Stager {
         // stalls before the first sample.
         let elapsed = now.duration_since(self.started).as_nanos();
         if elapsed >= RATE_SAMPLE.as_nanos() && self.received > 0 {
-            // `remaining / rate > left`, i.e. `remaining * elapsed >
-            // left * received`, in `u128` — never an integer ns-per-byte
-            // that truncates to zero on a fast link. The install
-            // only copies the payload into the job's view when there is no
-            // reflink; that copy is estimated at the measured rate too. The
-            // stream itself is written once, as it arrives.
+            // `remaining / rate > left` as `remaining * elapsed > left *
+            // received` in `u128`: an integer ns-per-byte would truncate to
+            // zero on a fast link. Without reflink the install copies the
+            // whole payload once more, estimated at the same rate.
             let install = if self.copies { self.total } else { 0 };
             let remaining = u128::from(self.total - self.offset) + u128::from(install);
             let left = self.deadline.saturating_duration_since(now).as_nanos();
@@ -1244,12 +1234,10 @@ impl Sink for Stager {
     }
 }
 
-/// Promote a staging generation exactly as a publication does: the
-/// generation lands inside the entry first, then `current` names it — a
-/// reader sees the old generation or the new one, never a torn name.
-/// Promotion is unconditional, the same rule a commit follows: a
-/// hydration only runs when the live pointer did not serve this request,
-/// so what it replaces was stale, corrupt or incompatible.
+/// Promote a staging generation as a publication does: the generation lands
+/// inside the entry first, then `current` names it, so a reader sees the old
+/// generation or the new one. Unconditional: hydration only runs when the
+/// live pointer did not serve this request.
 fn promote(entry: &Path, staging: &Path, generation: &str) -> io::Result<()> {
     fs::rename(staging, entry.join(generation))?;
     publish::sync_dir(entry)?;
@@ -1278,19 +1266,14 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_be_bytes(raw)
 }
 
-// ——— offering ——————————————————————————————————————————————
-
-/// Offer one sealed generation to the controller: offer the metadata,
-/// stream the canonical bytes. `Ok` carries the digest the controller
-/// stored; every error is a refusal the caller treats as a dropped offer,
-/// never a failure of anything else. The attempt's finalization calls
-/// this after its terminal report already left (`OFFER_BUDGET` bounds
-/// it), so an offer can never change a verdict.
+/// Offer one sealed generation to the controller. `Ok` carries the digest
+/// the controller stored; every error is a dropped offer, never a failure of
+/// anything else. Called after the attempt's terminal report left
+/// (`OFFER_BUDGET` bounds it), so an offer can never change a verdict.
 ///
 /// A controller that takes the digest at the end (protocol 9) gets the
-/// stream read once and hashed as it is sent; an older one needs
-/// the digest up front, which costs a hashing pass over the generation
-/// before the bytes go out.
+/// stream hashed as it is sent; an older one needs a separate hashing pass
+/// first.
 pub fn offer_generation(
     cache_root: &Path,
     attached: &Attached,
@@ -1337,10 +1320,9 @@ pub fn offer_generation(
     source.offer(&upload, deadline, &mut reader)
 }
 
-/// The canonical stream's digest for a sealed generation: the value the
-/// controller must reproduce before it stores anything. Bounded by
-/// `deadline` and `cancel` — an offer is optional work and never holds a
-/// worker past its budget.
+/// The canonical stream's digest for a sealed generation, which the
+/// controller must reproduce before it stores anything. Stops at `deadline`
+/// or `cancel` with `Miss::Unavailable`.
 fn stream_digest(
     bundle: &Bundle,
     generation_dir: &Path,
@@ -1435,10 +1417,9 @@ fn head_bytes(manifest_len: u64, files_len: u64, payload_len: u64) -> [u8; STREA
     head
 }
 
-/// The upload half of a bundle: `Read` yields the canonical stream in
-/// order, bounded per call exactly like a file, straight out of the
-/// bundle's own buffers and files — nothing is copied aside first. A read
-/// after the offer's cancel flag tripped fails, so the transport stops.
+/// `Read` over a bundle's canonical stream, straight from its buffers and
+/// files. A read after the offer's cancel flag tripped fails, so the
+/// transport stops.
 struct BundleReader<'a> {
     bundle: Bundle,
     dir: PathBuf,
@@ -1525,8 +1506,6 @@ impl Read for BundleReader<'_> {
         }
     }
 }
-
-// ——— the controller-side store ————————————————————————————
 
 /// The bundle id's spelling on disk: 64 lowercase hex characters.
 fn hex32(id: &[u8; 32]) -> String {
@@ -1663,12 +1642,10 @@ impl Serving {
         if total > MAX_BUNDLE_BYTES {
             return Err(Refusal::Store);
         }
-        // The resume request: serve from the worker's prefix only when the
-        // stored bundle really extends it; otherwise restart cold, which
-        // is always correct. Proving a prefix costs a hash of it, so a
-        // claimed prefix past `MAX_RESUME_HASH` is not proven at all — a
-        // cold restart — and a worker's `have` can never make the
-        // controller hash gigabytes per request.
+        // Serve from the worker's prefix only when the stored bundle
+        // extends it, else restart cold. Proving it costs a hash, so a
+        // prefix past `MAX_RESUME_HASH` restarts cold unproven: a worker
+        // cannot make the controller hash gigabytes per request.
         let requested = need.offset.min(total);
         let (offset, prefix, hasher) = if requested == 0 || requested > MAX_RESUME_HASH {
             (0, empty_digest(), blake3::Hasher::new())
@@ -1718,8 +1695,7 @@ impl Serving {
     }
 
     /// [`Serving::next_chunk`] into a caller-held chunk, reusing its byte
-    /// buffer — a serve loop allocates one buffer per transfer, not one
-    /// per 48 KiB frame. `false` means the stream is complete.
+    /// buffer. `false` means the stream is complete.
     pub fn next_chunk_into(&mut self, chunk: &mut Chunk) -> Result<bool, Refusal> {
         if self.offset >= self.plan.total {
             return Ok(false);
@@ -1734,8 +1710,7 @@ impl Serving {
             }
         };
         if read == 0 {
-            // The file is shorter than the plan: a store that lost bytes
-            // mid-serve must fail loudly, never end a stream short.
+            // Shorter than the plan: fail rather than end the stream short.
             return Err(Refusal::Store);
         }
         chunk.bytes.truncate(read);
@@ -1768,9 +1743,7 @@ pub struct Receiving {
 }
 
 impl Drop for Receiving {
-    /// An upload abandoned mid-stream — a refused chunk, a cancel, an idle
-    /// or lost session — takes its staging file with it; the lock
-    /// goes with `_lock`.
+    /// An upload abandoned mid-stream takes its staging file with it.
     fn drop(&mut self) {
         if !self.done {
             let _ = fs::remove_file(&self.part);
@@ -1796,9 +1769,8 @@ impl Receiving {
         if !at_end && bundle_path(&entry, &upload.digest).is_file() {
             return Ok(None);
         }
-        // The store shares its disk with SQLite and the object store: an
-        // upload that would not leave the reserve free is refused up front,
-        // never discovered as ENOSPC halfway through.
+        // The store shares its disk with SQLite and the object store:
+        // refuse up front rather than hit ENOSPC halfway.
         if let Some((free, total)) = store_space(store_root)
             && free
                 < upload
@@ -1820,8 +1792,7 @@ impl Receiving {
             format!("{}.part", hex32(&upload.digest))
         };
         let part = entry.join(scope::WRITING_NAME).join(name);
-        // A previous attempt's partial is discarded, never resumed: an
-        // offer restarts from zero, so no bytes can be spliced into a
+        // Offers never resume: truncating rules out splicing bytes into a
         // stream the sender did not reproduce.
         let file = fs::OpenOptions::new()
             .read(true)
@@ -1874,9 +1845,8 @@ impl Receiving {
     }
 
     /// Verify the completed stream, promote it into the entry and make it
-    /// `current`, then drop the bundle it superseded: an entry
-    /// keeps one bundle. Until this returns `Ok`, nothing of the transfer
-    /// is visible to a serve; a failed end removes the staging file.
+    /// `current`, then drop the superseded bundle (an entry keeps one).
+    /// Nothing is visible to a serve until this returns `Ok`.
     pub fn end(&mut self, digest: [u8; 32]) -> Result<(), Refusal> {
         if self.id == DIGEST_AT_END {
             // The offer stated its digest only now; the running hash below
@@ -1901,8 +1871,7 @@ impl Receiving {
         publish::write_synced(&tmp, hex32(&self.id).as_bytes()).map_err(|_| Refusal::Store)?;
         fs::rename(&tmp, self.entry.join(scope::CURRENT_NAME)).map_err(|_| Refusal::Store)?;
         publish::sync_dir(&self.entry).map_err(|_| Refusal::Store)?;
-        // Unlinking is safe for a serve already reading it: an open file
-        // outlives its name on unix.
+        // A serve already reading it keeps its open file.
         if let Some(previous) = previous {
             let _ = fs::remove_file(bundle_path(&self.entry, &previous));
         }

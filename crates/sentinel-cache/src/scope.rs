@@ -14,9 +14,8 @@ use sentinel_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-/// The kernel half of the `os-arch` platform component. Linux is the only
-/// executor today; the enum exists so a second OS can never reuse a scope
-/// directory silently — it would render a different component.
+/// The kernel half of the `os-arch` platform component. A second OS would
+/// render a different component, so it can never reuse a scope directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
@@ -88,9 +87,8 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// The name must already satisfy the schema's `valid_id` rule; this
-    /// re-checks rather than trusts, so metadata built by hand gets the
-    /// same answer the parser would have given.
+    /// The name is re-checked against the schema's `valid_id` rule, not
+    /// trusted.
     pub fn new(
         tenant: TenantId,
         repo: RepoId,
