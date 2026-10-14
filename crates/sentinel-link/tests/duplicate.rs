@@ -1,10 +1,3 @@
-//! At-least-once delivery on the link. A controller that repeats an
-//! offer — a retransmit after an uncertain send — gets it acknowledged
-//! again, and the worker's executor is asked once: a duplicate offer never
-//! becomes a duplicate execution within a healthy session. The controller
-//! here is a hand-rolled session over the public `session` module, so the
-//! duplicate can be sent on purpose.
-
 use std::{
     net::TcpStream,
     sync::{Arc, Mutex},
@@ -133,7 +126,6 @@ fn a_repeated_offer_is_acknowledged_twice_and_executed_once() {
                 panic!("the control hello must be admitted");
             };
             let sender = s.sender();
-            // The same offer, twice, then serve until the worker says goodbye.
             session::offer(&sender, &offer).unwrap();
             session::offer(&sender, &offer).unwrap();
             let _ = s.serve(&*controller);
@@ -163,7 +155,6 @@ fn a_repeated_offer_is_acknowledged_twice_and_executed_once() {
     let executor = Counting {
         offered: Mutex::new(Vec::new()),
     };
-    // One beat handles whatever arrived: both offers and the pong.
     link.beat(&executor).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while controller.acks.lock().unwrap().len() < 2 {

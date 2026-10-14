@@ -1,13 +1,3 @@
-//! The worker's side of the link: connect, enroll once, serve the session,
-//! and reconnect with bounded back-off when the controller is lost.
-//!
-//! A lost session does not end the work: the executor keeps the attempts it
-//! holds and keeps renewing them once the session is back; if it is not back
-//! before the lease deadline the executor stops them itself. A typed rejection is final for this
-//! configuration — the loop returns rather than retrying an unchanged hello
-//! — except `Unavailable`, the controller's "try again later", which backs
-//! off and retries like a lost connection.
-
 use std::{
     net::SocketAddr,
     sync::{
@@ -28,17 +18,11 @@ use crate::{
     tls,
 };
 
-/// The process's grip on the loop: `stop` ends the current session at once
-/// (the socket is closed from here, so no beat has to elapse first) and
-/// keeps [`run`] from starting another.
 #[derive(Default)]
 pub struct Handle {
     stop: AtomicBool,
     link: Mutex<Option<Sender>>,
-    /// Control sessions opened since process start; telemetry reports
-    /// reconnects from this count.
     sessions: std::sync::atomic::AtomicU64,
-    /// The process's live transport measurements, when it has any; without one every session reports [`Config::transport`].
     transport: Mutex<Option<TransportSource>>,
 }
 
@@ -58,15 +42,10 @@ impl Handle {
         self.stop.load(Ordering::Acquire)
     }
 
-    /// Control sessions this worker has opened (0 before the first).
     pub fn sessions(&self) -> u64 {
         self.sessions.load(Ordering::Acquire)
     }
 
-    /// Report transport telemetry from `source` (the Tailcat helper's latest
-    /// probe) instead of the fixed [`Config::transport`]: read at every
-    /// session start, and at every telemetry resend within a session, so a
-    /// path the helper re-measured reaches the controller.
     pub fn set_transport_source(&self, source: TransportSource) {
         *self.transport.lock().unwrap_or_else(|p| p.into_inner()) = Some(source);
     }
@@ -79,41 +58,23 @@ impl Handle {
     }
 }
 
-/// Reconnect back-off: doubling from [`BACKOFF_MIN`] up to [`BACKOFF_MAX`],
-/// with jitter, reset after a session that lasted at least [`STABLE_SESSION`].
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 pub const STABLE_SESSION: Duration = Duration::from_secs(30);
 
-/// Everything a worker needs to reach its controller.
 pub struct Config {
     pub controller: SocketAddr,
-    /// The controller fingerprint handed over with the enrollment.
     pub server: Digest,
-    /// Further controller fingerprints accepted beside `server`, for a
-    /// certificate rotation: both stay pinned until every worker reaches the
-    /// rotated controller. Empty outside a rotation; at most
-    /// `tls::MAX_PINS - 1`.
     pub also_pinned: Vec<Digest>,
     pub worker: WorkerId,
     pub name: String,
     pub hello: Hello,
     pub capacity: Capacity,
-    /// Protocol 7: what this machine offers the scheduler beyond CPU and
-    /// memory (labels, host, disk, availability). Sent right after `Welcome`
-    /// when the session negotiated protocol 7; ignored below it.
     pub profile: Profile,
-    /// Protocol 7: what the process measured about its transport
-    /// before the first session — the path and helper version from the
-    /// Tailcat probe, or Unknown. The link fills in round-trip time and byte
-    /// counters from the live session.
     pub transport: TransportStats,
-    /// Whether this worker exposes the remote cache to its executor;
-    /// disabled, every remote lookup is a local miss.
     pub remote_cache: bool,
 }
 
-/// What happened on the link, for the process's diagnostics.
 #[derive(Debug)]
 pub enum Event {
     Connected { worker: WorkerId, enrolled: bool },
@@ -121,13 +82,10 @@ pub enum Event {
     Backoff(Duration),
 }
 
-/// Cheap jitter without a randomness dependency: the schedule only has to
-/// avoid a fleet reconnecting in lockstep, not be unpredictable.
 fn jitter(base: Duration, seed: &mut u64) -> Duration {
     *seed ^= *seed << 13;
     *seed ^= *seed >> 7;
     *seed ^= *seed << 17;
-    // ±25 %.
     let quarter = base.as_millis() as u64 / 4;
     let offset = if quarter == 0 {
         0
@@ -137,15 +95,6 @@ fn jitter(base: Duration, seed: &mut u64) -> Duration {
     Duration::from_millis(base.as_millis() as u64 - quarter + offset)
 }
 
-/// Connect once and serve until `stop` is set or the session is lost.
-/// `enrollment` is presented only on this hello; the caller drops it after
-/// the first `Connected { enrolled: true }`.
-///
-/// A protocol-7 session gets its profile and telemetry reported first, then
-/// the second (bulk) connection is dialled and served on its own thread. The
-/// bulk connection is best-effort: when it cannot be established, or dies,
-/// bulk-class sends fall back to the control connection and the worker keeps
-/// working.
 pub fn session(
     config: &Config,
     client: Arc<rustls::ClientConfig>,
@@ -169,8 +118,6 @@ pub fn session(
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     link.set_remote_cache(config.remote_cache);
     if link.negotiated.protocol.0 >= PROFILE_MIN.0 {
-        // The profile opens with what the executor holds right now (resident
-        // images and cache bytes), not the configured placeholder.
         let mut profile = config.profile.clone();
         if let Some((version, availability)) = executor.availability() {
             profile.availability.images = availability.images;
@@ -192,7 +139,6 @@ pub fn session(
     welcomed.store(true, Ordering::Release);
     *handle.link.lock().unwrap_or_else(|p| p.into_inner()) = Some(link.sender());
     if handle.stopped() {
-        // Stopped between connect and registration: close what we just opened.
         handle.stop();
     }
     on_event(Event::Connected {
@@ -206,8 +152,6 @@ pub fn session(
     let outcome = std::thread::scope(|scope| {
         if let (Some(dialer), Some(bulk)) = (dialer, bulk) {
             let gate = Arc::clone(&stop_bulk);
-            // Its own jitter stream: bulk redials of a fleet must not align
-            // with each other or with the control reconnects.
             let seed = 0xD1B5_4A32_D192_ED03
                 ^ u64::from_le_bytes(config.worker.as_bytes()[8..].try_into().expect("8 bytes"));
             scope.spawn(move || serve_bulk(&dialer, bulk, executor, &gate, seed));
@@ -215,7 +159,6 @@ pub fn session(
         let outcome = link.run(executor, || handle.stopped());
         stop_bulk.store(true, Ordering::Release);
         if let Some(closer) = bulk_close {
-            // End the bulk reader now rather than at its next poll.
             closer.close();
         }
         outcome
@@ -224,10 +167,6 @@ pub fn session(
     outcome
 }
 
-/// Sleep up to `wait`, returning early (with `false`) once `stop` is set.
-/// Checked every [`STOP_POLL`], so whoever waits on this thread — the
-/// control session's teardown joins it — waits at most that long for a stop,
-/// never the whole back-off.
 fn wait_unless_stopped(stop: &AtomicBool, wait: Duration) -> bool {
     let deadline = Instant::now() + wait;
     loop {
@@ -242,15 +181,8 @@ fn wait_unless_stopped(stop: &AtomicBool, wait: Duration) -> bool {
     }
 }
 
-/// How often a back-off wait looks at its stop flag.
 const STOP_POLL: Duration = Duration::from_millis(50);
 
-/// Serve the bulk half of a session on its own thread: the first connection
-/// is already open, and a lost one is redialled with doubling, jittered
-/// back-off until the control session ends. The back-off wait watches the
-/// stop flag: the control session joins this thread before it returns, so an
-/// uninterruptible sleep here would hold a reconnect for up to
-/// [`BACKOFF_MAX`] — longer than a lease.
 fn serve_bulk(
     dialer: &session::BulkDialer,
     first: session::BulkLink,
@@ -267,9 +199,7 @@ fn serve_bulk(
         if let Some(mut bulk) = next.take() {
             let started = Instant::now();
             let _ = bulk.run(executor, || stop.load(Ordering::Acquire));
-            // A connection that opens and then dies at once (a peer that
-            // accepts and drops) has proved nothing: only one that served
-            // for a stable stretch earns the short back-off again.
+            // Only a stable session resets the back-off: an accept-then-drop peer must not cause a tight redial loop.
             if started.elapsed() >= STABLE_SESSION {
                 backoff = BACKOFF_MIN;
             }
@@ -289,10 +219,6 @@ fn serve_bulk(
     }
 }
 
-/// The worker's main loop: sessions back to back with bounded back-off,
-/// until `stop` is set. Returns the reason only when it is final: a typed
-/// rejection other than `Unavailable`, an identity that cannot be used, or
-/// the stop.
 pub fn run(
     config: Config,
     identity: Identity,
@@ -320,21 +246,14 @@ pub fn run(
             &welcomed,
             on_event,
         );
-        // Once welcomed, the enrollment is spent: never present it again.
         if welcomed.load(Ordering::Acquire) {
             enrollment = None;
         }
-        // A controller's `close_notify` is deliberate whether or not it came
-        // after the welcome: a hand-off closes a connection still in its
-        // handshake or hello the same way. Encrypted under the handshake the
-        // pinned certificate authenticated, it cannot be forged on the path.
+        // close_notify is trusted as deliberate: it is encrypted under the handshake
+        // the pinned certificate authenticated, so it cannot be forged on the path.
         let closed = matches!(outcome, Err(Error::Closed));
         match outcome {
             Ok(()) => return Ok(()),
-            // The controller's store was briefly unavailable (a restart
-            // herd, a full writer queue): the same hello will be accepted
-            // later, so it is retried like a lost connection — with the
-            // same jittered back-off, so a fleet does not retry in step.
             Err(Error::Rejected(session::Rejection::Unavailable)) if !handle.stopped() => {
                 on_event(Event::Disconnected(Error::Rejected(
                     session::Rejection::Unavailable,
@@ -344,9 +263,6 @@ pub fn run(
             Err(_) if handle.stopped() => return Ok(()),
             Err(error) => on_event(Event::Disconnected(error)),
         }
-        // A session (or connection) the controller closed on purpose (a
-        // hand-off to its restarted transport) is not a failure: the next
-        // dial waits only the shortest back-off, however short it was.
         if started.elapsed() >= STABLE_SESSION || closed {
             backoff = BACKOFF_MIN;
         }
