@@ -1,4 +1,4 @@
-//! The device authorization flow's durable half (O03, RFC 8628): pending
+//! The device authorization flow's durable half (RFC 8628): pending
 //! requests, approval or denial by a signed-in account, and one-time
 //! redemption.
 //!

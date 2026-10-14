@@ -1,4 +1,4 @@
-//! The controller's durable log store (W05 + D04): one directory per
+//! The controller's durable log store: one directory per
 //! attempt under `<logs>/<run>/<job>/<attempt>/` holding an append stream
 //! split into segments.
 //!
@@ -248,7 +248,7 @@ pub struct LogStore {
     changes: Arc<LogChanges>,
     compressor: Arc<Compressor>,
     worker: Mutex<Option<JoinHandle<()>>>,
-    /// Disk admission (D06); unset admits every append as before.
+    /// Disk admission; unset admits every append.
     admission: OnceLock<Arc<Admission>>,
     /// Stored bytes one attempt's log may occupy — `MAX_LOG_BYTES`
     /// normally, lower under `open_with_limit`.
@@ -467,7 +467,7 @@ impl LogStore {
     }
 
     /// Remove attempt directories and legacy flat logs that `gone` says
-    /// retention expired or that no attempt names (R01: the deadline lives in
+    /// retention expired or that no attempt names (the deadline lives in
     /// the database; this sweep only deletes files the database already
     /// released, and leftovers of a crash between the two). Open writers are
     /// never touched. One pass removes at most `limit` and looks at run
@@ -504,7 +504,7 @@ impl LogStore {
         let mut stopped = None;
         for (name, run_path) in runs {
             if run_path.is_file() {
-                // Legacy flat log: `logs/<attempt>.log` from before D04.
+                // Legacy flat log: `logs/<attempt>.log`.
                 seen += 1;
                 if let Some(id) = name
                     .strip_suffix(".log")
@@ -1247,7 +1247,7 @@ impl LogStore {
         Ok(Some(last))
     }
 
-    /// Pre-D04 flat logs (`<logs>/<attempt>.log`), kept readable. The read
+    /// Legacy flat logs (`<logs>/<attempt>.log`), kept readable. The read
     /// streams in bounded chunks like a segmented log; the step filter
     /// applies during the scan so foreign frames never eat the limit.
     pub fn tail_legacy(
@@ -1273,7 +1273,7 @@ impl LogStore {
         read_tail_page(&self.dir.join(format!("{attempt}.log")), after, page, step)
     }
 
-    /// Find a literal byte string in an attempt's log (O05): frames with
+    /// Find a literal byte string in an attempt's log: frames with
     /// sequence greater than `after`, scanned in stored order with one
     /// precompiled `memmem` finder and no per-frame allocation beyond the
     /// decode, until `limit` matching lines or `budget` payload bytes.
@@ -1296,7 +1296,7 @@ impl LogStore {
         search_dir(&self.attempt_dir(run, job, attempt), &mut scanner)
     }
 
-    /// [`LogStore::search`] over a pre-D04 flat log.
+    /// [`LogStore::search`] over a legacy flat log.
     pub fn search_legacy(&self, attempt: AttemptId, query: SearchQuery<'_>) -> Result<Search> {
         let mut scanner = Scanner::new(query)?;
         let file = match File::open(self.dir.join(format!("{attempt}.log"))) {
@@ -2580,7 +2580,7 @@ fn step_moved_on(entries: &[Entry], want: u32) -> bool {
     entries.iter().any(|e| e.step > want && e.seq > last_want)
 }
 
-/// The W05 flat-file reader, kept for logs written before D04 and for
+/// The flat-file reader, kept for legacy logs and for
 /// spool-shaped fixtures. Bounded however long the file: frames collect to
 /// `limit` while the scan keeps streaming to the end marker.
 pub fn read_tail(path: &Path, after: u64, limit: usize, step: Option<u32>) -> Result<Tail> {

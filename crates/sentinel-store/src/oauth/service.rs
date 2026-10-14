@@ -1,4 +1,4 @@
-//! Service-account grants (O06): a tenant administrator issues a bounded,
+//! Service-account grants: a tenant administrator issues a bounded,
 //! scoped refresh-token grant to a service principal of that tenant.
 //!
 //! A service grant is an ordinary grant row of kind 3 for the first-party

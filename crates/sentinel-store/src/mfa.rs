@@ -1,4 +1,4 @@
-//! Second factors and step-up (A06).
+//! Second factors and step-up.
 //!
 //! A session proves who you are. Step-up proves you are *still there*, just
 //! now, with something more than a cookie — before a change that would alter
