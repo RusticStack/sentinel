@@ -212,6 +212,13 @@ pub struct Settings {
     /// is not a member.
     pub role: Option<Role>,
     pub created_ms: i64,
+    /// When GitHub last confirmed the caller's own membership; `None` for a
+    /// membership managed here (or none).
+    pub github_confirmed_ms: Option<i64>,
+    /// The caller's queued GitHub check, when one is waiting: how many passes
+    /// in a row GitHub could not answer (rate limit, outage, missing App
+    /// permission). Zero for a check that is merely due.
+    pub github_check_failures: Option<u32>,
 }
 
 /// The settings of the tenant `slug` for `principal`, with the same uniform
@@ -219,13 +226,26 @@ pub struct Settings {
 /// absent, suspended and foreign are indistinguishable.
 pub fn settings(conn: &Connection, principal: Principal, slug: &str) -> Result<Settings> {
     let tenant = crate::auth::member_tenant_by_slug(conn, principal, slug)?;
-    let (slug, kind, source, created_ms, role, bound): (String, i64, i64, i64, Option<i64>, bool) =
-        conn.prepare_cached(
-            "SELECT t.slug, t.kind, t.membership_source, t.created_ms,
-                    (SELECT m.role FROM memberships m WHERE m.tenant_id = t.id AND m.user_id = ?2),
+    // Both left joins are primary-key probes of the caller's own rows.
+    let (slug, kind, source, created_ms, role, bound, confirmed, failures): (
+        String,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        bool,
+        Option<i64>,
+        Option<i64>,
+    ) = conn
+        .prepare_cached(
+            "SELECT t.slug, t.kind, t.membership_source, t.created_ms, m.role,
                     EXISTS(SELECT 1 FROM installations i
-                           WHERE i.tenant_id = t.id AND i.provider = 'github')
-             FROM tenants t WHERE t.id = ?1",
+                           WHERE i.tenant_id = t.id AND i.provider = 'github'),
+                    m.synced_ms, c.attempts
+             FROM tenants t
+             LEFT JOIN memberships m ON m.tenant_id = t.id AND m.user_id = ?2
+             LEFT JOIN github_member_checks c ON c.tenant_id = t.id AND c.user_id = ?2
+             WHERE t.id = ?1",
         )?
         .query_row(params![tenant.as_bytes(), principal.user.as_bytes()], |r| {
             Ok((
@@ -235,9 +255,13 @@ pub fn settings(conn: &Connection, principal: Principal, slug: &str) -> Result<S
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
             ))
         })?;
     Ok(Settings {
+        github_confirmed_ms: confirmed,
+        github_check_failures: failures.map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
         tenant,
         slug,
         personal: kind == 1,

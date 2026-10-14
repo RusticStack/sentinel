@@ -678,4 +678,48 @@ fn settings_report_github_backing_apart_from_a_bound_installation() {
         .unwrap();
     assert!(settings.github_backed);
     assert!(!settings.installation_bound);
+    // Nothing confirmed and nothing queued yet.
+    assert_eq!(settings.github_confirmed_ms, None);
+    assert_eq!(settings.github_check_failures, None);
+}
+
+#[test]
+fn settings_report_only_the_callers_own_github_standing() {
+    let w = world(TenantCreation::ApprovedUsers);
+    let ada = w.member("ada");
+    let bob = w.member("bob");
+    let tenant = w.create(ada, "acme", 10).unwrap();
+    let (ada_id, bob_id) = (ada.user, bob.user);
+    w.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE tenants SET membership_source = 1 WHERE id = ?1",
+                params![tenant.as_bytes()],
+            )?;
+            tx.execute(
+                "UPDATE memberships SET synced_ms = 5000 WHERE tenant_id = ?1 AND user_id = ?2",
+                params![tenant.as_bytes(), ada_id.as_bytes()],
+            )?;
+            // GitHub could not answer Ada's last three checks; Bob, who is
+            // no member, has a queued check of his own that must not leak.
+            tx.execute(
+                "INSERT INTO github_member_checks(tenant_id, user_id, next_ms, attempts)
+                 VALUES (?1, ?2, 0, 3), (?1, ?3, 0, 7)",
+                params![tenant.as_bytes(), ada_id.as_bytes(), bob_id.as_bytes()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let settings = w
+        .store
+        .read(|c| organizations::settings(c, ada, "acme"))
+        .unwrap();
+    assert_eq!(settings.github_confirmed_ms, Some(5000));
+    assert_eq!(settings.github_check_failures, Some(3));
+    // A queued check is no membership: Bob still cannot see the tenant.
+    assert!(matches!(
+        w.store.read(|c| organizations::settings(c, bob, "acme")),
+        Err(Error::NotFound)
+    ));
 }

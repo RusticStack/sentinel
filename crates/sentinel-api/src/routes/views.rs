@@ -39,7 +39,9 @@ fn decoded(query: &str, name: &str) -> Result<Option<String>, sentinel_protocol:
 }
 
 /// `GET /api/v1/tenants`: the tenants the caller is a member of, by slug,
-/// with the caller's role in each — what the page's tenant switcher offers.
+/// with the caller's role in each, its kind (`personal` or `organization`)
+/// and where its membership comes from (`app` or `github`) — what the page's
+/// namespace switcher groups by, without a settings read per tenant.
 /// A credential narrowed to one tenant lists that tenant only. The server
 /// still authorizes every request by membership; this list is convenience.
 pub(super) fn my_tenants(state: &State, request: &crate::http::Request) -> Route {
@@ -60,6 +62,8 @@ pub(super) fn my_tenants(state: &State, request: &crate::http::Request) -> Route
                     sentinel_core::auth::Role::Operator => "operator",
                     sentinel_core::auth::Role::TenantAdmin => "admin",
                 },
+                "kind": if c.personal { "personal" } else { "organization" },
+                "membership": if c.github_backed { "github" } else { "app" },
             }))
             .collect::<Vec<_>>(),
         "super_admin": who.super_admin,
