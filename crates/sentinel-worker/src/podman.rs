@@ -1,18 +1,18 @@
 //! Rootless Podman containers for one attempt each.
 //!
-//! The baseline the F07 probe proved enforceable, applied to every container:
+//! The enforceable baseline applied to every container:
 //! `--cpus`, `--memory` with swap capped at the same value, `--pids-limit`,
 //! `--network none`, a read-only root filesystem with a tmpfs `/tmp`, every
 //! capability dropped, `no-new-privileges`, and the user namespace rootless
 //! Podman gives (uid 0 inside is the worker user outside). The writable bind
-//! mounts are the workspace and the attempt's private cache views (K02) —
+//! mounts are the workspace and the attempt's private cache views —
 //! nothing shared, nothing of the host beyond them. There is no Docker
 //! socket, no privileged flag and nothing a pipeline can set to loosen any
 //! of this.
 //!
 //! Ownership is tracked by labels: every container is `sentinel-<attempt>`
 //! and carries `io.sentinel.worker` and `io.sentinel.attempt`, so what this
-//! worker owns can be listed from the runtime after a restart (W07).
+//! worker owns can be listed from the runtime after a restart.
 
 use std::{
     path::Path,
@@ -54,7 +54,7 @@ pub struct Runtime {
     pub cgroup_manager: String,
 }
 
-/// Where an image and the containers made from it live (P10D-5).
+/// Where an image and the containers made from it live.
 ///
 /// containers/image reuses a layer already present in the store it pulls
 /// into without fetching it from the source registry: an authorized pull
@@ -395,8 +395,8 @@ pub fn pull(
     pull_checked(image, authfile, store, timeout, cancel, true)
 }
 
-/// Whether a pull must ask the registry even when the digest is resident
-/// (B03). A credentialed pull must: its authorization is what the registry
+/// Whether a pull must ask the registry even when the digest is resident.
+/// A credentialed pull must: its authorization is what the registry
 /// decides, now, for this tenant. So must any pull into a tenant's private
 /// store. An anonymous pull into the shared store asks nobody's permission —
 /// the shared store only ever holds what was anonymously pullable, and a
@@ -482,7 +482,7 @@ const KEEPALIVE: &str =
     "trap 'exit 0' TERM INT; n=$1; while [ \"$n\" -gt 0 ]; do sleep 1; n=$((n-1)); done";
 
 /// One extra writable bind mount: `host` appears at `container`. Cache
-/// entries that declare an absolute path use it (K02) — the workspace
+/// entries that declare an absolute path use it — the workspace
 /// mount already covers every relative path, so nothing else asks.
 #[derive(Clone, Debug)]
 pub struct Mount {
@@ -620,7 +620,7 @@ fn exited(pid: i32) -> bool {
 /// secret step it guards is refused.
 pub const CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Graceful then forced termination of a container by name (W06): `SIGTERM`
+/// Graceful then forced termination of a container by name: `SIGTERM`
 /// to every step process in the container's cgroup — the keepalive is
 /// spared so the container stays up for the signal to be handled — then,
 /// if any is still there after `grace`, `podman stop -t 0` and removal.
@@ -748,7 +748,7 @@ impl Container {
                 "ALL",
                 "--security-opt",
                 "no-new-privileges",
-                // No core dumps (P10D-9): a crashing step would otherwise
+                // No core dumps: a crashing step would otherwise
                 // hand its memory — delivered secrets included — to the
                 // host's core handler. Soft and hard, so nothing inside
                 // can raise it back.
@@ -822,7 +822,7 @@ impl Container {
     /// [`Container::exec`] with the step's output streamed to `sink` as it
     /// is produced, in addition to the bounded tails. Secret environment
     /// values never pass through here: Podman would write them into the
-    /// exec session's spec on disk (P10D-8). The attempt delivers them in
+    /// exec session's spec on disk. The attempt delivers them in
     /// a file on the step's private mount instead and wraps `argv`.
     pub fn exec_streaming(
         &self,
@@ -952,7 +952,7 @@ impl Container {
     }
 
     /// Kill every process in the container but its keepalive, and wait
-    /// until none is left (P10D-1). All steps run as one user in one PID
+    /// until none is left. All steps run as one user in one PID
     /// namespace, so a process an earlier step left running — a daemon, a
     /// `setsid` watcher — could read a later step's environment through
     /// `/proc` or its files under the secret mount. The attempt clears the
@@ -1033,7 +1033,7 @@ pub fn owned(worker: WorkerId) -> Result<Vec<(AttemptId, String)>> {
     owned_in(worker, &Store::Shared)
 }
 
-/// [`owned`] in `store` — the ownership record W07 reconciles against,
+/// [`owned`] in `store` — the ownership record restart reconciliation reads,
 /// asked of every store the data directory holds.
 pub fn owned_in(worker: WorkerId, store: &Store) -> Result<Vec<(AttemptId, String)>> {
     let mut cmd = podman_in(store);
@@ -1077,7 +1077,7 @@ pub fn remove_named(name: &str, store: &Store) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// B03: only an anonymous pull into the shared store may use a resident
+    /// Only an anonymous pull into the shared store may use a resident
     /// digest without asking the registry; a credential or a private store
     /// always asks.
     #[test]
@@ -1092,7 +1092,7 @@ mod tests {
         assert!(registry_check_needed(false, &private));
     }
 
-    /// R01: the image listing the reclamation pass reads — one compact line
+    /// The image listing the reclamation pass reads — one compact line
     /// per image; malformed lines and non-digest ids are skipped, never
     /// removed by mistake.
     #[test]
@@ -1182,7 +1182,7 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "--root" || arg == "--runroot"));
     }
 
-    /// P10D-5: a credentialed pull and every later command on its
+    /// A credentialed pull and every later command on its
     /// container name the tenant's private store, whose graph root lives
     /// under the data directory and whose run root under the runtime one;
     /// two tenants never share one.

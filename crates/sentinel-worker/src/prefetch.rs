@@ -1,4 +1,4 @@
-//! K05 bounded image prefetch: pull, in the background, the images the
+//! Bounded image prefetch: pull, in the background, the images the
 //! controller says queued work this worker could be placed will need.
 //!
 //! The controller's hint (`Prefetch`, protocol 9) is the whole wanted set;
@@ -24,11 +24,10 @@
 //! pull does: it shares the single-flight slot (an attempt needing the
 //! image follows it and shares the download), records the digest in the
 //! held set when it lands — which the link reports as warm, so placement's
-//! locality prefers this worker — and pulls with the worker's own registry
-//! authority, exactly what a job the worker could be placed would pull.
-//! The hint names only such jobs (tenant pool access, architecture, labels,
-//! capacity — `dispatch::prefetch_hints`); tenant-scoped registry
-//! credentials are S05.
+//! locality prefers this worker — and pulls anonymously, never with a
+//! tenant's registry credentials.
+//! The hint names only jobs this worker could be placed (tenant pool access,
+//! architecture, labels, capacity — `dispatch::prefetch_hints`).
 
 use std::{
     sync::{

@@ -1,9 +1,9 @@
-//! Output redaction (W05): registered secret values are replaced before a
+//! Output redaction: registered secret values are replaced before a
 //! byte reaches the spool, and therefore before it reaches the link, the
 //! controller or a log reader.
 //!
 //! A redactor belongs to one attempt: registration is per attempt and
-//! dynamic — the secret resolver (S05/S06) registers each value into the
+//! dynamic — the secret resolver registers each value into the
 //! live attempt before the step that receives it starts — so one tenant's
 //! values never touch another's output, and they go with the attempt.
 //! Boundaries are handled: the redactor holds back the shortest tail of each
@@ -14,7 +14,7 @@
 //!
 //! Matching is leftmost-longest (at each position the longest value that
 //! starts there wins; the scan resumes after it) and costs O(bytes) whatever
-//! the number or length of the registered values (P10D-10): two
+//! the number or length of the registered values: two
 //! Aho–Corasick automata built once per registration set — one over the
 //! values reversed, which gives the longest value starting at every
 //! position in one backward pass, and one over the values as they are,
@@ -37,8 +37,8 @@ use sentinel_protocol::logs::Stream;
 /// matching to stay precise. The rule is a length, not an entropy test. The
 /// secret store accepts values from one byte, so the floor is enforced at
 /// delivery: a bound value below it fails the attempt as `Preparation`
-/// rather than reaching a job that could print it unredacted. Lines of a longer multi-line value are not held to
-/// the floor ([`carries_material`] decides those).
+/// rather than reaching a job that could print it unredacted. Lines of a
+/// longer multi-line value are not held to the floor ([`carries_material`] decides those).
 pub const MIN_SECRET_BYTES: usize = 4;
 /// The longest value whose base64 and percent-encoded forms are registered
 /// beside it: a value of a few KiB (a key, a token, a certificate) costs a
@@ -212,9 +212,8 @@ impl Redactor {
     ///
     /// Structured output carries values JSON-escaped (Go `test2json`,
     /// rustc/cargo JSON), and the controller's failure parser decodes them,
-    /// so every escaping a standard encoder produces is registered too
-    /// (P11D-4): the stored log never holds a decodable copy the raw value
-    /// would not have matched. A multi-line value is written by
+    /// so every escaping a standard encoder produces is registered too: the stored log never holds a decodable copy the raw
+    /// value would not have matched. A multi-line value is written by
     /// line-oriented producers one record per line, never contiguously, so
     /// each of its lines that [`carries_material`] is registered as well,
     /// raw and escaped, whatever its length. All of this is paid once here;
@@ -338,7 +337,7 @@ impl Redactor {
     }
 
     /// The bounded, printable excerpt of a step's stderr tail that a
-    /// failure detail carries (P10D-2): redacted **before** anything
+    /// failure detail carries: redacted **before** anything
     /// transforms it — lossy UTF-8 decoding, line selection, control
     /// filtering and the length cut could otherwise leave a value no longer
     /// matching exactly. A multi-line value is also redacted line by line,
@@ -690,7 +689,7 @@ mod tests {
         out
     }
 
-    /// P04-21: a shorter secret is not replaced while the rest of the
+    /// A shorter secret is not replaced while the rest of the
     /// buffer may still be the start of a longer one arriving next.
     #[test]
     fn the_longest_secret_wins_across_a_chunk_boundary() {
@@ -719,7 +718,7 @@ mod tests {
         ));
     }
 
-    /// P11D-4: a value JSON-escaped by Go's test2json or by serde-style
+    /// A value JSON-escaped by Go's test2json or by serde-style
     /// encoders is redacted in the stored bytes, so the failure parser has
     /// nothing to decode back into the plaintext.
     #[test]
@@ -787,7 +786,7 @@ mod tests {
         assert_eq!(run(&mut r, &[b"{ok}\n"]), b"{ok}\n".to_vec());
     }
 
-    /// The short-line residual of P11D-4: a line of a multi-line value is
+    /// A short line of a multi-line value: a line of a multi-line value is
     /// registered whatever its length once it holds anything but
     /// punctuation and whitespace, so a short password on its own line, a
     /// PEM's short last base64 line or a one-letter line never survives a
@@ -854,7 +853,7 @@ mod tests {
         assert_eq!(r.apply(Stream::Stderr, b"ret!\n").as_ref(), b"***!\n");
     }
 
-    /// The scan the automata replaced, kept as the specification: at each
+    /// The plain per-value scan, kept as the specification: at each
     /// reached position hold a tail that is a proper prefix of a longer
     /// value, else replace the longest value starting there.
     fn reference(secrets: &[Vec<u8>], buf: &[u8], hold: bool, out: &mut Vec<u8>) -> usize {
@@ -902,7 +901,7 @@ mod tests {
         }
     }
 
-    /// P10D-10: the automata keep the exact leftmost-longest semantics and
+    /// The automata keep the exact leftmost-longest semantics and
     /// hold-back of the scan they replaced, over many random value sets
     /// (overlapping prefixes and suffixes over a tiny alphabet), texts and
     /// chunkings.
@@ -961,11 +960,11 @@ mod tests {
         }
     }
 
-    /// P10D-10: 16 near-miss values of 64 KiB (a full 1 MiB bundle)
+    /// 16 near-miss values of 64 KiB (a full 1 MiB bundle)
     /// against a stream that keeps almost matching them cost O(output), not
     /// O(output × values × length): a MiB of such output is redacted within
-    /// a bound the old scan (16 comparisons of up to 64 KiB per byte) did
-    /// not meet.
+    /// a bound a per-value scan (16 comparisons of up to 64 KiB per byte)
+    /// would not meet.
     #[test]
     fn a_near_miss_value_costs_linear_time() {
         let mut r = Redactor::new();
@@ -1002,9 +1001,9 @@ mod tests {
         assert_eq!(out, REPLACEMENT);
     }
 
-    /// P10D-2: the excerpt is redacted before it is transformed. Each of
-    /// the transformations that used to run first — lossy decoding, line
-    /// selection, control filtering, the 200-character cut and the tail
+    /// The excerpt is redacted before it is transformed. Each of
+    /// the transformations that could otherwise run first — lossy decoding,
+    /// line selection, control filtering, the 200-character cut and the tail
     /// ring's cut — leaves no fragment of a value.
     #[test]
     fn a_failure_excerpt_carries_no_fragment_of_a_value() {

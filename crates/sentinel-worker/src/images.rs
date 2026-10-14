@@ -55,7 +55,7 @@ struct PullKey {
     tenant: Option<[u8; 16]>,
     credential: [u8; 32],
     /// Where the image lands: a credentialed pull goes to the tenant's
-    /// private store (P10D-5).
+    /// private store.
     store: podman::Store,
 }
 
@@ -196,10 +196,10 @@ struct State {
     /// Moves every time `held` gains a digest: the placement feed resends
     /// only when it changed.
     version: u64,
-    /// References in `pulling` whose leader is a prefetch (K05), not an
+    /// References in `pulling` whose leader is a prefetch, not an
     /// attempt: a prefetch yields to attempts' own pulls.
     prefetching: HashSet<PullKey>,
-    /// When each held digest was last pulled for use (R01): the image
+    /// When each held digest was last pulled for use: the image
     /// reclamation pass removes the least recently used first. Bounded with
     /// `held`.
     used: HashMap<Box<str>, Instant>,
@@ -431,7 +431,7 @@ impl Images {
         outcome
     }
 
-    /// K05: lead a pull of `image` ahead of any attempt needing it, or do
+    /// Lead a pull of `image` ahead of any attempt needing it, or do
     /// nothing (`None`) when the store is known to hold its digest or a
     /// pull of it is already in flight. An attempt that then needs the
     /// image follows this pull like any other and shares its download;
@@ -517,7 +517,7 @@ impl Images {
 
     /// The newest `max` held digests as placement keys — the first 8 bytes
     /// of each `sha256:` digest, what the profile's `Availability::images`
-    /// carries (K08, P07-6). A digest that is not `sha256:<hex>` has no key.
+    /// carries. A digest that is not `sha256:<hex>` has no key.
     pub fn held_keys(&self, max: usize) -> Vec<[u8; 8]> {
         let state = self.state();
         state
@@ -570,7 +570,7 @@ impl Images {
     }
 
     /// Choose what one reclamation pass removes from a store holding
-    /// `images` so it fits `budget` bytes (R01): only images no container
+    /// `images` so it fits `budget` bytes: only images no container
     /// uses, never a digest being pulled or used within [`IMAGE_KEEP`] (an
     /// attempt pulls, then creates its container — the gap is not an
     /// invitation), least recently used first (a digest this process never
@@ -679,7 +679,7 @@ mod tests {
         }
     }
 
-    /// R01: an image store over its budget gives up the least recently
+    /// An image store over its budget gives up the least recently
     /// used images no container holds, and never one just pulled for use.
     #[test]
     fn reclamation_takes_the_least_recently_used_and_spares_what_is_in_use() {
@@ -789,7 +789,7 @@ mod tests {
         stub.release.wait();
         for caller in callers {
             // The leader's exists/downloaded answer is what every
-            // follower gets (K08): this stub downloaded.
+            // follower gets: this stub downloaded.
             assert!(!caller.join().unwrap().unwrap());
         }
         assert_eq!(

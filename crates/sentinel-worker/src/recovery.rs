@@ -1,4 +1,4 @@
-//! Worker restart reconciliation (W07): what the previous process left
+//! Worker restart reconciliation: what the previous process left
 //! behind, settled before a single new offer is taken.
 //!
 //! An attempt in progress is recorded on disk the moment it is spawned —
@@ -146,7 +146,7 @@ pub fn leftovers(root: &Path) -> Result<Vec<Marker>> {
 /// recorded them reconciled.
 pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover>)> {
     let mut done = Recovered::default();
-    // Every store: the shared one and each tenant's private one (P10D-5).
+    // Every store: the shared one and each tenant's private one.
     for store in podman::Store::all(root) {
         for (_, name) in podman::owned_in(worker, &store)? {
             podman::remove_named(&name, &store)?;
@@ -206,7 +206,7 @@ pub fn recover(root: &Path, worker: WorkerId) -> Result<(Recovered, Vec<Leftover
 /// skips RAII cleanup, so remove its attempt trees before accepting work.
 fn reap_secret_directories(root: &Path) -> Result<()> {
     // Where an older worker staged them (the data directory), then where
-    // this one does (the runtime directory, P10D-8).
+    // this one does (the runtime directory).
     reap_secret_dir(&root.join(SECRET_DELIVERY_DIR))?;
     reap_secret_dir(&crate::attempt::secret_root(root))
 }
@@ -253,7 +253,7 @@ mod tests {
         fs::write(attempt.join("files/token"), b"secret-value").unwrap();
         fs::write(root.join(SECRET_DELIVERY_DIR).join("orphan"), b"orphan").unwrap();
 
-        // P10D-8: where this worker stages them now, too.
+        // Where this worker stages them now, too.
         let staged = crate::attempt::secret_root(&root).join("live-attempt");
         fs::create_dir_all(staged.join("env")).unwrap();
         fs::write(staged.join("env/step-0.sh"), b"export T='v'\n").unwrap();
