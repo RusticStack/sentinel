@@ -403,6 +403,13 @@ impl Changes {
         generation
     }
 
+    /// Wake every parked waiter without a commit, for a thread that must stop
+    /// waiting (its owner is shutting it down). The generation moves like a
+    /// commit's, which is harmless: a generation says only "re-read".
+    pub fn nudge(&self) {
+        self.committed();
+    }
+
     /// The writer's side, once a write has committed.
     #[inline]
     fn committed(&self) {

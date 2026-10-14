@@ -445,3 +445,70 @@ impl Publisher for Deliver {
         }
     }
 }
+
+/// A lane whose safety re-read is far away: only the commit notifier and the
+/// retry deadline can wake it in time.
+fn start_unpolled(f: &Fixture) -> Lane {
+    Lane::start(
+        Arc::clone(&f.store),
+        Box::new(Deliver),
+        Config {
+            idle: Duration::from_secs(120),
+            ..Config::default()
+        },
+        |_| {},
+    )
+}
+
+fn all_published(rows: &[checks::Publication]) -> bool {
+    !rows.is_empty() && rows.iter().all(|r| r.state == State::Published)
+}
+
+#[test]
+fn a_publication_committed_to_an_idle_lane_is_delivered_without_polling() {
+    let f = fixture();
+    let lane = start_unpolled(&f);
+    // Let the lane find nothing and go to sleep.
+    std::thread::sleep(Duration::from_millis(300));
+    let run = event_run(&f);
+    // Far inside the lane's two-minute safety re-read.
+    wait_for(&f, run, "the commit wakes the lane", all_published);
+    drop(lane);
+}
+
+#[test]
+fn a_backed_off_row_is_read_when_its_deadline_arrives_not_when_something_commits() {
+    let f = fixture();
+    let run = event_run(&f);
+    let due = UnixMillis::now().0 + 400;
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute("UPDATE check_publications SET next_attempt_ms = ?1", [due])?;
+            Ok(())
+        })
+        .unwrap();
+    let lane = start_unpolled(&f);
+    std::thread::sleep(Duration::from_millis(100));
+    let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
+    assert!(
+        rows.iter().all(|r| r.state == State::Pending),
+        "not due yet: {rows:?}"
+    );
+    // No commit follows: only the deadline can wake the lane.
+    wait_for(&f, run, "the deadline wakes the lane", all_published);
+    drop(lane);
+}
+
+#[test]
+fn dropping_an_idle_lane_stops_it_at_once() {
+    let f = fixture();
+    let lane = start_unpolled(&f);
+    std::thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    drop(lane);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the lane slept through its shutdown"
+    );
+}

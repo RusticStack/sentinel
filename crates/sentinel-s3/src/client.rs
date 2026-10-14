@@ -202,17 +202,31 @@ impl Client {
         extra: &[(&str, &str)],
         body: &[u8],
     ) -> Result<ureq::http::Response<ureq::Body>> {
-        let (host, path) = self.locate(key);
         let payload = if body.is_empty() {
             sigv4::EMPTY_SHA256.to_owned()
         } else {
             sigv4::sha256_hex(body)
         };
+        self.send_hashed(method, key, query, extra, body, &payload)
+    }
+
+    /// [`send`](Self::send) for a body whose SHA-256 the caller already
+    /// computed (alongside its `Content-MD5`, in one walk over the bytes).
+    fn send_hashed(
+        &self,
+        method: &str,
+        key: Option<&str>,
+        query: &[(&str, &str)],
+        extra: &[(&str, &str)],
+        body: &[u8],
+        payload: &str,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
+        let (host, path) = self.locate(key);
         let (amz_date, _) = sigv4::timestamp(now_secs());
         let creds = &self.config.credentials;
         let mut headers: Vec<(&str, &str)> = vec![
             ("host", &host),
-            ("x-amz-content-sha256", &payload),
+            ("x-amz-content-sha256", payload),
             ("x-amz-date", &amz_date),
         ];
         if let Some(token) = &creds.session_token {
@@ -225,7 +239,7 @@ impl Client {
                 path: &path,
                 query,
                 headers: &headers,
-                payload_sha256: &payload,
+                payload_sha256: payload,
             },
             &amz_date,
             &self.config.region,
@@ -343,11 +357,11 @@ impl Client {
             return Err(Error::Config("single upload above 5 GiB".into()));
         }
         let meta = Self::metadata_headers(metadata)?;
-        let md5 = content_md5(body);
+        let (sha256, md5) = body_hashes(body);
         let mut extra: Vec<(&str, &str)> =
             meta.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         extra.push(("content-md5", &md5));
-        let response = Self::ok(self.send("PUT", Some(key), &[], &extra, body)?)?;
+        let response = Self::ok(self.send_hashed("PUT", Some(key), &[], &extra, body, &sha256)?)?;
         Ok(etag(&Self::header(&response, "etag").unwrap_or_default()))
     }
 
@@ -376,13 +390,14 @@ impl Client {
             return Err(Error::Config("part number or size out of range".into()));
         }
         let n = number.to_string();
-        let md5 = content_md5(body);
-        let response = Self::ok(self.send(
+        let (sha256, md5) = body_hashes(body);
+        let response = Self::ok(self.send_hashed(
             "PUT",
             Some(key),
             &[("partNumber", &n), ("uploadId", upload_id)],
             &[("content-md5", &md5)],
             body,
+            &sha256,
         )?)?;
         Self::header(&response, "etag")
             .map(|e| etag(&e))
@@ -713,6 +728,27 @@ pub fn content_md5(body: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(body))
 }
 
+/// The signed SHA-256 payload hash (hex) and the `Content-MD5` of a body from
+/// one walk over its bytes: both digests take each 64 KiB chunk while it is
+/// still in cache, instead of two passes over a part that may be hundreds of
+/// MiB and far larger than any cache. The results equal
+/// [`sigv4::sha256_hex`] and [`content_md5`].
+pub fn body_hashes(body: &[u8]) -> (String, String) {
+    use base64::Engine as _;
+    use md5::Digest as _;
+    const CHUNK: usize = 64 << 10;
+    let mut sha = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut md5 = md5::Md5::new();
+    for chunk in body.chunks(CHUNK) {
+        sha.update(chunk);
+        md5.update(chunk);
+    }
+    (
+        sigv4::hex(sha.finish().as_ref()),
+        base64::engine::general_purpose::STANDARD.encode(md5.finalize()),
+    )
+}
+
 /// A default timeout pair: 10 s to connect, 60 s per read.
 pub fn default_timeouts() -> (Duration, Duration) {
     (Duration::from_secs(10), Duration::from_secs(60))
@@ -721,6 +757,19 @@ pub fn default_timeouts() -> (Duration, Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_walk_gives_the_same_hashes_as_two() {
+        // Empty, shorter than a chunk, exactly a chunk, and across chunks.
+        for len in [0usize, 1, 1000, 64 << 10, (64 << 10) + 1, 300_000] {
+            let body: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            assert_eq!(
+                body_hashes(&body),
+                (sigv4::sha256_hex(&body), content_md5(&body)),
+                "{len} bytes"
+            );
+        }
+    }
 
     #[test]
     fn ranges_count_their_bytes_and_refuse_to_wrap() {

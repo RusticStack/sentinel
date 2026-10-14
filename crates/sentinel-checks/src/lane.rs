@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sentinel_core::{CheckId, UnixMillis};
@@ -81,8 +81,20 @@ pub struct Batch {
     pub entries: Vec<Notice>,
 }
 
-/// How the lane paces itself. Defaults: 32 publications per batch, a 250 ms
-/// idle tick, and store-failure back-off from one second to thirty.
+/// The least time between two reads of the outbox that commits (not the
+/// clock) asked for: a storm of unrelated writes costs the lane at most one
+/// indexed read per interval. The first commit after a quiet spell is read at
+/// once, since the interval is measured from the previous read.
+const COMMIT_GAP: Duration = Duration::from_millis(50);
+
+/// How the lane paces itself. Defaults: 32 publications per batch, a 2 s
+/// safety re-read, and store-failure back-off from one second to thirty.
+///
+/// The lane does not poll. It sleeps on the store's commit notifier and a
+/// deadline at the earliest pending row's retry time, so a new publication is
+/// read when its transaction commits and a backed-off one exactly when it is
+/// due. `idle` is only the longest it sleeps without reading: the net for a
+/// write the notifier cannot see (another process on the same database).
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub batch: u16,
@@ -95,7 +107,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             batch: 32,
-            idle: Duration::from_millis(250),
+            idle: Duration::from_secs(2),
             min_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
         }
@@ -104,6 +116,7 @@ impl Default for Config {
 
 /// A running lane; dropping it stops and joins the thread.
 pub struct Lane {
+    store: Arc<Store>,
     stop: Arc<AtomicBool>,
     settled: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     thread: Option<thread::JoinHandle<()>>,
@@ -122,12 +135,14 @@ impl Lane {
         let thread = {
             let (stop, settled) = (Arc::clone(&stop), Arc::clone(&settled));
             let notice = Arc::clone(&notice);
+            let store = Arc::clone(&store);
             thread::Builder::new()
                 .name("sentinel-checks".into())
                 .spawn(move || run(&store, publisher, &config, &stop, &settled, &*notice))
                 .expect("spawn checks lane")
         };
         Lane {
+            store,
             stop,
             settled,
             thread: Some(thread),
@@ -141,6 +156,9 @@ impl Drop for Lane {
         let (lock, cv) = &*self.settled;
         *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
         cv.notify_all();
+        // The lane may be parked on the commit notifier rather than the
+        // condvar above.
+        self.store.changes().nudge();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -222,7 +240,15 @@ fn run(
     // deferred instead of being sent into a limit that is known to be spent.
     let mut parked: HashMap<u64, i64> = HashMap::new();
     let mut poison: HashMap<CheckId, u32> = HashMap::new();
-    while !stop.load(Ordering::Acquire) {
+    loop {
+        // The generation is read before the stop flag and before the read of
+        // the outbox: a commit or a shutdown after this point moves it, so
+        // the sleep below returns at once instead of missing it.
+        let seen = store.changes().generation();
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let polled = Instant::now();
         let due = match store.read(|c| checks::due(c, UnixMillis::now(), config.batch)) {
             Ok(due) => due,
             Err(_) => {
@@ -233,7 +259,12 @@ fn run(
         };
         if due.is_empty() {
             failures = 0;
-            wait(settled, config.idle);
+            let deadline = wake_at(store, config, polled);
+            store.changes().wait_past(seen, deadline);
+            // Unrelated commits wake the lane too: coalesce them.
+            if let Some(rest) = COMMIT_GAP.min(config.idle).checked_sub(polled.elapsed()) {
+                wait(settled, rest);
+            }
             continue;
         }
         let pass_start = UnixMillis::now();
@@ -365,6 +396,20 @@ fn run(
         if !batch.entries.is_empty() || pause_until.is_some() {
             notice(&batch);
         }
+    }
+}
+
+/// When an idle lane must read the outbox again without a commit: at the
+/// earliest pending row's retry time, and never later than `idle` from
+/// `from`.
+fn wake_at(store: &Store, config: &Config, from: Instant) -> Instant {
+    let ceiling = from + config.idle;
+    match store.read(checks::next_due_ms) {
+        Ok(Some(due_ms)) => {
+            let wait_ms = due_ms.saturating_sub(UnixMillis::now().0).max(0) as u64;
+            (from + Duration::from_millis(wait_ms)).min(ceiling)
+        }
+        _ => ceiling,
     }
 }
 

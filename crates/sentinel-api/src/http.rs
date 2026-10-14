@@ -18,7 +18,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
     io::{self, BufRead, BufReader, Cursor, Read, Write},
-    net::{IpAddr, Shutdown, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -56,7 +56,9 @@ pub(crate) struct Tune {
     pub per_peer: usize,
     /// Longest a single socket write may stall.
     pub write_stall: Duration,
-    /// Poll granularity for the nonblocking accept and permit waits.
+    /// Poll granularity for permit waits and the stop flag. The accept
+    /// itself blocks: a new connection is taken the moment it arrives, never
+    /// after a poll sleep.
     pub poll: Duration,
 }
 
@@ -1127,6 +1129,9 @@ pub(crate) struct Conns {
     sockets: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
     permits: Arc<Pool>,
     poll: Duration,
+    /// Where the listener can be reached from this host, to wake an acceptor
+    /// parked in a blocking accept when the server stops.
+    wake: SocketAddr,
     acceptor: Option<JoinHandle<()>>,
 }
 
@@ -1148,7 +1153,35 @@ impl Conns {
             let _ = socket.shutdown(Shutdown::Both);
         }
         if let Some(acceptor) = self.acceptor.take() {
-            let _ = acceptor.join();
+            // The acceptor sleeps in `accept`: a connection to our own
+            // listener ends it, and it sees `stop` before serving anything.
+            // Should the listener refuse even that (it is bound, so only a
+            // pathological host does), the thread is left to end at its next
+            // connection rather than hanging the shutdown.
+            let target = match self.wake.ip() {
+                IpAddr::V4(ip) if ip.is_unspecified() => {
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, self.wake.port()))
+                }
+                IpAddr::V6(ip) if ip.is_unspecified() => {
+                    SocketAddr::from((Ipv6Addr::LOCALHOST, self.wake.port()))
+                }
+                _ => self.wake,
+            };
+            for _ in 0..50 {
+                if acceptor.is_finished() {
+                    break;
+                }
+                let _ = TcpStream::connect_timeout(&target, Duration::from_millis(100));
+                for _ in 0..20 {
+                    if acceptor.is_finished() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            if acceptor.is_finished() {
+                let _ = acceptor.join();
+            }
         }
         self.permits.wait_full(self.poll);
     }
@@ -1173,7 +1206,12 @@ pub(crate) fn listen(
     tune: Tune,
     exempt: Vec<TrustedProxy>,
 ) -> io::Result<Conns> {
-    listener.set_nonblocking(true)?;
+    // A blocking accept: the acceptor wakes when a connection arrives (and
+    // on shutdown, when `Conns::shutdown` connects to it), instead of
+    // sleeping `poll` between nonblocking attempts — which delayed every new
+    // connection by up to a whole poll.
+    listener.set_nonblocking(false)?;
+    let wake = listener.local_addr()?;
     let (sockets, permits) = (
         Arc::new(Mutex::new(BTreeMap::new())),
         Pool::new(tune.connections),
@@ -1205,6 +1243,7 @@ pub(crate) fn listen(
         sockets,
         permits,
         poll: tune.poll,
+        wake,
         acceptor: Some(acceptor),
     })
 }
@@ -1277,6 +1316,11 @@ fn accept_loop(
         };
         match listener.accept() {
             Ok((stream, addr)) => {
+                // The wake-up connection of a shutdown, or one that raced it:
+                // nothing is served once the server is stopping.
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
                 let Some(peer_slot) = peers.admit(addr.ip()) else {
                     // This peer holds its share of connections: closing
                     // at once keeps the rest for everyone else.
@@ -1323,9 +1367,8 @@ fn accept_loop(
                         .remove(&id);
                 }
             }
-            // WouldBlock is the nonblocking poll; the rest is descriptor
-            // exhaustion or peers resetting mid-handshake — either way,
-            // back off a poll and keep accepting.
+            // Descriptor exhaustion or a peer reset mid-handshake: back off
+            // a poll and keep accepting.
             Err(_) => thread::sleep(tune.poll),
         }
     }
@@ -1711,6 +1754,77 @@ mod tests {
         let mut client = client;
         client.read_to_string(&mut wire).unwrap();
         assert!(wire.contains("connection: close\r\n"));
+    }
+
+    /// A new connection is accepted when it arrives, not at the next poll:
+    /// with a 100 ms poll (the production value) the old nonblocking accept
+    /// made the median connect-to-response time about 100 ms.
+    #[test]
+    fn a_new_connection_is_served_without_waiting_for_a_poll() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conns = listen(
+            listener,
+            Arc::new(|request: &mut Request| {
+                let _ = request.respond(Response::from_string("ok"));
+            }),
+            Arc::new(AtomicBool::new(false)),
+            Tune {
+                connections: 8,
+                handlers: 4,
+                poll: Duration::from_millis(100),
+                ..tune()
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let mut taken: Vec<Duration> = Vec::new();
+        for _ in 0..15 {
+            let started = Instant::now();
+            let mut client = TcpStream::connect(addr).unwrap();
+            client
+                .write_all(b"GET / HTTP/1.1\r\nhost: h\r\nconnection: close\r\n\r\n")
+                .unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut wire = Vec::new();
+            client.read_to_end(&mut wire).unwrap();
+            assert!(wire.starts_with(b"HTTP/1.1 200"), "{wire:?}");
+            taken.push(started.elapsed());
+            // Land the next connection at a different phase of any poll.
+            thread::sleep(Duration::from_millis(7));
+        }
+        taken.sort();
+        assert!(
+            taken[taken.len() / 2] < Duration::from_millis(50),
+            "median {:?} of {taken:?}",
+            taken[taken.len() / 2]
+        );
+        conns.close();
+    }
+
+    /// The acceptor sleeps in `accept`, so closing the server must wake it:
+    /// an idle server stops within a moment, not never.
+    #[test]
+    fn closing_an_idle_server_wakes_its_blocked_acceptor() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let conns = listen(
+            listener,
+            Arc::new(|_: &mut Request| {}),
+            Arc::new(AtomicBool::new(false)),
+            tune(),
+            Vec::new(),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        conns.close();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
