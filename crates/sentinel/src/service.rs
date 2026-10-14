@@ -2064,7 +2064,7 @@ fn start_server(
     };
     // Before the API serves: a request that mints a link queues its message
     // only when a lane will drain it, which the store row records.
-    let mail = start_mail(&config, public_url.as_deref(), &store, key.as_ref())?;
+    let mail = start_mail(config, public_url.as_deref(), &store, key.as_ref())?;
     announce_setup(&config.data_dir, &store)?;
     // Before the API serves, so the first verification already sees the rules.
     record_auto_join(&config.auto_join, &store)?;
