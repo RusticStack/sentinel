@@ -1,5 +1,11 @@
 <script setup lang="ts">
-const props = defineProps<{ slug: string }>();
+import type { NamespaceSettings } from "~~/shared/types/api";
+
+const props = defineProps<{ slug: string; settings?: NamespaceSettings | null }>();
+// People are added by hand only to an organization managed here; GitHub
+// decides a GitHub-managed one's members, and a personal namespace has one.
+const githubManaged = computed(() => props.settings?.membership === "github");
+const personal = computed(() => props.settings?.kind === "personal");
 const api = useApi();
 const act = useAct();
 const session = useSession();
@@ -60,8 +66,13 @@ const columns = [{ id: "member", header: "Member" }, { accessorKey: "kind", head
     <p v-if="data?.next" class="text-sm text-muted">Only the first 100 members are shown.</p>
   </section>
 
-  <section aria-labelledby="add-h" class="space-y-3">
+  <UAlert v-if="githubManaged" color="neutral" variant="subtle" icon="i-lucide-github" title="Membership of this organization is managed by GitHub."
+    description="People join and leave on GitHub, and Sentinel follows: owners are administrators here, other members operators. Members from GitHub cannot be changed or removed here; service accounts are still managed here (Service accounts)." />
+  <UAlert v-else-if="personal" color="neutral" variant="subtle" icon="i-lucide-user" title="A personal namespace has no other members."
+    description="Create an organization to work with others." :actions="[{ label: 'Organizations', to: '/organizations' }]" />
+  <section v-else aria-labelledby="add-h" class="space-y-3">
     <h2 id="add-h" class="text-base font-semibold">Add a member</h2>
+    <p v-if="settings?.kind === 'organization' && !settings.github_installation" class="text-sm text-muted">To add someone who has no account yet, <ULink :to="`/t/${slug}/admin/invitations`" class="text-primary">invite them by email</ULink>.</p>
     <form class="flex flex-wrap items-end gap-3" aria-label="Add a member" @submit.prevent="add">
       <UFormField label="Username or user id" name="who"><UInput id="m-user" v-model="who" required autocomplete="off" class="w-56" /></UFormField>
       <UFormField label="Role" name="role"><USelect id="m-role" v-model="role" :items="ROLES" class="w-36" /></UFormField>

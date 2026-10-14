@@ -151,6 +151,9 @@ fn the_wizard_creates_the_administrator_and_signs_them_in() {
     );
     assert_eq!(tenants["tenants"][0]["slug"], "acme");
     assert_eq!(tenants["tenants"][0]["role"], "admin");
+    // The switcher groups by kind and membership source without another read.
+    assert_eq!(tenants["tenants"][0]["kind"], "organization");
+    assert_eq!(tenants["tenants"][0]["membership"], "app");
 
     // Setup is closed for everyone afterwards, the same token included.
     let (_, _, closed) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
@@ -362,6 +365,8 @@ fn an_approved_user_creates_an_organization_when_policy_allows() {
     assert_eq!(settings["membership"], "app");
     assert_eq!(settings["role"], "admin");
     assert_eq!(settings["auto_join"]["applies"], false);
+    // An app-created organization has no GitHub standing to report.
+    assert!(settings.get("github_sync").is_none(), "{settings}");
     // A taken name and a reserved one are refused, uniformly for anyone.
     let (status, _) = send(
         &f,

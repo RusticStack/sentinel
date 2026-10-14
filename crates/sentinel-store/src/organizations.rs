@@ -212,6 +212,17 @@ pub struct Settings {
     /// is not a member.
     pub role: Option<Role>,
     pub created_ms: i64,
+    /// When GitHub last confirmed the caller's own membership; `None` for a
+    /// membership managed here (or none).
+    pub github_confirmed_ms: Option<i64>,
+    /// The caller's scheduled GitHub check, when one exists: how many passes
+    /// in a row GitHub could not answer (rate limit, outage, missing App
+    /// permission); zero for one that is merely scheduled.
+    pub github_check_failures: Option<u32>,
+    /// When that check is next due (a settled member keeps a row for the
+    /// periodic re-confirmation, so only a due time at or before now means
+    /// a check is waiting).
+    pub github_check_next_ms: Option<i64>,
 }
 
 /// The settings of the tenant `slug` for `principal`, with the same uniform
@@ -219,41 +230,44 @@ pub struct Settings {
 /// absent, suspended and foreign are indistinguishable.
 pub fn settings(conn: &Connection, principal: Principal, slug: &str) -> Result<Settings> {
     let tenant = crate::auth::member_tenant_by_slug(conn, principal, slug)?;
-    let (slug, kind, source, created_ms, role, bound): (String, i64, i64, i64, Option<i64>, bool) =
-        conn.prepare_cached(
-            "SELECT t.slug, t.kind, t.membership_source, t.created_ms,
-                    (SELECT m.role FROM memberships m WHERE m.tenant_id = t.id AND m.user_id = ?2),
+    // Both left joins are primary-key probes of the caller's own rows.
+    let (mut settings, role) = conn
+        .prepare_cached(
+            "SELECT t.slug, t.kind, t.membership_source, t.created_ms, m.role,
                     EXISTS(SELECT 1 FROM installations i
-                           WHERE i.tenant_id = t.id AND i.provider = 'github')
-             FROM tenants t WHERE t.id = ?1",
+                           WHERE i.tenant_id = t.id AND i.provider = 'github'),
+                    m.synced_ms, c.attempts, c.next_ms
+             FROM tenants t
+             LEFT JOIN memberships m ON m.tenant_id = t.id AND m.user_id = ?2
+             LEFT JOIN github_member_checks c ON c.tenant_id = t.id AND c.user_id = ?2
+             WHERE t.id = ?1",
         )?
         .query_row(params![tenant.as_bytes(), principal.user.as_bytes()], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
+            let settings = Settings {
+                tenant,
+                slug: r.get(0)?,
+                personal: r.get::<_, i64>(1)? == 1,
+                github_backed: r.get::<_, i64>(2)? == 1,
+                created_ms: r.get(3)?,
+                role: None,
+                installation_bound: r.get(5)?,
+                github_confirmed_ms: r.get(6)?,
+                github_check_failures: r
+                    .get::<_, Option<i64>>(7)?
+                    .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+                github_check_next_ms: r.get(8)?,
+            };
+            Ok((settings, r.get::<_, Option<i64>>(4)?))
         })?;
-    Ok(Settings {
-        tenant,
-        slug,
-        personal: kind == 1,
-        github_backed: source == 1,
-        installation_bound: bound,
-        role: match role {
-            None => None,
-            Some(1) => Some(Role::Reader),
-            Some(2) => Some(Role::Operator),
-            Some(3) => Some(Role::TenantAdmin),
-            Some(_) => return Err(Error::Corrupt("memberships.role")),
-        },
-        created_ms,
-    })
+    settings.role = match role {
+        None => None,
+        Some(1) => Some(Role::Reader),
+        Some(2) => Some(Role::Operator),
+        Some(3) => Some(Role::TenantAdmin),
+        Some(_) => return Err(Error::Corrupt("memberships.role")),
+    };
+    Ok(settings)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

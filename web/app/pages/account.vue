@@ -20,99 +20,7 @@ const isoDate = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
 // --- Authenticator app -------------------------------------------------
 
-const enrollPassword = ref("");
-const enrollError = ref("");
-const reauthenticate = ref(false);
-const enrolling = ref(false);
-const uri = ref<string | null>(null);
-const confirmCode = ref("");
-const confirmError = ref("");
-const confirming = ref(false);
 const reissuing = ref(false);
-const qr = computed(() => (uri.value ? encodeQr(uri.value) : null));
-const qrBox = computed(() => (qr.value ? qr.value.size + 8 : 0));
-const secret = computed(() => (uri.value ? totpSecret(uri.value) : null));
-const codeInput = useTemplateRef<{ inputRef?: HTMLInputElement }>("codeInput");
-
-async function startEnroll() {
-  if (enrolling.value) return;
-  enrolling.value = true;
-  enrollError.value = "";
-  reauthenticate.value = false;
-  const body = security.value?.password ? { password: enrollPassword.value } : undefined;
-  enrollPassword.value = "";
-  try {
-    const started = await api<{ provisioning_uri: string }>("/api/v1/mfa/enroll", { method: "POST", body: body ?? {} });
-    uri.value = started.provisioning_uri;
-    confirmCode.value = "";
-    confirmError.value = "";
-    nextTick(() => codeInput.value?.inputRef?.focus());
-  } catch (e) {
-    const err = e as ApiError;
-    if (err.code === "unauthenticated") return;
-    if (err.code === "forbidden" && err.details?.reauthenticate) {
-      reauthenticate.value = true;
-      enrollError.value = "Setting up an authenticator needs a recent sign-in. Sign in again, then come back here.";
-    } else if (err.code === "forbidden" && err.message === "enrollment refused") {
-      enrollError.value = "That password was not accepted. Five wrong attempts end this session.";
-    } else if (err.code === "conflict") {
-      enrollError.value = "An authenticator is already set up.";
-      await refresh();
-    } else if (err.code === "rate_limited") {
-      enrollError.value = `Too many attempts. Try again in ${retryAfter(err)}.`;
-    } else {
-      enrollError.value = err.code === "forbidden" ? err.message : refusal(err);
-    }
-  } finally {
-    enrolling.value = false;
-  }
-}
-
-function cancelEnroll() {
-  uri.value = null;
-  confirmCode.value = "";
-  confirmError.value = "";
-  refresh();
-}
-
-async function confirmEnroll() {
-  if (confirming.value) return;
-  const code = confirmCode.value.replace(/\s+/g, "");
-  confirmCode.value = "";
-  if (!/^\d{6}$/.test(code)) {
-    confirmError.value = "Enter the six-digit code the app shows now.";
-    return;
-  }
-  confirming.value = true;
-  confirmError.value = "";
-  try {
-    const done = await api<{ recovery_codes: string[] }>("/api/v1/mfa/enroll/confirm", { method: "POST", body: { code } });
-    uri.value = null;
-    if (session.me.value) {
-      session.me.value.mfa = true;
-      session.me.value.stepped_up = true;
-    }
-    await showOnce({
-      title: "Save your recovery codes",
-      description: "Each code confirms it's you once if the authenticator is not at hand.",
-      secrets: done.recovery_codes,
-      filename: "sentinel-recovery-codes.txt",
-      note: "Keep them apart from the device that runs the authenticator.",
-    });
-    toast.add({ title: "Authenticator set up", color: "success", icon: "i-lucide-check" });
-    await refresh();
-  } catch (e) {
-    const err = e as ApiError;
-    if (err.code === "unauthenticated") return;
-    confirmError.value = err.code === "forbidden" ? "That code was not accepted. Check the device's clock and use the current code; five wrong codes end this session."
-      : err.code === "not_found" ? "No setup is in progress any more. Start again."
-        : refusal(err);
-    if (err.code === "not_found") uri.value = null;
-    nextTick(() => codeInput.value?.inputRef?.focus());
-  } finally {
-    confirming.value = false;
-  }
-}
 
 async function reissue() {
   if (reissuing.value) return;
@@ -182,6 +90,60 @@ async function changePassword() {
   }
 }
 
+// --- Email address -----------------------------------------------------
+// A new address is a claim until its link is opened; the confirmed one stays
+// the account's until then. Every answer reads the same whether or not
+// another account holds the address.
+
+const newEmail = ref("");
+const emailNote = ref<"sent-email" | "sent-operator" | null>(null);
+const emailError = ref("");
+const savingEmail = ref(false);
+const resendingEmail = ref(false);
+const emailWait = useRetryWait();
+
+async function changeEmail() {
+  if (savingEmail.value || emailWait.waiting.value) return;
+  emailError.value = "";
+  emailNote.value = null;
+  if (!looksLikeEmail(newEmail.value)) {
+    emailError.value = "Enter an email address such as name@example.com.";
+    return;
+  }
+  savingEmail.value = true;
+  try {
+    const done = await withStepUp(() => api<{ verification: "email" | "operator" }>("/api/v1/me/email", { method: "POST", body: { email: newEmail.value.trim() } }));
+    emailNote.value = done.verification === "email" ? "sent-email" : "sent-operator";
+    newEmail.value = "";
+    await session.load(true);
+  } catch (e) {
+    if (e instanceof StepUpDeclined) return;
+    const err = e as ApiError;
+    if (err.code === "unauthenticated") return;
+    if (err.code === "rate_limited") emailWait.start(err);
+    emailError.value = err.code === "invalid_request" ? "Enter a plain email address, such as name@example.com." : refusal(err);
+  } finally {
+    savingEmail.value = false;
+  }
+}
+
+async function resendEmail() {
+  if (resendingEmail.value || emailWait.waiting.value) return;
+  resendingEmail.value = true;
+  emailError.value = "";
+  try {
+    const done = await api<{ verification: "email" | "operator" }>("/api/v1/me/email/resend", { method: "POST", body: {} });
+    emailNote.value = done.verification === "email" ? "sent-email" : "sent-operator";
+  } catch (e) {
+    const err = e as ApiError;
+    if (err.code === "unauthenticated") return;
+    if (err.code === "rate_limited") emailWait.start(err);
+    emailError.value = err.code === "conflict" ? "No address is waiting for confirmation." : err.code === "rate_limited" ? `You asked for several links already. Try again in ${retryAfter(err)}.` : refusal(err);
+  } finally {
+    resendingEmail.value = false;
+  }
+}
+
 // --- Linked identities -------------------------------------------------
 
 const linking = ref(false);
@@ -192,7 +154,7 @@ async function linkGitHub() {
     const started = await withStepUp(() => api<{ authorize_url: string }>("/api/v1/identities/github/link", { method: "POST", body: {} }));
     if (!/^https:\/\//.test(started.authorize_url)) throw new ApiError(0, { code: "invalid_response", message: "the controller gave an unexpected address" });
     // The round trip ends on `/`, which continues here.
-    try { sessionStorage.setItem("sentinel-return", "/account"); } catch { /* ignore */ }
+    rememberReturn("/account");
     await navigateTo(started.authorize_url, { external: true });
   } catch (e) {
     linking.value = false;
@@ -203,12 +165,7 @@ async function linkGitHub() {
   }
 }
 
-onBeforeUnmount(() => {
-  uri.value = null;
-  confirmCode.value = "";
-  enrollPassword.value = "";
-  clearPasswords();
-});
+onBeforeUnmount(clearPasswords);
 </script>
 
 <template>
@@ -242,48 +199,38 @@ onBeforeUnmount(() => {
             <p class="text-xs text-muted">Lost the device and every code? An operator can remove the authenticator on the controller host (<code>sentinel admin mfa disable</code>); that also signs out every session.</p>
           </div>
 
-          <!-- Step 2: scan and confirm -->
-          <div v-else-if="uri" class="space-y-4">
-            <ol class="list-decimal ps-5 text-sm space-y-1">
-              <li>Scan the code with an authenticator app, or enter the key by hand.</li>
-              <li>Type the six-digit code the app then shows.</li>
-            </ol>
-            <div class="flex flex-col gap-4 sm:flex-row sm:items-start">
-              <svg v-if="qr" :viewBox="`0 0 ${qrBox} ${qrBox}`" class="size-48 shrink-0 rounded-md bg-white" shape-rendering="crispEdges" role="img" aria-label="QR code for your authenticator app; the same key is written beside it">
-                <path :d="qrPath(qr)" fill="#000" />
-              </svg>
-              <div class="space-y-2 min-w-0">
-                <p class="text-sm text-muted">Key (time-based, 6 digits, 30 seconds)</p>
-                <p id="totp-key" class="font-mono text-sm break-all select-all rounded-md border border-default bg-muted px-3 py-2">{{ secret ?? "—" }}</p>
-                <UButton :to="uri" external size="sm" color="neutral" variant="link" icon="i-lucide-external-link" label="Open in an authenticator app on this device" class="px-0" />
-              </div>
-            </div>
-            <form class="flex flex-wrap items-end gap-3" aria-label="Confirm the authenticator" @submit.prevent="confirmEnroll">
-              <UFormField label="Code from the app" name="totp" hint="6 digits" :error="!!confirmError">
-                <UInput id="totp-confirm" ref="codeInput" v-model="confirmCode" autocomplete="one-time-code" inputmode="numeric" maxlength="7" required class="w-40" />
-              </UFormField>
-              <UButton type="submit" label="Confirm" :loading="confirming" />
-              <UButton color="neutral" variant="ghost" label="Cancel" @click="cancelEnroll" />
-            </form>
-            <UAlert v-if="confirmError" color="error" variant="subtle" icon="i-lucide-circle-alert" :title="confirmError" role="alert" />
-          </div>
+          <TotpEnroll v-else :has-password="security.password" :pending="security.mfa.pending" :username="session.me.value?.username" @done="refresh()" @cancel="refresh()" />
+        </UCard>
 
-          <!-- Step 1: start -->
-          <div v-else class="space-y-4">
-            <p class="text-sm">An authenticator app on your phone gives a code that changes every 30 seconds. Sentinel asks for it before sensitive changes, so a stolen session alone cannot make them.</p>
-            <UAlert v-if="security.mfa.pending" color="info" variant="subtle" icon="i-lucide-info" title="A setup was started and not finished."
-              description="Start again for a new key; the earlier one stops working." />
-            <form class="flex flex-wrap items-end gap-3" aria-label="Set up an authenticator" @submit.prevent="startEnroll">
-              <!-- For password managers: which account this password belongs to. -->
-              <input v-if="security.password" type="text" name="username" autocomplete="username" :value="session.me.value?.username ?? ''" class="sr" tabindex="-1" aria-hidden="true" readonly>
-              <UFormField v-if="security.password" label="Your password" name="enroll-password" :error="!!enrollError && !reauthenticate">
-                <UInput id="enroll-password" v-model="enrollPassword" type="password" autocomplete="current-password" required class="w-64 max-w-full" />
+        <!-- Email address -->
+        <UCard as="section" aria-labelledby="email-h">
+          <template #header>
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <h2 id="email-h" class="text-base font-semibold flex items-center gap-2"><UIcon name="i-lucide-mail" />Email address</h2>
+              <UBadge v-if="session.me.value?.email && session.me.value.email_verified" color="success" variant="subtle" icon="i-lucide-badge-check" label="Confirmed" />
+              <UBadge v-else-if="session.me.value?.email" color="warning" variant="subtle" label="Not confirmed" />
+            </div>
+          </template>
+          <div class="space-y-4 text-sm">
+            <p v-if="session.me.value?.email" class="break-all"><span class="text-muted">Address:</span> {{ session.me.value.email }}</p>
+            <p v-else class="text-muted">No email address. Adding one lets you sign in with it and accept invitations sent to it.</p>
+            <div v-if="session.me.value?.email && !session.me.value.email_verified" class="flex flex-wrap items-center gap-3">
+              <span>Open the link sent to this address to confirm it; until then it cannot sign in.</span>
+              <UButton size="sm" color="neutral" variant="outline" icon="i-lucide-send" :label="emailWait.waiting.value ? `Wait ${emailWait.waiting.value} s` : 'Send the link again'" :loading="resendingEmail" :disabled="!!emailWait.waiting.value" @click="resendEmail" />
+            </div>
+            <form class="flex flex-wrap items-end gap-3" aria-label="Change your email address" novalidate @submit.prevent="changeEmail">
+              <UFormField :label="session.me.value?.email ? 'New address' : 'Address'" name="new-email">
+                <UInput id="new-email" v-model="newEmail" type="email" autocomplete="email" autocapitalize="off" spellcheck="false" class="w-72 max-w-full" />
               </UFormField>
-              <UButton type="submit" icon="i-lucide-qr-code" :label="security.mfa.pending ? 'Start again' : 'Set up'" :loading="enrolling" />
+              <UButton type="submit" :label="session.me.value?.email ? 'Change address' : 'Add address'" :loading="savingEmail" :disabled="!!emailWait.waiting.value" />
             </form>
-            <p v-if="!security.password" class="text-xs text-muted">Your account signs in with GitHub, so setting up needs a sign-in within the last few minutes.</p>
-            <UAlert v-if="enrollError" color="error" variant="subtle" icon="i-lucide-circle-alert" :title="enrollError" role="alert"
-              :actions="reauthenticate ? [{ label: 'Sign in again', icon: 'i-lucide-log-in', onClick: () => { session.signOut('/account'); } }] : undefined" />
+            <p class="text-xs text-muted">A new address takes effect once you open the link sent to it; your current confirmed address keeps working until then.</p>
+            <div aria-live="polite">
+              <UAlert v-if="emailNote === 'sent-email'" color="success" variant="subtle" icon="i-lucide-mail-check" title="If that address can be used, a confirmation link is on its way." description="It works once, for 24 hours." />
+              <UAlert v-else-if="emailNote === 'sent-operator'" color="info" variant="subtle" icon="i-lucide-user-cog" title="This instance does not send email."
+                description="Ask your administrator for the confirmation link (sentinel admin account email-link)." />
+              <UAlert v-if="emailError" color="error" variant="subtle" icon="i-lucide-circle-alert" :title="emailError" role="alert" />
+            </div>
           </div>
         </UCard>
 
@@ -324,7 +271,7 @@ onBeforeUnmount(() => {
             </ul>
             <p v-else class="text-sm text-muted">No external account is linked.</p>
             <div v-if="security.github_link && !github" class="space-y-2">
-              <p class="text-sm">Link your GitHub account to sign in with it. You confirm it's you first, then approve on GitHub and come back here.</p>
+              <p class="text-sm">Link your GitHub account to sign in with it and to join organizations whose membership GitHub manages. You confirm it's you first, then approve on GitHub and come back here.</p>
               <UButton icon="i-lucide-github" color="neutral" variant="outline" label="Link a GitHub account" :loading="linking" @click="linkGitHub" />
             </div>
           </div>

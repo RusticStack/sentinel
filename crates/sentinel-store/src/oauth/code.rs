@@ -37,10 +37,16 @@ pub struct ConsentChoice {
     pub tenant: TenantId,
     pub slug: String,
     pub role: Role,
+    /// The account's personal namespace, not an organization.
+    pub personal: bool,
+    /// Membership is GitHub's to confirm (`membership_source = 1`).
+    pub github_backed: bool,
 }
 
-/// The consent page's tenant choices.
-const CONSENT_CHOICES: &str = "SELECT m.tenant_id, t.slug, m.role FROM memberships m
+/// The consent page's tenant choices. The kind and membership source come
+/// from the tenant row the join already reads.
+const CONSENT_CHOICES: &str = "SELECT m.tenant_id, t.slug, m.role, t.kind, t.membership_source
+     FROM memberships m
      JOIN tenants t ON t.id = m.tenant_id
      WHERE m.user_id = ?1 AND t.active = 1
      ORDER BY t.slug LIMIT ?2";
@@ -55,12 +61,16 @@ pub fn consent_choices(conn: &Connection, user: UserId) -> Result<Vec<ConsentCho
             r.get::<_, [u8; 16]>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, u8>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (tenant, slug, role) = row?;
+        let (tenant, slug, role, kind, source) = row?;
         out.push(ConsentChoice {
+            personal: kind == 1,
+            github_backed: source == 1,
             tenant: TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?,
             slug,
             role: match role {
