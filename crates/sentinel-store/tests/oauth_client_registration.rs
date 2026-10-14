@@ -1,6 +1,3 @@
-//! Registered OAuth clients are bounded public MCP clients, independent
-//! from human/service identities and their grants.
-
 use sentinel_auth::oauth::pkce;
 use sentinel_core::{
     UnixMillis, UserId,
@@ -133,7 +130,6 @@ fn dcr_and_cimd_clients_are_mcp_only_refreshable_and_not_users() {
         .unwrap();
     assert_eq!(clients, 2);
 
-    // Operators disable by the CIMD URL, with no SQL.
     let now = UnixMillis::now();
     store
         .writer()
@@ -215,7 +211,6 @@ fn exists(store: &Store, id: &str) -> bool {
         .is_ok()
 }
 
-/// A grant for `client`, obtained through consent and code exchange.
 fn grant_for(store: &Store, user: UserId, client: &str, now: UnixMillis) {
     let verifier = pkce::verifier();
     let challenge = pkce::challenge(&verifier);
@@ -247,9 +242,6 @@ fn grant_for(store: &Store, user: UserId, client: &str, now: UnixMillis) {
     .unwrap();
 }
 
-/// A flood fills the enabled-registration cap, but it can
-/// neither lock onboarding out for good nor displace a client in use.
-/// Maintenance reclaims what never obtained a grant, and no SQL is needed.
 #[test]
 fn registration_capacity_is_reclaimed_but_granted_clients_survive() {
     let dir = tempfile::tempdir().unwrap();
@@ -260,8 +252,6 @@ fn registration_capacity_is_reclaimed_but_granted_clients_survive() {
         .write(move |tx| provisioning::insert_human(tx, user, "Dev", false, T0))
         .unwrap();
 
-    // The first registration is the one that will hold a grant: it is also
-    // the oldest, so eviction must skip it on purpose, not by luck.
     let cap = usize::try_from(MAX_MCP_CLIENTS).unwrap();
     for n in 0..cap {
         register(&store, &dynamic_id(n), None, at(n as i64)).unwrap();
@@ -269,7 +259,6 @@ fn registration_capacity_is_reclaimed_but_granted_clients_survive() {
     grant_for(&store, user, &dynamic_id(0), at(1_000));
     assert_eq!(enabled_registrations(&store), MAX_MCP_CLIENTS);
 
-    // Full, and nothing is old enough to evict yet: refused, not grown.
     let late = dynamic_id(cap);
     assert!(matches!(
         register(&store, &late, None, at(60_000)),
@@ -277,8 +266,6 @@ fn registration_capacity_is_reclaimed_but_granted_clients_survive() {
     ));
     assert_eq!(enabled_registrations(&store), MAX_MCP_CLIENTS);
 
-    // Once unused rows are old enough, a newcomer displaces the oldest
-    // unused one and never the granted one.
     let later = at(EVICTABLE_CLIENT_AGE_MS + cap as i64);
     register(&store, &late, None, later).unwrap();
     assert_eq!(enabled_registrations(&store), MAX_MCP_CLIENTS);
@@ -292,8 +279,6 @@ fn registration_capacity_is_reclaimed_but_granted_clients_survive() {
     );
     assert!(exists(&store, &late));
 
-    // Maintenance deletes every registration that never obtained a grant
-    // once it is a day old; the granted client and the young one stay.
     let removed =
         oauth::purge_expired(&store, at(UNUSED_CLIENT_TTL_MS + cap as i64), 1_000).unwrap();
     assert!(removed >= cap - 2, "{removed}");
@@ -311,8 +296,6 @@ fn registration_capacity_is_reclaimed_but_granted_clients_survive() {
         .unwrap();
     assert_eq!(redirects, 2, "redirects go with their client");
 
-    // Disabling revokes the client's grants and frees its capacity; the
-    // grant's end then lets maintenance reclaim the row itself.
     let target = dynamic_id(0);
     let revoked = store
         .writer()
@@ -337,8 +320,6 @@ fn registration_capacity_is_reclaimed_but_granted_clients_survive() {
     assert_eq!(listed.len(), 0, "{listed:?}");
 }
 
-/// One address cannot take more than its share of the deployment's
-/// registrations; another address is unaffected.
 #[test]
 fn registrations_are_bounded_per_registering_address() {
     let dir = tempfile::tempdir().unwrap();
@@ -354,7 +335,6 @@ fn registrations_are_bounded_per_registering_address() {
         Err(McpRegistrationError::Registrant)
     ));
     register(&store, &dynamic_id(share + 1), Some(other), T0).unwrap();
-    // The share is of enabled registrations: reclamation returns it.
     oauth::purge_expired(&store, at(UNUSED_CLIENT_TTL_MS), 1_000).unwrap();
     register(
         &store,

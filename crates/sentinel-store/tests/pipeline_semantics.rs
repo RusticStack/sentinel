@@ -1,6 +1,3 @@
-//! Job conditions, failure propagation and rerun semantics of the schedule
-//! phase: what the controller decides for a blocked job once its dependencies
-//! have finished (docs/pipeline-schema.md, "Job conditions").
 use sentinel_core::{
     Actor, Event, FailureClass, JobId, JobState, Outcome, RepoId, RunId, RunState, TenantId,
     UnixMillis, aggregate,
@@ -51,8 +48,6 @@ fn spec_of(jobs_yaml: &str) -> RunSpec {
 
 const STEPS: &str = "image: busybox, steps: [{id: s, run: x}]";
 
-/// A run as an event-driven dispatch creates it: the run, the event it
-/// carries, then the release of whatever is decidable.
 fn start(f: &Fx, spec: &RunSpec, ref_name: Option<&str>) -> (RunId, Vec<JobId>) {
     let (tenant, repo, run) = (f.tenant, f.repo, RunId::new());
     let spec = spec.clone();
@@ -111,8 +106,6 @@ fn state(f: &Fx, job: JobId) -> JobState {
         .state
 }
 
-/// Run a queued job to its end the way a worker would, then decide its
-/// dependents, as the controller does when an attempt finishes.
 fn finish(f: &Fx, run: RunId, job: JobId, passed: bool, at: i64) {
     let tenant = f.tenant;
     f.store
@@ -202,8 +195,6 @@ fn always_runs_after_a_failure_and_a_plain_if_does_not() {
     finish(&f, run, test, false, 20);
     assert_eq!(state(&f, id_of(&spec, &ids, "cleanup")), JobState::Queued);
     assert_eq!(state(&f, id_of(&spec, &ids, "notify")), JobState::Queued);
-    // The event matches, but without a status function the dependency must
-    // also have succeeded; so for a job with no `if` at all.
     assert_eq!(state(&f, id_of(&spec, &ids, "deploy")), skipped());
     assert_eq!(state(&f, id_of(&spec, &ids, "plain")), skipped());
 }

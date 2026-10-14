@@ -1,8 +1,3 @@
-//! Token core: grants mint access/refresh pairs that authenticate into the
-//! ordinary authorization layer; refresh rotation with lost-response recovery
-//! and replay revocation; holder revocation; cascading revocation; the
-//! database's own refusals; and bounded purging.
-
 use sentinel_auth::{
     oauth::{self as forms, Kind},
     secret::Secret,
@@ -38,9 +33,6 @@ struct Ids {
     other_repo: RepoId,
 }
 
-/// A super admin (and a second one, so the first can be demoted), a
-/// developer who administers `acme`, a service principal of `acme`, and an
-/// unrelated tenant with its own repository.
 fn fixture() -> (tempfile::TempDir, Store, Ids) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
@@ -175,13 +167,10 @@ fn an_access_token_authenticates_through_the_live_authorization_layer() {
     store
         .read(|c| auth::require_repo(c, who.principal, i.repo, P::RUN))
         .unwrap();
-    // Narrowed to acme: another tenant's repository is not visible even
-    // though the account is a member there.
     assert!(matches!(
         store.read(|c| auth::require_repo(c, who.principal, i.other_repo, P::READ)),
         Err(Error::NotFound)
     ));
-    // The grant carries no tenant administration; the account's role does not add it.
     assert!(
         store
             .read(|c| auth::require_tenant_admin(c, who.principal, i.tenant))
@@ -208,8 +197,6 @@ fn expiry_revocation_and_audience_are_predicates_of_validation() {
         Err(Error::NotFound)
     ));
 
-    // A grant for another audience (reserved code 2, only reachable with
-    // the CHECK constraint lifted) is invisible to the API audience.
     let foreign = Secret::generate();
     let digest = foreign.digest().0;
     let (grant, dev) = (GrantId::new(), i.dev);
@@ -236,7 +223,6 @@ fn expiry_revocation_and_audience_are_predicates_of_validation() {
         Err(Error::NotFound)
     ));
 
-    // Revoking the grant ends its access token at once, before its expiry.
     let grant = minted.grant;
     store
         .writer()
@@ -282,7 +268,6 @@ fn service_principals_are_confined_to_their_home_tenant() {
             ..login_grant(i.bot, Scopes::RUNS_READ.union(Scopes::RUNS_WRITE))
         },
     );
-    // A service grant's refresh token lives as long as the grant.
     assert_eq!(minted.refresh_expires, at(oauth::SERVICE_DEFAULT_MS));
     let who = authenticate(&store, &minted.access, at(1)).unwrap();
     assert_eq!(who.principal.tenant, Some(i.tenant));
@@ -369,8 +354,6 @@ fn the_database_refuses_ineligible_grants() {
             "{what}: {refused:?}"
         );
     }
-    // Inside the ceiling the registered client is fine, and a suspended
-    // account can hold nothing.
     issue(
         &store,
         NewGrant {
@@ -386,7 +369,6 @@ fn the_database_refuses_ineligible_grants() {
         oauth::issue_grant_trusted(&store, login_grant(i.dev, Scopes::RUNS_READ), at(2)),
         Err(Error::Forbidden)
     ));
-    // The seeded CLI client redirects to loopback only, on its own path.
     let cli = store.read(|c| oauth::client(c, CLI_CLIENT_ID)).unwrap();
     assert!(cli.first_party && cli.loopback && cli.device);
     assert_eq!(cli.max_scopes, Scopes::ALL);
@@ -436,7 +418,6 @@ fn rotation_issues_exactly_one_successor() {
         })
         .unwrap();
     assert_eq!(generations, 3);
-    // Only the right client may present it.
     assert!(matches!(
         oauth::refresh(
             &store,
@@ -459,22 +440,16 @@ fn rotation_issues_exactly_one_successor() {
 fn a_lost_response_recovers_once_and_the_abandoned_successor_is_a_replay() {
     let (_dir, store, i) = fixture();
     let first = issue(&store, login_grant(i.dev, Scopes::CLI_DEFAULT));
-    // The response carrying `lost` never reached the client.
     let lost = refresh(&store, &first.refresh, None, at(1_000)).unwrap();
-    // Recovery at the last instant of the grace window; everything after it
-    // happens later still, as a real client's clock would run.
     let t = 1_000 + ROTATION_GRACE_MS;
     let recovered = refresh(&store, &first.refresh, None, at(t)).unwrap();
     assert_eq!(recovered.grant, first.grant);
     assert!(authenticate(&store, &recovered.access, at(t + 1)).is_ok());
-    // The abandoned successor's access token is gone with it.
     assert!(authenticate(&store, &lost.access, at(t + 1)).is_err());
-    // The recovered token keeps rotating normally.
     let next = refresh(&store, &recovered.refresh, None, at(t + 1_000)).unwrap();
     assert_eq!(next.refresh_expires, at(t + 1_000 + oauth::REFRESH_IDLE_MS));
     assert!(authenticate(&store, &next.access, at(t + 1_001)).is_ok());
     assert!(!revoked(&store, first.grant, i.dev));
-    // Presenting the superseded successor is a replay: the grant goes.
     assert!(matches!(
         refresh(&store, &lost.refresh, None, at(t + 2_000)),
         Err(RefreshError::Replay)
@@ -487,9 +462,7 @@ fn a_lost_response_recovers_once_and_the_abandoned_successor_is_a_replay() {
     ));
 }
 
-/// "Once" is once: a third presentation of the same token inside the window
-/// — someone else holding a copy of it — is a replay, not another recovery
-/// that would supersede the legitimate holder's successor again.
+/// A third presentation inside the window is a replay, never a second recovery.
 #[test]
 fn a_lost_response_is_not_recovered_a_second_time() {
     let (_dir, store, i) = fixture();
@@ -507,7 +480,6 @@ fn a_lost_response_is_not_recovered_a_second_time() {
 #[test]
 fn a_replay_after_grace_or_after_the_successor_was_used_revokes_and_audits() {
     let (_dir, store, i) = fixture();
-    // Past the grace window.
     let first = issue(&store, login_grant(i.dev, Scopes::CLI_DEFAULT));
     let second = refresh(&store, &first.refresh, None, at(1_000)).unwrap();
     assert!(matches!(
@@ -520,7 +492,6 @@ fn a_replay_after_grace_or_after_the_successor_was_used_revokes_and_audits() {
     assert_eq!(audit[0].event, Event::OAuthRefreshReplay);
     assert_eq!(audit[0].subject, Some(i.dev));
 
-    // Inside the window, but the successor was already used: no recovery.
     let first = issue(&store, login_grant(i.dev, Scopes::CLI_DEFAULT));
     let second = refresh(&store, &first.refresh, None, at(1_000)).unwrap();
     let third = refresh(&store, &second.refresh, None, at(2_000)).unwrap();
@@ -546,8 +517,6 @@ fn refresh_narrows_scopes_and_never_widens_them() {
             Err(RefreshError::InvalidScope)
         ));
     }
-    // A refused narrowing wrote nothing: the token is still live, and the
-    // next refresh without narrowing returns the grant's full scopes.
     let full = refresh(&store, &narrowed.refresh, None, at(3_000)).unwrap();
     assert_eq!(full.scopes, Scopes::CLI_DEFAULT);
 }
@@ -570,7 +539,6 @@ fn a_holder_revokes_the_whole_grant_with_either_token() {
     ));
 
     let by_access = issue(&store, login_grant(i.dev, Scopes::RUNS_READ));
-    // Another client's revocation, codes and garbage are silently ignored.
     for ignored in [
         text(Kind::Code, &by_access.access),
         text(Kind::Device, &by_access.refresh),
@@ -597,7 +565,6 @@ fn a_holder_revokes_the_whole_grant_with_either_token() {
     .unwrap();
     assert!(authenticate(&store, &by_access.access, at(7)).is_err());
     assert!(revoked(&store, by_access.grant, i.dev));
-    // Revoking again is harmless.
     oauth::revoke_presented(
         &store,
         CLI_CLIENT_ID,
@@ -627,7 +594,6 @@ fn grants_are_listed_and_revoked_only_by_their_owner_or_administrators() {
     assert_eq!(listed[0].kind, GrantKind::Code);
     assert_eq!(listed[0].client_id, CLI_CLIENT_ID);
     assert!(!listed[0].revoked);
-    // Nobody lists or revokes another account's grants by guessing.
     let second = Authority::credential(Principal::new(i.second, P::READ, None, None));
     assert!(matches!(
         store.read(|c| oauth::grants(c, second, i.dev, 10)),
@@ -640,7 +606,6 @@ fn grants_are_listed_and_revoked_only_by_their_owner_or_administrators() {
             .write(move |tx| oauth::revoke_grant(tx, second, own_grant, at(1))),
         Err(Error::NotFound)
     ));
-    // The service tenant's administrator may revoke the service grant.
     let tenant_admin = Authority::credential(Principal::new(
         i.dev,
         P::REPOSITORY.union(P::TENANT_ADMIN),
@@ -653,7 +618,6 @@ fn grants_are_listed_and_revoked_only_by_their_owner_or_administrators() {
         .write(move |tx| oauth::revoke_grant(tx, tenant_admin, service_grant, at(2)))
         .unwrap();
     assert!(revoked(&store, service.grant, i.bot));
-    // And the owner their own.
     store
         .writer()
         .write(move |tx| oauth::revoke_grant(tx, dev, own_grant, at(3)))
@@ -661,14 +625,11 @@ fn grants_are_listed_and_revoked_only_by_their_owner_or_administrators() {
     assert!(revoked(&store, own.grant, i.dev));
 }
 
-/// Revocations that cascade from other decisions, each in the same
-/// transaction as the decision.
 #[test]
 fn account_tenant_and_membership_decisions_revoke_grants() {
     let (_dir, store, i) = fixture();
     let root = Principal::new(i.root, P::ALL, None, None);
 
-    // Membership removal revokes the grants narrowed to that tenant only.
     let narrowed = issue(
         &store,
         NewGrant {
@@ -684,7 +645,6 @@ fn account_tenant_and_membership_decisions_revoke_grants() {
     assert!(revoked(&store, narrowed.grant, i.dev));
     assert!(!revoked(&store, broad.grant, i.dev));
 
-    // Tenant suspension revokes every grant narrowed to it, service grants too.
     let service = issue(
         &store,
         NewGrant {
@@ -701,14 +661,12 @@ fn account_tenant_and_membership_decisions_revoke_grants() {
     assert!(revoked(&store, service.grant, i.bot));
     assert!(!revoked(&store, broad.grant, i.dev));
 
-    // Account suspension revokes everything the account holds.
     store
         .writer()
         .write(move |tx| local_auth::set_active(tx, privileged(i), i.dev, false, at(3)))
         .unwrap();
     assert!(revoked(&store, broad.grant, i.dev));
 
-    // Rejection revokes an approved account's grants.
     let other = UserId::new();
     store
         .writer()
@@ -769,7 +727,6 @@ fn raw_sql_cannot_widen_or_resurrect_a_grant() {
     let (_dir, store, i) = fixture();
     let minted = issue(&store, login_grant(i.dev, Scopes::RUNS_READ));
     let grant = minted.grant;
-    // One rotation, so a rotated row exists to try to un-rotate.
     refresh(&store, &minted.refresh, None, at(1)).unwrap();
     store
         .writer()
@@ -788,7 +745,6 @@ fn raw_sql_cannot_widen_or_resurrect_a_grant() {
             let changed = tx.execute(sql, [grant.as_bytes()])?;
             Ok(changed)
         });
-        // Either refused, or it matched nothing it could change.
         assert!(
             matches!(outcome, Err(Error::Sqlite(_)) | Ok(0)),
             "{sql}: {outcome:?}"
@@ -828,7 +784,6 @@ fn purging_is_bounded_and_spares_live_grants() {
         if pass == 0 {
             break;
         }
-        // One of each kind at most, plus one grant and what hangs off it.
         assert!(pass <= 1 + 1 + 1 + 1 + 1 + 5, "{pass}");
         removed += pass;
     }
@@ -838,6 +793,5 @@ fn purging_is_bounded_and_spares_live_grants() {
         .unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].id, live.grant);
-    // The live grant's refresh token still rotates.
     refresh(&store, &live.refresh, None, later).unwrap();
 }
