@@ -765,9 +765,8 @@ pub(crate) fn route(
                     dispatch::list_queue(c, tenant, &connected, limit)
                 })
                 .map_err(store_error)?;
-            // While disk admission is closed nothing is placed at all
-            // a job nothing else holds is waiting on storage,
-            // not ready.
+            // While disk admission is closed nothing is placed at all: a job
+            // nothing else holds is waiting on storage, not ready.
             let storage = state.objects.admission().filter(|a| !a.is_open()).map(|a| {
                 if a.backlog_full() {
                     "external_copy_backlog"
