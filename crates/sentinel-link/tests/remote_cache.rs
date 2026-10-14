@@ -126,8 +126,6 @@ impl Deployment {
     }
 }
 
-/// An executor that holds what it is offered, hands out its reporter and
-/// reports whatever availability a test sets.
 struct Holder {
     offers: Mutex<mpsc::Sender<Offer>>,
     held: Mutex<Vec<AttemptId>>,
