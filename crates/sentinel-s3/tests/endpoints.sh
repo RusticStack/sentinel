@@ -3,8 +3,8 @@
 # Images are pinned by digest; MinIO is absent because it withdrew its public images in 2025.
 set -eu
 ROOT=${SENTINEL_S3_ROOT:-/srv/sentinel-s3}
-GARAGE=docker.io/dxflrs/garage@sha256:0d7c74fc8ca6fef68a5a941c0e7558c8b1e92ba3588fa7505400e1350456c796
-SEAWEED=docker.io/chrislusf/seaweedfs@sha256:f83509b0721dfd8e2e07faf76c0a899f67a8a889c89abe2fa0a5227ba1320362
+GARAGE=docker.io/dxflrs/garage@sha256:0d7c74fc8ca6fef68a5a941c0e7558c8b1e92ba3588fa7505400e1350456c796        # v2.4.1
+SEAWEED=docker.io/chrislusf/seaweedfs@sha256:f83509b0721dfd8e2e07faf76c0a899f67a8a889c89abe2fa0a5227ba1320362 # 4.47
 VERSITY=docker.io/versity/versitygw@sha256:97e7d5a35ab758eb1761a9e717644fafc614c5f6026c05482bd1fb77205193a1
 ZENKO=docker.io/zenko/cloudserver@sha256:b53e57829cf7df357323e60a19c9f98d2218f1b7ccb1d7cea5761a5a227a9ee3
 RUSTFS=docker.io/rustfs/rustfs@sha256:ba0a1b53e36f321c0d46f3867104abef169f7bc59c467c664ddac87e7ddc9a8b
@@ -12,11 +12,11 @@ NAMES="s3-garage s3-seaweed s3-versity s3-zenko s3-rustfs"
 
 secret() { head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
-creds() {
+creds() { # name key secret
     (umask 077; printf 'access_key_id = %s\nsecret_access_key = %s\n' "$2" "$3" > "$ROOT/$1/credentials")
 }
 
-wait_port() {
+wait_port() { # any HTTP answer will do
     i=0
     until curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$1/"; do
         i=$((i + 1)); [ $i -gt 240 ] && { echo "port $1 never answered" >&2; return 1; }

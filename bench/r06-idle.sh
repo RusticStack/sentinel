@@ -25,7 +25,7 @@ TOKEN=$("$BIN" admin token issue --data-dir "$C" --user root --name r06 \
 printf "listen = '127.0.0.1:0'\napi_listen = '127.0.0.1:0'\nlog_format = 'json'\n" >"$D/server.toml"
 "$BIN" server --config "$D/server.toml" --data-dir "$C" >"$D/server.log" 2>&1 &
 SP=$!
-event() {
+event() { # event <log> <name>: the first such record's fields, as JSON
   for _ in $(seq 1 300); do
     line=$(grep -m1 "\"$2\"" "$1" 2>/dev/null || true)
     [ -n "$line" ] && { printf '%s' "$line"; return; }
@@ -54,8 +54,7 @@ EXEC=$(grep -c '"executor_ready"' "$D/worker.log" || true)
 sleep "$SETTLE"
 
 ticks=$(getconf CLK_TCK)
-# utime, stime, cutime, cstime: all in clock ticks, not seconds.
-cpu() {
+cpu() { # utime + stime + cutime + cstime, in ticks
   awk '{ sub(/^.*\) /, ""); print $12 + $13 + $14 + $15 }' "/proc/$1/stat"
 }
 rss() { awk '/^VmRSS:/ { print $2 * 1024 }' "/proc/$1/status"; }

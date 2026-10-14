@@ -17,7 +17,7 @@ log() { printf 'k09 %s %s\n' "$(date +%T)" "$*" >&2; }
 
 jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 
-blocked() {
+blocked() { # recipe case reason
     printf '{"recipe":%s,"case":%s,"status":"blocked","reason":%s}\n' \
         "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")" >> "$OUT"
     log "blocked $1/$2: $3"
@@ -62,7 +62,7 @@ print(json.dumps({
 PY
 }
 
-prov_custom_tool() {
+prov_custom_tool() { # $1 = shared dir
     mkdir -p "$1/pkgs" "$1/tools"
     cp "$ROOT/fixtures/compiler/fakecc.sh" "$1/tools/fakecc.sh" || return 1
     local spec n v d
@@ -75,12 +75,12 @@ prov_custom_tool() {
     done
 }
 
-git_at() {
+git_at() { # dir, then args
     local d="$1"; shift
     git -C "$d" -c user.email=k09@example.com -c user.name=k09 "$@"
 }
 
-build_noop_repo() {
+build_noop_repo() { # → echoes the sha
     local repo="$WORK/repos/noop"
     rm -rf "$repo"; mkdir -p "$repo"
     git_at "$repo" init -q -b main
@@ -90,7 +90,7 @@ build_noop_repo() {
     git_at "$repo" rev-parse HEAD
 }
 
-build_incremental_repo() {
+build_incremental_repo() { # → echoes "<base> <edit-1> ... <edit-N>"
     local repo="$WORK/repos/incremental" dest i
     rm -rf "$repo"; mkdir -p "$repo"
     git_at "$repo" init -q -b main
@@ -116,7 +116,7 @@ build_incremental_repo() {
     echo
 }
 
-run_case() {
+run_case() { # recipe case pipeline sha
     local r="$1" c="$2" pipe="$3" sha="$4" rec
     rec="$("$DRIVER" \
         --pipeline "$pipe" --job build \

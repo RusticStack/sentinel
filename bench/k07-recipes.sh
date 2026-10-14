@@ -16,7 +16,7 @@ log() { printf 'k07 %s %s\n' "$(date +%T)" "$*" >&2; }
 
 jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 
-blocked() {
+blocked() { # recipe case reason
     printf '{"recipe":%s,"case":%s,"status":"blocked","reason":%s}\n' \
         "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")" >> "$OUT"
     log "blocked $1/$2: $3"
@@ -53,13 +53,13 @@ pod() {
     echo "\$ podman $*" >> "$LOGS/last-pod.log"
     timeout 900 podman "$@" >> "$LOGS/last-pod.log" 2>&1
 }
-podsh() {
+podsh() { # image, then any podman run flags via $3+, command = $2
     local img="$1" cmd="$2"
     shift 2
     pod run --rm --entrypoint /bin/sh "$@" "$img" -c "$cmd"
 }
 
-prov_custom_tool() {
+prov_custom_tool() { # $1 = shared dir
     mkdir -p "$1/pkgs" "$1/tools"
     cp "$ROOT/fixtures/compiler/fakecc.sh" "$1/tools/fakecc.sh" || return 1
     local spec n v d
@@ -72,7 +72,7 @@ prov_custom_tool() {
     done
 }
 
-prov_go() {
+prov_go() { # $1 = shared dir → goproxy/
     python3 - "$1/goproxy" <<'PY'
 import json, pathlib, sys, zipfile
 out = pathlib.Path(sys.argv[1])
@@ -100,12 +100,12 @@ mod("example.com/k07b", "v0.1.1", lib("k07b", "0.1.1"))
 PY
 }
 
-lock_go() {
+lock_go() { # $1 = variant dir
     podsh "${IMG_A[go]}" 'GOPROXY=file:///app/goproxy GOSUMDB=off GOFLAGS=-mod=mod GOTOOLCHAIN=local GOMODCACHE=/gomod GOCACHE=/gocache go mod tidy' \
         -v "$1:/app" -w /app
 }
 
-prov_rust() {
+prov_rust() { # $1 = shared dir → local-registry/
     local lr="$1/local-registry" spec n v d idx ck
     mkdir -p "$lr/index"
     for spec in "k07a 0.1.0" "k07b 0.1.0" "k07b 0.1.1"; do
@@ -128,12 +128,12 @@ prov_rust() {
     done
 }
 
-lock_rust() {
+lock_rust() { # $1 = variant dir (local-registry/ already inside)
     podsh "${IMG_A[rust]}" 'CARGO_HOME=/cargo CARGO_NET_OFFLINE=true cargo generate-lockfile --offline' \
         -v "$1:/workspace" -w /workspace
 }
 
-prov_pkgs() {
+prov_pkgs() { # $1 = shared dir
     local spec n v d
     mkdir -p "$1/pkgs"
     for spec in "k07a 1.0.0" "k07b 1.0.0" "k07b 1.0.1"; do
@@ -180,7 +180,7 @@ lock_bun() {
         -v "$1:/app" -w /app
 }
 
-prov_python() {
+prov_python() { # $1 → pkgs/sdist + pkgs/wheels
     local sd="$1/pkgs/sdist" wh="$1/pkgs/wheels" spec n v d
     mkdir -p "$sd" "$wh"
     for spec in "k07a 1.0.0" "k07b 1.0.0" "k07b 1.0.1"; do
@@ -207,7 +207,7 @@ EOF
 }
 lock_python() { :; }
 
-prov_maven() {
+prov_maven() { # $1 → m2-mirror/
     local m2="$1/m2-mirror" spec n v d cls
     mkdir -p "$m2"
     for spec in "k07a 1.0.0" "k07b 1.0.0" "k07b 1.0.1"; do
@@ -232,9 +232,9 @@ EOF
         -v "$app:/app" -v "$stage:/stage" -w /app || return 1
     cp -rn "$stage"/* "$m2"/ 2>/dev/null || cp -r "$stage"/* "$m2"/
 }
-lock_maven() { :; }
+lock_maven() { :; } # pom.xml is the dependency manifest
 
-prov_gradle() {
+prov_gradle() { # $1 → m2-mirror/ (hand-laid jars+poms+checksums; offline)
     local m2="$1/m2-mirror" spec n v d r cls
     mkdir -p "$m2"
     for spec in "k07a 1.0.0" "k07b 1.0.0" "k07b 1.0.1"; do
@@ -260,7 +260,7 @@ EOF
         rm -rf "$d"
     done
 }
-lock_gradle() {
+lock_gradle() { # $1 = variant dir
     podsh "${IMG_A[gradle]}" 'GRADLE_USER_HOME=/guh GRADLE_OPTS=-Dorg.gradle.daemon=false gradle --no-daemon build --write-locks' \
         -v "$1:/workspace" -w /workspace
 }
@@ -287,7 +287,7 @@ LOCK_python=lock_python
 LOCK_maven=lock_maven
 LOCK_gradle=lock_gradle
 
-materialize() {
+materialize() { # recipe variant dest
     local r="$1" v="$2" dest="$3" fn
     rm -rf "$dest"; mkdir -p "$dest"
     cp -a "$FIX/$r/tree/." "$dest/"
@@ -305,7 +305,7 @@ materialize() {
     chmod -R u+rw "$dest" 2>/dev/null || true
 }
 
-build_repo() {
+build_repo() { # recipe
     local r="$1" repo="$WORK/repos/$1" s
     rm -rf "$repo"; mkdir -p "$repo"
     git -C "$repo" init -q -b main
@@ -330,7 +330,7 @@ build_repo() {
     done | tr '\n' ' '
 }
 
-run_case() {
+run_case() { # recipe case sha image
     local r="$1" c="$2" sha="$3" img="$4" rec
     rec="$("$DRIVER" \
         --pipeline "$FIX/$r.yml" --job build \
