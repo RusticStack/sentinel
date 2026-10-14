@@ -45,7 +45,7 @@ export function useEndSession() {
     if (!me.value) return;
     me.value = null;
     tenants.value = [];
-    // After an expiry another tab may already hold a new secret; keep it.
+    // After an expiry another tab may already hold a fresh CSRF token; keep it.
     if (reason !== "expired") setCsrfToken(null);
     const here = router.currentRoute.value;
     const query: Record<string, string> = { reason };
