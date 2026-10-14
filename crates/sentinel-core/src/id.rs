@@ -148,6 +148,12 @@ identifier!(
     "inv"
 );
 identifier!(
+    /// One queued outbound message (the mail outbox). Names the row for the
+    /// lane and for an operator; it carries no secret.
+    MailId,
+    "mal"
+);
+identifier!(
     /// One forge App installation known to this deployment (A05). Existing is
     /// not being trusted: an installation is inactive until bound to a tenant.
     InstallationId,

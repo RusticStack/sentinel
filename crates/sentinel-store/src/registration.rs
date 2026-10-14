@@ -195,11 +195,99 @@ pub fn invite(
     terms: Terms<'_>,
     now: UnixMillis,
 ) -> Result<Invitation> {
+    invite_to(tx, authority, terms, None, now)
+}
+
+/// Invitations addressed to mailboxes one organization may create per hour:
+/// the ceiling on using an organization's invitation right to send mail.
+const EMAIL_INVITES_PER_HOUR: i64 = 50;
+
+/// An invitation sent by email (A05 extension): `invite` plus the mailbox it
+/// is addressed to. The organization must be app-created: a GitHub-backed
+/// one takes its members from GitHub, so an email invitation is refused for
+/// it (`InvalidInput`), whoever asks. The role is the invitation's term and
+/// the inviter must already be allowed to grant it (they administer the
+/// organization). When this deployment delivers mail and `key` is present
+/// the message is queued in the same transaction; otherwise the caller hands
+/// the secret to the inviter, who passes it on out of band. Accepting needs
+/// the mailbox proved ([`accept_invitation`], [`crate::email::confirm`]).
+pub fn invite_by_email(
+    tx: &Transaction<'_>,
+    authority: Authority,
+    terms: Terms<'_>,
+    email: &str,
+    key: Option<&sentinel_auth::sealed::Key>,
+    now: UnixMillis,
+) -> Result<Invited> {
+    let email = crate::email::normalize(email)?;
+    let invitation = invite_to(tx, authority, terms, Some(&email), now)?;
+    let (Some(key), Some(url), Some(tenant)) = (key, crate::email::delivery_url(tx)?, terms.tenant)
+    else {
+        return Ok(Invited {
+            invitation,
+            queued: false,
+        });
+    };
+    let slug: String = tx
+        .prepare_cached("SELECT slug FROM tenants WHERE id = ?1")?
+        .query_row([tenant.as_bytes()], |r| r.get(0))?;
+    let (subject, body) = crate::email::invitation_message(&url, &invitation.secret, &slug);
+    let queued = crate::email::enqueue(
+        tx,
+        key,
+        &crate::email::Outgoing {
+            kind: crate::email::Kind::Invitation,
+            recipient: &email,
+            subject: &subject,
+            body: &body,
+            ttl_ms: terms.lifetime_ms,
+        },
+        now,
+    )?;
+    Ok(Invited { invitation, queued })
+}
+
+/// An email invitation and whether its message was queued for delivery. When
+/// it was not, the secret is the inviter's to hand over.
+pub struct Invited {
+    pub invitation: Invitation,
+    pub queued: bool,
+}
+
+fn invite_to(
+    tx: &Transaction<'_>,
+    authority: Authority,
+    terms: Terms<'_>,
+    email: Option<&str>,
+    now: UnixMillis,
+) -> Result<Invitation> {
     check_terms(&terms)?;
     if authority.require_platform(tx).is_err() {
         let principal = authority.principal().ok_or(Error::Forbidden)?;
         let tenant = terms.tenant.ok_or(Error::Forbidden)?;
         crate::auth::require_tenant_admin(tx, principal, tenant)?;
+    }
+    if email.is_some() {
+        let tenant = terms
+            .tenant
+            .ok_or(Error::InvalidInput("invitation organization"))?;
+        if terms.identity.is_some() {
+            return Err(Error::InvalidInput("invitation identity"));
+        }
+        if tenant_is_github_backed(tx, tenant)? {
+            return Err(Error::InvalidInput("organization backed by GitHub"));
+        }
+        let recent: i64 = tx
+            .prepare_cached(
+                "SELECT COUNT(*) FROM invitations
+                 WHERE tenant_id = ?1 AND email IS NOT NULL AND created_ms > ?2",
+            )?
+            .query_row(params![tenant.as_bytes(), now.0 - 60 * 60 * 1000], |r| {
+                r.get(0)
+            })?;
+        if recent >= EMAIL_INVITES_PER_HOUR {
+            return Err(Error::Overloaded);
+        }
     }
     let id = InvitationId::new();
     let secret = Secret::generate();
@@ -210,7 +298,8 @@ pub fn invite(
     };
     tx.execute(
         "INSERT INTO invitations(token_digest, id, tenant_id, role, provider, subject,
-            created_by, created_ms, expires_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            created_by, created_ms, expires_ms, email)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             secret.digest().0,
             id.as_bytes(),
@@ -220,7 +309,8 @@ pub fn invite(
             subject,
             authority.actor().as_ref().map(UserId::as_bytes),
             now.0,
-            expires.0
+            expires.0,
+            email
         ],
     )?;
     audit(
@@ -229,7 +319,7 @@ pub fn invite(
         authority.actor(),
         None,
         authority.host_local(),
-        None,
+        email.map(|_| "email"),
     )?;
     Ok(Invitation {
         id,
@@ -281,6 +371,8 @@ pub struct InvitationRecord {
     pub expires: UnixMillis,
     pub redeemed: bool,
     pub revoked: bool,
+    /// The mailbox it is addressed to, if any.
+    pub email: Option<String>,
 }
 
 /// List invitations for one tenant, or deployment-wide ones for a platform
@@ -300,7 +392,7 @@ pub fn invitations(
         crate::auth::require_tenant_admin(conn, principal, tenant).map_err(|_| Error::NotFound)?;
     }
     let mut stmt = conn.prepare_cached(
-        "SELECT id, tenant_id, role, provider, subject, expires_ms, redeemed_ms, revoked_ms
+        "SELECT id, tenant_id, role, provider, subject, expires_ms, redeemed_ms, revoked_ms, email
          FROM invitations WHERE (?1 IS NULL OR tenant_id = ?1)
          ORDER BY created_ms DESC, id LIMIT ?2",
     )?;
@@ -316,6 +408,7 @@ pub fn invitations(
                 r.get::<_, i64>(5)?,
                 r.get::<_, Option<i64>>(6)?,
                 r.get::<_, Option<i64>>(7)?,
+                r.get::<_, Option<String>>(8)?,
             ))
         },
     )?;
@@ -327,30 +420,304 @@ pub fn invitations(
                 Some(b) => Some(TenantId::from_bytes(b).map_err(|_| Error::Corrupt("tenant_id"))?),
                 None => None,
             },
-            role: match row.2 {
-                Some(1) => Some(Role::Reader),
-                Some(2) => Some(Role::Operator),
-                Some(3) => Some(Role::TenantAdmin),
-                Some(_) => return Err(Error::Corrupt("invitations.role")),
-                None => None,
-            },
+            role: decode_role(row.2)?,
             identity: row.3.zip(row.4),
             expires: UnixMillis(row.5),
             redeemed: row.6.is_some(),
             revoked: row.7.is_some(),
+            email: row.8,
         })
     })
     .collect()
 }
 
-/// One unspent invitation's terms, as stored: tenant, role, and the verified
-/// identity it is bound to, if any.
-type Redeemable = (
-    Option<[u8; 16]>,
-    Option<i64>,
-    Option<String>,
-    Option<String>,
-);
+/// One unspent invitation's terms, as stored.
+pub(crate) struct Usable {
+    pub id: InvitationId,
+    pub tenant: Option<TenantId>,
+    pub role: Option<Role>,
+    /// The verified external identity it is bound to, if any.
+    pub identity: Option<(String, String)>,
+    /// The mailbox it is addressed to, if any (canonical).
+    pub email: Option<String>,
+}
+
+/// How an invitation is named: by the secret's digest (what a person
+/// presents) or by its identifier (what a verification token carries).
+pub(crate) enum Select {
+    Digest([u8; 32]),
+    Id(InvitationId),
+}
+
+/// The one statement deciding whether an invitation is redeemable now:
+/// unspent, unrevoked, unexpired, and its creator's authority intact (see
+/// the module notes). `$selector` binds `?1`; `?2` is the instant.
+macro_rules! usable_sql {
+    ($selector:literal) => {
+        concat!(
+            "SELECT i.id, i.tenant_id, i.role, i.provider, i.subject, i.email FROM invitations i
+             LEFT JOIN users c ON c.id = i.created_by
+             LEFT JOIN memberships cm
+               ON cm.tenant_id = i.tenant_id AND cm.user_id = i.created_by
+             WHERE ",
+            $selector,
+            " AND i.redeemed_ms IS NULL
+             AND i.revoked_ms IS NULL AND i.expires_ms > ?2
+             AND (i.created_by IS NULL OR
+                  (c.active = 1 AND (c.super_admin = 1 OR cm.role = 3)))"
+        )
+    };
+}
+
+fn decode_role(code: Option<i64>) -> Result<Option<Role>> {
+    Ok(match code {
+        Some(1) => Some(Role::Reader),
+        Some(2) => Some(Role::Operator),
+        Some(3) => Some(Role::TenantAdmin),
+        Some(_) => return Err(Error::Corrupt("invitations.role")),
+        None => None,
+    })
+}
+
+/// An invitation delegates its creator's authority, so it is only as good as
+/// that authority is now: the creator must still be an active super admin, or
+/// still administer the tenant the invitation grants membership of. Removal,
+/// suspension, rejection and demotion therefore void every unspent invitation
+/// the creator minted, with no bookkeeping. Host-local invitations (no
+/// creator) hold the database file's authority.
+pub(crate) fn usable_invitation(
+    conn: &Connection,
+    by: Select,
+    now: UnixMillis,
+) -> Result<Option<Usable>> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        [u8; 16],
+        Option<[u8; 16]>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = {
+        let map = |r: &rusqlite::Row<'_>| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        };
+        match by {
+            Select::Digest(digest) => conn
+                .prepare_cached(usable_sql!("i.token_digest = ?1"))?
+                .query_row(params![digest, now.0], map)
+                .optional()?,
+            Select::Id(id) => conn
+                .prepare_cached(usable_sql!("i.id = ?1"))?
+                .query_row(params![id.as_bytes(), now.0], map)
+                .optional()?,
+        }
+    };
+    let Some((id, tenant, role, provider, subject, email)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(Usable {
+        id: InvitationId::from_bytes(id).map_err(|_| Error::Corrupt("invitation id"))?,
+        tenant: tenant
+            .map(|b| TenantId::from_bytes(b).map_err(|_| Error::Corrupt("tenant_id")))
+            .transpose()?,
+        role: decode_role(role)?,
+        identity: provider.zip(subject),
+        email,
+    }))
+}
+
+/// Whether a tenant is bound to a GitHub App installation. Such an
+/// organization's membership is GitHub's to confirm, so an email invitation
+/// never applies to it.
+pub fn tenant_is_github_backed(conn: &Connection, tenant: TenantId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM installations WHERE tenant_id = ?1 AND provider = 'github')",
+        )?
+        .query_row([tenant.as_bytes()], |r| r.get(0))?)
+}
+
+fn tenant_is_open(conn: &Connection, tenant: TenantId) -> Result<bool> {
+    let active: bool = conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM tenants WHERE id = ?1 AND active = 1)")?
+        .query_row([tenant.as_bytes()], |r| r.get(0))?;
+    Ok(active && !tenant_is_github_backed(conn, tenant)?)
+}
+
+/// Spend an invitation for `user` and grant its membership, in the caller's
+/// transaction. Returns the tenant joined, if the invitation named one. An
+/// existing membership keeps its role: an invitation never changes one.
+pub(crate) fn redeem(
+    tx: &Transaction<'_>,
+    invitation: &Usable,
+    user: UserId,
+    now: UnixMillis,
+) -> Result<Option<TenantId>> {
+    let spent = tx.execute(
+        "UPDATE invitations SET redeemed_ms = ?2, redeemed_by = ?3
+         WHERE id = ?1 AND redeemed_ms IS NULL AND revoked_ms IS NULL",
+        params![invitation.id.as_bytes(), now.0, user.as_bytes()],
+    )?;
+    if spent != 1 {
+        return Ok(None);
+    }
+    let joined = match (invitation.tenant, invitation.role) {
+        (Some(tenant), Some(role)) => {
+            tx.execute(
+                "INSERT INTO memberships(tenant_id, user_id, role) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(tenant_id, user_id) DO NOTHING",
+                params![tenant.as_bytes(), user.as_bytes(), role as u8],
+            )?;
+            Some(tenant)
+        }
+        _ => None,
+    };
+    audit(
+        tx,
+        Event::InvitationRedeemed,
+        Some(user),
+        Some(user),
+        false,
+        None,
+    )?;
+    Ok(joined)
+}
+
+/// Redeem an email-bound invitation for the account that just verified
+/// `email`. Nothing happens (`None`) unless the invitation is still usable,
+/// addressed to exactly that verified address, and its organization is still
+/// open and app-created: the link token plus the verified mailbox.
+pub(crate) fn redeem_verified(
+    tx: &Transaction<'_>,
+    id: InvitationId,
+    user: UserId,
+    email: &str,
+    now: UnixMillis,
+) -> Result<Option<TenantId>> {
+    let Some(invitation) = usable_invitation(tx, Select::Id(id), now)? else {
+        return Ok(None);
+    };
+    if invitation.email.as_deref() != Some(email) {
+        return Ok(None);
+    }
+    if let Some(tenant) = invitation.tenant
+        && !tenant_is_open(tx, tenant)?
+    {
+        return Ok(None);
+    }
+    redeem(tx, &invitation, user, now)
+}
+
+/// What presenting an invitation as an existing account did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Accepted {
+    /// The account joined the organization.
+    Joined(TenantId),
+    /// Redeemed; the invitation named no organization.
+    Redeemed,
+    /// The account is already a member; the invitation stays unspent.
+    AlreadyMember,
+    /// The invitation is addressed to a mailbox the account has not proved:
+    /// a verification link was queued (or recorded for the operator), and
+    /// proving that address redeems the invitation.
+    VerificationSent,
+    /// The account's resend allowance is spent; try later.
+    Throttled,
+    /// Unknown, expired, spent, revoked, wrong address, wrong identity, or
+    /// not for this kind of organization. One answer for all of them.
+    Unusable,
+}
+
+/// An existing, signed-in account presents an invitation secret.
+///
+/// A link-form invitation (no mailbox) is redeemed on the spot. One addressed
+/// to a mailbox needs that mailbox proved: if the account already holds the
+/// address verified, it joins; otherwise the address is claimed on the account
+/// (unless the account verified another one: change it first) and a
+/// verification link sent, and the join happens when that link is opened.
+pub fn accept_invitation(
+    store: &Store,
+    user: UserId,
+    secret: &Secret,
+    key: Option<std::sync::Arc<sentinel_auth::sealed::Key>>,
+    now: UnixMillis,
+) -> Result<Accepted> {
+    let digest = secret.digest();
+    store.writer().write(move |tx| {
+        let Some(invitation) = usable_invitation(tx, Select::Digest(digest.0), now)? else {
+            return Ok(Accepted::Unusable);
+        };
+        let active: bool = tx
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND kind = 0 AND active = 1)",
+            )?
+            .query_row([user.as_bytes()], |r| r.get(0))?;
+        if !active {
+            return Ok(Accepted::Unusable);
+        }
+        // An identity-bound invitation belongs to whoever holds that identity.
+        if let Some((provider, subject)) = &invitation.identity {
+            let linked: bool = tx
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM external_identities
+                     WHERE provider = ?1 AND subject = ?2 AND user_id = ?3)",
+                )?
+                .query_row(params![provider, subject, user.as_bytes()], |r| r.get(0))?;
+            if !linked {
+                return Ok(Accepted::Unusable);
+            }
+        }
+        if let Some(tenant) = invitation.tenant {
+            let member: bool = tx
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM memberships WHERE tenant_id = ?1 AND user_id = ?2)",
+                )?
+                .query_row(params![tenant.as_bytes(), user.as_bytes()], |r| r.get(0))?;
+            if member {
+                return Ok(Accepted::AlreadyMember);
+            }
+            if invitation.email.is_some() && !tenant_is_open(tx, tenant)? {
+                return Ok(Accepted::Unusable);
+            }
+        }
+        let Some(address) = invitation.email.as_deref() else {
+            return Ok(match redeem(tx, &invitation, user, now)? {
+                Some(tenant) => Accepted::Joined(tenant),
+                None => Accepted::Redeemed,
+            });
+        };
+        let held: Option<(Option<String>, bool)> = tx
+            .prepare_cached("SELECT email, email_verified_ms IS NOT NULL FROM users WHERE id = ?1")?
+            .query_row([user.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        match held {
+            Some((Some(email), true)) if email == address => {
+                Ok(match redeem(tx, &invitation, user, now)? {
+                    Some(tenant) => Accepted::Joined(tenant),
+                    None => Accepted::Redeemed,
+                })
+            }
+            // Another verified address stays until the account changes it.
+            Some((Some(_), true)) => Ok(Accepted::Unusable),
+            Some(_) => Ok(
+                match crate::email::request(tx, key.as_deref(), user, address, Some(invitation.id), now)? {
+                    crate::email::Requested::Throttled => Accepted::Throttled,
+                    crate::email::Requested::Suppressed => Accepted::Unusable,
+                    _ => Accepted::VerificationSent,
+                },
+            ),
+            None => Ok(Accepted::Unusable),
+        }
+    })
+}
 
 /// How someone proposes to authenticate once admitted.
 pub enum Applicant<'a> {
@@ -358,6 +725,15 @@ pub enum Applicant<'a> {
     Local {
         display_name: &'a str,
         username: &'a str,
+        password: &'a [u8],
+    },
+    /// A local account identified by its email address and a password. The
+    /// address is a claim until verified; the account also gets a generated
+    /// username, so every local account has one. An invitation addressed to
+    /// that mailbox is redeemed only when the address is verified.
+    Email {
+        display_name: &'a str,
+        email: &'a str,
         password: &'a [u8],
     },
     /// An already-verified external identity (A04 established the proof).
@@ -371,9 +747,9 @@ pub enum Applicant<'a> {
 impl Applicant<'_> {
     fn display_name(&self) -> &str {
         match self {
-            Applicant::Local { display_name, .. } | Applicant::External { display_name, .. } => {
-                display_name
-            }
+            Applicant::Local { display_name, .. }
+            | Applicant::Email { display_name, .. }
+            | Applicant::External { display_name, .. } => display_name,
         }
     }
 }
@@ -384,9 +760,11 @@ impl Applicant<'_> {
 pub enum Refusal {
     RegistrationClosed,
     InvitationRequired,
-    /// Unknown, expired, spent, revoked, or bound to a different identity.
+    /// Unknown, expired, spent, revoked, bound to a different identity, or
+    /// addressed to a different mailbox.
     InvitationUnusable,
-    /// That username or external identity already belongs to an account.
+    /// That username, email address or external identity already belongs to
+    /// an account.
     AlreadyRegistered,
 }
 
@@ -399,25 +777,66 @@ pub enum Admission {
     Refused(Refusal),
 }
 
-/// Apply for an account.
-///
-/// Policy is read inside the writing transaction, so a policy change that
-/// commits while an application is in flight decides it. Password hashing
-/// happens before that transaction, never inside the writer.
+/// Apply for an account, with no mail delivery (see [`register_with`]).
 pub fn register(
     store: &Store,
     applicant: Applicant<'_>,
     invitation: Option<&Secret>,
     now: UnixMillis,
 ) -> Result<Admission> {
+    register_with(store, applicant, invitation, None, now)
+}
+
+/// A username for an account that registered by address: `user-` and twelve
+/// hex digits of a fresh identifier. Not secret and not meant to be typed;
+/// the address is the login identifier.
+fn generated_username(user: UserId) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = String::with_capacity(17);
+    name.push_str("user-");
+    for byte in &user.as_bytes()[..6] {
+        name.push(HEX[usize::from(byte >> 4)] as char);
+        name.push(HEX[usize::from(byte & 15)] as char);
+    }
+    name
+}
+
+/// Apply for an account.
+///
+/// Policy is read inside the writing transaction, so a policy change that
+/// commits while an application is in flight decides it. Password hashing
+/// happens before that transaction, never inside the writer. `key` (the
+/// deployment master key) lets an address registration queue its
+/// verification mail in the same transaction; without it the operator mints
+/// the link with the host-local CLI.
+///
+/// An [`Applicant::Email`] whose address another account already verified is
+/// refused as [`Refusal::AlreadyRegistered`]; callers answer exactly as they do
+/// for a new address. An invitation addressed to a mailbox is not spent here:
+/// it rides on the verification token and is redeemed, with its membership,
+/// when that address is proved.
+pub fn register_with(
+    store: &Store,
+    applicant: Applicant<'_>,
+    invitation: Option<&Secret>,
+    key: Option<std::sync::Arc<sentinel_auth::sealed::Key>>,
+    now: UnixMillis,
+) -> Result<Admission> {
     let display_name = applicant.display_name().to_owned();
-    let (username, phc, provider, subject) = match applicant {
+    let (username, phc, provider, subject, email) = match applicant {
         Applicant::Local {
             username, password, ..
         } => {
             let username = crate::local_auth::username(username)?.to_owned();
             let phc = password::hash(password).map_err(|_| Error::InvalidInput("password"))?;
-            (Some(username), Some(phc), None, None)
+            (Some(username), Some(phc), None, None, None)
+        }
+        Applicant::Email {
+            email, password, ..
+        } => {
+            let email = crate::email::normalize(email)?;
+            let phc = password::hash(password).map_err(|_| Error::InvalidInput("password"))?;
+            (None, Some(phc), None, None, Some(email))
         }
         Applicant::External {
             provider, subject, ..
@@ -426,6 +845,7 @@ pub fn register(
             None,
             Some(provider.to_owned()),
             Some(subject.to_owned()),
+            None,
         ),
     };
     let presented = invitation.map(Secret::digest);
@@ -437,64 +857,76 @@ pub fn register(
             return refuse(tx, Refusal::RegistrationClosed);
         }
 
-        // Redeem first: an invitation decides both admission and membership,
-        // and spending it in this transaction means a lost race creates nothing.
-        let redeemed = match presented {
+        // An invitation decides both admission and membership. One without a
+        // mailbox is spent in this transaction (a lost race creates nothing);
+        // one addressed to a mailbox waits for that address to be verified.
+        let (redeemed, deferred) = match presented {
             Some(digest) => {
-                // An invitation delegates its creator's authority, so it is
-                // only as good as that authority is now: the creator must still
-                // be an active super admin, or still administer the tenant the
-                // invitation grants membership of. Removal, suspension,
-                // rejection and demotion therefore void every unspent
-                // invitation the creator minted, with no bookkeeping. Host-local
-                // invitations (no creator) hold the database file's authority.
-                let row: Option<Redeemable> = tx
-                    .prepare_cached(
-                        "SELECT i.tenant_id, i.role, i.provider, i.subject FROM invitations i
-                         LEFT JOIN users c ON c.id = i.created_by
-                         LEFT JOIN memberships cm
-                           ON cm.tenant_id = i.tenant_id AND cm.user_id = i.created_by
-                         WHERE i.token_digest = ?1 AND i.redeemed_ms IS NULL
-                         AND i.revoked_ms IS NULL AND i.expires_ms > ?2
-                         AND (i.created_by IS NULL OR
-                              (c.active = 1 AND (c.super_admin = 1 OR cm.role = 3)))",
-                    )?
-                    .query_row(params![digest.0, now.0], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                    })
-                    .optional()?;
-                let Some(row) = row else {
+                let Some(found) = usable_invitation(tx, Select::Digest(digest.0), now)? else {
                     return refuse(tx, Refusal::InvitationUnusable);
                 };
                 // A bound invitation belongs to one verified identity.
-                if row.2.is_some() && (row.2 != provider || row.3 != subject) {
+                if let Some((bound_provider, bound_subject)) = &found.identity
+                    && (provider.as_ref() != Some(bound_provider)
+                        || subject.as_ref() != Some(bound_subject))
+                {
                     return refuse(tx, Refusal::InvitationUnusable);
                 }
-                Some((digest, row.0, row.1))
+                enum Addressed {
+                    No,
+                    ToApplicant,
+                    ToSomeoneElse,
+                }
+                let addressed = match (found.email.as_deref(), email.as_deref()) {
+                    (None, _) => Addressed::No,
+                    (Some(to), Some(applied)) if to == applied => Addressed::ToApplicant,
+                    _ => Addressed::ToSomeoneElse,
+                };
+                match addressed {
+                    Addressed::No => (Some(found), None),
+                    Addressed::ToApplicant => {
+                        if let Some(tenant) = found.tenant
+                            && !tenant_is_open(tx, tenant)?
+                        {
+                            return refuse(tx, Refusal::InvitationUnusable);
+                        }
+                        (None, Some(found.id))
+                    }
+                    // Addressed to a mailbox this applicant is not proving.
+                    Addressed::ToSomeoneElse => {
+                        return refuse(tx, Refusal::InvitationUnusable);
+                    }
+                }
             }
             None => {
                 if policy.registration == Registration::InviteOnly {
                     return refuse(tx, Refusal::InvitationRequired);
                 }
-                None
+                (None, None)
             }
         };
 
         // Refuse a taken login before writing anything. The unique indexes are
         // still the decision under a race; that path rolls the whole attempt
         // back rather than leaving an account with no way to sign in.
-        let taken: bool = match (&username, &provider, &subject) {
-            (Some(username), _, _) => tx
+        let taken: bool = match (&username, &provider, &subject, &email) {
+            (Some(username), _, _, _) => tx
                 .prepare_cached(
                     "SELECT EXISTS(SELECT 1 FROM local_credentials WHERE username = ?1)",
                 )?
                 .query_row([username], |r| r.get(0))?,
-            (_, Some(provider), Some(subject)) => tx
+            (_, Some(provider), Some(subject), _) => tx
                 .prepare_cached(
                     "SELECT EXISTS(SELECT 1 FROM external_identities
                      WHERE provider = ?1 AND subject = ?2)",
                 )?
                 .query_row(params![provider, subject], |r| r.get(0))?,
+            (_, _, _, Some(email)) => tx
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM users
+                     WHERE email = ?1 AND email_verified_ms IS NOT NULL)",
+                )?
+                .query_row([email], |r| r.get(0))?,
             _ => return Err(Error::InvalidInput("applicant")),
         };
         if taken {
@@ -503,24 +935,28 @@ pub fn register(
 
         // An invitation is itself the approval; without one, an application
         // under `ApprovalRequired` waits.
-        let approved = redeemed.is_some();
+        let approved = redeemed.is_some() || deferred.is_some();
         let user = UserId::new();
         tx.execute(
-            "INSERT INTO users(id, display_name, created_ms, status, active)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO users(id, display_name, created_ms, status, active, email)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 user.as_bytes(),
                 display_name,
                 now.0,
                 if approved { 1 } else { 0 },
-                approved
+                approved,
+                email
             ],
         )?;
-        let claimed = match (&username, &phc, &provider, &subject) {
-            (Some(username), Some(phc), _, _) => {
+        let claimed = match (&username, &phc, &provider, &subject, &email) {
+            (Some(username), Some(phc), _, _, _) => {
                 crate::local_auth::insert_credential(tx, user, username, phc, now)
             }
-            (_, _, Some(provider), Some(subject)) => {
+            (_, Some(phc), _, _, Some(_)) => {
+                crate::local_auth::insert_credential(tx, user, &generated_username(user), phc, now)
+            }
+            (_, _, Some(provider), Some(subject), _) => {
                 crate::auth::provisioning::link_verified_identity(tx, user, provider, subject, now)
             }
             _ => Err(Error::InvalidInput("applicant")),
@@ -534,25 +970,8 @@ pub fn register(
         }
         claimed?;
 
-        if let Some((digest, tenant, role)) = redeemed {
-            tx.execute(
-                "UPDATE invitations SET redeemed_ms = ?2, redeemed_by = ?3 WHERE token_digest = ?1",
-                params![digest.0, now.0, user.as_bytes()],
-            )?;
-            if let (Some(tenant), Some(role)) = (tenant, role) {
-                tx.execute(
-                    "INSERT INTO memberships(tenant_id, user_id, role) VALUES (?1, ?2, ?3)",
-                    params![tenant, user.as_bytes(), role],
-                )?;
-            }
-            audit(
-                tx,
-                Event::InvitationRedeemed,
-                Some(user),
-                Some(user),
-                false,
-                None,
-            )?;
+        if let Some(found) = &redeemed {
+            redeem(tx, found, user, now)?;
         }
         audit(
             tx,
@@ -566,6 +985,12 @@ pub fn register(
             false,
             None,
         )?;
+        if let Some(address) = &email {
+            // A brand-new account is under every allowance; whatever the
+            // outcome (queued, or left for the operator's CLI) the
+            // registration stands.
+            crate::email::request(tx, key.as_deref(), user, address, deferred, now)?;
+        }
         Ok(if approved {
             Admission::Admitted(user)
         } else {

@@ -124,6 +124,13 @@ pub enum Event {
     /// person did not accept anything, so the addition is recorded on its own
     /// in addition to the role change.
     MemberAdded = 58,
+    /// A verification link was minted for an address (queued for delivery or
+    /// issued by the host-local CLI). The address is never recorded.
+    EmailVerificationRequested = 59,
+    /// An account proved control of its address.
+    EmailVerified = 60,
+    /// The mail lane gave up on a message; the detail is its kind and reason.
+    MailAbandoned = 61,
 }
 
 impl Event {
@@ -188,6 +195,9 @@ impl Event {
             Event::ServiceAccountCreated => "service-account-created",
             Event::PlatformOverride => "platform-override",
             Event::MemberAdded => "member-added",
+            Event::EmailVerificationRequested => "email-verification-requested",
+            Event::EmailVerified => "email-verified",
+            Event::MailAbandoned => "mail-abandoned",
         }
     }
 
@@ -251,6 +261,9 @@ impl Event {
             56 => Event::ServiceAccountCreated,
             57 => Event::PlatformOverride,
             58 => Event::MemberAdded,
+            59 => Event::EmailVerificationRequested,
+            60 => Event::EmailVerified,
+            61 => Event::MailAbandoned,
             _ => return None,
         })
     }
@@ -562,8 +575,37 @@ fn candidate(conn: &Connection, login_name: &str) -> Result<Option<Candidate>> {
     }))
 }
 
+/// [`candidate`] for an address (canonical): the active account that
+/// verified it. An unverified claim identifies nobody.
+fn candidate_by_email(conn: &Connection, email: &str) -> Result<Option<Candidate>> {
+    let row = conn
+        .prepare_cached(
+            "SELECT c.user_id, c.phc, c.locked_until_ms FROM users u
+             JOIN local_credentials c ON c.user_id = u.id
+             WHERE u.email = ?1 AND u.email_verified_ms IS NOT NULL
+               AND u.kind = 0 AND u.active = 1",
+        )?
+        .query_row([email], |r| {
+            Ok((
+                r.get::<_, [u8; 16]>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .optional()?;
+    let Some((id, phc, locked_until)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(Candidate {
+        user: UserId::from_bytes(id).map_err(|_| Error::Corrupt("user_id"))?,
+        phc,
+        locked_until,
+    }))
+}
+
 /// Verify a password and, on success, issue a fresh opaque session. An unknown
-/// user costs the same work as a wrong password.
+/// user costs the same work as a wrong password. `login_name` is a username or
+/// a verified email address.
 pub fn login(
     store: &Store,
     login_name: &str,
@@ -574,19 +616,28 @@ pub fn login(
     // An attempt against an unknown or malformed name is still recorded, with no
     // subject: password spraying is visible in the audit trail, and the caller
     // cannot tell the outcomes apart from the response or from the time taken.
-    let Ok(login_name) = username(login_name) else {
-        password::spend_equal_work(password_bytes);
-        record_flood(store, Event::LoginRejected, None, None)?;
-        return Ok(Login::Rejected);
+    //
+    // The identifier is a username, or — when it holds an `@`, which no
+    // username can — an email address, which signs in only once verified.
+    // An address is personal data, so a rejected attempt never records it.
+    let (found, detail) = if login_name.contains('@') {
+        let found = match crate::email::normalize(login_name) {
+            Ok(email) => store.read(|conn| candidate_by_email(conn, &email))?,
+            Err(_) => None,
+        };
+        (found, None)
+    } else {
+        match username(login_name) {
+            Ok(name) => (
+                store.read(|conn| candidate(conn, name))?,
+                Some(name.to_owned()),
+            ),
+            Err(_) => (None, None),
+        }
     };
-    let Some(candidate) = store.read(|conn| candidate(conn, login_name))? else {
+    let Some(candidate) = found else {
         password::spend_equal_work(password_bytes);
-        record_flood(
-            store,
-            Event::LoginRejected,
-            None,
-            Some(login_name.to_owned()),
-        )?;
+        record_flood(store, Event::LoginRejected, None, detail)?;
         return Ok(Login::Rejected);
     };
     if candidate.locked_until > now.0 {

@@ -18,6 +18,7 @@ pub mod bundle;
 pub mod checks;
 pub mod codec;
 pub mod dispatch;
+pub mod email;
 pub mod github_events;
 pub mod idempotency;
 pub mod intake;

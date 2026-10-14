@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 blake3 = "1.8"
 flate2 = "1.1"
+idna = "1.1"
 memchr = "2.7"
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 serde_json = "1.0"

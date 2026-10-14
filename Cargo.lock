@@ -1352,6 +1352,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-mail"
+version = "0.1.0-dev"
+dependencies = [
+ "base64",
+ "rustls",
+ "sentinel-auth",
+ "sentinel-core",
+ "sentinel-store",
+ "tempfile",
+ "time",
+ "webpki-roots",
+]
+
+[[package]]
 name = "sentinel-pipeline"
 version = "0.1.0-dev"
 dependencies = [
@@ -1407,6 +1421,7 @@ version = "0.1.0-dev"
 dependencies = [
  "blake3",
  "flate2",
+ "idna",
  "memchr",
  "postcard",
  "rusqlite",
