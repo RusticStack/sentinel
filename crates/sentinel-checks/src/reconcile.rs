@@ -1,4 +1,4 @@
-//! The lifecycle reconcile lane (G05).
+//! The lifecycle reconcile lane.
 //!
 //! `github_refresh` rows are the durable hint list: a signed webhook asked
 //! for a refresh, or the periodic pass owes one. The lane asks GitHub — never

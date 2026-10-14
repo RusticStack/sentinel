@@ -1,4 +1,4 @@
-//! Q08 — remote cache hydration: cold transfer through an in-memory
+//! Remote cache hydration: cold transfer through an in-memory
 //! controller, resume from an interrupted transfer, refusal of corrupt or
 //! wrong-scope bytes, and the rule that a local hit never networks.
 //!
@@ -136,9 +136,9 @@ fn attached_for(scope: &Scope) -> Attached {
 /// A policy whose deadline no test run reaches. The restore-cost bound is
 /// wall-clock: it projects the remaining time from the rate measured so far
 /// (resume hashing and staging fsyncs included), so under a loaded machine a
-/// real 5 s budget aborted resumes these tests expect to finish (P08-C7's
-/// `Miss(Unavailable)` flake). Behavior tests do not depend on the clock;
-/// the budget itself is proven deterministically by
+/// real 5 s budget aborted resumes these tests expect to finish. Behavior
+/// tests do not depend on the clock; the budget itself is proven
+/// deterministically by
 /// `a_transfer_past_its_deadline_keeps_its_partial_for_the_next_attempt`.
 fn policy<'a>(source: &'a dyn Remote) -> remote::Policy<'a> {
     remote::Policy {
@@ -618,7 +618,7 @@ fn a_bundle_sealed_for_another_scope_never_serves() {
     );
 }
 
-/// P08-C8: the head is checked against the request as soon as it is whole,
+/// The head is checked against the request as soon as it is whole,
 /// so a bundle for another scope is refused after its first chunk instead
 /// of after its whole payload crossed the link and landed on disk.
 #[test]
@@ -698,7 +698,7 @@ fn a_controller_without_the_bundle_leaves_the_local_miss() {
     );
 }
 
-/// P08-C7: a transfer refused for now (`busy`) keeps the valid partial an
+/// A transfer refused for now (`busy`) keeps the valid partial an
 /// earlier attempt left; the next attempt resumes it.
 #[test]
 fn a_busy_answer_keeps_a_valid_partial() {
@@ -779,7 +779,7 @@ fn a_transfer_past_its_deadline_keeps_its_partial_for_the_next_attempt() {
     assert_eq!(resumed.stats.remote_from, Some(partial));
 }
 
-/// P08-C6: hydrations share the job's one deadline — a policy whose
+/// Hydrations share the job's one deadline — a policy whose
 /// deadline already passed never reaches the transport, so N caches can
 /// never cost N budgets.
 #[test]
@@ -811,8 +811,6 @@ fn a_spent_job_deadline_never_networks() {
         remote::BUDGET_MAX
     );
 }
-
-// ——— the controller-side store (P08-C4/C5/C8) ———
 
 fn upload_for(scope: &Scope, stream: &[u8]) -> Upload {
     Upload::of(
@@ -846,7 +844,7 @@ fn bundles(entry: &Path) -> Vec<String> {
     names
 }
 
-/// P08-C4: a second generation supersedes the first — the entry keeps one
+/// A second generation supersedes the first — the entry keeps one
 /// bundle — and the store sweep removes stale upload staging and evicts
 /// whole entries least recently served first under its budget.
 #[test]
@@ -888,7 +886,7 @@ fn the_controller_store_keeps_one_bundle_per_entry_and_a_byte_budget() {
     assert_eq!(swept.bytes, 5000);
 }
 
-/// P08-C5: an upload abandoned mid-stream removes its staging file and
+/// An upload abandoned mid-stream removes its staging file and
 /// releases the entry, so the next offer is not `busy`.
 #[test]
 fn an_abandoned_upload_leaves_nothing_behind() {
@@ -912,7 +910,7 @@ fn an_abandoned_upload_leaves_nothing_behind() {
     assert_eq!(bundles(&entry_of(&store, &scope)).len(), 1);
 }
 
-/// P08-C8: an upload is verified as it lands — a stream whose bytes do not
+/// An upload is verified as it lands — a stream whose bytes do not
 /// hash to the offered digest is refused at its end without a re-read, and
 /// a serve reproduces the stored stream through one reused chunk buffer,
 /// resuming only from a proven prefix.
@@ -954,7 +952,7 @@ fn uploads_verify_as_they_land_and_serves_resume_only_proven_prefixes() {
     }
 }
 
-/// P08-C8, protocol 9: a controller that takes the digest at the end gets
+/// Protocol 9: a controller that takes the digest at the end gets
 /// an upload naming `DIGEST_AT_END`, and the digest it stores is the same
 /// content address the digest-first path computes — the stream is read
 /// once instead of hashed in a pass of its own first. The stored bundle
