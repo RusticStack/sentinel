@@ -135,9 +135,9 @@ pub enum Rejected {
         supported_max: ProtocolVersion,
         upgrade_worker: bool,
     },
-    MissingCapabilities {
-        missing: Capabilities,
-    },
+    /// Required capabilities the worker did not advertise.
+    MissingCapabilities { missing: Capabilities },
+    /// `protocol_min > protocol_max`.
     InvalidRange,
 }
 

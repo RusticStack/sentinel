@@ -174,7 +174,11 @@ impl Publication {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Retry {
-    Scheduled { attempts: u32, next_attempt_ms: i64 },
+    Scheduled {
+        attempts: u32,
+        next_attempt_ms: i64,
+    },
+    /// The attempt budget is spent; the row is refused with that reason.
     Exhausted,
 }
 

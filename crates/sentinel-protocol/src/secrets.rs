@@ -88,8 +88,10 @@ pub struct DeliveryTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TargetKind {
     Environment,
-    File { path: String },
-    // Never exposed to a step: the bytes are used only for this job's image pull.
+    File {
+        path: String,
+    },
+    /// Never exposed to a step: the bytes are used only for this job's image pull.
     RegistryAuth,
 }
 

@@ -50,18 +50,16 @@ impl Boundary {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Compat {
-    Downloads {
-        tool: String,
-    },
+    /// Tool-addressed blobs; `tool` pins the installing tool's protocol.
+    Downloads { tool: String },
     Dependencies {
         lock: [u8; 32],
         installer: String,
         flags: String,
         abi: String,
     },
-    Compiler {
-        flags: String,
-    },
+    /// A stable toolchain namespace; the store pins the flags entries were written under.
+    Compiler { flags: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

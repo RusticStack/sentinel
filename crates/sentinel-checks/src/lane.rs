@@ -21,17 +21,12 @@ pub enum Publish {
         check_run_id: i64,
         check_suite_id: Option<i64>,
     },
-    Retry {
-        after_ms: i64,
-        detail: String,
-    },
-    Refused {
-        reason: String,
-    },
-    Throttled {
-        until_ms: i64,
-        scope: u64,
-    },
+    /// Transient: try again, no earlier than `after_ms` from now.
+    Retry { after_ms: i64, detail: String },
+    /// Permanent for this generation: recorded with a reason and not retried.
+    Refused { reason: String },
+    /// The publication's scope is rate-limited until `until_ms`; other scopes continue.
+    Throttled { until_ms: i64, scope: u64 },
 }
 
 pub trait Publisher: Send {

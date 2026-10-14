@@ -158,15 +158,20 @@ const MAX_DEFERRED: usize = 256;
 const DEFERRED_MAX_AGE: Duration = Duration::from_secs(300);
 
 enum Received {
+    /// The store took it.
     Applied,
+    /// A verdict already waiting for this attempt; a worker resends it until the controller
+    /// counts the attempt as released, and a copy adds nothing.
     Copy,
-    Queued {
-        kept: bool,
-    },
+    /// Another message of the attempt is waiting, so this one waits behind it; `kept` is
+    /// `false` when the full queue refused it.
+    Queued { kept: bool },
+    /// The store failed for a reason that says nothing about the message.
     Transient {
         error: sentinel_store::Error,
         kept: bool,
     },
+    /// The store refused it as stale: nothing changed.
     Stale,
 }
 
