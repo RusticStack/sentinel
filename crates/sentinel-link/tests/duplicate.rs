@@ -1,4 +1,4 @@
-//! W09: at-least-once delivery on the link. A controller that repeats an
+//! At-least-once delivery on the link. A controller that repeats an
 //! offer — a retransmit after an uncertain send — gets it acknowledged
 //! again, and the worker's executor is asked once: a duplicate offer never
 //! becomes a duplicate execution within a healthy session. The controller

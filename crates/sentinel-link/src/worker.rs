@@ -1,10 +1,9 @@
 //! The worker's side of the link: connect, enroll once, serve the session,
-//! and reconnect with bounded back-off when the controller is lost (W02).
+//! and reconnect with bounded back-off when the controller is lost.
 //!
 //! A lost session does not end the work: the executor keeps the attempts it
 //! holds and keeps renewing them once the session is back; if it is not back
-//! before the lease deadline the executor stops them itself (W06 reconciles
-//! the controller's view). A typed rejection is final for this
+//! before the lease deadline the executor stops them itself. A typed rejection is final for this
 //! configuration — the loop returns rather than retrying an unchanged hello
 //! — except `Unavailable`, the controller's "try again later", which backs
 //! off and retries like a lost connection.
@@ -36,11 +35,10 @@ use crate::{
 pub struct Handle {
     stop: AtomicBool,
     link: Mutex<Option<Sender>>,
-    /// Control sessions opened since process start; what Q07 telemetry
-    /// reports reconnects from, measured, never estimated.
+    /// Control sessions opened since process start; telemetry reports
+    /// reconnects from this count.
     sessions: std::sync::atomic::AtomicU64,
-    /// The process's live transport measurements (Q07), when it has any;
-    /// without one every session reports [`Config::transport`].
+    /// The process's live transport measurements, when it has any; without one every session reports [`Config::transport`].
     transport: Mutex<Option<TransportSource>>,
 }
 
@@ -68,7 +66,7 @@ impl Handle {
     /// Report transport telemetry from `source` (the Tailcat helper's latest
     /// probe) instead of the fixed [`Config::transport`]: read at every
     /// session start, and at every telemetry resend within a session, so a
-    /// path the helper re-measured reaches the controller (Q07).
+    /// path the helper re-measured reaches the controller.
     pub fn set_transport_source(&self, source: TransportSource) {
         *self.transport.lock().unwrap_or_else(|p| p.into_inner()) = Some(source);
     }
@@ -81,8 +79,8 @@ impl Handle {
     }
 }
 
-/// Reconnect back-off: doubling from the first to the second, with jitter,
-/// reset after a session that lasted at least [`STABLE_SESSION`].
+/// Reconnect back-off: doubling from [`BACKOFF_MIN`] up to [`BACKOFF_MAX`],
+/// with jitter, reset after a session that lasted at least [`STABLE_SESSION`].
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 pub const STABLE_SESSION: Duration = Duration::from_secs(30);
@@ -105,12 +103,12 @@ pub struct Config {
     /// memory (labels, host, disk, availability). Sent right after `Welcome`
     /// when the session negotiated protocol 7; ignored below it.
     pub profile: Profile,
-    /// Protocol 7 (Q07): what the process measured about its transport
+    /// Protocol 7: what the process measured about its transport
     /// before the first session — the path and helper version from the
     /// Tailcat probe, or Unknown. The link fills in round-trip time and byte
     /// counters from the live session.
     pub transport: TransportStats,
-    /// Whether this worker exposes the remote cache to its executor (Q08);
+    /// Whether this worker exposes the remote cache to its executor;
     /// disabled, every remote lookup is a local miss.
     pub remote_cache: bool,
 }
@@ -171,9 +169,8 @@ pub fn session(
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     link.set_remote_cache(config.remote_cache);
     if link.negotiated.protocol.0 >= PROFILE_MIN.0 {
-        // The profile opens with what the executor holds right now (P07-6):
-        // resident images and cache bytes, measured, never the configured
-        // placeholder.
+        // The profile opens with what the executor holds right now (resident
+        // images and cache bytes), not the configured placeholder.
         let mut profile = config.profile.clone();
         if let Some((version, availability)) = executor.availability() {
             profile.availability.images = availability.images;
@@ -253,7 +250,7 @@ const STOP_POLL: Duration = Duration::from_millis(50);
 /// back-off until the control session ends. The back-off wait watches the
 /// stop flag: the control session joins this thread before it returns, so an
 /// uninterruptible sleep here would hold a reconnect for up to
-/// [`BACKOFF_MAX`] — longer than a lease (P08-11).
+/// [`BACKOFF_MAX`] — longer than a lease.
 fn serve_bulk(
     dialer: &session::BulkDialer,
     first: session::BulkLink,

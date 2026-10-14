@@ -1,4 +1,4 @@
-//! Q09: one hundred concurrent worker sessions over real TLS against a real
+//! One hundred concurrent worker sessions over real TLS against a real
 //! `Controller`, each ending in a simulated executor.
 //!
 //! What this covers is the link and the scheduler at fleet scale: one hundred
