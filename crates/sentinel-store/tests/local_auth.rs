@@ -144,6 +144,38 @@ fn only_the_right_password_issues_a_session_and_it_carries_platform_authority() 
     );
 }
 
+/// The audit record is append-only: guesses at names that do not exist, and
+/// attempts against a locked account, stop adding rows once a window holds a
+/// handful, while accepted logins are always recorded.
+#[test]
+fn credential_free_floods_cannot_grow_the_audit_trail_without_bound() {
+    let (_dir, store) = store();
+    let (_root, _issued) = bootstrapped(&store);
+    let before = events(&store).len();
+    for n in 0..12 {
+        let name = format!("nobody{n}");
+        assert!(matches!(
+            local_auth::login(&store, &name, OTHER, Policy::default(), at(5_000 + n)).unwrap(),
+            Login::Rejected
+        ));
+    }
+    let rejected = events(&store)
+        .iter()
+        .filter(|e| **e == Event::LoginRejected)
+        .count();
+    assert!(
+        (1..=5).contains(&rejected),
+        "{rejected} rejections recorded"
+    );
+    assert!(events(&store).len() - before <= 5);
+    // A real login is still recorded after the flood.
+    assert!(matches!(
+        local_auth::login(&store, "root", PASSWORD, Policy::default(), at(6_000)).unwrap(),
+        Login::Accepted(_)
+    ));
+    assert!(events(&store).contains(&Event::LoginAccepted));
+}
+
 #[test]
 fn an_unrelated_or_forged_cookie_authenticates_nobody() {
     let (_dir, store) = store();

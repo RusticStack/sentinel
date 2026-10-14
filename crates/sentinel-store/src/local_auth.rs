@@ -360,6 +360,73 @@ pub(crate) fn audit(
     Ok(())
 }
 
+/// Rows of one kind a rejected-login flood may add per [`FLOOD_WINDOW_MS`].
+const FLOOD_ROWS: i64 = 5;
+const FLOOD_WINDOW_MS: i64 = 10_000;
+
+/// [`audit`] for events anyone can cause without a credential (a guess at a
+/// name that does not exist, a request against a locked account): the
+/// record is append-only, so an unbounded flood would be unbounded growth.
+/// Once [`FLOOD_ROWS`] rows of this event and subject exist inside the
+/// window, the attempt is not recorded; the first of every window always is,
+/// so spraying stays visible without being able to fill the disk.
+fn audit_flood(
+    tx: &Transaction<'_>,
+    event: Event,
+    subject: Option<UserId>,
+    detail: Option<&str>,
+) -> Result<()> {
+    let now = UnixMillis::now().0;
+    tx.prepare_cached(
+        "INSERT INTO auth_audit(at_ms, event, actor_user_id, subject_user_id, host_local, detail)
+         SELECT ?1, ?2, NULL, ?3, 0, ?4
+         WHERE (SELECT COUNT(*) FROM auth_audit
+                WHERE at_ms > ?5 AND event = ?2 AND subject_user_id IS ?3) < ?6",
+    )?
+    .execute(params![
+        now,
+        event as u8,
+        subject.as_ref().map(UserId::as_bytes),
+        detail.map(bounded_detail),
+        now - FLOOD_WINDOW_MS,
+        FLOOD_ROWS
+    ])?;
+    Ok(())
+}
+
+/// Record one flood-limited event, entering the single writer only while
+/// the window still has room (a cheap indexed read decides): a flood past
+/// the cap costs a reader, not a write transaction.
+fn record_flood(
+    store: &Store,
+    event: Event,
+    subject: Option<UserId>,
+    detail: Option<String>,
+) -> Result<()> {
+    let room = store.read(|conn| {
+        let rows: i64 = conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM auth_audit
+                 WHERE at_ms > ?1 AND event = ?2 AND subject_user_id IS ?3",
+            )?
+            .query_row(
+                params![
+                    UnixMillis::now().0 - FLOOD_WINDOW_MS,
+                    event as u8,
+                    subject.as_ref().map(UserId::as_bytes)
+                ],
+                |r| r.get(0),
+            )?;
+        Ok(rows < FLOOD_ROWS)
+    })?;
+    if room {
+        store
+            .writer()
+            .write(move |tx| audit_flood(tx, event, subject, detail.as_deref()))?;
+    }
+    Ok(())
+}
+
 /// Host-local admission of the first super admin. Refuses once the latch is set
 /// or any active super admin already exists: "first visitor wins" is not a
 /// bootstrap. The user, its credential and the latch are one commit.
@@ -487,33 +554,24 @@ pub fn login(
     // cannot tell the outcomes apart from the response or from the time taken.
     let Ok(login_name) = username(login_name) else {
         password::spend_equal_work(password_bytes);
-        store
-            .writer()
-            .write(move |tx| audit(tx, Event::LoginRejected, None, None, false, None))?;
+        record_flood(store, Event::LoginRejected, None, None)?;
         return Ok(Login::Rejected);
     };
     let Some(candidate) = store.read(|conn| candidate(conn, login_name))? else {
         password::spend_equal_work(password_bytes);
-        let attempted = login_name.to_owned();
-        store.writer().write(move |tx| {
-            audit(
-                tx,
-                Event::LoginRejected,
-                None,
-                None,
-                false,
-                Some(&attempted),
-            )
-        })?;
+        record_flood(
+            store,
+            Event::LoginRejected,
+            None,
+            Some(login_name.to_owned()),
+        )?;
         return Ok(Login::Rejected);
     };
     if candidate.locked_until > now.0 {
         password::spend_equal_work(password_bytes);
         let until = UnixMillis(candidate.locked_until);
         let user = candidate.user;
-        store
-            .writer()
-            .write(move |tx| audit(tx, Event::LoginLocked, None, Some(user), false, None))?;
+        record_flood(store, Event::LoginLocked, Some(user), None)?;
         return Ok(Login::Locked { until });
     }
 

@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-use crate::http::{Header, Request, Response, StatusCode};
+use crate::http::{BodyErr, Header, Request, Response, StatusCode};
 use sentinel_auth::cookie;
 use sentinel_core::{
     ArtifactId, AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis, UploadId, UserId,
@@ -65,6 +65,9 @@ pub(crate) enum Reply {
 pub(crate) type Route = Result<Reply, ApiError>;
 
 const JSON: &str = "application/json";
+
+/// Largest password-login body: a login name and a password, nothing more.
+const MAX_LOGIN_BODY_BYTES: usize = 16 << 10;
 
 pub(crate) fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static header")
@@ -315,6 +318,20 @@ pub(crate) fn body_limit(request: &mut Request, limit: usize) -> Result<Vec<u8>,
         );
     }
     Ok(bytes)
+}
+
+/// [`body_limit`] for a route with no credential yet: the body is read
+/// without a handler permit, under the small public-body pool and its
+/// tight deadline ([`Request::public_body`]), so a slow sender cannot take
+/// a permit from real work. Past the pool's wait the answer is `rate_limited`.
+pub(crate) fn public_body_limit(request: &mut Request, limit: usize) -> Result<Vec<u8>, ApiError> {
+    request.public_body(limit).map_err(|e| match e {
+        BodyErr::TooLarge => {
+            err(ErrorCode::PayloadTooLarge, "body too large").with_detail("limit_bytes", limit)
+        }
+        BodyErr::Busy => err(ErrorCode::RateLimited, "busy; retry shortly"),
+        BodyErr::Unreadable => err(ErrorCode::InvalidRequest, "unreadable body"),
+    })
 }
 
 pub(crate) fn parse<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, ApiError> {
@@ -799,7 +816,7 @@ fn github_hook(state: &State, request: &mut Request) -> Route {
         bounded_header(request, sentinel_github::webhook::EVENT_HEADER, 64).unwrap_or_default();
     let delivery = bounded_header(request, sentinel_github::webhook::DELIVERY_HEADER, 128);
     let signature = bounded_header(request, sentinel_github::webhook::SIGNATURE_HEADER, 128);
-    let body = body_limit(request, MAX_WEBHOOK_BODY_BYTES)?;
+    let body = public_body_limit(request, MAX_WEBHOOK_BODY_BYTES)?;
     let outcome = ingest::github(
         &state.store,
         secret,
@@ -843,7 +860,7 @@ fn generic_intake(state: &State, request: &mut Request, repo: &str) -> Route {
                 "present the repository hook secret",
             )
         })?;
-    let body = body_limit(request, MAX_HOOK_BODY_BYTES)?;
+    let body = public_body_limit(request, MAX_HOOK_BODY_BYTES)?;
     let ingested = ingest::generic(&state.store, &presented, repo, &body, UnixMillis::now())
         .map_err(intake_error)?;
     wake_intake(state, ingested.duplicate);
@@ -954,18 +971,43 @@ fn login(state: &State, request: &mut Request) -> Route {
             "sign-in from another site is refused",
         ));
     }
-    let bytes = body(request)?;
+    // Every attempt costs a password hash (an unknown name included) and a
+    // writer transaction: admit the client before reading or hashing.
+    if !crate::oauth::admitted(state, request, crate::oauth::Budget::Login) {
+        return Err(err(
+            ErrorCode::RateLimited,
+            "too many sign-in attempts; retry shortly",
+        )
+        .with_detail("retry_after_ms", 2000));
+    }
+    let bytes = public_body_limit(request, MAX_LOGIN_BODY_BYTES)?;
     let creds: LoginBody = parse(&bytes)?;
+    // One client's lockout against an account never locks anyone else out.
+    let client = crate::oauth::client_of(state, request);
+    let now = std::time::Instant::now();
+    if !state.logins.allowed(client, &creds.username, now) {
+        return Err(err(ErrorCode::Unauthenticated, "sign-in refused"));
+    }
+    // The store's account-wide lock is the ceiling for many clients
+    // together: it takes more failures than one client may make.
+    let account_policy = local_auth::Policy {
+        max_failures: state
+            .sessions
+            .max_failures
+            .saturating_mul(crate::login_guard::ACCOUNT_LOCK_FACTOR),
+        ..state.sessions
+    };
     let outcome = local_auth::login(
         &state.store,
         &creds.username,
         creds.password.as_bytes(),
-        state.sessions,
+        account_policy,
         UnixMillis::now(),
     )
     .map_err(store_error)?;
     match outcome {
         local_auth::Login::Accepted(issued) => {
+            state.logins.succeeded(client, &creds.username);
             let mut csrf = String::new();
             issued.csrf.expose(&mut csrf);
             let set_cookie =
@@ -978,6 +1020,13 @@ fn login(state: &State, request: &mut Request) -> Route {
         }
         // One answer for every non-accepted outcome; the audit trail has the detail.
         local_auth::Login::Rejected | local_auth::Login::Locked { .. } => {
+            state.logins.failed(
+                client,
+                &creds.username,
+                state.sessions.max_failures,
+                std::time::Duration::from_millis(state.sessions.lockout_ms.max(0) as u64),
+                now,
+            );
             Err(err(ErrorCode::Unauthenticated, "sign-in refused"))
         }
     }

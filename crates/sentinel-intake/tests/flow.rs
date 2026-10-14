@@ -233,6 +233,18 @@ fn the_generic_path_authenticates_scopes_and_deduplicates() {
         ),
         Err(IngestError::Unauthenticated)
     );
+    // Authentication comes first: without a valid secret a malformed body is
+    // refused as unauthenticated, never as a body the caller got to probe.
+    assert_eq!(
+        ingest::generic(
+            &f.store,
+            "sentinel_hook_not-a-secret",
+            f.repo,
+            b"not json",
+            now
+        ),
+        Err(IngestError::Unauthenticated)
+    );
     let unknown = RepoId::new();
     assert!(matches!(
         ingest::generic(&f.store, &f.token, unknown, &body("hook-3"), now),
