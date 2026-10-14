@@ -1,9 +1,4 @@
-//! The CLI as one camp's member sees the other camp: an owner administering
-//! `rusticstack` and a colleague administering `mutualismo`, each with only
-//! their own `sntl_` credential. Everything of the owner's the colleague
-//! names (run, job, attempt, queue, workers, dispatch) exits `not_found`
-//! (4) with the very message and JSON document a guessed identifier gets;
-//! the same commands work for the owner (so the refusals are not typos).
+//! Another camp's names get the same `not_found` document as guessed ones, so existence cannot be probed.
 
 use std::{
     path::PathBuf,
@@ -200,8 +195,6 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// The commands that name something of a camp, with `names` standing for
-/// its tenant slug, run, job and attempt.
 fn commands(org: &str, run: &str, job: &str, attempt: &str) -> Vec<Vec<String>> {
     let own = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
     vec![
@@ -266,7 +259,6 @@ fn the_other_camp_gets_not_found_with_the_same_document_a_guess_gets() {
             let document: Value = serde_json::from_str(text(&refused.stderr).trim()).unwrap();
             assert_eq!(document["code"], "not_found");
         }
-        // Dispatch into the other camp's repository: refused like a missing one.
         let pipeline = d.dir.path().join(".sentinel.yml");
         std::fs::write(
             &pipeline,
@@ -318,7 +310,6 @@ fn the_same_commands_work_for_the_camp_that_owns_the_things() {
             assert!(!document.to_string().contains("rusticstack") || camp.org == "rusticstack");
             assert!(!document.to_string().contains("mutualismo") || camp.org == "mutualismo");
         }
-        // `me` names the caller and nothing of the other camp.
         let me = api(&d, &camp.token, &["me", "--json"]);
         assert_eq!(code(&me), 0, "{}", text(&me.stderr));
         let other = if camp.org == "rusticstack" {
