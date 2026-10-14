@@ -27,16 +27,44 @@ pub struct CompiledJob {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompileError {
-    UnknownDependency { job: String, needs: String },
-    SelfDependency { job: String },
-    DuplicateDependency { job: String, needs: String },
-    Cycle { jobs: Vec<String> },
-    DuplicateStepId { job: String, step: String },
-    DuplicateCacheName { job: String, name: String },
-    DuplicateArtifactName { job: String, name: String },
-    StepTimeoutExceedsJob { job: String, step: String },
-    TooManySteps { limit: usize },
-    Expression { path: String, message: &'static str },
+    UnknownDependency {
+        job: String,
+        needs: String,
+    },
+    SelfDependency {
+        job: String,
+    },
+    DuplicateDependency {
+        job: String,
+        needs: String,
+    },
+    Cycle {
+        jobs: Vec<String>,
+    },
+    DuplicateStepId {
+        job: String,
+        step: String,
+    },
+    DuplicateCacheName {
+        job: String,
+        name: String,
+    },
+    DuplicateArtifactName {
+        job: String,
+        name: String,
+    },
+    StepTimeoutExceedsJob {
+        job: String,
+        step: String,
+    },
+    TooManySteps {
+        limit: usize,
+    },
+    Expression {
+        path: String,
+        message: &'static str,
+    },
+    /// Canonical encoding failed. Hashing nothing instead would give two pipelines the same identity.
     Encoding,
 }
 
@@ -291,7 +319,6 @@ impl Digest {
     fn encoded<T: serde::Serialize>(&mut self, v: &T) {
         match postcard::to_allocvec(v) {
             Ok(bytes) => self.bytes(&bytes),
-            // Never hash an empty buffer in its place: that is a collision.
             Err(_) => self.1 = false,
         }
     }

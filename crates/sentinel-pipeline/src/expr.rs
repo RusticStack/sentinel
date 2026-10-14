@@ -135,7 +135,6 @@ impl Func {
     }
 }
 
-/// Fully parenthesised, so printing and re-parsing yield the same tree.
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -661,9 +660,14 @@ pub enum HashFilesError {
     InvalidFileName,
     UnsafeFile,
     ChangedFile,
+    /// No file matched any pattern: a misconfiguration, never a silent key.
     NoMatch,
-    TooManyFiles { limit: usize },
-    TooManyBytes { limit: u64 },
+    TooManyFiles {
+        limit: usize,
+    },
+    TooManyBytes {
+        limit: u64,
+    },
     InvalidPattern(String),
     Io(String),
 }
