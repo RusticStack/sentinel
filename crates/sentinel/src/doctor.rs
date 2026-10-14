@@ -1,3 +1,9 @@
+//! ```json
+//! { "schema": "sentinel.doctor/1", "profile": "default", "server": "https://ci.example.com",
+//!   "ok": false,
+//!   "checks": [ { "name": "health", "ok": false, "detail": "…", "fix": "…" }, … ] }
+//! ```
+//!
 //! Nothing printed ever holds token material. The refresh check spends the stored
 //! refresh token for real, under the profile lock, so the profile keeps working.
 
@@ -15,7 +21,6 @@ use crate::{
 };
 
 pub const SCHEMA: &str = "sentinel.doctor/1";
-// Bounds each network check so an unreachable controller fails in seconds, not minutes.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Args, Debug)]
