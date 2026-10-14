@@ -106,7 +106,16 @@ fn world() -> World {
             auth::set_membership(tx, admin, globex, sam, Role::TenantAdmin)?;
             auth::create_repo(tx, admin, acme, acme_repo, "app", T)?;
             auth::create_repo(tx, admin, globex, globex_repo, "app", T)?;
-            auth::create_service_account(tx, admin, acme, bot, "bot", Role::Operator, T)?;
+            auth::create_service_account(
+                tx,
+                stepped(admin.user),
+                acme,
+                bot,
+                "bot",
+                Role::Operator,
+                Some("fixture"),
+                T,
+            )?;
             auth::set_repo_grant(tx, admin, acme_repo, bot, P::READ.union(P::RUN))?;
             Ok(())
         })

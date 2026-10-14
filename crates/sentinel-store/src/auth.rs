@@ -2,6 +2,7 @@
 //! boundaries; `jobs`/`runs` and raw SQL remain trusted controller primitives.
 //! Mutations check authority inside the SAME writer transaction as the change.
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use sentinel_auth::secret::Digest;
 use sentinel_core::{
     RepoId, TenantId, UnixMillis, UserId,
     auth::{Namespace, Permissions, Principal, Role},
@@ -230,15 +231,29 @@ pub fn list_repos(
 /// itself. The host-local variant exists so `sentinel admin` does not have to
 /// fabricate a `Principal` for somebody who never authenticated.
 ///
-/// `stepped_up` records whether the caller's session proved a second factor
-/// recently enough (A06). It is freshness, not authority: privileged changes
-/// require both it and a live platform-admin check.
+/// Step-up freshness (A06) is freshness, not authority: privileged changes
+/// require both it and a live platform-admin check. A browser session carries
+/// its token digest so freshness is **read again inside the writer
+/// transaction** of the change ([`Authority::require_fresh`]) rather than
+/// trusted from a flag computed when the request was identified: a session
+/// revoked, or whose window closed, in between is refused at the mutation.
 #[derive(Clone, Copy, Debug)]
 pub enum Authority {
-    /// An authenticated caller. Platform administration is checked live.
+    /// An authenticated caller whose step-up is a precomputed fact. Platform
+    /// administration is checked live. A bearer credential is always
+    /// unstepped; the stepped form is for tests and trusted callers that have
+    /// verified a proof themselves.
     Credential {
         principal: Principal,
         stepped_up: bool,
+    },
+    /// A browser session: its step-up stamp is re-read from the `sessions`
+    /// row in the transaction that makes the change.
+    Session {
+        principal: Principal,
+        token: Digest,
+        /// `Policy::step_up_ms`: how long a stamp stays fresh.
+        step_up_ms: i64,
     },
     /// A process that can already open this database, as with bootstrap and
     /// recovery. There is no network path to this variant, and no step-up can
@@ -256,7 +271,9 @@ impl Authority {
         }
     }
 
-    /// A browser session, with its step-up freshness evaluated against policy.
+    /// A browser session, with its step-up freshness evaluated against policy
+    /// now. Prefer [`Authority::live_session`] where the session token is at
+    /// hand: it re-checks inside the transaction.
     pub fn session(
         session: &crate::local_auth::Session,
         policy: crate::local_auth::Policy,
@@ -268,11 +285,61 @@ impl Authority {
         }
     }
 
+    /// A browser session identified by its token digest; freshness is judged
+    /// against the session row at the point of each privileged change.
+    pub const fn live_session(
+        principal: Principal,
+        token: Digest,
+        policy: crate::local_auth::Policy,
+    ) -> Self {
+        Self::Session {
+            principal,
+            token,
+            step_up_ms: policy.step_up_ms,
+        }
+    }
+
     /// Require platform administration.
     pub fn require_platform(&self, conn: &Connection) -> Result<()> {
         match self {
-            Authority::Credential { principal, .. } => require_platform_admin(conn, *principal),
+            Authority::Credential { principal, .. } | Authority::Session { principal, .. } => {
+                require_platform_admin(conn, *principal)
+            }
             Authority::HostLocal => Ok(()),
+        }
+    }
+
+    /// Require recent proof of presence, judged now. For a browser session
+    /// this is one primary-key probe of its row inside `conn`'s transaction:
+    /// a revoked or expired session, an un-stamped one, and a stamp outside
+    /// the window (or in the future) are all `StepUpRequired`. A bearer
+    /// credential never has it; host-local needs none.
+    pub fn require_fresh(&self, conn: &Connection) -> Result<()> {
+        match self {
+            Authority::HostLocal
+            | Authority::Credential {
+                stepped_up: true, ..
+            } => Ok(()),
+            Authority::Credential { .. } => Err(Error::StepUpRequired),
+            Authority::Session {
+                token, step_up_ms, ..
+            } => {
+                let now = UnixMillis::now().0;
+                let fresh: bool = conn
+                    .prepare_cached(
+                        "SELECT EXISTS(SELECT 1 FROM sessions
+                         WHERE token_digest = ?1 AND revoked_ms IS NULL
+                         AND idle_deadline_ms > ?2 AND absolute_deadline_ms > ?2
+                         AND stepped_up_ms IS NOT NULL AND stepped_up_ms <= ?2
+                         AND ?2 - stepped_up_ms < ?3)",
+                    )?
+                    .query_row(params![token.0, now, step_up_ms], |r| r.get(0))?;
+                if fresh {
+                    Ok(())
+                } else {
+                    Err(Error::StepUpRequired)
+                }
+            }
         }
     }
 
@@ -280,17 +347,65 @@ impl Authority {
     /// bar for changing who can authenticate, or as whom.
     pub fn require_privileged(&self, conn: &Connection) -> Result<()> {
         self.require_platform(conn)?;
-        match self {
-            Authority::Credential {
-                stepped_up: false, ..
-            } => Err(Error::StepUpRequired),
-            _ => Ok(()),
+        self.require_fresh(conn)
+    }
+
+    /// Live administration of `tenant` for a change that grants access.
+    ///
+    /// The administration check is [`require_tenant_admin`]. On top of it:
+    ///
+    /// - `strict` demands fresh step-up of everyone (issuing credentials);
+    /// - a platform administrator who is **not** an administrator-member of
+    ///   the tenant reaches it by platform scope alone, which carries no
+    ///   ambient data access (see [`require_object_read`]): that path always
+    ///   demands fresh step-up and an explicit `reason` (1..=100 characters)
+    ///   and is recorded as [`crate::local_auth::Event::PlatformOverride`].
+    ///
+    /// Refusals are ordered so a caller without administration learns nothing
+    /// (`Forbidden`) and a caller without proof is asked for it
+    /// (`StepUpRequired`) before the reason is judged. A host-local authority
+    /// is refused: it has no principal to attribute, and host-local
+    /// provisioning uses the trusted primitives.
+    pub fn require_tenant_access_change(
+        &self,
+        tx: &Transaction<'_>,
+        tenant: TenantId,
+        strict: bool,
+        reason: Option<&str>,
+    ) -> Result<Principal> {
+        let principal = self.principal().ok_or(Error::Forbidden)?;
+        require_tenant_admin(tx, principal, tenant)?;
+        let member_admin: bool = tx
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM memberships
+                 WHERE tenant_id = ?1 AND user_id = ?2 AND role = 3)",
+            )?
+            .query_row(params![tenant.as_bytes(), principal.user.as_bytes()], |r| {
+                r.get(0)
+            })?;
+        if strict || !member_admin {
+            self.require_fresh(tx)?;
         }
+        if !member_admin {
+            let reason = reason.ok_or(Error::InvalidInput("reason"))?;
+            bounded_text(reason, 100, "reason")?;
+            crate::local_auth::audit(
+                tx,
+                crate::local_auth::Event::PlatformOverride,
+                Some(principal.user),
+                None,
+                false,
+                Some(reason),
+            )?;
+        }
+        Ok(principal)
     }
 
     pub fn principal(&self) -> Option<Principal> {
         match self {
-            Authority::Credential { principal, .. } => Some(*principal),
+            Authority::Credential { principal, .. } | Authority::Session { principal, .. } => {
+                Some(*principal)
+            }
             Authority::HostLocal => None,
         }
     }
@@ -666,8 +781,35 @@ fn keep_an_admin(tx: &Transaction<'_>, tenant: TenantId, user: UserId) -> Result
     Ok(())
 }
 
+/// Name a person in `tenant`: a `usr_…` id as given, or else the **existing
+/// member** with that local sign-in name. A name is never resolved outside the
+/// tenant, so an administrator cannot probe which sign-in names exist
+/// deployment-wide: a non-member's name and an unknown name are the same
+/// `NotFound`. Adding someone who is not yet a member takes their (unguessable)
+/// id, which has to come from the person.
+pub fn resolve_member(conn: &Connection, tenant: TenantId, text: &str) -> Result<UserId> {
+    if let Ok(user) = text.parse::<UserId>() {
+        return Ok(user);
+    }
+    let bytes = conn
+        .prepare_cached(
+            "SELECT c.user_id FROM local_credentials c
+             JOIN memberships m ON m.user_id = c.user_id AND m.tenant_id = ?1
+             WHERE c.username = ?2",
+        )?
+        .query_row(params![tenant.as_bytes(), text], |r| {
+            r.get::<_, [u8; 16]>(0)
+        })
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    UserId::from_bytes(bytes).map_err(|_| Error::Corrupt("user_id"))
+}
+
 /// Set or change a member's role. A downgrade takes effect on the next query;
 /// the tenant's authorization epoch moves so anything long-lived re-checks.
+///
+/// This `Principal` form carries no step-up policy: it is for trusted
+/// provisioning and fixtures. Client routes use [`set_membership_as`].
 pub fn set_membership(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -676,9 +818,40 @@ pub fn set_membership(
     role: Role,
 ) -> Result<()> {
     require_tenant_admin(tx, principal, tenant)?;
+    apply_membership(tx, principal, tenant, user, role)
+}
+
+/// [`set_membership`] for a client route. A platform administrator who is not
+/// an administrator of the tenant changes membership only with fresh step-up
+/// and an audited `reason` ([`Authority::require_tenant_access_change`]); a
+/// tenant administrator needs neither.
+pub fn set_membership_as(
+    tx: &Transaction<'_>,
+    authority: Authority,
+    tenant: TenantId,
+    user: UserId,
+    role: Role,
+    reason: Option<&str>,
+) -> Result<()> {
+    let principal = authority.require_tenant_access_change(tx, tenant, false, reason)?;
+    apply_membership(tx, principal, tenant, user, role)
+}
+
+fn apply_membership(
+    tx: &Transaction<'_>,
+    principal: Principal,
+    tenant: TenantId,
+    user: UserId,
+    role: Role,
+) -> Result<()> {
     if role != Role::TenantAdmin {
         keep_an_admin(tx, tenant, user)?;
     }
+    let was_member: bool = tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM memberships WHERE tenant_id = ?1 AND user_id = ?2)",
+        )?
+        .query_row(params![tenant.as_bytes(), user.as_bytes()], |r| r.get(0))?;
     let changed = tx.execute(
         "INSERT INTO memberships(tenant_id, user_id, role)
         SELECT ?1, id, ?3 FROM users WHERE id = ?2 AND active = 1
@@ -690,6 +863,18 @@ pub fn set_membership(
         return Err(Error::NotFound);
     }
     crate::tenancy::bump_epoch(tx, tenant)?;
+    if !was_member {
+        // No invitation or acceptance precedes this: record that the person
+        // was added by someone else, apart from the role change below.
+        crate::local_auth::audit(
+            tx,
+            crate::local_auth::Event::MemberAdded,
+            Some(principal.user),
+            Some(user),
+            false,
+            None,
+        )?;
+    }
     crate::local_auth::audit(
         tx,
         crate::local_auth::Event::MembershipSet,
@@ -805,6 +990,9 @@ pub fn create_repo_trusted(
 
 /// Grant/revoke repository actions; NONE deletes a grant. Membership is a
 /// ceiling: a reader with a RUN bit still cannot run. Secrets are independent.
+///
+/// This `Principal` form carries no step-up policy: it is for trusted
+/// provisioning and fixtures. Client routes use [`set_repo_grant_as`].
 pub fn set_repo_grant(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -812,6 +1000,38 @@ pub fn set_repo_grant(
     user: UserId,
     permissions: Permissions,
 ) -> Result<()> {
+    let tenant = grant_target(tx, repo, permissions)?;
+    require_tenant_admin(tx, principal, tenant).map_err(not_found_if_forbidden)?;
+    apply_repo_grant(tx, principal, tenant, repo, user, permissions)
+}
+
+/// [`set_repo_grant`] for a client route: the same step-up and `reason` rule
+/// as [`set_membership_as`] for a platform administrator who does not
+/// administer the tenant.
+pub fn set_repo_grant_as(
+    tx: &Transaction<'_>,
+    authority: Authority,
+    repo: RepoId,
+    user: UserId,
+    permissions: Permissions,
+    reason: Option<&str>,
+) -> Result<()> {
+    let tenant = grant_target(tx, repo, permissions)?;
+    let principal = authority
+        .require_tenant_access_change(tx, tenant, false, reason)
+        .map_err(not_found_if_forbidden)?;
+    apply_repo_grant(tx, principal, tenant, repo, user, permissions)
+}
+
+fn not_found_if_forbidden(error: Error) -> Error {
+    match error {
+        Error::Forbidden => Error::NotFound,
+        other => other,
+    }
+}
+
+/// The tenant that owns `repo`, after the permission bits are checked.
+fn grant_target(tx: &Transaction<'_>, repo: RepoId, permissions: Permissions) -> Result<TenantId> {
     if !Permissions::REPOSITORY.contains(permissions) {
         return Err(Error::InvalidInput("repository permissions"));
     }
@@ -823,11 +1043,18 @@ pub fn set_repo_grant(
         )
         .optional()?
         .ok_or(Error::NotFound)?;
-    let tenant = TenantId::from_bytes(bytes).map_err(|_| Error::Corrupt("tenant_id"))?;
-    require_tenant_admin(tx, principal, tenant).map_err(|error| match error {
-        Error::Forbidden => Error::NotFound,
-        other => other,
-    })?;
+    TenantId::from_bytes(bytes).map_err(|_| Error::Corrupt("tenant_id"))
+}
+
+/// Write the grant for an already-authorized change.
+pub(crate) fn apply_repo_grant(
+    tx: &Transaction<'_>,
+    principal: Principal,
+    tenant: TenantId,
+    repo: RepoId,
+    user: UserId,
+    permissions: Permissions,
+) -> Result<()> {
     if permissions == Permissions::NONE {
         tx.execute(
             "DELETE FROM repo_grants WHERE tenant_id = ?1 AND user_id = ?2 AND repo_id = ?3",
@@ -849,16 +1076,22 @@ pub fn set_repo_grant(
     )
 }
 
+/// Create a service principal confined to `tenant`. Minting a principal that
+/// can later hold credentials needs fresh step-up
+/// ([`Authority::require_tenant_access_change`], strict), and a platform
+/// administrator who does not administer the tenant also gives a `reason`.
+#[allow(clippy::too_many_arguments)]
 pub fn create_service_account(
     tx: &Transaction<'_>,
-    principal: Principal,
+    authority: Authority,
     tenant: TenantId,
     user: UserId,
     name: &str,
     role: Role,
+    reason: Option<&str>,
     now: UnixMillis,
 ) -> Result<()> {
-    require_tenant_admin(tx, principal, tenant)?;
+    let principal = authority.require_tenant_access_change(tx, tenant, true, reason)?;
     if role == Role::TenantAdmin {
         return Err(Error::Forbidden);
     }

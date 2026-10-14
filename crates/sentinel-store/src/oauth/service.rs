@@ -29,7 +29,7 @@ use super::{
 };
 use crate::{
     Error, Result,
-    auth::require_tenant_admin,
+    auth::{Authority, require_tenant_admin},
     local_auth::{Event, audit},
 };
 
@@ -53,7 +53,13 @@ fn require_account(conn: &Connection, tenant: TenantId, account: UserId) -> Resu
 /// Issue a service grant; returns its handle, the refresh token (shown
 /// once) and the grant's absolute expiry.
 ///
-/// `Forbidden`: `principal` does not administer `tenant` (a platform
+/// Minting a refresh token that outlives the session which asked for it
+/// needs fresh step-up, re-checked in this transaction: a bearer credential
+/// or an OAuth token can never issue (`StepUpRequired`), and a platform
+/// administrator who does not administer `tenant` also gives a `reason`
+/// ([`Authority::require_tenant_access_change`]).
+///
+/// `Forbidden`: `authority` does not administer `tenant` (a platform
 /// administrator does). `NotFound`: `account` is not an active service
 /// principal of `tenant`, or `repo` is not a repository of it.
 /// `InvalidInput`: empty scopes or an administrative scope, a lifetime
@@ -61,16 +67,17 @@ fn require_account(conn: &Connection, tenant: TenantId, account: UserId) -> Resu
 #[allow(clippy::too_many_arguments)]
 pub fn issue_service_grant(
     tx: &Transaction<'_>,
-    principal: Principal,
+    authority: Authority,
     tenant: TenantId,
     account: UserId,
     name: &str,
     scopes: Scopes,
     repo: Option<RepoId>,
     lifetime_ms: i64,
+    reason: Option<&str>,
     now: UnixMillis,
 ) -> Result<(GrantId, Secret, UnixMillis)> {
-    require_tenant_admin(tx, principal, tenant)?;
+    let principal = authority.require_tenant_access_change(tx, tenant, true, reason)?;
     if scopes.is_empty() || !scopes.intersect(ADMIN_SCOPES).is_empty() {
         return Err(Error::InvalidInput("scope"));
     }
@@ -156,18 +163,22 @@ pub fn service_grants(
 
 /// Allow (or, with `Permissions::NONE`, withdraw) a service principal of
 /// `tenant` repository actions on a repository of the same tenant.
-/// `Forbidden`: `principal` does not administer `tenant`. `NotFound`: the
+/// Widening what a credential-holding principal can reach takes the same
+/// fresh step-up and `reason` rule as [`issue_service_grant`].
+///
+/// `Forbidden`: `authority` does not administer `tenant`. `NotFound`: the
 /// account is not a service principal of `tenant`, or the repository is
 /// not one of its repositories.
 pub fn allow_repo(
     tx: &Transaction<'_>,
-    principal: Principal,
+    authority: Authority,
     tenant: TenantId,
     account: UserId,
     repo: RepoId,
     permissions: Permissions,
+    reason: Option<&str>,
 ) -> Result<()> {
-    require_tenant_admin(tx, principal, tenant)?;
+    let principal = authority.require_tenant_access_change(tx, tenant, true, reason)?;
     require_account(tx, tenant, account)?;
     let owned: bool = tx
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM repos WHERE id = ?1 AND tenant_id = ?2)")?
@@ -175,7 +186,10 @@ pub fn allow_repo(
     if !owned {
         return Err(Error::NotFound);
     }
-    crate::auth::set_repo_grant(tx, principal, repo, account, permissions)
+    if !Permissions::REPOSITORY.contains(permissions) {
+        return Err(Error::InvalidInput("repository permissions"));
+    }
+    crate::auth::apply_repo_grant(tx, principal, tenant, repo, account, permissions)
 }
 
 #[cfg(test)]

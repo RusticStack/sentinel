@@ -941,30 +941,41 @@ fn members(state: &State, request: &Request, slug: &str, query: &str) -> Route {
 #[derive(Deserialize)]
 struct MemberBody {
     role: String,
+    /// Why, for a platform administrator who does not administer the tenant.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
-/// `PUT /tenants/{slug}/members/{user} {role}` adds or changes a member;
-/// `DELETE` removes one (revoking credentials narrowed to the tenant). The
-/// user is a `usr_…` id or a local sign-in name. Taking the admin role from
-/// the tenant's last administrator is `conflict`.
+/// `PUT /tenants/{slug}/members/{user} {role, reason?}` adds or changes a
+/// member; `DELETE` removes one (revoking credentials narrowed to the
+/// tenant). The user is a `usr_…` id, or the local sign-in name of an
+/// **existing member**: a name is never resolved outside the tenant, so the
+/// route is no oracle for which accounts exist, and adding a new member takes
+/// the id the person gave. A platform administrator who does not administer
+/// the tenant needs a stepped-up session and a `reason` (audited). Taking the
+/// admin role from the tenant's last administrator is `conflict`.
 fn set_member(state: &State, request: &mut Request, slug: &str, user: &str, put: bool) -> Route {
     let who = tenant_admin(state, request, true)?;
-    let role = if put {
+    let (role, reason) = if put {
         let body: MemberBody = parse(&body(request)?)?;
-        Some(parse_role(&body.role)?)
+        (Some(parse_role(&body.role)?), body.reason)
     } else {
-        None
+        (None, None)
     };
     let (slug, user) = (slug.to_owned(), user.to_owned());
-    let principal = who.principal;
+    let (principal, authority) = (who.principal, who.authority());
     let member = state
         .store
         .writer()
         .write(move |tx| {
             let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
-            let user = views::resolve_user(tx, &user)?;
+            // Administration first: only an administrator may name a person.
+            authz::require_tenant_admin(tx, principal, tenant)?;
+            let user = authz::resolve_member(tx, tenant, &user)?;
             match role {
-                Some(role) => authz::set_membership(tx, principal, tenant, user, role)?,
+                Some(role) => {
+                    authz::set_membership_as(tx, authority, tenant, user, role, reason.as_deref())?
+                }
                 None => authz::remove_membership(tx, principal, tenant, user, UnixMillis::now())?,
             }
             Ok(user)
@@ -1071,11 +1082,16 @@ fn source(state: &State, request: &Request, slug: &str, name: &str) -> Route {
 struct GrantBody {
     /// Any of `read`, `run`, `secrets`; empty withdraws the grant.
     access: Vec<String>,
+    /// Why, for a platform administrator who does not administer the tenant.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
-/// `PUT /tenants/{slug}/repos/{name}/grants/{user} {access}`: a member's
-/// repository access. Membership stays the ceiling: a reader granted `run`
-/// still cannot run.
+/// `PUT /tenants/{slug}/repos/{name}/grants/{user} {access, reason?}`: a
+/// member's repository access (the user is a `usr_…` id or a member's local
+/// sign-in name). Membership stays the ceiling: a reader granted `run` still
+/// cannot run. A platform administrator who does not administer the tenant
+/// needs a stepped-up session and a `reason` (audited).
 fn repo_grant(state: &State, request: &mut Request, slug: &str, name: &str, user: &str) -> Route {
     let who = tenant_admin(state, request, true)?;
     let body: GrantBody = parse(&body(request)?)?;
@@ -1094,7 +1110,7 @@ fn repo_grant(state: &State, request: &mut Request, slug: &str, name: &str, user
         };
         permissions = permissions.union(bit);
     }
-    let principal = who.principal;
+    let (principal, authority, reason) = (who.principal, who.authority(), body.reason.clone());
     let (slug, name, user) = (slug.to_owned(), name.to_owned(), user.to_owned());
     let user = state
         .store
@@ -1102,8 +1118,13 @@ fn repo_grant(state: &State, request: &mut Request, slug: &str, name: &str, user
         .write(move |tx| {
             let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
             let repo = lookup::repo_by_name(tx, tenant, &name)?;
-            let user = views::resolve_user(tx, &user)?;
-            authz::set_repo_grant(tx, principal, repo, user, permissions)?;
+            // Administration first: only an administrator may name a person.
+            authz::require_tenant_admin(tx, principal, tenant).map_err(|e| match e {
+                sentinel_store::Error::Forbidden => sentinel_store::Error::NotFound,
+                other => other,
+            })?;
+            let user = authz::resolve_member(tx, tenant, &user)?;
+            authz::set_repo_grant_as(tx, authority, repo, user, permissions, reason.as_deref())?;
             Ok(user)
         })
         .map_err(store_error)?;

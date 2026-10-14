@@ -165,7 +165,7 @@ Every `run` returns `Result<(), client::Error>`; `main.rs` reports the error in 
 
 ## Service accounts
 
-For a tenant administrator (the credential needs `tenant:admin`; see [OAuth](oauth.md#service-account-grants-o06)). `--tenant SLUG` defaults to the profile's context (`sentinel context use`); without either the command exits 2 before any request. Tenant, account, repository and grant arguments must be plain path segments (`A-Z a-z 0-9 - . _ ~`), checked locally.
+For a tenant administrator (the credential needs `tenant:admin`; see [OAuth](oauth.md#service-account-grants-o06)). **`create`, `allow` and `grant` mint or widen credentials, which needs a browser session that has stepped up ([step-up](step-up.md#issuing-credentials)); a CLI profile authenticates with an OAuth token or `sntl_` credential, which can never step up, so these three are refused with `forbidden` and `details.step_up` until a step-up-capable client (the web interface) offers them.** `grants` and `revoke` are unchanged. A tenant administrator's token with `tenant:admin` can still list and revoke the grants it governs. `--tenant SLUG` defaults to the profile's context (`sentinel context use`); without either the command exits 2 before any request. Tenant, account, repository and grant arguments must be plain path segments (`A-Z a-z 0-9 - . _ ~`), checked locally.
 
 | Command | Does |
 |---|---|

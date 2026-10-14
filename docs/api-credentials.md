@@ -25,14 +25,15 @@ The stored scope is a **ceiling, not a grant**. Validation is one primary-key pr
 
 What comes back is a `Principal`, and it is authorized exactly like a session's: membership and repository grants are live queries. Removing the membership behind a credential ends its access immediately, without touching the credential.
 
-Issuance goes through the same layer:
+**There is no HTTP route that issues a `sntl_` credential.** The only operator surface is the host-local `sentinel admin token issue` below, which provisions through `tokens::provision` for any account within what that account may hold. The store also has `tokens::issue`, the primitive that applies the authorization layer to an issuer — no route or command calls it today, so the rules below describe what it enforces for a caller that adds one, not an API you can reach:
 
-| Issuer | May issue for |
+| Issuer (`tokens::issue`) | May issue for |
 |---|---|
-| Host-local operator (`sentinel admin`) | Any account, within what that account may hold |
 | Platform admin | Any account |
 | Tenant admin | A service principal of that tenant |
 | Any account | Itself, never wider than the scope it is already acting under |
+
+Over the API a bearer-style credential for a service principal is an OAuth **service grant** instead ([OAuth](oauth.md#service-account-grants-o06)): `POST /tenants/{slug}/service-accounts/{usr}/grants`, which needs a browser session that has stepped up within the policy window ([step-up](step-up.md#issuing-credentials)); a bearer or OAuth token cannot issue one.
 
 Delegation only narrows: a request for more than the caller holds is refused before identity is considered, so an over-wide request fails the same way for every caller. Platform scope additionally requires the target account to be a super admin, enforced by the API and by a database trigger; a service principal can never carry it, and its credential is confined to its home tenant.
 
@@ -49,7 +50,7 @@ sentinel admin token revoke --data-dir <PATH> --id tok_...
 
 The secret is the only thing written to stdout, so a redirect captures exactly the credential and nothing else; the identifier, scope and expiry an operator reads go to stderr. `--user` accepts a local username or a `usr_` identifier, `--tenant`/`--repo` take operator-facing names, and every refusal — unknown scope name, lifetime beyond the maximum, unknown account, tenant or repository, `--repo` without `--tenant`, malformed or unknown `tok_` identifier — exits 2 with a plain message. `token list` prints metadata only; no command can print an existing secret.
 
-Authority is the operating system's, as with [bootstrap and recovery](local-authentication.md): the command opens the controller's database directly, so only a user who already has that access can provision a credential. Host-local name resolution lives in `sentinel-store::lookup`, a trusted internal beside `auth::provisioning`; it answers "which row is this name" and performs no authorization, and no route may expose it.
+Authority is the operating system's, as with [bootstrap and recovery](local-authentication.md): the command opens the controller's database directly, so only a user who already has that access can provision a credential. Host-local name resolution lives in `sentinel-store::lookup`, a trusted internal beside `auth::provisioning`; it answers "which row is this name" and performs no authorization. The rule is not "no route calls it" — routes do, for example `lookup::repo_by_name` after `auth::member_tenant_by_slug` in the same transaction, or `lookup::tenant_by_slug` followed by `auth::require_repo` in the same snapshot — but that **nothing a route answers may depend on a lookup alone**: it is the first half of a decision whose second half gives a denied row the same `not_found` as an absent one, and a route whose answer would differ ("exists but not yours") resolves through `auth::member_tenant_by_slug` or `auth::narrowing_by_name`, which check live membership in the resolving statement. Naming a person in a tenant uses `auth::resolve_member`, which resolves a sign-in name only among that tenant's members.
 
 ## Cost
 

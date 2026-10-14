@@ -68,7 +68,16 @@ fn fixture() -> Fixture {
             auth::set_membership(tx, admin, acme, dev, Role::TenantAdmin)?;
             auth::set_membership(tx, admin, other, dev, Role::Reader)?;
             auth::create_repo(tx, admin, acme, repo, "app", NOW)?;
-            auth::create_service_account(tx, admin, acme, bot, "bot", Role::Operator, NOW)?;
+            auth::create_service_account(
+                tx,
+                privileged(root),
+                acme,
+                bot,
+                "bot",
+                Role::Operator,
+                Some("fixture"),
+                NOW,
+            )?;
             Ok(())
         })
         .unwrap();

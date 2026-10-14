@@ -117,6 +117,13 @@ pub enum Event {
     OAuthDeviceDenied = 54,
     ServiceGrantIssued = 55,
     ServiceAccountCreated = 56,
+    /// A platform administrator who is not an administrator of the tenant
+    /// changed its access under platform scope; the detail is their reason.
+    PlatformOverride = 57,
+    /// A tenant administrator added an account that was not yet a member. The
+    /// person did not accept anything, so the addition is recorded on its own
+    /// in addition to the role change.
+    MemberAdded = 58,
 }
 
 impl Event {
@@ -179,6 +186,8 @@ impl Event {
             Event::OAuthDeviceDenied => "oauth-device-denied",
             Event::ServiceGrantIssued => "service-grant-issued",
             Event::ServiceAccountCreated => "service-account-created",
+            Event::PlatformOverride => "platform-override",
+            Event::MemberAdded => "member-added",
         }
     }
 
@@ -240,6 +249,8 @@ impl Event {
             54 => Event::OAuthDeviceDenied,
             55 => Event::ServiceGrantIssued,
             56 => Event::ServiceAccountCreated,
+            57 => Event::PlatformOverride,
+            58 => Event::MemberAdded,
             _ => return None,
         })
     }
@@ -785,7 +796,23 @@ pub fn logout(store: &Store, presented: &Secret, now: UnixMillis) -> Result<()> 
 
 /// Revoke every live session of one account: the caller's logout-all, and the
 /// rotation a password change, role change or suspension must perform.
+///
+/// A session that is no longer trusted may have left credentials behind that
+/// outlive it, so in the same transaction the service grants this account
+/// minted since its oldest live session began are revoked too
+/// ([`crate::oauth::revoke_minted_since`]). The window starts at the oldest
+/// session not individually revoked, expired ones included: a hijacked session
+/// that has gone idle may still have minted a credential. A session revoked by
+/// name closed its own window then ([`revoke_session`]).
 pub fn revoke_all(tx: &Transaction<'_>, user: UserId, now: UnixMillis) -> Result<usize> {
+    let since: Option<i64> = tx
+        .prepare_cached(
+            "SELECT MIN(created_ms) FROM sessions WHERE user_id = ?1 AND revoked_ms IS NULL",
+        )?
+        .query_row(params![user.as_bytes()], |r| r.get(0))?;
+    if let Some(since) = since {
+        crate::oauth::revoke_minted_since(tx, user, UnixMillis(since), now)?;
+    }
     let revoked = tx.execute(
         "UPDATE sessions SET revoked_ms = ?2 WHERE user_id = ?1 AND revoked_ms IS NULL",
         params![user.as_bytes(), now.0],
@@ -1047,6 +1074,13 @@ pub fn sessions(
 /// Revoke one named session of an account: its own, or a platform admin's
 /// decision. Immediate and audited; a session issued before migration 9 has no
 /// name and is reached by `logout_all` or `revoke_all` instead.
+///
+/// A grant records who minted it, not through which session, so the service
+/// grants the account minted from this session's creation until now are
+/// revoked in the same transaction: the response to a hijacked session must
+/// not leave its minted credential behind. Grants minted by the account's
+/// other sessions in that span are revoked too, and are reissued after a
+/// step-up.
 pub fn revoke_session(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -1055,6 +1089,13 @@ pub fn revoke_session(
     now: UnixMillis,
 ) -> Result<()> {
     may_administer(tx, authority, user)?;
+    let created: i64 = tx
+        .prepare_cached(
+            "SELECT created_ms FROM sessions WHERE id = ?1 AND user_id = ?2 AND revoked_ms IS NULL",
+        )?
+        .query_row(params![session.as_bytes(), user.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
     let revoked = tx.execute(
         "UPDATE sessions SET revoked_ms = ?3 WHERE id = ?1 AND user_id = ?2 AND revoked_ms IS NULL",
         params![session.as_bytes(), user.as_bytes(), now.0],
@@ -1062,6 +1103,7 @@ pub fn revoke_session(
     if revoked == 0 {
         return Err(Error::NotFound);
     }
+    crate::oauth::revoke_minted_since(tx, user, UnixMillis(created), now)?;
     audit(
         tx,
         Event::SessionRevoked,

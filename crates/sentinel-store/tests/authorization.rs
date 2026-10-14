@@ -13,6 +13,13 @@ const NOW: UnixMillis = UnixMillis(123);
 fn principal(user: UserId) -> Principal {
     Principal::new(user, P::ALL, None, None)
 }
+/// A caller that has just proven presence: the bar for minting service principals.
+fn stepped(user: UserId) -> auth::Authority {
+    auth::Authority::Credential {
+        principal: principal(user),
+        stepped_up: true,
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Ids {
@@ -100,11 +107,12 @@ fn fixture() -> (tempfile::TempDir, Store, Ids) {
             auth::set_repo_grant(tx, principal(i.bob), i.br, i.alice, P::REPOSITORY)?;
             auth::create_service_account(
                 tx,
-                principal(i.alice),
+                stepped(i.alice),
                 i.a,
                 i.bot,
                 "ci-bot",
                 Role::Operator,
+                None,
                 NOW,
             )?;
             auth::set_repo_grant(tx, principal(i.alice), i.ar, i.bot, P::READ.union(P::RUN))?;
@@ -526,11 +534,12 @@ fn authorization_and_mutation_share_the_writer_transaction() {
             .write(move |tx| {
                 auth::create_service_account(
                     tx,
-                    principal(i.root),
+                    stepped(i.root),
                     i.a,
                     rolled_back,
                     "rollback",
                     Role::Reader,
+                    Some("fixture"),
                     NOW,
                 )?;
                 auth::set_repo_grant(tx, principal(i.root), i.ar, rolled_back, P::ALL)

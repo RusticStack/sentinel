@@ -306,6 +306,37 @@ fn session(d: &Deployment, username: &str) -> String {
         .to_owned()
 }
 
+/// Root's browser session after a step-up, as the headers a mutation needs:
+/// the only caller that may create a service account, allow it a repository
+/// or issue it a grant. A bearer token, however administrative, cannot.
+fn stepped_root(d: &Deployment) -> [(&'static str, String); 2] {
+    let reply = send(
+        d,
+        "POST",
+        "/api/v1/login",
+        Body::Json(&json!({ "username": "root", "password": PASSWORD })),
+        &[],
+    );
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let cookie = reply
+        .header("set-cookie")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let csrf = reply.body["csrf"].as_str().unwrap().to_owned();
+    let proof = send(
+        d,
+        "POST",
+        "/api/v1/step-up",
+        Body::Json(&json!({ "method": "password", "code": PASSWORD })),
+        &[("cookie", &cookie), ("x-sentinel-csrf", &csrf)],
+    );
+    assert_eq!(proof.status, 200, "{}", proof.body);
+    [("cookie", cookie), ("x-sentinel-csrf", csrf)]
+}
+
 fn me(d: &Deployment, access: &str) -> Reply {
     send(
         d,
@@ -778,13 +809,17 @@ fn stdio_list_runs(d: &Deployment, machine: &Machine, profile: &str) -> (Out, Ve
 #[test]
 fn mcp_stdio_reports_scope_denial_without_starting_an_oauth_redirect_flow() {
     let d = deployment();
-    let bearer = format!("Bearer {}", d.root_token);
+    let root = stepped_root(&d);
+    let headers = [
+        (root[0].0, root[0].1.as_str()),
+        (root[1].0, root[1].1.as_str()),
+    ];
     let created = send(
         &d,
         "POST",
         "/api/v1/tenants/acme/service-accounts",
         Body::Json(&json!({ "name": "stdio-agent", "role": "operator" })),
-        &[("authorization", &bearer)],
+        &headers,
     );
     assert_eq!(created.status, 201, "{}", created.body);
     let account = created.body["user"].as_str().unwrap().to_owned();
@@ -793,7 +828,7 @@ fn mcp_stdio_reports_scope_denial_without_starting_an_oauth_redirect_flow() {
         "PUT",
         &format!("/api/v1/tenants/acme/service-accounts/{account}/repos/app"),
         Body::Json(&json!({ "access": ["read", "run"] })),
-        &[("authorization", &bearer)],
+        &headers,
     );
     assert_eq!(allowed.status, 200, "{}", allowed.body);
     // Repository read is granted; the credential's scope lacks runs:read.
@@ -802,7 +837,7 @@ fn mcp_stdio_reports_scope_denial_without_starting_an_oauth_redirect_flow() {
         "POST",
         &format!("/api/v1/tenants/acme/service-accounts/{account}/grants"),
         Body::Json(&json!({ "name": "stdio", "scope": "logs:read" })),
-        &[("authorization", &bearer)],
+        &headers,
     );
     assert_eq!(issued.status, 201, "{}", issued.body);
     let machine = Machine::new();
@@ -1720,13 +1755,28 @@ fn logout_revokes_on_the_server_and_offline_logout_exits_one() {
 #[test]
 fn a_service_grant_is_imported_and_used_without_any_prompt() {
     let d = deployment();
-    let bearer = format!("Bearer {}", d.root_token);
+    // An API credential holding every permission cannot mint one: issuing a
+    // credential asks for a step-up that only a browser session can give.
+    let refused = send(
+        &d,
+        "POST",
+        "/api/v1/tenants/acme/service-accounts",
+        Body::Json(&json!({ "name": "deployer", "role": "operator" })),
+        &[("authorization", &format!("Bearer {}", d.root_token))],
+    );
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    assert_eq!(refused.body["details"]["step_up"], true);
+    let root = stepped_root(&d);
+    let headers = [
+        (root[0].0, root[0].1.as_str()),
+        (root[1].0, root[1].1.as_str()),
+    ];
     let created = send(
         &d,
         "POST",
         "/api/v1/tenants/acme/service-accounts",
         Body::Json(&json!({ "name": "deployer", "role": "operator" })),
-        &[("authorization", &bearer)],
+        &headers,
     );
     assert_eq!(created.status, 201, "{}", created.body);
     let account = created.body["user"].as_str().unwrap().to_owned();
@@ -1735,7 +1785,7 @@ fn a_service_grant_is_imported_and_used_without_any_prompt() {
         "PUT",
         &format!("/api/v1/tenants/acme/service-accounts/{account}/repos/app"),
         Body::Json(&json!({ "access": ["read", "run"] })),
-        &[("authorization", &bearer)],
+        &headers,
     );
     assert_eq!(allowed.status, 200, "{}", allowed.body);
     let issued = send(
@@ -1743,7 +1793,7 @@ fn a_service_grant_is_imported_and_used_without_any_prompt() {
         "POST",
         &format!("/api/v1/tenants/acme/service-accounts/{account}/grants"),
         Body::Json(&json!({ "name": "ci", "scope": "runs:read runs:write" })),
-        &[("authorization", &bearer)],
+        &headers,
     );
     assert_eq!(issued.status, 201, "{}", issued.body);
     let m = Machine::new();

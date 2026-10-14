@@ -187,9 +187,10 @@ pub fn set(
     match (repo, authority) {
         (None, _) => authority.require_platform(tx)?,
         (Some(_), Authority::HostLocal) => {}
-        (Some(_), Authority::Credential { principal, .. }) => {
-            crate::auth::require_tenant_admin(tx, *principal, tenant)?
-        }
+        (
+            Some(_),
+            Authority::Credential { principal, .. } | Authority::Session { principal, .. },
+        ) => crate::auth::require_tenant_admin(tx, *principal, tenant)?,
     }
     let tenant_known: bool = tx
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM tenants WHERE id = ?1)")?
