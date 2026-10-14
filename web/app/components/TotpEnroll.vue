@@ -1,19 +1,9 @@
 <script setup lang="ts">
-// Enrolling an authenticator app: start (with the account's password, or a
-// recent sign-in for a GitHub-only account), scan the QR code drawn in the
-// page or type the key, confirm with a code, then see the recovery codes
-// once. Shared by the account page and the first-run wizard. The seed lives
-// in this component's memory only and is dropped when it has served, on
-// cancel and on unmount.
+// The seed lives only in this component and is dropped on cancel and unmount.
 const props = defineProps<{
-  /** The account has a local password, which starting needs. */
   hasPassword: boolean;
-  /** An enrollment was begun and not confirmed. */
   pending?: boolean;
-  /** For password managers: which account the password belongs to. */
   username?: string | null;
-  /** A password the caller already holds (the wizard just set it); the
-   *  field is then not shown. Sent once and never kept here. */
   password?: string | null;
 }>();
 const emit = defineEmits<{ started: []; done: []; cancel: [] }>();
@@ -127,7 +117,6 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <!-- Step 2: scan and confirm -->
   <div v-if="uri" class="space-y-4">
     <ol class="list-decimal ps-5 text-sm space-y-1">
       <li>Scan the code with an authenticator app, or enter the key by hand.</li>
@@ -153,7 +142,6 @@ onBeforeUnmount(() => {
     <UAlert v-if="confirmError" color="error" variant="subtle" icon="i-lucide-circle-alert" :title="confirmError" role="alert" />
   </div>
 
-  <!-- Step 1: start -->
   <div v-else class="space-y-4">
     <slot name="intro">
       <p class="text-sm">An authenticator app on your phone gives a code that changes every 30 seconds. Sentinel asks for it before sensitive changes, so a stolen session alone cannot make them.</p>

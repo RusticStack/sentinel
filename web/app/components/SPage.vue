@@ -1,6 +1,5 @@
 <script setup lang="ts">
-// One view: its title (the page's only level-one heading), actions, and
-// the main content landmark the skip link lands on.
+// #main is the skip-link target.
 defineProps<{ id: string; title: string }>();
 </script>
 

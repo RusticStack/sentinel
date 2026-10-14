@@ -1,7 +1,5 @@
 <script setup lang="ts">
-// Password sign-in by email address or username: what the sign-in page and
-// the invitation page share. The password lives in this form only and is
-// cleared after every try. A refusal never says whether the account exists.
+// A refusal never says whether the account exists; the password is cleared after every try.
 const emit = defineEmits<{ signedIn: [] }>();
 const session = useSession();
 const api = useApi();

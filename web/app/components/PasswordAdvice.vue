@@ -1,7 +1,5 @@
 <script setup lang="ts">
-// Guidance under a new-password field: a five-step meter and what would make
-// the password stronger, judged in the page (nothing is sent). The meter is
-// decorative; the words carry the meaning and are announced politely.
+// Judged in the page; the password is never sent anywhere.
 const props = defineProps<{ password: string; context?: string[]; id: string }>();
 const advice = computed(() => passwordAdvice(props.password, props.context ?? []));
 const colors = ["bg-error", "bg-error", "bg-warning", "bg-success", "bg-success"];
