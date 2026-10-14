@@ -204,7 +204,7 @@ async function testSmtp() {
     }
     if (err.code === "not_found") return setupGone();
     if (err.code === "rate_limited") smtpWait.start(err);
-    smtpResult.value = { kind: "error", message: err.code === "rate_limited" ? `Another test is running or too many were sent. Try again in ${retryAfter(err)}.` : refusal(err) };
+    smtpResult.value = { kind: "error", message: err.code === "rate_limited" ? `Another test is running or too many were sent. Try again in ${retryAfter(err)}.` : err.code === "forbidden" ? ORIGIN_REFUSED : refusal(err) };
   } finally {
     body.password = undefined;
     testing.value = false;
@@ -218,6 +218,11 @@ const FAILURE_WORDS: Record<string, string> = {
 };
 
 // --- Finishing -------------------------------------------------------------
+
+/// The controller refuses a request whose `Origin` is not its configured
+/// `public_url` — on a fresh deployment, usually a mismatch between the
+/// address in the browser and that setting.
+const ORIGIN_REFUSED = "The controller refused this page's address. Open Sentinel at the address the controller is configured with (its public_url), or set public_url to the address you are using and restart the controller.";
 
 const finishing = ref(false);
 const finishError = ref("");
@@ -270,6 +275,7 @@ async function finish() {
   } catch (e) {
     const err = e as ApiError;
     if (err.code === "forbidden" && err.message === "setup token refused") tokenRefused();
+    else if (err.code === "forbidden") finishError.value = ORIGIN_REFUSED;
     else if (err.code === "not_found") setupGone();
     else if (err.code === "conflict") finishError.value = "That address or one of the names is already taken. Change the administrator's address or the namespace names and try again.";
     else if (err.code === "invalid_request") finishError.value = `The controller refused a field (${err.message}). Check the answers above.`;

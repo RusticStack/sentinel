@@ -211,6 +211,7 @@ await scenario("public pages", async () => {
     await axAudit(page, `${name} page`, true);
     for (const dark of [false, true]) {
       await page.scheme(dark);
+      await go(page, path, ready);
       await sleep(200);
       const result = await page.eval(CONTRAST);
       check(`${name}, ${dark ? "dark" : "light"}: text contrast meets WCAG AA (${result.checked} elements)`, result.count === 0, result.bad);
