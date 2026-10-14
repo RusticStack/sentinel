@@ -1,5 +1,5 @@
 //! Storage quotas and retention at deployment, tenant, repository and run
-//! level (R01).
+//! level.
 //!
 //! The deployment's configuration sets the defaults ([`Deployment`]); a
 //! `storage_policies` row overrides them for one tenant (`repo_id = X''`) or
@@ -300,8 +300,7 @@ impl Reapply {
 /// stamped logs or artifacts per call ([`REAPPLY_BATCH`] in production, and
 /// read through a keyed index, so what other tenants hold costs nothing); a
 /// repository scope filters within that range, so a step may touch fewer rows
-/// than `batch`. A phase ends when fewer than `batch` candidates remain. The
-/// statements are the same as the unbatched ones were, bounded by a row range.
+/// than `batch`. A phase ends when fewer than `batch` candidates remain.
 pub fn reapply_step(
     tx: &Transaction<'_>,
     d: &Deployment,

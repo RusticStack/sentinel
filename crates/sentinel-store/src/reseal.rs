@@ -29,7 +29,7 @@ pub fn sealed_rows_exist(conn: &Connection) -> Result<bool> {
 }
 
 /// The key ids every sealed value was sealed under: what a restore needs
-/// in its key file (R04). Reads every sealed column once; these tables hold
+/// in its key file. Reads every sealed column once; these tables hold
 /// secrets, second factors and source credentials, never bulk data.
 pub fn key_ids(conn: &Connection) -> Result<std::collections::BTreeSet<u32>> {
     let mut ids = std::collections::BTreeSet::new();

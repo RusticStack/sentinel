@@ -157,7 +157,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
 /// The newest schema this build knows.
 pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 
-/// Migrations an older binary may keep running after (R05): `(version,
+/// Migrations an older binary may keep running after: `(version,
 /// readable_by)`, the oldest schema whose binary still operates on the
 /// result. Every migration not listed is readable only by its own version:
 /// a rollback past it needs the pre-migration snapshot or a backup. List a

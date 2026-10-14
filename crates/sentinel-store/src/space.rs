@@ -1,4 +1,4 @@
-//! Disk admission (D06): free-space watermarks, a metadata reserve and
+//! Disk admission: free-space watermarks, a metadata reserve and
 //! hysteresis, so discretionary writes stop before the disk fills.
 //!
 //! One [`Admission`] guards the data directory's filesystem and is shared by
@@ -13,7 +13,7 @@
 //!
 //! `floor` sits inside the reserve. The reserve in force is the configured
 //! one or, once the metadata database has grown, twice its size on disk
-//! (R01: [`Admission::set_metadata_bytes`]), whichever is larger.
+//! ([`Admission::set_metadata_bytes`]), whichever is larger.
 //!
 //! Discretionary writes — object staging, upload chunks, manifest files —
 //! pass through [`Admission::admit`]; the charge tracks bytes promised but
@@ -96,7 +96,7 @@ pub fn total_bytes(path: &Path) -> Result<u64> {
 
 const GIB: u64 = 1 << 30;
 
-/// Default levels for a filesystem of `total` bytes (R01). Fixed levels fit
+/// Default levels for a filesystem of `total` bytes. Fixed levels fit
 /// one disk size badly: 1 GiB of reserve is plenty on 50 GB and a rounding
 /// error on 2 TB, where one busy hour of logs outruns it. The reserve is a
 /// 64th of the disk and the low watermark a 32nd, each clamped (reserve
@@ -183,10 +183,10 @@ pub struct Admission {
     upload_charges: Mutex<HashMap<UploadId, u64>>,
     /// The metadata database's size on disk, reported by the maintenance
     /// pass; the reserve is never less than [`METADATA_RESERVE_FACTOR`]
-    /// times it (R01), so a growing database keeps room to grow and to
+    /// times it, so a growing database keeps room to grow and to
     /// checkpoint.
     metadata: AtomicU64,
-    /// The external copy's backlog is past its budget (R03): discretionary
+    /// The external copy's backlog is past its budget: discretionary
     /// admission stays closed until the replicator drains it.
     backlog_full: AtomicBool,
 }
@@ -234,7 +234,7 @@ impl Admission {
     }
 
     /// Close (or reopen) discretionary admission for the external copy's
-    /// backlog (R03), whatever the free space says.
+    /// backlog, whatever the free space says.
     pub fn set_backlog_full(&self, full: bool) {
         self.backlog_full.store(full, Ordering::Relaxed);
     }
