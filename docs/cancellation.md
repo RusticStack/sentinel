@@ -17,7 +17,7 @@ Implemented in `sentinel-store::dispatch` (`cancel`, `cancel_run`, `cancel_reque
 `Executor::cancel(attempt)` sets the attempt's cancel flag first, so a step that ends on its own meanwhile is still classified `Canceled` — the desired state wins over the incidental exit status — and then, off the session thread, `podman::terminate_named`:
 
 1. `podman inspect` gives the container's init pid and host cgroup path.
-2. **Graceful:** `SIGTERM` to every process in the container's cgroup **except the keepalive** (`cgroup.procs`, read from the host; rootless, so the processes are the worker account's and the signal needs no privilege). The keepalive is spared on purpose: if the container's init died, the runtime would `SIGKILL` everything at once and there would be no grace.
+2. **Graceful:** `SIGTERM` to every process in the container's cgroup **except the keepalive** (`cgroup.procs`, read from the host; rootless, so the processes are the worker account's and the signal needs no privilege). The keepalive is spared on purpose: if the container's init died, the runtime would `SIGKILL` everything at once and there would be no grace. The cgroup is frozen while its processes are listed and signalled (and thawed before the grace wait — a frozen task would never handle the signal), so a listed process cannot exit and have its pid reused by an unrelated process before the `SIGTERM` lands; where the freezer cannot be used the signal goes out unfrozen.
 3. Wait up to the grace period (`DEFAULT_CANCEL_GRACE`, 30 s; `Executor::set_cancel_grace`) for the cgroup to empty of step processes.
 4. **Forced:** if anything is still there, `podman stop -t 0` and `podman rm -f` — the whole container and process group, not one pid.
 

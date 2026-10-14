@@ -4,7 +4,7 @@ Implemented in `sentinel-link` (identity, pinned TLS, full-duplex framing, hello
 
 ## Identity is a key you hold
 
-There is no certificate authority. A worker generates its own self-signed TLS certificate (`Identity::generate`: ECDSA P-256 via `rcgen`); the **fingerprint** — BLAKE3 of the certificate DER — is its identity. The controller stores only that fingerprint; the private key never leaves the machine it was made on, is saved owner-only, and regenerating it means becoming a different worker.
+There is no certificate authority. A worker generates its own self-signed TLS certificate (`Identity::generate`: ECDSA P-256 via `rcgen`); the **fingerprint** — BLAKE3 of the certificate DER — is its identity. The controller stores only that fingerprint; the private key never leaves the machine it was made on, is saved owner-only, and regenerating it means becoming a different worker. The two PEM files are each written whole to a synced sibling and renamed into place, key first and certificate last, so neither is ever half-written; a start that finds exactly one of them (a first save an older version cut short between the two, or a file lost since) removes the orphan and generates a new identity, logging `identity_recovered` because the new fingerprint has to be enrolled afresh, instead of failing every later start.
 
 The trust runs both ways and both ways are pinned:
 
