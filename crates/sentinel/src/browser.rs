@@ -1,22 +1,10 @@
-//! Opening the sign-in URL in the user's browser, one argv element and
-//! no shell; the URL is always printed as well, so a headless machine or a
-//! failed launch still lets the user open it by hand.
-//!
-//! The launcher is named by absolute path on Windows
-//! (`%SystemRoot%\System32\rundll32.exe`, from `GetSystemDirectoryW`):
-//! process creation searches the CLI's own directory before the system
-//! directory, so a bare name would run a `rundll32.exe` planted beside
-//! `sentinel.exe`. The browser never inherits Sentinel's own settings or
-//! credentials: every `SENTINEL_*` variable (`SENTINEL_TOKEN` among them)
-//! is removed from the launcher's environment.
+//! Launched by absolute path on Windows so a planted `rundll32.exe` beside sentinel.exe never runs; no SENTINEL_* variable reaches the browser.
 
 use std::{
     ffi::{OsStr, OsString},
     process::{Command, Stdio},
 };
 
-/// The launcher program: `rundll32.exe` in the system directory on
-/// Windows, `xdg-open` (looked up on `PATH`) on Linux.
 pub fn opener() -> OsString {
     #[cfg(windows)]
     {
@@ -28,8 +16,6 @@ pub fn opener() -> OsString {
     }
 }
 
-/// `{system directory}\rundll32.exe`; the system directory comes from the
-/// OS, not from the environment.
 #[cfg(windows)]
 fn system_rundll32() -> OsString {
     use std::{os::windows::ffi::OsStringExt, path::Path};
@@ -44,21 +30,15 @@ fn system_rundll32() -> OsString {
     let dir = if (1..buf.len()).contains(&len) {
         OsString::from_wide(&buf[..len])
     } else {
-        // The system directory of every supported Windows.
         OsString::from(r"C:\Windows\System32")
     };
     Path::new(&dir).join("rundll32.exe").into_os_string()
 }
 
-/// The launcher for `url`: `rundll32 url.dll,FileProtocolHandler` on
-/// Windows, `xdg-open` on Linux. The URL is one argument, no shell parses
-/// it, and no `SENTINEL_*` variable reaches the browser.
 pub fn command(url: &str) -> Command {
     command_with(opener(), url)
 }
 
-/// [`command`] with another launcher program: the test harness points it at
-/// a stand-in instead of the real system launcher.
 #[doc(hidden)]
 pub fn command_with(program: impl AsRef<OsStr>, url: &str) -> Command {
     let mut command = Command::new(program);
@@ -77,13 +57,10 @@ pub fn command_with(program: impl AsRef<OsStr>, url: &str) -> Command {
     command
 }
 
-/// Print `url` on stderr and, when `launch`, hand it to the browser. Only
-/// `http://` and `https://` URLs are ever launched.
 pub fn open(url: &str, launch: bool) {
     open_with(url, launch, command)
 }
 
-/// [`open`] with another command builder (the test harness's stand-in).
 #[doc(hidden)]
 pub fn open_with(url: &str, launch: bool, build: impl FnOnce(&str) -> Command) {
     eprintln!("Open this URL in a browser to sign in:\n\n  {url}\n");
@@ -96,8 +73,6 @@ pub fn open_with(url: &str, launch: bool, build: impl FnOnce(&str) -> Command) {
         .stderr(Stdio::null())
         .spawn();
     match spawned {
-        // The launcher exits on its own once the browser has the URL; it is
-        // reaped when this short-lived process exits.
         Ok(_child) => eprintln!("A browser window should open; waiting for the sign-in…"),
         Err(e) => eprintln!("Could not start a browser ({e}); open the URL above yourself."),
     }

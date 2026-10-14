@@ -1,14 +1,3 @@
-//! The command surface over [`crate::client::Client`]: `run`, `status`,
-//! `wait`, `job`, `log`, `workers`, `queue`, `artifact` and `cache`, with
-//! text, JSON and NDJSON output, pagination and the stable exit codes
-//! (`docs/cli.md`).
-//!
-//! Output: text is for people; `--output json` prints one document (a list
-//! is collected, at most [`MAX_ITEMS`] items); `--output ndjson` prints one
-//! compact line per item as each page arrives, so a consumer can stream a
-//! ten-thousand-run listing without the whole of it in memory on either
-//! side. Failures are reported by `main` in the same mode.
-
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
@@ -22,11 +11,8 @@ mod logs;
 mod runs;
 mod secrets;
 
-/// Most items a listing prints, whatever `--limit` or `--all` asks for.
 pub const MAX_ITEMS: usize = 10_000;
-/// Items per page request; the server's own ceiling.
 const PAGE: usize = 500;
-/// Items a listing shows without `--limit` or `--all`.
 const DEFAULT_ITEMS: usize = 20;
 
 #[derive(Args, Debug)]
@@ -255,7 +241,6 @@ pub enum CacheCommand {
     Show { attempt: String },
 }
 
-/// One of the top-level commands, as parsed.
 #[derive(Debug)]
 pub enum Invocation {
     Run(RunArgs),
@@ -537,14 +522,12 @@ pub fn run(invocation: Invocation) -> Result<(), client::Error> {
     }
 }
 
-/// Resolve the output mode first, so even a connection failure is
-/// reported the way the user asked.
+/// Resolve the output mode first so a connection failure is still reported the way the user asked.
 fn connect(args: &ClientArgs) -> Result<(Client, Output), Error> {
     let output = args.output();
     Ok((Client::connect(args)?, output))
 }
 
-/// `--tenant`, else the profile's context, else a usage error naming both.
 fn tenant(client: &Client, flag: Option<String>) -> Result<String, Error> {
     let slug = flag
         .or_else(|| client.default_tenant().map(str::to_owned))
@@ -555,9 +538,7 @@ fn tenant(client: &Client, flag: Option<String>) -> Result<String, Error> {
     Ok(slug)
 }
 
-/// A value placed into a URL path or query: identifiers, slugs and names
-/// only use `[A-Za-z0-9._-]`, and anything else is refused locally rather
-/// than escaped into a different request.
+/// Identifiers are refused locally unless they match `[A-Za-z0-9._-]`; escaping would reach a different request.
 fn segment<'a>(what: &str, value: &'a str) -> Result<&'a str, Error> {
     if value.is_empty()
         || value.len() > 256
@@ -570,7 +551,6 @@ fn segment<'a>(what: &str, value: &'a str) -> Result<&'a str, Error> {
     Ok(value)
 }
 
-/// `90`, `90s`, `500ms`, `10m`, `2h`.
 fn parse_duration(text: &str) -> Result<Duration, Error> {
     let invalid = || Error::usage(format!("malformed duration {text:?}; use 90s, 10m or 1h"));
     let text = text.trim();
@@ -592,15 +572,10 @@ fn parse_duration(text: &str) -> Result<Duration, Error> {
     Ok(duration)
 }
 
-/// A string field of a server document, or `""`.
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
 }
 
-/// Whether a failure was a subscriber-slot refusal worth waiting out, and
-/// for how long: the server's `retry_after_ms` (else one second), capped at
-/// [`client::MAX_SERVER_BACKOFF`], plus up to half again of jitter so
-/// refused pollers do not return in lockstep.
 fn busy_backoff(error: &Error) -> Option<Duration> {
     let api = error.api.as_ref()?;
     if api["code"] != "rate_limited" {
@@ -611,8 +586,6 @@ fn busy_backoff(error: &Error) -> Option<Duration> {
     ))
 }
 
-/// Print a list: text lines and NDJSON items as they come; JSON collects
-/// and prints once in [`List::finish`].
 struct List {
     output: Output,
     items: Vec<Value>,
@@ -633,8 +606,6 @@ impl List {
         }
     }
 
-    /// JSON: `{key: [items], …extra}` as one document. Text and NDJSON
-    /// have already printed everything.
     fn finish(self, key: &str, extra: serde_json::Map<String, Value>) {
         if self.output == Output::Json {
             let mut doc = serde_json::Map::with_capacity(extra.len() + 1);
@@ -645,7 +616,6 @@ impl List {
     }
 }
 
-/// A job table for text output.
 fn jobs_text(run: &Value) -> String {
     let mut out = String::new();
     for job in run["jobs"].as_array().into_iter().flatten() {
@@ -663,7 +633,6 @@ fn jobs_text(run: &Value) -> String {
     out
 }
 
-/// A run's outcome as `wait` judges it: `passed` and `skipped` pass.
 fn passed(run: &Value) -> bool {
     matches!(text(run, "state"), "passed" | "skipped")
 }
@@ -704,7 +673,6 @@ mod tests {
         };
         let wait = busy_backoff(&limited).unwrap();
         assert!(wait >= Duration::from_millis(1000) && wait <= Duration::from_millis(1501));
-        // A huge named back-off is capped, and never overflows.
         let huge = Error {
             api: Some(serde_json::json!({
                 "code": "rate_limited", "details": { "retry_after_ms": u64::MAX }

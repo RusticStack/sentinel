@@ -1,11 +1,3 @@
-//! The legacy `sentinel api …` commands, kept with their flags and
-//! output: `me`, `run`, `status`, `runs`, `cancel`, `rerun`, `logs`,
-//! `workers`, `queue`, `drain`, `undrain`. They run on the shared
-//! [`sentinel::client::Client`] with a static credential from `--token-file`,
-//! `--token` or `SENTINEL_TOKEN` (an `sntl_` credential or an `sntl_at_`
-//! access token) and the server from `--server` or `SENTINEL_SERVER`, and
-//! exit with the shared exit codes.
-
 use std::path::Path;
 
 use sentinel::bounded;
