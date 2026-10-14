@@ -1,4 +1,4 @@
-//! The OAuth 2.0 authorization server's durable state (O01–O06): clients,
+//! The OAuth 2.0 authorization server's durable state: clients,
 //! grants, rotating refresh tokens, short-lived access tokens, authorization
 //! codes and device requests. Migration 30 holds every table and trigger.
 //!

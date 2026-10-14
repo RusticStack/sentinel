@@ -1,4 +1,4 @@
-//! The authorization-code flow's durable half (O01): consent choices, code
+//! The authorization-code flow's durable half: consent choices, code
 //! issuance on approval, and the single-use, PKCE-bound exchange.
 //!
 //! Consent itself is stateless: nothing is written until the account
