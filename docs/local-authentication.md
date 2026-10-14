@@ -64,6 +64,8 @@ Measured on `DOOMBRINGER` (i7-13700KF, Ubuntu 24.04 WSL2, ext4), release build, 
 
 Verification dominates by design, and the three login outcomes cost the same order of magnitude, which is the point of the placeholder record. Session validation is what every authenticated request pays: one primary-key probe and one key join, guarded by a query-plan test that rejects table scans and temporary sort trees. Sliding an idle deadline is the only write a read-only request can trigger, and only after five minutes.
 
+**Not recorded in the repo:** no `bench/` record or harness holds these means, so their sample count and spread are unknown and they cannot be reproduced from what is committed. Re-measure on the verification VPS and commit the record before citing them.
+
 WSL2 is a development reference, not a production qualification.
 
 ## Verification

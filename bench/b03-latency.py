@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """B03: measure the plan's latency budgets on a real controller and worker.
 
-    python3 bench/b03-latency.py ROOT OUT [--first N] [--logs N] [--cancel N]
-                                           [--failure N] [--queries N] [--cache N]
+    python3 bench/b03-latency.py ROOT OUT --source CHECKOUT [--binary SENTINEL]
+                                 [--first N] [--logs N] [--cancel N]
+                                 [--failure N] [--queries N] [--cache N]
 
 ROOT is a deployment bench/b03-setup.sh started. Every sample is a real push
 to one of the fixture's branches and a real intake event; nothing is
@@ -16,6 +17,10 @@ Budgets (plan.md section 12):
   ready_to_offer     attempts.offered_ms - jobs.queued_ms, idle capacity
   offer_to_ack       attempts.acked_ms - attempts.offered_ms
   ready_to_first     the first user process's own clock - jobs.queued_ms
+  intake_to_ready    jobs.queued_ms - the wall clock just before the intake POST
+                     (the pipeline resolution the queued_ms re-stamp excludes
+                     from every other budget; first samples only)
+  intake_to_first    the first user process's clock - the same POST time
   log_visible        a line's capture time -> received by a follow client
   cancel_to_end      POST cancel -> the job terminal (wait API)
   failure_query      GET /attempts/{id}/failure on a 100 MiB log
@@ -83,13 +88,14 @@ class Deployment:
         new = self.git("rev-parse", "HEAD")
         body = {"delivery_id": f"b03-{time.time_ns()}", "ref": f"refs/heads/{branch}",
                 "old_sha": old, "new_sha": new}
+        posted_ns = time.time_ns()  # wall clock, to compare with the store's stamps
         t0 = time.monotonic_ns()
         status, raw = self.call("POST", f"/intake/{self.repo}", body, token=self.hook)
         ack_ns = time.monotonic_ns() - t0
         if status != 202:
             raise SystemExit(f"intake answered {status}")
         delivery = json.loads(raw)["delivery"]
-        return delivery, ack_ns, time.time_ns()
+        return delivery, ack_ns, posted_ns
 
     def run_of(self, delivery, limit_s=60):
         """The run the intake lane dispatched for `delivery` (server log)."""
@@ -144,8 +150,60 @@ def run_bytes(run):
     return bytes.fromhex(run.removeprefix("run_").replace("-", ""))
 
 
+def read_first(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def field(path, key):
+    try:
+        with open(path) as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                if k.strip() == key:
+                    return v.strip()
+    except OSError:
+        pass
+    return None
+
+
+def stamp(source, binary):
+    """What the sentinel under test was built from and where it ran, copied
+    into every record. `source` is the checkout the deployment's binary was
+    built from (git is asked there, not trusted from a name); `binary` is
+    hashed so a rebuilt kit that no longer matches the checkout shows."""
+    def git(*args):
+        r = subprocess.run(["git", "-C", source, *args], capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else None
+    commit = git("rev-parse", "HEAD")
+    if commit is None:
+        raise SystemExit(f"cannot read the source commit of {source}; no record is written without it")
+    status = git("status", "--porcelain")
+    build = {"commit": commit, "dirty": None if status is None else bool(status)}
+    if binary:
+        import hashlib
+        with open(binary, "rb") as f:
+            build["binary_sha256"] = hashlib.sha256(f.read()).hexdigest()
+    mem = field("/proc/meminfo", "MemTotal")
+    host = {
+        "hostname": read_first("/etc/hostname"),
+        "kernel": read_first("/proc/sys/kernel/osrelease"),
+        "cpu_model": field("/proc/cpuinfo", "model name"),
+        "cpus_online": os.cpu_count(),
+        "mem_total_kib": int(mem.split()[0]) if mem else None,
+        "cpu_governor": read_first("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+    }
+    return {"build": build, "host": {k: v for k, v in host.items() if v is not None}}
+
+
+STAMP = {}
+
+
 def emit(out, **record):
-    out.write(json.dumps({"schema": "sentinel-bench/b03/1", **record}, separators=(",", ":")) + "\n")
+    out.write(json.dumps({"schema": "sentinel-bench/b03/1", **STAMP, **record}, separators=(",", ":")) + "\n")
     out.flush()
 
 
@@ -163,7 +221,7 @@ def logs_of(d, attempt, step=None):
 def first(d, out, n):
     for i in range(n):
         pressure = d.settle()
-        delivery, ack_ns, _ = d.push("first")
+        delivery, ack_ns, posted_ns = d.push("first")
         run = d.run_of(delivery)
         done = d.wait_finished(run)
         job = done["jobs"][0]
@@ -173,7 +231,11 @@ def first(d, out, n):
         emit(out, budget="first", sample=i, run=run, state=job["state"], cpu_pressure_avg60=pressure,
              intake_ack_ns=ack_ns, queued_ms=queued, offered_ms=offered, acked_ms=acked,
              ready_to_offer_ms=offered - queued, offer_to_ack_ms=acked - offered,
-             ready_to_first_ms=first_ns / 1e6 - queued)
+             ready_to_first_ms=first_ns / 1e6 - queued,
+             # The budgets above start at `queued_ms`, which is stamped after
+             # the pipeline is resolved; these two start at the event itself.
+             intake_to_ready_ms=queued - posted_ns / 1e6,
+             intake_to_first_ms=first_ns / 1e6 - posted_ns / 1e6)
         print(f"first {i}: offer {offered - queued} ms, ack {acked - offered} ms, first process {first_ns / 1e6 - queued:.0f} ms", file=sys.stderr)
 
 
@@ -269,9 +331,17 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("root")
     p.add_argument("out")
+    p.add_argument("--source", default=os.environ.get("SENTINEL_SRC"),
+                   help="the checkout the deployment's sentinel binary was built from (or SENTINEL_SRC); "
+                        "its commit and dirty state go into every record")
+    p.add_argument("--binary", default=os.environ.get("SENTINEL_BIN"),
+                   help="the deployed sentinel binary (or SENTINEL_BIN); its sha256 goes into every record")
     for name, default in [("first", 200), ("logs", 10), ("cancel", 30), ("failure", 3), ("queries", 50), ("cache", 30)]:
         p.add_argument(f"--{name}", type=int, default=default)
     a = p.parse_args()
+    if not a.source:
+        p.error("--source (or SENTINEL_SRC) is required: a record must name the build it measured")
+    STAMP.update(stamp(a.source, a.binary))
     d = Deployment(a.root)
     with open(a.out, "a") as out:
         first(d, out, a.first)

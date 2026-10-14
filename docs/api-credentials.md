@@ -64,6 +64,8 @@ Measured on `DOOMBRINGER` (i7-13700KF, Ubuntu 24.04 WSL2, ext4), release build, 
 
 Validation is what every API request pays, and it is a 32-byte primary-key probe plus one key join, guarded by a query-plan test that rejects table scans and temporary sort trees. Unlike a password, a presented credential needs no key derivation: it is already high-entropy, so there is nothing to slow down and no timing signal worth equalizing. `last_used_ms` is operator visibility, not authentication, and is written at most once a minute per credential.
 
+**Not recorded in the repo:** no `bench/` record or harness holds these means, so their sample count and spread are unknown and they cannot be reproduced from what is committed. Re-measure on the verification VPS and commit the record before citing them.
+
 WSL2 is a development reference, not a production qualification.
 
 ## Verification

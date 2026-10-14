@@ -136,13 +136,13 @@ B02's phase record ([`b02-sentinel.jsonl`](../bench/b02-sentinel.jsonl)) is the 
 
 | Phase (warm median) | Before | What it was |
 |---|---|---|
-| Intake → dispatch | 4.23 s | resolving `.sentinel.yml` at the pushed commit: a depth-one fetch of the whole tree, 75 MB, to read a 1.5 KB file |
+| Intake → dispatch | 4.23 s | resolving `.sentinel.yml` at the pushed commit: a depth-one fetch of the whole tree to read a 1.5 KB file (the fetch's own time and byte count were not recorded; see below) |
 | Finalize | 2.95 s | publishing the Go caches |
 | Checkout | 1.77 s | the worker's mirrored checkout |
 | Image pull | 1.03 s | a registry manifest request for an image already resident (fixed in [B03](latency-budgets.md#before-and-after-the-two-fixes)) |
 | Container start | 0.31 s | |
 
-**The largest cost, pipeline resolution, is cut.** The controller now reads the pipeline through a partial clone: the commit and its trees (`--filter=blob:none`), then the pipeline's own blob by its id. On this repository that is about 0.3 s and 0.2 MB instead of 3.6 s and 75 MB. A server that ignores the filter sends everything, and a failure anywhere on the partial path falls back to the whole depth-one fetch, so every server still works (`sentinel-git` `file_at`; test `a_filtering_server_sends_only_the_pipeline_blob`). The bench repository's server has `uploadpack.allowFilter` enabled, as GitHub's does. Pull-request resolution through a merge ref still fetches the whole tree; the same change applies there.
+**The largest cost, pipeline resolution, is cut.** The controller now reads the pipeline through a partial clone: the commit and its trees (`--filter=blob:none`), then the pipeline's own blob by its id. What the records show is the phase it sits in: intake → dispatch fell from 4.23 s (median of 10 warm B02 runs) to 0.48 s (median of 4 warm runs after the change). The isolated fetch figures quoted when the change was made (3.6 s and 75 MB before, 0.3 s and 0.2 MB after) appear in the commit message only, with no raw output committed: **not recorded in the repo**, so they are not evidence here; re-measure them with the fetch alone, on the reference host, before citing them. A server that ignores the filter sends everything, and a failure anywhere on the partial path falls back to the whole depth-one fetch, so every server still works (`sentinel-git` `file_at`; test `a_filtering_server_sends_only_the_pipeline_blob`). The bench repository's server has `uploadpack.allowFilter` enabled, as GitHub's does. Pull-request resolution through a merge ref still fetches the whole tree; the same change applies there.
 
 **After** ([`b04-pipeline-fetch.jsonl`](../bench/b04-pipeline-fetch.jsonl), 4 warm samples and a warm-up, same lane, host and caps):
 
@@ -152,9 +152,11 @@ B02's phase record ([`b02-sentinel.jsonl`](../bench/b02-sentinel.jsonl)) is the 
 | Image pull | 1.03 s | 0.05–0.07 s |
 | Checkout | 1.77 s | 1.79–1.87 s |
 | Finalize | 2.95 s | 2.77–3.55 s |
-| Everything but the test step | ~11.4 s | ~7.2 s |
+| Everything but the test step (intake to finish, less the step's own time) | 10.9 s (median of 10 warm B02 runs, 10.5–11.4 s) | 7.2 s (median of 4, 7.1–8.0 s) |
 
-Sentinel's overhead on this lane is now about 7 s against a healthy self-hosted runner's 11 s, plus its queue (B02). What remains, in order: cache publication in finalize (about 3 s), checkout (about 1.8 s), then dispatch and reporting (about 1.5 s together). CPU throttling and disk wait inside the test step were not profiled here. The step is capped at the contract's 10 CPUs, and its time is the same in every executor, so neither is an engine cost.
+The "after" column is four samples, so no tail is claimed; the earlier "~11.4 s" was the top of the "before" range, not its median. The runs carry no build commit or host block (the stamp was added afterwards, see [benchmarking](benchmarking.md)): the commit that added each file is the only attribution.
+
+Sentinel's overhead on this lane is now about 7 s against a healthy self-hosted runner's 11 s, plus its queue (B02). What remains, in order: cache publication in finalize (about 3 s), checkout (about 1.8 s), then dispatch and reporting (about 1.5 s together). **CPU throttling and disk wait were not profiled** (neither the cgroup's throttled time nor I/O pressure was recorded for any phase, in the test step or around it). The argument that the step's time is the same in every executor says the step is not an engine difference; it does not show that throttling or disk wait cost nothing in Sentinel's own phases (checkout, cache publication). That part of B04 is split out as B04a in `TODO.md` and is open.
 
 ## Reproducing
 
