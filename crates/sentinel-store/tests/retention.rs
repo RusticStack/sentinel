@@ -95,17 +95,12 @@ fn credential(user: UserId) -> Authority {
 impl Fixture {
     fn set(&self, authority: Authority, repo: Option<RepoId>, policy: Policy) -> Result<(), Error> {
         let tenant = self.tenant;
-        self.store.writer().write(move |tx| {
-            retention::set(
-                tx,
-                &authority,
-                &Deployment::default(),
-                tenant,
-                repo,
-                policy,
-                NOW,
-            )
-        })
+        let d = Deployment::default();
+        let rest = self
+            .store
+            .writer()
+            .write(move |tx| retention::set(tx, &authority, &d, tenant, repo, policy, NOW))?;
+        retention::finish_reapply(&self.store, &d, tenant, repo, rest)
     }
 
     /// A run with one job, placed on a fresh worker, whose attempt was then
@@ -443,6 +438,74 @@ fn lowered_retention_applies_to_logs_and_artifacts_already_stored() {
         .unwrap();
     assert_eq!(f.expires(attempt), Some(NOW.0 + d.log_retention_ms));
     assert_eq!(retained(), NOW.0 + DAY);
+}
+
+/// Re-applying a policy to what is stored runs a bounded number of rows per
+/// write and resumes from its cursor: a small batch leaves work for the next
+/// step, and the steps together reach exactly the unbatched result.
+#[test]
+fn reapplying_a_policy_is_bounded_per_write_and_resumes_to_the_same_result() {
+    let f = fixture();
+    let d = Deployment::default();
+    f.store
+        .writer()
+        .write(move |tx| retention::install(tx, &d))
+        .unwrap();
+    let attempts: Vec<AttemptId> = (0..5).map(|_| f.released_attempt(NOW).2).collect();
+    f.stamp(d, 10);
+    for attempt in &attempts {
+        assert_eq!(f.expires(*attempt), Some(NOW.0 + d.log_retention_ms));
+    }
+    // The tenant's policy narrows (written as the policy row alone, as a
+    // crash between a set and its re-stamping would leave it).
+    let tenant = f.tenant;
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO storage_policies(tenant_id, repo_id, log_retention_ms, updated_ms)
+                 VALUES (?1, X'', ?2, ?3)
+                 ON CONFLICT(tenant_id, repo_id) DO UPDATE SET
+                     log_retention_ms = excluded.log_retention_ms",
+                rusqlite::params![tenant.as_bytes().as_slice(), DAY, NOW.0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let narrowed = |f: &Fixture| {
+        attempts
+            .iter()
+            .filter(|a| f.expires(**a) == Some(NOW.0 + DAY))
+            .count()
+    };
+    assert_eq!(narrowed(&f), 0);
+    let step = |f: &Fixture, at: retention::Reapply| {
+        f.store
+            .writer()
+            .write(move |tx| retention::reapply_step(tx, &d, tenant, None, at, 2))
+            .unwrap()
+    };
+    let first = step(&f, retention::Reapply::default());
+    assert!(!first.done());
+    assert_eq!(narrowed(&f), 2, "one batch touches at most its size");
+    let mut at = first;
+    let mut steps = 1;
+    while !at.done() {
+        at = step(&f, at);
+        steps += 1;
+        assert!(steps < 20, "the cursor must advance");
+    }
+    assert_eq!(narrowed(&f), 5);
+    assert!(
+        steps >= 3,
+        "five rows in batches of two take several writes"
+    );
+    // Idempotent: another pass from the start changes nothing.
+    let mut again = retention::Reapply::default();
+    while !again.done() {
+        again = step(&f, again);
+    }
+    assert_eq!(narrowed(&f), 5);
 }
 
 #[test]

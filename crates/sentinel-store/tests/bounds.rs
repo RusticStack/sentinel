@@ -29,6 +29,44 @@ fn tenant_count(store: &Store) -> i64 {
         .unwrap()
 }
 
+/// A checkpoint does not hold the writer for a reader's whole read: with a
+/// snapshot open that the new commits outrun, the truncate gives up after its
+/// budget and reports a partial result, the writer works right after, and a
+/// checkpoint with no reader in the way completes.
+#[test]
+fn a_checkpoint_blocked_by_a_reader_returns_within_its_budget() {
+    let (_dir, store) = store();
+    let store = Arc::new(store);
+    let seen = Arc::clone(&store);
+    let (partial, took) = store
+        .read(move |c| {
+            c.execute_batch("BEGIN; SELECT COUNT(*) FROM tenants;")?;
+            let tenant = TenantId::new();
+            seen.writer()
+                .write(move |tx| jobs::insert_tenant(tx, tenant, "outrun", UnixMillis(1)))?;
+            let started = Instant::now();
+            let outcome = seen.checkpoint()?;
+            let took = started.elapsed();
+            c.execute_batch("COMMIT")?;
+            Ok((outcome == sentinel_store::Checkpointed::Partial, took))
+        })
+        .unwrap();
+    assert!(partial, "the open snapshot kept part of the log");
+    assert!(
+        took < Duration::from_secs(2),
+        "the writer was held for {took:?}, past the budget"
+    );
+    let tenant = TenantId::new();
+    store
+        .writer()
+        .write(move |tx| jobs::insert_tenant(tx, tenant, "after", UnixMillis(2)))
+        .unwrap();
+    assert_eq!(
+        store.checkpoint().unwrap(),
+        sentinel_store::Checkpointed::Complete
+    );
+}
+
 #[test]
 fn one_process_owns_the_database_and_ownership_ends_with_the_store() {
     let dir = tempfile::tempdir().unwrap();

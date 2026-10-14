@@ -760,13 +760,49 @@ impl Store {
         Shutdown::Stalled
     }
 
-    /// Fold the WAL back into the main file; call at quiet moments and on shutdown.
-    pub fn checkpoint(&self) -> Result<()> {
+    /// Fold the WAL back into the main file; call at quiet moments and on
+    /// shutdown. The writer thread is held for at most [`CHECKPOINT_BUDGET`]
+    /// of waiting on readers (the connection's own 5 s busy wait would let one
+    /// long read stall every write behind it) plus the copy of what no reader
+    /// needs, which the WAL's own size bounds. When a reader kept part of the
+    /// log, the work done stays done and the answer is
+    /// [`Checkpointed::Partial`]: call again at the next quiet moment.
+    pub fn checkpoint(&self) -> Result<Checkpointed> {
         self.writer.raw(|conn| {
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
-            Ok(())
+            conn.busy_timeout(CHECKPOINT_BUDGET)?;
+            let outcome = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                r.get::<_, i64>(0)
+            });
+            // Whatever the checkpoint did, later writes get their usual wait.
+            conn.busy_timeout(BUSY_TIMEOUT)?;
+            match outcome {
+                Ok(0) => Ok(Checkpointed::Complete),
+                Ok(_) => Ok(Checkpointed::Partial),
+                Err(rusqlite::Error::SqliteFailure(failure, _))
+                    if matches!(
+                        failure.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) =>
+                {
+                    Ok(Checkpointed::Partial)
+                }
+                Err(e) => Err(e.into()),
+            }
         })
     }
+}
+
+/// How long a checkpoint may wait for readers while it holds the writer.
+pub const CHECKPOINT_BUDGET: Duration = Duration::from_millis(200);
+
+/// What a checkpoint achieved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Checkpointed {
+    /// The WAL was folded into the main file and truncated.
+    Complete,
+    /// A reader still needed part of the log within the budget: everything no
+    /// reader needed was folded, the rest waits for a later call.
+    Partial,
 }
 
 #[cfg(test)]
