@@ -1,4 +1,4 @@
-//! R02/R03 end to end against real S3 services: the controller's
+//! End to end against real S3 services: the controller's
 //! replicator over `sentinel_s3`, for every endpoint `$SENTINEL_S3_ENDPOINTS`
 //! lists (`crates/sentinel-s3/tests/endpoints.sh`). Without the variable it
 //! reports that it was skipped, never a false pass.

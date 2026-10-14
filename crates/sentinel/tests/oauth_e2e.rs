@@ -1,11 +1,11 @@
-//! O07: the OAuth sign-in end to end, portable. The real `sentinel` binary
+//! The OAuth sign-in end to end, portable. The real `sentinel` binary
 //! (`CARGO_BIN_EXE_sentinel`) runs against an in-process controller API on
 //! loopback, with a temporary `SENTINEL_CONFIG_DIR` and the file credential
 //! store. A "browser" is played by this test: it signs in with a local
 //! password (`/api/v1/login`), submits the consent or device page with the
 //! session cookie, and follows the `303` to the CLI's own loopback
 //! listener; one login instead signs a GitHub-only account in through
-//! "Sign in with GitHub" against `sentinel_github::fake` (U07). Opening a
+//! "Sign in with GitHub" against `sentinel_github::fake`. Opening a
 //! real browser is not automated here: every browser login
 //! here uses `--no-browser`, which prints the same URL.
 //!
@@ -57,8 +57,6 @@ const GITHUB_SECRET: &str = "e2e-github-client-secret";
 /// Bound on any one CLI process, so a hang fails the test instead of CI.
 const PROCESS_LIMIT: Duration = Duration::from_secs(90);
 
-// ---------------------------------------------------------------- harness
-
 struct Deployment {
     _dir: tempfile::TempDir,
     store: Arc<Store>,
@@ -74,7 +72,7 @@ struct Deployment {
     tenant: TenantId,
     root: UserId,
     repo: RepoId,
-    /// The GitHub-shaped fake, when GitHub sign-in is configured (U07).
+    /// The GitHub-shaped fake, when GitHub sign-in is configured.
     github: Option<FakeGithub>,
 }
 
@@ -735,8 +733,6 @@ fn not_signed_in_hint(d: &Deployment, profile: &str) -> String {
     )
 }
 
-// ---------------------------------------------------------------- flows
-
 #[test]
 fn browser_login_then_status_and_commands_work() {
     let d = deployment();
@@ -800,7 +796,7 @@ fn stdio_list_runs(d: &Deployment, machine: &Machine, profile: &str) -> (Out, Ve
     (out, replies)
 }
 
-/// P11-10: stdio MCP on a real credential profile (a service grant imported
+/// Stdio MCP on a real credential profile (a service grant imported
 /// with `auth login --grant-file` into a temporary `SENTINEL_CONFIG_DIR`),
 /// not a static token. A scope refusal is told apart from a repository
 /// refusal by its named scope; after the grant is revoked the profile's
@@ -1017,8 +1013,8 @@ fn a_delegated_cli_writer_can_provision_a_secret_for_a_job_without_disclosure() 
             .contains(std::str::from_utf8(value).unwrap())
     );
 
-    // The delegated writer binds its secret to one job step through the CLI
-    // (P10S-2): no store call anywhere in the provisioning flow.
+    // The delegated writer binds its secret to one job step through the CLI:
+    // no store call anywhere in the provisioning flow.
     let bound = machine.run(&[
         "secret",
         "--profile",
@@ -1063,7 +1059,7 @@ fn a_delegated_cli_writer_can_provision_a_secret_for_a_job_without_disclosure() 
     secret_runtime::use_cli_secret_in_rootless_job(&d, value);
 }
 
-/// U07: an account that exists only through GitHub (admitted by an
+/// An account that exists only through GitHub (admitted by an
 /// invitation bound to its GitHub account, no password) signs the CLI in.
 /// The "browser" opens the printed URL, finds no session, follows "Sign in
 /// with GitHub" through the fake GitHub and the callback, lands back on the
@@ -1155,7 +1151,7 @@ fn a_github_only_account_signs_the_cli_in_through_github() {
     assert_eq!(at_github.status, 302);
     let callback = at_github.header("location").unwrap().to_owned();
     // GitHub's redirect back is cross-site: the callback issues nothing and
-    // moves the browser on to the same-origin finish hop (P09S-10).
+    // moves the browser on to the same-origin finish hop.
     let back = request(
         "GET",
         &callback,
@@ -1461,7 +1457,7 @@ fn the_cli_refuses_a_callback_with_the_wrong_state_or_issuer() {
         assert_eq!(landed.status, 400, "{what}");
         assert!(landed.text().contains("did not complete"), "{what}");
         if wrong_state {
-            // P09C-4: a callback for another login is ignored, not fatal;
+            // A callback for another login is ignored, not fatal;
             // the login still waits for its own, which here names the
             // wrong issuer and so ends it.
             let own = format!(
@@ -1823,8 +1819,6 @@ fn a_service_grant_is_imported_and_used_without_any_prompt() {
         assert!(audit.iter().any(|a| a.event == event), "{event:?}");
     }
 }
-
-// ---------------------------------------------------------------- doctor
 
 fn doctor(m: &Machine, env: &[(&str, &str)]) -> (Out, Value) {
     let out = m.run_env(env, &["doctor", "--json"]);

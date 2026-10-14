@@ -1,4 +1,4 @@
-//! S03/S04 and the Part 10 secrets fixes through the real `sentinel` binary
+//! The secrets commands through the real `sentinel` binary
 //! against an in-process controller API: stdin byte preservation, rotate,
 //! delete, exit codes, import preview pins, explicit idempotency replay, the
 //! retry hint on an unknown outcome, binding/allowlist/revocation commands,
@@ -258,7 +258,7 @@ fn stdin_values_rotate_and_delete_with_stable_exit_codes() {
     assert_eq!(code(&reuse), 5);
 }
 
-/// P10C-2: a caller-chosen key makes a rerun replay the first write
+/// A caller-chosen key makes a rerun replay the first write
 /// instead of rotating again, and an unknown outcome names that retry.
 #[test]
 fn a_rerun_with_the_same_key_replays_and_an_unknown_outcome_names_it() {
@@ -314,7 +314,7 @@ fn a_rerun_with_the_same_key_replays_and_an_unknown_outcome_names_it() {
     );
 }
 
-/// P10C-2 / P10C-4: preview reports literal-value hints and a pin; an
+/// Preview reports literal-value hints and a pin; an
 /// import bound to that pin refuses once a name moved.
 #[test]
 fn an_import_bound_to_its_preview_refuses_a_moved_version() {
@@ -448,7 +448,7 @@ fn an_import_bound_to_its_preview_refuses_a_moved_version() {
     assert!(err(&cr).contains("line 1"), "{}", err(&cr));
 }
 
-/// P10S-2: the documented provisioning flow runs entirely through the CLI.
+/// The documented provisioning flow runs entirely through the CLI.
 #[test]
 fn bindings_allowlists_and_revocation_run_through_the_cli() {
     let d = deployment();
@@ -563,7 +563,7 @@ fn bindings_allowlists_and_revocation_run_through_the_cli() {
     assert_eq!(code(&absent), 4);
 }
 
-/// P10C-5: a value mistakenly typed as an argument is refused and never
+/// A value mistakenly typed as an argument is refused and never
 /// copied into stderr.
 #[test]
 fn a_value_typed_as_an_argument_is_never_echoed() {
