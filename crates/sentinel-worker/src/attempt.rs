@@ -683,7 +683,7 @@ fn prepare(
     // attachments, so the slice cannot stay borrowed from `job`.
     let declared = compiled.spec.cache.clone();
     let resources = compiled.spec.resources;
-    let timeout_secs = compiled.timeout_secs;
+    let timeout_secs = compiled.spec.timeout_secs;
     let workspace = Workspace::create(root, job.attempt)?;
     let secret_directory = if job.secret_bundle.is_empty() {
         None

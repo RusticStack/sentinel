@@ -1626,7 +1626,7 @@ impl LinkExecutor for Executor {
     }
 
     fn offered(&self, offer: &Offer) -> bool {
-        let mut state = self.state();
+        let state = self.state();
         // An attempt already taken — a repeated offer, in this session or
         // an earlier one — is acknowledged again, never started twice.
         if state.live.contains_key(&offer.attempt) || state.awaiting.contains_key(&offer.attempt) {
