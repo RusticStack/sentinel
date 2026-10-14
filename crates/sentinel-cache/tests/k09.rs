@@ -526,7 +526,7 @@ fn eviction_during_active_use_never_undercuts_a_lease() {
     assert_eq!(
         gens(&entry2).len(),
         1,
-        "the unleased spare is evicted oldest-first"
+        "the unleashed spare is evicted oldest-first"
     );
     assert_eq!(stats.generations_removed, 1);
     assert_eq!(stats.bytes_freed, 500);
