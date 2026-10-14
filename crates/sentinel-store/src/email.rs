@@ -645,7 +645,9 @@ pub fn verify_host_local(
         Some(user),
         authority.host_local(),
         None,
-    )
+    )?;
+    crate::auto_join::apply(tx, user, now)?;
+    Ok(())
 }
 
 /// Make `email` the account's verified address and clear every other
@@ -721,6 +723,8 @@ pub fn confirm(store: &Store, secret: &Secret, now: UnixMillis) -> Result<Confir
             }
             None => None,
         };
+        // After the invitation: an account it just admitted is eligible.
+        crate::auto_join::apply(tx, user, now)?;
         Ok(Confirmation::Verified { user, joined })
     })
 }

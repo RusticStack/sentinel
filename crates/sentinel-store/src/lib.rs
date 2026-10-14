@@ -13,6 +13,7 @@
 
 pub mod artifacts;
 pub mod auth;
+pub mod auto_join;
 pub mod backup;
 pub mod bundle;
 pub mod checks;
