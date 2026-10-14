@@ -328,6 +328,33 @@ fn invite_to(
     })
 }
 
+/// The slug of a tenant, for a reply that names the organization joined.
+pub fn tenant_slug(conn: &Connection, tenant: TenantId) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached("SELECT slug FROM tenants WHERE id = ?1")?
+        .query_row([tenant.as_bytes()], |r| r.get(0))
+        .optional()?)
+}
+
+/// [`revoke_invitation`] for a route that names the tenant: an invitation of
+/// any other tenant (or none) is `NotFound`, not revoked.
+pub fn revoke_tenant_invitation(
+    tx: &Transaction<'_>,
+    authority: Authority,
+    tenant: TenantId,
+    id: InvitationId,
+    now: UnixMillis,
+) -> Result<()> {
+    let owner: Option<Option<[u8; 16]>> = tx
+        .prepare_cached("SELECT tenant_id FROM invitations WHERE id = ?1")?
+        .query_row([id.as_bytes()], |r| r.get(0))
+        .optional()?;
+    if owner.flatten().as_ref() != Some(tenant.as_bytes()) {
+        return Err(Error::NotFound);
+    }
+    revoke_invitation(tx, authority, id, now)
+}
+
 /// Revoke an unspent invitation. Platform admins, and the tenant admin of the
 /// tenant it would grant membership of.
 pub fn revoke_invitation(

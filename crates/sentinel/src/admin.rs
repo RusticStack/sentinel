@@ -15,7 +15,7 @@ use sentinel_core::{
     auth::{Permissions, Role},
 };
 use sentinel_store::{
-    Durability, MASTER_KEY_FILE, METADATA_FILE, Store,
+    Durability, MASTER_KEY_FILE, METADATA_FILE, Store, email,
     local_auth::{self, Event},
     lookup, mfa, oauth, operations,
     registration::{
@@ -29,10 +29,10 @@ use sentinel_store::{
 
 use crate::cli::{
     AccountArgs, AccountCommand, AdminArgs, AdminCommand, DataDir, IdentityArgs, IdentityCommand,
-    InviteArgs, InviteCommand, KeyArgs, KeyCommand, MfaArgs, MfaCommand, OauthClientArgs,
-    OauthClientCommand, ObjectsArgs, ObjectsCommand, PolicyArgs, PolicyCommand, PoolArgs,
-    PoolCommand, SessionArgs, SessionCommand, TenantArgs, TenantCommand, TokenArgs, TokenCommand,
-    WorkerArgs, WorkerCommand,
+    InviteArgs, InviteCommand, KeyArgs, KeyCommand, MailArgs, MailCommand, MfaArgs, MfaCommand,
+    OauthClientArgs, OauthClientCommand, ObjectsArgs, ObjectsCommand, PolicyArgs, PolicyCommand,
+    PoolArgs, PoolCommand, SessionArgs, SessionCommand, TenantArgs, TenantCommand, TokenArgs,
+    TokenCommand, WorkerArgs, WorkerCommand,
 };
 
 pub struct Error {
@@ -215,6 +215,7 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
         AdminCommand::OauthClient(args) => oauth_client(args, now)?,
         AdminCommand::Invite(args) => invite(args, now)?,
         AdminCommand::Account(args) => account(args, now)?,
+        AdminCommand::Mail(args) => mail(args)?,
         AdminCommand::Key(args) => key(args)?,
         AdminCommand::Mfa(args) => second_factor(args, now)?,
         AdminCommand::Session(args) => session(args, now)?,
@@ -665,7 +666,17 @@ fn tenant_storage(
 /// database directly: the operator already has that access, and there is no
 /// session to authorize them with before any credential exists.
 fn resolve_user(store: &Store, value: &str) -> Result<UserId, Error> {
-    let unknown = || fail("no account with that username or identifier");
+    let unknown = || fail("no account with that username, address or identifier");
+    // No username holds an `@`: an address names the account that verified
+    // it, else the newest one still claiming it.
+    if value.contains('@') {
+        let owned = value.to_owned();
+        return store
+            .read(move |conn| email::user_by_address(conn, &owned))
+            .ok()
+            .flatten()
+            .ok_or_else(unknown);
+    }
     if let Ok(id) = value.parse::<UserId>() {
         return store
             .read(move |conn| lookup::known_user(conn, id))
@@ -1022,6 +1033,68 @@ const fn role_name(value: Role) -> &'static str {
     }
 }
 
+/// An invitation addressed to a mailbox. With mail delivery configured and
+/// the master key readable the message is queued for the lane, sealed, and no
+/// secret is printed; otherwise (or with `--print-link`) the secret is the
+/// only thing on stdout, as for any invitation, and the operator passes it on.
+fn invite_email(
+    data: &DataDir,
+    store: &Store,
+    (tenant, wanted): (TenantId, Role),
+    address: &str,
+    lifetime_ms: i64,
+    print_link: bool,
+    now: UnixMillis,
+) -> Result<(), Error> {
+    let key = if print_link {
+        None
+    } else {
+        master_key(data).ok().map(std::sync::Arc::new)
+    };
+    let address = address.to_owned();
+    let invited = store
+        .writer()
+        .write(move |tx| {
+            registration::invite_by_email(
+                tx,
+                Authority::HostLocal,
+                Terms {
+                    tenant: Some(tenant),
+                    role: Some(wanted),
+                    identity: None,
+                    lifetime_ms,
+                },
+                &address,
+                key.as_deref(),
+                now,
+            )
+        })
+        .map_err(|error| match error {
+            sentinel_store::Error::InvalidInput("organization backed by GitHub") => {
+                fail("this organization's members come from GitHub; email invitations do not apply")
+            }
+            sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
+            sentinel_store::Error::Overloaded => {
+                fail("too many email invitations for this organization this hour")
+            }
+            other => fail(format!("cannot create the invitation: {other}")),
+        })?;
+    let invitation = invited.invitation;
+    if invited.queued {
+        eprintln!(
+            "issued {} expiring at {}; the message is queued for delivery",
+            invitation.id, invitation.expires.0
+        );
+    } else {
+        sentinel::outln!("{}", sentinel_auth::token::format(&invitation.secret));
+        eprintln!(
+            "issued {} expiring at {} (shown once); no message was queued, so pass the secret on",
+            invitation.id, invitation.expires.0
+        );
+    }
+    Ok(())
+}
+
 fn invite(args: &InviteArgs, now: UnixMillis) -> Result<(), Error> {
     match &args.command {
         InviteCommand::Create {
@@ -1030,6 +1103,8 @@ fn invite(args: &InviteArgs, now: UnixMillis) -> Result<(), Error> {
             role: wanted,
             identity,
             expires_in,
+            email,
+            print_link,
         } => {
             let store = open(data, true)?;
             let lifetime_ms = lifetime_ms(expires_in)?;
@@ -1037,6 +1112,20 @@ fn invite(args: &InviteArgs, now: UnixMillis) -> Result<(), Error> {
             let wanted = wanted.as_deref().map(role).transpose()?;
             if tenant.is_some() != wanted.is_some() {
                 return Err(fail("--tenant and --role are given together or not at all"));
+            }
+            if let Some(address) = email {
+                let (Some(tenant), Some(wanted)) = (tenant, wanted) else {
+                    return Err(fail("--email needs --tenant and --role"));
+                };
+                return invite_email(
+                    data,
+                    &store,
+                    (tenant, wanted),
+                    address,
+                    lifetime_ms,
+                    *print_link,
+                    now,
+                );
             }
             // Owned, so the writer closure can borrow it for the whole write.
             let bound: Option<(String, String)> = match identity.as_deref() {
@@ -1119,6 +1208,31 @@ fn invite(args: &InviteArgs, now: UnixMillis) -> Result<(), Error> {
     Ok(())
 }
 
+/// Whether this deployment delivers mail and what the outbox holds. Counts
+/// only: no address, no link.
+fn mail(args: &MailArgs) -> Result<(), Error> {
+    match &args.command {
+        MailCommand::Status { data } => {
+            let store = open(data, true)?;
+            let (enabled, url, (pending, delivered, abandoned)) = store
+                .read(|conn| {
+                    Ok((
+                        email::delivery_enabled(conn)?,
+                        email::public_url(conn)?,
+                        email::counts(conn)?,
+                    ))
+                })
+                .map_err(|error| fail(format!("cannot read the outbox: {error}")))?;
+            sentinel::outln!(
+                "delivery={} public_url={} pending={pending} delivered={delivered} abandoned={abandoned}",
+                if enabled { "on" } else { "off" },
+                url.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    Ok(())
+}
+
 fn account(args: &AccountArgs, now: UnixMillis) -> Result<(), Error> {
     match &args.command {
         AccountCommand::Pending { data } => {
@@ -1156,6 +1270,69 @@ fn account(args: &AccountArgs, now: UnixMillis) -> Result<(), Error> {
                     other => fail(format!("the decision failed: {other}")),
                 })?;
             eprintln!("{} {user}", if approve { "approved" } else { "rejected" });
+        }
+        AccountCommand::EmailLink {
+            data,
+            user,
+            email: address,
+            public_url,
+        } => {
+            let store = open(data, true)?;
+            let user = resolve_user(&store, user)?;
+            let address = address.clone();
+            let issued = store
+                .writer()
+                .write(move |tx| {
+                    email::issue_link(tx, Authority::HostLocal, user, address.as_deref(), now)
+                })
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound => {
+                        fail("nothing to verify: the account claims no address (give --email)")
+                    }
+                    sentinel_store::Error::Conflict => {
+                        fail("another account already verified that address")
+                    }
+                    sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
+                    other => fail(format!("cannot issue the link: {other}")),
+                })?;
+            let base = match public_url {
+                Some(url) => Some(url.trim_end_matches('/').to_owned()),
+                None => store.read(email::public_url).ok().flatten(),
+            };
+            let mut secret = String::new();
+            issued.secret.expose(&mut secret);
+            // The link (or the bare secret) alone on stdout, once.
+            match &base {
+                Some(base) => sentinel::outln!("{base}/verify-email#token={secret}"),
+                None => sentinel::outln!("{secret}"),
+            }
+            sentinel_auth::secret::wipe_string(&mut secret);
+            eprintln!(
+                "issued for {user} expiring at {} (shown once; earlier links no longer work){}",
+                issued.expires.0,
+                if base.is_none() {
+                    "; append the secret to <public_url>/verify-email#token="
+                } else {
+                    ""
+                }
+            );
+        }
+        AccountCommand::EmailVerify { data, user } => {
+            let store = open(data, true)?;
+            let user = resolve_user(&store, user)?;
+            store
+                .writer()
+                .write(move |tx| email::verify_host_local(tx, Authority::HostLocal, user, now))
+                .map_err(|error| match error {
+                    sentinel_store::Error::NotFound => {
+                        fail("the account has no unverified address to vouch for")
+                    }
+                    sentinel_store::Error::Conflict => {
+                        fail("another account already verified that address")
+                    }
+                    other => fail(format!("cannot verify the address: {other}")),
+                })?;
+            eprintln!("verified the address of {user}");
         }
     }
     Ok(())

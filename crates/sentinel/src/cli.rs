@@ -249,8 +249,10 @@ pub enum AdminCommand {
     OauthClient(OauthClientArgs),
     /// Create, list and revoke one-time invitations
     Invite(InviteArgs),
-    /// Review pending applications; approve or reject accounts
+    /// Review pending applications; approve or reject accounts; email links
     Account(AccountArgs),
+    /// Show the email outbox's state
+    Mail(MailArgs),
     /// Create or rotate the sealing key for second factors and source credentials
     Key(KeyArgs),
     /// Inspect or remove an account's second factor
@@ -897,6 +899,15 @@ pub enum InviteCommand {
         /// Lifetime such as 7d or 12h; bounded by the deployment maximum
         #[arg(long, value_name = "DURATION", default_value = "7d")]
         expires_in: String,
+        /// Address the invitation to this mailbox (needs --tenant and --role;
+        /// refused for a GitHub-backed organization). With mail delivery
+        /// configured the message is queued and no secret is printed;
+        /// otherwise the secret is printed to stdout as for any invitation
+        #[arg(long, value_name = "ADDRESS", conflicts_with = "identity")]
+        email: Option<String>,
+        /// Print the secret even when mail delivery is configured
+        #[arg(long, requires = "email")]
+        print_link: bool,
     },
     /// List invitations as metadata; secrets are never shown
     List {
@@ -941,6 +952,48 @@ pub enum AccountCommand {
         data: DataDir,
         #[arg(long)]
         user: String,
+    },
+    /// Mint an email verification link for an account and print it to stdout,
+    /// once: for a deployment without SMTP, so nobody is locked out. Earlier
+    /// links of the account stop working
+    EmailLink {
+        #[command(flatten)]
+        data: DataDir,
+        /// A local username, a `usr_` identifier or the address it claims
+        #[arg(long)]
+        user: String,
+        /// Prove this address instead of the one the account is proving
+        #[arg(long, value_name = "ADDRESS")]
+        email: Option<String>,
+        /// The deployment's public base URL; defaults to the one the
+        /// controller last started with. Without either only the secret is
+        /// printed
+        #[arg(long, value_name = "URL")]
+        public_url: Option<String>,
+    },
+    /// Mark an account's claimed email verified without a link: the operator
+    /// vouches for the address
+    EmailVerify {
+        #[command(flatten)]
+        data: DataDir,
+        /// A local username, a `usr_` identifier or the address it claims
+        #[arg(long)]
+        user: String,
+    },
+}
+
+#[derive(Args)]
+pub struct MailArgs {
+    #[command(subcommand)]
+    pub command: MailCommand,
+}
+
+#[derive(Subcommand)]
+pub enum MailCommand {
+    /// Report whether mail delivery is configured and the outbox's counts
+    Status {
+        #[command(flatten)]
+        data: DataDir,
     },
 }
 

@@ -180,6 +180,13 @@ pub fn normalize(input: &str) -> Result<String> {
     Ok(out)
 }
 
+/// The local part of an address already in canonical form.
+pub fn local_part_of(normalized: &str) -> &str {
+    normalized
+        .rsplit_once('@')
+        .map_or(normalized, |(local, _)| local)
+}
+
 /// The domain of an address already in canonical form.
 pub fn domain_of(normalized: &str) -> &str {
     normalized
@@ -203,15 +210,34 @@ pub fn delivery_enabled(conn: &Connection) -> Result<bool> {
     Ok(delivery_url(conn)?.is_some())
 }
 
-/// Record, at controller start, whether mail is delivered and the base URL its
-/// links name (`None` turns delivery off). Rows already queued stay queued: a
-/// later start with the lane delivers them, and they expire on their own.
-pub fn set_delivery(store: &Store, public_url: Option<&str>, now: UnixMillis) -> Result<()> {
+/// The base URL the controller was last started with, whether or not it
+/// delivers mail: what the host-local CLI builds a link on.
+pub fn public_url(conn: &Connection) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached("SELECT public_url FROM mail_settings WHERE id = 1")?
+        .query_row([], |r| r.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten())
+}
+
+/// Record, at controller start, whether mail is delivered and the base URL
+/// links name (`public_url`; delivery needs one). Rows already queued stay
+/// queued: a later start with the lane delivers them, and they expire on
+/// their own.
+pub fn set_delivery(
+    store: &Store,
+    enabled: bool,
+    public_url: Option<&str>,
+    now: UnixMillis,
+) -> Result<()> {
+    if enabled && public_url.is_none() {
+        return Err(Error::InvalidInput("mail public url"));
+    }
     let url = public_url.map(str::to_owned);
     store.writer().write(move |tx| {
         tx.execute(
             "UPDATE mail_settings SET enabled = ?1, public_url = ?2, updated_ms = ?3 WHERE id = 1",
-            params![url.is_some(), url, now.0],
+            params![enabled, url, now.0],
         )?;
         Ok(())
     })
@@ -364,6 +390,7 @@ fn mint(
     email: &str,
     invitation: Option<InvitationId>,
     now: UnixMillis,
+    host_local: bool,
 ) -> Result<Secret> {
     tx.execute(
         "UPDATE email_verifications SET used_ms = ?2 WHERE user_id = ?1 AND used_ms IS NULL",
@@ -392,9 +419,9 @@ fn mint(
     audit(
         tx,
         Event::EmailVerificationRequested,
+        (!host_local).then_some(user),
         Some(user),
-        Some(user),
-        false,
+        host_local,
         None,
     )?;
     Ok(secret)
@@ -446,7 +473,7 @@ fn request_canonical(
     if minted >= RESENDS_PER_WINDOW {
         return Ok(Requested::Throttled);
     }
-    let secret = mint(tx, user, email, invitation, now)?;
+    let secret = mint(tx, user, email, invitation, now, false)?;
     let (Some(key), Some(url)) = (key, delivery_url(tx)?) else {
         return Ok(Requested::Undelivered);
     };
@@ -553,23 +580,34 @@ pub struct IssuedLink {
     pub expires: UnixMillis,
 }
 
-/// Host-local: mint a fresh verification token for the address `user` is
-/// proving and return its secret, for an operator whose deployment sends no
-/// mail. Platform administration (the database file's authority), audited,
-/// and it voids the account's earlier links. The secret is shown once; the
-/// link is `<public_url>/verify-email#token=<secret>`.
+/// Host-local: mint a fresh verification token and return its secret, for an
+/// operator whose deployment sends no mail. The token proves the address the
+/// account is already proving, or `email` when the operator names one (which
+/// becomes the account's unverified claim, or the pending replacement of a
+/// verified address). Platform administration (the database file's
+/// authority), audited as host-local, and it voids the account's earlier
+/// links. The secret is shown once; the link is
+/// `<public_url>/verify-email#token=<secret>`. `Conflict` when another
+/// account already verified the address.
 pub fn issue_link(
     tx: &Transaction<'_>,
     authority: Authority,
     user: UserId,
+    email: Option<&str>,
     now: UnixMillis,
 ) -> Result<IssuedLink> {
     authority.require_platform(tx)?;
-    let (email, invitation) = pending_for(tx, user)?.ok_or(Error::NotFound)?;
+    if !live_user(tx, user)? {
+        return Err(Error::NotFound);
+    }
+    let (email, invitation) = match email {
+        Some(address) => (normalize(address)?, None),
+        None => pending_for(tx, user)?.ok_or(Error::NotFound)?,
+    };
     if verified_elsewhere(tx, &email, user)? {
         return Err(Error::Conflict);
     }
-    let secret = mint(tx, user, &email, invitation, now)?;
+    let secret = mint(tx, user, &email, invitation, now, true)?;
     Ok(IssuedLink {
         email,
         secret,
@@ -685,6 +723,21 @@ pub fn confirm(store: &Store, secret: &Secret, now: UnixMillis) -> Result<Confir
         };
         Ok(Confirmation::Verified { user, joined })
     })
+}
+
+/// The account an operator means by an address: the one that verified it, else
+/// the newest still claiming it. For the host-local CLI, which names accounts.
+pub fn user_by_address(conn: &Connection, address: &str) -> Result<Option<UserId>> {
+    let address = normalize(address)?;
+    let row: Option<[u8; 16]> = conn
+        .prepare_cached(
+            "SELECT id FROM users WHERE email = ?1 AND kind = 0 AND status != 2
+             ORDER BY email_verified_ms IS NULL, created_ms DESC, id LIMIT 1",
+        )?
+        .query_row([&address], |r| r.get(0))
+        .optional()?;
+    row.map(|bytes| UserId::from_bytes(bytes).map_err(|_| Error::Corrupt("user_id")))
+        .transpose()
 }
 
 /// An account's address and whether it is verified.

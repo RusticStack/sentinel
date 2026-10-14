@@ -44,6 +44,7 @@ use crate::{
 
 pub(crate) mod account;
 mod admin;
+mod email;
 mod failure;
 mod views;
 use failure::attempt_failure;
@@ -247,7 +248,10 @@ fn challenge(state: &State, request: &Request, path: &str, error: &ApiError) -> 
     let Some(rest) = path.strip_prefix("/api/v1/") else {
         return Vec::new();
     };
-    if rest.starts_with("hooks/") || rest.starts_with("intake/") || rest == "login" {
+    if rest.starts_with("hooks/")
+        || rest.starts_with("intake/")
+        || matches!(rest, "login" | "register" | "email/verify" | "email/resend")
+    {
         return Vec::new();
     }
     match error.code {
@@ -406,6 +410,9 @@ pub(crate) fn route(
     if let Some(reply) = account::route(state, request, method, &parts) {
         return reply;
     }
+    if let Some(reply) = email::route(state, request, method, &parts) {
+        return reply;
+    }
     if let Some(reply) = admin::route(state, request, method, &parts, query) {
         return reply;
     }
@@ -467,13 +474,20 @@ pub(crate) fn route(
         ("POST", ["api", "v1", "logout"]) => logout(state, request),
         ("GET", ["api", "v1", "me"]) => {
             let who = identify(state, request, false)?;
-            let username = state
+            let (username, address) = state
                 .store
-                .read(|c| local_auth::username_of(c, who.user))
+                .read(|c| {
+                    Ok((
+                        local_auth::username_of(c, who.user)?,
+                        sentinel_store::email::account_email(c, who.user)?,
+                    ))
+                })
                 .map_err(store_error)?;
             ok(json!({
                 "user": who.user.to_string(),
                 "username": username,
+                "email": address.as_ref().map(|(email, _)| email),
+                "email_verified": address.as_ref().is_some_and(|(_, verified)| *verified),
                 "super_admin": who.super_admin,
                 "via": match who.via {
                     auth::Via::Bearer => "bearer",
@@ -987,6 +1001,17 @@ fn login(state: &State, request: &mut Request) -> Route {
     let bytes = public_body_limit(request, MAX_LOGIN_BODY_BYTES)?;
     let creds: LoginBody = parse(&bytes)?;
     // One client's lockout against an account never locks anyone else out.
+    // An email address is one account whatever its case or IDN spelling, so
+    // the guard keys on the canonical form.
+    let identifier = if creds.username.contains('@') {
+        sentinel_store::email::normalize(&creds.username).unwrap_or_else(|_| creds.username.clone())
+    } else {
+        creds.username.clone()
+    };
+    let creds = LoginBody {
+        username: identifier,
+        ..creds
+    };
     let client = crate::oauth::client_of(state, request);
     let now = std::time::Instant::now();
     if !state.logins.allowed(client, &creds.username, now) {

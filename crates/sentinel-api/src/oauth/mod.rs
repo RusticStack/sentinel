@@ -72,6 +72,10 @@ pub(crate) enum Budget {
     /// `POST /api/v1/login`: each attempt is a password hash and a writer
     /// transaction, so a client gets a burst and then a slow refill.
     Login,
+    /// `POST /api/v1/register`: a password hash and a writer transaction.
+    Signup,
+    /// Email resend, verification and invitation links.
+    Mail,
 }
 
 /// Per client at the token endpoint: 10/s, burst 20.
@@ -94,6 +98,14 @@ const METADATA_CEILING: Rate = Rate::per_sec(10, 20);
 const LOGIN_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(3), 10);
 /// All clients together: bounds the hashing the host spends on logins.
 const LOGIN_CEILING: Rate = Rate::per_sec(10, 20);
+/// Self-service sign-ups per client: each is a password hash and a writer
+/// transaction, so burst 5, then one per 20 s; all clients together 2/s.
+const SIGNUP_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(20), 5);
+const SIGNUP_CEILING: Rate = Rate::per_sec(2, 10);
+/// Mail-sending and email-token requests per client (resends, verification
+/// and invitation links): burst 8, then one per 15 s; all clients 5/s.
+const MAIL_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(15), 8);
+const MAIL_CEILING: Rate = Rate::per_sec(5, 20);
 
 /// The authorization server's per-process state.
 pub(crate) struct OAuthState {
@@ -130,6 +142,10 @@ pub(crate) struct OAuthState {
     pub metadata_budget: Mutex<Limiter>,
     /// Password login admission.
     pub login_budget: Mutex<Limiter>,
+    /// Self-service sign-up admission.
+    pub signup_budget: Mutex<Limiter>,
+    /// Email resend, verification and invitation-link admission.
+    pub mail_budget: Mutex<Limiter>,
     /// Bounded in-memory CIMD cache.
     pub client_metadata: client::MetadataCache,
     /// Device-code digest -> (last poll, current interval in ms), bounded by
@@ -175,6 +191,8 @@ impl OAuthState {
             )),
             metadata_budget: Mutex::new(Limiter::new(METADATA_CLIENT, Some(METADATA_CEILING), now)),
             login_budget: Mutex::new(Limiter::new(LOGIN_CLIENT, Some(LOGIN_CEILING), now)),
+            signup_budget: Mutex::new(Limiter::new(SIGNUP_CLIENT, Some(SIGNUP_CEILING), now)),
+            mail_budget: Mutex::new(Limiter::new(MAIL_CLIENT, Some(MAIL_CEILING), now)),
             client_metadata: client::MetadataCache::default(),
             device_polls: Mutex::new(HashMap::new()),
             user_code_failures: Mutex::new(device::WrongCodes::new()),
@@ -378,6 +396,8 @@ pub(crate) fn admitted(state: &State, request: &Request, budget: Budget) -> bool
         Budget::Registration => take(&oauth.registration_budget),
         Budget::Metadata => take(&oauth.metadata_budget),
         Budget::Login => take(&oauth.login_budget),
+        Budget::Signup => take(&oauth.signup_budget),
+        Budget::Mail => take(&oauth.mail_budget),
     }
 }
 
