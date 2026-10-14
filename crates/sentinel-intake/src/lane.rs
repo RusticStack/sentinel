@@ -1,4 +1,4 @@
-//! The bounded resolution lane (G02/G03).
+//! The bounded resolution lane.
 //!
 //! One thread drains work in two phases. **Validation** settles pending
 //! deliveries against the source binding inside one writer transaction.
@@ -109,7 +109,7 @@ pub struct Lane {
 }
 
 impl Lane {
-    /// Start the lane. Without a resolver it only validates (G02's behavior);
+    /// Start the lane. Without a resolver it only validates;
     /// `wake` is called after every dispatched run so the dispatcher places it
     /// immediately.
     pub fn start(

@@ -1,5 +1,5 @@
 //! Dispatch resolution: a ready delivery becomes one immutable run, or an
-//! explicit outcome (G03).
+//! explicit outcome.
 //!
 //! Everything remote happens here, never inside a writer transaction: the
 //! source access is minted, the pipeline file is read from the
@@ -7,7 +7,7 @@
 //! whether it admits the event, and only then does one short transaction
 //! create the run, its jobs, its image pins, its provenance and the
 //! delivery's terminal state. A transient failure (a fetch, a GitHub outage)
-//! retries under the same attempt budget G02 uses; a permanent one settles
+//! retries under the same attempt budget validation uses; a permanent one settles
 //! with a short reason an operator can read.
 //!
 //! Trust is decided before any of that: a pull request whose head lives in
@@ -266,7 +266,7 @@ impl Resolver {
                 );
             }
         };
-        // The deployment's egress policy, as it is now.
+        // The deployment's egress policy, as it is at this moment.
         if !source::destination_allowed(&self.destinations, &binding.metadata.binding.remote) {
             return self.settle(
                 delivery,
@@ -538,7 +538,7 @@ impl Resolver {
         let dispatched = delivery.clone();
         // The run and its ready jobs exist from this write, not from when
         // resolution began: `now` predates the pipeline fetch, and stamping
-        // the jobs with it would count the fetch as queue time (B03).
+        // the jobs with it would count the fetch as queue time.
         let run = match self.store.writer().write(move |tx| {
             intake::dispatch(
                 tx,
@@ -597,9 +597,8 @@ impl Resolver {
                         detail: None,
                     });
                 };
-                // Fork trust: v1 runs only a head that lives in the bound
-                // repository. Hostile fork execution is a later feature, not
-                // an implicit default.
+                // Fork trust: only a head that lives in the bound repository
+                // runs; fork execution is never an implicit default.
                 let Some(bound_repo) = binding.forge.as_ref().map(|f| f.repo) else {
                     // A pull request without an App association is an internal
                     // inconsistency: only the adapter can prove PR metadata.

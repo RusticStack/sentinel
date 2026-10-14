@@ -1,11 +1,11 @@
-//! Opt-in bounded ref polling (G07).
+//! Opt-in bounded ref polling.
 //!
 //! One thread watches `poll_configs` for repositories whose poll has come
 //! due, asks the remote for its heads and tags through `git ls-remote`
 //! (bounded by duration, output size and ref count), and admits every
 //! observed transition as an ordinary `poll`-provider delivery through the
 //! same `intake::accept` a hook uses — validation, dedup, resolution and
-//! dispatch are then G02/G03's own path, unchanged.
+//! dispatch are then the ordinary intake path, unchanged.
 //!
 //! Polling is not a delivery guarantee: an advertisement is a point-in-time
 //! snapshot, so an intermediate push can be missed between polls, and the
