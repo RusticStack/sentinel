@@ -1,4 +1,4 @@
-//! Fleet placement (Q01–Q04): hard CPU/memory/disk/architecture/label
+//! Fleet placement: hard CPU/memory/disk/architecture/label
 //! constraints with an explicit reason when nothing satisfies them, fair
 //! queueing between tenants and repositories, a reserved path for waiting
 //! large jobs and pull-request feedback, host-level reservation across
@@ -730,14 +730,14 @@ fn fill(f: &Fixture, w: WorkerId, elsewhere: Capacity, now: UnixMillis) -> Vec<d
         .unwrap()
 }
 
-/// Q10: a two-tenant burst reaches a mixed fleet and the largest worker is
+/// A two-tenant burst reaches a mixed fleet and the largest worker is
 /// visited first — the order a mid-sweep enqueue or any unlucky sweep order
 /// produces. The six-core job fits only that worker, and all the small work
 /// is older, so the fair order puts it first. Told what the rest of the
 /// fleet can hold, the large worker offers the job only it can run first and
-/// the small work lands on the small workers. Plain `place` (the pre-Q10
-/// behavior) spends the large worker's room on quarter-core jobs, and the
-/// six-core job then waits for capacity nothing in the burst will release.
+/// the small work lands on the small workers. Plain `place` would spend the
+/// large worker's room on quarter-core jobs, and the six-core job would then
+/// wait for capacity nothing in the burst will release.
 #[test]
 fn a_job_only_the_largest_worker_fits_is_not_stranded_by_small_work() {
     let f = fixture();
@@ -848,10 +848,9 @@ jobs:
     steps: [{ id: s, run: 'true' }]
 ";
 
-/// P08-1: two queued runs of a serializing group used to exclude each other
-/// (each saw the other's live job) and neither ever placed. The older run
-/// goes first; the newer waits with `ConcurrencyLimit` exactly as long as the
-/// older is live, then goes.
+/// Two queued runs of a serializing group do not exclude each other: the
+/// older run goes first; the newer waits with `ConcurrencyLimit` exactly as
+/// long as the older is live, then goes.
 #[test]
 fn two_queued_runs_of_a_serial_group_both_run_in_order() {
     let f = fixture();
@@ -871,7 +870,7 @@ fn two_queued_runs_of_a_serial_group_both_run_in_order() {
     assert_eq!(second.job, later[0]);
 }
 
-/// P08-1: a group is a (tenant, repository, key) lock, as documented — a
+/// A group is a (tenant, repository, key) lock — a
 /// sibling repository's run of the same group name does not wait.
 #[test]
 fn a_concurrency_group_is_held_per_repository() {
@@ -893,8 +892,8 @@ fn a_concurrency_group_is_held_per_repository() {
     assert!(placed.contains(&mine[0]) && placed.contains(&theirs[0]));
 }
 
-/// P08-1: two `cancel_in_progress` runs created in the same millisecond used
-/// to survive together (a strict `<` cancelled neither); exactly one does.
+/// Two `cancel_in_progress` runs created in the same millisecond: exactly one
+/// survives (a strict `<` would cancel neither).
 #[test]
 fn same_millisecond_superseding_runs_leave_exactly_one() {
     let f = fixture();
@@ -917,8 +916,8 @@ jobs:
     assert_eq!(state(&f, second[0]), JobState::Queued);
 }
 
-/// P08-2: a large job waiting in another tenant's dedicated pool used to hold
-/// half of this pool's worker idle.
+/// A large job waiting in another tenant's dedicated pool does not hold half
+/// of this pool's worker idle.
 #[test]
 fn a_large_job_in_another_pool_reserves_nothing_here() {
     let f = fixture();
@@ -929,8 +928,8 @@ fn a_large_job_in_another_pool_reserves_nothing_here() {
     assert_eq!(fill_all(&f, w, f.pool, at(2_200)).len(), 16);
 }
 
-/// P08-2: an 8-core job no worker here can ever run (arm64 on an x86_64
-/// fleet) used to reserve its path for up to the six-hour queue timeout.
+/// An 8-core job no worker here can ever run (arm64 on an x86_64 fleet) does
+/// not reserve its path for up to the six-hour queue timeout.
 #[test]
 fn an_unrunnable_large_job_reserves_nothing() {
     let f = fixture();
@@ -946,8 +945,8 @@ fn an_unrunnable_large_job_reserves_nothing() {
     assert_eq!(fill_all(&f, w, f.pool, at(2_200)).len(), 16);
 }
 
-/// P08-2: a pull-request job this worker cannot run (it needs a label the
-/// worker lacks) used to keep a quarter of the host idle anyway.
+/// A pull-request job this worker cannot run (it needs a label the worker
+/// lacks) does not keep a quarter of the host idle.
 #[test]
 fn an_unrunnable_pull_request_job_reserves_nothing() {
     let f = fixture();
@@ -964,8 +963,8 @@ fn an_unrunnable_pull_request_job_reserves_nothing() {
     assert_eq!(fill_all(&f, w, f.pool, at(2_200)).len(), 8);
 }
 
-/// P08-3: the pull-request reserve summed every identity on the host, so two
-/// identities reserved half the machine instead of a quarter.
+/// The pull-request reserve is per host, not per identity: two identities on
+/// one host reserve a quarter of the machine, not half.
 #[test]
 fn the_pull_request_reserve_counts_the_host_once() {
     let f = fixture();
@@ -981,9 +980,9 @@ fn the_pull_request_reserve_counts_the_host_once() {
     assert!(placed.iter().any(|o| o.run == pr));
 }
 
-/// P08-4: labels were filtered after a per-tenant `LIMIT 32`, so forty `gpu`
-/// jobs hid a plain job from an idle worker and the explanation said
-/// `Capacity`. Labels are now part of the candidate scan.
+/// Labels are part of the candidate scan, not filtered after a per-tenant
+/// `LIMIT 32`: forty `gpu` jobs must not hide a plain job from an idle worker
+/// (the explanation would say `Capacity`).
 #[test]
 fn label_mismatched_jobs_never_hide_a_fitting_one() {
     let f = fixture();
@@ -1001,9 +1000,9 @@ fn label_mismatched_jobs_never_hide_a_fitting_one() {
     assert_eq!(offer.job, plain[0]);
 }
 
-/// P08-4: the same head-of-line hiding for jobs held for locality: forty
-/// jobs wait for a warm worker, and a job no worker has warm is still found
-/// behind them by paging past the held rows.
+/// Jobs held for locality do not hide others either: forty jobs wait for a
+/// warm worker, and a job no worker has warm is still found behind them by
+/// paging past the held rows.
 #[test]
 fn locality_held_jobs_never_hide_a_placeable_one() {
     let f = fixture();
@@ -1028,7 +1027,7 @@ fn locality_held_jobs_never_hide_a_placeable_one() {
     assert_eq!(offer.job, fresh);
 }
 
-/// P08-5: repository fairness inside a tenant. Repository A queued twenty
+/// Repository fairness inside a tenant. Repository A queued twenty
 /// jobs before repository B's one; B's job is placed second, not
 /// twenty-first.
 #[test]
@@ -1049,7 +1048,7 @@ fn a_repository_backlog_does_not_starve_its_siblings() {
     assert_eq!(second.job, theirs[0], "then the idle repository");
 }
 
-/// Q09's noisy tenant, with demand above capacity so the decision is
+/// A noisy tenant, with demand above capacity so the decision is
 /// observable: tenant A queues forty jobs first, tenant B four; a worker
 /// with room for eight gives B its four within the first eight.
 #[test]
@@ -1064,7 +1063,7 @@ fn a_noisy_tenant_does_not_crowd_out_a_quiet_one() {
     assert_eq!(placed.iter().filter(|o| o.tenant == quiet).count(), 4);
 }
 
-/// P08-6: expected completion, not the lease. A warm worker running a job
+/// Expected completion, not the lease. A warm worker running a job
 /// whose timeout reaches past the locality window is not about to free —
 /// renewal keeps its lease inside the window forever — so a cold worker
 /// takes the job at once.
@@ -1083,7 +1082,7 @@ fn a_busy_warm_worker_with_long_work_does_not_hold_a_cold_job() {
     assert_eq!(place(&f, cold, pool, at(2_300)).unwrap().job, target[0]);
 }
 
-/// P08-7: revocation fences the live session's attempts at once. The
+/// Revocation fences the live session's attempts at once. The
 /// revoked worker can no longer acknowledge, renew, report or publish, and
 /// the dispatcher's sweep settles what it held: the acknowledged attempt
 /// `Reconciled` (never replayed), the unacknowledged offer back to the queue.
@@ -1165,7 +1164,7 @@ fn a_revoked_worker_holds_nothing_and_its_attempts_are_settled() {
     );
 }
 
-/// P08-7 across the Part 04 paths: a revoked worker is served no run spec
+/// Revocation across the other paths: a revoked worker is served no run spec
 /// (which carries source access), cannot hand an acknowledged attempt back,
 /// and names no remote-cache boundary — each refused like a stranger's.
 #[test]
@@ -1226,7 +1225,7 @@ fn a_revoked_worker_gets_no_spec_hand_back_or_cache_boundary() {
     );
 }
 
-/// P08-13: a lease that has passed cannot be renewed back to life, and an
+/// A lease that has passed cannot be renewed back to life, and an
 /// attempt renewed between the sweep's read and its write is not expired.
 #[test]
 fn a_passed_lease_stays_expired_and_a_renewed_one_is_not_expired() {
@@ -1272,8 +1271,6 @@ fn a_passed_lease_stays_expired_and_a_renewed_one_is_not_expired() {
     assert_eq!(state(&f, a.job), JobState::Terminal(Outcome::InfraFailed));
 }
 
-// ——— bounded image prefetch (K05, B04) ———
-
 fn hints(f: &Fixture, workers: &[WorkerId]) -> Vec<(WorkerId, Vec<String>)> {
     let workers = workers.to_vec();
     f.store
@@ -1316,7 +1313,7 @@ fn pinned_run(
         .unwrap()
 }
 
-/// K05's placement payoff. A job whose image one busy worker holds warm is
+/// Prefetch placement payoff. A job whose image one busy worker holds warm is
 /// passed over by the idle cold worker (the bounded locality hold). The
 /// prefetch pass hints exactly that idle worker — not the warm one — and
 /// once its profile reports the image, the next placement puts the job on

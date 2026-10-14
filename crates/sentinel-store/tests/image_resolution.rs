@@ -1,4 +1,4 @@
-//! Parts 01–02 audit gate C05/W03: a job is admitted to execution only once
+//! A job is admitted to execution only once
 //! its image digest and platform are durably resolved, written once.
 
 use sentinel_core::{Actor, Event, RepoId, RunId, TenantId, UnixMillis, WorkerId};

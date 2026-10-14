@@ -1,4 +1,4 @@
-//! A02 behavior: host-local bootstrap, local login, opaque sessions, expiry and
+//! Behavior: host-local bootstrap, local login, opaque sessions, expiry and
 //! revocation, CSRF/cookie policy, audited recovery and last-admin protection.
 
 use sentinel_auth::{cookie, secret::Secret};
