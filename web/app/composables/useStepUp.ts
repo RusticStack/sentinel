@@ -18,7 +18,6 @@ export const needsStepUp = (e: unknown): e is ApiError => e instanceof ApiError 
 export function useStepUp() {
   const overlay = useOverlay();
   const session = useSession();
-  const dialog = overlay.create(StepUpModal, { destroyOnClose: true });
 
   return async function withStepUp<T>(call: () => Promise<T>): Promise<T> {
     try {
@@ -26,7 +25,9 @@ export function useStepUp() {
     } catch (e) {
       if (!needsStepUp(e)) throw e;
       const me = session.me.value;
-      const confirmed = await dialog.open({ mfa: !!me?.mfa, password: !!me?.username });
+      // One overlay per prompt: one created with `destroyOnClose` is gone
+      // after it closes and cannot be opened again.
+      const confirmed = await overlay.create(StepUpModal, { destroyOnClose: true }).open({ mfa: !!me?.mfa, password: !!me?.username });
       if (!confirmed) throw new StepUpDeclined();
       if (session.me.value) session.me.value.stepped_up = true;
       return await call();

@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import type { Grant, Member } from "~~/shared/types/api";
-import ShowOnceModal from "~/components/ShowOnceModal.vue";
 
 // Service accounts (O06): principals confined to this tenant that never sign
 // in. Creating one, giving it repository access and issuing it a credential
@@ -10,7 +9,7 @@ const props = defineProps<{ slug: string }>();
 const api = useApi();
 const act = useAct();
 const { ready, withReason } = useOverride(() => props.slug);
-const showOnce = useOverlay().create(ShowOnceModal, { destroyOnClose: true });
+const showOnce = useShowOnce();
 
 const { data, refresh } = await useAsyncData(`service-accounts-${props.slug}`, async () => {
   const page = await api<{ members: Member[]; next: string | null }>(`/api/v1/tenants/${props.slug}/members?limit=100`);
@@ -77,7 +76,7 @@ async function issueGrant(m: Member) {
     api<{ grant: string; refresh_token: string; expires_ms: number }>(`/api/v1/tenants/${props.slug}/service-accounts/${m.user}/grants`, { method: "POST", body }));
   if (!issued) return;
   f.name = "";
-  await showOnce.open({
+  await showOnce({
     title: `Credential for ${m.display_name}`,
     description: `A refresh token for ${body.scope}, valid until ${new Date(issued.expires_ms).toISOString().slice(0, 10)}. It is shown this once.`,
     secrets: [issued.refresh_token],

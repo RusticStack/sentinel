@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import type { Security } from "~~/shared/types/api";
-import ShowOnceModal from "~/components/ShowOnceModal.vue";
 
 // The signed-in person's own security: an authenticator app (enroll with a
 // QR code or the key, confirm with a code, recovery codes shown once and
@@ -13,7 +12,7 @@ const session = useSession();
 const toast = useToast();
 const withStepUp = useStepUp();
 const endSession = useEndSession();
-const showOnce = useOverlay().create(ShowOnceModal, { destroyOnClose: true });
+const showOnce = useShowOnce();
 
 const { data: security, error: loadError, refresh, status } = await useAsyncData("account-security", () => api<Security>("/api/v1/me/security"));
 const github = computed(() => security.value?.identities.find((i) => i.provider === "github") ?? null);
@@ -93,7 +92,7 @@ async function confirmEnroll() {
       session.me.value.mfa = true;
       session.me.value.stepped_up = true;
     }
-    await showOnce.open({
+    await showOnce({
       title: "Save your recovery codes",
       description: "Each code confirms it's you once if the authenticator is not at hand.",
       secrets: done.recovery_codes,
@@ -120,7 +119,7 @@ async function reissue() {
   reissuing.value = true;
   try {
     const fresh = await withStepUp(() => api<{ recovery_codes: string[] }>("/api/v1/mfa/recovery-codes", { method: "POST", body: {} }));
-    await showOnce.open({
+    await showOnce({
       title: "Your new recovery codes",
       description: "The earlier codes no longer work.",
       secrets: fresh.recovery_codes,
