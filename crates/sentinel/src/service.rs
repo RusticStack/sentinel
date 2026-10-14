@@ -1602,7 +1602,7 @@ struct Maintenance {
 
 #[cfg(feature = "server")]
 impl Maintenance {
-    fn start(store: Arc<sentinel_store::Store>) -> std::io::Result<Maintenance> {
+    fn start(store: Arc<sentinel_store::Store>, data_dir: PathBuf) -> std::io::Result<Maintenance> {
         let (stop, wake) = mpsc::sync_channel::<()>(0);
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let thread = std::thread::Builder::new()
@@ -1611,6 +1611,7 @@ impl Maintenance {
                 tracing::dispatcher::with_default(&dispatch, || {
                     let mut interval = MAINTENANCE_INTERVAL;
                     while let Err(mpsc::RecvTimeoutError::Timeout) = wake.recv_timeout(interval) {
+                        retire_setup_file(&store, &data_dir);
                         interval = if purge_expired(&store, PURGE_BATCH) {
                             BACKLOG_INTERVAL
                         } else {
@@ -1642,7 +1643,9 @@ fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
     // Idempotency keys are stamped by the deadline clock (the API's run
     // creation), so their TTL is judged on it; everything else is wall time.
     let steady = sentinel_core::UnixMillis::steady();
-    let purges: [(&str, Purge, sentinel_core::UnixMillis); 7] = [
+    let purges: [(&str, Purge, sentinel_core::UnixMillis); 8] = [
+        // The first-run token: gone once setup closed or the token expired.
+        ("setup", sentinel_store::setup::purge, wall),
         ("oauth", sentinel_store::oauth::purge_expired, wall),
         ("api_tokens", sentinel_store::tokens::purge_expired, wall),
         ("sessions", sentinel_store::local_auth::purge_expired, wall),
@@ -2048,30 +2051,37 @@ fn start_server(
     // Before the API serves: a request that mints a link queues its message
     // only when a lane will drain it, which the store row records.
     let mail = start_mail(&config, public_url.as_deref(), &store, key.as_ref())?;
-    let api = sentinel_api::Server::start(sentinel_api::Config {
-        listen: api_listen,
-        store: Arc::clone(&store),
-        logs: Arc::clone(&logs),
-        objects,
-        controller: controller.handle(),
-        secret_key: key.clone(),
-        sessions: sentinel_store::local_auth::Policy::default(),
-        github_webhook_secret,
-        intake: Some(lane.waker()),
-        public_url,
-        github_sign_in,
-        trusted_proxies: match trusted_proxies {
-            // Validated when the configuration was read.
-            Some(proxies) => proxies
-                .iter()
-                .filter_map(|proxy| sentinel_api::TrustedProxy::parse(proxy))
-                .collect(),
-            None => sentinel_api::TrustedProxy::loopback(),
+    announce_setup(&config.data_dir, &store)?;
+    // `auto_join` is the integration point for `SENTINEL_AUTO_JOIN_DOMAINS`:
+    // rules the operator configured, for the read-only organization settings.
+    let options = sentinel_api::Options::default();
+    let api = sentinel_api::Server::start_with(
+        sentinel_api::Config {
+            listen: api_listen,
+            store: Arc::clone(&store),
+            logs: Arc::clone(&logs),
+            objects,
+            controller: controller.handle(),
+            secret_key: key.clone(),
+            sessions: sentinel_store::local_auth::Policy::default(),
+            github_webhook_secret,
+            intake: Some(lane.waker()),
+            public_url,
+            github_sign_in,
+            trusted_proxies: match trusted_proxies {
+                // Validated when the configuration was read.
+                Some(proxies) => proxies
+                    .iter()
+                    .filter_map(|proxy| sentinel_api::TrustedProxy::parse(proxy))
+                    .collect(),
+                None => sentinel_api::TrustedProxy::loopback(),
+            },
         },
-    })
+        options,
+    )
     .map_err(|error| Error::runtime(format!("cannot listen on {api_listen}: {error}")))?;
     tracing::info!(event = "api_listening", addr = %api.local_addr(), issuer = %api.issuer());
-    let maintenance = Maintenance::start(Arc::clone(&store))
+    let maintenance = Maintenance::start(Arc::clone(&store), config.data_dir.clone())
         .map_err(|error| Error::runtime(format!("cannot start maintenance: {error}")))?;
     Ok(Running::Server {
         controller,
@@ -2088,6 +2098,90 @@ fn start_server(
         replicator,
         backups,
     })
+}
+
+/// First-run setup: while no super admin exists, issue a one-time setup token
+/// and show it to the host operator, and only to them: a `0600` file in the
+/// data directory and one console line. Once an administrator exists (the
+/// wizard or `sentinel admin bootstrap`) no token is issued and a stale file
+/// is removed. A restart while setup is still open issues a new token and
+/// voids the old one.
+#[cfg(feature = "server")]
+fn announce_setup(data_dir: &Path, store: &sentinel_store::Store) -> Result<(), Error> {
+    let path = data_dir.join(sentinel_store::setup::TOKEN_FILE);
+    let issued = sentinel_store::setup::issue(store, sentinel_core::UnixMillis::now())
+        .map_err(|error| Error::runtime(format!("cannot issue the setup token: {error}")))?;
+    let Some(token) = issued else {
+        remove_setup_file(&path);
+        return Ok(());
+    };
+    let mut text = String::new();
+    token.expose(&mut text);
+    write_owner_only(&path, text.as_bytes())
+        .map_err(|error| Error::runtime(format!("cannot write {}: {error}", path.display())))?;
+    // The one place a credential is logged, by design: the token is for
+    // whoever can read this host's console or data directory, it expires in
+    // an hour and is dead once setup completes. It is never logged again.
+    tracing::warn!(
+        event = "setup_required",
+        token = %text,
+        file = %path.display(),
+        expires_in_secs = sentinel_store::setup::TOKEN_TTL_MS / 1000,
+        "first-run setup is open: present this token to the setup wizard, or run `sentinel admin bootstrap` instead"
+    );
+    sentinel_auth::secret::wipe_string(&mut text);
+    Ok(())
+}
+
+/// Create `path` readable by its owner alone, replacing any earlier file (a
+/// new inode, so an old mode or a planted link is never reused).
+#[cfg(feature = "server")]
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+#[cfg(feature = "server")]
+fn remove_setup_file(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => tracing::info!(event = "setup_token_file_removed"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(event = "setup_token_file_remove_failed", error = %error);
+        }
+    }
+}
+
+/// Maintenance: drop the token file once the token is no longer good (setup
+/// completed, or it expired).
+#[cfg(feature = "server")]
+fn retire_setup_file(store: &sentinel_store::Store, data_dir: &Path) {
+    let path = data_dir.join(sentinel_store::setup::TOKEN_FILE);
+    if fs::symlink_metadata(&path).is_err() {
+        return;
+    }
+    // An unreadable answer keeps the file: removing it is only ever safe once
+    // the token is known dead.
+    let live = store
+        .read(|c| sentinel_store::setup::token_live(c, sentinel_core::UnixMillis::now()))
+        .unwrap_or(true);
+    if !live {
+        remove_setup_file(&path);
+    }
 }
 
 /// Start the mail lane when SMTP is configured, and record in the store

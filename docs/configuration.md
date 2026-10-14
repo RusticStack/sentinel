@@ -255,6 +255,10 @@ printf '%s' "$OPERATOR_PASSWORD" | ./target/release/sentinel admin bootstrap    
 printf '%s' "$NEW_PASSWORD" | ./target/release/sentinel admin recover     --data-dir "$PWD/data/controller" --username root
 ```
 
+### First-run setup without a shell
+
+A controller that starts while no super admin exists is in **setup mode**: it mints a one-time setup token and shows it only on the host, as a `0600` file `<data_dir>/setup-token` and one `setup_required` log line (the one place a credential is logged, by design; it expires in an hour and dies with setup). The web interface offers its first-run wizard while `GET /api/v1/setup` says `{"open":true}`, and the wizard asks for that token. `sentinel admin bootstrap` above stays available and closes the same latch; whichever finishes first wins and the other is refused. Nothing in setup is configuration: the choices (registration policy, `tenant_creation`, instance name and base URL, first organization) are stored in the database and audited, and the controller's `public_url` remains what links and the OAuth issuer are built on. Run an open-setup controller behind the reverse proxy only when its console is not shared; [admission](admission.md#first-run-setup) has the brute-force bounds.
+
 Scoped, expiring API credentials are provisioned the same way, and the secret is the only thing written to stdout:
 
 ```sh

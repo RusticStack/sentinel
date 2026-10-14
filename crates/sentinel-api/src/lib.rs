@@ -94,7 +94,7 @@ const _: () = assert!(
 /// party, and however many anonymous or signed-in callers ask.
 pub const OUTBOUND: usize = 1;
 const _: () = assert!(
-    WORKERS - TRANSFERS - 2 * OUTBOUND >= 1,
+    WORKERS - TRANSFERS - 3 * OUTBOUND >= 1,
     "keep a handler permit for control requests"
 );
 
@@ -163,7 +163,31 @@ pub struct Config {
     pub trusted_proxies: Vec<TrustedProxy>,
 }
 
+/// One operator rule of `SENTINEL_AUTO_JOIN_DOMAINS`: addresses at `domain`
+/// (canonical, exact) join the app-created organization `organization`.
+/// Parsing and applying the rules is not this crate's business; it only
+/// reports, read-only, whether a rule names an organization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoJoinRule {
+    pub domain: String,
+    pub organization: String,
+}
+
+/// Settings a deployment may add without every embedder spelling them out.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// The operator's auto-join rules, for the organization settings route.
+    pub auto_join: Vec<AutoJoinRule>,
+}
+
 pub(crate) struct State {
+    /// The operator's auto-join rules ([`Options::auto_join`]).
+    pub auto_join: Vec<AutoJoinRule>,
+    /// First-run SMTP tests in flight, a budget of their own ([`OUTBOUND`]).
+    pub setup_mail: Outbound,
+    /// Set once the first-run latch is seen closed; it never reopens, so the
+    /// status route stops asking the store.
+    pub setup_closed: AtomicBool,
     pub store: Arc<Store>,
     pub logs: Arc<LogStore>,
     pub objects: Arc<Objects>,
@@ -287,6 +311,11 @@ pub struct Server {
 
 impl Server {
     pub fn start(config: Config) -> std::io::Result<Server> {
+        Server::start_with(config, Options::default())
+    }
+
+    /// [`Server::start`] with the optional [`Options`].
+    pub fn start_with(config: Config, options: Options) -> std::io::Result<Server> {
         let listener = std::net::TcpListener::bind(config.listen)?;
         let addr = listener.local_addr()?;
         let issuer = match config.public_url {
@@ -306,6 +335,9 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let proxies = config.trusted_proxies.clone();
         let state = Arc::new(State {
+            auto_join: options.auto_join,
+            setup_mail: Outbound::default(),
+            setup_closed: AtomicBool::new(false),
             store: config.store,
             logs: config.logs,
             objects: config.objects,

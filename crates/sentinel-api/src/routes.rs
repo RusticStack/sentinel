@@ -46,6 +46,7 @@ pub(crate) mod account;
 mod admin;
 mod email;
 mod failure;
+mod setup;
 mod views;
 use failure::attempt_failure;
 
@@ -250,7 +251,10 @@ fn challenge(state: &State, request: &Request, path: &str, error: &ApiError) -> 
     };
     if rest.starts_with("hooks/")
         || rest.starts_with("intake/")
-        || matches!(rest, "login" | "register" | "email/verify" | "email/resend")
+        || matches!(
+            rest,
+            "login" | "register" | "email/verify" | "email/resend" | "setup" | "setup/smtp-test"
+        )
     {
         return Vec::new();
     }
@@ -408,6 +412,9 @@ pub(crate) fn route(
         return reply;
     }
     if let Some(reply) = account::route(state, request, method, &parts) {
+        return reply;
+    }
+    if let Some(reply) = setup::route(state, request, method, &parts) {
         return reply;
     }
     if let Some(reply) = email::route(state, request, method, &parts) {

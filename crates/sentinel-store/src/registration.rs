@@ -49,7 +49,7 @@ pub enum TenantCreation {
     /// Only a super admin, for organizations and personal namespaces alike.
     SuperAdminOnly = 0,
     /// An approved account may create its own personal namespace (one each,
-    /// enforced by the schema). Organizations remain a platform decision.
+    /// enforced by the schema) and its own organizations, within quotas.
     ApprovedUsers = 1,
 }
 
@@ -840,7 +840,7 @@ pub fn register(
 /// A username for an account that registered by address: `user-` and twelve
 /// hex digits of a fresh identifier. Not secret and not meant to be typed;
 /// the address is the login identifier.
-fn generated_username(user: UserId) -> String {
+pub(crate) fn generated_username(user: UserId) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut name = String::with_capacity(17);
     name.push_str("user-");
