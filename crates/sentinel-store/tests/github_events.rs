@@ -736,7 +736,7 @@ fn a_repository_refresh_verifies_or_revokes_under_the_sequence_fence() {
     assert_eq!(target.installation_external, INSTALLATION);
     // Verified: nothing revoked, the row is parked for the next period.
     let tx = f.conn.transaction().unwrap();
-    github_events::apply_repository(&tx, &work, target.repo, false, NOW).unwrap();
+    github_events::apply_repository(&tx, &work, target.repo, target.version, false, NOW).unwrap();
     tx.commit().unwrap();
     assert!(!binding_state(&f, f.repo).0);
     let parked = f
@@ -753,9 +753,145 @@ fn a_repository_refresh_verifies_or_revokes_under_the_sequence_fence() {
     );
     // Changed or gone: the binding is revoked under the same fence.
     let tx = f.conn.transaction().unwrap();
-    github_events::apply_repository(&tx, &work, target.repo, true, NOW).unwrap();
+    github_events::apply_repository(&tx, &work, target.repo, target.version, true, NOW).unwrap();
     tx.commit().unwrap();
     assert!(binding_state(&f, f.repo).0);
+}
+
+#[test]
+fn a_revocation_never_lands_on_a_binding_that_changed_since_it_was_read() {
+    let mut f = fixture();
+    let tx = f.conn.transaction().unwrap();
+    github_events::seed(&tx, NOW).unwrap();
+    tx.commit().unwrap();
+    let work = f
+        .conn
+        .query_row(
+            "SELECT id,kind,seq,attempts FROM github_refresh WHERE kind=1",
+            [],
+            |r| {
+                Ok(github_events::Refresh {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    seq: r.get(2)?,
+                    attempts: r.get(3)?,
+                })
+            },
+        )
+        .unwrap();
+    let target = github_events::repo_target(&f.conn, &work.id)
+        .unwrap()
+        .expect("a bound repository");
+    // The binding is rebound (version moves) while GitHub is being asked.
+    f.conn
+        .execute(
+            "UPDATE source_bindings SET version = version + 1 WHERE repo_id = ?1",
+            [f.repo.as_bytes()],
+        )
+        .unwrap();
+    let tx = f.conn.transaction().unwrap();
+    github_events::apply_repository(&tx, &work, target.repo, target.version, true, NOW).unwrap();
+    tx.commit().unwrap();
+    assert!(
+        !binding_state(&f, f.repo).0,
+        "the verdict was about the old binding, not the new one"
+    );
+
+    // The installation pass is fenced the same way.
+    let bound = github_events::bound_repositories(&f.conn, &target.installation).unwrap();
+    assert_eq!(bound.len(), 1);
+    let (repo, _, _, version) = bound[0].clone();
+    f.conn
+        .execute(
+            "UPDATE source_bindings SET version = version + 1 WHERE repo_id = ?1",
+            [f.repo.as_bytes()],
+        )
+        .unwrap();
+    let install = f
+        .conn
+        .query_row(
+            "SELECT id,kind,seq,attempts FROM github_refresh WHERE kind=0",
+            [],
+            |r| {
+                Ok(github_events::Refresh {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    seq: r.get(2)?,
+                    attempts: r.get(3)?,
+                })
+            },
+        )
+        .unwrap();
+    let tx = f.conn.transaction().unwrap();
+    github_events::apply_installation(
+        &tx,
+        &install,
+        Snapshot {
+            external_id: INSTALLATION,
+            account_id: ACCOUNT,
+            login: "account",
+            personal: false,
+            suspended: false,
+            permissions_valid: true,
+            expected: 0,
+        },
+        &[(repo, version)],
+        NOW,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(
+        !binding_state(&f, f.repo).0,
+        "a stale version revokes nothing"
+    );
+}
+
+#[test]
+fn a_row_that_keeps_failing_is_pushed_out_and_then_quarantined() {
+    let mut f = fixture();
+    let tx = f.conn.transaction().unwrap();
+    github_events::seed(&tx, NOW).unwrap();
+    tx.commit().unwrap();
+    let mut work = github_events::due(&f.conn, NOW).unwrap().unwrap();
+    let mut last = 0;
+    for _ in 0..(github_events::QUARANTINE_AFTER + 2) {
+        let tx = f.conn.transaction().unwrap();
+        github_events::settled(&tx, &work, NOW, true).unwrap();
+        tx.commit().unwrap();
+        let (attempts, next): (u32, i64) = f
+            .conn
+            .query_row(
+                "SELECT attempts,next_ms FROM github_refresh WHERE id=?1",
+                [work.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(next > NOW.0, "a failed row is never left due");
+        assert!(next >= last, "the back-off never shrinks");
+        last = next;
+        work.attempts = attempts;
+    }
+    assert!(
+        last >= NOW.0 + 60 * 60 * 1000,
+        "a row that failed {} times waits an hour: {}",
+        work.attempts,
+        last - NOW.0
+    );
+}
+
+#[test]
+fn an_unreadable_binding_is_reported_as_corrupt_not_as_absent() {
+    let f = fixture();
+    f.conn
+        .execute(
+            "UPDATE source_bindings SET binding = x'00ff' WHERE repo_id = ?1",
+            [f.repo.as_bytes()],
+        )
+        .unwrap();
+    assert!(matches!(
+        github_events::repo_target(&f.conn, f.repo.as_bytes()),
+        Err(Error::Corrupt(_))
+    ));
 }
 
 #[test]

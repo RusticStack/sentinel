@@ -32,7 +32,7 @@ use sentinel_github::{
     app::{App, Installation, InstallationRepo, RepoState, Token},
     checks::repository_path,
 };
-use sentinel_store::{Store, github_events, sources_forge};
+use sentinel_store::{Error as StoreError, Store, github_events, sources_forge};
 
 /// How long before expiry a cached reconciliation token is replaced.
 const TOKEN_MARGIN_MS: i64 = 120_000;
@@ -169,13 +169,26 @@ fn run(
             0 => worker.installation(&work),
             _ => worker.repository(&work),
         };
-        failures = 0;
+        // "store" means the pass could not record its outcome, so the row is
+        // still due: back off instead of picking it again at once.
+        let unrecorded = outcome == STORE;
+        if unrecorded {
+            failures = failures.saturating_add(1);
+        } else {
+            failures = 0;
+        }
         notice(&Notice {
             kind: work.kind,
             outcome,
         });
+        if unrecorded {
+            wait(settled, backoff(config, failures));
+        }
     }
 }
+
+/// The outcome of a pass whose result the store would not take.
+const STORE: &str = "store";
 
 /// What minting a reconciliation token resolved to.
 enum TokenOutcome {
@@ -247,6 +260,18 @@ impl Worker {
         if retry { "retry" } else { "settled" }
     }
 
+    /// A read of the row's target failed. A value the store cannot decode (a
+    /// corrupt binding blob, say) is a fact about this row, not a passing
+    /// fault: parking it under the retry back-off, which turns into a
+    /// quarantine, keeps it from being picked again at once and starving every
+    /// other row. Any other error is the store being unavailable.
+    fn unreadable(&self, work: &github_events::Refresh, error: &StoreError) -> String {
+        match error {
+            StoreError::Corrupt(_) => self.settle(work, true).into(),
+            _ => STORE.into(),
+        }
+    }
+
     /// The row's target vanished; drop it, fenced by the read sequence.
     fn finish(&self, work: &github_events::Refresh) -> &'static str {
         let work = *work;
@@ -270,7 +295,7 @@ impl Worker {
         {
             Ok(Some(target)) => target,
             Ok(None) => return self.finish(work).into(),
-            Err(_) => return "store".into(),
+            Err(error) => return self.unreadable(work, &error),
         };
         let mut installed = match self
             .app
@@ -338,20 +363,24 @@ impl Worker {
         &mut self,
         installed: &Installation,
         installation_row: &[u8; 16],
-    ) -> Result<Vec<sentinel_core::RepoId>, ()> {
+    ) -> Result<Vec<(sentinel_core::RepoId, i64)>, ()> {
+        // The bindings are read first, with their versions: GitHub's list is
+        // then at least as new as the set it is compared with, so a binding
+        // created after this read can never be judged absent. Each revocation
+        // is fenced on the version read here.
+        let bound = self
+            .store
+            .read(|c| github_events::bound_repositories(c, installation_row))
+            .map_err(|_| ())?;
         let token = self
             .app
             .reconciliation_token(installed, UnixMillis::now().0)
             .map_err(|_| ())?;
         let list = self.app.installation_repositories(&token).map_err(|_| ())?;
-        let bound = self
-            .store
-            .read(|c| github_events::bound_repositories(c, installation_row))
-            .map_err(|_| ())?;
         let observed: HashMap<u64, &InstallationRepo> =
             list.repos.iter().map(|repo| (repo.id, repo)).collect();
         let mut revoked = Vec::new();
-        for (repo, forge_id, remote) in bound {
+        for (repo, forge_id, remote, version) in bound {
             match observed.get(&forge_id) {
                 // An approved remote never follows a rename, transfer or
                 // archival: only an exact `owner/name` match stays bound.
@@ -360,11 +389,11 @@ impl Worker {
                         .map(|(owner, name)| seen.full_name == format!("{owner}/{name}"))
                         .unwrap_or(false);
                     if !approved || seen.archived {
-                        revoked.push(repo);
+                        revoked.push((repo, version));
                     }
                 }
                 // A truncated list proves membership, never absence.
-                None if !list.truncated => revoked.push(repo),
+                None if !list.truncated => revoked.push((repo, version)),
                 None => {}
             }
         }
@@ -377,7 +406,7 @@ impl Worker {
             Ok(Some(target)) => target,
             // The binding was revoked or never existed: nothing to verify.
             Ok(None) => return self.finish(work).into(),
-            Err(_) => return "store".into(),
+            Err(error) => return self.unreadable(work, &error),
         };
         let token = match self.token(target.installation_external, UnixMillis::now()) {
             TokenOutcome::Ready(token) => token,
@@ -419,12 +448,19 @@ impl Worker {
             .repository_state(&token, target.forge_repo, &target.remote, target.account)
         {
             Ok(RepoState::Verified) => {
-                let (work, repo) = (*work, target.repo);
+                let (work, repo, version) = (*work, target.repo, target.version);
                 if self
                     .store
                     .writer()
                     .write(move |tx| {
-                        github_events::apply_repository(tx, &work, repo, false, UnixMillis::now())
+                        github_events::apply_repository(
+                            tx,
+                            &work,
+                            repo,
+                            version,
+                            false,
+                            UnixMillis::now(),
+                        )
                     })
                     .is_err()
                 {
@@ -433,12 +469,19 @@ impl Worker {
                 "verified".into()
             }
             Ok(state) => {
-                let (work, repo) = (*work, target.repo);
+                let (work, repo, version) = (*work, target.repo, target.version);
                 if self
                     .store
                     .writer()
                     .write(move |tx| {
-                        github_events::apply_repository(tx, &work, repo, true, UnixMillis::now())
+                        github_events::apply_repository(
+                            tx,
+                            &work,
+                            repo,
+                            version,
+                            true,
+                            UnixMillis::now(),
+                        )
                     })
                     .is_err()
                 {

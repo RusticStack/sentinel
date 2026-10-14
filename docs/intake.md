@@ -240,8 +240,12 @@ parked run watch — is taken only when a pending delivery is due. Faults are
 isolated per delivery: one whose resolution hits a store fault is parked
 under its own retry schedule (`retried:store_fault`, same attempt budget) and
 the pass continues, so one delivery can never hold every other tenant's work
-behind it. Only a store that cannot even record that backs the lane off,
-from 1 s to 30 s.
+behind it. Each validation runs under its own savepoint, so a constraint or
+decode failure from SQLite while resolving or settling one delivery undoes only
+that delivery's writes and parks it the same way, instead of rolling back the
+whole batch and failing on the same delivery forever; a busy, full or failing
+database still fails the pass. Only a store that cannot even record that backs
+the lane off, from 1 s to 30 s.
 
 **Phase one, validation**, runs inside one writer transaction against the
 binding **as it is now**:

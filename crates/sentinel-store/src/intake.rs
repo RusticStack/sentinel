@@ -899,13 +899,24 @@ pub fn resolve_due(
     let due = due(tx, State::Pending, now, limit)?;
     let mut settled = Vec::with_capacity(due.len());
     for delivery in due {
-        match validate(tx, &delivery) {
+        // Each delivery runs under its own savepoint: a fault in one row
+        // undoes only that row's writes, so it is retried on its own
+        // schedule instead of rolling back, and re-failing, the whole batch.
+        tx.execute_batch("SAVEPOINT resolve_one")?;
+        let attempt = validate(tx, &delivery).and_then(|resolution| {
+            settle(tx, delivery.id, resolution, now)?;
+            Ok(resolution)
+        });
+        match attempt {
             Ok(resolution) => {
-                settle(tx, delivery.id, resolution, now)?;
+                tx.execute_batch("RELEASE resolve_one")?;
                 settled.push((delivery.id, resolution));
             }
-            Err(Error::Sqlite(e)) => return Err(Error::Sqlite(e)),
+            // The database itself is unwell (busy, full, I/O): nothing here
+            // is the delivery's fault, so the whole pass fails.
+            Err(Error::Sqlite(e)) if !is_row_fault(&e) => return Err(Error::Sqlite(e)),
             Err(_) => {
+                tx.execute_batch("ROLLBACK TO resolve_one; RELEASE resolve_one")?;
                 let exhausted = Resolution::Failed("resolution_attempts");
                 if retry(tx, delivery.id, now, exhausted)? == Retry::Exhausted {
                     settled.push((delivery.id, exhausted));
@@ -914,6 +925,18 @@ pub fn resolve_due(
         }
     }
     Ok(settled)
+}
+
+/// Whether a SQLite error is about one row's data (a violated constraint, a
+/// value that does not decode) rather than the database being unavailable.
+fn is_row_fault(error: &rusqlite::Error) -> bool {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _) => matches!(
+            failure.code,
+            rusqlite::ErrorCode::ConstraintViolation | rusqlite::ErrorCode::TypeMismatch
+        ),
+        _ => true,
+    }
 }
 
 /// Create the immutable run for a ready delivery: the compiled spec, one job

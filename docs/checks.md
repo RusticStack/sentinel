@@ -95,13 +95,26 @@ Retries, refusals and rate limits are explicit:
 - **transient** (a transport failure, a GitHub 5xx): the row is scheduled again
   with doubling back-off from one second to five minutes, inside an attempt
   budget of eight; the budget's exhaustion settles the row as refused with
-  `attempts`;
+  `attempts`. A **completed** check is the final status a required check gates
+  on, so it gets a longer budget: forty attempts with the ceiling raised to
+  fifteen minutes, which rides out an outage of about seven and a half hours;
+- **exhausted final status**: a completed check refused with `attempts` is put
+  back in the queue with a fresh budget **once per lane start** (only rows
+  settled within the last seven days, at most 1000 per start), so a long
+  outage followed by a restart still delivers the verdict, and a permanently
+  failing row costs one budget per restart rather than retrying forever;
 - **rate limit** (403/429 with `Retry-After`, or `X-RateLimit-Remaining: 0`
-  with a reset): the whole lane pauses until the reset (at most one hour,
-  slept in bounded pieces so shutdown stays prompt) and the current generation
-  is scheduled for the same time; a 429 without timing headers pauses for one minute;
+  with a reset): GitHub limits per installation, so only that installation is
+  parked. Its rows are deferred until the reset (at most one hour) **without
+  spending an attempt**, and every other installation keeps publishing; a 429
+  without timing headers parks for one minute;
+- **poison rows**: a row whose outcome cannot be written (the store rejects the
+  update three passes in a row) is parked for an hour instead of retried at the
+  head of the queue, so one bad row never blocks other checks or tenants. A
+  generation that moved under the publisher is simply re-read;
 - **permanent** (403 without rate-limit evidence, update/create 404, 422): the row records the
-  bounded reason and is not retried. A later state change starts a fresh
+  bounded reason (never empty; a blank GitHub message is recorded as
+  `invalid request`) and is not retried. A later state change starts a fresh
   generation and tries once more;
 - **token expiry**: a 401 drops the cached repository token and retries; the
   next attempt mints a new one. Repeated 401s exhaust the same eight-attempt budget.
@@ -147,6 +160,18 @@ desired generation follows a publication whose last delivered status was
 so the publisher *creates* a fresh check run, under the new generation's
 identity, instead of PATCHing or adopting a dead one. The run's in-progress phase is then
 visible on GitHub, which a reopened-then-ignored update never was.
+
+"Delivered" is what the store recorded, not what the previous desired state
+was. A completed generation that never reached GitHub (it is still pending or
+backing off) leaves the remote run live, so the handle and create mark are
+kept and the next attempt updates that run; dropping them would orphan an
+in-progress run and create a duplicate.
+
+Recording the desired state is idempotent: a draft whose status, conclusion,
+title and summary equal the stored ones changes nothing — the generation, the
+retry schedule and the delivery cursor stay put — so a re-record cannot restart
+a backing-off row or re-send what GitHub already has. A *refused* row is the
+exception: a fresh event for it re-arms it.
 
 A late completion from a superseded attempt cannot reach GitHub at all: the
 store's job fence refuses the report before any check row moves.
@@ -199,6 +224,31 @@ schedule.
 - A verified installation 404 disables it and revokes every binding that
   trusted it — a reinstalled App is a new identity. Every other failure is
   transport-class: retried under bounded back-off, never a revocation.
+- **Revocations are fenced on the binding's version.** The pass reads the bound
+  set with each binding's version *before* it asks GitHub, and the revocation
+  applies only while the binding still has that version: a repository rebound
+  between the read and the write keeps its new binding, and the next periodic
+  pass judges it afresh.
+- **A poison row cannot spin the lane.** Every pass outcome moves the row's
+  `next_ms` into the future. A target the store cannot decode (a corrupt
+  binding blob) is parked under the retry back-off like any failed pass, and
+  after twelve failures the row waits an hour between attempts; a pass that
+  could not record its outcome at all backs the lane off instead of picking the
+  same row again at once.
+
+A rerequest resets each job with a compare-and-set on the terminal state it
+just read, so a job that moved is never overwritten.
+
+**Receipt retention.** A control-event receipt is kept at least 30 days
+whatever retention an operator asks for, then purged. A signed delivery
+replayed after that is processed again, which is accepted deliberately:
+GitHub redelivers for days, not months; a replayed lifecycle event only
+enqueues an authenticated refresh or revokes (the safe direction, and the next
+pass re-verifies); and a replayed rerequest reruns at most the newest terminal
+run of a ref (older runs are `active_or_superseded`), within the 64-candidate
+cap. Keeping receipts forever would trade an unbounded table for protection
+against a captured signed payload whose replay can only do the above, so the
+bound stays.
 
 ## Configuration
 
@@ -231,7 +281,14 @@ holds at most 1024 repository tokens, evicting the earliest expiry at capacity.
   per job, transitions moving both, manual runs publishing nothing, a settled
   event's completed check (and the outcomes that publish nothing), revoked
   bindings and tag objects, retry/backoff/exhaustion, stale generations and the
-  recorded handle, identity immutability and ownership.
+  recorded handle, identity immutability and ownership, the completed-check
+  budget and its once-per-start re-arm, a throttle parking without spending an
+  attempt, idempotent re-records and handle retention until a completed state
+  is delivered, and a blank refusal reason stored as a non-empty one.
+- `crates/sentinel-checks/tests/lane.rs`: a retry or throttle that exhausts the
+  budget reported as refused, a throttle parking rows without spending
+  attempts, one throttled scope not stopping the others, and a row whose store
+  writes keep failing quarantined without blocking the lane.
 - `crates/sentinel-github` unit tests: repository-path parsing, payload bounds,
   conclusion/status parsing and the exact
   permission set of a checks token.
