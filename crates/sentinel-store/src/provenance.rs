@@ -246,6 +246,23 @@ pub fn cache_trust(
     Ok(Trust::derive(&trigger, verified, exact))
 }
 
+/// Whether a run may be handed secret plaintext. Only a run with recorded
+/// non-manual provenance qualifies: intake builds its pipeline from the file
+/// at a bound revision of the repository, which the repository's writers
+/// control. A manual run's pipeline was authored by the caller of a `run`
+/// grant, so it never receives secrets; a run without provenance cannot be
+/// classified and fails closed the same way.
+pub fn may_receive_secrets(conn: &Connection, run: RunId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT trigger != 'manual'
+             FROM run_provenance WHERE run_id = ?1",
+        )?
+        .query_row([run.as_bytes()], |r| r.get(0))
+        .optional()?
+        .unwrap_or(false))
+}
+
 /// One run's provenance; `None` for a run created before this contract
 /// (or by a path that does not record it).
 pub fn of_run(conn: &Connection, run: RunId) -> Result<Option<RunProvenance>> {

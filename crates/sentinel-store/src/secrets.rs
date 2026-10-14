@@ -1319,6 +1319,28 @@ fn prepare(
             encoded: encode_bundle(&DeliveryBundle::empty())?,
         });
     }
+    // A caller-authored (manual) pipeline never receives secrets, whatever
+    // the bindings say: bindings match any job and step, so the run's
+    // provenance is the only thing that separates a repository's own pipeline
+    // from one a `run` grant submitted. The refusal is audited as `denied`.
+    if !crate::provenance::may_receive_secrets(tx, run)? {
+        let (step, name) = declared_targets(compiled)
+            .next()
+            .map(|(step, name)| (step.to_owned(), name.to_owned()))
+            .ok_or(Error::Corrupt("secret declaration"))?;
+        *refusal = Some(AuditedRefusal {
+            tenant,
+            repo,
+            step,
+            name,
+            refused: Refused {
+                secret: None,
+                version: 0,
+                denied: true,
+            },
+        });
+        return Err(Error::Forbidden);
+    }
     let (protocol, capabilities): (i64, i64) = tx
         .prepare_cached(
             "SELECT protocol,capabilities FROM workers WHERE id=?1 AND revoked_ms IS NULL",
@@ -1453,6 +1475,24 @@ fn prepare(
     })
 }
 
+/// Every `(step, name)` the job declares in resolution order: the registry
+/// credential (empty step) first, then each step's variables and files.
+fn declared_targets(
+    compiled: &sentinel_pipeline::CompiledJob,
+) -> impl Iterator<Item = (&str, &str)> {
+    compiled
+        .spec
+        .registry_auth
+        .iter()
+        .map(|name| ("", name.as_str()))
+        .chain(compiled.spec.steps.iter().flat_map(|step| {
+            step.secrets
+                .iter()
+                .chain(step.secret_files.iter().map(|file| &file.name))
+                .map(|name| (step.id.as_str(), name.as_str()))
+        }))
+}
+
 /// Why a declared secret could not be delivered to an acknowledged
 /// attempt, value-free (P10D-7): what the attempt's failure detail says.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1510,20 +1550,15 @@ pub fn refuse_delivery(
     else {
         return Err(Error::Corrupt("job spec index"));
     };
-    let mut declared: Vec<(&str, &str)> = Vec::new();
-    if let Some(name) = &compiled.spec.registry_auth {
-        declared.push(("", name));
+    if !crate::provenance::may_receive_secrets(tx, run)?
+        && let Some((_, name)) = declared_targets(compiled).next()
+    {
+        return Ok(Some(Refusal {
+            fence: Fence(fence as u64),
+            detail: format!("secret {name}: withheld from a manual run"),
+        }));
     }
-    for step in &compiled.spec.steps {
-        for name in step
-            .secrets
-            .iter()
-            .chain(step.secret_files.iter().map(|file| &file.name))
-        {
-            declared.push((&step.id, name));
-        }
-    }
-    for (step, name) in declared {
+    for (step, name) in declared_targets(compiled) {
         let reason = match resolve(tx, repo, &job_name, step, name) {
             Ok(_) => continue,
             Err(Error::NotFound) => None,
