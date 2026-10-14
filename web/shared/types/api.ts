@@ -15,7 +15,38 @@ export interface Me {
   mfa: boolean;
 }
 
-export interface TenantChoice { slug: string; role: Role }
+/** A personal namespace (one account's own) or an organization. */
+export type NamespaceKind = "personal" | "organization";
+/** Where an organization's membership comes from: Sentinel (invitations,
+ *  administrators, the operator's domain rules) or GitHub. */
+export type MembershipSource = "app" | "github";
+
+/** A namespace the caller belongs to (`GET /tenants`); `kind` and
+ *  `membership` are absent from older controllers. */
+export interface TenantChoice { slug: string; role: Role; kind?: NamespaceKind; membership?: MembershipSource }
+
+/** `GET /tenants/{slug}/settings`. */
+export interface NamespaceSettings {
+  slug: string;
+  kind: NamespaceKind;
+  membership: MembershipSource;
+  github_installation: boolean;
+  role: Role | null;
+  created_ms: number;
+  /** The caller's own standing, for a GitHub-backed organization. */
+  github_sync?: { confirmed_ms: number | null; check_due: boolean; unanswered: number };
+  /** Administrators only: the operator's read-only domain rule. */
+  auto_join?: { applies: boolean; domains: string[] };
+}
+
+/** An invitation as metadata (`GET /tenants/{slug}/invitations`); never a secret. */
+export interface Invitation {
+  id: string;
+  email: string | null;
+  role: Role | null;
+  expires_ms: number;
+  state: "pending" | "redeemed" | "revoked" | "expired";
+}
 
 /** `GET /me/security`: what the account page shows, metadata only. */
 export interface Security {

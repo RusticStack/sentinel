@@ -203,17 +203,17 @@ export function parseDraft(text: string | null, maxStep: number): WizardDraft {
 
 // --- A member's standing in a GitHub-backed organization --------------------
 
-export interface GitHubSync { confirmed_ms: number | null; check_queued: boolean; unanswered: number }
+export interface GitHubSync { confirmed_ms: number | null; check_due: boolean; unanswered: number }
 
 export type Standing = "confirmed" | "checking" | "unknown" | "unconfirmed";
 
 /// How to describe the caller's own GitHub-derived access: `unknown` when
 /// GitHub has failed to answer (access kept for the grace period, nothing new
-/// granted), `checking` while a check is queued, `confirmed` once GitHub has
-/// confirmed it, `unconfirmed` when it has not yet.
-export function standing(sync: GitHubSync | undefined | null): Standing {
+/// granted), `checking` while a check is waiting to run, `confirmed` once
+/// GitHub has confirmed it, `unconfirmed` when it never has.
+export function githubStanding(sync: GitHubSync | undefined | null): Standing {
   if (!sync) return "unconfirmed";
   if (sync.unanswered > 0) return "unknown";
-  if (sync.check_queued && sync.confirmed_ms === null) return "checking";
-  return sync.confirmed_ms === null ? "unconfirmed" : sync.check_queued ? "checking" : "confirmed";
+  if (sync.check_due) return "checking";
+  return sync.confirmed_ms === null ? "unconfirmed" : "confirmed";
 }

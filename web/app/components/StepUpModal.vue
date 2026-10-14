@@ -19,10 +19,7 @@ const impossible = !props.mfa && !props.password;
 const code = ref("");
 const error = ref("");
 const busy = ref(false);
-const waitUntil = ref(0);
-const now = ref(Date.now());
-let ticker: ReturnType<typeof setInterval> | undefined;
-const waiting = computed(() => Math.max(0, Math.ceil((waitUntil.value - now.value) / 1000)));
+const { waiting, start: wait } = useRetryWait();
 const input = useTemplateRef<{ inputRef?: HTMLInputElement }>("input");
 
 const field = computed(() => method.value === "totp"
@@ -37,17 +34,7 @@ watch(method, () => {
   nextTick(() => input.value?.inputRef?.focus());
 });
 
-function wait(ms: number) {
-  waitUntil.value = Date.now() + ms;
-  now.value = Date.now();
-  clearInterval(ticker);
-  ticker = setInterval(() => {
-    now.value = Date.now();
-    if (now.value >= waitUntil.value) clearInterval(ticker);
-  }, 1000);
-}
 onBeforeUnmount(() => {
-  clearInterval(ticker);
   code.value = "";
 });
 
@@ -75,7 +62,7 @@ async function submit() {
       return;
     }
     if (err.code === "rate_limited") {
-      wait(Number(err.details?.retry_after_ms ?? 2000));
+      wait(err);
       error.value = `Too many attempts. Try again in ${retryAfter(err)}.`;
     } else if (err.code === "forbidden" && err.details?.step_up) {
       error.value = method.value === "totp"
