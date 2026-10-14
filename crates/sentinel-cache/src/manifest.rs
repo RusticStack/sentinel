@@ -50,18 +50,14 @@ impl Boundary {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Compat {
-    Downloads {
-        tool: String,
-    },
+    Downloads { tool: String },
     Dependencies {
         lock: [u8; 32],
         installer: String,
         flags: String,
         abi: String,
     },
-    Compiler {
-        flags: String,
-    },
+    Compiler { flags: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
