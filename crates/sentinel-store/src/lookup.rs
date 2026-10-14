@@ -1,26 +1,10 @@
-//! Unauthorized name resolution: "which row does this name mean".
-//!
-//! Trusted controller internals, like [`crate::auth::provisioning`]: these
-//! functions perform no authorization. The host-local administration command
-//! uses them freely, because it can already open the database file.
-//!
-//! A client route may use one only as the first half of an authorization
-//! decision taken in the same snapshot, where the second half answers
-//! `NotFound` for a denied row exactly as for an absent one (for example
-//! `repo_by_name` followed by [`crate::auth::require_repo`]). Nothing a
-//! route returns may depend on the lookup alone: a route that would answer
-//! differently for "exists but not yours" and "does not exist" must resolve
-//! through [`crate::auth`] instead ([`crate::auth::member_tenant_by_slug`],
-//! [`crate::auth::narrowing_by_name`]), which checks live membership in the
-//! resolving statement.
+//! Unauthorized name resolution: a route may use these only as the first half of an authorization decision in one snapshot.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sentinel_core::{RepoId, TenantId, UserId};
 
 use crate::{Error, Result};
 
-/// The account behind a local login name, whatever its status: an operator
-/// approving or rejecting an application names it the same way.
 pub fn user_by_username(conn: &Connection, username: &str) -> Result<UserId> {
     let bytes: [u8; 16] = conn
         .prepare_cached("SELECT user_id FROM local_credentials WHERE username = ?1")?
@@ -30,13 +14,10 @@ pub fn user_by_username(conn: &Connection, username: &str) -> Result<UserId> {
     UserId::from_bytes(bytes).map_err(|_| Error::Corrupt("user_id"))
 }
 
-/// Confirm that an account exists and is active, without revealing anything else.
 pub fn active_user(conn: &Connection, user: UserId) -> Result<()> {
     exists(conn, user, "active = 1")
 }
 
-/// Confirm that an account exists at all, whatever its status. Pending and
-/// rejected accounts are exactly the ones an operator needs to name.
 pub fn known_user(conn: &Connection, user: UserId) -> Result<()> {
     exists(conn, user, "1 = 1")
 }
@@ -50,7 +31,6 @@ fn exists(conn: &Connection, user: UserId, predicate: &str) -> Result<()> {
     if found { Ok(()) } else { Err(Error::NotFound) }
 }
 
-/// The active namespace with this canonical slug.
 pub fn tenant_by_slug(conn: &Connection, slug: &str) -> Result<TenantId> {
     let bytes: [u8; 16] = conn
         .prepare_cached("SELECT id FROM tenants WHERE slug = ?1 AND active = 1")?
@@ -60,7 +40,6 @@ pub fn tenant_by_slug(conn: &Connection, slug: &str) -> Result<TenantId> {
     TenantId::from_bytes(bytes).map_err(|_| Error::Corrupt("tenant_id"))
 }
 
-/// The active tenant's canonical slug for an already tenant-bound principal.
 /// Callers must still authorize every requested repository or resource.
 pub fn tenant_slug(conn: &Connection, tenant: TenantId) -> Result<String> {
     conn.prepare_cached("SELECT slug FROM tenants WHERE id = ?1 AND active = 1")?
@@ -69,8 +48,7 @@ pub fn tenant_slug(conn: &Connection, tenant: TenantId) -> Result<String> {
         .ok_or(Error::NotFound)
 }
 
-/// A namespace by slug whatever its state: an operator lifting a suspension
-/// must be able to name a suspended tenant.
+/// Deliberately ignores `active`: an operator lifting a suspension must be able to name a suspended tenant.
 pub fn tenant_by_slug_any(conn: &Connection, slug: &str) -> Result<TenantId> {
     let bytes: [u8; 16] = conn
         .prepare_cached("SELECT id FROM tenants WHERE slug = ?1")?
@@ -80,8 +58,6 @@ pub fn tenant_by_slug_any(conn: &Connection, slug: &str) -> Result<TenantId> {
     TenantId::from_bytes(bytes).map_err(|_| Error::Corrupt("tenant_id"))
 }
 
-/// A pool by its unique name.
-/// The tenant a job belongs to, for host-local commands that name a job.
 pub fn job_tenant(conn: &Connection, job: sentinel_core::JobId) -> Result<sentinel_core::TenantId> {
     let tenant: [u8; 16] = conn
         .prepare_cached("SELECT tenant_id FROM jobs WHERE id = ?1")?
@@ -91,7 +67,6 @@ pub fn job_tenant(conn: &Connection, job: sentinel_core::JobId) -> Result<sentin
     sentinel_core::TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))
 }
 
-/// The tenant a run belongs to.
 pub fn run_tenant(conn: &Connection, run: sentinel_core::RunId) -> Result<sentinel_core::TenantId> {
     let tenant: [u8; 16] = conn
         .prepare_cached("SELECT tenant_id FROM runs WHERE id = ?1")?
@@ -101,7 +76,6 @@ pub fn run_tenant(conn: &Connection, run: sentinel_core::RunId) -> Result<sentin
     sentinel_core::TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))
 }
 
-/// The repository a run belongs to.
 pub fn run_repo(conn: &Connection, run: sentinel_core::RunId) -> Result<RepoId> {
     let repo: [u8; 16] = conn
         .prepare_cached("SELECT repo_id FROM runs WHERE id = ?1")?
@@ -111,7 +85,6 @@ pub fn run_repo(conn: &Connection, run: sentinel_core::RunId) -> Result<RepoId> 
     RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))
 }
 
-/// The run a job belongs to.
 pub fn job_run(conn: &Connection, job: sentinel_core::JobId) -> Result<sentinel_core::RunId> {
     let run: [u8; 16] = conn
         .prepare_cached("SELECT run_id FROM jobs WHERE id = ?1")?
@@ -121,7 +94,6 @@ pub fn job_run(conn: &Connection, job: sentinel_core::JobId) -> Result<sentinel_
     sentinel_core::RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))
 }
 
-/// The job an attempt belongs to.
 pub fn attempt_job(
     conn: &Connection,
     attempt: sentinel_core::AttemptId,
@@ -143,8 +115,6 @@ pub fn pool_by_name(conn: &Connection, name: &str) -> Result<sentinel_core::Pool
     sentinel_core::PoolId::from_bytes(bytes).map_err(|_| Error::Corrupt("pool id"))
 }
 
-/// The tenant that owns a repository, whatever the tenant's state: an
-/// operator listing intake records must be able to name a suspended tenant.
 pub fn repo_tenant(
     conn: &Connection,
     repo: sentinel_core::RepoId,
@@ -157,7 +127,6 @@ pub fn repo_tenant(
     sentinel_core::TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))
 }
 
-/// A repository by name inside one tenant; the pair is the unique key.
 pub fn repo_by_name(conn: &Connection, tenant: TenantId, name: &str) -> Result<RepoId> {
     let bytes: [u8; 16] = conn
         .prepare_cached("SELECT id FROM repos WHERE tenant_id = ?1 AND name = ?2")?
