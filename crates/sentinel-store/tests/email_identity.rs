@@ -644,15 +644,23 @@ fn an_email_invitation_joins_only_when_its_mailbox_is_verified() {
     ));
 
     // The addressed person registers with the link and the mailbox...
-    let user = f.user_of(f.sign_up("guest@example.com", secret, None));
-    // ...but holds nothing until the mailbox is proved.
+    let user = match f.sign_up("guest@example.com", secret, None) {
+        Admission::Pending(user) => user,
+        other => panic!("an address-bound invitation admits only on proof: {other:?}"),
+    };
+    // ...but holds nothing, and is not even an active account, until the
+    // mailbox is proved: a leaked link alone yields neither.
     assert_eq!(f.role_in(f.tenant, user), 0);
+    assert!(!f.sign_in("guest@example.com"));
     let link = f.link(user, None, 20);
     match f.confirm(&link, 21) {
         Confirmation::Verified { joined, .. } => assert_eq!(joined, Some(f.tenant)),
         other => panic!("{other:?}"),
     }
     assert_eq!(f.role_in(f.tenant, user), Role::Reader as i64);
+    // The proof was the admission.
+    assert!(f.sign_in("guest@example.com"));
+    assert!(f.events().contains(&Event::RegistrationAdmitted));
 
     // One use: the link is spent, and a second person cannot take it.
     assert!(matches!(

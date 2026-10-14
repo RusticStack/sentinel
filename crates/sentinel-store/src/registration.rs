@@ -640,7 +640,26 @@ pub(crate) fn redeem_verified(
     {
         return Ok(None);
     }
-    redeem(tx, &invitation, user, now)
+    let joined = redeem(tx, &invitation, user, now)?;
+    if joined.is_some() {
+        // The invitation was the approval, and its mailbox is now proved: an
+        // account that registered with it waits no longer.
+        let admitted = tx.execute(
+            "UPDATE users SET status = 1, active = 1 WHERE id = ?1 AND kind = 0 AND status = 0",
+            [user.as_bytes()],
+        )?;
+        if admitted == 1 {
+            audit(
+                tx,
+                Event::RegistrationAdmitted,
+                None,
+                Some(user),
+                false,
+                None,
+            )?;
+        }
+    }
+    Ok(joined)
 }
 
 /// What presenting an invitation as an existing account did.
@@ -960,9 +979,12 @@ pub fn register_with(
             return refuse(tx, Refusal::AlreadyRegistered);
         }
 
-        // An invitation is itself the approval; without one, an application
-        // under `ApprovalRequired` waits.
-        let approved = redeemed.is_some() || deferred.is_some();
+        // A link-form invitation is itself the approval; without one, an
+        // application under `ApprovalRequired` waits. One addressed to a
+        // mailbox admits only when that mailbox is proved
+        // ([`redeem_verified`]), so a leaked link alone yields no active
+        // account.
+        let approved = redeemed.is_some();
         let user = UserId::new();
         tx.execute(
             "INSERT INTO users(id, display_name, created_ms, status, active, email)
