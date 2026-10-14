@@ -1,32 +1,4 @@
-//! The write path: what a finished attempt leaves behind. One
-//! writer per entry stages the job's private views under
-//! `<entry>/writing/gen-*`, seals the generation with its manifest, then
-//! promotes it by same-directory rename and swaps `current` atomically —
-//! a reader never sees a half-built generation, and a canceled or crashed
-//! writer never publishes a partial one.
-//!
-//! Trust scope is authorization: a publish writes only into the
-//! attachment's own scope directory, and `commit` refuses an attachment
-//! whose scope trust is not the job's. There is no cross-trust promotion
-//! — an untrusted publish can only ever produce entries of its own class.
-//!
-//! The job's views are read confined (`confined`): every declared target
-//! is resolved beneath the worker-owned workspace anchor without following
-//! a symlink at any component, and every file is reopened by descriptor
-//! with `O_NOFOLLOW` — a job cannot redirect publication at host files by
-//! planting or racing a link. An entry whose restore was refused
-//! (`invalid`) or whose key never rendered publishes nothing.
-//!
-//! Publication is bounded in bytes as well as files: a generation over
-//! [`MAX_GENERATION_BYTES`] of logical payload is refused before a byte is
-//! staged, a filesystem without room for the copy plus a reserve is
-//! refused the same way, and a sparse file is copied hole-for-hole so a
-//! mostly-empty file never amplifies into dense writes.
-//!
-//! Incremental reuse rides the source generation the job cloned from: a
-//! file whose digest matches the source's listing is staged by hardlink
-//! (one inode, no copy) and re-verified before seal, so a corrupted
-//! generation can never poison the next one.
+//! Job views are reopened beneath the workspace anchor with `O_NOFOLLOW`, so a job cannot redirect publication at host files.
 
 use std::{
     collections::HashMap,
@@ -51,77 +23,37 @@ use crate::{
     scope,
 };
 
-/// The deadline finalization gives the whole publish batch
-/// (docs/cache.md). The verdict's outcome never depends on it; its report
-/// waits for it, so the bound is minutes, not the job's own budget.
 pub const CACHE_PUBLISH_TIMEOUT: Duration = Duration::from_secs(3 * 60);
-
-/// The most logical payload one generation may carry: a quarter of the
-/// store's byte budget (`gc::DEFAULT_BUDGET_BYTES`), checked against the
-/// planned sizes before anything is staged.
 pub const MAX_GENERATION_BYTES: u64 = crate::gc::DEFAULT_BUDGET_BYTES / 4;
-
-/// Free space a publish always leaves on the store's filesystem beyond
-/// what its copy needs — 5 % of the filesystem, at most this much:
-/// concurrent attempts, log spools and mirrors share the disk.
 pub const FREE_SPACE_RESERVE: u64 = 1 << 30;
-
-/// Cancel and deadline are polled every this many walked or staged files.
 const CHECK_EVERY: u32 = 256;
-/// The deepest a payload walk descends: the `hash_files` traversal bound.
-/// Shared with restore, since a sealed generation never holds a deeper tree.
 pub(crate) const MAX_WALK_DEPTH: usize = 64;
-/// Stream block for hashing and copying; one buffer per commit.
 const COPY_BYTES: usize = 1 << 20;
-/// Copied files whose durability is settled one by one; past this many a
-/// commit flushes the store's filesystem once instead (`syncfs`), so a
-/// 100k-file generation pays one barrier, not 100k.
 const SYNC_FDS: usize = 64;
-/// Staging for the `current` swap: `current.tmp` then a rename. Shared with
-/// the remote path, which promotes a hydrated generation the same way.
 pub(crate) const CURRENT_TMP: &str = "current.tmp";
 
-/// What a commit did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Published {
-    /// A new generation was sealed and is now `current`.
     Sealed {
-        /// The `gen-*` directory name under the entry.
         generation: String,
-        /// Files the sealed `files` blob lists.
         files: u32,
-        /// Total payload bytes listed.
         bytes: u64,
-        /// Of `bytes`, how much was staged from the source generation
-        /// (hardlinked and verified) instead of copied from the job.
         reused_bytes: u64,
-        /// Entries the walk saw but did not stage: non-regular files,
-        /// symlinks, unencodable paths, files that vanished mid-publish.
         skipped: u64,
     },
-    /// Nothing was committed; the reason is stable vocabulary for logs.
     Skipped(SkipReason),
 }
 
-/// Why a commit published nothing. Not an error: the job already ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkipReason {
-    /// Another writer holds the entry's staging lock.
     Busy,
-    /// The attempt's cancel flag or the publish deadline stopped it.
     Canceled,
-    /// Every declared path produced zero files — nothing worth keeping.
     Empty,
-    /// The staged listing is identical to the source generation's — the
-    /// bytes are already published under an older generation.
     Unchanged,
-    /// Restore refused the entry (`invalid`: a declared path that cannot
-    /// serve, or a key that never rendered); a refused path is never walked.
     Refused,
 }
 
 impl SkipReason {
-    /// The stable lowercase spelling for logs.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Busy => "busy",
@@ -133,23 +65,12 @@ impl SkipReason {
     }
 }
 
-/// Every failure mode of a commit; a failed publish is a diagnostic, never
-/// a build failure.
 #[derive(Debug)]
 pub enum PublishError {
-    /// The attachment's scope trust is not the job's — refused before a
-    /// single directory was made. There is no cross-trust promotion.
     TrustMismatch,
-    /// The caller's deadline passed mid-commit; staging was removed.
     TimedOut,
-    /// The generation would exceed the `files` blob's bounds or
-    /// [`MAX_GENERATION_BYTES`]; refused before staging.
     TooLarge,
-    /// The store's filesystem has no room for the copy plus
-    /// [`FREE_SPACE_RESERVE`]; refused before staging.
     NoSpace,
-    /// The staging lock could not be taken for a reason other than a live
-    /// writer (which is `Skipped(Busy)` instead).
     Lock(LeaseError),
     Io(std::io::Error),
 }
@@ -178,8 +99,6 @@ impl From<LeaseError> for PublishError {
     }
 }
 
-/// How a stage stops short: cancellation is a `Skipped` answer, anything
-/// else a typed error. The caller drops the staging dir either way.
 enum Stop {
     Canceled,
     Failed(PublishError),
@@ -195,14 +114,6 @@ impl From<PublishError> for Stop {
     }
 }
 
-/// Commit one attached cache: stage the job's writable views as a sealed
-/// generation under the entry's scope and make it `current`. `trust` is
-/// the job's own — the publish is authorized only where the scope agrees.
-/// `deadline` and `cancel` bound the work; both are checked before
-/// staging and every `CHECK_EVERY` files inside it.
-///
-/// The caller is expected to hold `attached.lease`: it pins the source
-/// generation the reuse path reads.
 pub fn commit(
     cache_root: &Path,
     attached: &Attached,
@@ -214,29 +125,17 @@ pub fn commit(
     if attached.scope.trust != trust {
         return Err(PublishError::TrustMismatch);
     }
-    // What restore refused is never walked; an empty key could never serve
-    // (`Manifest::validate` refuses it).
     if attached.key.is_empty() || attached.outcome == Outcome::Miss(Miss::Invalid) {
         return Ok(Published::Skipped(SkipReason::Refused));
     }
     if cancel() || Instant::now() >= deadline {
         return Ok(Published::Skipped(SkipReason::Canceled));
     }
-    // Must match restore's derivation.
     let entry = attached
         .scope
         .entry_dir(cache_root, entry_key(attached.scope.class, &attached.key));
-    // One writer per entry: the lock never waits, a live one is `Busy`,
-    // and a dead writer's is reaped in place. The commit also pins its
-    // entry like a reader, so reclamation never removes it (source
-    // generation included) under a writer.
-    //
-    // Collection renames an unpinned entry aside, judges it again and puts
-    // it back if a pin landed meanwhile. A pin taken in that window moves
-    // with the entry, and a lock taken while it is away creates a fresh
-    // entry directory the put-back cannot replace, leaving the pin guarding
-    // nothing. So the pin is checked in place once the lock is held and
-    // retaken when it went with the old directory.
+    // Collection can move an entry aside while a pin is being taken, so the pin is re-checked under the lock.
+    // A pin that went with the old directory is retaken, otherwise it guards nothing.
     let mut turns = 3;
     let (_pin, _lock) = loop {
         let pin = Lease::acquire(&entry, "publish", crate::lease::DEFAULT_TTL)?;
@@ -272,53 +171,33 @@ pub fn commit(
         Err(Stop::Failed(e)) => Err(e),
     };
     if !matches!(out, Ok(Published::Sealed { .. })) {
-        // Promotion never ran.
         let _ = fs::remove_dir_all(&staging);
     }
     out
 }
 
-/// One file seen in a target, decided but not yet staged.
 struct Planned {
-    /// Which confined base the file is reopened beneath (`Plan::bases`).
     base: usize,
-    /// The file's path beneath that base, `/`-separated.
     rel: String,
-    /// The `payload/<i>/<rel>` path: the `files` entry name and the path
-    /// inside the generation.
     entry: String,
     size: u64,
     mode: u32,
-    /// Holes carry most of the file: copy it hole-for-hole.
     sparse: bool,
-    /// The job file's digest, computed only when the source generation
-    /// lists this path at the same size: the reuse proof.
     digest: Option<[u8; 32]>,
 }
 
-/// What the plan stage accumulates.
 struct Plan<'a> {
-    /// `payload/…` → the source generation's listing entry.
     listed: HashMap<&'a str, &'a FileEntry>,
     planned: Vec<Planned>,
-    /// The confined directories planned files are reopened beneath: one
-    /// per directory target, or the workspace anchor for a file target.
     bases: Vec<Base>,
-    /// Logical payload bytes planned so far, against [`MAX_GENERATION_BYTES`].
     bytes: u64,
-    /// Non-regular, unencodable or vanished entries, for diagnostics.
     skipped: u64,
-    /// Walked or staged files since the last cancel/deadline poll.
     since_check: u32,
-    /// Every planned file already matches the source listing.
     unchanged: bool,
-    /// The one copy/hash block this commit uses, allocated on first use.
     buf: Vec<u8>,
 }
 
 impl Plan<'_> {
-    /// The periodic guard: cancel before the deadline, so a canceled
-    /// writer is a `Skipped(Canceled)` even when it also ran out of time.
     fn check(&self, deadline: Instant, cancel: &dyn Fn() -> bool) -> Result<(), Stop> {
         if cancel() {
             return Err(Stop::Canceled);
@@ -345,8 +224,6 @@ impl Plan<'_> {
         &mut self.buf
     }
 
-    /// Bytes the copy will actually write: everything not provably
-    /// reusable from the source generation.
     fn copy_bytes(&self) -> u64 {
         self.planned
             .iter()
@@ -361,9 +238,6 @@ impl Plan<'_> {
     }
 }
 
-/// Walk the targets, then — when anything differs — stage, seal and
-/// promote. Split in two so an unchanged publish never writes a byte and
-/// a canceled plan leaves nothing on disk at all.
 fn stage(
     entry: &Path,
     staging: &Path,
@@ -373,14 +247,10 @@ fn stage(
     deadline: Instant,
     cancel: &dyn Fn() -> bool,
 ) -> Result<Published, Stop> {
-    // The generation the job's view was cloned from is the reuse source; a
-    // missing or corrupt listing means no reuse.
     let source = attached
         .generation
         .as_deref()
         .filter(|name| {
-            // A generation name is one safe component; anything else is
-            // ignored, never joined into a path.
             name.starts_with("gen-") && !name.contains(['/', '\\']) && !name.contains("..")
         })
         .and_then(|name| {
@@ -407,9 +277,6 @@ fn stage(
     if plan.planned.is_empty() {
         return Ok(Published::Skipped(SkipReason::Empty));
     }
-    // Cheapest correct skip: every planned file matches the source listing
-    // (path, size, digest, mode) and the listing has no extras, so a new
-    // generation would differ only in its seal time.
     if plan.unchanged
         && let Some((_, blob)) = &source
         && blob.entries.len() == plan.planned.len()
@@ -417,7 +284,6 @@ fn stage(
         return Ok(Published::Skipped(SkipReason::Unchanged));
     }
     plan.check(deadline, cancel)?;
-    // Refuse before a byte lands rather than hit ENOSPC halfway.
     if let Some((free, total)) = free_bytes(entry)
         && free < plan.copy_bytes().saturating_add(reserve(total))
     {
@@ -432,10 +298,8 @@ fn stage(
         cancel,
     )?;
     if entries.is_empty() {
-        // Everything vanished between plan and stage.
         return Ok(Published::Skipped(SkipReason::Empty));
     }
-    // Sorted by path so the listing and manifest digest are stable.
     let mut blob = FilesBlob { entries };
     blob.entries.sort_by(|a, b| a.path.cmp(&b.path));
     let encoded = blob.encode();
@@ -450,8 +314,6 @@ fn stage(
     manifest.seal(now);
     write_synced(&staging.join(scope::MANIFEST_NAME), &manifest.encode())?;
     sync_dir(staging)?;
-    // The sealed generation is durable inside the entry before `current`
-    // names it.
     fs::rename(staging, entry.join(generation))?;
     sync_dir(entry)?;
     let tmp = entry.join(CURRENT_TMP);
@@ -467,7 +329,6 @@ fn stage(
     })
 }
 
-/// `rel`'s components joined by `/` — the form a confined reopen takes.
 fn slash_path(rel: &Path) -> Option<String> {
     let mut out = String::new();
     for comp in rel.iter() {
@@ -479,9 +340,6 @@ fn slash_path(rel: &Path) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Walk one declared path into the plan, confined beneath the target's
-/// anchor. A missing target contributes nothing; a target that is — or
-/// sits beneath — a symlink or special entry is skipped, never followed.
 fn plan_target(
     plan: &mut Plan<'_>,
     index: usize,
@@ -496,7 +354,6 @@ fn plan_target(
         .ok()
         .and_then(slash_path)
     else {
-        // Not strictly beneath its anchor: no confined form, never read.
         plan.skipped += 1;
         return Ok(());
     };
@@ -515,7 +372,6 @@ fn plan_target(
             out
         }
         Node::File(meta) => {
-            // A declared file stages as `payload/<i>` itself.
             let base = plan.bases.len();
             let out = plan.plan_file(
                 base,
@@ -537,8 +393,6 @@ fn plan_target(
 }
 
 impl Plan<'_> {
-    /// Recursive walk of one target directory, descriptor by descriptor;
-    /// depth is capped and every entry is classified without following.
     #[allow(clippy::too_many_arguments)]
     fn walk(
         &mut self,
@@ -554,14 +408,10 @@ impl Plan<'_> {
             self.skipped += 1;
             return Ok(());
         }
-        // `entries` is sorted, so the sealed digest is independent of
-        // filesystem order.
         let children = dir.entries()?;
         for (name, kind) in children {
             self.tick(deadline, cancel)?;
             let Some(text) = name.to_str() else {
-                // Names the `files` blob can never encode are skipped,
-                // never mangled.
                 self.skipped += 1;
                 continue;
             };
@@ -575,7 +425,6 @@ impl Plan<'_> {
                     Some(child) => {
                         self.walk(&child, base, prefix, rel, depth + 1, deadline, cancel)
                     }
-                    // Replaced since the listing: not followed, counted.
                     None => {
                         self.skipped += 1;
                         Ok(())
@@ -599,8 +448,6 @@ impl Plan<'_> {
                         Ok(())
                     }
                 },
-                // Symlinks and special files are never followed and never
-                // encoded: counted, then passed over.
                 Kind::Other => {
                     self.skipped += 1;
                     Ok(())
@@ -612,9 +459,6 @@ impl Plan<'_> {
         Ok(())
     }
 
-    /// Decide one file's place in the listing: hash it only when the
-    /// source generation lists the same path at the same size — the
-    /// digest is the reuse proof and the unchanged check at once.
     #[allow(clippy::too_many_arguments)]
     fn plan_file(
         &mut self,
@@ -645,7 +489,6 @@ impl Plan<'_> {
                 Some((mut file, opened)) if opened.size == size => {
                     Some(hash_reader(&mut file, size, self.buf())?)
                 }
-                // Vanished or changed shape since the listing.
                 _ => {
                     self.skipped += 1;
                     return Ok(());
@@ -653,7 +496,6 @@ impl Plan<'_> {
             },
             _ => None,
         };
-        // A mode change with identical content still counts as changed.
         let same = match (self.listed.get(entry.as_str()), digest) {
             (Some(listed), Some(digest)) => listed.digest == digest && listed.mode == mode,
             _ => false,
@@ -674,9 +516,6 @@ impl Plan<'_> {
     }
 }
 
-/// Settles the durability of the files a commit copied before its listing
-/// and manifest are written: up to [`SYNC_FDS`] copies are `fdatasync`ed
-/// individually; past that one `syncfs` of the store covers them all.
 struct Durability {
     pending: Vec<fs::File>,
     whole_fs: bool,
@@ -685,7 +524,6 @@ struct Durability {
 impl Durability {
     fn staged(&mut self, file: fs::File) -> std::io::Result<()> {
         if cfg!(not(target_os = "linux")) {
-            // No `syncfs` to fall back on: settle each file now.
             return file.sync_data();
         }
         if self.whole_fs {
@@ -715,12 +553,6 @@ impl Durability {
     }
 }
 
-/// Stage every planned file and return its `files` entries with the
-/// payload totals. A file listed by the source generation with the same
-/// digest and mode is hardlinked out of that generation — one inode, no
-/// copy — then re-verified: the staged name is hashed and must match, or
-/// the link is dropped and the job's own bytes are copied. A generation
-/// whose content drifted can never poison its successor.
 fn materialize(
     plan: &mut Plan<'_>,
     staging: &Path,
@@ -736,8 +568,6 @@ fn materialize(
         pending: Vec::new(),
         whole_fs: false,
     };
-    // Planned files arrive in walk order, so siblings share a parent: the
-    // directory is created once per run of them, not once per file.
     let mut made: Option<PathBuf> = None;
     for planned in planned {
         plan.tick(deadline, cancel)?;
@@ -755,9 +585,7 @@ fn materialize(
             && listed.mode == planned.mode
             && fs::hard_link(source_dir.join(&listed.path), &dst).is_ok()
         {
-            // The staged name shares the source's inode, so this verifies
-            // the generation's own bytes. On drift the link is removed
-            // before the copy so it never truncates the source's inode.
+            // A drifted link is removed, never copied into: writing through it would truncate the source's inode.
             let verified = fs::File::open(&dst)
                 .and_then(|mut f| hash_reader(&mut f, planned.size, plan.buf()));
             match verified {
@@ -772,16 +600,11 @@ fn materialize(
         }
         let (digest, size, mode) = match staged {
             Some(staged) => staged,
-            // Size, digest and mode come from the bytes actually staged
-            // through the descriptor actually opened, so a file rewritten
-            // mid-publish cannot yield a listing its generation fails.
             None => match plan.bases[planned.base].open(&planned.rel)? {
                 Some((file, opened)) => {
                     let sparse = planned.sparse || opened.sparse();
                     let (digest, written, out) =
                         copy_hashed(file, &dst, planned.size, sparse, plan.buf())?;
-                    // Restore re-applies the staged file's own permission
-                    // bits (clone::file); hardlinked entries already carry them.
                     stamp_file_mode(&out, opened.mode)?;
                     durability.staged(out)?;
                     (digest, written, opened.mode)
@@ -804,7 +627,6 @@ fn materialize(
     Ok((entries, bytes, reused))
 }
 
-/// BLAKE3 of at most `limit` bytes of `reader`, through the caller's block.
 fn hash_reader(reader: &mut impl Read, limit: u64, buf: &mut [u8]) -> std::io::Result<[u8; 32]> {
     let mut hasher = blake3::Hasher::new();
     let mut left = limit;
@@ -823,10 +645,6 @@ fn hash_reader(reader: &mut impl Read, limit: u64, buf: &mut [u8]) -> std::io::R
     Ok(*hasher.finalize().as_bytes())
 }
 
-/// Copy at most `limit` bytes of `input` to a new file at `to`, hashing
-/// them as they land; returns the digest and length of exactly what was
-/// staged, and the open output for the durability pass. A sparse input is
-/// copied hole-for-hole: an all-zero block becomes a seek, never a write.
 fn copy_hashed(
     input: fs::File,
     to: &Path,
@@ -856,21 +674,15 @@ fn copy_hashed(
         written += read as u64;
     }
     if sparse {
-        // A trailing hole is a length, not bytes.
         output.set_len(written)?;
     }
     Ok((*hasher.finalize().as_bytes(), written, output))
 }
 
-/// What a publish leaves free on a filesystem of `total` bytes: 5 % of
-/// it, at most [`FREE_SPACE_RESERVE`].
 fn reserve(total: u64) -> u64 {
     (total / 20).min(FREE_SPACE_RESERVE)
 }
 
-/// `(free, total)` bytes of `path`'s filesystem, free as an unprivileged
-/// writer sees it; `None` where the platform cannot say (the check is
-/// then skipped).
 fn free_bytes(path: &Path) -> Option<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {
@@ -887,17 +699,12 @@ fn free_bytes(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
-/// Write a small file durably enough to be renamed over: contents are
-/// flushed to the device before the caller links the name into place.
-/// Shared with the remote path's `current` swap.
 pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = fs::File::create(path)?;
     file.write_all(bytes)?;
     file.sync_data()
 }
 
-/// fsync a directory so a rename inside it is durable. No-op off unix.
-/// Shared with the remote path.
 #[cfg(unix)]
 pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     fs::File::open(dir)?.sync_all()
@@ -907,9 +714,6 @@ pub(crate) fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Stamp a staged payload file with the mode the manifest records for it,
-/// minus the bits restore never applies (clone::mode_of keeps 0o777).
-/// No-op off unix. Shared with the remote path.
 pub(crate) fn stamp_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -923,7 +727,6 @@ pub(crate) fn stamp_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     }
 }
 
-/// [`stamp_mode`] on an open file: no second path lookup.
 fn stamp_file_mode(file: &fs::File, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -937,8 +740,6 @@ fn stamp_file_mode(file: &fs::File, mode: u32) -> std::io::Result<()> {
     }
 }
 
-/// The permission bits worth keeping — the exec bit on tools. Off unix a
-/// read-only file reads as `0o444`, anything else `0o644`.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn file_mode(meta: &fs::Metadata) -> u32 {
     #[cfg(unix)]

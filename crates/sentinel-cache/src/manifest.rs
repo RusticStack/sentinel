@@ -1,13 +1,4 @@
-//! The `manifest` file inside a generation directory: what the generation
-//! was sealed under and what it can still serve. The file is
-//! `sentinel.cache` magic, a format byte, a reserved zero byte, then a
-//! postcard body — 16 bytes of head, `MAX_MANIFEST_BYTES` at most, never
-//! read unbounded.
-//!
-//! The sibling `files` blob carries the per-file listing. It is separate
-//! because lookups read manifests and materialization reads listings; a
-//! 200k-file listing must never inflate the lookup path. The manifest pins
-//! the blob's digest, so the anchor here is enough to trust it.
+//! The `files` listing is a separate blob so lookups never pay for a large listing.
 
 use std::path::Path;
 
@@ -21,43 +12,25 @@ use crate::{
     scope::{Platform, Scope},
 };
 
-/// Manifest format this build reads and writes.
 pub const FORMAT: u8 = 1;
-/// The `files` blob format.
 pub const FILES_FORMAT: u8 = 1;
 const MAGIC: &[u8; 14] = b"sentinel.cache";
 const FILES_MAGIC: &[u8; 14] = b"sentinel.files";
-/// Magic + version + one reserved byte, kept zero.
 pub const HEAD_BYTES: usize = 16;
-/// Manifests are lookup-path reads: small and tightly capped. 64 KiB is
-/// far above any well-formed manifest (hundreds of bytes).
 pub const MAX_MANIFEST_BYTES: u64 = 64 << 10;
-/// The `files` listing is only read to materialize; still strictly capped.
 pub const MAX_FILES_BLOB_BYTES: u64 = 64 << 20;
-/// Entries one `files` blob may name.
 pub const MAX_FILE_ENTRIES: u32 = 1 << 20;
-/// Bounds on the free-text fields: cache keys render under a template cap
-/// and class inputs are short tokens; both get headroom, neither is
-/// unbounded.
 const MAX_KEY_BYTES: usize = 1024;
 const MAX_FIELD_BYTES: usize = 256;
 
-/// The boundary a generation was sealed under — every scope dimension,
-/// recorded so the manifest alone decides what it may serve. A directory
-/// moved under a different scope is caught here, not by its path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Boundary {
-    /// Raw `TenantId` bytes; validated back to a v4 UUID on decode.
     pub tenant: [u8; 16],
-    /// Raw `RepoId` bytes.
     pub repo: [u8; 16],
     pub class: Class,
     pub trust: Trust,
     pub platform: Platform,
-    /// The full toolchain descriptor digest; the scope path shows only
-    /// its first 8 bytes.
     pub toolchain: [u8; 32],
-    /// The cache name — the scope's last component.
     pub name: String,
 }
 
@@ -75,93 +48,54 @@ impl Boundary {
     }
 }
 
-/// What a request needs to match, beyond the boundary and the key. The
-/// variant is the class's own rule; `read` rejects a manifest whose
-/// variant disagrees with `boundary.class`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Compat {
-    /// `downloads`: tool-addressed blobs. `tool` pins the installing
-    /// tool's protocol (`cargo`, `npm`, …); reuse is allowed across
-    /// compatible lockfile edits because the tool validates content.
     Downloads { tool: String },
-    /// `dependencies`: an exact materialization. Every recorded input
-    /// must match — the whole point of the class.
     Dependencies {
-        /// BLAKE3 of the lockfile/manifest set the install consumed.
         lock: [u8; 32],
-        /// The installer identity and its flag string (`cargo`,
-        /// `pip --no-deps`, …).
         installer: String,
         flags: String,
-        /// ABI tag the materialization was built for.
         abi: String,
     },
-    /// `compiler`: a stable toolchain namespace. The compiler owns
-    /// input-level invalidation inside it; the store pins the flags
-    /// namespace the entries were written under.
     Compiler { flags: String },
 }
 
-/// One file inside a generation, relative to its directory — what restore
-/// clones and verifies.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
-    /// `/`-separated relative path, `valid_relative_path`-shaped.
     pub path: String,
     pub size: u64,
-    /// BLAKE3 of the file's content.
     pub digest: [u8; 32],
-    /// Permission bits worth keeping (the exec bit on tools).
     pub mode: u32,
 }
 
-/// The `files` blob body: the generation's listing, sorted by path.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesBlob {
     pub entries: Vec<FileEntry>,
 }
 
-/// A sealed generation's metadata. `sealed_ms == 0` means the write never
-/// completed; an unsealed generation is always a miss.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub boundary: Boundary,
-    /// The rendered key this generation was written under.
     pub key: String,
-    /// The class's compatibility inputs as recorded at seal.
     pub compat: Compat,
-    /// Unix milliseconds when sealed; 0 while unsealed.
     pub sealed_ms: u64,
-    /// Total payload bytes the `files` blob listed at seal time.
     pub bytes: u64,
-    /// Entry count of the `files` blob.
     pub files: u32,
-    /// BLAKE3 of the `files` blob — the anchor restore verifies before
-    /// materializing.
     pub files_digest: [u8; 32],
 }
 
-/// What a lookup asks for: the scope to serve, the rendered key, and the
-/// class's compatibility inputs.
 pub struct Request<'a> {
     pub scope: &'a Scope,
     pub key: &'a str,
     pub compat: &'a Compat,
 }
 
-/// The part of a key that is stable across content edits: everything
-/// before the last `-` — `cargo-9f8e…` and `npm-41aa…` differ in their
-/// volatile hash tail, and `downloads`/`compiler` namespaces serve by
-/// stem. A key with no `-` is its own stem, so the rule degrades to an
-/// exact match.
+/// Everything before the last `-`: the volatile hash tail is ignored, and a key without `-` matches exactly.
 pub(crate) fn key_stem(key: &str) -> &str {
     key.rsplit_once('-').map_or(key, |(stem, _)| stem)
 }
 
 impl Manifest {
-    /// The unsealed manifest for a generation still being written; the publisher
-    /// fills `bytes`/`files`/`files_digest` from the blob it produced and
-    /// calls `seal` last.
     pub fn writing(scope: &Scope, key: &str, compat: Compat) -> Manifest {
         Manifest {
             boundary: Boundary::of(scope),
@@ -174,7 +108,6 @@ impl Manifest {
         }
     }
 
-    /// Stamp the seal time; a sealed manifest may serve.
     pub fn seal(&mut self, now: UnixMillis) {
         self.sealed_ms = u64::try_from(now.0).unwrap_or(0);
     }
@@ -183,7 +116,6 @@ impl Manifest {
         self.sealed_ms != 0
     }
 
-    /// `head + postcard(manifest)`.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEAD_BYTES + 64);
         out.extend_from_slice(MAGIC);
@@ -193,8 +125,6 @@ impl Manifest {
         out
     }
 
-    /// Bytes → manifest. Every failure is a typed `Miss`: nothing here
-    /// panics and nothing guesses.
     pub fn decode(bytes: &[u8]) -> Result<Manifest, Miss> {
         if bytes.len() < HEAD_BYTES || &bytes[..MAGIC.len()] != MAGIC {
             return Err(Miss::Corrupt);
@@ -210,8 +140,6 @@ impl Manifest {
         manifest.validate().map(|_| manifest)
     }
 
-    /// Semantic checks after decode: a manifest that parses but is wrong
-    /// is `Invalid`, distinct from bytes that would not parse.
     fn validate(&self) -> Result<(), Miss> {
         let bad = || Miss::Invalid;
         if TenantId::from_bytes(self.boundary.tenant).is_err()
@@ -247,9 +175,6 @@ impl Manifest {
         if ok { Ok(()) } else { Err(bad()) }
     }
 
-    /// Whether this manifest may serve `want`. First mismatch wins and is
-    /// the reason, so an explanation names the outermost broken boundary.
-    /// Returns the recorded payload bytes on a hit.
     pub fn compatible(&self, want: &Request<'_>) -> Result<u64, Miss> {
         let b = &self.boundary;
         let s = want.scope;
@@ -276,8 +201,6 @@ impl Manifest {
         }
         match (&self.compat, want.compat) {
             (Compat::Downloads { tool }, Compat::Downloads { tool: want_tool }) => {
-                // The namespace, not the volatile tail: `cargo-<h1>` may
-                // serve `cargo-<h2>` because the tool validates content.
                 if key_stem(&self.key) != key_stem(want.key) {
                     return Err(Miss::WrongKey);
                 }
@@ -299,7 +222,6 @@ impl Manifest {
                     abi: want_abi,
                 },
             ) => {
-                // Exact materialization: the key and every recorded input.
                 if self.key != want.key {
                     return Err(Miss::WrongKey);
                 }
@@ -312,8 +234,6 @@ impl Manifest {
                 }
             }
             (Compat::Compiler { flags }, Compat::Compiler { flags: want_flags }) => {
-                // The compiler invalidates per input inside the namespace;
-                // the store pins stem and flags only.
                 if key_stem(&self.key) != key_stem(want.key) {
                     return Err(Miss::WrongKey);
                 }
@@ -321,18 +241,12 @@ impl Manifest {
                     return Err(Miss::Incompatible);
                 }
             }
-            // A `compat` variant from another class is nonsense input;
-            // `read` already rejects such manifests as `Invalid`.
             _ => return Err(Miss::Incompatible),
         }
         Ok(self.bytes)
     }
 }
 
-/// Read and verify the manifest in a generation directory. Bounded: at
-/// most `MAX_MANIFEST_BYTES + 1` bytes are ever read, and every failure
-/// mode is a `Miss` — a cache must degrade a build to a rebuild, never
-/// break it.
 pub fn read(generation_dir: &Path) -> Outcome {
     use std::io::Read;
     let file = match std::fs::File::open(generation_dir.join(crate::scope::MANIFEST_NAME)) {
@@ -355,9 +269,6 @@ pub fn read(generation_dir: &Path) -> Outcome {
     }
 }
 
-/// Read the manifest, then apply the request's boundary and class rule —
-/// the full lookup. The `current` pointer and generation choice are the caller's;
-/// this answers "may this generation dir serve this request".
 pub fn lookup(generation_dir: &Path, want: &Request<'_>) -> Outcome {
     match read(generation_dir) {
         Outcome::Hit(hit) => match hit.manifest.compatible(want) {
@@ -372,8 +283,7 @@ pub fn lookup(generation_dir: &Path, want: &Request<'_>) -> Outcome {
 }
 
 impl FilesBlob {
-    /// `head + postcard(blob)`; the entries are stored in the order given —
-    /// writers sort by path so reads and the manifest digest are stable.
+    /// Writers sort by path: the manifest pins the digest of this encoding, so it must be stable.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEAD_BYTES + 64);
         out.extend_from_slice(FILES_MAGIC);
@@ -383,7 +293,6 @@ impl FilesBlob {
         out
     }
 
-    /// BLAKE3 of the encoded blob — the `files_digest` a manifest records.
     pub fn digest(&self) -> [u8; 32] {
         *blake3::hash(&self.encode()).as_bytes()
     }
@@ -405,8 +314,7 @@ impl FilesBlob {
         }
         for e in &blob.entries {
             if !valid_relative_path(&e.path) {
-                // A listing entry that escapes the generation must never
-                // reach materialization.
+                // Escaping paths must never reach materialization.
                 return Err(Miss::Invalid);
             }
         }
@@ -414,8 +322,6 @@ impl FilesBlob {
     }
 }
 
-/// Read the `files` listing in a generation directory — bounded like
-/// `read`, and a `Miss` on the same terms.
 pub fn read_files(generation_dir: &Path) -> Result<FilesBlob, Miss> {
     use std::io::Read;
     let file = match std::fs::File::open(generation_dir.join(crate::scope::FILES_NAME)) {
@@ -463,7 +369,6 @@ mod tests {
         }
     }
 
-    /// A sealed, valid manifest for `scope()` under key `deps-<hash>`.
     fn manifest(scope: &Scope, key: &str, compat: Compat) -> Manifest {
         let mut m = Manifest::writing(scope, key, compat);
         m.bytes = 1234;
@@ -504,7 +409,6 @@ mod tests {
     fn head_corruption_is_typed() {
         let m = manifest(&scope(), "deps-aa00", deps_compat());
         let good = m.encode();
-        // Magic, version and the reserved byte each have their own answer.
         let mut bad = good.clone();
         bad[0] = b'X';
         assert_eq!(Manifest::decode(&bad), Err(Miss::Corrupt));
@@ -523,11 +427,8 @@ mod tests {
         let s = scope();
         let m = manifest(&s, "deps-aa00", deps_compat());
         let mut bytes = m.encode();
-        // First body byte is the tenant's first byte; byte 6 of a UUID
-        // carries the version nibble — anything but 4 is `Invalid`.
         bytes[HEAD_BYTES + 6] ^= 0x40;
         assert_eq!(Manifest::decode(&bytes), Err(Miss::Invalid));
-        // A `compat` payload from another class cannot be validated away.
         let wrong = Manifest {
             compat: Compat::Downloads {
                 tool: "cargo".to_string(),
@@ -535,7 +436,6 @@ mod tests {
             ..m
         };
         assert_eq!(Manifest::decode(&wrong.encode()), Err(Miss::Invalid));
-        // An unbounded key is invalid, not merely wrong.
         let mut long = manifest(&s, "deps-aa00", deps_compat());
         long.key = "k".repeat(MAX_KEY_BYTES + 1);
         assert_eq!(Manifest::decode(&long.encode()), Err(Miss::Invalid));
@@ -563,20 +463,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let generation = dir.path().join("generation-1-00000001");
         std::fs::create_dir(&generation).unwrap();
-        // Nothing at all.
         assert_eq!(read(&generation), Outcome::Miss(Miss::Absent));
-        // An oversize manifest is corrupt — and the read never allocates
-        // past the cap.
         std::fs::write(
             generation.join(crate::scope::MANIFEST_NAME),
             vec![b'x'; (MAX_MANIFEST_BYTES + 8) as usize],
         )
         .unwrap();
         assert_eq!(read(&generation), Outcome::Miss(Miss::Corrupt));
-        // A short garbage file likewise.
         std::fs::write(generation.join(crate::scope::MANIFEST_NAME), b"junk").unwrap();
         assert_eq!(read(&generation), Outcome::Miss(Miss::Corrupt));
-        // And a well-formed manifest hits.
         let s = scope();
         let m = manifest(&s, "deps-aa00", deps_compat());
         std::fs::write(generation.join(crate::scope::MANIFEST_NAME), m.encode()).unwrap();
@@ -642,7 +537,6 @@ mod tests {
             m.compatible(&request(&s, "deps-bb11", &want)),
             Err(Miss::WrongKey)
         );
-        // Any class input differing is `Incompatible`, not `WrongKey`.
         for field in 0..4 {
             let mut w = deps_compat();
             if let Compat::Dependencies {
@@ -681,14 +575,11 @@ mod tests {
         let want = Compat::Downloads {
             tool: "cargo".to_string(),
         };
-        // Same stem, different volatile tail: a compatible lockfile edit.
         assert_eq!(m.compatible(&request(&s, "cargo-bb11", &want)), Ok(1234));
-        // A different stem is a different namespace.
         assert_eq!(
             m.compatible(&request(&s, "npm-bb11", &want)),
             Err(Miss::WrongKey)
         );
-        // A different tool under the same stem is incompatible.
         let pip = Compat::Downloads {
             tool: "pip".to_string(),
         };
@@ -712,8 +603,6 @@ mod tests {
         let want = Compat::Compiler {
             flags: "-O2".to_string(),
         };
-        // The compiler invalidates inputs itself; the store only pins the
-        // namespace.
         assert_eq!(m.compatible(&request(&s, "obj-bb11", &want)), Ok(1234));
         let debug = Compat::Compiler {
             flags: "-O0".to_string(),
@@ -738,7 +627,6 @@ mod tests {
             Outcome::Hit(h) => assert_eq!(h.bytes, 1234),
             other => panic!("expected hit, got {other:?}"),
         }
-        // The same directory under a pull-request request misses.
         let mut pr = s.clone();
         pr.trust = Trust::PullRequest;
         assert_eq!(
@@ -775,14 +663,12 @@ mod tests {
                 "prefix len {len}"
             );
         }
-        // A path that escapes the generation must never reach materialization.
         let mut bad = blob.clone();
         bad.entries[0].path = "../outside".to_string();
         assert_eq!(FilesBlob::decode(&bad.encode()), Err(Miss::Invalid));
         let mut bad = blob.clone();
         bad.entries[0].path = "/abs".to_string();
         assert_eq!(FilesBlob::decode(&bad.encode()), Err(Miss::Invalid));
-        // And the bounded reader applies the same answers on disk.
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read_files(dir.path()), Err(Miss::Absent));
         std::fs::write(dir.path().join(crate::scope::FILES_NAME), &bytes).unwrap();
