@@ -1,12 +1,4 @@
-//! The device flow over real HTTP on loopback: `POST /oauth/device_authorization`, the
-//! device-code grant with `authorization_pending`, `slow_down` (and a
-//! growing interval), `access_denied`, `expired_token` and single
-//! redemption, the pending cap, and the `/device` approval page with its
-//! session requirement, form token, `Origin` check and wrong-code lockout.
-//! No HTML page ever carries the device code.
-//!
-//! The harness (`deployment()`, `send()`, `get()`, `grant()`, `bearer()`)
-//! is copied from `oauth_core.rs`.
+//! The harness below is copied from oauth_core.rs; keep the copies in sync.
 
 use std::sync::Arc;
 
@@ -38,9 +30,7 @@ pub struct Deployment {
     pub store: Arc<Store>,
     _controller: Controller,
     server: Option<sentinel_api::Server>,
-    /// `http://127.0.0.1:PORT`; also the issuer.
     pub base: String,
-    /// A `sntl_` credential for root with every permission.
     pub token: String,
     pub root: UserId,
     pub dev: UserId,
@@ -125,15 +115,12 @@ pub fn deployment() -> Deployment {
     }
 }
 
-/// A request body: none, JSON, or a raw `application/x-www-form-urlencoded` form.
 pub enum Body<'a> {
     None,
     Json(&'a Value),
     Form(&'a str),
 }
 
-/// What came back: status, every header (lower-case names) and the body as
-/// JSON (or a JSON string when it is not JSON).
 pub struct Reply {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -149,7 +136,6 @@ impl Reply {
     }
 }
 
-/// One request; redirects are returned, never followed.
 pub fn send(
     d: &Deployment,
     method: &str,
@@ -218,7 +204,6 @@ pub fn send(
     }
 }
 
-/// `GET` with an `Authorization` header.
 pub fn get(d: &Deployment, path: &str, authorization: &str) -> Reply {
     send(
         d,
@@ -229,7 +214,6 @@ pub fn get(d: &Deployment, path: &str, authorization: &str) -> Reply {
     )
 }
 
-/// A login grant for `user` issued without the browser, as the flows would.
 pub fn grant(d: &Deployment, user: UserId, scopes: Scopes) -> Minted {
     oauth::issue_grant_trusted(
         &d.store,
@@ -256,10 +240,8 @@ pub fn bearer(access: &Secret) -> String {
 
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// A started device request as the client sees it.
 struct Started {
     device_code: String,
-    /// Canonical (no dash).
     user_code: String,
 }
 
@@ -299,7 +281,6 @@ fn oauth_error(reply: &Reply) -> &str {
     reply.body["error"].as_str().unwrap_or("")
 }
 
-/// A root session cookie.
 fn sign_in(d: &Deployment) -> String {
     let login = send(
         d,
@@ -322,7 +303,6 @@ fn html(reply: &Reply) -> &str {
     reply.body.as_str().unwrap_or("")
 }
 
-/// The approval page for a user code, and its form token.
 fn approval_page(d: &Deployment, cookie: &str, user_code: &str) -> (Reply, String) {
     let page = send(
         d,
@@ -351,7 +331,6 @@ fn decide(d: &Deployment, cookie: &str, form: &str) -> Reply {
     )
 }
 
-/// Every HTML page must be free of the device code, in text or as its hex.
 fn assert_no_device_code(pages: &[&Reply], device_code: &str) {
     let hex = device_code.strip_prefix("sntl_dc_").unwrap();
     for page in pages {
@@ -389,7 +368,6 @@ fn a_device_login_is_approved_on_the_page_and_redeemed_once() {
     let entry = send(&d, "GET", "/device", Body::None, &[("cookie", &cookie)]);
     assert_eq!(entry.status, 200);
     assert!(html(&entry).contains("name=\"user_code\""));
-    // The user code as the person types it: lower case, with the dash.
     let (page, token) = approval_page(&d, &cookie, &display.to_ascii_lowercase());
     let text = html(&page);
     assert!(text.contains("Sentinel CLI"));
@@ -398,7 +376,6 @@ fn a_device_login_is_approved_on_the_page_and_redeemed_once() {
     assert!(text.contains("scope_runs:read") && text.contains("scope_logs:read"));
     assert!(!text.contains("scope_runs:write"));
     assert_eq!(page.header("x-frame-options"), Some("DENY"));
-    // Approve runs:read only.
     let done = decide(
         &d,
         &cookie,
@@ -420,11 +397,9 @@ fn a_device_login_is_approved_on_the_page_and_redeemed_once() {
     assert_eq!(me.body["scopes"], json!(["runs:read"]));
     assert_eq!(me.body["username"], "root");
 
-    // Redeemed once: every later poll is invalid_grant.
     let again = poll(&d, &device_code);
     assert_eq!(again.status, 400);
     assert_eq!(oauth_error(&again), "invalid_grant");
-    // The page no longer finds the code.
     let gone = send(
         &d,
         "GET",
@@ -443,17 +418,13 @@ fn polling_answers_pending_then_slows_a_fast_poller_down() {
     let pending = poll(&d, &s.device_code);
     assert_eq!(pending.status, 400);
     assert_eq!(oauth_error(&pending), "authorization_pending");
-    // Polling again at once is too fast, and again: the interval grows by
-    // five seconds each time (5 -> 10 -> 15 s).
     for _ in 0..2 {
         let fast = poll(&d, &s.device_code);
         assert_eq!(oauth_error(&fast), "slow_down", "{}", fast.body);
     }
-    // Waiting the original five seconds is not enough any more.
     std::thread::sleep(std::time::Duration::from_millis(5_200));
     let still = poll(&d, &s.device_code);
     assert_eq!(oauth_error(&still), "slow_down");
-    // Unknown and malformed device codes are invalid_grant, never pending.
     let unknown = poll(&d, &forms::format(Kind::Device, &Secret::generate()));
     assert_eq!(oauth_error(&unknown), "invalid_grant");
     let malformed = poll(&d, "sntl_rt_00");
@@ -503,7 +474,6 @@ fn an_expired_request_answers_expired_token() {
     let expired = poll(&d, &forms::format(Kind::Device, &seeded.device));
     assert_eq!(expired.status, 400);
     assert_eq!(oauth_error(&expired), "expired_token");
-    // Its user code is no longer approvable either.
     let cookie = sign_in(&d);
     let page = send(
         &d,
@@ -590,7 +560,6 @@ fn clients_scopes_and_resources_are_checked() {
 fn the_page_requires_a_session_and_its_own_form() {
     let d = deployment();
     let s = started(&d);
-    // No session, or only a bearer credential or access token: sign in.
     let access = grant(&d, d.root, Scopes::CLI_DEFAULT);
     let token = format!("Bearer {}", d.token);
     let oauth_bearer = bearer(&access.access);
@@ -625,7 +594,6 @@ fn the_page_requires_a_session_and_its_own_form() {
         "user_code={}&action=approve&scope_runs%3Aread=1&form_token=",
         s.user_code
     );
-    // A missing or foreign form token, or a foreign Origin, decides nothing.
     let missing = decide(&d, &cookie, &approve);
     assert_eq!(missing.status, 403);
     let wrong = decide(&d, &cookie, &format!("{approve}{}", "0".repeat(64)));
@@ -642,10 +610,8 @@ fn the_page_requires_a_session_and_its_own_form() {
         oauth_error(&poll(&d, &s.device_code)),
         "authorization_pending"
     );
-    // Narrowing to a tenant that does not exist is refused too.
     let nowhere = decide(&d, &cookie, &format!("{approve}{token}&tenant=nowhere"));
     assert_eq!(nowhere.status, 403);
-    // The same-origin form works.
     let own = send(
         &d,
         "POST",
@@ -689,14 +655,12 @@ fn five_wrong_user_codes_lock_the_account_out_for_a_while() {
         );
         assert_eq!(page.status, 404, "attempt {n}");
     }
-    // Malformed codes and wrong codes on the form count as well.
     let posted = decide(
         &d,
         &cookie,
         &format!("user_code=AEIOU123&form_token={token}&action=approve&scope_runs%3Aread=1"),
     );
     assert_eq!(posted.status, 400);
-    // Now even the right code is refused, on the page and on the form.
     let locked = send(
         &d,
         "GET",
@@ -721,13 +685,9 @@ fn five_wrong_user_codes_lock_the_account_out_for_a_while() {
     assert_no_device_code(&[&posted, &locked, &locked_post], &s.device_code);
 }
 
-/// Narrowing an approval to a tenant or repository the account has
-/// no part in answers exactly as narrowing to one that does not exist, and
-/// each such answer counts toward the wrong-code lockout.
 #[test]
 fn foreign_and_missing_narrowings_are_indistinguishable_and_limited() {
     let d = deployment();
-    // An organization root does not belong to, with a repository.
     let (globex, secret) = (TenantId::new(), RepoId::new());
     let root = d.root;
     let now = UnixMillis::now();
@@ -776,10 +736,8 @@ fn foreign_and_missing_narrowings_are_indistinguishable_and_limited() {
         (missing_repo.status, html(&missing_repo)),
         (missing.status, html(&missing))
     );
-    // Four refusals so far; the fifth locks the account out of the page.
     assert_eq!(attempt("tenant=elsewhere").status, 403);
     assert_eq!(attempt("tenant=acme").status, 429);
-    // Nothing was spent: the request is still pending.
     assert_eq!(
         oauth_error(&poll(&d, &s.device_code)),
         "authorization_pending"

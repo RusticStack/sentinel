@@ -1,7 +1,3 @@
-//! Read routes behind the web interface's run, worker and synchronization
-//! views. Each is the same authenticate → scope → store
-//! predicate path as every other route; nothing here is page-only.
-
 use sentinel_core::{
     AttemptId, RunId, UnixMillis,
     auth::{Permissions, Scopes},
@@ -20,8 +16,6 @@ use serde_json::{Value, json};
 use super::{Route, err, id, identify, ok, query_param, store_error};
 use crate::{State, auth};
 
-/// One query parameter, percent-decoded (`+` is a space); `None` when absent,
-/// `invalid_request` when repeated.
 fn decoded(query: &str, name: &str) -> Result<Option<String>, sentinel_protocol::error::ApiError> {
     let mut found = None;
     for (key, value) in form_urlencoded::parse(query.as_bytes()) {
@@ -38,12 +32,6 @@ fn decoded(query: &str, name: &str) -> Result<Option<String>, sentinel_protocol:
     Ok(found)
 }
 
-/// `GET /api/v1/tenants`: the tenants the caller is a member of, by slug,
-/// with the caller's role in each, its kind (`personal` or `organization`)
-/// and where its membership comes from (`app` or `github`) — what the page's
-/// namespace switcher groups by, without a settings read per tenant.
-/// A credential narrowed to one tenant lists that tenant only. The server
-/// still authorizes every request by membership; this list is convenience.
 pub(super) fn my_tenants(state: &State, request: &crate::http::Request) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::RUNS_READ)?;
@@ -70,9 +58,6 @@ pub(super) fn my_tenants(state: &State, request: &crate::http::Request) -> Route
     }))
 }
 
-/// `GET /tenants/{slug}/repos/{name}/runs?limit&before&ref|pr|sha`: newest
-/// runs first, optionally narrowed to one ref, one pull request or a commit
-/// prefix — at most one filter, each an index range.
 pub(super) fn runs(
     state: &State,
     request: &crate::http::Request,
@@ -165,10 +150,6 @@ pub(super) fn step_outcome_name(outcome: StepOutcome) -> &'static str {
     }
 }
 
-/// `GET /attempts/{att}/steps`: the attempt's measured phases and each
-/// step's outcome and duration from its terminal summary, or
-/// `{present:false}` while it has not reported. What was never measured is
-/// absent, never zero.
 pub(super) fn attempt_steps(state: &State, request: &crate::http::Request, attempt: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::RUNS_READ)?;
@@ -227,11 +208,6 @@ pub(super) fn attempt_steps(state: &State, request: &crate::http::Request, attem
     }))
 }
 
-/// `GET /workers?tenant=slug`: the pools the tenant may use and their
-/// workers — live connection and transport from the fleet, and from the
-/// store each worker's reported capacity, what is still free on its host,
-/// the attempts it holds (as totals: a shared worker's reservations belong
-/// to other tenants too), its labels and whether it is draining.
 pub(super) fn workers_view(state: &State, request: &crate::http::Request, query: &str) -> Route {
     let who = identify(state, request, false)?;
     auth::require_scope(&who, Scopes::RUNS_READ)?;
@@ -304,14 +280,8 @@ fn capacity_json(c: &dispatch::Capacity) -> Value {
     out
 }
 
-/// How far back `GET /tenants/{slug}/sync` counts refused publications by
-/// default: a day.
 const SYNC_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// `GET /tenants/{slug}/sync?since_ms&after&limit`: per repository the
-/// caller may read, GitHub check publications still pending (and the oldest
-/// one's age), refused since `since_ms` (default the last 24 h), the last
-/// successful publication, and deliveries not yet resolved into runs.
 pub(super) fn sync(
     state: &State,
     request: &crate::http::Request,

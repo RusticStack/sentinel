@@ -1,7 +1,3 @@
-//! Sign-up by email, verification and email invitations over real HTTP:
-//! the answers that must not tell an address apart, the proofs each route
-//! needs, and an organization administrator inviting a person by email.
-
 #[path = "support/web_fixture.rs"]
 mod fixture;
 
@@ -64,7 +60,6 @@ fn public(f: &Fixture, path: &str, body: Value) -> (u16, Value) {
     (status, body)
 }
 
-/// The operator's way to a link, as `sentinel admin account email-link`.
 fn operator_link(f: &Fixture, user: UserId, address: Option<&'static str>) -> String {
     let issued = f
         .store
@@ -133,7 +128,6 @@ fn accounts_claiming(f: &Fixture, address: &str) -> i64 {
 fn registering_a_registered_address_is_answered_like_a_new_one() {
     let f = Fixture::new(1);
     verify_address(&f, f.dana, "dana@example.com");
-    // The fixture admits by approval: an application waits as pending.
     let (new_status, new_body) = public(
         &f,
         "/api/v1/register",
@@ -146,10 +140,8 @@ fn registering_a_registered_address_is_answered_like_a_new_one() {
     );
     assert_eq!(new_status, 202, "{new_body}");
     assert_eq!((known_status, &known_body), (new_status, &new_body));
-    // Nothing leaked and nothing was taken from the verified owner.
     assert_eq!(accounts_claiming(&f, "dana@example.com"), 1);
     assert_eq!(accounts_claiming(&f, "newcomer@example.com"), 1);
-    // A pending account holds nothing and cannot sign in, verified or not.
     let (status, _, _) = call(
         &f.base,
         "POST",
@@ -179,7 +171,6 @@ fn registration_policy_refusals_do_not_depend_on_the_address() {
             assert_eq!(body["message"], message);
         }
     }
-    // A malformed address is a plain validation error, not an oracle.
     set_registration(&f, Registration::ApprovalRequired);
     let (status, _) = public(
         &f,
@@ -208,7 +199,6 @@ fn only_a_verified_address_signs_in() {
     assert_eq!(login("dana@example.com", "wrong password"), 401);
     assert_eq!(login("nobody@example.com", PASSWORD), 401);
 
-    // Rui claims an address and has not proved it: a claim is not a login.
     let rui = session(&f, "rui");
     let (status, body) = send(
         &f,
@@ -248,8 +238,6 @@ fn a_verification_link_works_once_and_a_bad_one_is_one_answer() {
     let unknown = public(&f, "/api/v1/email/verify", json!({ "token": never_issued }));
     let malformed = public(&f, "/api/v1/email/verify", json!({ "token": "nope" }));
     assert_eq!(replay.0, 400);
-    // One answer for all three: the same code and message (a request id, when
-    // present, differs per request and says nothing).
     for other in [&unknown, &malformed] {
         assert_eq!(other.0, replay.0);
         assert_eq!(other.1["code"], replay.1["code"]);
@@ -311,7 +299,6 @@ fn an_account_cannot_quietly_take_an_address_another_account_verified() {
     verify_address(&f, f.dana, "dana@example.com");
     let rui = session(&f, "rui");
 
-    // Browser sessions only, with their CSRF header.
     let (status, _, _) = call(
         &f.base,
         "POST",
@@ -329,7 +316,6 @@ fn an_account_cannot_quietly_take_an_address_another_account_verified() {
     );
     assert_eq!(status, 403);
 
-    // Asking for Dana's address is answered like any other, and changes nothing.
     let (own, own_body) = send(
         &f,
         "POST",
@@ -349,7 +335,6 @@ fn an_account_cannot_quietly_take_an_address_another_account_verified() {
     assert_eq!(me["email"], "rui@example.com");
     assert_eq!(accounts_claiming(&f, "dana@example.com"), 1);
 
-    // The account's resend allowance is its own: it runs out and is told so.
     let mut throttled = false;
     for _ in 0..(email::RESENDS_PER_WINDOW + 2) {
         let (status, _) = send(&f, "POST", "/api/v1/me/email/resend", None, &rui);
@@ -375,7 +360,6 @@ fn changing_a_verified_address_leaves_the_old_one_in_force_until_the_new_one_is_
         &dana,
     );
     assert_eq!(status, 202, "{body}");
-    // Nothing changed: the old address is still the verified identity.
     let (_, me) = send(&f, "GET", "/api/v1/me", None, &dana);
     assert_eq!(
         (me["email"].as_str(), me["email_verified"].as_bool()),
@@ -398,7 +382,6 @@ fn changing_a_verified_address_leaves_the_old_one_in_force_until_the_new_one_is_
         "trust does not transfer"
     );
 
-    // Proving the new address moves the identity to it.
     let link = operator_link(&f, f.dana, None);
     let (status, _) = public(&f, "/api/v1/email/verify", json!({ "token": link }));
     assert_eq!(status, 200);
@@ -431,10 +414,8 @@ fn an_organization_administrator_invites_by_email_and_a_member_cannot() {
         (row["email"].as_str(), row["state"].as_str()),
         (Some("guest@example.com"), Some("pending"))
     );
-    // The listing never carries the secret.
     assert!(!listing.to_string().contains("sntl_"));
 
-    // An operator (not an administrator) is refused; so are bad inputs.
     let dana = session(&f, "dana");
     let (status, _) = send(
         &f,
@@ -454,7 +435,6 @@ fn an_organization_administrator_invites_by_email_and_a_member_cannot() {
         assert_eq!(status, 400);
     }
 
-    // Revocation is the tenant's own: another tenant's path cannot reach it.
     let (status, _) = as_root(
         &f,
         "DELETE",
@@ -498,7 +478,6 @@ fn a_github_backed_organization_cannot_be_invited_into_by_email() {
     );
     assert_eq!(status, 400, "{body}");
     assert!(body["message"].as_str().unwrap().contains("GitHub"));
-    // The app-created organization beside it is unaffected.
     let (status, _) = as_root(
         &f,
         "POST",
@@ -523,7 +502,6 @@ fn a_signed_in_account_accepts_an_invitation_and_an_addressed_one_waits_for_the_
     };
     assert_eq!(joined(&f), vec!["acme".to_owned()]);
 
-    // A link-form invitation joins at once.
     let beta = f.beta;
     let plain = f
         .store
@@ -554,7 +532,6 @@ fn a_signed_in_account_accepts_an_invitation_and_an_addressed_one_waits_for_the_
         "{body}"
     );
     assert!(joined(&f).contains(&"beta".to_owned()));
-    // Spent, unknown and malformed secrets are one `not_found`.
     for secret in [
         token::format(&plain.secret),
         token::format(&Secret::generate()),
@@ -574,7 +551,6 @@ fn a_signed_in_account_accepts_an_invitation_and_an_addressed_one_waits_for_the_
 #[test]
 fn an_email_invitation_joins_when_its_mailbox_is_proved() {
     let f = Fixture::new(1);
-    // Beta's administrator invites Rui's address; Rui is not in beta yet.
     let (status, body) = as_root(
         &f,
         "POST",
@@ -603,7 +579,6 @@ fn an_email_invitation_joins_when_its_mailbox_is_proved() {
         "nothing is granted before the mailbox is proved"
     );
 
-    // Opening the link in the mail proves the mailbox and joins.
     let link = operator_link(&f, f.rui, None);
     let (status, body) = public(&f, "/api/v1/email/verify", json!({ "token": link }));
     assert_eq!((status, &body["joined"]), (200, &json!(true)), "{body}");
@@ -629,7 +604,6 @@ fn sign_up_with_an_email_invitation_for_another_address_is_refused() {
     );
     assert_eq!(status, 403, "{body}");
     assert_eq!(accounts_claiming(&f, "intruder@example.com"), 0);
-    // The addressed person registers with it.
     let (status, body) = public(
         &f,
         "/api/v1/register",
@@ -652,7 +626,6 @@ fn a_platform_administrator_outside_an_organization_cannot_invite_without_proof(
     f.store
         .writer()
         .write(move |tx| {
-            // An organization root administers by platform scope alone.
             authz::create_namespace(
                 tx,
                 Principal::new(root, Permissions::ALL, None, None),
@@ -664,7 +637,6 @@ fn a_platform_administrator_outside_an_organization_cannot_invite_without_proof(
         })
         .unwrap();
 
-    // A bearer credential never holds step-up: refused with or without a reason.
     for body in [
         json!({ "email": "mine@example.com", "role": "admin" }),
         json!({ "email": "mine@example.com", "role": "admin", "reason": "support case" }),
@@ -684,9 +656,6 @@ fn asking_for_an_address_answers_alike_past_the_link_allowance() {
     let f = Fixture::new(1);
     verify_address(&f, f.dana, "dana@example.com");
     let rui = session(&f, "rui");
-    // More requests for an unclaimed address than the per-account link
-    // allowance (within the per-client burst of 8): still `202`, like the
-    // address another account verified, so the allowance is no oracle.
     let mut replies = Vec::new();
     for _ in 0..(email::RESENDS_PER_WINDOW + 2) {
         let (status, _) = send(

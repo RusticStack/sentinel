@@ -1,11 +1,3 @@
-//! The authorization-code flow over real HTTP on loopback, driving a "browser" with a session
-//! cookie: sign-in without a session, error pages that never redirect to an
-//! untrusted client, RFC 6749 error redirects with `state` and `iss`, the
-//! consent form's anti-forgery checks, deny and approve, the single-use
-//! code exchange with replay revocation, and the page security headers.
-//!
-//! The harness is the minimal copy of `oauth_core.rs`'s.
-
 use std::sync::Arc;
 
 use sentinel_auth::{
@@ -32,7 +24,6 @@ const REDIRECT: &str = "http://127.0.0.1:49152/callback";
 const MCP_TEST_REDIRECT: &str = "http://127.0.0.1:33419/callback";
 const STATE: &str = "af0ifjsldkj";
 
-/// Authorization request parameters, in order.
 type Pairs = Vec<(&'static str, String)>;
 
 pub struct Deployment {
@@ -40,7 +31,6 @@ pub struct Deployment {
     pub store: Arc<Store>,
     _controller: Controller,
     server: Option<sentinel_api::Server>,
-    /// `http://127.0.0.1:PORT`; also the issuer.
     pub base: String,
     pub root: UserId,
     pub dev: UserId,
@@ -56,8 +46,6 @@ impl Drop for Deployment {
     }
 }
 
-/// Super admin `root` administering `acme` (repository `app`); `dev`, an
-/// operator of `acme` with its own password, and no platform rights.
 pub fn deployment() -> Deployment {
     let dir = tempfile::tempdir().unwrap();
     let store =
@@ -126,15 +114,12 @@ pub fn deployment() -> Deployment {
     }
 }
 
-/// A request body: none, JSON, or a raw `application/x-www-form-urlencoded` form.
 pub enum Body<'a> {
     None,
     Json(&'a Value),
     Form(&'a str),
 }
 
-/// What came back: status, every header (lower-case names) and the body as
-/// JSON (or a JSON string when it is not JSON).
 pub struct Reply {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -154,7 +139,6 @@ impl Reply {
     }
 }
 
-/// One request; redirects are returned, never followed.
 pub fn send(
     d: &Deployment,
     method: &str,
@@ -225,8 +209,6 @@ pub fn send(
     }
 }
 
-/// Allow anonymous RFC 7591 registration, which the default instance
-/// policy (Client ID Metadata Documents only) does not.
 fn open_registration(d: &Deployment) {
     d.store
         .writer()
@@ -410,8 +392,6 @@ fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
         &[],
     );
     assert_eq!(invalid_initialize.status, 400);
-    // Lifecycle negotiation: an older requested revision is answered with
-    // the one this server supports, and the client decides.
     let negotiated = mcp_request(&d, "POST", Some(&old_version), Some(&authorization), &[]);
     assert_eq!(negotiated.status, 200, "{:?}", negotiated.body);
     assert_eq!(negotiated.body["result"]["protocolVersion"], "2025-11-25");
@@ -439,9 +419,6 @@ fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
     );
     assert_eq!(active.status, 202);
 
-    // Streamable HTTP: an unsupported MCP-Protocol-Version is 400 (still
-    // naming the supported revision); an absent one is the session's
-    // negotiated revision.
     let ping = json!({"jsonrpc":"2.0","id":8,"method":"ping"});
     let wrong_version = mcp_request(
         &d,
@@ -462,8 +439,6 @@ fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
     );
     assert_eq!(missing_version.status, 200, "{:?}", missing_version.body);
     assert_eq!(missing_version.body["result"], json!({}));
-    // A missing session header is the client's error (400); an unknown one
-    // is an expired session (404), which makes the client re-initialize.
     let no_session = mcp_request(&d, "POST", Some(&ping), Some(&authorization), &[version]);
     assert_eq!(no_session.status, 400);
     let unknown_session = mcp_request(
@@ -502,7 +477,6 @@ fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
     assert!(challenge.contains("insufficient_scope") && challenge.contains("logs:read"));
     assert!(challenge.contains("oauth-protected-resource/mcp"));
 
-    // The reverse direction: an MCP-audience token is not an API credential.
     let api_with_mcp = send(
         &d,
         "GET",
@@ -518,8 +492,6 @@ fn mcp_http_uses_its_resource_audience_and_protected_sessions() {
         "{challenge}"
     );
 
-    // The scope a tool needs is the route's, not a guess from the
-    // path. A tenant named like a secrets route needs only runs:read.
     let secrets_named = mcp_request(
         &d,
         "POST",
@@ -680,9 +652,6 @@ fn mcp_refresh_requires_the_same_resource_indicator() {
 
 #[test]
 fn vscode_and_claude_public_clients_complete_the_remote_mcp_lifecycle() {
-    // These are the redirect registrations used by the selected VS Code and
-    // Claude MCP clients. Each is a public OAuth client; DCR never creates a
-    // Sentinel account or grants API-audience access.
     let d = deployment();
     let resource = format!("{}/mcp", d.base);
     let before_users: i64 = d
@@ -877,7 +846,6 @@ fn dynamic_registration_refuses_privileged_scopes_and_untrusted_redirects() {
     open_registration(&d);
     for (metadata, error) in [
         (
-            // Complete protocol fields, so only the scope can be refused.
             json!({
                 "client_name":"bad scope",
                 "redirect_uris":["https://client.example/callback"],
@@ -946,7 +914,6 @@ pub fn bearer(access: &Secret) -> String {
     format!("Bearer {}", forms::format(Kind::Access, access))
 }
 
-/// A password session: the `cookie` request header value.
 fn sign_in(d: &Deployment, username: &str) -> String {
     let reply = send(
         d,
@@ -971,7 +938,6 @@ fn encode(pairs: &[(&str, &str)]) -> String {
         .finish()
 }
 
-/// A complete, valid authorization request for the CLI client.
 fn request_pairs(challenge: &str) -> Pairs {
     vec![
         ("response_type", "code".into()),
@@ -997,7 +963,6 @@ fn with(mut pairs: Pairs, name: &'static str, value: Option<&str>) -> Pairs {
     pairs
 }
 
-/// The query of a `303` back to the client, which must target `REDIRECT`.
 fn returned(reply: &Reply) -> Vec<(String, String)> {
     returned_to(reply, REDIRECT)
 }
@@ -1019,7 +984,6 @@ fn param<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// Every hidden field of the consent page, unescaped.
 fn hidden_fields(page: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for piece in page.split("<input type=\"hidden\" name=\"").skip(1) {
@@ -1056,7 +1020,6 @@ fn assert_page_headers(reply: &Reply) {
     );
 }
 
-/// Render consent for `cookie` and return the hidden fields to post back.
 fn consent(d: &Deployment, cookie: &str, pairs: &[(&str, String)]) -> Vec<(String, String)> {
     let page = send(
         d,
@@ -1123,7 +1086,6 @@ fn without_a_session_the_endpoint_asks_to_sign_in_and_sets_nothing() {
     assert!(page.text().contains("Sentinel CLI"));
     assert!(page.header("set-cookie").is_none());
     assert!(page.header("location").is_none());
-    // Nothing reached the store: no code, no audit row about consent.
     let codes: i64 = d
         .store
         .read(|c| Ok(c.query_row("SELECT count(*) FROM oauth_codes", [], |r| r.get(0))?))
@@ -1210,7 +1172,6 @@ fn an_untrusted_client_or_redirect_gets_a_page_and_never_a_redirect() {
             assert_page_headers(&reply);
         }
     }
-    // A repeated parameter is malformed, also without a redirect.
     let reply = send(
         &d,
         "GET",
@@ -1287,7 +1248,6 @@ fn other_request_errors_redirect_with_error_state_and_iss() {
         assert_eq!(param(&back, "iss"), Some(d.base.as_str()), "{what}");
         assert!(param(&back, "code").is_none(), "{what}");
     }
-    // Without state the redirect still names the error and the issuer.
     let reply = send(
         &d,
         "GET",
@@ -1300,7 +1260,6 @@ fn other_request_errors_redirect_with_error_state_and_iss() {
     assert_eq!(param(&back, "state"), None);
     assert_eq!(param(&back, "iss"), Some(d.base.as_str()));
 
-    // The right resource is accepted; platform:admin needs a super admin.
     let ok = send(
         &d,
         "GET",
@@ -1415,7 +1374,6 @@ fn the_consent_form_needs_its_session_token_and_our_origin() {
         .unwrap();
     assert_eq!(codes, 0);
 
-    // A tampered hidden parameter is re-validated on POST.
     let tampered: Vec<(String, String)> = fields
         .iter()
         .map(|(k, v)| {
@@ -1485,7 +1443,6 @@ fn approval_returns_a_code_that_exchanges_exactly_once() {
     let code = param(&back, "code").unwrap().to_owned();
     assert!(code.starts_with("sntl_ac_"));
 
-    // The first exchange mints a working pair.
     let first = exchange(&d, &code, &verifier);
     assert_eq!(first.status, 200, "{:?}", first.body);
     assert_eq!(first.header("cache-control"), Some("no-store"));
@@ -1542,7 +1499,6 @@ fn the_token_endpoint_refuses_wrong_verifiers_and_missing_parameters() {
         (wrong.status, wrong.body["error"].as_str()),
         (400, Some("invalid_grant"))
     );
-    // The failed attempt spent it.
     let late = exchange(&d, &code, &verifier);
     assert_eq!(late.body["error"], "invalid_grant");
 
@@ -1575,7 +1531,6 @@ fn approval_can_narrow_to_a_tenant_and_repository() {
     );
     let fields = consent(&d, &cookie, &pairs);
     let tenant = d.tenant.to_string();
-    // A repository needs a tenant; an unknown name is a correctable choice.
     for (extra, notice) in [
         (vec![("repo", "app")], "Choose a tenant"),
         (
@@ -1637,8 +1592,6 @@ fn registered_clients(d: &Deployment) -> i64 {
         .unwrap()
 }
 
-/// Dynamic registration exists only while instance policy allows
-/// it, and the metadata advertises exactly what the policy allows.
 #[test]
 fn dynamic_registration_is_off_by_default_and_not_advertised() {
     let d = deployment();
@@ -1676,7 +1629,6 @@ fn dynamic_registration_is_off_by_default_and_not_advertised() {
         format!("{}/oauth/register", d.base)
     );
 
-    // Off: neither mechanism, and a metadata URL is refused before any fetch.
     d.store
         .writer()
         .write(|tx| {
@@ -1723,10 +1675,6 @@ fn dynamic_registration_is_off_by_default_and_not_advertised() {
     assert_eq!(registered_clients(&d), 0);
 }
 
-/// A standard native-client registration — the
-/// RFC 7591 default grant, an echoed advertised grant, `localhost` and a
-/// port-free loopback redirect — is accepted, and the loopback redirect
-/// then works on whatever port the client bound (RFC 8252 §7.3).
 #[test]
 fn standard_native_registrations_are_accepted_and_match_any_loopback_port() {
     let d = deployment();
@@ -1743,7 +1691,6 @@ fn standard_native_registrations_are_accepted_and_match_any_loopback_port() {
     ] {
         let reply = send(&d, "POST", "/oauth/register", Body::Json(&body), &[]);
         assert_eq!(reply.status, 201, "{:?}", reply.body);
-        // RFC 7591 §3.2.1: the answer states what the client actually got.
         assert_eq!(
             reply.body["grant_types"],
             json!(["authorization_code", "refresh_token"])
@@ -1795,9 +1742,7 @@ fn standard_native_registrations_are_accepted_and_match_any_loopback_port() {
     }
 }
 
-/// RFC 9700 §4.11.2: before anyone signs in, a request for a
-/// registered client is never answered with a redirect, however malformed;
-/// the same request from a signed-in account gets the RFC 6749 redirect.
+/// Before sign-in, a request for a registered client is never redirected, however malformed (RFC 9700 4.11.2).
 #[test]
 fn a_registered_clients_errors_redirect_only_after_sign_in() {
     let d = deployment();
@@ -1826,8 +1771,7 @@ fn a_registered_clients_errors_redirect_only_after_sign_in() {
     assert_eq!(param(&back, "state"), Some(STATE));
 }
 
-/// A CIMD client is reachable only through its metadata URL, never
-/// through the internal key that would skip the document's freshness check.
+/// A CIMD client is reachable only through its metadata URL, so the freshness check always runs.
 #[test]
 fn a_metadata_document_client_is_not_addressable_by_its_internal_key() {
     let d = deployment();
@@ -1865,9 +1809,6 @@ fn a_metadata_document_client_is_not_addressable_by_its_internal_key() {
     assert!(page.text().contains("not registered"));
 }
 
-/// An anonymous flood of authorization requests naming
-/// metadata documents on hosts it controls makes the server fetch nothing
-/// and store nothing, and the API keeps answering at once.
 #[test]
 fn anonymous_metadata_document_requests_neither_fetch_nor_hold_the_api() {
     let d = deployment();
@@ -1879,7 +1820,6 @@ fn anonymous_metadata_document_requests_neither_fetch_nor_hold_the_api() {
                 let d = &d;
                 let challenge = challenge.clone();
                 scope.spawn(move || {
-                    // A distinct document per request defeats any cache.
                     let url = format!("https://slow{n}.attacker.example.org/client.json");
                     let pairs = with(
                         with(request_pairs(&challenge), "client_id", Some(&url)),
@@ -1909,8 +1849,6 @@ fn anonymous_metadata_document_requests_neither_fetch_nor_hold_the_api() {
             .unwrap();
         (health, slowest)
     });
-    // Nothing was fetched: every answer is local work, far below the
-    // metadata fetch's own two-second bound.
     assert!(slowest.0 < std::time::Duration::from_secs(1), "{slowest:?}");
     assert!(slowest.1 < std::time::Duration::from_secs(1), "{slowest:?}");
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
@@ -1921,8 +1859,6 @@ fn anonymous_metadata_document_requests_neither_fetch_nor_hold_the_api() {
     );
 }
 
-/// An expired MCP token is refused as `invalid_token`, with the
-/// MCP resource's metadata, so the client refreshes.
 #[test]
 fn an_expired_mcp_token_gets_the_invalid_token_challenge() {
     let d = deployment();
