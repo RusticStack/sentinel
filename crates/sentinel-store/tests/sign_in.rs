@@ -1,6 +1,3 @@
-//! Single-use sign-in state, verified identity linking, sign-in by immutable
-//! provider subject, and the separation of proof from admission.
-
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
     UnixMillis, UserId,
@@ -26,7 +23,6 @@ fn store() -> (tempfile::TempDir, Store) {
     (dir, store)
 }
 
-/// An operator who has already been admitted locally, plus their session.
 fn admitted(store: &Store) -> (UserId, local_auth::Session) {
     let user =
         local_auth::bootstrap(store, "root", "Root", b"an operator password", at(0)).unwrap();
@@ -46,8 +42,6 @@ fn admitted(store: &Store) -> (UserId, local_auth::Session) {
     (user, session)
 }
 
-/// The session as it looks right after proving a second factor: linking an
-/// identity is an authentication change and requires that freshness.
 fn stepped(session: &local_auth::Session) -> local_auth::Session {
     local_auth::Session {
         stepped_up: Some(at(0)),
@@ -67,8 +61,6 @@ fn sign_in_state_is_single_use_expiring_and_bound_to_its_provider() {
     let (_dir, store) = store();
     let state = sign_in::begin(&store, GITHUB, Some("/runs"), at(1_000), 60_000).unwrap();
 
-    // A different secret, a different provider, and an expired attempt are all
-    // the same answer: no pending attempt.
     assert!(matches!(
         sign_in::consume(&store, GITHUB, &Secret::generate(), at(1_100)),
         Err(Error::NotFound)
@@ -82,7 +74,6 @@ fn sign_in_state_is_single_use_expiring_and_bound_to_its_provider() {
         sign_in::consume(&store, GITHUB, &state, at(1_100)).unwrap(),
         Some("/runs".into())
     );
-    // Replay of a spent attempt is refused, and cannot be undone by raw SQL.
     assert!(matches!(
         sign_in::consume(&store, GITHUB, &state, at(1_200)),
         Err(Error::NotFound)
@@ -148,7 +139,6 @@ fn a_sign_in_destination_must_be_a_same_site_path() {
         sign_in::consume(&store, GITHUB, &state, at(1_100)).unwrap(),
         Some("/runs/run_1".into())
     );
-    // An attempt with no destination is fine; the caller uses its own default.
     let state = sign_in::begin(&store, GITHUB, None, at(1_200), 60_000).unwrap();
     assert_eq!(
         sign_in::consume(&store, GITHUB, &state, at(1_300)).unwrap(),
@@ -163,7 +153,6 @@ fn a_verified_identity_signs_in_only_after_it_has_been_linked() {
     let (_dir, store) = store();
     let (user, session) = admitted(&store);
 
-    // Proof is not admission: nothing is registered for an unknown subject.
     assert!(matches!(
         sign_in::complete(&store, GITHUB, SUBJECT, Policy::default(), at(10)).unwrap(),
         Outcome::NoAccount
@@ -176,7 +165,6 @@ fn a_verified_identity_signs_in_only_after_it_has_been_linked() {
         .unwrap();
     assert_eq!(accounts, 1);
 
-    // Linking is an authenticated act by the account that will own it.
     sign_in::link(
         &store,
         &stepped(&session),
@@ -190,7 +178,6 @@ fn a_verified_identity_signs_in_only_after_it_has_been_linked() {
         signed_in(sign_in::complete(&store, GITHUB, SUBJECT, Policy::default(), at(30)).unwrap());
     assert_eq!(issued.user, user);
 
-    // The session it issues is an ordinary one, with the same authority.
     let federated = store
         .read(|conn| local_auth::authenticate(conn, &issued.session, at(40)))
         .unwrap();
@@ -218,12 +205,10 @@ fn identity_is_the_immutable_subject_not_the_renameable_login() {
     )
     .unwrap();
 
-    // A different subject is a different account, whatever it calls itself.
     assert!(matches!(
         sign_in::complete(&store, GITHUB, "9999", Policy::default(), at(30)).unwrap(),
         Outcome::NoAccount
     ));
-    // The same subject under another provider key is also unrelated.
     assert!(matches!(
         sign_in::complete(&store, "gitlab", SUBJECT, Policy::default(), at(30)).unwrap(),
         Outcome::NoAccount
@@ -260,7 +245,6 @@ fn an_identity_belongs_to_one_account_and_is_never_silently_moved() {
         .read(|conn| local_auth::authenticate(conn, &other_session.session, at(23)))
         .unwrap();
 
-    // Claiming an identity another account already holds fails; it is not taken.
     assert!(matches!(
         sign_in::link(
             &store,
@@ -277,8 +261,6 @@ fn an_identity_belongs_to_one_account_and_is_never_silently_moved() {
             .user,
         session.user
     );
-    // Relinking the same identity to its own account is refused too: the link
-    // is immutable, so there is no re-verification side effect to exploit.
     assert!(
         sign_in::link(
             &store,
@@ -362,7 +344,6 @@ fn linking_and_unlinking_are_audited_and_authorized() {
     assert_eq!(identities[0].provider, GITHUB);
     assert_eq!(identities[0].subject, SUBJECT);
 
-    // Another account can neither read nor remove somebody else's link.
     let outsider = UserId::new();
     store
         .writer()
@@ -389,7 +370,6 @@ fn linking_and_unlinking_are_audited_and_authorized() {
         sign_in::complete(&store, GITHUB, SUBJECT, Policy::default(), at(24)).unwrap(),
         Outcome::NoAccount
     ));
-    // Unlinking makes the identity claimable again, by the same account or another.
     sign_in::link(
         &store,
         &stepped(&session),

@@ -1,15 +1,9 @@
-//! Upgrades: a copy of the database before any migration, a failed
-//! migration leaving the database at its last good version with the copy
-//! named for the rollback, declared rollback compatibility letting an older
-//! build run on a newer database only when every unknown migration says so,
-//! and the preflight an operator runs before upgrading.
 use rusqlite::{Connection, params};
 use sentinel_core::{RepoId, RunId, TenantId, UnixMillis};
 use sentinel_store::{Durability, Error, Store, jobs, schema, upgrade, workers};
 
 const NOW: UnixMillis = UnixMillis(1_000_000_000);
 
-/// A database at `version`, built the way that release built it.
 fn database_at(path: &std::path::Path, version: u32) -> Connection {
     let mut conn = Connection::open(path).unwrap();
     conn.execute_batch(
@@ -79,17 +73,11 @@ fn an_upgrade_keeps_a_copy_of_the_database_from_before_it() {
     assert!(readable.contains(&(46, 46)), "{readable:?}");
     assert!(readable.contains(&(48, 47)), "{readable:?}");
     assert!(readable.contains(&(49, 48)), "{readable:?}");
-    // Email identity adds columns and tables an older binary does not maintain.
     assert!(readable.contains(&(50, 50)), "{readable:?}");
-    // The setup tables and the auto-join table are ones an older binary
-    // neither reads nor writes.
     assert!(readable.contains(&(52, 51)), "{readable:?}");
     assert!(readable.contains(&(53, 51)), "{readable:?}");
-    // Nothing pending: no copy.
     let (_, again) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
     assert!(again.is_none());
-    // Only the newest two copies are kept: a second deployment with two
-    // older copies beside it keeps the newer of those and its own.
     let other = dir.path().join("other");
     std::fs::create_dir_all(&other).unwrap();
     let path = other.join("metadata.sqlite");
@@ -109,7 +97,6 @@ fn a_failed_migration_stays_at_its_last_good_version_and_names_the_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("metadata.sqlite");
     let mut conn = database_at(&path, 3);
-    // Ownership migration 4 refuses: a run another tenant owns.
     let (a, b, repo, run) = (
         TenantId::new(),
         TenantId::new(),
@@ -162,7 +149,6 @@ fn an_older_build_runs_on_a_newer_database_only_when_every_unknown_migration_all
     let path = dir.path().join("metadata.sqlite");
     drop(Store::open(&path, Durability::Full).unwrap());
     let future = schema::LATEST + 1;
-    // A newer release's additive migration, readable by this build.
     Connection::open(&path)
         .unwrap()
         .execute(
@@ -177,7 +163,6 @@ fn an_older_build_runs_on_a_newer_database_only_when_every_unknown_migration_all
     assert!(snapshot.is_none(), "nothing migrates backwards");
     drop(store);
     assert_eq!(version(&path), future, "left as the newer release made it");
-    // One that needs itself: refused, and the preflight says why.
     Connection::open(&path)
         .unwrap()
         .execute(
@@ -228,8 +213,6 @@ fn a_worker_software_label_is_printable_and_bounded() {
     );
 }
 
-/// The offline diagnostic bundle of a stopped controller counts rows
-/// without naming tenants or repositories, and never writes.
 #[test]
 fn the_offline_diagnostic_bundle_counts_without_naming() {
     let dir = tempfile::tempdir().unwrap();
@@ -268,16 +251,10 @@ fn the_offline_diagnostic_bundle_counts_without_naming() {
     assert_eq!(std::fs::read(&path).unwrap(), before, "read-only");
 }
 
-/// A controller killed in the middle of a migration — the transaction
-/// open, the schema changed, nothing committed — leaves the database at the
-/// version before it, intact, and the next start migrates it. A copy cut
-/// short by the same kill is never listed as a snapshot and is replaced.
 #[test]
 fn a_process_killed_mid_migration_leaves_the_last_committed_version() {
     const CHILD: &str = "SENTINEL_R07_MIGRATION_CHILD";
     if let Ok(path) = std::env::var(CHILD) {
-        // The child: apply the last migration inside a transaction and die
-        // before it commits, as a kill or a power cut would.
         let mut conn = Connection::open(&path).unwrap();
         conn.pragma_update(None, "journal_mode", "WAL").unwrap();
         let (v, sql) = schema::MIGRATIONS[schema::LATEST as usize - 1];
@@ -317,7 +294,6 @@ fn a_process_killed_mid_migration_leaves_the_last_committed_version() {
     assert_eq!(after.database, from, "nothing of the migration committed");
     assert_eq!(after.integrity, "ok");
     assert_eq!(after.pending, vec![schema::LATEST]);
-    // The same kill during the copy: a truncated temporary file.
     let snapshot = upgrade::snapshot_path(&path, from);
     let mut partial = snapshot.clone().into_os_string();
     partial.push(".partial");

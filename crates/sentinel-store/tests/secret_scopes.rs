@@ -1,7 +1,3 @@
-//! Secrets: delegation boundaries, the named
-//! binding/allowlist/revocation surface, listing plans, idempotency-key
-//! reuse, and resealing every sealed column under a new key.
-
 use std::sync::Arc;
 
 use sentinel_auth::sealed::{Key, key_id};
@@ -41,8 +37,6 @@ impl Scoped {
     }
 }
 
-/// One tenant with an administrator, and a reader holding `WRITE_SECRETS`
-/// on repository `a` only; repository `b` is in the same tenant.
 fn scoped() -> Scoped {
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("master.key");
@@ -135,10 +129,6 @@ fn put_with(
     })
 }
 
-/// The three delegation boundaries, each a plain
-/// `NotFound`: a repo-A writer cannot write repo B of the same tenant, cannot
-/// write or allowlist at tenant scope, and a principal narrowed to repo A
-/// cannot reach repo B even with every permission.
 #[test]
 fn a_delegated_writer_stays_inside_its_repository_and_narrowing() {
     let s = scoped();
@@ -161,7 +151,6 @@ fn a_delegated_writer_stays_inside_its_repository_and_narrowing() {
             .write(move |tx| secrets::allow_repo(tx, writer, tenant, "T_TOKEN", repo_a, true, NOW)),
         Err(Error::NotFound)
     ));
-    // A repo-A writer cannot bind in repo B either, even by name.
     assert!(matches!(
         s.store.writer().write(move |tx| secrets::bind_named(
             tx, writer, repo_b, "", "", "A_TOKEN", false, false, NOW
@@ -181,8 +170,6 @@ fn a_delegated_writer_stays_inside_its_repository_and_narrowing() {
     ));
 }
 
-/// Store surface: bind by name, list, idempotent unbind, allowlist
-/// listing and idempotent single-version revocation.
 #[test]
 fn bindings_allowlists_and_revocations_are_idempotent_by_name() {
     let s = scoped();
@@ -191,7 +178,6 @@ fn bindings_allowlists_and_revocations_are_idempotent_by_name() {
     put_as(&s, writer, Scope::Repo(s.repo_a), "REPO_TOKEN").unwrap();
     put_as(&s, admin, Scope::Tenant(s.tenant), "SHARED").unwrap();
     let (tenant, repo_a) = (s.tenant, s.repo_a);
-    // Not allowlisted yet: the tenant source is refused like a missing one.
     assert!(matches!(
         s.store.writer().write(move |tx| secrets::bind_named(
             tx, writer, repo_a, "build", "", "SHARED", true, false, NOW
@@ -276,7 +262,6 @@ fn bindings_allowlists_and_revocations_are_idempotent_by_name() {
                 .collect::<rusqlite::Result<Vec<String>>>()?)
         })
         .unwrap();
-    // The repeated allow, unbind and revoke are each audited once.
     assert_eq!(
         actions,
         [
@@ -285,8 +270,6 @@ fn bindings_allowlists_and_revocations_are_idempotent_by_name() {
     );
 }
 
-/// Each listing scope is served by its own partial index, and a
-/// page of one scope never contains the other scope's names.
 #[test]
 fn each_listing_scope_walks_only_its_own_index() {
     let s = scoped();
@@ -335,8 +318,6 @@ fn each_listing_scope_walks_only_its_own_index() {
     );
 }
 
-/// Reusing a secret-write idempotency key for a different request
-/// is `IdempotencyMismatch`, distinct from a stale-version `Conflict`.
 #[test]
 fn a_reused_idempotency_key_is_a_mismatch_not_a_conflict() {
     let s = scoped();
@@ -369,11 +350,6 @@ fn a_reused_idempotency_key_is_a_mismatch_not_a_conflict() {
     ));
 }
 
-/// After a rotation, `reseal_all` moves every sealed column (active
-/// and revoked secret versions, a confirmed second-factor seed, a source
-/// credential) to the active key; a second run changes nothing, retiring
-/// the old keys leaves every row readable, and the triggers still refuse
-/// any rewrite of sealed bytes that is not a forward reseal.
 #[test]
 fn every_sealed_row_is_resealed_so_old_keys_can_be_retired() {
     let s = scoped();
@@ -394,7 +370,6 @@ fn every_sealed_row_is_resealed_so_old_keys_can_be_retired() {
         .writer()
         .write(move |tx| secrets::revoke_version(tx, admin, Scope::Repo(repo), "OLD", 1, NOW))
         .unwrap();
-    // A confirmed second factor sealed under the original key.
     let root = s.root;
     let seed = s.key.seal(
         &{
@@ -446,8 +421,6 @@ fn every_sealed_row_is_resealed_so_old_keys_can_be_retired() {
 
     Key::rotate(&s.key_path(), &s.dir.path().join("pre-rotation.key")).unwrap();
     let rotated = Arc::new(Key::load(&s.key_path()).unwrap());
-    // A value written after the rotation is already current: a mixed store,
-    // as after an interrupted reseal, is handled row by row.
     put_with(
         &s.store,
         rotated.clone(),
@@ -476,11 +449,9 @@ fn every_sealed_row_is_resealed_so_old_keys_can_be_retired() {
     let retired = Key::load(&s.key_path()).unwrap();
     assert_eq!(retired.len(), 1);
     s.store.read(|c| reseal::verify_key(c, &retired)).unwrap();
-    // The original key opens nothing any more.
     let original = Key::load(&s.dir.path().join("pre-rotation.key")).unwrap();
     assert!(s.store.read(|c| reseal::verify_key(c, &original)).is_err());
 
-    // Sealed bytes still cannot be rewritten except forward.
     let rows: Vec<Vec<u8>> = s
         .store
         .read(|c| {

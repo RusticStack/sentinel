@@ -111,7 +111,6 @@ fn full_lifecycle_with_fenced_lease_and_timestamps() {
         f.store.read(|c| jobs::run_state(c, tenant, run)).unwrap(),
         RunState::Terminal(Outcome::Passed)
     );
-    // Duplicate completion is reported, not applied.
     assert!(matches!(
         w.write(move |tx| jobs::transition(tx, tenant, job, wk, Event::Passed, t(70))),
         Err(Error::Transition(
@@ -190,8 +189,6 @@ fn stale_worker_fence_and_wrong_tenant_are_rejected() {
 fn compare_and_set_detects_out_of_band_change() {
     let f = fixture();
     let (tenant, job) = (f.tenant, f.job);
-    // Simulate a row changed after the read inside the same transaction by
-    // bumping the fence directly before the guarded UPDATE runs.
     let result = f.store.writer().write(move |tx| {
         let row = jobs::get_job(tx, tenant, job)?;
         assert_eq!(row.fence, Fence::NONE);
@@ -199,7 +196,6 @@ fn compare_and_set_detects_out_of_band_change() {
             "UPDATE jobs SET fence = 7 WHERE id = ?1",
             params![job.as_bytes()],
         )?;
-        // `transition` would re-read fence 7 and succeed, so replay the stale read by hand.
         let changed = tx.execute(
             "UPDATE jobs SET state_code = 1 WHERE id = ?1 AND state_code = 0 AND fence = ?2",
             params![job.as_bytes(), row.fence.0 as i64],
@@ -211,7 +207,6 @@ fn compare_and_set_detects_out_of_band_change() {
         }
     });
     assert!(matches!(result, Err(Error::Conflict)));
-    // The failed transaction rolled back entirely, including the fence bump.
     let row = f.store.read(|c| jobs::get_job(c, tenant, job)).unwrap();
     assert_eq!(row.fence, Fence::NONE);
     assert_eq!(row.state, JobState::Blocked);
@@ -222,12 +217,10 @@ fn foreign_keys_and_ownership_constraints_hold() {
     let f = fixture();
     let tenant = f.tenant;
     let w = f.store.writer();
-    // Job for a run that does not exist in this tenant.
     assert!(matches!(
         w.write(move |tx| jobs::insert_job(tx, tenant, RunId::new(), JobId::new(), "x", 1, 1)),
         Err(Error::NotFound)
     ));
-    // Run for a repo owned by another tenant.
     let other = TenantId::new();
     let other_repo = RepoId::new();
     w.write(move |tx| {
@@ -246,7 +239,6 @@ fn foreign_keys_and_ownership_constraints_hold() {
         )),
         Err(Error::NotFound)
     ));
-    // Raw insert with a dangling tenant is a constraint failure.
     let raw = w.write(|tx| {
         tx.execute(
             "INSERT INTO repos(id, tenant_id, name, created_ms) VALUES (?1, ?2, 'r', 1)",
@@ -290,7 +282,6 @@ fn ready_queue_orders_by_priority_then_sequence() {
         })
         .unwrap();
     assert_eq!(f.store.read(jobs::pick_ready).unwrap(), Some((tenant, b)));
-    // The plan must use the partial index, not scan.
     f.store
         .read(|conn| {
             let plan: String = conn.query_row(
@@ -359,8 +350,6 @@ fn acknowledged_writes_survive_reopen_without_checkpoint() {
 fn writer_queue_is_bounded_and_reports_back_pressure() {
     let f = fixture();
     let store = Arc::new(f.store);
-    // Block the writer inside a job, and know it is running there: the
-    // queue is then empty and holds exactly WRITER_QUEUE more.
     let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
     let (running_tx, running_rx) = std::sync::mpsc::channel::<()>();
     let blocker = {
@@ -377,10 +366,6 @@ fn writer_queue_is_bounded_and_reports_back_pressure() {
     running_rx
         .recv_timeout(Duration::from_secs(30))
         .expect("the blocking job never ran");
-    // Every submitter reports its answer as soon as it has one. While the
-    // writer is blocked an accepted job cannot answer, so the first answers
-    // are exactly the overflow — no sleep has to guess when every thread
-    // has tried to enqueue.
     const OVERFLOW: usize = 8;
     let (answer_tx, answers) = std::sync::mpsc::channel();
     let handles: Vec<_> = (0..sentinel_store::WRITER_QUEUE + OVERFLOW)
@@ -390,8 +375,6 @@ fn writer_queue_is_bounded_and_reports_back_pressure() {
         })
         .collect();
     drop(answer_tx);
-    // An accepted job's caller that outwaits WRITE_WAIT (a very slow host)
-    // is told `WriteAmbiguous`; that is accepted work, kept for below.
     let mut early = Vec::new();
     let mut rejected = 0;
     while rejected < OVERFLOW {
@@ -411,9 +394,6 @@ fn writer_queue_is_bounded_and_reports_back_pressure() {
     for handle in handles {
         handle.join().unwrap();
     }
-    // Every accepted job ran once the writer was free: accepted work is
-    // never dropped. (Past WRITE_WAIT a waiter is told the outcome is
-    // ambiguous — the job still runs.)
     let rest: Vec<_> = early.into_iter().chain(answers.iter()).collect();
     assert_eq!(rest.len(), sentinel_store::WRITER_QUEUE);
     assert!(
