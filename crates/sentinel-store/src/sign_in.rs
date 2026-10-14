@@ -241,6 +241,9 @@ pub fn link(
                 }
                 other => other,
             })?;
+        // Linking is what makes a GitHub organization's membership possible:
+        // ask for the person's check at once, so access follows the link.
+        crate::github_members::enqueue_user(tx, user, now)?;
         audit(
             tx,
             Event::IdentityLinked,
@@ -261,7 +264,6 @@ pub fn unlink(
     provider: &str,
     now: UnixMillis,
 ) -> Result<()> {
-    let _ = now;
     if authority.actor() != Some(user) {
         authority
             .require_platform(tx)
@@ -273,6 +275,12 @@ pub fn unlink(
     )?;
     if removed == 0 {
         return Err(Error::NotFound);
+    }
+    // Unlinking removes the access derived from the link, in the same
+    // transaction: no organization keeps a member its GitHub account no
+    // longer vouches for.
+    if provider == crate::github_members::PROVIDER {
+        crate::github_members::identity_unlinked(tx, user, now)?;
     }
     audit(
         tx,
@@ -291,7 +299,6 @@ pub fn unlink_host_local(
     provider: &str,
     now: UnixMillis,
 ) -> Result<()> {
-    let _ = now;
     let provider = provider.to_owned();
     store.writer().write(move |tx| {
         let removed = tx.execute(
@@ -300,6 +307,9 @@ pub fn unlink_host_local(
         )?;
         if removed == 0 {
             return Err(Error::NotFound);
+        }
+        if provider == crate::github_members::PROVIDER {
+            crate::github_members::identity_unlinked(tx, user, now)?;
         }
         audit(
             tx,

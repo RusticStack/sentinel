@@ -5,7 +5,7 @@
 #
 #   bench/b02-sentinel.sh setup   KIT ROOT BUNDLES MODCACHE
 #   bench/b02-sentinel.sh start   KIT ROOT
-#   bench/b02-sentinel.sh measure KIT ROOT CONDITION SAMPLES WARMUP OUT
+#   SENTINEL_SRC=CHECKOUT bench/b02-sentinel.sh measure KIT ROOT CONDITION SAMPLES WARMUP OUT
 #   bench/b02-sentinel.sh stop    KIT ROOT
 #
 # KIT holds `sentinel` (a release build with both roles), git_https.py (the
@@ -133,6 +133,9 @@ PY
   ;;
 measure)
   CONDITION=$4 SAMPLES=$5 WARMUP=$6 OUT=$7
+  # Every record names the build it measured: the checkout $BIN was built from.
+  : "${SENTINEL_SRC:?set SENTINEL_SRC to the checkout the sentinel binary was built from}"
+  git -C "$SENTINEL_SRC" rev-parse HEAD >/dev/null || { echo "cannot read the commit of $SENTINEL_SRC" >&2; exit 1; }
   cd "$ROOT"
   API="http://$(cat api.addr)/api/v1" TOKEN=$(cat token)
   settle() {
@@ -183,12 +186,37 @@ measure)
     attempt=$(printf '%s' "$body" | python3 -c 'import json,sys; r=json.load(sys.stdin)["run"]; print(r["jobs"][0]["attempt"])')
     steps=$(curl -fsS -H "authorization: Bearer $TOKEN" "$API/attempts/$attempt/steps")
     summary=$(curl -fsS -H "authorization: Bearer $TOKEN" "$API/attempts/$attempt/summary")
-    python3 - "$CONDITION" "$([ "$i" -le "$WARMUP" ] && echo 1 || echo 0)" "$pressure" "$start" "$dispatched" "$end" "$run" "$new" "$body" "$steps" "$summary" "$("$BIN" --version)" >> "$OUT" <<'PY'
-import json, sys
-condition, warmup, pressure, start, dispatched, end, run, sha, body, steps, summary, version = sys.argv[1:]
+    python3 - "$CONDITION" "$([ "$i" -le "$WARMUP" ] && echo 1 || echo 0)" "$pressure" "$start" "$dispatched" "$end" "$run" "$new" "$body" "$steps" "$summary" "$("$BIN" --version)" "$SENTINEL_SRC" "$BIN" >> "$OUT" <<'PY'
+import hashlib, json, os, subprocess, sys
+condition, warmup, pressure, start, dispatched, end, run, sha, body, steps, summary, version, src, binary = sys.argv[1:]
 job = json.loads(body)["run"]["jobs"][0]
+def git(*a):
+    r = subprocess.run(["git", "-C", src, *a], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+def first(path):
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return None
+def field(path, key):
+    try:
+        for line in open(path):
+            k, _, v = line.partition(":")
+            if k.strip() == key:
+                return v.strip()
+    except OSError:
+        pass
+mem = field("/proc/meminfo", "MemTotal")
+host = {"hostname": first("/etc/hostname"), "kernel": first("/proc/sys/kernel/osrelease"),
+        "cpu_model": field("/proc/cpuinfo", "model name"), "cpus_online": os.cpu_count(),
+        "mem_total_kib": int(mem.split()[0]) if mem else None,
+        "cpu_governor": first("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")}
+status = git("status", "--porcelain")
 print(json.dumps({
     "schema": "sentinel-bench/sentinel-run/1",
+    "build": {"commit": git("rev-parse", "HEAD"), "dirty": None if status is None else bool(status),
+              "binary_sha256": hashlib.sha256(open(binary, "rb").read()).hexdigest()},
+    "host": {k: v for k, v in host.items() if v is not None},
     "contract": {"id": "lockwell-ci", "revision": 1, "lane": "unit", "condition": condition},
     "sentinel": version, "warmup": warmup == "1", "cpu_pressure_avg60": float(pressure),
     "run": run, "sha": sha, "job_state": job.get("state"),

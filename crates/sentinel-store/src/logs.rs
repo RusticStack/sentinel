@@ -177,6 +177,10 @@ struct Open {
     ended: Option<u64>,
     /// Encode scratch, reused across frames.
     scratch: Vec<u8>,
+    /// The active segment holds frames written but not yet `fsync`ed
+    /// (`append_deferred`). Nothing is acknowledged over them until
+    /// [`sync_dirty`] has made them durable.
+    dirty: bool,
 }
 
 /// Sealed segments waiting to be compressed, drained by one thread.
@@ -718,6 +722,7 @@ impl LogStore {
             seg_checkpointed: false,
             ended,
             scratch: Vec::new(),
+            dirty: false,
         };
         if w.ended.is_some() {
             // Complete on disk: nothing to fold. Leftover plain segments
@@ -818,6 +823,10 @@ impl LogStore {
                     .truncate(false)
                     .open(&path)?;
                 file.set_len(complete_len)?;
+                // Frames a dropped writer left unsynced are acknowledged as
+                // duplicates when the worker resends them: make everything
+                // that survived durable before this writer serves anyone.
+                file.sync_data()?;
                 file.seek(SeekFrom::End(0))?;
                 w.seg = n;
                 w.seg_len = complete_len;
@@ -877,14 +886,58 @@ impl LogStore {
         attempt: AttemptId,
         frame: &Frame,
     ) -> Result<Appended> {
-        let appended = self.with_writer(run, job, attempt, |w| self.append_to(w, frame))?;
+        let appended = self.with_writer(run, job, attempt, |w| self.append_to(w, frame, true))?;
         if matches!(appended, Appended::Stored { .. }) {
             self.changes.bump();
         }
         Ok(appended)
     }
 
-    fn append_to(&self, w: &mut Open, frame: &Frame) -> Result<Appended> {
+    /// [`append`](Self::append) without the per-frame `fsync`, for a caller
+    /// that acknowledges in windows: `Stored` frames are written and
+    /// readable but **not durable** — the caller must [`sync`](Self::sync)
+    /// the attempt before acknowledging any of them. `Duplicate` is always
+    /// durable (a dirty segment is synced before it is answered).
+    pub fn append_deferred(
+        &self,
+        run: RunId,
+        job: JobId,
+        attempt: AttemptId,
+        frame: &Frame,
+    ) -> Result<Appended> {
+        let appended = self.with_writer(run, job, attempt, |w| self.append_to(w, frame, false))?;
+        if matches!(appended, Appended::Stored { .. }) {
+            self.changes.bump();
+        }
+        Ok(appended)
+    }
+
+    /// Make every frame `append_deferred` stored for the attempt durable.
+    /// An attempt with no open writer is an error, never a quiet success:
+    /// its unsynced frames (if any) are unaccounted for, so nothing may be
+    /// acknowledged over them — the caller's peer resends, and the reopened
+    /// writer syncs what survived before answering. A failed sync drops the
+    /// writer so the next call reopens from disk.
+    pub fn sync(&self, attempt: AttemptId) -> Result<()> {
+        let slot = self
+            .open
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&attempt)
+            .map(Arc::clone)
+            .ok_or(Error::Conflict)?;
+        let mut guard = slot.open.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(w) = guard.as_mut() else {
+            return Err(Error::Conflict);
+        };
+        let result = sync_dirty(w);
+        if result.is_err() {
+            *guard = None;
+        }
+        result
+    }
+
+    fn append_to(&self, w: &mut Open, frame: &Frame, durable: bool) -> Result<Appended> {
         if w.ended.is_some() {
             return Err(Error::Conflict);
         }
@@ -893,6 +946,9 @@ impl LogStore {
         // would otherwise be acked as a duplicate over a forgettable hole.
         persist_holes(w)?;
         if frame.seq <= w.last_seq && !in_hole(&w.holes, frame.seq) {
+            // The earlier copy may still be unsynced: the duplicate answer
+            // is an acknowledgement.
+            sync_dirty(w)?;
             return Ok(Appended::Duplicate {
                 through: w.last_seq,
             });
@@ -939,7 +995,15 @@ impl LogStore {
             sync_dir(&w.dir)?;
         }
         let file = w.file.as_mut().expect("opened above");
-        if let Err(e) = file.write_all(&w.scratch).and_then(|()| file.sync_data()) {
+        let written = file.write_all(&w.scratch).and_then(|()| {
+            if durable {
+                // Covers every deferred frame written before this one too.
+                file.sync_data()
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(e) = written {
             // Never acknowledged, so never kept: a short write (ENOSPC, a
             // file size limit) or a failed sync must not leave a record for
             // the next frame to land behind. `with_writer` reopens from
@@ -947,6 +1011,7 @@ impl LogStore {
             let _ = file.set_len(w.seg_len);
             return Err(e.into());
         }
+        w.dirty = !durable;
         let step_changed = frame.step != w.step;
         w.seg_len += record_len;
         w.len += record_len;
@@ -991,6 +1056,7 @@ impl LogStore {
         if let Some(file) = w.file.take() {
             file.sync_data()?;
         }
+        w.dirty = false;
         self.compressor.enqueue(seg_path(&w.dir, w.seg, false));
         w.seg += 1;
         w.seg_len = 0;
@@ -1858,13 +1924,27 @@ fn write_end_marker(dir: &Path, last_seq: u64, gaps: &[(u64, u64)]) -> Result<()
     sync_dir(dir)
 }
 
+/// `fsync` the active segment when deferred frames are waiting on it.
+fn sync_dirty(w: &mut Open) -> Result<()> {
+    if w.dirty {
+        if let Some(file) = w.file.as_ref() {
+            file.sync_data()?;
+        }
+        w.dirty = false;
+    }
+    Ok(())
+}
+
 /// Land the hole list if it changed: tmp, fsync, rename, directory
 /// fsync — complete or absent, like the end marker. Rare: only jumps and
-/// fills change it.
+/// fills change it. Deferred frames are made durable first: a fill is
+/// recorded as closed only once its frame is on disk, or a power loss
+/// would leave a closed hole whose resend is answered as a duplicate.
 fn persist_holes(w: &mut Open) -> Result<()> {
     if !w.holes_dirty {
         return Ok(());
     }
+    sync_dirty(w)?;
     let mut bytes = Vec::with_capacity(10 + w.holes.len() * 16);
     bytes.extend_from_slice(HOLES_MAGIC);
     bytes.extend_from_slice(&HOLES_FORMAT.to_le_bytes());

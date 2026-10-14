@@ -1,6 +1,6 @@
 # Rust workspace and platform contract
 
-Implemented for **F01**, updated through **F04**. The repository builds a `sentinel` executable with help/version, typed role configuration, Linux process startup/shutdown, and [tracing/timing/work-lane foundations](runtime-foundation.md). See [CLI and configuration](configuration.md). Job execution and GitHub integration are not implemented yet.
+Implemented for **F01**, updated through **F04**. The repository builds a `sentinel` executable with help/version, typed role configuration, Linux process startup/shutdown, and [tracing/timing/work-lane foundations](runtime-foundation.md). See [CLI and configuration](configuration.md). This page records the foundation as of F01–F04; job execution and GitHub integration were added later (see [executor](executor.md) and [GitHub sign-in](github-sign-in.md)).
 
 ## Workspace
 

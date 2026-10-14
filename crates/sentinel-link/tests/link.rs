@@ -351,6 +351,7 @@ impl WorkerProcess {
         let config = worker::Config {
             controller: d.controller().local_addr(),
             server: d.controller().fingerprint(),
+            also_pinned: Vec::new(),
             worker: id,
             name: "builder-1".into(),
             hello: {
@@ -359,7 +360,12 @@ impl WorkerProcess {
                 h
             },
             capacity: CAPACITY,
-            profile: sentinel_protocol::negotiate::Profile::default(),
+            profile: sentinel_protocol::negotiate::Profile {
+                // A profile-protocol worker states its scratch disk; zero offers none,
+                // and every job declares some.
+                disk_bytes: 64 << 30,
+                ..sentinel_protocol::negotiate::Profile::default()
+            },
             transport: sentinel_link::session::TransportStats::default(),
             remote_cache: false,
         };
@@ -513,6 +519,37 @@ fn a_worker_enrolls_once_heartbeats_reconnects_and_is_refused_after_revocation()
         d.controller().stats().rejected.load(Ordering::SeqCst) == 4
     });
     assert_eq!(d.controller().stats().admitted.load(Ordering::SeqCst), 2);
+}
+
+/// Certificate rotation overlap: a worker pinning the old and the new
+/// fingerprint reaches the controller on either, one pinning neither (or an
+/// empty or oversized set) does not.
+#[test]
+fn a_worker_pinning_a_set_of_fingerprints_accepts_any_of_them() {
+    let d = deployment();
+    let current = d.controller().fingerprint();
+    let retired = Identity::generate("retired").unwrap().fingerprint();
+    let stranger = Identity::generate("stranger").unwrap().fingerprint();
+    let attempt = |pins: &[sentinel_auth::secret::Digest]| {
+        let secret = d.enrollment(60_000);
+        let config = tls::client_config_pinned(Identity::generate("w").unwrap(), pins).unwrap();
+        session::connect(
+            d.controller().local_addr(),
+            config,
+            WorkerId::new(),
+            "w",
+            hello(),
+            Some(&secret),
+            CAPACITY,
+        )
+    };
+    assert!(attempt(&[retired, current]).is_ok());
+    assert!(attempt(&[current, retired]).is_ok());
+    let failure = attempt(&[retired, stranger]).unwrap_err();
+    assert!(matches!(failure, Error::Tls(_) | Error::Io(_)), "{failure}");
+    assert!(tls::client_config_pinned(Identity::generate("w").unwrap(), &[]).is_err());
+    let too_many = vec![current; tls::MAX_PINS + 1];
+    assert!(tls::client_config_pinned(Identity::generate("w").unwrap(), &too_many).is_err());
 }
 
 #[test]
@@ -711,9 +748,12 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     let tail = d.logs.tail(run, job, attempt, 0, 10, None).unwrap();
     assert_eq!(tail.frames.len(), 2);
     assert!(!tail.complete);
+    // The two frames may be acknowledged together or one by one, so count
+    // from what has been acknowledged, not from a fixed number.
+    let acked = recorder.log_acks.lock().unwrap().len();
     reporter.log(attempt, &text(2, "two\n")).unwrap();
     eventually("duplicate acked", || {
-        recorder.log_acks.lock().unwrap().len() == 3
+        recorder.log_acks.lock().unwrap().len() == acked + 1
     });
     assert_eq!(
         d.logs

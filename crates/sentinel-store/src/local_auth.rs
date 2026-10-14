@@ -117,6 +117,37 @@ pub enum Event {
     OAuthDeviceDenied = 54,
     ServiceGrantIssued = 55,
     ServiceAccountCreated = 56,
+    /// A platform administrator who is not an administrator of the tenant
+    /// changed its access under platform scope; the detail is their reason.
+    PlatformOverride = 57,
+    /// A tenant administrator added an account that was not yet a member. The
+    /// person did not accept anything, so the addition is recorded on its own
+    /// in addition to the role change.
+    MemberAdded = 58,
+    /// A verification link was minted for an address (queued for delivery or
+    /// issued by the host-local CLI). The address is never recorded.
+    EmailVerificationRequested = 59,
+    /// An account proved control of its address.
+    EmailVerified = 60,
+    /// The mail lane gave up on a message; the detail is its kind and reason.
+    MailAbandoned = 61,
+    /// GitHub confirmed a linked account as a member of a GitHub-backed
+    /// organization and Sentinel added or promoted the membership. The detail
+    /// names the tenant and the role; no GitHub login or id is recorded.
+    GithubMemberJoined = 70,
+    /// GitHub's answer changed a derived role (an owner demoted, a member
+    /// made an owner).
+    GithubMemberRoleChanged = 71,
+    /// Derived access ended: GitHub no longer lists the member, the GitHub
+    /// link was removed, or an unconfirmed row outlived its grace period.
+    GithubMemberRemoved = 72,
+    /// A tenant's membership source was changed by an administrator.
+    TenantBackingChanged = 73,
+    /// A verified address in a domain the operator listed in
+    /// `SENTINEL_AUTO_JOIN_DOMAINS` joined an app-created organization (or
+    /// created it, as its administrator). The detail names the organization
+    /// and the role; the address is never recorded.
+    DomainAutoJoined = 74,
 }
 
 impl Event {
@@ -179,6 +210,16 @@ impl Event {
             Event::OAuthDeviceDenied => "oauth-device-denied",
             Event::ServiceGrantIssued => "service-grant-issued",
             Event::ServiceAccountCreated => "service-account-created",
+            Event::PlatformOverride => "platform-override",
+            Event::MemberAdded => "member-added",
+            Event::EmailVerificationRequested => "email-verification-requested",
+            Event::EmailVerified => "email-verified",
+            Event::MailAbandoned => "mail-abandoned",
+            Event::GithubMemberJoined => "github-member-joined",
+            Event::GithubMemberRoleChanged => "github-member-role-changed",
+            Event::GithubMemberRemoved => "github-member-removed",
+            Event::TenantBackingChanged => "tenant-backing-changed",
+            Event::DomainAutoJoined => "domain-auto-joined",
         }
     }
 
@@ -240,6 +281,16 @@ impl Event {
             54 => Event::OAuthDeviceDenied,
             55 => Event::ServiceGrantIssued,
             56 => Event::ServiceAccountCreated,
+            57 => Event::PlatformOverride,
+            58 => Event::MemberAdded,
+            59 => Event::EmailVerificationRequested,
+            60 => Event::EmailVerified,
+            61 => Event::MailAbandoned,
+            70 => Event::GithubMemberJoined,
+            71 => Event::GithubMemberRoleChanged,
+            72 => Event::GithubMemberRemoved,
+            73 => Event::TenantBackingChanged,
+            74 => Event::DomainAutoJoined,
             _ => return None,
         })
     }
@@ -274,6 +325,8 @@ pub struct Session {
     pub csrf: Digest,
     pub idle_deadline: UnixMillis,
     pub absolute_deadline: UnixMillis,
+    /// When the session was issued (the sign-in that made it).
+    pub created: UnixMillis,
     /// When this session last proved a second factor, if ever.
     pub stepped_up: Option<UnixMillis>,
 }
@@ -284,6 +337,15 @@ impl Session {
     pub fn stepped_up_within(&self, policy: Policy, now: UnixMillis) -> bool {
         self.stepped_up
             .is_some_and(|at| at <= now && now.0.saturating_sub(at.0) < policy.step_up_ms)
+    }
+
+    /// Whether this session was issued within the step-up window: a person
+    /// who has just signed in has just proven themselves, which is the only
+    /// proof an account with neither a password nor a second factor (GitHub
+    /// only) can give before enrolling its first factor. Judged against the
+    /// recorded creation time, which no policy change can move.
+    pub fn signed_in_within(&self, policy: Policy, now: UnixMillis) -> bool {
+        self.created <= now && now.0.saturating_sub(self.created.0) < policy.step_up_ms
     }
 
     pub fn require_step_up(&self, policy: Policy, now: UnixMillis) -> Result<()> {
@@ -360,6 +422,73 @@ pub(crate) fn audit(
     Ok(())
 }
 
+/// Rows of one kind a rejected-login flood may add per [`FLOOD_WINDOW_MS`].
+const FLOOD_ROWS: i64 = 5;
+const FLOOD_WINDOW_MS: i64 = 10_000;
+
+/// [`audit`] for events anyone can cause without a credential (a guess at a
+/// name that does not exist, a request against a locked account): the
+/// record is append-only, so an unbounded flood would be unbounded growth.
+/// Once [`FLOOD_ROWS`] rows of this event and subject exist inside the
+/// window, the attempt is not recorded; the first of every window always is,
+/// so spraying stays visible without being able to fill the disk.
+fn audit_flood(
+    tx: &Transaction<'_>,
+    event: Event,
+    subject: Option<UserId>,
+    detail: Option<&str>,
+) -> Result<()> {
+    let now = UnixMillis::now().0;
+    tx.prepare_cached(
+        "INSERT INTO auth_audit(at_ms, event, actor_user_id, subject_user_id, host_local, detail)
+         SELECT ?1, ?2, NULL, ?3, 0, ?4
+         WHERE (SELECT COUNT(*) FROM auth_audit
+                WHERE at_ms > ?5 AND event = ?2 AND subject_user_id IS ?3) < ?6",
+    )?
+    .execute(params![
+        now,
+        event as u8,
+        subject.as_ref().map(UserId::as_bytes),
+        detail.map(bounded_detail),
+        now - FLOOD_WINDOW_MS,
+        FLOOD_ROWS
+    ])?;
+    Ok(())
+}
+
+/// Record one flood-limited event, entering the single writer only while
+/// the window still has room (a cheap indexed read decides): a flood past
+/// the cap costs a reader, not a write transaction.
+fn record_flood(
+    store: &Store,
+    event: Event,
+    subject: Option<UserId>,
+    detail: Option<String>,
+) -> Result<()> {
+    let room = store.read(|conn| {
+        let rows: i64 = conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM auth_audit
+                 WHERE at_ms > ?1 AND event = ?2 AND subject_user_id IS ?3",
+            )?
+            .query_row(
+                params![
+                    UnixMillis::now().0 - FLOOD_WINDOW_MS,
+                    event as u8,
+                    subject.as_ref().map(UserId::as_bytes)
+                ],
+                |r| r.get(0),
+            )?;
+        Ok(rows < FLOOD_ROWS)
+    })?;
+    if room {
+        store
+            .writer()
+            .write(move |tx| audit_flood(tx, event, subject, detail.as_deref()))?;
+    }
+    Ok(())
+}
+
 /// Host-local admission of the first super admin. Refuses once the latch is set
 /// or any active super admin already exists: "first visitor wins" is not a
 /// bootstrap. The user, its credential and the latch are one commit.
@@ -389,6 +518,8 @@ pub fn bootstrap(
             "INSERT INTO bootstrap(id, completed_ms, user_id) VALUES (1, ?1, ?2)",
             params![now.0, user.as_bytes()],
         )?;
+        // The latch is closed for the wizard too: its token dies with it.
+        tx.execute("DELETE FROM setup_token", [])?;
         audit(
             tx,
             Event::Bootstrap,
@@ -401,7 +532,7 @@ pub fn bootstrap(
     })
 }
 
-fn bootstrap_complete(conn: &Connection) -> Result<bool> {
+pub(crate) fn bootstrap_complete(conn: &Connection) -> Result<bool> {
     let complete: bool = conn
         .prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM bootstrap)
@@ -473,8 +604,37 @@ fn candidate(conn: &Connection, login_name: &str) -> Result<Option<Candidate>> {
     }))
 }
 
+/// [`candidate`] for an address (canonical): the active account that
+/// verified it. An unverified claim identifies nobody.
+fn candidate_by_email(conn: &Connection, email: &str) -> Result<Option<Candidate>> {
+    let row = conn
+        .prepare_cached(
+            "SELECT c.user_id, c.phc, c.locked_until_ms FROM users u
+             JOIN local_credentials c ON c.user_id = u.id
+             WHERE u.email = ?1 AND u.email_verified_ms IS NOT NULL
+               AND u.kind = 0 AND u.active = 1",
+        )?
+        .query_row([email], |r| {
+            Ok((
+                r.get::<_, [u8; 16]>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .optional()?;
+    let Some((id, phc, locked_until)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(Candidate {
+        user: UserId::from_bytes(id).map_err(|_| Error::Corrupt("user_id"))?,
+        phc,
+        locked_until,
+    }))
+}
+
 /// Verify a password and, on success, issue a fresh opaque session. An unknown
-/// user costs the same work as a wrong password.
+/// user costs the same work as a wrong password. `login_name` is a username or
+/// a verified email address.
 pub fn login(
     store: &Store,
     login_name: &str,
@@ -485,35 +645,35 @@ pub fn login(
     // An attempt against an unknown or malformed name is still recorded, with no
     // subject: password spraying is visible in the audit trail, and the caller
     // cannot tell the outcomes apart from the response or from the time taken.
-    let Ok(login_name) = username(login_name) else {
-        password::spend_equal_work(password_bytes);
-        store
-            .writer()
-            .write(move |tx| audit(tx, Event::LoginRejected, None, None, false, None))?;
-        return Ok(Login::Rejected);
+    //
+    // The identifier is a username, or — when it holds an `@`, which no
+    // username can — an email address, which signs in only once verified.
+    // An address is personal data, so a rejected attempt never records it.
+    let (found, detail) = if login_name.contains('@') {
+        let found = match crate::email::normalize(login_name) {
+            Ok(email) => store.read(|conn| candidate_by_email(conn, &email))?,
+            Err(_) => None,
+        };
+        (found, None)
+    } else {
+        match username(login_name) {
+            Ok(name) => (
+                store.read(|conn| candidate(conn, name))?,
+                Some(name.to_owned()),
+            ),
+            Err(_) => (None, None),
+        }
     };
-    let Some(candidate) = store.read(|conn| candidate(conn, login_name))? else {
+    let Some(candidate) = found else {
         password::spend_equal_work(password_bytes);
-        let attempted = login_name.to_owned();
-        store.writer().write(move |tx| {
-            audit(
-                tx,
-                Event::LoginRejected,
-                None,
-                None,
-                false,
-                Some(&attempted),
-            )
-        })?;
+        record_flood(store, Event::LoginRejected, None, detail)?;
         return Ok(Login::Rejected);
     };
     if candidate.locked_until > now.0 {
         password::spend_equal_work(password_bytes);
         let until = UnixMillis(candidate.locked_until);
         let user = candidate.user;
-        store
-            .writer()
-            .write(move |tx| audit(tx, Event::LoginLocked, None, Some(user), false, None))?;
+        record_flood(store, Event::LoginLocked, Some(user), None)?;
         return Ok(Login::Locked { until });
     }
 
@@ -633,6 +793,11 @@ pub fn issue_session(
             SessionId::new().as_bytes()
         ],
     )?;
+    // A sign-in re-checks the person against every GitHub-backed organization
+    // (one bounded statement; the lane asks GitHub, this request never does).
+    crate::github_members::enqueue_user(tx, user, now)?;
+    // An address verified before its domain was listed joins now.
+    crate::auto_join::apply(tx, user, now)?;
     Ok(Issued {
         user,
         session,
@@ -652,7 +817,7 @@ pub fn authenticate(conn: &Connection, presented: &Secret, now: UnixMillis) -> R
     let row = conn
         .prepare_cached(
             "SELECT s.user_id, s.csrf_digest, s.idle_deadline_ms, s.absolute_deadline_ms,
-                    u.super_admin, s.id, s.stepped_up_ms
+                    u.super_admin, s.id, s.stepped_up_ms, s.created_ms
              FROM sessions s JOIN users u ON u.id = s.user_id
              WHERE s.token_digest = ?1 AND s.revoked_ms IS NULL
              AND s.idle_deadline_ms > ?2 AND s.absolute_deadline_ms > ?2
@@ -667,6 +832,7 @@ pub fn authenticate(conn: &Connection, presented: &Secret, now: UnixMillis) -> R
                 r.get::<_, bool>(4)?,
                 r.get::<_, Option<[u8; 16]>>(5)?,
                 r.get::<_, Option<i64>>(6)?,
+                r.get::<_, i64>(7)?,
             ))
         })
         .optional()?
@@ -681,6 +847,7 @@ pub fn authenticate(conn: &Connection, presented: &Secret, now: UnixMillis) -> R
         csrf: Digest(row.1),
         idle_deadline: UnixMillis(row.2),
         absolute_deadline: UnixMillis(row.3),
+        created: UnixMillis(row.7),
         stepped_up: row.6.map(UnixMillis),
     })
 }
@@ -727,7 +894,23 @@ pub fn logout(store: &Store, presented: &Secret, now: UnixMillis) -> Result<()> 
 
 /// Revoke every live session of one account: the caller's logout-all, and the
 /// rotation a password change, role change or suspension must perform.
+///
+/// A session that is no longer trusted may have left credentials behind that
+/// outlive it, so in the same transaction the service grants this account
+/// minted since its oldest live session began are revoked too
+/// ([`crate::oauth::revoke_minted_since`]). The window starts at the oldest
+/// session not individually revoked, expired ones included: a hijacked session
+/// that has gone idle may still have minted a credential. A session revoked by
+/// name closed its own window then ([`revoke_session`]).
 pub fn revoke_all(tx: &Transaction<'_>, user: UserId, now: UnixMillis) -> Result<usize> {
+    let since: Option<i64> = tx
+        .prepare_cached(
+            "SELECT MIN(created_ms) FROM sessions WHERE user_id = ?1 AND revoked_ms IS NULL",
+        )?
+        .query_row(params![user.as_bytes()], |r| r.get(0))?;
+    if let Some(since) = since {
+        crate::oauth::revoke_minted_since(tx, user, UnixMillis(since), now)?;
+    }
     let revoked = tx.execute(
         "UPDATE sessions SET revoked_ms = ?2 WHERE user_id = ?1 AND revoked_ms IS NULL",
         params![user.as_bytes(), now.0],
@@ -745,27 +928,46 @@ pub fn logout_all(store: &Store, session: &Session, now: UnixMillis) -> Result<u
     })
 }
 
-/// Self-service password change. Requires the current password, then rotates
-/// every session: a password change must not leave old cookies working.
+/// Self-service password change. Requires the current password, then revokes
+/// every session (the caller's included) and every OAuth grant of the account:
+/// a password change must not leave old cookies or tokens working.
+///
+/// `presented` is the caller's session cookie. An account with a confirmed
+/// second factor also needs a fresh step-up: the password alone is the weaker
+/// proof and must not stand in for the factor, as it cannot for a step-up. A
+/// wrong current password returns `false`, is audited, and counts against the
+/// session like any wrong proof of presence (five revoke it); an account with
+/// no local credential is `NotFound`.
 pub fn change_password(
     store: &Store,
+    presented: &Secret,
     session: &Session,
+    policy: Policy,
     current: &[u8],
     new: &[u8],
     now: UnixMillis,
 ) -> Result<bool> {
     let user = session.user;
-    let stored = store.read(|conn| {
-        conn.prepare_cached("SELECT phc FROM local_credentials WHERE user_id = ?1")?
-            .query_row([user.as_bytes()], |r| r.get::<_, String>(0))
-            .optional()
-            .map_err(Error::from)
+    let (enrolled, stored) = store.read(|conn| {
+        conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM mfa_totp
+                WHERE user_id = ?1 AND confirmed_ms IS NOT NULL),
+                (SELECT phc FROM local_credentials WHERE user_id = ?1)",
+        )?
+        .query_row([user.as_bytes()], |r| {
+            Ok((r.get::<_, bool>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .map_err(Error::from)
     })?;
     let Some(stored) = stored else {
         password::spend_equal_work(current);
         return Err(Error::NotFound);
     };
+    if enrolled {
+        session.require_step_up(policy, now)?;
+    }
     if password::verify(&stored, current) != Verdict::Accepted {
+        crate::mfa::refuse_password(store, presented.digest().0, user, now)?;
         return Ok(false);
     }
     let phc = password::hash(new).map_err(|_| Error::InvalidInput("password"))?;
@@ -989,6 +1191,13 @@ pub fn sessions(
 /// Revoke one named session of an account: its own, or a platform admin's
 /// decision. Immediate and audited; a session issued before migration 9 has no
 /// name and is reached by `logout_all` or `revoke_all` instead.
+///
+/// A grant records who minted it, not through which session, so the service
+/// grants the account minted from this session's creation until now are
+/// revoked in the same transaction: the response to a hijacked session must
+/// not leave its minted credential behind. Grants minted by the account's
+/// other sessions in that span are revoked too, and are reissued after a
+/// step-up.
 pub fn revoke_session(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -997,6 +1206,13 @@ pub fn revoke_session(
     now: UnixMillis,
 ) -> Result<()> {
     may_administer(tx, authority, user)?;
+    let created: i64 = tx
+        .prepare_cached(
+            "SELECT created_ms FROM sessions WHERE id = ?1 AND user_id = ?2 AND revoked_ms IS NULL",
+        )?
+        .query_row(params![session.as_bytes(), user.as_bytes()], |r| r.get(0))
+        .optional()?
+        .ok_or(Error::NotFound)?;
     let revoked = tx.execute(
         "UPDATE sessions SET revoked_ms = ?3 WHERE id = ?1 AND user_id = ?2 AND revoked_ms IS NULL",
         params![session.as_bytes(), user.as_bytes(), now.0],
@@ -1004,6 +1220,7 @@ pub fn revoke_session(
     if revoked == 0 {
         return Err(Error::NotFound);
     }
+    crate::oauth::revoke_minted_since(tx, user, UnixMillis(created), now)?;
     audit(
         tx,
         Event::SessionRevoked,

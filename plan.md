@@ -1,6 +1,6 @@
 # Sentinel — implementation plan
 
-Status: design and acceptance criteria. Parts 01–12 of the [backlog](TODO.md) are implemented — foundations, contracts, identity and authorization, durable execution, sources and GitHub feedback, storage, caches, fleet scheduling, OAuth CLI/MCP, scoped secret management through fenced job delivery, bounded structured diagnostics, and the human web interface ([web interface](docs/web-ui.md)). Operations and performance work remain open. See [TODO](TODO.md) for per-task evidence and the [Parts 01–02 audit](docs/parts-01-02-audit.md) for outstanding gates.
+Status: design and acceptance criteria. Parts 01–13 of the [backlog](TODO.md) are implemented — foundations, contracts, identity and authorization, durable execution, sources and GitHub feedback, storage, caches, fleet scheduling, OAuth CLI/MCP, scoped secret management through fenced job delivery, bounded structured diagnostics, the human web interface ([web interface](docs/web-ui.md)), and retention, optional S3, backup and operations. Same-hardware performance work (Part 14) and release (Part 15) remain open. See [TODO](TODO.md) for per-task evidence and the [Parts 01–02 audit](docs/parts-01-02-audit.md) for outstanding gates.
 Reviewed: 2026-09-26. Repository: `RusticStack/sentinel`.
 
 Development tracker: [TODO.md](TODO.md) splits this design into actionable parts, dependencies, first-slice work, and verification gates. Implementation progress is recorded there.
@@ -376,7 +376,7 @@ A Nuxt 4 server (Vue, TypeScript, Nuxt UI) beside the controller renders pages a
 
 **Registration policy:** default `invite_only`; super admin may choose `closed` or `approval_required` per deployment. A successful GitHub login is authentication, not automatic admission. Pending accounts have no tenant data or worker access. Approvals/rejections, invitations, expiry, revocation, and suspensions are visible in the admin console/API and audited.
 
-Account registration, tenant creation, GitHub App installation binding, and runner enrollment are separate decisions. Allow existing members to sign in when registration is closed. Invitations bind to a verified identity (or authenticated acceptance with explicit admin approval), tenant, maximum role, expiry, and one-time nonce. Installing the App on GitHub alone cannot create an approved Sentinel tenant or allocate compute. Unknown installations remain unbound/inactive until an authorized binding exists. No mandatory SMTP: an admin can deliver a one-time invitation link out of band.
+Account registration, tenant creation, GitHub App installation binding, and runner enrollment are separate decisions. Allow existing members to sign in when registration is closed. Invitations bind to a verified identity (or authenticated acceptance with explicit admin approval), tenant, maximum role, expiry, and one-time nonce. Installing the App on GitHub alone cannot create an approved Sentinel tenant or allocate compute. Unknown installations remain unbound/inactive until an authorized binding exists. No mandatory email delivery (optional Resend): an admin can deliver a one-time invitation link out of band.
 
 | Role | Scope and powers |
 |---|---|
@@ -519,7 +519,7 @@ Resolve through hardware/workflow evidence:
 3. Optimized cache backend. ~~Byte/retention defaults.~~ Resolved: sized from the data file system and measured on the reference host, with policy per tenant and repository ([retention](docs/retention.md)).
 4. ~~UI stack and measured binary/RSS limits.~~ Resolved: Nuxt web interface, measured in [web interface](docs/web-ui.md#running-it).
 5. Tailcat pin/upgrade policy, wire framing, bulk concurrency.
-6. Key backup and recovery-point/recovery-time goals. ~~S3-outage policy.~~ Resolved: a bounded backlog on the controller's disk, then admission closes for new artifacts and uploads until it drains; the optional cache is never replicated ([s3](docs/s3.md#degraded-durability-and-admission-r03)).
+6. ~~Key backup and recovery-point/recovery-time goals.~~ Resolved (R04): RPO ≤ 1 hour (the backup interval), RTO ≤ 15 minutes for up to 100 GiB, from a measured drill ([backup](docs/backup.md)). ~~S3-outage policy.~~ Resolved: a bounded backlog on the controller's disk, then admission closes for new artifacts and uploads until it drains; the optional cache is never replicated ([s3](docs/s3.md#degraded-durability-and-admission-r03)).
 
 These gates do not defer scheduling correctness or multi-host design until after v1.
 
@@ -531,6 +531,6 @@ Inspected 2026-09-13; pin versions and recheck exact behavior during implementat
 - [Lockwell migration evidence and source inventory](docs/lockwell-migration.md): six workflows, Makefile, CI guide, Go module, CI contract tests, acceptance/chaos scripts, and production Compose reviewed through GitHub API on 2026-09-13.
 - [Blacksmith](https://www.blacksmith.sh/): vendor emphasizes fast hardware, colocated caches, persistent NVMe layers, microVM startup, and observability. Vendor claims are not independent benchmarks.
 - [Detailed performance research](docs/performance-research.md): Blacksmith technical docs/blogs, Depot architecture/cache/boot engineering, Bazel/Go cache semantics, and actual Lockwell job timestamps. [Auth research](docs/auth-and-secrets.md): native-app OAuth, device grant, and versioned MCP authorization specification.
-- [Tailcat README/source](https://github.com/tailscale/tailcat): Go CLI/library, account-free NAT transport, owned DERP, keys/forwarding, explicit instability; read through GitHub API. Integration has not been tested yet.
+- [Tailcat README/source](https://github.com/tailscale/tailcat): Go CLI/library, account-free NAT transport, owned DERP, keys/forwarding, explicit instability; read through GitHub API. Integration is implemented and tested (Q06/Q07; [feasibility probes](docs/feasibility-probes.md#4-tailcat-unattended-connectivity)).
 - [GitHub branch rename](https://docs.github.com/en/rest/branches/branches#rename-a-branch): consulted through Context7; appropriate permissions required and completion may be asynchronous.
 - Implementation verification references to recheck at corresponding milestones: [Checks](https://docs.github.com/en/rest/checks/runs), [webhooks](https://docs.github.com/en/webhooks/webhook-events-and-payloads), [SQLite WAL](https://www.sqlite.org/wal.html), [backup](https://www.sqlite.org/backup.html), [Woodpecker](https://woodpecker-ci.org/docs/intro), [MCP specification](https://modelcontextprotocol.io/specification/latest). This plan is not an implementation conformance report.

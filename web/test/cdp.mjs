@@ -77,7 +77,10 @@ export async function launch({ browser = findBrowser(), headless = true } = {}) 
       return page;
     },
     async close() {
-      try { await cdp.send("Browser.close"); } catch (e) { /* gone */ }
+      // A browser that exits as it answers never replies, and the promise
+      // would wait for ever (seen once in nine runs, after every check had
+      // passed): give it two seconds, then kill it below.
+      try { await Promise.race([cdp.send("Browser.close"), sleep(2000)]); } catch (e) { /* gone */ }
       ws.close();
       await sleep(300);
       try { child.kill(); } catch (e) { /* gone */ }
@@ -115,6 +118,11 @@ export class Page {
   async goto(url) {
     await this.send("Page.navigate", { url });
     await this.waitFor("document.readyState === 'complete'", 15000);
+    // A Nuxt page is server-rendered before it is interactive: a form filled
+    // and submitted in that gap is submitted natively (a reload, nothing
+    // signed in), so wait until Vue has taken the page over. Other pages
+    // have no such app and pass at once.
+    await this.waitFor("(() => { try { return typeof window.useNuxtApp !== 'function' || !window.useNuxtApp().isHydrating; } catch (e) { return true; } })()", 15000, "hydration");
   }
   /// Evaluate an expression (awaiting a promise) and return its value.
   async eval(expression) {

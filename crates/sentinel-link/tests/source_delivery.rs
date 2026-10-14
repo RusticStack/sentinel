@@ -262,11 +262,17 @@ impl WorkerProcess {
         let config = worker::Config {
             controller: d.controller().local_addr(),
             server: d.controller().fingerprint(),
+            also_pinned: Vec::new(),
             worker: id,
             name: "builder-1".into(),
             hello: hello(protocol),
             capacity: CAPACITY,
-            profile: sentinel_protocol::negotiate::Profile::default(),
+            profile: sentinel_protocol::negotiate::Profile {
+                // A profile-protocol worker states its scratch disk; zero offers none,
+                // and every job declares some.
+                disk_bytes: 64 << 30,
+                ..sentinel_protocol::negotiate::Profile::default()
+            },
             transport: sentinel_link::session::TransportStats::default(),
             remote_cache: false,
         };
@@ -349,7 +355,10 @@ fn a_bound_source_reaches_a_current_worker_with_its_credential_and_event() {
         }
     );
     assert_eq!(access.version, 1);
-    assert!(access.expires_ms > UnixMillis::now().0);
+    // Validity is restated on the worker's clock from receipt and covers a
+    // whole checkout deadline (mirror attempt plus the direct fallback), not
+    // the controller's 60 s wall-clock expiry.
+    assert!(access.expires_ms > UnixMillis::now().0 + 10 * 60 * 1000);
     assert!(!format!("{:?}", access.credential).contains(SECRET));
     // The run has no provenance here (the test creates it with the store
     // primitive), so the event facts are the manual fallback: recorded, never

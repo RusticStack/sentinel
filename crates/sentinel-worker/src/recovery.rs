@@ -66,7 +66,7 @@ fn marker_path(root: &Path, attempt: AttemptId) -> PathBuf {
 /// cut would leave a spool recovery discards as already reported.
 pub fn mark(root: &Path, attempt: AttemptId, fence: Fence) -> Result<()> {
     let dir = root.join(ATTEMPTS_DIR);
-    fs::create_dir_all(&dir)?;
+    crate::private_dir_all(&dir)?;
     let mut marker = OpenOptions::new()
         .write(true)
         .create(true)

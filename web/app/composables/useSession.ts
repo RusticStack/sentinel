@@ -1,4 +1,5 @@
 import type { Me, TenantChoice } from "~~/shared/types/api";
+import type { EndReason } from "./useApi";
 
 /// Who is signed in and the tenants they belong to. Loaded once per page
 /// load (on the server for the first render), and re-read whenever the
@@ -9,6 +10,7 @@ export function useSession() {
   const tenants = useState<TenantChoice[]>("tenants", () => []);
   const loaded = useState<boolean>("session-loaded", () => false);
   const api = useApi();
+  const end = useEndSession();
 
   async function load(force = false) {
     if (loaded.value && !force) return me.value;
@@ -32,19 +34,17 @@ export function useSession() {
     }
   }
 
-  async function ended() {
-    me.value = null;
-    tenants.value = [];
-    const route = useRoute();
-    await navigateTo({ path: "/login", query: route.path === "/login" ? {} : { next: route.fullPath } });
-  }
+  /// The session ended under the open page: sign in again and come back.
+  const ended = (reason: EndReason = "expired") => end(reason);
 
-  async function signOut() {
+  /// End the session; `next` is where a fresh sign-in continues (the
+  /// account page asks for one before a GitHub-only account enrolls).
+  async function signOut(next?: string) {
+    me.value = null; // a refused logout is not a session that "expired"
     try { await api("/api/v1/logout", { method: "POST", body: {} }); } catch { /* ended anyway */ }
     setCsrfToken(null);
-    me.value = null;
     tenants.value = [];
-    await navigateTo("/login");
+    await navigateTo({ path: "/login", query: next ? { next } : {} });
   }
 
   const roleIn = (slug: string | undefined) => tenants.value.find((t) => t.slug === slug)?.role ?? null;

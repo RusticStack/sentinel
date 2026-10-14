@@ -16,7 +16,7 @@ async function save() { await act("Admission policy", () => api("/api/v1/admin/p
       </UFormField>
       <UFormField label="Tenant creation" name="tenant_creation">
         <USelect id="pol-tenant" v-model="form.tenant_creation" class="w-full"
-          :items="[{ label: 'Platform administrators only', value: 'super_admin_only' }, { label: 'Approved users may create a personal namespace', value: 'approved_users' }]" />
+          :items="[{ label: 'Platform administrators only', value: 'super_admin_only' }, { label: 'Approved users may create organizations and a personal namespace', value: 'approved_users' }]" />
       </UFormField>
       <UFormField label="GitHub installation binding" name="installation_binding">
         <USelect id="pol-install" v-model="form.installation_binding" class="w-full"

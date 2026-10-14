@@ -147,6 +147,11 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (46, include_str!("migrations/046_retention.sql")),
     (47, include_str!("migrations/047_s3.sql")),
     (48, include_str!("migrations/048_upgrades.sql")),
+    (49, include_str!("migrations/049_reapply_indexes.sql")),
+    (50, include_str!("migrations/050_email_identity.sql")),
+    (51, include_str!("migrations/051_github_membership.sql")),
+    (52, include_str!("migrations/052_setup.sql")),
+    (53, include_str!("migrations/053_auto_join.sql")),
 ];
 
 /// The newest schema this build knows.
@@ -160,7 +165,7 @@ pub const LATEST: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 /// be broken by — an index, a column no older statement reads or writes
 /// with a default every older insert satisfies — and say so in
 /// `docs/compatibility.md`.
-pub const READABLE_BY: &[(u32, u32)] = &[(45, 44), (48, 47)];
+pub const READABLE_BY: &[(u32, u32)] = &[(45, 44), (48, 47), (49, 48), (52, 51), (53, 51)];
 
 /// The declared `readable_by` of `version`.
 pub fn readable_by(version: u32) -> u32 {

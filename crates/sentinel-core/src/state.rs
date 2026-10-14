@@ -174,6 +174,10 @@ pub enum Event {
     DependenciesSatisfied,
     /// Controller: dependency outcome or condition rules the job out.
     Skip,
+    /// Controller: the job's `if` could not be evaluated when its
+    /// dependencies finished. Ends it `infra_failed` (class `preparation`)
+    /// so a broken condition is never a silent skip or a silent run.
+    ConditionFailed,
     /// Controller: the job is leased to a worker under a new fence and the
     /// offer is on its way; the worker's acknowledgement lands on the attempt.
     Leased(Fence),
@@ -277,7 +281,11 @@ impl JobControl {
         match (actor, event) {
             (
                 Actor::Controller,
-                Event::DependenciesSatisfied | Event::Skip | Event::Leased(_) | Event::OfferLapsed,
+                Event::DependenciesSatisfied
+                | Event::Skip
+                | Event::ConditionFailed
+                | Event::Leased(_)
+                | Event::OfferLapsed,
             )
             | (
                 Actor::Controller,
@@ -308,6 +316,9 @@ impl JobControl {
         }
         let next = match (self.state, event) {
             (JobState::Blocked, Event::DependenciesSatisfied) => JobState::Queued,
+            (JobState::Blocked, Event::ConditionFailed) => {
+                JobState::Terminal(FailureClass::Preparation.outcome())
+            }
             (JobState::Blocked | JobState::Queued, Event::Skip) => {
                 JobState::Terminal(Outcome::Skipped)
             }
@@ -470,9 +481,10 @@ mod tests {
         JobState::Terminal(Outcome::Failed),
         JobState::Terminal(Outcome::InfraFailed),
     ];
-    const ALL_EVENTS: [Event; 15] = [
+    const ALL_EVENTS: [Event; 16] = [
         Event::DependenciesSatisfied,
         Event::Skip,
+        Event::ConditionFailed,
         Event::Leased(Fence(1)),
         Event::OfferLapsed,
         Event::PreparationStarted,
@@ -716,6 +728,30 @@ mod tests {
             at(JobState::Running, Fence(1)).apply(Actor::Controller, Event::Rerun),
             Err(TransitionError::Forbidden { .. })
         ));
+    }
+
+    #[test]
+    fn an_unevaluable_condition_ends_a_blocked_job_as_infra_failed() {
+        let mut blocked = at(JobState::Blocked, Fence::NONE);
+        assert_eq!(
+            blocked.apply(Actor::Controller, Event::ConditionFailed),
+            Ok(JobState::Terminal(Outcome::InfraFailed))
+        );
+        for state in ALL_STATES
+            .iter()
+            .filter(|s| !s.is_terminal() && **s != JobState::Blocked)
+        {
+            assert!(matches!(
+                at(*state, Fence(1)).apply(Actor::Controller, Event::ConditionFailed),
+                Err(TransitionError::Invalid { .. })
+            ));
+        }
+        for actor in [Actor::Worker(Fence::NONE), Actor::Reconciler] {
+            assert!(matches!(
+                at(JobState::Blocked, Fence::NONE).apply(actor, Event::ConditionFailed),
+                Err(TransitionError::Forbidden { .. })
+            ));
+        }
     }
 
     #[test]

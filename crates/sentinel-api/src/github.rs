@@ -30,10 +30,18 @@
 //! session; a hand-off is bound to the sign-in cookie, so nobody can
 //! complete another browser's.
 //!
-//! Both routes are admitted per client ([`crate::oauth::limit`]). The code
+//! `POST /api/v1/identities/github/link` is the same round trip for a browser
+//! that is already signed in: a session with a fresh step-up asks for the
+//! authorization URL, the callback verifies the identity and parks it with the
+//! digest of the session that asked, and `finish` links it to that account
+//! ([`sentinel_store::sign_in::link`]) only if that same session is presented
+//! on the same-origin hop. No session is issued or ended, and an identity
+//! already linked anywhere is never moved.
+//!
+//! The routes are admitted per client ([`crate::oauth::limit`]). The code
 //! exchange and the identity read are outbound calls of up to ten seconds
-//! each, so they draw on the deployment's [`crate::OUTBOUND`] budget (shared
-//! with CIMD metadata fetches); a callback past it is told to
+//! each, so they draw on their own [`crate::OUTBOUND`] budget (not shared
+//! with CIMD metadata fetches, which cannot make sign-in busy); a callback past it is told to
 //! reload, with its state still unspent.
 
 use std::{
@@ -106,6 +114,38 @@ pub(crate) struct Github {
     budget: Mutex<Limiter>,
     /// Callbacks waiting for their same-origin hop, oldest first.
     handoffs: Mutex<VecDeque<Handoff>>,
+    /// Link attempts begun by a signed-in browser and not yet called back,
+    /// oldest first.
+    links: Mutex<VecDeque<PendingLink>>,
+}
+
+/// An identity-linking attempt: which account, through which session, begun
+/// when. Held in memory only, like a hand-off — nothing in it is secret (two
+/// digests and an account ID), and an attempt lost to a restart is started
+/// again.
+struct PendingLink {
+    /// Digest of the state secret, which is also the browser's sign-in cookie.
+    state: sentinel_auth::secret::Digest,
+    user: UserId,
+    /// Digest of the session cookie that began it.
+    session: sentinel_auth::secret::Digest,
+    deadline: Instant,
+}
+
+/// Link attempts held at once. Starting one costs an admitted request (20/s
+/// deployment-wide) and lives at most [`STATE_TTL_MS`]; past the bound the
+/// oldest is dropped and that browser starts again.
+const MAX_LINKS: usize = 256;
+
+/// What a parked callback completes.
+enum Purpose {
+    /// Sign in as the resolved account.
+    SignIn,
+    /// Link the verified GitHub identity to the session that began the attempt.
+    Link {
+        subject: String,
+        session: sentinel_auth::secret::Digest,
+    },
 }
 
 /// How long a verified callback waits for its same-origin hop: the page
@@ -122,6 +162,7 @@ struct Handoff {
     cookie: sentinel_auth::secret::Digest,
     user: UserId,
     destination: Option<String>,
+    purpose: Purpose,
     deadline: Instant,
 }
 
@@ -142,7 +183,30 @@ impl Github {
             start_url: format!("{issuer}/auth/github/start"),
             budget: Mutex::new(Limiter::new(CLIENT, Some(CEILING), Instant::now())),
             handoffs: Mutex::new(VecDeque::new()),
+            links: Mutex::new(VecDeque::new()),
         })
+    }
+
+    fn park_link(&self, link: PendingLink, now: Instant) {
+        let mut queue = self.links.lock().unwrap_or_else(|p| p.into_inner());
+        while queue.front().is_some_and(|l| l.deadline <= now) || queue.len() >= MAX_LINKS {
+            queue.pop_front();
+        }
+        queue.push_back(link);
+    }
+
+    /// Take the live link attempt of this state, once. `None` for a sign-in.
+    fn take_link(
+        &self,
+        state: &sentinel_auth::secret::Digest,
+        now: Instant,
+    ) -> Option<PendingLink> {
+        let mut queue = self.links.lock().unwrap_or_else(|p| p.into_inner());
+        while queue.front().is_some_and(|l| l.deadline <= now) {
+            queue.pop_front();
+        }
+        let at = queue.iter().position(|l| digest_eq(&l.state, state))?;
+        queue.remove(at)
     }
 
     fn park(&self, handoff: Handoff, now: Instant) {
@@ -182,12 +246,62 @@ pub(crate) fn route(
     query: &str,
 ) -> Option<Route> {
     let github = state.github.as_ref()?;
-    Some(Ok(match (method, parts) {
-        ("GET", ["auth", "github", "start"]) => start(state, github, request, query),
-        ("GET", ["auth", "github", "callback"]) => callback(state, github, request, query),
-        ("GET", ["auth", "github", "finish"]) => finish(state, github, request),
+    Some(match (method, parts) {
+        ("GET", ["auth", "github", "start"]) => Ok(start(state, github, request, query)),
+        ("GET", ["auth", "github", "callback"]) => Ok(callback(state, github, request, query)),
+        ("GET", ["auth", "github", "finish"]) => Ok(finish(state, github, request)),
+        ("POST", ["api", "v1", "identities", "github", "link"]) => {
+            link_start(state, github, request)
+        }
         _ => return None,
-    }))
+    })
+}
+
+/// `POST /api/v1/identities/github/link`: a signed-in browser (session and
+/// CSRF header) with a fresh step-up begins linking a GitHub account to its
+/// own. Answers the GitHub authorization URL to navigate to and sets the
+/// browser's half of the state; the rest is the sign-in round trip
+/// ([`callback`], [`finish`]), which ends in [`sign_in::link`] under the same
+/// session. Linking changes who can authenticate, so a step-up is asked for
+/// here (`forbidden` with `details.step_up`) and judged again at the end.
+fn link_start(state: &State, github: &Github, request: &Request) -> routes::Route {
+    let (presented, session, now) = routes::account::browser_session(state, request, true)?;
+    if !github.admit(state, request) {
+        return Err(routes::err(
+            sentinel_protocol::error::ErrorCode::RateLimited,
+            "too many sign-in attempts; retry shortly",
+        )
+        .with_detail("retry_after_ms", 2000));
+    }
+    session
+        .require_step_up(state.sessions, now)
+        .map_err(routes::store_error)?;
+    let secret = Secret::generate();
+    let mut text = String::with_capacity(Secret::TEXT_LEN);
+    secret.expose(&mut text);
+    let authorize_url = github.app.authorize_url(&github.endpoints, &text);
+    let at = Instant::now();
+    github.park_link(
+        PendingLink {
+            state: secret.digest(),
+            user: session.user,
+            session: presented.digest(),
+            deadline: at + Duration::from_millis(STATE_TTL_MS as u64),
+        },
+        at,
+    );
+    let max_age = u32::try_from(STATE_TTL_MS / 1000).unwrap_or(600);
+    Ok(Reply::Json(
+        200,
+        serde_json::json!({
+            "authorize_url": authorize_url,
+            "expires_in": STATE_TTL_MS / 1000,
+        }),
+        vec![routes::header(
+            "set-cookie",
+            &cookie::issue_sign_in(&secret, max_age),
+        )],
+    ))
 }
 
 /// Whether `path` may be where a finished sign-in lands: the first page, the
@@ -316,17 +430,23 @@ fn callback(state: &State, github: &Github, request: &Request, query: &str) -> R
     }
     // Taken before the state is spent, so a busy answer leaves it pending
     // and a reload of this same URL completes.
-    let Some(_slot) = state.outbound.take() else {
+    let Some(_slot) = state.exchanges.take() else {
         return busy_page(
             503,
             "Sentinel is busy signing someone else in. Reload this page in a moment.",
         );
     };
-    let now = UnixMillis::now();
-    let destination = match sign_in::consume(&state.store, PROVIDER, &presented, now) {
-        Ok(destination) => destination,
-        Err(sentinel_store::Error::NotFound) => return ended(400, START_AGAIN),
-        Err(_) => return busy_page(503, "Sentinel is busy. Reload this page in a moment."),
+    // A link attempt is held in memory and spent by this take; a sign-in is
+    // spent in the store. Neither can be spent twice.
+    let link = github.take_link(&presented.digest(), Instant::now());
+    let destination = if link.is_some() {
+        None
+    } else {
+        match sign_in::consume(&state.store, PROVIDER, &presented, UnixMillis::now()) {
+            Ok(destination) => destination,
+            Err(sentinel_store::Error::NotFound) => return ended(400, START_AGAIN),
+            Err(_) => return busy_page(503, "Sentinel is busy. Reload this page in a moment."),
+        }
     };
     let identity = github
         .app
@@ -338,11 +458,22 @@ fn callback(state: &State, github: &Github, request: &Request, query: &str) -> R
             "GitHub did not confirm the sign-in. Start again from the page you were on.",
         );
     };
-    let user = match sign_in::resolve(&state.store, PROVIDER, &identity.subject) {
-        Ok(Some(user)) => user,
-        // One answer for "never linked", pending, rejected and suspended.
-        Ok(None) => return ended(403, NO_ACCOUNT),
-        Err(_) => return ended(503, "Sentinel is busy. Start again in a moment."),
+    // A link attempt names its account already; the identity is carried to the
+    // hop that holds the session. A sign-in resolves it through a link.
+    let (user, purpose) = match link {
+        Some(link) => (
+            link.user,
+            Purpose::Link {
+                subject: identity.subject,
+                session: link.session,
+            },
+        ),
+        None => match sign_in::resolve(&state.store, PROVIDER, &identity.subject) {
+            Ok(Some(user)) => (user, Purpose::SignIn),
+            // One answer for "never linked", pending, rejected and suspended.
+            Ok(None) => return ended(403, NO_ACCOUNT),
+            Err(_) => return ended(503, "Sentinel is busy. Start again in a moment."),
+        },
     };
     let now = Instant::now();
     github.park(
@@ -350,6 +481,7 @@ fn callback(state: &State, github: &Github, request: &Request, query: &str) -> R
             cookie: presented.digest(),
             user,
             destination,
+            purpose,
             deadline: now + HANDOFF_TTL,
         },
         now,
@@ -391,6 +523,9 @@ fn finish(state: &State, github: &Github, request: &Request) -> Reply {
     let Some(handoff) = github.take(&presented.digest(), Instant::now()) else {
         return ended(400, START_AGAIN);
     };
+    if let Purpose::Link { subject, session } = &handoff.purpose {
+        return finish_link(state, cookies, handoff.user, subject, session);
+    }
     let previous = cookies.and_then(|header| cookie::read(cookie::SESSION_COOKIE, header));
     let issued = match sign_in::finish(
         &state.store,
@@ -439,6 +574,75 @@ fn finish(state: &State, github: &Github, request: &Request) -> Reply {
             ),
             routes::header("set-cookie", &cookie::clear(cookie::SIGN_IN_COOKIE)),
         ],
+    )
+}
+
+const LINK_AGAIN: &str = "Sign in again, then link GitHub from your account page.";
+
+/// The same-origin hop of a link attempt: the session that began it must be
+/// the one presented here (its Strict cookie is sent on this hop only), and
+/// still fresh enough to link. Nothing about the sign-in changes: the session
+/// stays, and the browser moves on to the first page.
+fn finish_link(
+    state: &State,
+    cookies: Option<&str>,
+    user: UserId,
+    subject: &str,
+    began_with: &sentinel_auth::secret::Digest,
+) -> Reply {
+    let now = UnixMillis::now();
+    let session = cookies
+        .and_then(|header| cookie::read(cookie::SESSION_COOKIE, header))
+        .filter(|presented| digest_eq(&presented.digest(), began_with))
+        .and_then(|presented| {
+            state
+                .store
+                .read(|c| sentinel_store::local_auth::authenticate(c, &presented, now))
+                .ok()
+        })
+        .filter(|session| session.user == user);
+    let Some(session) = session else {
+        return ended(403, LINK_AGAIN);
+    };
+    match sign_in::link(
+        &state.store,
+        &session,
+        state.sessions,
+        PROVIDER,
+        subject,
+        now,
+    ) {
+        Ok(()) => {}
+        Err(sentinel_store::Error::StepUpRequired) => {
+            return ended(
+                403,
+                "Confirm it is you again, then link GitHub from your account page.",
+            );
+        }
+        Err(sentinel_store::Error::Conflict) => {
+            return ended(
+                409,
+                "That GitHub account is already linked to a Sentinel account.",
+            );
+        }
+        Err(_) => return ended(503, "Sentinel is busy. Start again in a moment."),
+    }
+    let mut target = String::with_capacity(state.oauth.path.len() + 1);
+    target.push_str(&state.oauth.path);
+    target.push('/');
+    let mut body = String::with_capacity(256 + 2 * target.len());
+    body.push_str("<meta http-equiv=\"refresh\" content=\"0; url=");
+    html::escape_into(&mut body, &target);
+    body.push_str("\">\n<p>GitHub is linked to your account. <a href=\"");
+    html::escape_into(&mut body, &target);
+    body.push_str("\">Continue</a></p>");
+    Reply::Html(
+        200,
+        html::document("GitHub linked", &body),
+        vec![routes::header(
+            "set-cookie",
+            &cookie::clear(cookie::SIGN_IN_COOKIE),
+        )],
     )
 }
 

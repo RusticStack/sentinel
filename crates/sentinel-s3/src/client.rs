@@ -89,6 +89,30 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Longest error code and request id kept from a refusal. S3's codes are short
+/// identifiers (`NoSuchUpload`, `SlowDown`); anything longer is not one.
+const MAX_CODE: usize = 64;
+const MAX_REQUEST_ID: usize = 64;
+
+/// `text` when it is a short identifier (ASCII letters, digits, `.`, `_`, `-`,
+/// at most `max` bytes), else `None`: remote text that is not one is dropped,
+/// never echoed into an error.
+fn identifier(text: &str, max: usize) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()
+        && text.len() <= max
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
+    .then(|| text.to_owned())
+}
+
+/// Bytes in the inclusive range `a..=b`; `None` when it is inverted or spans
+/// more than `u64` can count.
+fn range_len(a: u64, b: u64) -> Option<u64> {
+    b.checked_sub(a)?.checked_add(1)
+}
+
 /// Strip the quotes S3 wraps an ETag in.
 fn etag(value: &str) -> String {
     value.trim().trim_matches('"').to_owned()
@@ -178,17 +202,31 @@ impl Client {
         extra: &[(&str, &str)],
         body: &[u8],
     ) -> Result<ureq::http::Response<ureq::Body>> {
-        let (host, path) = self.locate(key);
         let payload = if body.is_empty() {
             sigv4::EMPTY_SHA256.to_owned()
         } else {
             sigv4::sha256_hex(body)
         };
+        self.send_hashed(method, key, query, extra, body, &payload)
+    }
+
+    /// [`send`](Self::send) for a body whose SHA-256 the caller already
+    /// computed (alongside its `Content-MD5`, in one walk over the bytes).
+    fn send_hashed(
+        &self,
+        method: &str,
+        key: Option<&str>,
+        query: &[(&str, &str)],
+        extra: &[(&str, &str)],
+        body: &[u8],
+        payload: &str,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
+        let (host, path) = self.locate(key);
         let (amz_date, _) = sigv4::timestamp(now_secs());
         let creds = &self.config.credentials;
         let mut headers: Vec<(&str, &str)> = vec![
             ("host", &host),
-            ("x-amz-content-sha256", &payload),
+            ("x-amz-content-sha256", payload),
             ("x-amz-date", &amz_date),
         ];
         if let Some(token) = &creds.session_token {
@@ -201,7 +239,7 @@ impl Client {
                 path: &path,
                 query,
                 headers: &headers,
-                payload_sha256: &payload,
+                payload_sha256: payload,
             },
             &amz_date,
             &self.config.region,
@@ -237,14 +275,21 @@ impl Client {
             .limit(64 * 1024)
             .read_to_vec()
             .unwrap_or_default();
+        // Remote text is data: only the short identifier alphabet is kept, and
+        // only a bounded run of it, so an endpoint cannot push a 64 KiB (or a
+        // log-injecting) message into this crate's errors.
         let code = xml::field(&body, "Code")
             .ok()
             .flatten()
+            .and_then(|code| identifier(&code, MAX_CODE))
             .unwrap_or_else(|| format!("http_{status}"));
-        let request_id = xml::field(&body, "RequestId").ok().flatten();
+        let request_id = xml::field(&body, "RequestId")
+            .ok()
+            .flatten()
+            .and_then(|id| identifier(&id, MAX_REQUEST_ID));
         let code = match request_id {
-            Some(id) if id.len() <= 128 => format!("{code} (request {id})"),
-            _ => code,
+            Some(id) => format!("{code} (request {id})"),
+            None => code,
         };
         match status {
             404 => Error::NotFound(code),
@@ -312,11 +357,11 @@ impl Client {
             return Err(Error::Config("single upload above 5 GiB".into()));
         }
         let meta = Self::metadata_headers(metadata)?;
-        let md5 = content_md5(body);
+        let (sha256, md5) = body_hashes(body);
         let mut extra: Vec<(&str, &str)> =
             meta.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         extra.push(("content-md5", &md5));
-        let response = Self::ok(self.send("PUT", Some(key), &[], &extra, body)?)?;
+        let response = Self::ok(self.send_hashed("PUT", Some(key), &[], &extra, body, &sha256)?)?;
         Ok(etag(&Self::header(&response, "etag").unwrap_or_default()))
     }
 
@@ -345,13 +390,14 @@ impl Client {
             return Err(Error::Config("part number or size out of range".into()));
         }
         let n = number.to_string();
-        let md5 = content_md5(body);
-        let response = Self::ok(self.send(
+        let (sha256, md5) = body_hashes(body);
+        let response = Self::ok(self.send_hashed(
             "PUT",
             Some(key),
             &[("partNumber", &n), ("uploadId", upload_id)],
             &[("content-md5", &md5)],
             body,
+            &sha256,
         )?)?;
         Self::header(&response, "etag")
             .map(|e| etag(&e))
@@ -518,15 +564,19 @@ impl Client {
         key: &str,
         range: Option<(u64, u64)>,
     ) -> Result<(u64, impl Read + use<>)> {
+        // The expected length of a range, checked before anything is sent: an
+        // inverted range or one spanning the whole `u64` space is a caller
+        // error, not an arithmetic wrap.
+        let expected = range
+            .map(|(a, b)| range_len(a, b).ok_or_else(|| Error::Config("invalid byte range".into())))
+            .transpose()?;
         let header = range.map(|(a, b)| format!("bytes={a}-{b}"));
         let extra: Vec<(&str, &str)> = header.iter().map(|h| ("range", h.as_str())).collect();
         let response = Self::ok(self.send("GET", Some(key), &[], &extra, &[])?)?;
         let len: u64 = Self::header(&response, "content-length")
             .and_then(|l| l.parse().ok())
             .ok_or_else(|| Error::Protocol("GET without a length".into()))?;
-        if let Some((a, b)) = range
-            && len != b - a + 1
-        {
+        if expected.is_some_and(|expected| len != expected) {
             return Err(Error::Protocol("range answered with another length".into()));
         }
         // The transport already stops at `Content-Length`; ureq's limit
@@ -678,7 +728,79 @@ pub fn content_md5(body: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(body))
 }
 
+/// The signed SHA-256 payload hash (hex) and the `Content-MD5` of a body from
+/// one walk over its bytes: both digests take each 64 KiB chunk while it is
+/// still in cache, instead of two passes over a part that may be hundreds of
+/// MiB and far larger than any cache. The results equal
+/// [`sigv4::sha256_hex`] and [`content_md5`].
+pub fn body_hashes(body: &[u8]) -> (String, String) {
+    use base64::Engine as _;
+    use md5::Digest as _;
+    const CHUNK: usize = 64 << 10;
+    let mut sha = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut md5 = md5::Md5::new();
+    for chunk in body.chunks(CHUNK) {
+        sha.update(chunk);
+        md5.update(chunk);
+    }
+    (
+        sigv4::hex(sha.finish().as_ref()),
+        base64::engine::general_purpose::STANDARD.encode(md5.finalize()),
+    )
+}
+
 /// A default timeout pair: 10 s to connect, 60 s per read.
 pub fn default_timeouts() -> (Duration, Duration) {
     (Duration::from_secs(10), Duration::from_secs(60))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_walk_gives_the_same_hashes_as_two() {
+        // Empty, shorter than a chunk, exactly a chunk, and across chunks.
+        for len in [0usize, 1, 1000, 64 << 10, (64 << 10) + 1, 300_000] {
+            let body: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            assert_eq!(
+                body_hashes(&body),
+                (sigv4::sha256_hex(&body), content_md5(&body)),
+                "{len} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn ranges_count_their_bytes_and_refuse_to_wrap() {
+        assert_eq!(range_len(0, 0), Some(1));
+        assert_eq!(range_len(1_000, 1_999), Some(1_000));
+        assert_eq!(range_len(5, 4), None, "an inverted range");
+        assert_eq!(range_len(0, u64::MAX), None, "one past what u64 counts");
+        assert_eq!(range_len(1, u64::MAX), Some(u64::MAX));
+    }
+
+    #[test]
+    fn only_short_identifiers_survive_from_a_refusal() {
+        assert_eq!(
+            identifier("NoSuchUpload", MAX_CODE).as_deref(),
+            Some("NoSuchUpload")
+        );
+        assert_eq!(
+            identifier(" 4442587FB7D0A2F9 ", MAX_REQUEST_ID).as_deref(),
+            Some("4442587FB7D0A2F9")
+        );
+        assert_eq!(identifier("", MAX_CODE), None);
+        assert_eq!(identifier(&"A".repeat(MAX_CODE + 1), MAX_CODE), None);
+        // Prose, markup and control characters are remote text, not codes.
+        for hostile in [
+            "Access Denied for key secret",
+            "<script>",
+            "Slow\nDown",
+            "a/b",
+            "caf\u{e9}",
+        ] {
+            assert_eq!(identifier(hostile, MAX_CODE), None, "{hostile:?}");
+        }
+    }
 }

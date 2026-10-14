@@ -107,31 +107,32 @@ pub struct JobRow {
 }
 
 fn read_job(conn: &Connection, tenant: TenantId, job: JobId) -> Result<JobRow> {
-    conn.query_row(
+    // Cached: every job transition reads the row, inside the writer
+    // transaction; re-preparing the statement each time is pure overhead.
+    conn.prepare_cached(
         "SELECT state_code, fence, cancel_requested, failure_class,
                 queued_ms, leased_ms, preparing_ms, running_ms, finalizing_ms, terminal_ms
          FROM jobs WHERE id = ?1 AND tenant_id = ?2",
-        params![job.as_bytes(), tenant.as_bytes()],
-        |r| {
-            let ms = |i: usize| -> rusqlite::Result<Option<UnixMillis>> {
-                Ok(r.get::<_, Option<i64>>(i)?.map(UnixMillis))
-            };
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                AttemptTimestamps {
-                    queued: ms(4)?,
-                    leased: ms(5)?,
-                    preparing: ms(6)?,
-                    running: ms(7)?,
-                    finalizing: ms(8)?,
-                    terminal: ms(9)?,
-                },
-            ))
-        },
-    )
+    )?
+    .query_row(params![job.as_bytes(), tenant.as_bytes()], |r| {
+        let ms = |i: usize| -> rusqlite::Result<Option<UnixMillis>> {
+            Ok(r.get::<_, Option<i64>>(i)?.map(UnixMillis))
+        };
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            AttemptTimestamps {
+                queued: ms(4)?,
+                leased: ms(5)?,
+                preparing: ms(6)?,
+                running: ms(7)?,
+                finalizing: ms(8)?,
+                terminal: ms(9)?,
+            },
+        ))
+    })
     .optional()?
     .ok_or(Error::NotFound)
     .and_then(|(code, fence, cancel, class, timestamps)| {
@@ -167,6 +168,21 @@ pub fn transition(
     now: UnixMillis,
 ) -> Result<JobState> {
     let row = read_job(tx, tenant, job)?;
+    transition_from(tx, tenant, job, &row, actor, event, now)
+}
+
+/// [`transition`] for a caller that read the job row in this transaction and
+/// changed nothing since: the update stays guarded by the state and fence of
+/// that row, so a stale row still ends in `Conflict`, never a wrong write.
+fn transition_from(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    job: JobId,
+    row: &JobRow,
+    actor: Actor,
+    event: Event,
+    now: UnixMillis,
+) -> Result<JobState> {
     let mut control = sentinel_core::JobControl {
         state: row.state,
         fence: row.fence,
@@ -189,6 +205,7 @@ pub fn transition(
         Event::LeaseExpired => Some(encode_failure(FailureClass::LeaseExpired)),
         Event::WorkerLost => Some(encode_failure(FailureClass::WorkerLost)),
         Event::Reconciled => Some(encode_failure(FailureClass::Reconciled)),
+        Event::ConditionFailed => Some(encode_failure(FailureClass::Preparation)),
         Event::CancelBeforeStart => Some(encode_failure(FailureClass::Canceled)),
         Event::QueueTimedOut => Some(encode_failure(FailureClass::QueueTimeout)),
         _ => None,
@@ -334,10 +351,11 @@ pub fn lease_reserved(
 ) -> Result<(AttemptId, Fence)> {
     let row = read_job(tx, tenant, job)?;
     let fence = row.fence.next();
-    transition(
+    transition_from(
         tx,
         tenant,
         job,
+        &row,
         Actor::Controller,
         Event::Leased(fence),
         now,
@@ -368,12 +386,30 @@ pub fn lease_reserved(
 pub fn run_state(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunState> {
     let mut stmt =
         conn.prepare_cached("SELECT state_code FROM jobs WHERE run_id = ?1 AND tenant_id = ?2")?;
-    let rows = stmt.query_map(params![run.as_bytes(), tenant.as_bytes()], |r| {
-        r.get::<_, i64>(0)
-    })?;
-    let mut states = Vec::new();
-    for code in rows {
-        states.push(decode_state(code?).ok_or(Error::Corrupt("state_code"))?);
+    let mut rows = stmt.query(params![run.as_bytes(), tenant.as_bytes()])?;
+    // The fold reads straight off the cursor; a failed read or an undecodable
+    // code ends it and is reported instead of the truncated answer.
+    let mut fault = None;
+    let state = aggregate(std::iter::from_fn(|| match rows.next() {
+        Ok(Some(row)) => match row
+            .get::<_, i64>(0)
+            .map_err(Error::from)
+            .and_then(|code| decode_state(code).ok_or(Error::Corrupt("state_code")))
+        {
+            Ok(state) => Some(state),
+            Err(e) => {
+                fault = Some(e);
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            fault = Some(Error::from(e));
+            None
+        }
+    }));
+    match fault {
+        Some(e) => Err(e),
+        None => Ok(state),
     }
-    Ok(aggregate(states))
 }

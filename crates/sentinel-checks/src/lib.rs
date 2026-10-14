@@ -14,7 +14,9 @@
 
 pub mod github;
 pub mod lane;
+pub mod members;
 pub mod reconcile;
 
 pub use lane::{Batch, Config, Lane, Notice, Publish, Publisher};
+pub use members::Members;
 pub use reconcile::Reconcile;

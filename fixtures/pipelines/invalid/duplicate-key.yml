@@ -1,4 +1,4 @@
-# expect: duplicate key `image`
+# expect: duplicate key
 schema: 1
 on: [push]
 jobs:

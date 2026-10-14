@@ -273,6 +273,7 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
         let config = worker::Config {
             controller: controller.local_addr(),
             server: controller.fingerprint(),
+            also_pinned: Vec::new(),
             worker: worker_id,
             name: "builder-1".into(),
             hello: Hello {
@@ -288,7 +289,12 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
                 cpu_millis: 4_000,
                 memory_bytes: 4 << 30,
             },
-            profile: sentinel_protocol::negotiate::Profile::default(),
+            profile: sentinel_protocol::negotiate::Profile {
+                // A profile-protocol worker states its scratch disk; zero offers none,
+                // and every job declares some.
+                disk_bytes: 64 << 30,
+                ..sentinel_protocol::negotiate::Profile::default()
+            },
             transport: sentinel_link::session::TransportStats::default(),
             remote_cache: false,
         };
@@ -402,6 +408,28 @@ jobs:
         .writer()
         .write(move |tx| {
             let ids = runs::create_run(tx, tenant, repo_id, run, &spec, UnixMillis::now())?;
+            sentinel_store::provenance::insert(
+                tx,
+                &sentinel_store::provenance::Provenance {
+                    tenant,
+                    repo: repo_id,
+                    trigger: "push".into(),
+                    delivery: None,
+                    provider: None,
+                    ref_name: Some("refs/heads/main".into()),
+                    old_sha: None,
+                    new_sha: None,
+                    head_sha: None,
+                    base_sha: None,
+                    merge_sha: None,
+                    pipeline_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                    pipeline_path: Some(".sentinel.yml".into()),
+                    pipeline_digest: [0; 16],
+                    pr_number: None,
+                },
+                run,
+                UnixMillis::now(),
+            )?;
             for job in &ids {
                 runs::resolve_image(tx, tenant, *job, DIGEST, "linux/amd64")?;
             }
@@ -779,6 +807,8 @@ jobs:
             cpu_millis: 500,
             memory_bytes: 128 << 20,
             pids: 64,
+            disk_bytes: 0,
+            lifetime_secs: 0,
         },
         ws.path(),
         &[],
@@ -826,6 +856,7 @@ jobs:
         let config = worker::Config {
             controller: controller.local_addr(),
             server: controller.fingerprint(),
+            also_pinned: Vec::new(),
             worker: worker_id,
             name: "builder-1".into(),
             hello: Hello {
@@ -839,7 +870,12 @@ jobs:
                 cpu_millis: 4_000,
                 memory_bytes: 4 << 30,
             },
-            profile: sentinel_protocol::negotiate::Profile::default(),
+            profile: sentinel_protocol::negotiate::Profile {
+                // A profile-protocol worker states its scratch disk; zero offers none,
+                // and every job declares some.
+                disk_bytes: 64 << 30,
+                ..sentinel_protocol::negotiate::Profile::default()
+            },
             transport: sentinel_link::session::TransportStats::default(),
             remote_cache: false,
         };

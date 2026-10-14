@@ -18,7 +18,10 @@ use sentinel_core::{
     Actor, AttemptId, DependencyPolicy, Event, FailureClass, Fence, JobId, JobState, Outcome,
     PoolId, RepoId, RunId, TenantId, UnixMillis, WorkerId, dependency_decision,
 };
-use sentinel_pipeline::schema::ArtifactWhen;
+use sentinel_pipeline::{
+    expr::{Context, DependencySummary, HashFilesError, Lookup, Phase, Value},
+    schema::ArtifactWhen,
+};
 use sentinel_protocol::{limits::MAX_LIST_ITEMS, summary::MAX_SUMMARY_BYTES};
 
 use crate::{
@@ -103,9 +106,12 @@ impl LogState {
 
 /// Resources as the scheduler counts them: CPU in thousandths of a core,
 /// bytes of memory and bytes of scratch disk. A zero capacity is a worker
-/// that takes no work. `disk_bytes = 0` on a worker additionally means it
-/// has never reported disk capacity (migration 28), and disk is then not
-/// part of its admission: unreported is not the same as zero.
+/// that takes no work. For disk, zero is "not reported", and what that
+/// means depends on the wire, never on the number alone:
+/// a worker that speaks the profile protocol (7 and later) states its disk
+/// every session, so zero from it is a measurement it could not make and
+/// no job that declares scratch disk ever places there; a worker older than
+/// that has no way to state it, and is admitted on CPU and memory alone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capacity {
     pub cpu_millis: i64,
@@ -115,8 +121,9 @@ pub struct Capacity {
 
 /// Record what a worker has, as it reported at its hello. Replaces the
 /// previous report: the measurement is the worker's, made each session.
-/// Protocol 6 workers report no disk, and `disk_bytes = 0` records that
-/// absence rather than claiming a zero-sized scratch area.
+/// The disk is replaced like CPU and memory: the figure of the latest hello or
+/// profile, zero when that session measured none. Protocol 6 and older workers
+/// report no disk and are not held to one (see [`Capacity`]).
 pub fn report_capacity(tx: &Transaction<'_>, worker: WorkerId, capacity: Capacity) -> Result<()> {
     if capacity.cpu_millis < 0 || capacity.memory_bytes < 0 || capacity.disk_bytes < 0 {
         return Err(Error::InvalidInput("capacity"));
@@ -140,23 +147,35 @@ pub fn report_capacity(tx: &Transaction<'_>, worker: WorkerId, capacity: Capacit
 
 /// [`free_capacity`]'s statement: one pass over the held-attempts partial
 /// index, driven from `workers` into `attempts_held_by_worker` (asserted by
-/// a test), so summing held attempts never scans the attempts table.
-const FREE_CAPACITY_SQL: &str = "SELECT w.cpu_millis - COALESCE((
-                SELECT SUM(a.cpu_millis) FROM attempts a JOIN workers h ON h.id = a.worker_id
-                WHERE a.released_ms IS NULL
-                  AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
-                       OR (w.host_id IS NULL AND h.id = w.id))), 0),
-            w.memory_bytes - COALESCE((
-                SELECT SUM(a.memory_bytes) FROM attempts a JOIN workers h ON h.id = a.worker_id
-                WHERE a.released_ms IS NULL
-                  AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
-                       OR (w.host_id IS NULL AND h.id = w.id))), 0),
-            CASE WHEN w.disk_bytes = 0 THEN 0 ELSE w.disk_bytes - COALESCE((
-                SELECT SUM(a.disk_bytes) FROM attempts a JOIN workers h ON h.id = a.worker_id
-                WHERE a.released_ms IS NULL
-                  AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
-                       OR (w.host_id IS NULL AND h.id = w.id))), 0) END
-     FROM workers w WHERE w.id = ?1 AND w.revoked_ms IS NULL";
+/// a test), so summing held attempts never scans the attempts table. The
+/// three sums come from one aggregate over the host's held attempts — the
+/// worker's host peers, or the worker alone without a host — instead of one
+/// identical join per resource. An aggregate without `GROUP BY` always yields
+/// its single row, so a worker with nothing held reads as zero held and an
+/// absent or revoked worker (no `w` row) still yields no row at all.
+const FREE_CAPACITY_SQL: &str = "SELECT w.cpu_millis - COALESCE(s.cpu, 0),
+            w.memory_bytes - COALESCE(s.memory, 0),
+            CASE WHEN w.disk_bytes = 0 THEN 0 ELSE w.disk_bytes - COALESCE(s.disk, 0) END
+     FROM workers w,
+          (SELECT SUM(a.cpu_millis) AS cpu, SUM(a.memory_bytes) AS memory,
+                  SUM(a.disk_bytes) AS disk
+           FROM workers me JOIN workers h
+                ON ((me.host_id IS NOT NULL AND h.host_id = me.host_id)
+                    OR (me.host_id IS NULL AND h.id = me.id))
+           JOIN attempts a ON a.worker_id = h.id AND a.released_ms IS NULL
+           WHERE me.id = ?1) s
+     WHERE w.id = ?1 AND w.revoked_ms IS NULL";
+
+/// Whether disk is part of a worker's admission: it speaks the profile
+/// protocol, whose every session states the disk it offers. The worker's
+/// `disk_bytes` is then the limit even when it is zero (a platform that could
+/// not measure offers nothing), while an older worker cannot report disk at
+/// all and keeps the admission it always had. Derived from the negotiated
+/// protocol and never from the figure, so "not reported" cannot read as
+/// "unlimited" on a worker that was able to report.
+fn disk_reported(protocol: i64) -> bool {
+    protocol >= i64::from(sentinel_protocol::negotiate::PROFILE_MIN.0)
+}
 
 /// What the worker has left: its reported capacity less every attempt still
 /// held that the host counts. Attempts of every worker sharing the same
@@ -371,8 +390,9 @@ struct WorkerFacts {
     arch: String,
     labels: Vec<u8>,
     draining: bool,
-    /// `false` when the worker has never reported disk (protocol 6): disk is
-    /// then not part of its admission, never read as a zero-sized scratch.
+    /// `false` for a worker too old to report disk (protocol 6 and older):
+    /// disk is then not part of its admission. `true` for every profile
+    /// protocol worker, whose zero is a limit of zero ([`disk_reported`]).
     disk_reported: bool,
     avail_images: Vec<u8>,
     cpu_millis: i64,
@@ -445,7 +465,7 @@ fn worker_facts(conn: &Connection, worker: WorkerId) -> Result<Option<(WorkerId,
             arch,
             labels,
             draining,
-            disk_reported: disk_bytes > 0,
+            disk_reported: disk_reported(protocol),
             avail_images,
             cpu_millis: cpu,
             memory_bytes: memory,
@@ -495,7 +515,7 @@ fn pool_workers(conn: &Connection, tenant: TenantId) -> Result<Vec<(WorkerId, Wo
                 arch,
                 labels,
                 draining,
-                disk_reported: disk > 0,
+                disk_reported: disk_reported(protocol),
                 avail_images: images,
                 cpu_millis: cpu,
                 memory_bytes: memory,
@@ -848,6 +868,8 @@ struct LocalityWorker {
     cpu_millis: i64,
     memory_bytes: i64,
     disk_bytes: i64,
+    /// [`disk_reported`] of the worker's protocol.
+    disk_reported: bool,
     avail_images: Vec<u8>,
     /// When the earliest attempt it holds must have ended: its offer plus
     /// its job's timeout. `None` when it holds nothing. This is an upper
@@ -862,7 +884,7 @@ struct LocalityWorker {
 fn locality_view(conn: &Connection, tenant: TenantId) -> Result<Vec<LocalityWorker>> {
     let mut stmt = conn.prepare_cached(
         "SELECT w.id, w.arch, w.labels, w.cpu_millis, w.memory_bytes, w.disk_bytes,
-                w.avail_images,
+                w.avail_images, w.protocol,
                 (SELECT MIN(a.offered_ms + j.timeout_ms) FROM attempts a
                  JOIN jobs j ON j.id = a.job_id
                  WHERE a.worker_id = w.id AND a.released_ms IS NULL)
@@ -884,13 +906,21 @@ fn locality_view(conn: &Connection, tenant: TenantId) -> Result<Vec<LocalityWork
                 r.get::<_, i64>(5)?,
             ),
             r.get::<_, Vec<u8>>(6)?,
-            r.get::<_, Option<i64>>(7)?,
+            r.get::<_, i64>(7)?,
+            r.get::<_, Option<i64>>(8)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, arch, labels, (cpu_millis, memory_bytes, disk_bytes), avail_images, frees_by) =
-            row?;
+        let (
+            id,
+            arch,
+            labels,
+            (cpu_millis, memory_bytes, disk_bytes),
+            avail_images,
+            protocol,
+            frees_by,
+        ) = row?;
         out.push(LocalityWorker {
             id: WorkerId::from_bytes(id).map_err(|_| Error::Corrupt("worker id"))?,
             arch,
@@ -898,6 +928,7 @@ fn locality_view(conn: &Connection, tenant: TenantId) -> Result<Vec<LocalityWork
             cpu_millis,
             memory_bytes,
             disk_bytes,
+            disk_reported: disk_reported(protocol),
             avail_images,
             frees_by,
         });
@@ -926,9 +957,7 @@ fn locality_hold(view: &[LocalityWorker], exclude: WorkerId, pick: &Pick, now: U
             && labels_subset(&pick.labels, &worker.labels)
             && worker.cpu_millis >= pick.cpu_millis
             && worker.memory_bytes >= pick.memory_bytes
-            && !(pick.disk_bytes > 0
-                && worker.disk_bytes > 0
-                && worker.disk_bytes < pick.disk_bytes)
+            && !(pick.disk_bytes > 0 && worker.disk_reported && worker.disk_bytes < pick.disk_bytes)
             && caches_image(&worker.avail_images, &key)
             && worker.frees_by.is_none_or(|until| until <= bound)
     })
@@ -1291,18 +1320,12 @@ impl Placement<'_, '_> {
         for stream in streams {
             let mut after = (i64::MIN, i64::MIN, i64::MIN);
             for _ in 0..MAX_PAGES {
-                let page = self.page(stream, far, after)?;
-                let full = page.len() == PAGE;
-                for pick in page {
-                    after = (pick.priority, pick.queued_ms, pick.created_seq);
-                    if self
-                        .locality
-                        .holds(self.tx, self.worker, self.facts, &pick, self.now)?
-                    {
-                        continue;
-                    }
+                let (found, full) = self.scan_page(stream, far, &mut after)?;
+                if let Some(pick) = found {
                     return self.lease(pick, lease_ms).map(Some);
                 }
+                // A short page means the stream has nothing left; a full
+                // one (every candidate held) may be followed by more.
                 if !full {
                     break;
                 }
@@ -1311,12 +1334,21 @@ impl Placement<'_, '_> {
         Ok(None)
     }
 
-    fn page(
-        &self,
+    /// One page of a stream's candidates, examined in order straight off the
+    /// cursor: a row becomes a [`Pick`] only when it is looked at, and the
+    /// scan stops at the first one locality does not hold — typically the
+    /// first row, so a page of sixteen costs one decoded candidate, not
+    /// sixteen. `after` is left at the last row examined, the keyset the next
+    /// page resumes from. The statement is reset before a pick is returned,
+    /// so the lease's writes never run under a live read cursor. The flag
+    /// says the page was full: with no pick, the next page may have more.
+    fn scan_page(
+        &mut self,
         stream: &Stream,
         far: Option<Capacity>,
-        after: (i64, i64, i64),
-    ) -> Result<Vec<Pick>> {
+        after: &mut (i64, i64, i64),
+    ) -> Result<(Option<Pick>, bool)> {
+        let tx = self.tx;
         let (large, large_since) = self.fairness.large.unwrap_or((0, 0));
         let far = far.map(|far| (1i64, far));
         let (exclusive, far) = far.unwrap_or((0, Capacity::default()));
@@ -1328,87 +1360,60 @@ impl Placement<'_, '_> {
             } else {
                 CANDIDATES_SQL
             };
-        let mut stmt = self.tx.prepare_cached(sql)?;
-        let rows = stmt.query_map(
-            named_params! {
-                ":tenant": stream.tenant.as_bytes(),
-                ":repo": stream.repo,
-                ":arch": self.facts.arch,
-                ":cpu": self.free.cpu_millis,
-                ":memory": self.free.memory_bytes,
-                ":disk_reported": i64::from(self.facts.disk_reported),
-                ":disk": self.free.disk_bytes,
-                ":labels": self.facts.labels,
-                ":worker_secret_delivery": i64::from(self.facts.secret_delivery),
-                ":after_priority": after.0,
-                ":after_queued": after.1,
-                ":after_seq": after.2,
-                ":large": large,
-                ":large_since": large_since,
-                ":pr_reserve": self.fairness.pr_reserve,
-                ":exclusive": exclusive,
-                ":far_cpu": far.cpu_millis,
-                ":far_memory": far.memory_bytes,
-                ":far_disk": far.disk_bytes,
-            },
-            |r| {
-                Ok((
-                    r.get::<_, [u8; 16]>(0)?,
-                    r.get::<_, [u8; 16]>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                    r.get::<_, i64>(7)?,
-                    r.get::<_, Option<String>>(8)?,
-                    r.get::<_, Vec<u8>>(9)?,
-                    r.get::<_, i64>(10)?,
-                    r.get::<_, bool>(11)?,
-                    (r.get::<_, i64>(12)?, r.get::<_, i64>(13)?),
-                    r.get::<_, bool>(14)?,
-                ))
-            },
-        )?;
-        let mut out = Vec::with_capacity(PAGE);
-        for row in rows {
-            let (
-                job,
-                run,
-                cpu,
-                memory,
-                disk,
-                digest,
-                platform,
-                index,
-                arch,
-                labels,
-                queued,
-                pr,
-                order,
-                requires_secret_delivery,
-            ) = row?;
-            out.push(Pick {
+        let mut stmt = tx.prepare_cached(sql)?;
+        let mut rows = stmt.query(named_params! {
+            ":tenant": stream.tenant.as_bytes(),
+            ":repo": stream.repo,
+            ":arch": self.facts.arch,
+            ":cpu": self.free.cpu_millis,
+            ":memory": self.free.memory_bytes,
+            ":disk_reported": i64::from(self.facts.disk_reported),
+            ":disk": self.free.disk_bytes,
+            ":labels": self.facts.labels,
+            ":worker_secret_delivery": i64::from(self.facts.secret_delivery),
+            ":after_priority": after.0,
+            ":after_queued": after.1,
+            ":after_seq": after.2,
+            ":large": large,
+            ":large_since": large_since,
+            ":pr_reserve": self.fairness.pr_reserve,
+            ":exclusive": exclusive,
+            ":far_cpu": far.cpu_millis,
+            ":far_memory": far.memory_bytes,
+            ":far_disk": far.disk_bytes,
+        })?;
+        let mut seen = 0;
+        while let Some(r) = rows.next()? {
+            seen += 1;
+            let order = (r.get::<_, i64>(12)?, r.get::<_, i64>(13)?);
+            let pick = Pick {
                 tenant: stream.tenant,
                 repo: Some(stream.repo),
-                job: JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?,
-                run: RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?,
-                cpu_millis: cpu,
-                memory_bytes: memory,
-                disk_bytes: disk,
-                image_digest: digest,
-                image_platform: platform,
-                spec_index: index,
-                arch,
-                labels,
-                pull_request: pr,
-                requires_secret_delivery,
-                queued_ms: queued,
+                job: JobId::from_bytes(r.get(0)?).map_err(|_| Error::Corrupt("job_id"))?,
+                run: RunId::from_bytes(r.get(1)?).map_err(|_| Error::Corrupt("run_id"))?,
+                cpu_millis: r.get(2)?,
+                memory_bytes: r.get(3)?,
+                disk_bytes: r.get(4)?,
+                image_digest: r.get(5)?,
+                image_platform: r.get(6)?,
+                spec_index: r.get(7)?,
+                arch: r.get(8)?,
+                labels: r.get(9)?,
+                queued_ms: r.get(10)?,
+                pull_request: r.get(11)?,
                 priority: order.0,
                 created_seq: order.1,
-            });
+                requires_secret_delivery: r.get(14)?,
+            };
+            *after = (pick.priority, pick.queued_ms, pick.created_seq);
+            if !self
+                .locality
+                .holds(tx, self.worker, self.facts, &pick, self.now)?
+            {
+                return Ok((Some(pick), true));
+            }
         }
-        Ok(out)
+        Ok((None, seen == PAGE))
     }
 
     fn lease(&self, pick: Pick, lease_ms: i64) -> Result<Offer> {
@@ -1856,13 +1861,11 @@ pub fn renew(
 /// silently.
 fn due_coverage(
     tx: &Transaction<'_>,
-    tenant: TenantId,
-    run: RunId,
+    spec: &sentinel_pipeline::RunSpec,
     spec_index: u32,
     attempt: AttemptId,
     passed: bool,
 ) -> Result<(Vec<sentinel_pipeline::schema::Artifact>, bool)> {
-    let spec = runs::get_run_spec(tx, tenant, run)?;
     let job = spec
         .pipeline
         .jobs
@@ -1944,9 +1947,14 @@ pub fn finish(
     );
     let mut missing = Vec::new();
     let mut event = event;
+    // The run spec is decoded at most once per finish: coverage reads it
+    // here and dependents are decided from the same copy below.
+    let mut spec = None;
     if finishing {
+        let decoded = runs::get_run_spec(tx, tenant, run)?;
         let lost;
-        (missing, lost) = due_coverage(tx, tenant, run, index, attempt, event == Event::Passed)?;
+        (missing, lost) = due_coverage(tx, &decoded, index, attempt, event == Event::Passed)?;
+        spec = Some(decoded);
         if event == Event::Passed && lost {
             event = Event::Failed(FailureClass::Publication);
         }
@@ -1991,7 +1999,7 @@ pub fn finish(
             now,
         )?;
     }
-    release_dependents(tx, tenant, run, now)?;
+    release_dependents_with(tx, tenant, run, now, &mut spec)?;
     Ok(next)
 }
 
@@ -2075,6 +2083,11 @@ pub fn cancel_run(
     now: UnixMillis,
 ) -> Result<usize> {
     let mut count = 0;
+    // The run-level desired state: what `cancelled()` answers in a job
+    // condition and what keeps a cancelled run from fetching its source.
+    // A rerun of one of its jobs clears it (`runs::rerun_job`).
+    tx.prepare_cached("UPDATE runs SET cancel_requested = 1 WHERE id = ?1 AND tenant_id = ?2")?
+        .execute(params![run.as_bytes(), tenant.as_bytes()])?;
     for (job, state) in runs::run_jobs(tx, tenant, run)? {
         if !state.is_terminal() && cancel_one(tx, tenant, job, now)? != Cancelled::AlreadyTerminal {
             count += 1;
@@ -2397,7 +2410,8 @@ fn run_of(conn: &Connection, tenant: TenantId, job: JobId) -> Result<RunId> {
 
 /// A worker's report over the link: the attempt must be held by that worker
 /// under that fence, then [`finish`] applies the event as the worker. A
-/// terminal report may carry the attempt's summary, written once.
+/// terminal report may carry the attempt's summary, written once; a summary
+/// over `MAX_SUMMARY_BYTES` is dropped and the verdict stands.
 #[allow(clippy::too_many_arguments)]
 pub fn report(
     tx: &Transaction<'_>,
@@ -2436,13 +2450,17 @@ pub fn report(
         }
         event => event,
     };
+    // The size is judged before the transition, never after it: refusing an
+    // oversized summary once the verdict was applied would roll the whole
+    // report back and leave a passing job to be failed by lease expiry. The
+    // summary is telemetry; the verdict is evidence. Too big (the column
+    // refuses more than `MAX_SUMMARY_BYTES`) means the attempt records no
+    // summary at all — absent, never a truncated blob that would decode wrong.
+    let summary = summary.filter(|s| s.len() <= MAX_SUMMARY_BYTES);
     let next = finish(tx, attempt, Actor::Worker(fence), event, now, logs)?;
     if let Some(summary) = summary
         && next.is_terminal()
     {
-        if summary.len() > MAX_SUMMARY_BYTES {
-            return Err(Error::InvalidInput("attempt summary"));
-        }
         tx.prepare_cached("UPDATE attempts SET summary = ?2 WHERE id = ?1 AND summary IS NULL")?
             .execute(params![attempt.as_bytes(), summary])?;
     }
@@ -2728,54 +2746,290 @@ pub fn spec_bytes(conn: &Connection, worker: WorkerId, attempt: AttemptId) -> Re
 }
 
 /// Decide every blocked job of the run whose dependencies have all finished:
-/// queue it, or skip it when a dependency rules it out. Reads the spec once,
-/// and only when the run still has a blocked job.
+/// queue it, skip it when a dependency or its `if` rules it out, or fail it
+/// when its `if` cannot be evaluated. Reads the spec once, and only when the
+/// run still has a blocked job.
+///
+/// A job without `if` follows `on_success`: it is skipped as soon as one
+/// dependency did not succeed and queued once every one did (a skipped
+/// dependency counts as success only when it was skipped by its own
+/// condition; one skipped because something upstream failed counts as a
+/// failure, so a failure can never be bypassed through a skipped job). A job
+/// with an `if` waits until every dependency is terminal, because
+/// `always()` and `failure()` need the whole picture, and then the condition
+/// decides; unless it calls `success()`, `failure()` or `always()` itself it
+/// also requires `success()`. See docs/pipeline-schema.md (job conditions).
 pub fn release_dependents(
     tx: &Transaction<'_>,
     tenant: TenantId,
     run: RunId,
     now: UnixMillis,
 ) -> Result<usize> {
-    let states = runs::run_jobs(tx, tenant, run)?;
+    release_dependents_with(tx, tenant, run, now, &mut None)
+}
+
+/// [`release_dependents`] for a caller that may already hold the run's
+/// decoded spec: `cached` is used when present and filled when this has to
+/// read it, so one transaction never decodes the same spec twice.
+fn release_dependents_with(
+    tx: &Transaction<'_>,
+    tenant: TenantId,
+    run: RunId,
+    now: UnixMillis,
+    cached: &mut Option<sentinel_pipeline::RunSpec>,
+) -> Result<usize> {
+    let mut states = runs::run_jobs(tx, tenant, run)?;
     if !states.iter().any(|(_, s)| *s == JobState::Blocked) {
         return Ok(0);
     }
-    let spec = runs::get_run_spec(tx, tenant, run)?;
+    if cached.is_none() {
+        *cached = Some(runs::get_run_spec(tx, tenant, run)?);
+    }
+    let spec = cached.as_ref().ok_or(Error::Corrupt("run_specs.spec"))?;
+    let mut by_failure = failure_skips(&states, spec)?;
+    let mut facts: Option<RunFacts> = None;
     let mut released = 0;
-    for (index, (job, state)) in states.iter().enumerate() {
-        if *state != JobState::Blocked {
+    // Dependencies precede their dependents, and each decision is written
+    // back to `states`, so a whole chain resolves in this one pass: a job
+    // skipped here is already skipped when the job behind it is decided.
+    for index in 0..states.len() {
+        let (job, state) = states[index];
+        if state != JobState::Blocked {
             continue;
         }
+        let effective = |need: u16| effective_state(&states, &by_failure, usize::from(need));
         let Some(compiled) = spec.pipeline.jobs.get(index) else {
             return Err(Error::Corrupt("run_specs.spec"));
         };
-        let mut decision = Some(true);
-        for need in &compiled.needs {
-            let upstream = states
-                .get(usize::from(*need))
-                .map(|(_, s)| *s)
-                .ok_or(Error::Corrupt("run_specs.spec"))?;
-            match dependency_decision(DependencyPolicy::OnSuccess, upstream) {
-                Some(true) => {}
-                Some(false) => {
-                    decision = Some(false);
-                    break;
+        if compiled
+            .needs
+            .iter()
+            .any(|need| usize::from(*need) >= index)
+        {
+            return Err(Error::Corrupt("run_specs.spec"));
+        }
+        let event = match &compiled.spec.condition {
+            None => {
+                let mut decision = Some(true);
+                for need in &compiled.needs {
+                    match dependency_decision(DependencyPolicy::OnSuccess, effective(*need)) {
+                        Some(true) => {}
+                        Some(false) => {
+                            decision = Some(false);
+                            break;
+                        }
+                        None => {
+                            decision = None;
+                            break;
+                        }
+                    }
                 }
-                None => {
-                    decision = None;
-                    break;
+                match decision {
+                    Some(true) => Event::DependenciesSatisfied,
+                    Some(false) => Event::Skip,
+                    None => continue,
                 }
             }
-        }
-        let event = match decision {
-            Some(true) => Event::DependenciesSatisfied,
-            Some(false) => Event::Skip,
-            None => continue,
+            Some(condition) => {
+                let mut summary = DependencySummary {
+                    all_succeeded: true,
+                    any_failed: false,
+                };
+                let mut results = Vec::with_capacity(compiled.needs.len());
+                let mut waiting = false;
+                for need in &compiled.needs {
+                    let JobState::Terminal(counted) = effective(*need) else {
+                        waiting = true;
+                        break;
+                    };
+                    let need = usize::from(*need);
+                    let JobState::Terminal(actual) = states[need].1 else {
+                        return Err(Error::Corrupt("run_specs.spec"));
+                    };
+                    summary.all_succeeded &= counted.is_success();
+                    summary.any_failed |= !counted.is_success();
+                    results.push((spec.pipeline.jobs[need].name.as_str(), actual));
+                }
+                if waiting {
+                    continue;
+                }
+                if facts.is_none() {
+                    facts = Some(run_facts(tx, tenant, run)?);
+                }
+                let Some(facts) = facts.as_ref() else {
+                    return Err(Error::Corrupt("run facts"));
+                };
+                if !condition.uses_status_function() && (!summary.all_succeeded || facts.cancelled)
+                {
+                    Event::Skip
+                } else {
+                    let context = ScheduleContext {
+                        facts,
+                        sha: &spec.source.sha,
+                        run,
+                        job,
+                        job_name: &compiled.name,
+                        summary,
+                        results,
+                    };
+                    match condition.eval(&context).map(|v| v.as_condition()) {
+                        Ok(Some(true)) => Event::DependenciesSatisfied,
+                        Ok(Some(false)) => Event::Skip,
+                        // The compiler types every condition, so this is a
+                        // spec from before it did, or a corrupted one. The
+                        // job fails visibly rather than running or skipping
+                        // on a guess.
+                        Ok(None) | Err(_) => Event::ConditionFailed,
+                    }
+                }
+            }
         };
-        jobs::transition(tx, tenant, *job, Actor::Controller, event, now)?;
+        let next = jobs::transition(tx, tenant, job, Actor::Controller, event, now)?;
+        let ended_by_failure = next == JobState::Terminal(Outcome::Skipped)
+            && compiled.needs.iter().any(|need| {
+                matches!(
+                    effective_state(&states, &by_failure, usize::from(*need)),
+                    JobState::Terminal(o) if !o.is_success()
+                )
+            });
+        states[index].1 = next;
+        by_failure[index] = ended_by_failure;
         released += 1;
     }
     Ok(released)
+}
+
+/// A job's state as its dependents count it: a skip caused by a failure
+/// upstream is a failure, anything else is what it is.
+fn effective_state(states: &[(JobId, JobState)], by_failure: &[bool], index: usize) -> JobState {
+    if by_failure[index] {
+        JobState::Terminal(Outcome::Failed)
+    } else {
+        states[index].1
+    }
+}
+
+/// Which jobs are skipped because something upstream did not succeed, as
+/// opposed to by their own condition. A job is such a skip when it is
+/// skipped and a dependency ended without success or is itself such a skip.
+/// Dependencies precede their dependents in the spec, so one pass suffices.
+fn failure_skips(
+    states: &[(JobId, JobState)],
+    spec: &sentinel_pipeline::RunSpec,
+) -> Result<Vec<bool>> {
+    let mut blocked = vec![false; states.len()];
+    for (index, (_, state)) in states.iter().enumerate() {
+        if *state != JobState::Terminal(Outcome::Skipped) {
+            continue;
+        }
+        let compiled = spec
+            .pipeline
+            .jobs
+            .get(index)
+            .ok_or(Error::Corrupt("run_specs.spec"))?;
+        let mut by_failure = false;
+        for need in &compiled.needs {
+            let need = usize::from(*need);
+            if need >= index {
+                return Err(Error::Corrupt("run_specs.spec"));
+            }
+            by_failure |=
+                blocked[need] || matches!(states[need].1, JobState::Terminal(o) if !o.is_success());
+        }
+        blocked[index] = by_failure;
+    }
+    Ok(blocked)
+}
+
+/// The run-level facts a job condition may read: the repository, whether
+/// cancellation is desired for the run, and the event that triggered it.
+struct RunFacts {
+    repo: RepoId,
+    repo_name: String,
+    cancelled: bool,
+    event: crate::provenance::EventFacts,
+}
+
+fn run_facts(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunFacts> {
+    let (repo, repo_name, cancelled): ([u8; 16], String, i64) = conn
+        .prepare_cached(
+            "SELECT r.repo_id, p.name, r.cancel_requested FROM runs r
+             JOIN repos p ON p.id = r.repo_id AND p.tenant_id = r.tenant_id
+             WHERE r.id = ?1 AND r.tenant_id = ?2",
+        )?
+        .query_row(params![run.as_bytes(), tenant.as_bytes()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    Ok(RunFacts {
+        repo: RepoId::from_bytes(repo).map_err(|_| Error::Corrupt("repo_id"))?,
+        repo_name,
+        cancelled: cancelled != 0,
+        event: crate::provenance::event_facts(conn, run)?,
+    })
+}
+
+/// The schedule-phase expression context: what a job's `if` sees once every
+/// dependency is terminal. It answers the same paths as the worker's
+/// context for the same run, so a job and its steps read one event.
+struct ScheduleContext<'a> {
+    facts: &'a RunFacts,
+    sha: &'a str,
+    run: RunId,
+    job: JobId,
+    job_name: &'a str,
+    summary: DependencySummary,
+    /// `(dependency job name, outcome)` for every `needs` entry.
+    results: Vec<(&'a str, Outcome)>,
+}
+
+impl Context for ScheduleContext<'_> {
+    fn phase(&self) -> Phase {
+        Phase::Schedule
+    }
+
+    fn lookup(&self, path: &[String]) -> Lookup {
+        let key: Vec<&str> = path.iter().map(String::as_str).collect();
+        let event = &self.facts.event;
+        Lookup::Value(match key.as_slice() {
+            ["event", "sha"] => Value::Str(self.sha.to_owned()),
+            ["event", "name"] => Value::Str(event.name.clone()),
+            ["event", "ref"] => Value::Str(event.ref_name.clone()),
+            ["event", "key"] => Value::Str(event.key.clone()),
+            ["event", "base_ref"] => match &event.base_ref {
+                Some(base) => Value::Str(base.clone()),
+                None => Value::Null,
+            },
+            ["event", "pr_number"] => match event.pr_number {
+                Some(number) => Value::Int(number as i64),
+                None => Value::Null,
+            },
+            ["repo", "id"] => Value::Str(self.facts.repo.to_string()),
+            ["repo", "name"] => Value::Str(self.facts.repo_name.clone()),
+            ["run", "id"] => Value::Str(self.run.to_string()),
+            ["job", "id"] => Value::Str(self.job.to_string()),
+            ["job", "name"] => Value::Str(self.job_name.to_owned()),
+            ["needs", name, "result"] => match self.results.iter().find(|(n, _)| n == name) {
+                Some((_, outcome)) => Value::Str(outcome.as_str().to_owned()),
+                None => return Lookup::Unresolved,
+            },
+            _ => return Lookup::Unresolved,
+        })
+    }
+
+    fn dependency_summary(&self) -> Option<DependencySummary> {
+        Some(self.summary)
+    }
+
+    fn cancelled(&self) -> Option<bool> {
+        Some(self.facts.cancelled)
+    }
+
+    fn hash_files(&self, _patterns: &[&str]) -> std::result::Result<String, HashFilesError> {
+        // `hash_files` resolves on the worker; a job condition cannot use it.
+        Err(HashFilesError::UnsupportedPlatform)
+    }
 }
 
 /// Why a job is not running, as the plan's structured reason.

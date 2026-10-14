@@ -13,7 +13,30 @@ const announce = useState("announce", () => "");
 // The tenant the pages act in: the route's, else the last one used.
 const active = computed(() => (typeof route.params.slug === "string" ? route.params.slug : tenant.value));
 const role = computed(() => session.roleIn(active.value ?? undefined));
-const tenantItems = computed(() => session.tenants.value.map((t) => ({ label: t.slug, value: t.slug, description: t.role })));
+// The switcher keeps the three kinds of namespace apart: the person's own,
+// organizations managed here, and organizations whose membership GitHub
+// manages (marked, so nobody looks here to invite people to them).
+const ROLE_NAMES: Record<string, string> = { reader: "Reader", operator: "Operator", admin: "Admin" };
+const tenantItems = computed(() => {
+  const personal: any[] = [];
+  const app: any[] = [];
+  const github: any[] = [];
+  for (const t of session.tenants.value) {
+    const role = ROLE_NAMES[t.role] ?? t.role;
+    if (t.kind === "personal") personal.push({ label: t.slug, value: t.slug, description: `Personal · ${role}`, icon: "i-lucide-user" });
+    else if (t.membership === "github") github.push({ label: t.slug, value: t.slug, description: `GitHub-managed · ${role}`, icon: "i-lucide-github" });
+    else app.push({ label: t.slug, value: t.slug, description: role, icon: "i-lucide-building-2" });
+  }
+  const groups: any[][] = [];
+  if (personal.length) groups.push([{ type: "label", label: "Personal" }, ...personal]);
+  if (app.length) groups.push([{ type: "label", label: "Organizations" }, ...app]);
+  if (github.length) groups.push([{ type: "label", label: "GitHub organizations" }, ...github]);
+  return groups;
+});
+const activeIcon = computed(() => {
+  const t = session.tenants.value.find((x) => x.slug === active.value);
+  return t?.kind === "personal" ? "i-lucide-user" : t?.membership === "github" ? "i-lucide-github" : "i-lucide-building-2";
+});
 
 function switchTenant(slug: string) {
   tenant.value = slug;
@@ -28,14 +51,14 @@ const links = computed<NavigationMenuItem[][]>(() => {
         { label: "Queue", icon: "i-lucide-list-ordered", to: `/t/${slug}/queue` },
         { label: "Workers", icon: "i-lucide-server", to: `/t/${slug}/workers` },
         { label: "GitHub sync", icon: "i-lucide-refresh-cw", to: `/t/${slug}/sync` },
+        { label: "Settings", icon: "i-lucide-settings", to: `/t/${slug}/settings` },
       ]
     : [];
   if (slug && (role.value === "admin" || session.me.value?.super_admin)) {
     main.push({ label: "Tenant admin", icon: "i-lucide-users", to: `/t/${slug}/admin` });
   }
-  const platform: NavigationMenuItem[] = session.me.value?.super_admin
-    ? [{ label: "Platform", icon: "i-lucide-shield", to: "/platform" }]
-    : [];
+  const platform: NavigationMenuItem[] = [{ label: "Organizations", icon: "i-lucide-building", to: "/organizations" }];
+  if (session.me.value?.super_admin) platform.push({ label: "Platform", icon: "i-lucide-shield", to: "/platform" });
   return [main, platform];
 });
 
@@ -46,6 +69,7 @@ function skipToMain() {
 const account = computed<DropdownMenuItem[][]>(() => [
   [{ label: session.me.value?.username || shortId(session.me.value?.user), type: "label", icon: "i-lucide-user" }],
   [
+    { label: "Account security", icon: "i-lucide-shield-check", to: "/account" },
     {
       label: colorMode.value === "dark" ? "Light theme" : "Dark theme",
       icon: colorMode.value === "dark" ? "i-lucide-sun" : "i-lucide-moon",
@@ -69,18 +93,18 @@ const account = computed<DropdownMenuItem[][]>(() => [
 
       <template #default="{ collapsed }">
         <USelectMenu
-          v-if="tenantItems.length && !collapsed"
+          v-if="session.tenants.value.length && !collapsed"
           :model-value="active ?? undefined"
           :items="tenantItems"
           value-key="value"
-          placeholder="Choose a tenant"
-          icon="i-lucide-building-2"
-          aria-label="Active tenant"
+          placeholder="Choose a namespace"
+          :icon="activeIcon"
+          aria-label="Active namespace"
           class="w-full"
           @update:model-value="(v: string) => switchTenant(v)"
         />
         <UNavigationMenu :collapsed="collapsed" :items="links[0]" orientation="vertical" tooltip aria-label="Tenant" />
-        <UNavigationMenu v-if="links[1]!.length" :collapsed="collapsed" :items="links[1]" orientation="vertical" tooltip class="mt-auto" aria-label="Platform" />
+        <UNavigationMenu :collapsed="collapsed" :items="links[1]" orientation="vertical" tooltip class="mt-auto" aria-label="Platform" />
       </template>
 
       <template #footer="{ collapsed }">

@@ -54,6 +54,8 @@ Not covered: the first probe versions produced false PASS/FAIL results for memor
 | Btrfs | explicit read/write | 1.80 s | 65 µs / 535 µs | 0.08 s |
 | Btrfs | `std::fs::copy` | 0.25 s | 10 µs / 39 µs | 0.86 s |
 
+**Order-confounded.** The caches were dropped once, before the first clone, and the modes then ran in a fixed order (reflink, `copy`, `fs-copy`): the first mode read a cold source and every later mode a source its predecessor had just pulled into the page cache. The wall times and every ratio in this table (and the read-back column, which depends on what the clone left cached) therefore mix the mode with its position, and were taken once per cell with no spread. They stay as the record of what ran; treat the ranking as indicative, not as a measured ratio. `bench/f07-storage.sh` now runs each mode in every round (`ROUNDS`, default 3) in a `shuf`fled order with the caches dropped before each, and tags each clone record with `round`, `position` and `caches_dropped` (`false` when the drop was not permitted, so that record's cache state is unknown). Re-measure on the VPS with it before quoting any ratio; none has been re-taken yet.
+
 Findings and decision:
 
 - Reflink clones are about 15 µs per file regardless of size, so a 20k-file cache tree attaches in ~0.3 s and shares blocks. On XFS and Btrfs `std::fs::copy` (`copy_file_range`) already reflinks transparently, which is why it matches `FICLONE`; on ext4 it still copies bytes but stays fast for small files through the kernel path.
@@ -94,6 +96,8 @@ Findings and decision:
 | btrfs | reflink (`FICLONE`/file) | 0.38 s | 52,854 | 12 µs / 115 µs | 1.94 s |
 | btrfs | explicit copy | 3.73 s | 5,361 | 126 µs / 878 µs | 0.18 s |
 | btrfs | `btrfs subvolume snapshot` | 0.01 s | 2,096,411 | — (one syscall) | 1.55 s |
+
+**Order-confounded.** Same defect as section 3: one cache drop after generating the fixture, then a fixed order (reflink, `copy`, `snapshot`) with one run per cell. Reflink alone started on a cold source; the byte copy and the snapshot found it cached by the time they ran, which flatters both against reflink and makes the "40x" and "370x" below order-dependent, not measurements of the modes. `bench/k02-cache-clone.sh` now runs `ROUNDS` (default 5) rounds, shuffles the mode order per round, drops the caches before each mode and tags every record with `round`, `position` and `caches_dropped`; the committed `bench/k02-cache-clone.jsonl` predates that and is unchanged, and no re-run exists yet (the decision below rests on the per-file cost being small in absolute terms, which the confound does not overturn; the ratios are not evidence).
 
 Findings and decision:
 

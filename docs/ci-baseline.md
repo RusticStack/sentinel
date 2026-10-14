@@ -8,7 +8,7 @@ All `lockwell-vps-*` and `lockwell-org-*` runners are **one VPS**, inspected ove
 
 | Item | Value |
 |---|---|
-| Host | `152.53.154.7`, QEMU guest, AMD EPYC 9645, 12 vCPUs (1 thread/core), 31 GiB RAM, 1 TB virtio disk, ext4 |
+| Host | the verification VPS (address in the ignored `.env`), QEMU guest, AMD EPYC 9645, 12 vCPUs (1 thread/core), 31 GiB RAM, 1 TB virtio disk, ext4 |
 | Kernel / runtime | Linux `7.0.0-31-generic`, rootless Docker 29.8.0 (overlayfs, systemd cgroup driver), Go 1.27.0 |
 | Runner listeners | 16 on this host: `lockwell-vps-1..6`, `lockwell-org-1..4`, `lockwell-sdk-{go,java,node}`, `website` under user `lockwell-ci`; `lockwell-vps-gate`, `gate-2` under `lockwell-gate` |
 | cgroup caps | `user-1000.slice` (lockwell-ci): `cpu.max` 10 CPUs, `memory.max` 26 GiB. `user-1001.slice` (gate): 8 CPUs, 16 GiB. Sum of caps (18 CPUs) exceeds the 12 vCPUs |

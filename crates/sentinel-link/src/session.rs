@@ -68,6 +68,19 @@ use crate::{Error, Result, identity::fingerprint_of};
 /// delayed packet must not tear down a session carrying live work.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(15);
+/// The beat interval the controller announces is advice from a peer, not a
+/// trusted number: a worker keeps it within these bounds, so `0` is never a
+/// ping flood and a huge value never lets the deadline lapse between beats
+/// (two beats must always fit inside [`HEARTBEAT_DEADLINE`]).
+pub const HEARTBEAT_MIN_INTERVAL: Duration = Duration::from_secs(1);
+pub const HEARTBEAT_MAX_INTERVAL: Duration = Duration::from_millis(7_500);
+const _: () = assert!(HEARTBEAT_MAX_INTERVAL.as_millis() * 2 <= HEARTBEAT_DEADLINE.as_millis());
+
+/// The announced beat interval, clamped to the bounds above.
+fn clamp_heartbeat(announced_ms: u32) -> Duration {
+    Duration::from_millis(u64::from(announced_ms))
+        .clamp(HEARTBEAT_MIN_INTERVAL, HEARTBEAT_MAX_INTERVAL)
+}
 /// Bytes read from the socket per call; one TLS record fits.
 const TLS_READ_BYTES: usize = 16 * 1024 + 512;
 /// A run spec crosses the link in chunks of this size, reassembled up to
@@ -548,6 +561,10 @@ impl SensitiveFrame for ServerMessage {
 pub enum LogVerdict {
     /// Stored and synced through this sequence.
     Acked(u64),
+    /// Written through this sequence but not yet durable: the session must
+    /// call [`SessionHandler::log_sync`] before it acknowledges, which lets
+    /// one `fsync` cover a whole burst of frames. Only `log` answers it.
+    Stored(u64),
     /// Permanently refused: the attempt is not this worker's, its log has
     /// already ended, or the size cap is reached. `LogRefused` goes out
     /// and the worker stops sending.
@@ -560,8 +577,9 @@ pub enum LogVerdict {
 }
 
 /// A file's permission bits inside an artifact manifest; only the low mode
-/// bits are meaningful on the wire.
-pub const ARTIFACT_MODE_BITS: u32 = 0o7777;
+/// bits are meaningful on the wire. Setuid, setgid and sticky are never
+/// carried: an artifact is data, not a privileged executable.
+pub const ARTIFACT_MODE_BITS: u32 = 0o777;
 
 /// The terminal code of an `ArtifactVerdict`: what the controller did with
 /// an artifact publication, so the worker learns how it was recorded.
@@ -720,6 +738,13 @@ pub struct JobContext {
     /// touch protected state.
     pub trust: Trust,
 }
+
+/// How long a worker honors a delivered source access, counted from the
+/// moment it arrives: the whole checkout deadline (ten minutes, covering a
+/// mirror lock wait or timeout followed by the direct fallback) plus two
+/// minutes before the checkout starts. The access lives only in the
+/// attempt's in-memory context, which the fence and lease already bound.
+pub const SOURCE_ACCESS_WINDOW_MS: i64 = 12 * 60 * 1000;
 
 const fn outcome_code(outcome: Outcome) -> u8 {
     match outcome {
@@ -1015,6 +1040,23 @@ pub trait Admission: Send + Sync {
         enrollment: Option<&Secret>,
         capacity: Capacity,
     ) -> std::result::Result<Admitted, Rejection>;
+
+    /// [`admit`](Self::admit) with the address the connection came from,
+    /// when it has one, for policies that budget unauthenticated peers by
+    /// source. The default ignores it.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_from(
+        &self,
+        _source: Option<std::net::IpAddr>,
+        fingerprint: &Digest,
+        worker: WorkerId,
+        name: &str,
+        hello: &Hello,
+        enrollment: Option<&Secret>,
+        capacity: Capacity,
+    ) -> std::result::Result<Admitted, Rejection> {
+        self.admit(fingerprint, worker, name, hello, enrollment, capacity)
+    }
 }
 
 /// The controller's answer to a heartbeat.
@@ -1061,6 +1103,13 @@ pub trait SessionHandler: Send + Sync {
     /// A log frame of an attempt this worker holds. Acknowledged only once
     /// durable; a frame out of sequence or past the size cap is refused.
     fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict;
+    /// Make the frames `log` answered [`LogVerdict::Stored`] for durable.
+    /// `false` is a transient fault: the session closes the connection and
+    /// acknowledges nothing, so the worker resends. The default has nothing
+    /// deferred.
+    fn log_sync(&self, _worker: WorkerId, _attempt: AttemptId) -> bool {
+        true
+    }
     /// The attempt's log is complete through `last_seq`. `Acked` means the
     /// end marker is durable; the session answers `LogEndAck` when the
     /// negotiated protocol carries it. The default refuses: nothing was
@@ -1191,16 +1240,31 @@ impl Sender {
     /// an unknown state, so the connection is torn down: the reader fails
     /// out, the session ends, and nothing waits on a dead peer forever.
     pub(crate) fn send<M: Serialize>(&self, message: &M) -> Result<()> {
-        self.send_inner(message, false)
+        self.send_inner(message, false, None)
+    }
+
+    /// [`send`](Self::send) for a caller that must not wait on one peer (the
+    /// controller's single dispatcher): fails with [`BUSY`], touching
+    /// nothing, when another thread is mid-write on this connection, and
+    /// otherwise writes under `within` instead of the full write timeout.
+    /// A write that runs past `within` tears the connection down exactly as
+    /// a timed-out `send` does.
+    pub(crate) fn send_bounded<M: Serialize>(&self, message: &M, within: Duration) -> Result<()> {
+        self.send_inner(message, false, Some(within))
     }
 
     /// Same frame path as `send`, but wipe the reusable postcard buffer after
     /// a secret payload is encoded and written.
     pub(crate) fn send_sensitive<M: Serialize>(&self, message: &M) -> Result<()> {
-        self.send_inner(message, true)
+        self.send_inner(message, true, None)
     }
 
-    fn send_inner<M: Serialize>(&self, message: &M, sensitive: bool) -> Result<()> {
+    fn send_inner<M: Serialize>(
+        &self,
+        message: &M,
+        sensitive: bool,
+        bound: Option<Duration>,
+    ) -> Result<()> {
         ENCODE.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
             scratch.clear();
@@ -1217,7 +1281,7 @@ impl Sender {
                             Err(Error::Protocol("frame too large"))
                         } else {
                             buffer[..4].copy_from_slice(&(len as u32).to_be_bytes());
-                            self.write_frame(&buffer)
+                            self.write_frame(&buffer, bound)
                         }
                     }
                 }
@@ -1232,7 +1296,7 @@ impl Sender {
                     Err(Error::Protocol("frame too large"))
                 } else {
                     buffer[..4].copy_from_slice(&(len as u32).to_be_bytes());
-                    self.write_frame(&buffer)
+                    self.write_frame(&buffer, bound)
                 }
             };
             if sensitive {
@@ -1243,7 +1307,7 @@ impl Sender {
         })
     }
 
-    fn write_frame(&self, frame: &[u8]) -> Result<()> {
+    fn write_frame(&self, frame: &[u8], bound: Option<Duration>) -> Result<()> {
         if self.0.closing.load(Ordering::Acquire) {
             // Past the close: a failed write here would tear the socket
             // down (and reset it on unread bytes) before the peer read the
@@ -1251,7 +1315,21 @@ impl Sender {
             // connection that is ending anyway.
             return Ok(());
         }
-        let mut conn = self.0.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut conn = match bound {
+            None => self.0.conn.lock().unwrap_or_else(|p| p.into_inner()),
+            // Busy is not a failure of the connection: nothing was written,
+            // so it stays open.
+            Some(_) => match self.0.conn.try_lock() {
+                Ok(conn) => conn,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Internal(BUSY)),
+            },
+        };
+        if let Some(within) = bound {
+            // Under the connection lock, so no other writer sees the
+            // shortened timeout; restored below on every path.
+            let _ = self.0.sock.set_write_timeout(Some(within));
+        }
         let written = (|| -> Result<()> {
             conn.writer().write_all(frame)?;
             let mut sock = &self.0.sock;
@@ -1260,6 +1338,9 @@ impl Sender {
             }
             Ok(())
         })();
+        if bound.is_some() {
+            let _ = self.0.sock.set_write_timeout(Some(HEARTBEAT_DEADLINE));
+        }
         drop(conn);
         match written {
             Ok(()) => {
@@ -2250,6 +2331,7 @@ fn accept_watched(
         .and_then(|certs| certs.first())
         .map(fingerprint_of)
         .ok_or(Error::Protocol("no client certificate"))?;
+    let source = socket.peer_addr().ok().map(|addr| addr.ip());
     let (tx, mut rx) = split(conn, socket)?;
     let first = loop {
         let remaining = deadline.saturating_sub(started.elapsed());
@@ -2286,7 +2368,8 @@ fn accept_watched(
                 ),
                 None => None,
             };
-            match admission.admit(
+            match admission.admit_from(
+                source,
                 &fingerprint,
                 worker,
                 &name,
@@ -2405,6 +2488,34 @@ impl WorkerSession {
     }
 }
 
+/// The most log frames written ahead of one `fsync`: well inside the
+/// worker's `MAX_UNACKED_LOG_FRAMES` window, so a full window is never
+/// waiting on an acknowledgement the batch has not earned yet.
+const LOG_SYNC_FRAMES: usize = 64;
+
+/// Make the deferred frames durable, then acknowledge each attempt once, at
+/// the highest sequence it holds. A sync that fails acknowledges nothing and
+/// closes the connection; the worker resends from its last acknowledgement.
+fn flush_log_acks(
+    handler: &dyn SessionHandler,
+    worker: WorkerId,
+    tx: &Sender,
+    unsynced: &mut Vec<(AttemptId, u64)>,
+    frames: &mut usize,
+) -> Result<()> {
+    *frames = 0;
+    for (attempt, through) in unsynced.drain(..) {
+        if !handler.log_sync(worker, attempt) {
+            return Err(Error::Internal("log store"));
+        }
+        tx.send(&ServerMessage::LogAck {
+            attempt: *attempt.as_bytes(),
+            through,
+        })?;
+    }
+    Ok(())
+}
+
 /// Serve one connection's inbound messages until `Bye`, a protocol violation
 /// or loss. `bulk` is `None` on the control connection: it carries
 /// heartbeats, offer answers and reports, accepts bulk-class messages as the
@@ -2441,8 +2552,26 @@ fn serve_connection(
     let transfers = Arc::new(AtomicUsize::new(0));
     // The cancel flag of each download in flight (protocol 8, P08-C2).
     let serving: Arc<Mutex<HashMap<AttemptId, Arc<AtomicBool>>>> = Arc::default();
+    // Log frames written but not yet acknowledged: one `fsync` per attempt
+    // covers the whole burst the receiver already holds, so the durability
+    // cost is paid per window of frames, never per frame. Nothing here is
+    // acknowledged before `log_sync` says it is durable.
+    let mut unsynced: Vec<(AttemptId, u64)> = Vec::new();
+    let mut unsynced_frames = 0usize;
     loop {
-        let received = rx.recv_timeout::<ClientMessage>(HEARTBEAT_DEADLINE)?;
+        let received = if unsynced.is_empty() {
+            rx.recv_timeout::<ClientMessage>(HEARTBEAT_DEADLINE)?
+        } else {
+            // Only what the receiver already holds: a zero wait never
+            // reads the socket, so an idle link acknowledges at once.
+            match rx.recv_timeout::<ClientMessage>(Duration::ZERO)? {
+                Some(message) => Some(message),
+                None => {
+                    flush_log_acks(handler, worker, tx, &mut unsynced, &mut unsynced_frames)?;
+                    rx.recv_timeout::<ClientMessage>(HEARTBEAT_DEADLINE)?
+                }
+            }
+        };
         if !uploads.is_empty() {
             let now = Instant::now();
             uploads.retain(|_, (_, moved)| now.duration_since(*moved) < UPLOAD_IDLE);
@@ -2453,6 +2582,9 @@ fn serve_connection(
             }
             return Err(Error::Lost);
         };
+        if !unsynced.is_empty() && !matches!(message, ClientMessage::Log { .. }) {
+            flush_log_acks(handler, worker, tx, &mut unsynced, &mut unsynced_frames)?;
+        }
         match message {
             ClientMessage::Ping { seq, held } => {
                 if !control {
@@ -2494,12 +2626,10 @@ fn serve_connection(
                     return Err(Error::Protocol("control message on bulk"));
                 }
                 let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                if summary
-                    .as_ref()
-                    .is_some_and(|s| s.len() > MAX_SUMMARY_BYTES)
-                {
-                    return Err(Error::Protocol("summary size"));
-                }
+                // An oversized summary (the frame cap leaves room above it)
+                // is telemetry the controller will not keep, not a reason to
+                // drop the session and lose the verdict riding with it.
+                let summary = summary.filter(|s| s.len() <= MAX_SUMMARY_BYTES);
                 handler.reported(worker, attempt, Fence(fence), event.to_event()?, summary);
             }
             ClientMessage::NeedSpec { attempt } => {
@@ -2573,10 +2703,28 @@ fn serve_connection(
                     bytes,
                 };
                 match handler.log(worker, id, frame) {
+                    LogVerdict::Stored(through) => {
+                        match unsynced.iter_mut().find(|(a, _)| *a == id) {
+                            Some((_, last)) => *last = through,
+                            None => unsynced.push((id, through)),
+                        }
+                        unsynced_frames += 1;
+                        if unsynced_frames >= LOG_SYNC_FRAMES {
+                            flush_log_acks(
+                                handler,
+                                worker,
+                                tx,
+                                &mut unsynced,
+                                &mut unsynced_frames,
+                            )?;
+                        }
+                    }
                     LogVerdict::Acked(through) => {
+                        flush_log_acks(handler, worker, tx, &mut unsynced, &mut unsynced_frames)?;
                         tx.send(&ServerMessage::LogAck { attempt, through })?;
                     }
                     LogVerdict::Refused => {
+                        flush_log_acks(handler, worker, tx, &mut unsynced, &mut unsynced_frames)?;
                         tx.send(&ServerMessage::LogRefused { attempt })?;
                     }
                     LogVerdict::Retry => return Err(Error::Internal("log store")),
@@ -2601,7 +2749,9 @@ fn serve_connection(
                     LogVerdict::Refused => {
                         tx.send(&ServerMessage::LogRefused { attempt })?;
                     }
-                    LogVerdict::Retry => return Err(Error::Internal("log store")),
+                    LogVerdict::Retry | LogVerdict::Stored(_) => {
+                        return Err(Error::Internal("log store"));
+                    }
                 }
             }
             ClientMessage::Abandon { attempt, fence } => {
@@ -2984,8 +3134,48 @@ fn ids(raw: &[[u8; 16]]) -> Result<Vec<AttemptId>> {
 }
 
 /// Push an offer to a worker. The dispatcher's only way in.
+///
+/// A connection another thread holds for a moment — the session's own
+/// reader taking the previous offer's acknowledgement off the wire — is
+/// waited for up to [`OFFER_BUSY_WAIT`]; a peer that holds it longer (a
+/// spec or log stream) is refused as [`BUSY`] so it costs the single
+/// dispatcher no more than that.
 pub fn offer(sender: &Sender, offer: &Offer) -> Result<()> {
-    sender.send(&ServerMessage::Offer(offer.to_wire()))
+    let message = ServerMessage::Offer(offer.to_wire());
+    let give_up = Instant::now() + OFFER_BUSY_WAIT;
+    loop {
+        match sender.send_bounded(&message, DISPATCH_WRITE_BOUND) {
+            Err(error) if is_busy(&error) && Instant::now() < give_up => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// How long [`offer`] waits for a connection that is busy for a moment
+/// before it reports [`BUSY`].
+pub const OFFER_BUSY_WAIT: Duration = Duration::from_millis(20);
+
+/// What the dispatcher's own pushes (offers, prefetch hints) may wait on one
+/// peer: they come from the single dispatcher thread, so a peer that stopped
+/// reading must cost the fleet this, not the 15 s write timeout.
+pub const DISPATCH_WRITE_BOUND: Duration = Duration::from_millis(250);
+
+/// The error [`Sender::send_bounded`] returns when another thread is
+/// mid-write on the connection: nothing was sent and the connection is fine.
+pub const BUSY: &str = "sender busy";
+
+/// Whether `error` is the [`BUSY`] refusal rather than a failed connection.
+pub fn is_busy(error: &Error) -> bool {
+    matches!(error, Error::Internal(BUSY))
+}
+
+/// Whether the connection is free for a push right now (a peer whose spec or
+/// log traffic holds the connection lock is skipped this pass, not waited
+/// for). Advisory: [`Sender::send_bounded`] is the check that counts.
+pub fn is_free(sender: &Sender) -> bool {
+    sender.0.conn.try_lock().is_ok()
 }
 
 /// Push a prefetch hint (protocol 9) to a session: the whole wanted set of
@@ -2999,9 +3189,12 @@ pub fn prefetch(sender: &Sender, images: &[String]) -> Result<()> {
     {
         return Err(Error::Protocol("prefetch hint"));
     }
-    sender.send(&ServerMessage::Prefetch {
-        images: images.to_vec(),
-    })
+    sender.send_bounded(
+        &ServerMessage::Prefetch {
+            images: images.to_vec(),
+        },
+        DISPATCH_WRITE_BOUND,
+    )
 }
 
 /// The worker's end of a session.
@@ -3095,7 +3288,7 @@ pub fn connect(
             tx: tx.clone(),
             worker: WorkerId::from_bytes(worker).map_err(|_| Error::Protocol("worker id"))?,
             negotiated,
-            interval: Duration::from_millis(u64::from(heartbeat_interval_ms)),
+            interval: clamp_heartbeat(heartbeat_interval_ms),
             seq: 0,
             addr,
             client: config,
@@ -3899,9 +4092,16 @@ fn handle_bulk_message(
         }
         ServerMessage::Source { attempt, access } => {
             let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-            if !access.validate(UnixMillis::now().0) {
+            // The controller's `expires_ms` is its own wall clock: comparing
+            // it with this host's would tear the link down on every bound
+            // spec when the two clocks differ by more than the access's life.
+            // Validity is instead measured from receipt, on this host's
+            // clock, for the window one checkout (mirror attempt, then the
+            // direct fallback) can take.
+            if !access.well_formed() {
                 return Err(Error::Protocol("source access"));
             }
+            let access = access.rebased(UnixMillis::now().0, SOURCE_ACCESS_WINDOW_MS);
             let context = state
                 .contexts
                 .get_mut(&attempt)
@@ -4137,6 +4337,14 @@ pub fn listen(addr: SocketAddr) -> Result<TcpListener> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_announced_heartbeat_interval_is_clamped() {
+        assert_eq!(clamp_heartbeat(0), HEARTBEAT_MIN_INTERVAL);
+        assert_eq!(clamp_heartbeat(1), HEARTBEAT_MIN_INTERVAL);
+        assert_eq!(clamp_heartbeat(5_000), HEARTBEAT_INTERVAL);
+        assert_eq!(clamp_heartbeat(u32::MAX), HEARTBEAT_MAX_INTERVAL);
+    }
+
     /// One loopback TLS connection, split: the worker end's sender and the
     /// controller end's receiver (kept so the peer stays open).
     fn tls_pair() -> (Sender, Receiver) {
@@ -4304,6 +4512,96 @@ mod tests {
         );
         assert!(again.elapsed() < Duration::from_millis(150));
         drop(peer);
+    }
+
+    /// A server-side sender whose peer completes the handshake and then
+    /// never reads. The peer thread is returned so the test keeps it alive.
+    fn sender_to_a_peer_that_never_reads() -> (Sender, thread::JoinHandle<()>) {
+        let server_identity = crate::identity::Identity::generate("controller").unwrap();
+        let pin = server_identity.fingerprint();
+        let server = crate::tls::server_config(server_identity).unwrap();
+        let client =
+            crate::tls::client_config(crate::identity::Identity::generate("worker").unwrap(), pin)
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = thread::spawn(move || {
+            let socket = TcpStream::connect(addr).unwrap();
+            let mut conn = rustls::Connection::Client(
+                ClientConnection::new(client, ServerName::try_from("sentinel").unwrap()).unwrap(),
+            );
+            handshake(&mut conn, &socket, HEARTBEAT_DEADLINE, None).unwrap();
+            thread::sleep(Duration::from_secs(10));
+        });
+        let (socket, _) = listener.accept().unwrap();
+        let mut conn = rustls::Connection::Server(ServerConnection::new(server).unwrap());
+        handshake(&mut conn, &socket, HEARTBEAT_DEADLINE, None).unwrap();
+        (split(conn, socket).unwrap().0, peer)
+    }
+
+    /// Finding 4: a dispatcher push to a peer that stopped reading waits at
+    /// most the dispatch bound (not the 15 s write timeout), fails, and
+    /// tears the connection down so the next push fails at once.
+    #[test]
+    fn a_bounded_send_to_a_peer_that_never_reads_fails_fast_and_closes() {
+        let (tx, peer) = sender_to_a_peer_that_never_reads();
+        let big = vec![0u8; 48 * 1024];
+        let overall = Instant::now();
+        let (failed, took) = loop {
+            let started = Instant::now();
+            if let Err(error) = tx.send_bounded(
+                &ServerMessage::Spec {
+                    attempt: [1; 16],
+                    seq: 0,
+                    last: false,
+                    bytes: big.clone(),
+                },
+                DISPATCH_WRITE_BOUND,
+            ) {
+                break (error, started.elapsed());
+            }
+            assert!(overall.elapsed() < Duration::from_secs(10), "never blocked");
+        };
+        assert!(matches!(failed, Error::Lost | Error::Io(_)), "{failed}");
+        assert!(!is_busy(&failed));
+        // The bound is 250 ms; well under the 15 s heartbeat deadline.
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        let again = Instant::now();
+        let next = tx
+            .send_bounded(
+                &ServerMessage::NoSpec { attempt: [1; 16] },
+                DISPATCH_WRITE_BOUND,
+            )
+            .unwrap_err();
+        assert!(!is_busy(&next));
+        assert!(again.elapsed() < Duration::from_millis(200));
+        drop(peer);
+    }
+
+    /// Finding 4: while another thread holds the connection, a bounded send
+    /// is refused as busy without waiting and without closing; the push
+    /// works once the connection is free again.
+    #[test]
+    fn a_bounded_send_skips_a_busy_connection_without_closing_it() {
+        let (tx, _rx) = tls_pair();
+        let held = tx.0.conn.lock().unwrap();
+        assert!(!is_free(&tx));
+        let started = Instant::now();
+        let refused = tx
+            .send_bounded(
+                &ServerMessage::NoSpec { attempt: [2; 16] },
+                DISPATCH_WRITE_BOUND,
+            )
+            .unwrap_err();
+        assert!(is_busy(&refused), "{refused}");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        drop(held);
+        assert!(is_free(&tx));
+        tx.send_bounded(
+            &ServerMessage::NoSpec { attempt: [2; 16] },
+            DISPATCH_WRITE_BOUND,
+        )
+        .expect("busy must not have closed the connection");
     }
 
     fn context(tenant: Option<TenantId>, trust: Trust) -> JobContext {

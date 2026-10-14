@@ -5,6 +5,9 @@ export type Role = "reader" | "operator" | "admin";
 export interface Me {
   user: string;
   username: string | null;
+  /** The account's email, verified or not; absent from older controllers. */
+  email?: string | null;
+  email_verified?: boolean;
   super_admin: boolean;
   via: "bearer" | "session" | "oauth";
   scopes: string[];
@@ -12,7 +15,77 @@ export interface Me {
   mfa: boolean;
 }
 
-export interface TenantChoice { slug: string; role: Role }
+/** A personal namespace (one account's own) or an organization. */
+export type NamespaceKind = "personal" | "organization";
+/** Where an organization's membership comes from: Sentinel (invitations,
+ *  administrators, the operator's domain rules) or GitHub. */
+export type MembershipSource = "app" | "github";
+
+/** A namespace the caller belongs to (`GET /tenants`); `kind` and
+ *  `membership` are absent from older controllers. */
+export interface TenantChoice { slug: string; role: Role; kind?: NamespaceKind; membership?: MembershipSource }
+
+/** `GET /tenants/{slug}/settings`. */
+export interface NamespaceSettings {
+  slug: string;
+  kind: NamespaceKind;
+  membership: MembershipSource;
+  github_installation: boolean;
+  role: Role | null;
+  created_ms: number;
+  /** The caller's own standing, for a GitHub-backed organization. */
+  github_sync?: { confirmed_ms: number | null; check_due: boolean; unanswered: number };
+  /** Administrators only: the operator's read-only domain rule. */
+  auto_join?: { applies: boolean; domains: string[] };
+}
+
+/** An invitation as metadata (`GET /tenants/{slug}/invitations`); never a secret. */
+export interface Invitation {
+  id: string;
+  email: string | null;
+  role: Role | null;
+  expires_ms: number;
+  state: "pending" | "redeemed" | "revoked" | "expired";
+}
+
+/** `GET /me/security`: what the account page shows, metadata only. */
+export interface Security {
+  password: boolean;
+  mfa: { enrolled: boolean; pending: boolean; recovery_codes_remaining: number };
+  identities: { provider: string; linked_ms: number }[];
+  github_link: boolean;
+}
+
+/** A tenant member (`GET /tenants/{slug}/members`). */
+export interface Member {
+  user: string;
+  display_name: string;
+  username: string | null;
+  kind: "person" | "service";
+  role: Role;
+  active: boolean;
+  /** `github` when the membership is derived from the person's linked GitHub account. */
+  source?: "app" | "github";
+  /** When GitHub last confirmed a derived membership. */
+  synced_ms?: number | null;
+}
+
+/** An OAuth grant as metadata (never a token). */
+export interface Grant {
+  id: string;
+  user: string;
+  client_id: string;
+  kind: string;
+  /** Space-separated scope names. */
+  scope: string;
+  tenant: string | null;
+  repo: string | null;
+  name: string | null;
+  created_ms: number;
+  expires_ms: number;
+  last_used_ms: number | null;
+  revoked: boolean;
+}
 
 export interface RunSummary {
   id: string;

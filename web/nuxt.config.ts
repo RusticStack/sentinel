@@ -13,7 +13,16 @@ export default defineNuxtConfig({
   // Self-hosted and possibly offline: no web fonts fetched at build time,
   // icons bundled from the local Lucide set instead of the Iconify API.
   ui: { fonts: false, theme: { colors: ["primary", "neutral", "success", "warning", "error", "info"] } },
+  // Nuxt UI turns this on: switching the colour mode would then append a
+  // `<style>` element that disables transitions, which the hash-only
+  // `style-src` refuses. Off, the switch simply animates colours.
+  colorMode: { disableTransition: false },
   icon: {
+    // Inline `<svg>` elements, not CSS classes: the default `css` mode adds a
+    // `<style>` element at run time for each icon first drawn in the browser,
+    // which the page's hash-only `style-src` (server/plugins/csp.ts) rightly
+    // refuses ("Applying inline style violates ... style-src").
+    mode: "svg",
     serverBundle: { collections: ["lucide"] },
     // Icons named at run time (state badges) are bundled explicitly; the
     // rest are found by scanning the components.
@@ -32,6 +41,13 @@ export default defineNuxtConfig({
     // The controller's API listener (`api_listen`), reached server-side:
     // NUXT_SENTINEL_API=http://127.0.0.1:7080
     sentinelApi: "http://127.0.0.1:7080",
+    // The header the reverse proxy in front of this process sets to the
+    // real client address (`x-forwarded-for`, `x-real-ip`, ...):
+    // NUXT_CLIENT_IP_HEADER=x-forwarded-for. Empty (the default) counts
+    // every client under the socket peer and trusts no header, so a client
+    // can never choose its own rate-limit bucket. Set it only when this
+    // process is reachable through that proxy alone.
+    clientIpHeader: "",
   },
 
   app: {
@@ -52,6 +68,7 @@ export default defineNuxtConfig({
           "x-frame-options": "DENY",
           "x-content-type-options": "nosniff",
           "referrer-policy": "no-referrer",
+          "permissions-policy": "accelerometer=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), microphone=(), midi=(), payment=(), serial=(), usb=(), interest-cohort=()",
         },
       },
       // Built assets are named by content.

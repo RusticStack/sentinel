@@ -1481,6 +1481,57 @@ pub fn grants(
     rows.map(|row| grant_record(row?)).collect()
 }
 
+/// One grant of `user` as metadata: what a token that may see only its own
+/// grant is shown. Another account's grant, and an absent one, are `NotFound`.
+pub fn own_grant(conn: &Connection, user: UserId, grant: GrantId) -> Result<GrantRecord> {
+    let row = conn
+        .prepare_cached(&format!(
+            "SELECT {GRANT_COLUMNS} FROM oauth_grants WHERE id = ?1 AND user_id = ?2"
+        ))?
+        .query_row(params![grant.as_bytes(), user.as_bytes()], raw_grant)
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    grant_record(row)
+}
+
+/// Revoke the live service grants `minter` issued at or after `since` (reason
+/// [`reason::ACCOUNT`]), and record one audit row with the count when there
+/// were any. Called when the minter's sessions are revoked: `since` is the
+/// start of the oldest of them, so a credential a hijacked session minted
+/// does not survive the response to the hijack. Grants older than every
+/// revoked session are untouched.
+///
+/// The walk is the live-grant range of `oauth_grants_by_expiry` filtered by
+/// kind, minter and age; it runs only when sessions are revoked, and the
+/// table holds live grants plus a bounded revoked tail.
+pub(crate) fn revoke_minted_since(
+    tx: &Transaction<'_>,
+    minter: UserId,
+    since: UnixMillis,
+    now: UnixMillis,
+) -> Result<usize> {
+    let revoked = tx
+        .prepare_cached(
+            "UPDATE oauth_grants SET revoked_ms = ?3, revoked_reason = ?4
+             WHERE expires_ms > ?3 AND revoked_ms IS NULL AND kind = 3
+             AND created_by = ?1 AND created_ms >= ?2 AND created_ms <= ?3",
+        )?
+        .execute(params![minter.as_bytes(), since.0, now.0, reason::ACCOUNT])?;
+    if revoked > 0 {
+        audit(
+            tx,
+            Event::OAuthGrantRevoked,
+            None,
+            Some(minter),
+            false,
+            Some(&format!(
+                "{revoked} service grants minted in session window"
+            )),
+        )?;
+    }
+    Ok(revoked)
+}
+
 /// Issue a grant and its first token pair without an authorization decision.
 /// Tests and host-local provisioning only; no route reaches it. The insert
 /// trigger still refuses ineligible terms (`Forbidden`).

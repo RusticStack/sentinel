@@ -200,6 +200,28 @@ pub struct Replicator {
     status: Arc<Status>,
     passes: AtomicU64,
     buffer: Mutex<Vec<u8>>,
+    /// Set by [`Replicator::failed`]: whether the current pass already
+    /// recorded its failure in the status (a stage that stops on a bucket
+    /// error does; one that stops on a store error does not).
+    recorded: AtomicBool,
+}
+
+/// The most the replicator's transfer buffer keeps between objects: the
+/// default part size. A larger configured part is freed once its object is
+/// done, so resident memory stays bounded however `part_bytes` is set.
+const RETAINED_BUFFER_BYTES: usize = 16 << 20;
+
+/// Replace `buffer`'s contents with exactly the next `len` bytes of `reader`,
+/// read into spare capacity (no zero-fill pass over a buffer that is about to
+/// be overwritten). A short read is `UnexpectedEof`, as `read_exact` reports.
+fn fill(reader: &mut impl Read, len: u64, buffer: &mut Vec<u8>) -> std::io::Result<()> {
+    buffer.clear();
+    buffer.reserve(len as usize);
+    reader.by_ref().take(len).read_to_end(buffer)?;
+    if buffer.len() as u64 != len {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -223,6 +245,7 @@ impl Replicator {
             status: Arc::new(Status::default()),
             passes: AtomicU64::new(0),
             buffer: Mutex::new(Vec::new()),
+            recorded: AtomicBool::new(false),
         }
     }
 
@@ -231,6 +254,7 @@ impl Replicator {
     }
 
     fn failed(&self, what: &str, error: &dyn std::fmt::Display) {
+        self.recorded.store(true, Ordering::Relaxed);
         self.status
             .consecutive_failures
             .fetch_add(1, Ordering::Relaxed);
@@ -248,6 +272,7 @@ impl Replicator {
     /// status says which); the caller backs off.
     pub fn pass(&self) -> std::result::Result<Pass, String> {
         let mut pass = Pass::default();
+        self.recorded.store(false, Ordering::Relaxed);
         let outcome = self.stages(&mut pass);
         self.measure();
         self.passes.fetch_add(1, Ordering::Relaxed);
@@ -264,7 +289,15 @@ impl Replicator {
                     .unwrap_or_else(|p| p.into_inner()) = None;
                 Ok(pass)
             }
-            Err(why) => Err(why),
+            Err(why) => {
+                // A store or eviction error stops the pass without touching
+                // the bucket: it still counts, or health would read healthy
+                // while nothing replicates.
+                if !self.recorded.load(Ordering::Relaxed) {
+                    self.failed("pass", &why);
+                }
+                Err(why)
+            }
         }
     }
 
@@ -305,7 +338,20 @@ impl Replicator {
         pass.more |= due.len() as u32 == DELETES_PER_PASS;
         for delete in due {
             let result = match delete {
-                Delete::Object { tenant, digest, .. } => {
+                Delete::Object { id, tenant, digest } => {
+                    // The same content may have been committed again since
+                    // this delete was queued (more than one batch of deletes
+                    // can be waiting while the upload stage runs): its key is
+                    // then a live object's copy. The recheck and the dropping
+                    // of the queued delete are one transaction.
+                    let live = self
+                        .store
+                        .writer()
+                        .write(move |tx| offload::keep_if_live(tx, id, tenant, &digest))
+                        .map_err(|e| e.to_string())?;
+                    if live {
+                        continue;
+                    }
                     self.bucket.delete(&remote_key(tenant, &digest))
                 }
                 Delete::Log {
@@ -398,41 +444,14 @@ impl Replicator {
             .read(|c| self.objects.open_read(c, object.tenant, object.digest))
             .map_err(|e| local(&e))?;
         let mut buffer = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
-        let matches = |hash: blake3::Hash| {
-            crate::objects::Digest::from_bytes(*hash.as_bytes()) == object.digest
-        };
-        if len <= self.settings.part_bytes {
-            buffer.clear();
-            buffer.resize(len as usize, 0);
-            reader.read_exact(&mut buffer).map_err(|e| local(&e))?;
-            let mut extra = [0u8; 1];
-            if reader.read(&mut extra).map_err(|e| local(&e))? != 0
-                || !matches(blake3::hash(&buffer))
-            {
-                return Err(Fault::Local("does not match its digest".into()));
-            }
-            self.bucket.put(&key, &buffer, Some(&blake3))?;
-        } else {
-            // Hash the whole file first: parts a resumed upload already
-            // holds are not read again below.
-            let mut hasher = blake3::Hasher::new();
-            let mut total = 0u64;
-            buffer.clear();
-            buffer.resize(self.settings.part_bytes.min(8 << 20) as usize, 0);
-            loop {
-                let n = reader.read(&mut buffer).map_err(|e| local(&e))?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..n]);
-                total += n as u64;
-            }
-            if total != len || !matches(hasher.finalize()) {
-                return Err(Fault::Local("does not match its digest".into()));
-            }
-            self.multipart(&key, &blake3, len, &mut reader, &mut buffer)?;
+        let outcome = self.upload(&key, &blake3, object, &mut reader, len, &mut buffer);
+        // A configured part size can be hundreds of MiB; the buffer stays
+        // resident between objects only up to the default part size.
+        if buffer.capacity() > RETAINED_BUFFER_BYTES {
+            *buffer = Vec::new();
         }
         drop(buffer);
+        outcome?;
         match self.bucket.head(&key)? {
             Some((got, meta)) if got == len && meta.as_deref().is_none_or(|m| m == blake3) => {
                 Ok(())
@@ -443,6 +462,53 @@ impl Replicator {
                 message: "the stored copy does not match the object".into(),
             })),
         }
+    }
+
+    /// Verify the local bytes against the digest and send them, through
+    /// `buffer`. Bytes are read into spare capacity, never zero-filled first.
+    fn upload(
+        &self,
+        key: &str,
+        blake3: &str,
+        object: &ObjectRef,
+        reader: &mut (impl Read + Seek),
+        len: u64,
+        buffer: &mut Vec<u8>,
+    ) -> std::result::Result<(), Fault> {
+        let local = |e: &dyn std::fmt::Display| Fault::Local(format!("local object: {e}"));
+        let matches = |hash: blake3::Hash| {
+            crate::objects::Digest::from_bytes(*hash.as_bytes()) == object.digest
+        };
+        if len <= self.settings.part_bytes {
+            fill(reader, len, buffer).map_err(|e| local(&e))?;
+            let mut extra = [0u8; 1];
+            if reader.read(&mut extra).map_err(|e| local(&e))? != 0
+                || !matches(blake3::hash(buffer))
+            {
+                return Err(Fault::Local("does not match its digest".into()));
+            }
+            self.bucket.put(key, buffer, Some(blake3))?;
+        } else {
+            // Hash the whole file first: parts a resumed upload already
+            // holds are not read again below.
+            let mut hasher = blake3::Hasher::new();
+            let mut total = 0u64;
+            buffer.clear();
+            buffer.resize(self.settings.part_bytes.min(8 << 20) as usize, 0);
+            loop {
+                let n = reader.read(&mut buffer[..]).map_err(|e| local(&e))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..n]);
+                total += n as u64;
+            }
+            if total != len || !matches(hasher.finalize()) {
+                return Err(Fault::Local("does not match its digest".into()));
+            }
+            self.multipart(key, blake3, len, reader, buffer)?;
+        }
+        Ok(())
     }
 
     /// A multipart upload, resumed from what the bucket holds when this
@@ -488,11 +554,9 @@ impl Replicator {
                 done.push((number, etag.clone()));
                 continue;
             }
-            buffer.clear();
-            buffer.resize(size as usize, 0);
             reader
                 .seek(SeekFrom::Start(offset))
-                .and_then(|_| reader.read_exact(buffer))
+                .and_then(|_| fill(reader, size, buffer))
                 .map_err(|e| BucketError {
                     transient: false,
                     not_found: false,
@@ -715,5 +779,33 @@ impl Replicator {
         {
             admission.set_backlog_full(now_full);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn fill_replaces_the_buffer_with_exactly_the_requested_bytes() {
+        let mut buffer = vec![9u8; 64];
+        let mut reader = Cursor::new((0..=255u8).collect::<Vec<_>>());
+        fill(&mut reader, 10, &mut buffer).unwrap();
+        assert_eq!(buffer, (0..10u8).collect::<Vec<_>>());
+        // The next call continues where the last stopped and drops the old.
+        fill(&mut reader, 3, &mut buffer).unwrap();
+        assert_eq!(buffer, vec![10, 11, 12]);
+        fill(&mut reader, 0, &mut buffer).unwrap();
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn fill_reports_a_short_read_as_a_truncated_object() {
+        let mut buffer = Vec::new();
+        let mut reader = Cursor::new(vec![1u8, 2, 3]);
+        let error = fill(&mut reader, 4, &mut buffer).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

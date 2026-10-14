@@ -13,12 +13,15 @@
 
 pub mod artifacts;
 pub mod auth;
+pub mod auto_join;
 pub mod backup;
 pub mod bundle;
 pub mod checks;
 pub mod codec;
 pub mod dispatch;
+pub mod email;
 pub mod github_events;
+pub mod github_members;
 pub mod idempotency;
 pub mod intake;
 pub mod jobs;
@@ -30,6 +33,7 @@ pub mod oauth;
 pub mod objects;
 pub mod offload;
 pub mod operations;
+pub mod organizations;
 pub mod poll;
 pub mod provenance;
 pub mod registration;
@@ -39,6 +43,7 @@ pub mod retention;
 pub mod runs;
 pub mod schema;
 pub mod secrets;
+pub mod setup;
 pub mod sign_in;
 pub mod sources;
 pub mod sources_forge;
@@ -175,6 +180,23 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Error {
+    /// Whether the failure says nothing about the request itself: the writer
+    /// or a reader was unavailable, slow or busy, so the same call may succeed
+    /// later (a `WriteAmbiguous` one may even have committed, which a retry of
+    /// a fenced transition then finds as `NotFound`/`Conflict`). Everything
+    /// else is a verdict on the row — stale, refused or corrupt — and retrying
+    /// it changes nothing.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::WriterUnavailable | Self::WriteAmbiguous | Self::Overloaded => true,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(failure, _)) => matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ),
+            _ => false,
+        }
+    }
+
     /// The variant's name and nothing else: safe to log, because it carries
     /// no payload — no SQL text, no path, no value from a row.
     pub fn kind(&self) -> &'static str {
@@ -384,6 +406,13 @@ impl Changes {
         drop(guard);
         self.waiters.fetch_sub(1, Ordering::SeqCst);
         generation
+    }
+
+    /// Wake every parked waiter without a commit, for a thread that must stop
+    /// waiting (its owner is shutting it down). The generation moves like a
+    /// commit's, which is harmless: a generation says only "re-read".
+    pub fn nudge(&self) {
+        self.committed();
     }
 
     /// The writer's side, once a write has committed.
@@ -743,11 +772,84 @@ impl Store {
         Shutdown::Stalled
     }
 
-    /// Fold the WAL back into the main file; call at quiet moments and on shutdown.
-    pub fn checkpoint(&self) -> Result<()> {
+    /// Fold the WAL back into the main file; call at quiet moments and on
+    /// shutdown. The writer thread is held for at most [`CHECKPOINT_BUDGET`]
+    /// of waiting on readers (the connection's own 5 s busy wait would let one
+    /// long read stall every write behind it) plus the copy of what no reader
+    /// needs, which the WAL's own size bounds. When a reader kept part of the
+    /// log, the work done stays done and the answer is
+    /// [`Checkpointed::Partial`]: call again at the next quiet moment.
+    pub fn checkpoint(&self) -> Result<Checkpointed> {
         self.writer.raw(|conn| {
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
-            Ok(())
+            conn.busy_timeout(CHECKPOINT_BUDGET)?;
+            let outcome = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                r.get::<_, i64>(0)
+            });
+            // Whatever the checkpoint did, later writes get their usual wait.
+            conn.busy_timeout(BUSY_TIMEOUT)?;
+            match outcome {
+                Ok(0) => Ok(Checkpointed::Complete),
+                Ok(_) => Ok(Checkpointed::Partial),
+                Err(rusqlite::Error::SqliteFailure(failure, _))
+                    if matches!(
+                        failure.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) =>
+                {
+                    Ok(Checkpointed::Partial)
+                }
+                Err(e) => Err(e.into()),
+            }
         })
+    }
+}
+
+/// How long a checkpoint may wait for readers while it holds the writer.
+pub const CHECKPOINT_BUDGET: Duration = Duration::from_millis(200);
+
+/// What a checkpoint achieved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Checkpointed {
+    /// The WAL was folded into the main file and truncated.
+    Complete,
+    /// A reader still needed part of the log within the budget: everything no
+    /// reader needed was folded, the rest waits for a later call.
+    Partial,
+}
+
+#[cfg(test)]
+mod transient_tests {
+    use super::Error;
+
+    /// Only failures that say nothing about the request are retryable: a
+    /// verdict on the row (stale, refused, corrupt) never becomes one.
+    #[test]
+    fn only_unavailability_is_transient() {
+        for error in [
+            Error::WriterUnavailable,
+            Error::WriteAmbiguous,
+            Error::Overloaded,
+        ] {
+            assert!(error.is_transient(), "{}", error.kind());
+        }
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(Error::Sqlite(busy).is_transient());
+        let constraint = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            None,
+        );
+        for error in [
+            Error::Conflict,
+            Error::NotFound,
+            Error::Forbidden,
+            Error::WriterPanicked,
+            Error::Corrupt("x"),
+            Error::Sqlite(constraint),
+        ] {
+            assert!(!error.is_transient(), "{}", error.kind());
+        }
     }
 }

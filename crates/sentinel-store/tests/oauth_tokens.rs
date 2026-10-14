@@ -75,7 +75,20 @@ fn fixture() -> (tempfile::TempDir, Store, Ids) {
             auth::set_membership(tx, root, i.other, i.dev, Role::Reader)?;
             auth::create_repo(tx, root, i.tenant, i.repo, "app", NOW)?;
             auth::create_repo(tx, root, i.other, i.other_repo, "app", NOW)?;
-            auth::create_service_account(tx, root, i.tenant, i.bot, "bot", Role::Operator, NOW)?;
+            let stepped = auth::Authority::Credential {
+                principal: root,
+                stepped_up: true,
+            };
+            auth::create_service_account(
+                tx,
+                stepped,
+                i.tenant,
+                i.bot,
+                "bot",
+                Role::Operator,
+                Some("fixture"),
+                NOW,
+            )?;
             auth::set_repo_grant(tx, root, i.repo, i.bot, P::READ.union(P::RUN))?;
             Ok(())
         })
@@ -731,8 +744,16 @@ fn password_change_and_recovery_revoke_grants() {
         .read(|c| local_auth::authenticate(c, &issued.session, now))
         .unwrap();
     assert!(
-        local_auth::change_password(&store, &session, b"first password", b"second password", now)
-            .unwrap()
+        local_auth::change_password(
+            &store,
+            &issued.session,
+            &session,
+            policy,
+            b"first password",
+            b"second password",
+            now
+        )
+        .unwrap()
     );
     assert!(revoked(&store, before.grant, i.dev));
 

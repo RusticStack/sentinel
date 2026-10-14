@@ -34,8 +34,8 @@ Reviewed 2026-09-14 before A01, then updated with its ownership fixes. This is a
 
 ## Remaining qualification
 
-- **Blocked by: dedicated production Linux benchmark host and a runnable executor** — repeat resource/isolation checks and obtain Sentinel end-to-end p95 on the target hardware.
-- **Blocked by: real-network/operator-owned DERP test setup** — Tailcat relay-only, failure/restart and NAT qualification.
+- *Historical; superseded as of 2026-10: the executor has run since Part 04, and the benchmark-host criterion is tracked in Part 14 of the [TODO tracker](../TODO.md).* **Blocked by: dedicated production Linux benchmark host and a runnable executor** — repeat resource/isolation checks and obtain Sentinel end-to-end p95 on the target hardware.
+- *Historical; largely superseded by Q07, whose live proof ran on WSL2, so a real-network NAT run is not claimed (relay-only, restart, changing-endpoint, NAT-failure and revoked-peer tests; see [feasibility probes](feasibility-probes.md#4-tailcat-unattended-connectivity)).* **Blocked by: real-network/operator-owned DERP test setup** — Tailcat relay-only, failure/restart and NAT qualification.
 - **Blocked by: fault-injecting SQLite VFS or equivalent power-loss test environment** — mid-fsync durability testing.
 - ~~Before W02, enforce the single-controller ownership contract in process startup~~ — done: `Store::open` takes an OS lock on `<database>.lock` for the life of the store and a second opener gets `AlreadyOwned`; a stalled shutdown keeps the lock until the process exits.
 

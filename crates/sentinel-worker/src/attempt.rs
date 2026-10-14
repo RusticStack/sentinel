@@ -200,7 +200,16 @@ impl Drop for StepSecrets {
 }
 
 fn create_private_dir(path: &Path, allow_existing: bool) -> Result<()> {
-    match fs::create_dir(path) {
+    // Created owner-only in one step, so a directory that will hold secrets
+    // is never visible with the umask's mode, not even briefly; the chmod
+    // below settles one that already existed.
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
         Ok(()) => {}
         Err(error) if allow_existing && error.kind() == std::io::ErrorKind::AlreadyExists => {
             let meta = fs::symlink_metadata(path)?;
@@ -674,6 +683,7 @@ fn prepare(
     // attachments, so the slice cannot stay borrowed from `job`.
     let declared = compiled.spec.cache.clone();
     let resources = compiled.spec.resources;
+    let timeout_secs = compiled.spec.timeout_secs;
     let workspace = Workspace::create(root, job.attempt)?;
     let secret_directory = if job.secret_bundle.is_empty() {
         None
@@ -849,6 +859,10 @@ fn prepare(
                 cpu_millis: resources.cpu_millis,
                 memory_bytes: resources.memory_bytes,
                 pids: DEFAULT_PIDS_LIMIT,
+                disk_bytes: resources.disk_bytes,
+                lifetime_secs: timeout_secs
+                    .max(1)
+                    .saturating_add(podman::KEEPALIVE_SLACK_SECS),
             },
             workspace.path(),
             &mounts,

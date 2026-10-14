@@ -65,7 +65,20 @@ fn fixture() -> (tempfile::TempDir, Store, Ids) {
             auth::set_membership(tx, root, i.tenant, i.dev, Role::TenantAdmin)?;
             auth::create_repo(tx, root, i.tenant, i.repo, "app", NOW)?;
             auth::create_repo(tx, root, i.other, i.other_repo, "app", NOW)?;
-            auth::create_service_account(tx, root, i.tenant, i.bot, "bot", Role::Operator, NOW)?;
+            let stepped = auth::Authority::Credential {
+                principal: root,
+                stepped_up: true,
+            };
+            auth::create_service_account(
+                tx,
+                stepped,
+                i.tenant,
+                i.bot,
+                "bot",
+                Role::Operator,
+                Some("fixture"),
+                NOW,
+            )?;
             Ok(())
         })
         .unwrap();

@@ -228,10 +228,16 @@ pub fn drift(
 
 /// `some avg60` of `/proc/pressure/cpu`, in percent.
 pub fn cpu_pressure() -> Option<f64> {
+    cpu_pressure_field("avg60=")
+}
+
+/// One average of the `some` line of `/proc/pressure/cpu` (`avg10=`,
+/// `avg60=`), in percent.
+pub fn cpu_pressure_field(key: &str) -> Option<f64> {
     let text = fs::read_to_string("/proc/pressure/cpu").ok()?;
     let some = text.lines().find(|l| l.starts_with("some"))?;
     some.split_whitespace()
-        .find_map(|f| f.strip_prefix("avg60="))?
+        .find_map(|f| f.strip_prefix(key))?
         .parse()
         .ok()
 }

@@ -238,9 +238,14 @@ pub fn validate_source(
 /// path or `file://` URL (other repositories and workspaces on the worker
 /// host), never `ssh://` (the worker account's own SSH identity and
 /// configuration), never `git://`, plain `http://`, a remote helper or
-/// userinfo. A bound repository is judged by [`validate_source`] instead.
+/// userinfo. The host must also be a public DNS name — never an IP literal in
+/// any notation, a bare hostname or a private-use suffix — unless the
+/// deployment explicitly allowlisted the authority
+/// ([`sentinel_protocol::source::MANUAL_DESTINATIONS_ENV`]); the worker
+/// additionally refuses names that resolve to non-public addresses. A bound
+/// repository is judged by [`validate_source`] instead.
 pub fn manual_remote_allowed(remote: &str) -> bool {
-    (remote.starts_with("https://") && sentinel_protocol::source::remote(remote).is_some())
+    sentinel_protocol::source::manual_destination_allowed(remote)
         || LOCAL_MANUAL_SOURCES.load(std::sync::atomic::Ordering::Relaxed)
 }
 

@@ -20,7 +20,7 @@ use sentinel_core::{
     auth::{Audience, Permissions, Principal, Scopes},
 };
 use sentinel_protocol::error::{ApiError, ErrorCode};
-use sentinel_store::{Error as StoreError, Store, local_auth, tokens};
+use sentinel_store::{Error as StoreError, Store, auth::Authority, local_auth, tokens};
 
 /// How the caller proved who they are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,18 +50,23 @@ pub struct Identity {
     /// A browser session that proved presence within the step-up window
     /// (A06). Never set for a bearer credential or an OAuth token, which
     /// can never step up.
+    ///
+    /// This is what the interface shows; it is **not** what authorizes a
+    /// change. A privileged mutation goes through [`Identity::authority`],
+    /// whose freshness for a session is read again inside the writer
+    /// transaction of the change.
     pub stepped_up: bool,
+    authority: Authority,
 }
 
 impl Identity {
-    /// The store authority this caller acts with: stepped up only for a
-    /// fresh session, so a privileged mutation from anything else is
-    /// `StepUpRequired`.
-    pub fn authority(&self) -> sentinel_store::auth::Authority {
-        sentinel_store::auth::Authority::Credential {
-            principal: self.principal,
-            stepped_up: self.stepped_up,
-        }
+    /// The store authority this caller acts with. A browser session's
+    /// step-up is judged against its row at the point of each privileged
+    /// mutation (a session revoked, or whose window closed, since the request
+    /// was identified is refused); a bearer credential or OAuth token is never
+    /// stepped up, so a privileged mutation from it is `StepUpRequired`.
+    pub fn authority(&self) -> Authority {
+        self.authority
     }
 }
 
@@ -131,6 +136,7 @@ pub fn identify(
                     grant: None,
                     expires: None,
                     stepped_up: false,
+                    authority: Authority::credential(principal),
                 })
             }
             Bearer::Access(secret) => {
@@ -166,6 +172,7 @@ pub fn identify(
         grant: None,
         expires: None,
         stepped_up: session.stepped_up_within(sessions, now),
+        authority: Authority::live_session(principal, secret.digest(), sessions),
     })
 }
 
@@ -198,6 +205,7 @@ fn oauth_identity(authenticated: sentinel_store::oauth::Authenticated) -> Identi
         grant: Some(authenticated.grant),
         expires: Some(authenticated.expires),
         stepped_up: false,
+        authority: Authority::credential(principal),
     }
 }
 

@@ -375,7 +375,10 @@ fn job_transitions_move_their_check_and_the_aggregate() {
         "{}",
         aggregate.summary
     );
-    assert!(aggregate.seq >= 3, "every transition is a generation");
+    assert!(
+        aggregate.seq >= 3,
+        "every change of content is a generation"
+    );
     assert_eq!(aggregate.published_seq, 0);
 
     // A timeout is its own conclusion; cancellation another.
@@ -782,4 +785,213 @@ fn attempts_exhaust_into_a_refusal_and_identity_belongs_to_the_target() {
     );
     tx.rollback().unwrap();
     let _ = accepted;
+}
+
+#[test]
+fn a_blank_refusal_reason_is_stored_as_a_non_empty_one() {
+    let mut f = fixture();
+    let (run, jobs) = {
+        let repo = f.repo;
+        create_run(&mut f, repo, true)
+    };
+    let build = publication(&f, run, &jobs[0].to_string());
+    let tx = f.conn.transaction().unwrap();
+    checks::refused(&tx, build.id, build.seq, " \u{7}\n ", NOW).unwrap();
+    tx.commit().unwrap();
+    let row = publication(&f, run, &jobs[0].to_string());
+    assert_eq!(row.state, checks::State::Refused);
+    assert_eq!(row.reason.as_deref(), Some("refused"));
+}
+
+#[test]
+fn repeating_the_stored_content_keeps_the_generation_and_the_retry_schedule() {
+    let mut f = fixture();
+    let (run, jobs) = {
+        let repo = f.repo;
+        create_run(&mut f, repo, true)
+    };
+    let build = publication(&f, run, &jobs[0].to_string());
+    let tx = f.conn.transaction().unwrap();
+    checks::retry(&tx, build.id, build.seq, NOW, 0).unwrap();
+    // The same desired state is recorded again.
+    checks::record_job(&tx, f.tenant, jobs[0], UnixMillis(NOW.0 + 5)).unwrap();
+    tx.commit().unwrap();
+    let again = publication(&f, run, &jobs[0].to_string());
+    assert_eq!(
+        again.seq, build.seq,
+        "identical content is not a generation"
+    );
+    assert!(
+        checks::due(&f.conn, NOW, 10)
+            .unwrap()
+            .iter()
+            .all(|p| p.id != build.id),
+        "the back-off survives a re-record"
+    );
+}
+
+#[test]
+fn the_remote_run_is_dropped_only_after_a_completed_state_was_delivered() {
+    let mut f = fixture();
+    let (run, jobs) = {
+        let repo = f.repo;
+        create_run(&mut f, repo, true)
+    };
+    let job = jobs[0];
+    step(&mut f, job, Event::Leased(Fence(1)), NOW.0 + 1);
+    let running = publication(&f, run, &job.to_string());
+    let tx = f.conn.transaction().unwrap();
+    checks::create_started(&tx, running.id, running.seq, NOW).unwrap();
+    checks::published(&tx, running.id, running.seq, 77, None, NOW).unwrap();
+    tx.commit().unwrap();
+    for (event, at) in [
+        (Event::PreparationStarted, 2),
+        (Event::StepsStarted, 3),
+        (Event::FinalizationStarted, 4),
+        (Event::Passed, 5),
+    ] {
+        step_as(&mut f, job, Actor::Worker(Fence(1)), event, NOW.0 + at);
+    }
+    let done = publication(&f, run, &job.to_string());
+    assert_eq!(done.status, Status::Completed);
+    assert_eq!(done.check_run_id, Some(77));
+
+    // The completed state never reached GitHub: new content for the row must
+    // keep the live run and its create mark instead of orphaning it.
+    f.conn
+        .execute(
+            "UPDATE check_publications SET title = 'stale' WHERE id = ?1",
+            [done.id.as_bytes()],
+        )
+        .unwrap();
+    let tx = f.conn.transaction().unwrap();
+    checks::record_job(&tx, f.tenant, job, UnixMillis(NOW.0 + 6)).unwrap();
+    tx.commit().unwrap();
+    let kept = publication(&f, run, &job.to_string());
+    assert_eq!(kept.seq, done.seq + 1);
+    assert_eq!(kept.check_run_id, Some(77));
+    assert!(kept.create_started_ms.is_some());
+
+    // Once the completed state is delivered, new work needs a fresh run.
+    let tx = f.conn.transaction().unwrap();
+    assert!(checks::published(&tx, kept.id, kept.seq, 77, None, NOW).unwrap());
+    tx.commit().unwrap();
+    f.conn
+        .execute(
+            "UPDATE check_publications SET title = 'stale again' WHERE id = ?1",
+            [kept.id.as_bytes()],
+        )
+        .unwrap();
+    let tx = f.conn.transaction().unwrap();
+    checks::record_job(&tx, f.tenant, job, UnixMillis(NOW.0 + 7)).unwrap();
+    tx.commit().unwrap();
+    let fresh = publication(&f, run, &job.to_string());
+    assert_eq!(fresh.check_run_id, None);
+    assert!(fresh.create_started_ms.is_none());
+}
+
+#[test]
+fn a_deferred_row_keeps_its_attempts_and_a_final_status_outlasts_a_long_outage() {
+    let mut f = fixture();
+    let (run, jobs) = {
+        let repo = f.repo;
+        create_run(&mut f, repo, true)
+    };
+    let build = publication(&f, run, &jobs[0].to_string());
+    let tx = f.conn.transaction().unwrap();
+    assert!(checks::defer(&tx, build.id, build.seq, NOW, NOW.0 + 120_000).unwrap());
+    // A park never exceeds its cap, whatever the caller asks for.
+    assert!(checks::defer(&tx, build.id, build.seq, NOW, i64::MAX).unwrap());
+    assert!(!checks::defer(&tx, build.id, build.seq + 1, NOW, NOW.0 + 1).unwrap());
+    tx.commit().unwrap();
+    let parked: (i64, i64) = f
+        .conn
+        .query_row(
+            "SELECT attempts, next_attempt_ms FROM check_publications WHERE id = ?1",
+            [build.id.as_bytes()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(parked, (0, NOW.0 + checks::MAX_DEFER_MS));
+
+    // A completed check keeps retrying well past the progress budget.
+    f.conn
+        .execute(
+            "UPDATE check_publications SET status = 'completed', conclusion = 'success'
+             WHERE id = ?1",
+            [build.id.as_bytes()],
+        )
+        .unwrap();
+    let (mut total_ms, mut attempts) = (0, 0);
+    loop {
+        let tx = f.conn.transaction().unwrap();
+        let outcome = checks::retry(&tx, build.id, build.seq, NOW, 0).unwrap();
+        tx.commit().unwrap();
+        attempts += 1;
+        match outcome {
+            checks::Retry::Scheduled {
+                next_attempt_ms, ..
+            } => total_ms += next_attempt_ms - NOW.0,
+            checks::Retry::Exhausted => break,
+        }
+    }
+    assert_eq!(attempts, checks::MAX_TERMINAL_ATTEMPTS);
+    assert!(
+        total_ms >= 6 * 3_600_000,
+        "a final status must survive an outage of hours: {total_ms} ms"
+    );
+}
+
+#[test]
+fn an_exhausted_final_status_is_rearmed_only_within_the_window() {
+    let mut f = fixture();
+    let (run, jobs) = {
+        let repo = f.repo;
+        create_run(&mut f, repo, true)
+    };
+    let build = publication(&f, run, &jobs[0].to_string());
+    // Every row is refused; only the completed one carries the exhausted reason.
+    f.conn
+        .execute(
+            "UPDATE check_publications SET state = 2, reason = 'forbidden', settled_ms = ?1",
+            [NOW.0],
+        )
+        .unwrap();
+    f.conn
+        .execute(
+            "UPDATE check_publications SET status = 'completed', conclusion = 'failure',
+                reason = 'attempts', attempts = 39 WHERE id = ?1",
+            [build.id.as_bytes()],
+        )
+        .unwrap();
+    let tx = f.conn.transaction().unwrap();
+    let old = UnixMillis(NOW.0 + checks::REARM_WINDOW_MS + 1);
+    assert_eq!(
+        checks::rearm_exhausted(&tx, old, checks::REARM_LIMIT).unwrap(),
+        0,
+        "a refusal older than the window stays refused"
+    );
+    assert_eq!(
+        checks::rearm_exhausted(&tx, NOW, checks::REARM_LIMIT).unwrap(),
+        1,
+        "only the exhausted completed check returns"
+    );
+    tx.commit().unwrap();
+    let row = publication(&f, run, &jobs[0].to_string());
+    assert_eq!(row.state, checks::State::Pending);
+    assert!(row.reason.is_none());
+    assert!(
+        checks::due(&f.conn, NOW, 10)
+            .unwrap()
+            .iter()
+            .any(|p| p.id == build.id)
+    );
+    assert!(
+        checks::of_run(&f.conn, f.tenant, run)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.id != build.id)
+            .all(|p| p.state == checks::State::Refused),
+        "rows refused for other reasons are not re-armed"
+    );
 }

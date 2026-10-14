@@ -1392,10 +1392,29 @@ impl Objects {
             return Err(Error::InvalidInput("manifest entries"));
         }
         let mut payload_len = 0u64;
+        // A manifest must be extractable: no path twice, and no path that is
+        // also a directory another entry lives under. Either would make
+        // `materialize` fail midway, after it had already written files.
+        let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
         for entry in entries {
             if !valid_entry_path(&entry.path) {
                 return Err(Error::InvalidInput("entry path"));
             }
+            if !seen.insert(entry.path.as_str()) {
+                return Err(Error::InvalidInput("duplicate entry path"));
+            }
+        }
+        for entry in entries {
+            let mut end = 0;
+            while let Some(slash) = entry.path[end..].find('/') {
+                end += slash;
+                if seen.contains(&entry.path[..end]) {
+                    return Err(Error::InvalidInput("entry path is also a directory"));
+                }
+                end += 1;
+            }
+        }
+        for entry in entries {
             // A manifest may only point at bytes the tenant already owns:
             // the object row is the reference commit, so its absence would
             // make the manifest dangle.
@@ -2623,9 +2642,11 @@ impl Objects {
             self.read(conn, tenant, entry.digest, &mut file)?;
             file.sync_data()?;
             #[cfg(unix)]
-            if entry.mode != 0 {
+            if entry.mode & 0o777 != 0 {
                 use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(fs::Permissions::from_mode(entry.mode))?;
+                // Never restore setuid, setgid or sticky, whatever a
+                // manifest recorded.
+                file.set_permissions(fs::Permissions::from_mode(entry.mode & 0o777))?;
             }
             written += entry.len;
         }

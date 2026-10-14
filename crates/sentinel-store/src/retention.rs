@@ -169,7 +169,11 @@ pub fn effective(
 }
 
 /// Set (or, when every field is `None`, remove) the policy of a tenant or
-/// one of its repositories, then re-apply retention to what it covers.
+/// one of its repositories, then start re-applying retention to what it
+/// covers: the policy row and the first [`REAPPLY_BATCH`] rows commit here,
+/// and the returned cursor is what [`finish_reapply`] continues from, one
+/// bounded write at a time, so no policy change occupies the writer for the
+/// size of the tenant.
 ///
 /// A tenant's policy is platform administration. A repository's is its
 /// tenant's administration, and may only narrow: its retention cannot exceed
@@ -182,14 +186,15 @@ pub fn set(
     repo: Option<RepoId>,
     policy: Policy,
     now: UnixMillis,
-) -> Result<()> {
+) -> Result<Reapply> {
     policy.validate()?;
     match (repo, authority) {
         (None, _) => authority.require_platform(tx)?,
         (Some(_), Authority::HostLocal) => {}
-        (Some(_), Authority::Credential { principal, .. }) => {
-            crate::auth::require_tenant_admin(tx, *principal, tenant)?
-        }
+        (
+            Some(_),
+            Authority::Credential { principal, .. } | Authority::Session { principal, .. },
+        ) => crate::auth::require_tenant_admin(tx, *principal, tenant)?,
     }
     let tenant_known: bool = tx
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM tenants WHERE id = ?1)")?
@@ -248,7 +253,7 @@ pub fn set(
             now.0,
         ])?;
     }
-    reapply(tx, d, tenant, repo)
+    reapply_step(tx, d, tenant, repo, Reapply::default(), REAPPLY_BATCH)
 }
 
 /// The effective log and artifact retention of an attempt's or artifact's
@@ -264,51 +269,165 @@ fn effective_sql(col: &str, repo: &str) -> String {
     )
 }
 
-/// Re-stamp the stamped, unexpired logs and re-clamp the artifacts of a
-/// tenant (every repository without its own narrower value follows it) or
-/// of one repository, to the policy now in force. One statement per kind;
-/// an administrative change is rare and may scan the tenant's rows.
-fn reapply(
+/// Rows one re-application write touches at most, per kind. Each write is a
+/// short transaction, and the writer serves everything else between them.
+pub const REAPPLY_BATCH: i64 = 512;
+
+/// Where re-applying a policy stands: a position in the tenant's stamped
+/// logs, then in its artifacts, by row id. Opaque; hand it back to
+/// [`reapply_step`] or [`finish_reapply`]. A step is idempotent, so a cursor
+/// that is lost or repeated costs time, never correctness.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[must_use = "the rows past the first batch are re-applied by finish_reapply"]
+pub struct Reapply {
+    /// 0: logs, 1: artifacts, 2: done.
+    phase: u8,
+    /// The last row id of the previous batch; rows after it are next.
+    after: [u8; 16],
+}
+
+impl Reapply {
+    /// Nothing is left to re-apply.
+    pub fn done(&self) -> bool {
+        self.phase >= 2
+    }
+}
+
+/// Re-stamp one batch of the stamped, unexpired logs, or re-clamp one batch
+/// of the artifacts, of a tenant (every repository without its own narrower
+/// value follows it) or of one repository, to the policy now in force. Rows
+/// are visited in row order from the cursor, at most `batch` of the tenant's
+/// stamped logs or artifacts per call ([`REAPPLY_BATCH`] in production, and
+/// read through a keyed index, so what other tenants hold costs nothing); a
+/// repository scope filters within that range, so a step may touch fewer rows
+/// than `batch`. A phase ends when fewer than `batch` candidates remain. The
+/// statements are the same as the unbatched ones were, bounded by a row range.
+pub fn reapply_step(
     tx: &Transaction<'_>,
     d: &Deployment,
     tenant: TenantId,
     repo: Option<RepoId>,
-) -> Result<()> {
-    let scope = if repo.is_some() {
-        " AND repo_id = ?3"
+    at: Reapply,
+    batch: i64,
+) -> Result<Reapply> {
+    if batch < 1 {
+        return Err(Error::InvalidInput("batch"));
+    }
+    if at.done() {
+        return Ok(at);
+    }
+    let logs_phase = at.phase == 0;
+    let (retention, expires) = if logs_phase {
+        (d.log_retention_ms, "log_retention_ms")
     } else {
-        ""
+        (d.artifact_retention_ms, "artifact_retention_ms")
     };
-    let logs = format!(
-        "UPDATE attempts SET log_expires_ms = released_ms + {}
-         WHERE tenant_id = ?1 AND log_expires_ms IS NOT NULL
-           AND log_expired_ms IS NULL{scope}",
-        effective_sql("log_retention_ms", "COALESCE(attempts.repo_id, X'')"),
-    );
-    let run_scope = if repo.is_some() {
-        " AND run_id IN (SELECT id FROM runs WHERE tenant_id = ?1 AND repo_id = ?3)"
-    } else {
-        ""
-    };
-    let artifacts = format!(
-        "UPDATE artifacts SET retain_until_ms = MIN(retain_until_ms, created_ms + {})
-         WHERE tenant_id = ?1{run_scope}",
-        effective_sql(
-            "artifact_retention_ms",
-            "(SELECT repo_id FROM runs WHERE id = artifacts.run_id)"
-        ),
-    );
     let t = tenant.as_bytes().as_slice();
-    match repo {
-        Some(repo) => {
-            let r = repo.as_bytes().as_slice();
-            tx.execute(&logs, params![t, d.log_retention_ms, r])?;
-            tx.execute(&artifacts, params![t, d.artifact_retention_ms, r])?;
+    // `?3` is the repository when the scope names one, and an unused NULL
+    // when it does not; every statement binds the same five values.
+    let r: Option<[u8; 16]> = repo.map(|r| *r.as_bytes());
+    let (bound_sql, update) = reapply_sql(logs_phase, repo.is_some(), expires, batch);
+    // The batch's last row: the `batch`-th of the tenant's candidate rows
+    // past the cursor, or none when the rest fits in this batch.
+    let bound: Option<[u8; 16]> = tx
+        .prepare_cached(&bound_sql)?
+        .query_row(
+            params![
+                t,
+                retention,
+                r.as_ref().map(|r| r.as_slice()),
+                at.after.as_slice()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let upper = bound.unwrap_or([0xff; 16]);
+    tx.prepare_cached(&update)?.execute(params![
+        t,
+        retention,
+        r.as_ref().map(|r| r.as_slice()),
+        at.after.as_slice(),
+        upper.as_slice()
+    ])?;
+    Ok(match (bound, logs_phase) {
+        (Some(after), _) => Reapply { after, ..at },
+        (None, true) => Reapply {
+            phase: 1,
+            after: [0; 16],
+        },
+        (None, false) => Reapply {
+            phase: 2,
+            after: [0; 16],
+        },
+    })
+}
+
+/// The two statements of one re-application step: the bound (the batch's
+/// last row id, or none when the rest fits) and the write over the id range
+/// it closes. The range is cut over the tenant's rows in a keyed index,
+/// `INDEXED BY` so the plan cannot fall back to the primary key, which would
+/// walk every tenant's rows to find this one's. A step therefore reads at
+/// most `batch` of the tenant's candidate rows plus the final remainder
+/// (itself under `batch`), whatever else the table holds; a repository scope
+/// only filters inside that range.
+fn reapply_sql(logs_phase: bool, scoped: bool, expires: &str, batch: i64) -> (String, String) {
+    let (table, index, filter) = if logs_phase {
+        (
+            "attempts",
+            "attempts_log_reapply",
+            "tenant_id = ?1 AND log_expires_ms IS NOT NULL AND log_expired_ms IS NULL",
+        )
+    } else {
+        ("artifacts", "artifacts_reapply", "tenant_id = ?1")
+    };
+    let scope = match (scoped, logs_phase) {
+        (false, _) => "",
+        (true, true) => " AND repo_id = ?3",
+        (true, false) => {
+            " AND run_id IN (SELECT id FROM runs WHERE tenant_id = ?1 AND repo_id = ?3)"
         }
-        None => {
-            tx.execute(&logs, params![t, d.log_retention_ms])?;
-            tx.execute(&artifacts, params![t, d.artifact_retention_ms])?;
-        }
+    };
+    let bound = format!(
+        "SELECT id FROM {table} INDEXED BY {index} WHERE id > ?4 AND {filter}
+         ORDER BY id LIMIT 1 OFFSET {}",
+        batch - 1
+    );
+    let update = if logs_phase {
+        format!(
+            "UPDATE attempts INDEXED BY {index} SET log_expires_ms = released_ms + {}
+             WHERE id > ?4 AND id <= ?5 AND {filter}{scope}",
+            effective_sql(expires, "COALESCE(attempts.repo_id, X'')"),
+        )
+    } else {
+        format!(
+            "UPDATE artifacts INDEXED BY {index}
+             SET retain_until_ms = MIN(retain_until_ms, created_ms + {})
+             WHERE id > ?4 AND id <= ?5 AND {filter}{scope}",
+            effective_sql(
+                expires,
+                "(SELECT repo_id FROM runs WHERE id = artifacts.run_id)"
+            ),
+        )
+    };
+    (bound, update)
+}
+
+/// Continue a re-application to its end, each batch in its own write so the
+/// writer is free between them. A failure leaves what was re-applied in
+/// place and the rest as it was; running [`set`] again (or this, with a
+/// fresh cursor) repeats the work, which is idempotent.
+pub fn finish_reapply(
+    store: &crate::Store,
+    d: &Deployment,
+    tenant: TenantId,
+    repo: Option<RepoId>,
+    mut at: Reapply,
+) -> Result<()> {
+    let d = *d;
+    while !at.done() {
+        at = store
+            .writer()
+            .write(move |tx| reapply_step(tx, &d, tenant, repo, at, REAPPLY_BATCH))?;
     }
     Ok(())
 }
@@ -734,4 +853,51 @@ pub fn purge_aborted_uploads(tx: &Transaction<'_>, now: UnixMillis, limit: u32) 
             .execute([id])? as u32;
     }
     Ok(purged)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn plans(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let values = vec![rusqlite::types::Value::Null; stmt.parameter_count()];
+        stmt.query_map(rusqlite::params_from_iter(values), |r| r.get(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// Each re-application statement walks the tenant's keyed index in row
+    /// order: never the primary key (every tenant's rows), never a sort, so
+    /// a step's reads are bounded by the batch whatever other tenants hold.
+    #[test]
+    fn reapply_statements_read_the_tenants_rows_by_key() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::migrate(&mut conn).unwrap();
+        crate::register_functions(&conn).unwrap();
+        for logs in [true, false] {
+            let index = if logs {
+                "attempts_log_reapply"
+            } else {
+                "artifacts_reapply"
+            };
+            for scoped in [false, true] {
+                let (bound, update) = reapply_sql(logs, scoped, "log_retention_ms", REAPPLY_BATCH);
+                for sql in [bound, update] {
+                    let plan = plans(&conn, &sql);
+                    assert!(
+                        plan.iter()
+                            .any(|p| p.contains(index) && p.contains("tenant_id=?")),
+                        "{sql} does not seek {index} by tenant: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().all(|p| !p.contains("TEMP B-TREE")),
+                        "{sql} sorts: {plan:?}"
+                    );
+                }
+            }
+        }
+    }
 }

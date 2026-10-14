@@ -15,6 +15,10 @@ const SUMMARY_FORMAT_V1: u8 = 1;
 const SUMMARY_FORMAT_V2: u8 = 2;
 /// A summary crosses the link inside one control frame with room to spare.
 pub const MAX_SUMMARY_BYTES: usize = 32 * 1024;
+// The store column refuses more than this (migration 15) and the link frame
+// that carries it is larger, so a summary that fits the frame but not the
+// column is a case the receivers handle by dropping it, never by failing.
+const _: () = assert!(MAX_SUMMARY_BYTES < crate::limits::MAX_CONTROL_MESSAGE_BYTES);
 /// Steps recorded per attempt; a job has at most this many steps anyway.
 pub const MAX_STEP_RECORDS: usize = 256;
 /// Cache records per attempt (K08). The schema caps a job at

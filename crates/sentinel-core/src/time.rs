@@ -2,7 +2,16 @@
 //! measured with the monotonic clock in the process that observed both ends
 //! (see the runtime foundations contract) and stored as separate nanosecond
 //! fields; never subtract two `UnixMillis` to produce a latency figure.
-use std::time::{SystemTime, UNIX_EPOCH};
+//!
+//! Deadline decisions (lease expiry, offer acknowledgement, queue and
+//! execution timeouts, idempotency TTL) are not provenance: they read
+//! [`UnixMillis::steady`], a process clock that advances with the monotonic
+//! clock and is anchored to the wall clock once, at its first read. The values
+//! it yields are stored in the same columns as before and stay comparable
+//! across a restart (the next process anchors to the wall clock again), but a
+//! wall-clock step while the process runs can never expire or extend a lease.
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Milliseconds since the Unix epoch, UTC. `i64` covers ±292 million years and
 /// matches SQLite's INTEGER affinity without conversion.
@@ -19,6 +28,22 @@ impl UnixMillis {
             .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
             .unwrap_or(0);
         Self(ms)
+    }
+
+    /// The controller process's deadline clock: the wall clock at the first
+    /// call plus the monotonic time elapsed since, so an NTP step or a VM
+    /// resume moves it by the time that really passed and no more. It is the
+    /// only clock deadline decisions and the timestamps they compare against
+    /// may use. Each process anchors on its own: the controller process is the
+    /// one that decides deadlines, and a short-lived command (the host-local
+    /// `admin cancel`) that stamps rows with the wall clock is off by at most
+    /// the wall-clock step the controller has absorbed since it started.
+    /// Never moves back.
+    #[must_use]
+    pub fn steady() -> Self {
+        static ANCHOR: OnceLock<(i64, Instant)> = OnceLock::new();
+        let (wall, at) = ANCHOR.get_or_init(|| (Self::now().0, Instant::now()));
+        Self(wall.saturating_add(at.elapsed().as_millis().min(i64::MAX as u128) as i64))
     }
 }
 
@@ -71,5 +96,15 @@ mod tests {
         assert_eq!(t.terminal, Some(UnixMillis(30)));
         assert_eq!(t.queued, None);
         assert!(UnixMillis::now().0 > 1_700_000_000_000);
+    }
+
+    #[test]
+    fn the_steady_clock_never_goes_back_and_starts_at_the_wall_clock() {
+        let a = UnixMillis::steady();
+        let b = UnixMillis::steady();
+        assert!(b >= a);
+        // Anchored to the wall clock: within a generous bound of it in a test
+        // process that has not seen a wall-clock step.
+        assert!((UnixMillis::now().0 - a.0).abs() < 60_000);
     }
 }

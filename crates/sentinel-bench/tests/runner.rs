@@ -76,6 +76,17 @@ fn direct_noop_emits_one_machine_readable_record() {
     assert_eq!(summary["count"], 3);
     assert!(summary["min_ns"].as_u64().unwrap() <= summary["median_ns"].as_u64().unwrap());
     assert!(summary["p95_ns"].as_u64().unwrap() <= summary["max_ns"].as_u64().unwrap());
+    // Spread is recorded, and three samples cannot support a tail: the
+    // record says its p95 is the maximum.
+    assert!(summary["mean_ns"].as_u64().unwrap() > 0);
+    assert!(summary["stddev_ns"].as_u64().is_some());
+    assert!(summary["mad_ns"].as_u64().is_some());
+    assert_eq!(summary["p95_is_max"], true);
+    // One unmeasured run preceded the samples; an undeclared cache state is
+    // never presented as verified.
+    assert_eq!(record["warm_state_basis"], "warmup-run");
+    assert!(record["conditions"].is_object());
+    assert!(record.get("interleave").is_none());
     assert!(record["host"]["cpus_online"].as_u64().unwrap() >= 1);
     assert!(record["image"].is_null());
     assert!(record["limits"]["cpus"].is_null());
@@ -117,6 +128,22 @@ fn a_record_names_its_source_and_compiler_even_outside_the_checkout() {
     assert!(record["source"]["git_dirty"].is_boolean());
     let rustc = record["tools"]["rustc"].as_str().unwrap();
     assert!(rustc.starts_with("rustc "), "{rustc}");
+}
+
+#[test]
+fn an_unwarmed_or_cold_declaration_is_labelled_unverified() {
+    let out = bench()
+        .args(["--samples", "1", "--warmup", "0", "--warm-state", "warm"])
+        .output()
+        .unwrap();
+    if !source_readable() {
+        assert!(refused_for_provenance(&out), "{out:?}");
+        return;
+    }
+    assert!(out.status.success(), "{out:?}");
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["warm_state_basis"], "unverified");
+    assert!(record["summary"].get("stddev_ns").is_none());
 }
 
 #[test]

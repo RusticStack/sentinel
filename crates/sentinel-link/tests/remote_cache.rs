@@ -213,6 +213,7 @@ impl WorkerProcess {
         let config = worker::Config {
             controller: d.controller.local_addr(),
             server: d.controller.fingerprint(),
+            also_pinned: Vec::new(),
             worker: id,
             name: "builder".into(),
             hello: Hello {
@@ -226,7 +227,12 @@ impl WorkerProcess {
                 cpu_millis: 4_000,
                 memory_bytes: 8 << 30,
             },
-            profile: sentinel_protocol::negotiate::Profile::default(),
+            profile: sentinel_protocol::negotiate::Profile {
+                // A profile-protocol worker states its scratch disk; zero offers none,
+                // and every job declares some.
+                disk_bytes: 64 << 30,
+                ..sentinel_protocol::negotiate::Profile::default()
+            },
             transport: sentinel_link::session::TransportStats::default(),
             remote_cache: true,
         };

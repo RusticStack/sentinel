@@ -774,6 +774,53 @@ fn manual_dispatch_refuses_local_and_ambient_credential_remotes() {
     assert_eq!(page["runs"].as_array().unwrap().len(), 1, "{page}");
 }
 
+/// A caller holding only `run` submits the pipeline, so it cannot ask for the
+/// repository's secrets: the dispatch is refused up front, naming the rule,
+/// and creates nothing.
+#[test]
+fn manual_dispatch_refuses_a_pipeline_that_declares_secrets() {
+    let d = deployment();
+    let auth = bearer(&d);
+    let image = "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
+    for job_extra in [
+        "    secrets: [TOKEN]\n    steps: [{ id: s, run: 'true', secrets: [TOKEN] }]\n",
+        "    secrets: [CERT]\n    steps: [{ id: s, run: 'true', secret_files: { CERT: cert.pem } }]\n",
+        "    secrets: [OCI]\n    registry_auth: OCI\n    steps: [{ id: s, run: 'true' }]\n",
+    ] {
+        let pipeline =
+            format!("schema: 1\non: [push]\njobs:\n  build:\n    image: {image}\n{job_extra}");
+        let mut body = dispatch_body();
+        body["pipeline"] = serde_json::Value::String(pipeline);
+        let (status, answer) = call(
+            &d,
+            "POST",
+            "/api/v1/tenants/acme/repos/app/runs",
+            Some(&body),
+            Some(&auth),
+            &[],
+        );
+        assert_eq!(
+            (status, answer["code"].as_str()),
+            (403, Some("forbidden")),
+            "{job_extra}: {answer}"
+        );
+        assert!(
+            answer["message"].as_str().unwrap().contains("secrets"),
+            "{answer}"
+        );
+    }
+    let (status, page) = call(
+        &d,
+        "GET",
+        "/api/v1/tenants/acme/repos/app/runs",
+        None,
+        Some(&auth),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert!(page["runs"].as_array().unwrap().is_empty(), "{page}");
+}
+
 #[test]
 fn dispatch_status_cancel_rerun_and_logs_work_through_the_api() {
     let d = deployment();

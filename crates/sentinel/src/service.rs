@@ -42,6 +42,10 @@ fn trusted_proxy_valid(_: &str) -> bool {
 /// Bounded drains at shutdown: sessions and dispatcher, then the store.
 const LINK_SHUTDOWN: Duration = Duration::from_secs(2);
 const STORE_SHUTDOWN: Duration = Duration::from_secs(5);
+/// How long a worker's shutdown waits for its attempts to be torn down
+/// (container removal is bounded at 10 s by the runtime helper).
+#[cfg(feature = "worker")]
+const WORKER_SHUTDOWN: Duration = Duration::from_secs(20);
 
 pub struct Error {
     pub code: u8,
@@ -84,6 +88,9 @@ struct FileConfig {
     // Worker: which controller to reach and how to trust it.
     controller: Option<String>,
     controller_fingerprint: Option<String>,
+    // Worker: further controller fingerprints trusted during a certificate
+    // rotation (at most three beside `controller_fingerprint`).
+    controller_fingerprint_also: Option<Vec<String>>,
     worker_name: Option<String>,
     enrollment_file: Option<PathBuf>,
     cpu_millis: Option<u64>,
@@ -117,6 +124,9 @@ struct FileConfig {
     s3: Option<S3File>,
     // Server: scheduled online backups (R04).
     backup: Option<BackupFile>,
+    // Server: optional Resend delivery of verification and invitation mail;
+    // `SENTINEL_RESEND_API_KEY_FILE` and `SENTINEL_EMAIL_FROM` override these keys.
+    mail: Option<MailFile>,
     // Worker: the controller's `tc…` address, as written to its `<data_dir>/tailcat/address`
     // (Q06). Required to dial a controller through the helper.
     tailcat_address: Option<String>,
@@ -204,6 +214,73 @@ impl S3File {
             return Err(Error::config("[s3] needs endpoint, region and bucket"));
         }
         Ok(())
+    }
+}
+
+/// The `[mail]` section: optional email delivery of verification and
+/// invitation mail through Resend (<https://resend.com>). Server only. Each
+/// key has an environment override (`SENTINEL_RESEND_API_KEY_FILE`,
+/// `SENTINEL_EMAIL_FROM`), which wins, so a container deployment needs no
+/// configuration file for it. Without them nothing is delivered and the
+/// host-local `sentinel admin` mints links on demand. The API key lives in
+/// `api_key_file` (an owner-only file holding the key), never in this file or
+/// the environment. Kept portable so the CLI build validates it.
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailFile {
+    /// Absolute path of the owner-only file holding the Resend API key.
+    api_key_file: Option<PathBuf>,
+    /// The sender: `ci@example.com` or `Sentinel <ci@example.com>`, on a
+    /// domain verified in Resend.
+    from: Option<String>,
+}
+
+/// A validated Resend configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MailSettings {
+    api_key_file: PathBuf,
+    from: String,
+}
+
+impl MailFile {
+    /// Merge the section with the environment (which wins) and validate. No
+    /// error echoes a value. `Ok(None)` when neither the key file nor the
+    /// sender is set; one without the other is an error rather than a
+    /// silently ignored setting.
+    fn resolve(self, env: &dyn Fn(&str) -> Option<String>) -> Result<Option<MailSettings>, Error> {
+        let set = |name: &str| env(name).filter(|value| !value.is_empty());
+        let key_file = set("SENTINEL_RESEND_API_KEY_FILE")
+            .map(PathBuf::from)
+            .or(self.api_key_file);
+        let from = set("SENTINEL_EMAIL_FROM").or(self.from);
+        let (key_file, from) = match (key_file, from) {
+            (None, None) => return Ok(None),
+            (Some(key_file), Some(from)) => (key_file, from),
+            _ => {
+                return Err(Error::config(
+                    "email delivery needs both the Resend API key file and the sender \
+                     (SENTINEL_RESEND_API_KEY_FILE and SENTINEL_EMAIL_FROM)",
+                ));
+            }
+        };
+        if !key_file.is_absolute() {
+            return Err(Error::config(
+                "the Resend API key file must be an absolute path",
+            ));
+        }
+        let from_ok =
+            from.len() <= 320 && from.contains('@') && !from.chars().any(char::is_control);
+        if !from_ok {
+            return Err(Error::config(
+                "the sender must be `ci@example.com` or `Sentinel <ci@example.com>`",
+            ));
+        }
+        #[cfg(feature = "server")]
+        sentinel_mail::Sender::parse(&from).map_err(Error::config)?;
+        Ok(Some(MailSettings {
+            api_key_file: key_file,
+            from,
+        }))
     }
 }
 
@@ -391,6 +468,8 @@ impl StorageFile {
 struct WorkerLink {
     controller: SocketAddr,
     fingerprint: [u8; 32],
+    /// Rotation overlap: fingerprints trusted beside `fingerprint`.
+    also_fingerprints: Vec<[u8; 32]>,
     name: String,
     enrollment_file: Option<PathBuf>,
     cpu_millis: Option<u64>,
@@ -417,6 +496,9 @@ struct WorkerLink {
     metrics_listen: Option<SocketAddr>,
 }
 
+// One value per process, built once at start: the size difference between the
+// roles costs nothing, and boxing either side only moves the lint.
+#[allow(clippy::large_enum_variant)]
 enum Role {
     Server {
         listen: SocketAddr,
@@ -445,6 +527,11 @@ struct Config {
     s3: Option<S3File>,
     #[cfg(feature = "server")]
     backup: Option<BackupFile>,
+    #[cfg(feature = "server")]
+    mail: Option<MailSettings>,
+    /// `SENTINEL_AUTO_JOIN_DOMAINS`, parsed (server role only).
+    #[cfg(feature = "server")]
+    auto_join: sentinel_store::auto_join::Parsed,
     role: Role,
 }
 
@@ -523,6 +610,7 @@ impl Config {
         let role = if role == "server" {
             if file.controller.is_some()
                 || file.controller_fingerprint.is_some()
+                || file.controller_fingerprint_also.is_some()
                 || file.worker_name.is_some()
                 || file.enrollment_file.is_some()
                 || file.cpu_millis.is_some()
@@ -539,7 +627,7 @@ impl Config {
                 || file.metrics_listen.is_some()
             {
                 return Err(Error::config(
-                    "controller, controller_fingerprint, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, disk_bytes, spool_reserve_bytes, spool_quota_bytes, cache_budget_bytes, mirror_budget_bytes, image_budget_bytes, tailcat_address and metrics_listen apply to the worker role only",
+                    "controller, controller_fingerprint, controller_fingerprint_also, worker_name, enrollment_file, cpu_millis, memory_bytes, git_mirrors, labels, disk_bytes, spool_reserve_bytes, spool_quota_bytes, cache_budget_bytes, mirror_budget_bytes, image_budget_bytes, tailcat_address and metrics_listen apply to the worker role only",
                 ));
             }
             let listen: SocketAddr = file
@@ -626,7 +714,8 @@ impl Config {
             }
             let link = match (file.controller, file.controller_fingerprint) {
                 (None, None) => {
-                    if file.worker_name.is_some()
+                    if file.controller_fingerprint_also.is_some()
+                        || file.worker_name.is_some()
                         || file.enrollment_file.is_some()
                         || file.cpu_millis.is_some()
                         || file.memory_bytes.is_some()
@@ -657,6 +746,21 @@ impl Config {
                             "controller_fingerprint must be the 64 lower-case hex characters the controller printed",
                         )
                     })?;
+                    let also = file.controller_fingerprint_also.unwrap_or_default();
+                    if also.len() >= sentinel_link::tls::MAX_PINS {
+                        return Err(Error::config(
+                            "controller_fingerprint_also lists too many fingerprints (at most 3)",
+                        ));
+                    }
+                    let also_fingerprints = also
+                        .iter()
+                        .map(|text| parse_hex32(text))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            Error::config(
+                                "controller_fingerprint_also entries must be 64 lower-case hex characters",
+                            )
+                        })?;
                     let name = file.worker_name.unwrap_or_else(|| "worker".to_owned());
                     if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
                         return Err(Error::config(
@@ -731,6 +835,7 @@ impl Config {
                     Some(WorkerLink {
                         controller,
                         fingerprint,
+                        also_fingerprints,
                         name,
                         enrollment_file: file.enrollment_file,
                         cpu_millis: file.cpu_millis,
@@ -787,6 +892,37 @@ impl Config {
             }
             backup.check(&data_dir)?;
         }
+        let mail = match &role {
+            Role::Server { public_url, .. } => {
+                let mail = file
+                    .mail
+                    .unwrap_or_default()
+                    .resolve(&|name| std::env::var(name).ok())?;
+                if mail.is_some() && public_url.is_none() {
+                    return Err(Error::config(
+                        "email delivery needs public_url: the links in messages are built on it",
+                    ));
+                }
+                mail
+            }
+            Role::Worker(_) => {
+                if file.mail.is_some() {
+                    return Err(Error::config("[mail] applies to the server role only"));
+                }
+                None
+            }
+        };
+        #[cfg(not(feature = "server"))]
+        let _ = mail;
+        // Only the controller joins people; a worker sharing the environment
+        // ignores it. A bad entry is warned about at start, by position.
+        #[cfg(feature = "server")]
+        let auto_join = match &role {
+            Role::Server { .. } => std::env::var("SENTINEL_AUTO_JOIN_DOMAINS")
+                .map(|text| sentinel_store::auto_join::parse(&text))
+                .unwrap_or_default(),
+            Role::Worker(_) => sentinel_store::auto_join::Parsed::default(),
+        };
         Ok(Self {
             data_dir,
             log_format: args.log_format.or(file.log_format).unwrap_or_default(),
@@ -797,6 +933,10 @@ impl Config {
             s3: file.s3,
             #[cfg(feature = "server")]
             backup: file.backup,
+            #[cfg(feature = "server")]
+            mail,
+            #[cfg(feature = "server")]
+            auto_join,
             role,
         })
     }
@@ -1064,6 +1204,31 @@ fn bootstrap_work<T: Send + 'static>(
         .map_err(|error| Error::runtime(error.to_string()))
 }
 
+/// Create the data directory owner-only (`0700`, whatever the umask): it
+/// holds the sealing key, the TLS identity, spools and checkouts. A
+/// directory that already exists keeps its mode — an operator may have
+/// chosen it — but one open to group or others is reported once, without
+/// echoing anything from the configuration.
+fn create_data_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+            tracing::warn!(
+                event = "data_dir_permissive",
+                "the data directory is open to other accounts; restrict it to its owner (chmod 700)"
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(path)
+}
+
 /// The sealing key, always `<data_dir>/master.key` (the path `admin key`
 /// writes). Absent is fine only while the database holds no sealed value;
 /// otherwise, or when the key does not open this database's newest sealed
@@ -1116,21 +1281,23 @@ fn identity(data_dir: &Path, stem: &str) -> Result<sentinel_link::identity::Iden
         data_dir.join(format!("{stem}.crt")),
         data_dir.join(format!("{stem}.key")),
     );
-    if cert.exists() || key.exists() {
-        return sentinel_link::identity::Identity::load(&cert, &key)
-            .map_err(|error| Error::runtime(format!("cannot load {stem} identity: {error}")));
+    use sentinel_link::identity::Origin;
+    let (identity, origin) = sentinel_link::identity::Identity::load_or_generate(stem, &cert, &key)
+        .map_err(|error| Error::runtime(format!("cannot load {stem} identity: {error}")))?;
+    match origin {
+        Origin::Loaded => {}
+        Origin::Generated => tracing::info!(
+            event = "identity_generated",
+            stem,
+            "{stem} identity generated"
+        ),
+        Origin::Recovered => tracing::warn!(
+            event = "identity_recovered",
+            stem,
+            "a {stem} identity file was found without its pair, so a new identity was generated; enroll its new fingerprint"
+        ),
     }
-    let generated = sentinel_link::identity::Identity::generate(stem)
-        .map_err(|error| Error::runtime(format!("cannot generate {stem} identity: {error}")))?;
-    generated
-        .save(&cert, &key)
-        .map_err(|error| Error::runtime(format!("cannot save {stem} identity: {error}")))?;
-    tracing::info!(
-        event = "identity_generated",
-        stem,
-        "{stem} identity generated"
-    );
-    Ok(generated)
+    Ok(identity)
 }
 
 /// What the running role holds until shutdown, drained in order. Constructed
@@ -1155,6 +1322,10 @@ enum Running {
         checks: Option<Box<sentinel_checks::Lane>>,
         /// The lifecycle reconcile lane draining `github_refresh`.
         reconcile: Option<Box<sentinel_checks::Reconcile>>,
+        /// The mail lane, when Resend is configured.
+        mail: Option<Box<sentinel_mail::Lane>>,
+        /// The GitHub-backed membership lane draining `github_member_checks`.
+        members: Option<Box<sentinel_checks::Members>>,
         /// The Q06 helper carrying the link port; absent with direct TLS.
         tailcat: Option<TailcatServer>,
         /// The external S3 copy's replicator, when `[s3]` is configured.
@@ -1173,6 +1344,8 @@ enum Running {
         /// Shared with the link thread, which replaces it when sessions over
         /// it keep failing.
         tailcat: Option<Arc<sentinel_link::tailcat::Forward>>,
+        /// Holds the running executor, so shutdown can end its attempts.
+        metrics: Arc<crate::worker_metrics::Metrics>,
     },
 }
 
@@ -1383,7 +1556,7 @@ struct Maintenance {
 
 #[cfg(feature = "server")]
 impl Maintenance {
-    fn start(store: Arc<sentinel_store::Store>) -> std::io::Result<Maintenance> {
+    fn start(store: Arc<sentinel_store::Store>, data_dir: PathBuf) -> std::io::Result<Maintenance> {
         let (stop, wake) = mpsc::sync_channel::<()>(0);
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let thread = std::thread::Builder::new()
@@ -1392,6 +1565,7 @@ impl Maintenance {
                 tracing::dispatcher::with_default(&dispatch, || {
                     let mut interval = MAINTENANCE_INTERVAL;
                     while let Err(mpsc::RecvTimeoutError::Timeout) = wake.recv_timeout(interval) {
+                        retire_setup_file(&store, &data_dir);
                         interval = if purge_expired(&store, PURGE_BATCH) {
                             BACKLOG_INTERVAL
                         } else {
@@ -1419,20 +1593,34 @@ type Purge =
 /// filled its batch, i.e. may have more to purge.
 #[cfg(feature = "server")]
 fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
-    let now = sentinel_core::UnixMillis::now();
-    let purges: [(&str, Purge); 6] = [
-        ("oauth", sentinel_store::oauth::purge_expired),
-        ("api_tokens", sentinel_store::tokens::purge_expired),
-        ("sessions", sentinel_store::local_auth::purge_expired),
-        ("sign_in", sentinel_store::sign_in::purge_expired),
-        ("idempotency", sentinel_store::idempotency::purge_expired),
+    let wall = sentinel_core::UnixMillis::now();
+    // Idempotency keys are stamped by the deadline clock (the API's run
+    // creation), so their TTL is judged on it; everything else is wall time.
+    let steady = sentinel_core::UnixMillis::steady();
+    let purges: [(&str, Purge, sentinel_core::UnixMillis); 8] = [
+        // The first-run token: gone once setup closed or the token expired.
+        ("setup", sentinel_store::setup::purge, wall),
+        ("oauth", sentinel_store::oauth::purge_expired, wall),
+        ("api_tokens", sentinel_store::tokens::purge_expired, wall),
+        ("sessions", sentinel_store::local_auth::purge_expired, wall),
+        ("sign_in", sentinel_store::sign_in::purge_expired, wall),
+        // Spent and expired verification tokens, settled mail and expired
+        // undelivered messages: bounded here so a deployment without Resend,
+        // where no mail lane runs, does not accumulate them either.
+        ("email", sentinel_store::email::purge, wall),
+        (
+            "idempotency",
+            sentinel_store::idempotency::purge_expired,
+            steady,
+        ),
         (
             "secret_idempotency",
             sentinel_store::secrets::purge_idempotency,
+            wall,
         ),
     ];
     let mut backlog = false;
-    for (kind, purge) in purges {
+    for (kind, purge, now) in purges {
         match purge(store, now, batch) {
             Ok(0) => {}
             Ok(removed) => {
@@ -1699,6 +1887,7 @@ fn start_server(
     // `github_refresh` work — webhook hints and the periodic pass — and is
     // also where a lost check answer gets found again by external ID.
     let mut reconcile = None;
+    let mut members = None;
     let checks = match &app {
         Some(app) => {
             tracing::info!(
@@ -1718,6 +1907,20 @@ fn start_server(
                             kind = notice.kind,
                             outcome = %notice.outcome
                         );
+                    });
+                },
+            )));
+            // GitHub-backed organizations: who is a member, and in which
+            // repositories, is whatever GitHub confirms for the person's
+            // linked account. The lane only observes; the store decides.
+            let members_dispatch = tracing::dispatcher::get_default(Clone::clone);
+            members = Some(Box::new(sentinel_checks::Members::start(
+                Arc::clone(&store),
+                Arc::clone(&app.app),
+                app.members,
+                move |notice| {
+                    tracing::dispatcher::with_default(&members_dispatch, || {
+                        tracing::info!(event = "github_members_checked", outcome = %notice.outcome);
                     });
                 },
             )));
@@ -1799,30 +2002,52 @@ fn start_server(
         }
         None => None,
     };
-    let api = sentinel_api::Server::start(sentinel_api::Config {
-        listen: api_listen,
-        store: Arc::clone(&store),
-        logs: Arc::clone(&logs),
-        objects,
-        controller: controller.handle(),
-        secret_key: key.clone(),
-        sessions: sentinel_store::local_auth::Policy::default(),
-        github_webhook_secret,
-        intake: Some(lane.waker()),
-        public_url,
-        github_sign_in,
-        trusted_proxies: match trusted_proxies {
-            // Validated when the configuration was read.
-            Some(proxies) => proxies
-                .iter()
-                .filter_map(|proxy| sentinel_api::TrustedProxy::parse(proxy))
-                .collect(),
-            None => sentinel_api::TrustedProxy::loopback(),
+    // Before the API serves: a request that mints a link queues its message
+    // only when a lane will drain it, which the store row records.
+    let (mail, mail_sender) = start_mail(config, public_url.as_deref(), &store, key.as_ref())?;
+    announce_setup(&config.data_dir, &store)?;
+    // Before the API serves, so the first verification already sees the rules.
+    record_auto_join(&config.auto_join, &store)?;
+    // The same rules, for the read-only organization settings.
+    let options = sentinel_api::Options {
+        mail: mail_sender,
+        auto_join: config
+            .auto_join
+            .rules
+            .iter()
+            .map(|rule| sentinel_api::AutoJoinRule {
+                domain: rule.domain.clone(),
+                organization: rule.slug.clone(),
+            })
+            .collect(),
+    };
+    let api = sentinel_api::Server::start_with(
+        sentinel_api::Config {
+            listen: api_listen,
+            store: Arc::clone(&store),
+            logs: Arc::clone(&logs),
+            objects,
+            controller: controller.handle(),
+            secret_key: key.clone(),
+            sessions: sentinel_store::local_auth::Policy::default(),
+            github_webhook_secret,
+            intake: Some(lane.waker()),
+            public_url,
+            github_sign_in,
+            trusted_proxies: match trusted_proxies {
+                // Validated when the configuration was read.
+                Some(proxies) => proxies
+                    .iter()
+                    .filter_map(|proxy| sentinel_api::TrustedProxy::parse(proxy))
+                    .collect(),
+                None => sentinel_api::TrustedProxy::loopback(),
+            },
         },
-    })
+        options,
+    )
     .map_err(|error| Error::runtime(format!("cannot listen on {api_listen}: {error}")))?;
     tracing::info!(event = "api_listening", addr = %api.local_addr(), issuer = %api.issuer());
-    let maintenance = Maintenance::start(Arc::clone(&store))
+    let maintenance = Maintenance::start(Arc::clone(&store), config.data_dir.clone())
         .map_err(|error| Error::runtime(format!("cannot start maintenance: {error}")))?;
     Ok(Running::Server {
         controller,
@@ -1833,10 +2058,217 @@ fn start_server(
         poll: Box::new(poll),
         checks,
         reconcile,
+        mail,
+        members,
         tailcat,
         replicator,
         backups,
     })
+}
+
+/// First-run setup: while no super admin exists, issue a one-time setup token
+/// and show it to the host operator, and only to them: a `0600` file in the
+/// data directory and one console line. Once an administrator exists (the
+/// wizard or `sentinel admin bootstrap`) no token is issued and a stale file
+/// is removed. A restart while setup is still open issues a new token and
+/// voids the old one.
+#[cfg(feature = "server")]
+fn announce_setup(data_dir: &Path, store: &sentinel_store::Store) -> Result<(), Error> {
+    let path = data_dir.join(sentinel_store::setup::TOKEN_FILE);
+    let issued = sentinel_store::setup::issue(store, sentinel_core::UnixMillis::now())
+        .map_err(|error| Error::runtime(format!("cannot issue the setup token: {error}")))?;
+    let Some(token) = issued else {
+        remove_setup_file(&path);
+        return Ok(());
+    };
+    let mut text = String::new();
+    token.expose(&mut text);
+    write_owner_only(&path, text.as_bytes())
+        .map_err(|error| Error::runtime(format!("cannot write {}: {error}", path.display())))?;
+    // The one place a credential is logged, by design: the token is for
+    // whoever can read this host's console or data directory, it expires in
+    // an hour and is dead once setup completes. It is never logged again.
+    tracing::warn!(
+        event = "setup_required",
+        token = %text,
+        file = %path.display(),
+        expires_in_secs = sentinel_store::setup::TOKEN_TTL_MS / 1000,
+        "first-run setup is open: present this token to the setup wizard, or run `sentinel admin bootstrap` instead"
+    );
+    sentinel_auth::secret::wipe_string(&mut text);
+    Ok(())
+}
+
+/// Create `path` readable by its owner alone, replacing any earlier file (a
+/// new inode, so an old mode or a planted link is never reused).
+#[cfg(feature = "server")]
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+#[cfg(feature = "server")]
+fn remove_setup_file(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => tracing::info!(event = "setup_token_file_removed"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(event = "setup_token_file_remove_failed", error = %error);
+        }
+    }
+}
+
+/// Maintenance: drop the token file once the token is no longer good (setup
+/// completed, or it expired).
+#[cfg(feature = "server")]
+fn retire_setup_file(store: &sentinel_store::Store, data_dir: &Path) {
+    let path = data_dir.join(sentinel_store::setup::TOKEN_FILE);
+    if fs::symlink_metadata(&path).is_err() {
+        return;
+    }
+    // An unreadable answer keeps the file: removing it is only ever safe once
+    // the token is known dead.
+    let live = store
+        .read(|c| sentinel_store::setup::token_live(c, sentinel_core::UnixMillis::now()))
+        .unwrap_or(true);
+    if !live {
+        remove_setup_file(&path);
+    }
+}
+
+/// Warn about every `SENTINEL_AUTO_JOIN_DOMAINS` entry that was dropped, by
+/// position and reason (never its text), then record the rules that stand.
+/// The setting replaces the previous run's rules whole: a removed domain stops
+/// new joins and removes nobody. A rule naming a GitHub-backed organization, a
+/// personal namespace or a suspended one is refused here and never joins.
+#[cfg(feature = "server")]
+fn record_auto_join(
+    parsed: &sentinel_store::auto_join::Parsed,
+    store: &Arc<sentinel_store::Store>,
+) -> Result<(), Error> {
+    for dropped in &parsed.ignored {
+        tracing::warn!(
+            event = "auto_join_entry_ignored",
+            index = dropped.index,
+            reason = dropped.reason.as_str()
+        );
+    }
+    let refused = sentinel_store::auto_join::set_rules(store, &parsed.rules)
+        .map_err(|error| Error::runtime(format!("cannot record auto-join domains: {error}")))?;
+    for dropped in &refused {
+        tracing::warn!(
+            event = "auto_join_entry_refused",
+            index = dropped.index,
+            reason = dropped.reason.as_str()
+        );
+    }
+    tracing::info!(
+        event = "auto_join_domains",
+        active = parsed.rules.len() - refused.len(),
+        ignored = parsed.ignored.len() + refused.len()
+    );
+    Ok(())
+}
+
+/// The mail lane (absent without the master key) and the Resend sender
+/// (absent without a configured key) that `start_mail` returns.
+#[cfg(feature = "server")]
+type MailStart = (
+    Option<Box<sentinel_mail::Lane>>,
+    Option<Arc<sentinel_mail::Resend>>,
+);
+
+/// Build the Resend sender when it is configured, and start the mail lane
+/// when there is also a master key to seal queued messages with; record in
+/// the store whether this deployment delivers mail. Without a sender, or
+/// without the master key that seals a queued message's link, nothing is
+/// queued: a request that needs a link still succeeds, and the operator mints
+/// one with `sentinel admin account email-link` or `invite create --email`.
+/// A configuration that cannot work (an unreadable or malformed key file)
+/// stops the start like any other configuration error. The sender is returned
+/// even without a master key: the first-run wizard's test message needs only
+/// the Resend key.
+#[cfg(feature = "server")]
+fn start_mail(
+    config: &Config,
+    public_url: Option<&str>,
+    store: &Arc<sentinel_store::Store>,
+    key: Option<&Arc<sentinel_auth::sealed::Key>>,
+) -> Result<MailStart, Error> {
+    let record = |enabled: bool| {
+        sentinel_store::email::set_delivery(
+            store,
+            enabled,
+            public_url,
+            sentinel_core::UnixMillis::now(),
+        )
+        .map_err(|error| Error::runtime(format!("cannot record mail delivery: {error}")))
+    };
+    let Some(mail) = &config.mail else {
+        record(false)?;
+        tracing::info!(
+            event = "mail_disabled",
+            "no Resend key configured: verification and invitation links are minted with `sentinel admin`"
+        );
+        return Ok((None, None));
+    };
+    let api_key = sentinel_mail::ApiKey::from_file(&mail.api_key_file)
+        .map_err(|reason| Error::config(format!("[mail] {reason}")))?;
+    let from = sentinel_mail::Sender::parse(&mail.from)
+        .map_err(|reason| Error::config(format!("[mail] {reason}")))?;
+    let resend = Arc::new(sentinel_mail::Resend::new(api_key, from));
+    let Some(key) = key else {
+        record(false)?;
+        tracing::warn!(
+            event = "mail_disabled",
+            "Resend is configured but there is no master key to seal queued messages; create one with `sentinel admin key create`"
+        );
+        return Ok((None, Some(resend)));
+    };
+    record(true)?;
+    tracing::info!(event = "mail_enabled", provider = "resend");
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let lane = sentinel_mail::Lane::start(
+        Arc::clone(store),
+        Arc::clone(key),
+        Box::new(Arc::clone(&resend)),
+        sentinel_mail::LaneConfig::default(),
+        move |batch| {
+            tracing::dispatcher::with_default(&dispatch, || {
+                if batch.abandoned > 0 {
+                    tracing::warn!(
+                        event = "mail_abandoned",
+                        abandoned = batch.abandoned,
+                        "messages were given up on"
+                    );
+                }
+                // Never the recipient: only the message's own identifier.
+                for entry in &batch.entries {
+                    tracing::info!(
+                        event = "mail_settled",
+                        mail = %entry.id,
+                        kind = entry.kind,
+                        outcome = %entry.outcome
+                    );
+                }
+            });
+        },
+    );
+    Ok((Some(Box::new(lane)), Some(resend)))
 }
 
 /// Build the S3 client from `[s3]`, check it once (a failure is logged and
@@ -1989,6 +2421,12 @@ mod worker_role {
                     sentinel_worker::executor::Notice::CostlyCacheHit { attempt, name, costly, stats } => {
                         tracing::warn!(event = "cache_costly_hit", attempt = %attempt, cache = %name, reason = costly.as_str(), copied_bytes = stats.copied_bytes, bytes = stats.bytes, lock_wait_ns = ?stats.lock_wait_ns, clone_ns = ?stats.clone_ns, "nominal hit paid rebuild-scale restore cost (docs/cache.md)");
                     }
+                    sentinel_worker::executor::Notice::OfferRefused { attempt, free_bytes, floor_bytes } => {
+                        tracing::warn!(event = "offer_refused_low_disk", attempt = %attempt, free_bytes, floor_bytes, "the data directory's disk is below the admission floor; offers are refused until it recovers");
+                    }
+                    sentinel_worker::executor::Notice::ShutDown { ended, left, handed_back } => {
+                        tracing::info!(event = "attempts_shut_down", ended, left, handed_back);
+                    }
                     sentinel_worker::executor::Notice::Availability(snapshot) => {
                         tracing::info!(event = "availability", images_held = snapshot.images_held.len(), images_in_flight = snapshot.images_in_flight, cache_entries = snapshot.cache_entries, cache_generations = snapshot.cache_generations, cache_bytes = snapshot.cache_bytes, truncated = snapshot.truncated);
                     }
@@ -2078,6 +2516,8 @@ mod worker_role {
         let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
             return 0;
         };
+        // SAFETY: `statvfs` is a plain C struct of integers, for which the
+        // all-zero bit pattern is valid.
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         // SAFETY: `cpath` is a valid NUL-terminated path and `stat` is a
         // writable, properly aligned statvfs.
@@ -2282,6 +2722,11 @@ mod worker_role {
         let settings = sentinel_link::worker::Config {
             controller,
             server: sentinel_auth::secret::Digest(link.fingerprint),
+            also_pinned: link
+                .also_fingerprints
+                .iter()
+                .map(|f| sentinel_auth::secret::Digest(*f))
+                .collect(),
             worker,
             name: link.name.clone(),
             hello: sentinel_protocol::negotiate::Hello {
@@ -2421,6 +2866,7 @@ mod worker_role {
             handle,
             thread,
             tailcat: forward,
+            metrics,
         })
     }
 }
@@ -2441,7 +2887,7 @@ fn initialize_and_wait(
         })
         .map_err(|error| Error::runtime(format!("cannot install shutdown handler: {error}")))?;
         let data_dir = config.data_dir.clone();
-        bootstrap_work(io, move || fs::create_dir_all(data_dir))?
+        bootstrap_work(io, move || create_data_dir(&data_dir))?
             .map_err(|error| Error::runtime(format!("cannot initialize data_dir: {error}")))?;
         match &config.role {
             #[cfg(feature = "server")]
@@ -2494,6 +2940,8 @@ fn initialize_and_wait(
             poll,
             checks,
             reconcile,
+            mail,
+            members,
             tailcat,
             replicator,
             backups,
@@ -2512,8 +2960,10 @@ fn initialize_and_wait(
             if let Some(tailcat) = tailcat {
                 tailcat.shutdown();
             }
+            drop(members);
             drop(reconcile);
             drop(checks);
+            drop(mail);
             drop(poll);
             drop(lane);
             let sessions_drained = controller.shutdown(LINK_SHUTDOWN);
@@ -2537,7 +2987,15 @@ fn initialize_and_wait(
             handle,
             thread,
             tailcat,
+            metrics,
         } => {
+            // Attempts first, while the session is still up: running ones
+            // are stopped and their containers removed (a container would
+            // otherwise run on after this process, while the controller
+            // reallocates its capacity), waiting ones are handed back.
+            if let Some(executor) = metrics.executor.get() {
+                executor.shutdown(WORKER_SHUTDOWN);
+            }
             handle.stop();
             let joined = thread.join().is_ok();
             if let Some(forward) = tailcat {
@@ -2906,5 +3364,104 @@ credentials_file = '/etc/sentinel/s3'
         assert_eq!(resolved.deployment.artifact_retention_ms, 86_400_000);
         assert_eq!(resolved.deployment.run_artifact_bytes, 1 << 30);
         assert_eq!(resolved.attempt_log_bytes, 64 << 20);
+    }
+
+    fn settled(file: MailFile, env: &dyn Fn(&str) -> Option<String>) -> MailSettings {
+        match file.resolve(env) {
+            Ok(Some(settings)) => settings,
+            _ => panic!("expected an email configuration"),
+        }
+    }
+
+    fn mail(text: &str) -> MailFile {
+        toml::from_str(text).unwrap()
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn email_is_off_without_a_key_and_a_sender_and_half_of_it_is_an_error() {
+        assert_eq!(MailFile::default().resolve(&no_env).ok(), Some(None));
+        for file in [
+            "api_key_file = '/etc/sentinel/resend-key'",
+            "from = 'ci@example.com'",
+        ] {
+            assert!(mail(file).resolve(&no_env).is_err(), "{file}");
+        }
+        // The same through the environment.
+        let stray =
+            |name: &str| (name == "SENTINEL_EMAIL_FROM").then(|| "ci@example.com".to_owned());
+        assert!(MailFile::default().resolve(&stray).is_err());
+        // Empty environment values are unset, so a blank override disables nothing.
+        let blank = |_: &str| Some(String::new());
+        let resolved = settled(
+            mail("api_key_file = '/etc/sentinel/resend-key'\nfrom = 'ci@example.com'"),
+            &blank,
+        );
+        assert_eq!(resolved.from, "ci@example.com");
+    }
+
+    #[test]
+    fn the_environment_wins_and_the_key_is_only_ever_a_file() {
+        let base = "api_key_file = '/etc/sentinel/resend-key'\nfrom = 'ci@example.com'\n";
+        let env = |name: &str| match name {
+            "SENTINEL_RESEND_API_KEY_FILE" => Some("/run/secrets/resend".to_owned()),
+            "SENTINEL_EMAIL_FROM" => Some("Sentinel CI <ci@example.org>".to_owned()),
+            _ => None,
+        };
+        let merged = settled(mail(base), &env);
+        assert_eq!(
+            merged.api_key_file.as_path(),
+            Path::new("/run/secrets/resend")
+        );
+        assert_eq!(merged.from, "Sentinel CI <ci@example.org>");
+        // There is no setting that carries the key itself.
+        assert!(toml::from_str::<MailFile>("api_key = 're_abc'").is_err());
+        assert!(toml::from_str::<MailFile>("resend_api_key = 're_abc'").is_err());
+    }
+
+    #[test]
+    fn a_bad_email_setting_is_refused_without_echoing_it() {
+        let key = "api_key_file = '/etc/sentinel/resend-key'\n";
+        let error = mail("api_key_file = 'relative/resend-key'\nfrom = 'ci@example.com'")
+            .resolve(&no_env)
+            .unwrap_err();
+        assert!(
+            !error.message.contains("relative/resend-key"),
+            "{}",
+            error.message
+        );
+        let mut bad = vec!["", "nobody"];
+        // The server build checks the whole address, not just its shape.
+        #[cfg(feature = "server")]
+        bad.extend([
+            "a@@b.example",
+            "@example.com",
+            "ci@",
+            "c i@example.com",
+            "Name <ci@example.com",
+            "Evil\\nBcc: x@y.z <ci@example.com>",
+        ]);
+        for bad_from in bad {
+            let file = mail(&format!("{key}from = '{bad_from}'"));
+            let error = file.resolve(&no_env).unwrap_err();
+            // The refusal is one of two fixed sentences, which themselves
+            // show an example address, so test for exactly those rather than
+            // for the value being a substring of the message.
+            assert!(
+                [
+                    "the sender must be `ci@example.com` or `Sentinel <ci@example.com>`",
+                    "the sender must be `addr@example.com` or `Name <addr@example.com>`",
+                ]
+                .contains(&error.message.as_str()),
+                "{}",
+                error.message
+            );
+        }
+        // A typo in the section is not ignored, and neither is an old key.
+        assert!(toml::from_str::<MailFile>("hots = 'x'").is_err());
+        assert!(toml::from_str::<MailFile>("host = 'x'").is_err());
     }
 }

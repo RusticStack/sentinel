@@ -73,9 +73,8 @@ pub fn generic(
     body: &[u8],
     now: UnixMillis,
 ) -> Result<Ingested, Error> {
-    let update: RefUpdate =
-        serde_json::from_slice(body).map_err(|_| Error::InvalidRequest("body"))?;
-    update.validate().map_err(Error::InvalidRequest)?;
+    // Authenticate before looking at the body: an unauthenticated caller
+    // gets no JSON parsing, and no validation oracle, for its bytes.
     let secret = intake::hook_token_parse(presented).ok_or(Error::Unauthenticated)?;
     let target = store
         .read(|c| intake::authenticate(c, &secret))
@@ -86,6 +85,9 @@ pub fn generic(
         // indistinguishable refusal.
         _ => return Err(Error::Unauthenticated),
     }
+    let update: RefUpdate =
+        serde_json::from_slice(body).map_err(|_| Error::InvalidRequest("body"))?;
+    update.validate().map_err(Error::InvalidRequest)?;
     accept(
         store,
         repo,
@@ -129,7 +131,11 @@ pub fn github(
         | "check_suite"
         | "installation"
         | "installation_repositories"
-        | "repository" => return control(store, event, delivery_id, body, now),
+        | "repository"
+        | "organization"
+        | "membership"
+        | "member"
+        | "team" => return control(store, event, delivery_id, body, now),
         "push" => {}
         // Pull requests arrive only through a bound App installation, and only
         // the actions that mean "there is something new to test" are intake;
@@ -223,6 +229,15 @@ fn control(
         } => E::Repository {
             installation,
             repository,
+        },
+        C::Members {
+            installation,
+            user,
+            removed,
+        } => E::Members {
+            installation,
+            user,
+            removed,
         },
     };
     let digest = webhook::control_digest(event, body);

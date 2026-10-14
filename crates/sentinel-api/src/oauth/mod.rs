@@ -69,6 +69,20 @@ pub(crate) enum Budget {
     Registration,
     /// Client ID Metadata Document retrieval.
     Metadata,
+    /// `POST /api/v1/login`: each attempt is a password hash and a writer
+    /// transaction, so a client gets a burst and then a slow refill.
+    Login,
+    /// `POST /api/v1/register`: a password hash and a writer transaction.
+    Signup,
+    /// Email resend, verification and invitation links.
+    Mail,
+    /// First-run setup attempts (`POST /api/v1/setup`, the mail test): a
+    /// token judgement, and for a right one a password hash. Tight, because
+    /// nothing legitimate asks more than a handful of times.
+    Setup,
+    /// `POST /api/v1/orgs`: the slug check inherently says whether a name is
+    /// taken, so a client gets a few and then a slow refill.
+    Organization,
 }
 
 /// Per client at the token endpoint: 10/s, burst 20.
@@ -85,6 +99,28 @@ const REGISTRATION_CLIENT: Rate = Rate::per_sec(2, 5);
 const REGISTRATION_CEILING: Rate = Rate::per_sec(10, 20);
 const METADATA_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(5), 4);
 const METADATA_CEILING: Rate = Rate::per_sec(10, 20);
+/// Password logins per client: burst 10, then one per 3 s. A person typing a
+/// password never meets it; the per-account lock ([`crate::login_guard`]) is
+/// what stops guessing, this bounds the hashing one address can demand.
+const LOGIN_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(3), 10);
+/// All clients together: bounds the hashing the host spends on logins.
+const LOGIN_CEILING: Rate = Rate::per_sec(10, 20);
+/// Self-service sign-ups per client: each is a password hash and a writer
+/// transaction, so burst 5, then one per 20 s; all clients together 2/s.
+const SIGNUP_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(20), 5);
+const SIGNUP_CEILING: Rate = Rate::per_sec(2, 10);
+/// Mail-sending and email-token requests per client (resends, verification
+/// and invitation links): burst 8, then one per 15 s; all clients 5/s.
+const MAIL_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(15), 8);
+const MAIL_CEILING: Rate = Rate::per_sec(5, 20);
+/// First-run setup attempts per client: burst 5, then one per 10 s; all
+/// clients together one per second, burst 5.
+const SETUP_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(10), 5);
+const SETUP_CEILING: Rate = Rate::per_sec(1, 5);
+/// Organization creations and name checks per client: burst 5, then one per
+/// 10 s; all clients together 2/s.
+const ORGANIZATION_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(10), 5);
+const ORGANIZATION_CEILING: Rate = Rate::per_sec(2, 10);
 
 /// The authorization server's per-process state.
 pub(crate) struct OAuthState {
@@ -119,6 +155,16 @@ pub(crate) struct OAuthState {
     pub registration_budget: Mutex<Limiter>,
     /// CIMD metadata fetch admission.
     pub metadata_budget: Mutex<Limiter>,
+    /// Password login admission.
+    pub login_budget: Mutex<Limiter>,
+    /// Self-service sign-up admission.
+    pub signup_budget: Mutex<Limiter>,
+    /// Email resend, verification and invitation-link admission.
+    pub mail_budget: Mutex<Limiter>,
+    /// First-run setup admission.
+    pub setup_budget: Mutex<Limiter>,
+    /// Self-service organization creation admission.
+    pub organization_budget: Mutex<Limiter>,
     /// Bounded in-memory CIMD cache.
     pub client_metadata: client::MetadataCache,
     /// Device-code digest -> (last poll, current interval in ms), bounded by
@@ -163,6 +209,15 @@ impl OAuthState {
                 now,
             )),
             metadata_budget: Mutex::new(Limiter::new(METADATA_CLIENT, Some(METADATA_CEILING), now)),
+            login_budget: Mutex::new(Limiter::new(LOGIN_CLIENT, Some(LOGIN_CEILING), now)),
+            signup_budget: Mutex::new(Limiter::new(SIGNUP_CLIENT, Some(SIGNUP_CEILING), now)),
+            mail_budget: Mutex::new(Limiter::new(MAIL_CLIENT, Some(MAIL_CEILING), now)),
+            setup_budget: Mutex::new(Limiter::new(SETUP_CLIENT, Some(SETUP_CEILING), now)),
+            organization_budget: Mutex::new(Limiter::new(
+                ORGANIZATION_CLIENT,
+                Some(ORGANIZATION_CEILING),
+                now,
+            )),
             client_metadata: client::MetadataCache::default(),
             device_polls: Mutex::new(HashMap::new()),
             user_code_failures: Mutex::new(device::WrongCodes::new()),
@@ -332,25 +387,7 @@ pub(crate) fn token_reply(minted: &Minted, now: UnixMillis) -> Reply {
 /// Admit one unauthenticated OAuth POST from this request's client against
 /// `budget` ([`limit`]).
 pub(crate) fn admit(state: &State, request: &Request, budget: Budget) -> Result<(), Reply> {
-    let client = client_of(state, request);
-    let now = Instant::now();
-    let take = |limiter: &Mutex<Limiter>| {
-        limiter
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .admit(client, now)
-    };
-    let oauth = &state.oauth;
-    let admitted = match budget {
-        Budget::Token => take(&oauth.token_budget),
-        Budget::Revoke => take(&oauth.begin_budget),
-        // The slow device bucket first: a client past it spends nothing
-        // from the budget revocation shares.
-        Budget::Device => take(&oauth.device_budget) && take(&oauth.begin_budget),
-        Budget::Registration => take(&oauth.registration_budget),
-        Budget::Metadata => take(&oauth.metadata_budget),
-    };
-    if admitted {
+    if admitted(state, request, budget) {
         Ok(())
     } else {
         let mut reply = error(
@@ -361,6 +398,33 @@ pub(crate) fn admit(state: &State, request: &Request, budget: Budget) -> Result<
             headers.push(routes::header("retry-after", "1"));
         }
         Err(reply)
+    }
+}
+
+/// Whether this request's client is within `budget`, spending one admission.
+pub(crate) fn admitted(state: &State, request: &Request, budget: Budget) -> bool {
+    let client = client_of(state, request);
+    let now = Instant::now();
+    let take = |limiter: &Mutex<Limiter>| {
+        limiter
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .admit(client, now)
+    };
+    let oauth = &state.oauth;
+    match budget {
+        Budget::Token => take(&oauth.token_budget),
+        Budget::Revoke => take(&oauth.begin_budget),
+        // The slow device bucket first: a client past it spends nothing
+        // from the budget revocation shares.
+        Budget::Device => take(&oauth.device_budget) && take(&oauth.begin_budget),
+        Budget::Registration => take(&oauth.registration_budget),
+        Budget::Metadata => take(&oauth.metadata_budget),
+        Budget::Login => take(&oauth.login_budget),
+        Budget::Signup => take(&oauth.signup_budget),
+        Budget::Mail => take(&oauth.mail_budget),
+        Budget::Setup => take(&oauth.setup_budget),
+        Budget::Organization => take(&oauth.organization_budget),
     }
 }
 
@@ -426,9 +490,15 @@ pub(crate) fn read_form(request: &mut Request) -> Result<Form, Reply> {
             "expected an application/x-www-form-urlencoded body",
         ));
     }
-    let bytes = routes::body_limit(request, MAX_OAUTH_FORM_BYTES).map_err(|e| {
+    let bytes = routes::public_body_limit(request, MAX_OAUTH_FORM_BYTES).map_err(|e| {
         if e.code == ErrorCode::PayloadTooLarge {
             error_status(413, OAuthErrorCode::InvalidRequest, "body too large")
+        } else if e.code == ErrorCode::RateLimited {
+            error_status(
+                503,
+                OAuthErrorCode::TemporarilyUnavailable,
+                "too many requests; retry shortly",
+            )
         } else {
             error(OAuthErrorCode::InvalidRequest, "unreadable body")
         }

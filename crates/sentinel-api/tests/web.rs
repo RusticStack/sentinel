@@ -163,14 +163,17 @@ fn a_caller_lists_its_own_tenants_and_a_narrowed_credential_only_its_one() {
     assert_eq!(status, 200);
     assert_eq!(
         body["tenants"],
-        json!([{ "slug": "acme", "role": "admin" }, { "slug": "beta", "role": "admin" }])
+        json!([
+            { "slug": "acme", "role": "admin", "kind": "organization", "membership": "app" },
+            { "slug": "beta", "role": "admin", "kind": "organization", "membership": "app" }
+        ])
     );
     assert_eq!(body["super_admin"], true);
     let dana = f.member(f.dana);
     let (_, body) = get(&f, "/api/v1/tenants", &dana);
     assert_eq!(
         body["tenants"],
-        json!([{ "slug": "acme", "role": "operator" }])
+        json!([{ "slug": "acme", "role": "operator", "kind": "organization", "membership": "app" }])
     );
     // `/me` says whether a session is stepped up and whether TOTP exists.
     let (_, me) = get(&f, "/api/v1/me", &dana);

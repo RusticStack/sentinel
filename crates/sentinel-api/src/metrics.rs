@@ -273,7 +273,8 @@ pub(crate) fn render(state: &State) -> String {
             held,
         );
         if let Some(oldest) = oldest {
-            let age = (sentinel_core::UnixMillis::now().0 - oldest).max(0) as f64 / 1e3;
+            // `queued_ms` is a deadline-clock stamp: age it on that clock.
+            let age = (sentinel_core::UnixMillis::steady().0 - oldest).max(0) as f64 / 1e3;
             out.one(
                 "sentinel_jobs_oldest_queued_seconds",
                 "gauge",

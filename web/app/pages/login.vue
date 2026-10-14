@@ -3,37 +3,25 @@ definePageMeta({ layout: "auth" });
 useHead({ title: "Sign in · Sentinel" });
 
 const route = useRoute();
-const session = useSession();
 const api = useApi();
-const username = ref("");
-const password = ref("");
-const error = ref("");
-const busy = ref(false);
 
 // GitHub sign-in is offered only when the controller has it configured.
 const { data: health } = await useAsyncData("health", () => api<{ github_sign_in?: boolean }>("/api/v1/health"));
 const github = computed(() => !!health.value?.github_sign_in);
 
-const next = computed(() => (typeof route.query.next === "string" && route.query.next.startsWith("/") ? route.query.next : "/"));
-
-async function submit() {
-  busy.value = true;
-  error.value = "";
-  try {
-    const me = await api<{ csrf: string }>("/api/v1/login", { method: "POST", body: { username: username.value, password: password.value } });
-    setCsrfToken(me.csrf);
-    password.value = "";
-    await session.load(true);
-    await navigateTo(next.value);
-  } catch (e) {
-    error.value = e instanceof ApiError && e.code === "unauthenticated" ? "Sign-in refused." : (e as Error).message;
-  } finally {
-    busy.value = false;
+const next = computed(() => sameOriginPath(route.query.next));
+// Why sign-in is asked for again, when the interface sent the person here.
+const notice = computed(() => {
+  switch (route.query.reason) {
+    case "expired": return { title: "Your session ended", description: "Sign in again to continue where you were." };
+    case "password-changed": return { title: "Password changed", description: "Every session of your account was signed out. Sign in with the new password." };
+    case "verified": return { title: "Address verified", description: "Sign in with your email address and password." };
+    default: return null;
   }
-}
+});
 
 function withGitHub() {
-  try { sessionStorage.setItem("sentinel-return", next.value); } catch { /* ignore */ }
+  rememberReturn(next.value);
 }
 </script>
 
@@ -45,18 +33,17 @@ function withGitHub() {
         <h1 class="text-lg font-semibold">Sign in to Sentinel</h1>
       </div>
     </template>
-    <form class="space-y-4" @submit.prevent="submit">
-      <UFormField label="Username" name="username">
-        <UInput id="username" v-model="username" autocomplete="username" required autofocus class="w-full" />
-      </UFormField>
-      <UFormField label="Password" name="password">
-        <UInput id="password" v-model="password" type="password" autocomplete="current-password" required class="w-full" />
-      </UFormField>
-      <UAlert v-if="error" color="error" variant="subtle" icon="i-lucide-circle-alert" :title="error" role="alert" />
-      <UButton type="submit" label="Sign in" block :loading="busy" />
-    </form>
-    <template v-if="github" #footer>
-      <UButton :to="`/auth/github/start?return_to=%2F`" external icon="i-lucide-github" color="neutral" variant="outline" label="Sign in with GitHub" block @click="withGitHub" />
+    <SignInForm @signed-in="navigateTo(next)">
+      <template #notice="{ error }">
+        <UAlert v-if="notice && !error" color="info" variant="subtle" icon="i-lucide-info" :title="notice.title" :description="notice.description" role="status" />
+      </template>
+    </SignInForm>
+    <template #footer>
+      <div class="space-y-3">
+        <UButton v-if="github" :to="`/auth/github/start?return_to=%2F`" external icon="i-lucide-github" color="neutral" variant="outline" label="Sign in with GitHub" block @click="withGitHub" />
+        <p class="text-sm text-center">New here? <ULink to="/register" class="font-medium text-primary">Create an account</ULink></p>
+        <p class="text-xs text-center text-muted"><ULink to="/verify-email" class="underline">Didn't get the verification email?</ULink></p>
+      </div>
     </template>
   </UCard>
 </template>

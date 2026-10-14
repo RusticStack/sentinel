@@ -1180,6 +1180,7 @@ dependencies = [
  "sentinel-github",
  "sentinel-intake",
  "sentinel-link",
+ "sentinel-mail",
  "sentinel-pipeline",
  "sentinel-protocol",
  "sentinel-s3",
@@ -1209,6 +1210,7 @@ dependencies = [
  "sentinel-github",
  "sentinel-intake",
  "sentinel-link",
+ "sentinel-mail",
  "sentinel-pipeline",
  "sentinel-protocol",
  "sentinel-store",
@@ -1258,7 +1260,6 @@ dependencies = [
  "sentinel-pipeline",
  "sentinel-protocol",
  "serde",
- "serde_json",
  "tempfile",
 ]
 
@@ -1353,6 +1354,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-mail"
+version = "0.1.0-dev"
+dependencies = [
+ "sentinel-auth",
+ "sentinel-core",
+ "sentinel-mail",
+ "sentinel-store",
+ "serde_json",
+ "tempfile",
+ "ureq",
+]
+
+[[package]]
 name = "sentinel-pipeline"
 version = "0.1.0-dev"
 dependencies = [
@@ -1398,7 +1412,6 @@ dependencies = [
  "md-5",
  "quick-xml",
  "ring",
- "tempfile",
  "ureq",
  "zeroize",
 ]
@@ -1409,6 +1422,7 @@ version = "0.1.0-dev"
 dependencies = [
  "blake3",
  "flate2",
+ "idna",
  "memchr",
  "postcard",
  "rusqlite",

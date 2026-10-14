@@ -458,6 +458,103 @@ fn a_canceled_report_without_a_request_is_not_recorded_as_a_cancel() {
     assert_eq!(row.failure_class, Some(FailureClass::Runtime));
 }
 
+/// Disk is judged by what the worker's protocol can state, not by whether the
+/// figure is zero: a worker too old to report disk is admitted on CPU and
+/// memory (every other test here), while a profile-protocol worker whose disk
+/// is zero offers none, so a job declaring scratch disk (all of them) does
+/// not place on it until it reports some. A rollback below the profile
+/// protocol forgets the figure it can no longer refresh.
+#[test]
+fn zero_disk_from_a_profile_worker_is_none_not_unlimited() {
+    let f = fixture();
+    let w = worker(&f);
+    run(&f, CHAIN);
+    let pool = f.pool;
+    f.store
+        .writer()
+        .write(move |tx| workers::renegotiate(tx, w, negotiated(7)))
+        .unwrap();
+    let offered = f
+        .store
+        .writer()
+        .write(move |tx| dispatch::place(tx, w, pool, dispatch::DEFAULT_LEASE_MS, at(2_100)))
+        .unwrap();
+    assert!(offered.is_none(), "no disk offered, no disk-declaring job");
+    f.store
+        .writer()
+        .write(move |tx| {
+            dispatch::report_capacity(
+                tx,
+                w,
+                Capacity {
+                    cpu_millis: 8_000,
+                    memory_bytes: 16 << 30,
+                    disk_bytes: 64 << 30,
+                },
+            )
+        })
+        .unwrap();
+    place(&f, w, at(2_200));
+    f.store
+        .writer()
+        .write(move |tx| workers::renegotiate(tx, w, negotiated(6)))
+        .unwrap();
+    let free = f
+        .store
+        .read(move |c| dispatch::free_capacity(c, w))
+        .unwrap();
+    assert_eq!(
+        free.disk_bytes, 0,
+        "a figure that can no longer be refreshed is dropped"
+    );
+}
+
+/// A summary over the column's cap must not turn a passing report into a
+/// lease expiry: the verdict stands and the attempt simply records no summary.
+#[test]
+fn an_oversized_summary_is_dropped_and_the_pass_stands() {
+    let f = fixture();
+    let w = worker(&f);
+    run(&f, CHAIN);
+    let offer = place(&f, w, at(2_100));
+    ack(&f, w, &offer, at(2_200));
+    let (attempt, fence) = (offer.attempt, offer.fence);
+    // Inside the 64 KiB control frame, above the 32 KiB summary cap.
+    let big = vec![7u8; 48 * 1024];
+    let next = f
+        .store
+        .writer()
+        .write(move |tx| {
+            // A pass is reported from finalization, after the worker has
+            // walked the earlier states; only the last report has a summary.
+            for (ms, event) in [
+                (2_210, Event::PreparationStarted),
+                (2_220, Event::StepsStarted),
+                (2_230, Event::FinalizationStarted),
+            ] {
+                dispatch::report(tx, w, attempt, fence, event, None, at(ms), None)?;
+            }
+            dispatch::report(
+                tx,
+                w,
+                attempt,
+                fence,
+                Event::Passed,
+                Some(&big),
+                at(2_300),
+                None,
+            )
+        })
+        .unwrap();
+    assert_eq!(next, JobState::Terminal(Outcome::Passed));
+    let tenant = f.tenant;
+    let stored = f
+        .store
+        .read(move |c| dispatch::attempt_summary(c, tenant, attempt))
+        .unwrap();
+    assert_eq!(stored, None);
+}
+
 /// P04-2: every hello renegotiates; an upgrade and a rollback are both
 /// recorded, a rollback below the profile protocol forgets profile-only
 /// placement facts, and a different architecture is not the same worker.

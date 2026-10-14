@@ -9,6 +9,7 @@
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import net from "node:net";
+import { createHmac } from "node:crypto";
 import { launch } from "./cdp.mjs";
 
 const cfg = JSON.parse(readFileSync(process.argv[2], "utf8"));
@@ -76,7 +77,13 @@ async function signIn(page, user) {
 
 async function go(page, path, ready, timeout = 20000) {
   await page.goto(cfg.base + path);
-  await page.waitFor(ready, timeout, `${path} ready`);
+  try {
+    await page.waitFor(ready, timeout, `${path} ready`);
+  } catch (error) {
+    // Say what the page showed, so a timeout is a finding rather than a guess.
+    const shown = await page.eval("JSON.stringify({ at: location.pathname, rows: [...document.querySelectorAll('main table tbody tr')].map((r) => r.textContent.replace(/\\s+/g, ' ').slice(0, 60)), alerts: [...document.querySelectorAll('[role=alert]')].map((a) => a.textContent.trim().slice(0, 120)), text: document.body.innerText.replace(/\\s+/g, ' ').slice(0, 400) })").catch(() => "(page unreadable)");
+    throw new Error(`${error.message}; the page showed ${shown}`);
+  }
 }
 
 const clickText = (selector, text) => `(() => { const el = [...document.querySelectorAll(${JSON.stringify(selector)})].find((e) => e.textContent.trim().includes(${JSON.stringify(text)})); if (!el) return false; el.click(); return true; })()`;
@@ -172,7 +179,82 @@ const PAGES = {
   platform: ["/platform/tenants", "document.querySelectorAll('main table tbody tr').length >= 2"],
   storage: ["/t/acme/admin/storage", "document.querySelectorAll('main table tbody tr').length >= 1"],
   disk: ["/platform/storage", "document.body.textContent.includes('Metadata database')"],
+  account: ["/account", "!!document.querySelector('#mfa-h') && !!document.querySelector('#password-h')"],
+  service: ["/t/acme/admin/service-accounts", "!!document.querySelector('#sa-new-h')"],
+  organizations: ["/organizations", "!!document.querySelector('#ns-h') && !!document.querySelector('#new-org-h')"],
+  settings: ["/t/acme/settings", "!!document.querySelector('#about-h') && !!document.querySelector('#members-h')"],
+  invitations: ["/t/acme/admin/invitations", "!!document.querySelector('#invite-h')"],
 };
+
+// Pages a signed-out visitor reaches: sign-up, the email links, the
+// forgot-password explanation.
+const PUBLIC_PAGES = {
+  register: ["/register", "!!document.querySelector('#su-email')"],
+  verify: ["/verify-email", "!!document.querySelector('#resend-email')"],
+  forgot: ["/forgot-password", "document.querySelector('h1') && document.querySelector('h1').textContent.includes('Forgot')"],
+  invitation: ["/invitations/accept", "document.querySelector('h1') && document.querySelector('h1').textContent.includes('invitation link')"],
+};
+
+/// The current RFC 6238 code (SHA-1, 6 digits, 30 s) for a base32 key.
+function totp(key) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = "";
+  for (const c of key.replace(/[\s=]/g, "").toUpperCase()) bits += alphabet.indexOf(c).toString(2).padStart(5, "0");
+  const secret = Buffer.from(bits.match(/.{8}/g).map((b) => parseInt(b, 2)));
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30000)));
+  const mac = createHmac("sha1", secret).update(counter).digest();
+  const at = mac[19] & 15;
+  return String((mac.readUInt32BE(at) & 0x7fffffff) % 1e6).padStart(6, "0");
+}
+
+await scenario("public pages", async () => {
+  // Setup closed (the seed has an administrator): the wizard is gone for good.
+  await go(page, "/setup", "location.pathname === '/login' && !!document.querySelector('#username')");
+  check("the setup wizard is not reachable once setup is complete", true);
+  for (const [name, [path, ready]] of Object.entries(PUBLIC_PAGES)) {
+    await go(page, path, ready);
+    await axAudit(page, `${name} page`, true);
+    for (const dark of [false, true]) {
+      await page.scheme(dark);
+      await go(page, path, ready);
+      await sleep(200);
+      const result = await page.eval(CONTRAST);
+      check(`${name}, ${dark ? "dark" : "light"}: text contrast meets WCAG AA (${result.checked} elements)`, result.count === 0, result.bad);
+    }
+    await page.scheme(false);
+    await page.viewport(360, 800);
+    await sleep(200);
+    const o = await page.eval(OVERFLOW);
+    check(`${name} at 360px: no horizontal page scroll`, o.scroll <= o.width + 1, o);
+    await page.screenshot(join(cfg.out, `${name}-360.png`));
+    await page.viewport(1280, 860);
+  }
+
+  // Sign-up under the default invitation-only policy: refused, and why.
+  await go(page, ...PUBLIC_PAGES.register);
+  check("sign-up asks password managers for a new password",
+    await page.eval("document.querySelector('#su-password').autocomplete === 'new-password' && document.querySelector('#su-again').autocomplete === 'new-password'"));
+  await page.fill("#su-email", "newcomer@example.com");
+  await page.fill("#su-password", "a long enough passphrase");
+  await page.fill("#su-again", "a long enough passphrase");
+  await page.key("Enter");
+  await page.waitFor("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('needs an invitation'))", 8000, "policy refusal");
+  check("a refused sign-up says the instance needs an invitation", true);
+  check("the password fields are emptied after sending", await page.eval("document.querySelector('#su-password').value === '' && document.querySelector('#su-again').value === ''"));
+
+  // A verification link that cannot be used: the secret leaves the address
+  // bar before anything is sent, and the refusal offers a new link.
+  await go(page, `/verify-email#token=${"ab".repeat(32)}`, "[...document.querySelectorAll('button')].some((b) => b.textContent.includes('Confirm my address'))");
+  check("a verification link's secret is removed from the address bar", (await page.eval("location.hash")) === "");
+  await page.clickText("button", "Confirm my address");
+  await page.waitFor("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('invalid or has expired')) && !!document.querySelector('#resend-email')", 8000, "invalid link");
+  check("an unusable verification link is said, with a way to get a new one", true);
+  await page.fill("#resend-email", "nobody-here@example.com");
+  await page.key("Enter");
+  await page.waitFor("[...document.querySelectorAll('[role=status]')].some((s) => s.textContent.includes('can be used here'))", 8000, "resend answer");
+  check("asking for a new link answers the same whether or not the address exists", true);
+});
 
 await scenario("sign-in", async () => {
   const started = Date.now();
@@ -281,12 +363,19 @@ await scenario("keyboard", async () => {
   await page.key("ArrowDown");
   check("log: arrow keys scroll by line", (await page.eval("document.querySelector('#log-view').scrollTop")) === 2 * lineH);
   await page.key("End");
-  // End may reveal the step's status row and grow the list by a row, and a
-  // niced, busy host renders the newly visible rows late: the key keeps
-  // working until the view rests at the bottom, for up to 3 s.
+  // End may reveal the step's status row and grow the list by a row, the
+  // list re-measures the rows it has just drawn, and a niced, busy host
+  // renders them late: the key keeps working until the view has rested at
+  // the bottom for three samples in a row (0.3 s), for up to 4 s. One
+  // sample is not enough: a re-measure can move the end just after it.
   const atEnd = "(() => { const v = document.querySelector('#log-view'); return v.scrollTop + v.clientHeight >= v.scrollHeight - 1; })()";
-  for (let i = 0; i < 30 && !(await page.eval(atEnd)); i++) { await sleep(100); await page.key("End"); }
-  check("log: End reaches the end", await page.eval(atEnd),
+  let rested = 0;
+  for (let i = 0; i < 40 && rested < 3; i++) {
+    if (await page.eval(atEnd)) rested++;
+    else { rested = 0; await page.key("End"); }
+    await sleep(100);
+  }
+  check("log: End reaches the end", rested >= 3,
     await page.eval("(() => { const v = document.querySelector('#log-view'); return { top: v.scrollTop, client: v.clientHeight, height: v.scrollHeight, rows: document.querySelectorAll('.log-row').length }; })()"));
   await page.key("Home");
   check("log: Home returns to the start", (await page.eval("document.querySelector('#log-view').scrollTop")) === 0);
@@ -449,7 +538,9 @@ await scenario("role changes during open sessions", async () => {
   const other = await browser.newPage({ width: 1280, height: 860 });
   current = other;
   await signIn(other, "dana");
-  await go(other, `/runs/${cfg.diamond}`, "document.querySelectorAll('main table tbody tr').length === 4");
+  // The jobs table is the first table; later tables (cache entries) load
+  // after hydration and add rows, so count the jobs table's rows only.
+  await go(other, `/runs/${cfg.diamond}`, "document.querySelector('main table').querySelectorAll('tbody tr').length === 4");
   check("dana (operator) sees no tenant admin link", !(await other.eval(`[...document.querySelectorAll('nav a')].some((a) => a.textContent.includes('Tenant admin'))`)));
   await root("PUT", "/api/v1/tenants/acme/members/dana", { role: "reader" });
   await other.eval(clickText("main table tbody tr button", "Cancel"));
@@ -460,7 +551,7 @@ await scenario("role changes during open sessions", async () => {
   await other.waitFor("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('no longer have access'))", 10000, "removal shown");
   metrics.removal_noticed_ms = Date.now() - removedAt;
   check("removal is noticed by the open page within 5 s", metrics.removal_noticed_ms < 5000, metrics.removal_noticed_ms);
-  await other.waitFor("!document.querySelector('[aria-label=\"Active tenant\"]')", 10000, "tenant list re-read");
+  await other.waitFor("!document.querySelector('[aria-label=\"Active namespace\"]')", 10000, "tenant list re-read");
   check("the tenant disappears from the navigation", true);
   await other.close();
   current = page;
@@ -505,6 +596,137 @@ await scenario("storage policy", async () => {
   check("a repository's log retention is set from the storage page", app.policy.log_retention_ms === 2 * 86_400_000, app.policy);
   await go(page, ...PAGES.disk);
   check("the deployment's disk and stored bytes are shown", await page.eval("document.body.textContent.includes('Stored by tenants') && document.body.textContent.includes('Data filesystem')"));
+});
+
+await scenario("organizations and invitations", async () => {
+  const { body: tenants } = await apiAs(cfg.auth, "GET", "/api/v1/tenants");
+  check("the tenant list says each namespace's kind and membership source",
+    (tenants.tenants || []).every((t) => ["personal", "organization"].includes(t.kind) && ["app", "github"].includes(t.membership)), tenants.tenants);
+
+  // Create an organization (root is a platform administrator, who may).
+  await go(page, ...PAGES.organizations);
+  await page.fill("#org-slug", "Bad Name");
+  await page.key("Enter");
+  await page.waitFor("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('lowercase'))", 5000, "name refused in the page");
+  check("an organization name of the wrong shape is refused before it is sent", true);
+  await page.fill("#org-slug", "web-team");
+  await page.key("Enter");
+  await page.waitFor("location.pathname === '/t/web-team/settings' && !!document.querySelector('#about-h')", 10000, "new organization");
+  check("a new organization opens on its settings, managed in Sentinel",
+    await page.eval("document.querySelector('main').textContent.includes('Managed in Sentinel')"));
+  check("an administrator sees the operator's domain rule, read-only",
+    await page.eval("!!document.querySelector('#domains-h') && document.querySelector('main').textContent.includes('Read-only') && !document.querySelector('#domains-h').closest('section').querySelector('input')"));
+
+  // The switcher now lists it, grouped.
+  await page.click('[aria-label="Active namespace"]');
+  await page.waitFor("!!document.querySelector('[role=option]')", 5000, "namespace options");
+  check("the namespace switcher groups organizations apart", await page.eval("[...document.querySelectorAll('[role=listbox] *')].some((e) => e.textContent.trim() === 'Organizations')"));
+  await page.key("Escape");
+
+  // Invite by email; without mail delivery the one-time link is shown once.
+  await go(page, "/t/web-team/admin/invitations", "!!document.querySelector('#inv-email')");
+  await page.fill("#inv-email", "invitee@example.com");
+  await page.key("Enter");
+  await page.waitFor("!!document.querySelector('[role=dialog] li') || [...document.querySelectorAll('main td')].some((t) => t.textContent.includes('invitee@example.com'))", 10000, "invitation made");
+  if (await page.eval("!!document.querySelector('[role=dialog] li')")) {
+    const link = await page.eval("document.querySelector('[role=dialog] li').textContent.trim()");
+    check("without mail delivery the invitation link is shown once, pointing at the accept page", /\/invitations\/accept#token=sntl_[0-9a-f]{64}$/.test(link), link.replace(/[0-9a-f]{64}/, "…"));
+    await page.click("[role=dialog] [role=checkbox]");
+    await page.clickText("[role=dialog] button", "Done");
+    await page.waitFor("!document.querySelector('[role=dialog]')", 8000, "link dialog closed");
+    check("the link leaves the page once saved", !(await page.eval(`document.body.textContent.includes(${JSON.stringify(link)})`)));
+  }
+  await page.waitFor("[...document.querySelectorAll('main tr')].some((r) => r.textContent.includes('invitee@example.com') && r.textContent.includes('Pending'))", 8000, "pending invitation listed");
+  check("the invitation is listed as pending, without its secret", !(await page.eval("/sntl_[0-9a-f]{64}/.test(document.querySelector('main').textContent)")));
+  await page.click('[aria-label="Revoke the invitation for invitee@example.com"]');
+  await page.waitFor("!!document.querySelector('[role=dialog]')", 5000, "revoke confirmation");
+  await page.clickText("[role=dialog] button", "Revoke");
+  await page.waitFor("[...document.querySelectorAll('main tr')].some((r) => r.textContent.includes('invitee@example.com') && r.textContent.includes('Revoked'))", 8000, "revoked");
+  check("an invitation is revoked from the list", true);
+
+  // An invitation link that cannot be used, signed in: the secret leaves the
+  // address bar, and the refusal names no organization.
+  await go(page, `/invitations/accept#token=sntl_${"cd".repeat(32)}`, "[...document.querySelectorAll('button')].some((b) => b.textContent.includes('Accept invitation'))");
+  check("an invitation link's secret is removed from the address bar", (await page.eval("location.hash")) === "");
+  await page.clickText("button", "Accept invitation");
+  await page.waitFor("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('could not accept'))", 8000, "unusable invitation");
+  check("an unusable invitation is said without naming an organization", !(await page.eval("document.querySelector('main').textContent.includes('acme')")));
+
+  // The end of a GitHub sign-in started from an invitation: the controller
+  // lands the browser on `/` with a full load. A signed-in person who
+  // already has tenants still goes back to the invitation, the parked
+  // secret is spent from storage and the return marker is gone.
+  await page.eval(`(() => {
+    document.cookie = "sentinel-return=%2Finvitations%2Faccept; Path=/; Max-Age=600; SameSite=Lax";
+    sessionStorage.setItem("sentinel-invitation", JSON.stringify({ token: "sntl_${"cd".repeat(32)}", until: Date.now() + 600000 }));
+    return true;
+  })()`);
+  await go(page, "/", "location.pathname.startsWith('/t/') || [...document.querySelectorAll('button')].some((b) => b.textContent.includes('Accept invitation'))");
+  check("a GitHub sign-in started from an invitation comes back to the invitation, not the first tenant",
+    await page.eval("location.pathname === '/invitations/accept' && [...document.querySelectorAll('button')].some((b) => b.textContent.includes('Accept invitation'))"),
+    await page.eval("location.pathname"));
+  check("the parked invitation secret leaves session storage once read", (await page.eval("sessionStorage.getItem('sentinel-invitation')")) === null);
+  check("the return marker is cleared once it has served", !(await page.eval("document.cookie.includes('sentinel-return=')")));
+  await go(page, "/", "location.pathname.startsWith('/t/')");
+  check("without a pending return `/` opens a tenant again", true);
+
+  // A parked secret past its ten minutes is dropped on the next page load,
+  // wherever the tab is.
+  await page.eval(`(() => { sessionStorage.setItem("sentinel-invitation", JSON.stringify({ token: "sntl_${"cd".repeat(32)}", until: Date.now() - 1 })); return true; })()`);
+  await go(page, "/organizations", "!!document.querySelector('#org-slug')");
+  check("an expired parked invitation secret is removed on the next load", (await page.eval("sessionStorage.getItem('sentinel-invitation')")) === null);
+});
+
+// Last: it enrolls a second factor for rui and changes rui's password,
+// which ends every session of that account.
+await scenario("account security", async () => {
+  const acct = await browser.newPage({ width: 390, height: 844 });
+  current = acct;
+  await signIn(acct, "rui");
+  await go(acct, ...PAGES.account);
+  await acct.fill("#enroll-password", cfg.password);
+  await acct.key("Enter");
+  await acct.waitFor("!!document.querySelector('main svg[role=img] path') && !!document.querySelector('#totp-key')", 10000, "QR code and key");
+  check("enrollment shows a QR code and the key", true);
+  check("the one-time-code field asks for autofill", await acct.eval("document.querySelector('#totp-confirm').autocomplete === 'one-time-code'"));
+  const key = await acct.eval("document.querySelector('#totp-key').textContent");
+  // A wrong code first (one of the five a session may get wrong).
+  const wrong = totp(key) === "000000" ? "111111" : "000000";
+  await acct.fill("#totp-confirm", wrong);
+  await acct.key("Enter");
+  await acct.waitFor("[...document.querySelectorAll('main [role=alert]')].some((a) => a.textContent.includes('not accepted'))", 8000, "wrong code refused");
+  check("a wrong confirmation code is refused and said, and the setup stays open", await acct.eval("!!document.querySelector('#totp-key')"));
+  await acct.fill("#totp-confirm", totp(key));
+  await acct.key("Enter");
+  const codesShown = `[...document.querySelectorAll('[role=dialog] li')].length === 10`;
+  await acct.waitFor(codesShown, 10000, "recovery codes");
+  check("ten recovery codes are shown once, in a dialog", true);
+  const first = await acct.eval("document.querySelector('[role=dialog] li').textContent.trim()");
+  check("the dialog closes only after the codes are saved",
+    await acct.eval(`[...document.querySelectorAll('[role=dialog] button')].find((b) => b.textContent.trim() === 'Done').disabled`));
+  await acct.click("[role=dialog] [role=checkbox]");
+  await acct.clickText("[role=dialog] button", "Done");
+  await acct.waitFor("!document.querySelector('[role=dialog]')", 8000, "codes dialog closed");
+  check("the codes leave the page once saved", !(await acct.eval(`document.body.textContent.includes(${JSON.stringify(first)})`)));
+  await acct.waitFor("document.querySelector('main').textContent.includes('10 of 10 left')", 8000, "enrolled state");
+  check("the page shows the authenticator on and the codes left", true);
+  const overflow = await acct.eval(OVERFLOW);
+  check("the account page fits a phone", overflow.scroll <= overflow.width, overflow);
+  await acct.fill("#pw-current", "not the password");
+  await acct.fill("#pw-new", "a fresh password for rui");
+  await acct.fill("#pw-again", "a fresh password for rui");
+  await acct.key("Enter");
+  await acct.waitFor("[...document.querySelectorAll('main [role=alert]')].some((a) => a.textContent.includes('current password was not accepted'))", 8000, "wrong current password");
+  check("a wrong current password is refused and said, and the session stays", await acct.eval("location.pathname === '/account'"));
+  await acct.fill("#pw-current", cfg.password);
+  await acct.fill("#pw-new", "a fresh password for rui");
+  await acct.fill("#pw-again", "a fresh password for rui");
+  await acct.key("Enter");
+  // Confirming the authenticator stepped the session up, so no dialog.
+  await acct.waitFor("location.pathname === '/login' && document.body.textContent.includes('Password changed')", 15000, "signed out after the change");
+  check("a password change signs out and says so", true);
+  await acct.close();
+  current = page;
 });
 
 const scriptErrors = page.errors.filter((e) => !e.startsWith("network:"));

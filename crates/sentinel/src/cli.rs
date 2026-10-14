@@ -249,8 +249,10 @@ pub enum AdminCommand {
     OauthClient(OauthClientArgs),
     /// Create, list and revoke one-time invitations
     Invite(InviteArgs),
-    /// Review pending applications; approve or reject accounts
+    /// Review pending applications; approve or reject accounts; email links
     Account(AccountArgs),
+    /// Show the email outbox's state
+    Mail(MailArgs),
     /// Create or rotate the sealing key for second factors and source credentials
     Key(KeyArgs),
     /// Inspect or remove an account's second factor
@@ -364,6 +366,15 @@ pub enum SourceCommand {
     RemoveInstallation {
         #[arg(long)]
         installation: String,
+    },
+    /// Make an organization tenant GitHub-backed (its members are whoever GitHub
+    /// confirms for their linked GitHub account), or app-managed again with --off
+    GithubBacking {
+        #[arg(long)]
+        tenant: String,
+        /// Return the tenant to invitation/administrator membership
+        #[arg(long)]
+        off: bool,
     },
 }
 
@@ -745,6 +756,34 @@ pub enum MfaCommand {
         #[arg(long)]
         user: String,
     },
+    /// Begin enrolling an authenticator app for an account, from the host:
+    /// the otpauth:// URI (it carries the seed) is the only thing on stdout,
+    /// once. Nothing changes until `confirm`; needs <data-dir>/master.key
+    Enroll {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+    },
+    /// Confirm an enrollment begun with `enroll` using a current code from
+    /// the app; the ten recovery codes are printed on stdout once
+    Confirm {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+        /// The six-digit code the app shows now
+        #[arg(long)]
+        code: String,
+    },
+    /// Replace an enrolled account's recovery codes: the old set stops
+    /// working and the new ten are printed on stdout once
+    Codes {
+        #[command(flatten)]
+        data: DataDir,
+        #[arg(long)]
+        user: String,
+    },
 }
 
 #[derive(Args)]
@@ -869,6 +908,15 @@ pub enum InviteCommand {
         /// Lifetime such as 7d or 12h; bounded by the deployment maximum
         #[arg(long, value_name = "DURATION", default_value = "7d")]
         expires_in: String,
+        /// Address the invitation to this mailbox (needs --tenant and --role;
+        /// refused for a GitHub-backed organization). With mail delivery
+        /// configured the message is queued and no secret is printed;
+        /// otherwise the secret is printed to stdout as for any invitation
+        #[arg(long, value_name = "ADDRESS", conflicts_with = "identity")]
+        email: Option<String>,
+        /// Print the secret even when mail delivery is configured
+        #[arg(long, requires = "email")]
+        print_link: bool,
     },
     /// List invitations as metadata; secrets are never shown
     List {
@@ -913,6 +961,48 @@ pub enum AccountCommand {
         data: DataDir,
         #[arg(long)]
         user: String,
+    },
+    /// Mint an email verification link for an account and print it to stdout,
+    /// once: for a deployment without email delivery, so nobody is locked out. Earlier
+    /// links of the account stop working
+    EmailLink {
+        #[command(flatten)]
+        data: DataDir,
+        /// A local username, a `usr_` identifier or the address it claims
+        #[arg(long)]
+        user: String,
+        /// Prove this address instead of the one the account is proving
+        #[arg(long, value_name = "ADDRESS")]
+        email: Option<String>,
+        /// The deployment's public base URL; defaults to the one the
+        /// controller last started with. Without either only the secret is
+        /// printed
+        #[arg(long, value_name = "URL")]
+        public_url: Option<String>,
+    },
+    /// Mark an account's claimed email verified without a link: the operator
+    /// vouches for the address
+    EmailVerify {
+        #[command(flatten)]
+        data: DataDir,
+        /// A local username, a `usr_` identifier or the address it claims
+        #[arg(long)]
+        user: String,
+    },
+}
+
+#[derive(Args)]
+pub struct MailArgs {
+    #[command(subcommand)]
+    pub command: MailCommand,
+}
+
+#[derive(Subcommand)]
+pub enum MailCommand {
+    /// Report whether mail delivery is configured and the outbox's counts
+    Status {
+        #[command(flatten)]
+        data: DataDir,
     },
 }
 

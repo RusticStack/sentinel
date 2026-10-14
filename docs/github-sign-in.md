@@ -28,7 +28,7 @@ Implemented in `sentinel-github` (bounded HTTPS client, authorization-code excha
 - **`GET /auth/github/finish`** takes the hand-off of the presented sign-in cookie once, then in one writer transaction revokes the session cookie the browser sent (whoever it belongs to; audited as a logout) and issues the new session. A request a browser labels anything but `Sec-Fetch-Site: same-origin` is refused with `403` and spends nothing, so another site cannot complete the sign-in without the old session; a request without this browser's sign-in cookie finds no hand-off (`400`), so nobody can complete another browser's; a second request finds nothing. A non-browser client that sends no `Sec-Fetch-Site` label is served as a same-origin one.
 - **The session** is the one password login issues: `__Host-sentinel_session`, `Path=/; Secure; HttpOnly; SameSite=Strict`, the absolute life as `Max-Age`, a fresh secret and CSRF secret. The fresh cookie replaces whatever `__Host-` session cookie the browser held, and the session that cookie named is revoked in the same transaction, so neither a planted cookie nor the previous session survives the sign-in (fixation; `__Host-` also keeps a sibling host from planting one). The finish page's `meta refresh` and link continue to the recorded destination, rather than a `303`, like the callback's; the destination therefore loads with the new session, and the consent page mints its form token from that session's CSRF digest. For `/` the page also hands the web interface its CSRF secret through `localStorage` (so every tab of the browser can act), as the password login's JSON response does; OAuth pages need no copy.
 - **The sign-in cookie** is `SameSite=Lax` (`cookie::issue_sign_in`), not `Strict`: GitHub's redirect back is a top-level cross-site `GET`, which a `Strict` cookie misses. It is still `__Host-`, `HttpOnly`, `Secure` and ten minutes long, it never authenticates a request, and it is cleared once the attempt ends (at the finish hop after a successful callback).
-- **Bounds.** The exchange and the identity read are outbound calls of up to ten seconds each, so at most one runs at a time, under the deployment's single outbound slot (`sentinel_api::OUTBOUND`, shared with OAuth client metadata fetches); another is told to reload, with its state still pending. No GitHub code or token, and no client secret, appears in a page or a log line: the token is dropped after one `/user` request, and refusal pages name no provider detail.
+- **Bounds.** The exchange and the identity read are outbound calls of up to ten seconds each, so at most one runs at a time, under a slot of its own (`sentinel_api::OUTBOUND` per kind of call; OAuth client metadata fetches have theirs, so a signed-in account fetching metadata cannot make sign-in busy); another is told to reload, with its state still pending. No GitHub code or token, and no client secret, appears in a page or a log line: the token is dropped after one `/user` request, and refusal pages name no provider detail.
 - **Redirect URI.** Always `{issuer}/auth/github/callback`, derived from `public_url` (or the bound loopback address); the GitHub OAuth app must register exactly that. `App::new` now also accepts plain HTTP to a loopback host (`127.0.0.1`, `[::1]`, `localhost`) for a controller used directly on its own machine, and refuses userinfo (`@`).
 - **Organizations.** A04 has no organization allow-list, and U07 adds none: admission is the linked identity (an invitation or an approved application), never GitHub membership.
 
@@ -38,14 +38,97 @@ Migration **37** widens `sign_in_states.redirect_to` from 512 to 2048 bytes (`si
 
 `NoAccount` is the honest answer, not an error: an unknown identity is not registered, is not given a placeholder account and does not become a tenant. Turning one into an account is [admission](admission.md): an invitation bound to that verified identity, or an application awaiting approval. Linking an existing account to a GitHub identity is the other path — be admitted, sign in, and link.
 
-Linking requires an authenticated session with a recent [step-up](step-up.md) — attaching an external account is a change to who can authenticate, and a stolen cookie alone must not be able to make it. A provider identity belongs to at most one account and is never silently moved: claiming one another account holds fails, and the link row is immutable, so there is no re-verification side effect to exploit. Unlinking is available to the account itself, a platform admin, or a host-local operator repairing a wrong link, and both directions are audited. A suspended account cannot sign in through its provider, because session issuance checks the account's live state.
+Linking requires an authenticated session with a recent [step-up](step-up.md) — attaching an external account is a change to who can authenticate, and a stolen cookie alone must not be able to make it. The route is `POST /api/v1/identities/github/link` ([below](#linking-from-a-signed-in-session)). An account that exists only through GitHub is already linked and has no password to step up with: it enrolls an authenticator app first ([step-up](step-up.md#enrolling-a-second-factor)). A provider identity belongs to at most one account and is never silently moved: claiming one another account holds fails, and the link row is immutable, so there is no re-verification side effect to exploit. Unlinking is available to the account itself, a platform admin, or a host-local operator repairing a wrong link, and both directions are audited. A suspended account cannot sign in through its provider, because session issuance checks the account's live state.
 
 There is deliberately no host-local *link* command: an operator who could type a subject could sign in as anybody. Linking only ever follows a verified provider sign-in.
+
+### Linking from a signed-in session
+
+The same round trip as sign-in, started by a browser that already holds a session:
+
+1. `POST /api/v1/identities/github/link` (session cookie and CSRF header; a bearer or OAuth token is `invalid_request`). A session without a fresh step-up gets `forbidden` with `details.step_up`; the start draws on the per-client GitHub budget. The answer is `{authorize_url, expires_in}` and the `__Host-sentinel_signin` cookie. The attempt (the state's digest, the account, the digest of the session that asked) is held **in memory** for ten minutes — nothing in it is secret, and one lost to a restart is started again — and bounded at 256, oldest dropped.
+2. The browser navigates to `authorize_url`. The callback (cross-site, so the Strict session cookie is withheld) requires the cookie and the `state` parameter to agree, spends the attempt once, exchanges the code and reads the immutable account ID exactly as for sign-in, then parks a hand-off carrying the **verified subject** and the starting session's digest and answers the page that moves on to `/auth/github/finish`.
+3. The same-origin hop (`Sec-Fetch-Site` checked, hand-off bound to the sign-in cookie) links only if the session cookie presented **is the session that began the attempt**, is still live and belongs to the same account, and the step-up is still fresh when `sign_in::link` runs in the writer. Then it audits `identity-linked`, answers a page that moves to `/`, and clears the sign-in cookie. No session is issued or ended. A different session, none, or an expired step-up is a `403` page and links nothing; an identity another account already holds is a `409` page and stays where it was.
+
+Because the link is made on the hop and never from the callback, another site cannot link its own GitHub account to a victim's session: it can neither start the attempt (CSRF header) nor complete it (the hop needs the sign-in cookie, the victim's session and a same-origin navigation).
 
 ```sh
 sentinel admin identity list --data-dir <PATH> --user root
 sentinel admin identity unlink --data-dir <PATH> --user root --provider github
 ```
+
+## GitHub-backed organizations
+
+A tenant is **app-managed** (membership by invitation or administrator, the only kind before migration **51**) or **GitHub-backed** (`tenants.membership_source = 1`). Nothing is inferred: every existing tenant stays app-managed until an administrator converts it, so an upgrade changes nobody's access. Implemented in `sentinel-store::github_members` (every decision, in the writer), the lane `sentinel-checks::members` (observes GitHub, never decides) and `sentinel-github::app` (the bounded reads).
+
+### Converting a tenant
+
+`PUT /api/v1/tenants/{slug}/membership-source {"source":"github"|"app","reason"?}` (tenant administration, fresh [step-up](step-up.md)) or, on the host, `sentinel admin source github-backing --tenant ten_… [--off]`. Converting needs an installation of a **GitHub organization** bound to the tenant (`account_personal = 0` from a fresh installation snapshot; otherwise `conflict`) and an organization tenant (never a personal namespace). The administrator making the change must already have a GitHub account linked if they are a member, so the change cannot lock them out.
+
+On conversion the tenant's existing human members start a grace clock (`memberships.synced_ms = now`) and are queued for a check: GitHub confirms them, or they are removed once the grace period passes. Service accounts stay app-managed. Converting back (or unbinding the tenant's last organization installation) leaves the derived access in place as ordinary, locally managed access. Both directions are audited (`tenant-backing-changed`).
+
+### Who is a member
+
+Identity is **only** the immutable numeric GitHub account id of a linked identity (the `external_identities` row the verified link flow wrote), never a login name and never an email. A GitHub-backed tenant admits a person only when that id belongs to an **active** member of the installation's organization:
+
+| GitHub says | Sentinel role |
+|---|---|
+| organization owner (`role: admin`, `state: active`) | tenant administrator |
+| any other active member | **operator** (the ceiling under which the repository permissions below apply; a reader ceiling would make GitHub's `write` meaningless) |
+| pending invitation, not a member, deleted account | no membership; an existing derived one is removed |
+
+Role changes follow GitHub in both directions: an owner demoted on GitHub is demoted here on the next check, and the keep-an-administrator rule does not apply to derived rows — GitHub, not Sentinel, decides who administers the organization.
+
+### Repository access
+
+Eligibility is the installation's repository list: only a repository with a live source binding to the tenant's installation can carry a derived grant, and a binding the reconcile lane revokes (the repository left the installation) takes its grants with it at the member's next check. Within that set GitHub's per-repository permission for the *same account id* decides, mapped and **never above what the person holds there**:
+
+| GitHub repository role | Sentinel permissions |
+|---|---|
+| `admin` | read, run, write secrets |
+| `maintain`, `write` | read, run |
+| `triage`, `read` | read |
+| `none`, a role this table does not name | none |
+
+`maintain` and `triage` are told apart from `write` and `read` by `role_name` (GitHub's legacy `permission` field folds them); a custom role keeps its base. Organization owners reach every repository of the tenant already and carry no derived grants. A member's grants are walked in steps of 25 repositories, resuming from a stored cursor, so a large installation costs bounded work per step. Hand-written grants, role changes, additions and removals of people, and invitations to the tenant are **refused** for a GitHub-backed tenant (`forbidden`; email-domain auto-join ([admission](admission.md#domain-auto-join)) does not apply either: it refuses a tenant that `github_members::is_github_backed` reports or that has a bound GitHub installation, at start and again when joining), and an invitation minted before the conversion is `invitation unusable` when redeemed: membership comes from GitHub or nowhere. Service accounts are still managed here.
+
+### How GitHub is asked
+
+Never on the request path. A sign-in, a link, a signed webhook or the periodic pass queues a `(tenant, person)` check (`github_member_checks`); the lane drains it:
+
+1. Mint a token for the installation with `members: read` and `metadata: read` and nothing else (`App::membership_token`; metadata read is what the per-repository collaborator permission read needs, and it grants no content or write access), only for an installation whose fresh snapshot is an organization, not suspended and not permission-invalid, and whose account id still equals the one the tenant was bound to. **The App must be granted the organization permission "Members: read"**; without it the token request is refused, which is an *unknown* answer (below), never a removal.
+2. `GET /user/{id}` for the current login of the stored numeric id (the login is only a path segment for the next request).
+3. `GET /orgs/{org}/memberships/{login}`. The reply must name the **same account id and the same organization id** as were asked about; anything else (a renamed login whose old name now belongs to someone else, a transferred organization) proves nothing.
+4. For a plain member, `GET /repos/{owner}/{name}/collaborators/{login}/permission` for the next 25 bound repositories, again requiring the same account id.
+
+Each pass commits under the queue row's sequence fence: if a signed event, a sign-in or an administrator asked for a check while the pass was on the wire, the pass is `superseded` and writes nothing — its observation may predate the event, and applying it could undo a removal — and the row is due again at once. A suspended tenant's members are still checked, so their clocks stay honest and expiry keeps working.
+
+A 404 for the membership is believed only after the installation snapshot is fetched again and still reports the same organization (id and login): a renamed organization answers 404 for everybody under its old name and must not remove anyone.
+
+### Unknown is not absent
+
+A rate limit (429, or 403 with a rate-limit header), a 5xx, an unreachable network, a missing App permission, an unverifiable or mismatching reply and a suspended installation are all **unknown**. Unknown keeps what exists until the grace period since GitHub last confirmed it (`memberships.synced_ms`; `repo_grants.synced_ms`) is over, **grants nothing new**, retries under bounded back-off (doubling to five minutes), and pauses the installation for as long as GitHub asked (at most an hour). A first-time candidate that stays unknown is dropped after five tries; the next sign-in or signed event asks again. After the grace period the lane removes the row. A member sees their own standing on the organization's settings page (`GET /tenants/{slug}/settings` `github_sync`: when GitHub last confirmed them, whether a check is due, and how many passes in a row went unanswered). Authorization queries never read `synced_ms`: derived rows are ordinary memberships and grants, so nothing on the request path changed, and expiry is the lane's job.
+
+Configuration (`<data_dir>/github-app.json`, [configuration](configuration.md)): `member_recheck_secs` (60–86,400, default 3,600), the interval between confirmations of a settled member, and `member_grace_secs` (300–2,592,000, default 86,400, at least twice the recheck interval). Request budget per hour is roughly `members × (2 + bound repositories) / recheck`: with signed webhooks the common change is seen at once, so the recheck interval is the safety net and may stay long.
+
+### Keeping access in sync
+
+| Trigger | Effect |
+|---|---|
+| sign-in, any method (`issue_session`), and a new link | queue a check of the person in every GitHub-backed tenant, at most 256, skipped for a pair checked within the last 60 s |
+| a member opening the tenant (`GET /tenants/{slug}/repos`) whose last confirmation is older than five minutes | queue a check, best effort: the request is served from the current rows and never waits for GitHub; the 60 s per-pair floor above applies |
+| `organization` `member_removed` (signed) | the linked account's derived access is **removed at once** (membership, grants, tenant-scoped API credentials, OAuth grants, epoch bump) and a check is queued so a stale or replayed delivery heals |
+| `organization` `member_added`, `membership`, `member` | queue a check of that account; nothing is granted from the body |
+| `team` changes | queue a check of everyone in the tenant |
+| periodic pass | every derived member is re-confirmed each recheck interval |
+| unlinking GitHub | every derived membership of the person ends in the same transaction as the unlink; app-managed memberships stay; leaving one organization on GitHub affects only that organization's access |
+| a person's account renamed on GitHub | nothing: the id is the identity |
+
+The webhook's installation id (inside the verified signature) picks the tenant, never the body; a replay of the same delivery returns the recorded outcome without acting again, and the same delivery id with a different body is a `conflict`. Subscribe the App to `organization`, `membership`, `member` and `team` events to get the near-instant path. All of it is audited as `github-member-joined`, `github-member-role-changed` and `github-member-removed` (the detail names the role or reason; no GitHub id or login is recorded).
+
+### Verification
+
+`crates/sentinel-store/tests/github_members.rs` drives every decision with hand-written observations: conversion preconditions, owner/member mapping and demotion, the permission table and derivation, removal revoking access and moving the epoch, unknown keeping within grace and expiring, a reply about another account discarded (forged identity, reused login, relink in flight), unlinking, the refused manual paths including a pre-conversion invitation, a signed removal and its replay, foreign installations, the sign-in queue's rate limit, unbinding and the resumable repository walk. `crates/sentinel-checks/tests/members.rs` runs the lane against a loopback GitHub: join, owner demotion, renamed login, reused login, pending invitation, removal, organization rename, 429/5xx/403 and a missing App permission. `crates/sentinel-github/src/webhook.rs` unit tests cover the membership events.
 
 ## Bounds and configuration
 

@@ -7,7 +7,7 @@
 //! redirect a form submission follows, which would block the consent
 //! page's `303` to the CLI's loopback listener.
 
-use crate::routes::{self, Reply};
+use crate::{http::Header, routes::Reply};
 
 /// Sent with every `Reply::Html`.
 pub(crate) const SECURITY_HEADERS: [(&str, &str); 4] = [
@@ -83,13 +83,14 @@ pub(crate) fn error_page(status: u16, message: &str) -> Reply {
     page(status, "Sentinel", &body)
 }
 
-/// `303 See Other` to `location`, with an empty body.
+/// `303 See Other` to `location`, with an empty body. A location that
+/// cannot be a header value (it carries a line break) is never sent: the
+/// answer is an error page, so no input can reach a panic here.
 pub(crate) fn redirect(location: &str) -> Reply {
-    Reply::Html(
-        303,
-        String::new(),
-        vec![routes::header("location", location)],
-    )
+    match Header::from_bytes(b"location", location.as_bytes()) {
+        Some(header) => Reply::Html(303, String::new(), vec![header]),
+        None => error_page(400, "The redirect address is not valid."),
+    }
 }
 
 /// The embedded sign-in form: a password login through `POST
@@ -182,6 +183,18 @@ mod tests {
         let mut out = String::new();
         escape_into(&mut out, text);
         out
+    }
+
+    #[test]
+    fn a_location_with_a_line_break_is_an_error_page_not_a_panic() {
+        assert!(matches!(
+            redirect("https://client.example/cb?x=1"),
+            Reply::Html(303, ..)
+        ));
+        assert!(matches!(
+            redirect("https://client.example/cb\r\nset-cookie: x=1"),
+            Reply::Html(400, ..)
+        ));
     }
 
     #[test]

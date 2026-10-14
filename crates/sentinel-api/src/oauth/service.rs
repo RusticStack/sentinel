@@ -5,8 +5,18 @@
 //!
 //! Every service-account route needs the `tenant:admin` scope and, in the
 //! store, live administration of the tenant (a platform administrator
-//! qualifies). A grant's refresh token appears exactly once, in the `201`
-//! answer that issues it; listings are metadata.
+//! qualifies). The routes that mint or widen credentials (create an account,
+//! allow a repository, issue a grant) also need a browser session that
+//! stepped up recently: a bearer credential or OAuth token never can, so a
+//! stolen token cannot mint a longer-lived one. A platform administrator who
+//! does not administer the tenant gives a `reason` for the audit. A grant's
+//! refresh token appears exactly once, in the `201` answer that issues it;
+//! listings are metadata.
+//!
+//! `GET /grants` and `DELETE /grants/{grt}` are about the caller's own
+//! credentials: a browser session, or a token with `tenant:admin`, manages
+//! them all; any other OAuth token sees and revokes only the grant it was
+//! issued under.
 
 use sentinel_auth::oauth::{self as forms, Kind};
 use sentinel_core::{
@@ -25,7 +35,7 @@ use serde_json::{Value, json};
 
 use crate::{
     State,
-    auth::require_scope,
+    auth::{Identity, Via, require_scope},
     http::Request,
     routes::{Reply, Route, body, err, id, identify, ok, parse, store_error},
 };
@@ -35,15 +45,27 @@ pub(crate) fn grants(state: &State, request: &mut Request, method: &str, rest: &
     match (method, rest) {
         ("GET", []) => {
             let who = identify(state, request, false)?;
-            let records = state
-                .store
-                .read(|c| grants::grants(c, Authority::credential(who.principal), who.user, 100))
-                .map_err(store_error)?;
+            let records = match who.grant {
+                _ if manages_grants(&who) => state.store.read(|c| {
+                    grants::grants(c, Authority::credential(who.principal), who.user, 100)
+                }),
+                Some(own) => state
+                    .store
+                    .read(|c| grants::own_grant(c, who.user, own).map(|g| vec![g])),
+                None => {
+                    require_scope(&who, Scopes::TENANT_ADMIN)?;
+                    return Err(err(ErrorCode::Forbidden, "not permitted"));
+                }
+            }
+            .map_err(store_error)?;
             ok(json!({ "grants": records.iter().map(grant_json).collect::<Vec<_>>() }))
         }
         ("DELETE", [grant]) => {
             let who = identify(state, request, true)?;
             let grant: GrantId = id(grant, "grant")?;
+            if !manages_grants(&who) && who.grant != Some(grant) {
+                require_scope(&who, Scopes::TENANT_ADMIN)?;
+            }
             let authority = Authority::credential(who.principal);
             state
                 .store
@@ -56,18 +78,30 @@ pub(crate) fn grants(state: &State, request: &mut Request, method: &str, rest: &
     }
 }
 
+/// Whether the caller manages every grant of its account: a browser session
+/// (the person themselves) or a token that holds `tenant:admin`. Anything
+/// else acts only on the grant it was issued under.
+fn manages_grants(who: &Identity) -> bool {
+    who.via == Via::Session || who.scopes.contains(Scopes::TENANT_ADMIN)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewAccount {
     name: String,
     #[serde(default)]
     role: Option<String>,
+    /// Why, for a platform administrator who does not administer the tenant.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepoAccess {
     access: Vec<String>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -79,6 +113,8 @@ struct NewServiceGrant {
     repo: Option<String>,
     #[serde(default)]
     expires_in_ms: Option<i64>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// `/api/v1/tenants/{slug}/service-accounts` and below; `rest` is the path
@@ -119,7 +155,8 @@ fn create(state: &State, request: &mut Request, slug: &str) -> Route {
         }
     };
     let (slug, principal, user) = (slug.to_owned(), who.principal, UserId::new());
-    let name = spec.name;
+    let authority = who.authority();
+    let (name, reason) = (spec.name, spec.reason);
     let echoed = name.clone();
     state
         .store
@@ -128,11 +165,12 @@ fn create(state: &State, request: &mut Request, slug: &str) -> Route {
             let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
             authz::create_service_account(
                 tx,
-                principal,
+                authority,
                 tenant,
                 user,
                 &name,
                 role,
+                reason.as_deref(),
                 UnixMillis::now(),
             )
         })
@@ -163,13 +201,22 @@ fn allow(state: &State, request: &mut Request, slug: &str, account: &str, repo: 
         });
     }
     let (slug, name, principal) = (slug.to_owned(), repo.to_owned(), who.principal);
+    let (authority, reason) = (who.authority(), spec.reason);
     state
         .store
         .writer()
         .write(move |tx| {
             let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
             let repo = lookup::repo_by_name(tx, tenant, &name)?;
-            service::allow_repo(tx, principal, tenant, account, repo, permissions)
+            service::allow_repo(
+                tx,
+                authority,
+                tenant,
+                account,
+                repo,
+                permissions,
+                reason.as_deref(),
+            )
         })
         .map_err(store_error)?;
     let access: Vec<&str> = [(Permissions::READ, "read"), (Permissions::RUN, "run")]
@@ -189,6 +236,7 @@ fn issue(state: &State, request: &mut Request, slug: &str, account: &str) -> Rou
         Scopes::parse(&spec.scope).map_err(|_| err(ErrorCode::InvalidRequest, "unknown scope"))?;
     let lifetime = spec.expires_in_ms.unwrap_or(SERVICE_DEFAULT_MS);
     let (slug, principal, name, repo) = (slug.to_owned(), who.principal, spec.name, spec.repo);
+    let (authority, reason) = (who.authority(), spec.reason);
     let now = UnixMillis::now();
     let (grant, refresh, expires) = state
         .store
@@ -199,7 +247,16 @@ fn issue(state: &State, request: &mut Request, slug: &str, account: &str) -> Rou
                 .map(|name| lookup::repo_by_name(tx, tenant, &name))
                 .transpose()?;
             service::issue_service_grant(
-                tx, principal, tenant, account, &name, scopes, repo, lifetime, now,
+                tx,
+                authority,
+                tenant,
+                account,
+                &name,
+                scopes,
+                repo,
+                lifetime,
+                reason.as_deref(),
+                now,
             )
         })
         .map_err(store_error)?;

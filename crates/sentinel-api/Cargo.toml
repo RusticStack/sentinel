@@ -17,6 +17,7 @@ sentinel-core = { path = "../sentinel-core" }
 sentinel-github = { path = "../sentinel-github" }
 sentinel-intake = { path = "../sentinel-intake" }
 sentinel-link = { path = "../sentinel-link", features = ["controller"] }
+sentinel-mail = { path = "../sentinel-mail" }
 sentinel-pipeline = { path = "../sentinel-pipeline" }
 sentinel-protocol = { path = "../sentinel-protocol" }
 sentinel-store = { path = "../sentinel-store" }
@@ -27,6 +28,7 @@ url = "2.5"
 
 [dev-dependencies]
 sentinel-github = { path = "../sentinel-github", features = ["fake"] }
+sentinel-mail = { path = "../sentinel-mail", features = ["test-endpoint"] }
 tempfile = "3.20"
 
 [lints]

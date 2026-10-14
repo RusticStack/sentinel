@@ -92,6 +92,11 @@ pub struct Config {
     pub controller: SocketAddr,
     /// The controller fingerprint handed over with the enrollment.
     pub server: Digest,
+    /// Further controller fingerprints accepted beside `server`, for a
+    /// certificate rotation: both stay pinned until every worker reaches the
+    /// rotated controller. Empty outside a rotation; at most
+    /// `tls::MAX_PINS - 1`.
+    pub also_pinned: Vec<Digest>,
     pub worker: WorkerId,
     pub name: String,
     pub hello: Hello,
@@ -263,17 +268,21 @@ fn serve_bulk(
             return;
         }
         if let Some(mut bulk) = next.take() {
+            let started = Instant::now();
             let _ = bulk.run(executor, || stop.load(Ordering::Acquire));
+            // A connection that opens and then dies at once (a peer that
+            // accepts and drops) has proved nothing: only one that served
+            // for a stable stretch earns the short back-off again.
+            if started.elapsed() >= STABLE_SESSION {
+                backoff = BACKOFF_MIN;
+            }
         }
         if !wait_unless_stopped(stop, jitter(backoff, &mut seed)) {
             return;
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
         match dialer.open() {
-            Ok(bulk) => {
-                next = Some(bulk);
-                backoff = BACKOFF_MIN;
-            }
+            Ok(bulk) => next = Some(bulk),
             Err(_) => {
                 if stop.load(Ordering::Acquire) {
                     return;
@@ -295,7 +304,10 @@ pub fn run(
     handle: &Handle,
     on_event: &dyn Fn(Event),
 ) -> Result<()> {
-    let client = tls::client_config(identity, config.server)?;
+    let pins: Vec<Digest> = std::iter::once(config.server)
+        .chain(config.also_pinned.iter().copied())
+        .collect();
+    let client = tls::client_config_pinned(identity, &pins)?;
     let mut backoff = BACKOFF_MIN;
     let mut seed = 0x9E37_79B9_7F4A_7C15
         ^ u64::from_le_bytes(config.worker.as_bytes()[..8].try_into().expect("8 bytes"));

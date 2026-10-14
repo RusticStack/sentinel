@@ -154,7 +154,7 @@ pub fn capture(workspace: &Path, decl: &Artifact, sink: &dyn Sink, attempt: Atte
             return Outcome::Failed;
         }
         let len = meta.len();
-        let mode = meta.mode() & 0o7777;
+        let mode = meta.mode() & 0o777;
         if !sink.file(attempt, path, len, mode) {
             sink.settle(attempt, &decl.name);
             return Outcome::Failed;

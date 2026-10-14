@@ -13,7 +13,7 @@ use std::{
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(version, about)]
 struct Cli {
     /// Fixed workload definition; `noop` is the reproducible baseline.
@@ -42,6 +42,12 @@ struct Cli {
     /// Execution path under measurement
     #[arg(long, value_enum, default_value_t = Runtime::Direct)]
     runtime: Runtime,
+    /// Also measure these runtimes, alternating with `--runtime` sample by
+    /// sample in ABBA order (the order reverses every sample), so drift in
+    /// host load or caches lands on every runtime alike instead of on
+    /// whichever ran last. One record per runtime, each naming the group
+    #[arg(long, value_enum)]
+    interleave: Vec<Runtime>,
     /// Image reference for the podman runtime; the record stores its digest
     #[arg(long)]
     image: Option<String>,
@@ -61,7 +67,8 @@ struct Cli {
     #[arg(long)]
     warmup: Option<u32>,
     /// Operator-declared state of image/runtime caches before the first
-    /// warm-up run; a contract condition declares its own
+    /// warm-up run; a contract condition declares its own. The record's
+    /// `warm_state_basis` says how much of it the runner could check
     #[arg(long, value_enum, required_unless_present = "contract")]
     warm_state: Option<WarmState>,
     /// Free-form label identifying the host/cohort
@@ -110,6 +117,13 @@ struct Record {
     workload: Workload,
     runtime: Runtime,
     warm_state: WarmState,
+    /// How the declared state was established: `contract-prepare` (the
+    /// contract's own per-run preparation resets it), `warmup-run` (an
+    /// identical unmeasured run completed before the first sample) or
+    /// `unverified` (operator-declared; nothing the runner can observe)
+    warm_state_basis: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interleave: Option<Interleave>,
     argv: Vec<String>,
     limits: Limits,
     source: Source,
@@ -122,8 +136,90 @@ struct Record {
     #[serde(skip_serializing_if = "Option::is_none")]
     toolchain: Option<String>,
     warmup: u32,
+    conditions: Conditions,
     samples: Vec<Sample>,
     summary: Summary,
+}
+
+/// Runtimes measured alternately in one group; each has its own record.
+#[derive(Serialize)]
+struct Interleave {
+    runtimes: Vec<Runtime>,
+    order: &'static str,
+}
+
+/// Host state around the measured window, so a sample set taken on a
+/// contended, stealing or throttled host says so. Every field is read from
+/// the kernel; an absent field was not readable there (a VM often has no
+/// cpufreq), never zero.
+#[derive(Clone, Default, Serialize)]
+struct Conditions {
+    /// CPU pressure (`some`, percent) before the first warm-up run
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_pressure_avg10_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_pressure_avg60_start: Option<f64>,
+    /// CPU pressure after the last sample; avg10 covers the sampling window
+    /// of a short run, avg60 lags it
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_pressure_avg10_end: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_pressure_avg60_end: Option<f64>,
+    /// Time the hypervisor took from this guest over the window, summed over
+    /// CPUs (`/proc/stat` steal), in nanoseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_steal_ns: Option<u64>,
+    /// `scaling_governor` of cpu0
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_governor: Option<String>,
+}
+
+/// Kernel counters read at the window's start and again at its end.
+struct Probe {
+    pressure_avg10: Option<f64>,
+    pressure_avg60: Option<f64>,
+    steal_ns: Option<u64>,
+}
+
+impl Probe {
+    fn read() -> Self {
+        Probe {
+            pressure_avg10: contract::cpu_pressure_field("avg10="),
+            pressure_avg60: contract::cpu_pressure_field("avg60="),
+            steal_ns: cpu_steal_ns(),
+        }
+    }
+}
+
+fn conditions(start: &Probe, end: &Probe) -> Conditions {
+    Conditions {
+        cpu_pressure_avg10_start: start.pressure_avg10,
+        cpu_pressure_avg60_start: start.pressure_avg60,
+        cpu_pressure_avg10_end: end.pressure_avg10,
+        cpu_pressure_avg60_end: end.pressure_avg60,
+        cpu_steal_ns: start
+            .steal_ns
+            .zip(end.steal_ns)
+            .map(|(a, b)| b.saturating_sub(a)),
+        cpu_governor: read_trim("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+    }
+}
+
+/// Cumulative steal time of all CPUs in nanoseconds: the eighth `cpu` field
+/// of `/proc/stat` is in clock ticks.
+#[cfg(unix)]
+fn cpu_steal_ns() -> Option<u64> {
+    let text = fs::read_to_string("/proc/stat").ok()?;
+    let line = text.lines().find(|l| l.starts_with("cpu "))?;
+    let ticks: u64 = line.split_whitespace().nth(8)?.parse().ok()?;
+    // SAFETY: sysconf takes a constant name and touches no memory of ours.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (hz > 0).then(|| ticks.saturating_mul(1_000_000_000 / hz as u64))
+}
+
+#[cfg(not(unix))]
+fn cpu_steal_ns() -> Option<u64> {
+    None
 }
 
 #[derive(Serialize)]
@@ -132,7 +228,7 @@ struct Limits {
     memory: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct Source {
     git_commit: Option<String>,
     git_dirty: Option<bool>,
@@ -168,6 +264,9 @@ struct Image {
 #[derive(Serialize)]
 struct Sample {
     index: u32,
+    /// Position in the whole measured sequence of an interleaved group
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seq: Option<u32>,
     elapsed_ns: u64,
     exit_code: Option<i32>,
     #[serde(flatten)]
@@ -196,6 +295,17 @@ struct Summary {
     median_ns: u64,
     p95_ns: u64,
     max_ns: u64,
+    mean_ns: u64,
+    /// Sample standard deviation (n - 1); absent for a single sample
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stddev_ns: Option<u64>,
+    /// Median absolute deviation from the median: a spread that one slow
+    /// outlier cannot move
+    mad_ns: u64,
+    /// The nearest-rank p95 is the largest sample (fewer than 20 samples),
+    /// so it describes one run, not a tail
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    p95_is_max: bool,
 }
 
 fn main() -> ExitCode {
@@ -212,6 +322,7 @@ fn main() -> ExitCode {
 /// What one invocation measures: the argv, its environment and the
 /// unmeasured preparation before each run.
 struct Plan {
+    runtime: Runtime,
     argv: Vec<String>,
     env: Vec<(String, String)>,
     dir: Option<PathBuf>,
@@ -230,20 +341,37 @@ fn run(cli: Cli) -> Result<(), String> {
     // Provenance first: a record without its source revision cannot be
     // attributed, so none is written (and nothing is measured) without it.
     let source = source_revision()?;
-    let plan = match &cli.contract {
-        Some(path) => contract_plan(&cli, path)?,
-        None => plain_plan(&cli)?,
-    };
-    if plan.samples == 0 {
+    let mut runtimes = vec![cli.runtime];
+    for runtime in &cli.interleave {
+        if !runtimes.contains(runtime) {
+            runtimes.push(*runtime);
+        }
+    }
+    let mut plans = Vec::with_capacity(runtimes.len());
+    for runtime in &runtimes {
+        let mut one = cli.clone();
+        one.runtime = *runtime;
+        plans.push(match &cli.contract {
+            Some(path) => contract_plan(&one, path)?,
+            None => plain_plan(&one)?,
+        });
+    }
+    if plans[0].samples == 0 {
         return Err("samples must be at least 1".into());
     }
+    // A declared warm state the runner can contradict is refused before any
+    // run; the rest is labelled by how it was established.
+    let bases = plans
+        .iter()
+        .map(warm_state_basis)
+        .collect::<Result<Vec<_>, _>>()?;
     let started_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
 
     let mut nonce = started_at_unix_ms as u64 * 1000;
-    let mut once = |index: u32| -> Result<Sample, String> {
+    let mut once = |plan: &Plan, index: u32| -> Result<Sample, String> {
         nonce += 1;
         if let Some((shell, prepare)) = &plan.prepare {
             prepare_run(
@@ -251,46 +379,74 @@ fn run(cli: Cli) -> Result<(), String> {
                 &prepare.replace("{sample_nonce}", &nonce.to_string()),
             )?;
         }
-        measure(&plan, index)
+        measure(plan, index)
     };
-    for _ in 0..plan.warmup {
-        check_exit(&once(0)?)?;
+    let before = Probe::read();
+    for _ in 0..plans[0].warmup {
+        for plan in &plans {
+            check_exit(&once(plan, 0)?)?;
+        }
     }
-    let mut samples = Vec::with_capacity(plan.samples as usize);
-    for index in 0..plan.samples {
-        let sample = once(index)?;
-        check_exit(&sample)?;
-        samples.push(sample);
+    let grouped = plans.len() > 1;
+    let mut samples: Vec<Vec<Sample>> = plans
+        .iter()
+        .map(|p| Vec::with_capacity(p.samples as usize))
+        .collect();
+    let mut seq = 0u32;
+    for index in 0..plans[0].samples {
+        // ABBA: the order reverses every sample, so a drift across the
+        // group cannot favour one runtime.
+        for k in abba_order(index, plans.len()) {
+            let mut sample = once(&plans[k], index)?;
+            check_exit(&sample)?;
+            if grouped {
+                sample.seq = Some(seq);
+                seq += 1;
+            }
+            samples[k].push(sample);
+        }
     }
-    let summary = summarize(&samples);
-    let record = Record {
-        schema: "sentinel-bench/1",
-        bench_version: env!("CARGO_PKG_VERSION"),
-        started_at_unix_ms,
-        label: cli.label.clone(),
-        workload: plan.workload,
-        runtime: cli.runtime,
-        warm_state: plan.warm_state,
-        argv: plan.argv.clone(),
-        limits: plan.limits,
-        source,
-        tools: Tools {
-            rustc: Some(env!("SENTINEL_BENCH_RUSTC"))
-                .filter(|v| !v.is_empty())
-                .map(str::to_owned),
-            podman: (cli.runtime == Runtime::Podman || cli.contract.is_some())
-                .then(|| command_line(&["podman", "--version"]))
-                .flatten(),
-        },
-        host: host_info(),
-        image: plan.image,
-        contract: plan.stamp,
-        toolchain: plan.toolchain,
-        warmup: plan.warmup,
-        samples,
-        summary,
-    };
-    let line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+    let conditions_seen = conditions(&before, &Probe::read());
+    let mut lines = Vec::with_capacity(plans.len());
+    let mut summaries = Vec::with_capacity(plans.len());
+    for ((plan, samples), basis) in plans.into_iter().zip(samples).zip(bases) {
+        let summary = summarize(&samples);
+        summaries.push(summary_line(plan.runtime, &summary));
+        let record = Record {
+            schema: "sentinel-bench/1",
+            bench_version: env!("CARGO_PKG_VERSION"),
+            started_at_unix_ms,
+            label: cli.label.clone(),
+            workload: plan.workload,
+            runtime: plan.runtime,
+            warm_state: plan.warm_state,
+            warm_state_basis: basis,
+            interleave: grouped.then(|| Interleave {
+                runtimes: runtimes.clone(),
+                order: "abba",
+            }),
+            argv: plan.argv.clone(),
+            limits: plan.limits,
+            source: source.clone(),
+            tools: Tools {
+                rustc: Some(env!("SENTINEL_BENCH_RUSTC"))
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned),
+                podman: (plan.runtime == Runtime::Podman || cli.contract.is_some())
+                    .then(|| command_line(&["podman", "--version"]))
+                    .flatten(),
+            },
+            host: host_info(),
+            image: plan.image,
+            contract: plan.stamp,
+            toolchain: plan.toolchain,
+            warmup: plan.warmup,
+            conditions: conditions_seen.clone(),
+            samples,
+            summary,
+        };
+        lines.push(serde_json::to_string(&record).map_err(|e| e.to_string())?);
+    }
     match &cli.output {
         Some(path) => {
             let mut file = OpenOptions::new()
@@ -298,20 +454,78 @@ fn run(cli: Cli) -> Result<(), String> {
                 .append(true)
                 .open(path)
                 .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-            writeln!(file, "{line}").map_err(|e| e.to_string())?;
+            for line in &lines {
+                writeln!(file, "{line}").map_err(|e| e.to_string())?;
+            }
         }
-        None => println!("{line}"),
+        None => {
+            for line in &lines {
+                println!("{line}");
+            }
+        }
     }
-    let s = &record.summary;
-    eprintln!(
-        "{} samples: min {} us, median {} us, p95 {} us, max {} us",
+    for line in summaries {
+        eprintln!("{line}");
+    }
+    Ok(())
+}
+
+/// The order the plans run within sample `index`: forward on even samples,
+/// reversed on odd ones.
+fn abba_order(index: u32, plans: usize) -> Vec<usize> {
+    if index.is_multiple_of(2) {
+        (0..plans).collect()
+    } else {
+        (0..plans).rev().collect()
+    }
+}
+
+fn summary_line(runtime: Runtime, s: &Summary) -> String {
+    let name = match runtime {
+        Runtime::Direct => "direct",
+        Runtime::Scoped => "scoped",
+        Runtime::Podman => "podman",
+    };
+    let spread = s
+        .stddev_ns
+        .map(|d| format!(", stddev {} us", d / 1000))
+        .unwrap_or_default();
+    let note = if s.p95_is_max {
+        " (p95 is the max: fewer than 20 samples)"
+    } else {
+        ""
+    };
+    format!(
+        "{name}: {} samples: min {} us, median {} us, mean {} us{spread}, mad {} us, p95 {} us, max {} us{note}",
         s.count,
         s.min_ns / 1000,
         s.median_ns / 1000,
+        s.mean_ns / 1000,
+        s.mad_ns / 1000,
         s.p95_ns / 1000,
         s.max_ns / 1000
-    );
-    Ok(())
+    )
+}
+
+/// How a plan's declared warm state is established (see `Record`), or an
+/// error when the runner can see that it does not hold: a warm podman run
+/// whose image is absent would pull inside the first sample.
+fn warm_state_basis(plan: &Plan) -> Result<&'static str, String> {
+    if matches!(plan.warm_state, WarmState::Warm)
+        && plan.runtime == Runtime::Podman
+        && plan.image.as_ref().is_some_and(|i| i.digest.is_none())
+    {
+        return Err(
+            "--warm-state warm, but the image is not present locally; pull it first (a pull inside a sample is not warm)"
+                .into(),
+        );
+    }
+    Ok(match (plan.warm_state, plan.stamp.is_some()) {
+        (WarmState::Cold, true) => "contract-prepare",
+        (WarmState::Cold, false) => "unverified",
+        (WarmState::Warm, _) if plan.warmup >= 1 => "warmup-run",
+        (WarmState::Warm, _) => "unverified",
+    })
 }
 
 /// A built-in workload (`noop`, `nonzero-exit`).
@@ -330,6 +544,7 @@ fn plain_plan(cli: &Cli) -> Result<Plan, String> {
     };
     let argv = wrap(cli.runtime, cli.image.as_deref(), &limits, &[], None, inner)?;
     Ok(Plan {
+        runtime: cli.runtime,
         argv,
         env: path_env(cli)?,
         dir: None,
@@ -430,6 +645,7 @@ fn contract_plan(cli: &Cli, path: &Path) -> Result<Plan, String> {
     all_env.extend(path_env(cli)?);
     let is_cold = condition_id == "cold";
     let mut plan = Plan {
+        runtime: cli.runtime,
         argv,
         env: all_env,
         dir: Some(dir),
@@ -473,6 +689,7 @@ fn contract_plan(cli: &Cli, path: &Path) -> Result<Plan, String> {
             vec!["go".into(), "version".into()],
         )?,
         ..Plan {
+            runtime: cli.runtime,
             argv: Vec::new(),
             env: plan.env.clone(),
             dir: plan.dir.clone(),
@@ -631,6 +848,7 @@ fn measure(plan: &Plan, index: u32) -> Result<Sample, String> {
     let elapsed_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     Ok(Sample {
         index,
+        seq: None,
         elapsed_ns,
         exit_code,
         usage,
@@ -671,13 +889,30 @@ fn wait_with_usage(child: &mut Child) -> Result<(Option<i32>, Usage), String> {
 fn summarize(samples: &[Sample]) -> Summary {
     let mut sorted: Vec<u64> = samples.iter().map(|s| s.elapsed_ns).collect();
     sorted.sort_unstable();
-    let nearest_rank = |p: f64| sorted[((p * sorted.len() as f64).ceil() as usize).max(1) - 1];
+    let n = sorted.len();
+    // Nearest rank in integers: rank = ceil(percent * n / 100), one-based.
+    let rank = |percent: usize| (percent * n).div_ceil(100).max(1);
+    let median = sorted[rank(50) - 1];
+    let p95_rank = rank(95);
+    let sum: u128 = sorted.iter().map(|&v| u128::from(v)).sum();
+    let mean = (sum / n as u128) as u64;
+    let stddev_ns = (n > 1).then(|| {
+        let m = sum as f64 / n as f64;
+        let ss: f64 = sorted.iter().map(|&v| (v as f64 - m).powi(2)).sum();
+        (ss / (n - 1) as f64).sqrt().round() as u64
+    });
+    let mut deviations: Vec<u64> = sorted.iter().map(|&v| v.abs_diff(median)).collect();
+    deviations.sort_unstable();
     Summary {
-        count: sorted.len(),
+        count: n,
         min_ns: sorted[0],
-        median_ns: nearest_rank(0.5),
-        p95_ns: nearest_rank(0.95),
-        max_ns: sorted[sorted.len() - 1],
+        median_ns: median,
+        p95_ns: sorted[p95_rank - 1],
+        max_ns: sorted[n - 1],
+        mean_ns: mean,
+        stddev_ns,
+        mad_ns: deviations[rank(50) - 1],
+        p95_is_max: p95_rank == n,
     }
 }
 
@@ -775,4 +1010,57 @@ fn mount_fs(path: &Path) -> Option<String> {
         })
         .max_by_key(|(len, _)| *len)
         .map(|(_, v)| v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn samples(ns: &[u64]) -> Vec<Sample> {
+        ns.iter()
+            .enumerate()
+            .map(|(i, &elapsed_ns)| Sample {
+                index: i as u32,
+                seq: None,
+                elapsed_ns,
+                exit_code: Some(0),
+                usage: Usage::default(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn p95_is_flagged_as_the_max_until_there_are_twenty_samples() {
+        let few: Vec<u64> = (1..=19).collect();
+        let s = summarize(&samples(&few));
+        assert!(s.p95_is_max && s.p95_ns == s.max_ns);
+        let enough: Vec<u64> = (1..=20).collect();
+        let s = summarize(&samples(&enough));
+        assert!(!s.p95_is_max && s.p95_ns == 19 && s.max_ns == 20);
+    }
+
+    #[test]
+    fn spread_is_reported_and_mad_ignores_one_outlier() {
+        let mut ns = vec![100u64; 9];
+        ns.push(10_000);
+        let s = summarize(&samples(&ns));
+        assert_eq!(s.median_ns, 100);
+        assert_eq!(s.mad_ns, 0);
+        assert!(s.stddev_ns.unwrap() > 3_000);
+        assert_eq!(s.mean_ns, 1_090);
+    }
+
+    #[test]
+    fn a_single_sample_has_no_standard_deviation() {
+        let s = summarize(&samples(&[42]));
+        assert_eq!((s.stddev_ns, s.mad_ns, s.mean_ns), (None, 0, 42));
+    }
+
+    #[test]
+    fn interleaved_order_reverses_every_sample() {
+        assert_eq!(abba_order(0, 2), [0, 1]);
+        assert_eq!(abba_order(1, 2), [1, 0]);
+        assert_eq!(abba_order(2, 3), [0, 1, 2]);
+        assert_eq!(abba_order(0, 1), [0]);
+    }
 }

@@ -9,12 +9,12 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+sentinel-auth = { path = "../sentinel-auth" }
 sentinel-core = { path = "../sentinel-core" }
 sentinel-github = { path = "../sentinel-github" }
 sentinel-store = { path = "../sentinel-store" }
 
 [dev-dependencies]
-sentinel-auth = { path = "../sentinel-auth" }
 sentinel-pipeline = { path = "../sentinel-pipeline" }
 sentinel-protocol = { path = "../sentinel-protocol" }
 serde_json = "1.0"

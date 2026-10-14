@@ -21,7 +21,19 @@ Argon2id through the maintained RustCrypto `argon2` crate at OWASP's 19 MiB / t=
 - Passwords are 12–256 bytes and may not be only spacing. That is an admission rule, not a composition rule: no character-class requirements, no silent truncation, no normalization of the bytes supplied.
 - One lane (`p=1`) deliberately: a login must not take a whole core of parallel work away from job scheduling. Verification never runs inside a database transaction.
 - An unknown or malformed username still pays for a verification against an unreachable placeholder record, so account existence is not revealed by response or by time. Every attempt is audited, with no subject for an unknown name.
-- Ten consecutive failures lock an account for fifteen minutes. The failure is counted only against the exact record that was tested, so a concurrent password change is not miscounted. The lockout is a window, not a standing debt: once it has ended, the next failure starts the count again at one, so one wrong guess (or one typo) after a lockout does not lock the account again — keeping an account locked takes a full run of ten failures per window, each of them audited. A successful login resets the count; host-local recovery clears the lockout immediately.
+- Through the API, the lock that stops a guesser is per client and account (`login_guard`): ten failures from one client against one account refuse that client for the lockout window, without a hash or an audit row, and one failure after the window locks it again; nobody else is affected. The account-wide lock below then applies at four times the policy's threshold, so it takes several clients together to reach it, and a stranger cannot lock the super admin out alone. Guesses at names that do not exist, and attempts against a locked account, add at most five audit rows per ten seconds each: the audit record is append-only, so a flood must not be able to grow it without bound. Host-local `sentinel admin` commands are unaffected.
+- Ten consecutive failures lock an account for fifteen minutes (the store's account-wide lock; the API raises its threshold as above). The failure is counted only against the exact record that was tested, so a concurrent password change is not miscounted. The lockout is a window, not a standing debt: once it has ended, the next failure starts the count again at one, so one wrong guess (or one typo) after a lockout does not lock the account again — keeping an account locked takes a full run of ten failures per window, each of them audited. A successful login resets the count; host-local recovery clears the lockout immediately.
+
+## Signing in with an email address
+
+The login identifier is a **username or a verified email address** (migration 50; the full model is in [admission](admission.md#email-identity-and-email-invitations)). An identifier containing `@` is an address — no username can hold one — and is canonicalized (ASCII local part lower-cased, IDN domain in punycode) before it is looked up, so every spelling of a verified address is one account.
+
+- Only a **verified** address signs in. A claimed-but-unproved address identifies nobody, so someone who registers a victim's address cannot sign in as, or lock out, the owner; verifying proves control of the mailbox with a single-use, expiring (24 h), digest-stored token delivered to it.
+- An unknown, unverified or malformed address pays the same placeholder verification as an unknown username, takes the same single `unauthenticated` answer, and records a rejected-login row **without the address** (a username attempt records its name; an address is personal data and spraying must not fill the audit log with them).
+- The password, the lockout and the sessions are the account's, not the identifier's: signing in by username and by address are the same credential, and failures count against the same record. The API's per-client guard keys on the canonical address.
+- An account created by address (`POST /api/v1/register`) has a generated `user-…` username as well, so every local account keeps a username for host-local administration; it can sign in by either once its address is verified.
+- Changing the address keeps the old verified one as the identity until the new one is proved; verification never carries over to a different address ([admission](admission.md#email-identity-and-email-invitations)).
+- Without a Resend key and sender the operator mints the verification link on the host: `sentinel admin account email-link --user <name-or-address>`, so an operator is never locked out of a deployment that cannot send mail ([configuration](configuration.md#email-delivery)).
 
 ## Sessions
 
@@ -29,7 +41,7 @@ Opaque 256-bit secrets from the OS CSPRNG, stored only as their BLAKE3 digest. A
 
 - Two deadlines, both absolute instants recorded at issuance: idle (8 h) and absolute (7 days). Expiry, revocation and the account's live `kind`/`active` state are predicates of the single validation statement, so a suspended account's cookie stops working immediately without waiting for a sweep.
 - Sliding the idle deadline is a write, so it happens only after `refresh_after_ms` (5 min) of the window is spent, and never past the absolute deadline. A session pinned to its absolute deadline is never refreshed again. The API slides it as part of authenticating a request (`sentinel-api::auth::identify`, best effort: a refresh the writer cannot take right now does not fail the request), so an active user stays signed in until the absolute deadline. The cookie's `Max-Age` is the absolute lifetime, not the idle window: the browser keeps the cookie as long as the session could live, and the server decides when it has gone idle.
-- Login issues a new session; it does not reuse one. Logout revokes one session, logout-all revokes every live session of the account, and a password change, super-admin demotion or suspension revokes them in the same transaction as the change. The database refuses to un-revoke a session, to move its absolute deadline or to change its user, CSRF secret or creation time.
+- Login issues a new session; it does not reuse one. Logout revokes one session, logout-all revokes every live session of the account, and a password change, super-admin demotion or suspension revokes them in the same transaction as the change. Whenever every live session of an account is revoked this way, the service grants that account minted since its oldest unrevoked session began are revoked in the same transaction, and revoking one session by name revokes those minted since it began, so a credential a hijacked session minted does not outlive the response ([step-up](step-up.md#service-credentials-minted-by-a-session)). The database refuses to un-revoke a session, to move its absolute deadline or to change its user, CSRF secret or creation time.
 - `purge_expired` deletes revoked and expired rows in bounded batches; it is maintenance, not the expiry mechanism.
 - A session's `Principal` carries repository bits plus `TENANT_ADMIN`, and `PLATFORM_ADMIN` only for an actual super admin. It is not a capability: `auth` still verifies membership and grants per tenant, per query. A06 adds step-up before privileged policy changes use the platform bit.
 
@@ -41,6 +53,16 @@ Opaque 256-bit secrets from the OS CSPRNG, stored only as their BLAKE3 digest. A
 - Cookie parsing refuses a duplicated or malformed cookie rather than taking the first match: two cookies of that name mean something is injecting them.
 - The HTTP API ([API](api.md)) uses exactly these bytes and this decision on every route: login, logout, every session mutation, and the OAuth consent and device pages (which add a form token and an `Origin` check).
 - Login itself is guarded against login CSRF — a cross-site page signing the victim into the attacker's account. `POST /api/v1/login` accepts only `content-type: application/json`, which a cross-site form cannot send (an `enctype="text/plain"` body can be shaped to parse as JSON) and a cross-site `fetch` cannot send without a CORS preflight the server never grants; and a present `Origin` must be the issuer's origin.
+
+## Changing a password
+
+`POST /api/v1/password {current, new}` ([API](api.md)) is the self-service change, for a browser session with its CSRF header. The rules:
+
+- The **current password** is always required. A wrong one (or an account that has no local password) is one `forbidden`, audited as a failed proof (`step-up-failed`) and counted against the **session**: five revoke it. It is never counted against the account's second factor, so a stolen cookie cannot lock the real factor out by guessing.
+- With a **second factor enrolled**, a fresh [step-up](step-up.md) is also required, asked for (`details.step_up`) before the password is judged: the password alone is the weaker proof.
+- On success the hash is replaced only if it is still the one that was verified (a concurrent change is `conflict`), the login lockout is cleared, and **every** session and OAuth grant of the account is revoked in the same transaction — this session included. The response clears the cookie; the person signs in again with the new password. API credentials do not depend on the password and stay live. `password-changed` is audited.
+- The request draws on the sign-in admission budget before any hash. A new password outside 12–256 bytes, or only spacing, is `invalid_request`.
+- Setting a first password for a GitHub-only account is `provision_credential`, a step-up change, not this route. Host-locally, `sentinel admin recover` is the password change: it resets the password, clears both lockouts and revokes sessions and grants.
 
 ## Recovery and the last super admin
 
@@ -62,6 +84,8 @@ Measured on `DOOMBRINGER` (i7-13700KF, Ubuntu 24.04 WSL2, ext4), release build, 
 | Unknown username | 15.3 ms |
 
 Verification dominates by design, and the three login outcomes cost the same order of magnitude, which is the point of the placeholder record. Session validation is what every authenticated request pays: one primary-key probe and one key join, guarded by a query-plan test that rejects table scans and temporary sort trees. Sliding an idle deadline is the only write a read-only request can trigger, and only after five minutes.
+
+**Not recorded in the repo:** no `bench/` record or harness holds these means, so their sample count and spread are unknown and they cannot be reproduced from what is committed. Re-measure on the verification VPS and commit the record before citing them.
 
 WSL2 is a development reference, not a production qualification.
 

@@ -2,7 +2,8 @@
 //! worker's exact-revision checkout.
 //!
 //! One discipline, one implementation: nothing from the host's Git
-//! configuration is consulted (`GIT_CONFIG_GLOBAL=/dev/null`,
+//! configuration is consulted (`HOME` names no directory,
+//! `GIT_CONFIG_GLOBAL=/dev/null`,
 //! `GIT_CONFIG_NOSYSTEM=1`), Git can never prompt, every invocation runs in
 //! its own process group under one deadline (past it the group is killed),
 //! credentials reach Git through owner-only helper files that are removed as
@@ -21,6 +22,9 @@
 //! groups, owner-only modes, `/dev/null`) is not portable.
 
 #[cfg(unix)]
+mod destination;
+
+#[cfg(unix)]
 mod unix;
 
 #[cfg(unix)]
@@ -29,8 +33,8 @@ pub mod mirror;
 #[cfg(unix)]
 pub use unix::{
     CHECKOUT_TIMEOUT, Checkout, Credential, ExitWatch, FetchedFile, MAX_PATH_BYTES, Output,
-    cancel_scope, checkout, checkout_authorized, file_at, file_at_merge, is_ancestor, ls_remote,
-    run, wait_step,
+    cancel_scope, checkout, checkout_authorized, die_with_parent, file_at, file_at_merge,
+    is_ancestor, ls_remote, run, wait_step,
 };
 
 #[cfg(not(unix))]

@@ -193,7 +193,8 @@ fn start(f: &Fixture, outcome: Publish) -> (Lane, mpsc::Receiver<Batch>) {
         Box::new(Stub { outcome }),
         Config {
             idle: Duration::from_millis(20),
-            max_pause: Duration::from_millis(100),
+            min_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(40),
             ..Config::default()
         },
         move |batch| {
@@ -248,30 +249,266 @@ fn a_retry_that_spends_the_budget_is_counted_and_reported_as_refused() {
     drop(lane);
 }
 
+/// Publishes the aggregate through a rate-limited scope and everything else
+/// through an open one.
+struct Scoped {
+    throttle_until_ms: i64,
+}
+
+fn is_aggregate(publication: &checks::Publication) -> bool {
+    publication.scope == checks::AGGREGATE_SCOPE
+}
+
+impl Publisher for Scoped {
+    fn publish(&mut self, publication: &checks::Publication) -> Publish {
+        if is_aggregate(publication) {
+            Publish::Throttled {
+                until_ms: self.throttle_until_ms,
+                scope: 1,
+            }
+        } else {
+            Publish::Published {
+                check_run_id: 5,
+                check_suite_id: None,
+            }
+        }
+    }
+
+    fn scope(&self, publication: &checks::Publication) -> u64 {
+        u64::from(is_aggregate(publication))
+    }
+}
+
+fn start_with(f: &Fixture, publisher: impl Publisher + 'static) -> Lane {
+    Lane::start(
+        Arc::clone(&f.store),
+        Box::new(publisher),
+        Config {
+            idle: Duration::from_millis(20),
+            min_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(40),
+            ..Config::default()
+        },
+        |_| {},
+    )
+}
+
+fn wait_for(f: &Fixture, run: RunId, what: &str, done: impl Fn(&[checks::Publication]) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
+        if done(&rows) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out ({what}): {rows:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
-fn a_throttle_that_spends_the_budget_reports_the_refusal_not_the_pause() {
+fn a_throttle_parks_the_row_without_spending_its_budget() {
     let f = fixture();
     let run = event_run(&f);
     spend_budget(&f);
+    let until = UnixMillis::now().0 + 600_000;
     let (lane, batches) = start(
         &f,
         Publish::Throttled {
-            until_ms: UnixMillis::now().0 + 150,
+            until_ms: until,
+            scope: 0,
         },
     );
 
-    // The first row's park spends its last attempt: refused, not throttled.
     let first = batches
         .recv_timeout(Duration::from_secs(10))
         .expect("the throttled batch");
-    assert_eq!(first.refused, 1, "{first:?}");
-    assert!(
-        first.entries.iter().all(|e| e.outcome.contains("refused")),
-        "an exhausted park is a refusal: {first:?}"
-    );
-    assert!(first.paused_until_ms.is_some(), "{first:?}");
-
-    // The row the pause skipped settles refused on the next pass.
-    wait_refused(&f, run);
+    assert_eq!(first.refused, 0, "a limit never refuses a row: {first:?}");
+    assert_eq!(first.paused_until_ms, Some(until), "{first:?}");
     drop(lane);
+    let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
+    assert!(!rows.is_empty());
+    for row in rows {
+        assert_eq!(row.state, State::Pending, "{row:?}");
+    }
+    // Every row, the one that hit the limit and the ones it skipped, kept its
+    // last attempt and waits for the reset.
+    let sql = format!(
+        "SELECT COUNT(*) FROM check_publications
+         WHERE attempts = {} AND next_attempt_ms >= {}",
+        checks::MAX_ATTEMPTS - 1,
+        until - 1_000
+    );
+    let parked: i64 = f
+        .store
+        .read(move |c| Ok(c.query_row(&sql, (), |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(parked, 2);
+}
+
+#[test]
+fn one_scope_being_throttled_does_not_stop_the_others() {
+    let f = fixture();
+    let run = event_run(&f);
+    let until = UnixMillis::now().0 + 600_000;
+    let lane = start_with(
+        &f,
+        Scoped {
+            throttle_until_ms: until,
+        },
+    );
+    wait_for(&f, run, "the open scope publishes", |rows| {
+        rows.iter()
+            .filter(|r| !is_aggregate(r))
+            .all(|r| r.state == State::Published)
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let parked = loop {
+        if let Some(parked) = aggregate_parked_until(&f) {
+            break parked;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the throttled row was never parked"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(lane);
+    assert!(parked >= until - 1_000, "parked until the reset: {parked}");
+    let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
+    let aggregate = rows.iter().find(|r| is_aggregate(r)).unwrap();
+    assert_eq!(aggregate.state, State::Pending);
+}
+
+fn aggregate_parked_until(f: &Fixture) -> Option<i64> {
+    f.store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT next_attempt_ms FROM check_publications WHERE scope = 'aggregate'",
+                (),
+                |r| r.get::<_, Option<i64>>(0),
+            )?)
+        })
+        .unwrap()
+}
+
+/// Makes every delivery write for the aggregate fail inside SQLite, the way a
+/// row the store cannot update would.
+fn poison_aggregate(f: &Fixture) {
+    f.store
+        .writer()
+        .write(|tx| {
+            tx.execute_batch(
+                "CREATE TRIGGER poison BEFORE UPDATE ON check_publications
+                 WHEN OLD.scope = 'aggregate' AND (NEW.state != OLD.state
+                    OR NEW.published_seq != OLD.published_seq)
+                 BEGIN SELECT RAISE(ABORT, 'poison'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_row_whose_store_writes_keep_failing_cannot_block_the_lane() {
+    let f = fixture();
+    let run = event_run(&f);
+    poison_aggregate(&f);
+    let lane = start_with(&f, Deliver);
+    wait_for(&f, run, "the healthy rows deliver", |rows| {
+        rows.iter()
+            .filter(|r| !is_aggregate(r))
+            .all(|r| r.state == State::Published)
+    });
+    // The poison row is quarantined for an hour, not retried in a tight loop.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let parked = loop {
+        if let Some(parked) = aggregate_parked_until(&f) {
+            break parked;
+        }
+        assert!(Instant::now() < deadline, "the poison row was never parked");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(lane);
+    assert!(parked > UnixMillis::now().0 + 30 * 60 * 1000, "{parked}");
+    let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
+    let aggregate = rows.iter().find(|r| is_aggregate(r)).unwrap();
+    assert_eq!(aggregate.state, State::Pending, "the poison row waits");
+}
+
+struct Deliver;
+
+impl Publisher for Deliver {
+    fn publish(&mut self, _publication: &checks::Publication) -> Publish {
+        Publish::Published {
+            check_run_id: 9,
+            check_suite_id: None,
+        }
+    }
+}
+
+/// A lane whose safety re-read is far away: only the commit notifier and the
+/// retry deadline can wake it in time.
+fn start_unpolled(f: &Fixture) -> Lane {
+    Lane::start(
+        Arc::clone(&f.store),
+        Box::new(Deliver),
+        Config {
+            idle: Duration::from_secs(120),
+            ..Config::default()
+        },
+        |_| {},
+    )
+}
+
+fn all_published(rows: &[checks::Publication]) -> bool {
+    !rows.is_empty() && rows.iter().all(|r| r.state == State::Published)
+}
+
+#[test]
+fn a_publication_committed_to_an_idle_lane_is_delivered_without_polling() {
+    let f = fixture();
+    let lane = start_unpolled(&f);
+    // Let the lane find nothing and go to sleep.
+    std::thread::sleep(Duration::from_millis(300));
+    let run = event_run(&f);
+    // Far inside the lane's two-minute safety re-read.
+    wait_for(&f, run, "the commit wakes the lane", all_published);
+    drop(lane);
+}
+
+#[test]
+fn a_backed_off_row_is_read_when_its_deadline_arrives_not_when_something_commits() {
+    let f = fixture();
+    let run = event_run(&f);
+    let due = UnixMillis::now().0 + 400;
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute("UPDATE check_publications SET next_attempt_ms = ?1", [due])?;
+            Ok(())
+        })
+        .unwrap();
+    let lane = start_unpolled(&f);
+    std::thread::sleep(Duration::from_millis(100));
+    let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
+    assert!(
+        rows.iter().all(|r| r.state == State::Pending),
+        "not due yet: {rows:?}"
+    );
+    // No commit follows: only the deadline can wake the lane.
+    wait_for(&f, run, "the deadline wakes the lane", all_published);
+    drop(lane);
+}
+
+#[test]
+fn dropping_an_idle_lane_stops_it_at_once() {
+    let f = fixture();
+    let lane = start_unpolled(&f);
+    std::thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    drop(lane);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the lane slept through its shutdown"
+    );
 }

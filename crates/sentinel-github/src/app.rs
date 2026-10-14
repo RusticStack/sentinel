@@ -51,6 +51,67 @@ pub struct InstallationRepos {
     pub truncated: bool,
 }
 
+/// GitHub's two organization roles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrgRole {
+    Owner,
+    Member,
+}
+
+/// A bounded read of GitHub that may prove nothing. `Known` and `Absent` are
+/// verified answers; `Unknown` is everything else — a rate limit, a server
+/// error, a missing App permission, an unreachable network, a reply about a
+/// different account or organization than the one asked about — and a caller
+/// must treat it as neither membership nor its absence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Answer<T> {
+    Known(T),
+    Absent,
+    Unknown {
+        /// GitHub's own "later", in seconds, when it sent one.
+        retry_after_s: Option<i64>,
+    },
+}
+
+impl<T> Answer<T> {
+    fn unknown(retry_after_s: Option<i64>) -> Self {
+        Answer::Unknown { retry_after_s }
+    }
+
+    /// A non-success reply: `Unknown`, carrying GitHub's rate-limit hint.
+    fn from_failure(reply: &crate::http::Reply) -> Self {
+        let wait = reply
+            .retry_after_s
+            .or_else(|| {
+                reply
+                    .rate_limit_reset_s
+                    .map(|at| at - crate::now_ms() / 1000)
+            })
+            .filter(|s| *s > 0);
+        Answer::unknown(wait)
+    }
+}
+
+/// A login as GitHub spells it, safe as a URL path segment.
+fn valid_login(login: &str) -> bool {
+    !login.is_empty()
+        && login.len() <= 128
+        && login
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// A repository owner or name, safe as a URL path segment.
+fn valid_path_part(part: &str) -> bool {
+    !part.is_empty()
+        && part.len() <= 100
+        && part != "."
+        && part != ".."
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+
 /// What the reconcile lane learned about one bound repository.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepoState {
@@ -66,6 +127,15 @@ pub enum RepoState {
 impl core::fmt::Debug for Token {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("Token(redacted)")
+    }
+}
+
+impl Drop for Token {
+    /// The installation token is wiped when it is released (best effort: the
+    /// copies the HTTP layer and the parsed response made are outside it).
+    /// Take the secret out with `mem::take` to keep it past the token.
+    fn drop(&mut self) {
+        sentinel_auth::secret::wipe_string(&mut self.secret);
     }
 }
 
@@ -255,6 +325,156 @@ impl App {
             repos,
             truncated: true,
         })
+    }
+
+    /// An installation-wide token for reading organization membership:
+    /// `members: read` plus `metadata: read` and nothing else. Metadata is
+    /// requested explicitly because `GET /repos/{o}/{r}/collaborators/{login}/permission`
+    /// needs repository Metadata read, which an organization-only token does
+    /// not carry; it grants no content, checks or write access. A different permission set is a
+    /// different token, so an installation whose App was never granted the
+    /// permission fails here (and only here), never in the source or Checks
+    /// paths. Minted only for an installation a fresh snapshot proved usable.
+    pub fn membership_token(&self, installation: &Installation, now_ms: i64) -> Result<Token> {
+        if installation.suspended || !installation.permissions_valid || installation.personal {
+            return Err(Error::Response("installation access refused"));
+        }
+        let value = self.http.post_authenticated(
+            &format!(
+                "{}/app/installations/{}/access_tokens",
+                self.endpoint, installation.id
+            ),
+            &self.jwt(now_ms)?,
+            &json!({"permissions":{"members":"read","metadata":"read"}}),
+        )?;
+        parse_token(&value, now_ms, &[("members", "read"), ("metadata", "read")])
+    }
+
+    /// The current login of the account with this immutable numeric id. The
+    /// login is only ever a path segment for the next request: it is checked
+    /// against the id GitHub echoes, and nothing is granted by it.
+    pub fn user_login(&self, token: &Token, github_id: u64) -> Answer<String> {
+        let reply = match self.http.send_json(
+            "GET",
+            &format!("{}/user/{github_id}", self.endpoint),
+            &token.secret,
+            None,
+        ) {
+            Ok(reply) => reply,
+            Err(_) => return Answer::unknown(None),
+        };
+        match reply.status {
+            200 => {
+                let login = reply.body["login"].as_str().filter(|l| valid_login(l));
+                match (reply.body["id"].as_u64(), login) {
+                    (Some(id), Some(login)) if id == github_id => Answer::Known(login.to_owned()),
+                    _ => Answer::unknown(None),
+                }
+            }
+            // The account no longer exists: nobody can hold this identity.
+            404 | 410 => Answer::Absent,
+            _ => Answer::from_failure(&reply),
+        }
+    }
+
+    /// Whether the account is an *active* member of the organization, and in
+    /// which role. Identity is the numeric id: the reply must name the same
+    /// account id and organization id that were asked about, or it proves
+    /// nothing (a renamed login, a reused login or an organization that was
+    /// transferred are all `Unknown`, never a guess). A pending invitation is
+    /// not membership.
+    pub fn org_membership(
+        &self,
+        token: &Token,
+        org_login: &str,
+        org_id: u64,
+        github_id: u64,
+        login: &str,
+    ) -> Answer<OrgRole> {
+        if !valid_login(org_login) || !valid_login(login) {
+            return Answer::unknown(None);
+        }
+        let reply = match self.http.send_json(
+            "GET",
+            &format!("{}/orgs/{org_login}/memberships/{login}", self.endpoint),
+            &token.secret,
+            None,
+        ) {
+            Ok(reply) => reply,
+            Err(_) => return Answer::unknown(None),
+        };
+        match reply.status {
+            200 => {
+                let body = &reply.body;
+                if body["user"]["id"].as_u64() != Some(github_id)
+                    || body["organization"]["id"].as_u64() != Some(org_id)
+                {
+                    return Answer::unknown(None);
+                }
+                match (body["state"].as_str(), body["role"].as_str()) {
+                    (Some("active"), Some("admin")) => Answer::Known(OrgRole::Owner),
+                    (Some("active"), Some("member")) => Answer::Known(OrgRole::Member),
+                    (Some("pending"), _) => Answer::Absent,
+                    _ => Answer::unknown(None),
+                }
+            }
+            404 => Answer::Absent,
+            _ => Answer::from_failure(&reply),
+        }
+    }
+
+    /// The account's role on one repository, as GitHub's canonical token
+    /// (`admin`, `maintain`, `write`, `triage`, `read` or `none`). A role the
+    /// contract does not name falls back to GitHub's legacy `permission`
+    /// field, which maps a custom role onto its base; the token is never
+    /// *higher* than what GitHub reported. Anything but a verified 200 for
+    /// the same account id is `Unknown`.
+    pub fn repo_role(
+        &self,
+        token: &Token,
+        owner: &str,
+        name: &str,
+        github_id: u64,
+        login: &str,
+    ) -> Answer<&'static str> {
+        if !valid_login(login) || !valid_path_part(owner) || !valid_path_part(name) {
+            return Answer::unknown(None);
+        }
+        let reply = match self.http.send_json(
+            "GET",
+            &format!(
+                "{}/repos/{owner}/{name}/collaborators/{login}/permission",
+                self.endpoint
+            ),
+            &token.secret,
+            None,
+        ) {
+            Ok(reply) => reply,
+            Err(_) => return Answer::unknown(None),
+        };
+        if reply.status != 200 {
+            return Answer::from_failure(&reply);
+        }
+        let body = &reply.body;
+        if body["user"]["id"].as_u64() != Some(github_id) {
+            return Answer::unknown(None);
+        }
+        let legacy = match body["permission"].as_str() {
+            Some("admin") => "admin",
+            Some("write") => "write",
+            Some("read") => "read",
+            Some("none") => "none",
+            _ => return Answer::unknown(None),
+        };
+        // `role_name` only ever narrows the legacy value: triage reads as
+        // `read`, maintain as `write`; a custom role keeps its base.
+        let narrowed = match (body["role_name"].as_str(), legacy) {
+            (Some("triage"), "write" | "read") => "triage",
+            (Some("maintain"), "write") => "maintain",
+            (Some("read"), "write" | "read") => "read",
+            _ => legacy,
+        };
+        Answer::Known(narrowed)
     }
 
     /// Whether the repository a binding approved still is that repository.

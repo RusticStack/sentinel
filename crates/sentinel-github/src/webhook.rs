@@ -229,6 +229,16 @@ pub enum Control {
         installation: u64,
         repository: u64,
     },
+    /// Who belongs to the organization, or what they may reach, changed.
+    /// `user` is the immutable numeric id of the account concerned (never a
+    /// login); `None` means the whole organization's access may have moved (a
+    /// team changed). `removed` is a signed `member_removed`, the one answer
+    /// acted on directly; everything else only asks for a fresh check.
+    Members {
+        installation: u64,
+        user: Option<u64>,
+        removed: bool,
+    },
 }
 
 /// Only retained identifiers are trusted. A body is bounded by the HTTP route;
@@ -303,6 +313,44 @@ pub fn parse_control(event: &str, body: &[u8]) -> Result<Option<Control>> {
             Some(Control::Repository {
                 installation,
                 repository: number(&v["repository"]["id"])?,
+            })
+        }
+        // Organization membership: a person joined or left. An invitation
+        // (`member_invited`, which carries no `membership`) is not membership.
+        "organization" if matches!(action, "member_added" | "member_removed") => {
+            Some(Control::Members {
+                installation,
+                user: Some(number(&v["membership"]["user"]["id"])?),
+                removed: action == "member_removed",
+            })
+        }
+        // Team membership, and a repository collaborator, changed for one
+        // person: their effective access is worth asking about again.
+        "membership" if matches!(action, "added" | "removed") => Some(Control::Members {
+            installation,
+            user: Some(number(&v["member"]["id"])?),
+            removed: false,
+        }),
+        "member" if matches!(action, "added" | "removed" | "edited") => Some(Control::Members {
+            installation,
+            user: Some(number(&v["member"]["id"])?),
+            removed: false,
+        }),
+        // A team's repositories or permissions moved: anyone may be affected.
+        "team"
+            if matches!(
+                action,
+                "created"
+                    | "deleted"
+                    | "edited"
+                    | "added_to_repository"
+                    | "removed_from_repository"
+            ) =>
+        {
+            Some(Control::Members {
+                installation,
+                user: None,
+                removed: false,
             })
         }
         _ => None,
@@ -624,6 +672,81 @@ mod tests {
             ),
             Err(Error::Response("repository limit"))
         ));
+    }
+
+    #[test]
+    fn membership_events_carry_the_numeric_id_and_only_a_removal_acts() {
+        let organization = |action: &str| {
+            serde_json::json!({
+                "action": action,
+                "installation": {"id": 42},
+                "membership": {"user": {"id": 1001, "login": "someone"}},
+                "organization": {"id": 73},
+            })
+        };
+        for (action, removed) in [("member_removed", true), ("member_added", false)] {
+            let parsed = parse_control(
+                "organization",
+                &serde_json::to_vec(&organization(action)).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(
+                    parsed,
+                    Control::Members { installation: 42, user: Some(1001), removed: r } if r == removed
+                ),
+                "{action}"
+            );
+        }
+        // Other organization actions are not membership.
+        assert!(
+            parse_control(
+                "organization",
+                &serde_json::to_vec(&organization("renamed")).unwrap()
+            )
+            .unwrap()
+            .is_none()
+        );
+        // Team membership and collaborator changes ask for a check, never act.
+        for event in ["membership", "member"] {
+            let body = serde_json::json!({
+                "action": "added",
+                "installation": {"id": 42},
+                "member": {"id": 2002},
+            });
+            assert!(matches!(
+                parse_control(event, &serde_json::to_vec(&body).unwrap())
+                    .unwrap()
+                    .unwrap(),
+                Control::Members {
+                    user: Some(2002),
+                    removed: false,
+                    ..
+                }
+            ));
+        }
+        // A team change may move anyone's access.
+        let team = serde_json::json!({"action": "edited", "installation": {"id": 42}});
+        assert!(matches!(
+            parse_control("team", &serde_json::to_vec(&team).unwrap())
+                .unwrap()
+                .unwrap(),
+            Control::Members {
+                user: None,
+                removed: false,
+                ..
+            }
+        ));
+        // The id is the numeric account id: a login in its place, a missing
+        // user, or a zero id is refused rather than guessed at.
+        for broken in [
+            serde_json::json!({"action":"member_removed","installation":{"id":42},"membership":{"user":{"login":"someone"}}}),
+            serde_json::json!({"action":"member_removed","installation":{"id":42},"membership":{"user":{"id":0}}}),
+            serde_json::json!({"action":"member_removed","installation":{"id":42}}),
+        ] {
+            assert!(parse_control("organization", &serde_json::to_vec(&broken).unwrap()).is_err());
+        }
     }
 
     #[test]

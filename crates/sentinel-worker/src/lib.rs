@@ -99,6 +99,36 @@ pub(crate) fn sync_dir(_dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create `dir` and its missing parents owner-only (`0700`, whatever the
+/// process umask), for the worker's own state under the data directory:
+/// workspaces, spools, attempt markers, mirrors and caches hold checkouts,
+/// logs and secrets-adjacent bytes no other account has a reason to read.
+/// A directory that already exists and belongs to this user is tightened to
+/// owner-only too (an earlier version created them with the umask's mode);
+/// one that is someone else's, or a symlink an operator pointed at another
+/// disk, is left as it is.
+pub(crate) fn private_dir_all(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::metadata(dir)?;
+        if meta.is_dir() && meta.uid() == euid() && meta.mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(meta.mode() & 0o7700))?;
+        }
+    }
+    Ok(())
+}
+
 /// Where the worker keeps short-lived private state that should never
 /// reach persistent disk — delivered secrets, private stores' run roots
 /// (P10D-8): `$XDG_RUNTIME_DIR/sentinel-<key>` when that variable names an

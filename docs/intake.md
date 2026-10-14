@@ -55,8 +55,11 @@ acknowledged the same way: `{"ignored": "unsupported_event"}`.
 
 ### Control events
 
-Five further signed events — `check_run`/`check_suite` rerequests,
-`installation`, `installation_repositories` and `repository` lifecycle changes
+Further signed events — `check_run`/`check_suite` rerequests,
+`installation`, `installation_repositories` and `repository` lifecycle changes,
+and the membership events `organization` (`member_added`, `member_removed`),
+`membership`, `member` and `team` that keep a GitHub-backed organization's
+members in sync ([GitHub sign-in](github-sign-in.md#github-backed-organizations))
 — are **control**, not intake: they keep only bounded identifiers, are
 receipted in `github_events` by delivery ID and content digest (a replay
 replays the recorded outcome; a changed body is a `conflict`), and answer
@@ -240,8 +243,12 @@ parked run watch — is taken only when a pending delivery is due. Faults are
 isolated per delivery: one whose resolution hits a store fault is parked
 under its own retry schedule (`retried:store_fault`, same attempt budget) and
 the pass continues, so one delivery can never hold every other tenant's work
-behind it. Only a store that cannot even record that backs the lane off,
-from 1 s to 30 s.
+behind it. Each validation runs under its own savepoint, so a constraint or
+decode failure from SQLite while resolving or settling one delivery undoes only
+that delivery's writes and parks it the same way, instead of rolling back the
+whole batch and failing on the same delivery forever; a busy, full or failing
+database still fails the pass. Only a store that cannot even record that backs
+the lane off, from 1 s to 30 s.
 
 **Phase one, validation**, runs inside one writer transaction against the
 binding **as it is now**:

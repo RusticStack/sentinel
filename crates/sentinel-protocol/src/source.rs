@@ -241,10 +241,174 @@ pub struct Access {
 }
 
 impl Access {
-    pub fn validate(&self, now_ms: i64) -> bool {
+    /// Everything about the access except whether it is still live: the
+    /// version, the binding and the credential's fit for the remote.
+    pub fn well_formed(&self) -> bool {
         self.version > 0
-            && self.expires_ms > now_ms
             && self.binding.validate()
             && self.credential.valid_for(&self.binding.remote)
+    }
+
+    pub fn validate(&self, now_ms: i64) -> bool {
+        self.expires_ms > now_ms && self.well_formed()
+    }
+
+    /// The same access with its expiry restated on the holder's own clock:
+    /// `window_ms` from `now_ms`. The controller's `expires_ms` is a
+    /// wall-clock instant, meaningless to a worker whose clock differs, so a
+    /// worker measures validity from the moment it received the access
+    /// instead of comparing the two clocks.
+    #[must_use]
+    pub fn rebased(mut self, now_ms: i64, window_ms: i64) -> Self {
+        self.expires_ms = now_ms.saturating_add(window_ms);
+        self
+    }
+}
+
+/// Environment variable naming the deployment's explicit allowlist of manual
+/// (unbound) destinations that are exempt from the public-destination policy:
+/// comma-separated `https://host[:port]` authorities, exact match. Read once
+/// per process by the controller (admission) and by the worker (fetch).
+pub const MANUAL_DESTINATIONS_ENV: &str = "SENTINEL_MANUAL_DESTINATIONS";
+
+fn listed_manual_destinations() -> &'static [String] {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var(MANUAL_DESTINATIONS_ENV)
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Whether the deployment explicitly allowlisted this manual remote's
+/// authority ([`MANUAL_DESTINATIONS_ENV`]).
+pub fn manual_destination_listed(remote_url: &str) -> bool {
+    remote(remote_url)
+        .is_some_and(|authority| listed_manual_destinations().iter().any(|a| a == authority))
+}
+
+/// The hostname and port of a canonical `https://` remote ([`remote`]); the
+/// port defaults to 443.
+pub fn https_host_port(remote_url: &str) -> Option<(&str, u16)> {
+    let authority = remote(remote_url)?.strip_prefix("https://")?;
+    Some(match authority.split_once(':') {
+        Some((host, port)) => (host, port.parse().ok()?),
+        None => (authority, 443),
+    })
+}
+
+/// Whether `host` is a public DNS name: at least two non-empty labels, a
+/// purely alphabetic (or `xn--`) top-level label — so no IPv4 literal in any
+/// notation (decimal, octal, hexadecimal), no bare hostname — and not a
+/// private-use or reserved suffix. A syntactic admission check only; the
+/// worker still resolves and refuses non-public addresses.
+pub fn public_dns_name(host: &str) -> bool {
+    const PRIVATE_TLDS: [&str; 11] = [
+        "localhost",
+        "local",
+        "localdomain",
+        "internal",
+        "lan",
+        "home",
+        "corp",
+        "intranet",
+        "private",
+        "arpa",
+        "invalid",
+    ];
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let mut labels = host.rsplit('.');
+    let Some(tld) = labels.next() else {
+        return false;
+    };
+    let tld_ok = (tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_lowercase()))
+        || (tld.starts_with("xn--") && tld.len() > 4);
+    let rest: Vec<&str> = labels.collect();
+    tld_ok && !PRIVATE_TLDS.contains(&tld) && !rest.is_empty() && rest.iter().all(|l| !l.is_empty())
+}
+
+/// The destination policy for a client-named manual remote at admission: an
+/// `https://` remote in the canonical grammar whose host is a public DNS
+/// name, or whose authority the deployment explicitly allowlisted.
+pub fn manual_destination_allowed(remote_url: &str) -> bool {
+    https_host_port(remote_url).is_some_and(|(host, _)| public_dns_name(host))
+        || (remote_url.starts_with("https://") && manual_destination_listed(remote_url))
+}
+
+#[cfg(test)]
+mod destination_tests {
+    use super::*;
+
+    #[test]
+    fn public_names_pass_and_internal_forms_do_not() {
+        for ok in [
+            "git.example.com",
+            "github.com",
+            "a-b.example.org",
+            "x.xn--p1ai",
+        ] {
+            assert!(public_dns_name(ok), "{ok}");
+        }
+        for bad in [
+            "localhost",
+            "intranet",
+            "127.0.0.1",
+            "169.254.169.254",
+            "2130706433",
+            "0x7f.1",
+            "0x7f.0.0.1",
+            "10.0.0.1",
+            "printer.local",
+            "svc.cluster.internal",
+            "a..com",
+            "x.localhost",
+            "",
+        ] {
+            assert!(!public_dns_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn manual_destinations_are_https_with_a_public_name() {
+        assert!(manual_destination_allowed(
+            "https://git.example.com/team/repo.git"
+        ));
+        assert!(manual_destination_allowed("https://git.example.com:8443/r"));
+        assert!(!manual_destination_allowed(
+            "https://169.254.169.254/latest"
+        ));
+        assert!(!manual_destination_allowed(
+            "https://metadata/computeMetadata"
+        ));
+        assert!(!manual_destination_allowed("https://127.0.0.1:8443/repo"));
+        assert!(!manual_destination_allowed(
+            "ssh://git@git.example.com/repo"
+        ));
+    }
+
+    #[test]
+    fn a_rebased_access_is_live_by_the_holders_clock_alone() {
+        let access = Access {
+            binding: Binding {
+                remote: "https://git.example.com/r".into(),
+                allowed_refs: vec!["refs/heads/main".into()],
+                pipeline_path: ".sentinel.yml".into(),
+                trust: String::new(),
+            },
+            version: 1,
+            expires_ms: 1,
+            credential: Credential::Public,
+        };
+        assert!(access.well_formed());
+        assert!(!access.validate(1_000));
+        let rebased = access.rebased(1_000, 5_000);
+        assert!(rebased.validate(5_999));
+        assert!(!rebased.validate(6_000));
     }
 }

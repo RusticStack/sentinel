@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-use crate::http::{Header, Request, Response, StatusCode};
+use crate::http::{BodyErr, Header, Request, Response, StatusCode};
 use sentinel_auth::cookie;
 use sentinel_core::{
     ArtifactId, AttemptId, JobId, JobState, RepoId, RunId, RunState, UnixMillis, UploadId, UserId,
@@ -42,8 +42,11 @@ use crate::{
     auth::{self, Identity, Refusal, Via},
 };
 
+pub(crate) mod account;
 mod admin;
+mod email;
 mod failure;
+mod setup;
 mod views;
 use failure::attempt_failure;
 
@@ -65,6 +68,9 @@ pub(crate) enum Reply {
 pub(crate) type Route = Result<Reply, ApiError>;
 
 const JSON: &str = "application/json";
+
+/// Largest password-login body: a login name and a password, nothing more.
+const MAX_LOGIN_BODY_BYTES: usize = 16 << 10;
 
 pub(crate) fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static header")
@@ -243,7 +249,13 @@ fn challenge(state: &State, request: &Request, path: &str, error: &ApiError) -> 
     let Some(rest) = path.strip_prefix("/api/v1/") else {
         return Vec::new();
     };
-    if rest.starts_with("hooks/") || rest.starts_with("intake/") || rest == "login" {
+    if rest.starts_with("hooks/")
+        || rest.starts_with("intake/")
+        || matches!(
+            rest,
+            "login" | "register" | "email/verify" | "email/resend" | "setup" | "setup/mail-test"
+        )
+    {
         return Vec::new();
     }
     match error.code {
@@ -317,6 +329,20 @@ pub(crate) fn body_limit(request: &mut Request, limit: usize) -> Result<Vec<u8>,
     Ok(bytes)
 }
 
+/// [`body_limit`] for a route with no credential yet: the body is read
+/// without a handler permit, under the small public-body pool and its
+/// tight deadline ([`Request::public_body`]), so a slow sender cannot take
+/// a permit from real work. Past the pool's wait the answer is `rate_limited`.
+pub(crate) fn public_body_limit(request: &mut Request, limit: usize) -> Result<Vec<u8>, ApiError> {
+    request.public_body(limit).map_err(|e| match e {
+        BodyErr::TooLarge => {
+            err(ErrorCode::PayloadTooLarge, "body too large").with_detail("limit_bytes", limit)
+        }
+        BodyErr::Busy => err(ErrorCode::RateLimited, "busy; retry shortly"),
+        BodyErr::Unreadable => err(ErrorCode::InvalidRequest, "unreadable body"),
+    })
+}
+
 pub(crate) fn parse<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, ApiError> {
     serde_json::from_slice(bytes).map_err(|_| err(ErrorCode::InvalidRequest, "invalid JSON body"))
 }
@@ -385,6 +411,15 @@ pub(crate) fn route(
     if let Some(reply) = crate::github::route(state, request, method, &parts, query) {
         return reply;
     }
+    if let Some(reply) = account::route(state, request, method, &parts) {
+        return reply;
+    }
+    if let Some(reply) = setup::route(state, request, method, &parts) {
+        return reply;
+    }
+    if let Some(reply) = email::route(state, request, method, &parts) {
+        return reply;
+    }
     if let Some(reply) = admin::route(state, request, method, &parts, query) {
         return reply;
     }
@@ -446,13 +481,20 @@ pub(crate) fn route(
         ("POST", ["api", "v1", "logout"]) => logout(state, request),
         ("GET", ["api", "v1", "me"]) => {
             let who = identify(state, request, false)?;
-            let username = state
+            let (username, address) = state
                 .store
-                .read(|c| local_auth::username_of(c, who.user))
+                .read(|c| {
+                    Ok((
+                        local_auth::username_of(c, who.user)?,
+                        sentinel_store::email::account_email(c, who.user)?,
+                    ))
+                })
                 .map_err(store_error)?;
             ok(json!({
                 "user": who.user.to_string(),
                 "username": username,
+                "email": address.as_ref().map(|(email, _)| email),
+                "email_verified": address.as_ref().is_some_and(|(_, verified)| *verified),
                 "super_admin": who.super_admin,
                 "via": match who.via {
                     auth::Via::Bearer => "bearer",
@@ -477,15 +519,35 @@ pub(crate) fn route(
             let who = identify(state, request, false)?;
             auth::require_scope(&who, Scopes::RUNS_READ)?;
             let slug = (*slug).to_owned();
-            let repos = state
+            let now = UnixMillis::now();
+            let (repos, stale) = state
                 .store
                 .read(|c| {
                     // Membership-checked, so a foreign tenant is the same
                     // `not_found` as an absent one, never an empty list.
                     let tenant = authz::member_tenant_by_slug(c, who.principal, &slug)?;
-                    authz::list_repos(c, who.principal, tenant, None, 100)
+                    let repos = authz::list_repos(c, who.principal, tenant, None, 100)?;
+                    // Opening a GitHub-backed tenant whose membership was last
+                    // confirmed a while ago asks the lane for a fresh check.
+                    let stale = sentinel_store::github_members::touch(
+                        c,
+                        tenant,
+                        who.principal.user,
+                        sentinel_store::github_members::OPEN_TTL_MS,
+                        now,
+                    )?;
+                    Ok((repos, stale))
                 })
                 .map_err(store_error)?;
+            if stale {
+                // Best effort and rate limited in the store: opening a tenant
+                // never fails or waits because GitHub is slow.
+                let user = who.principal.user;
+                let _ = state
+                    .store
+                    .writer()
+                    .write(move |tx| sentinel_store::github_members::enqueue_user(tx, user, now));
+            }
             ok(json!({
                 "repos": repos.iter().map(|r| json!({ "id": r.id.to_string(), "name": r.name })).collect::<Vec<_>>()
             }))
@@ -555,7 +617,7 @@ pub(crate) fn route(
                 .writer()
                 .write(move |tx| {
                     let now = UnixMillis::now();
-                    let count = dispatch::cancel_run(tx, tenant, run, now)?;
+                    let count = dispatch::cancel_run(tx, tenant, run, UnixMillis::steady())?;
                     operations::record(
                         tx,
                         tenant,
@@ -580,7 +642,7 @@ pub(crate) fn route(
                 .writer()
                 .write(move |tx| {
                     let now = UnixMillis::now();
-                    let outcome = dispatch::cancel(tx, tenant, job, now)?;
+                    let outcome = dispatch::cancel(tx, tenant, job, UnixMillis::steady())?;
                     operations::record(
                         tx,
                         tenant,
@@ -605,7 +667,7 @@ pub(crate) fn route(
                 .writer()
                 .write(move |tx| {
                     let now = UnixMillis::now();
-                    let next = runs::rerun_job(tx, tenant, job, now)?;
+                    let next = runs::rerun_job(tx, tenant, job, UnixMillis::steady())?;
                     operations::record(
                         tx,
                         tenant,
@@ -799,7 +861,7 @@ fn github_hook(state: &State, request: &mut Request) -> Route {
         bounded_header(request, sentinel_github::webhook::EVENT_HEADER, 64).unwrap_or_default();
     let delivery = bounded_header(request, sentinel_github::webhook::DELIVERY_HEADER, 128);
     let signature = bounded_header(request, sentinel_github::webhook::SIGNATURE_HEADER, 128);
-    let body = body_limit(request, MAX_WEBHOOK_BODY_BYTES)?;
+    let body = public_body_limit(request, MAX_WEBHOOK_BODY_BYTES)?;
     let outcome = ingest::github(
         &state.store,
         secret,
@@ -843,7 +905,7 @@ fn generic_intake(state: &State, request: &mut Request, repo: &str) -> Route {
                 "present the repository hook secret",
             )
         })?;
-    let body = body_limit(request, MAX_HOOK_BODY_BYTES)?;
+    let body = public_body_limit(request, MAX_HOOK_BODY_BYTES)?;
     let ingested = ingest::generic(&state.store, &presented, repo, &body, UnixMillis::now())
         .map_err(intake_error)?;
     wake_intake(state, ingested.duplicate);
@@ -954,18 +1016,54 @@ fn login(state: &State, request: &mut Request) -> Route {
             "sign-in from another site is refused",
         ));
     }
-    let bytes = body(request)?;
+    // Every attempt costs a password hash (an unknown name included) and a
+    // writer transaction: admit the client before reading or hashing.
+    if !crate::oauth::admitted(state, request, crate::oauth::Budget::Login) {
+        return Err(err(
+            ErrorCode::RateLimited,
+            "too many sign-in attempts; retry shortly",
+        )
+        .with_detail("retry_after_ms", 2000));
+    }
+    let bytes = public_body_limit(request, MAX_LOGIN_BODY_BYTES)?;
     let creds: LoginBody = parse(&bytes)?;
+    // One client's lockout against an account never locks anyone else out.
+    // An email address is one account whatever its case or IDN spelling, so
+    // the guard keys on the canonical form.
+    let identifier = if creds.username.contains('@') {
+        sentinel_store::email::normalize(&creds.username).unwrap_or_else(|_| creds.username.clone())
+    } else {
+        creds.username.clone()
+    };
+    let creds = LoginBody {
+        username: identifier,
+        ..creds
+    };
+    let client = crate::oauth::client_of(state, request);
+    let now = std::time::Instant::now();
+    if !state.logins.allowed(client, &creds.username, now) {
+        return Err(err(ErrorCode::Unauthenticated, "sign-in refused"));
+    }
+    // The store's account-wide lock is the ceiling for many clients
+    // together: it takes more failures than one client may make.
+    let account_policy = local_auth::Policy {
+        max_failures: state
+            .sessions
+            .max_failures
+            .saturating_mul(crate::login_guard::ACCOUNT_LOCK_FACTOR),
+        ..state.sessions
+    };
     let outcome = local_auth::login(
         &state.store,
         &creds.username,
         creds.password.as_bytes(),
-        state.sessions,
+        account_policy,
         UnixMillis::now(),
     )
     .map_err(store_error)?;
     match outcome {
         local_auth::Login::Accepted(issued) => {
+            state.logins.succeeded(client, &creds.username);
             let mut csrf = String::new();
             issued.csrf.expose(&mut csrf);
             let set_cookie =
@@ -978,6 +1076,13 @@ fn login(state: &State, request: &mut Request) -> Route {
         }
         // One answer for every non-accepted outcome; the audit trail has the detail.
         local_auth::Login::Rejected | local_auth::Login::Locked { .. } => {
+            state.logins.failed(
+                client,
+                &creds.username,
+                state.sessions.max_failures,
+                std::time::Duration::from_millis(state.sessions.lockout_ms.max(0) as u64),
+                now,
+            );
             Err(err(ErrorCode::Unauthenticated, "sign-in refused"))
         }
     }
@@ -1207,6 +1312,25 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
     }
     let compiled = compile_str(&dispatch.pipeline)
         .map_err(|e| err(ErrorCode::InvalidRequest, format!("pipeline: {e}")))?;
+    // A caller-authored pipeline never receives secrets: the grant to run
+    // jobs is not a grant to read what is bound to the repository, so refuse
+    // up front rather than fail the job later. Delivery enforces the same
+    // rule for any run recorded as manual.
+    if compiled.jobs.iter().any(|job| {
+        job.spec.registry_auth.is_some()
+            || job
+                .spec
+                .steps
+                .iter()
+                .any(|step| !step.secrets.is_empty() || !step.secret_files.is_empty())
+    }) {
+        return Err(err(
+            ErrorCode::Forbidden,
+            "a manually dispatched pipeline cannot use secrets; \
+             push the pipeline to a bound revision",
+        )
+        .with_detail("reason", "manual_run_secrets"));
+    }
     let source = PinnedSource::new(
         &dispatch.source.repo,
         &dispatch.source.sha,
@@ -1241,9 +1365,13 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
                 principal: &principal_text,
                 route: "runs.create",
             };
+            // Job and idempotency timestamps are deadline-clock values: the
+            // queue timeout and the key's TTL are decided against them. The
+            // provenance and check rows below stay wall-clock.
             let now = UnixMillis::now();
+            let steady = UnixMillis::steady();
             if let Some(key) = key {
-                match idempotency::begin(tx, scope, key, fingerprint, now)? {
+                match idempotency::begin(tx, scope, key, fingerprint, steady)? {
                     idempotency::Begin::Execute => {}
                     idempotency::Begin::Replay(run) => return Ok(Err(Some(run))),
                     idempotency::Begin::Mismatch => return Ok(Err(None)),
@@ -1251,7 +1379,7 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
                 }
             }
             let run = RunId::new();
-            let jobs = authz::create_run(tx, principal, repo, run, &spec, now)?;
+            let jobs = authz::create_run(tx, principal, repo, run, &spec, steady)?;
             for (job, (digest, platform)) in jobs.iter().zip(&images) {
                 runs::resolve_image(tx, tenant, *job, digest, platform)?;
             }

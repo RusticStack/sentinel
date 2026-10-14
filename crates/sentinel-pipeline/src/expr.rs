@@ -531,6 +531,11 @@ fn validate_path(path: &[String]) -> Result<(), &'static str> {
     }
 }
 
+const TY_STR: u8 = 1;
+const TY_INT: u8 = 2;
+const TY_BOOL: u8 = 4;
+const TY_NULL: u8 = 8;
+
 impl Expr {
     pub fn parse(src: &str) -> Result<Expr, ParseError> {
         if src.len() > MAX_EXPR_BYTES {
@@ -575,6 +580,82 @@ impl Expr {
                 .iter()
                 .map(Expr::min_phase)
                 .fold(f.min_phase(), Phase::max),
+        }
+    }
+
+    /// Whether the expression calls `success()`, `failure()` or `always()`:
+    /// the job condition then states its own dependency policy, otherwise
+    /// the dependencies must have succeeded for it to run.
+    pub fn uses_status_function(&self) -> bool {
+        match self {
+            Expr::Lit(_) | Expr::Path(_) => false,
+            Expr::Not(e) => e.uses_status_function(),
+            Expr::Bin(_, a, b) => a.uses_status_function() || b.uses_status_function(),
+            Expr::Call(f, args) => {
+                matches!(f, Func::Success | Func::Failure | Func::Always)
+                    || args.iter().any(Expr::uses_status_function)
+            }
+        }
+    }
+
+    /// The set of types the expression can evaluate to, as `TY_*` bits.
+    /// Operators are checked on the way: a comparison between types that can
+    /// never match, or a boolean operator over something that is not always
+    /// a boolean, is an error here instead of at evaluation time.
+    fn types(&self) -> Result<u8, &'static str> {
+        let only = |e: &Expr, want: u8, message: &'static str| match e.types()? {
+            t if t == want => Ok(()),
+            _ => Err(message),
+        };
+        match self {
+            Expr::Lit(Value::Null) => Ok(TY_NULL),
+            Expr::Lit(Value::Bool(_)) => Ok(TY_BOOL),
+            Expr::Lit(Value::Int(_)) => Ok(TY_INT),
+            Expr::Lit(Value::Str(_)) => Ok(TY_STR),
+            Expr::Path(p) => Ok(
+                match p.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+                    ["event", "base_ref"] => TY_STR | TY_NULL,
+                    ["event", "pr_number"] => TY_INT | TY_NULL,
+                    _ => TY_STR,
+                },
+            ),
+            Expr::Not(e) => {
+                only(e, TY_BOOL, "`!` needs a boolean operand")?;
+                Ok(TY_BOOL)
+            }
+            Expr::Bin(BinOp::And | BinOp::Or, a, b) => {
+                only(a, TY_BOOL, "`&&` and `||` need boolean operands")?;
+                only(b, TY_BOOL, "`&&` and `||` need boolean operands")?;
+                Ok(TY_BOOL)
+            }
+            Expr::Bin(BinOp::Eq | BinOp::Ne, a, b) => {
+                // Null compares with anything; every other pair of types
+                // that can meet must be the same type.
+                let (a, b) = (a.types()? & !TY_NULL, b.types()? & !TY_NULL);
+                if a != 0 && b != 0 && (a | b).count_ones() > 1 {
+                    return Err("comparison between different types");
+                }
+                Ok(TY_BOOL)
+            }
+            Expr::Call(f, args) => match f {
+                Func::Contains | Func::StartsWith | Func::EndsWith => {
+                    for a in args {
+                        only(a, TY_STR, "this function takes strings")?;
+                    }
+                    Ok(TY_BOOL)
+                }
+                Func::HashFiles => Ok(TY_STR),
+                Func::Success | Func::Failure | Func::Always | Func::Cancelled => Ok(TY_BOOL),
+            },
+        }
+    }
+
+    /// Reject a condition that is not always a boolean, so a job `if` can
+    /// never fail to evaluate on a type error once the dependencies finish.
+    pub fn check_condition(&self) -> Result<(), &'static str> {
+        match self.types()? {
+            TY_BOOL => Ok(()),
+            _ => Err("condition must be a boolean expression"),
         }
     }
 
@@ -1020,6 +1101,61 @@ mod tests {
         let mut refs = Vec::new();
         e.referenced_needs(&mut refs);
         assert_eq!(refs, ["test"]);
+    }
+
+    #[test]
+    fn a_condition_that_could_fail_a_type_check_is_rejected_before_it_runs() {
+        for ok in [
+            "true",
+            "always()",
+            "event.ref == 'refs/heads/main' && !cancelled()",
+            "event.pr_number == null",
+            "event.pr_number == 7",
+            "event.base_ref != 'main'",
+            "needs.test.result == 'passed' || failure()",
+            "starts_with(event.ref, 'refs/tags/')",
+            "hash_files('Cargo.lock') != ''",
+            "null == event.base_ref",
+        ] {
+            assert_eq!(Expr::parse(ok).unwrap().check_condition(), Ok(()), "{ok}");
+        }
+        for bad in [
+            "event.ref",
+            "'yes'",
+            "7",
+            "null",
+            "event.ref == 7",
+            "event.pr_number == 'x'",
+            "needs.test.result == true",
+            "!event.ref",
+            "event.ref && true",
+            "event.base_ref || true",
+            "contains(event.pr_number, '1')",
+            "hash_files('x')",
+        ] {
+            assert!(
+                Expr::parse(bad).unwrap().check_condition().is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_status_function_makes_a_condition_state_its_own_policy() {
+        for (src, uses) in [
+            ("always()", true),
+            ("failure() || event.ref == 'x'", true),
+            ("!(success() && cancelled())", true),
+            ("event.ref == 'x'", false),
+            ("cancelled()", false),
+            ("needs.test.result == 'failed'", false),
+        ] {
+            assert_eq!(
+                Expr::parse(src).unwrap().uses_status_function(),
+                uses,
+                "{src}"
+            );
+        }
     }
 
     #[test]

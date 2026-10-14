@@ -22,12 +22,18 @@ use crate::lane::Publish;
 /// How long before expiry a cached token is replaced.
 const TOKEN_MARGIN_MS: i64 = 120_000;
 const MAX_CACHED_TOKENS: usize = 1024;
-/// Longest rate-limit pause accepted, whatever GitHub says.
+/// Longest rate-limit park accepted, whatever GitHub says.
 const MAX_PAUSE_MS: i64 = 60 * 60 * 1000;
 
 struct CachedToken {
     secret: String,
     expires_ms: i64,
+}
+
+impl Drop for CachedToken {
+    fn drop(&mut self) {
+        sentinel_auth::secret::wipe_string(&mut self.secret);
+    }
 }
 
 pub struct GithubChecks {
@@ -39,6 +45,9 @@ pub struct GithubChecks {
     public_url: Option<String>,
     /// One token per repository: an installation token is repository-scoped.
     tokens: HashMap<RepoId, CachedToken>,
+    /// The installation each repository was last published through: GitHub
+    /// rate-limits per installation, so this is the lane's throttle scope.
+    installations: HashMap<RepoId, u64>,
 }
 
 impl GithubChecks {
@@ -49,7 +58,16 @@ impl GithubChecks {
             client: Client::new(),
             public_url: public_url.map(|url| url.trim_end_matches('/').to_owned()),
             tokens: HashMap::new(),
+            installations: HashMap::new(),
         }
+    }
+
+    fn remember_installation(&mut self, repo: RepoId, installation: u64) {
+        if self.installations.len() >= MAX_CACHED_TOKENS && !self.installations.contains_key(&repo)
+        {
+            self.installations.clear();
+        }
+        self.installations.insert(repo, installation);
     }
 
     /// A token for this repository, cached until close to expiry. The
@@ -68,7 +86,7 @@ impl GithubChecks {
         {
             return Ok(cached.secret.clone());
         }
-        let token = self
+        let mut token = self
             .app
             .checks_token(installation, account, forge_repo, remote, now.0)
             .map_err(|error| match error {
@@ -98,7 +116,7 @@ impl GithubChecks {
                 secret: token.secret.clone(),
             },
         );
-        Ok(token.secret)
+        Ok(std::mem::take(&mut token.secret))
     }
 
     fn details_url(&self, run: Option<sentinel_core::RunId>) -> Option<String> {
@@ -186,13 +204,25 @@ fn load_source(store: &Store, publication: &checks::Publication) -> Result<Sourc
     })
 }
 
+/// The scope of a repository whose installation is not known yet: it never
+/// matches a real installation id, so it is never skipped on another's limit.
+const UNKNOWN_SCOPE: u64 = u64::MAX;
+
 impl crate::lane::Publisher for GithubChecks {
+    fn scope(&self, publication: &checks::Publication) -> u64 {
+        self.installations
+            .get(&publication.repo)
+            .copied()
+            .unwrap_or(UNKNOWN_SCOPE)
+    }
+
     fn publish(&mut self, publication: &checks::Publication) -> Publish {
         let now = UnixMillis::now();
         let source = match load_source(&self.store, publication) {
             Ok(source) => source,
             Err(outcome) => return outcome,
         };
+        self.remember_installation(publication.repo, source.installation);
         let Some((owner, name)) = api::repository_path(&source.remote) else {
             return Publish::Refused {
                 reason: "repository path".into(),
@@ -304,6 +334,11 @@ impl GithubChecks {
                 until_ms: UnixMillis::now()
                     .0
                     .saturating_add(retry_after_ms.clamp(1_000, MAX_PAUSE_MS)),
+                scope: self
+                    .installations
+                    .get(&publication.repo)
+                    .copied()
+                    .unwrap_or(UNKNOWN_SCOPE),
             },
             Refusal::Unauthorized => {
                 // The cached token is stale or the permission was withdrawn:

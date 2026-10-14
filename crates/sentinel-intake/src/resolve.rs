@@ -546,7 +546,9 @@ impl Resolver {
                 &spec,
                 &images,
                 &provenance,
-                UnixMillis::now(),
+                // The run's jobs queue now, on the deadline clock their
+                // queue timeout is decided against.
+                UnixMillis::steady(),
             )
         }) {
             Ok(run) => run,

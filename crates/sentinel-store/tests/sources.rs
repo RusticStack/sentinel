@@ -295,6 +295,34 @@ fn destination_policy_and_credential_transport_cannot_be_bypassed() {
 }
 
 #[test]
+fn a_manual_remote_cannot_name_an_internal_destination() {
+    // The worker fetches a manual remote from inside the deployment's
+    // network, so a client may name only a public DNS name: no IP literal in
+    // any notation, bare hostname or private-use suffix.
+    for allowed in [
+        "https://git.example.com/team/repo.git",
+        "https://git.example.com:8443/team/repo.git",
+    ] {
+        assert!(sources::manual_remote_allowed(allowed), "{allowed}");
+    }
+    for refused in [
+        "https://169.254.169.254/latest/meta-data",
+        "https://127.0.0.1:8443/repo.git",
+        "https://2130706433/repo.git",
+        "https://0x7f.0.0.1/repo.git",
+        "https://metadata/computeMetadata/v1",
+        "https://localhost/repo.git",
+        "https://printer.local/repo.git",
+        "https://svc.cluster.internal/repo.git",
+        "http://git.example.com/repo.git",
+        "ssh://git@git.example.com/repo.git",
+        "/srv/other-repo",
+    ] {
+        assert!(!sources::manual_remote_allowed(refused), "{refused}");
+    }
+}
+
+#[test]
 fn installation_lifecycle_requires_binding_and_fresh_permissions() {
     let mut f = fixture();
     let snapshot = |expected, personal, suspended| sources_forge::Snapshot {

@@ -2,6 +2,7 @@
 const props = defineProps<{ slug: string }>();
 const api = useApi();
 const act = useAct();
+const { ready, withReason } = useOverride(() => props.slug);
 const { data, refresh } = await useRepos(() => props.slug);
 const name = ref("");
 const sources = ref<Record<string, any>>({});
@@ -22,7 +23,8 @@ async function source(repo: string) {
 function grantOf(id: string) { return (grants[id] ||= { who: "", access: ["read"] }); }
 async function grant(repo: { id: string; name: string }) {
   const g = grantOf(repo.id);
-  await act(`Access to ${repo.name}`, () => api(`/api/v1/tenants/${props.slug}/repos/${encodeURIComponent(repo.name)}/grants/${encodeURIComponent(g.who)}`, { method: "PUT", body: { access: g.access } }));
+  if (!ready()) return;
+  await act(`Access to ${repo.name}`, () => api(`/api/v1/tenants/${props.slug}/repos/${encodeURIComponent(repo.name)}/grants/${encodeURIComponent(g.who)}`, { method: "PUT", body: withReason({ access: g.access }) }));
 }
 </script>
 

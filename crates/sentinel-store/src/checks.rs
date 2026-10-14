@@ -24,13 +24,32 @@ pub const JOB_PREFIX: &str = "sentinel / ";
 /// External IDs let a rerequest (G05) find the run a check belongs to.
 pub const EXTERNAL_PREFIX: &str = "sentinel:";
 
+/// Attempts a progress check (queued, in progress) may spend before it is
+/// refused: a stale intermediate state is not worth chasing through an outage.
 pub const MAX_ATTEMPTS: u32 = 8;
+/// Attempts a completed check may spend. The final status is what a required
+/// check gates merges on, so it rides out an outage of hours (see
+/// `TERMINAL_MAX_BACKOFF_MS`) before it is refused with reason `attempts`.
+pub const MAX_TERMINAL_ATTEMPTS: u32 = 40;
 const BASE_BACKOFF_MS: i64 = 1_000;
 const MAX_BACKOFF_MS: i64 = 5 * 60 * 1000;
+/// Back-off ceiling for a completed check: fifteen minutes.
+const TERMINAL_MAX_BACKOFF_MS: i64 = 15 * 60 * 1000;
+/// Longest a row is parked by [`defer`] (a throttle or a quarantine).
+pub const MAX_DEFER_MS: i64 = 60 * 60 * 1000;
+/// How far back [`rearm_exhausted`] looks for a check that spent its budget.
+pub const REARM_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// Most rows one [`rearm_exhausted`] call re-pends.
+pub const REARM_LIMIT: u32 = 1_000;
 
-const COLUMNS: &str = "id, tenant_id, repo_id, run_id, delivery_id, scope, name, head_sha,
+macro_rules! columns {
+    () => {
+        "id, tenant_id, repo_id, run_id, delivery_id, scope, name, head_sha,
     external_id, status, conclusion, title, summary, check_run_id, seq, published_seq, state, reason,
-    check_suite_id, create_started_ms, create_seq";
+    check_suite_id, create_started_ms, create_seq"
+    };
+}
+const COLUMNS: &str = columns!();
 
 /// A check's desired status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,24 +241,31 @@ pub fn backoff_ms(attempts: u32) -> i64 {
         .min(MAX_BACKOFF_MS)
 }
 
+/// The same doubling for a completed check, capped at fifteen minutes.
+fn terminal_backoff_ms(attempts: u32) -> i64 {
+    BASE_BACKOFF_MS
+        .saturating_mul(1i64 << attempts.min(20))
+        .min(TERMINAL_MAX_BACKOFF_MS)
+}
+
 /// What one job's state means to a forge.
 fn job_content(
     state: sentinel_core::JobState,
     class: Option<sentinel_core::FailureClass>,
     job: &str,
-) -> (Status, Option<Conclusion>, String, String) {
+) -> (Status, Option<Conclusion>, &'static str, String) {
     use sentinel_core::JobState as S;
     match state {
         S::Blocked | S::Queued => (
             Status::Queued,
             None,
-            "Queued".into(),
+            "Queued",
             format!("job {job}: waiting for a worker"),
         ),
         S::Leased | S::Preparing | S::Running | S::Finalizing => (
             Status::InProgress,
             None,
-            "Running".into(),
+            "Running",
             format!("job {job}: running"),
         ),
         S::Terminal(outcome) => {
@@ -271,46 +297,46 @@ fn job_content(
             (
                 Status::Completed,
                 Some(Conclusion::of_outcome(outcome)),
-                title.to_owned(),
+                title,
                 format!("job {job}: {why}"),
             )
         }
     }
 }
 
-/// What the run as a whole means to a forge.
+/// What the run as a whole means to a forge, from the job states in one
+/// pass (no collection): the state and every count come from the same walk.
 fn aggregate_content(
-    jobs: &[(sentinel_core::JobState, Option<sentinel_core::FailureClass>)],
-) -> Result<(Status, Option<Conclusion>, String, String)> {
-    use sentinel_core::Outcome as O;
-    if jobs.is_empty() {
+    states: impl Iterator<Item = sentinel_core::JobState>,
+) -> Result<(Status, Option<Conclusion>, &'static str, String)> {
+    use sentinel_core::{JobState, Outcome as O};
+    let (mut total, mut passed, mut failed, mut skipped, mut cancelled) = (0usize, 0, 0, 0, 0);
+    let state = sentinel_core::aggregate(states.inspect(|state| {
+        total += 1;
+        if let JobState::Terminal(outcome) = state {
+            match outcome {
+                O::Passed => passed += 1,
+                O::Failed | O::InfraFailed => failed += 1,
+                O::Skipped => skipped += 1,
+                O::Canceled => cancelled += 1,
+                O::TimedOut => {}
+            }
+        }
+    }));
+    if total == 0 {
         return Err(Error::Corrupt("run has no jobs"));
     }
-    let state = sentinel_core::aggregate(jobs.iter().map(|(state, _)| *state));
-    let count = |wanted: O| {
-        jobs.iter()
-            .filter(
-                |(state, _)| matches!(state, sentinel_core::JobState::Terminal(o) if *o == wanted),
-            )
-            .count()
-    };
-    let total = jobs.len();
     let summary = format!(
-        "{}/{} jobs passed · {} failed · {} skipped · {} cancelled",
-        count(O::Passed),
-        total,
-        count(O::Failed) + count(O::InfraFailed),
-        count(O::Skipped),
-        count(O::Canceled),
+        "{passed}/{total} jobs passed · {failed} failed · {skipped} skipped · {cancelled} cancelled",
     );
     Ok(match state {
         sentinel_core::RunState::Pending => (
             Status::Queued,
             None,
-            "Queued".into(),
+            "Queued",
             format!("{total} jobs waiting for a worker"),
         ),
-        sentinel_core::RunState::Active => (Status::InProgress, None, "Running".into(), summary),
+        sentinel_core::RunState::Active => (Status::InProgress, None, "Running", summary),
         sentinel_core::RunState::Terminal(outcome) => {
             let title = match outcome {
                 O::Passed => "Passed",
@@ -323,7 +349,7 @@ fn aggregate_content(
             (
                 Status::Completed,
                 Some(Conclusion::of_outcome(outcome)),
-                title.to_owned(),
+                title,
                 summary,
             )
         }
@@ -378,20 +404,33 @@ struct Draft<'a> {
     external: String,
     status: Status,
     conclusion: Option<Conclusion>,
-    title: String,
+    title: &'static str,
     summary: String,
 }
 
 /// One statement: create the row or coalesce the newest desired state into it.
+///
+/// A draft that repeats the stored content (same status, conclusion, title and
+/// summary) changes nothing: the generation, the retry schedule and the
+/// delivery cursor stay put, so a re-record cannot restart a backing-off row
+/// or re-send what GitHub already has. The one exception is a refused row: a
+/// fresh event for it re-arms it.
+///
 /// A new generation resets the cursor to pending and clears any previous
-/// refusal or retry schedule. A generation that follows a `completed` one
-/// also drops the check-run handle: the remote run is terminal and GitHub
-/// silently keeps a completed run completed, so new work needs a fresh run —
-/// and the create mark goes with it, so that fresh run is created under its
-/// own identity instead of adopting the terminal one.
+/// refusal or retry schedule. A generation that follows a *delivered*
+/// `completed` one also drops the check-run handle: that remote run is
+/// terminal and GitHub silently keeps a completed run completed, so new work
+/// needs a fresh run — and the create mark goes with it, so that fresh run is
+/// created under its own identity instead of adopting the terminal one. A
+/// completed generation that was never delivered keeps its handle: the remote
+/// run is still the live one, and dropping the handle would orphan it and
+/// create a duplicate.
 fn upsert(tx: &Transaction<'_>, draft: Draft<'_>, now: UnixMillis) -> Result<()> {
     let id = CheckId::new();
-    tx.execute(
+    // Cached: this runs inside the writer transaction on every job
+    // transition, and the statement is long enough that re-preparing it
+    // would cost more than the row it writes.
+    tx.prepare_cached(
         "INSERT INTO check_publications(id, tenant_id, repo_id, run_id, delivery_id, scope, name,
             head_sha, external_id, status, conclusion, title, summary, seq, state, created_ms, updated_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, 0, ?14, ?14)
@@ -399,14 +438,26 @@ fn upsert(tx: &Transaction<'_>, draft: Draft<'_>, now: UnixMillis) -> Result<()>
             status = excluded.status, conclusion = excluded.conclusion,
             title = excluded.title, summary = excluded.summary,
             check_run_id = CASE WHEN check_publications.status = 'completed'
+                AND check_publications.state = 1
+                AND check_publications.published_seq = check_publications.seq
                 THEN NULL ELSE check_publications.check_run_id END,
             create_started_ms = CASE WHEN check_publications.status = 'completed'
+                AND check_publications.state = 1
+                AND check_publications.published_seq = check_publications.seq
                 THEN NULL ELSE check_publications.create_started_ms END,
             create_seq = CASE WHEN check_publications.status = 'completed'
+                AND check_publications.state = 1
+                AND check_publications.published_seq = check_publications.seq
                 THEN NULL ELSE check_publications.create_seq END,
-             seq = check_publications.seq + 1, state = 0, reason = NULL, attempts = 0,
-            next_attempt_ms = NULL, settled_ms = NULL, updated_ms = excluded.updated_ms",
-        params![
+            seq = check_publications.seq + 1, state = 0, reason = NULL, attempts = 0,
+            next_attempt_ms = NULL, settled_ms = NULL, updated_ms = excluded.updated_ms
+         WHERE check_publications.state = 2
+            OR check_publications.status IS NOT excluded.status
+            OR check_publications.conclusion IS NOT excluded.conclusion
+            OR check_publications.title IS NOT excluded.title
+            OR check_publications.summary IS NOT excluded.summary",
+    )?
+    .execute(params![
             id.as_bytes(),
             draft.tenant.as_bytes(),
             draft.repo.as_bytes(),
@@ -455,6 +506,7 @@ pub fn record_run(
         let job = JobId::from_bytes(*job).map_err(|_| Error::Corrupt("job_id"))?;
         let (status, conclusion, title, summary) =
             job_content(sentinel_core::JobState::Queued, None, job_name);
+        let scope = job.to_string();
         upsert(
             tx,
             Draft {
@@ -462,10 +514,10 @@ pub fn record_run(
                 repo: facts.repo,
                 run: Some(run),
                 delivery: None,
-                scope: &job.to_string(),
+                scope: &scope,
                 name: &qualified_name(job_name),
                 head_sha: &facts.head_sha,
-                external: external_id(run, &job.to_string()),
+                external: external_id(run, &scope),
                 status,
                 conclusion,
                 title,
@@ -475,7 +527,7 @@ pub fn record_run(
         )?;
         written += 1;
     }
-    written += record_aggregate(tx, tenant, run, now)?;
+    written += record_aggregate(tx, tenant, run, &facts, now)?;
     Ok(written)
 }
 
@@ -488,36 +540,42 @@ pub fn qualified_name(job: &str) -> String {
 }
 
 /// Recompute the stable aggregate from the run's job rows and coalesce it.
+/// The caller read the run's `facts` already (one join per transition, not
+/// two); the job states are folded straight off the cursor, never collected.
 fn record_aggregate(
     tx: &Transaction<'_>,
     tenant: TenantId,
     run: RunId,
+    facts: &RunFacts,
     now: UnixMillis,
 ) -> Result<usize> {
-    let Some(facts) = run_facts(tx, tenant, run)? else {
-        return Ok(0);
-    };
-    let rows: Vec<(i64, Option<i64>)> = tx
-        .prepare_cached(
-            "SELECT state_code, failure_class FROM jobs WHERE run_id = ?1 AND tenant_id = ?2",
-        )?
-        .query_map(params![run.as_bytes(), tenant.as_bytes()], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?
-        .collect::<std::result::Result<_, _>>()?;
-    let mut jobs = Vec::with_capacity(rows.len());
-    for (code, class) in rows {
-        let state = crate::codec::decode_state(code).ok_or(Error::Corrupt("state_code"))?;
-        let class = match class {
-            None => None,
-            Some(code) => {
-                Some(crate::codec::decode_failure(code).ok_or(Error::Corrupt("failure_class"))?)
+    let mut stmt =
+        tx.prepare_cached("SELECT state_code FROM jobs WHERE run_id = ?1 AND tenant_id = ?2")?;
+    let mut rows = stmt.query(params![run.as_bytes(), tenant.as_bytes()])?;
+    // A failed read or an undecodable code ends the walk; it is reported
+    // below, before the truncated walk could be mistaken for a short run.
+    let mut fault = None;
+    let content =
+        aggregate_content(std::iter::from_fn(|| match rows.next() {
+            Ok(Some(row)) => match row.get::<_, i64>(0).map_err(Error::from).and_then(|code| {
+                crate::codec::decode_state(code).ok_or(Error::Corrupt("state_code"))
+            }) {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    fault = Some(e);
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                fault = Some(Error::from(e));
+                None
             }
-        };
-        jobs.push((state, class));
+        }));
+    if let Some(e) = fault {
+        return Err(e);
     }
-    let content = aggregate_content(&jobs)?;
-    let (status, conclusion, title, summary) = content;
+    let (status, conclusion, title, summary) = content?;
     upsert(
         tx,
         Draft {
@@ -574,6 +632,7 @@ pub fn record_job(
         }
     };
     let (status, conclusion, title, summary) = job_content(state, class, &name);
+    let scope = job.to_string();
     upsert(
         tx,
         Draft {
@@ -581,10 +640,10 @@ pub fn record_job(
             repo: facts.repo,
             run: Some(run),
             delivery: None,
-            scope: &job.to_string(),
+            scope: &scope,
             name: &qualified_name(&name),
             head_sha: &facts.head_sha,
-            external: external_id(run, &job.to_string()),
+            external: external_id(run, &scope),
             status,
             conclusion,
             title,
@@ -592,7 +651,7 @@ pub fn record_job(
         },
         now,
     )?;
-    record_aggregate(tx, tenant, run, now)?;
+    record_aggregate(tx, tenant, run, &facts, now)?;
     Ok(())
 }
 
@@ -700,7 +759,7 @@ pub fn record_delivery(
             external: format!("{EXTERNAL_PREFIX}dlv:{delivery}"),
             status: Status::Completed,
             conclusion: Some(conclusion),
-            title: title.to_owned(),
+            title,
             summary,
         },
         now,
@@ -710,14 +769,34 @@ pub fn record_delivery(
 /// Publications whose newest generation has not been delivered yet and whose
 /// next attempt is due, oldest first.
 pub fn due(conn: &Connection, now: UnixMillis, limit: u16) -> Result<Vec<Publication>> {
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {COLUMNS} FROM check_publications
+    // A literal statement: the lane runs this on every wake, and formatting
+    // it each time would allocate a string only to find it in the cache.
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM check_publications
          WHERE state = 0 AND published_seq < seq
            AND (next_attempt_ms IS NULL OR next_attempt_ms <= ?1)
          ORDER BY created_ms, id LIMIT ?2"
     ))?;
     let rows = stmt.query_map(params![now.0, limit], decode_row)?;
     rows.map(|row| decode(row?)).collect()
+}
+
+/// When the earliest pending publication becomes due, as wall-clock
+/// milliseconds: `Some(0)` for one due already, `None` when nothing is
+/// pending. One read of the head of the `check_publications_due` index, so a
+/// lane that found nothing due can sleep exactly until the next backoff
+/// expires instead of polling for it.
+pub fn next_due_ms(conn: &Connection) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT COALESCE(next_attempt_ms, 0) FROM check_publications
+             WHERE state = 0 AND published_seq < seq
+             ORDER BY next_attempt_ms LIMIT 1",
+        )?
+        .query_row([], |r| r.get(0))
+        .optional()?)
 }
 
 /// One publication by ID, whatever its state.
@@ -910,6 +989,8 @@ pub fn published(
 }
 
 /// Make an attempt that failed transiently due again under the shared budget.
+/// A completed check has the longer budget and back-off ceiling
+/// ([`MAX_TERMINAL_ATTEMPTS`]); every other status gets [`MAX_ATTEMPTS`].
 pub fn retry(
     tx: &Transaction<'_>,
     id: CheckId,
@@ -917,17 +998,30 @@ pub fn retry(
     now: UnixMillis,
     delay_ms: i64,
 ) -> Result<Retry> {
-    let attempts: i64 = tx
-        .prepare_cached("SELECT attempts FROM check_publications WHERE id = ?1 AND seq = ?2")?
-        .query_row(params![id.as_bytes(), seq], |r| r.get(0))
+    let (attempts, status): (i64, String) = tx
+        .prepare_cached(
+            "SELECT attempts, status FROM check_publications WHERE id = ?1 AND seq = ?2",
+        )?
+        .query_row(params![id.as_bytes(), seq], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?
         .ok_or(Error::Conflict)?;
+    let terminal = status == Status::Completed.as_str();
+    let (budget, ceiling) = if terminal {
+        (MAX_TERMINAL_ATTEMPTS, TERMINAL_MAX_BACKOFF_MS)
+    } else {
+        (MAX_ATTEMPTS, MAX_BACKOFF_MS)
+    };
     let next = u32::try_from(attempts.saturating_add(1)).unwrap_or(u32::MAX);
-    if next >= MAX_ATTEMPTS {
+    if next >= budget {
         refused(tx, id, seq, "attempts", now)?;
         return Ok(Retry::Exhausted);
     }
-    let wait = backoff_ms(next).max(delay_ms.clamp(0, MAX_BACKOFF_MS));
+    let base = if terminal {
+        terminal_backoff_ms(next)
+    } else {
+        backoff_ms(next)
+    };
+    let wait = base.max(delay_ms.clamp(0, ceiling));
     let next_attempt_ms = now.0.saturating_add(wait);
     let changed = tx.execute(
         "UPDATE check_publications SET attempts = ?3, next_attempt_ms = ?4, updated_ms = ?5
@@ -943,6 +1037,48 @@ pub fn retry(
     })
 }
 
+/// Park a pending row until `until_ms` without spending an attempt: a rate
+/// limit says nothing about the row, so it must not eat the retry budget.
+/// The park is capped at [`MAX_DEFER_MS`]. Returns whether the row was still
+/// the pending generation `seq`; a moved or settled row needs no park.
+pub fn defer(
+    tx: &Transaction<'_>,
+    id: CheckId,
+    seq: i64,
+    now: UnixMillis,
+    until_ms: i64,
+) -> Result<bool> {
+    let until = until_ms.min(now.0.saturating_add(MAX_DEFER_MS));
+    let changed = tx.execute(
+        "UPDATE check_publications SET next_attempt_ms = ?3, updated_ms = ?4
+         WHERE id = ?1 AND seq = ?2 AND state = 0",
+        params![id.as_bytes(), seq, until, now.0],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Put completed checks that spent their whole budget back in the queue.
+///
+/// A check refused with reason `attempts` is a final status that never
+/// reached GitHub; once the outage that caused it is over, nothing else would
+/// ever deliver it. The delivery lane calls this once per start: rows settled
+/// within [`REARM_WINDOW_MS`], at most `limit`, get a fresh budget, so the
+/// path is bounded by restarts, the window and the limit: a permanently
+/// failing row is retried once per start, never forever. Returns how many
+/// rows were re-armed.
+pub fn rearm_exhausted(tx: &Transaction<'_>, now: UnixMillis, limit: u32) -> Result<usize> {
+    Ok(tx.execute(
+        "UPDATE check_publications SET state = 0, reason = NULL, attempts = 0,
+            next_attempt_ms = NULL, settled_ms = NULL, updated_ms = ?1
+         WHERE id IN (
+            SELECT id FROM check_publications
+            WHERE state = 2 AND reason = 'attempts' AND status = 'completed'
+              AND settled_ms >= ?2
+            ORDER BY settled_ms DESC LIMIT ?3)",
+        params![now.0, now.0.saturating_sub(REARM_WINDOW_MS), limit],
+    )?)
+}
+
 /// Give up on one generation: the row records why, and a later generation (a
 /// state change) starts fresh.
 pub fn refused(
@@ -952,11 +1088,18 @@ pub fn refused(
     reason: &str,
     now: UnixMillis,
 ) -> Result<()> {
-    let reason: String = reason
+    // The column requires 1..=128 characters: a blank reason would fail the
+    // CHECK and leave the row pending at the head of the queue.
+    let mut reason: String = reason
         .chars()
         .filter(|c| !c.is_control())
         .take(120)
-        .collect();
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    if reason.is_empty() {
+        reason.push_str("refused");
+    }
     let changed = tx.execute(
         "UPDATE check_publications SET state = 2, reason = ?3, next_attempt_ms = NULL,
             settled_ms = ?4, updated_ms = ?4

@@ -74,6 +74,9 @@ fn eventually(what: &str, within: Duration, mut predicate: impl FnMut() -> bool)
 struct Scripted {
     verdicts: Mutex<Vec<LogVerdict>>,
     logs: AtomicU64,
+    /// `log_sync` calls, and whether they report a fault.
+    syncs: AtomicU64,
+    sync_fails: AtomicBool,
 }
 
 impl SessionHandler for Scripted {
@@ -98,6 +101,10 @@ impl SessionHandler for Scripted {
         } else {
             script.remove(0)
         }
+    }
+    fn log_sync(&self, _: WorkerId, _: AttemptId) -> bool {
+        self.syncs.fetch_add(1, Ordering::SeqCst);
+        !self.sync_fails.load(Ordering::SeqCst)
     }
     fn abandoned(&self, _: WorkerId, _: AttemptId, _: Fence) {}
 }
@@ -143,6 +150,8 @@ impl Admission for ScriptedAdmission {
 struct Quiet {
     reporter: Mutex<Option<Reporter>>,
     refused: AtomicU64,
+    /// The highest sequence the controller acknowledged.
+    acked: AtomicU64,
 }
 
 impl Executor for Quiet {
@@ -163,7 +172,9 @@ impl Executor for Quiet {
     }
     fn spec(&self, _: AttemptId, _: JobContext, _: Vec<u8>) {}
     fn no_spec(&self, _: AttemptId) {}
-    fn log_acked(&self, _: AttemptId, _: u64) {}
+    fn log_acked(&self, _: AttemptId, through: u64) {
+        self.acked.fetch_max(through, Ordering::SeqCst);
+    }
     fn log_refused(&self, _: AttemptId) {
         self.refused.fetch_add(1, Ordering::SeqCst);
     }
@@ -236,6 +247,7 @@ fn an_unavailable_refusal_is_retried_and_the_worker_connects() {
     let config = worker::Config {
         controller: addr,
         server: fingerprint,
+        also_pinned: Vec::new(),
         worker: WorkerId::new(),
         name: "retrying".into(),
         hello: hello(6),
@@ -290,6 +302,7 @@ fn an_unavailable_refusal_is_retried_and_the_worker_connects() {
         worker::Config {
             controller: addr,
             server: fingerprint,
+            also_pinned: Vec::new(),
             worker: WorkerId::new(),
             name: "final".into(),
             hello: hello(6),
@@ -347,7 +360,7 @@ fn a_welcome_outside_the_hellos_range_is_refused() {
 fn a_transient_log_fault_closes_the_connection_instead_of_refusing() {
     let handler = Arc::new(Scripted {
         verdicts: Mutex::new(vec![LogVerdict::Retry]),
-        logs: AtomicU64::new(0),
+        ..Scripted::default()
     });
     let (addr, fingerprint, _) = stand_in(
         Arc::new(ScriptedAdmission {
@@ -615,4 +628,174 @@ fn stalled_handshakes_are_cut_at_their_deadline_and_cannot_lock_workers_out() {
         )
         .is_ok()
     });
+}
+
+/// An unknown certificate guessing enrollment secrets is budgeted per source
+/// before a guess reaches the single writer (each refused one commits an
+/// audit row): the first few are refused as wrong, the rest are told to try
+/// later and counted, and an already enrolled worker is never held to the
+/// budget.
+#[test]
+fn enrollment_guessing_is_rate_limited_and_never_touches_enrolled_workers() {
+    let d = deployment();
+    let (worker, identity) = (WorkerId::new(), Identity::generate("w").unwrap());
+    let (cert, key) = (d._dir.path().join("w.crt"), d._dir.path().join("w.key"));
+    identity.save(&cert, &key).unwrap();
+    let load = || Identity::load(&cert, &key).unwrap();
+    let secret = d.enrollment();
+    drop(d.connect(load(), worker, Some(&secret), 6).unwrap());
+
+    let mut wrong = 0;
+    let mut deferred = 0;
+    for _ in 0..12 {
+        let guess = Secret::generate();
+        match d
+            .connect(
+                Identity::generate("guesser").unwrap(),
+                WorkerId::new(),
+                Some(&guess),
+                6,
+            )
+            .unwrap_err()
+        {
+            Error::Rejected(Rejection::Enrollment) => wrong += 1,
+            Error::Rejected(Rejection::Unavailable) => deferred += 1,
+            other => panic!("unexpected {other}"),
+        }
+    }
+    assert!(
+        (1..=5).contains(&wrong),
+        "{wrong} guesses reached the writer"
+    );
+    assert_eq!(wrong + deferred, 12);
+    assert!(
+        d.controller
+            .stats()
+            .enrollment_limited
+            .load(Ordering::SeqCst)
+            >= 7
+    );
+    // The enrolled worker reconnects regardless.
+    assert!(d.connect(load(), worker, None, 6).is_ok());
+}
+
+/// Frames written ahead of their `fsync` are acknowledged only after the
+/// handler made them durable: a burst is answered at its highest sequence
+/// with at most one sync per frame, never an acknowledgement without one.
+#[test]
+fn deferred_log_frames_are_acknowledged_only_after_a_sync() {
+    let handler = Arc::new(Scripted {
+        verdicts: Mutex::new((1..=8).map(LogVerdict::Stored).collect()),
+        ..Scripted::default()
+    });
+    let (addr, fingerprint, _) = stand_in(
+        Arc::new(ScriptedAdmission {
+            answers: Mutex::new(Vec::new()),
+            asked: AtomicUsize::new(0),
+        }),
+        Arc::clone(&handler),
+        Arc::new(AtomicBool::new(true)),
+    );
+    let client = tls::client_config(Identity::generate("w").unwrap(), fingerprint).unwrap();
+    let mut link = session::connect(
+        addr,
+        client,
+        WorkerId::new(),
+        "w",
+        hello(6),
+        None,
+        capacity(),
+    )
+    .unwrap();
+    let executor = Quiet::default();
+    let attempt = AttemptId::new();
+    let stop = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let running = scope.spawn(|| link.run(&executor, || stop.load(Ordering::SeqCst)));
+        eventually("the session's reporter", Duration::from_secs(5), || {
+            executor.reporter.lock().unwrap().is_some()
+        });
+        let reporter = executor.reporter.lock().unwrap().clone().unwrap();
+        for seq in 1..=8 {
+            reporter
+                .log(
+                    attempt,
+                    &Frame {
+                        seq,
+                        step: 0,
+                        stream: Stream::Stdout,
+                        bytes: b"line
+"
+                        .to_vec(),
+                    },
+                )
+                .unwrap();
+        }
+        eventually(
+            "the last frame's acknowledgement",
+            Duration::from_secs(5),
+            || executor.acked.load(Ordering::SeqCst) == 8,
+        );
+        stop.store(true, Ordering::SeqCst);
+        let _ = running.join().unwrap();
+    });
+    let syncs = handler.syncs.load(Ordering::SeqCst);
+    assert!((1..=8).contains(&syncs), "{syncs} syncs for 8 frames");
+}
+
+/// A sync that fails acknowledges nothing and closes the connection, so the
+/// worker resends from its last acknowledgement instead of dropping frames
+/// that were never durable.
+#[test]
+fn a_failed_log_sync_closes_the_connection_without_an_acknowledgement() {
+    let handler = Arc::new(Scripted {
+        verdicts: Mutex::new(vec![LogVerdict::Stored(1)]),
+        sync_fails: AtomicBool::new(true),
+        ..Scripted::default()
+    });
+    let (addr, fingerprint, _) = stand_in(
+        Arc::new(ScriptedAdmission {
+            answers: Mutex::new(Vec::new()),
+            asked: AtomicUsize::new(0),
+        }),
+        Arc::clone(&handler),
+        Arc::new(AtomicBool::new(true)),
+    );
+    let client = tls::client_config(Identity::generate("w").unwrap(), fingerprint).unwrap();
+    let mut link = session::connect(
+        addr,
+        client,
+        WorkerId::new(),
+        "w",
+        hello(6),
+        None,
+        capacity(),
+    )
+    .unwrap();
+    let executor = Quiet::default();
+    let attempt = AttemptId::new();
+    let outcome = thread::scope(|scope| {
+        let running = scope.spawn(|| link.run(&executor, || false));
+        eventually("the session's reporter", Duration::from_secs(5), || {
+            executor.reporter.lock().unwrap().is_some()
+        });
+        let reporter = executor.reporter.lock().unwrap().clone().unwrap();
+        reporter
+            .log(
+                attempt,
+                &Frame {
+                    seq: 1,
+                    step: 0,
+                    stream: Stream::Stdout,
+                    bytes: b"hello
+"
+                    .to_vec(),
+                },
+            )
+            .unwrap();
+        running.join().unwrap()
+    });
+    assert!(outcome.is_err(), "the connection must close");
+    assert_eq!(executor.acked.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.refused.load(Ordering::SeqCst), 0);
 }
