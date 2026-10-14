@@ -1,0 +1,338 @@
+<script setup lang="ts">
+import type { Security } from "~~/shared/types/api";
+import ShowOnceModal from "~/components/ShowOnceModal.vue";
+
+// The signed-in person's own security: an authenticator app (enroll with a
+// QR code or the key, confirm with a code, recovery codes shown once and
+// reissued under step-up), the password, and linked identities. Secrets
+// (the seed, codes, passwords) live in this page's memory only, are
+// cleared as soon as they have served, and never reach storage or a URL.
+useHead({ title: "Account security · Sentinel" });
+const api = useApi();
+const session = useSession();
+const toast = useToast();
+const withStepUp = useStepUp();
+const endSession = useEndSession();
+const showOnce = useOverlay().create(ShowOnceModal, { destroyOnClose: true });
+
+const { data: security, error: loadError, refresh, status } = await useAsyncData("account-security", () => api<Security>("/api/v1/me/security"));
+const github = computed(() => security.value?.identities.find((i) => i.provider === "github") ?? null);
+const isoDate = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+
+// --- Authenticator app -------------------------------------------------
+
+const enrollPassword = ref("");
+const enrollError = ref("");
+const reauthenticate = ref(false);
+const enrolling = ref(false);
+const uri = ref<string | null>(null);
+const confirmCode = ref("");
+const confirmError = ref("");
+const confirming = ref(false);
+const reissuing = ref(false);
+const qr = computed(() => (uri.value ? encodeQr(uri.value) : null));
+const qrBox = computed(() => (qr.value ? qr.value.size + 8 : 0));
+const secret = computed(() => (uri.value ? totpSecret(uri.value) : null));
+const codeInput = useTemplateRef<{ inputRef?: HTMLInputElement }>("codeInput");
+
+async function startEnroll() {
+  if (enrolling.value) return;
+  enrolling.value = true;
+  enrollError.value = "";
+  reauthenticate.value = false;
+  const body = security.value?.password ? { password: enrollPassword.value } : undefined;
+  enrollPassword.value = "";
+  try {
+    const started = await api<{ provisioning_uri: string }>("/api/v1/mfa/enroll", { method: "POST", body: body ?? {} });
+    uri.value = started.provisioning_uri;
+    confirmCode.value = "";
+    confirmError.value = "";
+    nextTick(() => codeInput.value?.inputRef?.focus());
+  } catch (e) {
+    const err = e as ApiError;
+    if (err.code === "unauthenticated") return;
+    if (err.code === "forbidden" && err.details?.reauthenticate) {
+      reauthenticate.value = true;
+      enrollError.value = "Setting up an authenticator needs a recent sign-in. Sign in again, then come back here.";
+    } else if (err.code === "forbidden" && err.message === "enrollment refused") {
+      enrollError.value = "That password was not accepted. Five wrong attempts end this session.";
+    } else if (err.code === "conflict") {
+      enrollError.value = "An authenticator is already set up.";
+      await refresh();
+    } else if (err.code === "rate_limited") {
+      enrollError.value = `Too many attempts. Try again in ${retryAfter(err)}.`;
+    } else {
+      enrollError.value = err.code === "forbidden" ? err.message : refusal(err);
+    }
+  } finally {
+    enrolling.value = false;
+  }
+}
+
+function cancelEnroll() {
+  uri.value = null;
+  confirmCode.value = "";
+  confirmError.value = "";
+  refresh();
+}
+
+async function confirmEnroll() {
+  if (confirming.value) return;
+  const code = confirmCode.value.replace(/\s+/g, "");
+  confirmCode.value = "";
+  if (!/^\d{6}$/.test(code)) {
+    confirmError.value = "Enter the six-digit code the app shows now.";
+    return;
+  }
+  confirming.value = true;
+  confirmError.value = "";
+  try {
+    const done = await api<{ recovery_codes: string[] }>("/api/v1/mfa/enroll/confirm", { method: "POST", body: { code } });
+    uri.value = null;
+    if (session.me.value) {
+      session.me.value.mfa = true;
+      session.me.value.stepped_up = true;
+    }
+    await showOnce.open({
+      title: "Save your recovery codes",
+      description: "Each code confirms it's you once if the authenticator is not at hand.",
+      secrets: done.recovery_codes,
+      filename: "sentinel-recovery-codes.txt",
+      note: "Keep them apart from the device that runs the authenticator.",
+    });
+    toast.add({ title: "Authenticator set up", color: "success", icon: "i-lucide-check" });
+    await refresh();
+  } catch (e) {
+    const err = e as ApiError;
+    if (err.code === "unauthenticated") return;
+    confirmError.value = err.code === "forbidden" ? "That code was not accepted. Check the device's clock and use the current code; five wrong codes end this session."
+      : err.code === "not_found" ? "No setup is in progress any more. Start again."
+        : refusal(err);
+    if (err.code === "not_found") uri.value = null;
+    nextTick(() => codeInput.value?.inputRef?.focus());
+  } finally {
+    confirming.value = false;
+  }
+}
+
+async function reissue() {
+  if (reissuing.value) return;
+  reissuing.value = true;
+  try {
+    const fresh = await withStepUp(() => api<{ recovery_codes: string[] }>("/api/v1/mfa/recovery-codes", { method: "POST", body: {} }));
+    await showOnce.open({
+      title: "Your new recovery codes",
+      description: "The earlier codes no longer work.",
+      secrets: fresh.recovery_codes,
+      filename: "sentinel-recovery-codes.txt",
+    });
+    await refresh();
+  } catch (e) {
+    if (e instanceof StepUpDeclined) return;
+    const err = e as ApiError;
+    if (err.code === "unauthenticated") return;
+    toast.add({ title: `Recovery codes: ${err.code === "not_found" ? "no authenticator is set up" : refusal(err)}.`, color: "error", icon: "i-lucide-circle-alert", duration: 8000 });
+  } finally {
+    reissuing.value = false;
+  }
+}
+
+// --- Password ----------------------------------------------------------
+
+const current = ref("");
+const fresh = ref("");
+const again = ref("");
+const passwordError = ref("");
+const changing = ref(false);
+const bytes = (s: string) => new TextEncoder().encode(s).length;
+function clearPasswords() {
+  current.value = "";
+  fresh.value = "";
+  again.value = "";
+}
+
+async function changePassword() {
+  if (changing.value) return;
+  passwordError.value = "";
+  const n = bytes(fresh.value);
+  if (n < 12 || n > 256) {
+    passwordError.value = "The new password must be 12 to 256 bytes long.";
+    return;
+  }
+  if (fresh.value !== again.value) {
+    passwordError.value = "The new password and its repetition differ.";
+    return;
+  }
+  changing.value = true;
+  const body = { current: current.value, new: fresh.value };
+  try {
+    await withStepUp(() => api("/api/v1/password", { method: "POST", body }));
+    clearPasswords();
+    await endSession("password-changed");
+  } catch (e) {
+    if (e instanceof StepUpDeclined) return;
+    const err = e as ApiError;
+    if (err.code === "unauthenticated") return clearPasswords();
+    current.value = "";
+    passwordError.value = err.code === "forbidden" ? "The current password was not accepted. Five wrong attempts end this session."
+      : err.code === "invalid_request" ? "The new password must be 12 to 256 bytes long."
+        : err.code === "rate_limited" ? `Too many attempts. Try again in ${retryAfter(err)}.`
+          : refusal(err);
+  } finally {
+    changing.value = false;
+  }
+}
+
+// --- Linked identities -------------------------------------------------
+
+const linking = ref(false);
+async function linkGitHub() {
+  if (linking.value) return;
+  linking.value = true;
+  try {
+    const started = await withStepUp(() => api<{ authorize_url: string }>("/api/v1/identities/github/link", { method: "POST", body: {} }));
+    if (!/^https:\/\//.test(started.authorize_url)) throw new ApiError(0, { code: "invalid_response", message: "the controller gave an unexpected address" });
+    // The round trip ends on `/`, which continues here.
+    try { sessionStorage.setItem("sentinel-return", "/account"); } catch { /* ignore */ }
+    await navigateTo(started.authorize_url, { external: true });
+  } catch (e) {
+    linking.value = false;
+    if (e instanceof StepUpDeclined) return;
+    const err = e as ApiError;
+    if (err.code === "unauthenticated") return;
+    toast.add({ title: `Link GitHub: ${refusal(err)}.`, color: "error", icon: "i-lucide-circle-alert", duration: 8000 });
+  }
+}
+
+onBeforeUnmount(() => {
+  uri.value = null;
+  confirmCode.value = "";
+  enrollPassword.value = "";
+  clearPasswords();
+});
+</script>
+
+<template>
+  <SPage id="account" title="Account security">
+    <div class="max-w-3xl space-y-6">
+      <UAlert v-if="loadError" color="error" variant="subtle" icon="i-lucide-circle-alert" title="Could not load your account's security settings."
+        :description="loadError.message" role="alert" :actions="[{ label: 'Try again', onClick: () => { refresh(); } }]" />
+
+      <template v-else-if="security">
+        <!-- Authenticator app -->
+        <UCard as="section" aria-labelledby="mfa-h">
+          <template #header>
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <h2 id="mfa-h" class="text-base font-semibold flex items-center gap-2"><UIcon name="i-lucide-smartphone" />Authenticator app</h2>
+              <UBadge v-if="security.mfa.enrolled" color="success" variant="subtle" icon="i-lucide-shield-check" label="On" />
+              <UBadge v-else color="neutral" variant="outline" label="Off" />
+            </div>
+          </template>
+
+          <div v-if="security.mfa.enrolled" class="space-y-4">
+            <p class="text-sm">Codes from your authenticator app confirm sensitive changes: issuing service credentials, administration, your password.</p>
+            <div class="flex flex-wrap items-center justify-between gap-3 rounded-md border border-default p-3">
+              <div>
+                <h3 class="text-sm font-medium">Recovery codes</h3>
+                <p class="text-sm" :class="security.mfa.recovery_codes_remaining <= 3 ? 'text-warning' : 'text-muted'">
+                  {{ security.mfa.recovery_codes_remaining }} of 10 left<template v-if="security.mfa.recovery_codes_remaining === 0"> — replace them now</template><template v-else-if="security.mfa.recovery_codes_remaining <= 3"> — consider replacing them</template>.
+                </p>
+              </div>
+              <UButton color="neutral" variant="outline" icon="i-lucide-refresh-cw" label="Replace recovery codes" :loading="reissuing" @click="reissue" />
+            </div>
+            <p class="text-xs text-muted">Lost the device and every code? An operator can remove the authenticator on the controller host (<code>sentinel admin mfa disable</code>); that also signs out every session.</p>
+          </div>
+
+          <!-- Step 2: scan and confirm -->
+          <div v-else-if="uri" class="space-y-4">
+            <ol class="list-decimal ps-5 text-sm space-y-1">
+              <li>Scan the code with an authenticator app, or enter the key by hand.</li>
+              <li>Type the six-digit code the app then shows.</li>
+            </ol>
+            <div class="flex flex-col gap-4 sm:flex-row sm:items-start">
+              <svg v-if="qr" :viewBox="`0 0 ${qrBox} ${qrBox}`" class="size-48 shrink-0 rounded-md bg-white" shape-rendering="crispEdges" role="img" aria-label="QR code for your authenticator app; the same key is written beside it">
+                <path :d="qrPath(qr)" fill="#000" />
+              </svg>
+              <div class="space-y-2 min-w-0">
+                <p class="text-sm text-muted">Key (time-based, 6 digits, 30 seconds)</p>
+                <p class="font-mono text-sm break-all select-all rounded-md border border-default bg-muted px-3 py-2">{{ secret ?? "—" }}</p>
+                <UButton :to="uri" external size="sm" color="neutral" variant="link" icon="i-lucide-external-link" label="Open in an authenticator app on this device" class="px-0" />
+              </div>
+            </div>
+            <form class="flex flex-wrap items-end gap-3" aria-label="Confirm the authenticator" @submit.prevent="confirmEnroll">
+              <UFormField label="Code from the app" name="totp" hint="6 digits" :error="!!confirmError">
+                <UInput id="totp-confirm" ref="codeInput" v-model="confirmCode" autocomplete="one-time-code" inputmode="numeric" maxlength="7" required class="w-40" />
+              </UFormField>
+              <UButton type="submit" label="Confirm" :loading="confirming" />
+              <UButton color="neutral" variant="ghost" label="Cancel" @click="cancelEnroll" />
+            </form>
+            <UAlert v-if="confirmError" color="error" variant="subtle" icon="i-lucide-circle-alert" :title="confirmError" role="alert" />
+          </div>
+
+          <!-- Step 1: start -->
+          <div v-else class="space-y-4">
+            <p class="text-sm">An authenticator app on your phone gives a code that changes every 30 seconds. Sentinel asks for it before sensitive changes, so a stolen session alone cannot make them.</p>
+            <UAlert v-if="security.mfa.pending" color="info" variant="subtle" icon="i-lucide-info" title="A setup was started and not finished."
+              description="Start again for a new key; the earlier one stops working." />
+            <form class="flex flex-wrap items-end gap-3" aria-label="Set up an authenticator" @submit.prevent="startEnroll">
+              <!-- For password managers: which account this password belongs to. -->
+              <input v-if="security.password" type="text" name="username" autocomplete="username" :value="session.me.value?.username ?? ''" class="sr" tabindex="-1" aria-hidden="true" readonly>
+              <UFormField v-if="security.password" label="Your password" name="enroll-password" :error="!!enrollError && !reauthenticate">
+                <UInput id="enroll-password" v-model="enrollPassword" type="password" autocomplete="current-password" required class="w-64 max-w-full" />
+              </UFormField>
+              <UButton type="submit" icon="i-lucide-qr-code" :label="security.mfa.pending ? 'Start again' : 'Set up'" :loading="enrolling" />
+            </form>
+            <p v-if="!security.password" class="text-xs text-muted">Your account signs in with GitHub, so setting up needs a sign-in within the last few minutes.</p>
+            <UAlert v-if="enrollError" color="error" variant="subtle" icon="i-lucide-circle-alert" :title="enrollError" role="alert"
+              :actions="reauthenticate ? [{ label: 'Sign in again', icon: 'i-lucide-log-in', onClick: () => { session.signOut('/account'); } }] : undefined" />
+          </div>
+        </UCard>
+
+        <!-- Password -->
+        <UCard as="section" aria-labelledby="password-h">
+          <template #header>
+            <h2 id="password-h" class="text-base font-semibold flex items-center gap-2"><UIcon name="i-lucide-key-round" />Password</h2>
+          </template>
+          <form v-if="security.password" class="space-y-4" aria-label="Change your password" @submit.prevent="changePassword">
+            <input type="text" name="username" autocomplete="username" :value="session.me.value?.username ?? ''" class="sr" tabindex="-1" aria-hidden="true" readonly>
+            <UFormField label="Current password" name="current">
+              <UInput id="pw-current" v-model="current" type="password" autocomplete="current-password" required class="w-full sm:w-80" />
+            </UFormField>
+            <UFormField label="New password" name="new" hint="12 to 256 bytes">
+              <UInput id="pw-new" v-model="fresh" type="password" autocomplete="new-password" minlength="12" required class="w-full sm:w-80" />
+            </UFormField>
+            <UFormField label="New password again" name="again">
+              <UInput id="pw-again" v-model="again" type="password" autocomplete="new-password" minlength="12" required class="w-full sm:w-80" />
+            </UFormField>
+            <UAlert v-if="passwordError" color="error" variant="subtle" icon="i-lucide-circle-alert" :title="passwordError" role="alert" />
+            <p class="text-xs text-muted">Changing it signs out every session and app of your account, this one included<template v-if="security.mfa.enrolled">, and asks for a code from your authenticator first</template>.</p>
+            <UButton type="submit" label="Change password" :loading="changing" />
+          </form>
+          <p v-else class="text-sm text-muted">Your account has no local password: you sign in with GitHub.</p>
+        </UCard>
+
+        <!-- Linked identities -->
+        <UCard as="section" aria-labelledby="identities-h">
+          <template #header>
+            <h2 id="identities-h" class="text-base font-semibold flex items-center gap-2"><UIcon name="i-lucide-link" />Linked identities</h2>
+          </template>
+          <div class="space-y-4">
+            <ul v-if="security.identities.length" class="divide-y divide-default">
+              <li v-for="i in security.identities" :key="i.provider" class="flex items-center justify-between gap-2 py-2 text-sm">
+                <span class="flex items-center gap-2 font-medium capitalize"><UIcon :name="i.provider === 'github' ? 'i-lucide-github' : 'i-lucide-link'" />{{ i.provider }}</span>
+                <span class="text-muted">linked <time :datetime="new Date(i.linked_ms).toISOString()">{{ isoDate(i.linked_ms) }}</time></span>
+              </li>
+            </ul>
+            <p v-else class="text-sm text-muted">No external account is linked.</p>
+            <div v-if="security.github_link && !github" class="space-y-2">
+              <p class="text-sm">Link your GitHub account to sign in with it. You confirm it's you first, then approve on GitHub and come back here.</p>
+              <UButton icon="i-lucide-github" color="neutral" variant="outline" label="Link a GitHub account" :loading="linking" @click="linkGitHub" />
+            </div>
+          </div>
+        </UCard>
+      </template>
+
+      <USkeleton v-else-if="status === 'pending'" class="h-40 w-full" />
+    </div>
+  </SPage>
+</template>

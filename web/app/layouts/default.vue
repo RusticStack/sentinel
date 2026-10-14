@@ -46,6 +46,7 @@ function skipToMain() {
 const account = computed<DropdownMenuItem[][]>(() => [
   [{ label: session.me.value?.username || shortId(session.me.value?.user), type: "label", icon: "i-lucide-user" }],
   [
+    { label: "Account security", icon: "i-lucide-shield-check", to: "/account" },
     {
       label: colorMode.value === "dark" ? "Light theme" : "Dark theme",
       icon: colorMode.value === "dark" ? "i-lucide-sun" : "i-lucide-moon",
