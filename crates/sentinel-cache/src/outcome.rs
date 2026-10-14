@@ -1,6 +1,6 @@
 use crate::manifest::Manifest;
 
-/// Checked in declaration order by `compatible`: the outermost broken boundary is the reason.
+/// Variants follow the order `Manifest::compatible` checks them; the first mismatch is the reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Miss {
     Absent,
