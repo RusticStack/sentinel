@@ -1,4 +1,4 @@
-//! The web interface in a real browser (U06): a seeded controller, the
+//! The web interface in a real browser: a seeded controller, the
 //! built web interface (`web/.output`, Nuxt) in front of it as it is
 //! deployed, a job still writing its log, and `web/test/ui.mjs` driving a
 //! headless Chromium-family browser over the DevTools protocol — keyboard
