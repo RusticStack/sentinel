@@ -64,7 +64,7 @@ impl LogState {
     }
 }
 
-/// Disk zero means not reported only from workers older than protocol 7; from them it is a real limit.
+/// Zero disk means not reported only from workers older than protocol 7; from newer workers it is a real limit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capacity {
     pub cpu_millis: i64,
