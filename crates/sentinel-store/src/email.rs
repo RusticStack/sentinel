@@ -1,24 +1,5 @@
-//! Verified email identity and the durable mail outbox.
-//!
-//! An account may hold one email address. Holding is not proving: the address
-//! is a claim until a single-use, expiring token delivered to that mailbox is
-//! presented, and only a *verified* address is a login identifier, matches an
-//! email-bound invitation, or excludes another account from verifying the same
-//! address (first to verify wins; see migration 50). Changing the address never
-//! carries the old verification over: the old one stays until the new one is
-//! proved.
-//!
-//! Tokens are stored as digests, like every other secret. A message that has to
-//! carry a link is a different matter: the link exists in readable form from the
-//! moment it is minted until the mail lane has handed it to Resend. That
-//! window is the outbox row, whose body is sealed with the deployment master
-//! key and deleted as soon as the row settles. Without a Resend key (or without
-//! a master key) nothing is queued and the link is minted on demand by the
-//! host-local CLI, so a self-hosted operator is never locked out.
-//!
-//! Nothing here sends mail, and no request handler waits on the network: the
-//! transaction that mints a token also writes the outbox row, and
-//! `sentinel-mail`'s lane drains it.
+//! Tokens are stored as digests. A message carrying a link is kept only as a sealed
+//! outbox row, deleted once Resend accepts it.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::{
@@ -37,28 +18,17 @@ use crate::{
 const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 
-/// How long a verification link works.
 pub const VERIFICATION_TTL_MS: i64 = DAY_MS;
-/// Links one account may be sent per [`RESEND_WINDOW_MS`]; the resend after
-/// them is throttled whoever asks.
 pub const RESENDS_PER_WINDOW: i64 = 5;
 pub const RESEND_WINDOW_MS: i64 = HOUR_MS;
-/// Messages one recipient may be queued per window, across every account and
-/// every invitation: the ceiling on using this deployment to bury a mailbox.
 pub const RECIPIENT_PER_WINDOW: i64 = 5;
-/// Undelivered messages the outbox holds at once. Past it nothing more is
-/// queued (the request still succeeds; the operator's CLI mints a link).
 pub const MAX_PENDING: i64 = 2_000;
-/// Delivery attempts before a message is given up on.
 pub const MAX_ATTEMPTS: u32 = 8;
-/// How long a settled outbox row and an expired token are kept.
 pub const RETAIN_MS: i64 = 7 * DAY_MS;
-/// The longest an address may be: RFC 5321's path limit.
 pub const MAX_EMAIL_BYTES: usize = 254;
-/// The longest local part (RFC 5321).
 const MAX_LOCAL_BYTES: usize = 64;
 
-/// The kinds of message the outbox carries. The numbers are stored.
+/// Stored as `mail_outbox.kind`: never renumber.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Kind {
@@ -83,7 +53,6 @@ impl Kind {
     }
 }
 
-/// Characters RFC 5322 allows unquoted in a local part, besides the dot.
 const fn atext(b: u8) -> bool {
     b.is_ascii_alphanumeric()
         || matches!(
@@ -109,13 +78,6 @@ const fn atext(b: u8) -> bool {
         )
 }
 
-/// The canonical form of a mail domain: IDN labels in punycode (UTS 46 with
-/// the STD3 rules), lower case, a registrable shape (two or more labels, none
-/// empty or over 63 bytes, no label hyphen at an edge, a last label that is
-/// not all digits so an IP literal is never a domain). The one place a domain
-/// is compared: addresses and the operator's `SENTINEL_AUTO_JOIN_DOMAINS` both
-/// go through it, so `Example.COM`, `example.com` and `EXAMPLE.com` are one
-/// domain and `mail.example.com` is another.
 pub fn normalize_domain(input: &str) -> Result<String> {
     let bad = || Error::InvalidInput("email domain");
     let text = input.trim();
@@ -147,11 +109,6 @@ pub fn normalize_domain(input: &str) -> Result<String> {
     if valid { Ok(ascii) } else { Err(bad()) }
 }
 
-/// The canonical form of an address: `local@domain` with the local part lower
-/// cased (mail systems treat it case-insensitively, and so does this) and the
-/// domain per [`normalize_domain`]. The local part is ASCII: an address that
-/// needs an internationalized one is refused rather than mangled. At most
-/// [`MAX_EMAIL_BYTES`]. Diagnostics never echo the input.
 pub fn normalize(input: &str) -> Result<String> {
     let bad = || Error::InvalidInput("email address");
     let text = input.trim_matches([' ', '\t']);
@@ -178,21 +135,18 @@ pub fn normalize(input: &str) -> Result<String> {
     Ok(out)
 }
 
-/// The local part of an address already in canonical form.
 pub fn local_part_of(normalized: &str) -> &str {
     normalized
         .rsplit_once('@')
         .map_or(normalized, |(local, _)| local)
 }
 
-/// The domain of an address already in canonical form.
 pub fn domain_of(normalized: &str) -> &str {
     normalized
         .rsplit_once('@')
         .map_or(normalized, |(_, domain)| domain)
 }
 
-/// The public base URL links are built on, when this deployment delivers mail.
 pub(crate) fn delivery_url(conn: &Connection) -> Result<Option<String>> {
     Ok(conn
         .prepare_cached("SELECT public_url FROM mail_settings WHERE id = 1 AND enabled = 1")?
@@ -201,13 +155,10 @@ pub(crate) fn delivery_url(conn: &Connection) -> Result<Option<String>> {
         .flatten())
 }
 
-/// Whether this deployment delivers mail (a lane is running).
 pub fn delivery_enabled(conn: &Connection) -> Result<bool> {
     Ok(delivery_url(conn)?.is_some())
 }
 
-/// The base URL the controller was last started with, whether or not it
-/// delivers mail: what the host-local CLI builds a link on.
 pub fn public_url(conn: &Connection) -> Result<Option<String>> {
     Ok(conn
         .prepare_cached("SELECT public_url FROM mail_settings WHERE id = 1")?
@@ -216,10 +167,6 @@ pub fn public_url(conn: &Connection) -> Result<Option<String>> {
         .flatten())
 }
 
-/// Record, at controller start, whether mail is delivered and the base URL
-/// links name (`public_url`; delivery needs one). Rows already queued stay
-/// queued: a later start with the lane delivers them, and they expire on
-/// their own.
 pub fn set_delivery(
     store: &Store,
     enabled: bool,
@@ -246,18 +193,14 @@ fn sealing_context(id: &MailId) -> [u8; 24] {
     out
 }
 
-/// One message to queue.
 pub(crate) struct Outgoing<'a> {
     pub kind: Kind,
     pub recipient: &'a str,
     pub subject: &'a str,
     pub body: &'a str,
-    /// How long the message is worth delivering.
     pub ttl_ms: i64,
 }
 
-/// Queue one message: sealed, bounded, and refused (`false`) rather than
-/// piled up past the global or per-recipient ceilings.
 pub(crate) fn enqueue(
     tx: &Transaction<'_>,
     key: &Key,
@@ -341,21 +284,11 @@ pub(crate) fn invitation_message(
     )
 }
 
-/// What asking for a verification link did. Callers that must not reveal
-/// whether an address is known answer the same for every variant but
-/// [`Requested::Throttled`] on an authenticated route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Requested {
-    /// A link was minted and queued for delivery.
     Queued,
-    /// A link was recorded but this deployment sends no mail (or holds no
-    /// master key): the operator mints one with `sentinel admin account
-    /// email-link`.
     Undelivered,
-    /// The account (or the recipient) is over its resend allowance.
     Throttled,
-    /// Nothing to do: another account already verified that address, the
-    /// account already has it verified, or there is no such pending claim.
     Suppressed,
 }
 
@@ -376,8 +309,6 @@ fn verified_elsewhere(conn: &Connection, email: &str, user: UserId) -> Result<bo
         .query_row(params![email, user.as_bytes()], |r| r.get(0))?)
 }
 
-/// Record a fresh token for `email` (canonical) on `user`, voiding the
-/// account's earlier unused ones, and return its secret.
 fn mint(
     tx: &Transaction<'_>,
     user: UserId,
@@ -390,8 +321,6 @@ fn mint(
         "UPDATE email_verifications SET used_ms = ?2 WHERE user_id = ?1 AND used_ms IS NULL",
         params![user.as_bytes(), now.0],
     )?;
-    // An unverified claim follows the newest request; a verified address
-    // stays until the new one is proved.
     tx.execute(
         "UPDATE users SET email = ?2 WHERE id = ?1 AND email_verified_ms IS NULL
          AND email IS NOT ?2",
@@ -421,10 +350,6 @@ fn mint(
     Ok(secret)
 }
 
-/// Ask for a link proving `email` (any spelling; it is canonicalized) for
-/// `user`, optionally carrying an email-bound invitation that the proof will
-/// redeem. The per-account allowance is checked first and counts every link
-/// minted in the window, delivered or not.
 pub fn request(
     tx: &Transaction<'_>,
     key: Option<&Key>,
@@ -491,9 +416,6 @@ fn request_canonical(
     })
 }
 
-/// The address an account is still proving, and the invitation that proof
-/// will redeem: the newest link's target unless that address is already the
-/// account's verified one, else its unverified claim.
 fn pending_for(conn: &Connection, user: UserId) -> Result<Option<(String, Option<InvitationId>)>> {
     let current: Option<(Option<String>, Option<i64>)> = conn
         .prepare_cached(
@@ -530,7 +452,6 @@ fn pending_for(conn: &Connection, user: UserId) -> Result<Option<(String, Option
     }
 }
 
-/// Resend the link an authenticated account is waiting for.
 pub fn resend(
     tx: &Transaction<'_>,
     key: Option<&Key>,
@@ -543,9 +464,6 @@ pub fn resend(
     }
 }
 
-/// Resend for someone who names only an address (the "I never got it" form):
-/// the newest account still claiming it unverified, if any. The caller answers
-/// the same whatever this returns.
 pub fn resend_for_address(
     tx: &Transaction<'_>,
     key: Option<&Key>,
@@ -567,22 +485,12 @@ pub fn resend_for_address(
     resend(tx, key, user, now)
 }
 
-/// A link minted for the operator to hand over.
 pub struct IssuedLink {
     pub email: String,
     pub secret: Secret,
     pub expires: UnixMillis,
 }
 
-/// Host-local: mint a fresh verification token and return its secret, for an
-/// operator whose deployment sends no mail. The token proves the address the
-/// account is already proving, or `email` when the operator names one (which
-/// becomes the account's unverified claim, or the pending replacement of a
-/// verified address). Platform administration (the database file's
-/// authority), audited as host-local; it voids the account's earlier links.
-/// The secret is shown once; the link is
-/// `<public_url>/verify-email#token=<secret>`. `Conflict` when another
-/// account already verified the address.
 pub fn issue_link(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -609,9 +517,6 @@ pub fn issue_link(
     })
 }
 
-/// Host-local: mark an account's current address verified without a link (the
-/// operator vouches for it). Platform administration, audited with the
-/// host-local marker.
 pub fn verify_host_local(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -644,9 +549,6 @@ pub fn verify_host_local(
     Ok(())
 }
 
-/// Make `email` the account's verified address and clear every other
-/// account's unverified claim to it. The caller checked nobody else holds it
-/// verified.
 pub(crate) fn claim_verified(
     tx: &Transaction<'_>,
     user: UserId,
@@ -665,23 +567,15 @@ pub(crate) fn claim_verified(
     Ok(())
 }
 
-/// What presenting a verification token did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Confirmation {
-    /// The address is verified; `joined` is the tenant an email-bound
-    /// invitation carried by the token granted membership of.
     Verified {
         user: UserId,
         joined: Option<TenantId>,
     },
-    /// Unknown, expired, spent or voided token, or the address is verified by
-    /// another account. One answer for all; a presented token is spent either way.
     Refused,
 }
 
-/// Present a verification token. Single-use and race-safe: the token is spent,
-/// the address verified and any invitation it carries redeemed in one
-/// transaction, so a lost race changes nothing it should not.
 pub fn confirm(store: &Store, secret: &Secret, now: UnixMillis) -> Result<Confirmation> {
     let digest = secret.digest();
     store.writer().write(move |tx| {
@@ -728,8 +622,6 @@ pub fn confirm(store: &Store, secret: &Secret, now: UnixMillis) -> Result<Confir
     })
 }
 
-/// The account an operator means by an address: the one that verified it, else
-/// the newest still claiming it. For the host-local CLI, which names accounts.
 pub fn user_by_address(conn: &Connection, address: &str) -> Result<Option<UserId>> {
     let address = normalize(address)?;
     let row: Option<[u8; 16]> = conn
@@ -743,7 +635,6 @@ pub fn user_by_address(conn: &Connection, address: &str) -> Result<Option<UserId
         .transpose()
 }
 
-/// An account's address and whether it is verified.
 pub fn account_email(conn: &Connection, user: UserId) -> Result<Option<(String, bool)>> {
     Ok(conn
         .prepare_cached("SELECT email, email_verified_ms IS NOT NULL FROM users WHERE id = ?1")?
@@ -754,7 +645,6 @@ pub fn account_email(conn: &Connection, user: UserId) -> Result<Option<(String, 
         .and_then(|(email, verified)| email.map(|email| (email, verified))))
 }
 
-/// One message the lane should deliver.
 #[derive(Clone, Debug)]
 pub struct Pending {
     pub id: MailId,
@@ -765,15 +655,12 @@ pub struct Pending {
     sealed: Vec<u8>,
 }
 
-/// A message opened for sending.
 pub struct Message {
     pub subject: String,
     pub body: String,
 }
 
 impl Pending {
-    /// Open the sealed body. `None` when it cannot be opened (the key was
-    /// retired, or the row was altered): the lane gives the message up.
     pub fn open(&self, key: &Key) -> Option<Message> {
         let plain = key.open(&sealing_context(&self.id), &self.sealed).ok()?;
         let text = String::from_utf8(plain).ok()?;
@@ -785,7 +672,6 @@ impl Pending {
     }
 }
 
-/// Messages due for delivery, oldest first.
 pub fn due(conn: &Connection, now: UnixMillis, limit: u16) -> Result<Vec<Pending>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, kind, recipient, body, attempts, expires_ms FROM mail_outbox
@@ -815,8 +701,6 @@ pub fn due(conn: &Connection, now: UnixMillis, limit: u16) -> Result<Vec<Pending
     .collect()
 }
 
-/// When the earliest pending message becomes due, in wall-clock milliseconds
-/// (`None` when nothing is pending): one read of the head of the due index.
 pub fn next_due_ms(conn: &Connection) -> Result<Option<i64>> {
     Ok(conn
         .prepare_cached(
@@ -827,13 +711,10 @@ pub fn next_due_ms(conn: &Connection) -> Result<Option<i64>> {
         .optional()?)
 }
 
-/// Milliseconds to wait after failed attempt number `attempts` (1-based): one
-/// minute for the first, doubling, capped at fifteen minutes.
 pub fn backoff_ms(attempts: u32) -> i64 {
     (30_000i64 << attempts.min(10)).min(15 * 60 * 1000)
 }
 
-/// Resend accepted the message: settle it and drop the sealed body.
 pub fn delivered(tx: &Transaction<'_>, id: MailId, now: UnixMillis) -> Result<()> {
     let changed = tx.execute(
         "UPDATE mail_outbox SET state = 1, body = NULL, settled_ms = ?2 WHERE id = ?1 AND state = 0",
@@ -846,14 +727,12 @@ pub fn delivered(tx: &Transaction<'_>, id: MailId, now: UnixMillis) -> Result<()
     }
 }
 
-/// What a failed attempt did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Retry {
     Scheduled { attempts: u32, next_attempt_ms: i64 },
     GaveUp,
 }
 
-/// A bounded, control-free reason for the audit row and the outbox.
 fn brief(reason: &str) -> String {
     let mut text: String = reason
         .chars()
@@ -866,13 +745,8 @@ fn brief(reason: &str) -> String {
     text
 }
 
-/// The longest a service's `Retry-After` is honored: past it the back-off
-/// schedule decides.
 pub const MAX_RETRY_AFTER_MS: i64 = 60 * 60 * 1000;
 
-/// A transient failure: due again after the back-off (or `retry_after_ms`,
-/// when the service asked for longer, bounded by [`MAX_RETRY_AFTER_MS`]), or
-/// given up once the attempt budget or the message's own expiry is spent.
 pub fn retry(
     tx: &Transaction<'_>,
     id: MailId,
@@ -904,8 +778,6 @@ pub fn retry(
     })
 }
 
-/// A permanent failure (Resend refused the message, the body cannot be
-/// opened): settle it as given up with `reason`, audited.
 pub fn give_up(tx: &Transaction<'_>, id: MailId, reason: &str, now: UnixMillis) -> Result<()> {
     let kind: i64 = tx
         .prepare_cached("SELECT kind FROM mail_outbox WHERE id = ?1 AND state = 0")?
@@ -939,9 +811,6 @@ fn give_up_row(
     )
 }
 
-/// Bounded maintenance: expire undelivered messages past their life, delete
-/// settled rows and spent or expired tokens a week old. At most `limit` rows
-/// of each kind; returns how many were touched.
 pub fn purge(store: &Store, now: UnixMillis, limit: u32) -> Result<usize> {
     store.writer().write(move |tx| {
         let expired: Vec<([u8; 16], i64)> = {
@@ -978,7 +847,6 @@ pub fn purge(store: &Store, now: UnixMillis, limit: u32) -> Result<usize> {
     })
 }
 
-/// Outbox counts for diagnostics: pending, delivered, given up.
 pub fn counts(conn: &Connection) -> Result<(i64, i64, i64)> {
     let count = |state: i64| -> Result<i64> {
         Ok(conn
@@ -998,7 +866,6 @@ mod tests {
             normalize("  Alice.Smith+ci@Example.COM ").unwrap(),
             "alice.smith+ci@example.com"
         );
-        // An IDN domain is compared in punycode, whichever way it is written.
         assert_eq!(
             normalize("a@BÜCHER.example").unwrap(),
             normalize("a@xn--bcher-kva.example").unwrap()

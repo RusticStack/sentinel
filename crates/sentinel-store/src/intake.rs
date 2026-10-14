@@ -1,17 +1,5 @@
-//! Durable event intake.
-//!
-//! One authenticated ref update — a generic relay submission or a GitHub
-//! `push` — becomes one row here, keyed by the provider's delivery ID scoped
-//! to its repository, so redelivery is idempotent and visible. Acceptance
-//! happens inside one writer transaction and is acknowledged only after it
-//! commits; the controller resolves accepted deliveries asynchronously
-//! through [`resolve_due`], bounded by retries, batch size and a per-repo
-//! admission bound.
-//!
-//! Authentication is the caller's: the generic path verifies a repository
-//! hook secret with [`authenticate`], the GitHub path verifies the App's
-//! webhook signature before this module is reached. Either way the delivery
-//! is tenant-owned by the repository row, never by a caller-supplied tenant.
+//! Acceptance commits before the sender is acknowledged. A delivery's tenant comes from its repository row,
+//! never from the caller, and every caller authenticates before reaching this module.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::secret::Secret;
@@ -20,27 +8,17 @@ use sentinel_core::{DeliveryId, RepoId, TenantId, UnixMillis, UserId};
 use crate::registration::Authority;
 use crate::{Error, Result, sources};
 
-/// Pending deliveries one repository may hold. Past this the relay is told to
-/// back off explicitly; the queue cannot grow without bound.
 pub const MAX_PENDING_PER_REPO: i64 = 1024;
-/// Resolution attempts before a delivery is settled as failed. Retries are for
-/// transient faults, never for a decision.
 pub const MAX_ATTEMPTS: u32 = 8;
 const BASE_BACKOFF_MS: i64 = 1_000;
 const MAX_BACKOFF_MS: i64 = 5 * 60 * 1000;
 
-/// Lifecycle of one delivery. Settled states are terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
-    /// Accepted and durable; waiting for source validation.
     Pending,
-    /// The source was validated; waiting for pipeline resolution and dispatch.
     Ready,
-    /// Understood and deliberately not a trigger (deletion, foreign event).
     Ignored,
-    /// An explicit outcome: the event looked admissible but cannot run.
     Failed,
-    /// A run was created from this delivery; `Delivery.run` names it.
     Dispatched,
 }
 
@@ -76,7 +54,6 @@ impl State {
         }
     }
 
-    /// True while the delivery still needs work (either lane phase).
     pub const fn is_open(self) -> bool {
         matches!(self, Self::Pending | Self::Ready)
     }
@@ -93,7 +70,6 @@ impl State {
     }
 }
 
-/// One stored delivery, as read back.
 #[derive(Clone, Debug)]
 pub struct Delivery {
     pub id: DeliveryId,
@@ -110,12 +86,9 @@ pub struct Delivery {
     pub attempts: u32,
     pub received: UnixMillis,
     pub settled: Option<UnixMillis>,
-    /// The run this delivery dispatched, once it has.
     pub run: Option<sentinel_core::RunId>,
 }
 
-/// A new delivery's terms. Bounded and canonical: the store validates shape
-/// again, so no caller can persist something the wire contract would refuse.
 pub struct NewDelivery<'a> {
     pub provider: &'a str,
     pub external_id: &'a str,
@@ -125,12 +98,9 @@ pub struct NewDelivery<'a> {
     pub new_sha: &'a str,
 }
 
-/// The result of acceptance: exactly one row exists for this identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Accepted {
-    /// This call created the row.
     Fresh(DeliveryId),
-    /// The identity was already stored, with identical terms.
     Duplicate(DeliveryId),
 }
 
@@ -160,23 +130,16 @@ fn check(delivery: &NewDelivery<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Pull-request terms for a delivery. Bounded and canonical: numbers,
-/// refs and object ids only, never a payload.
 #[derive(Debug)]
 pub struct PrTerms<'a> {
     pub number: u64,
     pub action: &'a str,
     pub draft: bool,
-    /// The head branch as GitHub reports it (`feature`, not `refs/heads/…`).
     pub head_ref: &'a str,
     pub head_sha: &'a str,
-    /// The immutable numeric repository the head lives in: different from the
-    /// base repository means a fork, which the resolver refuses explicitly.
     pub head_repo: u64,
-    /// The base branch as GitHub reports it.
     pub base_ref: &'a str,
     pub base_sha: &'a str,
-    /// The tested merge commit, when GitHub computed one.
     pub merge_sha: Option<&'a str>,
 }
 
@@ -200,7 +163,6 @@ fn check_pr(pr: &PrTerms<'_>) -> Result<()> {
     Ok(())
 }
 
-/// A branch name as a provider reports it (no `refs/heads/` prefix).
 fn valid_branch_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 512
@@ -213,10 +175,6 @@ fn valid_branch_name(name: &str) -> bool {
             .any(|b| b <= 32 || b == 127 || b"~^:?*[\\".contains(&b))
 }
 
-/// Store one authenticated delivery. Deduplication and the admission bound
-/// are decided inside the caller's writer transaction, so acknowledgement
-/// cannot precede durability and two redeliveries cannot both be fresh. Pull
-/// requests carry their metadata in the same transaction.
 pub fn accept(
     tx: &Transaction<'_>,
     repo: RepoId,
@@ -244,8 +202,6 @@ pub fn accept(
         {
             return Ok(Accepted::Duplicate(existing.id));
         }
-        // One delivery identity, two different events: a sender bug, refused
-        // rather than silently collapsing the second.
         return Err(Error::Conflict);
     }
     let pending: i64 = tx
@@ -298,7 +254,6 @@ pub fn accept(
     Ok(Accepted::Fresh(id))
 }
 
-/// One delivery's pull-request metadata, when it is one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrDelivery {
     pub number: u64,
@@ -388,9 +343,6 @@ fn find(
     }
 }
 
-/// Resolve which repository an authenticated hook secret belongs to. `None`
-/// is an unknown secret (revoked or never issued); the caller maps that to a
-/// 401 without distinguishing the two. The tenant must still be active.
 pub fn authenticate(conn: &Connection, presented: &Secret) -> Result<Option<(TenantId, RepoId)>> {
     let row = conn
         .prepare_cached(
@@ -411,8 +363,6 @@ pub fn authenticate(conn: &Connection, presented: &Secret) -> Result<Option<(Ten
     )))
 }
 
-/// The format a hook secret is presented and printed in: a distinguishable
-/// prefix over the 64 lower-case hex characters of the secret itself.
 pub fn hook_token_text(secret: &Secret) -> String {
     let mut text = String::with_capacity(
         sentinel_protocol::intake::HOOK_TOKEN_PREFIX.len() + Secret::TEXT_LEN,
@@ -426,9 +376,6 @@ pub fn hook_token_parse(text: &str) -> Option<Secret> {
     Secret::parse(text.strip_prefix(sentinel_protocol::intake::HOOK_TOKEN_PREFIX)?)
 }
 
-/// Issue (or rotate) the repository's hook secret. One active secret per
-/// repository: issuing replaces the previous digest in the same transaction,
-/// so a rotated secret is unusable the moment this commits.
 pub fn issue_token(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -436,7 +383,6 @@ pub fn issue_token(
     now: UnixMillis,
 ) -> Result<Secret> {
     let tenant = tenant_admin_of(tx, authority, repo)?;
-    // A secret for a repository that cannot run is a footgun, not a feature.
     if sources::load_metadata(tx, repo)?.revoked {
         return Err(Error::NotFound);
     }
@@ -454,7 +400,6 @@ pub fn issue_token(
     Ok(secret)
 }
 
-/// Revoke the repository's hook secret. Nothing to revoke is `NotFound`.
 pub fn revoke_token(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -479,8 +424,6 @@ pub fn revoke_token(
     )
 }
 
-/// The tenant that owns the repository, requiring tenant administration for a
-/// credentialed caller. Host-local callers hold the database file already.
 fn tenant_admin_of(tx: &Transaction<'_>, authority: Authority, repo: RepoId) -> Result<TenantId> {
     match authority.principal() {
         Some(principal) => {
@@ -497,7 +440,6 @@ fn tenant_admin_of(tx: &Transaction<'_>, authority: Authority, repo: RepoId) -> 
     }
 }
 
-/// When the repository's hook secret was issued, if one exists. Metadata only.
 pub fn token_issued(conn: &Connection, repo: RepoId) -> Result<Option<UnixMillis>> {
     Ok(conn
         .prepare_cached("SELECT created_ms FROM source_intake_tokens WHERE repo_id = ?1")?
@@ -506,8 +448,6 @@ pub fn token_issued(conn: &Connection, repo: RepoId) -> Result<Option<UnixMillis
         .map(UnixMillis))
 }
 
-/// The tenant-owned repository behind a GitHub installation and immutable
-/// repository ID. Unbound, suspended or revoked authorizes nothing.
 pub fn github_target(
     conn: &Connection,
     installation_external_id: &str,
@@ -535,11 +475,9 @@ pub fn github_target(
     ))
 }
 
-/// Columns every delivery read shares, in decode order.
 const COLUMNS: &str = "id, tenant_id, repo_id, provider, external_id, event, ref_name, old_sha, \
     new_sha, state, reason, attempts, received_ms, settled_ms, run_id";
 
-/// One row, still raw: decode is where invalid blobs become typed errors.
 type Fields = (
     [u8; 16],
     [u8; 16],
@@ -620,8 +558,6 @@ fn decode(row: Fields) -> Result<Delivery> {
     })
 }
 
-/// Read one delivery by ID. Trusted internal: the caller has already decided
-/// who may see it (the host-local CLI, or the resolution lane).
 pub fn get(conn: &Connection, id: DeliveryId) -> Result<Delivery> {
     let row = conn
         .prepare_cached(&format!(
@@ -633,7 +569,6 @@ pub fn get(conn: &Connection, id: DeliveryId) -> Result<Delivery> {
     decode(row)
 }
 
-/// Newest deliveries of one repository, optionally one state only.
 pub fn list(
     conn: &Connection,
     tenant: TenantId,
@@ -661,10 +596,6 @@ pub fn list(
     rows.map(|row| decode(row?)).collect()
 }
 
-/// The newest delivery of one repository that reached a run on `ref_name` in
-/// the same event class (pull requests and ref updates are separate streams
-/// even when they share the base ref). The duplicate/reordered policy
-/// compares new events against it.
 pub fn last_dispatched(
     conn: &Connection,
     tenant: TenantId,
@@ -692,17 +623,11 @@ pub fn last_dispatched(
     row.map(decode).transpose()
 }
 
-/// Deliveries of one open state whose next attempt is due, oldest first.
-///
-/// The literal `state IN (0, 1)` term is what lets SQLite use the partial
-/// `deliveries_open` index (a bound `state = ?` alone never proves the
-/// index's predicate): the state is an index equality, the order is the
-/// index order, and the limit stops the walk — no scan, no sort, however
-/// much settled history the table holds.
 pub fn due(conn: &Connection, state: State, now: UnixMillis, limit: u16) -> Result<Vec<Delivery>> {
     if !state.is_open() {
         return Ok(Vec::new());
     }
+    // The literal IN (0, 1) lets SQLite pick the partial deliveries_open index; a bound state alone does not.
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {COLUMNS} FROM webhook_deliveries
          WHERE state IN (0, 1) AND state = ?1
@@ -713,8 +638,6 @@ pub fn due(conn: &Connection, state: State, now: UnixMillis, limit: u16) -> Resu
     rows.map(|row| decode(row?)).collect()
 }
 
-/// Whether any delivery of one open state is due: the lanes' idle probe,
-/// one index-backed read, so an idle tick never takes the writer.
 pub fn any_due(conn: &Connection, state: State, now: UnixMillis) -> Result<bool> {
     if !state.is_open() {
         return Ok(false);
@@ -728,7 +651,6 @@ pub fn any_due(conn: &Connection, state: State, now: UnixMillis) -> Result<bool>
         .query_row(params![state.code(), now.0], |r| r.get(0))?)
 }
 
-/// What resolution decided about one delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resolution {
     Ready,
@@ -746,13 +668,8 @@ impl Resolution {
     }
 }
 
-/// Revalidate a pending delivery against the source binding as it is *now*:
-/// intake authorized it, but a binding can be revoked or narrowed between
-/// acceptance and resolution, and a delivery that cannot be fetched, or is
-/// not a trigger, must not run.
 pub fn validate(conn: &Connection, delivery: &Delivery) -> Result<Resolution> {
-    // `NotFound` is the inactive tenant; any other error is a store fault
-    // and must stay one, not become a permanent verdict on the delivery.
+    // Only NotFound is a verdict; any other error is a store fault and must not settle the delivery.
     match sources::repo_tenant(conn, delivery.repo) {
         Ok(_) => {}
         Err(Error::NotFound) => return Ok(Resolution::Failed("tenant_suspended")),
@@ -778,8 +695,6 @@ pub fn validate(conn: &Connection, delivery: &Delivery) -> Result<Resolution> {
     Ok(Resolution::Ready)
 }
 
-/// Settle one open delivery (pending or ready). A settled delivery is final:
-/// the guarded update reports a conflict rather than rewriting an outcome.
 pub fn settle(
     tx: &Transaction<'_>,
     id: DeliveryId,
@@ -799,16 +714,12 @@ pub fn settle(
     if changed != 1 {
         return Err(Error::Conflict);
     }
-    // An event that was understood but produced no run still owes the forge a
-    // completed aggregate, or a required check would stay pending forever.
     if let Some(reason) = reason {
         crate::checks::record_delivery(tx, id, reason, now)?;
     }
     Ok(())
 }
 
-/// Settle a ready delivery as dispatched, naming the run it produced. The
-/// run must already exist in this transaction for the foreign key to hold.
 pub fn settle_dispatched(
     tx: &Transaction<'_>,
     id: DeliveryId,
@@ -826,20 +737,12 @@ pub fn settle_dispatched(
     Ok(())
 }
 
-/// What a retry did. The last attempt settles the delivery with the caller's
-/// terminal resolution rather than retrying forever.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Retry {
-    /// Another attempt is scheduled with capped backoff.
     Scheduled { attempts: u32, next_attempt_ms: i64 },
-    /// The attempt budget is spent and the delivery is settled.
     Exhausted,
 }
 
-/// Schedule another attempt with capped exponential backoff, or settle the
-/// delivery with `exhausted` once the attempt budget is spent. The reason is
-/// always explicit; `exhausted` must be terminal (never `Ready`). Applies to
-/// either open state: validation and dispatch share the budget.
 pub fn retry(
     tx: &Transaction<'_>,
     id: DeliveryId,
@@ -877,20 +780,12 @@ pub fn retry(
     })
 }
 
-/// Milliseconds to wait before attempt `attempts` (1-based): doubling from
-/// one second, capped at five minutes.
 pub fn backoff_ms(attempts: u32) -> i64 {
     BASE_BACKOFF_MS
         .saturating_mul(1i64 << attempts.min(20))
         .min(MAX_BACKOFF_MS)
 }
 
-/// One pass of the validation lane: revalidate and settle every due pending
-/// delivery. Runs inside one writer transaction; the caller bounds the batch.
-/// The rows `due` read are current — nothing else writes inside this
-/// transaction — so they are not read twice. A delivery whose validation
-/// hits a fault is given its own retry schedule and the pass continues: one
-/// unreadable binding cannot hold every later delivery behind it.
 pub fn resolve_due(
     tx: &Transaction<'_>,
     now: UnixMillis,
@@ -899,9 +794,6 @@ pub fn resolve_due(
     let due = due(tx, State::Pending, now, limit)?;
     let mut settled = Vec::with_capacity(due.len());
     for delivery in due {
-        // Each delivery runs under its own savepoint: a fault in one row
-        // undoes only that row's writes, so it is retried on its own
-        // schedule instead of rolling back, and re-failing, the whole batch.
         tx.execute_batch("SAVEPOINT resolve_one")?;
         let attempt = validate(tx, &delivery).and_then(|resolution| {
             settle(tx, delivery.id, resolution, now)?;
@@ -912,8 +804,6 @@ pub fn resolve_due(
                 tx.execute_batch("RELEASE resolve_one")?;
                 settled.push((delivery.id, resolution));
             }
-            // The database itself is unwell (busy, full, I/O): nothing here
-            // is the delivery's fault, so the whole pass fails.
             Err(Error::Sqlite(e)) if !is_row_fault(&e) => return Err(Error::Sqlite(e)),
             Err(_) => {
                 tx.execute_batch("ROLLBACK TO resolve_one; RELEASE resolve_one")?;
@@ -927,8 +817,6 @@ pub fn resolve_due(
     Ok(settled)
 }
 
-/// Whether a SQLite error is about one row's data (a violated constraint, a
-/// value that does not decode) rather than the database being unavailable.
 fn is_row_fault(error: &rusqlite::Error) -> bool {
     match error {
         rusqlite::Error::SqliteFailure(failure, _) => matches!(
@@ -939,10 +827,6 @@ fn is_row_fault(error: &rusqlite::Error) -> bool {
     }
 }
 
-/// Create the immutable run for a ready delivery: the compiled spec, one job
-/// row per job with its resolved image, the provenance row and the delivery's
-/// terminal state, all in the caller's transaction. Remote I/O never runs
-/// here — the resolver fetches and compiles first.
 pub fn dispatch(
     tx: &Transaction<'_>,
     delivery: &Delivery,
@@ -963,23 +847,13 @@ pub fn dispatch(
         crate::runs::resolve_image(tx, delivery.tenant, *job, digest, platform)?;
     }
     crate::provenance::insert(tx, provenance, run, now)?;
-    // The event that triggered the run is recorded now: a concurrency group
-    // template over `event.*` resolves here, and a run with
-    // `cancel_in_progress` supersedes the live run it replaces.
     crate::runs::apply_concurrency(tx, delivery.tenant, run, now)?;
-    // Jobs with an `if` start blocked and read the event recorded above.
     crate::dispatch::release_dependents(tx, delivery.tenant, run, now)?;
-    // Provenance exists now: an event-driven run on a forge-associated
-    // repository owes the stable aggregate and one check per job.
     crate::checks::record_run(tx, delivery.tenant, run, now)?;
     settle_dispatched(tx, delivery.id, run, now)?;
     Ok(run)
 }
 
-/// Delete settled deliveries older than `before`, in bounded batches. Never
-/// touches an open row (an unresolved event is work, not history) and never
-/// one a run's provenance depends on (a dispatched delivery is kept as long
-/// as its run), or a delivery retained by a check publication.
 pub fn purge_settled(tx: &Transaction<'_>, before: UnixMillis, limit: u32) -> Result<usize> {
     Ok(tx.execute(
         "DELETE FROM webhook_deliveries WHERE id IN (
