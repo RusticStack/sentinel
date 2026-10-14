@@ -83,9 +83,7 @@ podsh() { # image, then any podman run flags via $3+, command = $2
     pod run --rm --entrypoint /bin/sh "$@" "$img" -c "$cmd"
 }
 
-# ---------------------------------------------------------------------
 # Provision: build each recipe's checked-in dependency store once.
-# ---------------------------------------------------------------------
 
 prov_custom_tool() { # $1 = shared dir
     mkdir -p "$1/pkgs" "$1/tools"
@@ -308,9 +306,7 @@ lock_gradle() { # $1 = variant dir
 
 lock_none() { :; }
 
-# ---------------------------------------------------------------------
 # Materialize: copy tree + shared store + overlay into a variant dir.
-# ---------------------------------------------------------------------
 
 SHARED_PROV_custom_tool=prov_custom_tool
 SHARED_PROV_go=prov_go

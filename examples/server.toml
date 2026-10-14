@@ -8,7 +8,7 @@ listen = "127.0.0.1:7443"
 # Loopback; put TLS in front to expose it.
 api_listen = "127.0.0.1:7080"
 
-# Optional NAT-traversing transport (Q06): the pinned Tailcat helper serves
+# Optional NAT-traversing transport: the pinned Tailcat helper serves
 # only the link port above, to workers admitted by node key. Sentinel still
 # authenticates every worker itself; with enabled = false (or no section) the
 # link uses direct TLS and nothing below runs. The `tc…` address workers dial
