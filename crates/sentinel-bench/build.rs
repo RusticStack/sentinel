@@ -1,8 +1,5 @@
-//! Records the compiler that built the runner, so every benchmark record
-//! names its tool revision even when the runner executes as a user without
-//! `rustc` on `PATH`. Cargo rebuilds everything,
-//! this script included, when the toolchain changes, so the value is never
-//! stale.
+//! Captured at build time so each record names its compiler without rustc on PATH at run time.
+//! Cargo reruns this script when the toolchain changes, so the value cannot go stale.
 use std::{env, process::Command};
 
 fn main() {

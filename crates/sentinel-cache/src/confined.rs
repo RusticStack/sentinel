@@ -1,19 +1,5 @@
-//! Confined reads of a tree a job controlled.
-//!
-//! Publication walks the declared cache paths of a workspace the job had
-//! write access to. Every resolution here is anchored at a directory the
-//! worker opened itself and never resolves through a symlink: on Linux each
-//! step is descriptor-relative — `openat(O_NOFOLLOW)` per component,
-//! `fstatat(AT_SYMLINK_NOFOLLOW)` for classification, `openat2` with
-//! `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV` to reopen a file
-//! by its relative path — so a component swapped for a symlink between two
-//! steps can never redirect a read outside the declared tree. Sizes and
-//! modes come from the metadata of the entry actually opened.
-//!
-//! Off Linux (development hosts only — the executor is Linux) the same
-//! interface is path-based: every component is classified with
-//! `symlink_metadata` and a symlink anywhere is refused, which is correct
-//! for a quiescent tree but not race-free.
+//! Every step is descriptor-relative and never follows a symlink, so a component swapped for one between two steps
+//! cannot redirect a read out of the declared tree. Off Linux the checks are path-based and not race-free.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -22,43 +8,31 @@ use std::{
     path::Path,
 };
 
-/// What an entry is, classified without following it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     Dir,
     File,
-    /// Symlinks, devices, fifos, sockets — never followed, never read.
     Other,
 }
 
-/// A regular file's metadata, taken from the entry itself.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Meta {
     pub size: u64,
-    /// The permission bits worth keeping (exec on tools).
     pub mode: u32,
-    /// Bytes actually allocated on disk, where the platform reports it —
-    /// the sparse-file signal.
     pub allocated: Option<u64>,
 }
 
 impl Meta {
-    /// Allocated storage is less than half the logical size: holes carry
-    /// most of the file, and a dense copy would amplify it.
     pub fn sparse(&self) -> bool {
         self.allocated
             .is_some_and(|a| a.saturating_mul(2) < self.size)
     }
 }
 
-/// A declared path as found beneath its anchor.
 pub(crate) enum Node {
-    /// Nothing there: the job never made it.
     Missing,
     Dir(Base),
     File(Meta),
-    /// A symlink or special entry at the path, or a component above it
-    /// that is not a real directory: refused, never followed.
     Other,
 }
 
@@ -71,7 +45,6 @@ mod imp {
     };
     use std::os::{fd::OwnedFd, unix::ffi::OsStrExt};
 
-    /// A directory descriptor every lookup is relative to.
     pub(crate) struct Base {
         fd: OwnedFd,
     }
@@ -80,8 +53,7 @@ mod imp {
         .union(OFlags::DIRECTORY)
         .union(OFlags::NOFOLLOW)
         .union(OFlags::CLOEXEC);
-    /// `NONBLOCK` so a fifo swapped in after classification can never hold
-    /// the open; the descriptor is re-classified with `fstat` before a read.
+    /// NONBLOCK so a fifo swapped in after classification cannot block the open; fstat re-checks before reads.
     const FILE_FLAGS: OFlags = OFlags::RDONLY
         .union(OFlags::NOFOLLOW)
         .union(OFlags::NONBLOCK)
@@ -103,15 +75,11 @@ mod imp {
         }
     }
 
-    /// Errors that mean "this is not (any more) a plain directory/file
-    /// reachable without a symlink or a mount crossing".
     fn refused(e: Errno) -> bool {
         matches!(e, Errno::LOOP | Errno::NOTDIR | Errno::XDEV | Errno::NOENT)
     }
 
     impl Base {
-        /// Open the trusted anchor — a worker-owned directory — as the root
-        /// every later lookup is confined beneath.
         pub(crate) fn anchor(path: &Path) -> io::Result<Base> {
             let fd = rustix::fs::openat(
                 CWD,
@@ -122,7 +90,6 @@ mod imp {
             Ok(Base { fd })
         }
 
-        /// Resolve `rel` component by component beneath this base.
         pub(crate) fn resolve(&self, rel: &Path) -> io::Result<Node> {
             let comps: Vec<&OsStr> = rel.iter().collect();
             let Some((last, parents)) = comps.split_last() else {
@@ -155,8 +122,6 @@ mod imp {
             })
         }
 
-        /// This directory's entries, classified without following, sorted
-        /// by name bytes so a listing never depends on filesystem order.
         pub(crate) fn entries(&self) -> io::Result<Vec<(OsString, Kind)>> {
             let mut out = Vec::new();
             for entry in Dir::read_from(&self.fd)? {
@@ -175,7 +140,6 @@ mod imp {
                             AtFlags::SYMLINK_NOFOLLOW,
                         ) {
                             Ok(stat) => kind(&stat),
-                            // Vanished between the listing and the stat.
                             Err(Errno::NOENT) => continue,
                             Err(e) => return Err(e.into()),
                         }
@@ -188,8 +152,6 @@ mod imp {
             Ok(out)
         }
 
-        /// The child directory `name`, opened without following; `None` when
-        /// it vanished or is no longer a directory.
         pub(crate) fn dir(&self, name: &OsStr) -> io::Result<Option<Base>> {
             match rustix::fs::openat(&self.fd, name, DIR_FLAGS, Mode::empty()) {
                 Ok(fd) => Ok(Some(Base { fd })),
@@ -198,7 +160,6 @@ mod imp {
             }
         }
 
-        /// The child `name`'s metadata when it is a regular file.
         pub(crate) fn stat(&self, name: &OsStr) -> io::Result<Option<Meta>> {
             match rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) if kind(&stat) == Kind::File => Ok(Some(meta(&stat))),
@@ -207,7 +168,6 @@ mod imp {
             }
         }
 
-        /// Open the child `name` for reading when it is a regular file.
         pub(crate) fn open_child(&self, name: &OsStr) -> io::Result<Option<(File, Meta)>> {
             match rustix::fs::openat(&self.fd, name, FILE_FLAGS, Mode::empty()) {
                 Ok(fd) => regular(fd),
@@ -216,10 +176,6 @@ mod imp {
             }
         }
 
-        /// Open the regular file at `rel` beneath this base: one `openat2`
-        /// that refuses symlinks at every component, escapes and mount
-        /// crossings; per-component `openat(O_NOFOLLOW)` where the kernel
-        /// has no `openat2` (before 5.6, or filtered by seccomp).
         pub(crate) fn open(&self, rel: &str) -> io::Result<Option<(File, Meta)>> {
             let flags = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV;
             match rustix::fs::openat2(&self.fd, rel, FILE_FLAGS, Mode::empty(), flags) {
@@ -250,7 +206,6 @@ mod imp {
         }
     }
 
-    /// Classify an opened descriptor: only a regular file is read.
     fn regular(fd: OwnedFd) -> io::Result<Option<(File, Meta)>> {
         let stat = rustix::fs::fstat(&fd)?;
         if kind(&stat) != Kind::File {
@@ -265,7 +220,6 @@ mod imp {
     use super::*;
     use std::{fs, path::PathBuf};
 
-    /// A directory path every lookup is relative to.
     pub(crate) struct Base {
         path: PathBuf,
     }
