@@ -189,7 +189,7 @@ struct SignInConfig {
     api_url: Option<String>,
 }
 
-/// GitHub web sign-in (U07), when `<data_dir>/github-sign-in.json` exists:
+/// GitHub web sign-in, when `<data_dir>/github-sign-in.json` exists:
 /// the OAuth app's client ID and an absolute path to an owner-only file
 /// holding its client secret. The secret never enters the configuration
 /// file, the database or a log line; errors name the field, not a value.

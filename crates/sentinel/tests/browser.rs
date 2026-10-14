@@ -1,17 +1,17 @@
-//! The CLI's real browser opener, launched for real (O04 audit follow-up).
+//! The CLI's real browser opener, launched for real.
 //!
 //! No libtest harness: this binary plays three parts, chosen by how it was
 //! started, so the production opener runs and its spawn reaches a harmless
 //! stand-in instead of a browser.
 //!
-//! - **Test** (as built): copies itself into a temporary directory twice —
+//! - **Test**: copies itself into a temporary directory twice —
 //!   as a runner and under the platform opener's name (`rundll32.exe`
 //!   or `xdg-open`) — and starts the runner with credential-bearing
 //!   `SENTINEL_*` variables set.
 //! - **Runner**: opens the URL exactly as `sentinel auth login` does. On
 //!   Linux that is `sentinel::browser::open` unchanged, with the stand-in
 //!   first on `PATH`. On Windows production names the launcher by its
-//!   absolute System32 path (P09C-5), so the runner hands the same
+//!   absolute System32 path, so the runner hands the same
 //!   `browser::open_with`/`command_with` path the stand-in's location
 //!   instead; everything else — arguments, environment, spawn — is the
 //!   production code.
@@ -258,7 +258,7 @@ fn the_opener_command_is_the_platform_launcher_with_the_url_as_one_argument() {
     let command = sentinel::browser::command(url);
     let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
     if cfg!(windows) {
-        // P09C-5: an absolute path into the system directory, never a bare
+        // An absolute path into the system directory, never a bare
         // name that the CLI's own directory could answer.
         let program = Path::new(command.get_program());
         assert!(program.is_absolute(), "{program:?}");
