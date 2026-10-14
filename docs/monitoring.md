@@ -1,4 +1,4 @@
-# Monitoring, readiness and diagnostic bundles (R06)
+# Monitoring, readiness and diagnostic bundles
 
 A controller answers three questions without a log search: *is it serving* (`GET /api/v1/ready`), *how is it doing* (`GET /metrics`), and *what does support need to know* (the diagnostic bundle). A worker can expose its own metrics on a loopback port.
 

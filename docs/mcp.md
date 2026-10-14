@@ -1,4 +1,4 @@
-# MCP integration (X04–X08)
+# MCP integration
 
 `sentinel mcp` runs the MCP stdio transport as a child process. It implements
 the `2025-11-25` protocol revision using newline-delimited UTF-8 JSON-RPC on
@@ -79,7 +79,7 @@ in the append-only `operation_audit` table with the account, how it
 authenticated and, for an OAuth token, the grant and its client (migration 43;
 `sentinel_store::operations`).
 
-## Streamable HTTP (X05)
+## Streamable HTTP
 
 Configure an MCP client with the deployment's `{issuer}/mcp` endpoint. Sentinel
 implements the `2025-11-25` Streamable HTTP revision with JSON responses; it
@@ -123,10 +123,9 @@ absent one means the session's negotiated revision. A missing
 `Mcp-Session-Id` after initialize is `400`; an unknown or expired one is `404`,
 which tells the client to initialize again. Tool calls pass through Sentinel's API scope,
 tenant, repository, and ownership checks. See [OAuth](oauth.md) for audience
-and grant details. Client registration and metadata-document retrieval are
-implemented under X06; conformance coverage is described below.
+and grant details; client registration is covered below.
 
-## Client registration and conformance (X06–X07)
+## Client registration and conformance
 
 Sentinel supports MCP Client ID Metadata Documents and RFC 7591 DCR, subject
 to the instance policy (`sentinel admin policy set --oauth-client-registration
@@ -142,7 +141,7 @@ accepts RFC 7591 defaults, at most 16 redirect URIs, HTTPS domain callbacks
 and HTTP loopback callbacks (`127.0.0.1`, `[::1]`, `localhost`) that match on
 any port. Registrations are bounded per address and in total, reclaimed when
 unused, and listed or disabled with `sentinel admin oauth-client`; the details
-are in [OAuth](oauth.md#mcp-client-registration-and-metadata-discovery-x06).
+are in [OAuth](oauth.md#mcp-client-registration-and-metadata-discovery).
 
 The selected client profiles are Visual Studio Code's loopback callback
 (`http://127.0.0.1:33418`) and Claude's remote callback
@@ -158,7 +157,7 @@ documentation (VS Code's registration, for example, echoes the advertised
 device grant and lists `localhost` and port-bearing loopback redirects, which
 `standard_native_registrations_are_accepted_and_match_any_loopback_port`
 covers). No real MCP client application or SDK has been run against a
-Sentinel controller; X07's real-client exercise is outstanding.
+Sentinel controller.
 
 The CLI end-to-end test runs the actual `sentinel mcp` binary over stdio on a
 real credential profile: a service grant without `runs:read`, imported with
@@ -167,10 +166,9 @@ Its tool call returns the normal structured scope error naming
 `runs:read` (not a repository refusal). After the grant is revoked, the same
 profile's refresh is refused and the tool answers `client_unauthenticated`
 with the local `auth login` fix. Neither run produces an OAuth grant or
-starts an HTTP redirect flow (P11-10). Stdio remains an API client with local credentials; remote
-HTTP MCP authentication is a separate transport.
+starts an HTTP redirect flow.
 
-## Bounded diagnosis and rerun (X08)
+## Bounded diagnosis and rerun
 
 An API integration test writes a 100 MiB attempt log with a Go test failure at
 the beginning, prompt-like instructions, malformed/non-report text and a
