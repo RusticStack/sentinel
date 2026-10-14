@@ -1,5 +1,5 @@
 //! This process's own figures from `/proc/self` (Linux), for the controller's
-//! and the worker's metrics and diagnostics (R06). `None` where the platform
+//! and the worker's metrics and diagnostics. `None` where the platform
 //! has no `/proc`.
 
 /// What `/proc/self` says about this process right now.

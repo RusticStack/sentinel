@@ -1,4 +1,4 @@
-//! G05 reconcile: the `github_refresh` lane against a loopback stub — a
+//! The `github_refresh` lane against a loopback stub — a
 //! healthy pass verifies, a renamed or missing repository revokes its
 //! binding, a 404 installation disables and revokes, a suspended installation
 //! stays disabled, and a transient failure retries rather than revoking.

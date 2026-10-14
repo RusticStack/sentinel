@@ -45,7 +45,7 @@ impl Permissions {
     }
 }
 
-/// OAuth scopes (O02). Bit positions are STORED (grants, codes, access
+/// OAuth scopes. Bit positions are STORED (grants, codes, access
 /// tokens) and stable; the names are the wire form. A scope is a ceiling on
 /// [`Permissions`], never a grant of its own: every repository and tenant
 /// decision is still a live check against membership.
