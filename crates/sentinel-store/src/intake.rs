@@ -1,4 +1,4 @@
-//! Durable event intake (G02).
+//! Durable event intake.
 //!
 //! One authenticated ref update — a generic relay submission or a GitHub
 //! `push` — becomes one row here, keyed by the provider's delivery ID scoped
@@ -160,7 +160,7 @@ fn check(delivery: &NewDelivery<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Pull-request terms for a delivery (G03). Bounded and canonical: numbers,
+/// Pull-request terms for a delivery. Bounded and canonical: numbers,
 /// refs and object ids only, never a payload.
 #[derive(Debug)]
 pub struct PrTerms<'a> {

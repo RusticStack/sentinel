@@ -83,7 +83,7 @@ pub enum Error {
     NotFound,
     Forbidden,
     /// Allowed in principle, but the session must first prove presence with a
-    /// second factor (A06). Distinct from `Forbidden` so a client can prompt.
+    /// second factor. Distinct from `Forbidden` so a client can prompt.
     StepUpRequired,
     InvalidInput(&'static str),
     /// The state machine rejected the event.
@@ -108,19 +108,19 @@ pub enum Error {
     /// store; a second one is a deployment error, never a peer.
     AlreadyOwned,
     /// A job cannot be admitted to execution because its image digest and
-    /// platform have not been durably resolved (C05/W03 gate).
+    /// platform have not been durably resolved.
     Unresolved,
     /// A discretionary write was refused: free space is below the
-    /// watermarks or the admission charge would not fit (D06).
+    /// watermarks or the admission charge would not fit.
     StorageFull,
-    /// A write was refused because the tenant reached its storage quota
-    /// (D06). Not transient: bytes must be reclaimed or the quota raised.
+    /// A write was refused because the tenant reached its storage quota.
+    /// Not transient: bytes must be reclaimed or the quota raised.
     QuotaExceeded,
-    /// An idempotency key was reused for a different request (P10C-9):
+    /// An idempotency key was reused for a different request:
     /// a client bug, distinct from a stale compare-and-set `Conflict`.
     IdempotencyMismatch,
     Io(std::io::Error),
-    /// A migration failed (R05): the database stayed at `reached`, the last
+    /// A migration failed: the database stayed at `reached`, the last
     /// version that committed; `snapshot` is the copy taken before the
     /// first pending migration, to roll back to.
     MigrationFailed {
@@ -292,7 +292,7 @@ pub fn register_functions(conn: &Connection) -> Result<()> {
 
 /// Apply pending migrations. Idempotent; each version commits separately.
 ///
-/// A database newer than this build (a rollback, R05) is opened as it is —
+/// A database newer than this build (a rollback) is opened as it is —
 /// nothing migrated, nothing undone — only when every migration this build
 /// does not know declares it readable by this build's schema
 /// (`schema_migrations.readable_by`); otherwise it is refused as
@@ -357,7 +357,7 @@ type Job = Box<dyn FnOnce(&mut Connection, &Changes) + Send>;
 
 /// The commit notifier: a generation counter the writer thread bumps after
 /// every successful write that changed at least one row, and a parking place for readers
-/// that want to know when the database may have changed (the O05 long
+/// that want to know when the database may have changed (the long
 /// polls). A generation says only "something committed"; the waiter
 /// re-reads whatever it cares about.
 ///
@@ -449,7 +449,7 @@ pub const WRITER_QUEUE: usize = 256;
 /// accidentally empty database beside the real one.
 pub const METADATA_FILE: &str = "metadata.sqlite";
 
-/// The sealing key for values that must be recoverable (A06 TOTP seeds). Lives
+/// The sealing key for values that must be recoverable (TOTP seeds). Lives
 /// beside the database by default, but it is the operator's secret: keep it
 /// out of database backups, and treat losing it as losing every sealed value.
 pub const MASTER_KEY_FILE: &str = "master.key";
@@ -610,7 +610,7 @@ pub enum Shutdown {
 }
 
 impl Store {
-    /// Write a consistent copy of the database to `dest` (R04) with
+    /// Write a consistent copy of the database to `dest` with
     /// `VACUUM INTO` on a connection of its own: in WAL mode that is one
     /// read transaction on the source, so the writer and every reader keep
     /// going while it runs, and the copy is the database at one instant.
@@ -630,7 +630,7 @@ impl Store {
     }
 
     /// Bytes the metadata database occupies on disk now: the main file and
-    /// its write-ahead log (R01's reserve grows with it).
+    /// its write-ahead log.
     pub fn metadata_bytes(&self) -> u64 {
         let mut wal = self.path.clone().into_os_string();
         wal.push("-wal");
