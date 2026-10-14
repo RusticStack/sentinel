@@ -1,4 +1,4 @@
-# GitHub Checks outbox (G04)
+# GitHub Checks outbox
 
 A native GitHub run is only useful if the pull request says what happened. This
 document is the delivery contract: what a run publishes, how a delivery
@@ -23,9 +23,8 @@ required check, and it must mean the same thing on every run. Per-job checks
 are namespaced so a required aggregate is never satisfied by a partial run.
 
 A **manual** run publishes nothing at all. Its inline pipeline is an
-operator's diagnostic, and the plan is explicit that a manual focused run must
-never satisfy the full acceptance aggregate; named pipelines (Part 16) will
-give manual and scheduled runs their own scopes.
+operator's diagnostic, and a manual focused run must never satisfy the full
+acceptance aggregate.
 
 A **settled delivery** still owes an answer when the event was a real trigger
 but nothing could run: `failed:no_pipeline`, `failed:pipeline_invalid`,
@@ -63,9 +62,10 @@ infra failure > failed > timed out > canceled > passed; all-skipped is
 
 `details_url` is `<public_url>/runs/<run id>` when the deployment configures
 a public URL: the web interface's run page ([web interface](web-ui.md)), which
-asks a signed-out visitor to sign in and then opens it. Links published before
-Part 12 (`<public_url>/#/runs/<run id>`) still open the run. A check that belongs to no run — a refused event — has no link, and a
-deployment without `public_url` publishes checks without one.
+asks a signed-out visitor to sign in and then opens it. Legacy links of the form
+`<public_url>/#/runs/<run id>` still open the run. A check that belongs to no
+run (a refused event) has no link, and a deployment without `public_url`
+publishes checks without one.
 
 Each check row has a stable id `sentinel:<run id>:<aggregate|job id>` (or
 `sentinel:dlv:<delivery id>`), and every create sends it suffixed with the
@@ -97,8 +97,7 @@ new publication is read when its transaction commits — at once after a quiet
 spell, at most once per 50 ms under unrelated write load — and a backed-off row
 exactly when it is due. `Config::idle` (2 s by default) is only the longest
 sleep without a read, the net for a write the notifier cannot see, such as one
-from another process on the same database. The measured effect of replacing
-the 250 ms poll is pending VPS measurement.
+from another process on the same database.
 
 Retries, refusals and rate limits are explicit:
 
@@ -133,7 +132,7 @@ Delivery is at-least-once per generation with idempotent writes: a repeated
 attempt updates the same check run instead of creating another one.
 
 Delivery retention preserves events referenced by publications, including
-settled publications, so their durable identities remain available for G05.
+settled ones, so their durable identities remain available.
 
 ### Stale writes never win
 
@@ -168,8 +167,8 @@ desired generation follows a publication whose last delivered status was
 `completed` — a rerun, a rerequest, a retried check — the stored
 `check_run_id` is cleared on the upsert — together with the create mark —
 so the publisher *creates* a fresh check run, under the new generation's
-identity, instead of PATCHing or adopting a dead one. The run's in-progress phase is then
-visible on GitHub, which a reopened-then-ignored update never was.
+identity, instead of PATCHing or adopting a dead one. The run's in-progress
+phase is then visible on GitHub.
 
 "Delivered" is what the store recorded, not what the previous desired state
 was. A completed generation that never reached GitHub (it is still pending or
@@ -335,5 +334,3 @@ holds at most 1024 repository tokens, evicting the earliest expiry at capacity.
   installation, accepts a signed fork pull request, refuses it as
   `ignored:fork_pr` and publishes a completed neutral `sentinel / ci` on the
   delivered revision; the CLI shows the durable delivery.
-
-Live GitHub App, required-check and end-to-end rerequest verification is G06.
