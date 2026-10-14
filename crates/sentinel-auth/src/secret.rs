@@ -1,33 +1,22 @@
-//! Opaque 256-bit session and CSRF secrets.
-//!
-//! A secret is never stored: the database holds its BLAKE3 digest, so a stolen
-//! snapshot cannot be replayed as a cookie. Lookup is by digest, a full 32-byte
-//! primary key probe, so validation costs one index search and no scan.
+//! A secret is never stored: the database holds its BLAKE3 digest, so a stolen snapshot cannot be replayed as a cookie.
 
 use core::fmt;
 
-/// Bytes of a freshly minted or presented secret. Carries no `Debug`/`Display`.
 pub struct Secret([u8; Secret::LEN]);
 
-/// The stored form: `BLAKE3(secret)`. Safe to log, index and compare.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Digest(pub [u8; 32]);
 
 impl Secret {
     pub const LEN: usize = 32;
-    /// Hex, so `Display`/parse need no allocation and no encoding dependency.
     pub const TEXT_LEN: usize = Secret::LEN * 2;
 
-    /// Fresh secret from the operating system CSPRNG. Failing to obtain entropy
-    /// is fatal: issuing a guessable session is not an acceptable degradation.
     pub fn generate() -> Secret {
         let mut bytes = [0u8; Secret::LEN];
         getrandom::fill(&mut bytes).expect("operating system entropy");
         Secret(bytes)
     }
 
-    /// Accept a presented secret. Rejects anything that is not exactly the
-    /// expected lower-case hex length, before any database work.
     pub fn parse(text: &str) -> Option<Secret> {
         let text = text.as_bytes();
         if text.len() != Secret::TEXT_LEN {
@@ -44,7 +33,6 @@ impl Secret {
         Digest(*blake3::hash(&self.0).as_bytes())
     }
 
-    /// Render for the one place it may appear: the response that issues it.
     pub fn expose(&self, out: &mut String) {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         out.reserve(Secret::TEXT_LEN);
@@ -71,14 +59,12 @@ impl fmt::Debug for Secret {
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        // Best effort only: copies made by the caller are the caller's problem.
         self.0 = core::hint::black_box([0u8; Secret::LEN]);
     }
 }
 
 impl fmt::Debug for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Only the first bytes: enough to correlate audit records, useless as a key.
         write!(
             f,
             "digest:{:02x}{:02x}{:02x}{:02x}",
@@ -87,20 +73,16 @@ impl fmt::Debug for Digest {
     }
 }
 
-/// Overwrite `bytes` with zeros using
-/// volatile writes and a compiler fence (the `zeroize` crate): a plain
-/// `fill(0)` on a buffer that is about to be freed is dead-store eliminated.
+/// Overwrites with volatile writes and a compiler fence: a plain `fill(0)` before a free is dead-store eliminated.
 pub fn wipe(bytes: &mut [u8]) {
     zeroize::Zeroize::zeroize(bytes);
 }
 
-/// [`wipe`] for text: the whole allocation is zeroed, then the string is empty.
 pub fn wipe_string(text: &mut String) {
     zeroize::Zeroize::zeroize(text);
 }
 
-/// Constant-time equality for digests of secrets. `black_box` keeps the
-/// accumulator from being turned back into an early-exit comparison.
+/// Constant-time equality. `black_box` keeps the accumulator from becoming an early-exit comparison.
 #[must_use]
 pub fn digest_eq(a: &Digest, b: &Digest) -> bool {
     let mut diff = 0u8;

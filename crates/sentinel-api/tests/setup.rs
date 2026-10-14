@@ -1,8 +1,3 @@
-//! First-run setup and self-service organizations over real HTTP: the status
-//! route that says only whether setup is open, the one-time token's every
-//! refusal, one commit creating the administrator and signing them in, and an
-//! approved account creating an organization under policy.
-
 #[path = "support/web_fixture.rs"]
 mod fixture;
 
@@ -22,7 +17,6 @@ use sentinel_store::{
 };
 use serde_json::{Value, json};
 
-/// A controller on an empty database: nobody has been admitted.
 struct Fresh {
     _dir: tempfile::TempDir,
     store: Arc<Store>,
@@ -147,7 +141,6 @@ fn the_wizard_creates_the_administrator_and_signs_them_in() {
         .expect("a session cookie");
     let csrf = answer["csrf"].as_str().unwrap().to_owned();
 
-    // The session is the administrator's.
     let (_, _, me) = call(&f.base, "GET", "/api/v1/me", None, &[("cookie", &cookie)]);
     assert_eq!(me["super_admin"], true);
     assert_eq!(me["email"], "ada@example.com");
@@ -161,16 +154,13 @@ fn the_wizard_creates_the_administrator_and_signs_them_in() {
     );
     assert_eq!(tenants["tenants"][0]["slug"], "acme");
     assert_eq!(tenants["tenants"][0]["role"], "admin");
-    // The switcher groups by kind and membership source without another read.
     assert_eq!(tenants["tenants"][0]["kind"], "organization");
     assert_eq!(tenants["tenants"][0]["membership"], "app");
 
-    // Setup is closed for everyone afterwards, the same token included.
     let (_, _, closed) = call(&f.base, "GET", "/api/v1/setup", None, &[]);
     assert_eq!(closed, json!({ "open": false, "mail_configured": false }));
     let (status, _, _) = post(&f, "/api/v1/setup", &body(&token_text(&token)));
     assert_eq!(status, 404);
-    // And the password signs in by address.
     let (status, _, _) = post(
         &f,
         "/api/v1/login",
@@ -191,7 +181,6 @@ fn a_wrong_expired_or_malformed_token_is_one_refusal_and_creates_nothing() {
     }
     assert!(f.store.read(setup::is_open).unwrap());
 
-    // Age the token past its life: the right token is now refused too.
     f.store
         .writer()
         .write(|tx| {
@@ -208,9 +197,6 @@ fn a_wrong_expired_or_malformed_token_is_one_refusal_and_creates_nothing() {
 fn guessing_is_throttled_and_a_locked_setup_refuses_the_right_token() {
     let f = fresh();
     let token = setup::issue(&f.store, UnixMillis::now()).unwrap().unwrap();
-    // The per-client budget answers `429` once the burst is spent; whatever
-    // got through counted against the lock. Either way the right token never
-    // completes while guesses are landing.
     let mut statuses = Vec::new();
     for _ in 0..12 {
         let guess = token_text(&Secret::generate());
@@ -265,8 +251,6 @@ fn a_bad_field_is_a_bad_request_and_the_token_survives() {
 
 const RESEND_KEY: &str = "re_wizardkey_0123456789";
 
-/// A Resend stand-in answering each request with the next scripted status;
-/// returns its endpoint and the requests it saw.
 fn fake_resend(statuses: Vec<u16>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -339,7 +323,6 @@ fn the_mail_test_without_a_sender_says_not_configured_and_blocks_nothing() {
         (&json!(false), &json!("not_configured"))
     );
     assert!(f.store.read(setup::is_open).unwrap());
-    // Relay fields are not part of the contract: the body is token and to.
     let (status, _, _) = post(
         &f,
         "/api/v1/setup/mail-test",
@@ -358,7 +341,6 @@ fn the_mail_test_sends_through_the_configured_sender_and_reports_failures_briefl
     assert_eq!(status, json!({ "open": true, "mail_configured": true }));
     let token = setup::issue(&f.store, UnixMillis::now()).unwrap().unwrap();
     let text = token_text(&token);
-    // An address that is not one is reported before anything is sent.
     let (status, _, answer) = post(
         &f,
         "/api/v1/setup/mail-test",
@@ -453,7 +435,6 @@ fn send(
 fn an_approved_user_creates_an_organization_when_policy_allows() {
     let f = Fixture::new(1);
     let dana = session(&f, "dana");
-    // The default keeps creation with the platform.
     let (status, _) = send(
         &f,
         "POST",
@@ -481,9 +462,7 @@ fn an_approved_user_creates_an_organization_when_policy_allows() {
     assert_eq!(settings["membership"], "app");
     assert_eq!(settings["role"], "admin");
     assert_eq!(settings["auto_join"]["applies"], false);
-    // An app-created organization has no GitHub standing to report.
     assert!(settings.get("github_sync").is_none(), "{settings}");
-    // A taken name and a reserved one are refused, uniformly for anyone.
     let (status, _) = send(
         &f,
         "POST",
@@ -506,7 +485,6 @@ fn an_approved_user_creates_an_organization_when_policy_allows() {
 fn organization_creation_needs_a_browser_session_and_a_budget() {
     let f = Fixture::new(1);
     allow_creation(&f, TenantCreation::ApprovedUsers);
-    // A bearer credential cannot create what the account will own.
     let (status, _, _) = call(
         &f.base,
         "POST",
@@ -530,7 +508,6 @@ fn organization_creation_needs_a_browser_session_and_a_budget() {
             .0,
         );
     }
-    // The per-client budget (and the account quota) stop probing.
     assert!(
         statuses.contains(&429) || statuses.contains(&403),
         "{statuses:?}"
@@ -555,7 +532,6 @@ fn settings_never_confirm_a_namespace_to_someone_outside_it() {
         );
         assert_eq!(status, 404, "{slug}");
     }
-    // A member who does not administer sees no auto-join detail at all.
     let (status, settings) = send(&f, "GET", "/api/v1/tenants/acme/settings", None, &rui);
     assert_eq!(status, 200);
     assert!(settings.get("auto_join").is_none(), "{settings}");

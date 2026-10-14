@@ -1,41 +1,23 @@
-//! Second factors: time-based one-time passwords and one-use recovery codes.
-//!
-//! The TOTP construction itself comes from the maintained `totp-rs` crate;
-//! Sentinel supplies the seed, the policy (SHA-1, 6 digits, 30 seconds, one
-//! step of drift — what every authenticator app implements) and, importantly,
-//! the replay rule, which RFC 6238 leaves to the caller: a step that has been
-//! accepted once is never accepted again.
-//!
-//! Recovery codes are ordinary high-entropy secrets, stored as digests like
-//! every other credential here, and spent one at a time.
-
 use totp_rs::{Algorithm, Builder, Totp};
 
 use crate::secret::Digest;
 
-/// RFC 6238 defaults, and what authenticator apps assume.
 const DIGITS: u8 = 6;
 const STEP_SECONDS: u64 = 30;
-/// One step either side: enough for ordinary clock drift, and no more. A wider
-/// window multiplies the codes valid at any instant.
+/// One step either side covers ordinary clock drift; a wider window multiplies valid codes.
 const SKEW: u16 = 1;
-/// 160 bits, the size RFC 4226 recommends for HMAC-SHA1.
 const SEED_LEN: usize = 20;
 
 pub const RECOVERY_CODE_COUNT: usize = 10;
-/// 50 bits of entropy per code, in an alphabet without look-alike characters.
 const RECOVERY_ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
 const RECOVERY_LEN: usize = 10;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MfaError {
-    /// The seed is not a usable TOTP secret (wrong length, or unreadable).
     Seed,
-    /// The account name or issuer cannot appear in a provisioning URI.
     Label,
 }
 
-/// A fresh TOTP seed. Sealed before storage; shown to the enrolling person once.
 pub struct Seed([u8; SEED_LEN]);
 
 impl core::fmt::Debug for Seed {
@@ -66,16 +48,12 @@ impl Seed {
         &self.0
     }
 
-    /// The base32 form authenticator apps display and accept (RFC 4648, no
-    /// padding), as carried in a provisioning URI's `secret=` parameter.
     pub fn from_base32(text: &str) -> Result<Seed, MfaError> {
         let secret = totp_rs::Secret::try_from_base32(text).map_err(|_| MfaError::Seed)?;
         Seed::from_bytes(secret.as_ref())
     }
 
-    /// The `otpauth://` provisioning URI, which is what a QR code encodes and
-    /// what an app accepts when typed. It contains the seed, so it is shown
-    /// exactly once, at enrollment.
+    /// Contains the seed, so it is shown exactly once, at enrollment.
     pub fn provisioning_uri(&self, issuer: &str, account: &str) -> Result<String, MfaError> {
         self.totp(issuer, account)?
             .to_url()
@@ -96,13 +74,9 @@ impl Seed {
     }
 }
 
-/// Check a presented code at `unix_seconds`, returning the time step it
-/// matched. The caller **must** refuse a step it has already accepted: that is
-/// what stops a code shoulder-surfed or replayed within its 30-second window.
+/// The caller **must** refuse a step it has already accepted: that stops replay within the 30-second window.
 #[must_use]
 pub fn check(seed: &Seed, code: &str, unix_seconds: u64) -> Option<u64> {
-    // Reject anything that is not exactly the expected shape before doing HMAC
-    // work, and before the library sees it.
     if code.len() != usize::from(DIGITS) || !code.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -111,7 +85,6 @@ pub fn check(seed: &Seed, code: &str, unix_seconds: u64) -> Option<u64> {
         .check(code, unix_seconds)
 }
 
-/// A recovery code as shown to the person, once.
 pub struct RecoveryCode(String);
 
 impl core::fmt::Debug for RecoveryCode {
@@ -125,15 +98,11 @@ impl RecoveryCode {
         &self.0
     }
 
-    /// What gets stored. Recovery codes are high-entropy, so a digest is the
-    /// right form: no password KDF, and nothing presentable in a backup.
     pub fn digest(&self) -> Digest {
         Digest(*blake3::hash(self.0.as_bytes()).as_bytes())
     }
 }
 
-/// A fresh set of recovery codes. Issuing a set replaces any previous one, so
-/// codes from an old set stop working the moment new ones are handed out.
 pub fn recovery_codes() -> Vec<RecoveryCode> {
     (0..RECOVERY_CODE_COUNT).map(|_| recovery_code()).collect()
 }
@@ -146,16 +115,11 @@ fn recovery_code() -> RecoveryCode {
         if at == RECOVERY_LEN / 2 {
             code.push('-');
         }
-        // Modulo bias over a 31-character alphabet is under 1% per character
-        // and costs under a bit of the code's 50; rejection sampling here would
-        // buy nothing an attacker could use.
         code.push(RECOVERY_ALPHABET[usize::from(*byte) % RECOVERY_ALPHABET.len()] as char);
     }
     RecoveryCode(code)
 }
 
-/// Digest a presented recovery code. Normalizes the separator and case that a
-/// person may retype, and nothing else.
 #[must_use]
 pub fn recovery_digest(presented: &str) -> Option<Digest> {
     let normalized: String = presented
@@ -176,7 +140,6 @@ mod tests {
     use super::*;
     use crate::secret::digest_eq;
 
-    /// RFC 6238 appendix B, SHA-1, seed "12345678901234567890".
     #[test]
     fn codes_match_the_rfc_6238_reference_vectors() {
         let seed = Seed::from_bytes(b"12345678901234567890").unwrap();
@@ -203,7 +166,6 @@ mod tests {
             totp.generate(now).to_string()
         };
         assert_eq!(check(&seed, &code, now), Some(now / STEP_SECONDS));
-        // One step late or early still matches, two does not.
         assert!(check(&seed, &code, now + STEP_SECONDS).is_some());
         assert!(check(&seed, &code, now - STEP_SECONDS).is_some());
         assert!(check(&seed, &code, now + 2 * STEP_SECONDS).is_none());
@@ -226,8 +188,6 @@ mod tests {
         assert!(uri.starts_with("otpauth://totp/"), "{uri}");
         assert!(uri.contains("issuer=Sentinel"));
         assert!(uri.contains("secret="));
-        // Defaults (SHA-1, 6 digits, 30 seconds) are omitted from the URI by
-        // the library, which is what authenticator apps assume anyway.
         for explicit in ["digits=", "period=", "algorithm="] {
             assert!(!uri.contains(explicit), "{uri}");
         }
@@ -244,7 +204,6 @@ mod tests {
             assert_eq!(code.expose().len(), RECOVERY_LEN + 1);
             let digest = recovery_digest(code.expose()).unwrap();
             assert!(digest_eq(&digest, &code.digest()));
-            // Retyped without the separator, in upper case, with stray spaces.
             let retyped = code.expose().replace('-', "").to_uppercase();
             assert!(digest_eq(
                 &recovery_digest(&retyped).unwrap(),

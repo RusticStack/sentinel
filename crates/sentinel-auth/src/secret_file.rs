@@ -1,13 +1,5 @@
-//! Opening an operator-controlled secret file safely: the one place that
-//! decides what "owner-only" means, shared by the master key, the GitHub App
-//! key, the webhook secret and the sign-in client secret.
-//!
-//! The file is opened once and the *handle* is judged, so the file checked is
-//! the file read — a path swapped between a check and a read changes nothing.
-//! On Unix the open refuses a symbolic link (`O_NOFOLLOW`), and the handle must
-//! be a regular file owned by this user with no group or other access.
-//! Windows is a development platform only: a link is refused by name and the
-//! opened handle must be a regular file; its ACLs are the OS's business.
+//! The opened handle is judged, not the path, so the file checked is the file read.
+//! Unix refuses symbolic links at open (`O_NOFOLLOW`); Windows refuses them by name.
 
 use std::{
     fs::File,
@@ -17,20 +9,15 @@ use std::{
 
 use zeroize::Zeroize;
 
-/// Why a secret file was refused. Never carries the path or any content.
+/// Carries no path or content, so a refusal cannot leak secret material.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// A link, a directory, a device: anything but a regular file.
     NotRegular,
-    /// Could not be opened or inspected.
     Unreadable,
-    /// Readable or writable by group or others.
     GroupOrOtherAccess,
-    /// Owned by another user.
     WrongOwner,
 }
 
-/// Open `path` for reading and verify the opened handle.
 pub fn open(path: &Path) -> Result<File, Refusal> {
     let file = open_nofollow(path)?;
     let metadata = file.metadata().map_err(|_| Refusal::Unreadable)?;
@@ -50,9 +37,6 @@ pub fn open(path: &Path) -> Result<File, Refusal> {
     Ok(file)
 }
 
-/// Read at most `limit` bytes of a verified secret file into a buffer that is
-/// sized up front, so no reallocation leaves an unwiped copy behind, and is
-/// wiped by its owner's `zeroize`. `None` content means longer than `limit`.
 pub fn read(file: &mut File, limit: usize) -> io::Result<Option<Vec<u8>>> {
     let mut bytes = Vec::with_capacity(limit + 1);
     let read = file.take(limit as u64 + 1).read_to_end(&mut bytes);
