@@ -1,13 +1,3 @@
-//! Self-service organizations: who may create one, which names are taken by
-//! the product itself, how many one account may hold, and the read-only
-//! settings an organization shows.
-//!
-//! The deployment's `tenant_creation` policy ([`crate::registration`]) is the
-//! one permission: `approved-users` lets an approved account create its own
-//! personal namespace *and* organizations (within the quotas below); the
-//! default `super-admin-only` keeps both a platform decision. Membership of
-//! the new organization is the creator's, as its administrator.
-
 use rusqlite::{Connection, Transaction, params};
 use sentinel_core::{
     TenantId, UnixMillis,
@@ -19,12 +9,6 @@ use crate::{
     local_auth::{Event, audit},
 };
 
-/// Namespace names no organization may take: they are first path segments of
-/// the web interface and the API, or names a person would mistake for the
-/// deployment itself. Sorted, so a lookup is a binary search. Applies to
-/// organizations created through [`create_self_service`] and the first-run
-/// wizard; personal namespaces and the platform's `create_organization` are
-/// unchanged.
 pub const RESERVED_SLUGS: &[&str] = &[
     "about",
     "account",
@@ -83,17 +67,11 @@ pub const RESERVED_SLUGS: &[&str] = &[
     "www",
 ];
 
-/// Organizations one account may create through the self-service route, and
-/// how many in an hour. Bounded so an approved account cannot fill the
-/// namespace space; a platform administrator creates more with
-/// [`crate::tenancy::create_organization`].
 pub const MAX_SELF_SERVICE_ORGS: i64 = 10;
 pub const SELF_SERVICE_PER_HOUR: i64 = 3;
 
 const HOUR_MS: i64 = 60 * 60 * 1000;
 
-/// A slug an organization may take: a valid [`Namespace`] of 2 to 63 bytes
-/// that is not [reserved](RESERVED_SLUGS). Errors never echo the input.
 pub fn slug(value: &str) -> Result<Namespace<'_>> {
     let parsed = Namespace::parse(value).ok_or(Error::InvalidInput("organization name"))?;
     if value.len() < 2 || RESERVED_SLUGS.binary_search(&value).is_ok() {
@@ -102,16 +80,7 @@ pub fn slug(value: &str) -> Result<Namespace<'_>> {
     Ok(parsed)
 }
 
-/// Create an organization for the caller, when policy allows it, and make the
-/// caller its administrator.
-///
-/// A platform administrator may always; anyone else needs the deployment's
-/// `tenant_creation` to be `approved-users`, an approved active human account
-/// and an unscoped credential, and is held to [`MAX_SELF_SERVICE_ORGS`] in
-/// all and [`SELF_SERVICE_PER_HOUR`] per hour (`QuotaExceeded`). A taken name
-/// is `Conflict`: the slug check inherently answers whether a name exists, so
-/// callers rate-limit it. The tenant, the creator's admin membership and the
-/// audit rows are one commit.
+/// Conflict reveals whether a name exists, so callers must rate-limit it.
 pub fn create_self_service(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -128,8 +97,6 @@ pub fn create_self_service(
         {
             return Err(Error::Forbidden);
         }
-        // A credential scoped to one tenant acts inside it; creating another
-        // is outside what it acts under.
         if principal.tenant.is_some() || principal.repo.is_some() {
             return Err(Error::Forbidden);
         }
@@ -193,44 +160,23 @@ pub fn create_self_service(
     )
 }
 
-/// What an organization's settings page shows: its kind and where its
-/// membership comes from. Read-only: the membership source is changed by an
-/// explicit administrator act, and email-domain auto-join is the operator's
-/// environment variable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub tenant: TenantId,
     pub slug: String,
     pub personal: bool,
-    /// Membership is GitHub's to confirm (`membership_source = 1`).
     pub github_backed: bool,
-    /// A GitHub App installation is bound to the tenant. An email invitation
-    /// is refused for it even before it is converted, and email-domain
-    /// auto-join must never apply to it.
     pub installation_bound: bool,
-    /// The caller's membership role; `None` for a platform administrator who
-    /// is not a member.
     pub role: Option<Role>,
     pub created_ms: i64,
-    /// When GitHub last confirmed the caller's own membership; `None` for a
-    /// membership managed here (or none).
     pub github_confirmed_ms: Option<i64>,
-    /// The caller's scheduled GitHub check, when one exists: how many passes
-    /// in a row GitHub could not answer (rate limit, outage, missing App
-    /// permission); zero for one that is merely scheduled.
     pub github_check_failures: Option<u32>,
-    /// When that check is next due (a settled member keeps a row for the
-    /// periodic re-confirmation, so only a due time at or before now means
-    /// a check is waiting).
     pub github_check_next_ms: Option<i64>,
 }
 
-/// The settings of the tenant `slug` for `principal`, with the same uniform
-/// `NotFound` as every slug route ([`crate::auth::member_tenant_by_slug`]):
-/// absent, suspended and foreign are indistinguishable.
+/// Absent, suspended and foreign tenants all return NotFound so existence does not leak.
 pub fn settings(conn: &Connection, principal: Principal, slug: &str) -> Result<Settings> {
     let tenant = crate::auth::member_tenant_by_slug(conn, principal, slug)?;
-    // Both left joins are primary-key probes of the caller's own rows.
     let (mut settings, role) = conn
         .prepare_cached(
             "SELECT t.slug, t.kind, t.membership_source, t.created_ms, m.role,
