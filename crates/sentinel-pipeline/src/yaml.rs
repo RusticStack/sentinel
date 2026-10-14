@@ -71,7 +71,7 @@ pub enum YamlErrorKind {
     KeyTooLong { limit: usize },
     ScalarTooLong { limit: usize },
     NonStringKey,
-    DuplicateKey(String),
+    DuplicateKey,
 }
 
 impl fmt::Display for YamlError {
@@ -94,7 +94,7 @@ impl fmt::Display for YamlError {
                 write!(f, "value longer than {limit} bytes")
             }
             YamlErrorKind::NonStringKey => f.write_str("mapping keys must be plain strings"),
-            YamlErrorKind::DuplicateKey(k) => write!(f, "duplicate key `{k}`"),
+            YamlErrorKind::DuplicateKey => f.write_str("duplicate key"),
         }
     }
 }
@@ -156,7 +156,7 @@ impl Receiver {
                         );
                     }
                     if entries.iter().any(|(k, _)| *k == key) {
-                        return self.fail(mark, YamlErrorKind::DuplicateKey(key));
+                        return self.fail(mark, YamlErrorKind::DuplicateKey);
                     }
                     *pending = Some(key);
                 }
@@ -317,6 +317,15 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_key_diagnostic_never_echoes_the_key() {
+        let message = load("hunter2_token: 1\nhunter2_token: 2\n")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("duplicate key"), "{message}");
+        assert!(!message.contains("hunter2"), "{message}");
+    }
+
+    #[test]
     fn plain_scalars_resolve_conservatively() {
         let n = load("a: 1\nb: -2\nc: yes\nd: 1.5\ne: '3'\nf: ~\ng: true\nh: 0x10\n").unwrap();
         assert_eq!(n.get("a"), Some(&Node::Int(1)));
@@ -331,10 +340,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicates_anchors_aliases_tags_and_multiple_documents() {
-        assert_eq!(
-            kind("a: 1\na: 2\n"),
-            YamlErrorKind::DuplicateKey("a".into())
-        );
+        assert_eq!(kind("a: 1\na: 2\n"), YamlErrorKind::DuplicateKey);
         assert_eq!(kind("a: &x 1\nb: *x\n"), YamlErrorKind::Anchor);
         assert_eq!(kind("a: !!str 1\n"), YamlErrorKind::Tag);
         assert_eq!(kind("a: 1\n---\nb: 2\n"), YamlErrorKind::MultipleDocuments);

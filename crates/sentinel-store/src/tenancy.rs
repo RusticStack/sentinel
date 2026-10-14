@@ -104,6 +104,11 @@ pub fn suspend(
         })?
         .collect::<std::result::Result<_, _>>()?;
     tx.execute(
+        "UPDATE runs SET cancel_requested = 1 WHERE tenant_id = ?1 AND id IN (
+            SELECT run_id FROM jobs WHERE tenant_id = ?1 AND state_code < ?2)",
+        params![tenant.as_bytes(), TERMINAL_BASE],
+    )?;
+    tx.execute(
         "UPDATE jobs SET cancel_requested = 1 WHERE tenant_id = ?1 AND state_code < ?2",
         params![tenant.as_bytes(), TERMINAL_BASE],
     )?;

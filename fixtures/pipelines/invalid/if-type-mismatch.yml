@@ -1,0 +1,5 @@
+# expect: jobs.a.if: comparison between different types
+schema: 1
+on: [push]
+jobs:
+  a: {image: busybox, if: "event.pr_number == '7'", steps: [{id: s, run: x}]}

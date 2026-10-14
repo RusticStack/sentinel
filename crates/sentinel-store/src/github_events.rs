@@ -213,18 +213,29 @@ fn rerequest(
         // Each reset is compare-and-set on the terminal state just read, so a
         // job that moved in between is never overwritten.
         for ((job, seen), compiled) in jobs.iter().zip(&spec.pipeline.jobs) {
-            let state = if compiled.needs.is_empty() {
+            let ready = compiled.needs.is_empty() && compiled.spec.condition.is_none();
+            let state = if ready {
                 JobState::Queued
             } else {
                 JobState::Blocked
             };
-            let reset = tx.execute("UPDATE jobs SET state_code=?1,cancel_requested=0,failure_class=NULL,queued_ms=?2,leased_ms=NULL,preparing_ms=NULL,running_ms=NULL,finalizing_ms=NULL,terminal_ms=NULL WHERE id=?3 AND state_code=?4",params![crate::codec::encode_state(state),if compiled.needs.is_empty(){Some(now.0)}else{None},job.as_bytes(),crate::codec::encode_state(*seen)])?;
+            let reset = tx.execute("UPDATE jobs SET state_code=?1,cancel_requested=0,failure_class=NULL,queued_ms=?2,leased_ms=NULL,preparing_ms=NULL,running_ms=NULL,finalizing_ms=NULL,terminal_ms=NULL WHERE id=?3 AND state_code=?4",params![crate::codec::encode_state(state),if ready{Some(now.0)}else{None},job.as_bytes(),crate::codec::encode_state(*seen)])?;
             if reset != 1 {
                 // The single writer read these states in this very
                 // transaction: a miss means the row is not what it was.
                 return Err(Error::Corrupt("run job state"));
             }
         }
+        // The rerequest starts the cancelled run over: its run-level flag
+        // goes with the jobs' (docs/checks.md), or the run could never
+        // fetch its source again.
+        tx.execute(
+            "UPDATE runs SET cancel_requested=0 WHERE id=?1 AND tenant_id=?2",
+            params![run.as_bytes(), tenant.as_bytes()],
+        )?;
+        // Jobs with an `if` were blocked above; decide them against the
+        // event the run already carries.
+        crate::dispatch::release_dependents(tx, tenant, run, now)?;
         checks::record_run(tx, tenant, run, now)?;
         reran = true;
     }

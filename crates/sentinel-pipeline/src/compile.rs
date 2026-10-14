@@ -74,6 +74,10 @@ pub enum CompileError {
         path: String,
         message: &'static str,
     },
+    /// A condition or template could not be canonically encoded for the
+    /// digest. Hashing nothing instead would give two different pipelines the
+    /// same identity, so compilation stops.
+    Encoding,
 }
 
 impl fmt::Display for CompileError {
@@ -106,6 +110,7 @@ impl fmt::Display for CompileError {
             }
             Self::TooManySteps { limit } => write!(f, "jobs: more than {limit} steps in total"),
             Self::Expression { path, message } => write!(f, "{path}: {message}"),
+            Self::Encoding => f.write_str("jobs: cannot encode the canonical form for the digest"),
         }
     }
 }
@@ -293,7 +298,7 @@ pub fn compile(pipeline: Pipeline) -> Result<CompiledPipeline, CompileError> {
         });
     }
     let jobs: Vec<CompiledJob> = compiled.into_iter().map(|j| j.expect("placed")).collect();
-    let digest = digest_of(&on, concurrency.as_ref(), &jobs);
+    let digest = digest_of(&on, concurrency.as_ref(), &jobs)?;
     Ok(CompiledPipeline {
         on,
         concurrency,
@@ -304,11 +309,11 @@ pub fn compile(pipeline: Pipeline) -> Result<CompiledPipeline, CompileError> {
 
 /// FNV-1a 128 over a length-prefixed canonical serialisation. Not
 /// cryptographic; used for equality of compiled specs, never for trust.
-struct Digest(u128);
+struct Digest(u128, bool);
 
 impl Digest {
     const fn new() -> Self {
-        Self(0x6c62272e07bb014262b821756295c58d)
+        Self(0x6c62272e07bb014262b821756295c58d, true)
     }
     fn bytes(&mut self, b: &[u8]) {
         self.u64(b.len() as u64);
@@ -328,8 +333,11 @@ impl Digest {
     }
     fn encoded<T: serde::Serialize>(&mut self, v: &T) {
         // postcard is deterministic for a given type layout.
-        let bytes = postcard::to_allocvec(v).unwrap_or_default();
-        self.bytes(&bytes);
+        match postcard::to_allocvec(v) {
+            Ok(bytes) => self.bytes(&bytes),
+            // Never hash an empty buffer in its place: that is a collision.
+            Err(_) => self.1 = false,
+        }
     }
     fn opt_str(&mut self, s: Option<&str>) {
         match s {
@@ -369,7 +377,7 @@ fn digest_of(
     on: &Triggers,
     concurrency: Option<&crate::schema::Concurrency>,
     jobs: &[CompiledJob],
-) -> u128 {
+) -> Result<u128, CompileError> {
     let mut d = Digest::new();
     d.str("sentinel.pipeline/4");
     d.u64(u64::from(on.push.is_some()));
@@ -452,5 +460,9 @@ fn digest_of(
             d.u64(u64::from(a.required));
         }
     }
-    d.0
+    if d.1 {
+        Ok(d.0)
+    } else {
+        Err(CompileError::Encoding)
+    }
 }

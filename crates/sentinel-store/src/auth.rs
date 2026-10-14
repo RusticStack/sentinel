@@ -116,6 +116,9 @@ pub fn create_run(
     // `event.*` resolves to the manual event facts here instead of waiting
     // for an event that will never arrive.
     crate::runs::apply_concurrency(tx, tenant, run, now)?;
+    // Jobs with an `if` start blocked; their conditions read the event,
+    // which is settled now.
+    crate::dispatch::release_dependents(tx, tenant, run, now)?;
     Ok(jobs)
 }
 
