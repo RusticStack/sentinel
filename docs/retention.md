@@ -63,7 +63,7 @@ Fixed sizes fit one disk badly: 1 GiB of reserve is plenty on 50 GB and a roundi
 | worker images (per store) | a fifth | 2–50 GiB |
 | controller remote cache store | a tenth | 1–50 GiB |
 
-The reference host (the verification VPS: 12 vCPU AMD EPYC 9645, 31 GiB, ext4 on a virtio disk) measures **1,080,795,422,720 bytes** (263,866,070 blocks of 4 KiB), which gives a 15.7 GiB reserve, closing at 31.5 GiB free above it and reopening at 63 GiB, a 2.0 GiB log floor, and 50 GiB for each worker and remote store On 100 GiB a worker keeps 20 GiB of cache, 10 of mirrors and 20 of images, leaving half the disk to workspaces and spools. The worker stores together take at most half the disk by default.
+The reference host (the verification VPS: 12 vCPU AMD EPYC 9645, 31 GiB, ext4 on a virtio disk) measures **1,080,795,422,720 bytes** (263,866,070 blocks of 4 KiB), which gives a 15.7 GiB reserve, closing at 31.5 GiB free above it and reopening at 63 GiB, a 2.0 GiB log floor, and 50 GiB for each worker and remote store. On 100 GiB a worker keeps 20 GiB of cache, 10 of mirrors and 20 of images, leaving half the disk to workspaces and spools. The worker stores together take at most half the disk by default.
 
 **The reserve grows with the metadata database.** The reserve in force is the configured (or sized) one or twice the database's size on disk (main file plus write-ahead log), whichever is larger: room for the WAL to grow to the database's size before a checkpoint and for the database itself to keep growing, measured on every maintenance pass. `GET /admin/storage` and `admin objects status` report it.
 
