@@ -1,12 +1,12 @@
-# API credentials (A03)
+# API credentials
 
 Implemented in `sentinel-auth::token` (text form), `sentinel-store::tokens` (issuance, validation, revocation) and `sentinel admin token`, with append-only metadata migration **6**.
 
-This is how the CLI and the first API slice authenticate before browser OAuth (A09) exists. It is deliberately not a development mode: a credential produces the same `Principal` a browser session does, and every tenant, repository and administrative decision is still the live check in [authorization](authorization.md). There is no unauthenticated endpoint, no local-request exemption, and nothing that constructs full authority because a caller looked trusted.
+`sntl_` credentials are the long-lived bearer form for the CLI and tooling, provisioned host-locally; [OAuth](oauth.md) is the other. They are deliberately not a development mode: a credential produces the same `Principal` a browser session does, and every tenant, repository and administrative decision is still the live check in [authorization](authorization.md). There is no unauthenticated endpoint, no local-request exemption, and nothing that constructs full authority because a caller looked trusted.
 
 ## What a credential is
 
-A 256-bit opaque secret from the OS CSPRNG, presented as `sntl_` followed by 64 lower-case hex characters and stored only as its BLAKE3 digest. The same secret primitive as an [A02 session](local-authentication.md); the prefix exists so secret scanners and log filters can recognize one, and so a session cookie value can never be presented as a bearer token by accident. `Authorization: Bearer <credential>` is the transport; the scheme is matched case-insensitively, the credential is not.
+A 256-bit opaque secret from the OS CSPRNG, presented as `sntl_` followed by 64 lower-case hex characters and stored only as its BLAKE3 digest. The same secret primitive as a [session](local-authentication.md); the prefix exists so secret scanners and log filters can recognize one, and so a session cookie value can never be presented as a bearer token by accident. `Authorization: Bearer <credential>` is the transport; the scheme is matched case-insensitively, the credential is not.
 
 The secret is shown exactly once, at issuance. A lost credential is replaced, never recovered — the deployment does not hold anything that could show it again.
 
@@ -25,7 +25,7 @@ The stored scope is a **ceiling, not a grant**. Validation is one primary-key pr
 
 What comes back is a `Principal`, and it is authorized exactly like a session's: membership and repository grants are live queries. Removing the membership behind a credential ends its access immediately, without touching the credential.
 
-**There is no HTTP route that issues a `sntl_` credential.** The only operator surface is the host-local `sentinel admin token issue` below, which provisions through `tokens::provision` for any account within what that account may hold. The store also has `tokens::issue`, the primitive that applies the authorization layer to an issuer — no route or command calls it today, so the rules below describe what it enforces for a caller that adds one, not an API you can reach:
+**There is no HTTP route that issues a `sntl_` credential.** The only operator surface is the host-local `sentinel admin token issue` below, which provisions through `tokens::provision` for any account within what that account may hold. The store also has `tokens::issue`, which applies the authorization layer to an issuer. No route or command calls it, so the table describes what it enforces, not an API you can reach:
 
 | Issuer (`tokens::issue`) | May issue for |
 |---|---|
@@ -52,24 +52,6 @@ The secret is the only thing written to stdout, so a redirect captures exactly t
 
 Authority is the operating system's, as with [bootstrap and recovery](local-authentication.md): the command opens the controller's database directly, so only a user who already has that access can provision a credential. Host-local name resolution lives in `sentinel-store::lookup`, a trusted internal beside `auth::provisioning`; it answers "which row is this name" and performs no authorization. The rule is not "no route calls it" — routes do, for example `lookup::repo_by_name` after `auth::member_tenant_by_slug` in the same transaction, or `lookup::tenant_by_slug` followed by `auth::require_repo` in the same snapshot — but that **nothing a route answers may depend on a lookup alone**: it is the first half of a decision whose second half gives a denied row the same `not_found` as an absent one, and a route whose answer would differ ("exists but not yours") resolves through `auth::member_tenant_by_slug` or `auth::narrowing_by_name`, which check live membership in the resolving statement. Naming a person in a tenant uses `auth::resolve_member`, which resolves a sign-in name only among that tenant's members.
 
-## Cost
-
-Measured on `DOOMBRINGER` (i7-13700KF, Ubuntu 24.04 WSL2, ext4), release build, database at `synchronous=FULL`:
-
-| Operation | Mean |
-|---|---|
-| Credential validation | 1.3 µs |
-| Rejection of an unknown credential | 1.0 µs |
-| Issuance (durable commit) | 1.5 ms |
-
-Validation is what every API request pays, and it is a 32-byte primary-key probe plus one key join, guarded by a query-plan test that rejects table scans and temporary sort trees. Unlike a password, a presented credential needs no key derivation: it is already high-entropy, so there is nothing to slow down and no timing signal worth equalizing. `last_used_ms` is operator visibility, not authentication, and is written at most once a minute per credential.
-
-**Not recorded in the repo:** no `bench/` record or harness holds these means, so their sample count and spread are unknown and they cannot be reproduced from what is committed. Re-measure on the verification VPS and commit the record before citing them.
-
-WSL2 is a development reference, not a production qualification.
-
 ## Verification
 
-`crates/sentinel-store/tests/tokens.rs` uses two organizations, a tenant admin, a tenant-bound service principal and an unrelated account. It covers a host-local credential authorizing through A01 (and losing access the moment its membership is removed), the digest-only store, expiry and its bounds, refusal of empty and undefined scopes, a repository scope aimed at another tenant, platform scope requiring a super admin and being dropped on demotion, self-issue narrowing, a tenant admin issuing only for its own service principal, revocation by owner and by suspension, raw-SQL un-revoke and widening refused, another account unable to revoke or list, metadata-only listing with recorded use, audited issuance and revocation, and bounded purging. `sentinel-auth` unit tests cover the prefixed text form, rejection of a bare session-style value and `Authorization` header parsing. The `sentinel admin token` surface was exercised end to end on Linux.
-
-See [TODO.md](../TODO.md) for commands and results, and [OAuth and secrets](auth-and-secrets.md) for the OAuth flows that will supersede host-local provisioning for humans.
+`crates/sentinel-store/tests/tokens.rs` covers issuance, validation, narrowing, expiry, revocation and the immutability triggers; `sentinel-auth` unit tests cover the prefixed text form and `Authorization` header parsing. Validation is a primary-key probe guarded by a query-plan test that rejects table scans and temporary sort trees; `last_used_ms` is operator visibility, not authentication, and is written at most once a minute per credential.
