@@ -140,7 +140,6 @@ impl Sender {
     }
 }
 
-/// The Resend transport.
 pub struct Resend {
     agent: ureq::Agent,
     endpoint: String,

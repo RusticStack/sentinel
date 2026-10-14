@@ -706,7 +706,7 @@ pub struct DependencySummary {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HashFilesError {
-    /// Secure worker filesystem resolution is currently Linux-only.
+    /// Secure worker filesystem resolution is Linux-only.
     UnsupportedPlatform,
     TraversalLimit,
     DepthLimit,
