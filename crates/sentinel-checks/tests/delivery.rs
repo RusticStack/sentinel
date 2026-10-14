@@ -1,8 +1,3 @@
-//! Delivery: the outbox lane drains through the GitHub publisher against a
-//! loopback stub — creation, updates and conclusions, adoption after an
-//! ambiguous create, rate-limit pauses, a refreshed token, permanent refusals,
-//! the revoked-binding path, and a settled delivery's completed check.
-
 use std::{
     collections::VecDeque,
     io::{Read, Write},
@@ -90,17 +85,13 @@ struct Reply {
     status: u16,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
-    /// The remote effect landed but the answer never does: the connection
-    /// closes without a response.
     lost: bool,
 }
 
 #[derive(Default)]
 struct Data {
     records: Vec<Record>,
-    /// (method, path substring, reply): the first match is consumed.
     scripted: VecDeque<(String, String, Reply)>,
-    /// Check runs the stub reports for a list request.
     existing: Vec<serde_json::Value>,
     next_id: i64,
 }
@@ -128,10 +119,7 @@ impl Stub {
                 while !stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            // On Windows an accepted socket inherits the
-                            // listener's non-blocking mode; the connection is
-                            // served blocking, one thread each, so a request
-                            // that has not arrived yet is awaited, not dropped.
+                            // Windows: accepted sockets inherit the listener's non-blocking mode, so serve them blocking.
                             let _ = stream.set_nonblocking(false);
                             let data = Arc::clone(&data);
                             thread::spawn(move || serve(stream, &data));
@@ -184,9 +172,6 @@ impl Stub {
         ));
     }
 
-    /// Script a create whose remote effect lands but whose answer is dropped:
-    /// the run appears in the stub's listing (under the request's own
-    /// external ID) while the connection closes without a response.
     fn script_lost(&self, method: &str, path: &str, check_run_id: i64) {
         let mut data = self.data.lock().unwrap();
         data.scripted.push_back((
@@ -209,9 +194,6 @@ impl Stub {
         }));
     }
 
-    /// List a check run the way GitHub reports one that has finished: the
-    /// adoption lookup must pass it by, because a completed run cannot be
-    /// reopened — only a fresh create shows new work.
     fn adopt_completed(&self, check_run_id: i64, external_id: &str) {
         let mut data = self.data.lock().unwrap();
         data.existing.push(serde_json::json!({
@@ -225,7 +207,6 @@ impl Stub {
         self.data.lock().unwrap().records.clone()
     }
 
-    /// Wait until `matches` accepts the records, or fail the test.
     fn wait(&self, what: &str, matches: impl Fn(&[Record]) -> bool) -> Vec<Record> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -252,8 +233,6 @@ impl Drop for Stub {
 }
 
 fn serve(mut stream: TcpStream, data: &Arc<Mutex<Data>>) {
-    // Keep-alive, like a real server: a pooled connection is reused by the
-    // publisher, and an idle timeout closes it long after a test has finished.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     loop {
         let Some((method, path, body, authorization)) = read_request(&mut stream) else {
@@ -287,7 +266,6 @@ fn serve(mut stream: TcpStream, data: &Arc<Mutex<Data>>) {
             data.lock().unwrap().existing.push(serde_json::json!({
                 "id": reply.body["id"],
                 "external_id": request["external_id"],
-                // Listed with the status it was created with, as GitHub does.
                 "status": request["status"],
             }));
             return;
@@ -310,7 +288,6 @@ fn serve(mut stream: TcpStream, data: &Arc<Mutex<Data>>) {
     }
 }
 
-/// One request off a kept-alive connection, or `None` when the peer closed it.
 fn read_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>, String)> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -370,8 +347,6 @@ fn default_reply(data: &mut Data, method: &str, path: &str) -> Reply {
         };
     }
     if method == "POST" && path.contains("/access_tokens") {
-        // The token the publisher must accept: exactly `checks: write` plus the
-        // implicit metadata read.
         return Reply {
             status: 201,
             body: serde_json::json!({
@@ -396,7 +371,6 @@ fn default_reply(data: &mut Data, method: &str, path: &str) -> Reply {
         };
     }
     if method == "GET" && path.contains("/check-runs") {
-        // Paged like GitHub: `per_page` (default 30) and 1-based `page`.
         let param = |name: &str| {
             path.split(['?', '&'])
                 .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
@@ -551,7 +525,6 @@ fn spec() -> RunSpec {
     .unwrap()
 }
 
-/// One event-driven run with a single job, as `intake::dispatch` creates it.
 fn event_run(f: &mut Fixture) -> (RunId, JobId) {
     let (tenant, repo) = (f.tenant, f.repo);
     let run = RunId::new();
@@ -632,9 +605,6 @@ fn posts<'a>(records: &'a [Record], path: &str) -> Vec<&'a Record> {
         .collect()
 }
 
-/// Wait until every publication of the run has its newest generation
-/// delivered — the store is the durable truth, and the stub's records only say
-/// that a request arrived.
 fn wait_settled_run(f: &Fixture, run: RunId, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -677,7 +647,6 @@ fn a_run_publishes_a_stable_aggregate_and_per_job_checks() {
     let (run, build) = event_run(&mut f);
     let lane = start_lane(&f, publisher(&f));
 
-    // Every job and the aggregate are created queued; the token is minted once.
     let records = f.stub.wait("the queued checks", |records| {
         posts(records, "/check-runs").len() >= 2
     });
@@ -695,7 +664,6 @@ fn a_run_publishes_a_stable_aggregate_and_per_job_checks() {
         .unwrap();
     assert_eq!(aggregate.body["status"], "queued");
     assert_eq!(aggregate.body["head_sha"], SHA_B);
-    // The create carries its generation: every create names exactly one run.
     assert!(
         aggregate.body["external_id"]
             .as_str()
@@ -708,8 +676,6 @@ fn a_run_publishes_a_stable_aggregate_and_per_job_checks() {
         format!("https://ci.example/runs/{run}")
     );
     assert!(aggregate.body["check_run_id"].is_null());
-    // Every check call authenticates with the minted installation token, and
-    // the token was minted with an App JWT.
     assert!(
         records
             .iter()
@@ -733,10 +699,8 @@ fn a_run_publishes_a_stable_aggregate_and_per_job_checks() {
             .starts_with(&format!("sentinel:{run}:{build}:")),
         "{job:?}"
     );
-    // One repository token for both publications.
     assert_eq!(posts(&records, "/access_tokens").len(), 1);
 
-    // The job runs and passes: its check and the aggregate complete.
     step(&mut f, build, Actor::Controller, Event::Leased(Fence(1)));
     step(
         &mut f,
@@ -779,8 +743,6 @@ fn a_run_publishes_a_stable_aggregate_and_per_job_checks() {
     assert_eq!(last_aggregate.body["output"]["title"], "Passed");
     assert!(last_aggregate.body["completed_at"].is_string());
 
-    // The store's rows are settled: every generation published, the check-run
-    // handle recorded.
     wait_settled_run(&f, run, "the settled run");
     let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
     assert_eq!(rows.len(), 2);
@@ -790,7 +752,6 @@ fn a_run_publishes_a_stable_aggregate_and_per_job_checks() {
         assert!(row.check_run_id.is_some(), "{row:?}");
     }
     drop(lane);
-    // The publisher is idempotent: nothing is due any more.
     assert!(
         f.store
             .read(|c| checks::due(c, UnixMillis::now(), 10))
@@ -804,8 +765,6 @@ fn an_ambiguous_create_is_adopted_instead_of_duplicated() {
     let mut f = fixture(None);
     let (run, build) = event_run(&mut f);
     let external = format!("sentinel:{run}:{build}");
-    // The durable mark of an earlier create whose answer was lost: only a
-    // marked publication owes the adoption lookup before creating again.
     let (tenant, run_id, scope) = (f.tenant, run, build.to_string());
     let seq = f
         .store
@@ -819,7 +778,6 @@ fn an_ambiguous_create_is_adopted_instead_of_duplicated() {
             Ok(row.seq)
         })
         .unwrap();
-    // GitHub lists the run under the identity that create carried.
     f.stub.adopt(777, &checks::create_identity(&external, seq));
     let lane = start_lane(&f, publisher(&f));
     let records = f
@@ -830,10 +788,7 @@ fn an_ambiguous_create_is_adopted_instead_of_duplicated() {
                 .any(|r| r.method == "PATCH" && r.path.contains("/check-runs/777"))
                 && !posts(records, "/check-runs").is_empty()
         });
-    // The job's check was found and updated, not created again; the aggregate
-    // (which had no existing run) was created.
     assert_eq!(posts(&records, "/check-runs").len(), 1, "{records:#?}");
-    // No details_url without a configured public URL.
     let created = posts(&records, "/check-runs");
     assert!(created[0].body["details_url"].is_null());
     wait_settled_run(&f, run, "the adopted check");
@@ -856,8 +811,6 @@ fn an_ambiguous_create_is_adopted_instead_of_duplicated() {
 
 #[test]
 fn adoption_finds_its_run_past_a_large_first_page() {
-    // A commit with many reruns: the listing is larger than one page, and
-    // our run is on the second.
     let mut f = fixture(None);
     let (run, build) = event_run(&mut f);
     let external = format!("sentinel:{run}:{build}");
@@ -903,7 +856,6 @@ fn adoption_finds_its_run_past_a_large_first_page() {
             .any(|r| r.method == "GET" && r.path.contains("page=2")),
         "the second page was read: {records:#?}"
     );
-    // Only the aggregate (which had no run) was created.
     assert_eq!(posts(&records, "/check-runs").len(), 1, "{records:#?}");
     drop(lane);
 }
@@ -912,9 +864,6 @@ fn adoption_finds_its_run_past_a_large_first_page() {
 fn a_lost_create_response_is_found_by_external_id() {
     let mut f = fixture(None);
     let (run, _) = event_run(&mut f);
-    // The create lands remotely — the stub lists the run afterwards — but its
-    // answer never arrives. The durable create-started mark, written before
-    // the request went out, is what makes the next pass look before creating.
     f.stub.script_lost("POST", "/check-runs", 888);
     let lane = start_lane(&f, publisher(&f));
     let records = f.stub.wait("the adopted update", |records| {
@@ -922,8 +871,6 @@ fn a_lost_create_response_is_found_by_external_id() {
             .iter()
             .any(|r| r.method == "PATCH" && r.path.contains("/check-runs/888"))
     });
-    // Exactly two creates went out: the lost one and the other publication's.
-    // The lost one's retry adopted by external ID instead of creating again.
     assert_eq!(posts(&records, "/check-runs").len(), 2, "{records:#?}");
     assert_eq!(
         records.iter().filter(|r| r.method == "PATCH").count(),
@@ -948,7 +895,6 @@ fn a_rerun_creates_fresh_check_runs_because_completed_ones_are_immutable() {
     let (run, build) = event_run(&mut f);
     let lane = start_lane(&f, publisher(&f));
 
-    // Finish the run: both checks are created, then updated to completed.
     f.stub.wait("the queued creates", |records| {
         posts(records, "/check-runs").len() == 2
     });
@@ -976,8 +922,6 @@ fn a_rerun_creates_fresh_check_runs_because_completed_ones_are_immutable() {
     });
     wait_settled_run(&f, run, "the settled run");
 
-    // GitHub keeps completed check runs immutable: list them the way its
-    // lookup reports them, so the adoption path has the chance to go wrong.
     let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
     let dead: Vec<i64> = rows.iter().filter_map(|row| row.check_run_id).collect();
     assert_eq!(dead.len(), 2);
@@ -987,9 +931,6 @@ fn a_rerun_creates_fresh_check_runs_because_completed_ones_are_immutable() {
     }
     let before = f.stub.records().len();
 
-    // Rerunning the job starts new generations; the publisher must create
-    // fresh check runs rather than PATCH the completed ones, which GitHub
-    // would accept and silently ignore.
     let tenant = f.tenant;
     f.store
         .writer()
@@ -1020,7 +961,6 @@ fn a_rate_limit_pauses_delivery_and_a_retry_is_delivered() {
     for status in [403, 429] {
         let mut f = fixture(None);
         let (run, _) = event_run(&mut f);
-        // The first create is rate-limited; the retry succeeds.
         f.stub.script_headers(
             "POST",
             "/check-runs",
@@ -1032,8 +972,6 @@ fn a_rate_limit_pauses_delivery_and_a_retry_is_delivered() {
         let records = f.stub.wait("all checks delivered", |records| {
             posts(records, "/check-runs").len() >= 3
         });
-        // The first publication was refused once and then succeeded; the store
-        // holds no due rows, and the retry carried the same generation.
         assert_eq!(posts(&records, "/check-runs").len(), 3, "{records:#?}");
         wait_settled_run(&f, run, "the retried publications");
         let rows = f.store.read(|c| checks::of_run(c, f.tenant, run)).unwrap();
@@ -1047,7 +985,6 @@ fn a_rate_limit_pauses_delivery_and_a_retry_is_delivered() {
 
 #[test]
 fn an_expired_token_is_replaced_and_permanent_refusals_are_recorded() {
-    // A 401 on the first attempt mints a fresh token and succeeds.
     let mut f = fixture(None);
     let (run, _) = event_run(&mut f);
     f.stub.script(
@@ -1072,7 +1009,6 @@ fn an_expired_token_is_replaced_and_permanent_refusals_are_recorded() {
     assert!(rows.iter().all(|row| row.published_seq == row.seq));
     drop(lane);
 
-    // A 422 is permanent: the row records the reason and is not retried.
     let mut f = fixture(None);
     let (run, _) = event_run(&mut f);
     f.stub.script(
@@ -1082,13 +1018,11 @@ fn an_expired_token_is_replaced_and_permanent_refusals_are_recorded() {
         serde_json::json!({"message": "Validation Failed"}),
     );
     let lane = start_lane(&f, publisher(&f));
-    // Both publications are attempted; the scripted 422 lands on one of them.
     let records = f.stub.wait("both publications attempted", |records| {
         posts(records, "/check-runs").len() >= 2
     });
     let created = posts(&records, "/check-runs");
     assert_eq!(created.len(), 2, "{records:#?}");
-    // The refused row records the reason and is never retried.
     let (tenant, run_id) = (f.tenant, run);
     let refused: (i64, Option<String>) = f
         .store
@@ -1227,10 +1161,6 @@ fn a_settled_delivery_publishes_a_completed_check() {
 
 #[test]
 fn a_lost_answer_to_a_completed_create_is_adopted_not_duplicated() {
-    // A settled delivery's aggregate is created already `completed`. Its
-    // create lands but the answer is lost: the retry must adopt that
-    // completed run (it carries this create's own identity) rather than
-    // skip it and POST a second `sentinel / ci`.
     let f = fixture(None);
     let repo = f.repo;
     let sha = "c".repeat(40);
@@ -1280,7 +1210,6 @@ fn a_lost_answer_to_a_completed_create_is_adopted_not_duplicated() {
     drop(lane);
 }
 
-/// One process-level smoke check: the lane's thread must stop promptly.
 #[test]
 fn dropping_the_lane_joins_its_thread() {
     let f = fixture(None);

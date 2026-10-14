@@ -1,9 +1,3 @@
-//! The GitHub-backed membership lane against a loopback GitHub: a member is
-//! admitted only on verified answers, a renamed login keeps its access, a
-//! reused login and an organization rename prove nothing, a removed member is
-//! removed, and rate limits, server errors and a missing App permission keep
-//! what exists and grant nothing.
-
 use std::{
     collections::HashMap,
     io::{Read, Write},
@@ -70,19 +64,12 @@ const ORG: u64 = 73;
 const GITHUB_REPO: u64 = 91;
 const ALICE_ID: u64 = 1001;
 
-/// What the loopback GitHub currently believes. GitHub's answers are stable
-/// facts a test changes between passes.
 struct World {
     org_login: String,
-    /// Current login of every GitHub account, by immutable id.
     logins: HashMap<u64, String>,
-    /// Organization memberships by login: (account id the reply names, state, role).
     members: HashMap<String, (u64, &'static str, &'static str)>,
-    /// Repository permissions by (repo, login): (account id, legacy permission, role name).
     perms: HashMap<(String, String), (u64, &'static str, &'static str)>,
-    /// Every membership read answers this instead (status, retry-after).
     fail_memberships: Option<(u16, Option<i64>)>,
-    /// Token minting answers this instead (a missing App permission is 422).
     fail_tokens: Option<u16>,
     requests: Vec<String>,
 }
@@ -398,7 +385,6 @@ fn fixture() -> Fixture {
             github_members::set_backing_trusted(tx, tenant, true, now)
         })
         .unwrap();
-    // Alice is "alice-gh" on GitHub and an active member with write access.
     stub.with(|w| {
         w.logins.insert(ALICE_ID, "alice-gh".into());
         w.members
@@ -437,7 +423,6 @@ impl Fixture {
         )
     }
 
-    /// Ask for a check of Alice now, as a signed webhook or a sign-in would.
     fn ask(&self) {
         let (tenant, id) = (self.tenant, ALICE_ID);
         self.store
@@ -450,7 +435,6 @@ impl Fixture {
         self.notices.lock().unwrap().len()
     }
 
-    /// Ask, then wait until one more pass has been committed.
     fn pass(&self) -> String {
         let before = self.passes();
         self.ask();
@@ -508,7 +492,6 @@ fn a_verified_member_joins_with_the_role_and_repository_permission_github_report
     );
 
     let requests = f.stub.requests().join("\n");
-    // Identity travels as the numeric id: the login was resolved from it.
     assert!(requests.contains("GET /user/1001"), "{requests}");
     assert!(
         requests.contains("GET /orgs/acme/memberships/alice-gh"),
@@ -518,8 +501,6 @@ fn a_verified_member_joins_with_the_role_and_repository_permission_github_report
         requests.contains("/repos/acme/app/collaborators/alice-gh/permission"),
         "{requests}"
     );
-    // The token asks for organization members (read) plus the metadata read the
-    // collaborator-permission endpoint needs, and nothing wider.
     assert!(
         requests.contains(r#"{"permissions":{"members":"read","metadata":"read"}}"#),
         "{requests}"
@@ -556,7 +537,6 @@ fn a_renamed_login_keeps_access_because_the_id_is_the_identity() {
     let f = fixture();
     let _lane = f.start();
     assert_eq!(f.pass(), "joined");
-    // The account is renamed on GitHub; the old name is free.
     f.stub.with(|w| {
         w.logins.insert(ALICE_ID, "alice-renamed".into());
         let entry = w.members.remove("alice-gh").unwrap();
@@ -582,8 +562,6 @@ fn a_renamed_login_keeps_access_because_the_id_is_the_identity() {
 #[test]
 fn a_reply_about_another_account_never_admits_or_removes() {
     let f = fixture();
-    // The login now belongs to somebody else (id 2002): the membership reply
-    // names a different account than the one linked, so it proves nothing.
     f.stub.with(|w| {
         w.members
             .insert("alice-gh".into(), (2002, "active", "admin"));
@@ -593,7 +571,6 @@ fn a_reply_about_another_account_never_admits_or_removes() {
     assert_eq!(f.role(), None, "a reused login inherits nothing");
     assert_eq!(f.grant(), None);
 
-    // The same reply must not remove an existing member either.
     f.stub.with(|w| {
         w.members
             .insert("alice-gh".into(), (ALICE_ID, "active", "member"));
@@ -624,7 +601,6 @@ fn a_pending_invitation_is_not_membership_and_a_removed_member_is_removed() {
     });
     assert_eq!(f.pass(), "joined");
     assert_eq!(f.grant(), Some(3));
-    // GitHub no longer lists her: membership and grants go together.
     f.stub.with(|w| {
         w.members.remove("alice-gh");
     });
@@ -638,9 +614,6 @@ fn a_renamed_organization_cannot_remove_anyone() {
     let f = fixture();
     let _lane = f.start();
     assert_eq!(f.pass(), "joined");
-    // The organization is renamed: the old name answers 404 for everybody,
-    // which looks exactly like "not a member". The fresh installation
-    // snapshot reports a different login, so the 404 is not believed.
     f.stub.with(|w| w.org_login = "acme-renamed".into());
     assert_eq!(f.pass(), "kept: unreachable");
     assert_eq!(f.role(), Some(2), "nobody lost access over a rename");
@@ -657,8 +630,6 @@ fn rate_limits_server_errors_and_a_missing_permission_keep_access_and_grant_noth
         assert_eq!(f.pass(), "kept: unreachable", "{failure:?}");
         assert_eq!(f.role(), Some(2), "{failure:?}");
         assert_eq!(f.grant(), Some(3), "{failure:?}");
-        // GitHub recovers: a pause it asked for ends within a second and the
-        // very next check confirms the member again.
         f.stub.with(|w| w.fail_memberships = None);
         let deadline = Instant::now() + Duration::from_secs(20);
         while f.pass() != "confirmed" {
@@ -675,8 +646,6 @@ fn rate_limits_server_errors_and_a_missing_permission_keep_access_and_grant_noth
 #[test]
 fn an_app_without_the_members_permission_admits_nobody_and_asks_nothing_about_them() {
     let f = fixture();
-    // The App was never granted the members permission: minting the token is
-    // refused, which is unknown, and a first-time candidate gets nothing.
     f.stub.with(|w| w.fail_tokens = Some(422));
     let _lane = f.start();
     assert_eq!(f.pass(), "kept: unreachable");
@@ -691,8 +660,6 @@ fn an_app_without_the_members_permission_admits_nobody_and_asks_nothing_about_th
 #[test]
 fn a_person_without_a_linked_account_is_never_asked_about() {
     let f = fixture();
-    // No linked GitHub account: the lane has nothing to ask and nothing to
-    // confirm with, so no request about the person is made at all.
     let (alice, tenant) = (f.alice, f.tenant);
     f.store
         .writer()

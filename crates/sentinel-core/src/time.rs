@@ -1,20 +1,8 @@
-//! Persisted timestamps are UTC wall-clock provenance only. Durations are
-//! measured with the monotonic clock in the process that observed both ends
-//! (see the runtime foundations contract) and stored as separate nanosecond
-//! fields; never subtract two `UnixMillis` to produce a latency figure.
-//!
-//! Deadline decisions (lease expiry, offer acknowledgement, queue and
-//! execution timeouts, idempotency TTL) are not provenance: they read
-//! [`UnixMillis::steady`], a process clock that advances with the monotonic
-//! clock and is anchored to the wall clock once, at its first read. The values
-//! it yields stay comparable across a restart (the next process anchors to the
-//! wall clock again), but a wall-clock step while the process runs can never
-//! expire or extend a lease.
+//! Persisted timestamps are wall-clock provenance: never subtract two `UnixMillis` to get a latency.
+//! Deadline decisions read `UnixMillis::steady`, which a wall-clock step can neither move nor extend.
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// Milliseconds since the Unix epoch, UTC. `i64` covers ±292 million years and
-/// matches SQLite's INTEGER affinity without conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct UnixMillis(pub i64);
@@ -22,7 +10,6 @@ pub struct UnixMillis(pub i64);
 impl UnixMillis {
     #[must_use]
     pub fn now() -> Self {
-        // A clock before 1970 is a misconfigured host; clamp rather than panic.
         let ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
@@ -30,15 +17,6 @@ impl UnixMillis {
         Self(ms)
     }
 
-    /// The controller process's deadline clock: the wall clock at the first
-    /// call plus the monotonic time elapsed since, so an NTP step or a VM
-    /// resume moves it by the time that really passed and no more. It is the
-    /// only clock deadline decisions and the timestamps they compare against
-    /// may use. Each process anchors on its own: the controller process is the
-    /// one that decides deadlines, and a short-lived command (the host-local
-    /// `admin cancel`) that stamps rows with the wall clock is off by at most
-    /// the wall-clock step the controller has absorbed since it started.
-    /// Never moves back.
     #[must_use]
     pub fn steady() -> Self {
         static ANCHOR: OnceLock<(i64, Instant)> = OnceLock::new();
@@ -47,9 +25,6 @@ impl UnixMillis {
     }
 }
 
-/// When each state was entered for one attempt, recorded by the controller
-/// when it commits the transition (single clock domain). Absent means the
-/// state was never entered; a rerun starts a fresh record.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AttemptTimestamps {
     pub queued: Option<UnixMillis>,
@@ -61,8 +36,7 @@ pub struct AttemptTimestamps {
 }
 
 impl AttemptTimestamps {
-    /// Record entry into `state` at `at`; the first entry wins so a duplicate
-    /// or reordered delivery cannot move a timestamp later.
+    /// The first entry wins, so a duplicate or reordered delivery cannot move a timestamp later.
     pub const fn enter(&mut self, state: crate::state::JobState, at: UnixMillis) {
         use crate::state::JobState as S;
         let slot = match state {
@@ -103,8 +77,6 @@ mod tests {
         let a = UnixMillis::steady();
         let b = UnixMillis::steady();
         assert!(b >= a);
-        // Anchored to the wall clock: within a generous bound of it in a test
-        // process that has not seen a wall-clock step.
         assert!((UnixMillis::now().0 - a.0).abs() < 60_000);
     }
 }
