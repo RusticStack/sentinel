@@ -351,6 +351,7 @@ impl WorkerProcess {
         let config = worker::Config {
             controller: d.controller().local_addr(),
             server: d.controller().fingerprint(),
+            also_pinned: Vec::new(),
             worker: id,
             name: "builder-1".into(),
             hello: {
@@ -513,6 +514,38 @@ fn a_worker_enrolls_once_heartbeats_reconnects_and_is_refused_after_revocation()
         d.controller().stats().rejected.load(Ordering::SeqCst) == 4
     });
     assert_eq!(d.controller().stats().admitted.load(Ordering::SeqCst), 2);
+}
+
+/// Certificate rotation overlap: a worker pinning the old and the new
+/// fingerprint reaches the controller on either, one pinning neither (or an
+/// empty or oversized set) does not.
+#[test]
+fn a_worker_pinning_a_set_of_fingerprints_accepts_any_of_them() {
+    let d = deployment();
+    let current = d.controller().fingerprint();
+    let retired = Identity::generate("retired").unwrap().fingerprint();
+    let stranger = Identity::generate("stranger").unwrap().fingerprint();
+    let attempt = |pins: &[sentinel_auth::secret::Digest]| {
+        let secret = d.enrollment(60_000);
+        let config =
+            tls::client_config_pinned(Identity::generate("w").unwrap(), pins).unwrap();
+        session::connect(
+            d.controller().local_addr(),
+            config,
+            WorkerId::new(),
+            "w",
+            hello(),
+            Some(&secret),
+            CAPACITY,
+        )
+    };
+    assert!(attempt(&[retired, current]).is_ok());
+    assert!(attempt(&[current, retired]).is_ok());
+    let failure = attempt(&[retired, stranger]).unwrap_err();
+    assert!(matches!(failure, Error::Tls(_) | Error::Io(_)), "{failure}");
+    assert!(tls::client_config_pinned(Identity::generate("w").unwrap(), &[]).is_err());
+    let too_many = vec![current; tls::MAX_PINS + 1];
+    assert!(tls::client_config_pinned(Identity::generate("w").unwrap(), &too_many).is_err());
 }
 
 #[test]

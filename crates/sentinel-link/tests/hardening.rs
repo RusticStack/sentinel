@@ -236,6 +236,7 @@ fn an_unavailable_refusal_is_retried_and_the_worker_connects() {
     let config = worker::Config {
         controller: addr,
         server: fingerprint,
+        also_pinned: Vec::new(),
         worker: WorkerId::new(),
         name: "retrying".into(),
         hello: hello(6),
@@ -290,6 +291,7 @@ fn an_unavailable_refusal_is_retried_and_the_worker_connects() {
         worker::Config {
             controller: addr,
             server: fingerprint,
+            also_pinned: Vec::new(),
             worker: WorkerId::new(),
             name: "final".into(),
             hello: hello(6),

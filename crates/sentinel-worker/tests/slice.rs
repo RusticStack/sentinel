@@ -281,6 +281,7 @@ fn the_vertical_slice_survives_cancel_network_loss_and_controller_restart() {
         let config = worker::Config {
             controller: link_addr,
             server: fingerprint,
+            also_pinned: Vec::new(),
             worker: worker_id,
             name: "builder-1".into(),
             hello: Hello {

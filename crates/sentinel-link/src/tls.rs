@@ -3,10 +3,11 @@
 //! The controller requires a client certificate and accepts any well-formed
 //! one at the TLS layer: *which* fingerprints are live workers is the store's
 //! decision, made after the handshake with the certificate in hand. The worker
-//! accepts exactly one server fingerprint, the one it was enrolled with. No
-//! root store is consulted on either side, so a compromised public CA cannot
-//! insert itself, and a rotated controller certificate is an explicit
-//! re-enrollment, not a silent change of trust.
+//! accepts only the server fingerprints it was configured with: the one it
+//! was enrolled with and, for a certificate rotation, further ones the
+//! operator names (at most [`MAX_PINS`] in all). No root store is consulted
+//! on either side, so a compromised public CA cannot insert itself, and trust
+//! changes only by an explicit configuration edit, never silently.
 
 use std::sync::Arc;
 
@@ -71,9 +72,15 @@ impl ClientCertVerifier for AnyClient {
     }
 }
 
-/// Accept exactly one server: the fingerprint the worker was enrolled with.
+/// Most fingerprints a worker may pin at once: the current certificate, the
+/// next one during a rotation, and a little slack. Bounded so a typo cannot
+/// turn the pin into a list.
+pub const MAX_PINS: usize = 4;
+
+/// Accept only the pinned servers: the fingerprint the worker was enrolled
+/// with plus the operator-named ones of a rotation overlap.
 #[derive(Debug)]
-struct PinnedServer(Digest);
+struct PinnedServer(Vec<Digest>);
 
 impl ServerCertVerifier for PinnedServer {
     fn verify_server_cert(
@@ -84,7 +91,13 @@ impl ServerCertVerifier for PinnedServer {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        if digest_eq(&crate::identity::fingerprint_of(end_entity), &self.0) {
+        let presented = crate::identity::fingerprint_of(end_entity);
+        // Every pin is compared; which one matched is not observable.
+        let mut matched = false;
+        for pin in &self.0 {
+            matched |= digest_eq(&presented, pin);
+        }
+        if matched {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General("server fingerprint mismatch".into()))
@@ -126,12 +139,23 @@ pub fn server_config(identity: Identity) -> Result<Arc<ServerConfig>> {
 
 /// Worker-side configuration: present `identity`, accept only `server`.
 pub fn client_config(identity: Identity, server: Digest) -> Result<Arc<ClientConfig>> {
+    client_config_pinned(identity, &[server])
+}
+
+/// [`client_config`] for a controller certificate rotation: accept any of
+/// `servers` (at least one, at most [`MAX_PINS`]). The overlap is the
+/// operator's: the old and the new fingerprint are both listed until every
+/// worker has reconnected to the rotated controller, then the old one goes.
+pub fn client_config_pinned(identity: Identity, servers: &[Digest]) -> Result<Arc<ClientConfig>> {
+    if servers.is_empty() || servers.len() > MAX_PINS {
+        return Err(Error::Tls("controller pins".into()));
+    }
     let (cert, key) = identity.into_parts();
     let config = ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| Error::Tls(e.to_string()))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedServer(server)))
+        .with_custom_certificate_verifier(Arc::new(PinnedServer(servers.to_vec())))
         .with_client_auth_cert(vec![cert], key)
         .map_err(|e| Error::Tls(e.to_string()))?;
     Ok(Arc::new(config))

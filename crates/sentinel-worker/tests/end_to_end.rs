@@ -273,6 +273,7 @@ fn a_job_runs_in_a_rootless_container_and_its_verdict_reaches_the_controller() {
         let config = worker::Config {
             controller: controller.local_addr(),
             server: controller.fingerprint(),
+            also_pinned: Vec::new(),
             worker: worker_id,
             name: "builder-1".into(),
             hello: Hello {
@@ -826,6 +827,7 @@ jobs:
         let config = worker::Config {
             controller: controller.local_addr(),
             server: controller.fingerprint(),
+            also_pinned: Vec::new(),
             worker: worker_id,
             name: "builder-1".into(),
             hello: Hello {

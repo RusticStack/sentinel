@@ -142,6 +142,7 @@ fn a_clean_close_ends_the_session_at_once_and_redials_on_the_shortest_back_off()
     let settings = worker::Config {
         controller: addr,
         server: fingerprint,
+        also_pinned: Vec::new(),
         worker: WorkerId::new(),
         name: "w".into(),
         hello: Hello {
@@ -259,6 +260,7 @@ fn a_connection_closed_in_its_handshake_ends_at_once_and_redials_on_the_shortest
     let settings = worker::Config {
         controller: slow,
         server: fingerprint,
+        also_pinned: Vec::new(),
         worker: WorkerId::new(),
         name: "w".into(),
         hello: Hello {

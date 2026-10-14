@@ -1242,6 +1242,7 @@ fn a_hand_off_restarts_the_helper_only_on_a_change_and_spares_direct_tls() {
     let config = worker::Config {
         controller: controller.local_addr(),
         server: controller.fingerprint(),
+        also_pinned: Vec::new(),
         worker: WorkerId::new(),
         name: "direct".into(),
         hello: sentinel_protocol::negotiate::Hello {

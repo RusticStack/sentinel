@@ -319,6 +319,7 @@ impl WorkerProcess {
         let config = worker::Config {
             controller: d.controller().local_addr(),
             server: d.controller().fingerprint(),
+            also_pinned: Vec::new(),
             worker: id,
             name: "builder".into(),
             hello: hello(),
@@ -1060,6 +1061,7 @@ fn each_session_reports_the_helpers_latest_transport_measurement() {
     let config = worker::Config {
         controller: d.controller().local_addr(),
         server: d.controller().fingerprint(),
+        also_pinned: Vec::new(),
         worker: id,
         name: "measured".into(),
         hello: hello(),

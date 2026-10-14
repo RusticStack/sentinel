@@ -2056,6 +2056,7 @@ mod secret_runtime {
         let config = worker::Config {
             controller: d._controller.local_addr(),
             server: d._controller.fingerprint(),
+            also_pinned: Vec::new(),
             worker: worker_id,
             name: "secret-cli-worker".into(),
             hello: Hello {

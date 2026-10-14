@@ -730,6 +730,7 @@ fn play_worker(dir: &Path) {
     let settings = worker::Config {
         controller: slow,
         server: sentinel_auth::secret::Digest(fingerprint),
+        also_pinned: Vec::new(),
         worker: read("worker").trim().parse().unwrap(),
         name: "live-worker".into(),
         hello: sentinel_protocol::negotiate::Hello {
