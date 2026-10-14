@@ -1297,16 +1297,6 @@ pub fn place_in_fleet(
     placement.place_from_streams(&streams, None, lease_ms)
 }
 
-/// What one page of a stream's candidates came to.
-enum Scan {
-    /// The first candidate locality does not hold.
-    Found(Pick),
-    /// A whole page, every candidate held: the next page may have more.
-    Full,
-    /// A short page: the stream has nothing left.
-    Exhausted,
-}
-
 /// One placement's facts, read once and shared by its passes.
 struct Placement<'a, 't> {
     tx: &'a Transaction<'t>,
@@ -1330,10 +1320,14 @@ impl Placement<'_, '_> {
         for stream in streams {
             let mut after = (i64::MIN, i64::MIN, i64::MIN);
             for _ in 0..MAX_PAGES {
-                match self.scan_page(stream, far, &mut after)? {
-                    Scan::Found(pick) => return self.lease(pick, lease_ms).map(Some),
-                    Scan::Full => {}
-                    Scan::Exhausted => break,
+                let (found, full) = self.scan_page(stream, far, &mut after)?;
+                if let Some(pick) = found {
+                    return self.lease(pick, lease_ms).map(Some);
+                }
+                // A short page means the stream has nothing left; a full
+                // one (every candidate held) may be followed by more.
+                if !full {
+                    break;
                 }
             }
         }
@@ -1346,13 +1340,14 @@ impl Placement<'_, '_> {
     /// first row, so a page of sixteen costs one decoded candidate, not
     /// sixteen. `after` is left at the last row examined, the keyset the next
     /// page resumes from. The statement is reset before a pick is returned,
-    /// so the lease's writes never run under a live read cursor.
+    /// so the lease's writes never run under a live read cursor. The flag
+    /// says the page was full: with no pick, the next page may have more.
     fn scan_page(
         &mut self,
         stream: &Stream,
         far: Option<Capacity>,
         after: &mut (i64, i64, i64),
-    ) -> Result<Scan> {
+    ) -> Result<(Option<Pick>, bool)> {
         let tx = self.tx;
         let (large, large_since) = self.fairness.large.unwrap_or((0, 0));
         let far = far.map(|far| (1i64, far));
@@ -1415,14 +1410,10 @@ impl Placement<'_, '_> {
                 .locality
                 .holds(tx, self.worker, self.facts, &pick, self.now)?
             {
-                return Ok(Scan::Found(pick));
+                return Ok((Some(pick), true));
             }
         }
-        Ok(if seen == PAGE {
-            Scan::Full
-        } else {
-            Scan::Exhausted
-        })
+        Ok((None, seen == PAGE))
     }
 
     fn lease(&self, pick: Pick, lease_ms: i64) -> Result<Offer> {

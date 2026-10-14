@@ -709,8 +709,8 @@ fn deferred_log_frames_are_acknowledged_only_after_a_sync() {
     .unwrap();
     let executor = Quiet::default();
     let attempt = AttemptId::new();
+    let stop = AtomicBool::new(false);
     thread::scope(|scope| {
-        let stop = AtomicBool::new(false);
         let running = scope.spawn(|| link.run(&executor, || stop.load(Ordering::SeqCst)));
         eventually("the session's reporter", Duration::from_secs(5), || {
             executor.reporter.lock().unwrap().is_some()
