@@ -476,7 +476,7 @@ await scenario("role changes during open sessions", async () => {
   await other.waitFor("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('no longer have access'))", 10000, "removal shown");
   metrics.removal_noticed_ms = Date.now() - removedAt;
   check("removal is noticed by the open page within 5 s", metrics.removal_noticed_ms < 5000, metrics.removal_noticed_ms);
-  await other.waitFor("!document.querySelector('[aria-label=\"Active tenant\"]')", 10000, "tenant list re-read");
+  await other.waitFor("!document.querySelector('[aria-label=\"Active namespace\"]')", 10000, "tenant list re-read");
   check("the tenant disappears from the navigation", true);
   await other.close();
   current = page;
