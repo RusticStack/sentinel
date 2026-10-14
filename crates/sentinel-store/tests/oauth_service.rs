@@ -7,7 +7,7 @@
 
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
-    GrantId, RepoId, TenantId, UnixMillis, UserId,
+    GrantId, RepoId, SessionId, TenantId, UnixMillis, UserId,
     auth::{Audience, Namespace, Permissions as P, Principal, Role, Scopes},
 };
 use sentinel_protocol::oauth::CLI_CLIENT_ID;
@@ -367,6 +367,97 @@ fn revoking_an_accounts_sessions_revokes_service_grants_it_minted_in_the_window(
     let audit = store.read(|c| local_auth::recent_audit(c, 1)).unwrap();
     assert_eq!(audit[0].event, Event::OAuthGrantRevoked);
     assert_eq!(audit[0].subject, Some(i.admin));
+}
+
+/// A named session of `user` created at `created_ms`, optionally already
+/// expired; returns its id.
+fn named_session(store: &Store, user: UserId, created_ms: i64, expired: bool) -> SessionId {
+    let id = SessionId::new();
+    let now = UnixMillis::now().0;
+    let deadline = if expired {
+        now - 1_000
+    } else {
+        now + 3_600_000
+    };
+    store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO sessions(token_digest, user_id, csrf_digest, created_ms,
+                    idle_deadline_ms, absolute_deadline_ms, id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+                rusqlite::params![
+                    Secret::generate().digest().0,
+                    user.as_bytes(),
+                    [7u8; 32],
+                    created_ms,
+                    deadline,
+                    id.as_bytes()
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    id
+}
+
+fn mint_at(store: &Store, i: Ids, minter: UserId, at_ms: i64) -> GrantId {
+    let mut r = Issue::by(i, person(minter, false));
+    r.now = UnixMillis(at_ms);
+    issue(store, r).unwrap().0
+}
+
+fn grant_revoked(store: &Store, i: Ids, grant: GrantId) -> bool {
+    store
+        .read(|c| service::service_grants(c, person(i.admin, false), i.tenant, i.bot))
+        .unwrap()
+        .iter()
+        .find(|g| g.id == grant)
+        .unwrap()
+        .revoked
+}
+
+#[test]
+fn revoking_one_session_by_name_revokes_the_grants_minted_since_it_began() {
+    let (_dir, store, i) = fixture();
+    let now = UnixMillis::now();
+    let began = now.0 - 60_000;
+    let hijacked = named_session(&store, i.admin, began, false);
+    let other = named_session(&store, i.admin, now.0 - 30_000, false);
+    let before = mint_at(&store, i, i.admin, began - 5_000);
+    let during = mint_at(&store, i, i.admin, now.0 - 10_000);
+    store
+        .writer()
+        .write(move |tx| {
+            local_auth::revoke_session(tx, Authority::HostLocal, i.admin, hijacked, now)
+        })
+        .unwrap();
+    assert!(grant_revoked(&store, i, during));
+    assert!(!grant_revoked(&store, i, before));
+    // The other session is untouched; a second revoke of the same one is
+    // refused and revokes nothing further.
+    let later = mint_at(&store, i, i.admin, now.0 - 1_000);
+    let again = store.writer().write(move |tx| {
+        local_auth::revoke_session(tx, Authority::HostLocal, i.admin, hijacked, now)
+    });
+    assert!(matches!(again, Err(Error::NotFound)));
+    assert!(!grant_revoked(&store, i, later));
+    let _ = other;
+}
+
+#[test]
+fn logout_all_reaches_grants_minted_by_a_session_that_has_since_expired() {
+    let (_dir, store, i) = fixture();
+    let now = UnixMillis::now();
+    // The hijacked session went idle and expired but its row is not purged.
+    let _ = named_session(&store, i.admin, now.0 - 120_000, true);
+    let minted = mint_at(&store, i, i.admin, now.0 - 100_000);
+    let _ = named_session(&store, i.admin, now.0 - 10_000, false);
+    store
+        .writer()
+        .write(move |tx| local_auth::revoke_all(tx, i.admin, now))
+        .unwrap();
+    assert!(grant_revoked(&store, i, minted));
 }
 
 #[test]

@@ -847,6 +847,11 @@ fn apply_membership(
     if role != Role::TenantAdmin {
         keep_an_admin(tx, tenant, user)?;
     }
+    let was_member: bool = tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM memberships WHERE tenant_id = ?1 AND user_id = ?2)",
+        )?
+        .query_row(params![tenant.as_bytes(), user.as_bytes()], |r| r.get(0))?;
     let changed = tx.execute(
         "INSERT INTO memberships(tenant_id, user_id, role)
         SELECT ?1, id, ?3 FROM users WHERE id = ?2 AND active = 1
@@ -858,6 +863,18 @@ fn apply_membership(
         return Err(Error::NotFound);
     }
     crate::tenancy::bump_epoch(tx, tenant)?;
+    if !was_member {
+        // No invitation or acceptance precedes this: record that the person
+        // was added by someone else, apart from the role change below.
+        crate::local_auth::audit(
+            tx,
+            crate::local_auth::Event::MemberAdded,
+            Some(principal.user),
+            Some(user),
+            false,
+            None,
+        )?;
+    }
     crate::local_auth::audit(
         tx,
         crate::local_auth::Event::MembershipSet,

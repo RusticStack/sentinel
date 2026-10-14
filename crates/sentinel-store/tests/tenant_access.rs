@@ -222,11 +222,12 @@ fn an_accepted_override_is_audited_with_its_reason_and_fails_closed_for_host_loc
         Some("incident 7"),
     )
     .unwrap();
-    let audit = store.read(|c| local_auth::recent_audit(c, 2)).unwrap();
+    let audit = store.read(|c| local_auth::recent_audit(c, 3)).unwrap();
     assert_eq!(audit[0].event, Event::MembershipSet);
-    assert_eq!(audit[1].event, Event::PlatformOverride);
-    assert_eq!(audit[1].actor, Some(i.root));
-    assert_eq!(audit[1].detail.as_deref(), Some("incident 7"));
+    assert_eq!(audit[1].event, Event::MemberAdded);
+    assert_eq!(audit[2].event, Event::PlatformOverride);
+    assert_eq!(audit[2].actor, Some(i.root));
+    assert_eq!(audit[2].detail.as_deref(), Some("incident 7"));
     // Now an administrator-member, root needs neither proof nor reason here.
     grant(&store, i, unstepped(i.root, true), i.root, None).unwrap();
     // A host-local authority has no principal to attribute: refused.
@@ -256,4 +257,21 @@ fn sign_in_names_resolve_only_among_the_tenants_members() {
     )
     .unwrap();
     assert_eq!(resolve("stranger").unwrap(), i.stranger);
+}
+
+#[test]
+fn adding_a_non_member_is_audited_apart_from_changing_a_member() {
+    let (_dir, store, i) = fixture();
+    let admin = unstepped(i.admin, false);
+    set_member(&store, i, admin, i.stranger, Role::Reader, None).unwrap();
+    let audit = store.read(|c| local_auth::recent_audit(c, 2)).unwrap();
+    assert_eq!(audit[0].event, Event::MembershipSet);
+    assert_eq!(audit[1].event, Event::MemberAdded);
+    assert_eq!(audit[1].actor, Some(i.admin));
+    assert_eq!(audit[1].subject, Some(i.stranger));
+    // Changing the role of an existing member is not an addition.
+    set_member(&store, i, admin, i.stranger, Role::Operator, None).unwrap();
+    let audit = store.read(|c| local_auth::recent_audit(c, 2)).unwrap();
+    assert_eq!(audit[0].event, Event::MembershipSet);
+    assert_ne!(audit[1].event, Event::MemberAdded);
 }
