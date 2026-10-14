@@ -2003,12 +2003,7 @@ mod tests {
             stream
                 .write_all(
                     format!(
-                        "POST /p HTTP/1.1
-host: h
-x-forwarded-for: {client}
-content-length: {declared}
-
-{body}"
+                        "POST /p HTTP/1.1\r\nhost: h\r\nx-forwarded-for: {client}\r\ncontent-length: {declared}\r\n\r\n{body}"
                     )
                     .as_bytes(),
                 )
