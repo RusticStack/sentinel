@@ -375,7 +375,10 @@ fn job_transitions_move_their_check_and_the_aggregate() {
         "{}",
         aggregate.summary
     );
-    assert!(aggregate.seq >= 3, "every change of content is a generation");
+    assert!(
+        aggregate.seq >= 3,
+        "every change of content is a generation"
+    );
     assert_eq!(aggregate.published_seq, 0);
 
     // A timeout is its own conclusion; cancellation another.
@@ -814,7 +817,10 @@ fn repeating_the_stored_content_keeps_the_generation_and_the_retry_schedule() {
     checks::record_job(&tx, f.tenant, jobs[0], UnixMillis(NOW.0 + 5)).unwrap();
     tx.commit().unwrap();
     let again = publication(&f, run, &jobs[0].to_string());
-    assert_eq!(again.seq, build.seq, "identical content is not a generation");
+    assert_eq!(
+        again.seq, build.seq,
+        "identical content is not a generation"
+    );
     assert!(
         checks::due(&f.conn, NOW, 10)
             .unwrap()
