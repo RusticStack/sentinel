@@ -1,7 +1,3 @@
-//! Worker-side artifact capture: policy selection, confined resolution and the
-//! streamed publication protocol, against a scripted `Sink` that records
-//! every call and answers on cue.
-
 #![cfg(target_os = "linux")]
 
 use std::{fs, os::unix::fs::PermissionsExt, sync::Mutex};
@@ -21,8 +17,6 @@ enum Call {
     Settle(String),
 }
 
-/// A scripted wire: records calls, answers `begin` with `grant`, `end` and
-/// `absent` with `verdict`, and fails `data` after `data_fail_at` sends.
 struct Scripted {
     grant: Option<ArtifactCode>,
     verdict: ArtifactCode,
@@ -128,13 +122,11 @@ fn capture_streams_sorted_files_in_bounded_order() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out");
     fs::create_dir_all(&out).unwrap();
-    // Bigger than one 48 KiB frame, so seq ordering is exercised.
     let big: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect();
     fs::write(out.join("b.bin"), &big).unwrap();
     fs::write(out.join("a.txt"), "report\n").unwrap();
     fs::write(out.join("empty"), []).unwrap();
     fs::set_permissions(out.join("a.txt"), fs::Permissions::from_mode(0o640)).unwrap();
-    // Outside the pattern: never touched.
     fs::write(dir.path().join("secret.txt"), "no\n").unwrap();
 
     let sink = Scripted::stored();
@@ -149,7 +141,6 @@ fn capture_streams_sorted_files_in_bounded_order() {
     let calls = sink.calls();
     assert!(matches!(&calls[0], Call::Begin(n) if n == "dist"));
     assert!(matches!(calls.last(), Some(Call::End(n)) if n == "dist"));
-    // Sorted relative paths; the zero-length file declares no data.
     let files: Vec<(&str, u64, u32)> = calls
         .iter()
         .filter_map(|c| match c {
@@ -161,9 +152,7 @@ fn capture_streams_sorted_files_in_bounded_order() {
         files.iter().map(|(p, l, _)| (*p, *l)).collect::<Vec<_>>(),
         vec![("out/a.txt", 7), ("out/b.bin", 150_000), ("out/empty", 0)]
     );
-    // The explicitly-set mode survives; the others follow the umask.
     assert_eq!(files[0].2, 0o640);
-    // Chunks are seq-ordered per file and reassemble to the content.
     let mut next_seq = None;
     let mut collecting = false;
     let (mut assembled, mut a_txt) = (Vec::new(), Vec::new());
@@ -205,7 +194,6 @@ fn no_match_records_absent_and_refusals_fail() {
     assert_eq!(calls.len(), 1);
     assert!(matches!(&calls[0], Call::Absent { name, reason: 0 } if name == "cov"));
 
-    // A begin the controller refuses is a failed capture, not a stream.
     let sink = Scripted {
         grant: Some(ArtifactCode::NotDeclared),
         ..Scripted::stored()
@@ -219,7 +207,6 @@ fn no_match_records_absent_and_refusals_fail() {
     assert_eq!(outcome, Outcome::Failed);
     assert!(matches!(sink.calls().as_slice(), [Call::Begin(_)]));
 
-    // A verdict other than Stored closes the capture as failed.
     let sink = Scripted {
         verdict: ArtifactCode::TooLarge,
         ..Scripted::stored()
@@ -237,7 +224,6 @@ fn no_match_records_absent_and_refusals_fail() {
 fn escapes_and_unreadable_entries_fail_the_capture() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("keep.txt"), "k\n").unwrap();
-    // A symlink out of the workspace: confined resolution must refuse it.
     std::os::unix::fs::symlink("/etc/hostname", dir.path().join("escape")).unwrap();
 
     let sink = Scripted::stored();
@@ -257,7 +243,6 @@ fn escapes_and_unreadable_entries_fail_the_capture() {
         sink.calls()
     );
 
-    // A traversal pattern never leaves the patterns' grammar.
     let sink = Scripted::stored();
     let outcome = artifacts::capture(
         dir.path(),
@@ -267,7 +252,6 @@ fn escapes_and_unreadable_entries_fail_the_capture() {
     );
     assert_eq!(outcome, Outcome::Failed);
 
-    // The same escape mixed into a glob enumeration fails the capture too.
     let sink = Scripted::stored();
     let outcome = artifacts::capture(
         dir.path(),
@@ -294,8 +278,6 @@ fn a_failed_frame_settles_instead_of_streaming_on() {
     );
     assert_eq!(outcome, Outcome::Failed);
     let calls = sink.calls();
-    // begin, file, settle — the failed data send is not recorded and no
-    // further frame goes out.
     assert!(matches!(&calls[0], Call::Begin(_)));
     assert!(matches!(&calls[1], Call::File { .. }));
     assert!(matches!(&calls[2], Call::Settle(n) if n == "a"));
@@ -351,7 +333,6 @@ fn required_artifacts_gate_the_verdict_optional_ones_do_not() {
         "{failure:?}"
     );
 
-    // Everything optional: the same outcomes leave the verdict alone.
     let optional = [
         decl("a", &["missing/**"], ArtifactWhen::Always, false),
         decl("b", &["present.txt"], ArtifactWhen::Always, false),
@@ -368,8 +349,6 @@ fn required_artifacts_gate_the_verdict_optional_ones_do_not() {
         None
     );
 
-    // `when` filters before any capture runs: a success-only artifact does
-    // not touch the workspace on a failed attempt.
     let gated = [decl("s", &["present.txt"], ArtifactWhen::Success, true)];
     let sink = Scripted::stored();
     assert_eq!(
