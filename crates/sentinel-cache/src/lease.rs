@@ -8,7 +8,7 @@
 //! `min(declared expiry, mtime + MAX_TTL)` is in the future, so a torn
 //! write reads as fresh, never as collectible, until it is provably stale.
 //!
-//! A lease lives exactly as long as its holder does (P07-13): every held
+//! A lease lives exactly as long as its holder does: every held
 //! lease is registered with this process's keeper, which renews each one
 //! to its own TTL every [`RENEW_EVERY`] — so an attempt that runs for
 //! hours keeps its pin, while a process that dies stops renewing and its
@@ -233,7 +233,7 @@ impl Drop for Lease {
     }
 }
 
-/// The writer-ownership marker inside `<entry>/writing/` (K03). One
+/// The writer-ownership marker inside `<entry>/writing/`. One
 /// writer per entry: the marker is `create_new`, so acquisition can never
 /// share or wait — a held marker is `Busy`, a stale one is a dead
 /// writer's and is reaped in place.
@@ -277,7 +277,7 @@ impl WriteLock {
                         return Ok(None);
                     }
                     // A dead writer's marker: reap and retry. Reaping is a
-                    // rename, and what was moved is judged again (P07-14):
+                    // rename, and what was moved is judged again:
                     // when two writers race to reap the same dead marker,
                     // the slower one moves the faster one's *fresh* marker
                     // — it finds it live, puts it back and answers busy,
@@ -465,7 +465,7 @@ mod tests {
         assert_eq!(sweep(entry).unwrap().active, 1);
     }
 
-    /// P07-13: a held lease is renewed to its own TTL for as long as it is
+    /// A held lease is renewed to its own TTL for as long as it is
     /// held, and a released one is never resurrected by the keeper.
     #[test]
     fn a_held_lease_is_renewed_and_a_released_one_is_not() {
@@ -487,7 +487,7 @@ mod tests {
         );
     }
 
-    /// P07-14: a reaper that moves a marker which turned out to be live
+    /// A reaper that moves a marker which turned out to be live
     /// puts it back and answers busy — it never deletes a fresh claim.
     #[test]
     fn a_racing_reaper_never_deletes_a_fresh_marker() {

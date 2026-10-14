@@ -13,7 +13,7 @@
 //!
 //! Everything here is metadata. Corruption, incompatibility and truncation
 //! are `Miss` values, never build failures. Clone backends, publication
-//! leases, garbage collection and remote hydration (Q08, [`remote`]) build
+//! leases, garbage collection and remote hydration ([`remote`]) build
 //! on what this crate owns: paths, formats and reasons.
 
 pub mod attach;

@@ -94,10 +94,8 @@ fn direct_noop_emits_one_machine_readable_record() {
 
 #[test]
 fn a_record_names_its_source_and_compiler_even_outside_the_checkout() {
-    // F05: the committed baseline ran outside the checkout as a user without
-    // rustc on PATH, and its record carried neither revision.
-    // The compiler is recorded at build time, so it no longer depends on
-    // PATH at run time; the commit is asked of the build's own checkout.
+    // The compiler is recorded at build time, so it does not depend on PATH
+    // at run time; the commit is asked of the build's own checkout.
     let out = bench()
         .current_dir(std::env::temp_dir())
         .args([
@@ -185,7 +183,7 @@ fn podman_runtime_requires_image() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("--image is required"));
 }
 
-/// B01: a contract whose reference host is not this one is refused before
+/// A contract whose reference host is not this one is refused before
 /// anything runs, and nothing is written.
 #[test]
 fn a_contract_for_another_host_measures_nothing() {

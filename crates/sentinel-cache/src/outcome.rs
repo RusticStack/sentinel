@@ -43,7 +43,7 @@ pub enum Miss {
     /// invalid name, a `compat` payload from another class.
     Invalid,
     /// The entry could not be read this time: a transient filesystem or
-    /// lease failure on the restore path (K02). Distinct from `Corrupt` —
+    /// lease failure on the restore path. Distinct from `Corrupt` —
     /// the bytes may be fine, the store was not — and worth retrying.
     Unavailable,
 }
@@ -87,8 +87,8 @@ pub struct Hit {
 }
 
 /// What a lookup found — always total, never an error. The hit boxes its
-/// manifest: a miss is one byte, and the lookup path should never carry a
-/// 288-byte payload it did not earn.
+/// manifest so a miss stays small and the lookup path never carries a
+/// payload it did not earn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Hit(Box<Hit>),
