@@ -4,11 +4,11 @@
 use rusqlite::params;
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
-    auth::{Permissions as P, Principal, Role},
     TenantId, UnixMillis,
+    auth::{Permissions as P, Principal, Role},
 };
 use sentinel_store::{
-    email,
+    Durability, Error, Store, email,
     local_auth::{self, Login, Policy},
     organizations,
     registration::{
@@ -16,7 +16,6 @@ use sentinel_store::{
         TenantCreation, Terms,
     },
     setup::{self, Setup},
-    Durability, Error, Store,
 };
 
 const PASSWORD: &[u8] = b"a long enough administrator password";
