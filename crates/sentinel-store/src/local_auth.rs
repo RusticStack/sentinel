@@ -297,6 +297,17 @@ impl Session {
             .is_some_and(|at| at <= now && now.0.saturating_sub(at.0) < policy.step_up_ms)
     }
 
+    /// Whether this session was issued within the step-up window: a person
+    /// who has just signed in has just proven themselves, which is the only
+    /// proof an account with neither a password nor a second factor (GitHub
+    /// only) can give before enrolling its first factor. Derived from the
+    /// absolute deadline, so it is exact while the policy is the one the
+    /// session was issued under.
+    pub fn signed_in_within(&self, policy: Policy, now: UnixMillis) -> bool {
+        let issued = self.absolute_deadline.0.saturating_sub(policy.absolute_ms);
+        issued <= now.0 && now.0.saturating_sub(issued) < policy.step_up_ms
+    }
+
     pub fn require_step_up(&self, policy: Policy, now: UnixMillis) -> Result<()> {
         if self.stepped_up_within(policy, now) {
             Ok(())

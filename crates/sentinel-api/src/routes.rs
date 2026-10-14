@@ -42,6 +42,7 @@ use crate::{
     auth::{self, Identity, Refusal, Via},
 };
 
+pub(crate) mod account;
 mod admin;
 mod failure;
 mod views;
@@ -400,6 +401,9 @@ pub(crate) fn route(
         return reply;
     }
     if let Some(reply) = crate::github::route(state, request, method, &parts, query) {
+        return reply;
+    }
+    if let Some(reply) = account::route(state, request, method, &parts) {
         return reply;
     }
     if let Some(reply) = admin::route(state, request, method, &parts, query) {

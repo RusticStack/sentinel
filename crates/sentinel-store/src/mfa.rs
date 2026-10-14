@@ -491,6 +491,17 @@ pub fn enrolled(conn: &Connection, user: UserId) -> Result<bool> {
     Ok(enrolled)
 }
 
+/// Whether an enrollment was begun and not yet confirmed. The URI is never
+/// shown twice, so a client can only offer to start over (which supersedes it).
+pub fn enrollment_pending(conn: &Connection, user: UserId) -> Result<bool> {
+    let pending: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM mfa_totp WHERE user_id = ?1 AND confirmed_ms IS NULL)",
+        )?
+        .query_row([user.as_bytes()], |r| r.get(0))?;
+    Ok(pending)
+}
+
 /// How many unspent recovery codes remain. Metadata: the codes themselves are
 /// unrecoverable once shown.
 pub fn recovery_codes_remaining(conn: &Connection, user: UserId) -> Result<usize> {
