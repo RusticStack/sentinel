@@ -1,23 +1,5 @@
 #!/usr/bin/env bash
-# K07 recipe measurements: nine cache/environment recipes (custom tool,
-# Go, Rust, npm, pnpm, Bun, Python, Maven, Gradle) each run through five
-# cases — cold, warm, small-edit, changed-dependency, changed-toolchain —
-# as REAL attempts via crates/sentinel-worker/examples/k07-recipes.rs
-# (checkout, digest-pinned pull, cache restore, rootless Podman steps,
-# cache publication). One JSON record per case lands in $OUT.
-#
-# Measured steps run with --network none: every dependency comes from a
-# checked-in store — pkgs/ tarballs, a file:// Go module proxy, a cargo
-# local-registry, a file:// Maven repo — the same shapes a private mirror
-# serves in production. Provisioning builds those stores once, with the
-# real tools, into $WORK/prov (it may use the network; measurements do
-# not).
-#
-# A recipe whose store cannot be provisioned records `blocked` for every
-# case — never an invented number.
-#
-# Run inside WSL2 (rootless Podman) from the repo root:
-#   bash bench/k07-recipes.sh
+# Measured steps run with --network none, so every dependency must come from a checked-in store.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,14 +16,12 @@ log() { printf 'k07 %s %s\n' "$(date +%T)" "$*" >&2; }
 
 jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 
-blocked() { # recipe case reason
+blocked() {
     printf '{"recipe":%s,"case":%s,"status":"blocked","reason":%s}\n' \
         "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")" >> "$OUT"
     log "blocked $1/$2: $3"
 }
 
-# Deterministic rep_<uuid> per recipe: cache scope is repo-bound, so all
-# five cases of a recipe must share one id across reruns.
 repo_id() {
     python3 -c 'import hashlib,sys,uuid
 b = bytearray(hashlib.sha256(sys.argv[1].encode()).digest()[:16])
@@ -49,7 +29,6 @@ b[6] = (b[6] & 0x0F) | 0x40; b[8] = (b[8] & 0x3F) | 0x80
 print("rep_" + str(uuid.UUID(bytes=bytes(b))))' "k07-$1"
 }
 
-# Pinned digest pairs: A is the recipe's own image, B the toolchain change.
 declare -A IMG_A IMG_B
 IMG_A[custom-tool]="docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
 IMG_B[custom-tool]="docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0"
@@ -70,22 +49,17 @@ IMG_B[maven]="docker.io/library/maven@sha256:529278c758cac25258da21a71de9eecc553
 IMG_A[gradle]="docker.io/library/gradle@sha256:9c694fc78bbf3a63ca678e2c5794258447d19f26a802185ebd17227906a8d3c9"
 IMG_B[gradle]="docker.io/library/gradle@sha256:eb2209db6d5a025a0a8711a6f1a5556b654ecc07f05dc8703d2317eab410aa8e"
 
-# Bounded-output podman for provisioning. Images like maven/gradle/bun
-# carry a tool ENTRYPOINT, so provision commands always run through an
-# explicit /bin/sh entrypoint.
 pod() {
     echo "\$ podman $*" >> "$LOGS/last-pod.log"
     timeout 900 podman "$@" >> "$LOGS/last-pod.log" 2>&1
 }
-podsh() { # image, then any podman run flags via $3+, command = $2
+podsh() {
     local img="$1" cmd="$2"
     shift 2
     pod run --rm --entrypoint /bin/sh "$@" "$img" -c "$cmd"
 }
 
-# Provision: build each recipe's checked-in dependency store once.
-
-prov_custom_tool() { # $1 = shared dir
+prov_custom_tool() {
     mkdir -p "$1/pkgs" "$1/tools"
     cp "$ROOT/fixtures/compiler/fakecc.sh" "$1/tools/fakecc.sh" || return 1
     local spec n v d
@@ -98,7 +72,7 @@ prov_custom_tool() { # $1 = shared dir
     done
 }
 
-prov_go() { # $1 = shared dir → goproxy/
+prov_go() {
     python3 - "$1/goproxy" <<'PY'
 import json, pathlib, sys, zipfile
 out = pathlib.Path(sys.argv[1])
@@ -126,13 +100,12 @@ mod("example.com/k07b", "v0.1.1", lib("k07b", "0.1.1"))
 PY
 }
 
-# Per-variant go.sum through the real tool, offline against the proxy.
-lock_go() { # $1 = variant dir
+lock_go() {
     podsh "${IMG_A[go]}" 'GOPROXY=file:///app/goproxy GOSUMDB=off GOFLAGS=-mod=mod GOTOOLCHAIN=local GOMODCACHE=/gomod GOCACHE=/gocache go mod tidy' \
         -v "$1:/app" -w /app
 }
 
-prov_rust() { # $1 = shared dir → local-registry/
+prov_rust() {
     local lr="$1/local-registry" spec n v d idx ck
     mkdir -p "$lr/index"
     for spec in "k07a 0.1.0" "k07b 0.1.0" "k07b 0.1.1"; do
@@ -143,7 +116,6 @@ prov_rust() { # $1 = shared dir → local-registry/
         printf '/// The library version.\npub fn v() -> &'\''static str { "%s" }\n' "$v" > "$d/src/lib.rs"
         tar -czf "$lr/$n-$v.crate" -C "${d%/*}" "$n-$v" || return 1
         ck="$(sha256sum "$lr/$n-$v.crate" | cut -d' ' -f1)"
-        # Registry-index path: 1→1/, 2→2/, 3→3/c/, longer→cc/cc/
         case ${#n} in
             1) idx="1/$n";; 2) idx="2/$n";;
             3) idx="3/${n:0:1}/$n";;
@@ -156,15 +128,12 @@ prov_rust() { # $1 = shared dir → local-registry/
     done
 }
 
-lock_rust() { # $1 = variant dir (local-registry/ already inside)
+lock_rust() {
     podsh "${IMG_A[rust]}" 'CARGO_HOME=/cargo CARGO_NET_OFFLINE=true cargo generate-lockfile --offline' \
         -v "$1:/workspace" -w /workspace
 }
 
-# npm-pack the two tiny libs (all three versions) into pkgs/ — always
-# with the node image (the bun image has no npm; the tarballs are
-# tool-agnostic).
-prov_pkgs() { # $1 = shared dir
+prov_pkgs() {
     local spec n v d
     mkdir -p "$1/pkgs"
     for spec in "k07a 1.0.0" "k07b 1.0.0" "k07b 1.0.1"; do
@@ -187,7 +156,6 @@ lock_npm() {
 
 prov_pnpm() {
     prov_pkgs "$1" || return 1
-    # Vendor the pnpm dist bundle so the toolchain itself is checked in.
     local d="$WORK/prov/.pnpm-dist"
     rm -rf "$d"; mkdir -p "$d"
     podsh "${IMG_A[npm]}" 'npm pack pnpm@10.34.5 --pack-destination /out' \
@@ -212,7 +180,7 @@ lock_bun() {
         -v "$1:/app" -w /app
 }
 
-prov_python() { # $1 → pkgs/sdist + pkgs/wheels
+prov_python() {
     local sd="$1/pkgs/sdist" wh="$1/pkgs/wheels" spec n v d
     mkdir -p "$sd" "$wh"
     for spec in "k07a 1.0.0" "k07b 1.0.0" "k07b 1.0.1"; do
@@ -234,17 +202,12 @@ EOF
         tar -czf "$sd/$n-$v.tar.gz" -C "${d%/*}" "$n-$v" || return 1
         rm -rf "${d%/*}"
     done
-    # Build backends — the only part that needs the network, once.
     podsh "${IMG_A[python]}" 'pip download --no-deps -d /w setuptools wheel packaging' \
         -v "$wh:/w" -w /w
 }
-# requirements.txt is the lockfile; nothing else to generate.
 lock_python() { :; }
 
-# com.acme:k07a/k07b via the real installer into a maven-layout dir, then
-# one online build seeds the plugin tree the recipe needs; the merged dir
-# is a genuine mirror the file:// URL serves offline.
-prov_maven() { # $1 → m2-mirror/
+prov_maven() {
     local m2="$1/m2-mirror" spec n v d cls
     mkdir -p "$m2"
     for spec in "k07a 1.0.0" "k07b 1.0.0" "k07b 1.0.1"; do
@@ -261,8 +224,6 @@ EOF
         podsh "${IMG_A[maven]}" "javac com/acme/$cls.java && jar cf $n-$v.jar com/acme/$cls.class && mvn -B -q org.apache.maven.plugins:maven-install-plugin:3.1.2:install-file -Dfile=$n-$v.jar -DpomFile=$n-$v.pom -DlocalRepositoryPath=/m2" \
             -v "$d:/src" -v "$m2:/m2" -w /src || return 1
     done
-    # Stage a local repo: seed it with the k07 artifacts, then resolve
-    # everything the measured build needs from Central, once, online.
     local stage="$WORK/prov/.m2-stage" app="$WORK/prov/.mvn-app"
     rm -rf "$stage" "$app"; mkdir -p "$stage" "$app"
     cp -a "$FIX/maven/tree/." "$app/"
@@ -271,9 +232,9 @@ EOF
         -v "$app:/app" -v "$stage:/stage" -w /app || return 1
     cp -rn "$stage"/* "$m2"/ 2>/dev/null || cp -r "$stage"/* "$m2"/
 }
-lock_maven() { :; } # pom.xml is the dependency manifest
+lock_maven() { :; }
 
-prov_gradle() { # $1 → m2-mirror/ (hand-laid jars+poms+checksums; offline)
+prov_gradle() {
     local m2="$1/m2-mirror" spec n v d r cls
     mkdir -p "$m2"
     for spec in "k07a 1.0.0" "k07b 1.0.0" "k07b 1.0.1"; do
@@ -299,14 +260,12 @@ EOF
         rm -rf "$d"
     done
 }
-lock_gradle() { # $1 = variant dir
+lock_gradle() {
     podsh "${IMG_A[gradle]}" 'GRADLE_USER_HOME=/guh GRADLE_OPTS=-Dorg.gradle.daemon=false gradle --no-daemon build --write-locks' \
         -v "$1:/workspace" -w /workspace
 }
 
 lock_none() { :; }
-
-# Materialize: copy tree + shared store + overlay into a variant dir.
 
 SHARED_PROV_custom_tool=prov_custom_tool
 SHARED_PROV_go=prov_go
@@ -328,11 +287,10 @@ LOCK_python=lock_python
 LOCK_maven=lock_maven
 LOCK_gradle=lock_gradle
 
-materialize() { # recipe variant dest
+materialize() {
     local r="$1" v="$2" dest="$3" fn
     rm -rf "$dest"; mkdir -p "$dest"
     cp -a "$FIX/$r/tree/." "$dest/"
-    # Shared store minus the .done marker, which is script bookkeeping.
     if [ -d "$WORK/prov/$r" ]; then
         (cd "$WORK/prov/$r" && find . -mindepth 1 -maxdepth 1 ! -name .done -exec cp -a {} "$dest/" \;)
     fi
@@ -344,14 +302,10 @@ materialize() { # recipe variant dest
         tail -5 "$LOGS/last-pod.log" >&2
         return 1
     fi
-    # Lockfile tools leave root-owned files on some engines; normalize so
-    # git and later runs can read them.
     chmod -R u+rw "$dest" 2>/dev/null || true
 }
 
-# Build the three-commit repo: main = base, k07-source = edit-source,
-# k07-dep = edit-dep. Echoes "<base> <source> <dep>" on success.
-build_repo() { # recipe
+build_repo() {
     local r="$1" repo="$WORK/repos/$1" s
     rm -rf "$repo"; mkdir -p "$repo"
     git -C "$repo" init -q -b main
@@ -364,9 +318,7 @@ build_repo() { # recipe
             edit-source) git -C "$repo" checkout -qb k07-source;;
             edit-dep) git -C "$repo" checkout -qb k07-dep main;;
         esac
-        # Fresh mtimes, not cp -a: the variants' equal-size edits can land
-        # on recycled inodes with identical mtimes, which is exactly the
-        # stat tuple git's index trusts — a racily-clean false match.
+        # cp -r, not cp -a: preserved mtimes can let stale files pass the index's racy-clean check.
         find "$repo" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
         cp -r "$WORK/src/$r/$v/." "$repo/"
         git -C "$repo" add -A
@@ -378,7 +330,7 @@ build_repo() { # recipe
     done | tr '\n' ' '
 }
 
-run_case() { # recipe case sha image
+run_case() {
     local r="$1" c="$2" sha="$3" img="$4" rec
     rec="$("$DRIVER" \
         --pipeline "$FIX/$r.yml" --job build \

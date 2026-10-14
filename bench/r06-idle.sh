@@ -1,14 +1,5 @@
 #!/usr/bin/env bash
-# R06: the idle footprint of a controller and one enrolled worker on this host.
-# Both processes start from scratch, the worker enrolls and stays connected,
-# and after a settling minute the script measures each process's resident
-# memory (sampled every 10 s: max and last) and the CPU time it and its
-# waited-for children used over the window. Nothing else talks to them until
-# the end, when one scrape of the worker's metrics listener, one of
-# `/api/v1/ready` and one of `/metrics` confirm they are live.
-#
-# Run as an account with rootless Podman, so the worker's executor starts:
-#   BIN=/path/to/sentinel WINDOW=600 bench/r06-idle.sh >> bench/r06-idle.jsonl
+# Needs rootless Podman, or the worker's executor never starts (see executor_ready in the output).
 set -euo pipefail
 BIN=${BIN:-$HOME/r06/sentinel}
 WINDOW=${WINDOW:-600}
@@ -34,7 +25,7 @@ TOKEN=$("$BIN" admin token issue --data-dir "$C" --user root --name r06 \
 printf "listen = '127.0.0.1:0'\napi_listen = '127.0.0.1:0'\nlog_format = 'json'\n" >"$D/server.toml"
 "$BIN" server --config "$D/server.toml" --data-dir "$C" >"$D/server.log" 2>&1 &
 SP=$!
-event() { # event <log> <name>: the first such record's fields, as JSON
+event() {
   for _ in $(seq 1 300); do
     line=$(grep -m1 "\"$2\"" "$1" 2>/dev/null || true)
     [ -n "$line" ] && { printf '%s' "$line"; return; }
@@ -63,7 +54,8 @@ EXEC=$(grep -c '"executor_ready"' "$D/worker.log" || true)
 sleep "$SETTLE"
 
 ticks=$(getconf CLK_TCK)
-cpu() { # utime + stime + cutime + cstime, in ticks
+# utime, stime, cutime, cstime: all in clock ticks, not seconds.
+cpu() {
   awk '{ sub(/^.*\) /, ""); print $12 + $13 + $14 + $15 }' "/proc/$1/stat"
 }
 rss() { awk '/^VmRSS:/ { print $2 * 1024 }' "/proc/$1/status"; }
