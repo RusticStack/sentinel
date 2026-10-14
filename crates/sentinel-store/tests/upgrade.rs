@@ -81,6 +81,10 @@ fn an_upgrade_keeps_a_copy_of_the_database_from_before_it() {
     assert!(readable.contains(&(49, 48)), "{readable:?}");
     // Email identity adds columns and tables an older binary does not maintain.
     assert!(readable.contains(&(50, 50)), "{readable:?}");
+    // The setup tables and the auto-join table are ones an older binary
+    // neither reads nor writes.
+    assert!(readable.contains(&(52, 51)), "{readable:?}");
+    assert!(readable.contains(&(53, 51)), "{readable:?}");
     // Nothing pending: no copy.
     let (_, again) = upgrade::open_upgrading(&path, Durability::Full).unwrap();
     assert!(again.is_none());

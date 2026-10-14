@@ -143,6 +143,11 @@ pub enum Event {
     GithubMemberRemoved = 72,
     /// A tenant's membership source was changed by an administrator.
     TenantBackingChanged = 73,
+    /// A verified address in a domain the operator listed in
+    /// `SENTINEL_AUTO_JOIN_DOMAINS` joined an app-created organization (or
+    /// created it, as its administrator). The detail names the organization
+    /// and the role; the address is never recorded.
+    DomainAutoJoined = 74,
 }
 
 impl Event {
@@ -214,6 +219,7 @@ impl Event {
             Event::GithubMemberRoleChanged => "github-member-role-changed",
             Event::GithubMemberRemoved => "github-member-removed",
             Event::TenantBackingChanged => "tenant-backing-changed",
+            Event::DomainAutoJoined => "domain-auto-joined",
         }
     }
 
@@ -284,6 +290,7 @@ impl Event {
             71 => Event::GithubMemberRoleChanged,
             72 => Event::GithubMemberRemoved,
             73 => Event::TenantBackingChanged,
+            74 => Event::DomainAutoJoined,
             _ => return None,
         })
     }
@@ -789,6 +796,8 @@ pub fn issue_session(
     // A sign-in re-checks the person against every GitHub-backed organization
     // (one bounded statement; the lane asks GitHub, this request never does).
     crate::github_members::enqueue_user(tx, user, now)?;
+    // An address verified before its domain was listed joins now.
+    crate::auto_join::apply(tx, user, now)?;
     Ok(Issued {
         user,
         session,

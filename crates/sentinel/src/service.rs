@@ -589,6 +589,9 @@ struct Config {
     backup: Option<BackupFile>,
     #[cfg(feature = "server")]
     mail: Option<MailSettings>,
+    /// `SENTINEL_AUTO_JOIN_DOMAINS`, parsed (server role only).
+    #[cfg(feature = "server")]
+    auto_join: sentinel_store::auto_join::Parsed,
     role: Role,
 }
 
@@ -971,6 +974,15 @@ impl Config {
         };
         #[cfg(not(feature = "server"))]
         let _ = mail;
+        // Only the controller joins people; a worker sharing the environment
+        // ignores it. A bad entry is warned about at start, by position.
+        #[cfg(feature = "server")]
+        let auto_join = match &role {
+            Role::Server { .. } => std::env::var("SENTINEL_AUTO_JOIN_DOMAINS")
+                .map(|text| sentinel_store::auto_join::parse(&text))
+                .unwrap_or_default(),
+            Role::Worker(_) => sentinel_store::auto_join::Parsed::default(),
+        };
         Ok(Self {
             data_dir,
             log_format: args.log_format.or(file.log_format).unwrap_or_default(),
@@ -983,6 +995,8 @@ impl Config {
             backup: file.backup,
             #[cfg(feature = "server")]
             mail,
+            #[cfg(feature = "server")]
+            auto_join,
             role,
         })
     }
@@ -2052,9 +2066,20 @@ fn start_server(
     // only when a lane will drain it, which the store row records.
     let mail = start_mail(&config, public_url.as_deref(), &store, key.as_ref())?;
     announce_setup(&config.data_dir, &store)?;
-    // `auto_join` is the integration point for `SENTINEL_AUTO_JOIN_DOMAINS`:
-    // rules the operator configured, for the read-only organization settings.
-    let options = sentinel_api::Options::default();
+    // Before the API serves, so the first verification already sees the rules.
+    record_auto_join(&config.auto_join, &store)?;
+    // The same rules, for the read-only organization settings.
+    let options = sentinel_api::Options {
+        auto_join: config
+            .auto_join
+            .rules
+            .iter()
+            .map(|rule| sentinel_api::AutoJoinRule {
+                domain: rule.domain.clone(),
+                organization: rule.slug.clone(),
+            })
+            .collect(),
+    };
     let api = sentinel_api::Server::start_with(
         sentinel_api::Config {
             listen: api_listen,
@@ -2182,6 +2207,40 @@ fn retire_setup_file(store: &sentinel_store::Store, data_dir: &Path) {
     if !live {
         remove_setup_file(&path);
     }
+}
+
+/// Warn about every `SENTINEL_AUTO_JOIN_DOMAINS` entry that was dropped, by
+/// position and reason (never its text), then record the rules that stand.
+/// The setting replaces the previous run's rules whole: a removed domain stops
+/// new joins and removes nobody. A rule naming a GitHub-backed organization, a
+/// personal namespace or a suspended one is refused here and never joins.
+#[cfg(feature = "server")]
+fn record_auto_join(
+    parsed: &sentinel_store::auto_join::Parsed,
+    store: &Arc<sentinel_store::Store>,
+) -> Result<(), Error> {
+    for dropped in &parsed.ignored {
+        tracing::warn!(
+            event = "auto_join_entry_ignored",
+            index = dropped.index,
+            reason = dropped.reason.as_str()
+        );
+    }
+    let refused = sentinel_store::auto_join::set_rules(store, &parsed.rules)
+        .map_err(|error| Error::runtime(format!("cannot record auto-join domains: {error}")))?;
+    for dropped in &refused {
+        tracing::warn!(
+            event = "auto_join_entry_refused",
+            index = dropped.index,
+            reason = dropped.reason.as_str()
+        );
+    }
+    tracing::info!(
+        event = "auto_join_domains",
+        active = parsed.rules.len() - refused.len(),
+        ignored = parsed.ignored.len() + refused.len()
+    );
+    Ok(())
 }
 
 /// Start the mail lane when SMTP is configured, and record in the store
