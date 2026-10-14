@@ -17,6 +17,10 @@ Budgets (plan.md section 12):
   ready_to_offer     attempts.offered_ms - jobs.queued_ms, idle capacity
   offer_to_ack       attempts.acked_ms - attempts.offered_ms
   ready_to_first     the first user process's own clock - jobs.queued_ms
+  intake_to_ready    jobs.queued_ms - the wall clock just before the intake POST
+                     (the pipeline resolution the queued_ms re-stamp excludes
+                     from every other budget; first samples only)
+  intake_to_first    the first user process's clock - the same POST time
   log_visible        a line's capture time -> received by a follow client
   cancel_to_end      POST cancel -> the job terminal (wait API)
   failure_query      GET /attempts/{id}/failure on a 100 MiB log
@@ -84,13 +88,14 @@ class Deployment:
         new = self.git("rev-parse", "HEAD")
         body = {"delivery_id": f"b03-{time.time_ns()}", "ref": f"refs/heads/{branch}",
                 "old_sha": old, "new_sha": new}
+        posted_ns = time.time_ns()  # wall clock, to compare with the store's stamps
         t0 = time.monotonic_ns()
         status, raw = self.call("POST", f"/intake/{self.repo}", body, token=self.hook)
         ack_ns = time.monotonic_ns() - t0
         if status != 202:
             raise SystemExit(f"intake answered {status}")
         delivery = json.loads(raw)["delivery"]
-        return delivery, ack_ns, time.time_ns()
+        return delivery, ack_ns, posted_ns
 
     def run_of(self, delivery, limit_s=60):
         """The run the intake lane dispatched for `delivery` (server log)."""
@@ -216,7 +221,7 @@ def logs_of(d, attempt, step=None):
 def first(d, out, n):
     for i in range(n):
         pressure = d.settle()
-        delivery, ack_ns, _ = d.push("first")
+        delivery, ack_ns, posted_ns = d.push("first")
         run = d.run_of(delivery)
         done = d.wait_finished(run)
         job = done["jobs"][0]
@@ -226,7 +231,11 @@ def first(d, out, n):
         emit(out, budget="first", sample=i, run=run, state=job["state"], cpu_pressure_avg60=pressure,
              intake_ack_ns=ack_ns, queued_ms=queued, offered_ms=offered, acked_ms=acked,
              ready_to_offer_ms=offered - queued, offer_to_ack_ms=acked - offered,
-             ready_to_first_ms=first_ns / 1e6 - queued)
+             ready_to_first_ms=first_ns / 1e6 - queued,
+             # The budgets above start at `queued_ms`, which is stamped after
+             # the pipeline is resolved; these two start at the event itself.
+             intake_to_ready_ms=queued - posted_ns / 1e6,
+             intake_to_first_ms=first_ns / 1e6 - posted_ns / 1e6)
         print(f"first {i}: offer {offered - queued} ms, ack {acked - offered} ms, first process {first_ns / 1e6 - queued:.0f} ms", file=sys.stderr)
 
 
