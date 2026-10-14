@@ -1,12 +1,4 @@
-//! Tenant suspension, revocation propagation and pool grants.
-//!
-//! Suspending a tenant is one transaction: it stops intake by flipping the
-//! flag every predicate joins on, revokes the credentials scoped to the
-//! tenant, requests cancellation of its live jobs, and bumps the tenant's
-//! authorization epoch so anything long-lived re-authorizes.
-//!
-//! Retained evidence (runs, logs, artifacts) is not touched: suspension is a
-//! stop, not a deletion.
+//! Suspension stops work but never deletes retained evidence: runs, logs and artifacts stay.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{
@@ -20,8 +12,6 @@ use crate::{
     local_auth::{Event, audit},
 };
 
-/// A tenant's current authorization epoch. A subscription records this when it
-/// is authorized and re-authorizes when [`epoch`] no longer returns it.
 pub fn epoch(conn: &Connection, tenant: TenantId) -> Result<i64> {
     conn.prepare_cached("SELECT authz_epoch FROM tenants WHERE id = ?1")?
         .query_row([tenant.as_bytes()], |r| r.get(0))
@@ -29,8 +19,6 @@ pub fn epoch(conn: &Connection, tenant: TenantId) -> Result<i64> {
         .ok_or(Error::NotFound)
 }
 
-/// Move the epoch forward. Called by every change to who may act in a tenant;
-/// `pub(crate)` so `auth`'s membership and grant mutations bump it too.
 pub(crate) fn bump_epoch(tx: &Transaction<'_>, tenant: TenantId) -> Result<()> {
     let changed = tx.execute(
         "UPDATE tenants SET authz_epoch = authz_epoch + 1 WHERE id = ?1",
@@ -42,28 +30,15 @@ pub(crate) fn bump_epoch(tx: &Transaction<'_>, tenant: TenantId) -> Result<()> {
     Ok(())
 }
 
-/// What suspension did, so the caller can report it truthfully.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Suspension {
-    /// Credentials scoped to the tenant, including every service account's:
-    /// API credentials and OAuth grants alike.
     pub tokens_revoked: usize,
-    /// Unspent invitations into the tenant.
     pub invitations_revoked: usize,
-    /// Jobs that had not started and went straight to `Canceled`.
     pub jobs_canceled: usize,
-    /// Jobs a worker owns; cancellation is requested, the worker terminates.
     pub jobs_cancel_requested: usize,
 }
 
-/// Suspend a tenant. Platform administration with step-up: it ends service for
-/// every member at once.
-///
-/// Sessions are deployment-wide and are not revoked — a person may belong to
-/// other tenants — but nothing they hold reaches this tenant afterwards, since
-/// every predicate joins `tenants.active`. Jobs that a worker already owns are
-/// asked to stop through the durable cancel flag; the running attempt reports
-/// its own terminal state, never faked here.
+// Sessions survive suspension (people can belong to other tenants), but every predicate joins `tenants.active`.
 pub fn suspend(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -93,8 +68,6 @@ pub fn suspend(
     };
     done.tokens_revoked += crate::oauth::revoke_for_tenant(tx, tenant, now)?;
 
-    // Every live job gets the durable cancel flag; the ones nobody owns yet are
-    // finished here through the state machine, so the run aggregates honestly.
     let live: Vec<([u8; 16], i64)> = tx
         .prepare_cached("SELECT id, state_code FROM jobs WHERE tenant_id = ?1 AND state_code < ?2")?
         .query_map(params![tenant.as_bytes(), TERMINAL_BASE], |r| {
@@ -112,7 +85,6 @@ pub fn suspend(
     )?;
     for (id, state_code) in live {
         let job = JobId::from_bytes(id).map_err(|_| Error::Corrupt("job_id"))?;
-        // Blocked (0) and Queued (1) have no owner: cancel them outright.
         if state_code <= crate::codec::READY {
             crate::jobs::transition(
                 tx,
@@ -145,8 +117,6 @@ pub fn suspend(
     Ok(done)
 }
 
-/// Lift a suspension. Nothing revoked comes back: credentials are reissued,
-/// canceled jobs are rerun. Only the flag and the epoch change.
 pub fn reactivate(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -173,9 +143,6 @@ pub fn reactivate(
     )
 }
 
-/// Create an organization namespace. Platform administration; the first
-/// tenant of a deployment comes from the host-local operator before any route
-/// exists. Audited.
 pub fn create_organization(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -203,14 +170,10 @@ pub fn create_organization(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolKind {
-    /// Owned by one tenant; no grant needed and none possible.
     Dedicated(TenantId),
-    /// Platform-managed; admits only tenants with an explicit grant.
     Shared,
 }
 
-/// Register a pool. Platform administration: pools are capacity, and capacity
-/// is the platform's to allocate.
 pub fn create_pool(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -252,8 +215,6 @@ pub fn create_pool(
     )
 }
 
-/// Admit a tenant to a shared pool. Platform administration; the database
-/// refuses a grant on a dedicated pool.
 pub fn grant_pool(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -282,9 +243,6 @@ pub fn grant_pool(
     )
 }
 
-/// Withdraw a tenant from a shared pool. Jobs already leased on the pool's
-/// workers finish or are canceled by their own tenant's policy; new placement
-/// stops at once, because [`require_pool_access`] is checked at dispatch.
 pub fn revoke_pool_grant(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -312,10 +270,7 @@ pub fn revoke_pool_grant(
     )
 }
 
-/// Whether this tenant's work may be placed on this pool, right now. One
-/// statement: the tenant must be active, the pool active, and the tenant
-/// either the pool's owner or explicitly granted. The scheduler asks
-/// this per placement; it is not cached.
+// Checked per placement and never cached, so a revoked grant stops placement at once.
 pub fn require_pool_access(conn: &Connection, tenant: TenantId, pool: PoolId) -> Result<()> {
     let allowed: bool = conn
         .prepare_cached(
@@ -341,9 +296,6 @@ pub struct PoolRecord {
     pub active: bool,
 }
 
-/// Every pool a tenant may use: its dedicated pools and the shared pools it is
-/// granted. Membership of the tenant (or platform administration) is required
-/// to look; the pools of a tenant are part of its capacity, not public.
 pub fn pools_for_tenant(
     conn: &Connection,
     authority: Authority,
