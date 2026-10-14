@@ -14,6 +14,11 @@ export default defineNuxtConfig({
   // icons bundled from the local Lucide set instead of the Iconify API.
   ui: { fonts: false, theme: { colors: ["primary", "neutral", "success", "warning", "error", "info"] } },
   icon: {
+    // Inline `<svg>` elements, not CSS classes: the default `css` mode adds a
+    // `<style>` element at run time for each icon first drawn in the browser,
+    // which the page's hash-only `style-src` (server/plugins/csp.ts) rightly
+    // refuses ("Applying inline style violates ... style-src").
+    mode: "svg",
     serverBundle: { collections: ["lucide"] },
     // Icons named at run time (state badges) are bundled explicitly; the
     // rest are found by scanning the components.
