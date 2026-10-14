@@ -147,23 +147,24 @@ pub fn report_capacity(tx: &Transaction<'_>, worker: WorkerId, capacity: Capacit
 
 /// [`free_capacity`]'s statement: one pass over the held-attempts partial
 /// index, driven from `workers` into `attempts_held_by_worker` (asserted by
-/// a test), so summing held attempts never scans the attempts table.
-const FREE_CAPACITY_SQL: &str = "SELECT w.cpu_millis - COALESCE((
-                SELECT SUM(a.cpu_millis) FROM attempts a JOIN workers h ON h.id = a.worker_id
-                WHERE a.released_ms IS NULL
-                  AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
-                       OR (w.host_id IS NULL AND h.id = w.id))), 0),
-            w.memory_bytes - COALESCE((
-                SELECT SUM(a.memory_bytes) FROM attempts a JOIN workers h ON h.id = a.worker_id
-                WHERE a.released_ms IS NULL
-                  AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
-                       OR (w.host_id IS NULL AND h.id = w.id))), 0),
-            CASE WHEN w.disk_bytes = 0 THEN 0 ELSE w.disk_bytes - COALESCE((
-                SELECT SUM(a.disk_bytes) FROM attempts a JOIN workers h ON h.id = a.worker_id
-                WHERE a.released_ms IS NULL
-                  AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
-                       OR (w.host_id IS NULL AND h.id = w.id))), 0) END
-     FROM workers w WHERE w.id = ?1 AND w.revoked_ms IS NULL";
+/// a test), so summing held attempts never scans the attempts table. The
+/// three sums come from one aggregate over the host's held attempts — the
+/// worker's host peers, or the worker alone without a host — instead of one
+/// identical join per resource. An aggregate without `GROUP BY` always yields
+/// its single row, so a worker with nothing held reads as zero held and an
+/// absent or revoked worker (no `w` row) still yields no row at all.
+const FREE_CAPACITY_SQL: &str = "SELECT w.cpu_millis - COALESCE(s.cpu, 0),
+            w.memory_bytes - COALESCE(s.memory, 0),
+            CASE WHEN w.disk_bytes = 0 THEN 0 ELSE w.disk_bytes - COALESCE(s.disk, 0) END
+     FROM workers w,
+          (SELECT SUM(a.cpu_millis) AS cpu, SUM(a.memory_bytes) AS memory,
+                  SUM(a.disk_bytes) AS disk
+           FROM workers me JOIN workers h
+                ON ((me.host_id IS NOT NULL AND h.host_id = me.host_id)
+                    OR (me.host_id IS NULL AND h.id = me.id))
+           JOIN attempts a ON a.worker_id = h.id AND a.released_ms IS NULL
+           WHERE me.id = ?1) s
+     WHERE w.id = ?1 AND w.revoked_ms IS NULL";
 
 /// Whether disk is part of a worker's admission: it speaks the profile
 /// protocol, whose every session states the disk it offers. The worker's
@@ -1296,6 +1297,16 @@ pub fn place_in_fleet(
     placement.place_from_streams(&streams, None, lease_ms)
 }
 
+/// What one page of a stream's candidates came to.
+enum Scan {
+    /// The first candidate locality does not hold.
+    Found(Pick),
+    /// A whole page, every candidate held: the next page may have more.
+    Full,
+    /// A short page: the stream has nothing left.
+    Exhausted,
+}
+
 /// One placement's facts, read once and shared by its passes.
 struct Placement<'a, 't> {
     tx: &'a Transaction<'t>,
@@ -1319,32 +1330,30 @@ impl Placement<'_, '_> {
         for stream in streams {
             let mut after = (i64::MIN, i64::MIN, i64::MIN);
             for _ in 0..MAX_PAGES {
-                let page = self.page(stream, far, after)?;
-                let full = page.len() == PAGE;
-                for pick in page {
-                    after = (pick.priority, pick.queued_ms, pick.created_seq);
-                    if self
-                        .locality
-                        .holds(self.tx, self.worker, self.facts, &pick, self.now)?
-                    {
-                        continue;
-                    }
-                    return self.lease(pick, lease_ms).map(Some);
-                }
-                if !full {
-                    break;
+                match self.scan_page(stream, far, &mut after)? {
+                    Scan::Found(pick) => return self.lease(pick, lease_ms).map(Some),
+                    Scan::Full => {}
+                    Scan::Exhausted => break,
                 }
             }
         }
         Ok(None)
     }
 
-    fn page(
-        &self,
+    /// One page of a stream's candidates, examined in order straight off the
+    /// cursor: a row becomes a [`Pick`] only when it is looked at, and the
+    /// scan stops at the first one locality does not hold — typically the
+    /// first row, so a page of sixteen costs one decoded candidate, not
+    /// sixteen. `after` is left at the last row examined, the keyset the next
+    /// page resumes from. The statement is reset before a pick is returned,
+    /// so the lease's writes never run under a live read cursor.
+    fn scan_page(
+        &mut self,
         stream: &Stream,
         far: Option<Capacity>,
-        after: (i64, i64, i64),
-    ) -> Result<Vec<Pick>> {
+        after: &mut (i64, i64, i64),
+    ) -> Result<Scan> {
+        let tx = self.tx;
         let (large, large_since) = self.fairness.large.unwrap_or((0, 0));
         let far = far.map(|far| (1i64, far));
         let (exclusive, far) = far.unwrap_or((0, Capacity::default()));
@@ -1356,87 +1365,64 @@ impl Placement<'_, '_> {
             } else {
                 CANDIDATES_SQL
             };
-        let mut stmt = self.tx.prepare_cached(sql)?;
-        let rows = stmt.query_map(
-            named_params! {
-                ":tenant": stream.tenant.as_bytes(),
-                ":repo": stream.repo,
-                ":arch": self.facts.arch,
-                ":cpu": self.free.cpu_millis,
-                ":memory": self.free.memory_bytes,
-                ":disk_reported": i64::from(self.facts.disk_reported),
-                ":disk": self.free.disk_bytes,
-                ":labels": self.facts.labels,
-                ":worker_secret_delivery": i64::from(self.facts.secret_delivery),
-                ":after_priority": after.0,
-                ":after_queued": after.1,
-                ":after_seq": after.2,
-                ":large": large,
-                ":large_since": large_since,
-                ":pr_reserve": self.fairness.pr_reserve,
-                ":exclusive": exclusive,
-                ":far_cpu": far.cpu_millis,
-                ":far_memory": far.memory_bytes,
-                ":far_disk": far.disk_bytes,
-            },
-            |r| {
-                Ok((
-                    r.get::<_, [u8; 16]>(0)?,
-                    r.get::<_, [u8; 16]>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                    r.get::<_, i64>(7)?,
-                    r.get::<_, Option<String>>(8)?,
-                    r.get::<_, Vec<u8>>(9)?,
-                    r.get::<_, i64>(10)?,
-                    r.get::<_, bool>(11)?,
-                    (r.get::<_, i64>(12)?, r.get::<_, i64>(13)?),
-                    r.get::<_, bool>(14)?,
-                ))
-            },
-        )?;
-        let mut out = Vec::with_capacity(PAGE);
-        for row in rows {
-            let (
-                job,
-                run,
-                cpu,
-                memory,
-                disk,
-                digest,
-                platform,
-                index,
-                arch,
-                labels,
-                queued,
-                pr,
-                order,
-                requires_secret_delivery,
-            ) = row?;
-            out.push(Pick {
+        let mut stmt = tx.prepare_cached(sql)?;
+        let mut rows = stmt.query(named_params! {
+            ":tenant": stream.tenant.as_bytes(),
+            ":repo": stream.repo,
+            ":arch": self.facts.arch,
+            ":cpu": self.free.cpu_millis,
+            ":memory": self.free.memory_bytes,
+            ":disk_reported": i64::from(self.facts.disk_reported),
+            ":disk": self.free.disk_bytes,
+            ":labels": self.facts.labels,
+            ":worker_secret_delivery": i64::from(self.facts.secret_delivery),
+            ":after_priority": after.0,
+            ":after_queued": after.1,
+            ":after_seq": after.2,
+            ":large": large,
+            ":large_since": large_since,
+            ":pr_reserve": self.fairness.pr_reserve,
+            ":exclusive": exclusive,
+            ":far_cpu": far.cpu_millis,
+            ":far_memory": far.memory_bytes,
+            ":far_disk": far.disk_bytes,
+        })?;
+        let mut seen = 0;
+        while let Some(r) = rows.next()? {
+            seen += 1;
+            let order = (r.get::<_, i64>(12)?, r.get::<_, i64>(13)?);
+            let pick = Pick {
                 tenant: stream.tenant,
                 repo: Some(stream.repo),
-                job: JobId::from_bytes(job).map_err(|_| Error::Corrupt("job_id"))?,
-                run: RunId::from_bytes(run).map_err(|_| Error::Corrupt("run_id"))?,
-                cpu_millis: cpu,
-                memory_bytes: memory,
-                disk_bytes: disk,
-                image_digest: digest,
-                image_platform: platform,
-                spec_index: index,
-                arch,
-                labels,
-                pull_request: pr,
-                requires_secret_delivery,
-                queued_ms: queued,
+                job: JobId::from_bytes(r.get(0)?).map_err(|_| Error::Corrupt("job_id"))?,
+                run: RunId::from_bytes(r.get(1)?).map_err(|_| Error::Corrupt("run_id"))?,
+                cpu_millis: r.get(2)?,
+                memory_bytes: r.get(3)?,
+                disk_bytes: r.get(4)?,
+                image_digest: r.get(5)?,
+                image_platform: r.get(6)?,
+                spec_index: r.get(7)?,
+                arch: r.get(8)?,
+                labels: r.get(9)?,
+                queued_ms: r.get(10)?,
+                pull_request: r.get(11)?,
                 priority: order.0,
                 created_seq: order.1,
-            });
+                requires_secret_delivery: r.get(14)?,
+            };
+            *after = (pick.priority, pick.queued_ms, pick.created_seq);
+            if !self
+                .locality
+                .holds(tx, self.worker, self.facts, &pick, self.now)?
+            {
+                return Ok(Scan::Found(pick));
+            }
         }
-        Ok(out)
+        Ok(if seen == PAGE {
+            Scan::Full
+        } else {
+            Scan::Exhausted
+        })
     }
 
     fn lease(&self, pick: Pick, lease_ms: i64) -> Result<Offer> {
