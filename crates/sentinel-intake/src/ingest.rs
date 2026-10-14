@@ -1,27 +1,15 @@
-//! The two authenticated ingest paths, shared by the HTTP API and any other
-//! transport. Both end in one store transaction: accept, or refuse explicitly.
-
 use sentinel_core::{DeliveryId, RepoId, UnixMillis};
 use sentinel_protocol::intake::{RefUpdate, valid_delivery_id, valid_ref, valid_sha};
 use sentinel_store::{Store, intake};
 
-/// Why an ingest was refused. Every variant maps to one HTTP status and never
-/// echoes the body or a secret.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// Missing, malformed or unknown credential (hook secret or signature).
     Unauthenticated,
-    /// The request is not the contract: malformed body or headers.
     InvalidRequest(&'static str),
-    /// No such repository or delivery target for this credential.
     NotFound,
-    /// The target exists but cannot accept events (revoked binding, ...).
     Forbidden(&'static str),
-    /// The same delivery identity arrived with different content.
     Conflict,
-    /// Admission bound reached: retry with back-off.
     RateLimited,
-    /// Unexpected controller fault.
     Internal,
 }
 
@@ -40,32 +28,24 @@ impl From<sentinel_store::Error> for Error {
     }
 }
 
-/// One accepted delivery: its record id and whether the identity was already
-/// stored. A duplicate is an acknowledgement, not an error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ingested {
     pub id: DeliveryId,
     pub duplicate: bool,
 }
 
-/// What a GitHub delivery produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Github {
-    /// The App's webhook setup probe; nothing is stored.
     Pong,
     Ingested(Ingested),
     Controlled {
         outcome: String,
         duplicate: bool,
     },
-    /// A valid delivery that cannot be a trigger here. Reported to GitHub as
-    /// accepted — it must not retry — and recorded as a counter, not a row.
+    /// Acknowledged as accepted, not an error: GitHub must not retry it.
     Ignored(&'static str),
 }
 
-/// A generic relay submission: bearer-style hook secret over the raw body.
-/// The secret is scoped to one repository, so presenting it for another is a
-/// failed authentication rather than a forbidden repository.
 pub fn generic(
     store: &Store,
     presented: &str,
@@ -73,16 +53,14 @@ pub fn generic(
     body: &[u8],
     now: UnixMillis,
 ) -> Result<Ingested, Error> {
-    // Authenticate before looking at the body: an unauthenticated caller
-    // gets no JSON parsing, and no validation oracle, for its bytes.
+    // Authenticate before parsing: an unauthenticated caller must not reach the JSON validator.
     let secret = intake::hook_token_parse(presented).ok_or(Error::Unauthenticated)?;
     let target = store
         .read(|c| intake::authenticate(c, &secret))
         .map_err(Error::from)?;
     match target {
         Some((_, token_repo)) if token_repo == repo => {}
-        // Unknown secret, or a valid secret for another repository: one
-        // indistinguishable refusal.
+        // Unknown and cross-repository secrets get one indistinguishable refusal.
         _ => return Err(Error::Unauthenticated),
     }
     let update: RefUpdate =
@@ -104,8 +82,6 @@ pub fn generic(
     )
 }
 
-/// A GitHub webhook: the App webhook secret, the raw body, and the headers
-/// that say what it is and which delivery it is.
 pub fn github(
     store: &Store,
     secret: &[u8],
@@ -137,10 +113,6 @@ pub fn github(
         | "member"
         | "team" => return control(store, event, delivery_id, body, now),
         "push" => {}
-        // Pull requests arrive only through a bound App installation, and only
-        // the actions that mean "there is something new to test" are intake;
-        // every other action is acknowledged and ignored so GitHub does not
-        // retry it.
         "pull_request" => return pull_request(store, delivery_id, body, now),
         _ => return Ok(Github::Ignored("unsupported_event")),
     }
@@ -157,8 +129,6 @@ pub fn github(
     let installation = push.installation.to_string();
     let target = match store.read(|c| intake::github_target(c, &installation, repository)) {
         Ok(target) => target,
-        // A GitHub installation covers repositories this deployment has not
-        // bound; that is a normal state, not a failure to report to GitHub.
         Err(sentinel_store::Error::NotFound) => {
             return Ok(Github::Ignored("unbound_repository"));
         }
@@ -247,10 +217,6 @@ fn control(
         .write(move |tx| github_events::accept(tx, &delivery, &digest, &control, now))?;
     Ok(Github::Controlled { outcome, duplicate })
 }
-/// A pull request: known actions only, the base branch as the policy ref, the
-/// tested merge (or the head tip when GitHub computed none) as the revision.
-/// The head repository is stored, so a fork is a fact the resolver can refuse
-/// explicitly rather than an inference.
 fn pull_request(
     store: &Store,
     delivery_id: &str,
@@ -313,7 +279,6 @@ fn accept(
     pr: Option<intake::PrTerms<'_>>,
     now: UnixMillis,
 ) -> Result<Ingested, Error> {
-    // Own the borrowed terms so the writer closure can be `'static`.
     let delivery = OwnedDelivery {
         provider: delivery.provider.to_owned(),
         external_id: delivery.external_id.to_owned(),
@@ -366,7 +331,6 @@ fn accept(
     })
 }
 
-/// Owned pull-request terms for the writer closure.
 struct OwnedPr {
     number: u64,
     action: String,

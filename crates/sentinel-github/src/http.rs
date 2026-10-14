@@ -1,15 +1,7 @@
-//! The only outbound HTTP path in the sign-in flow, deliberately small.
-//!
-//! Bounded on every axis a remote server controls: total time, response header
-//! size, body size, and redirects (none — a redirect from a token endpoint is a
-//! misconfiguration or an attack, not something to follow with a secret in hand).
-
 use std::time::Duration;
 
 use crate::{Error, Result};
 
-/// Enough for a user record with a long biography; far below anything that
-/// could pressure memory. A larger response is a wrong endpoint.
 const MAX_BODY: u64 = 64 * 1024;
 const MAX_HEADERS: usize = 16 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,9 +43,7 @@ impl Client {
             .timeout_global(Some(TIMEOUT))
             .max_redirects(0)
             .max_response_header_size(MAX_HEADERS)
-            // Statuses are data here: GitHub reports OAuth failures with 200 and
-            // a body, and anything else must be reported as a refusal, not an
-            // exception carrying the request that produced it.
+            // GitHub reports OAuth failures as 200 with a body; statuses are data, not errors.
             .http_status_as_error(false)
             .user_agent(concat!("sentinel/", env!("CARGO_PKG_VERSION")))
             .build();
@@ -62,8 +52,7 @@ impl Client {
         }
     }
 
-    /// Form POST returning parsed JSON. Used for the code exchange, so the
-    /// secret travels in the body rather than a URL that could be logged.
+    /// The secret travels in the body, not in a URL that a log could record.
     pub fn post_form(&self, url: &str, fields: &[(&str, &str)]) -> Result<serde_json::Value> {
         let response = self
             .agent
@@ -74,8 +63,6 @@ impl Client {
         json(response)
     }
 
-    /// Authenticated GET returning parsed JSON. The credential is placed in the
-    /// header and nowhere else.
     pub fn get_authenticated(&self, url: &str, token: &str) -> Result<serde_json::Value> {
         let response = self
             .agent
@@ -88,9 +75,6 @@ impl Client {
         json(response)
     }
 
-    /// One bounded JSON request whose status is data: the Checks publisher
-    /// needs the rate-limit hints GitHub sends with refusals, so this returns
-    /// the status and headers instead of collapsing a non-2xx into an error.
     pub fn send_json(
         &self,
         method: &str,
@@ -101,9 +85,6 @@ impl Client {
         self.send_json_bounded(method, url, token, body, MAX_BODY)
     }
 
-    /// The same request with a caller-sized response limit, for the list
-    /// endpoints whose answers are legitimately larger than one object.
-    /// `max_body` is still a hard ceiling — never unlimited.
     pub fn send_json_bounded(
         &self,
         method: &str,
@@ -141,10 +122,6 @@ impl Client {
     }
 }
 
-/// One bounded reply whose status is data. `retry_after_s` and
-/// `rate_limit_reset_s` are the two ways GitHub says "later": a `Retry-After`
-/// header (seconds), or `X-RateLimit-Remaining: 0` with a reset epoch. Both
-/// are hints a caller must still bound.
 pub struct Reply {
     pub status: u16,
     pub retry_after_s: Option<i64>,
@@ -174,8 +151,6 @@ fn reply(mut response: ureq::http::Response<ureq::Body>, max_body: u64) -> Resul
         .limit(max_body)
         .read_to_string()
         .map_err(transport)?;
-    // A body that is not JSON (an error page) carries no information beyond
-    // the status, which the caller already has.
     let body = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
     Ok(Reply {
         status,
@@ -194,14 +169,12 @@ fn json(mut response: ureq::http::Response<ureq::Body>) -> Result<serde_json::Va
         .read_to_string()
         .map_err(transport)?;
     if !(200..300).contains(&status) {
-        // The body may quote the request, so only the status is reported.
         return Err(Error::Transport(format!("status {status}")));
     }
     serde_json::from_str(&body).map_err(|_| Error::Response("body is not JSON"))
 }
 
-/// Transport failures are summarized by kind. `ureq`'s message can contain the
-/// URL, which for the token endpoint would mean a credential in a log line.
+/// Summarized by kind: ureq messages can include the URL, which may carry a credential.
 fn transport(error: impl Into<TransportKind>) -> Error {
     Error::Transport(error.into().0)
 }

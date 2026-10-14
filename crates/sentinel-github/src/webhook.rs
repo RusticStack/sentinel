@@ -1,10 +1,4 @@
-//! GitHub webhook intake: raw-body signature verification and the ref-update
-//! fields the shared intake needs.
-//!
-//! The signature is HMAC-SHA256 over the **raw body** exactly as received —
-//! re-serializing JSON would change bytes and invalidate it — compared in
-//! constant time by the ring implementation. The secret is the App's webhook
-//! secret, configured out of band; this module never stores or prints it.
+//! Verification runs over the raw body: re-serializing JSON changes its bytes and breaks the signature.
 use serde_json::Value;
 
 use crate::{Error, Result};
@@ -13,13 +7,8 @@ pub const SIGNATURE_HEADER: &str = "x-hub-signature-256";
 pub const DELIVERY_HEADER: &str = "x-github-delivery";
 pub const EVENT_HEADER: &str = "x-github-event";
 
-/// GitHub's own delivery IDs are UUIDs; the shared contract allows a little
-/// more so a relay can reuse this shape.
 const MAX_BODY_FIELDS: usize = 64;
 
-/// True when `signature` (`sha256=<hex>`) authenticates `body` under `secret`.
-/// A malformed header, wrong length or different key is `false`, and the
-/// comparison itself is constant time.
 pub fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
     if secret.is_empty() || secret.len() > 256 {
         return false;
@@ -34,14 +23,9 @@ pub fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
     ring::hmac::verify(&key, body, &expected).is_ok()
 }
 
-/// A parsed `push` payload: the ref transition plus the immutable identifiers
-/// that decide which tenant it belongs to. Everything else in the payload is
-/// deliberately ignored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Push {
-    /// Numeric installation ID, when the delivery came through the App.
     pub installation: u64,
-    /// Immutable numeric repository ID.
     pub repository: u64,
     pub ref_name: String,
     pub before: String,
@@ -51,8 +35,6 @@ pub struct Push {
     pub forced: bool,
 }
 
-/// Parse the fields of a `push` event. Bounds every string it keeps, so a
-/// hostile payload cannot make the controller store or compare unbounded data.
 pub fn parse_push(body: &[u8]) -> Result<Push> {
     let value: Value =
         serde_json::from_slice(body).map_err(|_| Error::Response("payload is not JSON"))?;
@@ -93,12 +75,8 @@ pub fn parse_push(body: &[u8]) -> Result<Push> {
     })
 }
 
-/// A parsed `pull_request` payload. Git refs alone prove nothing about a pull
-/// request; these are the fields the adapter did verify, and the resolver
-/// decides trust from them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PullRequest {
-    /// The repository the delivery is for (the base repository).
     pub installation: u64,
     pub repository: u64,
     pub number: u64,
@@ -106,17 +84,12 @@ pub struct PullRequest {
     pub draft: bool,
     pub head_ref: String,
     pub head_sha: String,
-    /// The immutable numeric repository the head branch lives in: different
-    /// from `repository` means a fork.
     pub head_repo: u64,
     pub base_ref: String,
     pub base_sha: String,
-    /// The merge commit the change would be tested at, when GitHub computed
-    /// one. `None` means there is nothing truthful to check out.
     pub merge_sha: Option<String>,
 }
 
-/// Parse the fields of a `pull_request` event, bounded exactly like `push`.
 pub fn parse_pull_request(body: &[u8]) -> Result<PullRequest> {
     let value: Value =
         serde_json::from_slice(body).map_err(|_| Error::Response("payload is not JSON"))?;
@@ -178,8 +151,6 @@ pub fn parse_pull_request(body: &[u8]) -> Result<PullRequest> {
     Ok(PullRequest {
         installation,
         repository,
-        // The event carries `number`; older payloads also repeat it under
-        // `pull_request`, which is where the bounds of this contract live.
         number: map_number(object, "number").or_else(|_| map_number(pull, "number"))?,
         action: text(object, "action", 32)?,
         draft: pull.get("draft").and_then(Value::as_bool).unwrap_or(false),
@@ -229,11 +200,6 @@ pub enum Control {
         installation: u64,
         repository: u64,
     },
-    /// Who belongs to the organization, or what they may reach, changed.
-    /// `user` is the immutable numeric id of the account concerned (never a
-    /// login); `None` means the whole organization's access may have moved (a
-    /// team changed). `removed` is a signed `member_removed`, the one answer
-    /// acted on directly; everything else only asks for a fresh check.
     Members {
         installation: u64,
         user: Option<u64>,
@@ -241,8 +207,6 @@ pub enum Control {
     },
 }
 
-/// Only retained identifiers are trusted. A body is bounded by the HTTP route;
-/// repository arrays have an additional admission bound before any write.
 pub fn parse_control(event: &str, body: &[u8]) -> Result<Option<Control>> {
     let v: Value = serde_json::from_slice(body).map_err(|_| Error::Response("payload"))?;
     let number = |v: &Value| {
@@ -294,8 +258,7 @@ pub fn parse_control(event: &str, body: &[u8]) -> Result<Option<Control>> {
             })
         }
         "installation_repositories" if matches!(action, "added" | "removed") => {
-            // GitHub sends both arrays; a relay may carry only the populated
-            // one. Absence of `repositories_removed` means nothing was removed.
+            // A relay may send only the populated array; absence means nothing was removed.
             let removed = match v["repositories_removed"].as_array() {
                 Some(list) if list.len() <= 1024 => list
                     .iter()
@@ -315,8 +278,6 @@ pub fn parse_control(event: &str, body: &[u8]) -> Result<Option<Control>> {
                 repository: number(&v["repository"]["id"])?,
             })
         }
-        // Organization membership: a person joined or left. An invitation
-        // (`member_invited`, which carries no `membership`) is not membership.
         "organization" if matches!(action, "member_added" | "member_removed") => {
             Some(Control::Members {
                 installation,
@@ -324,8 +285,6 @@ pub fn parse_control(event: &str, body: &[u8]) -> Result<Option<Control>> {
                 removed: action == "member_removed",
             })
         }
-        // Team membership, and a repository collaborator, changed for one
-        // person: their effective access is worth asking about again.
         "membership" if matches!(action, "added" | "removed") => Some(Control::Members {
             installation,
             user: Some(number(&v["member"]["id"])?),
@@ -336,7 +295,6 @@ pub fn parse_control(event: &str, body: &[u8]) -> Result<Option<Control>> {
             user: Some(number(&v["member"]["id"])?),
             removed: false,
         }),
-        // A team's repositories or permissions moved: anyone may be affected.
         "team"
             if matches!(
                 action,
@@ -357,8 +315,7 @@ pub fn parse_control(event: &str, body: &[u8]) -> Result<Option<Control>> {
     })
 }
 
-/// Event kind is part of the receipt digest: replay under a different header
-/// must not be mistaken for the original control event.
+/// The event kind is hashed in, so a replay under another event header is a different receipt.
 pub fn control_digest(event: &str, body: &[u8]) -> [u8; 32] {
     let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
     digest.update(event.as_bytes());
@@ -379,8 +336,6 @@ const fn nibble(c: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
-    /// The documented GitHub example: HMAC-SHA256("It's a Secret to
-    /// Everybody", body) with the well-known secret.
     fn sign(secret: &[u8], body: &[u8]) -> String {
         let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
         let tag = ring::hmac::sign(&key, body);
@@ -397,20 +352,17 @@ mod tests {
         let body = br#"{"ref":"refs/heads/main"}"#;
         let header = sign(secret, body);
         assert!(verify_signature(secret, body, &header));
-        // One byte different: refused.
         assert!(!verify_signature(
             secret,
             br#"{"ref":"refs/heads/main "}"#,
             &header
         ));
-        // Whitespace-reformatted JSON is a different body.
         assert!(!verify_signature(
             secret,
             br#"{ "ref": "refs/heads/main" }"#,
             &header
         ));
         assert!(!verify_signature(b"another-secret-value", body, &header));
-        // Malformed headers never reach the comparison.
         for bad in [
             "",
             "sha256=",
@@ -448,8 +400,6 @@ mod tests {
         assert_eq!(pr.merge_sha.as_deref().unwrap().len(), 40);
         assert!(!pr.draft);
 
-        // A null merge commit is a fact, not an error: there is nothing
-        // truthful to test.
         let mut no_merge = body.clone();
         no_merge["pull_request"]["merge_commit_sha"] = Value::Null;
         assert!(
@@ -458,7 +408,6 @@ mod tests {
                 .merge_sha
                 .is_none()
         );
-        // A fork head is recorded, never flattened into the base repository.
         let mut fork = body.clone();
         fork["pull_request"]["head"]["repo"]["id"] = Value::from(999);
         assert_eq!(
@@ -467,7 +416,6 @@ mod tests {
                 .head_repo,
             999
         );
-        // Missing or malformed pieces are refused without echoing them.
         for (path, value) in [
             ("pull_request", Value::Null),
             ("number", Value::Null),
@@ -539,8 +487,6 @@ mod tests {
                 "repository": {"id": 91},
             })
         };
-        // A check-run rerequest carries the check's handles; a suite
-        // rerequest carries the suite's.
         let mut run = base("rerequested");
         run["check_run"] = serde_json::json!({
             "id": 4242,
@@ -577,10 +523,8 @@ mod tests {
                 ..
             }
         ));
-        // An external ID that is not ours is refused, not parsed.
         run["check_run"]["external_id"] = Value::from("other:123");
         assert!(parse_control("check_run", &serde_json::to_vec(&run).unwrap()).is_err());
-        // A non-rerequest action and an unknown event are ignored, not errors.
         let edited = base("edited");
         assert!(
             parse_control("repository", &serde_json::to_vec(&edited).unwrap())
@@ -631,7 +575,6 @@ mod tests {
             parsed,
             Control::Repositories { installation: 42, ref removed } if *removed == vec![91, 92]
         ));
-        // An `added` delivery may carry only the populated array.
         let added = serde_json::json!({
             "action": "added",
             "installation": {"id": 42},
@@ -659,7 +602,6 @@ mod tests {
                 }
             ));
         }
-        // The repository array is bounded before any of it is stored.
         let over = serde_json::json!({
             "action": "removed",
             "installation": {"id": 42},
@@ -699,7 +641,6 @@ mod tests {
                 "{action}"
             );
         }
-        // Other organization actions are not membership.
         assert!(
             parse_control(
                 "organization",
@@ -708,7 +649,6 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        // Team membership and collaborator changes ask for a check, never act.
         for event in ["membership", "member"] {
             let body = serde_json::json!({
                 "action": "added",
@@ -726,7 +666,6 @@ mod tests {
                 }
             ));
         }
-        // A team change may move anyone's access.
         let team = serde_json::json!({"action": "edited", "installation": {"id": 42}});
         assert!(matches!(
             parse_control("team", &serde_json::to_vec(&team).unwrap())
@@ -738,8 +677,6 @@ mod tests {
                 ..
             }
         ));
-        // The id is the numeric account id: a login in its place, a missing
-        // user, or a zero id is refused rather than guessed at.
         for broken in [
             serde_json::json!({"action":"member_removed","installation":{"id":42},"membership":{"user":{"login":"someone"}}}),
             serde_json::json!({"action":"member_removed","installation":{"id":42},"membership":{"user":{"id":0}}}),
@@ -754,7 +691,6 @@ mod tests {
         let body = br#"{"action":"rerequested"}"#;
         let digest = control_digest("check_run", body);
         assert_eq!(digest, control_digest("check_run", body));
-        // The same body under a different event header is a different event.
         assert_ne!(digest, control_digest("check_suite", body));
         assert_ne!(digest, control_digest("check_run", b"{}"));
     }

@@ -1,14 +1,4 @@
-//! The bounded resolution lane.
-//!
-//! One thread drains work in two phases. **Validation** settles pending
-//! deliveries against the source binding inside one writer transaction.
-//! **Dispatch** then takes ready deliveries, one at a time, through the
-//! resolver — which does its Git and HTTP work outside any transaction and
-//! ends in a short write — and wakes the dispatcher for every run it creates.
-//!
-//! A wake from an accepted delivery shortens the wait and the idle tick is the
-//! safety net for a missed wake; store failures back off doubling to a
-//! ceiling rather than spinning, and shutdown joins the thread.
+//! Resolution does Git and HTTP work outside any transaction, so the writer is never held across network I/O.
 
 use std::{
     sync::{
@@ -24,8 +14,6 @@ use sentinel_store::{Store, intake};
 
 use crate::resolve::{Outcome, Resolver};
 
-/// How the lane paces itself. Defaults: 64 deliveries per batch, a 250 ms
-/// idle tick, and failure back-off from one second to thirty.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub batch: u16,
@@ -45,28 +33,20 @@ impl Default for Config {
     }
 }
 
-/// One delivery the lane settled, with its readable outcome.
 #[derive(Clone, Debug)]
 pub struct Settled {
     pub id: DeliveryId,
     pub outcome: String,
 }
 
-/// One pass's settlements, for the caller's diagnostics.
 #[derive(Clone, Debug, Default)]
 pub struct Batch {
     pub settled: Vec<Settled>,
-    /// Permanent failures: the delivery is terminal with an explicit reason.
     pub failed: usize,
-    /// Transient faults: the delivery stays open with a scheduled attempt.
     pub retried: usize,
-    /// The pass itself failed before settling anything; carries the error.
-    /// Silent stalls are how a wedged lane looks healthy in the log.
     pub error: Option<String>,
 }
 
-/// Wake the lane from another thread. Cheap to clone; the intake route holds
-/// one so an accepted delivery is resolved without waiting for the tick.
 #[derive(Clone)]
 pub struct Waker {
     state: Arc<(Mutex<bool>, std::sync::Condvar)>,
@@ -85,8 +65,7 @@ impl Waker {
         cv.notify_one();
     }
 
-    /// Block until woken or `timeout` passes. A wake that arrived before the
-    /// wait is not lost.
+    /// A wake that arrives before the wait is not lost.
     fn wait(&self, timeout: Duration) {
         let (flag, cv) = &*self.state;
         let mut flag = flag.lock().unwrap_or_else(|p| p.into_inner());
@@ -101,7 +80,6 @@ impl Waker {
     }
 }
 
-/// A running lane; dropping it stops and joins the thread.
 pub struct Lane {
     stop: Arc<AtomicBool>,
     waker: Waker,
@@ -109,9 +87,6 @@ pub struct Lane {
 }
 
 impl Lane {
-    /// Start the lane. Without a resolver it only validates;
-    /// `wake` is called after every dispatched run so the dispatcher places it
-    /// immediately.
     pub fn start(
         store: Arc<Store>,
         resolver: Option<Arc<Resolver>>,
@@ -182,7 +157,6 @@ impl Lane {
         }
     }
 
-    /// A cheap handle for the intake route to call on acceptance.
     pub fn waker(&self) -> Waker {
         self.waker.clone()
     }
@@ -205,10 +179,7 @@ fn backoff(config: &Config, failures: u32) -> Duration {
         .min(config.max_backoff)
 }
 
-/// Phase one: revalidate due pending deliveries in one writer transaction.
-/// `Ok(Some(batch))` means at least one delivery settled. An idle tick costs
-/// one index-backed read: the writer — and the commit every change watcher
-/// wakes on — is taken only when a pending delivery is actually due.
+/// The writer, and the commit every change watcher wakes on, is taken only when a delivery is due.
 fn validate(store: &Store, config: &Config) -> Result<Option<Batch>, sentinel_store::Error> {
     let now = UnixMillis::now();
     if !store.read(move |c| intake::any_due(c, intake::State::Pending, now))? {
@@ -232,11 +203,6 @@ fn validate(store: &Store, config: &Config) -> Result<Option<Batch>, sentinel_st
     Ok(Some(batch))
 }
 
-/// Phase two: resolve ready deliveries, one bounded unit of remote work at a
-/// time. Faults are isolated per delivery: one that cannot be resolved right
-/// now is parked under its own retry schedule and the pass moves on, so no
-/// single delivery can hold every other tenant's work behind it. Only a
-/// store that cannot even record that fails the pass.
 fn dispatch(
     store: &Store,
     resolver: &Resolver,
@@ -269,10 +235,6 @@ fn dispatch(
     Ok(Some(batch))
 }
 
-/// Give one delivery whose resolution hit a store fault its own backoff
-/// under the shared attempt budget, so it stops being first in every pass.
-/// `Err` only when the store cannot record even that — then the lane itself
-/// backs off, since no other delivery could make progress either.
 fn park(
     store: &Store,
     delivery: &intake::Delivery,
