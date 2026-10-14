@@ -2184,6 +2184,14 @@ fn record_auto_join(
     Ok(())
 }
 
+/// The mail lane (absent without the master key) and the Resend sender
+/// (absent without a configured key) that `start_mail` returns.
+#[cfg(feature = "server")]
+type MailStart = (
+    Option<Box<sentinel_mail::Lane>>,
+    Option<Arc<sentinel_mail::Resend>>,
+);
+
 /// Build the Resend sender when it is configured, and start the mail lane
 /// when there is also a master key to seal queued messages with; record in
 /// the store whether this deployment delivers mail. Without a sender, or
@@ -2200,13 +2208,7 @@ fn start_mail(
     public_url: Option<&str>,
     store: &Arc<sentinel_store::Store>,
     key: Option<&Arc<sentinel_auth::sealed::Key>>,
-) -> Result<
-    (
-        Option<Box<sentinel_mail::Lane>>,
-        Option<Arc<sentinel_mail::Resend>>,
-    ),
-    Error,
-> {
+) -> Result<MailStart, Error> {
     let record = |enabled: bool| {
         sentinel_store::email::set_delivery(
             store,
