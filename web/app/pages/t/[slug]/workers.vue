@@ -1,10 +1,7 @@
 <script setup lang="ts">
 import type { Pool, Worker } from "~~/shared/types/api";
 
-// The pools this tenant may use: each worker's reported capacity, what it
-// holds now and what is free on its host, labels, warm cache, transport,
-// and drain for platform administrators. Reservations are totals: a shared
-// worker also serves other tenants.
+// Reserved figures are totals: a shared worker also serves other tenants.
 const route = useRoute();
 const api = useApi();
 const act = useAct();
@@ -53,8 +50,7 @@ const columns = [
         <template #held-cell="{ row }">
           <div>{{ row.original.held_attempts }} attempt{{ row.original.held_attempts === 1 ? "" : "s" }}</div>
           <div class="text-xs text-muted">{{ cpu(row.original.held.cpu_millis) }}, {{ fmtBytes(row.original.held.memory_bytes) }}</div>
-          <!-- A plain bar: the component library's progress formats its value
-               with the runtime's locale, which differs between server and browser. -->
+          <!-- Plain bar: the library's progress formats values with the locale, which differs between server and browser -->
           <div v-if="used(row.original) !== null" class="mt-1 h-1.5 w-28 rounded-full bg-elevated overflow-hidden" role="img" :aria-label="`${used(row.original)}% of CPU reserved`">
             <div class="h-full bg-primary" :style="{ width: `${used(row.original)}%` }" />
           </div>

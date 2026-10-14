@@ -1,16 +1,4 @@
-// U01 log-view candidates, loaded into one page each by log-view.mjs.
-// Every candidate ingests the same frames (32 KiB chunks of 127-character
-// lines, the shape the API serves) and shows them in a 70vh viewport:
-//
-//   naive    — one element per line, the first page's approach.
-//   preact   — Preact 10 + htm (the smallest mainstream component stack),
-//              windowed: only the rows in view are rendered, by state.
-//   vue      — Vue 3 (the interface's own framework), windowed the same
-//              way: rows rendered reactively from a scroll position.
-//   sentinel — the shipped viewer (web/app/utils/logviewer.ts, bundled
-//              by log-view.mjs) with its API replaced by the same frames.
-//
-// Each sets `window.bench = { load(frames) -> Promise, viewport }`.
+// Each candidate sets `window.bench = { load(frames) -> Promise, viewport }` for log-view.mjs.
 
 "use strict";
 
@@ -48,7 +36,7 @@ function naiveCandidate(root) {
         }
         view.append(fragment);
       }
-      void view.scrollHeight; // lay it out
+      void view.scrollHeight; // forces layout, so load time includes it
     },
   };
 }
@@ -124,8 +112,7 @@ function vueCandidate(root) {
 
 function sentinelCandidate(root) {
   let frames = [];
-  // The viewer's API, answered from memory with the API's page bounds
-  // (at most 500 frames and 1 MiB of payload).
+  // Answers from memory with the API's page bounds: 500 frames and 1 MiB per page.
   const page = async (query) => {
     const after = Number(new URLSearchParams(query).get("after") || 0);
     const out = [];

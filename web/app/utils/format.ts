@@ -1,5 +1,4 @@
-// Formatting shared by every view. Unmeasured values show as an em dash,
-// never as zero.
+// Unmeasured values show as an em dash, never as zero.
 
 export function fmtBytes(n: number | null | undefined): string {
   if (n === null || n === undefined) return "—";
@@ -40,7 +39,6 @@ export const words = (s: string | null | undefined) => (s ? s.replace(/_/g, " ")
 
 type BadgeColor = "success" | "error" | "warning" | "info" | "neutral" | "primary";
 
-/// A state's colour and icon; the state is always also spelled out.
 export function stateLook(state: string): { color: BadgeColor; icon: string } {
   switch (state) {
     case "passed": case "published": case "hit": case "online":
