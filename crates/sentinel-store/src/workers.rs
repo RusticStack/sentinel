@@ -1,4 +1,4 @@
-//! Worker enrollment, identity and liveness (W01).
+//! Worker enrollment, identity and liveness.
 //!
 //! A worker is admitted the way a person is: by a one-time, expiring secret an
 //! operator hands to the machine, redeemed exactly once. What the redemption
@@ -40,7 +40,7 @@ pub struct Worker {
     pub negotiated: Negotiated,
     pub enrolled: UnixMillis,
     pub last_seen: Option<UnixMillis>,
-    /// The software it announced at its last hello (R05); `None` before.
+    /// The software it announced at its last hello; `None` before.
     pub software: Option<String>,
 }
 
@@ -273,7 +273,7 @@ pub fn software_label(announced: &str) -> Option<String> {
     (!label.is_empty()).then(|| label.to_owned())
 }
 
-/// Record the software a worker announced at this hello (R05).
+/// Record the software a worker announced at this hello.
 pub fn record_software(tx: &Transaction<'_>, worker: WorkerId, software: &str) -> Result<()> {
     tx.prepare_cached("UPDATE workers SET software = ?2 WHERE id = ?1")?
         .execute(params![worker.as_bytes(), software])?;
@@ -345,8 +345,8 @@ pub fn seen(tx: &Transaction<'_>, worker: WorkerId, now: UnixMillis) -> Result<(
 }
 
 /// Revoke a worker. Its current session is refused at its next authentication
-/// and it can never enroll again under the same identity; W06 adds lease and
-/// attempt reconciliation for work it held.
+/// and it can never enroll again under the same identity. Leases and attempts
+/// it held are not touched here.
 pub fn revoke(
     tx: &Transaction<'_>,
     authority: Authority,

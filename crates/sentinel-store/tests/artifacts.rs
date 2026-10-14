@@ -1,4 +1,4 @@
-//! D03 artifact records: the captured/absent/failed terminal states,
+//! Artifact records: the captured/absent/failed terminal states,
 //! manifest-version invariants, the attempt→job→run→tenant ownership
 //! trigger, and the incremental `Staging` writer that link frames use.
 
@@ -459,7 +459,7 @@ fn a_deduped_stage_never_deletes_the_committed_object() {
     assert_eq!(out, b"same body");
 }
 
-/// P06-1 (a): the creator of a file discards *after* a deduper of the same
+/// The creator of a file discards *after* a deduper of the same
 /// bytes committed — the committed object keeps its file.
 #[test]
 fn a_creator_discarding_after_a_dedup_commit_keeps_the_object() {
@@ -494,7 +494,7 @@ fn a_creator_discarding_after_a_dedup_commit_keeps_the_object() {
     assert_eq!(out, b"shared bytes");
 }
 
-/// P06-1 (a), other order: the creator discards while the deduper's commit
+/// The creator discards while the deduper's commit
 /// is still pending — the live stage's pin keeps the file for it.
 #[test]
 fn a_discard_before_a_pending_dedup_commit_keeps_the_file() {
@@ -540,7 +540,7 @@ fn a_discard_before_a_pending_dedup_commit_keeps_the_file() {
     );
 }
 
-/// P06-7: a deduplicated streaming seal removes its temporary copy.
+/// A deduplicated streaming seal removes its temporary copy.
 #[test]
 fn a_deduped_stage_seal_leaves_nothing_in_tmp() {
     let f = fixture();
