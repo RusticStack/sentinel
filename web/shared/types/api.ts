@@ -5,6 +5,9 @@ export type Role = "reader" | "operator" | "admin";
 export interface Me {
   user: string;
   username: string | null;
+  /** The account's email, verified or not; absent from older controllers. */
+  email?: string | null;
+  email_verified?: boolean;
   super_admin: boolean;
   via: "bearer" | "session" | "oauth";
   scopes: string[];
