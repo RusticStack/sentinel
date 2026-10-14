@@ -15,7 +15,7 @@ The YAML event stream feeds a receiver that enforces limits as events arrive, so
 | Scalar length | 4,096 bytes |
 | Documents | exactly one |
 
-Anchors, aliases, tags, non-string keys and duplicate keys are errors with line and column. Plain scalars resolve only `null`, `true`/`false` and decimal integers; `yes`, `on`, octal, hex and floats stay strings, so nothing is coerced behind the author's back.
+Anchors, aliases, tags, non-string keys and duplicate keys are errors with line and column; the duplicate-key message names the position, never the key (diagnostics do not echo parser payloads). Plain scalars resolve only `null`, `true`/`false` and decimal integers; `yes`, `on`, octal, hex and floats stay strings, so nothing is coerced behind the author's back.
 
 ## Document shape
 
