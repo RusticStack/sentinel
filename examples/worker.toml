@@ -1,24 +1,18 @@
-# Linux worker lifecycle; keep its state separate from the controller.
+# Worker data directory; keep it separate from the controller's.
 data_dir = "/var/lib/sentinel-worker"
 log_format = "text"
 log_level = "info"
-# Uncomment to connect: the address and the fingerprint the controller logged
-# at `link_listening`, and the one-time enrollment from `sentinel admin worker enroll`.
+# Uncomment to connect. Address and fingerprint are logged at `link_listening`; enrollment comes from `sentinel admin worker enroll`.
 # controller = "10.0.0.5:7443"
 # controller_fingerprint = "0000000000000000000000000000000000000000000000000000000000000000"
-# While rotating the controller certificate, also trust the new fingerprint (at most 3 more):
+# Extra fingerprints trusted during controller certificate rotation (max 3).
 # controller_fingerprint_also = ["0000000000000000000000000000000000000000000000000000000000000000"]
 # worker_name = "builder-1"
 # enrollment_file = "/etc/sentinel/enrollment"
 # git_mirrors = true               # per-repository object mirrors under <data_dir>/mirrors (default on)
 
-# Optional NAT-traversing transport: the pinned helper forwards the
-# controller's Tailcat address to loopback, so `controller` becomes
-# "127.0.0.1:<listen_port>" — the two go together. With enabled = false (or no
-# section) the link uses direct TLS and nothing below runs. The address is the
-# `tc…` in the controller's <data_dir>/tailcat/address (a credential); this
-# worker's node key is recorded in <data_dir>/tailcat/client-default.nodekey,
-# and the controller's tailcat-allow admits it as `nodekey:… <this worker.id>`.
+# Optional NAT-traversing transport; without it (or with enabled = false) the link uses direct TLS. With it, `controller` is 127.0.0.1:<listen_port>.
+# Admit this worker's node key (<data_dir>/tailcat/client-default.nodekey) in the controller's tailcat-allow.
 # tailcat_address = "tc<address>"  # the controller's Tailcat address
 # [tailcat]
 # enabled = true

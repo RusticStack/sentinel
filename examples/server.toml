@@ -1,18 +1,14 @@
-# Linux controller lifecycle. CLI --data-dir overrides this path.
+# Controller data directory; the --data-dir flag overrides it.
 data_dir = "/var/lib/sentinel"
 log_format = "text"
 log_level = "info"
-# Where workers connect. Loopback by default; exposing it is an explicit decision.
+# Worker link address; loopback by default.
 listen = "127.0.0.1:7443"
-# Where the API answers (the web interface, sentinel-web, proxies to it).
-# Loopback; put TLS in front to expose it.
+# API address, proxied by sentinel-web; put TLS in front before exposing it.
 api_listen = "127.0.0.1:7080"
 
-# Optional NAT-traversing transport: the pinned Tailcat helper serves
-# only the link port above, to workers admitted by node key. Sentinel still
-# authenticates every worker itself; with enabled = false (or no section) the
-# link uses direct TLS and nothing below runs. The `tc…` address workers dial
-# is written to <data_dir>/tailcat/address (owner-only); treat it as a credential.
+# Optional NAT-traversing transport; without it (or with enabled = false) the link uses direct TLS.
+# The tc… address in <data_dir>/tailcat/address is a credential (owner-only).
 # [tailcat]
 # enabled = true
 # binary = "/usr/local/bin/tailcat"
@@ -20,7 +16,4 @@ api_listen = "127.0.0.1:7080"
 # derpmap_url = "https://derp.example.com/derp.json"  # operator-owned DERP map
 # region = "derp.example.com"     # region name in that map; omit to fix a region
 # listen_port = 7443              # the link port the helper serves; match `listen`
-# Workers are admitted in <data_dir>/tailcat-allow (owner-only), one
-# `nodekey:<hex> wrk_<worker id>` per line; a revoked worker's key is dropped
-# within 10 s, and an empty list admits no peer. The helper is restarted when
-# the admitted set changes.
+# Admitted workers: <data_dir>/tailcat-allow, one `nodekey:<hex> wrk_<worker id>` per line (owner-only); an empty list admits none.
