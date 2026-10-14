@@ -402,6 +402,29 @@ struct Unconfirmed {
     sent: Instant,
 }
 
+/// Drop the verdicts kept for [`REPORT_KEEP`] at `now`: the controller's
+/// lease has settled those attempts by then.
+fn forget_unconfirmed(unconfirmed: &mut HashMap<AttemptId, Unconfirmed>, now: Instant) {
+    unconfirmed.retain(|_, u| now.saturating_duration_since(u.first) < REPORT_KEEP);
+}
+
+/// The verdicts to send again at `now`: those last sent [`REPORT_RESEND`] ago
+/// or more, marked as sent now. Each stays unconfirmed (and so held, renewing
+/// its lease) until the controller stops counting the attempt.
+fn due_resends(
+    unconfirmed: &mut HashMap<AttemptId, Unconfirmed>,
+    now: Instant,
+) -> Vec<(AttemptId, Fence, Event, Option<Vec<u8>>)> {
+    let mut due = Vec::new();
+    for (attempt, u) in unconfirmed.iter_mut() {
+        if now.saturating_duration_since(u.sent) >= REPORT_RESEND {
+            u.sent = now;
+            due.push((*attempt, u.fence, u.event, u.summary.clone()));
+        }
+    }
+    due
+}
+
 struct State {
     reporter: Option<Reporter>,
     /// Terminal verdicts sent and not yet confirmed, by attempt.
@@ -1363,20 +1386,12 @@ impl Inner {
     fn resend_unconfirmed(&self) {
         let (reporter, due) = {
             let mut state = self.state();
-            state
-                .unconfirmed
-                .retain(|_, u| u.first.elapsed() < REPORT_KEEP);
+            let now = Instant::now();
+            forget_unconfirmed(&mut state.unconfirmed, now);
             let Some(reporter) = state.reporter.clone() else {
                 return;
             };
-            let mut due = Vec::new();
-            for (attempt, u) in state.unconfirmed.iter_mut() {
-                if u.sent.elapsed() >= REPORT_RESEND {
-                    u.sent = Instant::now();
-                    due.push((*attempt, u.fence, u.event, u.summary.clone()));
-                }
-            }
-            (reporter, due)
+            (reporter, due_resends(&mut state.unconfirmed, now))
         };
         for (attempt, fence, event, summary) in due {
             let _ = match summary {
@@ -2108,5 +2123,62 @@ mod tests {
             "a leaving worker reported a verdict"
         );
         live.stop();
+    }
+
+    fn unconfirmed(sent: Instant, summary: Option<Vec<u8>>) -> Unconfirmed {
+        Unconfirmed {
+            fence: Fence(3),
+            event: Event::Passed,
+            summary,
+            first: sent,
+            sent,
+        }
+    }
+
+    /// A sent verdict the controller has not confirmed is sent again every
+    /// `REPORT_RESEND`, summary included, and never sooner; each resend
+    /// restarts the interval, so a controller whose store is down is asked
+    /// at a steady pace and not on every heartbeat.
+    #[test]
+    fn an_unconfirmed_verdict_is_resent_on_its_interval_with_its_summary() {
+        let (a, b) = (AttemptId::new(), AttemptId::new());
+        let t0 = Instant::now();
+        let mut map = HashMap::new();
+        map.insert(a, unconfirmed(t0, Some(b"summary".to_vec())));
+        // `b` was sent later, so it is not due when `a` is.
+        map.insert(b, unconfirmed(t0 + Duration::from_secs(3), None));
+        assert!(due_resends(&mut map, t0 + REPORT_RESEND - Duration::from_millis(1)).is_empty());
+        let due = due_resends(&mut map, t0 + REPORT_RESEND);
+        assert_eq!(due.len(), 1);
+        let (attempt, fence, event, summary) = &due[0];
+        assert_eq!(
+            (*attempt, *fence, *event, summary.as_deref()),
+            (a, Fence(3), Event::Passed, Some(&b"summary"[..]))
+        );
+        // Marked sent: not due again until another interval has passed.
+        assert!(due_resends(&mut map, t0 + REPORT_RESEND + Duration::from_secs(1)).is_empty());
+        let later = due_resends(&mut map, t0 + REPORT_RESEND * 2);
+        let mut got: Vec<_> = later.iter().map(|d| d.0).collect();
+        got.sort_by_key(|id| id.as_bytes().to_vec());
+        let mut want = vec![a, b];
+        want.sort_by_key(|id| id.as_bytes().to_vec());
+        assert_eq!(got, want);
+        // Resending keeps the verdict held: it is only ever removed by the
+        // controller's confirmation or by age.
+        assert_eq!(map.len(), 2);
+    }
+
+    /// A verdict is kept until the controller confirms it, up to
+    /// `REPORT_KEEP`: past that the lease has settled the attempt.
+    #[test]
+    fn an_unconfirmed_verdict_is_kept_until_its_keep_window_ends() {
+        let a = AttemptId::new();
+        let t0 = Instant::now();
+        let mut map = HashMap::new();
+        map.insert(a, unconfirmed(t0, None));
+        forget_unconfirmed(&mut map, t0 + REPORT_KEEP - Duration::from_secs(1));
+        assert!(map.contains_key(&a), "still held and renewing its lease");
+        forget_unconfirmed(&mut map, t0 + REPORT_KEEP);
+        assert!(map.is_empty());
     }
 }

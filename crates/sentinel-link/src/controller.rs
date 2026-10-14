@@ -231,6 +231,13 @@ impl DeferredQueue {
         }
     }
 
+    /// Whether a verdict of `attempt` is waiting.
+    fn has_report(&self, attempt: AttemptId) -> bool {
+        self.items
+            .iter()
+            .any(|m| m.attempt == attempt && matches!(m.what, Deferred::Report { .. }))
+    }
+
     /// Attempts with a verdict waiting.
     fn awaiting_reports(&self) -> HashSet<AttemptId> {
         self.items
@@ -247,6 +254,110 @@ const MAX_DEFERRED: usize = 256;
 /// How long a message is retried. Past this the store has been unusable far
 /// longer than a lease, and the lease expiry owns the attempt.
 const DEFERRED_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// What became of a worker message offered to the deferral queue.
+enum Received {
+    /// The store took it.
+    Applied,
+    /// A verdict already waiting for this attempt: a worker sends it again
+    /// until the controller counts the attempt as released, and a copy adds
+    /// nothing.
+    Copy,
+    /// Another message of the attempt is waiting, so this one waits behind
+    /// it; `kept` is `false` when the full queue refused it.
+    Queued { kept: bool },
+    /// The store failed for a reason that says nothing about the message.
+    Transient {
+        error: sentinel_store::Error,
+        kept: bool,
+    },
+    /// The store refused it as stale: nothing changed.
+    Stale,
+}
+
+/// Offer `message` to the queue: behind its attempt's earlier messages when
+/// there are any, else to `apply` at once, keeping it only when that fails
+/// transiently. `apply` runs without the queue locked.
+fn receive_with(
+    queue: &Mutex<DeferredQueue>,
+    message: &DeferredMessage,
+    apply: impl FnOnce(&DeferredMessage) -> sentinel_store::Result<()>,
+) -> Received {
+    {
+        let mut q = queue.lock().unwrap_or_else(|p| p.into_inner());
+        if q.holds(message.attempt) {
+            if matches!(message.what, Deferred::Report { .. }) && q.has_report(message.attempt) {
+                return Received::Copy;
+            }
+            return Received::Queued {
+                kept: q.push(message.clone()),
+            };
+        }
+    }
+    match apply(message) {
+        Ok(()) => Received::Applied,
+        Err(error) if error.is_transient() => {
+            let kept = queue
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(message.clone());
+            Received::Transient { error, kept }
+        }
+        Err(_) => Received::Stale,
+    }
+}
+
+/// What a retry of the queue's head found.
+enum Retried {
+    Applied,
+    /// Older than the retry window: given up on, the lease settles it.
+    Aged,
+    Stale,
+    Transient(sentinel_store::Error),
+}
+
+/// Apply the queue's messages oldest first until it is empty or the store
+/// fails transiently again (the head then stays for the next pass). The head
+/// stays queued while `apply` runs, so a message of the same attempt that
+/// arrives meanwhile queues behind it. `each` sees every outcome.
+fn retry_with(
+    queue: &Mutex<DeferredQueue>,
+    max_age: Duration,
+    mut apply: impl FnMut(&DeferredMessage) -> sentinel_store::Result<()>,
+    mut each: impl FnMut(&DeferredMessage, &Retried),
+) {
+    loop {
+        let head = queue.lock().unwrap_or_else(|p| p.into_inner()).head();
+        let Some(message) = head else {
+            return;
+        };
+        let outcome = if message.since.elapsed() >= max_age {
+            Retried::Aged
+        } else {
+            match apply(&message) {
+                Ok(()) => Retried::Applied,
+                Err(e) if e.is_transient() => Retried::Transient(e),
+                Err(_) => Retried::Stale,
+            }
+        };
+        each(&message, &outcome);
+        if matches!(outcome, Retried::Transient(_)) {
+            return;
+        }
+        queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .settle(message.id);
+    }
+}
+
+/// Leave out of the expiry sweep the attempts whose verdict waits for the
+/// store: their worker finished and can no longer renew the lease.
+fn shield(due: &mut Vec<(AttemptId, RunId, JobId)>, waiting: &HashSet<AttemptId>) {
+    if !waiting.is_empty() {
+        due.retain(|(attempt, _, _)| !waiting.contains(attempt));
+    }
+}
 
 struct Peer {
     sender: Sender,
@@ -893,10 +1004,7 @@ impl Inner {
             .store
             .read(|c| dispatch::expired_scoped(c, now))
             .map(|mut due| {
-                let waiting = self.awaiting_report();
-                if !waiting.is_empty() {
-                    due.retain(|(attempt, _, _)| !waiting.contains(attempt));
-                }
+                shield(&mut due, &self.awaiting_report());
                 due
             }) {
             Ok(due) if !due.is_empty() => {
@@ -1510,34 +1618,14 @@ impl Inner {
             what,
             since: Instant::now(),
         };
-        let queued = self
-            .deferred
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .holds(attempt);
-        if queued {
-            // A worker sends its verdict again until the controller counts
-            // the attempt as released: while one is waiting, a copy adds
-            // nothing, and is not queued.
-            let copy = matches!(message.what, Deferred::Report { .. })
-                && self
-                    .deferred
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .awaiting_reports()
-                    .contains(&attempt);
-            if !copy {
-                self.defer(message);
+        match receive_with(&self.deferred, &message, |m| self.apply(m)) {
+            Received::Applied | Received::Copy => {}
+            Received::Queued { kept } => self.counted(kept),
+            Received::Transient { error, kept } => {
+                self.failed(false, "worker_message", &error);
+                self.counted(kept);
             }
-            return;
-        }
-        match self.apply(&message) {
-            Ok(()) => {}
-            Err(e) if e.is_transient() => {
-                self.failed(false, "worker_message", &e);
-                self.defer(message);
-            }
-            Err(_) => self.stale(&message, false),
+            Received::Stale => self.stale(&message, false),
         }
     }
 
@@ -1604,12 +1692,8 @@ impl Inner {
         }
     }
 
-    fn defer(&self, message: DeferredMessage) {
-        let kept = self
-            .deferred
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(message);
+    /// Count a message kept for retry, or one the full queue refused.
+    fn counted(&self, kept: bool) {
         let counter = if kept {
             &self.stats.deferred_worker_messages
         } else {
@@ -1625,34 +1709,19 @@ impl Inner {
     /// attempt meanwhile queues behind it. Runs at the head of a dispatch
     /// pass, before the expiry sweep reads the leases.
     fn retry_deferred(&self) {
-        loop {
-            let head = self
-                .deferred
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .head();
-            let Some(message) = head else {
-                return;
-            };
-            let outcome = if message.since.elapsed() >= DEFERRED_MAX_AGE {
-                self.stats.deferred_dropped.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            } else {
-                self.apply(&message)
-            };
-            match outcome {
-                Err(e) if e.is_transient() => {
-                    self.failed(false, "worker_message", &e);
-                    return;
+        retry_with(
+            &self.deferred,
+            DEFERRED_MAX_AGE,
+            |m| self.apply(m),
+            |message, retried| match retried {
+                Retried::Applied => {}
+                Retried::Aged => {
+                    self.stats.deferred_dropped.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(_) => self.stale(&message, true),
-                Ok(()) => {}
-            }
-            self.deferred
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .settle(message.id);
-        }
+                Retried::Stale => self.stale(message, true),
+                Retried::Transient(e) => self.failed(false, "worker_message", e),
+            },
+        );
     }
 
     /// Attempts whose terminal verdict the controller holds but the store has
@@ -3723,6 +3792,216 @@ mod tests {
             assert!(queue.push(message(id, AttemptId::new(), report())));
         }
         assert!(!queue.push(message(u64::MAX, a, report())));
+    }
+
+    use sentinel_store::Error as StoreError;
+
+    fn queue() -> Mutex<DeferredQueue> {
+        Mutex::new(DeferredQueue::default())
+    }
+
+    fn ids(queue: &Mutex<DeferredQueue>) -> Vec<u64> {
+        let q = queue.lock().unwrap();
+        q.items.iter().map(|m| m.id).collect()
+    }
+
+    /// Every transient store error keeps the verdict instead of dropping it
+    /// as stale, whatever the error; a stale refusal is dropped and counts as
+    /// the stale report it is.
+    #[test]
+    fn a_transient_store_error_keeps_the_message_and_a_stale_one_drops_it() {
+        let errors: [fn() -> StoreError; 3] = [
+            || StoreError::WriterUnavailable,
+            || StoreError::WriteAmbiguous,
+            || StoreError::Overloaded,
+        ];
+        for error in errors {
+            let q = queue();
+            let m = message(1, AttemptId::new(), report());
+            let got = receive_with(&q, &m, |_| Err(error()));
+            assert!(
+                matches!(got, Received::Transient { kept: true, .. }),
+                "{:?} is kept",
+                error()
+            );
+            assert_eq!(ids(&q), vec![1]);
+        }
+        let q = queue();
+        let got = receive_with(&q, &message(1, AttemptId::new(), report()), |_| {
+            Err(StoreError::InvalidInput("stale"))
+        });
+        assert!(matches!(got, Received::Stale));
+        assert!(ids(&q).is_empty(), "a stale message is not kept");
+    }
+
+    /// The whole path of a passed job whose report the store refused: kept,
+    /// its attempt shielded from lease expiry, a worker's repeat not queued
+    /// twice, applied once at the head of the next pass, and no longer
+    /// shielded after.
+    #[test]
+    fn a_refused_report_is_retried_once_and_shields_its_attempt_until_then() {
+        let q = queue();
+        let (a, other) = (AttemptId::new(), AttemptId::new());
+        let m = message(1, a, report());
+        let got = receive_with(&q, &m, |_| Err(StoreError::WriterUnavailable));
+        assert!(matches!(got, Received::Transient { kept: true, .. }));
+        let due = |attempts: &[AttemptId]| -> Vec<(AttemptId, RunId, JobId)> {
+            attempts
+                .iter()
+                .map(|&a| (a, RunId::new(), JobId::new()))
+                .collect()
+        };
+        let mut sweep = due(&[a, other]);
+        shield(&mut sweep, &q.lock().unwrap().awaiting_reports());
+        assert_eq!(
+            sweep.iter().map(|d| d.0).collect::<Vec<_>>(),
+            vec![other],
+            "only the attempt with a waiting verdict is shielded"
+        );
+        // The worker's resend of the same verdict is a copy: nothing queued,
+        // and the store is not asked.
+        let got = receive_with(&q, &message(2, a, report()), |_| {
+            panic!("a copy must not reach the store")
+        });
+        assert!(matches!(got, Received::Copy));
+        assert_eq!(ids(&q), vec![1]);
+        // The next pass applies it, once.
+        let applied = std::cell::RefCell::new(Vec::new());
+        let seen = std::cell::RefCell::new(0);
+        retry_with(
+            &q,
+            DEFERRED_MAX_AGE,
+            |m| {
+                applied.borrow_mut().push(m.id);
+                Ok(())
+            },
+            |_, r| {
+                assert!(matches!(r, Retried::Applied));
+                *seen.borrow_mut() += 1;
+            },
+        );
+        assert_eq!(*applied.borrow(), vec![1]);
+        assert_eq!(*seen.borrow(), 1);
+        assert!(ids(&q).is_empty());
+        let mut sweep = due(&[a]);
+        shield(&mut sweep, &q.lock().unwrap().awaiting_reports());
+        assert_eq!(sweep.len(), 1, "settled: the lease owns it again");
+    }
+
+    /// A verdict never overtakes the acknowledgement before it, a store that
+    /// is still down ends the pass with the head in place, and the next pass
+    /// resumes in arrival order.
+    #[test]
+    fn retries_keep_arrival_order_and_stop_at_a_store_that_is_still_down() {
+        let q = queue();
+        let a = AttemptId::new();
+        let got = receive_with(&q, &message(1, a, Deferred::Ack), |_| {
+            Err(StoreError::WriteAmbiguous)
+        });
+        assert!(matches!(got, Received::Transient { kept: true, .. }));
+        // The report arrives while the ack waits: behind it, store untouched.
+        let got = receive_with(&q, &message(2, a, report()), |_| {
+            panic!("a report must wait for the acknowledgement before it")
+        });
+        assert!(matches!(got, Received::Queued { kept: true }));
+        assert_eq!(ids(&q), vec![1, 2]);
+        // Still down: one attempt at the head, nothing behind it applied.
+        let calls = std::cell::RefCell::new(Vec::new());
+        let transient = std::cell::RefCell::new(0);
+        retry_with(
+            &q,
+            DEFERRED_MAX_AGE,
+            |m| {
+                calls.borrow_mut().push(m.id);
+                Err(StoreError::Overloaded)
+            },
+            |_, r| {
+                if matches!(r, Retried::Transient(_)) {
+                    *transient.borrow_mut() += 1;
+                }
+            },
+        );
+        assert_eq!(*calls.borrow(), vec![1]);
+        assert_eq!(*transient.borrow(), 1);
+        assert_eq!(ids(&q), vec![1, 2]);
+        // Back up: the acknowledgement, then the report.
+        retry_with(
+            &q,
+            DEFERRED_MAX_AGE,
+            |m| {
+                calls.borrow_mut().push(m.id);
+                Ok(())
+            },
+            |_, _| {},
+        );
+        assert_eq!(*calls.borrow(), vec![1, 1, 2]);
+        assert!(ids(&q).is_empty());
+    }
+
+    /// A retried message the store now calls stale (its write of unknown
+    /// outcome had committed, or the lease moved on) is settled and reported
+    /// as stale to the controller, which owes the release and wake then.
+    #[test]
+    fn a_retried_message_that_turns_out_stale_is_settled_as_stale() {
+        let q = queue();
+        let a = AttemptId::new();
+        let _ = receive_with(&q, &message(1, a, report()), |_| {
+            Err(StoreError::WriteAmbiguous)
+        });
+        let outcomes = std::cell::RefCell::new(Vec::new());
+        retry_with(
+            &q,
+            DEFERRED_MAX_AGE,
+            |_| Err(StoreError::InvalidInput("stale")),
+            |m, r| {
+                outcomes
+                    .borrow_mut()
+                    .push((m.attempt == a, matches!(r, Retried::Stale)))
+            },
+        );
+        assert_eq!(*outcomes.borrow(), vec![(true, true)]);
+        assert!(ids(&q).is_empty());
+    }
+
+    /// Past the retry window the message is given up on without asking the
+    /// store, and settled so the queue cannot hold it forever.
+    #[test]
+    fn a_message_past_its_retry_window_is_dropped_unapplied() {
+        let q = queue();
+        let _ = receive_with(&q, &message(1, AttemptId::new(), report()), |_| {
+            Err(StoreError::WriterUnavailable)
+        });
+        let aged = std::cell::RefCell::new(0);
+        retry_with(
+            &q,
+            Duration::ZERO,
+            |_| panic!("an aged message must not be applied"),
+            |_, r| {
+                if matches!(r, Retried::Aged) {
+                    *aged.borrow_mut() += 1;
+                }
+            },
+        );
+        assert_eq!(*aged.borrow(), 1);
+        assert!(ids(&q).is_empty());
+    }
+
+    /// The queue is bounded: past `MAX_DEFERRED` a refused message is
+    /// reported as not kept, for the counter, rather than growing memory.
+    #[test]
+    fn a_full_queue_refuses_the_next_transient_message() {
+        let q = queue();
+        for id in 0..MAX_DEFERRED as u64 {
+            let got = receive_with(&q, &message(id, AttemptId::new(), report()), |_| {
+                Err(StoreError::WriterUnavailable)
+            });
+            assert!(matches!(got, Received::Transient { kept: true, .. }));
+        }
+        let got = receive_with(&q, &message(u64::MAX, AttemptId::new(), report()), |_| {
+            Err(StoreError::WriterUnavailable)
+        });
+        assert!(matches!(got, Received::Transient { kept: false, .. }));
+        assert_eq!(ids(&q).len(), MAX_DEFERRED);
     }
 
     fn ranked(cpu_millis: i64, load_ns: i64, cache_bytes: i64) -> Ranked {
