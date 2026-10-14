@@ -33,7 +33,6 @@ async function refreshList() {
   try { await session.refreshTenants(); } finally { refreshing.value = false; }
 }
 
-// --- Create an organization ----------------------------------------------
 
 const slug = ref("");
 const touched = ref(false);

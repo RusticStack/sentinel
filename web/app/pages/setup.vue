@@ -71,7 +71,6 @@ onBeforeUnmount(() => {
   again.value = "";
 });
 
-// --- Moving between steps ------------------------------------------------
 
 const stepError = ref("");
 
@@ -130,7 +129,6 @@ function goTo(at: number) {
   step.value = !isSetupToken(token.value) ? 0 : at > 1 && !password.value ? 1 : at;
 }
 
-// --- The choices, in words -------------------------------------------------
 
 const REGISTRATIONS: { value: RegistrationChoice; label: string; description: string }[] = [
   { value: "invite-only", label: "By invitation only", description: "Nobody can sign up on their own. You (or an organization's administrators) invite people by email; an invitation is their approval. Recommended." },
@@ -144,7 +142,6 @@ const CREATIONS: { value: TenantCreationChoice; label: string; description: stri
 const regLabel = computed(() => REGISTRATIONS.find((r) => r.value === draft.registration)?.label ?? draft.registration);
 const creationLabel = computed(() => CREATIONS.find((c) => c.value === draft.tenantCreation)?.label ?? draft.tenantCreation);
 
-// --- Email ---------------------------------------------------------------
 
 // Whether the controller has a Resend key and sender (`GET /setup`); `null`
 // until known. Read again each time the step opens, so a controller set up
@@ -232,8 +229,6 @@ const emailSummary = computed(() => {
   if (mailConfigured.value) return "Configured; not tested";
   return "Not tested (optional)";
 });
-
-// --- Finishing -------------------------------------------------------------
 
 /// The controller refuses a request whose `Origin` is not its configured
 /// `public_url` — on a fresh deployment, usually a mismatch between the

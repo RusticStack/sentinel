@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Platform administration: registrations, tenants and their quotas,
 // worker pools, admission policy and the audit trail. Suspension and
-// policy changes need a fresh second factor (A06); the page asks for it
+// policy changes need a fresh second factor; the page asks for it
 // when the controller does.
 const route = useRoute();
 const session = useSession();
