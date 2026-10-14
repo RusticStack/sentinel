@@ -560,8 +560,9 @@ pub enum LogVerdict {
 }
 
 /// A file's permission bits inside an artifact manifest; only the low mode
-/// bits are meaningful on the wire.
-pub const ARTIFACT_MODE_BITS: u32 = 0o7777;
+/// bits are meaningful on the wire. Setuid, setgid and sticky are never
+/// carried: an artifact is data, not a privileged executable.
+pub const ARTIFACT_MODE_BITS: u32 = 0o777;
 
 /// The terminal code of an `ArtifactVerdict`: what the controller did with
 /// an artifact publication, so the worker learns how it was recorded.

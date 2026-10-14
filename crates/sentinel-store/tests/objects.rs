@@ -818,6 +818,66 @@ fn materialize_writes_verified_entries() {
     );
 }
 
+#[test]
+fn a_manifest_that_could_not_be_extracted_is_refused_at_commit() {
+    let mut fx = fixture();
+    let a = fx.put(fx.tenant, b"payload");
+    for entries in [
+        // The same path twice.
+        vec![entry("out/a", a, 7), entry("out/a", a, 7)],
+        // A file that is also the directory of another entry, either order.
+        vec![entry("out", a, 7), entry("out/a", a, 7)],
+        vec![entry("out/a", a, 7), entry("out", a, 7)],
+    ] {
+        let tx = fx.conn.transaction().unwrap();
+        assert!(matches!(
+            fx.objects
+                .commit_manifest(&tx, fx.tenant, Kind::Artifact, "dup", &entries),
+            Err(Error::InvalidInput(_))
+        ));
+        drop(tx);
+    }
+    // Siblings that merely share a prefix are fine.
+    let tx = fx.conn.transaction().unwrap();
+    fx.objects
+        .commit_manifest(
+            &tx,
+            fx.tenant,
+            Kind::Artifact,
+            "ok",
+            &[
+                entry("out/a", a, 7),
+                entry("out/ab", a, 7),
+                entry("o", a, 7),
+            ],
+        )
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_never_restores_setuid_setgid_or_sticky() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fx = fixture();
+    let a = fx.put(fx.tenant, b"payload");
+    let tx = fx.conn.transaction().unwrap();
+    let mut special = entry("bin/tool", a, 7);
+    special.mode = 0o7755;
+    fx.objects
+        .commit_manifest(&tx, fx.tenant, Kind::Artifact, "m", &[special])
+        .unwrap();
+    tx.commit().unwrap();
+    let dest = fx.dir.path().join("extract");
+    fx.objects
+        .materialize(&fx.conn, fx.tenant, Kind::Artifact, "m", None, &dest)
+        .unwrap();
+    let mode = std::fs::metadata(dest.join("bin/tool"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7777, 0o755);
+}
+
 #[cfg(unix)]
 #[test]
 fn materialize_refuses_symlinked_ancestors() {
