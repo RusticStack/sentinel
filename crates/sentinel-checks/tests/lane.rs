@@ -1,8 +1,3 @@
-//! Lane outcome accounting: a retry that spends the last attempt is a
-//! durable refusal — counted and reported as refused on the `Retry` and
-//! `Throttled` arms alike, never as "retried"/"throttled" while the row is
-//! durably dead.
-
 use std::{
     sync::{Arc, mpsc},
     time::{Duration, Instant},
@@ -42,8 +37,6 @@ struct Fixture {
     repo: RepoId,
 }
 
-/// The tenant/repo/binding chain `record_run` needs to create outbox rows:
-/// an event-driven run on a forge-bound repository.
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("master.key");
@@ -115,8 +108,6 @@ fn fixture() -> Fixture {
     }
 }
 
-/// One event-driven run with a single job: the outbox gets its check and
-/// the aggregate.
 fn event_run(f: &Fixture) -> RunId {
     let (tenant, repo) = (f.tenant, f.repo);
     let run = RunId::new();
@@ -161,7 +152,6 @@ fn event_run(f: &Fixture) -> RunId {
     run
 }
 
-/// Spend every due row's retry budget down to the last attempt.
 fn spend_budget(f: &Fixture) {
     f.store
         .writer()
@@ -175,7 +165,6 @@ fn spend_budget(f: &Fixture) {
         .unwrap();
 }
 
-/// One scripted outcome for every publication the lane hands over.
 struct Stub {
     outcome: Publish,
 }
@@ -204,7 +193,6 @@ fn start(f: &Fixture, outcome: Publish) -> (Lane, mpsc::Receiver<Batch>) {
     (lane, rx)
 }
 
-/// Wait until every outbox row of the run is durably refused.
 fn wait_refused(f: &Fixture, run: RunId) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -249,8 +237,6 @@ fn a_retry_that_spends_the_budget_is_counted_and_reported_as_refused() {
     drop(lane);
 }
 
-/// Publishes the aggregate through a rate-limited scope and everything else
-/// through an open one.
 struct Scoped {
     throttle_until_ms: i64,
 }
@@ -330,8 +316,6 @@ fn a_throttle_parks_the_row_without_spending_its_budget() {
     for row in rows {
         assert_eq!(row.state, State::Pending, "{row:?}");
     }
-    // Every row, the one that hit the limit and the ones it skipped, kept its
-    // last attempt and waits for the reset.
     let sql = format!(
         "SELECT COUNT(*) FROM check_publications
          WHERE attempts = {} AND next_attempt_ms >= {}",
@@ -391,8 +375,6 @@ fn aggregate_parked_until(f: &Fixture) -> Option<i64> {
         .unwrap()
 }
 
-/// Makes every delivery write for the aggregate fail inside SQLite, the way a
-/// row the store cannot update would.
 fn poison_aggregate(f: &Fixture) {
     f.store
         .writer()
@@ -419,7 +401,6 @@ fn a_row_whose_store_writes_keep_failing_cannot_block_the_lane() {
             .filter(|r| !is_aggregate(r))
             .all(|r| r.state == State::Published)
     });
-    // The poison row is quarantined for an hour, not retried in a tight loop.
     let deadline = Instant::now() + Duration::from_secs(20);
     let parked = loop {
         if let Some(parked) = aggregate_parked_until(&f) {
@@ -446,8 +427,6 @@ impl Publisher for Deliver {
     }
 }
 
-/// A lane whose safety re-read is far away: only the commit notifier and the
-/// retry deadline can wake it in time.
 fn start_unpolled(f: &Fixture) -> Lane {
     Lane::start(
         Arc::clone(&f.store),
@@ -468,10 +447,8 @@ fn all_published(rows: &[checks::Publication]) -> bool {
 fn a_publication_committed_to_an_idle_lane_is_delivered_without_polling() {
     let f = fixture();
     let lane = start_unpolled(&f);
-    // Let the lane find nothing and go to sleep.
     std::thread::sleep(Duration::from_millis(300));
     let run = event_run(&f);
-    // Far inside the lane's two-minute safety re-read.
     wait_for(&f, run, "the commit wakes the lane", all_published);
     drop(lane);
 }
@@ -495,7 +472,6 @@ fn a_backed_off_row_is_read_when_its_deadline_arrives_not_when_something_commits
         rows.iter().all(|r| r.state == State::Pending),
         "not due yet: {rows:?}"
     );
-    // No commit follows: only the deadline can wake the lane.
     wait_for(&f, run, "the deadline wakes the lane", all_published);
     drop(lane);
 }

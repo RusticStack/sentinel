@@ -1,8 +1,3 @@
-//! Core contracts shared by server, worker and CLI: typed identifiers, the
-//! job/run state machine with fenced transitions, failure classes,
-//! cancellation desired state and timestamp provenance. Pure, dependency-light
-//! and allocation-free so every process can embed it without cost.
-
 pub mod auth;
 pub mod id;
 pub mod process;

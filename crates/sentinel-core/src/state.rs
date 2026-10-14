@@ -1,29 +1,15 @@
-//! Job and run state machine.
-//!
-//! Every transition is a pure, allocation-free function of (current state,
-//! event, actor). The controller applies it inside one SQLite transaction with
-//! compare-and-set on the persisted state and fence, so a stale worker or a
-//! duplicate message can never move a job backwards or overwrite a newer
-//! attempt. All enums are `#[repr(u8)]` so they persist as one byte and match
-//! by jump table.
+//! Transitions apply inside one SQLite transaction with compare-and-set on the persisted state and fence,
+//! so a stale worker or a duplicate message can never move a job backwards.
 use crate::id::Fence;
 
-/// Final result of a job attempt or an aggregated run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Outcome {
     Passed = 0,
-    /// Dependencies did not require it (condition false or an upstream failed
-    /// with `skip` policy). Not a failure and never blocks a run from passing.
     Skipped = 1,
-    /// Cancellation desired state was honoured.
     Canceled = 2,
-    /// Queue or execution timeout fired.
     TimedOut = 3,
-    /// A user command exited non-zero or was killed inside its own budget.
     Failed = 4,
-    /// Sentinel or the host failed: preparation, worker loss, lease expiry,
-    /// storage. Never attributed to the repository.
     InfraFailed = 5,
 }
 
@@ -43,35 +29,20 @@ impl Outcome {
     }
 }
 
-/// Why a non-passing outcome happened. Stored with the attempt so diagnostics
-/// never have to re-derive it from logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum FailureClass {
-    /// A step's command returned non-zero.
     CommandFailed = 0,
-    /// A step's process died from a signal (not Sentinel's own termination).
     CommandSignaled = 1,
-    /// The job's cgroup memory limit killed a process.
     OutOfMemory = 2,
-    /// Execution timeout; `TimedOut` outcome.
     ExecutionTimeout = 3,
-    /// Waited in the queue longer than allowed; `TimedOut` outcome.
     QueueTimeout = 4,
-    /// Cancel requested by an operator, supersession or tenant policy.
     Canceled = 5,
-    /// Source checkout, image pull or cache restore failed.
     Preparation = 6,
-    /// Heartbeats stopped and the lease could not be renewed.
     LeaseExpired = 7,
-    /// Worker session closed or the worker was revoked/drained.
     WorkerLost = 8,
-    /// Controller restart found the attempt in an unknown state.
     Reconciled = 9,
-    /// Log spool, artifact or cache publication failed durably.
     Publication = 10,
-    /// The container runtime failed while a step was being run — the exec
-    /// could not start or the runtime errored — not the command itself.
     Runtime = 11,
 }
 
@@ -93,7 +64,6 @@ impl FailureClass {
         }
     }
 
-    /// The only outcome each class may accompany. Persisting any other pair is a bug.
     pub const fn outcome(self) -> Outcome {
         match self {
             Self::CommandFailed | Self::CommandSignaled | Self::OutOfMemory => Outcome::Failed,
@@ -109,22 +79,14 @@ impl FailureClass {
     }
 }
 
-/// Lifecycle position of a job. Terminal carries the outcome so one byte plus
-/// a discriminant describes the whole state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum JobState {
-    /// Waiting for dependencies or a condition.
     Blocked = 0,
-    /// Eligible for dispatch; in the ready queue.
     Queued = 1,
-    /// Leased to a worker under a fence; the offer is pending or acknowledged.
     Leased = 2,
-    /// Worker is checking out, pulling images, restoring caches.
     Preparing = 3,
-    /// Steps are executing.
     Running = 4,
-    /// Steps are done; finalizers, cache commit, log flush in progress.
     Finalizing = 5,
     Terminal(Outcome) = 6,
 }
@@ -133,7 +95,6 @@ impl JobState {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Terminal(_))
     }
-    /// A worker owns the job between lease acknowledgement and terminal.
     pub const fn is_worker_owned(self) -> bool {
         matches!(
             self,
@@ -153,88 +114,47 @@ impl JobState {
     }
 }
 
-/// Who requests a transition. Permission is part of the table: a worker can
-/// only advance the attempt it holds, the controller owns queueing and
-/// leases, the reconciler may only fail or requeue uncertain attempts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Actor {
-    /// Scheduler, dispatcher, timeout and cancel enforcement inside the controller.
     Controller = 0,
-    /// The worker holding the attempt identified by this fence.
     Worker(Fence) = 1,
-    /// Startup reconciliation after a controller or worker restart.
     Reconciler = 2,
 }
 
-/// Events that may move a job. Each names the actor allowed to raise it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// Controller: all dependencies reached a satisfying outcome.
     DependenciesSatisfied,
-    /// Controller: dependency outcome or condition rules the job out.
     Skip,
-    /// Controller: the job's `if` could not be evaluated when its
-    /// dependencies finished. Ends it `infra_failed` (class `preparation`)
-    /// so a broken condition is never a silent skip or a silent run.
+    /// A broken condition ends infra_failed, never a silent skip or a silent run.
     ConditionFailed,
-    /// Controller: the job is leased to a worker under a new fence and the
-    /// offer is on its way; the worker's acknowledgement lands on the attempt.
     Leased(Fence),
-    /// Controller: the offer was declined or not acknowledged in time. Back
-    /// to the queue; the fence stays advanced so a late acknowledgement or
-    /// report from that attempt is stale.
     OfferLapsed,
-    /// Worker: preparation began.
     PreparationStarted,
-    /// Worker: first step process started.
     StepsStarted,
-    /// Worker: steps finished, finalizers running.
     FinalizationStarted,
-    /// Worker: everything durable, attempt succeeded.
     Passed,
-    /// Worker: attempt ended without success.
     Failed(FailureClass),
-    /// Controller: cancel desired state applies while no worker owns the job.
     CancelBeforeStart,
-    /// Controller: queue timeout while waiting.
     QueueTimedOut,
-    /// Controller or reconciler: lease renewal missed.
     LeaseExpired,
-    /// Controller or reconciler: worker session gone.
     WorkerLost,
-    /// Reconciler: attempt found in an unknown state after restart.
     Reconciled,
-    /// Controller: operator asked for a new attempt of a finished job. The
-    /// compiled spec is unchanged; only the attempt (and fence) is new. A job
-    /// with cancellation desired cannot be rerun; dispatch a new run instead.
     Rerun,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransitionError {
-    /// The event is not defined for the current state.
     Invalid { from: JobState, event: Event },
-    /// The actor may not raise this event.
     Forbidden { actor: Actor, event: Event },
-    /// A worker event carried a fence other than the current one.
     StaleFence { current: Fence, presented: Fence },
-    /// Terminal states absorb everything; reported separately so callers can
-    /// treat duplicates as idempotent acknowledgements.
     AlreadyTerminal(Outcome),
 }
 
-/// Persisted per-job control fields the machine needs besides the state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JobControl {
     pub state: JobState,
-    /// Fence of the current attempt; `NONE` until first lease.
     pub fence: Fence,
-    /// Durable desired state: once set, no cancel path clears it (a GitHub
-    /// check-run rerequest is the one deliberate reset; docs/checks.md). The controller
-    /// stops new starts immediately; a running attempt is asked to stop and
-    /// its worker reports `Failed(Canceled)` when done (or is killed after
-    /// the grace period and reported by lease expiry).
     pub cancel_requested: bool,
 }
 
@@ -247,21 +167,13 @@ impl JobControl {
         }
     }
 
-    /// Record the cancel desired state. Returns true if the job can be moved
-    /// to terminal immediately (no worker owns it); the caller then applies
-    /// `Event::CancelBeforeStart`. Otherwise the running attempt must be
-    /// signalled and the job stays in its state until the worker reports.
     pub const fn request_cancel(&mut self) -> bool {
         self.cancel_requested = true;
         matches!(self.state, JobState::Blocked | JobState::Queued)
     }
 
-    /// Apply one event. On success the state (and fence for `Leased`) are
-    /// updated in place and the new state is returned; on error nothing changes.
     pub const fn apply(&mut self, actor: Actor, event: Event) -> Result<JobState, TransitionError> {
         if let JobState::Terminal(o) = self.state {
-            // The single way out of terminal: a controller rerun of a job that
-            // is not cancelled. Everything else is absorbed.
             return match (actor, event) {
                 (Actor::Controller, Event::Rerun) if !self.cancel_requested => {
                     self.state = JobState::Queued;
@@ -277,7 +189,6 @@ impl JobControl {
                 _ => Err(TransitionError::AlreadyTerminal(o)),
             };
         }
-        // Permission check first: a forbidden actor never learns validity details.
         match (actor, event) {
             (
                 Actor::Controller,
@@ -303,7 +214,6 @@ impl JobControl {
                 | Event::Failed(_),
             )
             | (Actor::Reconciler, Event::LeaseExpired | Event::WorkerLost | Event::Reconciled) => {}
-            // Rerun only applies to terminal jobs, handled above.
             _ => return Err(TransitionError::Forbidden { actor, event }),
         }
         if let Actor::Worker(presented) = actor
@@ -375,22 +285,14 @@ impl Default for JobControl {
     }
 }
 
-/// Aggregated run state derived from its jobs. Never stored as truth; recomputed
-/// from job rows inside the same transaction that changed a job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RunState {
-    /// No job has left `Blocked`/`Queued` yet.
     Pending = 0,
-    /// At least one job is worker-owned or some are still pending after others finished.
     Active = 1,
     Terminal(Outcome) = 2,
 }
 
-/// Fold job states into the run state. Precedence among terminal outcomes is
-/// `InfraFailed > Failed > TimedOut > Canceled > Passed`; `Skipped` counts as
-/// success unless every job was skipped. Runs with zero jobs are rejected by
-/// the compiler, so an empty iterator is reported as `Pending`.
 pub fn aggregate<I: IntoIterator<Item = JobState>>(jobs: I) -> RunState {
     let mut worst: Option<Outcome> = None;
     let mut started = false;
@@ -403,7 +305,6 @@ pub fn aggregate<I: IntoIterator<Item = JobState>>(jobs: I) -> RunState {
             JobState::Terminal(o) => {
                 if o != Outcome::Skipped {
                     all_skipped = false;
-                    // `Outcome` derives `Ord` in precedence order.
                     worst = Some(match worst {
                         Some(w) if w >= o => w,
                         _ => o,
@@ -434,21 +335,14 @@ pub fn aggregate<I: IntoIterator<Item = JobState>>(jobs: I) -> RunState {
     })
 }
 
-/// Whether a dependent may start given its dependency's outcome and the
-/// declared policy. `Skipped` upstream satisfies `on_success` so optional
-/// branches do not drag the DAG.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DependencyPolicy {
-    /// Default: upstream passed or was skipped.
     OnSuccess = 0,
-    /// Upstream reached any terminal outcome except canceled.
     Always = 1,
-    /// Upstream failed, timed out or infra-failed.
     OnFailure = 2,
 }
 
-/// `Some(true)` start, `Some(false)` skip, `None` keep waiting.
 pub const fn dependency_decision(policy: DependencyPolicy, upstream: JobState) -> Option<bool> {
     let JobState::Terminal(o) = upstream else {
         return None;
@@ -680,8 +574,6 @@ mod tests {
 
     #[test]
     fn no_transition_leaves_a_non_terminal_state_without_a_defined_successor() {
-        // Every (state, event) pair is either a defined move, Forbidden, Invalid,
-        // StaleFence or AlreadyTerminal; the machine never panics.
         for state in ALL_STATES {
             for event in ALL_EVENTS {
                 for actor in [
@@ -763,7 +655,6 @@ mod tests {
             Ok(JobState::Queued)
         );
         assert_eq!(j.fence, Fence(1));
-        // The lapsed attempt's worker is now stale in every direction.
         assert!(matches!(
             j.apply(Actor::Worker(Fence(1)), Event::PreparationStarted),
             Err(TransitionError::Invalid { .. })
@@ -776,7 +667,6 @@ mod tests {
             j.apply(Actor::Worker(Fence(1)), Event::StepsStarted),
             Err(TransitionError::StaleFence { .. })
         ));
-        // Only the controller lapses an offer, and only from Leased.
         for actor in [Actor::Worker(Fence(2)), Actor::Reconciler] {
             assert!(matches!(
                 j.apply(actor, Event::OfferLapsed),

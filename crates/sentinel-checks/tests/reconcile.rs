@@ -1,8 +1,3 @@
-//! The `github_refresh` lane against a loopback stub — a
-//! healthy pass verifies, a renamed or missing repository revokes its
-//! binding, a 404 installation disables and revokes, a suspended installation
-//! stays disabled, and a transient failure retries rather than revoking.
-
 use std::{
     collections::VecDeque,
     io::{Read, Write},
@@ -63,17 +58,10 @@ const REF: &str = "refs/heads/main";
 
 #[derive(Default)]
 struct Data {
-    /// (method, path substring, status, body): the first match is consumed.
-    /// For once-only faults like a transient 500.
     scripted: VecDeque<(String, String, u16, serde_json::Value)>,
-    /// Persistent overrides: GitHub's answers are stable facts, so a gone or
-    /// suspended installation answers the same way to every pass.
     installation_status: Option<u16>,
     installation: Option<serde_json::Value>,
-    /// Repositories `/installation/repositories` reports; `None` keeps the
-    /// bound repository present under its approved name.
     listed: Option<Vec<serde_json::Value>>,
-    /// What `/repositories/{id}` answers by default.
     repository: Option<serde_json::Value>,
     requests: Vec<String>,
 }
@@ -195,8 +183,7 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String)> {
         parts.next().unwrap_or_default().to_owned(),
         parts.next().unwrap_or_default().to_owned(),
     );
-    // The body must be consumed too: it is bytes on this keep-alive
-    // connection, not the start of the next request.
+    // Consume the body too: on a keep-alive connection it would otherwise start the next request.
     let mut length = buffer.len() - (header_end + 4);
     let mut wanted = 0usize;
     for line in lines {
@@ -441,8 +428,6 @@ fn a_healthy_installation_and_repository_verify() {
         notices_have(&notices, "refreshed") && notices_have(&notices, "verified")
     });
     assert!(!binding_revoked(&f));
-    // The reconcile token is installation-wide contents:read — never
-    // checks:write and never repository-scoped.
     assert!(
         f.stub
             .requests()
@@ -456,8 +441,6 @@ fn a_healthy_installation_and_repository_verify() {
 
 #[test]
 fn a_renamed_or_dropped_repository_loses_its_binding() {
-    // The installation still covers the repository id, but under a different
-    // name: the approved remote does not follow the rename.
     let f = fixture();
     f.stub.data.lock().unwrap().listed = Some(vec![
         serde_json::json!({"id": GITHUB_REPO, "full_name": "other/renamed", "archived": false}),
@@ -465,7 +448,6 @@ fn a_renamed_or_dropped_repository_loses_its_binding() {
     let notices = Arc::new(Mutex::new(Vec::new()));
     let lane = start(&f, Arc::clone(&notices));
     until("the rename revoke", || binding_revoked(&f));
-    // The notice follows the store write, so wait for it rather than race it.
     until("the revoke notice", || {
         notices
             .lock()
@@ -484,8 +466,6 @@ fn a_renamed_or_dropped_repository_loses_its_binding() {
     );
     drop(lane);
 
-    // The repository vanished from the grant entirely: an untruncated list
-    // that omits it revokes.
     let f = fixture();
     f.stub.data.lock().unwrap().listed = Some(Vec::new());
     let notices = Arc::new(Mutex::new(Vec::new()));
@@ -493,8 +473,6 @@ fn a_renamed_or_dropped_repository_loses_its_binding() {
     until("the removal revoke", || binding_revoked(&f));
     drop(lane);
 
-    // And the repository pass itself: a mismatched clone URL revokes the
-    // binding without rewriting the approved remote.
     let f = fixture();
     f.stub.data.lock().unwrap().repository = Some(serde_json::json!({
         "id": GITHUB_REPO,
@@ -531,9 +509,6 @@ fn a_suspended_installation_stays_disabled_until_the_api_clears_it() {
     }));
     let notices = Arc::new(Mutex::new(Vec::new()));
     let lane = start(&f, Arc::clone(&notices));
-    // The kind-0 pass applies the suspended snapshot; the kind-1 repository
-    // pass cannot mint through a suspended installation and hands the row
-    // back to kind 0.
     until("the suspended refresh", || {
         notices_have(&notices, "refreshed")
     });
@@ -569,7 +544,6 @@ fn a_transient_failure_retries_without_revoking() {
     drop(lane);
 }
 
-/// The lane survives its own settlement: rows seeded before start are due.
 #[test]
 fn dropping_the_lane_joins_its_thread() {
     let f = fixture();
