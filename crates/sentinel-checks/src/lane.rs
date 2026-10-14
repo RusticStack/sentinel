@@ -21,9 +21,17 @@ pub enum Publish {
         check_run_id: i64,
         check_suite_id: Option<i64>,
     },
-    Retry { after_ms: i64, detail: String },
-    Refused { reason: String },
-    Throttled { until_ms: i64, scope: u64 },
+    Retry {
+        after_ms: i64,
+        detail: String,
+    },
+    Refused {
+        reason: String,
+    },
+    Throttled {
+        until_ms: i64,
+        scope: u64,
+    },
 }
 
 pub trait Publisher: Send {

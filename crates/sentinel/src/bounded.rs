@@ -11,9 +11,7 @@ pub const PIPELINE_BYTES: u64 = sentinel_pipeline::yaml::MAX_PIPELINE_FILE_BYTES
 #[derive(Debug)]
 pub enum ReadError {
     Io(io::Error),
-    TooLarge {
-        limit: u64,
-    },
+    TooLarge { limit: u64 },
     NotUtf8,
 }
 
