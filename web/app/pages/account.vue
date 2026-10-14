@@ -154,7 +154,7 @@ async function linkGitHub() {
     const started = await withStepUp(() => api<{ authorize_url: string }>("/api/v1/identities/github/link", { method: "POST", body: {} }));
     if (!/^https:\/\//.test(started.authorize_url)) throw new ApiError(0, { code: "invalid_response", message: "the controller gave an unexpected address" });
     // The round trip ends on `/`, which continues here.
-    try { sessionStorage.setItem("sentinel-return", "/account"); } catch { /* ignore */ }
+    rememberReturn("/account");
     await navigateTo(started.authorize_url, { external: true });
   } catch (e) {
     linking.value = false;

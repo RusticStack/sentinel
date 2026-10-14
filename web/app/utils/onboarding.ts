@@ -23,6 +23,25 @@ export function fragmentToken(hash: string, kind: "verification" | "invitation")
   return (kind === "invitation" ? isInvitationToken(token) : isVerificationToken(token)) ? token : null;
 }
 
+/// An invitation secret parked in this tab's session storage across a
+/// GitHub sign-in round trip: the key, its lifetime, and the stored form.
+export const INVITATION_STASH = "sentinel-invitation";
+export const INVITATION_STASH_MS = 10 * 60 * 1000;
+export const stashInvitation = (token: string, now: number) => JSON.stringify({ token, until: now + INVITATION_STASH_MS });
+
+/// The parked secret in `raw`, or `null` when it is absent, malformed, not
+/// an invitation token or past its ten minutes (the caller removes it
+/// either way).
+export function unstashInvitation(raw: string | null, now: number): string | null {
+  if (!raw || raw.length > 512) return null;
+  try {
+    const { token, until } = JSON.parse(raw);
+    return typeof token === "string" && isInvitationToken(token) && Number(until) > now && Number(until) <= now + INVITATION_STASH_MS ? token : null;
+  } catch {
+    return null;
+  }
+}
+
 /** UTF-8 length, the unit the controller's password bounds use. */
 export const byteLength = (s: string) => new TextEncoder().encode(s).length;
 

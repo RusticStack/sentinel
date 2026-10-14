@@ -13,9 +13,6 @@ useHead({ title: "Accept an invitation · Sentinel" });
 const api = useApi();
 const session = useSession();
 
-const STASH = "sentinel-invitation";
-const STASH_MS = 10 * 60 * 1000;
-
 type Phase = "reading" | "missing" | "ready" | "accepting" | "joined" | "member" | "redeemed" | "verify" | "unusable";
 const phase = ref<Phase>("reading");
 const tenant = ref<string | null>(null);
@@ -29,23 +26,25 @@ const { waiting, start: wait } = useRetryWait();
 
 const { data: health } = await useAsyncData("health", () => api<{ github_sign_in?: boolean }>("/api/v1/health"));
 
+/// Take the parked secret back, removing it whatever it holds.
 function unstash(): string | null {
   try {
-    const raw = sessionStorage.getItem(STASH);
-    sessionStorage.removeItem(STASH);
-    if (!raw) return null;
-    const { token: t, until } = JSON.parse(raw);
-    return typeof t === "string" && isInvitationToken(t) && Number(until) > Date.now() ? t : null;
+    const raw = sessionStorage.getItem(INVITATION_STASH);
+    sessionStorage.removeItem(INVITATION_STASH);
+    return unstashInvitation(raw, Date.now());
   } catch {
     return null;
   }
 }
 
 onMounted(() => {
-  token.value = fragmentToken(location.hash, "invitation") ?? unstash();
+  // Read (and so remove) the stash on every visit, even when the link's
+  // fragment brings a secret of its own and wins.
+  const parked = unstash();
+  token.value = fragmentToken(location.hash, "invitation") ?? parked;
   // Back here by another way than `/` (signing in as someone else): the
   // return marker has served.
-  try { if (sessionStorage.getItem("sentinel-return") === "/invitations/accept") sessionStorage.removeItem("sentinel-return"); } catch { /* ignore */ }
+  rememberReturn(null);
   if (location.hash) history.replaceState(history.state, "", location.pathname + location.search);
   phase.value = token.value ? "ready" : "missing";
 });
@@ -88,9 +87,9 @@ async function accept() {
 /// signing in as someone else), to come back here.
 function stash() {
   try {
-    if (token.value) sessionStorage.setItem(STASH, JSON.stringify({ token: token.value, until: Date.now() + STASH_MS }));
-    sessionStorage.setItem("sentinel-return", "/invitations/accept");
+    if (token.value) sessionStorage.setItem(INVITATION_STASH, stashInvitation(token.value, Date.now()));
   } catch { /* storage off: the person opens the link again after signing in */ }
+  rememberReturn("/invitations/accept");
 }
 
 function switchAccount() {

@@ -13,3 +13,24 @@ export function sameOriginPath(value: unknown, fallback = "/"): string {
     return fallback;
   }
 }
+
+/// Where a round trip that leaves the interface (GitHub sign-in, linking
+/// GitHub) continues. The controller ends it on `/` with a full page load,
+/// so the marker is a cookie the server-side render of `/` can read; it
+/// holds only a path on this origin, never a secret, and lives ten minutes.
+export const RETURN_COOKIE = "sentinel-return";
+export const RETURN_SECONDS = 600;
+
+/// The `document.cookie` assignment that records `path` (made same-origin
+/// first) as the pending return, or clears it when `path` is null.
+export function returnCookie(path: string | null, secure: boolean): string {
+  const value = path === null ? "" : encodeURIComponent(sameOriginPath(path));
+  const age = path === null ? 0 : RETURN_SECONDS;
+  return `${RETURN_COOKIE}=${value}; Path=/; Max-Age=${age}; SameSite=Lax${secure ? "; Secure" : ""}`;
+}
+
+/// Record the pending return in the browser, synchronously, so it is set
+/// before an external navigation leaves the page.
+export function rememberReturn(path: string | null) {
+  try { document.cookie = returnCookie(path, location.protocol === "https:"); } catch { /* cookies off: the round trip ends on `/` */ }
+}

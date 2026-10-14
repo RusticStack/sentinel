@@ -21,7 +21,7 @@ const notice = computed(() => {
 });
 
 function withGitHub() {
-  try { sessionStorage.setItem("sentinel-return", next.value); } catch { /* ignore */ }
+  rememberReturn(next.value);
 }
 </script>
 
