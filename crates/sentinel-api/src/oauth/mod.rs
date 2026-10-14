@@ -1,26 +1,3 @@
-//! The OAuth 2.0 authorization server's HTTP surface.
-//!
-//! [`route`] runs before the `/api/v1` router and owns `/.well-known/*`,
-//! `/oauth/*`, `/device`, `/api/v1/grants*` and
-//! `/api/v1/tenants/{slug}/service-accounts*`. This module answers the
-//! metadata documents, dispatches the token endpoint by `grant_type`
-//! (implementing `refresh_token`; `authorization_code` goes to [`code`],
-//! the device grant to [`device`]) and implements RFC 7009 revocation.
-//!
-//! The `/oauth/*` endpoints speak RFC 6749: `application/x-www-form-urlencoded`
-//! bodies of at most [`MAX_OAUTH_FORM_BYTES`], a repeated parameter is
-//! `invalid_request`, and errors are `{"error", "error_description"}` with
-//! `cache-control: no-store` and `pragma: no-cache`. Unauthenticated POSTs
-//! are admitted per client and under a deployment-wide ceiling ([`limit`]);
-//! overflow is `temporarily_unavailable`.
-//!
-//! The issuer may carry a path (`https://ci.example.com/sentinel`). Every URL
-//! a page or document hands out is built from the issuer, and the metadata
-//! documents are served both at the issuer-relative paths and at the RFC
-//! 8414 §3.1 / RFC 9728 §3.1 locations (well-known segment between host and
-//! issuer path). [`OAuthState::local_path`] strips the issuer path from a
-//! request that a proxy forwarded without stripping it.
-
 pub(crate) mod client;
 pub(crate) mod code;
 pub(crate) mod device;
@@ -55,122 +32,62 @@ use crate::{
 };
 use limit::{Limiter, Rate};
 
-/// Which admission budget an unauthenticated OAuth POST draws on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Budget {
-    /// `/oauth/token`: refresh, code exchange and device polling.
     Token,
-    /// `/oauth/revoke`.
     Revoke,
-    /// `/oauth/device_authorization`: the revoke budget, plus the slow
-    /// per-client device bucket.
     Device,
-    /// RFC 7591 client registration.
     Registration,
-    /// Client ID Metadata Document retrieval.
     Metadata,
-    /// `POST /api/v1/login`: each attempt is a password hash and a writer
-    /// transaction, so a client gets a burst and then a slow refill.
     Login,
-    /// `POST /api/v1/register`: a password hash and a writer transaction.
     Signup,
-    /// Email resend, verification and invitation links.
     Mail,
-    /// First-run setup attempts (`POST /api/v1/setup`, the mail test): a
-    /// token judgement, and for a right one a password hash. Tight, because
-    /// nothing legitimate asks more than a handful of times.
     Setup,
-    /// `POST /api/v1/orgs`: the slug check inherently says whether a name is
-    /// taken, so a client gets a few and then a slow refill.
     Organization,
 }
 
-/// Per client at the token endpoint: 10/s, burst 20.
 const TOKEN_CLIENT: Rate = Rate::per_sec(10, 20);
-/// Per client at revocation and device authorization: 5/s, burst 10.
 const BEGIN_CLIENT: Rate = Rate::per_sec(5, 10);
-/// The deployment-wide ceiling of each of those two budgets: 20/s, burst 40.
 const CEILING: Rate = Rate::per_sec(20, 40);
-/// New device requests per client: burst 8, then one per 30 s, so one
-/// client holds at most about 28 of the deployment's pending requests over
-/// a request's ten-minute life.
 const DEVICE_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(30), 8);
 const REGISTRATION_CLIENT: Rate = Rate::per_sec(2, 5);
 const REGISTRATION_CEILING: Rate = Rate::per_sec(10, 20);
 const METADATA_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(5), 4);
 const METADATA_CEILING: Rate = Rate::per_sec(10, 20);
-/// Password logins per client: burst 10, then one per 3 s. A person typing a
-/// password never meets it; the per-account lock ([`crate::login_guard`]) is
-/// what stops guessing, this bounds the hashing one address can demand.
 const LOGIN_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(3), 10);
-/// All clients together: bounds the hashing the host spends on logins.
 const LOGIN_CEILING: Rate = Rate::per_sec(10, 20);
-/// Self-service sign-ups per client: each is a password hash and a writer
-/// transaction, so burst 5, then one per 20 s; all clients together 2/s.
 const SIGNUP_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(20), 5);
 const SIGNUP_CEILING: Rate = Rate::per_sec(2, 10);
-/// Mail-sending and email-token requests per client (resends, verification
-/// and invitation links): burst 8, then one per 15 s; all clients 5/s.
 const MAIL_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(15), 8);
 const MAIL_CEILING: Rate = Rate::per_sec(5, 20);
-/// First-run setup attempts per client: burst 5, then one per 10 s; all
-/// clients together one per second, burst 5.
 const SETUP_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(10), 5);
 const SETUP_CEILING: Rate = Rate::per_sec(1, 5);
-/// Organization creations and name checks per client: burst 5, then one per
-/// 10 s; all clients together 2/s.
 const ORGANIZATION_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(10), 5);
 const ORGANIZATION_CEILING: Rate = Rate::per_sec(2, 10);
 
-/// The authorization server's per-process state.
 pub(crate) struct OAuthState {
-    /// The issuer: `public_url`, or `http://{bound address}`.
     pub issuer: String,
-    /// `scheme://host[:port]` of the issuer, for `Origin` checks.
     pub origin: String,
-    /// The issuer's path (`/sentinel`), or empty.
     pub path: String,
-    /// `{issuer}/api/v1`, the `resource` of `Audience::Api`.
     pub api_resource: String,
-    /// `{issuer}/mcp`, the `resource` of `Audience::Mcp`.
     pub mcp_resource: String,
-    /// The RFC 9728 §3.1 metadata URL of `api_resource`, named in every
-    /// `401` challenge.
     pub resource_metadata: String,
-    /// RFC 9728 metadata URL for the MCP resource.
     pub mcp_resource_metadata: String,
-    /// `{issuer}/api/v1/login`, which the embedded sign-in posts to.
     pub login_url: String,
-    /// `{issuer}/device`, which the device page's forms submit to.
     pub device_url: String,
-    /// Keys consent and device-approval form tokens; random per process.
     pub form_key: [u8; 32],
-    /// Admission of `/oauth/token`.
     pub token_budget: Mutex<Limiter>,
-    /// Admission of `/oauth/revoke` and `/oauth/device_authorization`.
     pub begin_budget: Mutex<Limiter>,
-    /// The per-client device-request bucket.
     pub device_budget: Mutex<Limiter>,
-    /// Public DCR registration admission.
     pub registration_budget: Mutex<Limiter>,
-    /// CIMD metadata fetch admission.
     pub metadata_budget: Mutex<Limiter>,
-    /// Password login admission.
     pub login_budget: Mutex<Limiter>,
-    /// Self-service sign-up admission.
     pub signup_budget: Mutex<Limiter>,
-    /// Email resend, verification and invitation-link admission.
     pub mail_budget: Mutex<Limiter>,
-    /// First-run setup admission.
     pub setup_budget: Mutex<Limiter>,
-    /// Self-service organization creation admission.
     pub organization_budget: Mutex<Limiter>,
-    /// Bounded in-memory CIMD cache.
     pub client_metadata: client::MetadataCache,
-    /// Device-code digest -> (last poll, current interval in ms), bounded by
-    /// `sentinel_store::oauth::MAX_PENDING_DEVICE`.
     pub device_polls: Mutex<HashMap<[u8; 32], (Instant, u32)>>,
-    /// Wrong user codes per account, bounded.
     pub user_code_failures: Mutex<device::WrongCodes>,
 }
 
@@ -241,9 +158,6 @@ impl OAuthState {
         }
     }
 
-    /// A request path as this server routes it: a proxy that forwards
-    /// `/sentinel/device` unchanged for the issuer `…/sentinel` reaches
-    /// `/device`. A path outside the issuer's is left alone.
     pub(crate) fn local_path<'a>(&self, path: &'a str) -> &'a str {
         if self.path.is_empty() {
             return path;
@@ -255,9 +169,6 @@ impl OAuthState {
         }
     }
 
-    /// Whether `rest` (path segments after a well-known name) is the
-    /// issuer's path followed by `suffix`: the RFC 8414 / 9728 location for
-    /// a path-carrying issuer. With no issuer path, only `suffix` matches.
     fn issuer_path_then(&self, rest: &[&str], suffix: &[&str]) -> bool {
         let mut segments = self.path.split('/').filter(|s| !s.is_empty());
         let mut rest = rest.iter();
@@ -279,8 +190,6 @@ pub(crate) fn route(
     query: &str,
 ) -> Option<Route> {
     Some(match (method, parts) {
-        // Issuer-relative (what the CLI asks for through a path-stripping
-        // proxy), and the RFC location with the issuer path appended.
         ("GET", [".well-known", "oauth-authorization-server", rest @ ..])
             if rest.is_empty() || state.oauth.issuer_path_then(rest, &[]) =>
         {
@@ -310,8 +219,7 @@ pub(crate) fn route(
     })
 }
 
-/// RFC 8414 metadata. The registration members follow the live instance
-/// policy (one single-row read), so turning DCR off also stops advertising it.
+// Registration members follow the live policy, so turning DCR off also stops advertising it.
 fn metadata(state: &State) -> Route {
     let policy = state
         .store
@@ -339,13 +247,10 @@ fn no_cache() -> Vec<Header> {
     vec![routes::header("pragma", "no-cache")]
 }
 
-/// An RFC 6749 error answer (`cache-control: no-store` is added for every
-/// JSON reply; `pragma: no-cache` here).
 pub(crate) fn error(code: OAuthErrorCode, description: &str) -> Reply {
     error_status(code.http_status(), code, description)
 }
 
-/// An RFC 6749 error answer with an explicit status (413, 429).
 pub(crate) fn error_status(status: u16, code: OAuthErrorCode, description: &str) -> Reply {
     Reply::Json(
         status,
@@ -354,8 +259,6 @@ pub(crate) fn error_status(status: u16, code: OAuthErrorCode, description: &str)
     )
 }
 
-/// A store failure at an OAuth endpoint: busy is `temporarily_unavailable`,
-/// anything else `server_error`.
 pub(crate) fn store_failure(e: sentinel_store::Error) -> Reply {
     match e {
         sentinel_store::Error::WriterUnavailable
@@ -368,7 +271,6 @@ pub(crate) fn store_failure(e: sentinel_store::Error) -> Reply {
     }
 }
 
-/// The token response for a freshly minted pair (RFC 6749 §5.1).
 pub(crate) fn token_reply(minted: &Minted, now: UnixMillis) -> Reply {
     let seconds =
         |until: UnixMillis| u64::try_from(until.0.saturating_sub(now.0) / 1000).unwrap_or(0);
@@ -384,8 +286,6 @@ pub(crate) fn token_reply(minted: &Minted, now: UnixMillis) -> Reply {
     Reply::Json(200, json!(body), no_cache())
 }
 
-/// Admit one unauthenticated OAuth POST from this request's client against
-/// `budget` ([`limit`]).
 pub(crate) fn admit(state: &State, request: &Request, budget: Budget) -> Result<(), Reply> {
     if admitted(state, request, budget) {
         Ok(())
@@ -401,7 +301,6 @@ pub(crate) fn admit(state: &State, request: &Request, budget: Budget) -> Result<
     }
 }
 
-/// Whether this request's client is within `budget`, spending one admission.
 pub(crate) fn admitted(state: &State, request: &Request, budget: Budget) -> bool {
     let client = client_of(state, request);
     let now = Instant::now();
@@ -415,8 +314,7 @@ pub(crate) fn admitted(state: &State, request: &Request, budget: Budget) -> bool
     match budget {
         Budget::Token => take(&oauth.token_budget),
         Budget::Revoke => take(&oauth.begin_budget),
-        // The slow device bucket first: a client past it spends nothing
-        // from the budget revocation shares.
+        // The slow device bucket goes first, so a client past it spends nothing from the shared budget.
         Budget::Device => take(&oauth.device_budget) && take(&oauth.begin_budget),
         Budget::Registration => take(&oauth.registration_budget),
         Budget::Metadata => take(&oauth.metadata_budget),
@@ -428,7 +326,6 @@ pub(crate) fn admitted(state: &State, request: &Request, budget: Budget) -> bool
     }
 }
 
-/// The admission key of this request's client ([`limit::client_key`]).
 pub(crate) fn client_of(state: &State, request: &Request) -> u128 {
     limit::client_key(
         request.peer(),
@@ -437,15 +334,11 @@ pub(crate) fn client_of(state: &State, request: &Request) -> u128 {
     )
 }
 
-/// A parsed `application/x-www-form-urlencoded` body. Each name appears at
-/// most once; an empty value counts as absent (RFC 6749 §3.1).
 pub(crate) struct Form(Vec<(String, String)>);
 
-/// More parameters than any OAuth request needs.
 const MAX_FORM_PAIRS: usize = 32;
 
 impl Form {
-    /// Parse a form body, refusing repeated names and runaway pair counts.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Form, OAuthError> {
         let mut pairs: Vec<(String, String)> = Vec::new();
         for (name, value) in form_urlencoded::parse(bytes) {
@@ -466,7 +359,6 @@ impl Form {
         Ok(Form(pairs))
     }
 
-    /// A parameter's value; `None` when absent or empty.
     pub(crate) fn get(&self, name: &str) -> Option<&str> {
         self.0
             .iter()
@@ -476,7 +368,6 @@ impl Form {
     }
 }
 
-/// Read and parse a form body at an OAuth endpoint.
 pub(crate) fn read_form(request: &mut Request) -> Result<Form, Reply> {
     let form_type = routes::header_value(request, "content-type").is_some_and(|value| {
         value.split(';').next().is_some_and(|t| {
@@ -506,16 +397,13 @@ pub(crate) fn read_form(request: &mut Request) -> Result<Form, Reply> {
     Form::parse(&bytes).map_err(|e| Reply::Json(e.http_status(), json!(e), no_cache()))
 }
 
-/// The session behind a browser page request, if any. Bearer credentials
-/// never drive consent or device approval.
+// Bearer credentials never drive consent or device approval.
 pub(crate) fn session(state: &State, request: &Request) -> Option<Identity> {
     routes::identify(state, request, false)
         .ok()
         .filter(|who| who.via == Via::Session)
 }
 
-/// The OAuth token endpoint (RFC 6749 §3.2): public clients identify by
-/// `client_id`; `resource`, when given, must name a resource of this deployment.
 fn token(state: &State, request: &mut Request) -> Reply {
     if let Err(reply) = admit(state, request, Budget::Token) {
         return reply;
@@ -567,7 +455,6 @@ fn token(state: &State, request: &mut Request) -> Reply {
     }
 }
 
-/// The `refresh_token` grant: rotate, optionally narrowing `scope`.
 fn refresh(state: &State, client: &Client, form: &Form, resource: Option<Audience>) -> Reply {
     let Some(text) = form.get("refresh_token") else {
         return error(OAuthErrorCode::InvalidRequest, "refresh_token is required");
@@ -594,8 +481,6 @@ fn refresh(state: &State, client: &Client, form: &Form, resource: Option<Audienc
     }
 }
 
-/// RFC 7009 revocation: either token kind revokes its whole grant. The
-/// answer is 200 whether or not the token was known.
 fn revoke(state: &State, request: &mut Request) -> Reply {
     if let Err(reply) = admit(state, request, Budget::Revoke) {
         return reply;
@@ -639,7 +524,6 @@ mod tests {
         assert_eq!(s.path, "/sentinel");
         assert_eq!(s.login_url, "https://ci.example/sentinel/api/v1/login");
         assert_eq!(s.device_url, "https://ci.example/sentinel/device");
-        // RFC 9728 §3.1: the well-known segment goes before the path.
         assert_eq!(
             s.resource_metadata,
             "https://ci.example/.well-known/oauth-protected-resource/sentinel/api/v1"

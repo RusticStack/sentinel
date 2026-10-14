@@ -1,12 +1,3 @@
-//! The device authorization flow over HTTP (RFC 8628): `POST
-//! /oauth/device_authorization`, the device-code branch of the token
-//! endpoint with its in-memory `slow_down` limiter, and the `GET`/`POST
-//! /device` approval page ([`page`], in `device/page.rs`).
-//!
-//! The device code goes only to the polling client, in the JSON answer of
-//! the authorization request; no page ever renders it. A person types the
-//! user code on `/device` while signed in with a session.
-
 #[path = "device/page.rs"]
 mod page_impl;
 
@@ -39,10 +30,6 @@ use crate::{
 
 pub(crate) use page_impl::{WrongCodes, page};
 
-/// `POST /oauth/device_authorization` (RFC 8628 §3.1): a public client asks
-/// for a device code and a user code. `scope` defaults to the CLI default
-/// within the client's ceiling; at the deployment's pending cap the answer
-/// is `429 slow_down`.
 pub(crate) fn authorization(state: &State, request: &mut Request) -> Route {
     Ok(authorize(state, request))
 }
@@ -134,14 +121,10 @@ fn authorize(state: &State, request: &mut Request) -> Reply {
     Reply::Json(200, json!(body), vec![routes::header("pragma", "no-cache")])
 }
 
-/// Ceiling on a device's polling interval: its whole life.
 const MAX_INTERVAL_MS: u32 = DEVICE_LIFETIME_MS as u32;
 
-/// Pace one poll of `key` at `now` (RFC 8628 §3.5). A device seen before
-/// that polls sooner than its current interval is told to slow down and
-/// its interval grows by [`SLOW_DOWN_STEP_MS`]; either way the poll time is
-/// recorded. Devices not yet seen pass: only known pending requests are
-/// remembered (see [`remember`]), so unknown codes cannot grow the map.
+// Unseen devices pass unpaced: only known pending requests are remembered,
+// so unknown codes cannot grow the map.
 fn paced(polls: &mut HashMap<[u8; 32], (Instant, u32)>, key: &[u8; 32], now: Instant) -> bool {
     let Some((last, interval)) = polls.get_mut(key) else {
         return true;
@@ -156,10 +139,6 @@ fn paced(polls: &mut HashMap<[u8; 32], (Instant, u32)>, key: &[u8; 32], now: Ins
     !early
 }
 
-/// Remember a pending request's poll at `now`, keeping its interval. The
-/// map holds at most [`MAX_PENDING_DEVICE`] entries, which is also the
-/// store's cap on pending requests; when full, entries idle for a whole
-/// request life are dropped first, and if none is, this one goes unpaced.
 fn remember(
     polls: &mut HashMap<[u8; 32], (Instant, u32)>,
     key: [u8; 32],
@@ -179,10 +158,6 @@ fn remember(
         .or_insert((now, initial_ms));
 }
 
-/// `grant_type=urn:ietf:params:oauth:grant-type:device_code` (RFC 8628
-/// §3.4–3.5): `authorization_pending`, `slow_down`, `access_denied`,
-/// `expired_token`, or the tokens exactly once; any later poll is
-/// `invalid_grant`.
 pub(crate) fn token(
     state: &State,
     client: &Client,
@@ -251,19 +226,15 @@ mod tests {
         let mut polls = HashMap::new();
         let key = [7u8; 32];
         let start = Instant::now();
-        // Unknown devices pass and are not remembered by pacing alone.
         assert!(paced(&mut polls, &key, start));
         assert!(polls.is_empty());
         remember(&mut polls, key, start, 5_000);
-        // 4.9 s later is early: slow down, interval 10 s.
         let t = start + Duration::from_millis(4_900);
         assert!(!paced(&mut polls, &key, t));
         assert_eq!(polls[&key].1, 10_000);
-        // Waiting the old 5 s is still early now: 15 s.
         let t = t + Duration::from_millis(5_000);
         assert!(!paced(&mut polls, &key, t));
         assert_eq!(polls[&key].1, 15_000);
-        // Honoring the grown interval passes and keeps it.
         let t = t + Duration::from_millis(15_000);
         assert!(paced(&mut polls, &key, t));
         assert_eq!(polls[&key].1, 15_000);
@@ -285,11 +256,9 @@ mod tests {
             k[..8].copy_from_slice(&(n as u64).to_le_bytes());
             remember(&mut polls, k, start, 5_000);
         }
-        // Full of live entries: a new one goes unremembered.
         remember(&mut polls, [0xff; 32], start, 5_000);
         assert_eq!(polls.len(), MAX_PENDING_DEVICE);
         assert!(!polls.contains_key(&[0xff; 32]));
-        // Once they have idled a whole request life they make room.
         let later = start + Duration::from_millis(DEVICE_LIFETIME_MS as u64);
         remember(&mut polls, [0xff; 32], later, 5_000);
         assert_eq!(polls.len(), 1);

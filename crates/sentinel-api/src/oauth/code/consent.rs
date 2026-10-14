@@ -1,7 +1,3 @@
-//! The consent page: who is asking, for what, on which deployment, and the
-//! narrowing the account may choose. Every dynamic value is escaped; every
-//! request parameter rides in a hidden field so `POST` can re-validate it.
-
 use std::fmt::Write as _;
 
 use sentinel_core::auth::Role;
@@ -16,7 +12,6 @@ use crate::{
     routes::Reply,
 };
 
-/// The consent page with `200`.
 pub(super) fn page(
     state: &State,
     params: &Params<'_>,
@@ -27,7 +22,6 @@ pub(super) fn page(
     page_status(state, params, who, form_token, notice, 200)
 }
 
-/// The consent page with `status` (a re-render after a correctable choice).
 pub(super) fn page_status(
     state: &State,
     params: &Params<'_>,
@@ -53,7 +47,6 @@ pub(super) fn page_status(
         body.push_str("</p>\n");
     }
     if params.client.registered {
-        // A registered client names itself; nothing here vouches for it.
         body.push_str(
             "<p class=\"warn\">Third-party application: its name and details were supplied \
              by whoever registered it and are not verified by this deployment.</p>\n\
@@ -135,8 +128,6 @@ pub(super) fn page_status(
     )
 }
 
-/// `scheme://host[:port]` of a redirect URI: where the browser goes, which
-/// the consent page shows prominently for third-party clients.
 fn redirect_host(uri: &str) -> &str {
     let Some(at) = uri.find("://") else {
         return uri;
@@ -155,7 +146,6 @@ fn hidden(out: &mut String, name: &str, value: &str) {
     out.push_str("\">\n");
 }
 
-/// Plain words for each scope.
 fn describe(scope: &str) -> &'static str {
     match scope {
         "runs:read" => "see repositories, runs, workers and the queue",
