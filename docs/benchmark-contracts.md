@@ -1,4 +1,4 @@
-# Benchmark contracts (B01)
+# Benchmark contracts
 
 Every Part 14 number is measured under a **frozen contract**. A contract is a JSON file (`sentinel.bench-contract/1`) that fixes what a representative check is and the conditions it is measured under. The runner refuses to measure when the host or the inputs differ from it, and every record names the contract revision and digest it was taken under. Records from two revisions are never compared.
 
@@ -15,7 +15,7 @@ The contract for the sub-minute target is [`bench/contracts/lockwell-ci.json`](.
 | Tools | The versions Lockwell's Makefile pins: staticcheck 0.8.1, golangci-lint 2.13.2, govulncheck 1.8.0, cyclonedx-gomod 1.12.0 (the [migration notes](lockwell-migration.md) quote older ones) |
 | Environment | Lockwell's CI environment: `GOTOOLCHAIN=local`, the file-first `GOPROXY` over the checked-in `.goproxy`, and the SDK directories. Build cache, module cache, `GOPATH` and temporary directory sit under the bench root |
 | Lanes | `unit`, `unit-legacy-json`, `vet-build`, `race`, `integration`, `integration-race`, `gofmt`, `coverage` and `fuzz`, each with `ci.yml`'s exact command. `-count=1`, `-race`, both 30-second fuzz budgets and the integration suite's own process are kept |
-| Not measured yet, with the reason | staticcheck and golangci-lint (they install tools from the network on a miss), supply-chain (reads a live vulnerability database), docker/Compose (an optional lane kept external), Node, browser and advisory lanes (B05, B06), and the long acceptance, chaos, production and release scopes (reported separately, never inside the sub-minute target) |
+| Not measured, with the reason | staticcheck and golangci-lint (they install tools from the network on a miss), supply-chain (reads a live vulnerability database), docker/Compose (an optional lane kept external), Node, browser and advisory lanes (B05, B06), and the long acceptance, chaos, production and release scopes (reported separately, never inside the sub-minute target) |
 
 ## Conditions
 
@@ -118,7 +118,7 @@ The contract's `unit` lane measured through four executors on the reference host
 
 Differences the numbers carry:
 
-- **Sources.** The GitHub runner checks out from github.com over the network. Woodpecker and the direct runs use the checkout in place. Sentinel's jobs have no network egress and no extra checkouts yet, so its bench source is Lockwell `cbe48fc7` plus the two SDK trees vendored under `sdk-checkouts/`, `.goproxy` completed from a warm module cache of the same `go.sum`, and the pipeline ([`b02-sentinel.yml`](../bench/b02-sentinel.yml)). The test command, image, caps and SDK bytes are the same. The cold samples therefore differ: Sentinel's read modules from the local proxy, while the others fetched those missing from `.goproxy` over the network.
+- **Sources.** The GitHub runner checks out from github.com over the network. Woodpecker and the direct runs use the checkout in place. Sentinel's jobs have no network egress and no extra checkouts, so its bench source is Lockwell `cbe48fc7` plus the two SDK trees vendored under `sdk-checkouts/`, `.goproxy` completed from a warm module cache of the same `go.sum`, and the pipeline ([`b02-sentinel.yml`](../bench/b02-sentinel.yml)). The test command, image, caps and SDK bytes are the same. The cold samples therefore differ: Sentinel's read modules from the local proxy, while the others fetched those missing from `.goproxy` over the network.
 - **Users.** Woodpecker and Sentinel run the step as uid 0 inside a rootless container (the bench user outside). Podman in B01 kept the user's own uid, and the GitHub runner and scoped runs ran directly as the bench user.
 - **Clock start.** GitHub's job clock starts at run creation, after GitHub received the push. Sentinel's starts at the intake event, after the push. Woodpecker's has no source step at all.
 
@@ -127,8 +127,6 @@ What the measurements say:
 - **The lane is test-bound.** Every executor spends 64–67 s in the same `go test -count=1`, and no engine changes that. The sub-minute target for this lane needs the test time itself to shrink (B07), not only the engine.
 - **Engine overhead is about 11 s for both Sentinel and a healthy self-hosted runner.** Sentinel is not faster than the GitHub runner on this lane today: 77.6 s against 75 s of job plus about 2 s of queue. Woodpecker's exec adds 1–3 s over a bare container because it does no source or cache handling.
 - **Sentinel's overhead, in order of size:** 4.2 s from intake to dispatch (the controller resolves the pipeline at the pushed revision through Git before creating the run), 3.0 s of cache publication in finalize, 1.8 s of checkout, and 1.0 s of registry manifest check per job. These are B04's first targets.
-
-Found on the way: the repository's HTTPS Git test fixture (`fixtures/git_https.py`) did not pass `Content-Encoding` or `Git-Protocol` to `git http-backend`. A fetch from a populated mirror sends a gzipped request over about 1 KiB, and the server hung up. It now passes both. The Lockwell branch `sentinel-bench/b02` carried only the benchmark workflow. Its runner registration was removed after the samples, and the branch is deleted, while the runs stay in the Actions history.
 
 ## B04: the critical path, profiled and cut
 
@@ -142,7 +140,7 @@ B02's phase record ([`b02-sentinel.jsonl`](../bench/b02-sentinel.jsonl)) is the 
 | Image pull | 1.03 s | a registry manifest request for an image already resident (fixed in [B03](latency-budgets.md#before-and-after-the-two-fixes)) |
 | Container start | 0.31 s | |
 
-**The largest cost, pipeline resolution, is cut.** The controller now reads the pipeline through a partial clone: the commit and its trees (`--filter=blob:none`), then the pipeline's own blob by its id. What the records show is the phase it sits in: intake → dispatch fell from 4.23 s (median of 10 warm B02 runs) to 0.48 s (median of 4 warm runs after the change). The isolated fetch figures quoted when the change was made (3.6 s and 75 MB before, 0.3 s and 0.2 MB after) appear in the commit message only, with no raw output committed: **not recorded in the repo**, so they are not evidence here; re-measure them with the fetch alone, on the reference host, before citing them. A server that ignores the filter sends everything, and a failure anywhere on the partial path falls back to the whole depth-one fetch, so every server still works (`sentinel-git` `file_at`; test `a_filtering_server_sends_only_the_pipeline_blob`). The bench repository's server has `uploadpack.allowFilter` enabled, as GitHub's does. Pull-request resolution through a merge ref still fetches the whole tree; the same change applies there.
+**Pipeline resolution.** The controller reads the pipeline through a partial clone: the commit and its trees (`--filter=blob:none`), then the pipeline's own blob by its id. What the records show is the phase it sits in: intake → dispatch fell from 4.23 s (median of 10 warm B02 runs) to 0.48 s (median of 4 warm runs after the change). The isolated fetch figures quoted when the change was made (3.6 s and 75 MB before, 0.3 s and 0.2 MB after) appear in the commit message only, with no raw output committed: **not recorded in the repo**, so they are not evidence here; re-measure them with the fetch alone, on the reference host, before citing them. A server that ignores the filter sends everything, and a failure anywhere on the partial path falls back to the whole depth-one fetch, so every server still works (`sentinel-git` `file_at`; test `a_filtering_server_sends_only_the_pipeline_blob`). The bench repository's server has `uploadpack.allowFilter` enabled, as GitHub's does. Pull-request resolution through a merge ref (`file_at_merge`) still fetches the whole tree.
 
 **After** ([`b04-pipeline-fetch.jsonl`](../bench/b04-pipeline-fetch.jsonl), 4 warm samples and a warm-up, same lane, host and caps):
 
@@ -154,9 +152,9 @@ B02's phase record ([`b02-sentinel.jsonl`](../bench/b02-sentinel.jsonl)) is the 
 | Finalize | 2.95 s | 2.77–3.55 s |
 | Everything but the test step (intake to finish, less the step's own time) | 10.9 s (median of 10 warm B02 runs, 10.5–11.4 s) | 7.2 s (median of 4, 7.1–8.0 s) |
 
-The "after" column is four samples, so no tail is claimed; the earlier "~11.4 s" was the top of the "before" range, not its median. The runs carry no build commit or host block (the stamp was added afterwards, see [benchmarking](benchmarking.md)): the commit that added each file is the only attribution.
+The "after" column is four samples, so no tail is claimed. The runs carry no build commit or host block (records carry them since; see [benchmarking](benchmarking.md#record-format-sentinel-bench1)): the commit that added each file is the only attribution.
 
-Sentinel's overhead on this lane is now about 7 s against a healthy self-hosted runner's 11 s, plus its queue (B02). What remains, in order: cache publication in finalize (about 3 s), checkout (about 1.8 s), then dispatch and reporting (about 1.5 s together). **CPU throttling and disk wait were not profiled** (neither the cgroup's throttled time nor I/O pressure was recorded for any phase, in the test step or around it). The argument that the step's time is the same in every executor says the step is not an engine difference; it does not show that throttling or disk wait cost nothing in Sentinel's own phases (checkout, cache publication). That part of B04 is split out as B04a in `TODO.md` and is open.
+Sentinel's overhead on this lane is about 7 s against a healthy self-hosted runner's 11 s, plus its queue (B02). What remains, in order: cache publication in finalize (about 3 s), checkout (about 1.8 s), then dispatch and reporting (about 1.5 s together). **CPU throttling and disk wait were not profiled** (neither the cgroup's throttled time nor I/O pressure was recorded for any phase, in the test step or around it). The argument that the step's time is the same in every executor says the step is not an engine difference; it does not show that throttling or disk wait cost nothing in Sentinel's own phases (checkout, cache publication). That part of B04 is split out as B04a in `TODO.md` and is open.
 
 ## Reproducing
 
