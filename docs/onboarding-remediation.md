@@ -18,9 +18,9 @@ What changed since the onboarding pass: mail is delivered only through the Resen
 | `cargo test-linux` | same | unfixed branch: 1,632 run, 1,630 passed, 2 failed, 21 skipped. Final tree: **1,632 passed, 21 skipped** (0 failed) in 121 s |
 | `pnpm -C web test:unit` | same, pnpm 12.3.4 and Node 22.22.1 from `/srv/sentinel-runs` (user-local, nothing global) | 22 of 22 passed |
 | `pnpm -C web build` | same | passed (Nuxt 4 / Nitro build completes in about a minute; the stall seen on the workstation did not occur) |
-| Web browser test | same, `SENTINEL_BROWSER=/opt/chrome-headless-shell/as-root` | final tree: **229 of 229 checks** (the test passes). Before the CSP fixes: 227 of 229, the two `no script errors` checks |
+| Web browser test | same, `SENTINEL_BROWSER=/opt/chrome-headless-shell/as-root` | final tree (`dccd77e`), five runs in a row: **229 of 229 checks, five passes**. Before the CSP fixes: 227 of 229, the two `no script errors` checks |
 
-Unlike the previous pass, the final `test-cli` and `test-linux` runs are clean full runs of the final tree, started after the sources were touched, and the web unit, build and browser runs are of the same tree. Host load at the start was low (CPU pressure `some avg10` about 1 to 2); an earlier probe saw a load average of 135 from other services' Nuxt builds, and no result here comes from that period except the first, failing, lint run.
+Unlike the previous pass, the final `test-cli` (1,586 passed, 120 s) and `test-linux` (1,632 passed, 112 s) runs are clean full runs of the final tree `dccd77e`, started after the sources were touched, and the web unit, build and the five browser runs are of the same tree (the Rust crates did not change after the first two full runs, which gave the same counts; the final run repeated them anyway). Host load at the start was low (CPU pressure `some avg10` about 1 to 2); an earlier probe saw a load average of 135 from other services' Nuxt builds, and no result here comes from that period except the first, failing, lint run.
 
 ### Fixed in this pass
 
@@ -33,7 +33,15 @@ Unlike the previous pass, the final `test-cli` and `test-linux` runs are clean f
 
 ### Flaky tests
 
-None of them failed in the two clean full runs of the final tree. In isolation on the VPS, five runs each, all passed: `sentinel-link::tailcat back_off_resets_after_a_healthy_helper_and_never_delays_a_new_list` (7.5 s each), `sentinel-store::bounds a_stalled_write_is_reported_as_ambiguous_not_as_failed` (11.4 s) and `sentinel-store::local_auth credential_free_floods_cannot_grow_the_audit_trail_without_bound` (6 s). The browser test's `role changes during open sessions` passed in all five browser runs of this pass (it timed out once in three runs on the onboarding tree, under heavier host load). No race was reproduced, so nothing was changed in code or tests; all four are timing-bound by design and stay on the watch list for a contended host. Nothing was weakened or deleted.
+None of them failed in the two clean full runs of the final tree. In isolation on the VPS, five runs each, all passed: `sentinel-link::tailcat back_off_resets_after_a_healthy_helper_and_never_delays_a_new_list` (7.5 s each), `sentinel-store::bounds a_stalled_write_is_reported_as_ambiguous_not_as_failed` (11.4 s) and `sentinel-store::local_auth credential_free_floods_cannot_grow_the_audit_trail_without_bound` (6 s). The three Rust tests did not reproduce a failure, so nothing was changed in them; they are timing-bound by design and stay on the watch list for a contended host.
+
+The browser test's `role changes during open sessions` was a real test race, found when the CSP fix made the flake reproducible (it failed once in six runs before, then in every run after the first fix below). Three causes, each fixed in `web/test` (no assertion weakened):
+
+- `Page.goto` returned when the document loaded, before Vue had taken a Nuxt page over, so a form filled and submitted in that gap was submitted natively (a reload, nothing signed in: "timed out waiting for signed in"). `goto` now waits for `useNuxtApp().isHydrating` to end on a Nuxt page.
+- With that fixed, the scenario waited for `main table tbody tr` to have exactly four rows across all tables. The run page's cache table fills after hydration and adds two rows, so the wait only held while the page was still the server render. It now counts the jobs table's rows only. A timed-out navigation also reports the rows and alerts the page showed, which is how this was found.
+- Two rarer hangs showed up in the repeat runs. Once in nine runs `log: End reaches the end` failed because the log list re-measures its rows just after a sample said "at the bottom"; the test now needs three consecutive samples at rest. And once the browser exited while answering `Browser.close`, whose reply never came, so the driver waited for ever after all 229 checks had passed (the stuck process was killed by PID); the close now gives up after two seconds and kills the browser.
+
+Nothing was weakened or deleted.
 
 ### Still pending
 
