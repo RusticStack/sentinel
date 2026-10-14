@@ -77,7 +77,10 @@ export async function launch({ browser = findBrowser(), headless = true } = {}) 
       return page;
     },
     async close() {
-      try { await cdp.send("Browser.close"); } catch (e) { /* gone */ }
+      // A browser that exits as it answers never replies, and the promise
+      // would wait for ever (seen once in nine runs, after every check had
+      // passed): give it two seconds, then kill it below.
+      try { await Promise.race([cdp.send("Browser.close"), sleep(2000)]); } catch (e) { /* gone */ }
       ws.close();
       await sleep(300);
       try { child.kill(); } catch (e) { /* gone */ }
