@@ -1,19 +1,3 @@
-//! Sign-up by email, email verification and email invitations over the API.
-//!
-//! Public routes (`register`, `email/verify`, `email/resend`) take only a JSON
-//! body with the deployment's own `Origin`, draw on an admission budget before
-//! anything is read or hashed, and answer the **same** for a new address, an
-//! address that is already registered and one that is unknown: whether an
-//! address has an account is never an answer. What does differ is deployment
-//! policy (registration closed, an invitation required), which says nothing
-//! about the address.
-//!
-//! Nothing here sends mail. A route that needs a link written writes it to the
-//! durable outbox in the same transaction that mints the token; the mail lane
-//! delivers it. A deployment without Resend answers `"verification": "operator"`
-//! and the operator hands the link over from the host
-//! (`sentinel admin account email-link`).
-
 use sentinel_auth::{secret::Secret, token};
 use sentinel_core::{
     InvitationId, UnixMillis,
@@ -33,9 +17,7 @@ use super::{
 };
 use crate::{State, auth, http::Request, oauth::Budget};
 
-/// Largest body any route here takes: an address, a password, a token.
 const MAX_BODY_BYTES: usize = 8 << 10;
-/// Passwords longer than this are not hashed (the hash costs memory).
 const MAX_PASSWORD_BYTES: usize = sentinel_auth::password::MAX_LEN;
 
 pub(super) fn route(
@@ -62,8 +44,6 @@ pub(super) fn route(
     })
 }
 
-/// How the person is told to expect their link: by mail, or from the
-/// operator. Deployment-wide, so it says nothing about any address.
 fn delivery_mode(state: &State) -> &'static str {
     let delivered =
         state.secret_key.is_some() && state.store.read(email::delivery_enabled).unwrap_or(false);
@@ -83,10 +63,7 @@ fn rate_limited() -> ApiError {
         .with_detail("retry_after_ms", 60_000)
 }
 
-/// What every public JSON route checks before reading its body, as sign-in
-/// does: an `application/json` body (a cross-site form cannot send one without
-/// a preflight this server never grants), this deployment's own `Origin`
-/// when the browser sends one, and an admission slot for the client.
+/// Cross-site forms cannot send application/json without a preflight, which this server never grants.
 fn public_json(state: &State, request: &mut Request, budget: Budget) -> Result<Vec<u8>, ApiError> {
     let json_body = header_value(request, "content-type").is_some_and(|value| {
         value
@@ -119,18 +96,10 @@ struct RegisterBody {
     password: String,
     #[serde(default)]
     display_name: Option<String>,
-    /// An invitation secret (`sntl_…`), when the deployment requires one or
-    /// the person was invited.
     #[serde(default)]
     invitation: Option<String>,
 }
 
-/// `POST /api/v1/register {email, password, display_name?, invitation?}`:
-/// self-service sign-up by email, when the deployment's registration policy
-/// allows it. `202` for every address (new, already registered, or unknown);
-/// `403` when registration is closed, an invitation is required or the
-/// invitation cannot be used. The account is a claim until the mailbox is
-/// proved, and only a verified address signs in.
 fn register(state: &State, request: &mut Request) -> Route {
     let bytes = public_json(state, request, Budget::Signup)?;
     let body: RegisterBody = parse(&bytes)?;
@@ -140,7 +109,6 @@ fn register(state: &State, request: &mut Request) -> Route {
     let address = email::normalize(&body.email).map_err(store_error)?;
     let invitation: Option<Secret> = match body.invitation.as_deref() {
         None | Some("") => None,
-        // A malformed secret is an unusable invitation, as a wrong one is.
         Some(text) => Some(
             token::parse(text)
                 .ok_or_else(|| err(ErrorCode::Forbidden, "the invitation cannot be used"))?,
@@ -166,7 +134,6 @@ fn register(state: &State, request: &mut Request) -> Route {
     )
     .map_err(store_error)?;
     match outcome {
-        // The same answer whether the address is new or already taken.
         Admission::Admitted(_)
         | Admission::Pending(_)
         | Admission::Refused(Refusal::AlreadyRegistered) => accepted(state),
@@ -189,10 +156,6 @@ struct TokenBody {
     token: String,
 }
 
-/// `POST /api/v1/email/verify {token}`: present the link's token. Single-use
-/// and expiring; unknown, spent, expired and "another account verified it
-/// first" are one `invalid_request`. Needs no session: the link is opened
-/// from a mail client.
 fn verify(state: &State, request: &mut Request) -> Route {
     let bytes = public_json(state, request, Budget::Mail)?;
     let body: TokenBody = parse(&bytes)?;
@@ -217,9 +180,6 @@ struct EmailBody {
     email: String,
 }
 
-/// `POST /api/v1/email/resend {email}`: the "I never got it" form. Always
-/// `202`: whether the address has a pending claim, how many links it was
-/// already sent and whether its allowance is spent are not answers.
 fn resend_public(state: &State, request: &mut Request) -> Route {
     let bytes = public_json(state, request, Budget::Mail)?;
     let body: EmailBody = parse(&bytes)?;
@@ -234,12 +194,7 @@ fn resend_public(state: &State, request: &mut Request) -> Route {
     accepted(state)
 }
 
-/// `POST /api/v1/me/email {email}` (browser session): add an address to the
-/// account, or ask to change it. The new address is a claim until its link is
-/// opened, and the old verified one stays until then. Replacing a **verified**
-/// address needs a session that signed in or stepped up recently, since it
-/// changes who can sign in. `202` whether or not another account holds the
-/// address; `429` when this account's resend allowance is spent.
+/// Replacing a verified address needs a recent sign-in or step-up, since it changes who can sign in.
 fn set_email(state: &State, request: &mut Request) -> Route {
     let (_, session, now) = browser_session(state, request, true)?;
     if !crate::oauth::admitted(state, request, Budget::Mail) {
@@ -265,14 +220,10 @@ fn set_email(state: &State, request: &mut Request) -> Route {
         .writer()
         .write(move |tx| email::request(tx, key.as_deref(), user, &address, None, now))
         .map_err(store_error)?;
-    // One answer for a claimed, suppressed or throttled address: nothing here
-    // may reveal whether another account holds it.
+    // One answer for every address state, so nothing reveals whether another account holds it.
     accepted(state)
 }
 
-/// `POST /api/v1/me/email/resend` (browser session): send the link again for
-/// the address the account is proving. `409` when nothing is waiting, `429`
-/// when the allowance is spent.
 fn resend_own(state: &State, request: &mut Request) -> Route {
     let (_, session, now) = browser_session(state, request, true)?;
     if !crate::oauth::admitted(state, request, Budget::Mail) {
@@ -295,12 +246,6 @@ fn resend_own(state: &State, request: &mut Request) -> Route {
     }
 }
 
-/// `POST /api/v1/invitations/accept {token}` (browser session): present an
-/// invitation as the signed-in account. A link-form invitation joins at once.
-/// One addressed to a mailbox needs that mailbox proved: `200 joined` when
-/// the account already holds the address verified, otherwise `202
-/// verification_sent` and the join happens when its link is opened. Unknown,
-/// expired, spent, revoked or addressed elsewhere is one `not_found`.
 fn accept(state: &State, request: &mut Request) -> Route {
     let (_, session, now) = browser_session(state, request, true)?;
     if !crate::oauth::admitted(state, request, Budget::Mail) {
@@ -366,20 +311,14 @@ const fn role_name(role: Role) -> &'static str {
 #[serde(deny_unknown_fields)]
 struct InviteBody {
     email: String,
-    /// Defaults to `reader`, the lowest role.
     #[serde(default)]
     role: Option<String>,
-    /// Defaults to seven days; at most thirty.
     #[serde(default)]
     expires_in_secs: Option<u64>,
-    /// Required (1..=100 characters) with fresh step-up when the caller
-    /// reaches the organization by platform scope alone.
     #[serde(default)]
     reason: Option<String>,
 }
 
-/// Optional body of the invitation revocation: only the platform-override
-/// `reason`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RevokeBody {
@@ -387,13 +326,6 @@ struct RevokeBody {
     reason: Option<String>,
 }
 
-/// `POST /api/v1/tenants/{slug}/invitations {email, role?, expires_in_secs?}`
-/// (tenant admin): invite a person by email to an **app-created**
-/// organization. The invitation joins them with `role` (default `reader`)
-/// once their mailbox is proved. A GitHub-backed organization is refused:
-/// its members come from GitHub. With mail delivery the message is queued
-/// (`"delivery": "email"`); without it the response carries the one-time
-/// `token` for the inviter to pass on (`"delivery": "link"`).
 fn invite(state: &State, request: &mut Request, slug: &str) -> Route {
     let who = tenant_admin(state, request, true)?;
     let body: InviteBody = parse(&super::body_limit(request, MAX_BODY_BYTES)?)?;
@@ -420,9 +352,6 @@ fn invite(state: &State, request: &mut Request, slug: &str) -> Route {
         .writer()
         .write(move |tx| {
             let tenant = authz::member_tenant_by_slug(tx, principal, &slug)?;
-            // A platform administrator who is not an administrator-member
-            // needs fresh step-up and an audited reason, as for any other
-            // access-granting change.
             authority.require_tenant_access_change(tx, tenant, false, reason.as_deref())?;
             registration::invite_by_email(
                 tx,
@@ -458,8 +387,6 @@ fn invite(state: &State, request: &mut Request, slug: &str) -> Route {
     Ok(Reply::Json(201, value, Vec::new()))
 }
 
-/// `GET /api/v1/tenants/{slug}/invitations` (tenant admin): the tenant's
-/// invitations, newest first. Metadata only: never a secret.
 fn list_invitations(state: &State, request: &Request, slug: &str) -> Route {
     let who = tenant_admin(state, request, false)?;
     let (slug, authority, principal) = (slug.to_owned(), who.authority(), who.principal);
@@ -485,8 +412,6 @@ fn list_invitations(state: &State, request: &Request, slug: &str) -> Route {
     }))
 }
 
-/// `DELETE /api/v1/tenants/{slug}/invitations/{id}` (tenant admin): revoke an
-/// unspent invitation of this tenant. Another tenant's is `not_found`.
 fn revoke_invitation(state: &State, request: &mut Request, slug: &str, invitation: &str) -> Route {
     let who = tenant_admin(state, request, true)?;
     let invitation: InvitationId = id(invitation, "invitation")?;
