@@ -156,7 +156,9 @@ pub struct Stats {
     pub placement_errors: AtomicU64,
     /// Expiry, queue-timeout, offer-lapse and revocation sweeps the store
     /// failed, counted and logged the same way. A sweep that found its row
-    /// already moved (renewed, acknowledged, released) is not a failure.
+    /// already moved (renewed, acknowledged, released) is not a failure. A
+    /// worker acknowledgement or report the store refused transiently counts
+    /// here too (stage `worker_message`), then waits for retry.
     pub sweep_errors: AtomicU64,
     /// Prefetch hints sent (protocol 9, K05): one per session whose wanted
     /// set changed.
@@ -260,8 +262,10 @@ struct Peer {
     /// rest of the fleet can hold are read from here, never from the store.
     cpu_millis: i64,
     memory_bytes: i64,
-    /// The scratch disk its protocol-7 profile reported; 0 until then (or
-    /// for protocol 6), which is not a disk constraint.
+    /// The scratch disk its protocol-7 profile reported; 0 until then, and
+    /// 0 stays "none offered" for a profile-protocol worker. A worker older
+    /// than the profile protocol cannot report disk and has no constraint
+    /// ([`Peer::size`]).
     disk_bytes: AtomicI64,
     /// The measured load its protocol-7 profile reported: CPU busy
     /// nanoseconds over the worker's sampling window, across all cores; 0
@@ -577,15 +581,18 @@ fn other_than(top: (i64, usize, i64), index: usize) -> i64 {
 }
 
 impl Peer {
-    /// What this worker holds, as the sweep compares it: a worker that never
-    /// reported disk has no disk constraint.
+    /// What this worker holds, as the sweep compares it: a worker too old to
+    /// report disk has no disk constraint, while a profile-protocol worker's
+    /// zero is a limit of zero (the store's `disk_reported` rule), so it is
+    /// never the room a disk-hungry job could wait for.
     fn size(&self) -> dispatch::Capacity {
         dispatch::Capacity {
             cpu_millis: self.cpu_millis,
             memory_bytes: self.memory_bytes,
-            disk_bytes: match self.disk_bytes.load(Ordering::Relaxed) {
-                0 => i64::MAX,
-                disk => disk,
+            disk_bytes: if self.protocol >= PROFILE_MIN.0 {
+                self.disk_bytes.load(Ordering::Relaxed)
+            } else {
+                i64::MAX
             },
         }
     }
@@ -1509,7 +1516,19 @@ impl Inner {
             .unwrap_or_else(|p| p.into_inner())
             .holds(attempt);
         if queued {
-            self.defer(message);
+            // A worker sends its verdict again until the controller counts
+            // the attempt as released: while one is waiting, a copy adds
+            // nothing, and is not queued.
+            let copy = matches!(message.what, Deferred::Report { .. })
+                && self
+                    .deferred
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .awaiting_reports()
+                    .contains(&attempt);
+            if !copy {
+                self.defer(message);
+            }
             return;
         }
         match self.apply(&message) {
@@ -1518,7 +1537,7 @@ impl Inner {
                 self.failed(false, "worker_message", &e);
                 self.defer(message);
             }
-            Err(_) => self.stale(&message.what),
+            Err(_) => self.stale(&message, false),
         }
     }
 
@@ -1570,10 +1589,18 @@ impl Inner {
     }
 
     /// A message the store refused as stale: stale reports are counted, a
-    /// stale acknowledgement changes nothing.
-    fn stale(&self, what: &Deferred) {
-        if matches!(what, Deferred::Report { .. }) {
+    /// stale acknowledgement changes nothing. `retried` says the message had
+    /// failed transiently before: a write of unknown outcome may have
+    /// committed then, so its report owes the release and wake it would have
+    /// done (both idempotent). A first-try stale report owes nothing, and
+    /// must not touch the log state of an attempt it does not own.
+    fn stale(&self, m: &DeferredMessage, retried: bool) {
+        if matches!(m.what, Deferred::Report { .. }) {
             self.stats.stale_reports.fetch_add(1, Ordering::Relaxed);
+            if retried {
+                self.released(m.worker, m.attempt);
+                self.wake();
+            }
         }
     }
 
@@ -1618,7 +1645,7 @@ impl Inner {
                     self.failed(false, "worker_message", &e);
                     return;
                 }
-                Err(_) => self.stale(&message.what),
+                Err(_) => self.stale(&message, true),
                 Ok(()) => {}
             }
             self.deferred
@@ -2215,8 +2242,13 @@ impl SessionHandler for Inner {
     /// Protocol 7. Records the profile and, in the same transaction, the
     /// capacity with the disk the profile carries — the hello's own capacity
     /// write was deferred for exactly this one, so placement never sees a
-    /// disk of zero for a worker that reports one. Values the worker did not
-    /// measure (zero on the wire) are reported absent, so a column keeps its
+    /// disk of zero for a worker that reports one. The labels, the warm
+    /// images and the disk are the worker's whole statement for this
+    /// session and replace the stored ones: an empty label set or image list
+    /// is a fact (none), and a disk of zero is a platform that could not
+    /// measure, which no job declaring scratch disk is placed on. Only the
+    /// values that are a measurement of a moment (host, cache bytes, load)
+    /// are reported absent when zero on the wire, so a column keeps its
     /// last known value instead of being overwritten with a zero claim.
     fn profiled(&self, worker: WorkerId, profile: &Profile, capacity: Capacity) -> Result<()> {
         let capacity = dispatch::Capacity {

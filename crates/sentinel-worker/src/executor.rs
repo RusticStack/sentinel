@@ -169,6 +169,12 @@ const LEASE: Duration = Duration::from_millis(sentinel_protocol::limits::LEASE_M
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a spec request goes unanswered before it is asked again.
 pub const SPEC_RETRY: Duration = Duration::from_secs(10);
+/// A terminal report the controller has not confirmed (by no longer counting
+/// the attempt as held) is sent again after this long, and every this often.
+const REPORT_RESEND: Duration = Duration::from_secs(5);
+/// A terminal report is kept until the controller confirms it for at most
+/// this long; the controller's lease has settled the attempt by then.
+const REPORT_KEEP: Duration = Duration::from_secs(600);
 /// How long an acknowledged attempt waits for its spec before it is handed
 /// back to the controller unstarted.
 pub const SPEC_DEADLINE: Duration = Duration::from_secs(60);
@@ -383,8 +389,23 @@ mod secret_delivery_tests {
     }
 }
 
+/// A terminal verdict that was handed to the link. The link answers nothing,
+/// so the only confirmation is the controller no longer counting the attempt
+/// as held (its heartbeat answer names the attempt in `stop`). Until then the
+/// attempt stays in the heartbeat's held list, which keeps its lease renewed
+/// while the controller's store is slow, and the verdict is sent again.
+struct Unconfirmed {
+    fence: Fence,
+    event: Event,
+    summary: Option<Vec<u8>>,
+    first: Instant,
+    sent: Instant,
+}
+
 struct State {
     reporter: Option<Reporter>,
+    /// Terminal verdicts sent and not yet confirmed, by attempt.
+    unconfirmed: HashMap<AttemptId, Unconfirmed>,
     /// Offers taken and waiting for their spec.
     awaiting: HashMap<AttemptId, Awaiting>,
     live: HashMap<AttemptId, Live>,
@@ -680,6 +701,7 @@ impl Executor {
             spool,
             state: Mutex::new(State {
                 reporter: None,
+                unconfirmed: HashMap::new(),
                 awaiting: HashMap::new(),
                 live: HashMap::new(),
                 pending: Vec::new(),
@@ -1317,8 +1339,50 @@ impl Inner {
             (Some(reporter), None) => reporter.report(attempt, fence, event).is_ok(),
             (None, _) => false,
         };
+        if matches!(event, Event::Passed | Event::Failed(_)) {
+            let now = Instant::now();
+            state.unconfirmed.insert(
+                attempt,
+                Unconfirmed {
+                    fence,
+                    event,
+                    summary: summary.clone(),
+                    first: now,
+                    sent: now,
+                },
+            );
+        }
         if !sent {
             state.pending.push((attempt, fence, event, summary));
+        }
+    }
+
+    /// Send again the terminal verdicts the controller has not confirmed for
+    /// [`REPORT_RESEND`]; forget those kept for [`REPORT_KEEP`]. A duplicate
+    /// of an applied verdict is stale at the controller and changes nothing.
+    fn resend_unconfirmed(&self) {
+        let (reporter, due) = {
+            let mut state = self.state();
+            state
+                .unconfirmed
+                .retain(|_, u| u.first.elapsed() < REPORT_KEEP);
+            let Some(reporter) = state.reporter.clone() else {
+                return;
+            };
+            let mut due = Vec::new();
+            for (attempt, u) in state.unconfirmed.iter_mut() {
+                if u.sent.elapsed() >= REPORT_RESEND {
+                    u.sent = Instant::now();
+                    due.push((*attempt, u.fence, u.event, u.summary.clone()));
+                }
+            }
+            (reporter, due)
+        };
+        for (attempt, fence, event, summary) in due {
+            let _ = match summary {
+                Some(bytes) => reporter.finish(attempt, fence, event, bytes),
+                None => reporter.report(attempt, fence, event),
+            };
         }
     }
 
@@ -1622,14 +1686,22 @@ impl LinkExecutor for Executor {
     }
 
     fn stop(&self, attempt: AttemptId) {
-        let live = {
+        let (live, confirmed_only) = {
             let mut state = self.state();
-            state.awaiting.remove(&attempt);
-            state
+            let confirmed = state.unconfirmed.remove(&attempt).is_some();
+            let waiting = state.awaiting.remove(&attempt).is_some();
+            let live = state
                 .live
                 .get(&attempt)
-                .map(|l| (Arc::clone(&l.cancel), l.store.clone()))
+                .map(|l| (Arc::clone(&l.cancel), l.store.clone()));
+            let only = confirmed && !waiting && live.is_none();
+            (live, only)
         };
+        if confirmed_only {
+            // The controller settled a verdict the worker had sent: the
+            // confirmation it waited for, not an attempt being stopped.
+            return;
+        }
         if let Some((cancel, store)) = live {
             cancel.store(true, Ordering::Release);
             // End the container now, off this thread — it is the session's
@@ -1701,6 +1773,7 @@ impl LinkExecutor for Executor {
             .live
             .keys()
             .chain(state.awaiting.keys())
+            .chain(state.unconfirmed.keys())
             .copied()
             .collect()
     }
@@ -1716,6 +1789,9 @@ impl LinkExecutor for Executor {
     /// neither kill live work early nor let it run past its expiry.
     fn renewed_at(&self, _until: UnixMillis, sent: Instant) {
         self.state().lease_deadline = Some(sent + LEASE.saturating_sub(LEASE_GUARD));
+        // Every answered heartbeat is the moment to look again at verdicts
+        // the controller has not confirmed.
+        self.resend_unconfirmed();
     }
 
     fn attached(&self, reporter: Reporter) {

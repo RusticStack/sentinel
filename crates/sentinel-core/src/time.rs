@@ -34,7 +34,11 @@ impl UnixMillis {
     /// call plus the monotonic time elapsed since, so an NTP step or a VM
     /// resume moves it by the time that really passed and no more. It is the
     /// only clock deadline decisions and the timestamps they compare against
-    /// may use; every process of one controller shares it. Never moves back.
+    /// may use. Each process anchors on its own: the controller process is the
+    /// one that decides deadlines, and a short-lived command (the host-local
+    /// `admin cancel`) that stamps rows with the wall clock is off by at most
+    /// the wall-clock step the controller has absorbed since it started.
+    /// Never moves back.
     #[must_use]
     pub fn steady() -> Self {
         static ANCHOR: OnceLock<(i64, Instant)> = OnceLock::new();
