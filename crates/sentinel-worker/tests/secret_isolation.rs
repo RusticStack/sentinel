@@ -397,6 +397,8 @@ fn secret_delivery_holds_its_boundaries_in_rootless_podman() {
             cpu_millis: 1_000,
             memory_bytes: 128 << 20,
             pids: 256,
+            disk_bytes: 0,
+            lifetime_secs: 0,
         },
         ws.path(),
         &[],

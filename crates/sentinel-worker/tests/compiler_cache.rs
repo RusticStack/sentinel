@@ -153,6 +153,8 @@ fn a_compiler_namespace_persists_across_attempts_and_the_tool_decides_staleness(
         cpu_millis: 1_000,
         memory_bytes: 256 << 20,
         pids: podman::DEFAULT_PIDS_LIMIT,
+        disk_bytes: 0,
+        lifetime_secs: 0,
     };
     let run_fakecc = sh("sh /workspace/fakecc.sh /cc-cache src/a.c src/b.c");
 

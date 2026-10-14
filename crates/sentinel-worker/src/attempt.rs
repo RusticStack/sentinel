@@ -674,6 +674,7 @@ fn prepare(
     // attachments, so the slice cannot stay borrowed from `job`.
     let declared = compiled.spec.cache.clone();
     let resources = compiled.spec.resources;
+    let timeout_secs = compiled.timeout_secs;
     let workspace = Workspace::create(root, job.attempt)?;
     let secret_directory = if job.secret_bundle.is_empty() {
         None
@@ -849,6 +850,10 @@ fn prepare(
                 cpu_millis: resources.cpu_millis,
                 memory_bytes: resources.memory_bytes,
                 pids: DEFAULT_PIDS_LIMIT,
+                disk_bytes: resources.disk_bytes,
+                lifetime_secs: timeout_secs
+                    .max(1)
+                    .saturating_add(podman::KEEPALIVE_SLACK_SECS),
             },
             workspace.path(),
             &mounts,

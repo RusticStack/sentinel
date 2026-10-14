@@ -32,6 +32,14 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default process budget per container: enough for any build, small enough
 /// that a fork bomb ends inside its cgroup.
 pub const DEFAULT_PIDS_LIMIT: u32 = 4096;
+/// How long past its steps' budget a container's keepalive outlives them:
+/// room for the secret-clearing passes, artifact capture and the graceful
+/// stop that precede the attempt's own teardown. Past it the keepalive ends
+/// by itself, and with it the container's whole PID namespace.
+pub const KEEPALIVE_SLACK_SECS: u64 = 5 * 60;
+/// The keepalive's bound when the caller names none: the pipeline's longest
+/// allowed job timeout plus [`KEEPALIVE_SLACK_SECS`].
+pub const KEEPALIVE_MAX_SECS: u64 = 24 * 60 * 60 + KEEPALIVE_SLACK_SECS;
 /// Where the workspace is mounted inside every container.
 pub const WORKSPACE_MOUNT: &str = "/workspace";
 pub const LABEL_WORKER: &str = "io.sentinel.worker";
@@ -444,7 +452,34 @@ pub struct Limits {
     pub cpu_millis: u32,
     pub memory_bytes: u64,
     pub pids: u32,
+    /// The job's declared scratch disk. Podman cannot meter a bind mount's
+    /// total, so it bounds what it can: no single file a step writes may
+    /// exceed it (`--ulimit fsize`). The total is the worker's admission
+    /// check. `0` sets no file-size limit.
+    pub disk_bytes: u64,
+    /// How long the container may live — the job's timeout plus
+    /// [`KEEPALIVE_SLACK_SECS`] — after which its keepalive exits and the
+    /// kernel takes every process in the container with it, so a worker
+    /// that died without tearing the attempt down leaves nothing running
+    /// past its budget. `0` means [`KEEPALIVE_MAX_SECS`].
+    pub lifetime_secs: u64,
 }
+
+impl Limits {
+    /// The keepalive's bound in seconds.
+    fn keepalive_secs(&self) -> u64 {
+        match self.lifetime_secs {
+            0 => KEEPALIVE_MAX_SECS,
+            secs => secs,
+        }
+    }
+}
+
+/// The container's main process: counts `n` seconds down (argument one) and
+/// exits, or exits at once on `TERM`/`INT`. A bounded loop in POSIX `sh`
+/// rather than `podman create --timeout`, which not every Podman supports.
+const KEEPALIVE: &str =
+    "trap 'exit 0' TERM INT; n=$1; while [ \"$n\" -gt 0 ]; do sleep 1; n=$((n-1)); done";
 
 /// One extra writable bind mount: `host` appears at `container`. Cache
 /// entries that declare an absolute path use it (K02) — the workspace
@@ -600,16 +635,27 @@ pub fn terminate_named(name: &str, store: &Store, grace: Duration) -> Result<Ter
         remove_named(name, store)?;
         return Ok(Terminated::Forced);
     };
+    // Frozen while listing and signalling, so no listed process can exit and
+    // have its pid reused by an unrelated process before the signal lands.
+    // The signal stays pending on a frozen task and is delivered at the
+    // thaw, which happens before the grace wait (a frozen task would never
+    // handle it). Where the freezer cannot be used the signal goes out
+    // unfrozen, to a pid that may just have exited.
+    let frozen = freeze(&cgroup, true, Instant::now() + CLEAR_TIMEOUT);
     let pids = step_pids(&cgroup, init);
-    if pids.is_empty() {
-        return Ok(Terminated::Gone);
-    }
     for pid in &pids {
-        // SAFETY: a plain signal to a pid we just read from the container's
-        // own cgroup; a pid that exited meanwhile makes kill fail harmlessly.
+        // SAFETY: a plain signal to a pid read from the container's own
+        // cgroup while it is frozen, so it cannot have exited and been
+        // reused; unfrozen, a pid that exited meanwhile makes kill fail.
         unsafe {
             libc::kill(*pid, libc::SIGTERM);
         }
+    }
+    if frozen {
+        freeze(&cgroup, false, Instant::now() + CLEAR_TIMEOUT);
+    }
+    if pids.is_empty() {
+        return Ok(Terminated::Gone);
     }
     let deadline_at = Instant::now() + grace;
     while Instant::now() < deadline_at {
@@ -708,6 +754,11 @@ impl Container {
                 // can raise it back.
                 "--ulimit",
                 "core=0:0",
+                // The container's own main process is the keepalive, whatever
+                // the image's ENTRYPOINT says: left alone, an image
+                // entrypoint would take the keepalive for its arguments.
+                "--entrypoint",
+                "/bin/sh",
                 "--workdir",
                 WORKSPACE_MOUNT,
                 "--pull",
@@ -715,6 +766,10 @@ impl Container {
             ])
             .arg("--volume")
             .arg(format!("{}:{WORKSPACE_MOUNT}", workspace.display()));
+        if limits.disk_bytes > 0 {
+            cmd.arg("--ulimit")
+                .arg(format!("fsize={0}:{0}", limits.disk_bytes));
+        }
         for mount in mounts {
             cmd.arg("--volume").arg(format!(
                 "{}:{}:{}",
@@ -723,11 +778,10 @@ impl Container {
                 if mount.read_only { "ro" } else { "rw" }
             ));
         }
-        cmd.arg("--").arg(image).args([
-            "/bin/sh",
-            "-c",
-            "trap 'exit 0' TERM INT; while :; do sleep 1; done",
-        ]);
+        cmd.arg("--")
+            .arg(image)
+            .args(["-c", KEEPALIVE, "sentinel-keepalive"])
+            .arg(limits.keepalive_secs().to_string());
         let created = process::run(cmd, deadline(CONTAINER_START_TIMEOUT), "podman create")?;
         if !created.success() {
             return Err(Error::Preparation(format!(

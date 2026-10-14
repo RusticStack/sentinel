@@ -779,6 +779,8 @@ jobs:
             cpu_millis: 500,
             memory_bytes: 128 << 20,
             pids: 64,
+            disk_bytes: 0,
+            lifetime_secs: 0,
         },
         ws.path(),
         &[],
