@@ -55,7 +55,6 @@ identifier!(RunId, "run");
 identifier!(JobId, "job");
 identifier!(AttemptId, "att");
 
-/// Only attach IDs that actually exist. A new process does not imply a run/job.
 #[derive(Clone, Copy, Debug)]
 pub struct Correlation {
     pub process_id: ProcessId,

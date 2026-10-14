@@ -1,14 +1,5 @@
-//! Credential storage for profiles: Windows Credential Manager or an
-//! owner-only file under the configuration directory, chosen by platform or
-//! `SENTINEL_CREDENTIAL_STORE=file|os`.
-//!
-//! A stored credential is one opaque blob per profile (the JSON
-//! [`crate::profile::Credentials`]). The OS stores key it by the key the
-//! profile recorded at sign-in ([`scoped_key`],
-//! `sentinel:{issuer}:{profile}:{directory digest}`; profiles from before
-//! that use [`key`]); the file store by profile name,
-//! `credentials/<profile>.json`. Only the backend a profile recorded at
-//! sign-in is ever read, so a profile never silently changes stores.
+//! Only the backend a profile recorded at sign-in is ever read, so a profile never
+//! silently changes stores.
 
 use std::path::Path;
 
@@ -20,14 +11,10 @@ pub mod file;
 #[cfg(windows)]
 pub mod windows;
 
-/// Where a profile's credential lives. Recorded in `profiles.json` as
-/// `"os"` or `"file"`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
-    /// Windows Credential Manager.
     Os,
-    /// `credentials/<profile>.json`, owner-only.
     File,
 }
 
@@ -40,12 +27,8 @@ impl Backend {
     }
 }
 
-/// Whether this build has an OS credential store: Windows only; other
-/// platforms use the file store.
 pub const OS_AVAILABLE: bool = cfg!(windows);
 
-/// The backend for a new sign-in: `SENTINEL_CREDENTIAL_STORE` when set,
-/// otherwise the OS store where one exists and the file store elsewhere.
 pub fn preferred() -> Result<Backend, Error> {
     match std::env::var("SENTINEL_CREDENTIAL_STORE") {
         Ok(v) if v == "file" => Ok(Backend::File),
@@ -61,26 +44,17 @@ pub fn preferred() -> Result<Backend, Error> {
     }
 }
 
-/// The OS-store key of a profile signed in before keys named their
-/// configuration directory. The OS store is per user, so two configuration
-/// directories share this key; profiles that recorded no key keep using it.
 pub fn key(issuer: &str, profile: &str) -> String {
     format!("sentinel:{issuer}:{profile}")
 }
 
-/// The OS-store key for a new sign-in: the legacy key plus 16 hex digits of
-/// BLAKE3 over the configuration directory's canonical path. Two
-/// configuration directories (a CI runner's, a project's, a test's) then
-/// hold independent credentials, matching their independent refresh locks
-/// (`locks/<profile>.lock` lives in the directory). The key is recorded in
-/// the profile at sign-in, so later spellings of the path do not matter.
+// The path digest keeps each config directory's credential separate, matching its refresh lock.
 pub fn scoped_key(dir: &Path, issuer: &str, profile: &str) -> String {
     let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let digest = blake3::hash(canonical.as_os_str().as_encoded_bytes()).to_hex();
     format!("sentinel:{issuer}:{profile}:{}", &digest[..16])
 }
 
-/// Read a profile's credential blob; `Ok(None)` when none is stored.
 pub fn read(
     backend: Backend,
     dir: &Path,
@@ -93,7 +67,6 @@ pub fn read(
     }
 }
 
-/// Store (replace) a profile's credential blob.
 pub fn write(
     backend: Backend,
     dir: &Path,
@@ -107,7 +80,6 @@ pub fn write(
     }
 }
 
-/// Remove a profile's credential; absent is success.
 pub fn delete(backend: Backend, dir: &Path, os_key: &str, profile: &str) -> Result<(), Error> {
     match backend {
         Backend::File => file::delete(dir, profile),
@@ -121,7 +93,6 @@ fn os_error(what: &str, error: &std::io::Error) -> Error {
     ))
 }
 
-/// The platform's OS store, or an `Unsupported` error where there is none.
 mod os {
     #[cfg(not(windows))]
     use std::io;

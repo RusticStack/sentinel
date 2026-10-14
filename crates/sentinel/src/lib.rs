@@ -1,11 +1,5 @@
-//! Shared command options, the portable API client and its commands, and
-//! Linux runtime foundations. These are internal development APIs, not a
-//! stable plugin/SDK contract.
-
 use clap::ValueEnum;
 
-/// `print!` to standard output through [`client::stdout_fmt`]: a closed
-/// pipe ends the command quietly with exit 0 instead of a panic.
 #[macro_export]
 macro_rules! out {
     ($($arg:tt)*) => {
@@ -13,7 +7,6 @@ macro_rules! out {
     };
 }
 
-/// `println!` to standard output through [`client::stdout_fmt`].
 #[macro_export]
 macro_rules! outln {
     () => {

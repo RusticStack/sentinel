@@ -1,11 +1,5 @@
-//! Protected-input secret commands. Values are held only long enough to send
-//! the request; output and every error contain metadata or fixed diagnostics.
-//!
-//! Writes are retry-safe across invocations: every write carries one
-//! idempotency key (`--idempotency-key`, or a generated one), and a write
-//! whose outcome is unknown (exit 6) reports that key and the expected
-//! version it was sent with, so rerunning with both replays the first
-//! result instead of rotating again.
+//! Writes carry an idempotency key and the expected version; on exit 6 both are
+//! reported, so a rerun replays the first result instead of rotating again.
 
 use std::{
     collections::HashMap,
@@ -183,9 +177,6 @@ fn validate_name(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// The store's rule for repository names: 1–128 bytes, no control
-/// characters. Anything else (`/` included, as in `RusticStack/app`) is
-/// percent-encoded into the query rather than refused.
 fn validate_repo(repo: &str) -> Result<(), Error> {
     if repo.is_empty() || repo.len() > MAX_REPO_NAME || repo.chars().any(char::is_control) {
         return Err(Error::usage(
@@ -204,7 +195,6 @@ fn scope_path(client: &Client, scope: &SecretScopeArgs) -> Result<(String, Optio
     Ok((path, scope.repo.clone()))
 }
 
-/// `path?k=v&…`, every value form-encoded; `None` values are skipped.
 fn with_query(path: &str, pairs: &[(&str, Option<&str>)]) -> String {
     let mut query = form_urlencoded::Serializer::new(String::new());
     for (key, value) in pairs {
@@ -224,8 +214,6 @@ fn secret_path(base: &str, name: &str, repo: Option<&str>) -> String {
     with_query(&format!("{base}/{name}"), &[("repo", repo)])
 }
 
-/// Every metadata record in the scope, in name order; stops early once a
-/// page passes `until` (the greatest name the caller needs).
 fn all_metadata(
     client: &Client,
     scope: &SecretScopeArgs,
@@ -295,9 +283,6 @@ fn describe(
     Ok(())
 }
 
-/// A write that may or may not have been applied (exit 6) names the exact
-/// retry that replays it: the same idempotency key and expected version(s).
-/// Nothing here contains a value.
 fn retry_hint(mut error: Error, key: &str, expected: (&str, &str)) -> Error {
     if error.exit != Exit::Busy {
         return error;
@@ -406,7 +391,6 @@ struct Import<'a> {
     idempotency: Option<&'a str>,
 }
 
-/// `NAME=V,…` as `--if-versions` takes it: every parsed name exactly once.
 fn parse_pin(text: &str, names: &[&str]) -> Result<Vec<u64>, Error> {
     let invalid = || Error::usage("--if-versions must list every imported NAME=version once");
     let mut pinned: HashMap<&str, u64> = HashMap::with_capacity(names.len());
@@ -518,8 +502,6 @@ fn pin_text<'a>(pairs: impl Iterator<Item = (&'a str, u64)>) -> String {
     out
 }
 
-/// Names, expected versions and literal hints only, plus the exact
-/// `--if-versions` pin that binds a later import to what was previewed.
 fn preview(output: Output, entries: &[(&str, u64, bool, bool, bool)]) -> Result<(), Error> {
     let pin = pin_text(entries.iter().map(|entry| (entry.0, entry.1)));
     let items: Vec<Value> = entries
@@ -817,8 +799,6 @@ fn read_input(file: Option<&Path>, stdin_flag: bool) -> Result<Vec<u8>, Error> {
     }
 }
 
-/// Redirected stdin, byte for byte (a trailing newline is part of the
-/// value), bounded.
 fn read_stdin(input: impl io::Read) -> Result<Vec<u8>, Error> {
     bounded::read(input, sentinel_protocol::secrets::MAX_SECRET_BYTES as u64)
         .map_err(|_| Error::usage("secret stdin must be at most 65536 bytes"))
@@ -848,10 +828,6 @@ fn read_protected_file(path: &Path, limit: usize) -> Result<Vec<u8>, Error> {
 const PROMPT_MULTILINE: &str =
     "the hidden prompt accepts one line; use --file or --stdin for multi-line values";
 
-/// The hidden prompt's line editor, fed raw terminal input. It never
-/// truncates: a value longer than the limit, a paste with more than one
-/// line, Ctrl+C and Ctrl+D on an empty line are refusals. The
-/// buffer is wiped when dropped.
 struct PromptLine {
     bytes: WipeBytes,
     limit: usize,
@@ -865,9 +841,6 @@ impl PromptLine {
         }
     }
 
-    /// Feed one chunk. `Ok(true)` when the line ended in this chunk;
-    /// anything after the terminator (other than the `\n` of a CRLF) is
-    /// another line and refused.
     fn feed(&mut self, chunk: &[u8]) -> Result<bool, Error> {
         for (index, &byte) in chunk.iter().enumerate() {
             match byte {
@@ -888,7 +861,6 @@ impl PromptLine {
                     return Err(Error::usage("secret value is empty"));
                 }
                 0x7f | 0x08 => {
-                    // Remove one whole UTF-8 character.
                     while let Some(last) = self.bytes.0.pop() {
                         if last & 0xC0 != 0x80 {
                             break;
@@ -923,10 +895,7 @@ fn prompt() -> Result<(), Error> {
         .map_err(|_| Error::remote("cannot write secret prompt"))
 }
 
-/// Unix: raw input (no echo, no canonical line limit, no signal keys, so
-/// Ctrl+C reaches the editor and the terminal state is always restored);
-/// any input still pending after the line is a paste of more lines and is
-/// refused. `TCSAFLUSH` on restore discards it, so none reaches the shell.
+// TCSAFLUSH on restore discards pasted input so no extra line reaches the shell.
 #[cfg(unix)]
 fn read_hidden() -> Result<Vec<u8>, Error> {
     use std::os::fd::AsRawFd;
@@ -1001,11 +970,6 @@ fn read_hidden() -> Result<Vec<u8>, Error> {
     line.finish()
 }
 
-/// Windows: the console in raw mode (no echo, no line editing, Ctrl+C as a
-/// character), read with `ReadConsoleW`. After the line, any pending key
-/// press is the rest of a paste: it is refused, and the input buffer is
-/// flushed on every path so no pasted line reaches the shell or its
-/// history.
 #[cfg(windows)]
 fn read_hidden() -> Result<Vec<u8>, Error> {
     use windows_sys::Win32::{
@@ -1079,7 +1043,6 @@ fn read_hidden() -> Result<Vec<u8>, Error> {
         let mut pending: Vec<u16> = carry.take().into_iter().collect();
         pending.extend_from_slice(&units[..read as usize]);
         units.fill(0);
-        // A high surrogate at the end waits for its pair in the next read.
         if pending.last().is_some_and(|u| (0xD800..0xDC00).contains(u)) {
             carry = pending.pop();
         }
@@ -1172,10 +1135,6 @@ mod tests {
         assert!(read_stdin(&big[..]).is_err());
     }
 
-    /// The prompt strips one terminator (LF, CR or CRLF), edits
-    /// with backspace, and refuses instead of truncating: more than the
-    /// limit, a second pasted line, Ctrl+C, and Ctrl+D or Enter on an
-    /// empty line.
     #[test]
     fn the_prompt_line_never_truncates_and_refuses_pastes() {
         let line = |chunks: &[&[u8]], limit: usize| {
@@ -1275,8 +1234,6 @@ mod tests {
         }
     }
 
-    /// A file that inherits a broader ACL (the temp directory's
-    /// Administrators and others) is refused with the `icacls` fix.
     #[cfg(windows)]
     #[test]
     fn a_permissive_windows_file_is_refused_with_the_icacls_fix() {

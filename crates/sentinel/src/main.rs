@@ -37,8 +37,6 @@ fn run_admin(args: cli::AdminArgs) -> ExitCode {
     }
 }
 
-/// A worker host has no metadata store; only its Tailcat identity is
-/// administered there.
 #[cfg(all(target_os = "linux", feature = "worker", not(feature = "server")))]
 fn run_admin(args: cli::AdminArgs) -> ExitCode {
     let cli::AdminCommand::Tailcat(args) = args.command else {
@@ -64,8 +62,6 @@ fn run_admin(_args: cli::AdminArgs) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// A client command's outcome as the process exit: the failure is reported
-/// on stderr in the command's output mode, and its exit code is returned.
 fn finish(outcome: Result<(), client::Error>) -> ExitCode {
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
@@ -76,10 +72,7 @@ fn finish(outcome: Result<(), client::Error>) -> ExitCode {
     }
 }
 
-/// Parse arguments. For `sentinel secret`, a parse error that would quote
-/// an offending argument (a value typed where none is accepted, as in
-/// `secret set TOKEN hunter2` or `--value=hunter2`) is replaced by a fixed
-/// message, so the stray value is not copied into captured stderr.
+// Clap would echo the offending argument; a secret value must not reach captured stderr.
 fn parse() -> Result<Cli, ExitCode> {
     use clap::error::ErrorKind;
     let error = match Cli::try_parse() {
