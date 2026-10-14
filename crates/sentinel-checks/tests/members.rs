@@ -518,9 +518,10 @@ fn a_verified_member_joins_with_the_role_and_repository_permission_github_report
         requests.contains("/repos/acme/app/collaborators/alice-gh/permission"),
         "{requests}"
     );
-    // The token asks for organization members (read) and nothing wider.
+    // The token asks for organization members (read) plus the metadata read the
+    // collaborator-permission endpoint needs, and nothing wider.
     assert!(
-        requests.contains(r#"{"permissions":{"members":"read"}}"#),
+        requests.contains(r#"{"permissions":{"members":"read","metadata":"read"}}"#),
         "{requests}"
     );
 }

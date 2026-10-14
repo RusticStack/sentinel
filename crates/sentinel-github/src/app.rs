@@ -328,7 +328,10 @@ impl App {
     }
 
     /// An installation-wide token for reading organization membership:
-    /// `members: read` and nothing else. A different permission set is a
+    /// `members: read` plus `metadata: read` and nothing else. Metadata is
+    /// requested explicitly because `GET /repos/{o}/{r}/collaborators/{login}/permission`
+    /// needs repository Metadata read, which an organization-only token does
+    /// not carry; it grants no content, checks or write access. A different permission set is a
     /// different token, so an installation whose App was never granted the
     /// permission fails here (and only here), never in the source or Checks
     /// paths. Minted only for an installation a fresh snapshot proved usable.
@@ -342,9 +345,9 @@ impl App {
                 self.endpoint, installation.id
             ),
             &self.jwt(now_ms)?,
-            &json!({"permissions":{"members":"read"}}),
+            &json!({"permissions":{"members":"read","metadata":"read"}}),
         )?;
-        parse_token(&value, now_ms, &[("members", "read")])
+        parse_token(&value, now_ms, &[("members", "read"), ("metadata", "read")])
     }
 
     /// The current login of the account with this immutable numeric id. The
