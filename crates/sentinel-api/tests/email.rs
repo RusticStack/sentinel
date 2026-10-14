@@ -248,8 +248,13 @@ fn a_verification_link_works_once_and_a_bad_one_is_one_answer() {
     let unknown = public(&f, "/api/v1/email/verify", json!({ "token": never_issued }));
     let malformed = public(&f, "/api/v1/email/verify", json!({ "token": "nope" }));
     assert_eq!(replay.0, 400);
-    assert_eq!(replay, unknown);
-    assert_eq!(replay, malformed);
+    // One answer for all three: the same code and message (a request id, when
+    // present, differs per request and says nothing).
+    for other in [&unknown, &malformed] {
+        assert_eq!(other.0, replay.0);
+        assert_eq!(other.1["code"], replay.1["code"]);
+        assert_eq!(other.1["message"], replay.1["message"]);
+    }
 }
 
 #[test]
