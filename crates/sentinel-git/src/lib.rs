@@ -29,8 +29,8 @@ pub mod mirror;
 #[cfg(unix)]
 pub use unix::{
     CHECKOUT_TIMEOUT, Checkout, Credential, ExitWatch, FetchedFile, MAX_PATH_BYTES, Output,
-    cancel_scope, checkout, checkout_authorized, file_at, file_at_merge, is_ancestor, ls_remote,
-    run, wait_step,
+    cancel_scope, checkout, checkout_authorized, die_with_parent, file_at, file_at_merge,
+    is_ancestor, ls_remote, run, wait_step,
 };
 
 #[cfg(not(unix))]

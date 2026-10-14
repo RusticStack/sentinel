@@ -255,6 +255,44 @@ fn drain(mut stream: impl Read + Send + 'static, capture: Capture) -> thread::Jo
     })
 }
 
+/// Have the kernel `SIGKILL` the helper if the process that spawns it dies
+/// (Linux `PR_SET_PDEATHSIG`; a no-op elsewhere). A fetch holding a
+/// credential in its environment, or a pull, then cannot outlive a crashed
+/// or killed worker or controller until its own deadline.
+///
+/// The signal follows the *thread* that forked the helper, which is how
+/// every caller uses it: the helper is started and waited for on one
+/// thread. It reaches the helper itself, not processes the helper starts.
+/// If the parent is already gone when the helper starts, the spawn fails
+/// instead of running unowned.
+pub fn die_with_parent(command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `getpid` has no preconditions and cannot fail.
+        let parent = unsafe { libc::getpid() };
+        // SAFETY: the closure runs in the forked child before `exec` and
+        // calls only `prctl` and `getppid`, both async-signal-safe; it
+        // allocates nothing and takes no lock.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0)
+                    != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // The parent may have died between `fork` and `prctl`, when
+                // the signal would never come.
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = command;
+}
+
 fn kill_group(child: &mut Child) {
     // SAFETY: a plain syscall on our own child's process group id; a group
     // that already vanished makes kill fail harmlessly.
@@ -283,6 +321,7 @@ fn run_capped(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    die_with_parent(&mut command);
     let mut child = command.spawn()?;
     let overflow = max_payload.map(|limit| {
         Arc::new(Overflow {
@@ -300,8 +339,17 @@ fn run_capped(
     let stderr = drain(child.stderr.take().expect("piped"), Capture::Tail);
     let watch = ExitWatch::of(&child);
     let status = loop {
-        if let Some(status) = wait_step(&mut child, &watch, deadline)? {
-            break status;
+        match wait_step(&mut child, &watch, deadline) {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                // A wait that failed must not leave the helper running with
+                // its credentials in its environment, unobserved.
+                kill_group(&mut child);
+                let _ = stdout.join();
+                let _ = stderr.join();
+                return Err(error.into());
+            }
         }
         if overflow
             .as_ref()

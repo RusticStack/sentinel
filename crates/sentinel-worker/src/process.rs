@@ -182,6 +182,9 @@ pub fn run_canceled(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    // A worker that dies takes its helpers with it (`git`, `podman`
+    // clients), instead of leaving them to run on to their deadlines.
+    sentinel_git::die_with_parent(&mut command);
     let mut child = command.spawn()?;
     let readers = drain(
         child.stdout.take().expect("piped"),
@@ -202,8 +205,17 @@ pub fn run_canceled(
     };
     let watch = sentinel_git::ExitWatch::of(&child);
     let status = loop {
-        if let Some(status) = sentinel_git::wait_step(&mut child, &watch, deadline)? {
-            break status;
+        match sentinel_git::wait_step(&mut child, &watch, deadline) {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                // A failed wait must not leave the helper running
+                // unobserved: kill its group and settle its readers.
+                kill_group(&mut child);
+                let _ = stdout.join();
+                let _ = stderr.join();
+                return Err(error.into());
+            }
         }
         let canceled = cancel.is_some_and(|c| c.load(Ordering::Acquire));
         if canceled || Instant::now() >= deadline {
