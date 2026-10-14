@@ -56,7 +56,7 @@ cpu_millis = 8000                  # override measured capacity (default: every 
 memory_bytes = 34359738368         # override measured capacity (default: total less a host reserve); the whole host's
 git_mirrors = true                 # keep per-repository object mirrors under <data_dir>/mirrors (default on; [mirrors](mirrors.md))
 labels = ["linux", "gpu"]          # scheduling labels this worker selects work by; at most 16, each 1-128 bytes (default none)
-disk_bytes = 1073741824            # scratch disk offered to jobs; default: the data directory's free space less an eighth (clamped to 512 MiB-2 GiB)
+disk_bytes = 1073741824            # scratch disk offered to jobs; default: the data directory's free space less an eighth (clamped to 512 MiB-2 GiB); a platform that cannot measure it offers none, and no job is placed there
 spool_reserve_bytes = 1073741824   # free space the log spools never write the data directory below (default 1 GiB; 0 = none)
 spool_quota_bytes = 4294967296     # bytes every attempt's log spool may hold together (> 0, default 4 GiB); output past either is declared as log gaps ([logs](logs.md))
 cache_budget_bytes = 53687091200   # what the local cache may hold (≥ 64 MiB); default a fifth of the data file system, 1-50 GiB ([retention](retention.md))

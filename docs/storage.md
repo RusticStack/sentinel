@@ -47,7 +47,7 @@ Encodings: IDs are raw UUID bytes; `state_code` is one integer with terminal sta
 
 Version 14 ([worker link](worker-link.md#dispatch-w02)) copies each job's `cpu_millis`/`memory_bytes` from its spec, records a worker's reported capacity, and makes the attempt row the reservation: `cpu_millis`, `memory_bytes`, `offered_ms`, `acked_ms` and `released_ms`, with `attempts_held_by_worker` (partial, `released_ms IS NULL`) for the capacity sum and `attempts_pending_ack` (partial, unacknowledged and held) for the ack-timeout sweep. A trigger fixes an attempt's identity, worker and reservation at the lease and refuses to undo an acknowledgement or a release.
 
-Version 15 ([executor](executor.md#steps-w04)) adds `attempts.summary` (at most 32 KiB, the worker's encoded `AttemptSummary`), written once with the terminal report; the recreated `attempt_update` trigger refuses to replace it.
+Version 15 ([executor](executor.md#steps-w04)) adds `attempts.summary` (at most 32 KiB, the worker's encoded `AttemptSummary`), written once with the terminal report; the recreated `attempt_update` trigger refuses to replace it. A report whose summary is larger is applied without it (checked before the transition, never after: a rollback would have left the passing job to its lease), and the attempt records no summary.
 
 Version 16 ([cancellation](cancellation.md)) copies each job's execution timeout to `jobs.timeout_ms` for the controller's backstop and adds `attempts_held_by_lease` and `jobs_queued_since`, the partial indexes the expiry and queue-timeout sweeps walk.
 
@@ -55,7 +55,7 @@ Version 16 ([cancellation](cancellation.md)) copies each job's execution timeout
 
 One thread owns the only write connection. `Writer::write` sends a closure over a bounded channel (256 slots), runs it inside `BEGIN IMMEDIATE`, commits, and only then replies. With `synchronous=FULL` the WAL is fsynced before `COMMIT` returns, so **a write is acknowledged to the caller only when it is on disk**. This is the contract worker acknowledgements, lease grants and cancel requests rely on. `Durability::Normal` exists for replayable data and tests; it is never used for transitions.
 
-A full queue returns `WriterUnavailable` immediately instead of blocking or growing; callers shed load or retry with back-off. Readers use separate read-only WAL connections and observe a committed snapshot; the pool, the writer's answer and shutdown are bounded as the table under [Bounds and failure behavior](#bounds-and-failure-behavior) lists. Long read snapshots can still constrain checkpoint progress.
+A full queue returns `WriterUnavailable` immediately instead of blocking or growing; callers shed load or retry with back-off. Readers use separate read-only WAL connections and observe a committed snapshot; the pool, the writer's answer and shutdown are bounded as the table under [Bounds and failure behavior](#bounds-and-failure-behavior) lists. Long read snapshots can still constrain checkpoint progress: `Store::checkpoint` waits at most `CHECKPOINT_BUDGET` (200 ms) for readers while it holds the writer, and answers `Checkpointed::Partial` when a reader kept part of the log (what no reader needed is folded; call again at a quiet moment). Pending VPS measurement: how often a partial answer occurs under production read load.
 
 At the API a `WriteAmbiguous` answer is `503 outcome_unknown`, not retryable as is ([protocol](protocol.md#structured-errors)); `WriterUnavailable` and `Overloaded`, where nothing was attempted, stay `429 rate_limited`.
 
