@@ -1,4 +1,4 @@
-//! G03 through the real binaries: a running server loads its webhook secret,
+//! Through the real binaries: a running server loads its webhook secret,
 //! accepts an authenticated generic ref update, resolves it off the request
 //! path against a repository served on loopback HTTPS — policy, pinned
 //! revision, immutable run — and the host-local CLI shows the durable record
