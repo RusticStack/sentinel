@@ -1,6 +1,3 @@
-//! Tenant-owned sealed secrets and explicit repository/job/step eligibility.
-//! This module exposes metadata to clients; plaintext has no read API. Only
-//! fenced preparation may open a sealed value for an authorized attempt.
 use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -21,15 +18,10 @@ pub struct Idempotency<'a> {
     pub principal: &'a str,
     pub route: &'a str,
     pub key: IdempotencyKey,
-    /// A keyed MAC of the request (`Key::fingerprinter`), never an unkeyed
-    /// digest of a value: this row is stored beside the ciphertext.
+    // Keyed MAC, never an unkeyed digest: this row is stored beside the ciphertext.
     pub fingerprint: Fingerprint,
 }
 
-/// Return a completed metadata-only response for an identical secret write.
-/// The write and saved response share the same transaction, so there is no
-/// durable in-flight state after a crash. A key reused for a different
-/// request is [`Error::IdempotencyMismatch`], not a version conflict.
 pub fn idempotency_replay(
     tx: &Transaction<'_>,
     idempotency: Idempotency<'_>,
@@ -75,7 +67,6 @@ pub fn idempotency_replay(
     Ok(Some(response))
 }
 
-/// Save only a bounded JSON result containing secret metadata, never values.
 pub fn idempotency_save(
     tx: &Transaction<'_>,
     idempotency: Idempotency<'_>,
@@ -103,9 +94,6 @@ pub fn idempotency_save(
     Ok(())
 }
 
-/// Bound retained secret-write retry records independently of ordinary run
-/// idempotency records. The controller maintenance tick calls this in small
-/// indexed batches.
 pub fn purge_idempotency(store: &crate::Store, now: UnixMillis, limit: u32) -> Result<usize> {
     let cutoff = now.0 - IDEMPOTENCY_TTL_MS;
     store.writer().write(move |tx| {
@@ -157,9 +145,7 @@ pub struct Metadata {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binding {
     pub repo: RepoId,
-    /// Empty means every job, but a job must still declare the secret.
     pub job: String,
-    /// Empty means all steps of this job.
     pub step: String,
     pub name: String,
     pub secret: SecretId,
@@ -176,7 +162,6 @@ pub struct Resolved {
 
 pub struct PreparedDelivery {
     pub fence: Fence,
-    /// One bounded postcard encoding, ready for the link to chunk directly.
     pub encoded: sentinel_protocol::secrets::SecretBytes,
 }
 
@@ -254,9 +239,7 @@ fn scope_owner(
     }
 }
 
-/// Check current store authority for an operation before returning a cached
-/// idempotent response. A retry must never preserve access after a grant or
-/// membership was removed.
+// Authority is rechecked on every replay: a retry must not keep access after a grant is removed.
 pub fn authorize(conn: &Connection, principal: Principal, scope: Scope, write: bool) -> Result<()> {
     scope_owner(conn, principal, scope, write).map(|_| ())
 }
@@ -316,9 +299,6 @@ fn audit(tx: &Transaction<'_>, meta: &Metadata, event: Audit<'_>, now: UnixMilli
     Ok(())
 }
 
-/// Create or rotate using compare-and-set. `expected=0` creates; later writes
-/// require the observed current version. Old versions remain sealed until
-/// explicitly revoked for audit and history; each new attempt resolves current.
 pub fn put(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -330,10 +310,6 @@ pub fn put(
     put_owned(tx, principal.user, owner, &update, key, now)
 }
 
-/// An atomic multi-name write (env-file import): authority is checked once
-/// for the scope, then every entry is created or rotated in this
-/// transaction. Any refusal rolls the whole import back with the caller's
-/// transaction.
 pub fn put_all<'a>(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -462,8 +438,6 @@ fn put_owned(
     Ok(meta)
 }
 
-/// Read only a bounded name/version/timestamp record; ciphertext is not
-/// projected. A missing or unauthorized scope has the same result.
 pub fn describe(
     conn: &Connection,
     principal: Principal,
@@ -477,8 +451,6 @@ pub fn describe(
     lookup(conn, tenant, repo, name)
 }
 
-/// One name in one scope. Each scope has its own statement so each is served
-/// by its unique partial index (`secrets_tenant_name`, `secrets_repo_name`).
 fn lookup(
     conn: &Connection,
     tenant: TenantId,
@@ -507,10 +479,6 @@ fn lookup(
     decode(row.ok_or(Error::NotFound)?)
 }
 
-/// Keyset pagination by name. No ciphertext or value-derived fingerprint is
-/// read, even temporarily. At most 100 metadata records per call. A tenant
-/// page and a repository page each walk only their own partial index, never
-/// the other scope's names.
 pub fn list(
     conn: &Connection,
     principal: Principal,
@@ -542,10 +510,6 @@ pub fn list(
         .collect()
 }
 
-/// Allow (or stop allowing) a tenant secret in exactly one owned
-/// repository. Idempotent: setting the state it already has changes and
-/// audits nothing. Removing the allow entry removes its bindings in the
-/// same transaction, and resolution rechecks the allowlist anyway.
 pub fn allow_repo(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -608,9 +572,6 @@ pub fn allow_repo(
     )
 }
 
-/// The repositories a tenant secret is allowed in: a keyset page by
-/// repository ID, at most 100. Readable by a tenant member or its
-/// administrator; names only, never a value.
 pub fn list_allowed(
     conn: &Connection,
     principal: Principal,
@@ -642,8 +603,6 @@ pub fn list_allowed(
     .collect()
 }
 
-/// Permanently disable a secret and every retained version. Its name is
-/// reserved, so a concurrent or stale create cannot silently resurrect it.
 pub fn delete(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -682,10 +641,6 @@ pub fn delete(
     Ok(meta)
 }
 
-/// Revoke one historical version without changing the current number. A
-/// revoked current version makes resolution fail until a fresh rotation.
-/// Idempotent: revoking an already revoked version changes and audits
-/// nothing; a version that never existed is `NotFound`.
 pub fn revoke_version(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -726,9 +681,6 @@ pub fn revoke_version(
     )
 }
 
-/// A repository secret writer can bind an existing repo secret or an
-/// allowlisted tenant secret; broad tenant-secret administration stays with
-/// the tenant administrator. Repo operators have no implicit write authority.
 pub fn bind(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -739,9 +691,6 @@ pub fn bind(
     bind_owned(tx, principal.user, tenant, binding, now)
 }
 
-/// [`bind`] by name: the source is the repository's own secret of that name,
-/// or with `from_tenant` the tenant secret, which must be allowlisted for the
-/// repository. A missing or foreign source is `NotFound`.
 #[allow(clippy::too_many_arguments)]
 pub fn bind_named(
     tx: &Transaction<'_>,
@@ -850,8 +799,6 @@ fn bind_owned(
     )
 }
 
-/// Remove one binding. Idempotent: removing a binding that does not exist
-/// changes and audits nothing, so a retried unbind is not an error.
 pub fn unbind(
     tx: &Transaction<'_>,
     principal: Principal,
@@ -902,7 +849,6 @@ pub fn unbind(
     )
 }
 
-/// Metadata-only keyset page, scoped to one authorized repository.
 pub fn list_bindings(
     conn: &Connection,
     principal: Principal,
@@ -974,13 +920,9 @@ fn tenant_name_exists_repo(conn: &Connection, repo: RepoId, name: &str) -> Resul
         .query_row(params![repo.as_bytes(), name], |r| r.get(0))?)
 }
 
-/// Why resolution refused a target, carried out of a failed preparation so
-/// the refusal can be audited. IDs only; never a value.
 struct Refused {
     secret: Option<SecretId>,
     version: u64,
-    /// `denied`: a binding exists but policy refuses it (ambiguity, removed
-    /// allowlist). `missing`: no binding, or its version or secret is gone.
     denied: bool,
 }
 
@@ -994,8 +936,6 @@ impl Refused {
     }
 }
 
-/// Return the current version identity selected by exact step, job, then repo
-/// binding. Only fenced preparation may turn this identity into attempt-bound plaintext.
 pub fn resolve(
     conn: &Connection,
     repo: RepoId,
@@ -1089,8 +1029,6 @@ fn resolve_detail(
     }))
 }
 
-/// Record actual use only inside the same writer transaction as the
-/// preparation decision. The caller holds the fenced delivery transaction.
 pub fn audit_use(
     tx: &Transaction<'_>,
     attempt: AttemptId,
@@ -1117,7 +1055,6 @@ pub fn audit_use(
     record_use(tx, tenant, repo, attempt, step, resolved, now)
 }
 
-/// The use row for a target the caller resolved in this same transaction.
 fn record_use(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -1143,9 +1080,6 @@ fn record_use(
     Ok(())
 }
 
-/// A target an attempt was refused, recorded after its preparation rolled
-/// back: tenant, repository, attempt, step, the name and whatever secret
-/// ID and version were resolved. Never a value.
 struct AuditedRefusal {
     tenant: TenantId,
     repo: RepoId,
@@ -1154,14 +1088,7 @@ struct AuditedRefusal {
     refused: Refused,
 }
 
-/// Resolve and open only the declared targets of the acknowledged attempt's
-/// durable spec. The writer transaction serializes this fence/capability
-/// check with revocation, binding changes, version rotation and the use audit.
-///
-/// A target refused by policy (no binding, an ambiguous name, a removed
-/// allowlist entry, a revoked current version) fails the preparation. The
-/// caller's transaction then rolls back; [`deliver`] instead commits one
-/// `use` audit row with result `denied` or `missing` for the refused target.
+// The writer transaction serializes this check with revocation, rebinding, rotation and the use audit.
 pub fn prepare_delivery(
     tx: &Transaction<'_>,
     key: &Key,
@@ -1172,9 +1099,6 @@ pub fn prepare_delivery(
     prepare_recorded(tx, key, worker, attempt, now)?
 }
 
-/// Prepare an attempt's delivery in one writer transaction. A policy refusal
-/// commits only its audit row: the preparation's own writes are rolled back
-/// to a savepoint first, so no `use` row survives a refused attempt.
 pub fn deliver(
     store: &Store,
     key: Arc<Key>,
@@ -1229,7 +1153,6 @@ fn prepare_recorded(
     }
 }
 
-/// A heap buffer wiped when dropped, for postcard output holding values.
 struct Wiped(Vec<u8>);
 
 impl Drop for Wiped {
@@ -1239,8 +1162,7 @@ impl Drop for Wiped {
     }
 }
 
-/// Encode into a buffer sized once, so no reallocation frees an unwiped
-/// copy of already-serialized values.
+// Sized once so no reallocation leaves an unwiped copy of serialized values.
 fn encode_bundle(
     bundle: &sentinel_protocol::secrets::DeliveryBundle,
 ) -> Result<sentinel_protocol::secrets::SecretBytes> {
@@ -1319,10 +1241,7 @@ fn prepare(
             encoded: encode_bundle(&DeliveryBundle::empty())?,
         });
     }
-    // A caller-authored (manual) pipeline never receives secrets, whatever
-    // the bindings say: bindings match any job and step, so the run's
-    // provenance is the only thing that separates a repository's own pipeline
-    // from one a `run` grant submitted. The refusal is audited as `denied`.
+    // Bindings match any job and step, so only provenance keeps manual pipelines from receiving secrets.
     if !crate::provenance::may_receive_secrets(tx, run)? {
         let (step, name) = declared_targets(compiled)
             .next()
@@ -1354,8 +1273,6 @@ fn prepare(
         return Err(Error::Forbidden);
     }
 
-    // Resolve one declared target; a policy refusal is remembered for the
-    // audit and fails the preparation.
     let mut resolve_target = |step: &str, name: &str| -> Result<Resolved> {
         match resolve_detail(tx, repo, &job_name, step, name)? {
             Ok(resolved) => Ok(resolved),
@@ -1475,8 +1392,6 @@ fn prepare(
     })
 }
 
-/// Every `(step, name)` the job declares in resolution order: the registry
-/// credential (empty step) first, then each step's variables and files.
 fn declared_targets(
     compiled: &sentinel_pipeline::CompiledJob,
 ) -> impl Iterator<Item = (&str, &str)> {
@@ -1493,23 +1408,12 @@ fn declared_targets(
         }))
 }
 
-/// Why a declared secret could not be delivered to an acknowledged
-/// attempt, value-free: what the attempt's failure detail says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {
-    /// The fence the attempt is held under, for the failure report.
     pub fence: Fence,
-    /// `secret NAME: unbound|deleted|revoked|ambiguous`.
     pub detail: String,
 }
 
-/// The first declared secret of the acknowledged attempt that cannot be
-/// resolved, and why — checked in the same order preparation resolves
-/// them. `None` when the attempt is not acknowledged here or every declared
-/// name resolves (the refusal was something else). Read-only: the refused
-/// use was already audited by the [`deliver`] that failed, once;
-/// this only names it for the attempt's failure detail, in the writer
-/// transaction that then settles the attempt.
 pub fn refuse_delivery(
     tx: &Transaction<'_>,
     worker: WorkerId,
@@ -1565,7 +1469,6 @@ pub fn refuse_delivery(
             Err(Error::Conflict) => Some("ambiguous"),
             Err(e) => return Err(e),
         };
-        // The binding the resolver would have followed, if any.
         let bound: Option<(bool, bool)> = tx
             .query_row(
                 "SELECT s.active,
@@ -1593,8 +1496,6 @@ pub fn refuse_delivery(
     Ok(None)
 }
 
-/// Open exactly one already-authorized immutable version. This stays private
-/// to the store preparation path; client-facing metadata never exposes it.
 type StoredSecretVersion = ([u8; 16], Option<[u8; 16]>, String, i64, bool, Vec<u8>, bool);
 
 fn open_value(conn: &Connection, key: &Key, resolved: &Resolved) -> Result<Vec<u8>> {

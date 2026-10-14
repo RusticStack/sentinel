@@ -1,15 +1,3 @@
-//! External sign-in: pending authorization state, and what a verified provider
-//! identity is allowed to do.
-//!
-//! This module never talks to a provider and never decides whether a proof is
-//! genuine — `sentinel-github` does that. What arrives here is already verified:
-//! a configured provider key and an immutable provider subject. What leaves is
-//! a session, or the honest answer that no account holds that identity.
-//!
-//! Authenticating somewhere else is not admission. An unknown identity is not
-//! registered here, is not given a placeholder account, and does not become a
-//! tenant: invitations, approval and registration policy are decided elsewhere.
-
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_auth::secret::Secret;
 use sentinel_core::{UnixMillis, UserId};
@@ -20,17 +8,10 @@ use crate::{
     local_auth::{Event, Issued, Policy, Session, audit},
 };
 
-/// Long enough for a person to sign in and approve, short enough that a pending
-/// attempt is not a standing target.
 pub const STATE_TTL_MS: i64 = 10 * 60 * 1000;
 
-/// Longest destination recorded with a pending attempt (migration 37): room
-/// for an OAuth authorization request's whole query, so a sign-in started on
-/// the consent page returns to it with its parameters intact.
 pub const MAX_REDIRECT_BYTES: usize = 2048;
 
-/// Where to send the browser once sign-in completes. Same-site paths only: an
-/// absolute URL here would turn a successful login into an open redirect.
 fn destination(redirect_to: Option<&str>) -> Result<Option<String>> {
     let Some(path) = redirect_to else {
         return Ok(None);
@@ -46,9 +27,7 @@ fn destination(redirect_to: Option<&str>) -> Result<Option<String>> {
     Ok(Some(path.to_owned()))
 }
 
-/// Begin an authorization round trip. The returned secret goes into the
-/// `state` parameter *and* into the browser's `__Host-` sign-in cookie; the
-/// callback must present both, so a stolen redirect URL is not enough.
+// The callback must present both the state and the cookie, so a stolen redirect URL is not enough.
 pub fn begin(
     store: &Store,
     provider: &str,
@@ -83,9 +62,6 @@ pub fn begin(
     Ok(state)
 }
 
-/// Spend a pending attempt. Succeeds at most once per attempt: the same state
-/// presented twice, after expiry, or for a different provider is `NotFound`.
-/// Returns the validated same-site destination, when one was recorded.
 pub fn consume(
     store: &Store,
     provider: &str,
@@ -108,22 +84,12 @@ pub fn consume(
     })
 }
 
-/// What a verified identity resolved to.
 #[derive(Debug)]
 pub enum Outcome {
-    /// The identity is linked to an active account; a session was issued.
     SignedIn(Issued),
-    /// Nothing is linked to this identity. Not an error and not a registration:
-    /// the caller decides whether an invitation or approval can turn it into one.
     NoAccount,
 }
 
-/// Sign in with an already-verified provider identity: [`resolve`] then
-/// [`finish`], with no previous session to end.
-///
-/// The subject is the provider's immutable account ID. A renamed login resolves
-/// to the same account; a reused login handle resolves to nobody, because the
-/// handle was never the key.
 pub fn complete(
     store: &Store,
     provider: &str,
@@ -137,10 +103,6 @@ pub fn complete(
     }
 }
 
-/// The active account a verified provider identity is linked to, or `None`
-/// (audited as a rejected login) when nothing is. Issues nothing: a browser
-/// flow resolves on the provider's cross-site callback and issues the session
-/// on the same-site hop that follows ([`finish`]).
 pub fn resolve(store: &Store, provider: &str, subject: &str) -> Result<Option<UserId>> {
     let user = store
         .read(|conn| crate::auth::provisioning::resolve_verified_identity(conn, provider, subject));
@@ -157,12 +119,7 @@ pub fn resolve(store: &Store, provider: &str, subject: &str) -> Result<Option<Us
     }
 }
 
-/// Issue the session of an account [`resolve`] returned, first revoking the
-/// session the browser presented (`previous`, whoever it belongs to) in the
-/// same transaction: the browser is switching to this sign-in, so the session
-/// it held must not outlive the switch. The account could have been
-/// suspended since it was resolved: the session insert trigger refuses it,
-/// and that is the same honest answer as never having been linked.
+// The browser's previous session is revoked in the same transaction, so it cannot outlive the switch.
 pub fn finish(
     store: &Store,
     provider: &str,
@@ -212,13 +169,7 @@ pub fn finish(
     }
 }
 
-/// Link a verified identity to the account of an authenticated session.
-///
-/// Linking changes who can authenticate as this account, so it needs the same
-/// recent proof of presence as any other change to authentication: a stolen
-/// cookie must not be able to attach an attacker's GitHub account. A provider
-/// identity is linked to at most one account and is never silently moved —
-/// relinking an already-claimed identity fails rather than taking it.
+// Linking needs recent proof of presence: a stolen cookie must not attach an attacker's account.
 pub fn link(
     store: &Store,
     session: &Session,
@@ -233,7 +184,6 @@ pub fn link(
     store.writer().write(move |tx| {
         crate::auth::provisioning::link_verified_identity(tx, user, &provider, &subject, now)
             .map_err(|error| match error {
-                // The unique key refuses a second claim on one identity.
                 Error::Sqlite(rusqlite::Error::SqliteFailure(code, _))
                     if code.code == rusqlite::ErrorCode::ConstraintViolation =>
                 {
@@ -241,8 +191,6 @@ pub fn link(
                 }
                 other => other,
             })?;
-        // Linking is what makes a GitHub organization's membership possible:
-        // ask for the person's check at once, so access follows the link.
         crate::github_members::enqueue_user(tx, user, now)?;
         audit(
             tx,
@@ -255,8 +203,6 @@ pub fn link(
     })
 }
 
-/// Remove a link. The account itself or a platform admin may do so; the audit
-/// record survives, so an unlink before a relink is visible.
 pub fn unlink(
     tx: &Transaction<'_>,
     authority: Authority,
@@ -276,9 +222,6 @@ pub fn unlink(
     if removed == 0 {
         return Err(Error::NotFound);
     }
-    // Unlinking removes the access derived from the link, in the same
-    // transaction: no organization keeps a member its GitHub account no
-    // longer vouches for.
     if provider == crate::github_members::PROVIDER {
         crate::github_members::identity_unlinked(tx, user, now)?;
     }
@@ -292,7 +235,6 @@ pub fn unlink(
     )
 }
 
-/// Host-local unlink, for an operator repairing a wrong link without a session.
 pub fn unlink_host_local(
     store: &Store,
     user: UserId,
@@ -329,8 +271,6 @@ pub struct Identity {
     pub linked: UnixMillis,
 }
 
-/// One account's linked identities. The account itself or a platform admin may
-/// look; a subject is not a secret, but it is not public either.
 pub fn identities(conn: &Connection, authority: Authority, user: UserId) -> Result<Vec<Identity>> {
     if authority.actor() != Some(user) {
         authority
@@ -351,8 +291,6 @@ pub fn identities(conn: &Connection, authority: Authority, user: UserId) -> Resu
     rows.map(|row| row.map_err(Error::from)).collect()
 }
 
-/// Delete spent and expired attempts in bounded batches. Maintenance only:
-/// single use and expiry are already enforced by `consume`.
 pub fn purge_expired(store: &Store, now: UnixMillis, limit: u32) -> Result<usize> {
     store.writer().write(move |tx| {
         let removed = tx.execute(

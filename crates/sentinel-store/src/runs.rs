@@ -1,10 +1,3 @@
-//! Run creation, spec retrieval and reruns.
-//!
-//! A run is created in one transaction with its immutable spec and one job
-//! row per compiled job. Jobs with no dependencies start `Queued`; the rest
-//! start `Blocked` and are released by the scheduler from the spec's
-//! dependency indices. A rerun is a new attempt of an existing job under the
-//! same spec; a new dispatch is a new run with its own spec.
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{
     Actor, Event, JobControl, JobId, JobState, RepoId, RunId, TenantId, UnixMillis,
@@ -21,10 +14,8 @@ use crate::{
     provenance::{self, EventFacts},
 };
 
-/// Default queue priority; lower runs first.
 pub const DEFAULT_PRIORITY: u8 = 5;
 
-/// Insert the run, its spec and its jobs. Returns job IDs in compiled order.
 pub fn create_run(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -47,10 +38,6 @@ pub fn create_run(
         ],
     )?;
     let mut ids = Vec::with_capacity(spec.pipeline.jobs.len());
-    // The concurrency group is applied here when its template needs only
-    // facts the store already holds; a template over `event.*` waits for the
-    // run's provenance (recorded after this transaction's run row) and is
-    // applied by [`apply_concurrency`] then.
     let group = create_group(tx, tenant, repo, run, spec)?;
     let mut mark_index = tx.prepare_cached(
         "UPDATE jobs SET spec_index = ?1, cpu_millis = ?3, memory_bytes = ?4, timeout_ms = ?5,
@@ -91,9 +78,6 @@ pub fn create_run(
                     .any(|step| { !step.secrets.is_empty() || !step.secret_files.is_empty() }),
         ])?;
         if let Ok(image) = sentinel_pipeline::run::ImageRef::parse(&job.spec.image) {
-            // The repository part travels with the digest so a prefetch
-            // hint can name `name@digest` without decoding the spec;
-            // a name outside the reference charset is simply never hinted.
             let name = dispatch::prefetch_name(&image.name).then_some(image.name.as_str());
             if image.digest.is_some() || name.is_some() {
                 tx.execute(
@@ -103,10 +87,7 @@ pub fn create_run(
                 )?;
             }
         }
-        // A job with an `if` starts blocked even with nothing to wait for: its
-        // condition reads the run's event, which is recorded after this
-        // transaction creates the run, so the caller releases it once that
-        // exists (`dispatch::release_dependents`).
+        // A job with an `if` starts blocked: its condition reads the run's event, recorded after this transaction.
         if job.needs.is_empty() && job.spec.condition.is_none() {
             jobs::transition(
                 tx,
@@ -124,14 +105,9 @@ pub fn create_run(
     {
         supersede(tx, tenant, repo, run, group, now)?;
     }
-    // Every compiled job has its check row from the start, so a required
-    // aggregate never waits for the first transition to appear. The callers
-    // record it after provenance exists (only event-driven runs publish).
     Ok(ids)
 }
 
-/// The worker-facing architecture spelling stored on a job: the same words
-/// `workers.arch` records, so placement compares one string.
 fn job_arch(arch: Option<sentinel_pipeline::schema::Arch>) -> Option<&'static str> {
     match arch {
         Some(sentinel_pipeline::schema::Arch::Amd64) => Some("x86_64"),
@@ -140,13 +116,8 @@ fn job_arch(arch: Option<sentinel_pipeline::schema::Arch>) -> Option<&'static st
     }
 }
 
-/// Longest rendered concurrency group, matching the schema's template bound.
 const MAX_GROUP_BYTES: usize = 256;
 
-/// Run-level facts a dispatch-phase template may read: the repository, the
-/// run and — when the run's provenance is already recorded — its event. A
-/// path this context does not hold stays `Unresolved`, so a template that
-/// needs it fails rendering instead of keying on a default.
 struct RunContext {
     repo: RepoId,
     repo_name: String,
@@ -201,8 +172,6 @@ impl Context for RunContext {
     }
 }
 
-/// Render the run's concurrency group, or `None` when the pipeline declares
-/// none or the template needs facts that are not available yet.
 fn render_group(
     conn: &Connection,
     tenant: TenantId,
@@ -229,9 +198,6 @@ fn render_group(
     Ok(concurrency.group.render(&context, MAX_GROUP_BYTES).ok())
 }
 
-/// The group `create_run` may apply before provenance exists: rendered with
-/// event paths unresolved, so a template that reads `event.*` is deferred
-/// rather than keyed on a guess about the event that will arrive.
 fn create_group(
     conn: &Connection,
     tenant: TenantId,
@@ -251,12 +217,6 @@ fn create_group(
     }
 }
 
-/// Apply the run's concurrency group once its provenance exists — for an
-/// event-driven run, recorded after the run row by the same dispatch
-/// transaction. Writes the rendered group onto the run's jobs and, when the
-/// pipeline asked to cancel in progress, cancels every live run of the
-/// repository still holding that group. Idempotent: calling it again
-/// recomputes the same group and finds no live superseded run.
 pub fn apply_concurrency(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -288,16 +248,7 @@ pub fn apply_concurrency(
     Ok(())
 }
 
-/// Cancel every live run of the repository already holding `group` that is
-/// not newer than this run: a group is a (tenant, repository, key) lock,
-/// never a global branch string. Workers learn through the usual cancel
-/// path — a running attempt is told on its next heartbeat, an unstarted job
-/// ends now.
-///
-/// "Not newer" is `created_ms <=`, not `<`: two runs created in the same
-/// millisecond must still supersede one another (the one applied later
-/// wins), or both would stay live and serialize behind each other instead
-/// of the older being cancelled.
+// `<=`, not `<`: runs created in the same millisecond must still supersede one another.
 fn supersede(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -332,17 +283,12 @@ fn supersede(
     Ok(cancelled)
 }
 
-/// The image a job will actually run: digest and platform, both durable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedImage {
     pub digest: String,
     pub platform: String,
 }
 
-/// Record what the image reference resolved to, once. A spec pinned by digest
-/// pre-fills the digest, so resolution must agree with it; the platform is
-/// always the resolver's to state. Refuses to change either afterwards, and
-/// refuses malformed values before touching the row.
 pub fn resolve_image(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -381,9 +327,6 @@ pub fn resolve_image(
     Ok(())
 }
 
-/// Every compiled job's digest-pinned image and platform, in job order, or
-/// the first failure: a malformed reference is `InvalidInput`, an unpinned one
-/// `Unresolved`.
 pub fn pinned_images(spec: &RunSpec) -> Result<Vec<(String, String)>> {
     let mut out = Vec::with_capacity(spec.pipeline.jobs.len());
     for job in &spec.pipeline.jobs {
@@ -399,7 +342,6 @@ pub fn pinned_images(spec: &RunSpec) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// What a job will run, or `Unresolved` if admission must still wait.
 pub fn resolved_image(conn: &Connection, tenant: TenantId, job: JobId) -> Result<ResolvedImage> {
     let row: Option<(Option<String>, Option<String>)> = conn
         .prepare_cached(
@@ -416,7 +358,6 @@ pub fn resolved_image(conn: &Connection, tenant: TenantId, job: JobId) -> Result
     }
 }
 
-/// The spec exactly as written at creation.
 pub fn get_run_spec(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunSpec> {
     let (format, bytes): (i64, Vec<u8>) = conn
         .query_row(
@@ -426,15 +367,12 @@ pub fn get_run_spec(conn: &Connection, tenant: TenantId, run: RunId) -> Result<R
         )
         .optional()?
         .ok_or(Error::NotFound)?;
-    // Stored formats `SPEC_FORMAT_READ_MIN..=SPEC_FORMAT` all decode; the
-    // body carries its own format byte that selects the layout.
     if !(SPEC_FORMAT_READ_MIN as i64..=SPEC_FORMAT as i64).contains(&format) {
         return Err(Error::Corrupt("run_specs.format"));
     }
     RunSpec::decode(&bytes).map_err(|_| Error::Corrupt("run_specs.spec"))
 }
 
-/// Job IDs of a run in compiled order, with their current state.
 pub fn run_jobs(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<(JobId, JobState)>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, state_code FROM jobs WHERE run_id = ?1 AND tenant_id = ?2 ORDER BY spec_index",
@@ -453,9 +391,7 @@ pub fn run_jobs(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<(
     Ok(out)
 }
 
-/// Rerun a finished job: back to `Queued` under the same spec with attempt
-/// history cleared. The fence is untouched; the next lease advances it, so
-/// a late completion from the previous attempt still carries a stale fence.
+// The fence is kept: the next lease advances it, so a late completion from the old attempt stays stale.
 pub fn rerun_job(
     tx: &Transaction<'_>,
     tenant: TenantId,
@@ -485,23 +421,11 @@ pub fn rerun_job(
     if changed != 1 {
         return Err(Error::Conflict);
     }
-    // Same funnel as every other job move: a rerun requeues the job, and its
-    // check (plus the aggregate's) must show the new work — a fresh check
-    // run, since a completed one cannot be reopened.
     crate::checks::record_job(tx, tenant, job, now)?;
     revive_skipped_dependents(tx, tenant, job, now)?;
     Ok(next)
 }
 
-/// The rest of a rerun: every job downstream of `job` that ended `Skipped`
-/// goes back to `Blocked`, so it is decided again against the new attempt
-/// instead of staying skipped for a failure that no longer stands. Only a
-/// chain of skipped jobs is followed — a dependent that ran keeps its result
-/// — and a job with cancellation desired is left alone. The run's own cancel
-/// flag is cleared: a rerun resumes the run.
-///
-/// Jobs are in dependency order (every dependency has a smaller index), so
-/// one forward pass finds the whole skipped chain.
 fn revive_skipped_dependents(
     tx: &Transaction<'_>,
     tenant: TenantId,

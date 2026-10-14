@@ -1,7 +1,3 @@
-//! Read models for status: a run with its jobs, and recent runs of a
-//! repository. Authorization is the caller's, through `auth::require_repo` on
-//! the run's repository.
-
 use rusqlite::{Connection, OptionalExtension, params};
 use sentinel_core::{
     AttemptId, AttemptTimestamps, FailureClass, JobId, JobState, RepoId, RunId, RunState, TenantId,
@@ -22,10 +18,7 @@ pub struct JobStatus {
     pub failure_class: Option<FailureClass>,
     pub cancel_requested: bool,
     pub timestamps: AttemptTimestamps,
-    /// The newest attempt, if any was ever leased.
     pub attempt: Option<AttemptId>,
-    /// Whether that attempt's log end marker is durable — `None` until an
-    /// attempt exists.
     pub log_state: Option<LogState>,
     pub fence: u64,
 }
@@ -39,15 +32,10 @@ pub struct RunStatus {
     pub created: UnixMillis,
     pub cancel_requested: bool,
     pub state: RunState,
-    /// What triggered the run (`push`, `tag`, `pull_request`, `manual`);
-    /// `None` only for a run created without provenance.
     pub trigger: Option<String>,
-    /// In compiled order.
     pub jobs: Vec<JobStatus>,
 }
 
-/// The job verdict visible from one attempt. An older attempt must not
-/// inherit the mutable state of a later rerun.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttemptJobStatus {
     pub current: bool,
@@ -55,14 +43,7 @@ pub struct AttemptJobStatus {
     pub failure_class: Option<FailureClass>,
 }
 
-/// Read the job state only when `attempt` still owns the job, with an indexed
-/// join over that attempt (no run-wide status vector).
-///
-/// Only a lease advances the fence, so fence equality alone would let an
-/// attempt keep "owning" a job that was requeued under it. A rerun, a push
-/// re-trigger, or a lapsed or declined offer (`dispatch::give_back`) clears
-/// `leased_ms`, which only the next lease sets again; a later cancel or queue
-/// timeout of the requeued job is therefore not the old attempt's verdict.
+// Fence alone cannot prove ownership: only a lease advances it, so `leased_ms` must also match.
 pub fn attempt_job_status(
     conn: &Connection,
     tenant: TenantId,
@@ -103,7 +84,6 @@ pub fn attempt_job_status(
     })
 }
 
-/// The run and every job of it, in one read snapshot.
 pub fn run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunStatus> {
     let head: Option<([u8; 16], String, i64, i64)> = conn
         .prepare_cached(
@@ -189,30 +169,18 @@ pub struct RunSummary {
     pub sha: String,
     pub created: UnixMillis,
     pub state: RunState,
-    /// From the run's provenance: `push`, `tag`, `pull_request`, `manual`;
-    /// `None` only for a run created without provenance.
     pub trigger: Option<String>,
-    /// The ref the run was created for (a pull request's base branch).
     pub ref_name: Option<String>,
     pub pr_number: Option<u64>,
 }
 
-/// What [`filtered_runs`] narrows a repository's runs to. Each is a range on
-/// its own index (migration 45), so a filtered page costs what an
-/// unfiltered one does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunFilter<'a> {
-    /// Exactly this ref (`refs/heads/main`, `refs/tags/v1`).
     Ref(&'a str),
-    /// Runs of this pull request.
     Pr(u64),
-    /// Runs whose pinned commit starts with this lowercase hex prefix,
-    /// 7 to 64 characters: long enough that the matching range stays a
-    /// handful of rows.
     Sha(&'a str),
 }
 
-/// The newest runs of a repository, newest first, at most `limit`.
 pub fn recent_runs(
     conn: &Connection,
     tenant: TenantId,
@@ -222,21 +190,13 @@ pub fn recent_runs(
     runs_page(conn, tenant, repo, None, limit).map(|page| page.runs)
 }
 
-/// One page of a repository's runs, newest first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunPage {
     pub runs: Vec<RunSummary>,
-    /// The cursor for the next page — the last listed run — when more runs
-    /// exist past this page; `None` on the last page.
     pub next: Option<RunId>,
 }
 
-/// Keyset pagination over `runs_by_repo`, newest first: at most `limit`
-/// runs strictly older than `before` in `(created_ms, id)` order, so pages
-/// stay stable when runs share a millisecond or new runs arrive. `before`
-/// must be a run of this repository, else `NotFound` (a foreign run's
-/// timestamp is not revealed). One extra row is read to tell whether a next
-/// page exists.
+// `before` must be a run of this repository: a foreign run's timestamp must not be revealed.
 pub fn runs_page(
     conn: &Connection,
     tenant: TenantId,
@@ -247,8 +207,6 @@ pub fn runs_page(
     if !(1..=500).contains(&limit) {
         return Err(Error::InvalidInput("page size"));
     }
-    // The cursor as a key: (created_ms, id). Without one, a key above every
-    // real run keeps one statement (and one plan) for both cases.
     let (cursor_ms, cursor_id): (i64, [u8; 16]) = match before {
         None => (i64::MAX, [0xff; 16]),
         Some(run) => {
@@ -283,8 +241,6 @@ pub fn runs_page(
     }
     let more = out.len() > usize::from(limit);
     out.truncate(usize::from(limit));
-    // One grouped read for every listed run's job states; the `IN` subquery
-    // is the same page, materialized once.
     let mut states: std::collections::HashMap<[u8; 16], Vec<JobState>> =
         std::collections::HashMap::with_capacity(out.len());
     if !out.is_empty() {
@@ -322,8 +278,6 @@ pub fn runs_page(
     Ok(RunPage { runs, next })
 }
 
-/// One listed run as its statement reads it, before its jobs are folded
-/// into a state. Column order: id, sha, created, trigger, ref, PR.
 struct SummaryRow {
     id: [u8; 16],
     sha: String,
@@ -361,16 +315,12 @@ impl SummaryRow {
     }
 }
 
-/// A page of runs: a range on `runs_by_repo`, whose trailing primary key
-/// makes the index `(tenant_id, repo_id, created_ms, id)`; each listed run's
-/// provenance is one primary-key probe.
 pub const PAGE_SQL: &str =
     "SELECT r.id, r.source_sha, r.created_ms, p.trigger, p.ref_name, p.pr_number
      FROM runs r LEFT JOIN run_provenance p ON p.run_id = r.id
      WHERE r.tenant_id = ?1 AND r.repo_id = ?2 AND (r.created_ms, r.id) < (?3, ?4)
      ORDER BY r.created_ms DESC, r.id DESC LIMIT ?5";
 
-/// Runs of one ref, newest first: a range on `provenance_by_ref`.
 pub const REF_PAGE_SQL: &str =
     "SELECT p.run_id, r.source_sha, r.created_ms, p.trigger, p.ref_name, p.pr_number
      FROM run_provenance p JOIN runs r ON r.id = p.run_id
@@ -378,7 +328,6 @@ pub const REF_PAGE_SQL: &str =
        AND (p.created_ms, p.run_id) < (?4, ?5)
      ORDER BY p.created_ms DESC, p.run_id DESC LIMIT ?6";
 
-/// Runs of one pull request, newest first: a range on `provenance_by_pr`.
 pub const PR_PAGE_SQL: &str =
     "SELECT p.run_id, r.source_sha, r.created_ms, p.trigger, p.ref_name, p.pr_number
      FROM run_provenance p JOIN runs r ON r.id = p.run_id
@@ -386,10 +335,7 @@ pub const PR_PAGE_SQL: &str =
        AND (p.created_ms, p.run_id) < (?4, ?5)
      ORDER BY p.created_ms DESC, p.run_id DESC LIMIT ?6";
 
-/// Runs of commits starting with a prefix: a range on `runs_by_sha`
-/// (`[prefix, prefix + "g")`, as hex digits sort below `g`), then ordered.
-/// A 7-digit prefix matches one commit in all but enormous histories, so the
-/// ordering works on that commit's runs, not the repository's.
+// The range [prefix, prefix + "g") works because hex digits sort below 'g'.
 pub const SHA_PAGE_SQL: &str =
     "SELECT r.id, r.source_sha, r.created_ms, p.trigger, p.ref_name, p.pr_number
      FROM runs r INDEXED BY runs_by_sha LEFT JOIN run_provenance p ON p.run_id = r.id
@@ -397,11 +343,6 @@ pub const SHA_PAGE_SQL: &str =
        AND (r.created_ms, r.id) < (?5, ?6)
      ORDER BY r.created_ms DESC, r.id DESC LIMIT ?7";
 
-/// One page of a repository's runs narrowed by `filter`, newest first, with
-/// the same keyset contract as [`runs_page`]: `before` must be a run of this
-/// repository (it need not match the filter), and `next` is `None` on the
-/// last page. Ref and PR pages are ordered by the provenance row's creation
-/// time, written with the run.
 pub fn filtered_runs(
     conn: &Connection,
     tenant: TenantId,
@@ -509,8 +450,6 @@ pub fn filtered_runs(
     }
     let more = out.len() > usize::from(limit);
     out.truncate(usize::from(limit));
-    // Each listed run's job states: one `jobs_by_run` range per run, at
-    // most `limit` of them, on one cached statement and one reused buffer.
     let mut jobs = conn.prepare_cached("SELECT state_code FROM jobs WHERE run_id = ?1")?;
     let mut codes = Vec::new();
     let mut runs = Vec::with_capacity(out.len());
@@ -531,22 +470,14 @@ pub fn filtered_runs(
     Ok(RunPage { runs, next })
 }
 
-/// The job states of the same page.
 pub const PAGE_JOBS_SQL: &str = "SELECT run_id, state_code FROM jobs WHERE run_id IN (
      SELECT id FROM runs
      WHERE tenant_id = ?1 AND repo_id = ?2 AND (created_ms, id) < (?3, ?4)
      ORDER BY created_ms DESC, id DESC LIMIT ?5)";
 
-/// A run's change version for long polls: 64-bit FNV-1a over the run's
-/// cancel flag and, for every job in id order (the order `jobs_by_run` already
-/// delivers, so no sort), its id, state code, fence, cancel flag and newest
-/// attempt's log state. Any state change a status reader can see changes it
-/// (with FNV's collision odds). Computed straight off the rows without
-/// allocating, so a parked poll can re-check after every commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunVersion {
     pub version: u64,
-    /// Every job is terminal: nothing about the run will change by itself.
     pub finished: bool,
 }
 
@@ -562,15 +493,11 @@ fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The per-job rows [`run_version`] hashes. `jobs` is `WITHOUT ROWID`, so
-/// `jobs_by_run(run_id)` entries carry the primary key and deliver `id`
-/// order for one run: a parked poll's re-check never builds a sort.
 pub const VERSION_JOBS_SQL: &str = "SELECT j.id, j.state_code, j.fence, j.cancel_requested,
         (SELECT a.log_state FROM attempts a WHERE a.job_id = j.id
          ORDER BY a.fence DESC LIMIT 1)
      FROM jobs j WHERE j.run_id = ?1 AND j.tenant_id = ?2 ORDER BY j.id";
 
-/// See [`RunVersion`]. `NotFound` for a run outside `tenant`.
 pub fn run_version(conn: &Connection, tenant: TenantId, run: RunId) -> Result<RunVersion> {
     let cancel: i64 = conn
         .prepare_cached("SELECT cancel_requested FROM runs WHERE id = ?1 AND tenant_id = ?2")?
@@ -587,7 +514,6 @@ pub fn run_version(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Ru
         let code: i64 = row.get(1)?;
         let fence: i64 = row.get(2)?;
         let job_cancel: i64 = row.get(3)?;
-        // Absent (no attempt yet) hashes apart from every stored code.
         let log_state: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(-1);
         hash = fnv(hash, &id);
         hash = fnv(hash, &code.to_le_bytes());
