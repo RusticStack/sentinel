@@ -171,7 +171,7 @@ pub fn issue(
         return Ok(access);
     };
     let app = app.ok_or(Error::Refused("github_unconfigured"))?;
-    let token = app
+    let mut token = app
         .source_token(
             forge.installation,
             forge.account,
@@ -206,7 +206,7 @@ pub fn issue(
         expires_ms: token.expires_ms.min(now.0.saturating_add(60_000)),
         credential: Credential::Https {
             username: "x-access-token".into(),
-            secret: token.secret,
+            secret: std::mem::take(&mut token.secret),
         },
     })
 }

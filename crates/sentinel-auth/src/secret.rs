@@ -87,6 +87,18 @@ impl fmt::Debug for Digest {
     }
 }
 
+/// Overwrite `bytes` with zeros using
+/// volatile writes and a compiler fence (the `zeroize` crate): a plain
+/// `fill(0)` on a buffer that is about to be freed is dead-store eliminated.
+pub fn wipe(bytes: &mut [u8]) {
+    zeroize::Zeroize::zeroize(bytes);
+}
+
+/// [`wipe`] for text: the whole allocation is zeroed, then the string is empty.
+pub fn wipe_string(text: &mut String) {
+    zeroize::Zeroize::zeroize(text);
+}
+
 /// Constant-time equality for digests of secrets. `black_box` keeps the
 /// accumulator from being turned back into an early-exit comparison.
 #[must_use]

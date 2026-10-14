@@ -42,6 +42,26 @@ fn file(path: &Path, limit: usize) -> Result<Vec<u8>, Error> {
     )
 }
 
+/// Read an operator file that holds a secret: opened once without following
+/// a link and judged on the open handle (a regular file, owned by this user,
+/// closed to group and others), exactly as the master key is
+/// ([`sentinel_auth::secret_file`]). The buffer is wiped by the caller.
+/// Errors name `what` and the rule broken, never the path or any content.
+fn secret_input(path: &Path, limit: usize, what: &str) -> Result<Vec<u8>, Error> {
+    use sentinel_auth::secret_file::{self, Refusal};
+    let mut input = secret_file::open(path).map_err(|refusal| {
+        fail(&match refusal {
+            Refusal::GroupOrOtherAccess => format!("{what} must be owner-only"),
+            Refusal::WrongOwner => format!("{what} must be owned by this user"),
+            Refusal::NotRegular => format!("{what} must be a regular file, not a link"),
+            Refusal::Unreadable => format!("cannot read {what}"),
+        })
+    })?;
+    secret_file::read(&mut input, limit)
+        .map_err(|_| fail(&format!("cannot read {what}")))?
+        .ok_or_else(|| fail(&format!("{what} exceeds limit")))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AppConfig {
@@ -88,19 +108,14 @@ pub fn load_app(root: &Path) -> Result<Option<GithubApp>, Error> {
     if !config.private_key_file.is_absolute() {
         return Err(fail("App key path must be absolute"));
     }
-    use std::os::unix::fs::PermissionsExt;
-    let input =
-        std::fs::File::open(&config.private_key_file).map_err(|_| fail("cannot open App key"))?;
-    let metadata = input
-        .metadata()
-        .map_err(|_| fail("cannot inspect App key"))?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err(fail("App key must be an owner-only regular file"));
-    }
-    let bytes = bounded(input, 16 * 1024)?;
-    let pem = std::str::from_utf8(&bytes).map_err(|_| fail("invalid App key"))?;
-    let mut app =
-        sentinel_github::app::App::new(config.app_id, pem).map_err(|_| fail("invalid App key"))?;
+    let mut bytes = secret_input(&config.private_key_file, 16 * 1024, "App key")?;
+    let app = std::str::from_utf8(&bytes)
+        .map_err(|_| fail("invalid App key"))
+        .and_then(|pem| {
+            sentinel_github::app::App::new(config.app_id, pem).map_err(|_| fail("invalid App key"))
+        });
+    sentinel_auth::secret::wipe(&mut bytes);
+    let mut app = app?;
     if let Some(api_url) = &config.api_url {
         app = app
             .with_endpoint(api_url)
@@ -126,23 +141,19 @@ pub fn load_webhook_secret(root: &Path) -> Result<Option<Arc<[u8]>>, Error> {
     if !path.exists() {
         return Ok(None);
     }
-    let config: WebhookConfig = serde_json::from_slice(&file(&path, 4096)?)
-        .map_err(|_| fail("invalid GitHub webhook configuration"))?;
+    // The file is the secret's home, so it is judged before it is parsed.
+    let mut bytes = secret_input(&path, 4096, "GitHub webhook configuration")?;
+    let parsed = serde_json::from_slice::<WebhookConfig>(&bytes);
+    sentinel_auth::secret::wipe(&mut bytes);
+    let mut config = parsed.map_err(|_| fail("invalid GitHub webhook configuration"))?;
     let secret = config.secret.as_bytes();
-    if !(16..=256).contains(&secret.len()) || secret.iter().any(|b| !(0x20..0x7f).contains(b)) {
-        return Err(fail(
-            "GitHub webhook secret must be 16-256 printable ASCII bytes",
-        ));
-    }
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(&path)
-        .map_err(|_| fail("cannot inspect GitHub webhook configuration"))?
-        .permissions()
-        .mode();
-    if mode & 0o077 != 0 {
-        return Err(fail("GitHub webhook configuration must be owner-only"));
-    }
-    Ok(Some(Arc::from(secret)))
+    let valid =
+        (16..=256).contains(&secret.len()) && secret.iter().all(|b| (0x20..0x7f).contains(b));
+    let secret: Option<Arc<[u8]>> = valid.then(|| Arc::from(secret));
+    sentinel_auth::secret::wipe_string(&mut config.secret);
+    secret
+        .map(Some)
+        .ok_or_else(|| fail("GitHub webhook secret must be 16-256 printable ASCII bytes"))
 }
 
 #[derive(Deserialize)]
@@ -169,16 +180,15 @@ pub fn load_sign_in(root: &Path) -> Result<Option<sentinel_api::GithubSignIn>, E
     if !config.client_secret_file.is_absolute() {
         return Err(fail("GitHub sign-in client_secret_file must be absolute"));
     }
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(&config.client_secret_file)
-        .map_err(|_| fail("cannot inspect the GitHub sign-in client secret file"))?
-        .permissions()
-        .mode();
-    if mode & 0o077 != 0 {
-        return Err(fail("GitHub sign-in client secret file must be owner-only"));
-    }
-    let client_secret = sentinel_github::oauth::read_secret(&config.client_secret_file)
-        .map_err(|_| fail("cannot read the GitHub sign-in client secret file"))?;
+    // `read_secret` opens the file once without following a link and judges
+    // the handle: owner-only, owned by this user, a regular file.
+    let client_secret =
+        sentinel_github::oauth::read_secret(&config.client_secret_file).map_err(|_| {
+            fail(
+                "cannot read the GitHub sign-in client secret file (it must be an \
+                 owner-only regular file owned by this user, not a link)",
+            )
+        })?;
     let endpoints = match (&config.web_url, &config.api_url) {
         (None, None) => sentinel_github::oauth::Endpoints::github(),
         (Some(web), Some(api)) => sentinel_github::oauth::Endpoints::enterprise(web, api)
@@ -508,5 +518,44 @@ mod tests {
             0o600,
         );
         assert!(load_sign_in(dir.path()).is_err());
+
+        // A link to an owner-only file is not that file: the open refuses it.
+        let link = dir.path().join("client-secret-link");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        write(
+            &config,
+            &format!(
+                r#"{{"client_id":"Iv1.abc","client_secret_file":"{}"}}"#,
+                link.display()
+            ),
+            0o600,
+        );
+        let error = load_sign_in(dir.path()).unwrap_err();
+        assert!(!error.message.contains("s3cret"), "{}", error.message);
+    }
+
+    #[test]
+    fn the_webhook_secret_file_is_judged_on_its_open_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_webhook_secret(dir.path()).unwrap().is_none());
+        let path = dir.path().join("github-webhook.json");
+        let body = r#"{"secret":"a-webhook-secret-value"}"#;
+        write(&path, body, 0o600);
+        let secret = load_webhook_secret(dir.path()).unwrap().unwrap();
+        assert_eq!(&*secret, b"a-webhook-secret-value");
+        // Group- or world-readable: refused, and the value is not echoed.
+        write(&path, body, 0o640);
+        let error = load_webhook_secret(dir.path()).err().unwrap();
+        assert!(!error.message.contains("a-webhook"), "{}", error.message);
+        // A link to an owner-only file is refused as well.
+        let real = dir.path().join("real.json");
+        write(&real, body, 0o600);
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+        assert!(load_webhook_secret(dir.path()).is_err());
+        // Short secrets are refused after the file passes.
+        std::fs::remove_file(&path).unwrap();
+        write(&path, r#"{"secret":"short"}"#, 0o600);
+        assert!(load_webhook_secret(dir.path()).is_err());
     }
 }
