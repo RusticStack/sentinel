@@ -76,7 +76,7 @@ END;
 -- drained by the mail lane, never sent from a request handler. The body
 -- carries the link, so it is sealed with the master key and deleted the moment
 -- the row settles: no readable link outlives its delivery. Rows exist only
--- when SMTP is configured and the master key is present; otherwise the
+-- when Resend is configured and the master key is present; otherwise the
 -- host-local CLI mints a link on demand.
 CREATE TABLE mail_outbox(
     id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
@@ -84,7 +84,7 @@ CREATE TABLE mail_outbox(
     kind INTEGER NOT NULL CHECK(kind IN (1, 2)),
     recipient TEXT NOT NULL CHECK(length(recipient) BETWEEN 3 AND 254),
     body BLOB CHECK(body IS NULL OR length(body) BETWEEN 1 AND 16384),
-    -- 0 pending, 1 delivered to the relay, 2 given up (with `reason`)
+    -- 0 pending, 1 delivered to Resend, 2 given up (with `reason`)
     state INTEGER NOT NULL DEFAULT 0 CHECK(state IN (0, 1, 2)),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
     next_attempt_ms INTEGER NOT NULL,

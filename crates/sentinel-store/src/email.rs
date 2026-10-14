@@ -10,13 +10,13 @@
 //!
 //! Tokens are stored as digests, like every other secret. A message that has to
 //! carry a link is a different matter: the link exists in readable form from the
-//! moment it is minted until the mail lane has handed it to the relay. That
+//! moment it is minted until the mail lane has handed it to Resend. That
 //! window is the outbox row, whose body is sealed with the deployment master key
-//! and deleted as soon as the row settles. Without SMTP (or without a master
+//! and deleted as soon as the row settles. Without a Resend key (or without a master
 //! key) nothing is queued and the link is minted on demand by the host-local
 //! CLI, so a self-hosted operator is never locked out.
 //!
-//! Nothing here sends mail, and no request handler waits on a relay: the
+//! Nothing here sends mail, and no request handler waits on the network: the
 //! transaction that mints a token also writes the outbox row, and
 //! `sentinel-mail`'s lane drains it.
 
@@ -151,8 +151,8 @@ pub fn normalize_domain(input: &str) -> Result<String> {
 
 /// The canonical form of an address: `local@domain` with the local part lower
 /// cased (mail systems treat it case-insensitively, and so does this) and the
-/// domain per [`normalize_domain`]. The local part is ASCII: SMTPUTF8 is not
-/// spoken, so an address that needs it is refused rather than mangled. At most
+/// domain per [`normalize_domain`]. The local part is ASCII: internationalized local parts are not
+/// accepted, so an address that needs it is refused rather than mangled. At most
 /// [`MAX_EMAIL_BYTES`]. Diagnostics never echo the input.
 pub fn normalize(input: &str) -> Result<String> {
     let bad = || Error::InvalidInput("email address");
@@ -841,7 +841,7 @@ pub fn backoff_ms(attempts: u32) -> i64 {
     (30_000i64 << attempts.min(10)).min(15 * 60 * 1000)
 }
 
-/// The relay accepted the message: settle it and drop the sealed body.
+/// Resend accepted the message: settle it and drop the sealed body.
 pub fn delivered(tx: &Transaction<'_>, id: MailId, now: UnixMillis) -> Result<()> {
     let changed = tx.execute(
         "UPDATE mail_outbox SET state = 1, body = NULL, settled_ms = ?2 WHERE id = ?1 AND state = 0",
@@ -874,9 +874,20 @@ fn brief(reason: &str) -> String {
     text
 }
 
-/// A transient failure: due again after the back-off, or given up once the
-/// attempt budget or the message's own expiry is spent.
-pub fn retry(tx: &Transaction<'_>, id: MailId, now: UnixMillis, reason: &str) -> Result<Retry> {
+/// The longest a service's `Retry-After` is honored: past it the back-off
+/// schedule decides.
+pub const MAX_RETRY_AFTER_MS: i64 = 60 * 60 * 1000;
+
+/// A transient failure: due again after the back-off (or `retry_after_ms`,
+/// when the service asked for longer, bounded by [`MAX_RETRY_AFTER_MS`]), or
+/// given up once the attempt budget or the message's own expiry is spent.
+pub fn retry(
+    tx: &Transaction<'_>,
+    id: MailId,
+    now: UnixMillis,
+    reason: &str,
+    retry_after_ms: i64,
+) -> Result<Retry> {
     let row: Option<(i64, i64, i64)> = tx
         .prepare_cached(
             "SELECT attempts, expires_ms, kind FROM mail_outbox WHERE id = ?1 AND state = 0",
@@ -885,7 +896,8 @@ pub fn retry(tx: &Transaction<'_>, id: MailId, now: UnixMillis, reason: &str) ->
         .optional()?;
     let (attempts, expires_ms, kind) = row.ok_or(Error::Conflict)?;
     let next = u32::try_from(attempts.saturating_add(1)).unwrap_or(u32::MAX);
-    let next_attempt_ms = now.0.saturating_add(backoff_ms(next));
+    let wait_ms = backoff_ms(next).max(retry_after_ms.clamp(0, MAX_RETRY_AFTER_MS));
+    let next_attempt_ms = now.0.saturating_add(wait_ms);
     if next >= MAX_ATTEMPTS || next_attempt_ms >= expires_ms {
         give_up_row(tx, id, kind, "attempts", reason, now)?;
         return Ok(Retry::GaveUp);
@@ -900,7 +912,7 @@ pub fn retry(tx: &Transaction<'_>, id: MailId, now: UnixMillis, reason: &str) ->
     })
 }
 
-/// A permanent failure (the relay refused the recipient, the body cannot be
+/// A permanent failure (Resend refused the message, the body cannot be
 /// opened): settle it as given up with `reason`, audited.
 pub fn give_up(tx: &Transaction<'_>, id: MailId, reason: &str, now: UnixMillis) -> Result<()> {
     let kind: i64 = tx

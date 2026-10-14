@@ -1,6 +1,6 @@
 [package]
 name = "sentinel-mail"
-description = "Durable email delivery: a bounded SMTP client and the outbox lane"
+description = "Durable email delivery: a bounded Resend HTTPS client and the outbox lane"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,16 +8,20 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Lets a test point the client at a local server over plain HTTP. Enabled only
+# through dev-dependencies, never by a production build or by configuration.
+test-endpoint = []
+
 [dependencies]
-base64 = "0.23"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 sentinel-auth = { path = "../sentinel-auth" }
 sentinel-core = { path = "../sentinel-core" }
 sentinel-store = { path = "../sentinel-store" }
-time = { version = "0.3", features = ["formatting"] }
-webpki-roots = "1.0"
+serde_json = "1.0"
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
+sentinel-mail = { path = ".", features = ["test-endpoint"] }
 tempfile = "3.20"
 
 [lints]

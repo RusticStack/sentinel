@@ -2,15 +2,15 @@
 //!
 //! It reads a batch of due messages, opens each (the body is sealed with the
 //! master key), hands it to the transport, and writes the outcome back in a
-//! short transaction. It never holds the writer while a relay is on the
+//! short transaction. It never holds the writer while the service is on the
 //! network, and it never sends from a request handler: a handler only writes
 //! the row.
 //!
 //! The lane does not poll. It sleeps on the store's commit notifier and a
 //! deadline at the earliest pending message's retry time. A transient failure
-//! (relay down, slow, or misconfigured) schedules the message again with
+//! (unreachable, throttling or failing) schedules the message again with
 //! doubling backoff under the row's attempt budget and pauses the pass, so a
-//! dead relay costs one connection attempt per pause rather than one per
+//! dead service costs one connection attempt per pause rather than one per
 //! queued message. A refusal of the message itself is recorded and not
 //! retried. A message the lane cannot open (its key was retired) is given up.
 //! Maintenance (expiring undelivered rows, deleting week-old settled rows and
@@ -32,7 +32,7 @@ use sentinel_store::{
     email::{self, Retry},
 };
 
-use crate::smtp::{Failure, Mail, Transport};
+use crate::{Failure, Mail, Transport};
 
 /// How the lane paces itself: 16 messages per pass, a 10 s safety re-read
 /// (the net for a write the notifier cannot see), failure backoff from one
@@ -216,12 +216,14 @@ fn run(
                             batch.delivered += 1;
                             Written::Done("delivered".into())
                         }),
-                    Err(Failure::Transient(why)) => {
+                    Err(Failure::Transient { why, retry_after }) => {
                         pause = true;
                         let reason = why.clone();
+                        let not_before_ms = retry_after
+                            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
                         store
                             .writer()
-                            .write(move |tx| email::retry(tx, id, at, &reason))
+                            .write(move |tx| email::retry(tx, id, at, &reason, not_before_ms))
                             .map(|retry| match retry {
                                 Retry::Scheduled { attempts, .. } => {
                                     batch.retried += 1;

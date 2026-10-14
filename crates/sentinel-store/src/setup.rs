@@ -98,7 +98,7 @@ pub struct Setup<'a> {
 }
 
 /// Judge a presented token without using it, for the wizard's side steps (the
-/// SMTP test). A wrong token counts against the same lock as [`complete`];
+/// mail test). A wrong token counts against the same lock as [`complete`];
 /// the refusals are the same.
 pub fn verify(store: &Store, token: &Secret, now: UnixMillis) -> Result<()> {
     let presented = token.digest();

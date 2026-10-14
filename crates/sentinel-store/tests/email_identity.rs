@@ -103,7 +103,7 @@ impl Fixture {
         }
     }
 
-    /// The operator's way to a link: host-local, for a deployment with no SMTP.
+    /// The operator's way to a link: host-local, for a deployment without Resend.
     fn link(&self, user: UserId, address: Option<&'static str>, now: i64) -> Secret {
         self.store
             .writer()
@@ -241,7 +241,7 @@ fn an_existing_username_account_adds_and_verifies_an_address() {
         .writer()
         .write(move |tx| email::request(tx, None, user, "Old@Example.com", None, at(10)))
         .unwrap();
-    assert_eq!(requested, Requested::Undelivered, "no SMTP, no queue");
+    assert_eq!(requested, Requested::Undelivered, "no Resend key, no queue");
     assert!(!f.sign_in("old@example.com"), "a claim is not an identity");
 
     let link = f.link(user, None, 11);
@@ -541,7 +541,7 @@ fn failed_delivery_backs_off_and_gives_up_without_keeping_the_link() {
         let outcome = f
             .store
             .writer()
-            .write(move |tx| email::retry(tx, id, at(now), "relay unreachable"))
+            .write(move |tx| email::retry(tx, id, at(now), "service unreachable", 0))
             .unwrap();
         match outcome {
             email::Retry::Scheduled {
@@ -571,7 +571,7 @@ fn failed_delivery_backs_off_and_gives_up_without_keeping_the_link() {
     let last = f
         .store
         .writer()
-        .write(move |tx| email::retry(tx, id, at(now), "relay unreachable"))
+        .write(move |tx| email::retry(tx, id, at(now), "service unreachable", 0))
         .unwrap();
     assert_eq!(last, email::Retry::GaveUp);
     assert!(
@@ -583,6 +583,34 @@ fn failed_delivery_backs_off_and_gives_up_without_keeping_the_link() {
     assert!(f.events().contains(&Event::MailAbandoned));
     let (pending, delivered, abandoned) = f.store.read(email::counts).unwrap();
     assert_eq!((pending, delivered, abandoned), (0, 0, 1));
+}
+
+#[test]
+fn a_retry_after_pushes_the_next_attempt_out_but_is_bounded() {
+    let f = fixture();
+    let key = f.key();
+    email::set_delivery(&f.store, true, Some("https://ci.example.com"), at(1)).unwrap();
+    f.user_of(f.sign_up("slow@example.com", &f.admission(), Some(Arc::clone(&key))));
+    let id = f.store.read(|c| email::due(c, at(10), 10)).unwrap()[0].id;
+    let wait = |retry_after_ms: i64, now: i64| {
+        match f
+            .store
+            .writer()
+            .write(move |tx| email::retry(tx, id, at(now), "throttled", retry_after_ms))
+            .unwrap()
+        {
+            email::Retry::Scheduled {
+                next_attempt_ms, ..
+            } => next_attempt_ms - now,
+            email::Retry::GaveUp => panic!("gave up"),
+        }
+    };
+    // Longer than the back-off: honored.
+    assert_eq!(wait(120_000, 100), 120_000);
+    // Shorter than the back-off: the back-off stands.
+    assert!(wait(1, 200) >= email::backoff_ms(2));
+    // An absurd request is capped.
+    assert_eq!(wait(i64::MAX, 300), email::MAX_RETRY_AFTER_MS);
 }
 
 #[test]
