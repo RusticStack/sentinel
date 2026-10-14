@@ -25,7 +25,6 @@ use sentinel_worker::{
     podman,
 };
 
-/// One test at a time: the shim's switches are process-wide.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 const SHIM: &str = r#"#!/bin/sh

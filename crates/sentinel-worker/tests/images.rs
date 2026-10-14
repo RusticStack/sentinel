@@ -182,8 +182,6 @@ fn the_pull_overlaps_the_checkout() {
     assert!(rec.summary.lock().unwrap().is_some());
 }
 
-/// A tag-only reference is refused before any pull machinery runs, on the
-/// shared path just as on the direct one.
 #[test]
 fn an_unpinned_reference_is_still_refused() {
     let images = Images::with_download(|_, _, _, _, _| Ok(false));

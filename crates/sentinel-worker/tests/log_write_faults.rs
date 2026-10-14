@@ -1,4 +1,3 @@
-//! The kernel cuts a write short (RLIMIT_FSIZE), as a full disk does mid-record.
 //! The limit is process-wide, so this binary holds exactly one test.
 
 #![cfg(target_os = "linux")]
@@ -77,9 +76,7 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// A frame whose write was cut short is never acknowledged, and the frames
-/// after it are never written behind its remains: the resend of it and
-/// everything after read back exactly.
+/// A cut-short frame is never acknowledged and never has frames written behind it.
 #[test]
 fn a_short_write_never_strands_a_record_in_the_log_or_the_spool() {
     let temp = tempfile::tempdir().unwrap();

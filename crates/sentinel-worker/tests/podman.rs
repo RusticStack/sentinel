@@ -153,7 +153,6 @@ fn a_container_is_limited_unprivileged_offline_read_only_and_owned() {
         "hello\n"
     );
 
-    // Exit statuses and signals are reported as such; a workdir applies.
     fs::create_dir(ws.path().join("sub")).unwrap();
     let mut cmd = sh("pwd; exit 3", 30);
     cmd.workdir = Some("sub".into());
