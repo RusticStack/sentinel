@@ -116,7 +116,10 @@ Retries, refusals and rate limits are explicit:
   with a reset): GitHub limits per installation, so only that installation is
   parked. Its rows are deferred until the reset (at most one hour) **without
   spending an attempt**, and every other installation keeps publishing; a 429
-  without timing headers parks for one minute;
+  without timing headers parks for one minute. A repository whose installation
+  is not known yet carries the scope `u64::MAX`, which never equals a real
+  installation id, so it is never held back by another installation's limit
+  (a scope of 0 would throttle unrelated installations);
 - **poison rows**: a row whose outcome cannot be written (the store rejects the
   update three passes in a row) is parked for an hour instead of retried at the
   head of the queue, so one bad row never blocks other checks or tenants. A
@@ -157,7 +160,9 @@ duplicate. A row created before migration 33 keeps the old rule for its
 bare id: only a live run is adopted. The lookup is paged (100 runs a page,
 at most ten pages, each answer bounded to 1 MiB), so a commit with many
 reruns neither overflows one bounded answer nor hides the run past the first
-page. A crash between the
+page. A check run that has vanished during the lookup is reported as refused
+(`lookup: …`), never recreated under the same name, because recreating it would
+publish a duplicate on the forge. A crash between the
 mark and the request costs one harmless lookup; a crash after the request is
 what the mark exists for. An update is idempotent, so an ambiguous *update*
 needs no mark: the next attempt updates the same run again.
