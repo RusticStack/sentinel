@@ -1,4 +1,4 @@
-//! Tenant-scoped immutable objects and versioned manifests (D01).
+//! Tenant-scoped immutable objects and versioned manifests.
 //!
 //! Layout under the controller's data directory, all on one filesystem:
 //!
@@ -425,7 +425,7 @@ pub struct Meta {
     pub created_ms: UnixMillis,
 }
 
-/// What a manifest may name. `Cache` exists so later phases do not overload
+/// What a manifest may name. `Cache` keeps cache entries out of
 /// the artifact namespace; the wire value is part of the schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -538,31 +538,30 @@ pub struct Objects {
     upload_io: [Mutex<()>; UPLOAD_STRIPES],
     /// Where the bounded orphan sweep resumes: the last shard it finished.
     sweep_cursor: Mutex<Option<String>>,
-    /// Disk admission; unset admits everything (tests and hosts without
-    /// watermarks behave exactly as before D06).
+    /// Disk admission; unset admits everything.
     admission: OnceLock<Arc<Admission>>,
-    /// The deployment's storage limits (R01): the default tenant quota, the
+    /// The deployment's storage limits: the default tenant quota, the
     /// deployment-wide cap and the retention defaults.
     deployment: Mutex<crate::retention::Deployment>,
-    /// Where an evicted object's bytes are fetched back from (R02); unset
+    /// Where an evicted object's bytes are fetched back from; unset
     /// when no external copy is configured.
     remote: OnceLock<Arc<dyn Remote>>,
     /// Objects fetched back since the maintenance pass last looked: their
     /// rows are marked local again there, off the read path.
     rehydrated: Mutex<Vec<(TenantId, Digest)>>,
-    /// The external copy's replicator status, when one runs (R03): what
+    /// The external copy's replicator status, when one runs: what
     /// the API and metrics report.
     replication: OnceLock<Arc<crate::replicate::Status>>,
     /// Held by anything that deletes committed bytes — the storage pass
     /// (reclaim, orphans, log expiry) and eviction — and by a backup for its
-    /// whole run (R04), so a backup's snapshot never names a file that goes
+    /// whole run, so a backup's snapshot never names a file that goes
     /// before it is copied.
     maintenance: Mutex<()>,
-    /// The backup scheduler, when `[backup]` is configured (R04).
+    /// The backup scheduler, when `[backup]` is configured.
     backups: OnceLock<Arc<dyn crate::backup::Control>>,
 }
 
-/// The external copy an evicted object is fetched back from (R02). The
+/// The external copy an evicted object is fetched back from. The
 /// implementation streams the object at `key` into `out` and returns the
 /// bytes written; the store verifies length and digest before the file is
 /// placed.
@@ -667,7 +666,7 @@ impl Objects {
         self.maintenance.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Publish the backup scheduler (R04).
+    /// Publish the backup scheduler.
     pub fn set_backups(&self, backups: Arc<dyn crate::backup::Control>) {
         let _ = self.backups.set(backups);
     }
@@ -677,7 +676,7 @@ impl Objects {
         self.backups.get()
     }
 
-    /// Publish the replicator's status (R03).
+    /// Publish the replicator's status.
     pub fn set_replication(&self, status: Arc<crate::replicate::Status>) {
         let _ = self.replication.set(status);
     }
@@ -687,13 +686,13 @@ impl Objects {
         self.replication.get()
     }
 
-    /// Install the external copy evicted objects are fetched back from (R02).
+    /// Install the external copy evicted objects are fetched back from.
     pub fn set_remote(&self, remote: Arc<dyn Remote>) {
         let _ = self.remote.set(remote);
     }
 
     /// Open an object's local file, fetching it back from the external copy
-    /// first when it was evicted (R02). The fetch is verified — length and
+    /// first when it was evicted. The fetch is verified — length and
     /// digest — before the file is placed, so a corrupt or truncated remote
     /// copy is `Corrupt`, never served.
     fn open_local(&self, tenant: TenantId, digest: Digest, len: u64) -> Result<File> {
@@ -759,8 +758,8 @@ impl Objects {
         std::mem::take(&mut *self.rehydrated.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
-    /// Remove the local files of objects whose rows were just marked evicted
-    /// (R02), skipping any a reader or stage pins right now — those stay
+    /// Remove the local files of objects whose rows were just marked evicted,
+    /// skipping any a reader or stage pins right now — those stay
     /// local and the caller marks them back. Runs after the eviction commits.
     /// Returns what it removed.
     pub fn evict_files(&self, victims: &[(TenantId, Digest)]) -> Vec<(TenantId, Digest)> {
@@ -796,7 +795,7 @@ impl Objects {
             .tenant_quota_bytes = bytes;
     }
 
-    /// Install the deployment's storage limits (R01). Set at startup.
+    /// Install the deployment's storage limits. Set at startup.
     pub fn set_deployment(&self, deployment: crate::retention::Deployment) {
         *self.deployment.lock().unwrap_or_else(|p| p.into_inner()) = deployment;
     }
@@ -1586,7 +1585,7 @@ impl Objects {
             }
         }
         // Committed objects: (tenant, digest) -> (len, evicted). An evicted
-        // object (R02: its only copy is in S3) is not expected on disk, and a
+        // object (its only copy is in S3) is not expected on disk, and a
         // file for it is one fetched back.
         let mut committed: HashMap<(TenantId, Digest), (u64, bool)> = HashMap::new();
         let mut rows =
@@ -2257,8 +2256,8 @@ impl Objects {
         Ok(swept)
     }
 
-    /// Backfill `manifest_refs` for manifests committed before the edges
-    /// existed (`refs_indexed = 0`). Reads each manifest file, inserts its
+    /// Backfill `manifest_refs` for manifests whose edges are not indexed
+    /// yet (`refs_indexed = 0`). Reads each manifest file, inserts its
     /// edges and flips the flag — all inside the caller's transaction, at
     /// most `limit` manifests per call. A manifest that will not decode is
     /// skipped: its tenant's objects stay unreclaimable until it is fixed.

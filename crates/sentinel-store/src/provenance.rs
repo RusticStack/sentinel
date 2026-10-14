@@ -1,5 +1,5 @@
 //! Why a run exists: one immutable row per run, written in the same
-//! transaction as the run itself (G03).
+//! transaction as the run itself.
 //!
 //! A manual dispatch names its pipeline inline and has no delivery; an event
 //! names the delivery that produced it, the ref transition, and — for a pull
@@ -184,8 +184,7 @@ impl EventFacts {
 }
 
 /// One run's event facts. A run without provenance (created by a raw store
-/// primitive, or before this contract) is the manual mode: the only path that
-/// did not record one.
+/// primitive) is the manual mode: the only path that did not record one.
 pub fn event_facts(conn: &Connection, run: RunId) -> Result<EventFacts> {
     let row: Option<(String, Option<String>, Option<i64>)> = conn
         .prepare_cached(
@@ -203,7 +202,7 @@ pub fn event_facts(conn: &Connection, run: RunId) -> Result<EventFacts> {
     })
 }
 
-/// The cache trust class of one run (P07-2, docs/cache.md): `Protected`
+/// The cache trust class of one run (docs/cache.md): `Protected`
 /// only for a `push`/`tag` that arrived through verified intake (a
 /// recorded delivery — never the API) for a ref the repository's live
 /// binding names *exactly*; `PullRequest` for pull-request runs;
@@ -263,8 +262,8 @@ pub fn may_receive_secrets(conn: &Connection, run: RunId) -> Result<bool> {
         .unwrap_or(false))
 }
 
-/// One run's provenance; `None` for a run created before this contract
-/// (or by a path that does not record it).
+/// One run's provenance; `None` for a run created by a path that does not
+/// record it.
 pub fn of_run(conn: &Connection, run: RunId) -> Result<Option<RunProvenance>> {
     type Row = (
         [u8; 16],
@@ -363,7 +362,7 @@ pub fn of_run(conn: &Connection, run: RunId) -> Result<Option<RunProvenance>> {
 }
 
 /// The event kind of a run, for the status views. `None` means the run has no
-/// provenance row (created before G03).
+/// provenance row.
 pub fn trigger_of(conn: &Connection, run: RunId) -> Result<Option<String>> {
     Ok(conn
         .prepare_cached("SELECT trigger FROM run_provenance WHERE run_id = ?1")?
