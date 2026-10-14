@@ -351,6 +351,31 @@ pub fn queue_object_delete(
     Ok(())
 }
 
+/// Decide whether a queued object-copy delete still applies. When the same
+/// content has been committed again (a live `objects` row names the key), the
+/// queued delete is dropped and `true` is returned: the S3 copy now belongs to
+/// that row and must stay. The check and the drop are one statement sequence
+/// in the caller's transaction, so no commit can land between them.
+pub fn keep_if_live(
+    tx: &Transaction<'_>,
+    id: i64,
+    tenant: TenantId,
+    digest: &Digest,
+) -> Result<bool> {
+    let live: bool = tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM objects WHERE tenant_id = ?1 AND digest = ?2)",
+        )?
+        .query_row(
+            params![tenant.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+            |r| r.get(0),
+        )?;
+    if live {
+        delete_done(tx, id)?;
+    }
+    Ok(live)
+}
+
 pub fn delete_done(tx: &Transaction<'_>, id: i64) -> Result<()> {
     tx.prepare_cached("DELETE FROM s3_deletes WHERE id = ?1")?
         .execute([id])?;

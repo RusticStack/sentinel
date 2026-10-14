@@ -760,3 +760,68 @@ fn a_refused_credential_degrades_the_copy_until_it_is_replaced() {
     assert_eq!(r.status().state(), "healthy");
     assert_eq!(r.status().consecutive_failures.load(Ordering::Relaxed), 0);
 }
+
+#[test]
+fn a_queued_delete_never_removes_the_copy_of_content_committed_again() {
+    let f = fixture();
+    let digest = f.put(b"same bytes twice");
+    let r = f.replicator(SETTINGS);
+    r.pass().unwrap();
+    let key = objects::remote_key(f.tenant, &digest);
+    let tenant = f.tenant;
+    // Reclaimed: the delete of its copy is queued.
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "DELETE FROM objects WHERE tenant_id = ?1 AND digest = ?2",
+                rusqlite::params![tenant.as_bytes().as_slice(), digest.as_bytes().as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // The same content is committed again and its copy recorded before the
+    // queued delete runs (the case of more than one batch of deletes waiting).
+    assert_eq!(f.put(b"same bytes twice"), digest);
+    let object = f.store.read(|c| offload::unreplicated(c, 1)).unwrap()[0];
+    let now = UnixMillis::now();
+    f.store
+        .writer()
+        .write(move |tx| offload::replicated(tx, &object, now).map(|_| ()))
+        .unwrap();
+    let pass = r.pass().unwrap();
+    assert_eq!(pass.deleted, 0, "the delete no longer applies");
+    assert!(f.bucket.keys().contains(&key), "the live copy stays");
+    let queued: i64 = f
+        .store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM s3_deletes", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(queued, 0, "the stale delete was dropped, not left to retry");
+    assert_eq!(f.read(digest).unwrap(), b"same bytes twice");
+}
+
+#[test]
+fn a_store_failure_stops_the_pass_and_degrades_health() {
+    let f = fixture();
+    f.put(b"anything");
+    let r = f.replicator(SETTINGS);
+    r.pass().unwrap();
+    assert_eq!(r.status().state(), "healthy");
+    // The store cannot answer the delete queue read: the pass fails before
+    // the bucket is touched, and health must say so.
+    f.store
+        .writer()
+        .write(|tx| {
+            tx.execute_batch("DROP TABLE s3_deletes")?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(r.pass().is_err());
+    let status = r.status();
+    assert_eq!(status.consecutive_failures.load(Ordering::Relaxed), 1);
+    assert_eq!(status.state(), "degraded");
+    assert!(status.last_error.lock().unwrap().is_some());
+    // Failures accumulate; one is not recorded twice for the same pass.
+    assert!(r.pass().is_err());
+    assert_eq!(status.consecutive_failures.load(Ordering::Relaxed), 2);
+}
