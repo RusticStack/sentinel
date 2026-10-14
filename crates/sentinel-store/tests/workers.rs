@@ -1,7 +1,3 @@
-//! Worker store behavior: enrollment is one-time, expiring, pool-bound and
-//! platform-issued; a worker's identity and pool are fixed; liveness is
-//! recorded at a bounded cadence; revocation is final.
-
 use sentinel_auth::secret::{Digest, Secret};
 use sentinel_core::{
     PoolId, TenantId, UnixMillis, UserId, WorkerId,
@@ -119,7 +115,6 @@ fn enroll(
 fn enrollment_is_platform_issued_pool_bound_single_use_and_expiring() {
     let f = fixture();
     let pool = f.pool;
-    // Issuing needs platform administration and an active pool with a bounded lifetime.
     let member = Principal::new(UserId::new(), P::ALL, None, None);
     let refused = f.store.writer().write(move |tx| {
         workers::issue_enrollment(tx, Authority::credential(member), pool, 60_000, NOW).map(|_| ())
@@ -150,7 +145,6 @@ fn enrollment_is_platform_issued_pool_bound_single_use_and_expiring() {
     let (worker, fp) = (WorkerId::new(), fingerprint());
     let enrolled = enroll(&f, &issued.secret, worker, fp, at(2_000)).unwrap();
     assert_eq!((enrolled.id, enrolled.pool), (worker, pool));
-    // Spent: a second machine gets nothing, and neither does the same one.
     assert!(matches!(
         enroll(
             &f,
@@ -161,8 +155,6 @@ fn enrollment_is_platform_issued_pool_bound_single_use_and_expiring() {
         ),
         Err(Error::NotFound)
     ));
-    // A reused identity or fingerprint with a fresh enrollment is a conflict,
-    // and the fresh enrollment stays unspent for the real machine.
     let fresh = f
         .store
         .writer()
@@ -179,7 +171,6 @@ fn enrollment_is_platform_issued_pool_bound_single_use_and_expiring() {
         Err(Error::Conflict)
     ));
     enroll(&f, &fresh.secret, WorkerId::new(), fingerprint(), at(2_400)).unwrap();
-    // Expired and revoked enrollments are the same "no".
     let short = f
         .store
         .writer()
@@ -242,7 +233,6 @@ fn a_worker_is_known_by_fingerprint_bound_to_its_pool_and_revocable() {
         Err(Error::NotFound)
     ));
 
-    // Liveness moves forward at a bounded cadence and never backwards.
     f.store
         .writer()
         .write(move |tx| workers::seen(tx, worker, at(5_000)))
@@ -262,7 +252,6 @@ fn a_worker_is_known_by_fingerprint_bound_to_its_pool_and_revocable() {
         at(5_000 + workers::SEEN_RECORD_INTERVAL_MS)
     ));
 
-    // The pool cannot be moved or the fingerprint swapped by raw SQL.
     let shared = f.shared;
     let raw = f.store.writer().write(move |tx| {
         tx.execute("UPDATE workers SET pool_id = ?1", [shared.as_bytes()])?;
@@ -270,7 +259,6 @@ fn a_worker_is_known_by_fingerprint_bound_to_its_pool_and_revocable() {
     });
     assert!(matches!(raw, Err(Error::Sqlite(_))));
 
-    // Listing: the platform, and members of a tenant the pool admits.
     let live = f
         .store
         .read(|c| workers::in_pool(c, Authority::HostLocal, pool))
@@ -283,8 +271,6 @@ fn a_worker_is_known_by_fingerprint_bound_to_its_pool_and_revocable() {
         Err(Error::NotFound)
     ));
 
-    // Revocation: platform-only, refused from now on, not repeatable, and the
-    // worker leaves the pool listing.
     let refused = f
         .store
         .writer()
@@ -338,8 +324,6 @@ fn a_worker_is_known_by_fingerprint_bound_to_its_pool_and_revocable() {
             )
         })
         .unwrap();
-    // The pool itself is still active, so the worker still authenticates; it
-    // is placement that the suspended tenant loses. That is deliberate:
-    // a dedicated pool's machines stay enrolled through a suspension.
+    // Suspension drops placement, not enrollment: dedicated pool machines still authenticate.
     assert!(f.store.read(|c| workers::authenticate(c, &fp2)).is_ok());
 }

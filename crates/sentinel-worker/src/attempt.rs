@@ -1,23 +1,3 @@
-//! One attempt from offer to terminal: prepare (workspace, checkout, image,
-//! container), run the steps in order, finalize (tear everything down), and
-//! report each phase under the attempt's fence with a measured summary.
-//!
-//! Step semantics are the run spec's: `/bin/sh -e -c` or `bash -eo
-//! pipefail -c`, job environment then step environment then the worker's
-//! own context, working directory under the workspace, per-step timeout
-//! bounded by what is left of the job's. A step's `if` is evaluated in the
-//! worker phase against the job context and the checkout; false skips the
-//! step, anything else than a boolean fails preparation. Steps after a
-//! failed one never start.
-//!
-//! The verdict distinguishes: exit 0 passes; any other
-//! status is `CommandFailed`; death by signal `CommandSignaled`, unless the
-//! cgroup's OOM counter moved, which is `OutOfMemory`; a step past its
-//! budget `ExecutionTimeout`; a runtime that could not run the step
-//! `Runtime`; anything that stops the steps from starting `Preparation`; a
-//! cancel seen between steps `Canceled`. Every phase is timed monotonically
-//! and the summary travels with the terminal report.
-
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -48,59 +28,31 @@ use crate::{
     workspace::Workspace,
 };
 
-/// Test builds only: a step with this id panics the attempt thread just
-/// before it would run.
 #[cfg(test)]
 pub(crate) const PANIC_STEP: &str = "panic-injected";
 
-/// What the attempt is: identity, fence, the spec, which job of it, and
-/// the controller's context for its expressions.
 pub struct Job {
     pub worker: WorkerId,
     pub attempt: AttemptId,
     pub fence: Fence,
     pub job_index: usize,
-    /// `sha256:…`, as the controller resolved it; the name is the spec's.
     pub digest: String,
     pub spec: RunSpec,
     pub context: JobContext,
-    /// Controller-authorized values bound to the acknowledged attempt's
-    /// fence. The protocol wrapper wipes each owned value on drop.
     pub secret_bundle: sentinel_protocol::secrets::DeliveryBundle,
-    /// The worker's image pulls: concurrent attempts share one download
-    /// per `name@sha256:…`.
     pub images: Images,
-    /// The job's declared caches as restored for this attempt: filled by
-    /// preparation, read back by finalization. Each entry holds its scope,
-    /// rendered key, the outcome that produced the view and the private
-    /// writable directory the container saw.
     pub caches: Vec<sentinel_cache::attach::Attached>,
-    /// The worker's shared object mirrors, when the process could open them;
-    /// `None` runs every checkout direct.
     pub mirrors: Option<checkout::Mirrors>,
-    /// A pause between starting the checkout and pulling the image, so a
-    /// cancel that arrives during preparation can be exercised
-    /// deterministically. Zero in production.
     pub prepare_hold: std::time::Duration,
 }
 
-/// Where a step's file targets appear in its container.
 pub const SECRET_FILES_MOUNT: &str = "/run/sentinel-secrets";
-/// Where a step's environment targets appear in its container, as a shell
-/// file its wrapper sources.
 pub const SECRET_ENV_MOUNT: &str = "/run/sentinel-env";
 
-/// Where delivered secrets are staged: under the worker's runtime
-/// directory — a tmpfs when `$XDG_RUNTIME_DIR` is usable — never
-/// the workspace, caches or artifact roots.
 pub fn secret_root(root: &Path) -> PathBuf {
     crate::runtime_dir(root).join("secret-delivery")
 }
 
-/// The store an attempt's image and container live in: the
-/// tenant's private store when the job pulls with `registry_auth`, the
-/// shared one otherwise. Deterministic, so the executor's teardown paths
-/// name the same store preparation used.
 pub fn store_for(root: &Path, job: &Job) -> Result<podman::Store> {
     let private = job.secret_bundle.targets.iter().any(|target| {
         matches!(
@@ -111,8 +63,6 @@ pub fn store_for(root: &Path, job: &Job) -> Result<podman::Store> {
     if !private {
         return Ok(podman::Store::Shared);
     }
-    // Registry auth only travels on protocol 10, whose context always
-    // names the tenant; without one there is no store to scope it to.
     let tenant = job
         .context
         .tenant
@@ -120,12 +70,6 @@ pub fn store_for(root: &Path, job: &Job) -> Result<podman::Store> {
     podman::Store::private(root, *tenant.as_bytes())
 }
 
-/// Protected scratch for one attempt. It is outside the checkout so
-/// artifacts and cache publication never traverse secret material. The
-/// attempt directory is owner-only on the host; the two directories below
-/// it are mounted read-only into the attempt's container alone and are
-/// world-readable inside so an image that runs as a non-root user can read
-/// its targets.
 struct SecretDirectory {
     attempt_dir: PathBuf,
     files_dir: PathBuf,
@@ -174,8 +118,6 @@ impl Drop for SecretDirectory {
     }
 }
 
-/// Per-step paths are removed and overwritten before another step starts,
-/// including error, timeout, cancellation, and unwind paths.
 struct StepSecrets {
     env_file: Option<PathBuf>,
     files: Vec<PathBuf>,
@@ -199,9 +141,7 @@ impl Drop for StepSecrets {
 }
 
 fn create_private_dir(path: &Path, allow_existing: bool) -> Result<()> {
-    // Created owner-only in one step, so a directory that will hold secrets
-    // is never visible with the umask's mode, not even briefly; the chmod
-    // below settles one that already existed.
+    // Created owner-only in one step, so a secret directory never shows the umask's mode.
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -226,9 +166,6 @@ fn create_private_dir(path: &Path, allow_existing: bool) -> Result<()> {
     Ok(())
 }
 
-/// A directory under a secret mount: readable and traversable by any
-/// container user (the mount is read-only and private to the attempt; the
-/// owner-only attempt directory above it is the host boundary).
 fn create_mounted_dir(path: &Path) -> Result<()> {
     fs::create_dir(path)?;
     #[cfg(unix)]
@@ -239,13 +176,10 @@ fn create_mounted_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A host-only secret file (the registry auth file): owner-only.
 fn create_secret_file(path: &Path) -> Result<std::fs::File> {
     create_file_mode(path, 0o600)
 }
 
-/// A file under a secret mount: readable by the image's user, whoever that
-/// is.
 fn create_mounted_file(path: &Path) -> Result<std::fs::File> {
     create_file_mode(path, 0o644)
 }
@@ -259,7 +193,6 @@ fn create_file_mode(path: &Path, mode: u32) -> Result<std::fs::File> {
         options.mode(mode);
     }
     let file = options.open(path)?;
-    // The umask may have narrowed it; the mode is part of the contract.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -270,9 +203,6 @@ fn create_file_mode(path: &Path, mode: u32) -> Result<std::fs::File> {
     Ok(file)
 }
 
-/// Write `value` as one `export NAME='value'` line for the step's wrapper
-/// shell to source. Env values are UTF-8 without NUL, CR or LF (checked on
-/// arrival); inside single quotes only `'` itself needs care.
 fn write_export(file: &mut std::fs::File, name: &str, value: &[u8]) -> Result<()> {
     let mut line = Vec::with_capacity(name.len() + value.len() + 12);
     line.extend_from_slice(b"export ");
@@ -292,10 +222,7 @@ fn write_export(file: &mut std::fs::File, name: &str, value: &[u8]) -> Result<()
     Ok(())
 }
 
-/// The step's argv behind a `/bin/sh` wrapper that exports its secret
-/// environment from the private mount and then `exec`s it: the values
-/// never pass through Podman, which would copy them into the exec
-/// session's spec on disk, nor through any argv.
+/// Values reach the step by sourced file, never through Podman or argv, which would persist them.
 fn wrap_with_env(argv: Vec<String>, step: usize) -> Vec<String> {
     let mut wrapped = Vec::with_capacity(argv.len() + 4);
     wrapped.push("/bin/sh".to_owned());
@@ -408,18 +335,10 @@ fn materialize_step_secrets(
     Ok(cleanup)
 }
 
-/// Where the phases are reported. Ordered per attempt; the link's reporter
-/// or a test's recorder.
 pub trait Report: Send + Sync {
     fn event(&self, attempt: AttemptId, fence: Fence, event: Event);
-    /// The terminal event with the encoded summary.
     fn finish(&self, attempt: AttemptId, fence: Fence, event: Event, summary: Vec<u8>);
-    /// A cache publication's outcome from finalization — diagnostics only,
-    /// never the verdict. The default drops it.
     fn cache_note(&self, _attempt: AttemptId, _note: CacheNote) {}
-    /// A nominal hit's restore tripped the costly-hit rule
-    /// (docs/cache.md) — diagnostics only, never the verdict. `stats` is
-    /// the measured evidence. The default drops it.
     fn costly_hit(
         &self,
         _attempt: AttemptId,
@@ -428,64 +347,40 @@ pub trait Report: Send + Sync {
         _stats: &sentinel_cache::Stats,
     ) {
     }
-    /// The session's remote-cache transport, when the link offers
-    /// one: a local miss may hydrate through it and a sealed generation
-    /// may be offered back. `None` — the default — leaves both off.
     fn remote(&self) -> Option<Arc<dyn sentinel_cache::remote::Remote>> {
         None
     }
 }
 
-/// One cache's publication outcome, reported once per attempted entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheNote {
-    /// The declared cache's name.
     pub name: String,
     pub outcome: CacheOutcome,
 }
 
-/// What publication did with one attached cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CacheOutcome {
-    /// A new generation was sealed and is now `current`.
     Sealed {
         generation: String,
         bytes: u64,
-        /// Of `bytes`, how much was staged from the source generation.
         reused_bytes: u64,
     },
-    /// Nothing committed; the publish module's stable reason.
     Skipped(&'static str),
-    /// The commit failed; bounded detail, never the job's failure.
     Failed(String),
 }
 
-/// Where step output goes: the executor's spool and link. Writes are
-/// called from the reader threads with small chunks and must be quick;
-/// `complete` runs after the last step and blocks, bounded, until the log
-/// is acknowledged and closed, returning whether that happened.
 pub trait Output: Send + Sync {
     fn write(&self, step: u32, stream: Stream, bytes: &[u8]);
     fn complete(&self) -> bool;
-    /// Step `step` finished: output it held back (a possible secret prefix)
-    /// is released as that step's. The default holds nothing.
     fn step_done(&self, _step: u32) {}
-    /// `text` with the attempt's registered values redacted: every
-    /// diagnostic that leaves the attempt (the verdict detail, the stored
-    /// summary, the process log) passes through here. The default redacts
-    /// nothing.
     fn redact(&self, text: String) -> String {
         text
     }
-    /// The bounded excerpt of a failed step's stderr tail for its verdict
-    /// detail, redacted before it is decoded, cut to a line and shortened.
-    /// The default redacts nothing.
     fn excerpt(&self, stderr: &[u8]) -> String {
         crate::redact::excerpt(stderr)
     }
 }
 
-/// An output that discards everything, for callers without a log.
 pub struct NoOutput;
 impl Output for NoOutput {
     fn write(&self, _: u32, _: Stream, _: &[u8]) {}
@@ -494,24 +389,18 @@ impl Output for NoOutput {
     }
 }
 
-/// The attempt's verdict as reported, with the bounded reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Passed,
     Failed(FailureClass, String),
 }
 
-/// The per-attempt cancel flag the executor flips on `stop`.
 pub type Cancel = Arc<AtomicBool>;
 
 fn ns(started: Instant) -> Option<u64> {
     Some(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
 }
 
-/// Run the whole attempt. Returns the verdict and the summary that were
-/// reported. `sink` publishes declared artifacts during finalization, while
-/// the workspace still exists. `job` is mutable because preparation fills
-/// `job.caches` — the restored-cache carrier finalization reads.
 pub fn run(
     root: &Path,
     job: &mut Job,
@@ -521,14 +410,9 @@ pub fn run(
     cancel: &Cancel,
 ) -> (Verdict, AttemptSummary) {
     report.event(job.attempt, job.fence, Event::PreparationStarted);
-    // The session's remote transport, when it has one. Resolved once per
-    // attempt: hydration during preparation and offers after the verdict
-    // both go through it.
     let remote = report.remote();
     let mut summary = AttemptSummary::default();
     let prepared = prepare(root, job, cancel, &mut summary, remote.as_deref());
-    // A nominal hit that paid rebuild-scale restore cost is a diagnostic,
-    // never the verdict — flagged once per entry.
     for attached in &job.caches {
         if let Some(costly) = attached.costly_hit() {
             report.costly_hit(job.attempt, &attached.name, costly, &attached.stats);
@@ -536,10 +420,6 @@ pub fn run(
     }
     let mut sealed: Vec<SealedCache> = Vec::new();
     let verdict = match prepared {
-        // A cancel that lands while preparing is a cancel, whatever step of
-        // the preparation it interrupted. The log — empty or not — is closed
-        // on this path too, so nothing waits in the spool for steps that
-        // never ran.
         Err(_) if cancel.load(Ordering::Acquire) => {
             if output.complete() {
                 recovery::mark_ended(root, job.attempt);
@@ -567,9 +447,6 @@ pub fn run(
             summary.steps_ns = ns(started);
             report.event(job.attempt, job.fence, Event::FinalizationStarted);
             let started = Instant::now();
-            // Artifacts are part of finalization: resolved against the live
-            // workspace and committed on the controller before teardown —
-            // `when: always` captures even a canceled run's remains.
             let declared = job
                 .spec
                 .pipeline
@@ -585,13 +462,8 @@ pub fn run(
                 sink,
             );
             sealed = finalize(root, job, &verdict, report, prepared, cancel);
-            // The log is part of finalization: the attempt is not done until
-            // what it printed is durable on the controller, or the wait ran
-            // out and the failure is on record.
             let published = output.complete();
             if published {
-                // The spool went with it; if the report below never leaves,
-                // recovery must still call the log delivered, not lost.
                 recovery::mark_ended(root, job.attempt);
             }
             summary.finalize_ns = ns(started);
@@ -605,9 +477,7 @@ pub fn run(
             }
         }
     };
-    // A step's stderr, a helper's excerpt or a fallback reason can carry a
-    // value the job printed: redacted like its log before it becomes the
-    // verdict, the stored summary or a line in the worker's own log.
+    // Job-printed values can reach these strings: redact them before they leave the attempt.
     let verdict = match verdict {
         Verdict::Failed(class, why) => Verdict::Failed(class, output.redact(why)),
         passed => passed,
@@ -618,15 +488,10 @@ pub fn run(
     let event = match &verdict {
         Verdict::Passed => Event::Passed,
         Verdict::Failed(class, why) => {
-            // The failure reason leads; a mirror fallback reason recorded
-            // during preparation follows it, inside the same 500-character
-            // bound.
             summary.detail = failure_detail(why, &summary.detail);
             Event::Failed(*class)
         }
     };
-    // One bounded record per declared cache rides the terminal summary; a
-    // phase that never ran stays absent, never zero.
     summary.caches = job
         .caches
         .iter()
@@ -637,15 +502,10 @@ pub fn run(
         Ok(bytes) => report.finish(job.attempt, job.fence, event, bytes),
         Err(_) => report.event(job.attempt, job.fence, event),
     }
-    // A sealed generation is offered only after the terminal report has
-    // left; the offer is bounded background work and can never change what
-    // this attempt reported.
     offer_caches(root, job, &sealed, remote.as_deref(), cancel);
     (verdict, summary)
 }
 
-/// The summary's `detail` for a failed attempt: the failure reason, then
-/// any checkout fallback reason preparation recorded, within 500 chars.
 fn failure_detail(why: &str, fallback: &str) -> String {
     if fallback.is_empty() {
         why.chars().take(500).collect()
@@ -670,14 +530,9 @@ fn prepare(
         .jobs
         .get(job.job_index)
         .ok_or_else(|| Error::Preparation("job index outside the spec".into()))?;
-    // The spec names the image; the run pinned its digest. Both are used,
-    // never the tag: the bytes are the ones every attempt of the run gets.
     let image = sentinel_pipeline::run::ImageRef::parse(&compiled.spec.image)
         .map_err(|_| Error::Preparation("image reference".into()))?;
     let image = format!("{}@{}", image.name, job.digest);
-    // Lift what the closure needs out of the `job` borrow: the declared
-    // caches feed `restore_caches`, which takes `&mut Job` to record the
-    // attachments, so the slice cannot stay borrowed from `job`.
     let declared = compiled.spec.cache.clone();
     let resources = compiled.spec.resources;
     let timeout_secs = compiled.spec.timeout_secs;
@@ -694,14 +549,6 @@ fn prepare(
         }
     };
     let outcome = (|| {
-        // The checkout and the image pull are independent — one fills the
-        // fresh workspace, the other the worker's content store — so the
-        // checkout runs on its own thread while the pull overlaps it here,
-        // joined before the container starts. Each summary field measures
-        // its own phase's wall time, so `checkout_ns` and `image_pull_ns`
-        // together can exceed the preparation's. The Git helpers are tied
-        // to the attempt's cancel flag: a cancel kills a fetch under way
-        // instead of letting it run to the checkout deadline.
         let spawned = std::thread::Builder::new()
             .name(format!("sentinel-checkout-{}", job.attempt))
             .spawn({
@@ -737,13 +584,9 @@ fn prepare(
             }
         }
         if cancel.load(Ordering::Acquire) {
-            // The checkout owns the workspace until it finishes; join it
-            // before the teardown below destroys the directory.
             let _ = join_checkout(&mut co, summary);
             return Err(Error::Preparation("canceled".into()));
         }
-        // A checkout that has already failed — an unknown revision says so
-        // in milliseconds — skips the pull.
         if co.as_ref().is_some_and(|co| co.is_finished()) {
             join_checkout(&mut co, summary)?;
         }
@@ -797,24 +640,14 @@ fn prepare(
         }
         if let Ok(present) = &pulled {
             summary.image_pull_ns = ns(started);
-            // Whether the digest was resident before the authorized
-            // registry check.
             summary.image_present = Some(*present);
         }
-        // Join before the workspace could be torn down under a checkout
-        // still running. The first failure wins — the checkout's ahead of
-        // the pull's.
         let checked_out = join_checkout(&mut co, summary);
         if cancel.load(Ordering::Acquire) {
             return Err(Error::Preparation("canceled".into()));
         }
         checked_out.and(pulled)?;
         let store = store?;
-        // Attach the declared caches — each hit is cloned into the
-        // job's private view, each miss still leaves the writable target
-        // directories a job always sees. Never fatal: a cache-path error
-        // is an explainable miss recorded on the entry. Absolute declared
-        // paths reach the container through the collected bind mounts.
         let mut mounts = restore_caches(root, job, &declared, workspace.path(), &image, remote);
         let (mut files, mut env) = (false, false);
         for target in &job.secret_bundle.targets {
@@ -877,15 +710,8 @@ fn prepare(
     }
 }
 
-/// The checkout thread's handle: the mirror-aware outcome carries the
-/// fetch/materialization split and route; the `Option<u64>` is the phase's
-/// own wall time so a joined thread can still stamp `checkout_ns`.
 type CheckoutThread = std::thread::JoinHandle<Result<(checkout::Outcome, Option<u64>)>>;
 
-/// Join the checkout thread, once — `None` after the first call. A thread
-/// that could not produce its result is a preparation failure like the
-/// checkout's own; `checkout_ns` is stamped only when the checkout
-/// completed.
 fn join_checkout(co: &mut Option<CheckoutThread>, summary: &mut AttemptSummary) -> Result<()> {
     let Some(handle) = co.take() else {
         return Ok(());
@@ -904,18 +730,6 @@ fn join_checkout(co: &mut Option<CheckoutThread>, summary: &mut AttemptSummary) 
     Ok(())
 }
 
-/// Resolve every declared `cache:` entry against the fresh checkout —
-/// render its key (`hash_files` reads the workspace), derive the scope
-/// through the shared `attach` derivations, look the entry up and clone a
-/// hit into the job's private view. `job.caches` receives one `Attached`
-/// per declaration, in order, for finalization to publish; the
-/// returned mounts carry the absolute declared paths into the container.
-/// Never fails the attempt: any error on the cache path is an explainable
-/// miss recorded on the entry, and the declared paths stay writable
-/// directories either way. `image` is the pinned `name@digest` — the
-/// toolchain descriptor every scope is built under. `remote` is the
-/// session's transport: when present, a local miss may hydrate
-/// through the controller under `min(5 s, job timeout / 4)`.
 fn restore_caches(
     root: &Path,
     job: &mut Job,
@@ -927,8 +741,6 @@ fn restore_caches(
     if declared.is_empty() {
         return Vec::new();
     }
-    // The hydration budget derives from the job's own timeout: a quarter of
-    // it, capped at five seconds (remote::BUDGET_MAX).
     let job_timeout = job
         .spec
         .pipeline
@@ -936,9 +748,6 @@ fn restore_caches(
         .get(job.job_index)
         .map(|j| Duration::from_secs(j.spec.timeout_secs.max(1)))
         .unwrap_or(Duration::ZERO);
-    // One hydration deadline for the whole job, fixed before its first
-    // restore: N declared caches share the budget rather than each taking
-    // their own.
     let remote = remote.map(|source| sentinel_cache::remote::Policy {
         source,
         attempt: *job.attempt.as_bytes(),
@@ -969,9 +778,6 @@ fn restore_caches(
     job.caches = declared
         .iter()
         .filter_map(|decl| {
-            // A name `Scope::new` rejects never passed the schema; a spec
-            // built by hand gets no entry rather than a guessed one. A key
-            // that will not render is an explainable miss, not a failure.
             let scope = sentinel_cache::Scope::new(
                 tenant,
                 job.context.repo,
@@ -1003,9 +809,7 @@ fn restore_caches(
         .collect()
 }
 
-/// Podman's own exit codes for an exec that never ran the command. 126 and
-/// 127 are also what a shell returns for an unrunnable or missing command,
-/// so the runtime's `Error:` line on stderr is what settles it.
+/// Exit codes 125-127 also come from the shell, so the runtime's `Error:` line decides.
 fn runtime_failure(exit: &podman::Exit) -> bool {
     let text = String::from_utf8_lossy(&exit.stderr);
     let last = text
@@ -1041,9 +845,6 @@ fn execute(
     let context = WorkerContext::new(&job.context, &job.spec, workspace);
     let mut oom_seen = container.oom_kills().unwrap_or(0);
     let mut failure: Option<(FailureClass, String)> = None;
-    // Every declared step is considered in order. `job.caches` is written by
-    // `restore_caches` and read only by `publish_caches`, so a cache hit
-    // restores bytes, never a verdict: no path lets a hit skip work.
     for (index, step) in compiled.steps.iter().enumerate() {
         let mut record = StepRecord {
             index: index as u32,
@@ -1055,9 +856,6 @@ fn execute(
             summary.steps.push(record);
             continue;
         }
-        // Lets a test exercise the executor's panic containment with the
-        // container running and output spooled. Test builds only: no
-        // pipeline can reach this in any other build.
         #[cfg(test)]
         if step.id == PANIC_STEP {
             panic!("injected panic before step {index}");
@@ -1104,8 +902,6 @@ fn execute(
             ));
             continue;
         };
-        // The job's budget bounds every step's; a job cannot outlive its
-        // timeout by having many steps each within theirs.
         let remaining = job_deadline.saturating_duration_since(Instant::now());
         command.timeout_secs = command.timeout_secs.min(remaining.as_secs().max(1));
         let started = Instant::now();
@@ -1121,10 +917,7 @@ fn execute(
                 ));
                 continue;
             };
-            // Nothing an earlier step left running may watch this
-            // step's environment or files. The container is emptied down
-            // to its keepalive before anything is materialized; a
-            // container that cannot be emptied gets no secret.
+            // Clear strays before materializing secrets: no earlier process may watch them.
             if let Err(e) = container.clear_strays() {
                 record.outcome = StepOutcome::Runtime;
                 summary.steps.push(record);
@@ -1152,9 +945,6 @@ fn execute(
             Arc::new(move |stream, bytes: &[u8]| output.write(step_index, stream, bytes))
         };
         let exec = container.exec_streaming(&command, &extra, Some(sink));
-        // …and nothing this step started outlives it into a later one,
-        // whatever it held. Its files go only once its processes have.
-        // A timed-out or canceled step's container is already stopped.
         let cleared = if secret_step
             && exec.as_ref().is_ok_and(|exit| !exit.timed_out)
             && !cancel.load(Ordering::Acquire)
@@ -1164,8 +954,6 @@ fn execute(
             Ok(())
         };
         drop(step_secrets);
-        // Whatever the step printed last and the redactor held back is
-        // this step's output, released before the next one starts.
         output.step_done(index as u32);
         let exit = match exec.and_then(|exit| cleared.map(|()| exit)) {
             Ok(exit) => exit,
@@ -1179,8 +967,6 @@ fn execute(
         };
         record.duration_ns = ns(started);
         let (outcome, why) = if cancel.load(Ordering::Acquire) {
-            // Ended by the cancel order, however the process went: the
-            // desired state wins over the incidental exit status.
             (
                 StepOutcome::Signaled {
                     signal: exit.signal.unwrap_or(0),
@@ -1246,10 +1032,6 @@ fn execute(
     }
 }
 
-/// Capture every declared artifact whose `when` matches the step verdict.
-/// A required artifact that does not publish — no match, capture failure or
-/// a refused verdict — is a finalization failure; optional outcomes are
-/// recorded and left out of the verdict.
 pub fn capture_artifacts(
     attempt: AttemptId,
     workspace: &Path,
@@ -1284,9 +1066,6 @@ fn describe(error: &EvalError) -> String {
     }
 }
 
-/// Whether the steps' verdict leaves cache state worth keeping: the job's
-/// commands ran, so their writes are real work the next attempt can reuse.
-/// A canceled, timed-out or never-started attempt publishes nothing.
 fn cache_worthy(verdict: &Verdict) -> bool {
     match verdict {
         Verdict::Passed => true,
@@ -1297,10 +1076,6 @@ fn cache_worthy(verdict: &Verdict) -> bool {
     }
 }
 
-/// The summary's per-entry record from the carrier restore filled
-/// and the commit answered — stable vocabulary throughout: `"hit"` or a
-/// `Miss` reason for the lookup, `"sealed"` or a `SkipReason`/`"failed"`
-/// for the publish, and the documented costly-hit flag.
 fn cache_record(attached: &sentinel_cache::attach::Attached) -> CacheRecord {
     let stats = &attached.stats;
     let (staged, reused, dirty, publish) = match stats.committed {
@@ -1310,10 +1085,6 @@ fn cache_record(attached: &sentinel_cache::attach::Attached) -> CacheRecord {
         }) => (
             Some(staged_bytes),
             Some(reused_bytes),
-            // The dirty side: what the job's view rewrote versus the
-            // source generation — staged minus reused (reused is a
-            // subset of staged by construction; saturating anyway, a
-            // record must never panic).
             Some(staged_bytes.saturating_sub(reused_bytes)),
             Some("sealed".to_owned()),
         ),
@@ -1347,13 +1118,6 @@ fn cache_record(attached: &sentinel_cache::attach::Attached) -> CacheRecord {
     }
 }
 
-/// Commit each attached cache under its own scope, while the workspace's
-/// writable views still exist. The verdict never depends on publication
-/// (its report waits for it): the whole batch is bounded by
-/// `CACHE_PUBLISH_TIMEOUT`, each entry's outcome is reported as a
-/// `CacheNote` and stamped on the carrier's stats for the summary's
-/// per-entry record. The returned list names the generations this attempt
-/// sealed — what a later offer may send to the controller.
 fn publish_caches(
     root: &Path,
     job: &mut Job,
@@ -1377,8 +1141,6 @@ fn publish_caches(
             deadline,
             &canceled,
         );
-        // The commit's cost and answer land on the carrier — the summary
-        // reads them back for the attempt's per-entry records.
         attached.stats.commit_ns = ns(started);
         let outcome = match committed {
             Ok(sentinel_cache::publish::Published::Sealed {
@@ -1440,43 +1202,23 @@ fn finalize(
         container,
         secret_directory,
     } = prepared;
-    // The container goes first: once it is stopped and removed no
-    // job process — the keepalive, or anything a step left running — can
-    // rewrite, swap or re-link the writable views while publication reads
-    // them. The views themselves live in the workspace (and its private
-    // `.sentinel-cache/` directory), which outlives the container.
-    // Publication then walks them confined beneath the workspace anyway, so
-    // a container that would not stop cannot redirect it either.
+    // Stop the container first: no job process may rewrite the views publication reads.
     let _ = container.destroy();
     drop(secret_directory);
-    // Cache publication is finalization work: it reads the job's writable
-    // views, so it must precede the workspace's teardown — and a verdict
-    // that never ran the job's commands leaves nothing worth keeping.
     let sealed = if cache_worthy(verdict) {
         publish_caches(root, job, report, cancel)
     } else {
         Vec::new()
     };
-    // Runs even when the container would not stop: a container that will
-    // not stop must not keep a workspace alive. The failure is left to
-    // recovery, which lists what this worker still owns.
     let _ = workspace.destroy();
     sealed
 }
 
-/// One generation this attempt sealed: the carrier it belongs to (by
-/// position, the same order `job.caches` is in) and the directory name
-/// under its entry.
 struct SealedCache {
     index: usize,
     generation: String,
 }
 
-/// Offer every sealed generation to the controller, one bounded transfer
-/// each, after the terminal report has left. An offer
-/// never changes a verdict: a refusal, a session that went away, or a
-/// deadline that passed simply drops it — the local copy is already the
-/// job's own.
 fn offer_caches(
     root: &Path,
     job: &Job,
@@ -1568,9 +1310,6 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
-            // The host boundary is the owner-only attempt
-            // directory; what is mounted read-only into the attempt's
-            // container is readable by whatever user its image runs as.
             assert_eq!(mode(&attempt_dir), 0o700);
             assert_eq!(mode(&secret_root(&root)), 0o700);
             assert_eq!(mode(&directory.files_dir), 0o755);
@@ -1586,10 +1325,6 @@ mod tests {
         assert!(!attempt_dir.exists());
     }
 
-    /// Environment targets reach the step through the wrapper shell that
-    /// sources the private file and `exec`s the step — exactly, whatever the
-    /// value holds (quotes, `$`, backticks, spaces, non-ASCII) and up to the
-    /// maximum secret size. The values appear in no argv.
     #[test]
     fn env_targets_reach_the_step_exactly_through_the_wrapper() {
         use sentinel_protocol::secrets::{
@@ -1623,8 +1358,6 @@ mod tests {
         };
         let paths = materialize_step_secrets(&directory, &bundle, 3).unwrap();
         let env = paths.env_file.clone().unwrap();
-        // The wrapper as the container runs it, with the mount path
-        // pointing at the host file.
         let argv = wrap_with_env(
             vec![
                 "/bin/sh".into(),
@@ -1659,8 +1392,6 @@ mod tests {
         assert!(!env.exists());
     }
 
-    /// A failed attempt keeps the mirror fallback reason next to
-    /// its own, bounded.
     #[test]
     fn a_failure_keeps_the_checkout_fallback_reason() {
         assert_eq!(
@@ -1677,9 +1408,6 @@ mod tests {
 
     #[test]
     fn publication_follows_whether_the_commands_ran() {
-        // Passed and command-level failures publish; everything that
-        // stopped the commands from running — or the operator's cancel —
-        // keeps nothing.
         assert!(cache_worthy(&Verdict::Passed));
         for class in [
             FailureClass::CommandFailed,
@@ -1709,8 +1437,6 @@ mod tests {
         }
     }
 
-    /// The smallest spec that carries cache declarations: a push pipeline
-    /// whose `key` renders through `hash_files` against the checkout.
     fn spec() -> RunSpec {
         let yaml = "schema: 1\non: [push]\njobs:\n  main:\n    image: example.test/i:1@sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n    resources: { cpu: 1, memory: 128MiB }\n    cache:\n      - name: deps\n        key: deps-${{ hash_files('f.lock') }}\n        paths: [vendor, /opt/cc]\n    steps: [{ id: s, run: 'true' }]\n";
         RunSpec::new(
@@ -1757,9 +1483,6 @@ mod tests {
         }
     }
 
-    /// The job-side contract of a miss: `job.caches` is populated in
-    /// declaration order with the explainable outcome, and every declared
-    /// path is a writable directory the job can just use.
     #[test]
     fn a_cache_miss_still_leaves_writable_targets_and_populates_job() {
         let temp = tempfile::tempdir().unwrap();
@@ -1784,8 +1507,6 @@ mod tests {
             sentinel_cache::Outcome::Miss(sentinel_cache::Miss::Absent)
         );
         assert_eq!(attached.targets.len(), 2);
-        // The relative target materialized under the workspace and a job
-        // can write it; the absolute one is private and mounts in.
         let vendor = ws.join("vendor");
         assert!(vendor.is_dir());
         fs::write(vendor.join("fresh"), b"x").unwrap();
@@ -1794,8 +1515,6 @@ mod tests {
         assert_eq!(mounts[0].host, attached.targets[1].dir);
         assert!(mounts[0].host.is_dir());
 
-        // The summary's record for the entry: the miss's reason and the
-        // lookup measurement, everything else absent.
         let record = cache_record(attached);
         assert_eq!(record.name, "deps");
         assert_eq!(
@@ -1809,8 +1528,6 @@ mod tests {
         assert!(!record.costly_hit);
     }
 
-    /// A report sink that records the diagnostics `run` emits, and hands
-    /// out whatever remote transport a test installed on it.
     #[derive(Default)]
     struct Notes {
         cache_notes: Mutex<Vec<CacheNote>>,
@@ -1837,8 +1554,6 @@ mod tests {
         }
     }
 
-    /// A transport that records every offer it stores; a fetch always
-    /// misses, which is all the offer path needs of it.
     #[derive(Default)]
     struct Recorder {
         offered: Mutex<Vec<(String, u64)>>,
@@ -1871,8 +1586,6 @@ mod tests {
         }
     }
 
-    /// A job that wrote into its view publishes; the commit's cost and
-    /// byte split land on the carrier and ride the summary record.
     #[test]
     fn publish_stamps_commit_stats_and_the_record_carries_them() {
         let temp = tempfile::tempdir().unwrap();
@@ -1883,7 +1596,6 @@ mod tests {
         let declared = job.spec.pipeline.jobs[0].spec.cache.clone();
         let image = format!("example.test/i@{}", job.digest);
         restore_caches(&root, &mut job, &declared, &ws, &image, None);
-        // The job's own work: one new file in the declared path's view.
         fs::write(ws.join("vendor/lib"), b"new").unwrap();
         let notes = Notes::default();
         let flag: Cancel = Arc::new(AtomicBool::new(false));
@@ -1915,10 +1627,6 @@ mod tests {
         ));
     }
 
-    /// A sealed generation is offered through the session's transport —
-    /// and only there: with no transport the same publish stands, and a
-    /// refused offer leaves the local generation and every stat exactly
-    /// as they were.
     #[test]
     fn a_sealed_generation_is_offered_only_when_a_transport_exists() {
         let temp = tempfile::tempdir().unwrap();
@@ -1935,13 +1643,9 @@ mod tests {
         let sealed = publish_caches(&root, &mut job, &notes, &flag);
         let generation = sealed[0].generation.clone();
 
-        // No transport: an offer is impossible and nothing pretends
-        // otherwise.
         offer_caches(&root, &job, &sealed, None, &flag);
         assert!(job.caches[0].stats.committed.is_some());
 
-        // With one: the canonical stream is read whole and the key the
-        // controller receives is the entry's own.
         let recorder = Arc::new(Recorder::default());
         let transport: &dyn sentinel_cache::remote::Remote = recorder.as_ref();
         offer_caches(&root, &job, &sealed, Some(transport), &flag);
@@ -1951,8 +1655,6 @@ mod tests {
         let offered_len = offered[0].1;
         drop(offered);
 
-        // The stream is exactly the sealed generation: head, manifest,
-        // listing and payload — and the generation is still there after.
         let attached = &job.caches[0];
         let gen_dir = attached
             .scope
@@ -1972,9 +1674,6 @@ mod tests {
         assert_eq!(offered_len, expected);
     }
 
-    /// The record's flag is the carrier's rule: a reflink-root hit that
-    /// copied every byte reads `costly_hit` — the notice goes through
-    /// `report.costly_hit` the same way.
     #[test]
     fn a_hit_that_paid_full_copy_records_the_flag() {
         let temp = tempfile::tempdir().unwrap();
@@ -1985,8 +1684,6 @@ mod tests {
         let declared = job.spec.pipeline.jobs[0].spec.cache.clone();
         let image = format!("example.test/i@{}", job.digest);
         restore_caches(&root, &mut job, &declared, &ws, &image, None);
-        // Shape the carrier the way a reflink root that refused every
-        // file leaves it: a hit whose copy covered all bytes.
         let attached = &mut job.caches[0];
         attached.outcome = sentinel_cache::Outcome::Hit(Box::new(sentinel_cache::Hit {
             manifest: sentinel_cache::Manifest::writing(
@@ -2008,8 +1705,6 @@ mod tests {
         assert_eq!(record.outcome, "hit");
     }
 
-    /// A spec with a `class: compiler` cache and two steps, for proving a
-    /// hit never becomes a cached verdict.
     fn spec_compiler() -> RunSpec {
         let yaml = "schema: 1\non: [push]\njobs:\n  main:\n    image: example.test/i:1@sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n    resources: { cpu: 1, memory: 128MiB }\n    cache:\n      - name: cc\n        class: compiler\n        key: cc-normal-${{ hash_files('f.lock') }}\n        paths: [ccache]\n    steps: [{ id: build, run: 'cc -c a.c' }, { id: test, run: './run-tests' }]\n";
         RunSpec::new(
@@ -2019,11 +1714,6 @@ mod tests {
         .unwrap()
     }
 
-    /// Seal a compiler generation exactly where `restore_caches` will
-    /// look: the same tenant/repo/trust/platform/toolchain derivation,
-    /// the rendered key's stem as the entry, the rendered key itself in
-    /// the manifest — so `cc-normal-<h1>` is what a `cc-normal-<h2>`
-    /// request serves.
     fn seal_compiler(
         root: &Path,
         job: &Job,
@@ -2054,15 +1744,12 @@ mod tests {
             &decl.name,
         )
         .unwrap();
-        // Render the key exactly as `restore_caches` will: `hash_files`
-        // reads the workspace that is already standing.
         let context = WorkerContext::new(&job.context, &job.spec, ws);
         let key = decl
             .key
             .render(&context, sentinel_cache::attach::MAX_KEY_BYTES)
             .unwrap();
         let compat = sentinel_cache::attach::declared_compat(decl, &key, platform);
-        // `restore_caches` resolves entries under `<root>/cache`.
         let cache_root = root.join(sentinel_cache::attach::ROOT_DIR);
         let entry = scope.entry_dir(
             &cache_root,
@@ -2079,8 +1766,6 @@ mod tests {
             entries.push(FileEntry {
                 path: format!("payload/0/{rel}"),
                 size: body.len() as u64,
-                // BLAKE3 of the content — the same digest the store
-                // computes, reached through the public toolchain hash.
                 digest: Scope::toolchain_digest(body),
                 mode: 0o644,
             });
@@ -2098,11 +1783,6 @@ mod tests {
         fs::write(entry.join(scope::CURRENT_NAME), format!("{name}\n")).unwrap();
     }
 
-    /// A cache hit restores bytes into the job's private view and nothing
-    /// else: `execute` iterates `compiled.steps` unconditionally, so a hit
-    /// can never suppress a step or carry a verdict. After a hit the spec
-    /// `execute` runs is the freshly compiled one, every declared step
-    /// still present.
     #[test]
     fn a_cache_hit_restores_bytes_and_never_touches_the_step_plan() {
         let temp = tempfile::tempdir().unwrap();
@@ -2112,8 +1792,6 @@ mod tests {
         let mut job = job(spec_compiler());
         let declared = job.spec.pipeline.jobs[0].spec.cache.clone();
         let image = format!("example.test/i@{}", job.digest);
-        // A generation sealed under `cc-normal-<h1>`; the request renders
-        // `cc-normal-<h2>` — same stem, small lockfile edit.
         seal_compiler(&root, &job, &ws, &declared[0], &[("obj/a.o", b"object")]);
 
         let mounts = restore_caches(&root, &mut job, &declared, &ws, &image, None);
@@ -2131,8 +1809,6 @@ mod tests {
             "the hit materialized real bytes into the job's view"
         );
         assert!(mounts.is_empty(), "a relative path needs no bind mount");
-        // The step plan is untouched by the hit: the spec `execute` will
-        // run is identical to a fresh compile, both steps still present.
         assert_eq!(job.spec, spec_compiler());
         let steps = &job.spec.pipeline.jobs[0].spec.steps;
         assert_eq!(steps.len(), 2);
