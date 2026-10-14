@@ -7,7 +7,7 @@ pub const SUMMARY_FORMAT: u8 = 3;
 const SUMMARY_FORMAT_V1: u8 = 1;
 const SUMMARY_FORMAT_V2: u8 = 2;
 pub const MAX_SUMMARY_BYTES: usize = 32 * 1024;
-// A summary that fits the frame but not the store column is dropped by receivers, never failed.
+// Must fit one control frame; receivers drop a summary the store column cannot hold, never fail the job.
 const _: () = assert!(MAX_SUMMARY_BYTES < crate::limits::MAX_CONTROL_MESSAGE_BYTES);
 pub const MAX_STEP_RECORDS: usize = 256;
 pub const MAX_CACHE_RECORDS: usize = 16;
