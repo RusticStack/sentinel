@@ -1,5 +1,4 @@
-//! Fixed-size execution lanes. Admission never blocks the calling control thread.
-//! Captured payload sizes must also be bounded by callers; queue depth is not a byte quota.
+//! Queue depth is not a byte quota: callers must bound captured payload sizes.
 use std::{
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -48,8 +47,6 @@ pub struct Task<T> {
     result: Receiver<Result<T, WorkError>>,
 }
 impl<T> Task<T> {
-    /// Blocking wait, suitable for bootstrap/drain only, not a future async control loop.
-    /// Timeout does not interrupt a running closure or free its occupied lane.
     pub fn wait(self, timeout: Duration) -> Result<T, WorkError> {
         self.result
             .recv_timeout(timeout)
@@ -69,8 +66,6 @@ pub struct Executor {
 }
 
 impl Executor {
-    /// One dedicated thread per lane, plus at most `capacity` waiting tasks.
-    /// Separate instances for I/O and CPU prevent either class consuming the other's thread.
     pub fn new(class: WorkClass, capacity: usize) -> std::io::Result<Self> {
         if !(1..=1024).contains(&capacity) {
             return Err(std::io::Error::new(
@@ -117,8 +112,7 @@ impl Executor {
                 span.in_scope(|| {
                     let queue_wait_ns = elapsed_ns(queued);
                     let started = Instant::now();
-                    // A panic must not permanently remove the lane. The normal panic hook
-                    // still runs; callers must not panic with sensitive payloads.
+                    // Catch panics so a failing job cannot remove the lane; the panic hook still logs the payload, so do not panic with secrets.
                     let value =
                         catch_unwind(AssertUnwindSafe(work)).map_err(|_| WorkError::Panicked);
                     tracing::debug!(
@@ -143,8 +137,6 @@ impl Executor {
         Ok(Task { result })
     }
 
-    /// Stop admission, drop pending tasks, and wait at most the supplied deadline
-    /// for the active task. Rust threads cannot be forcibly cancelled.
     pub fn shutdown(&mut self, timeout: Duration) -> bool {
         self.stopping.store(true, Ordering::Release);
         self.sender.take();

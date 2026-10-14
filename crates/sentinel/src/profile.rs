@@ -1,19 +1,4 @@
-//! Named sign-in profiles: `profiles.json` (schema
-//! `sentinel.profiles/1`, no secrets) in the configuration directory, the
-//! credential blob in the OS store or an owner-only file ([`crate::keystore`]),
-//! and access-token refresh serialized across processes by a lock file.
-//!
-//! Configuration directory: `SENTINEL_CONFIG_DIR`, else `%APPDATA%\Sentinel`
-//! (Windows) or `${XDG_CONFIG_HOME:-$HOME/.config}/sentinel` (Linux). A
-//! directory inside a Git work tree (any ancestor holding `.git`) is
-//! refused, so a credential can never be committed by accident.
-//!
-//! Refresh: [`Handle::access_token`] answers from memory while more than 30 s
-//! of the access token remain; otherwise it takes `locks/<profile>.lock`
-//! (an OS file lock, polled for at most 30 s), re-reads the stored
-//! credential — another process may have refreshed meanwhile — and only
-//! then spends the refresh token. One machine therefore never presents one
-//! refresh token twice, which the server would treat as replay.
+//! Refresh is serialized by the profile lock and re-reads the store first: presenting one refresh token twice counts as replay.
 
 use std::{
     collections::BTreeMap,
@@ -35,26 +20,18 @@ use crate::{
     keystore::{self, Backend, file},
 };
 
-/// The `schema` of `profiles.json`.
 pub const SCHEMA: &str = "sentinel.profiles/1";
-/// The profile `sentinel auth login` writes without `--profile`.
 pub const DEFAULT_PROFILE: &str = "default";
-/// Refresh when fewer than this many milliseconds of the access token remain.
 pub const REFRESH_MARGIN_MS: u64 = 30_000;
-/// How long a process waits for another's refresh before giving up (exit 6).
 pub const LOCK_DEADLINE: Duration = Duration::from_secs(30);
-/// Largest OAuth answer read back.
 const MAX_ANSWER: u64 = 64 << 10;
 
-/// Milliseconds since the Unix epoch (token expiry is wall-clock time).
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Profile names are file names: 1–64 of `A-Z a-z 0-9 . _ -`, not
-/// starting with `.`.
 pub fn validate_name(name: &str) -> Result<(), Error> {
     let ok = (1..=64).contains(&name.len())
         && !name.starts_with('.')
@@ -70,38 +47,25 @@ pub fn validate_name(name: &str) -> Result<(), Error> {
     }
 }
 
-/// One entry of `profiles.json`. Never holds a secret.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
-    /// The normalized controller URL.
     pub server: String,
-    /// The issuer the server's metadata named at sign-in (equal to `server`).
     pub issuer: String,
     pub client_id: String,
-    /// `usr_…` of the signed-in account.
     pub user: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
-    /// `grt_…` of the grant.
     pub grant: String,
-    /// Space-separated granted scopes.
     pub scopes: String,
-    /// Default tenant slug (`sentinel context use`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
-    /// Where the credential is stored.
     pub store: Backend,
-    /// The OS-store key the credential was stored under
-    /// ([`keystore::scoped_key`]). Absent for the file store, and for
-    /// profiles signed in before keys named their configuration directory,
-    /// which keep the legacy per-user [`keystore::key`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     pub created_ms: u64,
 }
 
 impl Profile {
-    /// The OS-store key of this profile's credential.
     pub fn os_key(&self, name: &str) -> String {
         match &self.key {
             Some(key) => key.clone(),
@@ -109,19 +73,11 @@ impl Profile {
         }
     }
 
-    /// Signed in before OS-store keys named their configuration directory:
-    /// the credential sits under the per-user [`keystore::key`], which
-    /// every configuration directory with this profile name and issuer
-    /// shares.
     pub fn is_legacy(&self) -> bool {
         self.store == Backend::Os && self.key.is_none()
     }
 
-    /// Refuse an entry no sign-in could have written: `profiles.json`
-    /// decides where refresh tokens are sent (`issuer`) and which OS-store
-    /// entry is read and deleted (`key`), so a changed file must not steer
-    /// either. Sign-in records `issuer` equal to the normalized `server`,
-    /// and `key` as [`keystore::scoped_key`] of this profile.
+    // profiles.json chooses where refresh tokens go and which OS-store entry is deleted, so a changed file must not steer either.
     pub fn check(&self, name: &str) -> Result<(), Error> {
         let tampered = |what: &str| {
             Error::usage(format!(
@@ -153,7 +109,6 @@ impl Profile {
     }
 }
 
-/// `profiles.json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profiles {
     pub schema: String,
@@ -173,18 +128,12 @@ impl Default for Profiles {
     }
 }
 
-/// The stored credential blob (JSON), kept in the OS store or the
-/// owner-only file. `Debug` redacts both tokens.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credentials {
-    /// `sntl_rt_…`
     pub refresh: String,
-    /// `sntl_at_…`
     pub access: String,
     pub access_expires_ms: u64,
     pub refresh_expires_ms: u64,
-    /// `grt_…` of the grant these tokens belong to, as the token endpoint
-    /// named it. Absent in credentials stored by older builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant: Option<String>,
 }
@@ -202,8 +151,7 @@ impl fmt::Debug for Credentials {
 }
 
 impl Credentials {
-    /// From a token-endpoint answer received after `sent_ms` (expiry is
-    /// counted from the request, never later than the server meant).
+    // Expiry counts from the send time, so the client never trusts a token past the server's expiry.
     pub fn from_response(response: &TokenResponse, sent_ms: u64) -> Result<Credentials, Error> {
         if tokens::parse(Kind::Access, &response.access_token).is_none()
             || tokens::parse(Kind::Refresh, &response.refresh_token).is_none()
@@ -227,14 +175,11 @@ impl Credentials {
     }
 }
 
-/// The configuration directory and everything in it.
 #[derive(Clone, Debug)]
 pub struct Config {
     dir: PathBuf,
 }
 
-/// Held while a profile (or `profiles.json`) is being changed; the OS lock
-/// is released when the file closes.
 pub struct Lock(#[allow(dead_code)] File);
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -262,7 +207,6 @@ fn default_dir() -> Result<PathBuf, Error> {
 }
 
 impl Config {
-    /// The directory from the environment (see the module docs).
     pub fn from_env() -> Result<Config, Error> {
         let dir = match env_path("SENTINEL_CONFIG_DIR") {
             Some(dir) => dir,
@@ -271,7 +215,6 @@ impl Config {
         Config::at(dir)
     }
 
-    /// A configuration directory at `dir`; refused inside a Git work tree.
     pub fn at(dir: impl Into<PathBuf>) -> Result<Config, Error> {
         let dir = std::path::absolute(dir.into())
             .map_err(|e| Error::usage(format!("bad configuration directory: {e}")))?;
@@ -297,7 +240,6 @@ impl Config {
         self.dir.join("profiles.json")
     }
 
-    /// `profiles.json`, or an empty set when there is none.
     pub fn load(&self) -> Result<Profiles, Error> {
         if !self.dir.exists() {
             return Ok(Profiles::default());
@@ -322,14 +264,11 @@ impl Config {
         Ok(profiles)
     }
 
-    /// Read-modify-write `profiles.json` under its lock, replaced atomically.
     pub fn update<T>(
         &self,
         change: impl FnOnce(&mut Profiles) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        // A name no profile can take (profile names never start with `.`):
-        // signing in holds the profile's own lock while updating, and a
-        // profile called `profiles` must not wait on itself.
+        // Profile names never start with '.', so this lock cannot be a profile's own lock.
         let _lock = self.lock_path(".profiles")?;
         let mut profiles = self.load()?;
         let out = change(&mut profiles)?;
@@ -338,7 +277,6 @@ impl Config {
         Ok(out)
     }
 
-    /// The per-profile lock that serializes refresh, sign-in and sign-out.
     pub fn lock(&self, profile: &str) -> Result<Lock, Error> {
         validate_name(profile)?;
         self.lock_path(profile)
@@ -377,8 +315,6 @@ impl Config {
         }
     }
 
-    /// The named profile, or the current one; `Ok(None)` when no profile is
-    /// configured at all.
     pub fn handle(&self, name: Option<&str>) -> Result<Option<Handle>, Error> {
         let mut profiles = self.load()?;
         let name = match name {
@@ -404,15 +340,6 @@ impl Config {
         }))))
     }
 
-    /// Whose sign-in the legacy shared OS-store entry of `name` holds
-    /// ([`Profile::is_legacy`]), before signing out of it or replacing it:
-    /// only this profile's own grant may be revoked or deleted, since
-    /// another configuration directory may have signed in under the same
-    /// entry since. A credential stored by this build names its
-    /// grant; an older one is asked about with `/api/v1/me` while its access
-    /// token lasts, else by spending its refresh token, whose answer names
-    /// the grant (another directory's successor is then put back for it).
-    /// The caller holds the profile lock ([`Config::lock`]).
     pub fn legacy_owner(&self, agent: &ureq::Agent, name: &str, profile: &Profile) -> Owner {
         let stored = match self.read_credentials(name, profile) {
             Ok(Some(stored)) => stored,
@@ -440,7 +367,6 @@ impl Config {
             }
         }
         if stored.refresh_expires_ms <= now {
-            // Expired whoever holds it: nothing left to revoke.
             return Owner::Ours(stored);
         }
         let form = form(&[
@@ -458,14 +384,11 @@ impl Config {
         if ours(&response.sentinel_grant) {
             Owner::Ours(fresh)
         } else {
-            // Another directory's chain: its successor goes back where that
-            // directory will look for it.
             let _ = self.write_credentials(name, profile, &fresh);
             Owner::Theirs
         }
     }
 
-    /// The stored credential of `name`, from the backend its profile records.
     pub fn read_credentials(
         &self,
         name: &str,
@@ -478,7 +401,6 @@ impl Config {
             .transpose()
     }
 
-    /// Replace the stored credential of `name` in its recorded backend.
     pub fn write_credentials(
         &self,
         name: &str,
@@ -491,10 +413,6 @@ impl Config {
         keystore::write(profile.store, &self.dir, &profile.os_key(name), name, &blob)
     }
 
-    /// Store a new credential in `preferred`; when the OS store fails, fall
-    /// back to the owner-only file with a notice on stderr. Returns the
-    /// backend used and, for the OS store, the key used
-    /// ([`keystore::scoped_key`]), for the profile to record.
     pub fn store_credentials(
         &self,
         name: &str,
@@ -520,7 +438,6 @@ impl Config {
         }
     }
 
-    /// Remove the stored credential of `name` (absent is fine).
     pub fn delete_credentials(&self, name: &str, profile: &Profile) -> Result<(), Error> {
         validate_name(name)?;
         profile.check(name)?;
@@ -528,40 +445,25 @@ impl Config {
     }
 }
 
-/// Whose sign-in a legacy shared OS-store entry holds
-/// ([`Config::legacy_owner`]).
 #[derive(Debug)]
 pub enum Owner {
-    /// Nothing is stored.
     Absent,
-    /// This profile's grant, with its current tokens (to revoke).
     Ours(Credentials),
-    /// Another configuration directory's sign-in: leave it alone.
     Theirs,
-    /// Could not tell (the controller is unreachable): leave it alone.
     Unknown,
 }
 
-/// Resolve `name`, or the `current` profile when `None`. `Ok(None)` means
-/// no profile is configured at all.
 pub fn resolve(name: Option<&str>) -> Result<Option<Handle>, client::Error> {
     Config::from_env()?.handle(name)
 }
 
-/// One resolved profile: its name, the normalized server it belongs to, the
-/// default tenant, and access to its stored credential.
-/// Boxed so a client credential holding it stays pointer-sized.
 pub struct Handle(Box<Inner>);
 
 struct Inner {
     config: Config,
     name: String,
     profile: Profile,
-    /// The access token last read or minted and its expiry, so a command
-    /// making many requests reads the store once.
     cached: Mutex<Option<(String, u64)>>,
-    /// The directory-scoped key a legacy profile's credential moved to in
-    /// this process or another ([`Handle::migrate`]).
     migrated: OnceLock<String>,
 }
 
@@ -579,17 +481,14 @@ impl Handle {
         &self.0.name
     }
 
-    /// The profile's server (normalized when the profile was written).
     pub fn server(&self) -> &str {
         &self.0.profile.server
     }
 
-    /// The default tenant chosen with `sentinel context use`.
     pub fn tenant(&self) -> Option<&str> {
         self.0.profile.tenant.as_deref()
     }
 
-    /// The whole profile entry.
     pub fn profile(&self) -> &Profile {
         &self.0.profile
     }
@@ -612,8 +511,6 @@ impl Handle {
         access
     }
 
-    /// Where the credential is: the profile as recorded, or, once a legacy
-    /// profile has moved, the same profile under its scoped key.
     fn location(&self) -> std::borrow::Cow<'_, Profile> {
         match self.0.migrated.get() {
             Some(key) => std::borrow::Cow::Owned(Profile {
@@ -624,7 +521,6 @@ impl Handle {
         }
     }
 
-    /// A legacy profile that has not moved yet.
     fn legacy(&self) -> bool {
         self.0.profile.is_legacy() && self.0.migrated.get().is_none()
     }
@@ -633,7 +529,6 @@ impl Handle {
         let config = &self.0.config;
         let mut stored = config.read_credentials(&self.0.name, &self.location())?;
         if stored.is_none() && self.legacy() {
-            // Another process of this directory may have moved it.
             let moved = config
                 .load()?
                 .profiles
@@ -646,9 +541,6 @@ impl Handle {
             }
         }
         let stored = stored.ok_or_else(|| self.not_signed_in("no stored credential"))?;
-        // A legacy entry is shared by every configuration directory with
-        // this profile name and server; one naming another grant holds
-        // another directory's sign-in, which this profile must not use.
         if self.legacy()
             && stored
                 .grant
@@ -662,15 +554,6 @@ impl Handle {
         Ok(stored)
     }
 
-    /// Move a legacy profile's refreshed credential to its directory-scoped
-    /// key, under the profile lock. The successor is first written
-    /// back to the shared entry, so a failure below loses nothing. If the
-    /// refresh named another grant, the entry held another directory's
-    /// sign-in: it keeps its successor there, and this profile is signed
-    /// out. Otherwise the credential moves to the scoped key, the profile
-    /// records it, and the shared entry is deleted: a second directory that
-    /// shared this very grant is then signed out rather than left to replay
-    /// a spent refresh token.
     fn migrate(&self, fresh: &Credentials) -> Result<(), Error> {
         let (config, name, profile) = (&self.0.config, &self.0.name, &self.0.profile);
         config.write_credentials(name, profile, fresh)?;
@@ -695,14 +578,10 @@ impl Handle {
             Ok(())
         })?;
         let _ = self.0.migrated.set(key);
-        // Best effort: an entry left behind holds a token this directory no
-        // longer presents.
         let _ = config.delete_credentials(name, profile);
         Ok(())
     }
 
-    /// A usable access token, refreshed under the profile lock when fewer
-    /// than 30 seconds remain.
     pub fn access_token(&self, agent: &ureq::Agent) -> Result<String, client::Error> {
         let now = now_ms();
         if let Some((token, expires)) = &*self.0.cached.lock().unwrap_or_else(|e| e.into_inner())
@@ -714,13 +593,9 @@ impl Handle {
         if stored.access_expires_ms > now + REFRESH_MARGIN_MS {
             return Ok(self.remember(&stored));
         }
-        // Another process may refresh while this one waits for the lock;
-        // whatever is stored then with time left is used as is.
         self.refresh(agent, |_| true)
     }
 
-    /// Refresh after the server rejected `rejected`; if another process has
-    /// already replaced it, use the newer token instead of refreshing again.
     pub fn force_refresh(
         &self,
         agent: &ureq::Agent,
@@ -729,20 +604,12 @@ impl Handle {
         self.refresh(agent, |stored| stored.access != rejected)
     }
 
-    /// Under the profile lock: re-read, reuse a token another process minted
-    /// when `newer` accepts it and it has time left, else spend the refresh
-    /// token and store the successor before anything else can read.
     fn refresh(
         &self,
         agent: &ureq::Agent,
         newer: impl Fn(&Credentials) -> bool,
     ) -> Result<String, Error> {
         let _lock = self.0.config.lock(&self.0.name)?;
-        // A legacy entry is shared with other configuration directories,
-        // whose profile locks are their own: this one serializes the refresh
-        // of the entry itself, so no two directories present its refresh
-        // token at once. The loser re-reads below and finds the
-        // winner's successor, or the entry moved and itself signed out.
         #[cfg(windows)]
         let _legacy = if self.legacy() {
             let key = keystore::key(&self.0.profile.issuer, &self.0.name);
@@ -772,10 +639,6 @@ impl Handle {
         ]);
         let url = format!("{}{TOKEN_PATH}", self.0.profile.issuer);
         let mut answer = token_call(agent, &url, &form)?;
-        // A busy authorization server spent nothing (or, if the rotation
-        // committed after all, a second presentation within the grace
-        // window recovers it once), so one retry after the server's
-        // `retry-after: 1` is safe and rides out a brief overload.
         if matches!(&answer, Err(e) if e.error == OAuthErrorCode::TemporarilyUnavailable) {
             std::thread::sleep(Duration::from_secs(1));
             answer = token_call(agent, &url, &form)?;
@@ -802,8 +665,6 @@ impl Handle {
     }
 }
 
-/// An HTTP agent for the OAuth endpoints: statuses are answers, redirects
-/// are not followed, 60 s bound.
 pub fn agent() -> ureq::Agent {
     ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
@@ -814,7 +675,6 @@ pub fn agent() -> ureq::Agent {
     )
 }
 
-/// `application/x-www-form-urlencoded` from pairs.
 pub fn form(pairs: &[(&str, &str)]) -> String {
     let mut out = form_urlencoded::Serializer::new(String::with_capacity(256));
     for (name, value) in pairs {
@@ -823,8 +683,6 @@ pub fn form(pairs: &[(&str, &str)]) -> String {
     out.finish()
 }
 
-/// The exit for an RFC 6749 error from the token, device or revocation
-/// endpoint.
 pub fn oauth_exit(code: OAuthErrorCode) -> Exit {
     match code {
         OAuthErrorCode::InvalidGrant
@@ -840,8 +698,6 @@ pub fn oauth_exit(code: OAuthErrorCode) -> Exit {
     }
 }
 
-/// An [`Error`] for an OAuth refusal (the description never echoes a
-/// submitted value, so it is safe to show).
 pub fn oauth_failure(error: &OAuthError) -> Error {
     Error::new(
         oauth_exit(error.error),
@@ -854,7 +710,6 @@ fn transport(url: &str, error: &ureq::Error) -> Error {
     Error::new(Exit::Busy, format!("cannot reach {origin}: {error}"))
 }
 
-/// Status and body (at most 64 KiB) of a POST of `form` to `url`.
 pub fn post_form(agent: &ureq::Agent, url: &str, form: &str) -> Result<(u16, String), Error> {
     let response = agent
         .post(url)
@@ -865,7 +720,6 @@ pub fn post_form(agent: &ureq::Agent, url: &str, form: &str) -> Result<(u16, Str
     read_answer(url, response)
 }
 
-/// Status and body (at most 64 KiB) of a GET, with an optional bearer.
 pub fn get(agent: &ureq::Agent, url: &str, bearer: Option<&str>) -> Result<(u16, String), Error> {
     let mut request = agent.get(url).header("accept", "application/json");
     let auth;
@@ -891,8 +745,6 @@ fn read_answer(
     Ok((status, body))
 }
 
-/// POST to the token endpoint: `Ok(Ok(tokens))`, `Ok(Err(oauth error))`, or
-/// `Err` for transport failures and malformed answers.
 pub fn token_call(
     agent: &ureq::Agent,
     url: &str,

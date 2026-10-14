@@ -19,31 +19,21 @@ use sentinel::{
 };
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
-/// Where the controller listens for workers unless configured otherwise:
-/// loopback, so exposing it is an explicit decision.
 const DEFAULT_LISTEN: &str = "127.0.0.1:7443";
-/// Where the API answers unless configured otherwise: loopback; TLS and
-/// exposure are the reverse proxy's.
 const DEFAULT_API_LISTEN: &str = "127.0.0.1:7080";
-/// Most `trusted_proxies` entries a configuration may list.
 const MAX_TRUSTED_PROXIES: usize = 64;
 
-/// Whether a `trusted_proxies` entry is an address or a CIDR network.
 #[cfg(feature = "server")]
 fn trusted_proxy_valid(entry: &str) -> bool {
     sentinel_api::TrustedProxy::parse(entry).is_some()
 }
 
-/// A build without the server role never uses the entries.
 #[cfg(not(feature = "server"))]
 fn trusted_proxy_valid(_: &str) -> bool {
     true
 }
-/// Bounded drains at shutdown: sessions and dispatcher, then the store.
 const LINK_SHUTDOWN: Duration = Duration::from_secs(2);
 const STORE_SHUTDOWN: Duration = Duration::from_secs(5);
-/// How long a worker's shutdown waits for its attempts to be torn down
-/// (container removal is bounded at 10 s by the runtime helper).
 #[cfg(feature = "worker")]
 const WORKER_SHUTDOWN: Duration = Duration::from_secs(20);
 
@@ -77,65 +67,35 @@ struct FileConfig {
     data_dir: Option<PathBuf>,
     log_format: Option<LogFormat>,
     log_level: Option<LogLevel>,
-    // Server: where workers connect, and where the API answers.
     listen: Option<String>,
     api_listen: Option<String>,
-    // Server: the deployment-facing base URL, which is the OAuth issuer.
     public_url: Option<String>,
-    // Server: the reverse proxy's networks, whose X-Forwarded-For the
-    // unauthenticated admission budgets believe. Absent means loopback only.
     trusted_proxies: Option<Vec<String>>,
-    // Worker: which controller to reach and how to trust it.
     controller: Option<String>,
     controller_fingerprint: Option<String>,
-    // Worker: further controller fingerprints trusted during a certificate
-    // rotation (at most three beside `controller_fingerprint`).
     controller_fingerprint_also: Option<Vec<String>>,
     worker_name: Option<String>,
     enrollment_file: Option<PathBuf>,
     cpu_millis: Option<u64>,
     memory_bytes: Option<u64>,
-    // Worker: what the scheduler may select this machine by and the
-    // scratch disk it offers jobs. Labels default to none; disk defaults to
-    // the free space of the data directory at start.
     labels: Option<Vec<String>>,
     disk_bytes: Option<u64>,
-    // Worker: free space the log spools leave on the data directory's file
-    // system, and the bytes they may hold together.
     spool_reserve_bytes: Option<u64>,
     spool_quota_bytes: Option<u64>,
-    // Worker: what the disposable stores may hold; unset ones are
-    // sized from the data directory's file system.
     cache_budget_bytes: Option<u64>,
     mirror_budget_bytes: Option<u64>,
     image_budget_bytes: Option<u64>,
-    // Worker: keep per-repository object mirrors under the data directory
-    // (default on; `false` checks out every attempt directly).
     git_mirrors: Option<bool>,
-    // Worker: a loopback address answering `GET /metrics`; off when unset.
     metrics_listen: Option<String>,
-    // Server: disk admission watermarks, quotas and retention.
     storage: Option<StorageFile>,
-    // The optional pinned Tailcat helper, for either role.
     tailcat: Option<TailcatFile>,
-    // Whether this process participates in remote cache hydration.
     remote_cache: Option<RemoteCacheFile>,
-    // Server: the optional external S3 copy of objects and logs.
     s3: Option<S3File>,
-    // Server: scheduled online backups.
     backup: Option<BackupFile>,
-    // Server: optional Resend delivery of verification and invitation mail;
-    // `SENTINEL_RESEND_API_KEY_FILE` and `SENTINEL_EMAIL_FROM` override these keys.
     mail: Option<MailFile>,
-    // Worker: the controller's `tc…` address, as written to its `<data_dir>/tailcat/address`.
-    // Required to dial a controller through the helper.
     tailcat_address: Option<String>,
 }
 
-/// The `[tailcat]` section, resolved into the helper's own
-/// `sentinel_link::tailcat::TailcatConfig` in the role that runs it. Kept as
-/// a plain mirror here so the portable CLI build — which links no link crate
-/// — can still validate the section.
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TailcatFile {
@@ -147,16 +107,10 @@ struct TailcatFile {
     listen_port: Option<u16>,
 }
 
-/// The `[remote_cache]` section: whether this process participates in
-/// remote cache hydration. The controller holds objects workers offer so
-/// another worker can hydrate them; the worker fetches and offers. Local
-/// cache hits never traverse the link either way.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RemoteCacheFile {
     enabled: Option<bool>,
-    /// Server: what the controller's remote cache store may hold;
-    /// unset is sized from the data directory's file system.
     budget_bytes: Option<u64>,
 }
 
@@ -166,8 +120,6 @@ impl RemoteCacheFile {
     }
 }
 
-/// The `[s3]` section: the optional external copy of objects and
-/// finished logs. Server only. Kept portable so the CLI build validates it.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct S3File {
@@ -180,11 +132,8 @@ struct S3File {
     path_style: bool,
     ca_file: Option<PathBuf>,
     credentials_file: PathBuf,
-    /// Part size, and the largest object sent in one request.
     part_bytes: Option<u64>,
-    /// Local copies of replicated objects kept up to this; unset keeps all.
     local_bytes: Option<u64>,
-    /// Unreplicated bytes past which new artifacts and uploads are refused.
     backlog_bytes: Option<u64>,
 }
 
@@ -217,25 +166,13 @@ impl S3File {
     }
 }
 
-/// The `[mail]` section: optional email delivery of verification and
-/// invitation mail through Resend (<https://resend.com>). Server only. Each
-/// key has an environment override (`SENTINEL_RESEND_API_KEY_FILE`,
-/// `SENTINEL_EMAIL_FROM`), which wins, so a container deployment needs no
-/// configuration file for it. Without them nothing is delivered and the
-/// host-local `sentinel admin` mints links on demand. The API key lives in
-/// `api_key_file` (an owner-only file holding the key), never in this file or
-/// the environment. Kept portable so the CLI build validates it.
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MailFile {
-    /// Absolute path of the owner-only file holding the Resend API key.
     api_key_file: Option<PathBuf>,
-    /// The sender: `ci@example.com` or `Sentinel <ci@example.com>`, on a
-    /// domain verified in Resend.
     from: Option<String>,
 }
 
-/// A validated Resend configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MailSettings {
     api_key_file: PathBuf,
@@ -243,10 +180,6 @@ struct MailSettings {
 }
 
 impl MailFile {
-    /// Merge the section with the environment (which wins) and validate. No
-    /// error echoes a value. `Ok(None)` when neither the key file nor the
-    /// sender is set; one without the other is an error rather than a
-    /// silently ignored setting.
     fn resolve(self, env: &dyn Fn(&str) -> Option<String>) -> Result<Option<MailSettings>, Error> {
         let set = |name: &str| env(name).filter(|value| !value.is_empty());
         let key_file = set("SENTINEL_RESEND_API_KEY_FILE")
@@ -284,15 +217,11 @@ impl MailFile {
     }
 }
 
-/// The `[backup]` section: scheduled online backups into a directory
-/// on another disk or a mounted volume. Server only.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BackupFile {
     dir: PathBuf,
-    /// How often; default hourly (the recovery point for metadata).
     interval_secs: Option<u64>,
-    /// Backups kept; default 24.
     keep: Option<usize>,
 }
 
@@ -319,52 +248,30 @@ impl BackupFile {
     }
 }
 
-/// One scheduling label: bounded like a name, no control characters.
 fn valid_label(label: &str) -> bool {
     !label.is_empty() && label.len() <= 128 && !label.chars().any(char::is_control)
 }
 
-/// Labels one worker may advertise; mirrors
-/// `sentinel_protocol::negotiate::MAX_PROFILE_LABELS`, kept local so the
-/// portable CLI build (which links no protocol crate) validates the same
-/// bound.
 const MAX_LABELS: usize = 16;
 
-/// The `[storage]` section: all fields optional, resolved to defaults.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StorageFile {
-    /// Free bytes held back for metadata and log evidence.
     reserve_bytes: Option<u64>,
-    /// Discretionary writes refuse below this free figure above the
-    /// reserve...
     low_watermark_bytes: Option<u64>,
-    /// ...and admit again above this one (hysteresis).
     high_watermark_bytes: Option<u64>,
-    /// Cap on everything every tenant stores together; 0 is unlimited.
     quota_bytes: Option<u64>,
-    /// Default stored-bytes cap per tenant; 0 is unlimited.
     tenant_quota_bytes: Option<u64>,
-    /// Finished attempt logs are kept this long unless a tenant or
-    /// repository policy says otherwise.
     log_retention_secs: Option<u64>,
-    /// Longest artifact retention a pipeline's `retain` may ask for.
     artifact_retention_secs: Option<u64>,
-    /// Artifact bytes one run may store.
     run_artifact_bytes: Option<u64>,
-    /// Stored log bytes one attempt may produce.
     attempt_log_bytes: Option<u64>,
-    /// The maintenance pass runs at most this often.
     sweep_interval_secs: Option<u64>,
 }
 
-/// Resolved storage settings; constructed only for the server role (the
-/// worker build links no `sentinel_store`, and refuses `[storage]` at load).
 #[cfg(feature = "server")]
 #[derive(Clone, Copy)]
 struct Storage {
-    /// Explicit watermarks; an unset one follows the data filesystem's size
-    /// ([`Storage::marks`]).
     reserve: Option<u64>,
     low: Option<u64>,
     high: Option<u64>,
@@ -378,9 +285,6 @@ const MIB: u64 = 1 << 20;
 
 #[cfg(feature = "server")]
 impl Storage {
-    /// The watermarks for a data filesystem of `total` bytes: each explicit
-    /// level as configured, each unset one from
-    /// [`sentinel_store::space::default_watermarks`].
     fn marks(&self, total: u64) -> Result<sentinel_store::space::Watermarks, Error> {
         let sized = sentinel_store::space::default_watermarks(total);
         let reserve = self.reserve.unwrap_or(sized.reserve);
@@ -395,8 +299,6 @@ impl Storage {
             reserve,
             low,
             high,
-            // Log evidence keeps the top slice of the reserve so the
-            // metadata database keeps the rest.
             floor: reserve / 8,
         })
     }
@@ -462,56 +364,37 @@ impl StorageFile {
     }
 }
 
-/// The worker's link settings; absent when no controller is configured, in
-/// which case the worker idles (a lifecycle-only process).
 #[derive(Clone)]
 struct WorkerLink {
     controller: SocketAddr,
     fingerprint: [u8; 32],
-    /// Rotation overlap: fingerprints trusted beside `fingerprint`.
     also_fingerprints: Vec<[u8; 32]>,
     name: String,
     enrollment_file: Option<PathBuf>,
     cpu_millis: Option<u64>,
     memory_bytes: Option<u64>,
     git_mirrors: bool,
-    /// Scheduling labels this machine selects work by (protocol 7).
     labels: Vec<String>,
-    /// Scratch disk offered to jobs; `None` measures free space at start.
     disk_bytes: Option<u64>,
-    /// The spools' free-space reserve and shared quota; `None` keeps the
-    /// executor's defaults.
     spool_reserve_bytes: Option<u64>,
     spool_quota_bytes: Option<u64>,
-    /// The disposable stores' budgets (cache, mirrors, images); `None`
-    /// sizes one from the data directory's file system.
     budgets: [Option<u64>; 3],
-    /// The helper to run, when the worker dials through Tailcat.
     tailcat: Option<TailcatFile>,
-    /// The controller's `tc…` address the helper carries.
     tailcat_address: Option<String>,
-    /// Whether this worker exposes the remote cache to its executor.
     remote_cache: bool,
-    /// The loopback address of the metrics listener, when enabled.
     metrics_listen: Option<SocketAddr>,
 }
 
-// One value per process, built once at start: the size difference between the
-// roles costs nothing, and boxing either side only moves the lint.
+// One value per process, built once: the size difference costs nothing, and boxing either side only moves the lint.
 #[allow(clippy::large_enum_variant)]
 enum Role {
     Server {
         listen: SocketAddr,
         api_listen: SocketAddr,
-        /// The OAuth issuer; `None` means `http://{api_listen}`.
         public_url: Option<String>,
-        /// Validated `trusted_proxies` entries; `None` means loopback only.
         trusted_proxies: Option<Vec<String>>,
-        /// The helper the server runs for its link port, when enabled.
         tailcat: Option<TailcatFile>,
-        /// Whether the controller serves remote cache objects.
         remote_cache: bool,
-        /// What that store may hold; `None` sizes it from the disk.
         remote_cache_budget: Option<u64>,
     },
     Worker(Option<WorkerLink>),
@@ -529,7 +412,6 @@ struct Config {
     backup: Option<BackupFile>,
     #[cfg(feature = "server")]
     mail: Option<MailSettings>,
-    /// `SENTINEL_AUTO_JOIN_DOMAINS`, parsed (server role only).
     #[cfg(feature = "server")]
     auto_join: sentinel_store::auto_join::Parsed,
     role: Role,
@@ -914,8 +796,6 @@ impl Config {
         };
         #[cfg(not(feature = "server"))]
         let _ = mail;
-        // Only the controller joins people; a worker sharing the environment
-        // ignores it. A bad entry is warned about at start, by position.
         #[cfg(feature = "server")]
         let auto_join = match &role {
             Role::Server { .. } => std::env::var("SENTINEL_AUTO_JOIN_DOMAINS")
@@ -995,14 +875,6 @@ fn read_config(path: &Path) -> Result<String, Error> {
     String::from_utf8(bytes).map_err(|_| Error::config("configuration must be UTF-8"))
 }
 
-/// Keep the process's memory out of core dumps and away from same-user
-/// debuggers: the controller opens sealed secret values and the
-/// worker holds delivered ones, and buffers that held them are wiped only
-/// where Sentinel owns them — not in every copy a library or allocator
-/// made. `RLIMIT_CORE` 0 (soft and hard) also covers every helper this
-/// process starts; `PR_SET_DUMPABLE` 0 additionally makes `/proc/<pid>`
-/// private and blocks `ptrace` by other processes of the same user. Best
-/// effort: a refusal leaves the process as it was.
 #[cfg(target_os = "linux")]
 fn keep_memory_out_of_dumps() {
     let none = libc::rlimit {
@@ -1092,7 +964,6 @@ pub fn run(role: &str, args: ServiceArgs) -> Result<(), Error> {
             })
         })
     });
-    // Do not fall back to synchronous stderr if the sink itself is stalled.
     if !diagnostics.shutdown(Duration::from_millis(500)) || diagnostics.losses().io_errors > 0 {
         result = Err(Error::runtime("diagnostic output is incomplete"));
     }
@@ -1102,9 +973,6 @@ pub fn run(role: &str, args: ServiceArgs) -> Result<(), Error> {
     result
 }
 
-/// The helper configuration of an enabled `[tailcat]` section; `None`
-/// leaves the link on direct TLS. `listen_port` is the role's default for the
-/// port the helper carries.
 fn helper_config(
     file: Option<&TailcatFile>,
     listen_port: u16,
@@ -1129,7 +997,6 @@ fn helper_config(
     }))
 }
 
-/// The controller's `tc…` address a worker dials through the helper.
 fn tailcat_address(link: &WorkerLink) -> Result<sentinel_link::tailcat::Address, Error> {
     let text = link
         .tailcat_address
@@ -1140,9 +1007,6 @@ fn tailcat_address(link: &WorkerLink) -> Result<sentinel_link::tailcat::Address,
     })
 }
 
-/// What `sentinel admin tailcat` needs from a role's configuration file: the
-/// data directory, the enabled helper and, for a worker, the controller's
-/// address. The file is validated exactly as the role itself would.
 pub(crate) struct TailcatSetup {
     pub data_dir: PathBuf,
     pub helper: sentinel_link::tailcat::TailcatConfig,
@@ -1204,11 +1068,6 @@ fn bootstrap_work<T: Send + 'static>(
         .map_err(|error| Error::runtime(error.to_string()))
 }
 
-/// Create the data directory owner-only (`0700`, whatever the umask): it
-/// holds the sealing key, the TLS identity, spools and checkouts. A
-/// directory that already exists keeps its mode — an operator may have
-/// chosen it — but one open to group or others is reported once, without
-/// echoing anything from the configuration.
 fn create_data_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1229,11 +1088,6 @@ fn create_data_dir(path: &Path) -> std::io::Result<()> {
     fs::create_dir_all(path)
 }
 
-/// The sealing key, always `<data_dir>/master.key` (the path `admin key`
-/// writes). Absent is fine only while the database holds no sealed value;
-/// otherwise, or when the key does not open this database's newest sealed
-/// values (a mismatched restore), the controller refuses to start (exit 2)
-/// instead of serving 500s at first use.
 #[cfg(feature = "server")]
 fn master_key(
     data_dir: &Path,
@@ -1274,8 +1128,6 @@ fn master_key(
     Ok(Some(Arc::new(key)))
 }
 
-/// Load the role's TLS identity from the data directory, generating it on
-/// first start. The key file is the process's secret and stays owner-only.
 fn identity(data_dir: &Path, stem: &str) -> Result<sentinel_link::identity::Identity, Error> {
     let (cert, key) = (
         data_dir.join(format!("{stem}.crt")),
@@ -1300,9 +1152,6 @@ fn identity(data_dir: &Path, stem: &str) -> Result<sentinel_link::identity::Iden
     Ok(identity)
 }
 
-/// What the running role holds until shutdown, drained in order. Constructed
-/// once per process and never moved in bulk, so its size is not worth another
-/// indirection; both lanes are boxed to keep it from growing further.
 #[allow(clippy::large_enum_variant)]
 enum Running {
     Idle,
@@ -1310,27 +1159,16 @@ enum Running {
     Server {
         controller: sentinel_link::controller::Controller,
         api: sentinel_api::Server,
-        /// The credential purge tick; holds a store handle until stopped.
         maintenance: Maintenance,
         store: Arc<sentinel_store::Store>,
-        /// Boxed: the enum is constructed once per process, and this keeps
-        /// the variant from dominating its size.
         lane: Box<sentinel_intake::Lane>,
-        /// The opt-in ref poller feeding the same intake path.
         poll: Box<sentinel_intake::Poll>,
-        /// The Checks outbox lane, when a GitHub App is configured.
         checks: Option<Box<sentinel_checks::Lane>>,
-        /// The lifecycle reconcile lane draining `github_refresh`.
         reconcile: Option<Box<sentinel_checks::Reconcile>>,
-        /// The mail lane, when Resend is configured.
         mail: Option<Box<sentinel_mail::Lane>>,
-        /// The GitHub-backed membership lane draining `github_member_checks`.
         members: Option<Box<sentinel_checks::Members>>,
-        /// The Tailcat helper carrying the link port; absent with direct TLS.
         tailcat: Option<TailcatServer>,
-        /// The external S3 copy's replicator, when `[s3]` is configured.
         replicator: Option<sentinel::offload::Running>,
-        /// Scheduled backups, when `[backup]` is configured.
         backups: Option<(
             Arc<sentinel_store::backup::Scheduler>,
             std::thread::JoinHandle<()>,
@@ -1340,28 +1178,15 @@ enum Running {
     Worker {
         handle: Arc<sentinel_link::worker::Handle>,
         thread: std::thread::JoinHandle<()>,
-        /// The Tailcat helper the worker dials through; absent with direct TLS.
-        /// Shared with the link thread, which replaces it when sessions over
-        /// it keep failing.
         tailcat: Option<Arc<sentinel_link::tailcat::Forward>>,
-        /// Holds the running executor, so shutdown can end its attempts.
         metrics: Arc<crate::worker_metrics::Metrics>,
     },
 }
 
-/// Run the helper that carries the link port, keep its
-/// `tc…` address in the owner-only `<data_dir>/tailcat/address` (the operator
-/// hands that exact string to workers as `tailcat_address`; the log names only
-/// the file), and keep the admitted node keys current from
-/// `<data_dir>/tailcat-allow` minus every key whose worker is revoked. `None`
-/// means direct TLS.
 #[cfg(feature = "server")]
 struct TailcatServer {
     server: Arc<sentinel_link::tailcat::Server>,
-    /// Dropping it wakes and ends the allow-list refresher at once.
     stop: mpsc::SyncSender<()>,
-    /// The refresher holds a store handle; it is joined before the store
-    /// drains.
     refresher: std::thread::JoinHandle<()>,
 }
 
@@ -1374,14 +1199,9 @@ impl TailcatServer {
     }
 }
 
-/// How often the allow list and the workers it names are re-read: a
-/// revoked worker's tunnel closes within one tick.
 #[cfg(feature = "server")]
 const TAILCAT_ALLOW_REFRESH: Duration = Duration::from_secs(10);
 
-/// The keys the helper may admit: every listed key whose worker is not
-/// revoked. A worker the store does not know yet stays admitted — it has to
-/// reach the controller over the tunnel to enroll at all.
 #[cfg(feature = "server")]
 fn admitted_keys(
     store: &sentinel_store::Store,
@@ -1419,8 +1239,7 @@ fn start_tailcat(
     let server = sentinel_link::tailcat::start_server(&helper, &config.data_dir, &keys)
         .map_err(|error| Error::runtime(format!("cannot start the tailcat helper: {error}")))?;
     match server.wait_ready(Duration::from_secs(60)) {
-        // The address is a credential: it lives in an owner-only file, and
-        // the log names only that file.
+        // The address is a credential: log only the owner-only file it is written to.
         Ok(_) => tracing::info!(
             event = "tailcat_listening",
             address_file = %server.address_file().display(),
@@ -1432,9 +1251,6 @@ fn start_tailcat(
             "the helper did not report an address within 60s; workers cannot dial it yet"
         ),
     }
-    // The allow list is an operator file and revocation is a store fact;
-    // both are re-read on a slow tick, so a newly admitted key takes effect
-    // and a revoked worker's tunnel closes without a restart.
     let server = Arc::new(server);
     let (stop, wake) = mpsc::sync_channel::<()>(0);
     let refresher = {
@@ -1451,9 +1267,6 @@ fn start_tailcat(
                     while let Err(mpsc::RecvTimeoutError::Timeout) =
                         wake.recv_timeout(TAILCAT_ALLOW_REFRESH)
                     {
-                        // A key rotation staged, committed or abandoned by
-                        // `sentinel admin tailcat`: serve the staged key
-                        // beside the active one, or switch.
                         match server.reload_keys() {
                             Ok(()) => rotation_warned = false,
                             Err(_) if !rotation_warned => {
@@ -1466,14 +1279,10 @@ fn start_tailcat(
                             Err(_) => {}
                         }
                         match sentinel_link::tailcat::allow_list(&data_dir) {
-                            // An empty or absent file is a decision: it
-                            // closes every tunnel (`--allow=none`).
                             Ok(read) => {
                                 file_warned = false;
                                 listed = read;
                             }
-                            // An unreadable or malformed file is not: keep the
-                            // last good list, still filtered by revocation.
                             Err(_) if !file_warned => {
                                 file_warned = true;
                                 tracing::warn!(
@@ -1486,10 +1295,6 @@ fn start_tailcat(
                         match admitted_keys(&store, &listed) {
                             Ok(keys) => {
                                 store_warned = false;
-                                // A real change restarts the helper; the
-                                // sessions it carries are closed through it
-                                // first, so their workers reconnect at once
-                                // instead of at their heartbeat deadline.
                                 if let Some(handoff) = link.hand_off(&server, &keys) {
                                     tracing::info!(
                                         event = "tailcat_allow_changed",
@@ -1528,26 +1333,13 @@ fn start_tailcat(
     }))
 }
 
-/// How often expired rows are purged: sessions, API credentials, external
-/// sign-in state, OAuth rows and idempotency records. Validation never
-/// depends on it — every check tests expiry and revocation itself, and an
-/// expired idempotency record already executes afresh — so this only bounds
-/// table growth.
 #[cfg(feature = "server")]
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(600);
-/// The next tick's delay while some purge still had a full batch to take:
-/// a backlog drains a batch per kind per second, releasing the writer
-/// between batches, instead of one batch per ten minutes.
 #[cfg(feature = "server")]
 const BACKLOG_INTERVAL: Duration = Duration::from_secs(1);
-/// Rows each purge removes per kind per tick; a backlog drains over
-/// several ticks instead of holding the writer.
 #[cfg(feature = "server")]
 const PURGE_BATCH: u32 = 1000;
 
-/// The maintenance tick: one thread that sleeps on a channel and runs the
-/// bounded purges every [`MAINTENANCE_INTERVAL`] (or [`BACKLOG_INTERVAL`]
-/// while a backlog remains). Dropping the sender wakes and ends it at once.
 #[cfg(feature = "server")]
 struct Maintenance {
     stop: mpsc::SyncSender<()>,
@@ -1577,36 +1369,27 @@ impl Maintenance {
         Ok(Maintenance { stop, thread })
     }
 
-    /// Stop the tick and release its store handle before the store drains.
     fn stop(self) {
         drop(self.stop);
         let _ = self.thread.join();
     }
 }
 
-/// One bounded purge: the store, "now", and the per-call row budget.
 #[cfg(feature = "server")]
 type Purge =
     fn(&sentinel_store::Store, sentinel_core::UnixMillis, u32) -> sentinel_store::Result<usize>;
 
-/// One tick: at most `batch` rows of each kind. Returns whether any kind
-/// filled its batch, i.e. may have more to purge.
 #[cfg(feature = "server")]
 fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
     let wall = sentinel_core::UnixMillis::now();
-    // Idempotency keys are stamped by the deadline clock (the API's run
-    // creation), so their TTL is judged on it; everything else is wall time.
+    // Idempotency keys are stamped by the deadline clock, so their TTL is judged on it.
     let steady = sentinel_core::UnixMillis::steady();
     let purges: [(&str, Purge, sentinel_core::UnixMillis); 8] = [
-        // The first-run token: gone once setup closed or the token expired.
         ("setup", sentinel_store::setup::purge, wall),
         ("oauth", sentinel_store::oauth::purge_expired, wall),
         ("api_tokens", sentinel_store::tokens::purge_expired, wall),
         ("sessions", sentinel_store::local_auth::purge_expired, wall),
         ("sign_in", sentinel_store::sign_in::purge_expired, wall),
-        // Spent and expired verification tokens, settled mail and expired
-        // undelivered messages: bounded here so a deployment without Resend,
-        // where no mail lane runs, does not accumulate them either.
         ("email", sentinel_store::email::purge, wall),
         (
             "idempotency",
@@ -1646,8 +1429,6 @@ fn start_server(
     (remote_cache, remote_cache_budget): (bool, Option<u64>),
 ) -> Result<Running, Error> {
     let path = config.data_dir.join(sentinel_store::METADATA_FILE);
-    // A pending migration is preceded by a copy of the database, and
-    // a failed one names that copy to roll back to.
     let (store, snapshot) =
         sentinel_store::upgrade::open_upgrading(&path, sentinel_store::Durability::Full).map_err(
             |error| match error {
@@ -1679,8 +1460,6 @@ fn start_server(
         );
     }
     let store = Arc::new(store);
-    // Before anything listens: a controller whose sealed values it cannot
-    // open must not come up looking healthy.
     let key = master_key(&config.data_dir, &store)?;
     let identity = identity(&config.data_dir, "controller")?;
     let fingerprint = hex32(&identity.fingerprint().0);
@@ -1691,9 +1470,6 @@ fn start_server(
         )
         .map_err(|error| Error::runtime(format!("cannot open the log store: {error}")))?,
     );
-    // Disk admission: one gate over the data directory's filesystem
-    // shared by objects and logs; staged writes and uploads charge it.
-    // Unset watermarks follow the data filesystem's size.
     let total = sentinel_store::space::total_bytes(&config.data_dir).unwrap_or(0);
     let marks = config.storage.marks(total)?;
     let admission = Arc::new(
@@ -1718,8 +1494,6 @@ fn start_server(
         artifact_retention_ms = deployment.artifact_retention_ms,
     );
     logs.set_admission(Arc::clone(&admission));
-    // Reconcile the object tree against committed rows before serving:
-    // staged leftovers are swept, orphans/corrupt/missing are reported.
     let objects = sentinel_store::objects::Objects::open(&config.data_dir)
         .map_err(|error| Error::runtime(format!("cannot open the object store: {error}")))?;
     objects.set_admission(Arc::clone(&admission));
@@ -1739,8 +1513,6 @@ fn start_server(
             "object store recovery found inconsistencies"
         );
     }
-    // Expired resumable uploads are retired and their staging files dropped;
-    // open-but-live ones keep their bytes for the client to resume.
     let objects = Arc::new(objects);
     let swept = store
         .writer()
@@ -1764,9 +1536,6 @@ fn start_server(
     controller.set_storage_policy(sentinel_link::controller::StoragePolicy {
         interval_ms: config.storage.sweep_interval_ms,
     });
-    // Remote cache: the controller holds objects workers offer, so a
-    // second worker can hydrate them without the WAN. The directory is
-    // created here for operators; uploads create it lazily anyway.
     if remote_cache {
         let root = config.data_dir.join("remote-cache");
         fs::create_dir_all(&root).map_err(|error| {
@@ -1775,15 +1544,11 @@ fn start_server(
                 root.display()
             ))
         })?;
-        // Unset, the store takes a tenth of the data file system, 1 to
-        // 50 GiB: 50 GiB on a 1 TB host.
         let budget = remote_cache_budget.unwrap_or_else(|| (total / 10).clamp(1 << 30, 50 << 30));
         controller.set_remote_cache_budget(budget);
         controller.set_remote_cache(root);
     }
     let tailcat = start_tailcat(config, &store, tailcat, listen, controller.handle())?;
-    // One destination policy for every controller-side fetch: worker spec
-    // delivery, intake resolution and ref polling all recheck it.
     let destinations = crate::source_admin::load_destinations(&config.data_dir)
         .map_err(|_| Error::runtime("cannot load source destination policy"))?;
     let intake_destinations: Arc<[String]> = destinations.clone().into();
@@ -1796,11 +1561,6 @@ fn start_server(
     if let Some(key) = &key {
         controller.set_source_key(Arc::clone(key));
     }
-    // The durable intake lane: accepted deliveries are validated and
-    // resolved off the request path, bounded, and woken by the intake route.
-    // Its thread is not inside the service's scoped diagnostic dispatcher, so
-    // the dispatcher is captured here and installed around each notice,
-    // exactly as `work.rs` does for its lanes.
     let resolver = sentinel_intake::Resolver::new(
         Arc::clone(&store),
         key.clone(),
@@ -1846,9 +1606,6 @@ fn start_server(
             });
         },
     );
-    // The opt-in ref poller: nothing is configured until an operator
-    // opts a repository in, but the lane runs so a new configuration takes
-    // effect without a restart. Its deliveries ride the intake lane above.
     let poll_dispatch = tracing::dispatcher::get_default(Clone::clone);
     let poll = sentinel_intake::Poll::start(
         Arc::clone(&store),
@@ -1882,10 +1639,6 @@ fn start_server(
     if github_webhook_secret.is_some() {
         tracing::info!(event = "github_webhook_enabled");
     }
-    // The Checks outbox lane and the lifecycle reconcile lane: both need an
-    // App, so neither starts without one. The reconcile lane drains durable
-    // `github_refresh` work — webhook hints and the periodic pass — and is
-    // also where a lost check answer gets found again by external ID.
     let mut reconcile = None;
     let mut members = None;
     let checks = match &app {
@@ -1910,9 +1663,6 @@ fn start_server(
                     });
                 },
             )));
-            // GitHub-backed organizations: who is a member, and in which
-            // repositories, is whatever GitHub confirms for the person's
-            // linked account. The lane only observes; the store decides.
             let members_dispatch = tracing::dispatcher::get_default(Clone::clone);
             members = Some(Box::new(sentinel_checks::Members::start(
                 Arc::clone(&store),
@@ -1975,7 +1725,6 @@ fn start_server(
     let github_sign_in = crate::source_admin::load_sign_in(&config.data_dir)
         .map_err(|error| Error::runtime(error.message))?;
     if let Some(sign_in) = &github_sign_in {
-        // The client ID is public; the secret is never logged.
         tracing::info!(event = "github_sign_in_enabled", client_id = %sign_in.client_id);
     }
     let replicator = match &config.s3 {
@@ -2002,13 +1751,9 @@ fn start_server(
         }
         None => None,
     };
-    // Before the API serves: a request that mints a link queues its message
-    // only when a lane will drain it, which the store row records.
     let (mail, mail_sender) = start_mail(config, public_url.as_deref(), &store, key.as_ref())?;
     announce_setup(&config.data_dir, &store)?;
-    // Before the API serves, so the first verification already sees the rules.
     record_auto_join(&config.auto_join, &store)?;
-    // The same rules, for the read-only organization settings.
     let options = sentinel_api::Options {
         mail: mail_sender,
         auto_join: config
@@ -2035,7 +1780,6 @@ fn start_server(
             public_url,
             github_sign_in,
             trusted_proxies: match trusted_proxies {
-                // Validated when the configuration was read.
                 Some(proxies) => proxies
                     .iter()
                     .filter_map(|proxy| sentinel_api::TrustedProxy::parse(proxy))
@@ -2066,12 +1810,6 @@ fn start_server(
     })
 }
 
-/// First-run setup: while no super admin exists, issue a one-time setup token
-/// and show it to the host operator, and only to them: a `0600` file in the
-/// data directory and one console line. Once an administrator exists (the
-/// wizard or `sentinel admin bootstrap`) no token is issued and a stale file
-/// is removed. A restart while setup is still open issues a new token and
-/// voids the old one.
 #[cfg(feature = "server")]
 fn announce_setup(data_dir: &Path, store: &sentinel_store::Store) -> Result<(), Error> {
     let path = data_dir.join(sentinel_store::setup::TOKEN_FILE);
@@ -2085,9 +1823,7 @@ fn announce_setup(data_dir: &Path, store: &sentinel_store::Store) -> Result<(), 
     token.expose(&mut text);
     write_owner_only(&path, text.as_bytes())
         .map_err(|error| Error::runtime(format!("cannot write {}: {error}", path.display())))?;
-    // The one place a credential is logged, by design: the token is for
-    // whoever can read this host's console or data directory, it expires in
-    // an hour and is dead once setup completes. It is never logged again.
+    // Logged on purpose: the token is readable only by whoever reads this host's console or data directory.
     tracing::warn!(
         event = "setup_required",
         token = %text,
@@ -2099,8 +1835,6 @@ fn announce_setup(data_dir: &Path, store: &sentinel_store::Store) -> Result<(), 
     Ok(())
 }
 
-/// Create `path` readable by its owner alone, replacing any earlier file (a
-/// new inode, so an old mode or a planted link is never reused).
 #[cfg(feature = "server")]
 fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -2132,16 +1866,12 @@ fn remove_setup_file(path: &Path) {
     }
 }
 
-/// Maintenance: drop the token file once the token is no longer good (setup
-/// completed, or it expired).
 #[cfg(feature = "server")]
 fn retire_setup_file(store: &sentinel_store::Store, data_dir: &Path) {
     let path = data_dir.join(sentinel_store::setup::TOKEN_FILE);
     if fs::symlink_metadata(&path).is_err() {
         return;
     }
-    // An unreadable answer keeps the file: removing it is only ever safe once
-    // the token is known dead.
     let live = store
         .read(|c| sentinel_store::setup::token_live(c, sentinel_core::UnixMillis::now()))
         .unwrap_or(true);
@@ -2150,11 +1880,6 @@ fn retire_setup_file(store: &sentinel_store::Store, data_dir: &Path) {
     }
 }
 
-/// Warn about every `SENTINEL_AUTO_JOIN_DOMAINS` entry that was dropped, by
-/// position and reason (never its text), then record the rules that stand.
-/// The setting replaces the previous run's rules whole: a removed domain stops
-/// new joins and removes nobody. A rule naming a GitHub-backed organization, a
-/// personal namespace or a suspended one is refused here and never joins.
 #[cfg(feature = "server")]
 fn record_auto_join(
     parsed: &sentinel_store::auto_join::Parsed,
@@ -2184,24 +1909,12 @@ fn record_auto_join(
     Ok(())
 }
 
-/// The mail lane (absent without the master key) and the Resend sender
-/// (absent without a configured key) that `start_mail` returns.
 #[cfg(feature = "server")]
 type MailStart = (
     Option<Box<sentinel_mail::Lane>>,
     Option<Arc<sentinel_mail::Resend>>,
 );
 
-/// Build the Resend sender when it is configured, and start the mail lane
-/// when there is also a master key to seal queued messages with; record in
-/// the store whether this deployment delivers mail. Without a sender, or
-/// without the master key that seals a queued message's link, nothing is
-/// queued: a request that needs a link still succeeds, and the operator mints
-/// one with `sentinel admin account email-link` or `invite create --email`.
-/// A configuration that cannot work (an unreadable or malformed key file)
-/// stops the start like any other configuration error. The sender is returned
-/// even without a master key: the first-run wizard's test message needs only
-/// the Resend key.
 #[cfg(feature = "server")]
 fn start_mail(
     config: &Config,
@@ -2271,9 +1984,6 @@ fn start_mail(
     Ok((Some(Box::new(lane)), Some(resend)))
 }
 
-/// Build the S3 client from `[s3]`, check it once (a failure is logged and
-/// the replicator starts degraded: local copies are kept until the bucket
-/// answers), install the read-through fetch, and start the replicator.
 #[cfg(feature = "server")]
 fn start_replicator(
     s3: &S3File,
@@ -2307,8 +2017,6 @@ fn start_replicator(
     }
     let bucket = Arc::new(sentinel::offload::S3Bucket::new(client));
     objects.set_remote(Arc::clone(&bucket) as Arc<dyn sentinel_store::objects::Remote>);
-    // Unset, the backlog may hold a sixteenth of the data file system, 1 to
-    // 64 GiB, before new artifacts wait for it.
     let settings = sentinel_store::replicate::Settings {
         part_bytes: s3.part_bytes.unwrap_or(16 << 20),
         local_bytes: s3.local_bytes.unwrap_or(0),
@@ -2340,9 +2048,6 @@ mod worker_role {
     use sentinel_core::AttemptId;
     use sentinel_link::session::{Capacity, Executor as LinkExecutor, Offer};
 
-    /// Without a usable rootless runtime there is nothing to run an offer
-    /// with: every offer is declined, so the job stays queued instead of
-    /// sitting leased on a machine that cannot start it.
     struct NoExecutor;
     impl LinkExecutor for NoExecutor {
         fn offered(&self, offer: &Offer) -> bool {
@@ -2363,7 +2068,6 @@ mod worker_role {
         fn log_refused(&self, _: AttemptId) {}
     }
 
-    /// The real executor when rootless Podman answers, else the decliner.
     fn executor(
         data_dir: &Path,
         worker: sentinel_core::WorkerId,
@@ -2440,7 +2144,6 @@ mod worker_role {
             git_mirrors,
         ) {
             Ok(executor) => {
-                // Before the link starts: no attempt has spooled a byte yet.
                 executor.set_spool_limits(
                     spool
                         .0
@@ -2449,7 +2152,6 @@ mod worker_role {
                         .1
                         .unwrap_or(sentinel_worker::spool::DEFAULT_SPOOL_QUOTA),
                 );
-                // Unset budgets follow the data directory's file system.
                 let sized = sentinel_worker::executor::StorageBudgets::sized(
                     sentinel_worker::spool::filesystem_bytes(data_dir).unwrap_or(0),
                 );
@@ -2486,8 +2188,6 @@ mod worker_role {
         }
     }
 
-    /// Measured capacity: every core, and total memory less a host reserve of
-    /// one eighth (at least 512 MiB, at most 2 GiB). Overridable per key.
     fn capacity(link: &WorkerLink) -> Capacity {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as u64);
         let total = fs::read_to_string("/proc/meminfo")
@@ -2508,8 +2208,6 @@ mod worker_role {
         }
     }
 
-    /// Free bytes on the filesystem holding `path`, or 0 when the platform
-    /// cannot say — reported as "not measured", never as "full".
     #[cfg(target_os = "linux")]
     fn disk_free(path: &Path) -> u64 {
         use std::os::unix::ffi::OsStrExt;
@@ -2532,11 +2230,6 @@ mod worker_role {
         0
     }
 
-    /// The scratch disk this worker offers jobs: the operator's `disk_bytes`,
-    /// or the data directory's free space less a reserve of one eighth
-    /// (clamped to 512 MiB–2 GiB) for logs, metadata and artifacts. Zero
-    /// means the platform could not measure it, and jobs that require disk
-    /// then never place here.
     fn profile_disk(link: &WorkerLink, data_dir: &Path) -> u64 {
         match link.disk_bytes {
             Some(bytes) => bytes,
@@ -2548,14 +2241,9 @@ mod worker_role {
         }
     }
 
-    /// CPU busy time in nanoseconds over a short window: the worker's load
-    /// input to placement. 0 when unmeasurable (not Linux, or
-    /// /proc/stat unreadable), never a claim of idleness.
     #[cfg(target_os = "linux")]
     fn load_ns() -> u64 {
         const WINDOW: Duration = Duration::from_millis(100);
-        // USER_HZ is 100 on every Linux the executor supports, so one
-        // /proc/stat tick is 10 ms.
         const TICK_NS: u64 = 10_000_000;
         fn busy_ticks() -> Option<u64> {
             let text = fs::read_to_string("/proc/stat").ok()?;
@@ -2566,7 +2254,6 @@ mod worker_role {
                 .split_whitespace()
                 .filter_map(|value| value.parse().ok())
                 .collect();
-            // user nice system idle iowait irq softirq steal …
             if values.len() < 8 {
                 return None;
             }
@@ -2587,11 +2274,6 @@ mod worker_role {
         0
     }
 
-    /// The protocol-7 profile: what the scheduler may select this machine by
-    /// and what it can offer jobs. `images`/`cache_bytes` start empty here
-    /// and are filled per session from the executor's own record
-    /// (`Executor::availability`): the held image keys and the cache store's
-    /// estimated bytes, refreshed from protocol 8 whenever they change.
     fn profile(link: &WorkerLink, data_dir: &Path) -> sentinel_protocol::negotiate::Profile {
         sentinel_protocol::negotiate::Profile {
             labels: link.labels.clone(),
@@ -2605,9 +2287,6 @@ mod worker_role {
         }
     }
 
-    /// Run the helper the worker dials through, when it is enabled.
-    /// Returns the address the link must dial, the transport telemetry the
-    /// helper already measured, and the helper itself to shut down later.
     fn tailcat(
         link: &WorkerLink,
         data_dir: &Path,
@@ -2634,10 +2313,6 @@ mod worker_role {
         let forward = sentinel_link::tailcat::start_forward(&config, data_dir, &address)
             .map_err(|error| Error::runtime(format!("cannot start the tailcat helper: {error}")))?;
         stats.helper_version = forward.telemetry().version;
-        // The path is what `tailcat ping` reported — a pong via DERP or from
-        // an ip:port — and stays Unknown when no probe measured it. The seed
-        // RTT is the latency the pong itself reported, never the wall time
-        // of the ping process; the first control beat replaces it.
         stats.path = sentinel_link::session::Path::Unknown;
         if let Ok(measured) = forward.probe() {
             stats.path = measured.path;
@@ -2654,13 +2329,10 @@ mod worker_role {
             .display(),
             path = ?stats.path
         );
-        // The worker dials the helper's loopback forward; the helper carries
-        // exactly the link port.
         let local = SocketAddr::from(([127, 0, 0, 1], forward.local_addr().port()));
         Ok((local, stats, Some(forward)))
     }
 
-    /// The worker's generated identifier, fixed on first start.
     fn worker_id(data_dir: &Path) -> Result<sentinel_core::WorkerId, Error> {
         let path = data_dir.join("worker.id");
         match sentinel::bounded::text(&path, 4 << 10) {
@@ -2703,16 +2375,8 @@ mod worker_role {
         };
         let capacity = capacity(link);
         let profile = profile(link, &config.data_dir);
-        // The helper, when enabled, is up before the first dial: the link
-        // then reaches the controller at its loopback forward.
         let (controller, transport, forward) = tailcat(link, &config.data_dir)?;
         let forward = forward.map(Arc::new);
-        // The reflink bit is the cache root's own probe answer, so the
-        // advertised capability and the backend restore uses never disagree.
-        // This worker answers a hand-off close before its forward goes, and
-        // replaces the forward on every clean close (below), so the
-        // controller may keep its old helper for a close it did not hear
-        // answered.
         let mut capabilities = sentinel_protocol::negotiate::Capabilities::REQUIRED
             .union(sentinel_protocol::negotiate::Capabilities::HANDOFF_ANSWER)
             .union(sentinel_protocol::negotiate::Capabilities::SECRET_DELIVERY);
@@ -2757,9 +2421,6 @@ mod worker_role {
             tailcat = forward.is_some()
         );
         let handle = Arc::new(sentinel_link::worker::Handle::new());
-        // With a helper, every session starts from — and every
-        // telemetry resend refreshes — the path and latency the helper's
-        // latest probe measured, not the probe at process start.
         if let Some(forward) = &forward {
             let forward = Arc::clone(forward);
             handle.set_transport_source(Arc::new(move || {
@@ -2817,9 +2478,6 @@ mod worker_role {
                                     events.connected.store(true, std::sync::atomic::Ordering::Relaxed);
                                     events.connects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if enrolled && let Some(path) = &enrollment_file {
-                                        // Spent: the secret is refused from now on
-                                        // anyway, but a spent secret on disk invites
-                                        // confusion at the next start.
                                         let _ = fs::remove_file(path);
                                     }
                                     tracing::info!(event = "link_connected", worker = %worker, enrolled);
@@ -2828,13 +2486,6 @@ mod worker_role {
                                     events.connected.store(false, std::sync::atomic::Ordering::Relaxed);
                                     events.disconnects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(event = "link_lost", error = %error);
-                                    // The same forward can take tens of seconds
-                                    // to carry a new session after the
-                                    // controller's helper restarts (every
-                                    // allow-list change); a fresh one does not.
-                                    // A clean close is the controller's hand-off
-                                    // to that restart: always replaced, after the
-                                    // worker's own end had time to get through.
                                     if let Some(forward) = &tunnel
                                         && matches!(error, sentinel_link::Error::Closed)
                                     {
@@ -2878,8 +2529,7 @@ fn initialize_and_wait(
     startup: PhaseTimer,
     service_started: Instant,
 ) -> Result<(), Error> {
-    // Register before initialization so shutdown requested during startup is retained.
-    // Signal callbacks only enqueue; cleanup and reporting stay on the main thread.
+    // Register before initialization so a shutdown during startup is kept; signal callbacks only enqueue.
     let (sender, receiver) = mpsc::sync_channel(1);
     let initialized = (|| {
         ctrlc::set_handler(move || {
@@ -2949,8 +2599,6 @@ fn initialize_and_wait(
             api.shutdown();
             maintenance.stop();
             if let Some((scheduler, thread)) = backups {
-                // A backup under way finishes: its staging directory would
-                // otherwise be left for the next one to clear.
                 scheduler.stop();
                 let _ = thread.join();
             }
@@ -2989,10 +2637,7 @@ fn initialize_and_wait(
             tailcat,
             metrics,
         } => {
-            // Attempts first, while the session is still up: running ones
-            // are stopped and their containers removed (a container would
-            // otherwise run on after this process, while the controller
-            // reallocates its capacity), waiting ones are handed back.
+            // Stop attempts while the session is up: their containers must be removed before the controller reallocates capacity.
             if let Some(executor) = metrics.executor.get() {
                 executor.shutdown(WORKER_SHUTDOWN);
             }
@@ -3009,9 +2654,6 @@ fn initialize_and_wait(
 
 #[cfg(all(test, target_os = "linux"))]
 mod hardening_tests {
-    /// A service process ends up with no core limit it could raise
-    /// and not dumpable. Checked in a forked child so the test binary's own
-    /// flags are left alone.
     #[test]
     fn a_service_process_keeps_its_memory_out_of_dumps() {
         // SAFETY: the child only makes raw syscalls (setrlimit, prctl,
@@ -3107,8 +2749,6 @@ mod tests {
                 key: key('b').unwrap(),
                 worker: pending,
             },
-            // The enrolled worker mid-rotation: its new key is listed beside
-            // the old one until the old one is retired.
             Admission {
                 key: key('c').unwrap(),
                 worker: enrolled,
@@ -3256,7 +2896,6 @@ credentials_file = '/etc/sentinel/s3'
     #[test]
     fn storage_defaults_and_validation() {
         let resolved = resolve_ok(StorageFile::default());
-        // A 64 GiB data filesystem sizes the watermarks to 1, 2 and 4 GiB; a 1 TB one scales them up.
         let marks = marks_ok(&resolved, 64 << 30);
         assert_eq!(
             marks,
@@ -3271,7 +2910,6 @@ credentials_file = '/etc/sentinel/s3'
         assert_eq!(big.reserve, 1_000_000_000_000 / 64);
         assert_eq!(big.low, 1_000_000_000_000 / 32);
         assert_eq!(big.high, 2 * big.low);
-        // Clamped on tiny and huge disks alike.
         assert_eq!(marks_ok(&resolved, 1 << 30).reserve, 1 << 30);
         assert_eq!(marks_ok(&resolved, 1 << 50).reserve, 16 << 30);
         let d = resolved.deployment;
@@ -3283,9 +2921,6 @@ credentials_file = '/etc/sentinel/s3'
         assert_eq!(resolved.attempt_log_bytes, 256 << 20);
         assert_eq!(resolved.sweep_interval_ms, 300_000);
 
-        // reserve under 64 MiB, low under reserve, high under low: refused
-        // (an explicit level below a sized one only at startup, when the
-        // filesystem's size is known).
         for (reserve, low, high) in [
             (Some(1u64 << 20), None, None),
             (Some(2 << 30), Some((2 << 30) - 1), None),
@@ -3304,7 +2939,6 @@ credentials_file = '/etc/sentinel/s3'
             ..Default::default()
         };
         assert!(resolve_ok(low_under_sized).marks(64 << 30).is_err());
-        // Sweep, retention and size bounds.
         for file in [
             StorageFile {
                 sweep_interval_secs: Some(4),
@@ -3341,7 +2975,6 @@ credentials_file = '/etc/sentinel/s3'
         ] {
             assert!(file.resolve().is_err());
         }
-        // A full override resolves.
         let file = StorageFile {
             reserve_bytes: Some(1 << 30),
             low_watermark_bytes: Some(2 << 30),
@@ -3388,11 +3021,9 @@ credentials_file = '/etc/sentinel/s3'
         ] {
             assert!(mail(file).resolve(&no_env).is_err(), "{file}");
         }
-        // The same through the environment.
         let stray =
             |name: &str| (name == "SENTINEL_EMAIL_FROM").then(|| "ci@example.com".to_owned());
         assert!(MailFile::default().resolve(&stray).is_err());
-        // Empty environment values are unset, so a blank override disables nothing.
         let blank = |_: &str| Some(String::new());
         let resolved = settled(
             mail("api_key_file = '/etc/sentinel/resend-key'\nfrom = 'ci@example.com'"),
@@ -3415,7 +3046,6 @@ credentials_file = '/etc/sentinel/s3'
             Path::new("/run/secrets/resend")
         );
         assert_eq!(merged.from, "Sentinel CI <ci@example.org>");
-        // There is no setting that carries the key itself.
         assert!(toml::from_str::<MailFile>("api_key = 're_abc'").is_err());
         assert!(toml::from_str::<MailFile>("resend_api_key = 're_abc'").is_err());
     }
@@ -3432,7 +3062,6 @@ credentials_file = '/etc/sentinel/s3'
             error.message
         );
         let mut bad = vec!["", "nobody"];
-        // The server build checks the whole address, not just its shape.
         #[cfg(feature = "server")]
         bad.extend([
             "a@@b.example",
@@ -3445,9 +3074,6 @@ credentials_file = '/etc/sentinel/s3'
         for bad_from in bad {
             let file = mail(&format!("{key}from = '{bad_from}'"));
             let error = file.resolve(&no_env).unwrap_err();
-            // The refusal is one of two fixed sentences, which themselves
-            // show an example address, so test for exactly those rather than
-            // for the value being a substring of the message.
             assert!(
                 [
                     "the sender must be `ci@example.com` or `Sentinel <ci@example.com>`",
@@ -3458,7 +3084,6 @@ credentials_file = '/etc/sentinel/s3'
                 error.message
             );
         }
-        // A typo in the section is not ignored, and neither is an old key.
         assert!(toml::from_str::<MailFile>("hots = 'x'").is_err());
         assert!(toml::from_str::<MailFile>("host = 'x'").is_err());
     }
