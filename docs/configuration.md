@@ -98,6 +98,14 @@ dir = "/mnt/backup/sentinel"       # absolute, outside data_dir: another disk or
 interval_secs = 3600               # 300..604800 (default hourly: the metadata recovery point)
 keep = 24                          # newest backups kept (1..1000, default 24)
 
+# server only: optional SMTP delivery of email verification and invitation links ([admission](admission.md#email-identity-and-email-invitations)); absent = nothing is sent and `sentinel admin` mints links. Needs public_url. Each key has a SENTINEL_SMTP_* environment override (below)
+[mail]
+host = "smtp.example.com"          # relay host name or IP address
+port = 587                         # default: 587 (starttls), 465 (implicit), 25 (none)
+tls = "starttls"                   # "starttls" (default, never downgraded), "implicit", or "none" (a relay on this host only, no credentials)
+credentials_file = "/etc/sentinel/smtp"  # optional; absolute, owner-only: `username = …` and `password = …` lines
+from = "sentinel@example.com"      # the sender address
+
 # server only: disk admission, quotas and retention ([retention](retention.md), [storage](storage.md#disk-admission-quotas-and-reclamation-d06))
 [storage]
 reserve_bytes = 16777216000        # held back for metadata and log evidence (≥ 64 MiB); default a 64th of the data file system, 1-16 GiB; never less than twice the metadata database
@@ -191,6 +199,22 @@ Rotation leaves revocation unchanged. Every allow-list line names its worker, so
 **Health.** A worker runs `tailcat ping` every 30 s: it proves mesh reachability and measures the path, and a helper that stops reaching the controller is replaced. A helper is judged only once it has run a full interval, and a failed probe replaces only the helper it probed — never a successor that started while the probe was in flight. The probe sends nothing through the forward, and a `ping` cannot show that the forward itself is stuck, because it runs as a fresh process each time. The data path's health is the Sentinel session itself. A control session (or connection) the controller closed cleanly, a hand-off, replaces the worker's helper 200 ms later whatever its age. A lost or refused one replaces it at once (`tailcat_replaced`), unless that helper started less than 10 s ago; a younger helper is left for the probe to judge, so that while the controller is down the worker does not kill each new helper before it could connect. Helper restarts back off from 1 s to 30 s across consecutive failures; a helper that reported readiness (or ran past its 60 s readiness deadline) resets the back-off, and a deliberate replacement — a new allow list, a failed probe, a lost session — starts the next helper at once. The helper carries only the link port (never `serve all`, an exit node, a shell or its file mode; those words are refused as modes, flag names or flag values, except inside an `https://` URL), and the worker binds loopback only.
 
 **Self-hosted relay.** Run Tailscale's `derper` where both sides reach its TLS port (TCP; STUN on UDP 3478 is optional and only helps direct paths form), with a certificate the helpers trust — a public CA, or a private CA named by `SSL_CERT_FILE`/`SSL_CERT_DIR` in Sentinel's environment on both roles. Serve a DERP map naming it over `https` with a trusted certificate as well, and set `derpmap_url` (plus `region` when the map has several) on both sides; the map is trust material. The live suite (`crates/sentinel-link/tests/tailcat_live.rs`) runs this with `derper` v1.86.2 in manual certificate mode on the Podman bridge gateway, a private CA through `SSL_CERT_FILE` and direct UDP dropped: the link runs via `DERP(local)` only.
+
+### Email delivery
+
+Verification links and email invitations ([admission](admission.md#email-identity-and-email-invitations)) are delivered by an optional SMTP relay, drained from a durable outbox by the controller's mail lane. Configure it in `[mail]` or in the environment of the controller; the environment wins key by key, so a container needs no configuration file for it:
+
+| Key | Environment | Meaning |
+|---|---|---|
+| `host` | `SENTINEL_SMTP_HOST` | The relay. Without a host nothing is delivered; any other key without one is a configuration error. |
+| `port` | `SENTINEL_SMTP_PORT` | 1–65535; default 587 for `starttls`, 465 for `implicit`, 25 for `none`. |
+| `tls` | `SENTINEL_SMTP_TLS` | `starttls` (default): the greeting is plaintext, `STARTTLS` is mandatory (a relay that does not offer it is refused, never used in plaintext) and plaintext already buffered when the upgrade starts is refused. `implicit`: TLS from the first byte. `none`: only for `localhost` or a loopback address, and never with credentials. Server certificates are checked against the bundled web PKI roots. |
+| `credentials_file` | `SENTINEL_SMTP_CREDENTIALS_FILE` | Absolute path to an owner-only regular file of at most 8 KiB with `username = …` and `password = …` lines, like the other secret files. The password is never in the configuration file, the environment or an error, and is sent only inside TLS (`AUTH PLAIN`, else `AUTH LOGIN`). |
+| `from` | `SENTINEL_SMTP_FROM` | The sender address, as `ci@example.com`; normalized like every address. Required with a host. |
+
+The server role only: a worker's configuration with a `[mail]` section is refused. Delivery also needs `public_url` (links are built on it) and the master key (`admin key create`; it seals queued messages). Without a master key the controller starts, logs `mail_disabled` and queues nothing. A configuration that cannot work (an unreadable credentials file, a refused setting) stops the start with exit 2 and never echoes a value. Each connection carries one message with a 10 s connect timeout, 15 s per read or write, a 60 s session deadline, reply lines of at most 1 KiB, replies of at most 64 lines and messages of at most 32 KiB. The controller logs `mail_enabled` (host, port, whether authenticated), `mail_settled` and `mail_abandoned` with the message's `mal_` identifier, never an address or a link.
+
+Without `[mail]` nothing is queued and a request that needs a link still succeeds. The operator mints links on the host (`sentinel admin account email-link`, `invite create --email`, `account email-verify`), and `sentinel admin mail status` reports whether the controller delivers mail and the outbox's counts ([admission](admission.md#email-identity-and-email-invitations)).
 
 ### Remote cache
 

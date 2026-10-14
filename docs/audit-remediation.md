@@ -174,7 +174,7 @@ Fixed: tenant-membership oracle removed, platform-override audit (event code 57)
 
 Deferred:
 
-- No invitation and accept step (needs a table, route and UI). A non-consensual add is audited as `member-added` and documented; adding a non-member needs the 128-bit `usr_` id.
+- An invitation and accept step now exists for email invitations to app-created organizations ([admission](admission.md#email-invitations): the person proves the invited mailbox before anything is granted). Adding an existing account by `usr_` id is still non-consensual: it is audited as `member-added` and documented, and adding a non-member needs the 128-bit `usr_` id.
 - The `usr_` id response difference (active non-member succeeds, unknown or inactive is NotFound) is not equalized.
 - Grants minted by a session that expired and was purged, or revoked individually before this change, stay outside the revoke window.
 
