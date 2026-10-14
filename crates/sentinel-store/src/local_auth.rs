@@ -285,6 +285,8 @@ pub struct Session {
     pub csrf: Digest,
     pub idle_deadline: UnixMillis,
     pub absolute_deadline: UnixMillis,
+    /// When the session was issued (the sign-in that made it).
+    pub created: UnixMillis,
     /// When this session last proved a second factor, if ever.
     pub stepped_up: Option<UnixMillis>,
 }
@@ -300,12 +302,10 @@ impl Session {
     /// Whether this session was issued within the step-up window: a person
     /// who has just signed in has just proven themselves, which is the only
     /// proof an account with neither a password nor a second factor (GitHub
-    /// only) can give before enrolling its first factor. Derived from the
-    /// absolute deadline, so it is exact while the policy is the one the
-    /// session was issued under.
+    /// only) can give before enrolling its first factor. Judged against the
+    /// recorded creation time, which no policy change can move.
     pub fn signed_in_within(&self, policy: Policy, now: UnixMillis) -> bool {
-        let issued = self.absolute_deadline.0.saturating_sub(policy.absolute_ms);
-        issued <= now.0 && now.0.saturating_sub(issued) < policy.step_up_ms
+        self.created <= now && now.0.saturating_sub(self.created.0) < policy.step_up_ms
     }
 
     pub fn require_step_up(&self, policy: Policy, now: UnixMillis) -> Result<()> {
@@ -732,7 +732,7 @@ pub fn authenticate(conn: &Connection, presented: &Secret, now: UnixMillis) -> R
     let row = conn
         .prepare_cached(
             "SELECT s.user_id, s.csrf_digest, s.idle_deadline_ms, s.absolute_deadline_ms,
-                    u.super_admin, s.id, s.stepped_up_ms
+                    u.super_admin, s.id, s.stepped_up_ms, s.created_ms
              FROM sessions s JOIN users u ON u.id = s.user_id
              WHERE s.token_digest = ?1 AND s.revoked_ms IS NULL
              AND s.idle_deadline_ms > ?2 AND s.absolute_deadline_ms > ?2
@@ -747,6 +747,7 @@ pub fn authenticate(conn: &Connection, presented: &Secret, now: UnixMillis) -> R
                 r.get::<_, bool>(4)?,
                 r.get::<_, Option<[u8; 16]>>(5)?,
                 r.get::<_, Option<i64>>(6)?,
+                r.get::<_, i64>(7)?,
             ))
         })
         .optional()?
@@ -761,6 +762,7 @@ pub fn authenticate(conn: &Connection, presented: &Secret, now: UnixMillis) -> R
         csrf: Digest(row.1),
         idle_deadline: UnixMillis(row.2),
         absolute_deadline: UnixMillis(row.3),
+        created: UnixMillis(row.7),
         stepped_up: row.6.map(UnixMillis),
     })
 }

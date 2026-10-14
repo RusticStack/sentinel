@@ -1149,6 +1149,64 @@ fn host_local_enrollment_needs_the_code_marks_the_audit_and_leaves_sessions_alon
 }
 
 #[test]
+fn wrong_confirmation_codes_count_against_the_session_and_never_lock_a_pending_factor() {
+    let f = fixture();
+    let now = at(T0 + 10);
+    let enrollment =
+        mfa::begin_enrollment(&f.store, &f.key, &f.session(now), "Sentinel", "root", now).unwrap();
+    let seed = seed_from_uri(&enrollment.provisioning_uri);
+    let wrong = wrong_codes(&seed, now, mfa::MAX_STEP_UP_FAILURES as usize);
+    for (n, code) in wrong.iter().enumerate() {
+        let alive = f
+            .store
+            .read(|c| local_auth::authenticate(c, &f.cookie, now))
+            .is_ok();
+        assert!(alive, "revoked before the limit, at guess {n}");
+        let session = f.session(now);
+        assert!(matches!(
+            mfa::confirm_enrollment(&f.store, &f.key, &f.cookie, &session, code, now),
+            Err(Error::Forbidden)
+        ));
+    }
+    // The fifth wrong code revoked the session; the pending factor is not
+    // locked (its account counter only runs once confirmed) and each
+    // failure is audited.
+    assert!(matches!(
+        f.store
+            .read(|c| local_auth::authenticate(c, &f.cookie, now)),
+        Err(Error::NotFound)
+    ));
+    assert!(!factor_locked_pending(&f, now));
+    let failed = f
+        .store
+        .read(|c| local_auth::recent_audit(c, 100))
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.event == Event::StepUpFailed)
+        .count();
+    assert_eq!(failed, wrong.len());
+
+    // Signing in again, the person can still confirm the same enrollment.
+    let (cookie, session) = sign_in(&f, now);
+    let code = f.code_for(&seed, now);
+    mfa::confirm_enrollment(&f.store, &f.key, &cookie, &session, &code, now).unwrap();
+    assert!(f.store.read(|c| mfa::enrolled(c, f.root)).unwrap());
+}
+
+fn factor_locked_pending(f: &Fixture, now: UnixMillis) -> bool {
+    f.store
+        .read(|c| {
+            c.query_row(
+                "SELECT locked_until_ms > ?2 OR failures != 0 FROM mfa_totp WHERE user_id = ?1",
+                rusqlite::params![f.root.as_bytes(), now.0],
+                |r| r.get(0),
+            )
+            .map_err(Error::from)
+        })
+        .unwrap()
+}
+
+#[test]
 fn a_session_is_a_fresh_sign_in_only_inside_the_step_up_window() {
     let f = fixture();
     let policy = Policy::default();

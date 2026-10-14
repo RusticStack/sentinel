@@ -396,6 +396,49 @@ fn five_wrong_current_passwords_revoke_the_session() {
 }
 
 #[test]
+fn five_wrong_confirmation_codes_revoke_the_session_and_the_enrollment_survives() {
+    let f = Fixture::new(1);
+    let s = session(&f, "root");
+    let (_, body) = post(
+        &f,
+        "/api/v1/mfa/enroll",
+        json!({ "password": PASSWORD }),
+        &s,
+    );
+    let uri = body["provisioning_uri"].as_str().unwrap().to_owned();
+    let right = code_from(&uri);
+    let wrong = if right == "000000" {
+        "000001"
+    } else {
+        "000000"
+    };
+    for _ in 0..5 {
+        let (status, _) = post(
+            &f,
+            "/api/v1/mfa/enroll/confirm",
+            json!({ "code": wrong }),
+            &s,
+        );
+        assert_eq!(status, 403);
+    }
+    // The cookie that kept guessing is no longer a session at all.
+    let (status, _, _) = send(&f, "GET", "/api/v1/me", None, &s);
+    assert_eq!(status, 401);
+
+    // The person signs in again and confirms the same enrollment.
+    let again = session(&f, "root");
+    let state = security(&f, &again);
+    assert_eq!(state["mfa"]["pending"], true);
+    let (status, body) = post(
+        &f,
+        "/api/v1/mfa/enroll/confirm",
+        json!({ "code": right }),
+        &again,
+    );
+    assert_eq!(status, 200, "{body}");
+}
+
+#[test]
 fn with_a_second_factor_a_password_change_asks_for_the_step_up_first() {
     let f = Fixture::new(1);
     let first = session(&f, "root");

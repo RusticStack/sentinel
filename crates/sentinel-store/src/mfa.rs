@@ -185,7 +185,17 @@ fn confirm(
         .ok_or(Error::NotFound)
     })?;
     let seed = open_seed(key, user, &sealed)?;
-    let step = mfa::check(&seed, code, unix_seconds(now)).ok_or(Error::Forbidden)?;
+    let Some(step) = mfa::check(&seed, code, unix_seconds(now)) else {
+        // A pending enrollment has no expiry, and a correct code yields the
+        // recovery codes, so a cookie guessing at it is counted like any
+        // wrong proof: five revoke the session. The factor itself is not yet
+        // confirmed, so its account lockout is not involved. Host-local has
+        // no session to count against.
+        if let Some(digest) = stamp_session {
+            refuse(store, digest, user, now)?;
+        }
+        return Err(Error::Forbidden);
+    };
 
     let codes = mfa::recovery_codes();
     let digests: Vec<[u8; 32]> = codes.iter().map(|code| code.digest().0).collect();
