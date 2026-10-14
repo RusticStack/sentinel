@@ -1064,6 +1064,31 @@ fn bootstrap_work<T: Send + 'static>(
         .map_err(|error| Error::runtime(error.to_string()))
 }
 
+/// Create the data directory owner-only (`0700`, whatever the umask): it
+/// holds the sealing key, the TLS identity, spools and checkouts. A
+/// directory that already exists keeps its mode — an operator may have
+/// chosen it — but one open to group or others is reported once, without
+/// echoing anything from the configuration.
+fn create_data_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+            tracing::warn!(
+                event = "data_dir_permissive",
+                "the data directory is open to other accounts; restrict it to its owner (chmod 700)"
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(path)
+}
+
 /// The sealing key, always `<data_dir>/master.key` (the path `admin key`
 /// writes). Absent is fine only while the database holds no sealed value;
 /// otherwise, or when the key does not open this database's newest sealed
@@ -1116,21 +1141,23 @@ fn identity(data_dir: &Path, stem: &str) -> Result<sentinel_link::identity::Iden
         data_dir.join(format!("{stem}.crt")),
         data_dir.join(format!("{stem}.key")),
     );
-    if cert.exists() || key.exists() {
-        return sentinel_link::identity::Identity::load(&cert, &key)
-            .map_err(|error| Error::runtime(format!("cannot load {stem} identity: {error}")));
+    use sentinel_link::identity::Origin;
+    let (identity, origin) = sentinel_link::identity::Identity::load_or_generate(stem, &cert, &key)
+        .map_err(|error| Error::runtime(format!("cannot load {stem} identity: {error}")))?;
+    match origin {
+        Origin::Loaded => {}
+        Origin::Generated => tracing::info!(
+            event = "identity_generated",
+            stem,
+            "{stem} identity generated"
+        ),
+        Origin::Recovered => tracing::warn!(
+            event = "identity_recovered",
+            stem,
+            "a {stem} identity file was found without its pair, so a new identity was generated; enroll its new fingerprint"
+        ),
     }
-    let generated = sentinel_link::identity::Identity::generate(stem)
-        .map_err(|error| Error::runtime(format!("cannot generate {stem} identity: {error}")))?;
-    generated
-        .save(&cert, &key)
-        .map_err(|error| Error::runtime(format!("cannot save {stem} identity: {error}")))?;
-    tracing::info!(
-        event = "identity_generated",
-        stem,
-        "{stem} identity generated"
-    );
-    Ok(generated)
+    Ok(identity)
 }
 
 /// What the running role holds until shutdown, drained in order. Constructed
@@ -2441,7 +2468,7 @@ fn initialize_and_wait(
         })
         .map_err(|error| Error::runtime(format!("cannot install shutdown handler: {error}")))?;
         let data_dir = config.data_dir.clone();
-        bootstrap_work(io, move || fs::create_dir_all(data_dir))?
+        bootstrap_work(io, move || create_data_dir(&data_dir))?
             .map_err(|error| Error::runtime(format!("cannot initialize data_dir: {error}")))?;
         match &config.role {
             #[cfg(feature = "server")]

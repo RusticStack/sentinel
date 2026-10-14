@@ -275,8 +275,13 @@ pub fn die_with_parent(command: &mut Command) {
         // allocates nothing and takes no lock.
         unsafe {
             command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0)
-                    != 0
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                ) != 0
                 {
                     return Err(std::io::Error::last_os_error());
                 }
