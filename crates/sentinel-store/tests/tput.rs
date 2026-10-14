@@ -1,4 +1,4 @@
-//! Concurrent log append throughput (P06-8 measurement). `--ignored`.
+//! Concurrent log append throughput measurement. `--ignored`.
 use std::{sync::Arc, time::Instant};
 
 use sentinel_core::{AttemptId, JobId, RunId};

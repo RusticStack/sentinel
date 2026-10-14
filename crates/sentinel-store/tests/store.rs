@@ -199,8 +199,7 @@ fn compare_and_set_detects_out_of_band_change() {
             "UPDATE jobs SET fence = 7 WHERE id = ?1",
             params![job.as_bytes()],
         )?;
-        // `transition` re-reads (fence 7), applies, and its UPDATE guards on fence 7:
-        // that succeeds. So instead guard-check via a stale read replayed manually.
+        // `transition` would re-read fence 7 and succeed, so replay the stale read by hand.
         let changed = tx.execute(
             "UPDATE jobs SET state_code = 1 WHERE id = ?1 AND state_code = 0 AND fence = ?2",
             params![job.as_bytes(), row.fence.0 as i64],
