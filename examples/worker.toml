@@ -6,6 +6,8 @@ log_level = "info"
 # at `link_listening`, and the one-time enrollment from `sentinel admin worker enroll`.
 # controller = "10.0.0.5:7443"
 # controller_fingerprint = "0000000000000000000000000000000000000000000000000000000000000000"
+# While rotating the controller certificate, also trust the new fingerprint (at most 3 more):
+# controller_fingerprint_also = ["0000000000000000000000000000000000000000000000000000000000000000"]
 # worker_name = "builder-1"
 # enrollment_file = "/etc/sentinel/enrollment"
 # git_mirrors = true               # per-repository object mirrors under <data_dir>/mirrors (default on)

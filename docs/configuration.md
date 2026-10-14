@@ -48,6 +48,8 @@ trusted_proxies = ["127.0.0.1"]
 # worker only: the controller to reach and the fingerprint it logged at `link_listening`
 controller = "10.0.0.5:7443"
 controller_fingerprint = "<64 lower-case hex characters>"
+# worker only, during a controller certificate rotation: further fingerprints trusted beside the one above (at most 3); remove the old one once every worker reconnected ([rotation](worker-link.md))
+# controller_fingerprint_also = ["<64 lower-case hex characters>"]
 worker_name = "builder-1"          # 1-128 bytes, default "worker"
 enrollment_file = "/etc/sentinel/enrollment"  # absolute; read on start, removed once spent
 cpu_millis = 8000                  # override measured capacity (default: every core); the WHOLE host's, see below
@@ -110,7 +112,7 @@ attempt_log_bytes = 268435456      # stored log bytes one attempt may produce (1
 sweep_interval_secs = 300          # the maintenance pass runs on its own thread at most this often (5..86400)
 ```
 
-The three common fields are optional in the file; `listen`, `api_listen`, `public_url` and `[storage]` are refused for the worker and the worker keys (`labels`, `disk_bytes`, `spool_reserve_bytes`, `spool_quota_bytes`, `cache_budget_bytes`, `mirror_budget_bytes`, `image_budget_bytes`, `tailcat_address`, `metrics_listen`) for the server, as are `[remote_cache] budget_bytes`, `[s3]` and `[backup]` for the worker; `[tailcat]` is accepted by both roles; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
+The three common fields are optional in the file; `listen`, `api_listen`, `public_url` and `[storage]` are refused for the worker and the worker keys (`labels`, `disk_bytes`, `spool_reserve_bytes`, `spool_quota_bytes`, `cache_budget_bytes`, `mirror_budget_bytes`, `image_budget_bytes`, `tailcat_address`, `metrics_listen`) for the server, as are `[remote_cache] budget_bytes`, `[s3]` and `[backup]` for the worker; `[tailcat]` is accepted by both roles; `controller` and `controller_fingerprint` are set together or not at all, and the other worker keys (including `controller_fingerprint_also`) need them. A worker without a controller configured idles as a lifecycle-only process. Empty files use the logging defaults above and the role data path:
 
 - Server: `/var/lib/sentinel`
 - Worker: `/var/lib/sentinel-worker`

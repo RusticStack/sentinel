@@ -1028,6 +1028,23 @@ pub trait Admission: Send + Sync {
         enrollment: Option<&Secret>,
         capacity: Capacity,
     ) -> std::result::Result<Admitted, Rejection>;
+
+    /// [`admit`](Self::admit) with the address the connection came from,
+    /// when it has one, for policies that budget unauthenticated peers by
+    /// source. The default ignores it.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_from(
+        &self,
+        _source: Option<std::net::IpAddr>,
+        fingerprint: &Digest,
+        worker: WorkerId,
+        name: &str,
+        hello: &Hello,
+        enrollment: Option<&Secret>,
+        capacity: Capacity,
+    ) -> std::result::Result<Admitted, Rejection> {
+        self.admit(fingerprint, worker, name, hello, enrollment, capacity)
+    }
 }
 
 /// The controller's answer to a heartbeat.
@@ -1204,16 +1221,31 @@ impl Sender {
     /// an unknown state, so the connection is torn down: the reader fails
     /// out, the session ends, and nothing waits on a dead peer forever.
     pub(crate) fn send<M: Serialize>(&self, message: &M) -> Result<()> {
-        self.send_inner(message, false)
+        self.send_inner(message, false, None)
+    }
+
+    /// [`send`](Self::send) for a caller that must not wait on one peer (the
+    /// controller's single dispatcher): fails with [`BUSY`], touching
+    /// nothing, when another thread is mid-write on this connection, and
+    /// otherwise writes under `within` instead of the full write timeout.
+    /// A write that runs past `within` tears the connection down exactly as
+    /// a timed-out `send` does.
+    pub(crate) fn send_bounded<M: Serialize>(&self, message: &M, within: Duration) -> Result<()> {
+        self.send_inner(message, false, Some(within))
     }
 
     /// Same frame path as `send`, but wipe the reusable postcard buffer after
     /// a secret payload is encoded and written.
     pub(crate) fn send_sensitive<M: Serialize>(&self, message: &M) -> Result<()> {
-        self.send_inner(message, true)
+        self.send_inner(message, true, None)
     }
 
-    fn send_inner<M: Serialize>(&self, message: &M, sensitive: bool) -> Result<()> {
+    fn send_inner<M: Serialize>(
+        &self,
+        message: &M,
+        sensitive: bool,
+        bound: Option<Duration>,
+    ) -> Result<()> {
         ENCODE.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
             scratch.clear();
@@ -1230,7 +1262,7 @@ impl Sender {
                             Err(Error::Protocol("frame too large"))
                         } else {
                             buffer[..4].copy_from_slice(&(len as u32).to_be_bytes());
-                            self.write_frame(&buffer)
+                            self.write_frame(&buffer, bound)
                         }
                     }
                 }
@@ -1245,7 +1277,7 @@ impl Sender {
                     Err(Error::Protocol("frame too large"))
                 } else {
                     buffer[..4].copy_from_slice(&(len as u32).to_be_bytes());
-                    self.write_frame(&buffer)
+                    self.write_frame(&buffer, bound)
                 }
             };
             if sensitive {
@@ -1256,7 +1288,7 @@ impl Sender {
         })
     }
 
-    fn write_frame(&self, frame: &[u8]) -> Result<()> {
+    fn write_frame(&self, frame: &[u8], bound: Option<Duration>) -> Result<()> {
         if self.0.closing.load(Ordering::Acquire) {
             // Past the close: a failed write here would tear the socket
             // down (and reset it on unread bytes) before the peer read the
@@ -1264,7 +1296,21 @@ impl Sender {
             // connection that is ending anyway.
             return Ok(());
         }
-        let mut conn = self.0.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut conn = match bound {
+            None => self.0.conn.lock().unwrap_or_else(|p| p.into_inner()),
+            // Busy is not a failure of the connection: nothing was written,
+            // so it stays open.
+            Some(_) => match self.0.conn.try_lock() {
+                Ok(conn) => conn,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return Err(Error::Internal(BUSY)),
+            },
+        };
+        if let Some(within) = bound {
+            // Under the connection lock, so no other writer sees the
+            // shortened timeout; restored below on every path.
+            let _ = self.0.sock.set_write_timeout(Some(within));
+        }
         let written = (|| -> Result<()> {
             conn.writer().write_all(frame)?;
             let mut sock = &self.0.sock;
@@ -1273,6 +1319,9 @@ impl Sender {
             }
             Ok(())
         })();
+        if bound.is_some() {
+            let _ = self.0.sock.set_write_timeout(Some(HEARTBEAT_DEADLINE));
+        }
         drop(conn);
         match written {
             Ok(()) => {
@@ -2263,6 +2312,7 @@ fn accept_watched(
         .and_then(|certs| certs.first())
         .map(fingerprint_of)
         .ok_or(Error::Protocol("no client certificate"))?;
+    let source = socket.peer_addr().ok().map(|addr| addr.ip());
     let (tx, mut rx) = split(conn, socket)?;
     let first = loop {
         let remaining = deadline.saturating_sub(started.elapsed());
@@ -2299,7 +2349,8 @@ fn accept_watched(
                 ),
                 None => None,
             };
-            match admission.admit(
+            match admission.admit_from(
+                source,
                 &fingerprint,
                 worker,
                 &name,
@@ -2998,7 +3049,28 @@ fn ids(raw: &[[u8; 16]]) -> Result<Vec<AttemptId>> {
 
 /// Push an offer to a worker. The dispatcher's only way in.
 pub fn offer(sender: &Sender, offer: &Offer) -> Result<()> {
-    sender.send(&ServerMessage::Offer(offer.to_wire()))
+    sender.send_bounded(&ServerMessage::Offer(offer.to_wire()), DISPATCH_WRITE_BOUND)
+}
+
+/// What the dispatcher's own pushes (offers, prefetch hints) may wait on one
+/// peer: they come from the single dispatcher thread, so a peer that stopped
+/// reading must cost the fleet this, not the 15 s write timeout.
+pub const DISPATCH_WRITE_BOUND: Duration = Duration::from_millis(250);
+
+/// The error [`Sender::send_bounded`] returns when another thread is
+/// mid-write on the connection: nothing was sent and the connection is fine.
+pub const BUSY: &str = "sender busy";
+
+/// Whether `error` is the [`BUSY`] refusal rather than a failed connection.
+pub fn is_busy(error: &Error) -> bool {
+    matches!(error, Error::Internal(BUSY))
+}
+
+/// Whether the connection is free for a push right now (a peer whose spec or
+/// log traffic holds the connection lock is skipped this pass, not waited
+/// for). Advisory: [`Sender::send_bounded`] is the check that counts.
+pub fn is_free(sender: &Sender) -> bool {
+    sender.0.conn.try_lock().is_ok()
 }
 
 /// Push a prefetch hint (protocol 9) to a session: the whole wanted set of
@@ -3012,9 +3084,12 @@ pub fn prefetch(sender: &Sender, images: &[String]) -> Result<()> {
     {
         return Err(Error::Protocol("prefetch hint"));
     }
-    sender.send(&ServerMessage::Prefetch {
-        images: images.to_vec(),
-    })
+    sender.send_bounded(
+        &ServerMessage::Prefetch {
+            images: images.to_vec(),
+        },
+        DISPATCH_WRITE_BOUND,
+    )
 }
 
 /// The worker's end of a session.

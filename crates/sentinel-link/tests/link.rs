@@ -527,8 +527,7 @@ fn a_worker_pinning_a_set_of_fingerprints_accepts_any_of_them() {
     let stranger = Identity::generate("stranger").unwrap().fingerprint();
     let attempt = |pins: &[sentinel_auth::secret::Digest]| {
         let secret = d.enrollment(60_000);
-        let config =
-            tls::client_config_pinned(Identity::generate("w").unwrap(), pins).unwrap();
+        let config = tls::client_config_pinned(Identity::generate("w").unwrap(), pins).unwrap();
         session::connect(
             d.controller().local_addr(),
             config,

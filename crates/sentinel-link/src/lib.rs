@@ -21,6 +21,8 @@
 //! uses direct TLS exactly as before.
 
 #[cfg(feature = "controller")]
+mod admission;
+#[cfg(feature = "controller")]
 pub mod controller;
 pub mod identity;
 pub mod session;

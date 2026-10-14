@@ -618,3 +618,52 @@ fn stalled_handshakes_are_cut_at_their_deadline_and_cannot_lock_workers_out() {
         .is_ok()
     });
 }
+
+/// An unknown certificate guessing enrollment secrets is budgeted per source
+/// before a guess reaches the single writer (each refused one commits an
+/// audit row): the first few are refused as wrong, the rest are told to try
+/// later and counted, and an already enrolled worker is never held to the
+/// budget.
+#[test]
+fn enrollment_guessing_is_rate_limited_and_never_touches_enrolled_workers() {
+    let d = deployment();
+    let (worker, identity) = (WorkerId::new(), Identity::generate("w").unwrap());
+    let (cert, key) = (d._dir.path().join("w.crt"), d._dir.path().join("w.key"));
+    identity.save(&cert, &key).unwrap();
+    let load = || Identity::load(&cert, &key).unwrap();
+    let secret = d.enrollment();
+    drop(d.connect(load(), worker, Some(&secret), 6).unwrap());
+
+    let mut wrong = 0;
+    let mut deferred = 0;
+    for _ in 0..12 {
+        let guess = Secret::generate();
+        match d
+            .connect(
+                Identity::generate("guesser").unwrap(),
+                WorkerId::new(),
+                Some(&guess),
+                6,
+            )
+            .unwrap_err()
+        {
+            Error::Rejected(Rejection::Enrollment) => wrong += 1,
+            Error::Rejected(Rejection::Unavailable) => deferred += 1,
+            other => panic!("unexpected {other}"),
+        }
+    }
+    assert!(
+        (1..=5).contains(&wrong),
+        "{wrong} guesses reached the writer"
+    );
+    assert_eq!(wrong + deferred, 12);
+    assert!(
+        d.controller
+            .stats()
+            .enrollment_limited
+            .load(Ordering::SeqCst)
+            >= 7
+    );
+    // The enrolled worker reconnects regardless.
+    assert!(d.connect(load(), worker, None, 6).is_ok());
+}
