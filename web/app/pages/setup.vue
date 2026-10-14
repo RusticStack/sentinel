@@ -152,7 +152,9 @@ const creationLabel = computed(() => CREATIONS.find((c) => c.value === draft.ten
 const mailConfigured = ref<boolean | null>(null);
 async function readMailConfigured() {
   try {
-    mailConfigured.value = (await api<{ open: boolean; mail_configured?: boolean }>("/api/v1/setup")).mail_configured === true;
+    const status = await api<{ open: boolean; mail_configured?: boolean }>("/api/v1/setup");
+    if (status.open === false) return setupGone();
+    mailConfigured.value = status.mail_configured === true;
   } catch {
     // Unknown: the test itself says whether mail is configured.
   }
@@ -425,7 +427,7 @@ const firstNamespace = computed(() => completed.value?.organization ?? completed
           <UAlert v-if="mailResult?.kind === 'sent'" color="success" variant="subtle" icon="i-lucide-mail-check" title="Test message sent."
             description="Check that it arrived (and not in spam)." />
           <UAlert v-else-if="mailResult?.kind === 'failed'" color="warning" variant="subtle" icon="i-lucide-mail-warning" :title="`${FAILURE_WORDS[mailResult.failure] ?? 'The test failed'}.`"
-            :description="mailResult.reason ? `Resend said: ${mailResult.reason}` : undefined" />
+            :description="mailResult.reason ? `${mailResult.failure === 'transient' || mailResult.failure === 'permanent' ? 'Resend said' : 'The controller said'}: ${mailResult.reason}` : undefined" />
           <UAlert v-else-if="mailResult?.kind === 'error'" color="error" variant="subtle" icon="i-lucide-circle-alert" :title="mailResult.message" />
         </div>
         <p class="text-xs text-muted">A failed test does not stop setup: you can finish now and configure email later.</p>
