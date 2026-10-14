@@ -117,6 +117,9 @@ pub enum Event {
     OAuthDeviceDenied = 54,
     ServiceGrantIssued = 55,
     ServiceAccountCreated = 56,
+    /// A platform administrator who is not an administrator of the tenant
+    /// changed its access under platform scope; the detail is their reason.
+    PlatformOverride = 57,
 }
 
 impl Event {
@@ -179,6 +182,7 @@ impl Event {
             Event::OAuthDeviceDenied => "oauth-device-denied",
             Event::ServiceGrantIssued => "service-grant-issued",
             Event::ServiceAccountCreated => "service-account-created",
+            Event::PlatformOverride => "platform-override",
         }
     }
 
@@ -240,6 +244,7 @@ impl Event {
             54 => Event::OAuthDeviceDenied,
             55 => Event::ServiceGrantIssued,
             56 => Event::ServiceAccountCreated,
+            57 => Event::PlatformOverride,
             _ => return None,
         })
     }
@@ -727,7 +732,22 @@ pub fn logout(store: &Store, presented: &Secret, now: UnixMillis) -> Result<()> 
 
 /// Revoke every live session of one account: the caller's logout-all, and the
 /// rotation a password change, role change or suspension must perform.
+///
+/// A session that is no longer trusted may have left credentials behind that
+/// outlive it, so in the same transaction the service grants this account
+/// minted since its oldest live session began are revoked too
+/// ([`crate::oauth::revoke_minted_since`]). Revoking a single session by name
+/// does not: a grant records who minted it, not through which session.
 pub fn revoke_all(tx: &Transaction<'_>, user: UserId, now: UnixMillis) -> Result<usize> {
+    let since: Option<i64> = tx
+        .prepare_cached(
+            "SELECT MIN(created_ms) FROM sessions WHERE user_id = ?1 AND revoked_ms IS NULL
+             AND idle_deadline_ms > ?2 AND absolute_deadline_ms > ?2",
+        )?
+        .query_row(params![user.as_bytes(), now.0], |r| r.get(0))?;
+    if let Some(since) = since {
+        crate::oauth::revoke_minted_since(tx, user, UnixMillis(since), now)?;
+    }
     let revoked = tx.execute(
         "UPDATE sessions SET revoked_ms = ?2 WHERE user_id = ?1 AND revoked_ms IS NULL",
         params![user.as_bytes(), now.0],

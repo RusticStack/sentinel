@@ -382,8 +382,20 @@ fn only_an_admitted_active_person_can_decide() {
         .write(move |tx| {
             provisioning::insert_human(tx, suspended, "Suspended", false, NOW)?;
             local_auth::set_active(tx, root, suspended, false, NOW)?;
-            let admin = Principal::new(i.root, P::ALL, None, None);
-            auth::create_service_account(tx, admin, i.tenant, bot, "bot", Role::Operator, NOW)
+            let admin = auth::Authority::Credential {
+                principal: Principal::new(i.root, P::ALL, None, None),
+                stepped_up: true,
+            };
+            auth::create_service_account(
+                tx,
+                admin,
+                i.tenant,
+                bot,
+                "bot",
+                Role::Operator,
+                Some("fixture"),
+                NOW,
+            )
         })
         .unwrap();
     let start = begin(&store, Scopes::RUNS_READ, NOW);

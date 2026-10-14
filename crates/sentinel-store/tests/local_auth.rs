@@ -504,11 +504,12 @@ fn credentials_and_sessions_are_refused_for_non_human_principals() {
             )?;
             sentinel_store::auth::create_service_account(
                 tx,
-                admin,
+                stepped(admin),
                 tenant,
                 bot,
                 "bot",
                 sentinel_core::auth::Role::Operator,
+                Some("fixture"),
                 at(2_200),
             )
         })
