@@ -90,6 +90,16 @@ bounded thread that:
 3. writes the outcome back in a short transaction, guarded by the sequence it
    read.
 
+The lane does not poll. When nothing is due it sleeps on the store's commit
+notifier and a deadline at the earliest pending row's retry time
+(`checks::next_due_ms`, one read of the head of `check_publications_due`): a
+new publication is read when its transaction commits — at once after a quiet
+spell, at most once per 50 ms under unrelated write load — and a backed-off row
+exactly when it is due. `Config::idle` (2 s by default) is only the longest
+sleep without a read, the net for a write the notifier cannot see, such as one
+from another process on the same database. The measured effect of replacing
+the 250 ms poll is pending VPS measurement.
+
 Retries, refusals and rate limits are explicit:
 
 - **transient** (a transport failure, a GitHub 5xx): the row is scheduled again
@@ -290,7 +300,10 @@ holds at most 1024 repository tokens, evicting the earliest expiry at capacity.
 - `crates/sentinel-checks/tests/lane.rs`: a retry or throttle that exhausts the
   budget reported as refused, a throttle parking rows without spending
   attempts, one throttled scope not stopping the others, and a row whose store
-  writes keep failing quarantined without blocking the lane.
+  writes keep failing quarantined without blocking the lane, a publication
+  committed to an idle lane (safety re-read two minutes away) delivered by the
+  commit notifier, a backed-off row read at its deadline with no commit to wake
+  the lane, and an idle lane dropped promptly.
 - `crates/sentinel-github` unit tests: repository-path parsing, payload bounds,
   conclusion/status parsing and the exact
   permission set of a checks token.

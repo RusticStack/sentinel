@@ -42,9 +42,14 @@ pub const REARM_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// Most rows one [`rearm_exhausted`] call re-pends.
 pub const REARM_LIMIT: u32 = 1_000;
 
-const COLUMNS: &str = "id, tenant_id, repo_id, run_id, delivery_id, scope, name, head_sha,
+macro_rules! columns {
+    () => {
+        "id, tenant_id, repo_id, run_id, delivery_id, scope, name, head_sha,
     external_id, status, conclusion, title, summary, check_run_id, seq, published_seq, state, reason,
-    check_suite_id, create_started_ms, create_seq";
+    check_suite_id, create_started_ms, create_seq"
+    };
+}
+const COLUMNS: &str = columns!();
 
 /// A check's desired status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -764,14 +769,34 @@ pub fn record_delivery(
 /// Publications whose newest generation has not been delivered yet and whose
 /// next attempt is due, oldest first.
 pub fn due(conn: &Connection, now: UnixMillis, limit: u16) -> Result<Vec<Publication>> {
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {COLUMNS} FROM check_publications
+    // A literal statement: the lane runs this on every wake, and formatting
+    // it each time would allocate a string only to find it in the cache.
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM check_publications
          WHERE state = 0 AND published_seq < seq
            AND (next_attempt_ms IS NULL OR next_attempt_ms <= ?1)
          ORDER BY created_ms, id LIMIT ?2"
     ))?;
     let rows = stmt.query_map(params![now.0, limit], decode_row)?;
     rows.map(|row| decode(row?)).collect()
+}
+
+/// When the earliest pending publication becomes due, as wall-clock
+/// milliseconds: `Some(0)` for one due already, `None` when nothing is
+/// pending. One read of the head of the `check_publications_due` index, so a
+/// lane that found nothing due can sleep exactly until the next backoff
+/// expires instead of polling for it.
+pub fn next_due_ms(conn: &Connection) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT COALESCE(next_attempt_ms, 0) FROM check_publications
+             WHERE state = 0 AND published_seq < seq
+             ORDER BY next_attempt_ms LIMIT 1",
+        )?
+        .query_row([], |r| r.get(0))
+        .optional()?)
 }
 
 /// One publication by ID, whatever its state.
