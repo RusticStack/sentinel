@@ -1,16 +1,9 @@
-//! Mutation idempotency. A client supplies an `Idempotency-Key`; the server
-//! scopes it to (tenant, principal, route) and stores the request body
-//! fingerprint with the first response. A repeat with the same fingerprint
-//! replays that response; a repeat with a different body is rejected with
-//! `idempotency_mismatch`. Keys expire after [`IDEMPOTENCY_TTL_MS`].
 use std::fmt;
 
 use crate::limits::MAX_IDEMPOTENCY_KEY_BYTES;
 
 pub const IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// Client-chosen key: 1..=64 bytes of printable ASCII without spaces.
-/// Stored inline; no allocation on the request path.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IdempotencyKey {
     len: u8,
@@ -45,7 +38,6 @@ impl IdempotencyKey {
     }
 
     pub fn as_str(&self) -> &str {
-        // Validated ASCII at construction.
         std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
     }
 }
@@ -56,9 +48,7 @@ impl fmt::Debug for IdempotencyKey {
     }
 }
 
-/// Stable 128-bit fingerprint of a request body (FNV-1a, 128-bit). Not a
-/// cryptographic hash: the only party who can collide it is the caller
-/// against their own earlier request, which changes nothing for them.
+// FNV-1a, not cryptographic: only the caller can collide it, with its own earlier request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Fingerprint(pub u128);
@@ -76,17 +66,11 @@ impl Fingerprint {
     }
 }
 
-/// What the server should do with a mutation carrying a key, given what it
-/// has stored for that scope and key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
-    /// No record (or an expired one): execute and store the response.
     Execute,
-    /// Same body seen before: return the stored response without executing.
     Replay,
-    /// Same key, different body.
     Mismatch,
-    /// First request still in flight: the client should retry shortly.
     InFlight,
 }
 
@@ -94,7 +78,6 @@ pub enum Decision {
 pub struct Stored {
     pub fingerprint: Fingerprint,
     pub stored_at_ms: i64,
-    /// `false` while the first execution has not completed.
     pub completed: bool,
 }
 

@@ -1,9 +1,3 @@
-//! Strict parser for the explicit secret env-file format.
-//!
-//! This is data parsing only: no quotes, escapes, interpolation, shell or
-//! dotenv rules are applied. Values are the bytes after the first `=` up to
-//! the line ending; use `secret set --file` for multiline values.
-
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -17,8 +11,6 @@ pub const MAX_DELIVERY_VALUES: usize = MAX_DELIVERY_TARGETS;
 const DELIVERY_VALUE_WIRE_OVERHEAD: usize = 16;
 const DELIVERY_TARGET_WIRE_UPPER_BOUND: usize = 384;
 
-/// Byte storage used for a serialized secret bundle. Its debug view exposes
-/// only the size, and every owned buffer is wiped when released.
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct SecretBytes(Vec<u8>);
@@ -85,7 +77,6 @@ impl fmt::Debug for DeliveryValue {
     }
 }
 
-/// An explicitly authorized use of one value by one compiled step.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DeliveryTarget {
     pub step: u16,
@@ -97,11 +88,8 @@ pub struct DeliveryTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TargetKind {
     Environment,
-    File {
-        path: String,
-    },
-    /// OCI `auth.json` bytes kept on the host and used only for this job's
-    /// image pull. `step` is zero by convention; it is never exposed to a step.
+    File { path: String },
+    // Never exposed to a step: the bytes are used only for this job's image pull.
     RegistryAuth,
 }
 
@@ -132,11 +120,6 @@ impl DeliveryBundle {
         self.targets.is_empty()
     }
 
-    /// A conservative allocation-free upper bound for its postcard wire
-    /// size. The target bound covers both maximum-length names and file
-    /// paths; value overhead covers the byte-string length prefix and struct
-    /// framing. Preparation checks this as it grows so oversized bundles do
-    /// not first allocate every secret value.
     pub fn within_wire_limit(&self) -> bool {
         if self.values.len() > MAX_DELIVERY_VALUES || self.targets.len() > MAX_DELIVERY_TARGETS {
             return false;
@@ -161,7 +144,6 @@ impl DeliveryBundle {
         size <= MAX_DELIVERY_BYTES
     }
 
-    /// Bound the decoded control data before any worker filesystem work.
     pub fn valid(&self) -> bool {
         self.within_wire_limit()
             && self
@@ -217,10 +199,9 @@ impl Drop for WipeEntries {
 pub enum ImportFault {
     TooLarge,
     NotUtf8,
-    /// A UTF-16 byte-order mark: PowerShell 5.1's default `>` encoding.
+    // A UTF-16 byte-order mark, the default of PowerShell 5.1's `>` redirection.
     Utf16,
-    /// A carriage return that does not end a CRLF line: records written
-    /// with bare CR would otherwise merge into one value.
+    // Bare CRs would merge records written with CR-only line endings into one value.
     BareCarriageReturn,
     InvalidLine,
     InvalidName,
@@ -230,12 +211,9 @@ pub enum ImportFault {
     TooManyEntries,
 }
 
-/// Why an env file was refused, and the 1-based line when one is to blame.
-/// Neither ever includes a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImportError {
     pub fault: ImportFault,
-    /// 0 when the fault is the file as a whole.
     pub line: usize,
 }
 
@@ -271,10 +249,6 @@ impl fmt::Display for ImportError {
     }
 }
 
-/// Hints about a literal value that is probably not what the author meant,
-/// for the metadata-only import preview: whether it is wrapped in matching
-/// quotes (stored with them) or starts or ends with whitespace. Only these
-/// booleans leave; never the value.
 pub fn literal_hints(value: &[u8]) -> (bool, bool) {
     let quoted =
         value.len() >= 2 && matches!(value[0], b'"' | b'\'') && value[value.len() - 1] == value[0];
@@ -283,12 +257,6 @@ pub fn literal_hints(value: &[u8]) -> (bool, bool) {
     (quoted, padded)
 }
 
-/// Parse `NAME=value` records. Blank and `#` comment lines are ignored;
-/// names are case-sensitive and must match `[A-Z_][A-Z0-9_]*`. A UTF-8 BOM
-/// at the start is skipped. Lines end with LF or CRLF; any other CR is
-/// refused. A final newline is syntax, not part of a value. Everything
-/// after the first `=` is the literal value: quotes, `#`, spaces and `$` are
-/// kept as written. Errors name the line, never a value.
 pub fn parse_env_file(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ImportError> {
     if bytes.len() > MAX_IMPORT_BYTES {
         return Err(ImportError::file(ImportFault::TooLarge));
@@ -337,7 +305,6 @@ pub fn parse_env_file(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ImportErro
         if entries.0.len() == MAX_IMPORT_ENTRIES {
             return Err(at(ImportFault::TooManyEntries));
         }
-        // Names were checked as ASCII and the file as UTF-8.
         entries.0.push((
             String::from_utf8(name.to_vec()).expect("ASCII name"),
             value.to_vec(),
@@ -403,7 +370,6 @@ mod tests {
 
     #[test]
     fn a_bare_carriage_return_is_refused_with_its_line() {
-        // A bare CR must not merge `B` into `A`'s value.
         let error = parse_env_file(b"A=1\rB=2\r").unwrap_err();
         assert_eq!(
             error,

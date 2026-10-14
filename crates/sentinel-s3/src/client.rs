@@ -1,6 +1,3 @@
-//! The S3 operations: single and multipart uploads (with resume and abort),
-//! range reads, head, delete and listing.
-
 use std::{
     io::Read,
     sync::Arc,
@@ -9,22 +6,17 @@ use std::{
 
 use crate::{Config, Error, Result, sigv4, xml};
 
-/// Largest body read for anything but an object's own bytes.
 const MAX_RESPONSE: u64 = 4 << 20;
 const MAX_HEADERS: usize = 32 * 1024;
-/// S3's own bounds on multipart uploads.
 pub const MIN_PART_BYTES: u64 = 5 << 20;
 pub const MAX_PART_BYTES: u64 = 5 << 30;
 pub const MAX_PARTS: u32 = 10_000;
-/// User metadata one object may carry here.
 const MAX_METADATA: usize = 8;
 
-/// What `HEAD` reports about an object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Head {
     pub len: u64,
     pub etag: String,
-    /// `x-amz-meta-*` values, by the name after the prefix, lower-case.
     pub metadata: Vec<(String, String)>,
 }
 
@@ -37,7 +29,6 @@ impl Head {
     }
 }
 
-/// One uploaded part of a multipart upload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Part {
     pub number: u32,
@@ -45,21 +36,15 @@ pub struct Part {
     pub len: u64,
 }
 
-/// An unfinished multipart upload the bucket still holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MultipartUpload {
-    /// The full key, prefix included.
     pub key: String,
     pub upload_id: String,
-    /// `2026-09-28T12:00:00.000Z`, as the service wrote it.
     pub initiated: String,
 }
 
-/// One page of unfinished uploads, and the `(key, upload id)` markers the
-/// next page starts after.
 pub type UploadPage = (Vec<MultipartUpload>, Option<(String, String)>);
 
-/// One page of a listing: full keys and sizes, and where the next starts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObjectPage {
     pub objects: Vec<(String, u64)>,
@@ -89,14 +74,9 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Longest error code and request id kept from a refusal. S3's codes are short
-/// identifiers (`NoSuchUpload`, `SlowDown`); anything longer is not one.
 const MAX_CODE: usize = 64;
 const MAX_REQUEST_ID: usize = 64;
 
-/// `text` when it is a short identifier (ASCII letters, digits, `.`, `_`, `-`,
-/// at most `max` bytes), else `None`: remote text that is not one is dropped,
-/// never echoed into an error.
 fn identifier(text: &str, max: usize) -> Option<String> {
     let text = text.trim();
     (!text.is_empty()
@@ -107,13 +87,10 @@ fn identifier(text: &str, max: usize) -> Option<String> {
     .then(|| text.to_owned())
 }
 
-/// Bytes in the inclusive range `a..=b`; `None` when it is inverted or spans
-/// more than `u64` can count.
 fn range_len(a: u64, b: u64) -> Option<u64> {
     b.checked_sub(a)?.checked_add(1)
 }
 
-/// Strip the quotes S3 wraps an ETag in.
 fn etag(value: &str) -> String {
     value.trim().trim_matches('"').to_owned()
 }
@@ -122,8 +99,7 @@ impl Client {
     pub fn new(config: Config) -> Result<Client> {
         config.validate()?;
         let (scheme, host) = match config.endpoint.split_once("://") {
-            // A default port is dropped: the signed host must be the one the
-            // transport sends, which omits it.
+            // The signed host must match what the transport sends, which omits a default port.
             Some(("https", host)) => ("https", host.trim_end_matches(":443").to_owned()),
             Some(("http", host)) => ("http", host.trim_end_matches(":80").to_owned()),
             _ => return Err(Error::Config("endpoint scheme".into())),
@@ -171,12 +147,10 @@ impl Client {
         &self.config
     }
 
-    /// The full key for a path under the configured prefix.
     pub fn key(&self, path: &str) -> String {
         format!("{}{}", self.config.prefix, path)
     }
 
-    /// The host header and encoded path for a full key (`None`: the bucket).
     fn locate(&self, key: Option<&str>) -> (String, String) {
         let encoded = key.map(|k| sigv4::uri_encode(k, true)).unwrap_or_default();
         if self.config.path_style {
@@ -192,8 +166,6 @@ impl Client {
         }
     }
 
-    /// Sign and send one request. `body` is sent as is and hashed into the
-    /// signature; `extra` headers are signed too.
     fn send(
         &self,
         method: &str,
@@ -210,8 +182,6 @@ impl Client {
         self.send_hashed(method, key, query, extra, body, &payload)
     }
 
-    /// [`send`](Self::send) for a body whose SHA-256 the caller already
-    /// computed (alongside its `Content-MD5`, in one walk over the bytes).
     fn send_hashed(
         &self,
         method: &str,
@@ -267,7 +237,6 @@ impl Client {
             .map_err(|e| Error::Transient(transport(&e)))
     }
 
-    /// The service's refusal, classified; never includes the request.
     fn refusal(status: u16, mut response: ureq::http::Response<ureq::Body>) -> Error {
         let body = response
             .body_mut()
@@ -275,9 +244,7 @@ impl Client {
             .limit(64 * 1024)
             .read_to_vec()
             .unwrap_or_default();
-        // Remote text is data: only the short identifier alphabet is kept, and
-        // only a bounded run of it, so an endpoint cannot push a 64 KiB (or a
-        // log-injecting) message into this crate's errors.
+        // Remote text is untrusted: only a short identifier survives, so it cannot inject text into errors.
         let code = xml::field(&body, "Code")
             .ok()
             .flatten()
@@ -350,8 +317,6 @@ impl Client {
             .collect()
     }
 
-    /// Store `body` at `key` in one request (up to [`MAX_PART_BYTES`]).
-    /// Returns the ETag.
     pub fn put_object(&self, key: &str, body: &[u8], metadata: &[(&str, &str)]) -> Result<String> {
         if body.len() as u64 > MAX_PART_BYTES {
             return Err(Error::Config("single upload above 5 GiB".into()));
@@ -365,8 +330,6 @@ impl Client {
         Ok(etag(&Self::header(&response, "etag").unwrap_or_default()))
     }
 
-    /// Begin a multipart upload; the caller records the id to resume or
-    /// abort it after a restart.
     pub fn create_multipart(&self, key: &str, metadata: &[(&str, &str)]) -> Result<String> {
         let meta = Self::metadata_headers(metadata)?;
         let extra: Vec<(&str, &str)> = meta.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
@@ -376,9 +339,6 @@ impl Client {
             .ok_or_else(|| Error::Protocol("no UploadId".into()))
     }
 
-    /// Upload one part (1-based `number`); its `Content-MD5` (and, where the
-    /// service checks it, the signed payload hash) makes the service verify
-    /// it. Returns the part's ETag.
     pub fn upload_part(
         &self,
         key: &str,
@@ -405,7 +365,6 @@ impl Client {
             .ok_or_else(|| Error::Protocol("part without an ETag".into()))
     }
 
-    /// Finish a multipart upload from its parts in order.
     pub fn complete_multipart(&self, key: &str, upload_id: &str, parts: &[Part]) -> Result<String> {
         if parts.is_empty() || parts.windows(2).any(|w| w[1].number <= w[0].number) {
             return Err(Error::Config(
@@ -443,8 +402,6 @@ impl Client {
             .unwrap_or_default())
     }
 
-    /// Abandon a multipart upload and free its parts. An upload already gone
-    /// is not an error.
     pub fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()> {
         match Self::ok(self.send("DELETE", Some(key), &[("uploadId", upload_id)], &[], &[])?) {
             Ok(_) | Err(Error::NotFound(_)) => Ok(()),
@@ -452,8 +409,6 @@ impl Client {
         }
     }
 
-    /// The parts an unfinished upload already holds — what a resumed upload
-    /// need not send again.
     pub fn list_parts(&self, key: &str, upload_id: &str) -> Result<Vec<Part>> {
         let mut out = Vec::new();
         let mut marker = String::new();
@@ -485,8 +440,6 @@ impl Client {
         }
     }
 
-    /// Unfinished multipart uploads under `prefix` (a full key prefix), a
-    /// page at a time — what abort cleanup walks.
     pub fn list_multipart_uploads(
         &self,
         prefix: &str,
@@ -522,7 +475,6 @@ impl Client {
         Ok((uploads, next))
     }
 
-    /// An object's size, ETag and metadata; `None` when there is none.
     pub fn head_object(&self, key: &str) -> Result<Option<Head>> {
         let response = self.send("HEAD", Some(key), &[], &[], &[])?;
         let status = response.status().as_u16();
@@ -530,7 +482,6 @@ impl Client {
             return Ok(None);
         }
         if !(200..300).contains(&status) {
-            // HEAD answers carry no body: classify by status alone.
             return Err(match status {
                 429 | 500..=599 => Error::Transient(format!("http_{status}")),
                 _ => Error::Refused {
@@ -557,16 +508,11 @@ impl Client {
         }))
     }
 
-    /// Read an object, or `range` (`start..=end`) of it, as a stream bounded
-    /// by the answer's `Content-Length`.
     pub fn get_object(
         &self,
         key: &str,
         range: Option<(u64, u64)>,
     ) -> Result<(u64, impl Read + use<>)> {
-        // The expected length of a range, checked before anything is sent: an
-        // inverted range or one spanning the whole `u64` space is a caller
-        // error, not an arithmetic wrap.
         let expected = range
             .map(|(a, b)| range_len(a, b).ok_or_else(|| Error::Config("invalid byte range".into())))
             .transpose()?;
@@ -579,8 +525,6 @@ impl Client {
         if expected.is_some_and(|expected| len != expected) {
             return Err(Error::Protocol("range answered with another length".into()));
         }
-        // The transport already stops at `Content-Length`; ureq's limit
-        // counts reaching it as exceeding it, so it sits one past.
         let reader = response
             .into_body()
             .into_with_config()
@@ -589,7 +533,6 @@ impl Client {
         Ok((len, reader))
     }
 
-    /// Delete an object; one already gone is not an error.
     pub fn delete_object(&self, key: &str) -> Result<()> {
         match Self::ok(self.send("DELETE", Some(key), &[], &[], &[])?) {
             Ok(_) | Err(Error::NotFound(_)) => Ok(()),
@@ -597,7 +540,6 @@ impl Client {
         }
     }
 
-    /// One page (≤ 1,000) of the keys under `prefix`, after `continuation`.
     pub fn list_objects(&self, prefix: &str, continuation: Option<&str>) -> Result<ObjectPage> {
         let mut query = vec![("list-type", "2"), ("prefix", prefix), ("max-keys", "1000")];
         if let Some(token) = continuation {
@@ -620,8 +562,6 @@ impl Client {
         Ok(page)
     }
 
-    /// Create the configured bucket (an operator's setup step, and the
-    /// compatibility tests'); one that already exists and is ours is fine.
     pub fn create_bucket(&self) -> Result<()> {
         let body = if self.config.region == "us-east-1" {
             String::new()
@@ -640,8 +580,6 @@ impl Client {
         }
     }
 
-    /// Store `body` while claiming `claimed_sha256` as its hash — only for
-    /// proving that an endpoint verifies the signed payload hash.
     #[doc(hidden)]
     pub fn put_object_claiming(
         &self,
@@ -693,8 +631,6 @@ impl Client {
         Self::ok(response).map(|_| ())
     }
 
-    /// A cheap reachability and authority check: list at most one key under
-    /// the prefix.
     pub fn check(&self) -> Result<()> {
         let prefix = self.config.prefix.clone();
         let query = vec![
@@ -706,8 +642,6 @@ impl Client {
     }
 }
 
-/// A transport failure described without the URL (which could carry a
-/// presigned query) or any header.
 fn transport(error: &ureq::Error) -> String {
     match error {
         ureq::Error::Timeout(_) => "timed out".into(),
@@ -720,19 +654,12 @@ fn transport(error: &ureq::Error) -> String {
     }
 }
 
-/// `Content-MD5` of a body: base64 of its MD5, which the service must check
-/// and refuse on mismatch.
 pub fn content_md5(body: &[u8]) -> String {
     use base64::Engine as _;
     use md5::Digest as _;
     base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(body))
 }
 
-/// The signed SHA-256 payload hash (hex) and the `Content-MD5` of a body from
-/// one walk over its bytes: both digests take each 64 KiB chunk while it is
-/// still in cache, instead of two passes over a part that may be hundreds of
-/// MiB and far larger than any cache. The results equal
-/// [`sigv4::sha256_hex`] and [`content_md5`].
 pub fn body_hashes(body: &[u8]) -> (String, String) {
     use base64::Engine as _;
     use md5::Digest as _;
@@ -749,7 +676,6 @@ pub fn body_hashes(body: &[u8]) -> (String, String) {
     )
 }
 
-/// A default timeout pair: 10 s to connect, 60 s per read.
 pub fn default_timeouts() -> (Duration, Duration) {
     (Duration::from_secs(10), Duration::from_secs(60))
 }
@@ -760,7 +686,6 @@ mod tests {
 
     #[test]
     fn one_walk_gives_the_same_hashes_as_two() {
-        // Empty, shorter than a chunk, exactly a chunk, and across chunks.
         for len in [0usize, 1, 1000, 64 << 10, (64 << 10) + 1, 300_000] {
             let body: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
             assert_eq!(
@@ -792,7 +717,6 @@ mod tests {
         );
         assert_eq!(identifier("", MAX_CODE), None);
         assert_eq!(identifier(&"A".repeat(MAX_CODE + 1), MAX_CODE), None);
-        // Prose, markup and control characters are remote text, not codes.
         for hostile in [
             "Access Denied for key secret",
             "<script>",
