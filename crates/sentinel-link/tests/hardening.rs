@@ -1,9 +1,3 @@
-//! Hardening of the link: a retryable refusal is retried, a
-//! reconnect renegotiates and is recorded, a welcome outside the hello's
-//! range is refused, a transient log fault is never a permanent refusal,
-//! an idle bulk connection lives as long as its session, and peers that
-//! never finish a handshake cannot hold the session slots.
-
 use std::{
     io::Write,
     net::TcpStream,
@@ -68,13 +62,10 @@ fn eventually(what: &str, within: Duration, mut predicate: impl FnMut() -> bool)
     }
 }
 
-/// A handler that accepts everything and answers log frames with a
-/// scripted verdict sequence.
 #[derive(Default)]
 struct Scripted {
     verdicts: Mutex<Vec<LogVerdict>>,
     logs: AtomicU64,
-    /// `log_sync` calls, and whether they report a fault.
     syncs: AtomicU64,
     sync_fails: AtomicBool,
 }
@@ -109,7 +100,6 @@ impl SessionHandler for Scripted {
     fn abandoned(&self, _: WorkerId, _: AttemptId, _: Fence) {}
 }
 
-/// Admits with a scripted list of answers, then negotiates normally.
 struct ScriptedAdmission {
     answers: Mutex<Vec<Result<Option<Negotiated>, Rejection>>>,
     asked: AtomicUsize,
@@ -150,7 +140,6 @@ impl Admission for ScriptedAdmission {
 struct Quiet {
     reporter: Mutex<Option<Reporter>>,
     refused: AtomicU64,
-    /// The highest sequence the controller acknowledged.
     acked: AtomicU64,
 }
 
@@ -180,9 +169,6 @@ impl Executor for Quiet {
     }
 }
 
-/// A controller stand-in: accepts connections under `admission`, serves
-/// control sessions with `handler` and bulk connections for as long as
-/// `alive` holds.
 fn stand_in(
     admission: Arc<ScriptedAdmission>,
     handler: Arc<Scripted>,
@@ -225,8 +211,6 @@ fn stand_in(
     (addr, fingerprint, bulk_ended)
 }
 
-/// `Unavailable` is the controller's "try again later". The worker
-/// backs off and retries it; it does not stop for good.
 #[test]
 fn an_unavailable_refusal_is_retried_and_the_worker_connects() {
     let admission = Arc::new(ScriptedAdmission {
@@ -288,7 +272,6 @@ fn an_unavailable_refusal_is_retried_and_the_worker_connects() {
     handle.stop();
     assert!(running.join().unwrap().is_ok());
 
-    // Any other rejection is still final: the loop returns it.
     let admission = Arc::new(ScriptedAdmission {
         answers: Mutex::new(vec![Err(Rejection::NotEnrolled)]),
         asked: AtomicUsize::new(0),
@@ -323,8 +306,6 @@ fn an_unavailable_refusal_is_retried_and_the_worker_connects() {
     ));
 }
 
-/// a welcome at a version the hello did not offer is refused by the
-/// worker instead of failing on its first frame.
 #[test]
 fn a_welcome_outside_the_hellos_range_is_refused() {
     let forced = Negotiated {
@@ -353,9 +334,6 @@ fn a_welcome_outside_the_hellos_range_is_refused() {
     assert!(matches!(refused, Error::Protocol(_)), "{refused}");
 }
 
-/// a transient controller fault on a log frame closes the
-/// connection so the worker resends; it is never answered `LogRefused`,
-/// which would end the attempt's log for good.
 #[test]
 fn a_transient_log_fault_closes_the_connection_instead_of_refusing() {
     let handler = Arc::new(Scripted {
@@ -407,9 +385,6 @@ fn a_transient_log_fault_closes_the_connection_instead_of_refusing() {
     assert_eq!(handler.logs.load(Ordering::SeqCst), 1);
 }
 
-/// bulk has no heartbeat of its own; while its control session is
-/// alive an idle bulk connection is kept past the heartbeat deadline, and
-/// it ends once the control session does.
 #[test]
 fn an_idle_bulk_connection_lives_as_long_as_its_session() {
     let alive = Arc::new(AtomicBool::new(true));
@@ -433,10 +408,8 @@ fn an_idle_bulk_connection_lives_as_long_as_its_session() {
     )
     .unwrap();
     let bulk = link.bulk_dialer().unwrap().open().unwrap();
-    // Idle past the heartbeat deadline: still attached.
     thread::sleep(session::HEARTBEAT_DEADLINE + Duration::from_secs(2));
     assert_eq!(bulk_ended.load(Ordering::SeqCst), 0);
-    // The session goes: so does the bulk connection, within one deadline.
     alive.store(false, Ordering::SeqCst);
     eventually(
         "the bulk connection to end",
@@ -531,10 +504,6 @@ impl Deployment {
     }
 }
 
-/// every hello renegotiates. A worker enrolled at protocol 6 that
-/// reconnects offering 7 is welcomed at 7 and records it (so its profile —
-/// and with it its disk — reaches placement); rolled back to 5 it is
-/// welcomed at 5, never at a version it cannot speak.
 #[test]
 fn a_reconnecting_worker_is_renegotiated_and_recorded() {
     let d = deployment();
@@ -580,10 +549,6 @@ fn a_reconnecting_worker_is_renegotiated_and_recorded() {
     assert_eq!(stored(&d), ProtocolVersion(5));
 }
 
-/// connections that never finish their handshake hold a slot of the
-/// small pre-admission cap for at most the handshake deadline — a byte
-/// dripped now and then does not extend it — and an enrolled worker gets
-/// in once they are cut.
 #[test]
 fn stalled_handshakes_are_cut_at_their_deadline_and_cannot_lock_workers_out() {
     let d = deployment();
@@ -595,15 +560,12 @@ fn stalled_handshakes_are_cut_at_their_deadline_and_cannot_lock_workers_out() {
     let mut drip = TcpStream::connect(addr).unwrap();
     let dripping = thread::spawn(move || {
         let started = Instant::now();
-        // One byte every 150 ms: each read wait is well inside any per-read
-        // timeout, so only an absolute deadline ends this connection.
         while drip.write_all(&[0x16]).is_ok() && started.elapsed() < Duration::from_secs(10) {
             thread::sleep(Duration::from_millis(150));
         }
         started.elapsed()
     });
     thread::sleep(Duration::from_millis(100));
-    // Both pre-admission slots are taken: a new connection is shed.
     assert!(
         d.connect(
             Identity::generate("w").unwrap(),
@@ -614,8 +576,6 @@ fn stalled_handshakes_are_cut_at_their_deadline_and_cannot_lock_workers_out() {
         .is_err()
     );
     assert!(d.controller.stats().shed.load(Ordering::SeqCst) >= 1);
-    // Cut at the deadline (at most twice it, by construction), after which
-    // an enrolled worker is admitted.
     let cut = dripping.join().unwrap();
     assert!(cut < Duration::from_secs(3), "drip survived {cut:?}");
     drop(idle);
@@ -630,11 +590,6 @@ fn stalled_handshakes_are_cut_at_their_deadline_and_cannot_lock_workers_out() {
     });
 }
 
-/// An unknown certificate guessing enrollment secrets is budgeted per source
-/// before a guess reaches the single writer (each refused one commits an
-/// audit row): the first few are refused as wrong, the rest are told to try
-/// later and counted, and an already enrolled worker is never held to the
-/// budget.
 #[test]
 fn enrollment_guessing_is_rate_limited_and_never_touches_enrolled_workers() {
     let d = deployment();
@@ -675,13 +630,9 @@ fn enrollment_guessing_is_rate_limited_and_never_touches_enrolled_workers() {
             .load(Ordering::SeqCst)
             >= 7
     );
-    // The enrolled worker reconnects regardless.
     assert!(d.connect(load(), worker, None, 6).is_ok());
 }
 
-/// Frames written ahead of their `fsync` are acknowledged only after the
-/// handler made them durable: a burst is answered at its highest sequence
-/// with at most one sync per frame, never an acknowledgement without one.
 #[test]
 fn deferred_log_frames_are_acknowledged_only_after_a_sync() {
     let handler = Arc::new(Scripted {
@@ -743,9 +694,7 @@ fn deferred_log_frames_are_acknowledged_only_after_a_sync() {
     assert!((1..=8).contains(&syncs), "{syncs} syncs for 8 frames");
 }
 
-/// A sync that fails acknowledges nothing and closes the connection, so the
-/// worker resends from its last acknowledgement instead of dropping frames
-/// that were never durable.
+/// A failed sync closes the connection: acknowledging frames that were never durable loses logs.
 #[test]
 fn a_failed_log_sync_closes_the_connection_without_an_acknowledgement() {
     let handler = Arc::new(Scripted {

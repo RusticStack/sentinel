@@ -1,8 +1,3 @@
-//! The controller's hand-off close (`Sender::close_notify`), as a worker
-//! sees it: the session ends at once with [`Error::Closed`] rather than at
-//! the heartbeat deadline, and the reconnect waits only the shortest
-//! back-off however often it happens, where a lost session doubles it.
-
 use std::{
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
@@ -95,7 +90,6 @@ impl Executor for Idle {
     fn log_refused(&self, _: AttemptId) {}
 }
 
-/// Sessions the controller closes, one after another.
 const CLOSES: usize = 4;
 
 #[test]
@@ -105,8 +99,6 @@ fn a_clean_close_ends_the_session_at_once_and_redials_on_the_shortest_back_off()
     let config = tls::server_config(identity).unwrap();
     let listener = session::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
-    // Each session is welcomed, closed cleanly 50 ms later, and served
-    // until the worker's side is gone too.
     let controller = thread::spawn(move || {
         let mut welcomed = Vec::new();
         loop {
@@ -118,16 +110,12 @@ fn a_clean_close_ends_the_session_at_once_and_redials_on_the_shortest_back_off()
             };
             welcomed.push(Instant::now());
             if welcomed.len() > CLOSES {
-                // Held open until the worker stops, so the worker's last
-                // session ends by its own stop, not by a dropped socket.
                 break (welcomed, session);
             }
             let sender = session.sender();
             thread::sleep(Duration::from_millis(50));
             let closed = Instant::now();
             sender.close_notify();
-            // The worker's close answers ours: the session ends then, well
-            // before any heartbeat deadline.
             let _ = session.serve(&Welcoming);
             assert!(
                 closed.elapsed() < Duration::from_secs(2),
@@ -179,9 +167,7 @@ fn a_clean_close_ends_the_session_at_once_and_redials_on_the_shortest_back_off()
         let (welcomed, last) = controller.join().unwrap();
         handle.stop();
         drop(last);
-        // Doubling would have made the third wait at least 3 s (4 s less its
-        // jitter); every wait here is the first back-off, at most 1.25 s,
-        // plus a local handshake.
+        // Doubling would have made the third wait at least 3 s; the first back-off is at most 1.25 s.
         for pair in welcomed.windows(2) {
             let gap = pair[1] - pair[0];
             assert!(
@@ -193,17 +179,8 @@ fn a_clean_close_ends_the_session_at_once_and_redials_on_the_shortest_back_off()
     assert_eq!(events.lock().unwrap().len(), CLOSES);
 }
 
-/// Connections the controller closes while they are still in their TLS
-/// handshake, one after another.
 const HANDSHAKE_CLOSES: usize = 3;
 
-/// A hand-off also meets connections that are not sessions yet. Each one
-/// here is held in its TLS handshake by a slow link (the controller's
-/// flight reaches the worker, the worker's answer never reaches the
-/// controller) until the hand-off claims it. The worker must read the claim
-/// as the controller's clean close at once, not wait out its own 15 s
-/// deadline for the welcome, and redial on its shortest back-off every
-/// time, although it was never welcomed.
 #[test]
 fn a_connection_closed_in_its_handshake_ends_at_once_and_redials_on_the_shortest_back_off() {
     let identity = Identity::generate("controller").unwrap();
@@ -242,7 +219,6 @@ fn a_connection_closed_in_its_handshake_ends_at_once_and_redials_on_the_shortest
                 accepting.join().unwrap()
             });
             assert!(matches!(outcome, Err(Error::Closed)), "{:?}", outcome.err());
-            // The worker's end answered the close within the bound.
             assert_eq!(arrival.answered(), Some(true));
         }
         let (socket, _) = listener.accept().unwrap();
@@ -300,7 +276,6 @@ fn a_connection_closed_in_its_handshake_ends_at_once_and_redials_on_the_shortest
             );
         });
         let (claimed, arrived, last) = controller.join().unwrap();
-        // The worker stops once welcomed; its last session is held till then.
         drop(last);
         let events = events.lock().unwrap();
         assert_eq!(events.len(), HANDSHAKE_CLOSES, "{events:?}");
@@ -310,8 +285,6 @@ fn a_connection_closed_in_its_handshake_ends_at_once_and_redials_on_the_shortest
                 seen < Duration::from_millis(500),
                 "saw the close after {seen:?}"
             );
-            // Doubling would have made the third wait at least 3 s: every
-            // wait here is the first back-off, at most 1.25 s.
             let redial = arrived[index + 1] - *at;
             assert!(
                 redial < Duration::from_millis(1_600),
@@ -321,10 +294,6 @@ fn a_connection_closed_in_its_handshake_ends_at_once_and_redials_on_the_shortest
     });
 }
 
-/// A slow link to `upstream`: bytes and ends pass both ways, except that on
-/// each of the first `stalls` connections the client's bytes stop getting
-/// through once the server's first bytes (its TLS flight) came back, which
-/// `stalled` announces. The server is then held in its handshake.
 fn slow_link(upstream: SocketAddr, stalls: usize, stalled: mpsc::Sender<()>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let local = listener.local_addr().unwrap();
@@ -352,8 +321,6 @@ fn slow_link(upstream: SocketAddr, stalls: usize, stalled: mpsc::Sender<()>) -> 
     local
 }
 
-/// Copy `from` to `to` until `from` ends, passing a FIN on as a FIN and an
-/// error as a reset; `pass` decides per read whether bytes are delivered.
 fn pump(mut from: TcpStream, mut to: TcpStream, mut pass: impl FnMut() -> bool) {
     let mut buf = [0u8; 16 * 1024];
     loop {

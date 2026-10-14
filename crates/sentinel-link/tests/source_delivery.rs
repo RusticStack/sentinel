@@ -1,6 +1,3 @@
-//! Source delivery across the link: a bound repository's access reaches a protocol-2
-//! worker only with the spec of an attempt it acknowledged, and a protocol-1
-//! worker is refused instead of silently checking out without a credential.
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -179,10 +176,8 @@ fn hello(protocol_max: u16) -> Hello {
     }
 }
 
-/// A spec delivery: the attempt, its context (none when refused), the bytes.
 type SpecRecord = (AttemptId, Option<session::JobContext>, Vec<u8>);
 
-/// What the worker was told, and the reporter that asks for more.
 #[derive(Default)]
 struct Captured {
     specs: Mutex<Vec<SpecRecord>>,
@@ -195,8 +190,6 @@ impl Executor for Captured {
         self.held.lock().unwrap().push(offer.attempt);
         true
     }
-    /// The real worker asks for the spec only after its acknowledgement is on
-    /// the wire; the test does the same through the attached reporter.
     fn accepted(&self, attempt: AttemptId) {
         if let Some(reporter) = self.reporter.lock().unwrap().clone() {
             reporter.need_spec(attempt).unwrap();
@@ -229,7 +222,6 @@ impl Executor for Captured {
     fn log_refused(&self, _: AttemptId) {}
 }
 
-/// A worker thread result, named once so the struct type stays readable.
 type WorkerResult = sentinel_link::Result<()>;
 
 struct WorkerProcess {
@@ -238,7 +230,6 @@ struct WorkerProcess {
 }
 
 impl WorkerProcess {
-    /// Enroll, connect at `protocol`, and wait until the reporter is attached.
     fn start(d: &Deployment, protocol: u16, executor: Arc<Captured>) -> WorkerProcess {
         let identity = Identity::generate("worker").unwrap();
         let id = WorkerId::new();
@@ -309,14 +300,10 @@ impl Drop for WorkerProcess {
     }
 }
 
-/// Offer, acknowledgement, `NeedSpec`, and whatever came back. The real flow
-/// asks for the spec from `accepted`, so no manual `need_spec` is needed.
 fn first_spec(d: &Deployment, protocol: u16) -> (Option<session::JobContext>, Vec<u8>) {
     d.controller().wake();
     let attempts = Arc::new(Captured::default());
     let worker = WorkerProcess::start(d, protocol, Arc::clone(&attempts));
-    // The worker attaches asynchronously; give the reporter a moment before
-    // the offer can arrive, then nudge a retry if the flow missed the first.
     thread::sleep(Duration::from_millis(100));
     let deadline = Instant::now() + Duration::from_secs(10);
     let answer = loop {
@@ -355,14 +342,8 @@ fn a_bound_source_reaches_a_current_worker_with_its_credential_and_event() {
         }
     );
     assert_eq!(access.version, 1);
-    // Validity is restated on the worker's clock from receipt and covers a
-    // whole checkout deadline (mirror attempt plus the direct fallback), not
-    // the controller's 60 s wall-clock expiry.
     assert!(access.expires_ms > UnixMillis::now().0 + 10 * 60 * 1000);
     assert!(!format!("{:?}", access.credential).contains(SECRET));
-    // The run has no provenance here (the test creates it with the store
-    // primitive), so the event facts are the manual fallback: recorded, never
-    // invented.
     assert_eq!(context.event.name, "manual");
     assert_eq!(context.event.key, "manual");
     assert!(context.event.base_ref.is_none());
@@ -372,8 +353,6 @@ fn a_bound_source_reaches_a_current_worker_with_its_credential_and_event() {
 #[test]
 fn a_worker_below_the_context_protocol_is_refused_rather_than_misreading_it() {
     for protocol in [1, 2] {
-        // A fresh deployment per protocol: the first worker leases the only
-        // job, and a leased job is not re-offered.
         let d = deployment();
         let (context, bytes) = first_spec(&d, protocol);
         assert!(

@@ -1,13 +1,3 @@
-//! A three-worker fleet of mixed capacity over real TLS against a real
-//! `Controller`. A burst from two tenants is placed by capacity, a forced
-//! partition is survived without duplicate execution, a stale fence changes
-//! nothing, and a drained worker takes no new offers while keeping the work
-//! it already holds.
-//!
-//! The executors are recorders: they acknowledge offers and report outcomes
-//! by hand. No container, checkout or step ever runs, so this is link and
-//! scheduler evidence, not executor evidence.
-
 use std::{
     collections::HashSet,
     path::PathBuf,
@@ -45,8 +35,6 @@ use sentinel_store::{
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// Mixed capacities, in millicpu and bytes: the six-core job only fits the
-/// largest worker, so placement is forced rather than merely plausible.
 const EDGE: Capacity = Capacity {
     cpu_millis: 2_500,
     memory_bytes: 2 << 30,
@@ -61,7 +49,6 @@ const LARGE: Capacity = Capacity {
 };
 const CAPACITIES: [Capacity; 3] = [EDGE, STANDARD, LARGE];
 
-/// Tenant A's build: three sizes, one of which only the large worker can take.
 const BUILD: &str = "schema: 1
 on: [push]
 jobs:
@@ -79,7 +66,6 @@ jobs:
     steps: [{ id: s, run: 'true' }]
 ";
 
-/// Tenant B's verify: small work for the other tenant on the same pool.
 const VERIFY: &str = "schema: 1
 on: [push]
 jobs:
@@ -93,7 +79,6 @@ jobs:
     steps: [{ id: s, run: 'true' }]
 ";
 
-/// Tenant B asks for more than every worker has: it must never be placed.
 const OVERSIZED: &str = "schema: 1
 on: [push]
 jobs:
@@ -103,7 +88,6 @@ jobs:
     steps: [{ id: s, run: 'true' }]
 ";
 
-/// Eight quarter-core jobs: tenant A's noisy backlog.
 fn noise() -> String {
     let mut yaml = String::from("schema: 1\non: [push]\njobs:\n");
     for i in 0..8 {
@@ -114,7 +98,6 @@ fn noise() -> String {
     yaml
 }
 
-/// A single quarter-core job, for the probe and the drain phases.
 fn one_job() -> String {
     String::from(
         "schema: 1
@@ -153,12 +136,10 @@ fn hello() -> Hello {
 struct Deployment {
     _dir: tempfile::TempDir,
     store: Arc<Store>,
-    /// Held for the controller's lifetime; the tests read the store.
     _logs: Arc<sentinel_store::logs::LogStore>,
     _objects: Arc<sentinel_store::objects::Objects>,
     controller: Option<Controller>,
     _identity_files: (PathBuf, PathBuf),
-    /// Two tenants share one platform pool.
     tenant_a: TenantId,
     tenant_b: TenantId,
     repo_a: RepoId,
@@ -251,8 +232,6 @@ impl Deployment {
             .secret
     }
 
-    /// Create runs, resolve every image, and return each run's job ids in
-    /// compiled order. No wake: the caller decides when the burst is ready.
     fn runs(&self, specs: Vec<(TenantId, RepoId, String)>) -> Vec<Vec<JobId>> {
         let prepared: Vec<(TenantId, RepoId, RunSpec)> = specs
             .into_iter()
@@ -297,7 +276,6 @@ impl Deployment {
     }
 }
 
-/// A worker process: `worker::run` on its own thread with a stop handle.
 struct WorkerProcess {
     handle: Arc<worker::Handle>,
     events: Arc<Mutex<Vec<String>>>,
@@ -325,7 +303,6 @@ impl WorkerProcess {
             hello: hello(),
             capacity,
             profile,
-            // Nothing measured: the worker reports no Tailcat transport here.
             transport: Default::default(),
             remote_cache: false,
         };
@@ -378,8 +355,6 @@ impl WorkerProcess {
     }
 }
 
-/// What the fleet's executors must do: acknowledge every offer and hold what
-/// they accept. No work ever runs.
 struct Recorder {
     offers: Mutex<Vec<Offer>>,
     held: Mutex<Vec<AttemptId>>,
@@ -437,9 +412,6 @@ impl Executor for Recorder {
     fn log_refused(&self, _: AttemptId) {}
 }
 
-/// Wait until `predicate` holds, within forty-five seconds. This is a wait,
-/// not a latency claim: the burst has to lease under loaded CI machines, and
-/// the promptness bound out of an idle fleet is asserted separately.
 fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(45);
     while !predicate() {
@@ -448,15 +420,12 @@ fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
     }
 }
 
-/// Run one attempt of `job` to `Passed` through the recorder that holds it.
 fn pass(d: &Deployment, fleet: &[(WorkerId, &Arc<Recorder>)], tenant: TenantId, job: JobId) {
     let (worker, recorder) = fleet
         .iter()
         .find(|(w, _)| d.held(*w).iter().any(|h| h.job == job))
         .map(|(w, r)| (*w, Arc::clone(*r)))
         .unwrap();
-    // The lease alone is not enough: the report is applied only for an
-    // acknowledged attempt, exactly as a real worker would have acked first.
     eventually("the attempt acknowledged", || {
         d.held(worker)
             .iter()
@@ -479,7 +448,6 @@ fn pass(d: &Deployment, fleet: &[(WorkerId, &Arc<Recorder>)], tenant: TenantId, 
     recorder.release(held.attempt);
 }
 
-/// `heavy` only fits the largest worker; every other job fits anywhere.
 #[test]
 fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition() {
     let mut d = deployment();
@@ -526,9 +494,6 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
         live == expected
     });
 
-    // Protocol 7: wait until every worker's profile (its disk, at least)
-    // has reached the store, so the measured burst sees the same facts a
-    // real fleet would — and the window below measures the wake alone.
     for worker in ids.iter().copied() {
         eventually("the reported disk", || {
             d.store
@@ -539,8 +504,6 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
         });
     }
 
-    // One probe job proves placement is live after the profiles; the burst's
-    // window then measures the wake alone.
     let probe = d.runs(vec![(d.tenant_b, d.repo_b, one_job())])[0][0];
     d.controller().wake();
     eventually("a probe placement", || {
@@ -548,8 +511,6 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
     });
     pass(&d, &fleet, d.tenant_b, probe);
 
-    // The burst: tenant A's build and its noisy backlog, tenant B's verify,
-    // and one job no worker can ever fit — all enqueued before one wake.
     let acknowledged_before = d.controller().stats().acknowledged.load(Ordering::SeqCst);
     let runs = d.runs(vec![
         (d.tenant_a, d.repo_a, BUILD.to_owned()),
@@ -571,7 +532,6 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
             .iter()
             .all(|(tenant, job)| d.state(*tenant, *job) == JobState::Leased)
     });
-    // One dispatch pass delivers the whole burst: the wake, not the poll.
     assert!(
         woken.elapsed() < RECONCILE_INTERVAL,
         "the burst took {:?} to place",
@@ -582,8 +542,6 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
             >= acknowledged_before + fitting.len() as u64
     });
 
-    // Mixed capacity routed deterministically: the six-core job is on the
-    // large worker alone, and no worker was oversubscribed by its offers.
     for (index, recorder) in recorders.iter().enumerate() {
         let held = recorder.held();
         let offers = recorder.offers.lock().unwrap();
@@ -627,7 +585,6 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
         "the six-core job belongs to the large worker"
     );
 
-    // Two tenants: every offer says whose job it is, and both tenants ran.
     let (a_offers, b_offers) = recorders.iter().fold((0usize, 0usize), |acc, r| {
         r.offers.lock().unwrap().iter().fold(acc, |acc, o| {
             if o.tenant == d.tenant_a {
@@ -640,7 +597,6 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
     });
     assert!(a_offers >= 2 && b_offers >= 1, "{a_offers} vs {b_offers}");
 
-    // The oversized job is unsatisfiable, and its reason says so.
     assert_eq!(d.state(d.tenant_b, huge), JobState::Queued);
     let connected = d.controller().connected();
     let reason = d
@@ -657,9 +613,6 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
             .all(|r| r.offers.lock().unwrap().iter().all(|o| o.job != huge))
     );
 
-    // A forced partition: the large worker's session is closed from the
-    // controller's side, it reconnects, and its acknowledged lease survives
-    // the gap — no second offer, no second execution anywhere.
     let heavy_offer = recorders[2]
         .offers
         .lock()
@@ -686,8 +639,6 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
         .unwrap();
     assert_eq!(d.state(d.tenant_a, heavy_attempt.job), JobState::Leased);
     assert!(heavy_attempt.acknowledged);
-    // The new session renews the recovered lease before anything is
-    // reported through it: the reporter is live and owns the attempt.
     let lease_before = heavy_attempt.lease_until;
     eventually("the recovered lease renewed", || {
         d.held(large)
@@ -706,8 +657,6 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
         "a healthy-session retransmit must not execute the job twice"
     );
 
-    // The worker holding `heavy` finishes it over the new session: the same
-    // attempt, the same fence, exactly one terminal outcome.
     for event in [
         Event::StepsStarted,
         Event::FinalizationStarted,
@@ -723,7 +672,6 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
     });
     recorders[2].release(heavy_attempt.attempt);
 
-    // A stale fence through a live session changes nothing and is counted.
     let (stale_worker, stale_recorder) = fleet
         .iter()
         .find(|(w, _)| !d.held(*w).is_empty())
@@ -740,7 +688,6 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
     });
     assert!(d.state(stale.tenant, stale.job).is_worker_owned());
 
-    // No attempt was ever offered twice, in or across sessions.
     let mut seen = HashSet::new();
     for recorder in &recorders {
         for offer in recorder.offers.lock().unwrap().iter() {
@@ -764,8 +711,6 @@ fn a_mixed_fleet_places_a_two_tenant_burst_by_capacity_then_survives_a_partition
     );
 }
 
-/// A drained worker takes no new offers, keeps the attempt it already holds,
-/// and resumes placing when undrained. The wait reason names the drain.
 #[test]
 fn a_drained_worker_takes_no_new_offers_and_keeps_its_held_attempt() {
     let mut d = deployment();
@@ -783,7 +728,6 @@ fn a_drained_worker_takes_no_new_offers_and_keeps_its_held_attempt() {
     process.wait_for("Connected", 1);
     eventually("fleet", || d.controller().connected() == vec![id]);
 
-    // The only worker takes and acknowledges one job before the drain.
     let first = d.runs(vec![(d.tenant_a, d.repo_a, one_job())])[0][0];
     d.controller().wake();
     eventually("the first job leased", || {
@@ -794,8 +738,6 @@ fn a_drained_worker_takes_no_new_offers_and_keeps_its_held_attempt() {
     });
     assert_eq!(d.held(id).len(), 1);
 
-    // Drained: a second job waits with the drain as its reason, the held
-    // attempt is not released and the worker is not told to stop.
     d.store
         .writer()
         .write(move |tx| workers::drain(tx, Authority::HostLocal, id, UnixMillis::now()))
@@ -818,7 +760,6 @@ fn a_drained_worker_takes_no_new_offers_and_keeps_its_held_attempt() {
     assert_eq!(d.held(id).len(), 1, "draining must not release held work");
     assert!(recorder.stopped.lock().unwrap().is_empty());
 
-    // Undrained, the waiting job is placed under a fresh attempt.
     d.store
         .writer()
         .write(move |tx| workers::undrain(tx, Authority::HostLocal, id))
@@ -827,8 +768,6 @@ fn a_drained_worker_takes_no_new_offers_and_keeps_its_held_attempt() {
     eventually("the second job leased after undrain", || {
         d.state(d.tenant_a, second) == JobState::Leased
     });
-    // Leased is written with the offer; the worker records the offer when
-    // it arrives.
     eventually("the second offer delivered", || {
         recorder.offers.lock().unwrap().len() >= 2
     });
@@ -844,8 +783,6 @@ fn a_drained_worker_takes_no_new_offers_and_keeps_its_held_attempt() {
     );
 }
 
-/// Start `n` identical protocol-7 workers, each its own host, and wait until
-/// all are connected with their profiles recorded.
 fn identical_fleet(
     d: &Deployment,
     n: usize,
@@ -884,9 +821,6 @@ fn identical_fleet(
     (ids, recorders, processes)
 }
 
-/// Placement goes in rounds ranked by commitment and measured load, so a
-/// burst of three quarter-core jobs lands one on each of three identical idle
-/// workers rather than all on whichever came first.
 #[test]
 fn a_burst_spreads_over_identical_workers() {
     let mut d = deployment();
@@ -898,9 +832,6 @@ fn a_burst_spreads_over_identical_workers() {
             .iter()
             .all(|job| d.state(d.tenant_a, *job) == JobState::Leased)
     });
-    // A job is leased when its offer is written; the worker records the
-    // offer only when it arrives. Wait for all three to arrive, then judge
-    // where they went.
     eventually("every offer delivered", || {
         recorders
             .iter()
@@ -924,11 +855,6 @@ fn a_burst_spreads_over_identical_workers() {
     );
 }
 
-/// Revocation is written by another process (the host-local admin
-/// command); the controller notices within a reconciliation pass, closes the
-/// revoked worker's live session, and fences what it held — the
-/// acknowledged attempt ends `Reconciled` rather than renewing forever — and
-/// the worker cannot come back.
 #[test]
 fn revoking_a_connected_worker_ends_its_session_and_fences_its_work() {
     let mut d = deployment();
@@ -972,7 +898,6 @@ fn revoking_a_connected_worker_ends_its_session_and_fences_its_work() {
         Some(sentinel_core::FailureClass::Reconciled)
     );
     assert!(d.held(worker).is_empty());
-    // The worker is refused on reconnect: its loop ends with the rejection.
     let process = processes.pop().unwrap();
     let outcome = process.stop();
     assert!(
@@ -988,7 +913,6 @@ fn revoking_a_connected_worker_ends_its_session_and_fences_its_work() {
     );
 }
 
-/// `n` quarter-core jobs of one run.
 fn noise_of(n: usize) -> String {
     let mut yaml = String::from("schema: 1\non: [push]\njobs:\n");
     for i in 0..n {
@@ -999,9 +923,6 @@ fn noise_of(n: usize) -> String {
     yaml
 }
 
-/// A store error in placement leaves evidence. Break the schema under a
-/// running controller: the failure is counted (and logged by kind), the
-/// loop keeps running, and nothing is offered.
 #[test]
 fn a_failing_placement_is_counted_not_swallowed() {
     let mut d = deployment();
@@ -1034,11 +955,6 @@ fn a_failing_placement_is_counted_not_swallowed() {
     );
 }
 
-/// Transport telemetry follows a live source. With one on the worker handle
-/// (the Tailcat helper's latest probe), each session reports what the helper
-/// last measured — here a relayed path, then, after the helper re-measures
-/// and the session reconnects, a direct one — and the controller exposes it
-/// per worker.
 #[test]
 fn each_session_reports_the_helpers_latest_transport_measurement() {
     use sentinel_link::session::{Path, TransportStats};
@@ -1064,7 +980,6 @@ fn each_session_reports_the_helpers_latest_transport_measurement() {
         hello: hello(),
         capacity: STANDARD,
         profile: profile(40, 128 << 30),
-        // What a process without a live source would send: never used here.
         transport: TransportStats::default(),
         remote_cache: false,
     };
@@ -1088,7 +1003,6 @@ fn each_session_reports_the_helpers_latest_transport_measurement() {
     assert_eq!(first.helper_version.as_deref(), Some("tailcat 0.6.0"));
     assert_eq!(first.reconnects, 0);
 
-    // The helper re-measures a direct path; the next session reports it.
     *measured.lock().unwrap() = Path::Direct;
     assert!(link.disconnect(id));
     eventually("the re-measured path reported", || {
