@@ -279,7 +279,7 @@ pub fn admit(
         return Ok(Some(out));
     }
 
-    // A ref still advertised, however badly, is never a deletion.
+    // A ref still advertised, even with an invalid tip, is never treated as deleted.
     let mut present = std::collections::HashSet::with_capacity(tips.len());
     let mut processed = std::collections::HashSet::with_capacity(tips.len());
     for &tip in &tips {
