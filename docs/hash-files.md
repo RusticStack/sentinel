@@ -1,6 +1,6 @@
-# Bounded filesystem hashing (C06)
+# Bounded filesystem hashing
 
-`sentinel-pipeline::hash_files::hash_files` implements the worker-phase resolver; `resolve_paths` exposes the same confined walk without content hashing, and D03 artifact capture uses it so workspace publication inherits every guarantee below. Expression grammar, event/ref filters, concurrency/dependency conditions and placement rules remain in [pipeline schema](pipeline-schema.md#expressions-c06).
+`sentinel-pipeline::hash_files::hash_files` implements the worker-phase resolver; `resolve_paths` exposes the same confined walk without content hashing, and artifact capture uses it so workspace publication inherits every guarantee below. Expression grammar, event/ref filters, concurrency/dependency conditions and placement rules remain in [pipeline schema](pipeline-schema.md#expressions-c06).
 
 ## Limits and resource cost
 
@@ -33,12 +33,10 @@ Only a missing literal path is treated as a normal nonmatch; errors while openin
 
 ## Snapshot and execution boundary
 
-Confinement is not snapshot isolation. Same-length in-place writes can race a read, and individually valid regular files can be replaced between traversal and content opening. Metadata checks catch observed changes but do not prove an immutable tree. Workers must resolve source-derived keys against their private prepared checkout before starting writable jobs, or use an immutable snapshot for later resolution. Tenant-controlled hardlinks or mounts must not be introduced by checkout preparation. W03 owns that workspace lifecycle.
+Confinement is not snapshot isolation. Same-length in-place writes can race a read, and individually valid regular files can be replaced between traversal and content opening. Metadata checks catch observed changes but do not prove an immutable tree. Workers must resolve source-derived keys against their private prepared checkout before starting writable jobs, or use an immutable snapshot for later resolution. Tenant-controlled hardlinks or mounts must not be introduced by checkout preparation; the worker's [workspace lifecycle](executor.md) owns that.
 
-The resolver bounds memory, traversal work and content I/O, not the wall time of an individual kernel operation on a stalled filesystem. Worker execution deadlines/cancellation remain the worker's responsibility. No new benchmark latency claim is made.
+The resolver bounds memory, traversal work and content I/O, not the wall time of an individual kernel operation on a stalled filesystem. Worker execution deadlines and cancellation remain the worker's responsibility.
 
 ## Verification
 
-Eight Linux resolver tests cover static digest compatibility and pattern-order deduplication; recursive matches; root, intermediate-directory and leaf symlink replacement; FIFO rejection; missing-root errors; growth, truncation and read errors; actual byte exhaustion; deep trees; streaming budgets spent on nonmatches; 10,000 unique files with overlapping patterns and rejection at 10,001; non-UTF-8/backslash names; and bounded path length. Non-Linux tests verify explicit unsupported resolution without filesystem access. Existing expression, fixture, malformed-input and offline CLI tests remain the grammar/phase regression suite.
-
-Verification commands and completion evidence are recorded in [TODO.md](../TODO.md). Linux checks use WSL2 and do not establish production throughput.
+The Linux resolver tests cover static digest compatibility and pattern-order deduplication; recursive matches; root, intermediate-directory and leaf symlink replacement; FIFO rejection; missing-root errors; growth, truncation and read errors; actual byte exhaustion; deep trees; streaming budgets spent on nonmatches; 10,000 unique files with overlapping patterns and rejection at 10,001; non-UTF-8/backslash names; and bounded path length. Non-Linux tests verify explicit unsupported resolution without filesystem access. The expression, fixture, malformed-input and offline CLI tests are the grammar and phase regression suite. None of these establish production throughput.
