@@ -2021,9 +2021,15 @@ mod tests {
         let _slow = post("198.51.100.1", "x", 100);
         thread::sleep(Duration::from_millis(150));
 
-        let same = status(post("198.51.100.1", "ok", 2));
+        // A body that arrived whole needs no slot, so each request here
+        // sends part of its body: it is only read through a slot.
+        let same = status(post("198.51.100.1", "o", 2));
         assert!(same.starts_with(b"HTTP/1.1 400"), "got {same:?}");
-        let other = status(post("198.51.100.2", "ok", 2));
+        // Another client gets the other slot, and finishes its body.
+        let mut other = post("198.51.100.2", "o", 2);
+        thread::sleep(Duration::from_millis(100));
+        other.write_all(b"k").unwrap();
+        let other = status(other);
         assert!(other.starts_with(b"HTTP/1.1 200"), "got {other:?}");
         conns.close();
     }

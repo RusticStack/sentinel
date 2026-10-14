@@ -3134,9 +3134,28 @@ fn ids(raw: &[[u8; 16]]) -> Result<Vec<AttemptId>> {
 }
 
 /// Push an offer to a worker. The dispatcher's only way in.
+///
+/// A connection another thread holds for a moment — the session's own
+/// reader taking the previous offer's acknowledgement off the wire — is
+/// waited for up to [`OFFER_BUSY_WAIT`]; a peer that holds it longer (a
+/// spec or log stream) is refused as [`BUSY`] so it costs the single
+/// dispatcher no more than that.
 pub fn offer(sender: &Sender, offer: &Offer) -> Result<()> {
-    sender.send_bounded(&ServerMessage::Offer(offer.to_wire()), DISPATCH_WRITE_BOUND)
+    let message = ServerMessage::Offer(offer.to_wire());
+    let give_up = Instant::now() + OFFER_BUSY_WAIT;
+    loop {
+        match sender.send_bounded(&message, DISPATCH_WRITE_BOUND) {
+            Err(error) if is_busy(&error) && Instant::now() < give_up => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            outcome => return outcome,
+        }
+    }
 }
+
+/// How long [`offer`] waits for a connection that is busy for a moment
+/// before it reports [`BUSY`].
+pub const OFFER_BUSY_WAIT: Duration = Duration::from_millis(20);
 
 /// What the dispatcher's own pushes (offers, prefetch hints) may wait on one
 /// peer: they come from the single dispatcher thread, so a peer that stopped
