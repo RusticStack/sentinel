@@ -14,7 +14,7 @@ const busy = ref(false);
 const { data: health } = await useAsyncData("health", () => api<{ github_sign_in?: boolean }>("/api/v1/health"));
 const github = computed(() => !!health.value?.github_sign_in);
 
-const next = computed(() => (typeof route.query.next === "string" && route.query.next.startsWith("/") ? route.query.next : "/"));
+const next = computed(() => (sameOriginPath(route.query.next)));
 
 async function submit() {
   busy.value = true;
