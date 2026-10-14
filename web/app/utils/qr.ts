@@ -1,16 +1,9 @@
-// A QR code (ISO/IEC 18004) for an authenticator app's `otpauth://` URI:
-// byte mode, error correction level M, the smallest version that fits, the
-// mask with the lowest penalty. Small and dependency-free so the seed never
-// leaves this page for a library or a service; rendered as one SVG path.
+// Dependency-free so the TOTP seed never leaves this page.
 
-// Per version (index 0 unused), level M: error-correction codewords per
-// block and the number of blocks.
 const ECC_PER_BLOCK = [0, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28];
 const BLOCKS = [0, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49];
-/** Format information's two error-correction bits for level M. */
 const LEVEL_M = 0;
 
-/** A square of modules, `true` dark, row-major (`modules[y * size + x]`). */
 export interface Qr { size: number; version: number; mask: number; modules: Uint8Array }
 
 function rawModules(ver: number): number {
@@ -48,7 +41,6 @@ function rsDivisor(degree: number): Uint8Array {
   return out;
 }
 
-/** Reed-Solomon error-correction codewords of `data` (exported for its test). */
 export function rsRemainder(data: ArrayLike<number>, degree: number): Uint8Array {
   const divisor = rsDivisor(degree);
   const out = new Uint8Array(degree);
@@ -61,7 +53,6 @@ export function rsRemainder(data: ArrayLike<number>, degree: number): Uint8Array
   return out;
 }
 
-/** Version-`ver` codewords of `bytes`: header, data, padding, then blocks with their error correction, interleaved. */
 function codewords(bytes: Uint8Array, ver: number): Uint8Array {
   const capacity = dataCodewords(ver);
   const data = new Uint8Array(capacity);
@@ -159,7 +150,6 @@ function masked(mask: number, x: number, y: number): boolean {
   }
 }
 
-/** The 15 format bits (level M and `mask`, BCH-protected, masked). */
 export function formatBits(mask: number): number {
   const data = (LEVEL_M << 3) | mask;
   let rem = data;
@@ -167,7 +157,6 @@ export function formatBits(mask: number): number {
   return ((data << 10) | rem) ^ 0x5412;
 }
 
-/** Encode `text` (UTF-8), or `null` when it exceeds version 40. */
 export function encodeQr(text: string): Qr | null {
   const bytes = new TextEncoder().encode(text);
   let ver = 1;
@@ -267,7 +256,6 @@ export function encodeQr(text: string): Qr | null {
   return { size, version: ver, mask: bestMask, modules: best! };
 }
 
-/** One SVG path drawing the dark modules, offset by a 4-module quiet zone (the viewBox is `size + 8` square). */
 export function qrPath(qr: Qr): string {
   let d = "";
   for (let y = 0; y < qr.size; y++) {
@@ -276,7 +264,6 @@ export function qrPath(qr: Qr): string {
   return d;
 }
 
-/** The base32 seed of an `otpauth://` URI, grouped in fours for typing, or `null`. */
 export function totpSecret(uri: string): string | null {
   if (!uri.startsWith("otpauth://")) return null;
   const query = uri.indexOf("?");

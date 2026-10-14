@@ -1,7 +1,4 @@
-// After a client-side navigation, move focus to the new view's heading so
-// a screen reader starts reading there, and name the tab after it. A link
-// from the old single-page interface (`/#/runs/<id>`, what GitHub check
-// runs point at) goes to the run.
+// A link from the old single-page interface (`/#/runs/<id>`, what GitHub check runs point at) goes to the run.
 export default defineNuxtPlugin((nuxtApp) => {
   const router = useRouter();
   const legacy = location.hash.match(/^#\/runs\/(run_[0-9a-f-]{36})$/);

@@ -1,37 +1,23 @@
-// The log viewer: one attempt's log as steps that fold, each loaded on
-// demand through `?step=` pages; a live attempt is followed through this
-// server's event stream, resumed after the last frame held. Only the rows in
-// view (plus a small overscan) exist as elements, whatever the log's
-// length; lines held in memory are bounded, and what the bound released,
-// what the store never stored (gaps) and a line cut short are always said.
-//
-// Plain DOM on purpose, outside Vue's reactivity: up to a quarter-million
-// held lines, their typed columns, the memory bound and the stream state
-// are ordinary data here, never proxied or tracked. The pooled rows are
-// reused and only their text, link and class change while scrolling;
-// the measurement in docs/web-ui.md (bench/u01-log-view.jsonl) put this
-// within noise of the same window rendered by Vue or Preact.
+// Plain DOM outside Vue's reactivity: held lines are plain data, never proxied or tracked.
 
 import type { Frame, LogPage, StepRecord } from "~~/shared/types/api";
 import { fmtNs } from "./format";
 
 export const LOG = {
-  PAGE_FRAMES: 500,     // the API's page ceiling
-  OVERSCAN: 12,         // rows rendered above and below the viewport
-  MAX_LINES: 250000,    // lines held across all steps
-  MAX_CHARS: 48 << 20,  // characters held across all steps
-  TRIM: 25000,          // lines released at once when a bound is hit
-  MAX_LINE: 4096,       // characters of one line shown before "… N more"
-  JUMP_CONTEXT: 40,     // frames loaded before a deep-linked line
+  PAGE_FRAMES: 500, // the API's page ceiling
+  OVERSCAN: 12,
+  MAX_LINES: 250000,
+  MAX_CHARS: 48 << 20,
+  TRIM: 25000,
+  MAX_LINE: 4096,
+  JUMP_CONTEXT: 40,
   LINE_H: 18,
 };
 
-// ANSI CSI/OSC sequences are dropped: colour codes are noise in text.
 const ANSI = /\x1b\[[0-?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]/g;
 const STREAM = { stdout: 0, stderr: 1, meta: 2 } as const;
 
 type Kind = Float64ArrayConstructor | Uint8ArrayConstructor;
-/// Growable typed columns: no object per line.
 class Column {
   private data: Float64Array | Uint8Array;
   length = 0;
@@ -82,8 +68,7 @@ export class Section {
   error: string | null = null;
   constructor(index: number, id: string) { this.index = index; this.id = id; this.reset(0); }
   reset(after: number) {
-    // A page requested before a reset belongs to the old window and is
-    // dropped when it arrives.
+    // A page requested before a reset is for the old window and is dropped on arrival.
     this.gen++;
     this.text = [];
     this.seq = new Column(Float64Array);
@@ -108,14 +93,10 @@ export interface ViewerOptions {
   steps: { index: number; id: string }[];
   outcomes: StepRecord[] | null;
   complete: boolean;
-  /// Read a page of the log (`GET /api/v1/attempts/{id}/logs?…`).
-  page: (query: string) => Promise<LogPage>;
-  /// Search (`GET …/logs/search?…`).
-  search: (query: string) => Promise<{ matches: { seq: number; step: number; text: string }[]; next_after: number | null; next_carry: string | null; complete: boolean }>;
+  page:(query: string) => Promise<LogPage>;
+  search:(query: string) => Promise<{ matches: { seq: number; step: number; text: string }[]; next_after: number | null; next_carry: string | null; complete: boolean }>;
   announce: (text: string) => void;
-  /// A refusal (removed from the tenant, session ended).
   refused: (body: any) => void;
-  /// Put a deep link into the address bar without navigating.
   linked: (step: number, seq: number, q?: string) => void;
 }
 
@@ -137,7 +118,6 @@ export class LogViewer {
   source: EventSource | null = null;
   closed = false;
   searchFound = 0;
-  // Elements.
   results!: HTMLUListElement;
   stateLine!: HTMLElement;
   searchBox!: HTMLInputElement;
@@ -200,8 +180,6 @@ export class LogViewer {
         this.viewport)));
   }
 
-  /// Failed and unfinished steps open; passed or skipped ones fold. With
-  /// no outcomes yet, the last step (the one being written) opens.
   foldDefaults() {
     let any = false;
     for (const s of this.sections) {
@@ -275,8 +253,6 @@ export class LogViewer {
   }
 
   draw(row: HTMLElement & { shownRow?: number; shownVersion?: number; shownTotal?: number; parts?: HTMLElement[] | null }, index: number) {
-    // A pooled row already showing this row at this version is left
-    // alone: scrolling redraws only the rows that came into view.
     if (row.shownRow === index && row.shownVersion === this.version) return;
     row.shownRow = index;
     row.shownVersion = this.version;
@@ -313,9 +289,6 @@ export class LogViewer {
     row.append(el("span", { class: "gut" }, ""), el("span", { class: "txt" }, text));
   }
 
-  /// The common row keeps its two nodes (link and text); only their text,
-  /// the link and the class move. Only a stderr row carries a third, the
-  /// "stderr:" said to screen readers, so ordinary rows cost no more.
   drawLine(row: HTMLElement & { parts?: HTMLElement[] | null; sr?: HTMLElement; cls?: string }, index: number, sec: Section, i: number) {
     const stream = sec.stream.get(i);
     const seq = sec.seq.get(i);
@@ -387,7 +360,7 @@ export class LogViewer {
   }
 
   maybeLoad(first: number, last: number) {
-    if (this.live) return; // the stream fills a live log
+    if (this.live) return;
     for (let k = 0; k < this.sections.length; k++) {
       const sec = this.sections[k]!;
       if (!sec.expanded || sec.loading || sec.done || sec.error) continue;
@@ -396,7 +369,6 @@ export class LogViewer {
     }
   }
 
-  /// One page of a step past `sec.after`.
   async loadPage(sec: Section): Promise<LogPage | null> {
     const gen = sec.gen;
     sec.loading = true;
@@ -429,11 +401,9 @@ export class LogViewer {
     if (count) count.textContent = sec.expanded ? `${sec.lines.toLocaleString()} lines` : "folded";
   }
 
-  /// Frames into lines; an open line continues in the same stream's next
-  /// frame. A jump over a declared gap becomes a visible marker line.
   appendFrames(sec: Section, frames: Frame[]) {
     for (const f of frames) {
-      if (f.seq <= sec.after && sec.lines) continue; // already held
+      if (f.seq <= sec.after && sec.lines) continue;
       const last = sec.lines ? sec.seq.get(sec.lines - 1) : sec.after;
       for (const [from, to] of this.gaps) {
         if (from > last && to < f.seq) {
@@ -441,7 +411,6 @@ export class LogViewer {
         }
       }
       const stream = f.stream === "stderr" ? STREAM.stderr : STREAM.stdout;
-      // The escape byte is rare; only a frame holding one pays for the regex.
       const parts = (f.text.indexOf("\x1b") < 0 ? f.text : f.text.replace(ANSI, "")).split("\n");
       for (let p = 0; p < parts.length; p++) {
         const piece = parts[p]!;
@@ -473,8 +442,6 @@ export class LogViewer {
     sec.chars += text.length;
   }
 
-  /// Hold at most MAX_LINES / MAX_CHARS: release the oldest lines of the
-  /// largest step, keep what is being read in view, and say so.
   bound(growing: Section) {
     let lines = 0, chars = 0;
     for (const s of this.sections) { lines += s.lines; chars += s.chars; }
@@ -506,7 +473,6 @@ export class LogViewer {
     await this.window(sec, Math.max(0, first - 1 - LOG.JUMP_CONTEXT * 4), first);
   }
 
-  /// Replace a section with the window after `after`, up to `until`.
   async window(sec: Section, after: number, until: number) {
     sec.reset(after);
     sec.expanded = true;
@@ -519,8 +485,6 @@ export class LogViewer {
     }
   }
 
-  /// Show frame `seq` of step `step` (the line holding `needle`, when
-  /// given), highlighted, loading a window around it when not held.
   async jump(step: number, seq: number, needle?: string | null) {
     if (needle) { this.needle = needle; this.searchBox.value = needle; }
     const sec = this.section(step);
@@ -556,10 +520,7 @@ export class LogViewer {
 
   scrollToEnd() { this.viewport.scrollTop = this.viewport.scrollHeight; }
 
-  /// Follow a live attempt through this server's event stream: frames as
-  /// they land, step by step, until the log completes. The browser
-  /// reconnects by itself with the last event's `step:seq`, so a dropped
-  /// connection never repeats or loses a line.
+  // The browser resumes with the last event's step:seq, so a dropped connection repeats or loses no line.
   followLive() {
     let k = 0;
     while (k < this.sections.length - 1 && this.sections[k]!.outcome) k++;
@@ -593,7 +554,6 @@ export class LogViewer {
     source.addEventListener("complete", (e) => {
       source.close();
       this.live = false;
-      // Every step was streamed from its start: all of it is held.
       for (const s of this.sections) s.done = true;
       this.completed(JSON.parse((e as MessageEvent).data));
       this.layout();
@@ -633,8 +593,6 @@ export class LogViewer {
     this.changed();
   }
 
-  /// Indexed literal search on the controller, page by page (4 MiB of log
-  /// a request) until something is found; each hit jumps to its line.
   async runSearch(resume?: { after: number; carry: string | null }) {
     const q = this.searchBox.value;
     if (!q) return this.clearSearch();

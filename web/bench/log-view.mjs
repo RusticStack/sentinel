@@ -1,12 +1,3 @@
-// U01: measure the log-view candidates in web/bench/candidates.js in a real
-// browser and print one JSON line (appended to bench/u01-log-view.jsonl
-// with --record). Needs Node 22+, `pnpm -C web install`, a Chromium-family
-// browser, and Preact + htm unpacked somewhere (a comparison only; neither
-// ships):
-//
-//   npm pack preact@10.29.8 htm@3.1.1 && tar xzf … (see docs/web-ui.md)
-//   PREACT_DIR=… HTM_DIR=… node web/bench/log-view.mjs [--lines 200000] [--record]
-
 import { writeFileSync, readFileSync, appendFileSync, mkdtempSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { tmpdir, cpus, totalmem, release, platform } from "node:os";
@@ -38,11 +29,9 @@ const url = (p) => pathToFileURL(p).href;
 const gz = (...paths) => paths.reduce((n, p) => n + gzipSync(readFileSync(p), { level: 9 }).length, 0);
 
 const dir = mkdtempSync(join(tmpdir(), "sentinel-u01-"));
-// The shipped viewer, bundled as the interface bundles it (minified).
 const viewerBundle = join(dir, "viewer.js");
 await build({ entryPoints: [files.viewer], bundle: true, minify: true, format: "iife", globalName: "SentinelLog", outfile: viewerBundle, logLevel: "silent" });
-// The viewer's own rules from the interface's stylesheet (the rest is
-// Tailwind input, not CSS a page can load as is).
+// Only the log viewer's rules: the rest of main.css is Tailwind input.
 const css = readFileSync(files.css, "utf8");
 const logCss = css.slice(css.indexOf("[hidden]"), css.indexOf("/* Job graph. */"));
 function pageFor(name) {
@@ -117,7 +106,7 @@ for (const name of ["naive", "preact", "vue", "sentinel"]) {
 await browser.close();
 
 let commit = null;
-try { commit = execSync("git rev-parse --short HEAD", { cwd: repo }).toString().trim() + (execSync("git status --porcelain", { cwd: repo }).toString().trim() ? "+dirty" : ""); } catch (e) { /* no git */ }
+try { commit = execSync("git rev-parse --short HEAD", { cwd: repo }).toString().trim() + (execSync("git status --porcelain", { cwd: repo }).toString().trim() ? "+dirty" : ""); } catch (e) {}
 const record = {
   record: "u01-log-view",
   date: new Date().toISOString().slice(0, 10),
