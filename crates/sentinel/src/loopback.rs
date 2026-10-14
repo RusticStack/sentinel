@@ -1,5 +1,5 @@
-//! The single-use loopback listener the browser sign-in redirects to (O04,
-//! RFC 8252 §7.3): bound to `127.0.0.1:0`, the whole wait bounded (five
+//! The single-use loopback listener the browser sign-in redirects to (RFC 8252
+//! §7.3): bound to `127.0.0.1:0`, the whole wait bounded (five
 //! minutes), each request head at most 8 KiB and 10 s, only `GET /callback`
 //! considered — any other path is answered `404` and the wait goes on.
 //! Only a `/callback` carrying this login's `state` (compared in constant

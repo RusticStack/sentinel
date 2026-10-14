@@ -79,7 +79,7 @@ fn finish(outcome: Result<(), client::Error>) -> ExitCode {
 /// Parse arguments. For `sentinel secret`, a parse error that would quote
 /// an offending argument (a value typed where none is accepted, as in
 /// `secret set TOKEN hunter2` or `--value=hunter2`) is replaced by a fixed
-/// message, so the stray value is not copied into captured stderr (P10C-5).
+/// message, so the stray value is not copied into captured stderr.
 fn parse() -> Result<Cli, ExitCode> {
     use clap::error::ErrorKind;
     let error = match Cli::try_parse() {

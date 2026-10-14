@@ -1,4 +1,4 @@
-//! The controller's optional external S3 copy (R02/R03): the `sentinel_s3`
+//! The controller's optional external S3 copy: the `sentinel_s3`
 //! client adapted to the store's [`Bucket`] and read-through [`Remote`]
 //! seams, and the replicator's thread.
 
