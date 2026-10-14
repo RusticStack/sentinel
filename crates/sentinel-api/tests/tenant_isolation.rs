@@ -529,7 +529,7 @@ struct Probe {
     path: String,
     body: Body,
     headers: Vec<(&'static str, &'static str)>,
-    /// A typo in the path would otherwise make every refusal look right.
+    /// Also require the owner to read this path, so a typo cannot make every refusal look right.
     owner_reads: bool,
 }
 
