@@ -1258,7 +1258,6 @@ dependencies = [
  "sentinel-pipeline",
  "sentinel-protocol",
  "serde",
- "serde_json",
  "tempfile",
 ]
 
@@ -1398,7 +1397,6 @@ dependencies = [
  "md-5",
  "quick-xml",
  "ring",
- "tempfile",
  "ureq",
  "zeroize",
 ]
