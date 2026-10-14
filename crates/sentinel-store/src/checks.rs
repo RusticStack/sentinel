@@ -1,4 +1,4 @@
-//! The GitHub Checks outbox (G04).
+//! The GitHub Checks outbox.
 //!
 //! One durable row per check: the stable required aggregate `sentinel / ci`
 //! and one `sentinel / <job>` per compiled job, plus a completed aggregate for
@@ -21,7 +21,7 @@ pub const AGGREGATE_SCOPE: &str = "aggregate";
 pub const AGGREGATE_NAME: &str = "sentinel / ci";
 /// Per-job check names; the aggregate above is the required one.
 pub const JOB_PREFIX: &str = "sentinel / ";
-/// External IDs let a rerequest (G05) find the run a check belongs to.
+/// External IDs let a rerequest find the run a check belongs to.
 pub const EXTERNAL_PREFIX: &str = "sentinel:";
 
 /// Attempts a progress check (queued, in progress) may spend before it is
@@ -184,7 +184,7 @@ pub struct Publication {
     pub summary: String,
     pub check_run_id: Option<i64>,
     /// The check suite the run landed in, recorded from the forge's answer;
-    /// a `check_suite` rerequest resolves runs through it (G05).
+    /// a `check_suite` rerequest resolves runs through it.
     pub check_suite_id: Option<i64>,
     /// When a create was last attempted, set durably before the request. Its
     /// presence means an earlier create may have landed: a later attempt must

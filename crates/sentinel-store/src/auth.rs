@@ -234,7 +234,7 @@ pub fn list_repos(
 /// itself. The host-local variant exists so `sentinel admin` does not have to
 /// fabricate a `Principal` for somebody who never authenticated.
 ///
-/// Step-up freshness (A06) is freshness, not authority: privileged changes
+/// Step-up freshness is freshness, not authority: privileged changes
 /// require both it and a live platform-admin check. A browser session carries
 /// its token digest so freshness is **read again inside the writer
 /// transaction** of the change ([`Authority::require_fresh`]) rather than
@@ -472,7 +472,7 @@ pub fn require_tenant_admin(
     }
 }
 
-/// Tenant-scoped object transfer authority (D02). The tenant comes from the
+/// Tenant-scoped object transfer authority. The tenant comes from the
 /// resource row or the namespace lookup — never trusted from the request.
 /// `write` distinguishes upload sessions (membership at operator role or
 /// above, plus the RUN bit) from object downloads (any live member). A
@@ -519,7 +519,7 @@ pub fn require_tenant_member(
     }
 }
 
-/// Object download authority (D02). Bytes are repository evidence, so a
+/// Object download authority. Bytes are repository evidence, so a
 /// digest is readable only through something that already grants it:
 ///
 /// - an **artifact**: some manifest edge to `(tenant, digest)` belongs to an
@@ -1132,8 +1132,7 @@ fn bounded_text(value: &str, max: usize, field: &'static str) -> Result<()> {
 }
 
 /// Trusted admission/authentication persistence primitives. No HTTP/CLI route
-/// may expose these directly. A02 owns first-admin/password admission, A04 owns
-/// verified provider proof and identity linking, and A05 owns registration.
+/// may expose these directly.
 pub mod provisioning {
     use super::*;
 
