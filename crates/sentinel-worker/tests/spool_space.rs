@@ -1,5 +1,5 @@
 //! A log pipe whose spool refuses output — the worker's spool quota or its
-//! free-space reserve (R01/D06) — still closes its log, over a real
+//! free-space reserve — still closes its log, over a real
 //! loopback TLS session into a real `LogStore`: the refused frames are
 //! declared as gaps, the end goes out once every *stored* frame is
 //! acknowledged, and the refusals are counted by cause.
@@ -140,9 +140,8 @@ impl Executor for Forward {
 }
 
 /// The quota runs out after three frames: the next two are refused and
-/// declared. Before the fix the end waited for an acknowledgement of the
-/// refused tail — which never comes, since it was never sent — until the
-/// 60 s flush timeout failed the attempt as a publication failure.
+/// declared. The end does not wait for an acknowledgement of the refused
+/// tail, which is never sent, so the attempt is not failed by the flush timeout.
 #[test]
 fn a_spool_refusing_its_tail_still_closes_the_log_with_the_gaps_declared() {
     let temp = tempfile::tempdir().unwrap();

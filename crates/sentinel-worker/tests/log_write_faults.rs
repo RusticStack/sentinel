@@ -84,9 +84,7 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 /// A frame whose write was cut short is never acknowledged, and the frames
 /// after it are never written behind its remains: the resend of it and
-/// everything after read back exactly. Before the fix the store kept the
-/// partial record and appended behind it, and a reopen read the rest of
-/// the segment as garbage — acknowledged frames lost.
+/// everything after read back exactly.
 #[test]
 fn a_short_write_never_strands_a_record_in_the_log_or_the_spool() {
     let temp = tempfile::tempdir().unwrap();

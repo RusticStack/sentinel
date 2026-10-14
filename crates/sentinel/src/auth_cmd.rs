@@ -1,4 +1,4 @@
-//! `sentinel auth login|status|logout` and `sentinel context use|show` (O04):
+//! `sentinel auth login|status|logout` and `sentinel context use|show`:
 //! browser (loopback + PKCE) and device sign-in, grant import for agents,
 //! status without token material, logout with server revocation.
 //!
@@ -485,7 +485,7 @@ fn save_login(
     if let Some(old) = &previous {
         // A legacy shared OS-store entry may hold another configuration
         // directory's sign-in by now; only this profile's own is revoked
-        // and deleted (P09C-8).
+        // and deleted.
         let (stored, ours) = if old.is_legacy() {
             match config.legacy_owner(&quick_agent(), name, old) {
                 profile::Owner::Ours(stored) => (Some(stored), true),
@@ -768,7 +768,7 @@ fn run_logout(args: &LogoutArgs) -> Result<(), Error> {
             continue;
         };
         // A legacy shared OS-store entry is revoked and deleted only when it
-        // still holds this profile's own grant (P09C-8).
+        // still holds this profile's own grant.
         let stored = if entry.is_legacy() {
             match config.legacy_owner(&agent, name, &entry) {
                 profile::Owner::Ours(stored) => Some(stored),

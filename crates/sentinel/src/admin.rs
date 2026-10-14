@@ -98,8 +98,7 @@ pub(crate) fn open(data: &DataDir, reporting: bool) -> Result<Store, Error> {
             path.display()
         )));
     }
-    // A new binary's admin command migrates like its server would, with the
-    // same snapshot first (R05).
+    // Migrates like the server would, with the same snapshot first.
     let (store, snapshot) = sentinel_store::upgrade::open_upgrading(&path, Durability::Full)
         .map_err(|error| fail(format!("cannot open {}: {error}", path.display())))?;
     if let Some(snapshot) = snapshot {
@@ -235,8 +234,8 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
 }
 
 /// Scope vocabulary for the host-local command. These names map onto the stored
-/// permission bits; the OAuth scope vocabulary is a separate surface (A09) and
-/// is not defined by this parser.
+/// permission bits; the OAuth scope vocabulary is a separate surface and is
+/// not defined by this parser.
 fn scope(text: &str) -> Result<Permissions, Error> {
     let mut permissions = Permissions::NONE;
     for name in text.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -310,7 +309,7 @@ pub(crate) fn duration_ms(text: &str, max_ms: i64) -> Result<i64, Error> {
         })
 }
 
-/// `admin diagnostics` (R06): the sanitized bundle, read-only.
+/// `admin diagnostics`: the sanitized bundle, read-only.
 fn diagnostics(data: &DataDir, integrity: bool) -> Result<(), Error> {
     if !data.data_dir.is_absolute() {
         return Err(fail("data_dir must be an absolute path"));
@@ -325,7 +324,7 @@ fn diagnostics(data: &DataDir, integrity: bool) -> Result<(), Error> {
     Ok(())
 }
 
-/// `admin upgrade check` (R05): what starting this build on the data
+/// `admin upgrade check`: what starting this build on the data
 /// directory would do, without opening the store (which would migrate).
 fn upgrade_check(data: &DataDir) -> Result<(), Error> {
     if !data.data_dir.is_absolute() {
@@ -387,7 +386,7 @@ fn backup_id(dir: &std::path::Path, id: Option<&str>) -> Result<String, Error> {
     }
 }
 
-/// `admin backup create|list|verify|prune` (R04), host-local.
+/// `admin backup create|list|verify|prune`, host-local.
 fn backup(args: &crate::cli::BackupArgs) -> Result<(), Error> {
     use crate::cli::BackupCommand;
     use sentinel_store::backup;
@@ -493,7 +492,7 @@ fn backup(args: &crate::cli::BackupArgs) -> Result<(), Error> {
     Ok(())
 }
 
-/// `admin restore` (R04): rebuild a data directory from a backup, then open
+/// `admin restore`: rebuild a data directory from a backup, then open
 /// it as the controller would: migrations, then object recovery.
 fn restore(
     from: &std::path::Path,
@@ -936,7 +935,7 @@ fn policy(args: &PolicyArgs, now: UnixMillis) -> Result<(), Error> {
     Ok(())
 }
 
-/// Registered OAuth clients (X06): the operator's view and switch, with no
+/// Registered OAuth clients: the operator's view and switch, with no
 /// SQL. Disabling revokes the client's grants in the same transaction.
 fn oauth_client(args: &OauthClientArgs, now: UnixMillis) -> Result<(), Error> {
     match &args.command {
@@ -1344,7 +1343,7 @@ fn key(args: &KeyArgs) -> Result<(), Error> {
             if !data.data_dir.is_absolute() {
                 return Err(fail("data_dir must be an absolute path"));
             }
-            // The one path the controller reads (P10S-4).
+            // The one path the controller reads.
             let path = data.data_dir.join(MASTER_KEY_FILE);
             sentinel_auth::sealed::Key::create(&path)
                 .map_err(|error| fail(format!("cannot create the key: {error:?}")))?;
@@ -1384,7 +1383,7 @@ fn key(args: &KeyArgs) -> Result<(), Error> {
     Ok(())
 }
 
-/// Offline re-encryption (P10S-5): with the controller stopped (the database
+/// Offline re-encryption: with the controller stopped (the database
 /// ownership lock is held throughout), move every sealed value to the active
 /// key in bounded batches, then optionally drop every other key. Rerunning
 /// after an interruption continues where it stopped; `--retire` refuses
@@ -1634,7 +1633,7 @@ fn tenant(args: &TenantArgs, now: UnixMillis) -> Result<(), Error> {
                 .map_err(|_| fail("no tenant with that slug"))?;
             let objects = sentinel_store::objects::Objects::open(&data.data_dir)
                 .map_err(|error| fail(format!("cannot open the object store: {error}")))?;
-            // The default quota the controller last started with (R01).
+            // The default quota the controller last started with.
             if let Ok(d) = store.read(sentinel_store::retention::installed) {
                 objects.set_deployment(d);
             }
@@ -2110,7 +2109,7 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
             let free = sentinel_store::space::free_bytes(&args.data.data_dir).ok();
             let total = sentinel_store::space::total_bytes(&args.data.data_dir).ok();
             // What a controller without explicit `[storage]` watermarks
-            // derives from this filesystem (R01); explicit settings in the
+            // derives from this filesystem; explicit settings in the
             // controller's configuration override them.
             let sized = total.map(sentinel_store::space::default_watermarks);
             let metadata = store.metadata_bytes();
@@ -2142,15 +2141,15 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
 }
 
 /// Print an attempt's log from the controller's own files. Host-local like
-/// everything here; the API (W08) reads the same files with authorization.
+/// everything here; the API reads the same files with authorization.
 fn logs(data: &DataDir, attempt: &str, follow: bool) -> Result<(), Error> {
     use std::io::Write;
     let attempt: sentinel_core::AttemptId = attempt
         .parse()
         .map_err(|_| fail("expected an att_ attempt identifier"))?;
     let root = data.data_dir.join(sentinel_store::logs::LOGS_DIR);
-    // D04 segments live under logs/<run>/<job>/<attempt>; resolve through
-    // the database, falling back to the pre-D04 flat file.
+    // Segments live under logs/<run>/<job>/<attempt>; resolve through the
+    // database, falling back to the flat `<attempt>.log` file.
     let dir = open(data, true).ok().and_then(|store| {
         store
             .read(|c| {
