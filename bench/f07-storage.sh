@@ -10,7 +10,7 @@ set -uo pipefail
 PROBE="${PROBE:-/root/sentinel-probes}"
 OUT="${OUT:-/root/f07-storage.jsonl}"; : > "$OUT"
 ROUNDS="${ROUNDS:-3}"
-# WSL drops loop mounts when the VM idles; remount the fixtures created for F07.
+# WSL drops loop mounts when the VM idles; remount the loop-mounted fixtures.
 for fs in xfs btrfs; do mountpoint -q /mnt/f07-$fs || mount -o loop /srv/f07/$fs.img /mnt/f07-$fs || exit 1; done
 df -T /root /mnt/f07-xfs /mnt/f07-btrfs | tail -3
 declare -A FS=([ext4]=/root/f07-ext4 [xfs]=/mnt/f07-xfs/f07 [btrfs]=/mnt/f07-btrfs/f07)

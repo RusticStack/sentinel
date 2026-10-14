@@ -12,7 +12,7 @@ log_level = "info"
 # enrollment_file = "/etc/sentinel/enrollment"
 # git_mirrors = true               # per-repository object mirrors under <data_dir>/mirrors (default on)
 
-# Optional NAT-traversing transport (Q06): the pinned helper forwards the
+# Optional NAT-traversing transport: the pinned helper forwards the
 # controller's Tailcat address to loopback, so `controller` becomes
 # "127.0.0.1:<listen_port>" — the two go together. With enabled = false (or no
 # section) the link uses direct TLS and nothing below runs. The address is the

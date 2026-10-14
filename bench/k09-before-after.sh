@@ -84,10 +84,8 @@ print(json.dumps({
 PY
 }
 
-# ---------------------------------------------------------------------
 # Repos: a one-commit noop repo, and the custom-tool two-commit repo
 # (base + edit-source overlay) with its checked-in package store.
-# ---------------------------------------------------------------------
 
 prov_custom_tool() { # $1 = shared dir
     mkdir -p "$1/pkgs" "$1/tools"
@@ -172,7 +170,7 @@ command -v python3 >/dev/null || { log "python3 required"; exit 1; }
 command -v podman  >/dev/null || { log "podman required"; exit 1; }
 meta_record >> "$OUT"
 
-# --- 1. no-op: bare vs cold vs warm -----------------------------------
+# 1. no-op: bare vs cold vs warm
 
 SHA_NOOP="$(build_noop_repo)"
 [ -n "${SHA_NOOP:-}" ] || { log "noop repo failed"; exit 1; }
@@ -189,7 +187,7 @@ for _ in $(seq "$SAMPLES"); do
     run_case noop noop-cache-warm "$PIPES/noop-cache.yml" "$SHA_NOOP"
 done
 
-# --- 2. incremental build: nocache vs cold vs warm ---------------------
+# 2. incremental build: nocache vs cold vs warm
 
 if [ ! -f "$WORK/prov/custom-tool/.done" ]; then
     rm -rf "$WORK/prov/custom-tool"; mkdir -p "$WORK/prov/custom-tool"
