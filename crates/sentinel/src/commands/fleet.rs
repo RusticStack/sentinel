@@ -1,5 +1,3 @@
-//! `job cancel|rerun`, `workers list|drain|undrain` and `queue`.
-
 use serde_json::{Map, Value, json};
 
 use super::{List, segment, tenant, text};
@@ -19,7 +17,6 @@ pub(super) fn job(client: &Client, output: Output, job: &str, rerun: bool) -> Re
     Ok(())
 }
 
-/// Pools are the items: one NDJSON line per pool with its workers.
 pub(super) fn workers(
     client: &Client,
     output: Output,
@@ -67,8 +64,6 @@ pub(super) fn drain(
     Ok(())
 }
 
-/// Waiting jobs are the items; the server bounds the list (at most 500)
-/// and reports the total, which JSON keeps and text summarizes.
 pub(super) fn queue(
     client: &Client,
     output: Output,
@@ -113,7 +108,6 @@ pub(super) fn queue(
     Ok(())
 }
 
-/// A waiting age as a person reads it: seconds, then minutes, then hours.
 fn age_text(age_ms: u64) -> String {
     let secs = age_ms / 1000;
     match secs {

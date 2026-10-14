@@ -1,8 +1,4 @@
-//! A log pipe whose spool refuses output — the worker's spool quota or its
-//! free-space reserve — still closes its log, over a real
-//! loopback TLS session into a real `LogStore`: the refused frames are
-//! declared as gaps, the end goes out once every *stored* frame is
-//! acknowledged, and the refusals are counted by cause.
+//! A refused log tail still closes the log, with the refused frames declared as gaps.
 
 #![cfg(target_os = "linux")]
 
@@ -50,9 +46,6 @@ impl Admission for AnyAdmission {
     }
 }
 
-/// The controller's log handling, reduced to its store: a frame is
-/// acknowledged through the stored frontier once durable, and the end once
-/// its marker is.
 struct Logs {
     store: LogStore,
     run: RunId,
@@ -99,7 +92,6 @@ impl SessionHandler for Logs {
     fn abandoned(&self, _: WorkerId, _: AttemptId, _: Fence) {}
 }
 
-/// Hands acknowledgements to the pipe, as the executor does.
 #[derive(Default)]
 struct Forward {
     reporter: Mutex<Option<Reporter>>,
@@ -139,9 +131,7 @@ impl Executor for Forward {
     }
 }
 
-/// The quota runs out after three frames: the next two are refused and
-/// declared. The end does not wait for an acknowledgement of the refused
-/// tail, which is never sent, so the attempt is not failed by the flush timeout.
+// The end must not wait for an ack of the refused tail, which is never sent.
 #[test]
 fn a_spool_refusing_its_tail_still_closes_the_log_with_the_gaps_declared() {
     let temp = tempfile::tempdir().unwrap();
@@ -205,7 +195,6 @@ fn a_spool_refusing_its_tail_still_closes_the_log_with_the_gaps_declared() {
     for n in 1..=3 {
         pipe.write(0, Stream::Stdout, format!("line {n}\n").as_bytes());
     }
-    // The worker's spools now hold all the quota allows.
     space.set_limits(0, space.used());
     for n in 4..=5 {
         pipe.write(0, Stream::Stdout, format!("line {n}\n").as_bytes());
@@ -219,7 +208,6 @@ fn a_spool_refusing_its_tail_still_closes_the_log_with_the_gaps_declared() {
     );
     assert_eq!(pipe.refusals().quota, 2);
     assert_eq!(pipe.refusals().total(), 2);
-    // The spool is gone and its bytes left the quota.
     assert!(!worker.join(SPOOL_DIR).join(attempt.to_string()).exists());
     assert_eq!(space.used(), 0);
     let tail = handler.store.tail(run, job, attempt, 0, 10, None).unwrap();

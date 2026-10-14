@@ -1,12 +1,4 @@
-//! Host-local administration of local login.
-//!
-//! Authority here is the operating system's: the command opens the controller's
-//! database file directly, so only a user who already has that access can admit
-//! the first super admin or recover a locked-out account. Nothing in this module
-//! is reachable over the network, and the server process does not expose it.
-//!
-//! Passwords are read from standard input only. They never appear in argv, in
-//! the process list, in shell history, in diagnostics or in an error message.
+//! Passwords come from standard input only, never argv, so they stay out of the process list.
 
 use std::io::IsTerminal;
 
@@ -45,9 +37,6 @@ pub(crate) fn fail(message: impl Into<String>) -> Error {
     }
 }
 
-/// Read the password as raw bytes from standard input, dropping one trailing
-/// newline so a piped file or heredoc works. Bytes are preserved otherwise: a
-/// passphrase is not trimmed, normalized or re-encoded.
 fn read_password() -> Result<Vec<u8>, Error> {
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
@@ -55,8 +44,7 @@ fn read_password() -> Result<Vec<u8>, Error> {
             "read the password from standard input, for example: sentinel admin bootstrap ... < secret-file",
         ));
     }
-    // At most the longest accepted password plus a CRLF: `< /dev/zero` or an
-    // endless pipe is refused, not buffered.
+    // Bounded: an endless source such as /dev/zero is refused, not buffered.
     let limit = sentinel_auth::password::MAX_LEN as u64 + 2;
     let mut password = match sentinel::bounded::read(stdin.lock(), limit) {
         Ok(bytes) => bytes,
@@ -84,9 +72,6 @@ fn read_password() -> Result<Vec<u8>, Error> {
     Ok(password)
 }
 
-/// Open the controller's database in its data directory. Reporting refuses to
-/// create one: `status` against a mistyped path must say so, not answer about a
-/// new empty database it just made.
 pub(crate) fn open(data: &DataDir, reporting: bool) -> Result<Store, Error> {
     if !data.data_dir.is_absolute() {
         return Err(fail("data_dir must be an absolute path"));
@@ -98,7 +83,6 @@ pub(crate) fn open(data: &DataDir, reporting: bool) -> Result<Store, Error> {
             path.display()
         )));
     }
-    // Migrates like the server would, with the same snapshot first.
     let (store, snapshot) = sentinel_store::upgrade::open_upgrading(&path, Durability::Full)
         .map_err(|error| fail(format!("cannot open {}: {error}", path.display())))?;
     if let Some(snapshot) = snapshot {
@@ -233,9 +217,6 @@ pub fn run(args: AdminArgs) -> Result<(), Error> {
     Ok(())
 }
 
-/// Scope vocabulary for the host-local command. These names map onto the stored
-/// permission bits; the OAuth scope vocabulary is a separate surface and is
-/// not defined by this parser.
 fn scope(text: &str) -> Result<Permissions, Error> {
     let mut permissions = Permissions::NONE;
     for name in text.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -276,17 +257,12 @@ fn scope_names(permissions: Permissions) -> String {
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// Whole units only (`30d`, `12h`, `90m`, `45s`). A lifetime is an operator
-/// decision, so it is stated plainly rather than parsed loosely.
 fn lifetime_ms(text: &str) -> Result<i64, Error> {
     duration_ms(text, tokens::MAX_LIFETIME_MS)
 }
 
-/// Parse `<whole number><d|h|m|s>` with an explicit ceiling. No calendar
-/// arithmetic, no fractional units, no unbounded retention.
 pub(crate) fn duration_ms(text: &str, max_ms: i64) -> Result<i64, Error> {
-    // Split before the last *character*: a multibyte unit must be refused,
-    // not panic on a byte offset inside it.
+    // Split on the last character boundary; a byte offset could land inside a multibyte unit.
     let (digits, unit) = text.split_at(text.char_indices().last().map_or(0, |(at, _)| at));
     let scale = match unit {
         "d" => DAY_MS,
@@ -309,7 +285,6 @@ pub(crate) fn duration_ms(text: &str, max_ms: i64) -> Result<i64, Error> {
         })
 }
 
-/// `admin diagnostics`: the sanitized bundle, read-only.
 fn diagnostics(data: &DataDir, integrity: bool) -> Result<(), Error> {
     if !data.data_dir.is_absolute() {
         return Err(fail("data_dir must be an absolute path"));
@@ -324,8 +299,6 @@ fn diagnostics(data: &DataDir, integrity: bool) -> Result<(), Error> {
     Ok(())
 }
 
-/// `admin upgrade check`: what starting this build on the data
-/// directory would do, without opening the store (which would migrate).
 fn upgrade_check(data: &DataDir) -> Result<(), Error> {
     if !data.data_dir.is_absolute() {
         return Err(fail("data_dir must be an absolute path"));
@@ -375,7 +348,6 @@ fn upgrade_check(data: &DataDir) -> Result<(), Error> {
     }
 }
 
-/// The backup `id`, or the newest in `dir`.
 fn backup_id(dir: &std::path::Path, id: Option<&str>) -> Result<String, Error> {
     match id {
         Some(id) => Ok(id.to_owned()),
@@ -386,7 +358,6 @@ fn backup_id(dir: &std::path::Path, id: Option<&str>) -> Result<String, Error> {
     }
 }
 
-/// `admin backup create|list|verify|prune`, host-local.
 fn backup(args: &crate::cli::BackupArgs) -> Result<(), Error> {
     use crate::cli::BackupCommand;
     use sentinel_store::backup;
@@ -492,8 +463,6 @@ fn backup(args: &crate::cli::BackupArgs) -> Result<(), Error> {
     Ok(())
 }
 
-/// `admin restore`: rebuild a data directory from a backup, then open
-/// it as the controller would: migrations, then object recovery.
 fn restore(
     from: &std::path::Path,
     id: Option<&str>,
@@ -548,11 +517,6 @@ fn restore(
     Ok(())
 }
 
-/// `admin tenant storage`: show a tenant's (or one repository's) storage
-/// policy, effective limits and usage, or change it. Given settings replace
-/// the stored ones, `--inherit` drops them; the rest are kept. Validation and
-/// re-stamping are the store's (`retention::set`), with the limits the
-/// controller last started with.
 fn tenant_storage(
     data: &DataDir,
     tenant: &str,
@@ -661,13 +625,8 @@ fn tenant_storage(
     Ok(())
 }
 
-/// Resolve a `usr_` identifier or a local username. Host-local lookups read the
-/// database directly: the operator already has that access, and there is no
-/// session to authorize them with before any credential exists.
 fn resolve_user(store: &Store, value: &str) -> Result<UserId, Error> {
     let unknown = || fail("no account with that username, address or identifier");
-    // No username holds an `@`: an address names the account that verified
-    // it, else the newest one still claiming it.
     if value.contains('@') {
         let owned = value.to_owned();
         return store
@@ -688,8 +647,6 @@ fn resolve_user(store: &Store, value: &str) -> Result<UserId, Error> {
         .map_err(|_| unknown())
 }
 
-/// Resolve the optional tenant/repository narrowing by their operator-facing
-/// names. The store still refuses a repository outside the named tenant.
 fn resolve_target(
     store: &Store,
     tenant: Option<&String>,
@@ -747,8 +704,6 @@ fn token(args: &TokenArgs, now: UnixMillis) -> Result<(), Error> {
                 sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
                 other => fail(format!("the account cannot hold that credential: {other}")),
             })?;
-            // The secret is the only thing on stdout, so a redirect captures it
-            // exactly; everything an operator reads goes to stderr.
             sentinel::outln!("{}", sentinel_auth::token::format(&granted.secret));
             eprintln!(
                 "issued {} for {user}, scope {}, expires at {} (shown once)",
@@ -793,9 +748,6 @@ fn token(args: &TokenArgs, now: UnixMillis) -> Result<(), Error> {
     Ok(())
 }
 
-/// Linking only ever happens through a verified provider sign-in, so there is
-/// no host-local link command: an operator who could type a subject could sign
-/// in as anybody. Removing a wrong link is the host-local repair path.
 fn identity(args: &IdentityArgs, now: UnixMillis) -> Result<(), Error> {
     match &args.command {
         IdentityCommand::List { data, user } => {
@@ -935,8 +887,6 @@ fn policy(args: &PolicyArgs, now: UnixMillis) -> Result<(), Error> {
     Ok(())
 }
 
-/// Registered OAuth clients: the operator's view and switch, with no
-/// SQL. Disabling revokes the client's grants in the same transaction.
 fn oauth_client(args: &OauthClientArgs, now: UnixMillis) -> Result<(), Error> {
     match &args.command {
         OauthClientCommand::List { data } => {
@@ -1032,10 +982,6 @@ const fn role_name(value: Role) -> &'static str {
     }
 }
 
-/// An invitation addressed to a mailbox. With mail delivery configured and
-/// the master key readable the message is queued for the lane, sealed, and no
-/// secret is printed; otherwise (or with `--print-link`) the secret is the
-/// only thing on stdout, as for any invitation, and the operator passes it on.
 fn invite_email(
     data: &DataDir,
     store: &Store,
@@ -1126,7 +1072,6 @@ fn invite(args: &InviteArgs, now: UnixMillis) -> Result<(), Error> {
                     now,
                 );
             }
-            // Owned, so the writer closure can borrow it for the whole write.
             let bound: Option<(String, String)> = match identity.as_deref() {
                 None => None,
                 Some(value) => {
@@ -1157,8 +1102,6 @@ fn invite(args: &InviteArgs, now: UnixMillis) -> Result<(), Error> {
                     sentinel_store::Error::InvalidInput(what) => fail(format!("invalid {what}")),
                     other => fail(format!("cannot create the invitation: {other}")),
                 })?;
-            // The secret alone on stdout, as with credentials: deliver the link
-            // out of band. There is no way to show it again.
             sentinel::outln!("{}", sentinel_auth::token::format(&invitation.secret));
             eprintln!(
                 "issued {} expiring at {} (shown once)",
@@ -1207,8 +1150,6 @@ fn invite(args: &InviteArgs, now: UnixMillis) -> Result<(), Error> {
     Ok(())
 }
 
-/// Whether this deployment delivers mail and what the outbox holds. Counts
-/// only: no address, no link.
 fn mail(args: &MailArgs) -> Result<(), Error> {
     match &args.command {
         MailCommand::Status { data } => {
@@ -1300,7 +1241,6 @@ fn account(args: &AccountArgs, now: UnixMillis) -> Result<(), Error> {
             };
             let mut secret = String::new();
             issued.secret.expose(&mut secret);
-            // The link (or the bare secret) alone on stdout, once.
             match &base {
                 Some(base) => sentinel::outln!("{base}/verify-email#token={secret}"),
                 None => sentinel::outln!("{secret}"),
@@ -1343,7 +1283,6 @@ fn key(args: &KeyArgs) -> Result<(), Error> {
             if !data.data_dir.is_absolute() {
                 return Err(fail("data_dir must be an absolute path"));
             }
-            // The one path the controller reads.
             let path = data.data_dir.join(MASTER_KEY_FILE);
             sentinel_auth::sealed::Key::create(&path)
                 .map_err(|error| fail(format!("cannot create the key: {error:?}")))?;
@@ -1362,9 +1301,7 @@ fn key(args: &KeyArgs) -> Result<(), Error> {
                 return Err(fail("data_dir and backup must be absolute paths"));
             }
             let path = data.data_dir.join(MASTER_KEY_FILE);
-            // Hold the controller's database ownership lock for the whole
-            // rotation. A running controller must not keep sealing with the
-            // old in-memory key after the file changes.
+            // Hold the database ownership lock: a running controller must not keep the old key in memory.
             let _owner = data
                 .data_dir
                 .join(METADATA_FILE)
@@ -1383,11 +1320,6 @@ fn key(args: &KeyArgs) -> Result<(), Error> {
     Ok(())
 }
 
-/// Offline re-encryption: with the controller stopped (the database
-/// ownership lock is held throughout), move every sealed value to the active
-/// key in bounded batches, then optionally drop every other key. Rerunning
-/// after an interruption continues where it stopped; `--retire` refuses
-/// while any value still needs a retired key.
 fn reseal(data: &DataDir, retire: bool, backup: Option<&std::path::Path>) -> Result<(), Error> {
     if !data.data_dir.is_absolute() || backup.is_some_and(|b| !b.is_absolute()) {
         return Err(fail("data_dir and backup must be absolute paths"));
@@ -1437,7 +1369,6 @@ fn reseal(data: &DataDir, retire: bool, backup: Option<&std::path::Path>) -> Res
     Ok(())
 }
 
-/// Load the deployment's master key, which seals every TOTP seed.
 fn master_key(data: &DataDir) -> Result<sentinel_auth::sealed::Key, Error> {
     let path = data.data_dir.join(MASTER_KEY_FILE);
     sentinel_auth::sealed::Key::load(&path).map_err(|_| {
@@ -1448,11 +1379,6 @@ fn master_key(data: &DataDir) -> Result<sentinel_auth::sealed::Key, Error> {
     })
 }
 
-/// Enrollment and reissue run at the host for the operator who is sitting
-/// with the person and their device (a GitHub-only super admin on a headless
-/// deployment, say): authorized by the database file like removal, audited as
-/// host-local, with every secret on stdout alone and only once. Removal is the
-/// recovery path for a lost device.
 fn second_factor(args: &MfaArgs, now: UnixMillis) -> Result<(), Error> {
     match &args.command {
         MfaCommand::Enroll { data, user } => {
@@ -1633,7 +1559,6 @@ fn tenant(args: &TenantArgs, now: UnixMillis) -> Result<(), Error> {
                 .map_err(|_| fail("no tenant with that slug"))?;
             let objects = sentinel_store::objects::Objects::open(&data.data_dir)
                 .map_err(|error| fail(format!("cannot open the object store: {error}")))?;
-            // The default quota the controller last started with.
             if let Ok(d) = store.read(sentinel_store::retention::installed) {
                 objects.set_deployment(d);
             }
@@ -1692,7 +1617,6 @@ fn tenant(args: &TenantArgs, now: UnixMillis) -> Result<(), Error> {
         TenantCommand::Reactivate { data, tenant } => (data, tenant, false),
     };
     let store = open(data, true)?;
-    // A suspended tenant is inactive, so resolve by slug without that filter.
     let owned = slug.clone();
     let id = store
         .read(move |conn| lookup::tenant_by_slug_any(conn, &owned))
@@ -1870,8 +1794,6 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
                     sentinel_store::Error::NotFound => fail("no live worker with that identifier"),
                     other => fail(format!("cannot change the drain state: {other}")),
                 })?;
-            // Attempts the worker already holds keep running: draining is
-            // about what it is offered next, not what it is doing.
             eprintln!("{} {id}", if drain { "draining" } else { "undrained" });
         }
         WorkerCommand::Revoke { data, id } => {
@@ -1892,10 +1814,6 @@ fn worker(args: &WorkerArgs, now: UnixMillis) -> Result<(), Error> {
     Ok(())
 }
 
-/// Cancellation as desired state, recorded host-locally: an unstarted job is
-/// `canceled` at once; a running one is told through its worker's next
-/// heartbeat and reports its own end. The server's dispatcher notices on
-/// its next pass.
 fn cancel(
     data: &DataDir,
     job: Option<&str>,
@@ -1957,17 +1875,12 @@ fn cancel(
     Ok(())
 }
 
-/// Reconcile or rehash the object store. Host-local: the commands read the
-/// database directly and must run while no controller owns it, or they open
-/// their own read connection — `recover` sweeps `tmp/`, which a running
-/// controller may be writing into, so it requires the store stopped.
 fn objects(args: &ObjectsArgs) -> Result<(), Error> {
     let objects = sentinel_store::objects::Objects::open(&args.data.data_dir)
         .map_err(|error| fail(format!("cannot open the object store: {error}")))?;
     match args.command {
         ObjectsCommand::Recover => {
-            // tmp/ is staging for in-flight writes; sweeping it under a live
-            // controller would delete staged bodies mid-upload.
+            // tmp/ holds in-flight writes; sweeping it under a live controller deletes staged bodies.
             let store = open(&args.data, true)?;
             let report = store
                 .read(|conn| objects.recover(conn))
@@ -2002,8 +1915,7 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
             );
         }
         ObjectsCommand::Sweep => {
-            // Retiring expired sessions removes their incoming/ files; under
-            // a live controller a client could be mid-chunk, so stopped only.
+            // A live controller may have a client mid-chunk, so this runs only on a stopped store.
             let store = open(&args.data, true)?;
             let swept = store
                 .writer()
@@ -2012,11 +1924,7 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
             sentinel::outln!("{}", serde_json::json!({ "expired": swept }));
         }
         ObjectsCommand::Reclaim => {
-            // The full maintenance pass: expired sessions and leases, expired
-            // artifacts (their manifest versions retire, releasing the object
-            // references), the manifest backfill, then reclamation of
-            // unreferenced, unleased objects and orphan files. Row deletions
-            // commit before their files unlink, so a stopped store is safe.
+            // Row deletions commit before their files unlink, so a stopped store is safe.
             let store = open(&args.data, true)?;
             let now = sentinel_core::UnixMillis::now();
             let objects = std::sync::Arc::new(objects);
@@ -2040,8 +1948,6 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
             let (uploads, leases, manifests, indexed, reclaimed) = report;
             let manifest_files = manifests.len();
             let (objects_reclaimed, bytes_reclaimed) = (reclaimed.objects, reclaimed.bytes);
-            // Every unlink re-checks ownership on the writer, the same path
-            // the controller's maintenance pass takes.
             let mut doomed = manifests;
             doomed.extend(reclaimed.doomed);
             {
@@ -2108,9 +2014,6 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
                 .map_err(|error| fail(format!("cannot read storage state: {error}")))?;
             let free = sentinel_store::space::free_bytes(&args.data.data_dir).ok();
             let total = sentinel_store::space::total_bytes(&args.data.data_dir).ok();
-            // What a controller without explicit `[storage]` watermarks
-            // derives from this filesystem; explicit settings in the
-            // controller's configuration override them.
             let sized = total.map(sentinel_store::space::default_watermarks);
             let metadata = store.metadata_bytes();
             let deployment = report.iter().map(|(_, used, _)| used).sum::<u64>();
@@ -2140,16 +2043,12 @@ fn objects(args: &ObjectsArgs) -> Result<(), Error> {
     Ok(())
 }
 
-/// Print an attempt's log from the controller's own files. Host-local like
-/// everything here; the API reads the same files with authorization.
 fn logs(data: &DataDir, attempt: &str, follow: bool) -> Result<(), Error> {
     use std::io::Write;
     let attempt: sentinel_core::AttemptId = attempt
         .parse()
         .map_err(|_| fail("expected an att_ attempt identifier"))?;
     let root = data.data_dir.join(sentinel_store::logs::LOGS_DIR);
-    // Segments live under logs/<run>/<job>/<attempt>; resolve through the
-    // database, falling back to the flat `<attempt>.log` file.
     let dir = open(data, true).ok().and_then(|store| {
         store
             .read(|c| {
@@ -2195,7 +2094,6 @@ fn logs(data: &DataDir, attempt: &str, follow: bool) -> Result<(), Error> {
             };
             match out.write_all(&frame.bytes) {
                 Ok(()) => {}
-                // The reader of the pipe stopped (`| head`): end quietly.
                 Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
                 Err(error) => return Err(fail(format!("cannot write: {error}"))),
             }
@@ -2227,7 +2125,6 @@ mod tests {
     fn durations_need_a_unit_and_never_split_a_character() {
         assert_eq!(duration_ms("7d", 30 * DAY_MS).ok(), Some(7 * DAY_MS));
         assert_eq!(duration_ms("90s", DAY_MS).ok(), Some(90_000));
-        // Byte `len - 1` falls inside the multibyte unit.
         for bad in ["30д", "é", "", "d", "0d", "1.5d"] {
             assert!(duration_ms(bad, 30 * DAY_MS).is_err(), "{bad}");
         }

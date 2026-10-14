@@ -1,9 +1,4 @@
-//! A controller with a store, a local repository with one commit, and a
-//! worker link over loopback TLS running whatever executor a test hands it —
-//! the setup of `end_to_end.rs`, for tests that drive the real executor
-//! (rootless Podman, `SENTINEL_PODMAN_TESTS=1`). Shared by
-//! `tests/executor_faults.rs` and the executor's own unit tests, so it names
-//! no `sentinel_worker` item.
+//! Shared by several test binaries, so it names no `sentinel_worker` item and asks `podman` directly.
 
 #![allow(dead_code)]
 
@@ -42,7 +37,6 @@ use sentinel_store::{
 pub const IMAGE: &str = "docker.io/library/busybox";
 pub const DIGEST: &str = "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
 
-/// Whether this run may use rootless Podman.
 pub fn podman_enabled() -> bool {
     if std::env::var_os("SENTINEL_PODMAN_TESTS").is_some() {
         return true;
@@ -51,7 +45,6 @@ pub fn podman_enabled() -> bool {
     false
 }
 
-/// Wait for `predicate`, failing the test with `what` after `within`.
 pub fn eventually(what: &str, within: Duration, mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + within;
     while !predicate() {
@@ -83,7 +76,6 @@ pub struct Live {
     pub tenant: TenantId,
     pub repo_id: RepoId,
     pub pool: PoolId,
-    /// The tenant admin every setup write is made as.
     pub root: UserId,
     pub worker: WorkerId,
     pub worker_dir: PathBuf,
@@ -91,15 +83,9 @@ pub struct Live {
     pub sha: String,
     handle: Arc<Handle>,
     link: Option<thread::JoinHandle<sentinel_link::Result<()>>>,
-    /// Set once [`Live::stop`] has checked that nothing leaked.
     settled: bool,
 }
 
-/// Every container the runtime still knows under `worker`'s ownership
-/// label, running or not: `sentinel-<attempt>` for each of the test's
-/// attempts, since the worker id is the test's own. `None` when `podman`
-/// could not be asked. Asked of `podman` directly: this file names no
-/// `sentinel_worker` item.
 pub fn containers_of(worker: WorkerId) -> Option<Vec<String>> {
     let output = Command::new("podman")
         .args(["ps", "-a", "--filter"])
@@ -119,17 +105,12 @@ pub fn containers_of(worker: WorkerId) -> Option<Vec<String>> {
 }
 
 impl Live {
-    /// Start the controller, then a worker link running the executor
-    /// `make` builds from the worker's data directory and id; returns once
-    /// the worker is connected.
     pub fn start<E: Executor + Send + Sync + 'static>(
         make: impl FnOnce(&Path, WorkerId) -> E,
     ) -> (Live, Arc<E>) {
         Self::start_with(make, 5, Capabilities::REQUIRED, None)
     }
 
-    /// [`Live::start`] with the worker's protocol ceiling and capabilities,
-    /// and the controller's sealing key when secrets are delivered.
     pub fn start_with<E: Executor + Send + Sync + 'static>(
         make: impl FnOnce(&Path, WorkerId) -> E,
         protocol_max: u16,
@@ -226,8 +207,7 @@ impl Live {
                     memory_bytes: 4 << 30,
                 },
                 profile: sentinel_protocol::negotiate::Profile {
-                    // A profile-protocol worker states its scratch disk; zero offers none,
-                    // and every job declares some.
+                    // A profile-protocol worker must state its scratch disk; zero offers none and every job declares some.
                     disk_bytes: 64 << 30,
                     ..sentinel_protocol::negotiate::Profile::default()
                 },
@@ -275,13 +255,10 @@ impl Live {
         self.controller.as_ref().expect("running")
     }
 
-    /// Enqueue a run of `yaml` (every job on the pinned busybox) and wake
-    /// the dispatcher. Returns the run and its jobs in compiled order.
     pub fn enqueue(&self, yaml: &str) -> (RunId, Vec<JobId>) {
         self.enqueue_pinned(yaml, DIGEST)
     }
 
-    /// [`Live::enqueue`] with every job's image resolved to `digest`.
     pub fn enqueue_pinned(&self, yaml: &str, digest: &str) -> (RunId, Vec<JobId>) {
         let digest = digest.to_owned();
         let spec = RunSpec::new(
@@ -317,8 +294,6 @@ impl Live {
             .unwrap()
     }
 
-    /// Whether the job's latest attempt has printed `needle` into the
-    /// controller's log.
     pub fn printed(&self, run: RunId, job: JobId, needle: &str) -> bool {
         self.attempt(job).is_some_and(|attempt| {
             self.logs
@@ -332,9 +307,6 @@ impl Live {
         })
     }
 
-    /// Stop the worker link and the controller, then assert that no
-    /// container of the test's attempts survives the test: the executor
-    /// tears down every container it started, whatever ended the attempt.
     pub fn stop(mut self) {
         self.handle.stop();
         if let Some(link) = self.link.take() {
@@ -356,10 +328,6 @@ impl Live {
     }
 }
 
-/// A test that fails ends while its attempts may still run: the process
-/// exits before their threads tear their containers down, and no later
-/// worker start reconciles a test's one-off worker id. Force-remove them
-/// here, so a failing test leaves nothing running behind it.
 impl Drop for Live {
     fn drop(&mut self) {
         if self.settled {
