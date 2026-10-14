@@ -1,6 +1,3 @@
-//! Host-local second-factor enrollment through the operator's actual command
-//! surface: the secrets appear once, on stdout alone, and a wrong code or a
-//! second enrollment changes nothing.
 #![cfg(all(target_os = "linux", feature = "server"))]
 
 use std::process::{Command, Output, Stdio};
@@ -60,7 +57,6 @@ fn current_code(uri: &str) -> String {
 fn enrolling_from_the_host_needs_the_key_and_a_valid_code_and_prints_secrets_once() {
     let (_root, data) = bootstrapped();
 
-    // No master key yet: enrollment is refused and says how to create one.
     let keyless = sentinel(&data, &["admin", "mfa", "enroll", "--user", "root"]);
     assert!(!keyless.status.success());
     assert!(String::from_utf8_lossy(&keyless.stderr).contains("key create"));
@@ -70,7 +66,6 @@ fn enrolling_from_the_host_needs_the_key_and_a_valid_code_and_prints_secrets_onc
             .success()
     );
 
-    // The URI is the only thing on stdout, and nothing is enrolled by it.
     let begun = sentinel(&data, &["admin", "mfa", "enroll", "--user", "root"]);
     assert!(begun.status.success());
     let out = lines(&begun);
@@ -82,7 +77,6 @@ fn enrolling_from_the_host_needs_the_key_and_a_valid_code_and_prints_secrets_onc
     let status = sentinel(&data, &["admin", "mfa", "status", "--user", "root"]);
     assert!(lines(&status).contains(&"enrolled: false".to_owned()));
 
-    // A wrong code confirms nothing and prints no recovery code.
     let wrong = sentinel(
         &data,
         &[
@@ -108,19 +102,16 @@ fn enrolling_from_the_host_needs_the_key_and_a_valid_code_and_prints_secrets_onc
     let status = lines(&status);
     assert!(status.contains(&"enrolled: true".to_owned()), "{status:?}");
 
-    // A second enrollment is refused rather than replacing the factor.
     let again = sentinel(&data, &["admin", "mfa", "enroll", "--user", "root"]);
     assert!(!again.status.success());
     assert!(again.stdout.is_empty());
 
-    // Reissue replaces the set: ten new codes, none of the old.
     let reissued = sentinel(&data, &["admin", "mfa", "codes", "--user", "root"]);
     assert!(reissued.status.success());
     let second = lines(&reissued);
     assert_eq!(second.len(), 10);
     assert!(second.iter().all(|code| !first.contains(code)));
 
-    // An account without a factor has nothing to reissue.
     let (_other_root, other) = bootstrapped();
     let none = sentinel(&other, &["admin", "mfa", "codes", "--user", "root"]);
     assert!(!none.status.success() && none.stdout.is_empty());

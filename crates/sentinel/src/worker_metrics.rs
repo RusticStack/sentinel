@@ -1,12 +1,4 @@
-//! The worker's optional metrics listener: `metrics_listen` in the
-//! worker's configuration names a loopback address, and `GET /metrics` there
-//! answers the Prometheus text format. Loopback only, so a node exporter or
-//! an agent on the same machine scrapes it; the figures name no tenant,
-//! repository, attempt or secret.
-//!
-//! What it counts comes from the executor's notices (attempts, spool
-//! refusals, cache and image reclamation, availability) and the link's
-//! events, plus the process's own figures and the data directory's disk.
+//! Loopback only: the figures name no tenant, repository, attempt or secret.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -15,7 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-/// The counters the executor's notices and the link's events feed.
 #[derive(Default)]
 pub struct Metrics {
     pub connected: AtomicBool,
@@ -34,12 +25,10 @@ pub struct Metrics {
     pub cache_entries: AtomicU64,
     pub images_held: AtomicU64,
     pub images_in_flight: AtomicU64,
-    /// The running executor, once it started (none without a runtime).
     pub executor: OnceLock<sentinel_worker::executor::Executor>,
 }
 
 impl Metrics {
-    /// Count one executor notice.
     pub fn count(&self, notice: &sentinel_worker::executor::Notice) {
         use sentinel_worker::executor::Notice;
         let add = |a: &AtomicU64| {
@@ -246,9 +235,7 @@ impl Metrics {
     }
 }
 
-/// Serve `metrics` on `listen` from a thread of its own until the process
-/// exits. One connection at a time, each bounded to two seconds and 4 KiB of
-/// request: a scrape is small and rare.
+/// One connection at a time, each capped at two seconds and 4 KiB of request.
 pub fn serve(
     listen: SocketAddr,
     metrics: Arc<Metrics>,

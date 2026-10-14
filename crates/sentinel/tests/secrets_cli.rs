@@ -1,9 +1,3 @@
-//! The secrets commands through the real `sentinel` binary
-//! against an in-process controller API: stdin byte preservation, rotate,
-//! delete, exit codes, import preview pins, explicit idempotency replay, the
-//! retry hint on an unknown outcome, binding/allowlist/revocation commands,
-//! and a value typed as an argument never being echoed.
-
 use std::{
     io::Write,
     process::{Command, Output, Stdio},
@@ -149,7 +143,6 @@ fn json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|_| panic!("{}", err(output)))
 }
 
-/// The stored plaintext of one version, opened with the deployment's key.
 fn stored(d: &Deployment, repo: Option<RepoId>, name: &'static str, version: u64) -> Vec<u8> {
     let (tenant, key) = (d.tenant, d.key.clone());
     let sealed: Vec<u8> = d
@@ -194,7 +187,6 @@ fn stdin_values_rotate_and_delete_with_stable_exit_codes() {
     assert_eq!(json(&set)["version"], 1);
     assert_eq!(stored(&d, Some(d.repo), "TOKEN", 1), b"line one\r\n\xff");
 
-    // Implicit stdin (not a terminal): the same byte-exact read.
     let implicit = cli(
         &d,
         &[&["secret", "set", "TOKEN"][..], &scope].concat(),
@@ -258,8 +250,6 @@ fn stdin_values_rotate_and_delete_with_stable_exit_codes() {
     assert_eq!(code(&reuse), 5);
 }
 
-/// A caller-chosen key makes a rerun replay the first write
-/// instead of rotating again, and an unknown outcome names that retry.
 #[test]
 fn a_rerun_with_the_same_key_replays_and_an_unknown_outcome_names_it() {
     let d = deployment();
@@ -282,13 +272,10 @@ fn a_rerun_with_the_same_key_replays_and_an_unknown_outcome_names_it() {
     assert_eq!((code(&first), code(&second)), (0, 0), "{}", err(&second));
     assert_eq!(json(&first), json(&second));
     assert_eq!(json(&second)["version"], 1);
-    // The same key for a different value is a client bug, exit 5.
     let reused = cli(&d, &args, Some(b"other"));
     assert_eq!(code(&reused), 5);
     assert!(err(&reused).contains("idempotency_mismatch"));
 
-    // No controller answers: the write's outcome is unknown (exit 6), and
-    // the error names the key and version that would replay it.
     let unreachable = cli_to(
         "http://127.0.0.1:9",
         &d,
@@ -314,8 +301,6 @@ fn a_rerun_with_the_same_key_replays_and_an_unknown_outcome_names_it() {
     );
 }
 
-/// Preview reports literal-value hints and a pin; an
-/// import bound to that pin refuses once a name moved.
 #[test]
 fn an_import_bound_to_its_preview_refuses_a_moved_version() {
     let d = deployment();
@@ -371,7 +356,6 @@ fn an_import_bound_to_its_preview_refuses_a_moved_version() {
     );
     assert!(String::from_utf8_lossy(&text.stdout).contains("pin: --if-versions A=1,B=0"));
 
-    // Someone rotates A after the preview: the pinned import changes nothing.
     let moved = cli(
         &d,
         &[
@@ -423,7 +407,6 @@ fn an_import_bound_to_its_preview_refuses_a_moved_version() {
     assert_eq!(stored(&d, None, "A", 3), b"\"quoted\"");
     assert_eq!(stored(&d, None, "B", 1), b"plain");
 
-    // A bare CR is refused with its line number, before any request.
     std::fs::write(dir.join("cr.env"), b"A=1\rB=2\r").unwrap();
     #[cfg(unix)]
     {
@@ -448,7 +431,6 @@ fn an_import_bound_to_its_preview_refuses_a_moved_version() {
     assert!(err(&cr).contains("line 1"), "{}", err(&cr));
 }
 
-/// The documented provisioning flow runs entirely through the CLI.
 #[test]
 fn bindings_allowlists_and_revocation_run_through_the_cli() {
     let d = deployment();
@@ -563,8 +545,6 @@ fn bindings_allowlists_and_revocation_run_through_the_cli() {
     assert_eq!(code(&absent), 4);
 }
 
-/// A value mistakenly typed as an argument is refused and never
-/// copied into stderr.
 #[test]
 fn a_value_typed_as_an_argument_is_never_echoed() {
     let d = deployment();

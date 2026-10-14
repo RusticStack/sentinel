@@ -1,6 +1,3 @@
-//! Host-local surface: a bootstrapped operator creates a repository and
-//! binds a source through `sentinel admin source` with nothing but the
-//! database file, and the metadata output never contains the credential.
 #![cfg(all(target_os = "linux", feature = "server"))]
 
 use std::{fs, io::Write as _, process::Command};
@@ -28,7 +25,6 @@ fn fails(args: &[&str]) -> std::process::Output {
     output
 }
 
-/// Run with `stdin` fed from a string; returns the finished output.
 fn with_stdin(args: &[&str], input: &str) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sentinel"))
         .args(args)
@@ -115,7 +111,6 @@ fn a_host_local_operator_binds_a_source_and_sees_no_credential() {
         .and_then(|rest| rest.split('"').next())
         .expect("create prints the repository")
         .to_owned();
-    // No binding yet, and an off-policy destination, are refusals.
     fails(&[
         "admin",
         "source",
@@ -176,7 +171,6 @@ fn a_host_local_operator_binds_a_source_and_sees_no_credential() {
     ]);
     assert!(shown.contains("\"version\":1") && shown.contains("git.example:8443"));
     assert!(!shown.contains("s3cret-token"));
-    // Rotation is compare-and-set; a stale expectation is a conflict.
     let stale = bind("https://git.example:8443/team/repo.git");
     assert_eq!(stale.status.code(), Some(2));
     ok(&[
@@ -270,7 +264,6 @@ fn a_bound_repository_opts_into_polling_and_back_out() {
         .and_then(|rest| rest.split('"').next())
         .expect("create prints the repository")
         .to_owned();
-    // Polling needs a live binding; an unbound repository is a refusal.
     fails(&[
         "admin",
         "source",
@@ -307,7 +300,6 @@ fn a_bound_repository_opts_into_polling_and_back_out() {
         "{}",
         String::from_utf8_lossy(&bound.stderr)
     );
-    // Enabling requires both an interval and a selection.
     fails(&[
         "admin",
         "source",

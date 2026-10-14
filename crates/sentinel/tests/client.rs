@@ -1,8 +1,3 @@
-//! The shared API client, portable: how server answers become exit codes,
-//! how JSON mode reports failures, retries on busy answers, and the static
-//! credential rules. A fake HTTP server on loopback answers every request
-//! with one canned response and counts what it saw.
-
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
@@ -17,7 +12,6 @@ use std::{
 
 use sentinel::client::{Client, ClientArgs, Exit};
 
-/// Answers every request with `status` and `body`, then closes.
 struct Fake {
     url: String,
     requests: Arc<AtomicUsize>,
@@ -64,9 +58,7 @@ impl Drop for Fake {
     }
 }
 
-/// Read one request head (and any declared body), count it, answer, close.
-/// The count happens-before the response is written: a client that has read
-/// the answer to its last attempt always finds that attempt counted.
+/// Counted before the response is written, so a client always sees its attempt counted.
 fn answer(stream: TcpStream, status: u16, body: &str, seen: &AtomicUsize) {
     let mut reader = BufReader::new(&stream);
     let mut length = 0usize;
@@ -150,12 +142,10 @@ fn server_answers_become_stable_exit_codes() {
         (409, error_body("conflict"), 5, 1),
         (422, error_body("idempotency_mismatch"), 5, 1),
         (400, error_body("invalid_request"), 1, 1),
-        // Busy answers are retried (a GET is safe to repeat), then exit 6.
         (429, error_body("rate_limited"), 6, 3),
         (507, error_body("storage_full"), 6, 3),
         (500, error_body("internal"), 6, 3),
         (503, error_body("outcome_unknown"), 6, 3),
-        // A proxy's answer that is not sentinel.error/1, and a malformed 200.
         (502, "bad gateway".into(), 1, 3),
         (200, "not json".into(), 1, 1),
     ];
@@ -190,7 +180,6 @@ fn json_mode_reports_one_error_document_on_stderr_only() {
     assert_eq!(document["schema"], "sentinel.error/1");
     assert_eq!(document["code"], "not_found");
 
-    // A failure with no server document gets a client_ code in the same shape.
     let bad = dir.path().join("bad-token");
     std::fs::write(&bad, "not-a-token").unwrap();
     let output = api(&fake.url, &bad, &["--json"]);
@@ -249,7 +238,6 @@ fn a_static_credential_is_checked_before_any_request() {
     assert_eq!(Client::connect(&missing).unwrap_err().exit, Exit::Usage);
     assert_eq!(fake.requests(), 0, "connecting sends nothing");
 
-    // The same client maps answers to exits in-process.
     let not_found = Fake::start(404, &error_body("not_found"));
     let client = Client::connect(&args(&not_found.url, &good)).unwrap();
     let error = client.get("/api/v1/me").unwrap_err();
@@ -259,7 +247,6 @@ fn a_static_credential_is_checked_before_any_request() {
 
 #[test]
 fn a_closed_stdout_ends_a_networked_command_quietly_with_exit_zero() {
-    // `… --output ndjson | head -1` used to end in a panic (exit 101).
     let dir = tempfile::tempdir().unwrap();
     let token = token_file(&dir);
     let fake = Fake::start(200, r#"{"user":"usr_x","via":"bearer"}"#);
@@ -293,7 +280,6 @@ fn an_unknown_write_outcome_is_repeated_only_under_its_idempotency_key() {
         ..ClientArgs::default()
     };
     let body = r#"{"schema":"sentinel.error/1","code":"outcome_unknown","message":"canned","retryable":false,"details":{"retry_with_idempotency_key":true}}"#;
-    // The first write may still commit, so an unkeyed POST is sent once.
     let fake = Fake::start(503, body);
     let client = Client::connect(&args(&fake.url)).unwrap();
     let error = client
@@ -306,7 +292,6 @@ fn an_unknown_write_outcome_is_repeated_only_under_its_idempotency_key() {
         error.message
     );
     assert_eq!(fake.requests(), 1);
-    // The same key makes a repeat a replay, never a second execution.
     let keyed = Fake::start(503, body);
     let client = Client::connect(&args(&keyed.url)).unwrap();
     let error = client
@@ -320,10 +305,6 @@ const NAMED_BACKOFF: &str = r#"{"schema":"sentinel.error/1","code":"rate_limited
 
 #[test]
 fn a_named_server_backoff_is_honored_then_retried() {
-    // A store too busy to check the credential answers
-    // `rate_limited` with `retry_after_ms`, like a refused long poll. It is
-    // an overload like any other, so a request safe to repeat is retried —
-    // but only after the server's own back-off, plus jitter.
     let dir = tempfile::tempdir().unwrap();
     let fake = Fake::start(429, NAMED_BACKOFF);
     let client = Client::connect(&ClientArgs {
@@ -342,7 +323,6 @@ fn a_named_server_backoff_is_honored_then_retried() {
         waited >= std::time::Duration::from_millis(2000),
         "two named back-offs of at least 1 s: {waited:?}"
     );
-    // An unkeyed POST is still never repeated.
     let once = Fake::start(429, NAMED_BACKOFF);
     let client = Client::connect(&ClientArgs {
         server: Some(once.url.clone()),
@@ -358,8 +338,6 @@ fn a_named_server_backoff_is_honored_then_retried() {
     assert_eq!(once.requests(), 1);
 }
 
-/// Through MCP: a tool call meets the same overload and is retried
-/// by the shared client before the tool reports it.
 #[test]
 fn an_mcp_tool_call_retries_a_named_backoff() {
     let dir = tempfile::tempdir().unwrap();
@@ -403,9 +381,6 @@ fn an_mcp_tool_call_retries_a_named_backoff() {
     assert_eq!(fake.requests(), 3);
 }
 
-/// Both worker listings show how each worker is reached: `{path} {rtt}ms`
-/// when measured, `rtt=-` when the round trip was not, `transport=-` when
-/// the worker never reported. JSON output stays the server's document.
 #[test]
 fn worker_listings_show_each_workers_transport_and_json_stays_the_server_document() {
     let body = r#"{"pools":[{"name":"linux","kind":"shared","workers":[
@@ -465,21 +440,17 @@ fn worker_listings_show_each_workers_transport_and_json_stays_the_server_documen
     assert_eq!(raw, server);
 }
 
-/// One request as the scripted server saw it.
 #[derive(Clone, Debug)]
 struct Seen {
     target: String,
     range: Option<String>,
 }
 
-/// An answer: status, content type, body, and how to send the body.
 struct Reply {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
-    /// Send the body in pieces of this many bytes, pausing between them.
     pace: Option<(usize, std::time::Duration)>,
-    /// Send only this many body bytes, then hold the connection silently.
     stall_after: Option<usize>,
 }
 
@@ -497,8 +468,6 @@ impl Reply {
 
 type Script = dyn Fn(&Seen) -> Reply + Send + Sync;
 
-/// A loopback server answering each connection on its own thread from a
-/// script, able to trickle or stall a body.
 struct Scripted {
     url: String,
     seen: Arc<std::sync::Mutex<Vec<Seen>>>,
@@ -608,12 +577,10 @@ fn serve_scripted(stream: TcpStream, script: &Script, log: &std::sync::Mutex<Vec
     }
     let _ = out.flush();
     if reply.stall_after.is_some() {
-        // Hold the connection open without a byte, as a stuck proxy would.
         thread::sleep(std::time::Duration::from_secs(8));
     }
 }
 
-/// A payload, its manifest answer and the object path the CLI will fetch.
 struct Object {
     payload: Vec<u8>,
     digest: String,
@@ -639,8 +606,6 @@ impl Object {
         format!("/api/v1/tenants/acme/objects/{}", self.digest)
     }
 
-    /// The object's bytes after `range` (`bytes=START-END`), as the
-    /// controller serves them: `206` with `content-range`, or `200` whole.
     fn answer(&self, range: Option<&str>) -> Reply {
         let len = self.payload.len();
         match range.and_then(|r| r.strip_prefix("bytes=")) {
@@ -667,8 +632,6 @@ impl Object {
     }
 }
 
-/// `sentinel artifact download run_x art_x --path out.bin --out OUT` with
-/// the transfer bounds scaled from 60 s and 30 s down to `timeout_ms`.
 fn download(server: &str, dir: &tempfile::TempDir, out: &Path, timeout_ms: u64) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sentinel"))
         .env_remove("SENTINEL_TOKEN")
@@ -695,9 +658,6 @@ fn parts(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// A transfer that takes far longer than the whole-call bound (60 s
-/// in production, 1 s here) still completes while bytes keep arriving:
-/// downloads are bounded per wait for the network, not as a whole.
 #[test]
 fn a_slow_download_longer_than_the_call_bound_completes() {
     let object = Arc::new(Object::new(64 << 10));
@@ -708,7 +668,6 @@ fn a_slow_download_longer_than_the_call_bound_completes() {
         }
         assert_eq!(seen.target, served.path());
         Reply {
-            // 2 KiB every 100 ms: 3.2 s for the whole body.
             pace: Some((2 << 10, std::time::Duration::from_millis(100))),
             ..served.answer(seen.range.as_deref())
         }
@@ -733,8 +692,6 @@ fn a_slow_download_longer_than_the_call_bound_completes() {
     assert!(parts(dir.path()).is_empty());
 }
 
-/// A transfer that stalls mid-body resumes with a `Range` request
-/// for the rest, and the digest of the whole still decides.
 #[test]
 fn a_stalled_download_resumes_from_its_partial_file() {
     let object = Arc::new(Object::new(96 << 10));
@@ -772,9 +729,6 @@ fn a_stalled_download_resumes_from_its_partial_file() {
     assert!(parts(dir.path()).is_empty());
 }
 
-/// A transfer that stops making progress exits 6 and keeps what it
-/// has; running the command again continues after those bytes instead of
-/// starting over.
 #[test]
 fn an_interrupted_download_keeps_its_bytes_and_the_next_run_resumes() {
     let object = Arc::new(Object::new(64 << 10));
@@ -790,7 +744,6 @@ fn an_interrupted_download_keeps_its_bytes_and_the_next_run_resumes() {
         if mode.load(Ordering::Acquire) {
             return reply;
         }
-        // Broken: the first request gets a quarter, every resume nothing.
         let stall = if seen.range.is_none() { quarter } else { 0 };
         Reply {
             stall_after: Some(stall),
@@ -828,9 +781,6 @@ fn an_interrupted_download_keeps_its_bytes_and_the_next_run_resumes() {
     assert!(parts(dir.path()).is_empty());
 }
 
-/// An answer that says `finished` next to a view of a live run
-/// (a rerun committed between the server's two reads) is progress, not
-/// the end; `wait` goes on and judges the run it finally sees.
 #[test]
 fn wait_does_not_judge_a_finished_answer_whose_run_is_live_again() {
     let polls = Arc::new(AtomicUsize::new(0));
