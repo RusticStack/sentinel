@@ -1,11 +1,3 @@
-//! The GitHub publisher: turns a stored publication into a check run.
-//!
-//! It mints one `checks: write` token per repository and reuses it until it is
-//! close to expiring, adopts a check run an earlier attempt may have created
-//! before creating another one, and maps GitHub's refusals onto the lane's
-//! three outcomes: retry, refuse, or pause the lane when the rate limit is
-//! spent.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -19,10 +11,8 @@ use sentinel_store::{Error as StoreError, Store, checks, sources, sources_forge}
 
 use crate::lane::Publish;
 
-/// How long before expiry a cached token is replaced.
 const TOKEN_MARGIN_MS: i64 = 120_000;
 const MAX_CACHED_TOKENS: usize = 1024;
-/// Longest rate-limit park accepted, whatever GitHub says.
 const MAX_PAUSE_MS: i64 = 60 * 60 * 1000;
 
 struct CachedToken {
@@ -40,13 +30,9 @@ pub struct GithubChecks {
     store: Arc<Store>,
     app: Arc<App>,
     client: Client,
-    /// Public base URL of this deployment for `details_url`; absent means the
-    /// checks carry no link.
     public_url: Option<String>,
-    /// One token per repository: an installation token is repository-scoped.
     tokens: HashMap<RepoId, CachedToken>,
-    /// The installation each repository was last published through: GitHub
-    /// rate-limits per installation, so this is the lane's throttle scope.
+    // GitHub rate-limits per installation, which is the lane's throttle scope.
     installations: HashMap<RepoId, u64>,
 }
 
@@ -70,8 +56,6 @@ impl GithubChecks {
         self.installations.insert(repo, installation);
     }
 
-    /// A token for this repository, cached until close to expiry. The
-    /// installation, account and clone URL are verified by the App client.
     fn token(
         &mut self,
         repo: RepoId,
@@ -147,8 +131,6 @@ impl GithubChecks {
             conclusion,
             title: publication.title.clone(),
             summary: publication.summary.clone(),
-            // The identity the run was created with; a create below replaces
-            // it with its own generation's.
             external_id: publication.created_identity(),
             details_url: self.details_url(publication.run),
             completed_at: (status == api::Status::Completed).then(|| api::timestamp(now.0)),
@@ -156,8 +138,6 @@ impl GithubChecks {
     }
 }
 
-/// What the store needs to publish one row: the binding under it, the forge
-/// association, and the canonical `owner/name` GitHub knows it by.
 struct Source {
     remote: String,
     installation: u64,
@@ -204,8 +184,6 @@ fn load_source(store: &Store, publication: &checks::Publication) -> Result<Sourc
     })
 }
 
-/// The scope of a repository whose installation is not known yet: it never
-/// matches a real installation id, so it is never skipped on another's limit.
 const UNKNOWN_SCOPE: u64 = u64::MAX;
 
 impl crate::lane::Publisher for GithubChecks {
@@ -243,11 +221,8 @@ impl crate::lane::Publisher for GithubChecks {
             Ok(check) => check,
             Err(outcome) => return outcome,
         };
-        // An earlier create may have landed without its answer being
-        // recorded — the durable `create_started` mark is what says one may
-        // exist. Only then is the adoption lookup owed; a first attempt goes
-        // straight to create, and a crash between create and record is still
-        // reconciled because the mark was written before the request.
+        // A create may have landed before its answer was recorded, so the lookup
+        // is owed only when the durable create_started mark says one may exist.
         let existing = match publication.check_run_id {
             Some(id) => Some(id),
             None if publication.create_started_ms.is_some() => match api::find(
@@ -296,7 +271,6 @@ impl crate::lane::Publisher for GithubChecks {
                             &check,
                         )
                     }
-                    // The generation moved while the lane held the row: re-read.
                     Err(StoreError::Conflict) => {
                         return Publish::Retry {
                             after_ms: 0,
@@ -341,8 +315,6 @@ impl GithubChecks {
                     .unwrap_or(UNKNOWN_SCOPE),
             },
             Refusal::Unauthorized => {
-                // The cached token is stale or the permission was withdrawn:
-                // drop it and let the next attempt mint a fresh one.
                 self.tokens.remove(&publication.repo);
                 Publish::Retry {
                     after_ms: 0,
@@ -354,8 +326,6 @@ impl GithubChecks {
                 detail: format!("github: {reason}"),
             },
             Refusal::Refused { reason } => {
-                // A check run that vanished is not worth recreating under the
-                // same name: report it rather than publishing a duplicate.
                 let reason = if during_find {
                     format!("lookup: {reason}")
                 } else {

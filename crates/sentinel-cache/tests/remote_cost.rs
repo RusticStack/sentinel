@@ -1,19 +1,7 @@
-//! Measurement, not a check: what the worker side of one remote
-//! cache transfer costs — wall time and the bytes it moves through
-//! `read`/`write` syscalls (`/proc/self/io` `rchar`/`wchar`) — for a
-//! hydration (fetch, install, materialize into the job's view) and for an
-//! offer (hash and stream a sealed generation). The controller here is an
-//! in-memory stand-in that serves 48 KiB chunks with their running digest
-//! and hashes what it receives, so the counters are the worker's own.
-//! Ignored by default:
-//!
 //! ```sh
 //! SENTINEL_REMOTE_COST_DIR=/root/bench cargo test --release -p sentinel-cache \
 //!     --test remote_cost -- --ignored --nocapture --test-threads=1
 //! ```
-//!
-//! `SENTINEL_REMOTE_COST_FILES` × `SENTINEL_REMOTE_COST_FILE_BYTES` size the
-//! payload (default 64 × 4 MiB = 256 MiB of pseudo-random bytes).
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -50,7 +38,6 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// `(rchar, wchar)` of this process so far.
 fn io_counters() -> (u64, u64) {
     let text = fs::read_to_string("/proc/self/io").unwrap();
     let field = |name: &str| {
@@ -91,7 +78,6 @@ fn compat(scope: &Scope) -> Compat {
     attach::declared_compat(&decl(), KEY, scope.platform)
 }
 
-/// One sealed generation of `files` pseudo-random files.
 fn seal(root: &Path, scope: &Scope, files: u64, bytes: u64) -> String {
     let entry = scope.entry_dir(root, attach::entry_key(scope.class, KEY));
     let generation = "gen-00000000000001500000-00000001".to_owned();
@@ -129,9 +115,6 @@ fn seal(root: &Path, scope: &Scope, files: u64, bytes: u64) -> String {
     generation
 }
 
-/// The in-memory controller: one stored stream, served in 48 KiB chunks
-/// with the running digest, as `Serving` does; offers are hashed as they
-/// arrive, as `Receiving` does, and kept.
 #[derive(Default)]
 struct Store {
     stream: Mutex<Vec<u8>>,
@@ -190,8 +173,7 @@ impl Remote for Store {
         Ok(digest)
     }
 
-    /// Like a protocol-9 controller, unless the run asks for the
-    /// digest-first path an older one needs.
+    /// Protocol 9 takes the digest at the end; the env var selects the older digest-first path.
     fn digest_at_end(&self) -> bool {
         std::env::var_os("SENTINEL_REMOTE_COST_DIGEST_FIRST").is_none()
     }
@@ -233,8 +215,6 @@ fn transfer_cost() {
         let publisher = temp.path().join("publisher");
         let scope = test_scope();
         let generation = seal(&publisher, &scope, files, bytes);
-        // The publisher's own writes are flushed first, so no run pays for
-        // the setup's write-back.
         assert!(
             std::process::Command::new("sync")
                 .arg("-f")
@@ -285,7 +265,6 @@ fn transfer_cost() {
         let hydrate_ns = started.elapsed().as_nanos();
         let (r2, w2) = io_counters();
         assert!(attached.outcome.is_hit(), "hydration missed");
-        // What the hydration left dirty still has to reach the disk.
         let synced = Instant::now();
         assert!(
             std::process::Command::new("sync")
