@@ -1,4 +1,4 @@
-// The log viewer (U03): one attempt's log as steps that fold, each loaded on
+// The log viewer: one attempt's log as steps that fold, each loaded on
 // demand through `?step=` pages; a live attempt is followed through this
 // server's event stream, resumed after the last frame held. Only the rows in
 // view (plus a small overscan) exist as elements, whatever the log's
@@ -9,8 +9,8 @@
 // held lines, their typed columns, the memory bound and the stream state
 // are ordinary data here, never proxied or tracked. The pooled rows are
 // reused and only their text, link and class change while scrolling;
-// U01 (docs/web-ui.md, bench/u01-log-view.jsonl) measured this within
-// noise of the same window rendered by Vue or Preact.
+// the measurement in docs/web-ui.md (bench/u01-log-view.jsonl) put this
+// within noise of the same window rendered by Vue or Preact.
 
 import type { Frame, LogPage, StepRecord } from "~~/shared/types/api";
 import { fmtNs } from "./format";

@@ -25,7 +25,6 @@ const invitesApply = computed(() => data.value?.kind === "organization" && !gith
 const where = computed(() => githubStanding(data.value?.github_sync));
 const isoDate = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
-// --- Re-check with GitHub ------------------------------------------------
 // Opening the namespace's repositories asks Sentinel to check the caller
 // with GitHub when the last confirmation is older than five minutes (at
 // most once a minute); the answer arrives in the background.

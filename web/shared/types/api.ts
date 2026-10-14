@@ -154,11 +154,11 @@ export interface LogPage {
   next_after: number | null;
   next: string;
   step_done: boolean;
-  /** Set when retention removed this log (R01): when it did. */
+  /** Set when retention removed this log: when it did. */
   expired_ms?: number;
 }
 
-/** Scheduled backups (R04). */
+/** Scheduled backups. */
 export interface Backups {
   configured: boolean;
   scheduler?: {
@@ -174,7 +174,7 @@ export interface Backups {
   backups: { id: string; started_ms: number; took_ms: number; schema: number; version: string; metadata_bytes: number; objects: number; objects_remote_only: number; key_required: boolean; key_ids: number[] }[];
 }
 
-/** A storage policy as set (R01); `null` inherits. */
+/** A storage policy as set; `null` inherits. */
 export interface StoragePolicy {
   quota_bytes: number | null;
   log_retention_ms: number | null;
@@ -220,7 +220,7 @@ export interface DeploymentStorage {
   log_retention_ms: number;
   artifact_retention_ms: number;
   run_artifact_bytes: number;
-  /** The external S3 copy (R02/R03), when configured. */
+  /** The external S3 copy, when configured. */
   s3: {
     state: "healthy" | "degraded" | "unknown";
     backlog_bytes: number;
@@ -250,7 +250,7 @@ export interface Worker {
   id: string;
   name: string;
   arch: string;
-  /** The negotiated worker protocol and the software it announced (R05). */
+  /** The negotiated worker protocol and the software it announced. */
   protocol: number;
   software: string | null;
   connected: boolean;
