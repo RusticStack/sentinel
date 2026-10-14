@@ -189,6 +189,7 @@ pub fn transition(
         Event::LeaseExpired => Some(encode_failure(FailureClass::LeaseExpired)),
         Event::WorkerLost => Some(encode_failure(FailureClass::WorkerLost)),
         Event::Reconciled => Some(encode_failure(FailureClass::Reconciled)),
+        Event::ConditionFailed => Some(encode_failure(FailureClass::Preparation)),
         Event::CancelBeforeStart => Some(encode_failure(FailureClass::Canceled)),
         Event::QueueTimedOut => Some(encode_failure(FailureClass::QueueTimeout)),
         _ => None,
