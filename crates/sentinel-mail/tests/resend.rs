@@ -1,7 +1,3 @@
-//! The Resend client against a local scripted HTTP server: the request it
-//! makes, how each status is classified, and that nothing secret or personal
-//! reaches an error.
-
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -21,7 +17,6 @@ enum Script {
         headers: Vec<(&'static str, String)>,
         body: Vec<u8>,
     },
-    /// Accept, then say nothing for longer than any test deadline.
     Hang,
 }
 
@@ -49,7 +44,6 @@ impl Seen {
 
 type Log = Arc<Mutex<Vec<Seen>>>;
 
-/// Serve one scripted reply per connection; returns the endpoint URL.
 fn serve(script: Vec<Script>) -> (String, Log) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/emails", listener.local_addr().unwrap());
@@ -271,7 +265,6 @@ fn a_retry_after_a_server_error_reuses_the_idempotency_key() {
         log[0].header("idempotency-key"),
         log[1].header("idempotency-key")
     );
-    // A different message is a different key.
     drop(log);
     let (url, log) = serve(vec![reply(200, "{}"), reply(200, "{}")]);
     let sender = client(&url);
@@ -314,7 +307,6 @@ fn an_oversize_response_is_bounded_and_only_the_status_counts() {
         failure(client(&url).deliver(&mail(MailId::new()))),
         Failure::Permanent(_)
     ));
-    // Accepted is accepted: the reply is not even read.
     let (url, _) = serve(vec![big(200)]);
     client(&url).deliver(&mail(MailId::new())).unwrap();
 }

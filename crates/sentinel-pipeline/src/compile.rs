@@ -1,8 +1,3 @@
-//! Deterministic compilation: validates cross-job references and the DAG,
-//! fixes an execution order that depends only on the document (not on hash
-//! seeds or declaration whims), and computes a content digest so identical
-//! input always yields an identical compiled pipeline and identical runs
-//! can be recognised.
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -19,64 +14,29 @@ pub const MAX_STEPS_TOTAL: usize = 1024;
 pub struct CompiledPipeline {
     pub on: Triggers,
     pub concurrency: Option<crate::schema::Concurrency>,
-    /// Jobs in a canonical topological order: dependencies first; ties broken
-    /// by name so the order is stable across edits elsewhere in the file.
     pub jobs: Vec<CompiledJob>,
-    /// 128-bit digest of the canonical form.
     pub digest: u128,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledJob {
     pub name: String,
-    /// Indices into `jobs`, ascending; every index is smaller than this job's.
     pub needs: Vec<u16>,
     pub spec: Job,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompileError {
-    UnknownDependency {
-        job: String,
-        needs: String,
-    },
-    SelfDependency {
-        job: String,
-    },
-    DuplicateDependency {
-        job: String,
-        needs: String,
-    },
-    Cycle {
-        jobs: Vec<String>,
-    },
-    DuplicateStepId {
-        job: String,
-        step: String,
-    },
-    DuplicateCacheName {
-        job: String,
-        name: String,
-    },
-    DuplicateArtifactName {
-        job: String,
-        name: String,
-    },
-    StepTimeoutExceedsJob {
-        job: String,
-        step: String,
-    },
-    TooManySteps {
-        limit: usize,
-    },
-    /// An `if` or template references a job outside `needs` or a phase it cannot reach.
-    Expression {
-        path: String,
-        message: &'static str,
-    },
-    /// A condition or template could not be canonically encoded for the
-    /// digest. Hashing nothing instead would give two different pipelines the
-    /// same identity, so compilation stops.
+    UnknownDependency { job: String, needs: String },
+    SelfDependency { job: String },
+    DuplicateDependency { job: String, needs: String },
+    Cycle { jobs: Vec<String> },
+    DuplicateStepId { job: String, step: String },
+    DuplicateCacheName { job: String, name: String },
+    DuplicateArtifactName { job: String, name: String },
+    StepTimeoutExceedsJob { job: String, step: String },
+    TooManySteps { limit: usize },
+    Expression { path: String, message: &'static str },
     Encoding,
 }
 
@@ -211,7 +171,6 @@ pub fn compile(pipeline: Pipeline) -> Result<CompiledPipeline, CompileError> {
             limit: MAX_STEPS_TOTAL,
         });
     }
-    // Canonical name order first; indices below refer to this order.
     let mut sorted: Vec<(String, Job)> = jobs;
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
     let index_of = |name: &str| sorted.binary_search_by(|(n, _)| n.as_str().cmp(name)).ok();
@@ -243,8 +202,7 @@ pub fn compile(pipeline: Pipeline) -> Result<CompiledPipeline, CompileError> {
         needs_idx.push(idx);
     }
 
-    // Kahn's algorithm with a name-ordered ready set: the smallest ready
-    // name always goes next, which makes the order a pure function of the DAG.
+    // Smallest ready name first: the order is a pure function of the DAG.
     let mut indegree: Vec<u16> = needs_idx.iter().map(|d| d.len() as u16).collect();
     let mut dependents: Vec<Vec<u16>> = vec![Vec::new(); n];
     for (j, deps) in needs_idx.iter().enumerate() {
@@ -255,7 +213,7 @@ pub fn compile(pipeline: Pipeline) -> Result<CompiledPipeline, CompileError> {
     let mut ready: Vec<u16> = (0..n as u16)
         .filter(|&i| indegree[i as usize] == 0)
         .collect();
-    ready.sort_unstable_by(|a, b| b.cmp(a)); // pop() yields the smallest
+    ready.sort_unstable_by(|a, b| b.cmp(a));
     let mut order: Vec<u16> = Vec::with_capacity(n);
     let mut position = vec![u16::MAX; n];
     while let Some(i) = ready.pop() {
@@ -307,8 +265,7 @@ pub fn compile(pipeline: Pipeline) -> Result<CompiledPipeline, CompileError> {
     })
 }
 
-/// FNV-1a 128 over a length-prefixed canonical serialisation. Not
-/// cryptographic; used for equality of compiled specs, never for trust.
+/// Not cryptographic: equality of compiled specs only, never trust.
 struct Digest(u128, bool);
 
 impl Digest {
@@ -332,7 +289,6 @@ impl Digest {
         self.bytes(s.as_bytes());
     }
     fn encoded<T: serde::Serialize>(&mut self, v: &T) {
-        // postcard is deterministic for a given type layout.
         match postcard::to_allocvec(v) {
             Ok(bytes) => self.bytes(&bytes),
             // Never hash an empty buffer in its place: that is a collision.
@@ -434,8 +390,6 @@ fn digest_of(
         d.u64(s.cache.len() as u64);
         for c in &s.cache {
             d.str(&c.name);
-            // The class decides the entry's validity rule, so it is part
-            // of what the compiled pipeline means.
             d.u64(u64::from(c.class.to_u8()));
             d.encoded(&c.key);
             d.u64(c.paths.len() as u64);

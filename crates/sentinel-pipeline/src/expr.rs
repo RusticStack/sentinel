@@ -1,14 +1,4 @@
-//! Bounded expression language for `${{ … }}` and `if:`.
-//!
-//! The grammar is deliberately tiny: literals, dotted context paths, `==`,
-//! `!=`, `!`, `&&`, `||`, parentheses and a fixed set of functions. There
-//! are no loops, no user functions, no string building beyond templates,
-//! no filesystem or network access: `hash_files` is the only input that
-//! touches disk and it is resolved by the worker against the pinned source
-//! under documented limits. Expressions are parsed once at compile time
-//! into an AST that is stored with the run spec, then evaluated in phases:
-//! a value that is not yet known in the current phase is `Unresolved`, never
-//! a default.
+//! A value not known in the current phase is `Unresolved`, never defaulted.
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -18,23 +8,16 @@ pub const MAX_TOKENS: usize = 256;
 pub const MAX_DEPTH: usize = 16;
 pub const MAX_ARGS: usize = 8;
 pub const MAX_PATH_SEGMENTS: usize = 4;
-/// `hash_files` limits enforced by the worker's resolver.
 pub const MAX_HASH_PATTERNS: usize = 8;
 pub const MAX_HASH_FILES: usize = 10_000;
 pub const MAX_HASH_BYTES: u64 = 256 << 20;
 
-/// When an expression is evaluated. Each context path and function has a
-/// minimum phase; earlier evaluation yields `Unresolved`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Phase {
-    /// Only structure is known; nothing evaluates.
     Compile = 0,
-    /// Event, repository and run context are known (intake/dispatch).
     Dispatch = 1,
-    /// Dependency outcomes are known (job `if`, before queueing).
     Schedule = 2,
-    /// The worker has the pinned checkout (`hash_files`, step `if`).
     Worker = 3,
 }
 
@@ -55,8 +38,7 @@ impl Value {
             Value::Str(_) => "string",
         }
     }
-    /// Truthiness for `if`: only `true` passes. Strings and integers are
-    /// not conditions; requiring a boolean catches `if: ${{ event.ref }}`.
+    /// Only a boolean passes: `if: ${{ event.ref }}` must fail, not run.
     pub const fn as_condition(&self) -> Option<bool> {
         match self {
             Value::Bool(b) => Some(*b),
@@ -68,21 +50,13 @@ impl Value {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Func {
-    /// `success()`: every dependency passed or was skipped.
     Success,
-    /// `failure()`: at least one dependency failed, timed out or infra-failed.
     Failure,
-    /// `always()`: true regardless of dependencies (but not after cancel).
     Always,
-    /// `cancelled()`: the run has cancellation desired.
     Cancelled,
-    /// `contains(haystack, needle)` on strings.
     Contains,
-    /// `starts_with(s, prefix)` on strings.
     StartsWith,
-    /// `ends_with(s, suffix)` on strings.
     EndsWith,
-    /// `hash_files('pattern', …)`: content hash of matching pinned-source files.
     HashFiles,
 }
 
@@ -129,7 +103,6 @@ pub enum BinOp {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expr {
     Lit(Value),
-    /// Dotted context path, e.g. `event.ref` or `needs.test.result`.
     Path(Vec<String>),
     Not(Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
@@ -162,8 +135,7 @@ impl Func {
     }
 }
 
-/// Canonical text: fully parenthesised binary operations, so printing and
-/// re-parsing yields the same tree and diagnostics show exactly what runs.
+/// Fully parenthesised, so printing and re-parsing yield the same tree.
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -207,7 +179,6 @@ impl fmt::Display for Template {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseError {
-    /// Byte offset into the expression text.
     pub at: usize,
     pub message: String,
 }
@@ -287,7 +258,6 @@ fn tokenize(src: &str) -> Result<Vec<(usize, Tok<'_>)>, ParseError> {
                 Tok::OrOr
             }
             b'\'' => {
-                // Single-quoted string; '' escapes a quote. No other escapes.
                 let mut s = String::new();
                 i += 1;
                 loop {
@@ -372,7 +342,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Precedence: || < && < (== !=) < unary !
     fn parse_or(&mut self, depth: usize) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_and(depth)?;
         while self.peek() == Some(&Tok::OrOr) {
@@ -400,7 +369,6 @@ impl<'a> Parser<'a> {
         };
         self.pos += 1;
         let rhs = self.parse_unary(depth)?;
-        // Non-associative: `a == b == c` is an error, not a surprise.
         if matches!(self.peek(), Some(Tok::EqEq | Tok::NotEq)) {
             return Err(self.err("comparisons cannot be chained; use parentheses"));
         }
@@ -508,8 +476,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Known context roots and their shapes. Unknown paths are compile errors so
-/// a typo cannot silently evaluate to null.
+/// Unknown paths are compile errors: a typo must not evaluate to null.
 fn validate_path(path: &[String]) -> Result<(), &'static str> {
     let seg = |i: usize| path.get(i).map(String::as_str);
     match (seg(0), seg(1), seg(2)) {
@@ -563,7 +530,6 @@ impl Expr {
         Ok(e)
     }
 
-    /// Earliest phase at which every part of this expression can resolve.
     pub fn min_phase(&self) -> Phase {
         match self {
             Expr::Lit(_) => Phase::Compile,
@@ -583,9 +549,6 @@ impl Expr {
         }
     }
 
-    /// Whether the expression calls `success()`, `failure()` or `always()`:
-    /// the job condition then states its own dependency policy, otherwise
-    /// the dependencies must have succeeded for it to run.
     pub fn uses_status_function(&self) -> bool {
         match self {
             Expr::Lit(_) | Expr::Path(_) => false,
@@ -598,10 +561,6 @@ impl Expr {
         }
     }
 
-    /// The set of types the expression can evaluate to, as `TY_*` bits.
-    /// Operators are checked on the way: a comparison between types that can
-    /// never match, or a boolean operator over something that is not always
-    /// a boolean, is an error here instead of at evaluation time.
     fn types(&self) -> Result<u8, &'static str> {
         let only = |e: &Expr, want: u8, message: &'static str| match e.types()? {
             t if t == want => Ok(()),
@@ -629,8 +588,6 @@ impl Expr {
                 Ok(TY_BOOL)
             }
             Expr::Bin(BinOp::Eq | BinOp::Ne, a, b) => {
-                // Null compares with anything; every other pair of types
-                // that can meet must be the same type.
                 let (a, b) = (a.types()? & !TY_NULL, b.types()? & !TY_NULL);
                 if a != 0 && b != 0 && (a | b).count_ones() > 1 {
                     return Err("comparison between different types");
@@ -650,8 +607,6 @@ impl Expr {
         }
     }
 
-    /// Reject a condition that is not always a boolean, so a job `if` can
-    /// never fail to evaluate on a type error once the dependencies finish.
     pub fn check_condition(&self) -> Result<(), &'static str> {
         match self.types()? {
             TY_BOOL => Ok(()),
@@ -659,7 +614,6 @@ impl Expr {
         }
     }
 
-    /// Job names referenced through `needs.<job>.result`.
     pub fn referenced_needs(&self, out: &mut Vec<String>) {
         match self {
             Expr::Path(p) if p[0] == "needs" => {
@@ -678,26 +632,20 @@ impl Expr {
     }
 }
 
-/// What the evaluator asks of its environment. Implementations return
-/// `Unresolved` for anything not known in their phase.
 pub trait Context {
     fn phase(&self) -> Phase;
-    /// Look up a validated context path.
     fn lookup(&self, path: &[String]) -> Lookup;
     fn dependency_summary(&self) -> Option<DependencySummary>;
     fn cancelled(&self) -> Option<bool>;
-    /// Resolve `hash_files` patterns; only called in `Phase::Worker`.
     fn hash_files(&self, patterns: &[&str]) -> Result<String, HashFilesError>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup {
     Value(Value),
-    /// Known path, value not available in this phase.
     Unresolved,
 }
 
-/// Aggregate of a job's dependencies for `success()`/`failure()`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DependencySummary {
     pub all_succeeded: bool,
@@ -706,7 +654,6 @@ pub struct DependencySummary {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HashFilesError {
-    /// Secure worker filesystem resolution is Linux-only.
     UnsupportedPlatform,
     TraversalLimit,
     DepthLimit,
@@ -714,21 +661,15 @@ pub enum HashFilesError {
     InvalidFileName,
     UnsafeFile,
     ChangedFile,
-    /// No file matched any pattern: a misconfiguration, never a silent key.
     NoMatch,
-    TooManyFiles {
-        limit: usize,
-    },
-    TooManyBytes {
-        limit: u64,
-    },
+    TooManyFiles { limit: usize },
+    TooManyBytes { limit: u64 },
     InvalidPattern(String),
     Io(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EvalError {
-    /// A path or function is not available in the current phase.
     Unresolved {
         phase: Phase,
         needs: Phase,
@@ -789,7 +730,6 @@ impl Expr {
             Expr::Not(e) => Ok(Value::Bool(!expect_bool(e.eval(ctx)?)?)),
             Expr::Bin(op, a, b) => match op {
                 BinOp::And => {
-                    // Short-circuit, but both sides must be booleans when evaluated.
                     if !expect_bool(a.eval(ctx)?)? {
                         return Ok(Value::Bool(false));
                     }
@@ -860,7 +800,6 @@ impl Expr {
     }
 }
 
-/// A string with `${{ … }}` interpolations, parsed once.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Template {
     pub parts: Vec<Part>,
@@ -929,7 +868,6 @@ impl Template {
         }
     }
 
-    /// Render with bounded output; null interpolations are errors.
     pub fn render(&self, ctx: &dyn Context, max_bytes: usize) -> Result<String, EvalError> {
         let mut out = String::new();
         for p in &self.parts {
