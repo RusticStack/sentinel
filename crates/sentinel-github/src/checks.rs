@@ -422,12 +422,20 @@ fn github_refusal(reply: &crate::http::Reply) -> Refusal {
 /// One bounded, control-free line from a GitHub error body.
 fn bounded_message(body: &Value) -> String {
     let text = body["message"].as_str().unwrap_or("invalid request");
-    text.chars()
+    let bounded = text
+        .chars()
         .filter(|c| !c.is_control())
         .take(120)
         .collect::<String>()
         .trim()
-        .to_owned()
+        .to_owned();
+    // An empty or control-only message must still leave a reason the store
+    // accepts (its column requires at least one character).
+    if bounded.is_empty() {
+        "invalid request".to_owned()
+    } else {
+        bounded
+    }
 }
 
 /// Minimal percent-encoding for a query value: names may contain spaces and
@@ -506,6 +514,20 @@ mod tests {
         assert!(payload(&check).is_ok());
         check.completed_at = Some(String::new());
         assert!(payload(&check).is_err());
+    }
+
+    #[test]
+    fn a_refusal_reason_is_never_empty_and_stays_bounded() {
+        for body in [
+            serde_json::json!({"message": ""}),
+            serde_json::json!({"message": "   "}),
+            serde_json::json!({"message": "\u{7}\n\t"}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(bounded_message(&body), "invalid request", "{body}");
+        }
+        let long = serde_json::json!({"message": "x".repeat(500)});
+        assert_eq!(bounded_message(&long).len(), 120);
     }
 
     #[test]
