@@ -14,6 +14,41 @@ export interface Me {
 
 export interface TenantChoice { slug: string; role: Role }
 
+/** `GET /me/security`: what the account page shows, metadata only. */
+export interface Security {
+  password: boolean;
+  mfa: { enrolled: boolean; pending: boolean; recovery_codes_remaining: number };
+  identities: { provider: string; linked_ms: number }[];
+  github_link: boolean;
+}
+
+/** A tenant member (`GET /tenants/{slug}/members`). */
+export interface Member {
+  user: string;
+  display_name: string;
+  username: string | null;
+  kind: "person" | "service";
+  role: Role;
+  active: boolean;
+}
+
+/** An OAuth grant as metadata (never a token). */
+export interface Grant {
+  id: string;
+  user: string;
+  client_id: string;
+  kind: string;
+  /** Space-separated scope names. */
+  scope: string;
+  tenant: string | null;
+  repo: string | null;
+  name: string | null;
+  created_ms: number;
+  expires_ms: number;
+  last_used_ms: number | null;
+  revoked: boolean;
+}
+
 export interface RunSummary {
   id: string;
   sha: string;
