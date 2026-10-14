@@ -1,4 +1,4 @@
-//! R04's recovery drill, measured: a deployment with 20,000 runs of
+//! The recovery drill, measured: a deployment with 20,000 runs of
 //! metadata, 2 GiB of artifacts in 2,048 objects plus 1,000 small ones and
 //! 200 finished logs of about 4 MiB is backed up online, backed up again (nothing
 //! changed), verified, and restored onto an empty data directory that is

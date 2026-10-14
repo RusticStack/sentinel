@@ -1,4 +1,4 @@
-//! Upgrades (R05): what a database needs before this build opens it, and the
+//! Upgrades: what a database needs before this build opens it, and the
 //! snapshot taken before any migration runs.
 //!
 //! Migrations are forward-only and each runs in its own transaction
@@ -147,19 +147,17 @@ pub fn snapshots(database: &Path) -> Vec<(u32, PathBuf)> {
 }
 
 /// Open the store, copying the database aside first when this build will
-/// migrate it. Returns the store and the snapshot it took, if any.
-///
-/// A migration that fails leaves the database at the last version that
-/// committed; the error then names the snapshot to roll back to
+/// migrate it. Returns the store and the snapshot it took, if any. A failed
+/// migration's error names the snapshot to roll back to
 /// ([`Error::MigrationFailed`]).
 pub fn open_upgrading(path: &Path, durability: Durability) -> Result<(Store, Option<PathBuf>)> {
     let inspection = inspect(path)?;
     let mut snapshot = None;
     if !inspection.fresh && !inspection.newer && !inspection.pending.is_empty() {
         let dest = snapshot_path(path, inspection.database);
-        // Written under a temporary name and renamed once durable (R07): a
-        // copy interrupted by a crash or a full disk is never taken for a
-        // complete one, and a rerun starts it again.
+        // Written under a temporary name and renamed once durable: a copy
+        // interrupted by a crash or a full disk is never taken for a complete
+        // one, and a rerun starts it again.
         let mut partial = dest.clone().into_os_string();
         partial.push(".partial");
         let partial = PathBuf::from(partial);

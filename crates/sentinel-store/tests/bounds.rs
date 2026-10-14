@@ -1,5 +1,4 @@
-//! Parts 01–02 audit gates C02/W02: the store's resource bounds and failure
-//! behavior before any request loop is attached. Stalled work, a panicking
+//! The store's resource bounds and failure behavior. Stalled work, a panicking
 //! closure, reader saturation, orderly shutdown and single-controller
 //! ownership are each exercised for real, with wall-clock bounds asserted.
 

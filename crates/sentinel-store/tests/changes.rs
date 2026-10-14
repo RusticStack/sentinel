@@ -1,6 +1,6 @@
-//! O05 store additions: the commit notifier that long polls park on, the
-//! keyset run pagination behind `run list --all`, the allocation-free run
-//! version, and the bounded literal log search.
+//! The commit notifier that long polls park on, the keyset run pagination
+//! behind `run list --all`, the allocation-free run version, and the bounded
+//! literal log search.
 
 use std::{
     collections::HashSet,
@@ -47,7 +47,7 @@ fn a_write_that_changes_nothing_does_not_advance_the_generation() {
     let (_dir, store) = store();
     let _ = repo(&store);
     let before = store.changes().generation();
-    // The intake lane's idle validation pass used to be exactly this.
+    // `resolve_due` with nothing due changes no row.
     let settled = store
         .writer()
         .write(|tx| sentinel_store::intake::resolve_due(tx, UnixMillis(5), 64))
@@ -313,7 +313,7 @@ fn run_pages_are_index_ranges() {
 
 #[test]
 fn the_run_version_recheck_reads_an_index_range_without_a_sort() {
-    // P09-17: a parked waiter re-checks up to 100 times a second under
+    // A parked waiter re-checks up to 100 times a second under
     // commit load; each re-check must not build a temporary B-tree.
     let (_dir, store) = store();
     store

@@ -1,4 +1,4 @@
-//! R04: an online backup of a store that keeps writing, verified end to end
+//! An online backup of a store that keeps writing, verified end to end
 //! and restored onto an empty data directory — objects, manifests, logs and
 //! the controller's files byte for byte, the master key required and checked
 //! when sealed values exist — corruption and loss caught by verification,
@@ -462,7 +462,7 @@ fn backup_ids_sort_by_time() {
     ));
 }
 
-/// R07: a backup interrupted part-way (its staging directory and a
+/// A backup interrupted part-way (its staging directory and a
 /// half-copied object left behind) is never listed, the next backup removes
 /// what it left and succeeds, an object the data directory lost is recorded
 /// instead of failing the backup, and pruning removes the stray part file.
