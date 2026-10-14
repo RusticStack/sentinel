@@ -1,8 +1,3 @@
-//! Execution hardening: terminal edges decide dependents,
-//! a recorded cancel settles an offer that goes back, hand-backs are fenced
-//! and never infrastructure failures, specs wait for a durable
-//! acknowledgement, expiry re-checks the lease, and every hello renegotiates.
-
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
     AttemptId, Event, FailureClass, Fence, JobId, JobState, Outcome, PoolId, RepoId, RunId,
@@ -180,8 +175,6 @@ fn run_state(f: &Fixture, run: RunId) -> RunState {
         .unwrap()
 }
 
-/// Cancelling one unstarted job decides its dependents in the same
-/// transaction; the run finishes instead of waiting forever.
 #[test]
 fn cancelling_an_unstarted_job_skips_its_dependents_and_ends_the_run() {
     let f = fixture();
@@ -201,9 +194,6 @@ fn cancelling_an_unstarted_job_skips_its_dependents_and_ends_the_run() {
     assert_eq!(run_state(&f, run_id), RunState::Terminal(Outcome::Canceled));
 }
 
-/// A cancel recorded while the offer is unacknowledged settles the
-/// job as soon as the offer lapses or is declined; it never waits in the
-/// queue for a placement it cannot get.
 #[test]
 fn a_cancel_recorded_while_offered_ends_the_job_when_the_offer_goes_back() {
     let f = fixture();
@@ -245,9 +235,6 @@ fn a_cancel_recorded_while_offered_ends_the_job_when_the_offer_goes_back() {
     );
 }
 
-/// A decline is fenced on the holder, and an acknowledged
-/// attempt the worker never started (its spec never arrived) goes back to
-/// the queue: not an infrastructure failure, and not after a lease wait.
 #[test]
 fn a_decline_is_fenced_and_hands_back_an_acknowledged_attempt_that_never_started() {
     let f = fixture();
@@ -256,7 +243,6 @@ fn a_decline_is_fenced_and_hands_back_an_acknowledged_attempt_that_never_started
     let offer = place(&f, w, at(2_100));
     ack(&f, w, &offer, at(2_150));
     let (attempt, fence) = (offer.attempt, offer.fence);
-    // Another worker naming the attempt, or a stale fence, changes nothing.
     for (who, fence) in [(other, fence), (w, Fence(fence.0 + 1))] {
         assert!(matches!(
             f.store
@@ -266,8 +252,6 @@ fn a_decline_is_fenced_and_hands_back_an_acknowledged_attempt_that_never_started
         ));
     }
     assert_eq!(state(&f, offer.job), JobState::Leased);
-    // The holder hands it back: queued again, capacity released, and the
-    // next placement is a new attempt under a higher fence.
     assert_eq!(
         f.store
             .writer()
@@ -284,7 +268,6 @@ fn a_decline_is_fenced_and_hands_back_an_acknowledged_attempt_that_never_started
     let again = place(&f, w, at(2_400));
     assert_eq!(again.job, ids[0]);
     assert!(again.fence.0 > fence.0);
-    // Once the worker reported a phase the attempt ran: no hand-back.
     ack(&f, w, &again, at(2_500));
     let (attempt, fence) = (again.attempt, again.fence);
     f.store
@@ -311,9 +294,6 @@ fn a_decline_is_fenced_and_hands_back_an_acknowledged_attempt_that_never_started
     assert_eq!(state(&f, ids[0]), JobState::Preparing);
 }
 
-/// Nothing that could start work is served before the
-/// acknowledgement is durable; a cancelled, unstarted attempt is named so
-/// the controller settles it instead of serving it.
 #[test]
 fn the_spec_is_served_only_after_the_acknowledgement() {
     let f = fixture();
@@ -359,7 +339,6 @@ fn the_spec_is_served_only_after_the_acknowledgement() {
         .write(move |tx| dispatch::cancel(tx, tenant, job, at(2_300)))
         .unwrap();
     assert_eq!(gate(&f), dispatch::SpecGate::Canceled(fence));
-    // The controller settles it through the hand-back: canceled at once.
     f.store
         .writer()
         .write(move |tx| dispatch::decline(tx, w, attempt, fence, at(2_400)))
@@ -367,8 +346,6 @@ fn the_spec_is_served_only_after_the_acknowledgement() {
     assert_eq!(state(&f, job), JobState::Terminal(Outcome::Canceled));
 }
 
-/// A renewal that commits after the sweep read the attempt as due
-/// wins; the batch expiry re-checks the lease in its own write.
 #[test]
 fn expiry_rechecks_the_lease_in_its_write() {
     let f = fixture();
@@ -381,8 +358,6 @@ fn expiry_rechecks_the_lease_in_its_write() {
     let due = f.store.read(|c| dispatch::expired_scoped(c, late)).unwrap();
     assert_eq!(due.len(), 1);
     assert_eq!((due[0].0, due[0].2), (attempt, offer.job));
-    // The worker renews at its deadline; that write commits only after the
-    // sweep's read (a renewal of an already-passed lease is refused).
     let deadline = at(late.0 - 1);
     f.store
         .writer()
@@ -397,7 +372,6 @@ fn expiry_rechecks_the_lease_in_its_write() {
         0
     );
     assert_eq!(state(&f, offer.job), JobState::Leased);
-    // Past the renewed lease it expires, and a durable end is recorded.
     let later = at(late.0 + dispatch::DEFAULT_LEASE_MS + 1);
     assert_eq!(
         f.store
@@ -424,8 +398,6 @@ fn expiry_rechecks_the_lease_in_its_write() {
     assert_eq!(state_code, dispatch::LogState::Complete as i64);
 }
 
-/// A worker's `canceled` with no cancel ever requested is its own
-/// infrastructure event (a watchdog, a shutdown), never the user's verdict.
 #[test]
 fn a_canceled_report_without_a_request_is_not_recorded_as_a_cancel() {
     let f = fixture();
@@ -458,12 +430,8 @@ fn a_canceled_report_without_a_request_is_not_recorded_as_a_cancel() {
     assert_eq!(row.failure_class, Some(FailureClass::Runtime));
 }
 
-/// Disk is judged by what the worker's protocol can state, not by whether the
-/// figure is zero: a worker too old to report disk is admitted on CPU and
-/// memory (every other test here), while a profile-protocol worker whose disk
-/// is zero offers none, so a job declaring scratch disk (all of them) does
-/// not place on it until it reports some. A rollback below the profile
-/// protocol forgets the figure it can no longer refresh.
+// A profile-protocol worker reporting zero disk offers none; a worker too old to report disk is admitted on CPU and memory alone.
+// A rollback below the profile protocol forgets the disk figure it can no longer refresh.
 #[test]
 fn zero_disk_from_a_profile_worker_is_none_not_unlimited() {
     let f = fixture();
@@ -509,8 +477,6 @@ fn zero_disk_from_a_profile_worker_is_none_not_unlimited() {
     );
 }
 
-/// A summary over the column's cap must not turn a passing report into a
-/// lease expiry: the verdict stands and the attempt simply records no summary.
 #[test]
 fn an_oversized_summary_is_dropped_and_the_pass_stands() {
     let f = fixture();
@@ -519,14 +485,11 @@ fn an_oversized_summary_is_dropped_and_the_pass_stands() {
     let offer = place(&f, w, at(2_100));
     ack(&f, w, &offer, at(2_200));
     let (attempt, fence) = (offer.attempt, offer.fence);
-    // Inside the 64 KiB control frame, above the 32 KiB summary cap.
     let big = vec![7u8; 48 * 1024];
     let next = f
         .store
         .writer()
         .write(move |tx| {
-            // A pass is reported from finalization, after the worker has
-            // walked the earlier states; only the last report has a summary.
             for (ms, event) in [
                 (2_210, Event::PreparationStarted),
                 (2_220, Event::StepsStarted),
@@ -555,9 +518,6 @@ fn an_oversized_summary_is_dropped_and_the_pass_stands() {
     assert_eq!(stored, None);
 }
 
-/// Every hello renegotiates; an upgrade and a rollback are both
-/// recorded, a rollback below the profile protocol forgets profile-only
-/// placement facts, and a different architecture is not the same worker.
 #[test]
 fn renegotiation_records_upgrades_and_rollbacks_but_not_a_new_architecture() {
     let f = fixture();
@@ -614,7 +574,6 @@ fn renegotiation_records_upgrades_and_rollbacks_but_not_a_new_architecture() {
     ));
 }
 
-/// A refused enrollment is audited and the audit row commits.
 #[test]
 fn a_refused_enrollment_is_audited() {
     let f = fixture();

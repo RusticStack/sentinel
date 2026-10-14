@@ -1,28 +1,3 @@
-//! Store-level placement load — 100 worker identities and 10,000 queued
-//! jobs, with capacity actually held.
-//!
-//! What it measures: the scheduler and the SQLite write path alone. No TLS
-//! session, container, checkout or step runs; workers are rows. The
-//! dispatcher's structure is reproduced: rounds in which every worker that
-//! can still take work is offered one job, all in one writer transaction.
-//! Offers are acknowledged and **held** — capacity fills exactly as a real
-//! fleet's does, so every placement's free-capacity sums, fairness probes
-//! and candidate scans run against a loaded fleet. When no worker can take
-//! more, the held work completes (a terminal report per attempt, freeing its
-//! reservation) and the next wave places. The mix is realistic rather than
-//! uniform: four tenants (one noisy, with 70 % of the jobs) over three
-//! repositories each, a share of pull-request runs (the PR reserve and its
-//! probe are live), label-constrained jobs only half the fleet can run, and
-//! identities paired on shared hosts (host-level reservation is live).
-//!
-//! Reported (one JSON line, also appended to `$SENTINEL_BENCH_OUT` when set):
-//! per-placement latency p50/p95/p99/max, queue wait (enqueue to placement)
-//! p50/p95/p99/max, throughput, waves and rounds, placement failures, and on
-//! Linux the process's CPU time, peak RSS and I/O bytes. What it does not
-//! cover: the 100 real TLS sessions — that is `sentinel-link`'s
-//! `fleet_sessions.rs`, a separate test (100 sessions × 200 jobs) — and
-//! any executor work.
-
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
@@ -48,21 +23,15 @@ use sentinel_store::{
 const WORKERS: usize = 100;
 const JOBS_PER_RUN: usize = 50;
 const RUNS: usize = 200;
-/// Two hundred runs of fifty jobs: ten thousand queued jobs.
 const JOBS: usize = RUNS * JOBS_PER_RUN;
 const TENANTS: usize = 4;
 const REPOS_PER_TENANT: usize = 3;
-/// Every tenth run is a pull request.
 const PR_EVERY: usize = 10;
-/// Every eighth run's jobs need the `ssd` label, which half the fleet has.
 const LABELED_EVERY: usize = 8;
 const NOW: UnixMillis = UnixMillis(1_000);
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-/// Each identity reports its host's whole capacity (the documented model),
-/// and two identities share each host, so a pair holds 32 quarter-core jobs
-/// between them, not 64.
 const WORKER_CAPACITY: dispatch::Capacity = dispatch::Capacity {
     cpu_millis: 8_000,
     memory_bytes: 16 << 30,
@@ -89,8 +58,6 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[index]
 }
 
-/// The process's CPU time (ms), peak RSS (KiB) and read/written bytes from
-/// `/proc/self`; absent where unmeasured.
 fn process_usage() -> serde_json::Value {
     #[cfg(target_os = "linux")]
     {
@@ -132,7 +99,6 @@ struct Fleet {
     pool: PoolId,
     workers: Vec<WorkerId>,
     tenants: Vec<TenantId>,
-    /// `(tenant, job)` → when it was enqueued (all at the start).
     jobs: usize,
 }
 
@@ -215,9 +181,6 @@ fn fleet() -> Fleet {
         })
         .unwrap();
 
-    // Ten thousand jobs: the noisy tenant (0) owns 70 % of the runs, the
-    // three quiet tenants 10 % each; runs round-robin over each tenant's
-    // repositories.
     let plain = RunSpec::new(
         PinnedSource::new("https://github.com/o/r.git", SHA, Some("refs/heads/main")).unwrap(),
         compile_str(&run_yaml(false)).unwrap(),
@@ -306,8 +269,6 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
             "placement stalled at {} of {JOBS}",
             placed.len()
         );
-        // Fill: rounds of one placement per still-hungry worker, one writer
-        // transaction per round, held — as the controller's pass does.
         let mut active = f.workers.clone();
         let mut held: Vec<(WorkerId, dispatch::Offer)> = Vec::new();
         while !active.is_empty() {
@@ -353,7 +314,6 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
             "wave {waves} placed nothing with {} left",
             JOBS - placed.len()
         );
-        // Capacity really was held: no host went negative.
         for worker in &f.workers {
             let worker = *worker;
             let free = f
@@ -368,7 +328,6 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
             placed.len(),
             started.elapsed()
         );
-        // Complete the wave: every held attempt ends, its reservation frees.
         for chunk in held.chunks(256) {
             let chunk: Vec<(WorkerId, dispatch::Offer)> = chunk.to_vec();
             f.store
@@ -394,8 +353,6 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
     let elapsed = started.elapsed();
     assert_eq!(placed.len(), JOBS);
 
-    // Fairness is observable here because demand exceeds one wave: each
-    // quiet tenant (10 % of the jobs) got at least its share of the first.
     let first_total: usize = first_wave.values().sum();
     for tenant in &f.tenants[1..] {
         let share = first_wave.get(tenant).copied().unwrap_or(0);
@@ -449,8 +406,6 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
         writeln!(file, "{report}").unwrap();
     }
 
-    // A ceiling to catch a quadratic placement scan or a stalled wave, not
-    // a latency claim; measured numbers are in bench/q09-fleet-load.jsonl.
     const BOUND: Duration = Duration::from_secs(180);
     assert!(
         elapsed < BOUND,
@@ -458,9 +413,6 @@ fn one_hundred_workers_drain_ten_thousand_jobs_with_bounded_runtime() {
     );
 }
 
-/// `GET /queue`'s store work for a tenant with 5,000 queued jobs and 20
-/// connected 8-core workers, at the route's default and maximum page sizes.
-/// The page is cut in the query and only its jobs are explained.
 #[test]
 #[ignore = "P08-8 listing cost: cargo test --release -p sentinel-store --test fleet_load -- --ignored --nocapture"]
 fn listing_a_five_thousand_job_queue_explains_only_the_page() {

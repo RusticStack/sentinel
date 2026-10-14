@@ -1,6 +1,3 @@
-//! Verified email identity, email invitations and the mail outbox: the
-//! behavior a person or an attacker can observe, and the failure paths.
-
 use std::sync::Arc;
 
 use rusqlite::params;
@@ -68,8 +65,6 @@ impl Fixture {
         Arc::new(Key::load(&path).unwrap())
     }
 
-    /// A link-form invitation that admits one account to a deployment that is
-    /// invite-only by default.
     fn admission(&self) -> Secret {
         let admin = self.admin;
         self.store
@@ -103,7 +98,6 @@ impl Fixture {
         }
     }
 
-    /// The operator's way to a link: host-local, for a deployment without Resend.
     fn link(&self, user: UserId, address: Option<&'static str>, now: i64) -> Secret {
         self.store
             .writer()
@@ -181,7 +175,6 @@ fn an_address_signs_in_only_after_it_is_verified_and_in_any_spelling() {
     let invitation = f.admission();
     let user = f.user_of(f.sign_up("Ana.Lima@Example.COM", &invitation, None));
 
-    // The claim is recorded canonically, and is not yet an identity.
     assert_eq!(
         f.address_of(user),
         Some(("ana.lima@example.com".to_owned(), false))
@@ -197,11 +190,9 @@ fn an_address_signs_in_only_after_it_is_verified_and_in_any_spelling() {
         f.address_of(user),
         Some(("ana.lima@example.com".to_owned(), true))
     );
-    // Any spelling of the verified address, with the one password.
     assert!(f.sign_in("ana.lima@example.com"));
     assert!(f.sign_in("  ANA.LIMA@example.com"));
     assert!(!f.sign_in("someone.else@example.com"));
-    // The generated username keeps working beside it.
     let username = f
         .store
         .read(|conn| local_auth::username_of(conn, user))
@@ -259,21 +250,17 @@ fn a_verification_link_is_single_use_and_expires() {
     let user = f.user_of(f.sign_up("one@example.com", &f.admission(), None));
 
     let first = f.link(user, None, 20);
-    // A newer link voids the older one.
     let second = f.link(user, None, 30);
     assert_eq!(f.confirm(&first, 31), Confirmation::Refused);
     assert!(matches!(
         f.confirm(&second, 32),
         Confirmation::Verified { .. }
     ));
-    // Replaying the spent link verifies nothing and changes nothing.
     assert_eq!(f.confirm(&second, 33), Confirmation::Refused);
 
-    // Expiry: a link is dead one millisecond past its life.
     let other = f.user_of(f.sign_up("two@example.com", &f.admission(), None));
     let link = f.link(other, None, 100);
     assert_eq!(f.confirm(&link, 100 + TTL), Confirmation::Refused);
-    // An unknown secret is the same refusal.
     assert_eq!(f.confirm(&Secret::generate(), 101), Confirmation::Refused);
     assert_eq!(
         f.address_of(other),
@@ -309,7 +296,6 @@ fn only_the_digest_of_a_token_is_stored() {
 fn the_first_account_to_verify_an_address_owns_it_and_a_claim_alone_blocks_nobody() {
     let f = fixture();
     let squatter = f.user_of(f.sign_up("victim@example.com", &f.admission(), None));
-    // A claim does not stop the real owner from registering the address.
     let owner = f.user_of(f.sign_up("victim@example.com", &f.admission(), None));
     assert_ne!(squatter, owner);
 
@@ -319,8 +305,6 @@ fn the_first_account_to_verify_an_address_owns_it_and_a_claim_alone_blocks_nobod
         f.confirm(&owners_link, 22),
         Confirmation::Verified { .. }
     ));
-    // The squatter's proof arrives second and gets nothing: the address is
-    // verified elsewhere, and their claim was cleared by the owner's proof.
     assert_eq!(f.confirm(&squatters_link, 23), Confirmation::Refused);
     assert_eq!(f.address_of(squatter), None);
     assert_eq!(
@@ -328,14 +312,11 @@ fn the_first_account_to_verify_an_address_owns_it_and_a_claim_alone_blocks_nobod
         Some(("victim@example.com".to_owned(), true))
     );
 
-    // From now on registering that address is refused, with the refusal the
-    // API answers exactly as it answers a new address.
     let again = f.sign_up("VICTIM@example.com", &f.admission(), None);
     assert!(matches!(
         again,
         Admission::Refused(Refusal::AlreadyRegistered)
     ));
-    // And no operator link can verify it for a third account either.
     let third = f.user_of(f.sign_up("third@example.com", &f.admission(), None));
     let refused = f
         .store
@@ -363,7 +344,6 @@ fn changing_an_address_keeps_the_old_one_until_the_new_one_is_proved() {
         Confirmation::Verified { .. }
     ));
 
-    // Ask to move to a new address: nothing about the account changes yet.
     let proof = f.link(user, Some("new@example.com"), 30);
     assert_eq!(
         f.address_of(user),
@@ -397,27 +377,22 @@ fn resends_are_throttled_per_account_and_never_tell_an_address_apart() {
             .write(move |tx| email::resend(tx, None, user, at(now)))
             .unwrap()
     };
-    // Sign-up minted the first link; four more fit in the window.
     for second in 0..(email::RESENDS_PER_WINDOW - 1) {
         assert_eq!(resend(100 + second), Requested::Undelivered);
     }
     assert_eq!(resend(200), Requested::Throttled);
-    // The window slides: an hour later the account may ask again.
     assert_eq!(
         resend(200 + email::RESEND_WINDOW_MS + 1),
         Requested::Undelivered
     );
 
-    // The unauthenticated form: a pending address, a verified one and an
-    // unknown one all succeed without error; the store never refuses on the
-    // address, so the API can answer one way.
+    // The store never refuses on the address, so the API answers the same way for every address.
     for address in ["busy@example.com", "ghost@example.com", "Ghost@Example.COM"] {
         f.store
             .writer()
             .write(move |tx| email::resend_for_address(tx, None, address, at(10_000_000)))
             .unwrap();
     }
-    // A malformed address is a validation error, not an oracle.
     let error = f
         .store
         .writer()
@@ -452,13 +427,11 @@ fn a_queued_message_is_sealed_delivered_once_and_its_body_deleted() {
         })
         .unwrap();
     assert!(!stored.windows(10).any(|w| w == b"verify-ema"));
-    // A different key cannot open it.
     let other_dir = tempfile::tempdir().unwrap();
     let other_path = other_dir.path().join("master.key");
     Key::create(&other_path).unwrap();
     assert!(due[0].open(&Key::load(&other_path).unwrap()).is_none());
 
-    // The link in the message verifies the account.
     let token = message
         .body
         .split("#token=")
@@ -493,7 +466,6 @@ fn a_queued_message_is_sealed_delivered_once_and_its_body_deleted() {
         })
         .unwrap();
     assert!(body_left.is_none(), "a delivered message keeps no link");
-    // Settling twice is a conflict, not a second delivery record.
     let again = f
         .store
         .writer()
@@ -504,7 +476,6 @@ fn a_queued_message_is_sealed_delivered_once_and_its_body_deleted() {
 #[test]
 fn without_delivery_or_a_key_nothing_is_queued() {
     let f = fixture();
-    // Delivery on, but no key: the link is not queued readable.
     email::set_delivery(&f.store, true, Some("https://ci.example.com"), at(1)).unwrap();
     f.user_of(f.sign_up("nokey@example.com", &f.admission(), None));
     assert!(
@@ -513,7 +484,6 @@ fn without_delivery_or_a_key_nothing_is_queued() {
             .unwrap()
             .is_empty()
     );
-    // A key, but delivery off.
     email::set_delivery(&f.store, false, Some("https://ci.example.com"), at(2)).unwrap();
     f.user_of(f.sign_up("off@example.com", &f.admission(), Some(f.key())));
     assert!(
@@ -523,7 +493,6 @@ fn without_delivery_or_a_key_nothing_is_queued() {
             .is_empty()
     );
     assert!(!f.store.read(email::delivery_enabled).unwrap());
-    // Enabling delivery needs a URL to build links on.
     assert!(email::set_delivery(&f.store, true, None, at(3)).is_err());
 }
 
@@ -552,7 +521,6 @@ fn failed_delivery_backs_off_and_gives_up_without_keeping_the_link() {
                 let wait = next_attempt_ms - now;
                 assert!(wait >= last_wait, "backoff never shrinks");
                 last_wait = wait;
-                // Not due before its time, due at it.
                 assert!(
                     f.store
                         .read(|c| email::due(c, at(now), 10))
@@ -603,11 +571,8 @@ fn a_retry_after_pushes_the_next_attempt_out_but_is_bounded() {
         } => next_attempt_ms - now,
         email::Retry::GaveUp => panic!("gave up"),
     };
-    // Longer than the back-off: honored.
     assert_eq!(wait(120_000, 100), 120_000);
-    // Shorter than the back-off: the back-off stands.
     assert!(wait(1, 200) >= email::backoff_ms(2));
-    // An absurd request is capped.
     assert_eq!(wait(i64::MAX, 300), email::MAX_RETRY_AFTER_MS);
 }
 
@@ -616,7 +581,6 @@ fn a_mailbox_cannot_be_buried_in_messages() {
     let f = fixture();
     let key = f.key();
     email::set_delivery(&f.store, true, Some("https://ci.example.com"), at(1)).unwrap();
-    // Many accounts, one victim address: the recipient ceiling holds.
     for n in 0..(email::RECIPIENT_PER_WINDOW + 3) {
         let invitation = f.admission();
         let admission = registration::register_with(
@@ -647,12 +611,10 @@ fn an_email_invitation_joins_only_when_its_mailbox_is_verified() {
     );
     let secret = &invited.invitation.secret;
 
-    // Someone proving a different mailbox cannot use it.
     assert!(matches!(
         f.sign_up("other@example.com", secret, None),
         Admission::Refused(Refusal::InvitationUnusable)
     ));
-    // Neither can an applicant who proves no mailbox at all.
     let wrong_kind = registration::register(
         &f.store,
         Applicant::Local {
@@ -669,13 +631,10 @@ fn an_email_invitation_joins_only_when_its_mailbox_is_verified() {
         Admission::Refused(Refusal::InvitationUnusable)
     ));
 
-    // The addressed person registers with the link and the mailbox...
     let user = match f.sign_up("guest@example.com", secret, None) {
         Admission::Pending(user) => user,
         other => panic!("an address-bound invitation admits only on proof: {other:?}"),
     };
-    // ...but holds nothing, and is not even an active account, until the
-    // mailbox is proved: a leaked link alone yields neither.
     assert_eq!(f.role_in(f.tenant, user), 0);
     assert!(!f.sign_in("guest@example.com"));
     let link = f.link(user, None, 20);
@@ -684,11 +643,9 @@ fn an_email_invitation_joins_only_when_its_mailbox_is_verified() {
         other => panic!("{other:?}"),
     }
     assert_eq!(f.role_in(f.tenant, user), Role::Reader as i64);
-    // The proof was the admission.
     assert!(f.sign_in("guest@example.com"));
     assert!(f.events().contains(&Event::RegistrationAdmitted));
 
-    // One use: the link is spent, and a second person cannot take it.
     assert!(matches!(
         f.sign_up("guest@example.com", secret, None),
         Admission::Refused(Refusal::InvitationUnusable)
@@ -708,14 +665,12 @@ fn an_existing_account_accepts_an_invitation_by_proving_the_mailbox() {
         Confirmation::Verified { .. }
     ));
 
-    // Addressed to the verified address: joins at once.
     let own = f.email_invitation("member@example.com");
     let accepted =
         registration::accept_invitation(&f.store, user, &own.invitation.secret, None, at(30))
             .unwrap();
     assert_eq!(accepted, Accepted::Joined(f.tenant));
     assert_eq!(f.role_in(f.tenant, user), Role::Reader as i64);
-    // Spent: the same link does nothing for anyone now.
     let again =
         registration::accept_invitation(&f.store, user, &own.invitation.secret, None, at(31))
             .unwrap();
@@ -724,8 +679,6 @@ fn an_existing_account_accepts_an_invitation_by_proving_the_mailbox() {
         Accepted::AlreadyMember | Accepted::Unusable
     ));
 
-    // A username account with no address: accepting claims the invited
-    // address and sends a verification; the join waits for it.
     let other_invitation = f.admission();
     let old = f.user_of(
         match registration::register(
@@ -797,7 +750,6 @@ fn a_link_form_invitation_still_joins_an_existing_account_at_once() {
         registration::accept_invitation(&f.store, user, &invitation.secret, None, at(6)).unwrap();
     assert_eq!(outcome, Accepted::Joined(f.tenant));
     assert_eq!(f.role_in(f.tenant, user), Role::Operator as i64);
-    // Unknown, and a secret that is not an invitation at all, look alike.
     let nothing =
         registration::accept_invitation(&f.store, user, &Secret::generate(), None, at(7)).unwrap();
     assert_eq!(nothing, Accepted::Unusable);
@@ -843,7 +795,6 @@ fn a_github_backed_organization_refuses_email_invitations() {
         matches!(refused, Err(Error::InvalidInput(_))),
         "{refused:?}"
     );
-    // Nothing was written for it.
     let invitations: i64 = f
         .store
         .read(|conn| {
@@ -862,7 +813,6 @@ fn a_github_backed_organization_refuses_email_invitations() {
 fn an_email_invitation_requires_an_organization_a_valid_address_and_the_inviters_authority() {
     let f = fixture();
     let admin = f.admin;
-    // No organization named.
     let orgless = f
         .store
         .writer()
@@ -878,7 +828,6 @@ fn an_email_invitation_requires_an_organization_a_valid_address_and_the_inviters
         })
         .map(|_| ());
     assert!(matches!(orgless, Err(Error::InvalidInput(_))));
-    // A malformed address.
     let (tenant, admin) = (f.tenant, f.admin);
     let malformed = f
         .store
@@ -899,7 +848,6 @@ fn an_email_invitation_requires_an_organization_a_valid_address_and_the_inviters
         })
         .map(|_| ());
     assert!(matches!(malformed, Err(Error::InvalidInput(_))));
-    // An ordinary member cannot invite.
     let member = f.user_of(f.sign_up("plain@example.com", &f.admission(), None));
     let principal = Principal::new(member, P::REPOSITORY.union(P::TENANT_ADMIN), None, None);
     let tenant = f.tenant;
@@ -997,7 +945,6 @@ fn an_unknown_account_or_one_claiming_no_address_cannot_be_given_a_link() {
         })
         .map(|_| ());
     assert!(matches!(result, Err(Error::NotFound)));
-    // An account that claims no address has nothing to prove unless one is named.
     let invitation = f.admission();
     let local = f.user_of(
         match registration::register(
@@ -1028,7 +975,6 @@ fn an_unknown_account_or_one_claiming_no_address_cannot_be_given_a_link() {
 fn the_operator_can_vouch_for_an_address_and_only_a_platform_authority_can() {
     let f = fixture();
     let user = f.user_of(f.sign_up("vouched@example.com", &f.admission(), None));
-    // A non-platform credential cannot.
     let nobody = Principal::new(user, P::REPOSITORY, None, None);
     let denied = f
         .store

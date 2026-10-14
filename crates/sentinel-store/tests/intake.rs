@@ -1,8 +1,3 @@
-//! Store behavior: acceptance is deduplicated and bounded, hook
-//! secrets are digest-only and rotatable, GitHub targets resolve only through
-//! a bound installation, resolution settles every case with an explicit reason
-//! under a bounded retry budget, and a ready delivery dispatches one immutable
-//! run with its provenance.
 use rusqlite::Connection;
 use sentinel_auth::sealed::Key;
 use sentinel_core::{
@@ -35,7 +30,6 @@ struct Fixture {
     alice: Principal,
     tenant: TenantId,
     repo: RepoId,
-    /// A second repository of the same tenant: ownership mismatch cases.
     other: RepoId,
 }
 
@@ -168,27 +162,21 @@ fn acceptance_is_deduplicated_and_redelivery_is_an_acknowledgement() {
         panic!("first acceptance must be fresh");
     };
     assert_eq!(fetch(&f, id).state, State::Pending);
-    // Redelivery with identical terms: acknowledged, nothing new stored.
     assert_eq!(
         accept(&mut f, "push-1", REF, SHA_A, SHA_B),
         Accepted::Duplicate(id)
     );
     assert_eq!(count(&f), 1);
     assert_eq!(fetch(&f, id).state, State::Pending);
-    // The same identity with different content is a sender bug, not a replay.
     assert!(matches!(
         accept_err(&mut f, "push-1", "refs/heads/other", SHA_B),
         Error::Conflict
     ));
-    // The same content under a new identity is a distinct transition: a ref
-    // returning to an earlier commit is reported, not deduplicated away.
     let Accepted::Fresh(second) = accept(&mut f, "push-2", REF, SHA_B, SHA_A) else {
         panic!("distinct delivery must be fresh");
     };
     assert_ne!(second, id);
 
-    // A revoked binding refuses events and loses its hook secret in the same
-    // transaction.
     let tx = f.conn.transaction().unwrap();
     intake::issue_token(&tx, Authority::HostLocal, f.repo, NOW).unwrap();
     sources::revoke(
@@ -255,8 +243,6 @@ fn the_admission_bound_refuses_new_events_but_still_acknowledges_duplicates() {
         accept_err(&mut f, "one-too-many", REF, SHA_B),
         Error::Overloaded
     ));
-    // A duplicate of a pending delivery is not new work: it stays an
-    // acknowledgement even at the bound.
     let existing: DeliveryId = f
         .conn
         .query_row(
@@ -283,7 +269,6 @@ fn hook_secrets_are_digest_only_rotatable_and_revocable() {
         Some((f.tenant, f.repo))
     );
     assert_eq!(intake::token_issued(&f.conn, f.repo).unwrap(), Some(NOW));
-    // Digest only: the stored blob is not the secret's text form.
     let stored: Vec<u8> = f
         .conn
         .query_row("SELECT token_digest FROM source_intake_tokens", [], |r| {
@@ -294,13 +279,11 @@ fn hook_secrets_are_digest_only_rotatable_and_revocable() {
     let mut text = String::new();
     first.expose(&mut text);
     assert_ne!(stored, text.as_bytes());
-    // An unrelated secret authenticates nothing.
     assert_eq!(
         intake::authenticate(&f.conn, &sentinel_auth::secret::Secret::generate()).unwrap(),
         None
     );
 
-    // Rotation: the previous secret stops working the moment it commits.
     let tx = f.conn.transaction().unwrap();
     let second = intake::issue_token(&tx, Authority::HostLocal, f.repo, NOW).unwrap();
     tx.commit().unwrap();
@@ -310,7 +293,6 @@ fn hook_secrets_are_digest_only_rotatable_and_revocable() {
         Some((f.tenant, f.repo))
     );
 
-    // Revocation is final, and revoking nothing is NotFound.
     let tx = f.conn.transaction().unwrap();
     intake::revoke_token(&tx, Authority::HostLocal, f.repo, NOW).unwrap();
     tx.commit().unwrap();
@@ -323,8 +305,6 @@ fn hook_secrets_are_digest_only_rotatable_and_revocable() {
     ));
     tx.rollback().unwrap();
 
-    // Attribution is audited: the credentialed issue names the account, the
-    // host-local ones name nobody.
     let (action, actor): (String, Option<[u8; 16]>) = f
         .conn
         .query_row(
@@ -336,7 +316,6 @@ fn hook_secrets_are_digest_only_rotatable_and_revocable() {
     assert_eq!(action, "hook-token");
     assert_eq!(actor, Some(*f.alice.user.as_bytes()));
 
-    // A suspended tenant's secret authenticates nothing.
     let tx = f.conn.transaction().unwrap();
     let third = intake::issue_token(&tx, Authority::HostLocal, f.repo, NOW).unwrap();
     tx.commit().unwrap();
@@ -361,7 +340,6 @@ fn github_targets_resolve_only_through_a_bound_installation() {
         permissions_valid: true,
         expected,
     };
-    // A known installation, before any binding: authorizes nothing.
     let tx = f.conn.transaction().unwrap();
     let installation = sources_forge::refresh(&tx, snapshot(0, false), NOW).unwrap();
     tx.commit().unwrap();
@@ -393,7 +371,6 @@ fn github_targets_resolve_only_through_a_bound_installation() {
         intake::github_target(&f.conn, "42", 91).unwrap(),
         (f.tenant, f.repo)
     );
-    // A different repository or installation resolves nothing.
     assert!(matches!(
         intake::github_target(&f.conn, "42", 92),
         Err(Error::NotFound)
@@ -402,7 +379,6 @@ fn github_targets_resolve_only_through_a_bound_installation() {
         intake::github_target(&f.conn, "43", 91),
         Err(Error::NotFound)
     ));
-    // A suspended installation authorizes nothing.
     let tx = f.conn.transaction().unwrap();
     sources_forge::refresh(&tx, snapshot(1, true), NOW).unwrap();
     tx.commit().unwrap();
@@ -410,7 +386,6 @@ fn github_targets_resolve_only_through_a_bound_installation() {
         intake::github_target(&f.conn, "42", 91),
         Err(Error::NotFound)
     ));
-    // A revoked binding authorizes nothing.
     let tx = f.conn.transaction().unwrap();
     sources_forge::refresh(&tx, snapshot(2, false), NOW).unwrap();
     sources::revoke(
@@ -427,7 +402,6 @@ fn github_targets_resolve_only_through_a_bound_installation() {
         intake::github_target(&f.conn, "42", 91),
         Err(Error::NotFound)
     ));
-    // A suspended tenant authorizes nothing either.
     let tx = f.conn.transaction().unwrap();
     sources_forge::refresh(&tx, snapshot(3, false), NOW).unwrap();
     sources::bind(
@@ -466,7 +440,6 @@ fn resolution_settles_every_case_with_an_explicit_reason() {
     let _ = accept(&mut f, "suspended-2", REF, SHA_B, SHA_ZERO);
     let _ = accept(&mut f, "suspended-3", "refs/heads/other", SHA_A, SHA_B);
 
-    // Suspended tenant first: everything due fails with that reason.
     f.conn
         .execute(
             "UPDATE tenants SET active = 0 WHERE id = ?1",
@@ -490,8 +463,6 @@ fn resolution_settles_every_case_with_an_explicit_reason() {
         )
         .unwrap();
 
-    // A fresh batch: an allowed ref is ready, a deletion is ignored, and a
-    // ref the binding never allowed is an explicit failure.
     let ready = accept(&mut f, "ready", REF, SHA_A, SHA_B).id();
     let deleted = accept(&mut f, "deleted", REF, SHA_B, SHA_ZERO).id();
     let other = accept(&mut f, "other", "refs/heads/other", SHA_A, SHA_B).id();
@@ -514,8 +485,6 @@ fn resolution_settles_every_case_with_an_explicit_reason() {
     assert_eq!(fetch(&f, deleted).state, State::Ignored);
     assert_eq!(fetch(&f, other).reason.as_deref(), Some("ref_not_allowed"));
 
-    // A ready delivery is still open: the dispatch lane may settle it as
-    // ignored or failed, and once terminal it cannot be settled again.
     let tx = f.conn.transaction().unwrap();
     intake::settle(&tx, ready, Resolution::Ignored("dispatch_skipped"), NOW).unwrap();
     tx.commit().unwrap();
@@ -526,7 +495,6 @@ fn resolution_settles_every_case_with_an_explicit_reason() {
     ));
     tx.rollback().unwrap();
 
-    // A binding revoked after acceptance fails on the next resolution.
     let revoked = accept(&mut f, "revoked", REF, SHA_A, SHA_B).id();
     let tx = f.conn.transaction().unwrap();
     sources::revoke(
@@ -555,7 +523,6 @@ fn resolution_settles_every_case_with_an_explicit_reason() {
 fn retries_back_off_doubling_and_stop_at_the_attempt_budget() {
     let mut f = fixture();
     let accepted = accept(&mut f, "retry", REF, SHA_A, SHA_B).id();
-    // A retry is invisible to `due` until its next attempt is reached.
     let tx = f.conn.transaction().unwrap();
     intake::retry(
         &tx,
@@ -591,8 +558,6 @@ fn retries_back_off_doubling_and_stop_at_the_attempt_budget() {
         tx.commit().unwrap();
         assert_eq!(fetch(&f, accepted).attempts, attempt);
     }
-    // At the budget the delivery fails with an explicit reason instead of
-    // being retried forever.
     let tx = f.conn.transaction().unwrap();
     intake::retry(
         &tx,
@@ -628,19 +593,15 @@ fn retention_purges_settled_rows_only_and_terms_cannot_be_rewritten() {
     let pending = accept(&mut f, "pending", REF, SHA_A, SHA_B).id();
     let ready = accept(&mut f, "ready", REF, SHA_A, SHA_B).id();
     let tx = f.conn.transaction().unwrap();
-    // One terminal row, one open row awaiting dispatch: retention must keep
-    // the open one, because an unresolved event is work, not history.
     intake::settle(&tx, settled, Resolution::Ignored("expired"), NOW).unwrap();
     intake::settle(&tx, ready, Resolution::Ready, NOW).unwrap();
     tx.commit().unwrap();
-    // Nothing is old enough yet.
     let tx = f.conn.transaction().unwrap();
     assert_eq!(
         intake::purge_settled(&tx, UnixMillis(NOW.0 - 1), 10).unwrap(),
         0
     );
     tx.rollback().unwrap();
-    // A sweep past the retention removes only the terminal row.
     let tx = f.conn.transaction().unwrap();
     assert_eq!(
         intake::purge_settled(&tx, UnixMillis(NOW.0 + 1), 10).unwrap(),
@@ -653,7 +614,6 @@ fn retention_purges_settled_rows_only_and_terms_cannot_be_rewritten() {
     ));
     assert_eq!(fetch(&f, pending).state, State::Pending);
     assert_eq!(fetch(&f, ready).state, State::Ready);
-    // The terms of a stored delivery are immutable, through raw SQL too.
     for sql in [
         "UPDATE webhook_deliveries SET ref_name = 'refs/heads/rewritten'",
         "UPDATE webhook_deliveries SET external_id = 'rewritten'",
@@ -686,7 +646,6 @@ fn spec(pinned: bool) -> RunSpec {
     .unwrap()
 }
 
-/// Accept, validate and dispatch one delivery, as the lane would.
 fn dispatch_ready(
     f: &mut Fixture,
     id: &str,
@@ -802,11 +761,9 @@ fn a_ready_delivery_dispatches_one_immutable_run_with_its_provenance() {
     let run = intake::dispatch(&tx, &delivery, &run_spec, &images, &provenance, NOW).unwrap();
     tx.commit().unwrap();
 
-    // The delivery is terminal and names its run.
     let delivery = fetch(&f, accepted);
     assert_eq!(delivery.state, State::Dispatched);
     assert_eq!(delivery.run, Some(run));
-    // The run holds the immutable spec and a resolved image per job.
     let stored = runs::get_run_spec(&f.conn, f.tenant, run).unwrap();
     assert_eq!(stored.source.sha, SHA_B);
     assert_eq!(stored.pipeline.digest, run_spec.pipeline.digest);
@@ -822,7 +779,6 @@ fn a_ready_delivery_dispatches_one_immutable_run_with_its_provenance() {
     let resolved = runs::resolved_image(&f.conn, f.tenant, job).unwrap();
     assert_eq!(resolved.platform, "linux/amd64");
     assert!(resolved.digest.starts_with("sha256:"));
-    // Provenance is written once and cannot be rewritten or deleted.
     let recorded = provenance::of_run(&f.conn, run).unwrap().unwrap();
     assert_eq!(recorded.trigger, "push");
     assert_eq!(recorded.delivery, Some(accepted));
@@ -839,8 +795,6 @@ fn a_ready_delivery_dispatches_one_immutable_run_with_its_provenance() {
             "raw SQL rewrote provenance: {sql}"
         );
     }
-    // Provenance must belong to the run it names — the run's repository, not
-    // just its tenant — and a delivery's run binding is part of its terms.
     let foreign = RunId::new();
     f.conn
         .execute(
@@ -881,13 +835,11 @@ fn a_ready_delivery_dispatches_one_immutable_run_with_its_provenance() {
             .is_err(),
         "a delivery's run binding is part of its terms"
     );
-    // The worker context reads the event facts: a push names its branch.
     let facts = provenance::event_facts(&f.conn, run).unwrap();
     assert_eq!(facts.name, "push");
     assert_eq!(facts.ref_name, REF);
     assert_eq!(facts.key, "main");
     assert!(facts.base_ref.is_none() && facts.pr_number.is_none());
-    // A run with no provenance is the manual mode, not an invented event.
     let orphan = RunId::new();
     f.conn
         .execute(
@@ -899,14 +851,12 @@ fn a_ready_delivery_dispatches_one_immutable_run_with_its_provenance() {
     assert_eq!(facts.name, "manual");
     assert_eq!(facts.key, "manual");
 
-    // Dispatching the same delivery twice cannot create a second run.
     let tx = f.conn.transaction().unwrap();
     assert!(matches!(
         intake::dispatch(&tx, &delivery, &run_spec, &images, &provenance, NOW),
         Err(Error::Conflict)
     ));
     tx.rollback().unwrap();
-    // Retention keeps a delivery a run's provenance depends on.
     let tx = f.conn.transaction().unwrap();
     assert_eq!(
         intake::purge_settled(&tx, UnixMillis(NOW.0 + 1), 10).unwrap(),
@@ -928,7 +878,6 @@ fn the_duplicate_and_reordered_policy_compares_within_one_stream() {
     let mut f = fixture();
     let first = dispatch_ready(&mut f, "a", SHA_A, SHA_B, SHA_B, NOW);
     let second = dispatch_ready(&mut f, "b", SHA_B, SHA_C, SHA_C, UnixMillis(NOW.0 + 10));
-    // The newest dispatched transition of the branch is the second one.
     assert_eq!(
         intake::last_dispatched(&f.conn, f.tenant, f.repo, REF, false)
             .unwrap()
@@ -937,8 +886,6 @@ fn the_duplicate_and_reordered_policy_compares_within_one_stream() {
         second
     );
     assert_ne!(first, second);
-    // A pull request targeting the same branch is a separate stream: its
-    // transition never compares against the push stream.
     let pr = accept_pr(&mut f, "pr-1", &pr_terms(GITHUB_REPO_ID, Some(SHA_A))).unwrap();
     assert_eq!(
         intake::last_dispatched(&f.conn, f.tenant, f.repo, REF, true)
@@ -972,8 +919,6 @@ fn the_duplicate_and_reordered_policy_compares_within_one_stream() {
     let tx = f.conn.transaction().unwrap();
     intake::dispatch(&tx, &delivery, &run_spec, &images, &provenance, NOW).unwrap();
     tx.commit().unwrap();
-    // The PR stream now has its own newest transition, and the push stream is
-    // untouched.
     assert_eq!(
         intake::last_dispatched(&f.conn, f.tenant, f.repo, REF, true)
             .unwrap()
@@ -988,7 +933,6 @@ fn the_duplicate_and_reordered_policy_compares_within_one_stream() {
             .id,
         second
     );
-    // Its event facts are the pull-request ones: merge ref, base branch, number.
     let run = fetch(&f, pr.id()).run.unwrap();
     let facts = provenance::event_facts(&f.conn, run).unwrap();
     assert_eq!(facts.name, "pull_request");
@@ -1013,11 +957,9 @@ fn pull_request_terms_are_stored_and_bounded() {
     assert!(!pr.draft);
     assert_eq!(pr.head_ref, "feature");
     assert_eq!(pr.head_sha, SHA_A);
-    // A fork head is recorded as a fact, never flattened into the base repo.
     assert_eq!(pr.head_repo, 999);
     assert_eq!(pr.base_ref, "main");
     assert_eq!(pr.merge_sha.as_deref(), Some(SHA_C));
-    // The delivery's own terms stand for the tested merge.
     let delivery = fetch(&f, accepted.id());
     assert_eq!(delivery.event, "pull_request");
     assert_eq!(delivery.ref_name.as_deref(), Some(REF));
@@ -1028,7 +970,6 @@ fn pull_request_terms_are_stored_and_bounded() {
             .is_none()
     );
 
-    // Malformed terms are refused before anything is stored.
     let mut cases = 0;
     let mut check = |terms: &intake::PrTerms<'_>| {
         cases += 1;
@@ -1068,8 +1009,6 @@ fn pull_request_terms_are_stored_and_bounded() {
     });
     assert_eq!(cases, 7);
     assert_eq!(count(&f), 1, "only the first delivery exists");
-    // The terms prove trust, so they cannot be rewritten, and raw SQL cannot
-    // attach them to a delivery that does not exist.
     for sql in [
         "UPDATE pr_deliveries SET head_repo_id = 1",
         "UPDATE pr_deliveries SET merge_sha = NULL",
@@ -1099,13 +1038,9 @@ fn pull_request_terms_are_stored_and_bounded() {
     );
 }
 
-/// The lanes' due query and idle probe run several times a second over a
-/// table that keeps every settled delivery a run depends on: they must be
-/// index searches that stop at their limit, never a scan plus a sort.
 #[test]
 fn the_due_queries_are_index_searches_without_a_sort() {
     let mut f = fixture();
-    // Some settled history and some open work.
     for n in 0..20 {
         let accepted = accept(&mut f, &format!("push-{n}"), REF, SHA_A, SHA_B);
         if n % 2 == 0 {
@@ -1142,7 +1077,6 @@ fn the_due_queries_are_index_searches_without_a_sort() {
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
         assert!(plan.contains("deliveries_open"), "{plan}");
     }
-    // And the queries the lanes actually run agree with the plans above.
     let pending = intake::due(&f.conn, State::Pending, NOW, 64).unwrap();
     assert_eq!(pending.len(), 10);
     assert!(pending.windows(2).all(|w| w[0].received <= w[1].received));
@@ -1155,15 +1089,11 @@ fn the_due_queries_are_index_searches_without_a_sort() {
     );
 }
 
-/// A store fault while validating one delivery is not a verdict about it:
-/// the delivery is retried under the attempt budget, never settled as
-/// `tenant_suspended`, and the rest of the pass still settles.
+// A store fault is retried under the attempt budget, never settled as tenant_suspended.
 #[test]
 fn a_store_fault_during_validation_retries_instead_of_suspending() {
     let mut f = fixture();
     let faulty = accept(&mut f, "push-1", REF, SHA_A, SHA_B).id();
-    // An unreadable tenant id: `repo_tenant` answers `Corrupt`, not
-    // `NotFound`. Rewrite both sides of the foreign key with it.
     let mut bad = *f.tenant.as_bytes();
     bad[6] &= 0x0f; // version nibble 0: not an id this build issues
     f.conn
@@ -1192,10 +1122,7 @@ fn a_store_fault_during_validation_retries_instead_of_suspending() {
     assert!(row.reason.is_none(), "{row:?}");
 }
 
-/// A SQLite constraint failure while settling one delivery undoes only that
-/// delivery's writes: it is retried on its own schedule and the rest of the
-/// batch still settles, instead of the whole pass rolling back and failing on
-/// the same row forever.
+// A constraint failure undoes only that delivery's writes, so one bad row cannot wedge the whole pass.
 #[test]
 fn a_constraint_failure_in_one_delivery_does_not_abort_the_batch() {
     let mut f = fixture();
