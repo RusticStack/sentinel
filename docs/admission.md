@@ -1,6 +1,6 @@
 # Registration and admission (A05)
 
-Implemented in `sentinel-store::registration` and `sentinel admin policy|invite|account`, with append-only metadata migration **8**. Verified email identity, email invitations and the mail outbox ([below](#email-identity-and-email-invitations)) are `sentinel-store::email`, the `sentinel-mail` crate and migration **50**.
+Implemented in `sentinel-store::registration` and `sentinel admin policy|invite|account`, with append-only metadata migration **8**. Verified email identity, email invitations and the mail outbox ([below](#email-identity-and-email-invitations)) are `sentinel-store::email`, the `sentinel-mail` crate and migration **50**. Operator-configured email-domain auto-join ([below](#domain-auto-join)) is `sentinel-store::auto_join` and migration **52**.
 
 Four decisions are kept apart, because conflating them is how a CI system ends up granting compute to whoever clicked "install":
 
@@ -106,6 +106,17 @@ Accepting needs the **mailbox proved**, in one of two ways, and never grants any
 Redemption is one-use and race-safe: the invitation is spent in the same transaction that verifies the address and writes the membership, and an existing membership keeps its role. A link-form invitation (no address) is accepted by an existing account with the secret alone and still admits a new account at registration. Every step is audited: `invitation-created` (detail `email`), `email-verification-requested`, `email-verified`, `invitation-redeemed`.
 
 The emailed links are `<public_url>/verify-email#token=<secret>` and `<public_url>/invitations/accept#token=<secret>` (the secret in the fragment, so it reaches no server log or `Referer`). The web interface does not yet have pages at those paths; until it does, a client posts the token to the API routes above.
+
+## Domain auto-join
+
+The operator can map mail domains to app-created organizations with `SENTINEL_AUTO_JOIN_DOMAINS` ([configuration](configuration.md#domain-auto-join)). This is the only automatic membership for an app-created organization besides email invitations. Everyone still gets their own personal namespace; it is independent of this.
+
+- **When.** In the transaction that verifies an address (the link, `sentinel admin account email-verify`, the verification that redeems an email invitation or follows an address change), and at every sign-in for an address that was verified before its domain was listed. One idempotent join: an existing membership keeps its role and is not audited again.
+- **Who.** Only a **verified** address, matched exactly on the part after the `@` in its canonical form (case-insensitive, IDN as punycode; no suffix, no subdomain), by an account that is admitted and active: a domain match is not an approval, so an account waiting under `approval-required` joins at its first sign-in after the operator approves it.
+- **Role.** The lowest, `reader`. The one exception is the first matching person for an organization that does not exist yet: the organization is created on that first match and that person administers it. An organization that already exists (created by the operator or earlier) is only ever joined as a reader. The two-account race is settled by the single writer, so the organization is created once.
+- **Never.** A GitHub-backed organization (a bound GitHub App installation, or membership source GitHub) is not joined: its members come from GitHub only, so neither this nor an email invitation applies. The same holds for a personal namespace and a suspended organization. The refusal is made when the rules are recorded at start (the entry is dropped and logged by position) and again in the joining transaction, because an organization can be bound to GitHub later.
+- **Audit.** `domain-auto-joined` (event 74; detail the organization and `reader` or `admin`, never the address), plus `namespace-created` when the match created the organization.
+- **Removing a domain** stops new joins; nobody who joined is removed. An administrator who removes a member will see them rejoin at their next sign-in while the domain is listed.
 
 ## Who is deciding
 

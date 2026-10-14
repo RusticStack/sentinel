@@ -216,6 +216,20 @@ The server role only: a worker's configuration with a `[mail]` section is refuse
 
 Without `[mail]` nothing is queued and a request that needs a link still succeeds. The operator mints links on the host (`sentinel admin account email-link`, `invite create --email`, `account email-verify`), and `sentinel admin mail status` reports whether the controller delivers mail and the outbox's counts ([admission](admission.md#email-identity-and-email-invitations)).
 
+### Domain auto-join
+
+`SENTINEL_AUTO_JOIN_DOMAINS` (environment of the controller only; no configuration-file key) lets the operator say which mail domains belong to which **app-created** organization. A person whose **verified** address is in a listed domain joins that organization automatically ([admission](admission.md#domain-auto-join)). It is trusted because the operator set it: there is no DNS proof.
+
+```
+SENTINEL_AUTO_JOIN_DOMAINS="rusticstack.com=rustic, example.org, bücher.example=books"
+```
+
+- Entries are separated by commas or white space; each is `domain=organization` or a bare `domain`, which names the organization after the domain with every dot a hyphen (`example.org` is `example-org`). The organization name is a namespace slug: lower case letters, digits and hyphens, at most 63, no hyphen at either end. Several domains may name one organization; a name *derived* from a bare domain may not be shared with a different domain (`a.b.example` and `a-b.example` would both derive `a-b-example`), so the later entry is dropped.
+- A domain is compared exactly, in one canonical form (lower case, IDN in punycode): `Example.COM` is `example.com`; `mail.example.com`, `example.com.evil.io` and `evilexample.com` are other domains, and so is a homograph spelling. No wildcard, no suffix and no subdomain rule exists; list each domain you mean.
+- The controller reads the setting at start. A malformed entry (bad shape, invalid domain or name, a domain listed twice, a collision, or past 1,024 entries) is **dropped alone** and logged as `auto_join_entry_ignored` with its 1-based position and a fixed reason, never its text; the controller still starts. A rule whose organization already exists but is GitHub-backed, is a personal namespace or is suspended is dropped the same way as `auto_join_entry_refused`. `auto_join_domains` reports how many rules stand.
+- The rules in force are recorded in the database at each start, replacing the previous run's. Removing a domain stops **new** joins and removes nobody; restarting changes nobody's access.
+- Only the controller reads it; a worker ignores it.
+
 ### Remote cache
 
 `[remote_cache] enabled = true` (the default) is what makes the two Q08 halves line up: the controller keeps objects workers offer under `<data_dir>/remote-cache`, and a worker fetches, offers and resumes objects over its bulk connection. Set it to `false` on either side to make every remote lookup a local miss — a worker then never asks and never offers, and a controller without the section serves nothing (`denied`). A local cache hit never touches the link in any configuration.
