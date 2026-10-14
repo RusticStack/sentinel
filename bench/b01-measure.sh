@@ -1,14 +1,4 @@
 #!/usr/bin/env bash
-# B01: identical-isolation comparisons on the reference host, as the bench
-# user, after bench/b01-setup.sh prepared b01-scoped and b01-podman.
-#   bench/b01-measure.sh KIT OUT
-# KIT holds sentinel-bench and contracts/; OUT is the JSONL file appended to.
-#
-# 1. The no-op floor: a direct process, then the same
-#    process in a systemd scope and in a container under identical caps
-#    (1 CPU / 256 MiB, then the contract's 10 CPUs / 26 GiB).
-# 2. The contract's `unit` lane (Lockwell's ci.yml `test` unit step) cold,
-#    warm and small-edit, scoped and in a container, each on its own root.
 set -euo pipefail
 KIT=$1
 OUT=$2
@@ -18,8 +8,7 @@ BUSYBOX=docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede
 cd "$HOME"
 podman image exists "$BUSYBOX" || podman pull -q "$BUSYBOX" >/dev/null
 
-# The runner refuses a contended start (CPU pressure avg60 >= 5 %), and a
-# lane leaves its own pressure behind: wait for the host to settle first.
+# The runner refuses a contended start, and a lane leaves its own pressure behind: settle first.
 settle() {
   for _ in $(seq 1 60); do
     awk '/^some/ { split($3, a, "="); exit !(a[2] < 2) }' /proc/pressure/cpu && return 0
@@ -38,7 +27,7 @@ for caps in "1 256m" "10 26g"; do
   noop --runtime podman --image "$BUSYBOX" --cpus "$1" --memory "$2"
 done
 
-lane() { # lane <runtime> <lane> <condition>
+lane() {
   settle
   local extra=()
   [ "$1" = scoped ] && extra=(--path-prepend "$HOME/b01-$1/toolchain/go/bin")

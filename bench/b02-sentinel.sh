@@ -1,24 +1,4 @@
 #!/usr/bin/env bash
-# B02: the lockwell-ci contract's `unit` lane through Sentinel itself — a git
-# push, the generic intake event, dispatch, a rootless worker, the pipeline in
-# bench/b02-sentinel.yml — on the reference host, as the bench user.
-#
-#   bench/b02-sentinel.sh setup   KIT ROOT BUNDLES MODCACHE
-#   bench/b02-sentinel.sh start   KIT ROOT
-#   SENTINEL_SRC=CHECKOUT bench/b02-sentinel.sh measure KIT ROOT CONDITION SAMPLES WARMUP OUT
-#   bench/b02-sentinel.sh stop    KIT ROOT
-#
-# KIT holds `sentinel` (a release build with both roles), git_https.py (the
-# repository's loopback HTTPS Git fixture, its per-request limit raised from
-# 10 s to 300 s for a repository of this size) and b02-sentinel.yml. setup builds
-# the bench source — Lockwell at the contract's commit with the SDK trees
-# vendored under sdk-checkouts/ and .goproxy completed from MODCACHE (a warm
-# module cache of the same go.sum), since jobs have no egress and no extra
-# checkouts yet — serves it from a bare repository over loopback HTTPS, and
-# prepares a controller (tenant, bound source, pool, enrollment) and a worker.
-# measure pushes one commit per run (empty; for small-edit the contract's
-# edit; for cold after emptying the worker's cache), posts the ref update to
-# the intake route, and times intake to the run's end. One JSON line per run.
 set -euo pipefail
 MODE=$1 KIT=$2 ROOT=$3
 BIN="$KIT/sentinel"
@@ -28,7 +8,7 @@ JAVA_SDK=37c921f6390ff85a8f2e4034a62482cab7c54020
 C="$ROOT/controller" W="$ROOT/worker"
 ident=(-c user.name=sentinel-bench -c user.email=bench@sentinel.invalid)
 
-event() { # event <log> <event> [nth]: that record's JSON, waiting up to 60 s
+event() {
   local n=${3:-1}
   for _ in $(seq 1 600); do
     line=$(grep "\"event\":\"$2\"" "$1" 2>/dev/null | sed -n "${n}p" || true)
@@ -46,7 +26,7 @@ start_worker() {
   echo $! > "$ROOT/worker.pgid"
   event "$ROOT/worker.log" link_connected >/dev/null
 }
-stop_group() { # stop_group <pgid file>
+stop_group() {
   [ -f "$1" ] || return 0
   kill -TERM -- "-$(cat "$1")" 2>/dev/null || true
   for _ in $(seq 1 100); do kill -0 -- "-$(cat "$1")" 2>/dev/null || break; sleep 0.1; done
@@ -67,8 +47,7 @@ setup)
       git -C "tmp-$name" archive "$commit" | tar -x -C "work/sdk-checkouts/$name"
       rm -rf "tmp-$name"
     done
-    # Complete the checked-in module proxy from a warm module cache of the
-    # same go.sum (the proxy protocol's layout is the cache's download tree).
+    # Jobs have no egress: the checked-in module proxy is completed from a warm cache of the same go.sum.
     (cd "$MODCACHE/cache/download" && find . -path ./sumdb -prune -o -type f -print) | while read -r f; do
       [ -e "work/.goproxy/$f" ] || install -D -m 644 "$MODCACHE/cache/download/$f" "work/.goproxy/$f"
     done
@@ -102,7 +81,6 @@ setup)
   ;;
 start)
   cd "$ROOT"
-  # The Git server, then the binding to its (new) port, then the processes.
   setsid env FIXTURE_PASSWORD="$ROOT/password" python3 "$KIT/git_https.py" "$ROOT/git" ca.pem tls.key > git.port 2>/dev/null < /dev/null &
   echo $! > git.pgid
   for _ in $(seq 1 100); do [ -s git.port ] && break; sleep 0.1; done
@@ -126,14 +104,12 @@ PY
   printf 'controller = "%s"\ncontroller_fingerprint = "%s"\nworker_name = "b02"\nenrollment_file = "%s/enrollment"\n' \
     "$(field "$link" addr)" "$(field "$link" fingerprint)" "$ROOT" > worker.toml
   start_worker
-  # The bench account reads its own tenant's runs.
   curl -fsS -X PUT -H "authorization: Bearer $(cat token)" -H 'content-type: application/json' \
     -d '{"role":"admin"}' "http://$(cat api.addr)/api/v1/tenants/acme/members/root" >/dev/null
   echo "started: git on $port, api on $(cat api.addr)"
   ;;
 measure)
   CONDITION=$4 SAMPLES=$5 WARMUP=$6 OUT=$7
-  # Every record names the build it measured: the checkout $BIN was built from.
   : "${SENTINEL_SRC:?set SENTINEL_SRC to the checkout the sentinel binary was built from}"
   git -C "$SENTINEL_SRC" rev-parse HEAD >/dev/null || { echo "cannot read the commit of $SENTINEL_SRC" >&2; exit 1; }
   cd "$ROOT"
@@ -174,8 +150,7 @@ measure)
     done
     [ -n "$run" ] || { echo "no run for delivery $delivery" >&2; grep "$delivery" server.log | tail -3 >&2; exit 1; }
     dispatched=$(date +%s%N)
-    # Park on the run until it finishes: each answer's version goes back as
-    # `since`, so a call returns only on a visible change (or after 25 s).
+    # Long-poll: passing the last version as since makes each call return only on a visible change.
     body="" since=""
     for _ in $(seq 1 400); do
       body=$(curl -fsS -H "authorization: Bearer $TOKEN" "$API/runs/$run/wait?timeout_ms=25000${since:+&since=$since}")

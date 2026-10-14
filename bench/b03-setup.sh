@@ -1,14 +1,4 @@
 #!/usr/bin/env bash
-# B03: a Sentinel deployment for the latency budgets, as the bench user on
-# the reference host: a controller and a worker, and a small repository bound
-# over loopback HTTPS whose branches each carry one measurement's pipeline
-# (bench/b03-latency.py pushes to them and posts the intake events).
-#
-#   bench/b03-setup.sh setup KIT ROOT
-#   bench/b03-setup.sh start KIT ROOT
-#   bench/b03-setup.sh stop  KIT ROOT
-#
-# KIT holds `sentinel` (release, both roles) and git_https.py.
 set -euo pipefail
 MODE=$1 KIT=$2 ROOT=$3
 BIN="$KIT/sentinel"
@@ -16,7 +6,7 @@ C="$ROOT/controller" W="$ROOT/worker"
 IMAGE=docker.io/library/golang:1.27.1-trixie@sha256:7bffdb405cd12940d2980daa49a86ef575ed4525a17ee7d0c9562547357ab46a
 ident=(-c user.name=sentinel-bench -c user.email=bench@sentinel.invalid)
 
-event() { # event <log> <event>: the first such record, waiting up to 60 s
+event() {
   for _ in $(seq 1 600); do
     line=$(grep -m1 "\"event\":\"$2\"" "$1" 2>/dev/null || true)
     [ -n "$line" ] && { printf '%s' "$line"; return; }
@@ -34,7 +24,7 @@ stop_group() {
   rm -f "$1"
 }
 
-pipeline() { # pipeline <job body>: a one-job pipeline on the warm image
+pipeline() {
   printf 'schema: 1\non: [push]\njobs:\n  probe:\n    image: %s\n    resources: { cpu: 1, memory: 512MiB }\n    timeout: 20m\n%s\n' "$IMAGE" "$1"
 }
 
@@ -45,31 +35,26 @@ setup)
     git init -q -b main work
     echo "B03 latency fixture" > work/README
     git -C work add README && git "${ident[@]}" -C work commit -q -m base
-    branch() { # branch <name> <job body>
+    branch() {
       git -C work checkout -q -B "$1" main
       pipeline "$2" > work/.sentinel.yml
       git -C work add .sentinel.yml && git "${ident[@]}" -C work commit -q -m "$1"
     }
-    # Budget 4: the first user process prints the wall clock (ns).
     branch first '    steps:
       - id: first
         run: date +%s%N'
-    # Budget 6: a line every 100 ms, each carrying its own capture time.
     branch logs '    steps:
       - id: lines
         run: for i in $(seq 1 100); do echo "t=$(date +%s%N)"; sleep 0.1; done'
-    # Budget 7: a step that ends on SIGTERM; the cancel is timed.
     branch cancel '    steps:
       - id: wait
         run: exec sleep 600'
-    # Budget 8: 100 MiB of output, then a Go test failure, as go test -json.
     branch failure '    steps:
       - id: test
         run: |
           head -c 104857600 /dev/zero | tr "\\0" "x" | fold -w 511
           printf "%s\\n" "{\"Action\":\"run\",\"Package\":\"example/b03\",\"Test\":\"TestBudget\"}" "{\"Action\":\"output\",\"Package\":\"example/b03\",\"Test\":\"TestBudget\",\"Output\":\"    b03_test.go:7: the needle: want 1, got 2\\n\"}" "{\"Action\":\"fail\",\"Package\":\"example/b03\",\"Test\":\"TestBudget\",\"Elapsed\":0.01}"
           exit 1'
-    # Budget 5: a fixed published fixture, 1,000 files of 64 KiB (64 MiB).
     branch cache '    cache:
       - name: fixture
         class: dependencies
