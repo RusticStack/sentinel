@@ -64,14 +64,15 @@ export type ProxyVerdict =
   | { kind: "proxy"; limit: number };
 
 /// Decides, from the raw request target, whether the controller serves it.
-/// The allowlist is checked on the path exactly as it will be sent, and a
+/// The allowlist is checked on the path exactly as it will be sent (the query
+/// string is never inspected: percent-encoding is normal there), and a
 /// target that is ambiguous is refused when it could reach the controller
 /// under any reading, never forwarded.
 export function classifyProxyPath(raw: string, method: string): ProxyVerdict {
   if (!raw.startsWith("/")) return { kind: "pass" };
   const cut = raw.indexOf("?");
   const bare = cut < 0 ? raw : raw.slice(0, cut);
-  const ambiguous = AMBIGUOUS.test(raw) || dotSegments(bare);
+  const ambiguous = AMBIGUOUS.test(bare) || dotSegments(bare);
   if (isProxied(bare)) {
     return ambiguous ? { kind: "reject" } : { kind: "proxy", limit: bodyLimit(bare, method) };
   }
