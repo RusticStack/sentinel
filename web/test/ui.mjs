@@ -175,6 +175,18 @@ const PAGES = {
   disk: ["/platform/storage", "document.body.textContent.includes('Metadata database')"],
   account: ["/account", "!!document.querySelector('#mfa-h') && !!document.querySelector('#password-h')"],
   service: ["/t/acme/admin/service-accounts", "!!document.querySelector('#sa-new-h')"],
+  organizations: ["/organizations", "!!document.querySelector('#ns-h') && !!document.querySelector('#new-org-h')"],
+  settings: ["/t/acme/settings", "!!document.querySelector('#about-h') && !!document.querySelector('#members-h')"],
+  invitations: ["/t/acme/admin/invitations", "!!document.querySelector('#invite-h')"],
+};
+
+// Pages a signed-out visitor reaches: sign-up, the email links, the
+// forgot-password explanation.
+const PUBLIC_PAGES = {
+  register: ["/register", "!!document.querySelector('#su-email')"],
+  verify: ["/verify-email", "!!document.querySelector('#resend-email')"],
+  forgot: ["/forgot-password", "document.querySelector('h1') && document.querySelector('h1').textContent.includes('Forgot')"],
+  invitation: ["/invitations/accept", "document.querySelector('h1') && document.querySelector('h1').textContent.includes('invitation link')"],
 };
 
 /// The current RFC 6238 code (SHA-1, 6 digits, 30 s) for a base32 key.
@@ -189,6 +201,53 @@ function totp(key) {
   const at = mac[19] & 15;
   return String((mac.readUInt32BE(at) & 0x7fffffff) % 1e6).padStart(6, "0");
 }
+
+await scenario("public pages", async () => {
+  // Setup closed (the seed has an administrator): the wizard is gone for good.
+  await go(page, "/setup", "location.pathname === '/login' && !!document.querySelector('#username')");
+  check("the setup wizard is not reachable once setup is complete", true);
+  for (const [name, [path, ready]] of Object.entries(PUBLIC_PAGES)) {
+    await go(page, path, ready);
+    await axAudit(page, `${name} page`, true);
+    for (const dark of [false, true]) {
+      await page.scheme(dark);
+      await sleep(200);
+      const result = await page.eval(CONTRAST);
+      check(`${name}, ${dark ? "dark" : "light"}: text contrast meets WCAG AA (${result.checked} elements)`, result.count === 0, result.bad);
+    }
+    await page.scheme(false);
+    await page.viewport(360, 800);
+    await sleep(200);
+    const o = await page.eval(OVERFLOW);
+    check(`${name} at 360px: no horizontal page scroll`, o.scroll <= o.width + 1, o);
+    await page.screenshot(join(cfg.out, `${name}-360.png`));
+    await page.viewport(1280, 860);
+  }
+
+  // Sign-up under the default invitation-only policy: refused, and why.
+  await go(page, ...PUBLIC_PAGES.register);
+  check("sign-up asks password managers for a new password",
+    await page.eval("document.querySelector('#su-password').autocomplete === 'new-password' && document.querySelector('#su-again').autocomplete === 'new-password'"));
+  await page.fill("#su-email", "newcomer@example.com");
+  await page.fill("#su-password", "a long enough passphrase");
+  await page.fill("#su-again", "a long enough passphrase");
+  await page.key("Enter");
+  await page.waitFor("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('needs an invitation'))", 8000, "policy refusal");
+  check("a refused sign-up says the instance needs an invitation", true);
+  check("the password fields are emptied after sending", await page.eval("document.querySelector('#su-password').value === '' && document.querySelector('#su-again').value === ''"));
+
+  // A verification link that cannot be used: the secret leaves the address
+  // bar before anything is sent, and the refusal offers a new link.
+  await go(page, `/verify-email#token=${"ab".repeat(32)}`, "[...document.querySelectorAll('button')].some((b) => b.textContent.includes('Confirm my address'))");
+  check("a verification link's secret is removed from the address bar", (await page.eval("location.hash")) === "");
+  await page.clickText("button", "Confirm my address");
+  await page.waitFor("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('invalid or has expired')) && !!document.querySelector('#resend-email')", 8000, "invalid link");
+  check("an unusable verification link is said, with a way to get a new one", true);
+  await page.fill("#resend-email", "nobody-here@example.com");
+  await page.key("Enter");
+  await page.waitFor("[...document.querySelectorAll('[role=status]')].some((s) => s.textContent.includes('can be used here'))", 8000, "resend answer");
+  check("asking for a new link answers the same whether or not the address exists", true);
+});
 
 await scenario("sign-in", async () => {
   const started = Date.now();
@@ -521,6 +580,61 @@ await scenario("storage policy", async () => {
   check("a repository's log retention is set from the storage page", app.policy.log_retention_ms === 2 * 86_400_000, app.policy);
   await go(page, ...PAGES.disk);
   check("the deployment's disk and stored bytes are shown", await page.eval("document.body.textContent.includes('Stored by tenants') && document.body.textContent.includes('Data filesystem')"));
+});
+
+await scenario("organizations and invitations", async () => {
+  const { body: tenants } = await apiAs(cfg.auth, "GET", "/api/v1/tenants");
+  check("the tenant list says each namespace's kind and membership source",
+    (tenants.tenants || []).every((t) => ["personal", "organization"].includes(t.kind) && ["app", "github"].includes(t.membership)), tenants.tenants);
+
+  // Create an organization (root is a platform administrator, who may).
+  await go(page, ...PAGES.organizations);
+  await page.fill("#org-slug", "Bad Name");
+  await page.key("Enter");
+  await page.waitFor("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('lowercase'))", 5000, "name refused in the page");
+  check("an organization name of the wrong shape is refused before it is sent", true);
+  await page.fill("#org-slug", "web-team");
+  await page.key("Enter");
+  await page.waitFor("location.pathname === '/t/web-team/settings' && !!document.querySelector('#about-h')", 10000, "new organization");
+  check("a new organization opens on its settings, managed in Sentinel",
+    await page.eval("document.querySelector('main').textContent.includes('Managed in Sentinel')"));
+  check("an administrator sees the operator's domain rule, read-only",
+    await page.eval("!!document.querySelector('#domains-h') && document.querySelector('main').textContent.includes('Read-only') && !document.querySelector('#domains-h').closest('section').querySelector('input')"));
+
+  // The switcher now lists it, grouped.
+  await page.click('[aria-label="Active namespace"]');
+  await page.waitFor("!!document.querySelector('[role=option]')", 5000, "namespace options");
+  check("the namespace switcher groups organizations apart", await page.eval("[...document.querySelectorAll('[role=listbox] *')].some((e) => e.textContent.trim() === 'Organizations')"));
+  await page.key("Escape");
+
+  // Invite by email; without mail delivery the one-time link is shown once.
+  await go(page, "/t/web-team/admin/invitations", "!!document.querySelector('#inv-email')");
+  await page.fill("#inv-email", "invitee@example.com");
+  await page.key("Enter");
+  await page.waitFor("!!document.querySelector('[role=dialog] li') || [...document.querySelectorAll('main td')].some((t) => t.textContent.includes('invitee@example.com'))", 10000, "invitation made");
+  if (await page.eval("!!document.querySelector('[role=dialog] li')")) {
+    const link = await page.eval("document.querySelector('[role=dialog] li').textContent.trim()");
+    check("without mail delivery the invitation link is shown once, pointing at the accept page", /\/invitations\/accept#token=sntl_[0-9a-f]{64}$/.test(link), link.replace(/[0-9a-f]{64}/, "…"));
+    await page.click("[role=dialog] [role=checkbox]");
+    await page.clickText("[role=dialog] button", "Done");
+    await page.waitFor("!document.querySelector('[role=dialog]')", 8000, "link dialog closed");
+    check("the link leaves the page once saved", !(await page.eval(`document.body.textContent.includes(${JSON.stringify(link)})`)));
+  }
+  await page.waitFor("[...document.querySelectorAll('main tr')].some((r) => r.textContent.includes('invitee@example.com') && r.textContent.includes('Pending'))", 8000, "pending invitation listed");
+  check("the invitation is listed as pending, without its secret", !(await page.eval("/sntl_[0-9a-f]{64}/.test(document.querySelector('main').textContent)")));
+  await page.click('[aria-label="Revoke the invitation for invitee@example.com"]');
+  await page.waitFor("!!document.querySelector('[role=dialog]')", 5000, "revoke confirmation");
+  await page.clickText("[role=dialog] button", "Revoke");
+  await page.waitFor("[...document.querySelectorAll('main tr')].some((r) => r.textContent.includes('invitee@example.com') && r.textContent.includes('Revoked'))", 8000, "revoked");
+  check("an invitation is revoked from the list", true);
+
+  // An invitation link that cannot be used, signed in: the secret leaves the
+  // address bar, and the refusal names no organization.
+  await go(page, `/invitations/accept#token=sntl_${"cd".repeat(32)}`, "[...document.querySelectorAll('button')].some((b) => b.textContent.includes('Accept invitation'))");
+  check("an invitation link's secret is removed from the address bar", (await page.eval("location.hash")) === "");
+  await page.clickText("button", "Accept invitation");
+  await page.waitFor("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('could not accept'))", 8000, "unusable invitation");
+  check("an unusable invitation is said without naming an organization", !(await page.eval("document.querySelector('main').textContent.includes('acme')")));
 });
 
 // Last: it enrolls a second factor for rui and changes rui's password,
