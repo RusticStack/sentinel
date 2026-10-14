@@ -1,15 +1,5 @@
-//! The single-use loopback listener the browser sign-in redirects to (RFC 8252
-//! §7.3): bound to `127.0.0.1:0`, the whole wait bounded (five
-//! minutes), each request head at most 8 KiB and 10 s, only `GET /callback`
-//! considered — any other path is answered `404` and the wait goes on.
-//! Only a `/callback` carrying this login's `state` (compared in constant
-//! time) decides: its `iss` must be the issuer (RFC 9207), then it carries
-//! the code or the refusal. A callback with any other `state` — a stray
-//! local process, or a web page that found the port — is answered `400`
-//! and ignored, so it cannot end the sign-in. Each connection is served on
-//! its own short-lived thread (at most [`MAX_CONNECTIONS`] at once), so an
-//! idle connection never holds up the browser's. The browser gets a static
-//! page either way; nothing from the request is echoed.
+//! Only a `/callback` carrying this login's `state` (compared in constant time) decides the sign-in.
+//! Any other state is answered `400` and ignored, so a stray local process or web page cannot end it.
 
 use std::{
     io::{Read, Write},
@@ -27,19 +17,11 @@ use sentinel_protocol::oauth::CLI_REDIRECT_PATH;
 
 use crate::client::{Error, Exit};
 
-/// How long a browser sign-in may take.
 pub const WAIT: Duration = Duration::from_secs(5 * 60);
-/// The largest request head read.
 pub const MAX_HEAD: usize = 8 << 10;
-/// How long one connection may take to send its head.
 const PER_REQUEST: Duration = Duration::from_secs(10);
-/// Connections served at once; beyond this a new one is closed unanswered
-/// until one ends, which bounds the threads and memory a flood can take.
 pub const MAX_CONNECTIONS: usize = 32;
-/// The pause after a failed `accept` (a persistent error such as `EMFILE`
-/// must not spin a core until the deadline).
 const ACCEPT_PAUSE: Duration = Duration::from_millis(10);
-/// Stack for a connection thread: it holds one 8 KiB head buffer.
 const CONNECTION_STACK: usize = 64 << 10;
 
 const DONE_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Sentinel sign-in</title></head>\
@@ -47,16 +29,12 @@ const DONE_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><tit
 const FAILED_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Sentinel sign-in</title></head>\
 <body><p>Sentinel sign-in did not complete. Return to the terminal for details.</p></body></html>";
 
-/// The listening socket of one browser sign-in.
 pub struct Listener {
     listener: TcpListener,
     addr: SocketAddr,
 }
 
-/// What one connection amounted to.
 enum Outcome {
-    /// Not this login's callback (another path or `state`, oversized, or
-    /// unreadable): keep waiting.
     Ignored,
     Done(Result<String, Error>),
 }
@@ -75,20 +53,14 @@ impl Listener {
         self.addr.port()
     }
 
-    /// `http://127.0.0.1:{port}/callback`.
     pub fn redirect_uri(&self) -> String {
         format!("http://127.0.0.1:{}{CLI_REDIRECT_PATH}", self.addr.port())
     }
 
-    /// Wait at most `timeout` for this login's callback and return its
-    /// authorization code. `state` and `issuer` are what the callback must
-    /// carry.
     pub fn wait(self, state: &str, issuer: &str, timeout: Duration) -> Result<String, Error> {
         let deadline = Instant::now() + timeout;
         let addr = self.addr;
-        // A blocking accept has no timeout: a watchdog connects to the
-        // listener once the deadline passes, unless told the wait is over.
-        // A connection thread that decided the login wakes it the same way.
+        // A blocking accept has no timeout, so a watchdog connects to wake it at the deadline.
         let expired = Arc::new(AtomicBool::new(false));
         let (finished, finished_rx) = mpsc::channel::<()>();
         let watchdog = {
@@ -162,7 +134,6 @@ fn respond(mut stream: &TcpStream, status: &str, page: &str) {
     let _ = stream.flush();
 }
 
-/// Read one request head of at most [`MAX_HEAD`] bytes.
 fn read_head(mut stream: &TcpStream, buf: &mut [u8; MAX_HEAD]) -> Option<usize> {
     let mut len = 0;
     loop {
@@ -220,7 +191,6 @@ fn serve(stream: TcpStream, state: &str, issuer: &str, deadline: Instant) -> Out
     outcome
 }
 
-/// Constant-time equality of two strings (length is not secret).
 fn same(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
@@ -236,9 +206,6 @@ fn refused(message: &str) -> Error {
     Error::new(Exit::Auth, message.to_owned())
 }
 
-/// Judge a callback query. Without this login's `state` it is not this
-/// login's callback and is ignored. With it: exactly one of each
-/// parameter, then the issuer, then an error or the code.
 fn callback(query: &[u8], state: &str, issuer: &str) -> Outcome {
     let (mut got_iss, mut code, mut error) = (None, None, None);
     let (mut states, mut ours, mut repeated) = (0u32, false, false);

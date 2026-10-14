@@ -188,8 +188,7 @@ impl Diagnostics {
         self.writer.snapshot()
     }
 
-    /// A stalled stderr/pipe must not indefinitely delay process shutdown.
-    /// False means output is incomplete; the caller decides its exit policy.
+    // A stalled sink must not delay process exit indefinitely.
     pub fn shutdown(&mut self, timeout: Duration) -> bool {
         self.writer
             .sender

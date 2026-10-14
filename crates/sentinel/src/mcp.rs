@@ -1,7 +1,3 @@
-//! The MCP stdio server (protocol revision 2025-11-25). It uses the shared
-//! API client, so profile refresh, scope checks and repository ownership are
-//! the same as for Sentinel's other clients.
-
 use std::{
     io::{self, BufRead, Write},
     path::PathBuf,
@@ -341,10 +337,6 @@ fn tool_result(value: Value, is_error: bool) -> Value {
     })
 }
 
-/// The stdio transport's side of the shared tool mapper
-/// ([`sentinel_protocol::mcp::execute_tool`]): the same argument checks and
-/// API calls as Streamable HTTP, made through the profile's API client. A
-/// dispatched pipeline is compiled here first, which saves the round trip.
 struct Stdio<'a> {
     client: &'a Client,
 }
@@ -513,9 +505,6 @@ mod tests {
         assert!(!invalid.to_string().contains("jobs: []"));
     }
 
-    /// `arguments` is optional in MCP: a tool with no required argument is
-    /// not refused as invalid params, and the shared mapper's own checks
-    /// answer, exactly as over Streamable HTTP.
     #[test]
     fn stdio_tools_call_without_arguments_uses_defaults() {
         let client = Client::with_token("http://127.0.0.1:1", &test_token()).unwrap();
