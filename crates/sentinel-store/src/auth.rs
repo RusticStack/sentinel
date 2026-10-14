@@ -847,6 +847,9 @@ fn apply_membership(
     user: UserId,
     role: Role,
 ) -> Result<()> {
+    // In a GitHub-backed tenant GitHub decides who is a member and in which
+    // role: no administrator adds a person or changes a role by hand.
+    crate::github_members::require_app_managed(tx, tenant, Some(user))?;
     if role != Role::TenantAdmin {
         keep_an_admin(tx, tenant, user)?;
     }
@@ -903,6 +906,9 @@ pub fn remove_membership(
     now: UnixMillis,
 ) -> Result<()> {
     require_tenant_admin(tx, principal, tenant)?;
+    // A derived member the administrator removed would be restored by the next
+    // check: leaving is done in GitHub, and the answer follows from there.
+    crate::github_members::require_app_managed(tx, tenant, Some(user))?;
     keep_an_admin(tx, tenant, user)?;
     let removed = tx.execute(
         "DELETE FROM memberships WHERE tenant_id = ?1 AND user_id = ?2",
@@ -1058,6 +1064,10 @@ pub(crate) fn apply_repo_grant(
     user: UserId,
     permissions: Permissions,
 ) -> Result<()> {
+    // Repository access of a GitHub-backed tenant's people is derived from
+    // GitHub's per-repository permission; a hand-written grant would be a way
+    // above what the person holds there. Service accounts stay app-managed.
+    crate::github_members::require_app_managed(tx, tenant, Some(user))?;
     if permissions == Permissions::NONE {
         tx.execute(
             "DELETE FROM repo_grants WHERE tenant_id = ?1 AND user_id = ?2 AND repo_id = ?3",

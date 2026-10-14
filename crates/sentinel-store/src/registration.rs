@@ -201,6 +201,10 @@ pub fn invite(
         let tenant = terms.tenant.ok_or(Error::Forbidden)?;
         crate::auth::require_tenant_admin(tx, principal, tenant)?;
     }
+    // Membership of a GitHub-backed tenant is never offered by invitation.
+    if let Some(tenant) = terms.tenant {
+        crate::github_members::require_app_managed(tx, tenant, None)?;
+    }
     let id = InvitationId::new();
     let secret = Secret::generate();
     let expires = UnixMillis(now.0.saturating_add(terms.lifetime_ms));
@@ -456,6 +460,8 @@ pub fn register(
                            ON cm.tenant_id = i.tenant_id AND cm.user_id = i.created_by
                          WHERE i.token_digest = ?1 AND i.redeemed_ms IS NULL
                          AND i.revoked_ms IS NULL AND i.expires_ms > ?2
+                         AND NOT EXISTS(SELECT 1 FROM tenants gt
+                              WHERE gt.id = i.tenant_id AND gt.membership_source = 1)
                          AND (i.created_by IS NULL OR
                               (c.active = 1 AND (c.super_admin = 1 OR cm.role = 3)))",
                     )?
@@ -843,6 +849,12 @@ pub fn unbind_installation(
     tx.execute(
         "UPDATE installations SET tenant_id = NULL, bound_by = NULL, bound_ms = NULL WHERE id = ?1",
         [installation.as_bytes()],
+    )?;
+    // The organization is no longer the tenant's source of members.
+    crate::github_members::installation_released(
+        tx,
+        TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("tenant_id"))?,
+        now,
     )?;
     audit(
         tx,

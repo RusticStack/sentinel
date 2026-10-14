@@ -229,6 +229,16 @@ pub enum Control {
         installation: u64,
         repository: u64,
     },
+    /// Who belongs to the organization, or what they may reach, changed.
+    /// `user` is the immutable numeric id of the account concerned (never a
+    /// login); `None` means the whole organization's access may have moved (a
+    /// team changed). `removed` is a signed `member_removed`, the one answer
+    /// acted on directly; everything else only asks for a fresh check.
+    Members {
+        installation: u64,
+        user: Option<u64>,
+        removed: bool,
+    },
 }
 
 /// Only retained identifiers are trusted. A body is bounded by the HTTP route;
@@ -303,6 +313,45 @@ pub fn parse_control(event: &str, body: &[u8]) -> Result<Option<Control>> {
             Some(Control::Repository {
                 installation,
                 repository: number(&v["repository"]["id"])?,
+            })
+        }
+        // Organization membership: a person joined, was invited or left.
+        "organization"
+            if matches!(action, "member_added" | "member_removed" | "member_invited") =>
+        {
+            Some(Control::Members {
+                installation,
+                user: Some(number(&v["membership"]["user"]["id"])?),
+                removed: action == "member_removed",
+            })
+        }
+        // Team membership, and a repository collaborator, changed for one
+        // person: their effective access is worth asking about again.
+        "membership" if matches!(action, "added" | "removed") => Some(Control::Members {
+            installation,
+            user: Some(number(&v["member"]["id"])?),
+            removed: false,
+        }),
+        "member" if matches!(action, "added" | "removed" | "edited") => Some(Control::Members {
+            installation,
+            user: Some(number(&v["member"]["id"])?),
+            removed: false,
+        }),
+        // A team's repositories or permissions moved: anyone may be affected.
+        "team"
+            if matches!(
+                action,
+                "created"
+                    | "deleted"
+                    | "edited"
+                    | "added_to_repository"
+                    | "removed_from_repository"
+            ) =>
+        {
+            Some(Control::Members {
+                installation,
+                user: None,
+                removed: false,
             })
         }
         _ => None,

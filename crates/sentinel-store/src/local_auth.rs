@@ -124,6 +124,18 @@ pub enum Event {
     /// person did not accept anything, so the addition is recorded on its own
     /// in addition to the role change.
     MemberAdded = 58,
+    /// GitHub confirmed a linked account as a member of a GitHub-backed
+    /// organization and Sentinel added or promoted the membership. The detail
+    /// names the tenant and the role; no GitHub login or id is recorded.
+    GithubMemberJoined = 70,
+    /// GitHub's answer changed a derived role (an owner demoted, a member
+    /// made an owner).
+    GithubMemberRoleChanged = 71,
+    /// Derived access ended: GitHub no longer lists the member, the GitHub
+    /// link was removed, or an unconfirmed row outlived its grace period.
+    GithubMemberRemoved = 72,
+    /// A tenant's membership source was changed by an administrator.
+    TenantBackingChanged = 73,
 }
 
 impl Event {
@@ -188,6 +200,10 @@ impl Event {
             Event::ServiceAccountCreated => "service-account-created",
             Event::PlatformOverride => "platform-override",
             Event::MemberAdded => "member-added",
+            Event::GithubMemberJoined => "github-member-joined",
+            Event::GithubMemberRoleChanged => "github-member-role-changed",
+            Event::GithubMemberRemoved => "github-member-removed",
+            Event::TenantBackingChanged => "tenant-backing-changed",
         }
     }
 
@@ -251,6 +267,10 @@ impl Event {
             56 => Event::ServiceAccountCreated,
             57 => Event::PlatformOverride,
             58 => Event::MemberAdded,
+            70 => Event::GithubMemberJoined,
+            71 => Event::GithubMemberRoleChanged,
+            72 => Event::GithubMemberRemoved,
+            73 => Event::TenantBackingChanged,
             _ => return None,
         })
     }
@@ -713,6 +733,9 @@ pub fn issue_session(
             SessionId::new().as_bytes()
         ],
     )?;
+    // A sign-in re-checks the person against every GitHub-backed organization
+    // (one bounded statement; the lane asks GitHub, this request never does).
+    crate::github_members::enqueue_user(tx, user, now)?;
     Ok(Issued {
         user,
         session,
