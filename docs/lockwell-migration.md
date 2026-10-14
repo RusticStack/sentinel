@@ -1,14 +1,14 @@
 # Lockwell -> Sentinel migration specification
 
-Status: requirements and conversion design, **not an executable Sentinel pipeline**. Sentinel is currently a planning repository. Lockwell workflows and tests have not been changed by this review.
+Status: requirements and conversion design, **not an executable Sentinel pipeline**. Lockwell workflows and tests are unchanged by this document.
 
-Repository: `RusticStack/lockwell` (the requested “lovkwell”). Reviewed main on 2026-09-13; observed HEAD `0c2ec406cc79e8af89856401863785eb210d7e71`. Recheck source revisions before implementation because workflows were read from moving main.
+Repository: `RusticStack/lockwell`. Reviewed main on 2026-09-13; observed HEAD `0c2ec406cc79e8af89856401863785eb210d7e71`. Recheck source revisions before implementation because workflows were read from moving main.
 
 ## Objective
 
 Adapt Lockwell CI to Sentinel's purpose-built performance model, preserving the assertions/evidence of each migrated lane while reducing waiting, repeated work, and contention. Port orchestration and provider-specific contract tests; keep Go tests, SDK conformance, and acceptance validators repository-owned. Supporting Lockwell does not justify fundamentally changing Sentinel or reproducing every Actions feature.
 
-**Scope correction:** the earlier demand for all six workflows, VM pools, Docker/Compose compatibility, and publishing as Sentinel v1 release gates is withdrawn. Lockwell is a demanding measurement/adaptation case. Adapt tests to existing Sentinel execution primitives; lanes needing unsupported capabilities may stay external. Complete replacement remains a repository migration goal, not a requirement to reshape the engine. The inventory below records current workload needs and possible translations, not committed core features.
+Scope: Lockwell is a demanding measurement/adaptation case, not a set of Sentinel v1 release gates (all six workflows, VM pools, Docker/Compose compatibility and publishing are not required). Adapt tests to existing Sentinel execution primitives; lanes needing unsupported capabilities may stay external. Complete replacement remains a repository migration goal, not a requirement to reshape the engine. The inventory below records current workload needs and possible translations, not committed core features.
 
 ## Observed workflow inventory
 
@@ -110,7 +110,7 @@ Optimization order:
 5. Prebuild pinned sidecar dependency images: current production clients install boto3/JS dependencies at startup and some use `latest`. Record/pin versions through a reviewed Lockwell change, so speed does not hide changed client coverage.
 6. Prefer locality over transferring huge test data; generate run-owned datasets on target disk. Index small reports instead of sending full logs to agents.
 
-Primary ambition is now **under one minute for representative warm PR required feedback on the same hardware previously taking five minutes or more**, not the earlier 25% reduction goal. See [performance research](performance-research.md) for observed 8m38s run timings, cache strategy, a 55-second budget, and experiments needed to make this credible. Keep required-check scope explicit; no dropped assertions or silently cached `-count=1` tests. Report long production/chaos scopes separately without presenting them as completed under a minute. VM/cluster readiness is measured only when such an external/optional environment is actually used.
+The primary ambition is **under one minute for representative warm PR required feedback on the same hardware previously taking five minutes or more**. See [performance research](performance-research.md) for observed 8m38s run timings, cache strategy, a 55-second budget, and experiments needed to make this credible. Keep required-check scope explicit; no dropped assertions or silently cached `-count=1` tests. Report long production/chaos scopes separately without presenting them as completed under a minute. VM/cluster readiness is measured only when such an external/optional environment is actually used.
 
 Cutover checklist:
 
@@ -125,4 +125,4 @@ Cutover checklist:
 
 All from [RusticStack/lockwell](https://github.com/RusticStack/lockwell): `.github/workflows/{ci,acceptance-gate,acceptance-focus,cluster-chaos,production-test,release}.yml`, `CI.md`, `Makefile`, `go.mod`, `docs/runner_ci_contract_test.go` (reviewed relevant assertions), `scripts/acceptance-gate.sh`, `scripts/cluster-chaos-docker.sh` (reviewed execution/resource/cleanup sections), and `deploy/compose/docker-compose.production-test.yml`.
 
-Some workflow/CI comments still describe Postgres while the inspected production Compose and current Go module indicate embedded Badger storage. Use executable configuration and tests as the migration source of truth, and reconcile stale prose during conversion. This was a CI design review, not a run of Lockwell's tests or an audit of every source file.
+Some Lockwell workflow/CI comments describe Postgres while the inspected production Compose and Go module indicate embedded Badger storage. Use executable configuration and tests as the migration source of truth. This is a CI design review, not a run of Lockwell's tests or an audit of every source file.
