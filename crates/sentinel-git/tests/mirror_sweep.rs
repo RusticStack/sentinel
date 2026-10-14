@@ -1,7 +1,5 @@
-//! The mirror disk bound, in a process of its own: a sweep skips a
-//! mirror whose lock is momentarily held, and git children that other tests
-//! fork in the same process can hold an inherited copy of a lock descriptor
-//! until they exec — which would make which mirror goes depend on timing.
+//! Runs in its own process: git children forked by other tests can hold an inherited lock descriptor
+//! until they exec, which would make which mirror a sweep removes depend on timing.
 #![cfg(unix)]
 
 use std::{fs, time::Duration};
@@ -12,9 +10,6 @@ use sentinel_git::mirror::Mirrors;
 mod support;
 use support::{repository, source, work};
 
-/// The sweep bounds mirror disk — a killed fetch's stale `tmp_*`
-/// goes, and over the budget the least recently written mirror goes; a
-/// mirror whose writer lock is held is never touched.
 #[test]
 fn the_sweep_bounds_mirror_disk() {
     let temp = tempfile::tempdir().unwrap();
@@ -33,7 +28,6 @@ fn the_sweep_bounds_mirror_disk() {
             )
             .unwrap();
     }
-    // `old` was written an hour earlier; a dead fetch left a temp pack.
     let lock = temp.path().join(format!("mirrors/{old}.lock"));
     fs::OpenOptions::new()
         .write(true)
@@ -56,8 +50,6 @@ fn the_sweep_bounds_mirror_disk() {
         s.bytes / 2
     };
     assert!(!tmp.exists());
-    // Alone in this process, nothing holds a lock here: the sweep sees both
-    // mirrors and removes the least recently written.
     let swept = mirrors.sweep(one + one / 2);
     assert_eq!(swept.removed, 1, "{swept:?}");
     assert!(!mirrors.path(&old).exists(), "least recently written goes");

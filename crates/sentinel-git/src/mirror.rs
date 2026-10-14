@@ -1,43 +1,3 @@
-//! Worker-local Git object mirrors.
-//!
-//! One bare mirror per repository id lives at `<data_dir>/mirrors/<repo-id>/`.
-//! Attempts share it under three rules:
-//!
-//! - **Serialized writes.** A `flock(LOCK_EX)` on the sibling
-//!   `<repo-id>.lock` serializes every writer (init/fetch/verify/gc). The
-//!   lock is kernel-held on an open file: a dead owner releases it, so there
-//!   is no stale-lock state to take over; a bounded non-blocking poll is the
-//!   whole wait. The lock file's contents (owner pid and the wait deadline)
-//!   are provenance for an operator, never part of the protocol.
-//! - **Reader leases.** Materialization copies the object store while a
-//!   writer may be appending to it; Git never removes objects outside `gc`,
-//!   and `gc` runs only under the write lock with no live lease in
-//!   `<repo-id>.leases/`. A lease is a file named by the attempt holding an
-//!   expiry timestamp, published by rename; an expired or stale lease file
-//!   is swept, so a crashed attempt can hold GC off for at most its TTL.
-//! - **Private objects.** The worktree gets its own object files: a
-//!   reflink (`FICLONE`, copy-on-write extents) of the store when the data
-//!   directory's filesystem supports it — probed once at [`Mirrors::open`]
-//!   — else a plain copy of a small store, and for a larger one a depth-1
-//!   fetch of the pinned commit out of the mirror, which writes one tree's
-//!   objects instead of the whole history. Nothing in the job's
-//!   `.git` shares an inode with the mirror, so a job cannot rewrite
-//!   shared objects, and no `alternates` file ever points outside the
-//!   workspace.
-//!
-//! Fetches are incremental and full-history: the pinned commit itself plus
-//! the event ref the binding allows (`+ref:refs/sentinel/event`), so a later
-//! attempt negotiates against real history instead of re-cloning. The pinned
-//! SHA is verified as a commit after the fetch — an absent or non-commit
-//! revision is a preparation failure naming the SHA, never a fallback.
-//! `gc.auto` and `maintenance.auto` are disabled per invocation: pruning
-//! only ever happens through the lease-checked path here.
-//!
-//! Mirror failures split two ways: [`Error::Mirror`] (and [`Error::Io`])
-//! mean the *infrastructure* could not serve — the caller may fall back to a
-//! direct checkout; [`Error::Preparation`] names the remote's answer or the
-//! missing pinned revision and never falls back.
-
 use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
@@ -63,60 +23,29 @@ use crate::{
     },
 };
 
-/// The directory under the worker's data directory holding every mirror.
 pub const MIRRORS_DIR: &str = "mirrors";
-/// Longest wait for a mirror's writer lock before the caller falls back to
-/// a direct checkout. Fetches are incremental, so a healthy lock moves fast;
-/// a writer doing a first full fetch may legitimately hold it for a while.
 pub const LOCK_WAIT: Duration = Duration::from_secs(120);
-/// A reader lease is trusted for at most this long; a crashed attempt's
-/// lease stops blocking GC once this TTL passes.
 pub const LEASE_TTL: Duration = Duration::from_secs(20 * 60);
-/// Default GC trigger: more than this many pack files in the mirror.
 pub const GC_MAX_PACKS: usize = 16;
-/// Default GC trigger: more than this many loose objects in the mirror.
 pub const GC_MAX_LOOSE: usize = 4096;
-/// A materialization copying more files than this is not copying a mirror.
 const MAX_OBJECT_FILES: u64 = 2_000_000;
-/// Without reflink, a store up to this size is byte-copied into the job;
-/// a larger one is materialized by a depth-1 fetch of the pinned commit.
-/// Measured on WSL2 ext4 with an 8 MiB tree, materialization plus the
-/// `syncfs` its write-back costs (`tests/mirror_cost.rs`): the copy wins
-/// at 9–42 MiB of store (75–132 ms against the fetch's 145–205 ms) and
-/// loses from 76 MiB (493 ms against 147 ms; 337–725 ms against 155 ms
-/// at 262 MiB), where the fetch writes 31x fewer bytes.
 const COPY_MAX_BYTES: u64 = 48 << 20;
-/// Poll interval for the lock and for lease drains.
 const WAIT_POLL: Duration = Duration::from_millis(25);
-/// A reader lease outlives its reader's own deadline by this much, so a
-/// lease can never lapse while its materialization is still allowed to run.
 const LEASE_MARGIN: Duration = Duration::from_secs(60);
-/// The remote a mirror was built from, recorded inside it: a mirror serves
-/// only the binding that filled it.
 const REMOTE_FILE: &str = "sentinel-remote";
-/// Default budget for all mirrors together (`Mirrors::sweep`).
 pub const MIRRORS_BUDGET_BYTES: u64 = 50 << 30;
-/// A mirror no writer touched for this long is removed by the sweep.
 pub const MIRROR_IDLE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
-/// Git's in-flight names (`tmp_*`) older than this belong to a killed
-/// fetch; the sweep removes them.
 const STALE_TMP: Duration = Duration::from_secs(60 * 60);
 
-/// Handle over `<data_dir>/mirrors`, created once per worker process: the
-/// reflink capability of the filesystem is probed here, not per attempt.
 #[derive(Clone, Debug)]
 pub struct Mirrors {
     root: PathBuf,
     reflink: bool,
     gc_max_packs: usize,
     gc_max_loose: usize,
-    /// [`COPY_MAX_BYTES`] unless a test forces the fetch path.
     copy_max: u64,
 }
 
-/// A reader lease: a file under `<repo-id>.leases/` named by the attempt,
-/// holding its expiry in unix milliseconds. Published by rename so a sweeper
-/// never reads a torn record; removed on drop.
 struct Lease(PathBuf);
 
 impl Drop for Lease {
@@ -125,16 +54,11 @@ impl Drop for Lease {
     }
 }
 
-/// How a mirror fetch is authorized: a bound source access, or a manual
-/// run's plain credential. Exactly one applies per checkout.
 enum Auth<'a> {
     Manual(Option<&'a Credential>),
     Bound(&'a Access),
 }
 
-/// The context every mirror fetch shares: the bound credential install and
-/// the manual credential (at most one applies), the stderr redaction list
-/// and the deadline.
 struct Ctx<'a> {
     private: Option<&'a Private>,
     credential: Option<&'a Credential>,
@@ -143,15 +67,10 @@ struct Ctx<'a> {
 }
 
 impl Mirrors {
-    /// Open (creating) the mirrors root and probe reflink support once.
-    /// Failure is an `Error::Io`: the caller decides whether the process
-    /// runs checkouts directly instead.
     pub fn open(root: &Path) -> Result<Mirrors> {
         Self::open_tuned(root, GC_MAX_PACKS, GC_MAX_LOOSE)
     }
 
-    /// `open` with a lowered GC trigger, so conformance tests can reach the
-    /// GC path deterministically.
     pub fn open_tuned(root: &Path, gc_max_packs: usize, gc_max_loose: usize) -> Result<Mirrors> {
         fs::create_dir_all(root)?;
         let reflink = reflink_supported(root)?;
@@ -164,9 +83,6 @@ impl Mirrors {
         })
     }
 
-    /// Materialize every checkout by the depth-1 fetch, whatever the
-    /// store's size or the filesystem — the path a large mirror takes, so
-    /// conformance tests reach it with a small one.
     #[doc(hidden)]
     pub fn fetch_materialization(mut self) -> Mirrors {
         self.reflink = false;
@@ -174,18 +90,14 @@ impl Mirrors {
         self
     }
 
-    /// Whether the filesystem holding `root` performed the reflink probe.
     pub fn reflink(&self) -> bool {
         self.reflink
     }
 
-    /// The mirror's path for `repo` — stable across attempts.
     pub fn path(&self, repo: &RepoId) -> PathBuf {
         self.root.join(repo.to_string())
     }
 
-    /// Mirrored checkout without a source access (manual mode): fetch the
-    /// pinned commit from `source.repo`, verify it, materialize privately.
     pub fn checkout(
         &self,
         workspace: &Path,
@@ -205,9 +117,6 @@ impl Mirrors {
         )
     }
 
-    /// Mirrored checkout under a source access: expiry, exact remote and
-    /// the allowed ref are rechecked before Git runs, exactly like
-    /// [`crate::checkout_authorized`].
     pub fn checkout_authorized(
         &self,
         workspace: &Path,
@@ -251,9 +160,6 @@ impl Mirrors {
                 "pinned revision is not a full object id".into(),
             ));
         }
-        // The event ref enriches the mirror's history when the access names
-        // one the binding allows (a bound run) or the run recorded a real
-        // ref (manual mode); the pinned SHA is always the authority.
         let event_ref = source.ref_name.as_deref().filter(|r| match access {
             Some(access) => access.binding.allows(r),
             None => valid_ref_name(r),
@@ -263,16 +169,12 @@ impl Mirrors {
         let leases = self.root.join(format!("{repo}.leases"));
         let suspect = self.root.join(format!("{repo}.suspect"));
 
-        // The writer phase, serialized on the flock'd lock file. The `File`
-        // itself is the lock: the kernel releases it on close or death, so
-        // there is no stale-lock state to take over.
         let lock_deadline = Instant::now() + LOCK_WAIT.min(timeout);
         let lock = Self::lock(&self.root.join(format!("{repo}.lock")), lock_deadline)?;
         let fetch_started = Instant::now();
         self.ensure(&dir, &suspect, &leases, &source.repo, deadline)?;
         let private = access.map(|a| Private::install(&dir, a)).transpose()?;
         let mut secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
-        // A manual credential is redacted like a bound one.
         if let Some(credential) = credential
             && !credential.secret.is_empty()
         {
@@ -286,9 +188,6 @@ impl Mirrors {
         };
         let commit = self.fetch_and_verify(&dir, source, event_ref, &ctx, &suspect, &leases)?;
         drop(private);
-        // Pin the verified commit so a lease-checked GC can never prune the
-        // objects this attempt is about to copy. A store that cannot take a
-        // ref is the mirror's fault, so it reports as such.
         let mut pin = git(&dir);
         pin.args(["update-ref", "refs/sentinel/pin", &commit]);
         step(pin, deadline, "git update-ref", &secrets).map_err(|e| match e {
@@ -296,13 +195,10 @@ impl Mirrors {
             other => other,
         })?;
         let store_bytes = self.gc_if_due(&dir, &leases, deadline)?;
-        // The reader lease is created while still holding the write lock:
-        // a GC that follows can never miss it.
         let lease = self.lease(&leases, lease_name, deadline)?;
         let fetch_ns = elapsed_ns(fetch_started);
         drop(lock);
 
-        // The reader phase: a private object store in the workspace.
         let materialize_started = Instant::now();
         let materialized = self.materialize(&dir, workspace, &commit, store_bytes, deadline);
         drop(lease);
@@ -313,10 +209,7 @@ impl Mirrors {
                 materialize_ns: elapsed_ns(materialize_started),
             }),
             Err(e) => {
-                // Only damage to the store itself marks it for a rebuild: a
-                // deadline, a full workspace or a checkout error on a healthy
-                // store says nothing about the mirror, and a rebuild would
-                // refetch the whole history for nothing.
+                // Only store damage earns a rebuild; a deadline or full workspace would refetch all history for nothing.
                 let damaged = !matches!(e, Error::Timeout(_) | Error::TooLarge(_))
                     && !self.healthy(&dir, Instant::now() + Duration::from_secs(30));
                 let e = if damaged {
@@ -342,15 +235,12 @@ impl Mirrors {
         }
     }
 
-    /// Acquire the writer lock, polling `flock(LOCK_NB)` until `deadline`.
-    /// The file records owner and deadline for an operator's eyes only.
     fn lock(path: &Path, deadline: Instant) -> Result<File> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            // The incumbent's provenance is only rewritten by whoever next
-            // holds the lock — a waiter must not wipe it.
+            // Do not truncate: a waiter must not wipe the incumbent's provenance before it holds the lock.
             .truncate(false)
             .open(path)?;
         let fd = file.as_raw_fd();
@@ -382,13 +272,10 @@ impl Mirrors {
         Ok(file)
     }
 
-    /// Does the mirror look like a bare repository — without asking Git?
     fn looks_bare(dir: &Path) -> bool {
         dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir()
     }
 
-    /// Whether Git itself accepts the store; costs one process, run only
-    /// when a fetch or verify has already failed.
     fn healthy(&self, dir: &Path, deadline: Instant) -> bool {
         let mut probe = git(dir);
         probe.args(["rev-parse", "--is-bare-repository"]);
@@ -396,18 +283,11 @@ impl Mirrors {
             Ok(output) => trim(&output.stdout) == "true",
             Err(_) => false,
         };
-        // Every ref tip must still read as an object: a corrupt or
-        // truncated pack under a tip is store damage — rebuilt once — not
-        // the remote's answer. One object read per ref, no history walk.
         let mut tips = git(dir);
         tips.args(["rev-list", "--no-walk", "--all", "--quiet"]);
         bare && step(tips, deadline, "git rev-list", &[]).is_ok()
     }
 
-    /// Bring the mirror up: a missing or damaged store is rebuilt (after
-    /// any live readers drain, bounded by `deadline`); a `suspect` mark from
-    /// a failed materialization forces the same. Also drops a credential
-    /// helper directory a crashed fetch may have left behind.
     fn ensure(
         &self,
         dir: &Path,
@@ -416,9 +296,7 @@ impl Mirrors {
         remote: &str,
         deadline: Instant,
     ) -> Result<()> {
-        // A mirror serves only the remote that filled it: a binding
-        // that now names another remote starts from an empty store, so no
-        // object of the old one can reach a workspace of the new one.
+        // A mirror serves only the remote that filled it: other remotes start from an empty store.
         let recorded = fs::read_to_string(dir.join(REMOTE_FILE)).ok();
         if suspect.exists() || !Self::looks_bare(dir) || recorded.as_deref() != Some(remote) {
             self.rebuild(dir, suspect, leases, deadline)?;
@@ -428,8 +306,6 @@ impl Mirrors {
         Ok(())
     }
 
-    /// Rebuild the mirror from scratch. Readers copying the old store would
-    /// see it vanish mid-copy, so live leases are drained first, bounded.
     fn rebuild(&self, dir: &Path, suspect: &Path, leases: &Path, deadline: Instant) -> Result<()> {
         while Self::leases_live(leases)? {
             if Instant::now() >= deadline {
@@ -455,11 +331,6 @@ impl Mirrors {
         Ok(())
     }
 
-    /// Fetch, then require the pinned commit to verify. A failure splits by
-    /// cause: a store Git itself rejects is rebuilt once and the whole round
-    /// retried; a failure on a sound store is the remote's answer and
-    /// propagates; an absent pinned commit is a preparation failure naming
-    /// the SHA, never a fallback to another revision.
     fn fetch_and_verify(
         &self,
         dir: &Path,
@@ -473,8 +344,6 @@ impl Mirrors {
             let outcome = self.fetch_wants(dir, source, event_ref, ctx);
             match outcome {
                 Ok(commit) => return Ok(commit),
-                // Deadlines and IO are neither the remote's answer nor store
-                // damage — they propagate unchanged.
                 Err(e @ (Error::Timeout(_) | Error::Io(_))) => return Err(e),
                 Err(e) => {
                     if self.healthy(dir, ctx.deadline) {
@@ -492,12 +361,6 @@ impl Mirrors {
         unreachable!("the loop returns on its second pass at the latest")
     }
 
-    /// One round of wants, tried in the order that fails cheapest: the
-    /// pinned commit and the event ref together (the common case, one round
-    /// trip), then each alone — the commit may be reachable from the ref
-    /// even when the server refuses a SHA it never advertised, and the ref
-    /// may simply have been deleted. Any fetch that runs is followed by the
-    /// same verify; the last failure propagates.
     fn fetch_wants(
         &self,
         dir: &Path,
@@ -512,9 +375,7 @@ impl Mirrors {
         match self.fetch(dir, &source.repo, &wants, ctx) {
             Ok(()) => return self.verify(dir, &source.sha, ctx.deadline),
             Err(e) if event_ref.is_none() => return Err(e),
-            // Narrower wants help only when the server refused one of the
-            // wants themselves; an authentication, network or
-            // store failure would only be asked twice more.
+            // Narrower wants help only when the server refused a want; auth or network failures would repeat.
             Err(e) if !want_refused(&e) => return Err(e),
             Err(_) => {}
         }
@@ -535,11 +396,6 @@ impl Mirrors {
         self.verify(dir, &source.sha, ctx.deadline)
     }
 
-    /// One incremental fetch of `wants` — refspecs after `--`. `gc.auto`
-    /// and `maintenance.auto` are off: pruning is this module's own
-    /// decision, taken under the lock with no live readers. Credential files
-    /// are the same askpass/GIT_SSH discipline as the direct checkout,
-    /// installed beside the mirror for this fetch only.
     fn fetch(&self, dir: &Path, remote: &str, wants: &[String], ctx: &Ctx<'_>) -> Result<()> {
         let mut fetch = git(dir);
         transport(&mut fetch, ctx.private);
@@ -561,9 +417,6 @@ impl Mirrors {
         output.map(|_| ())
     }
 
-    /// The pinned revision must verify as a commit after the fetch — a
-    /// missing or non-commit object is a preparation failure naming the
-    /// SHA, never a fallback to another revision.
     fn verify(&self, dir: &Path, sha: &str, deadline: Instant) -> Result<String> {
         let mut verify = git(dir);
         verify.args([
@@ -587,9 +440,6 @@ impl Mirrors {
         Ok(commit)
     }
 
-    /// GC only when the store actually crossed a trigger, and only with no
-    /// live readers: expired leases are swept first, a live one skips this
-    /// round — a later fetch retries.
     fn gc_if_due(&self, dir: &Path, leases: &Path, deadline: Instant) -> Result<u64> {
         let objects = dir.join("objects");
         let (packs, loose, bytes) = Self::object_stats(&objects)?;
@@ -613,15 +463,9 @@ impl Mirrors {
             Error::Preparation(what) => Error::Mirror(what),
             other => other,
         })?;
-        // The store was just rewritten; its size decides how it is read.
         Ok(Self::object_stats(&objects)?.2)
     }
 
-    /// `(pack files, loose objects, bytes)` in the mirror's object store;
-    /// `tmp_*` leftovers count too — only GC or the sweep ever reclaims
-    /// them. `bytes` is exact up to [`COPY_MAX_BYTES`] and only known to
-    /// exceed it past that: loose objects stop being statted once the
-    /// materialization choice is settled.
     fn object_stats(objects: &Path) -> Result<(usize, u64, u64)> {
         let mut packs = 0usize;
         let mut loose = 0u64;
@@ -629,8 +473,6 @@ impl Mirrors {
         let pack_dir = objects.join("pack");
         if let Ok(entries) = fs::read_dir(&pack_dir) {
             for entry in entries.flatten() {
-                // A killed fetch's `tmp_pack_*` counts like a pack: it is
-                // disk the next GC reclaims.
                 let name = entry.file_name();
                 if name.as_bytes().ends_with(b".pack") || name.as_bytes().starts_with(b"tmp_") {
                     packs += 1;
@@ -662,8 +504,6 @@ impl Mirrors {
         Ok((packs, loose, bytes))
     }
 
-    /// Are readers holding leases? Expired and stale records are swept as a
-    /// side effect — a crashed attempt can hold GC off for at most its TTL.
     fn leases_live(leases: &Path) -> Result<bool> {
         let entries = match fs::read_dir(leases) {
             Ok(entries) => entries,
@@ -674,9 +514,6 @@ impl Mirrors {
         let mut live = false;
         for entry in entries.flatten() {
             let path = entry.path();
-            // A `.<name>.tmp` is a lease being published — which happens only
-            // under the writer lock every caller here holds: any one seen is
-            // a crashed publisher's, never a reader.
             if entry.file_name().as_bytes().starts_with(b".") {
                 let _ = fs::remove_file(&path);
                 continue;
@@ -689,17 +526,12 @@ impl Mirrors {
                     let _ = fs::remove_file(&path);
                     continue;
                 }
-                // A declared expiry is the reader's own deadline plus a
-                // margin: it holds however long that is.
                 Some(_) => {
                     live = true;
                     continue;
                 }
                 None => {}
             }
-            // Unparseable content is a stale record: trust its age — older
-            // than a lease can live is stale, younger is conservatively a
-            // live reader.
             let stale = entry
                 .metadata()
                 .ok()
@@ -715,9 +547,6 @@ impl Mirrors {
         Ok(live)
     }
 
-    /// Publish a reader lease for `name` (the attempt id): expiry timestamp
-    /// inside, written to a temp file then renamed so a sweeper never reads
-    /// a torn record. Runs under the write lock.
     fn lease(&self, leases: &Path, name: &str, deadline: Instant) -> Result<Lease> {
         if name.is_empty()
             || name.len() > 128
@@ -728,13 +557,9 @@ impl Mirrors {
             return Err(Error::Preparation("lease name is not usable".into()));
         }
         fs::create_dir_all(leases)?;
-        // The lease lasts as long as its reader may run, plus a margin — the
-        // reader's own deadline, never a fixed wall-clock guess.
         let remaining = deadline.saturating_duration_since(Instant::now());
         let expiry = UnixMillis::now().0 + (remaining + LEASE_MARGIN).as_millis() as i64;
         let tmp = leases.join(format!(".{name}.tmp"));
-        // Truncating, not `create_new`: a crashed attempt's leftover temp
-        // file must not block the same attempt id's next lease.
         OpenOptions::new()
             .write(true)
             .create(true)
@@ -746,15 +571,6 @@ impl Mirrors {
         Ok(Lease(path))
     }
 
-    /// Populate `workspace` (empty) with `commit` out of the mirror: a
-    /// private object store, then `checkout --detach` and a final HEAD
-    /// verification. The store is built the cheapest measured way:
-    ///
-    /// - reflink the whole store when the filesystem proved capable — cost
-    ///   per file, not per byte, and GC keeps the file count small;
-    /// - byte-copy it when it is at most [`COPY_MAX_BYTES`];
-    /// - otherwise fetch the pinned commit alone at depth 1, so the job's
-    ///   `.git` holds one tree instead of every revision ever fetched.
     fn materialize(
         &self,
         mirror: &Path,
@@ -800,13 +616,6 @@ impl Mirrors {
         Ok(())
     }
 
-    /// Fetch exactly the pinned commit's tree out of the mirror into the
-    /// workspace (`--depth 1`, protocol v2 over a local path): Git packs
-    /// only the objects the checkout reaches, and the workspace indexes its
-    /// own pack — private inodes, no `alternates`, and bytes proportional
-    /// to the tree rather than to every revision the mirror ever fetched.
-    /// The mirror is only read: upload-pack runs against it
-    /// under this attempt's reader lease, which keeps GC from pruning it.
     fn fetch_pinned(
         mirror: &Path,
         workspace: &Path,
@@ -842,10 +651,6 @@ impl Mirrors {
         Ok(())
     }
 
-    /// Copy the mirror's object store file by file, reflink or bytes. Git's
-    /// own in-flight names (`tmp_*`) and anything that is not a regular
-    /// file or directory are never copied; `info/alternates` is never
-    /// copied either — the workspace's object store must stand alone.
     fn copy_objects(
         src: &Path,
         dst: &Path,
@@ -874,8 +679,6 @@ impl Mirrors {
                     }
                     stack.push((entry.path(), target));
                 } else if ftype.is_file() {
-                    // No alternates may reach the job: it would point at the
-                    // mirror's store the job must not mutate.
                     if name == OsStr::new("alternates")
                         && from.file_name() == Some(OsStr::new("info"))
                     {
@@ -892,10 +695,6 @@ impl Mirrors {
         Ok(())
     }
 
-    /// One object file: reflink when supported — copy-on-write extents keep
-    /// the job's store private without the copy's cost — else `fs::copy`,
-    /// which reflinks transparently on filesystems that support it anyway.
-    /// A reflink failure falls back to the byte copy.
     fn copy_file(src: &Path, dst: &Path, reflink: bool) -> Result<()> {
         if reflink && Self::reflink_file(src, dst).is_ok() {
             return Ok(());
@@ -904,8 +703,6 @@ impl Mirrors {
         Ok(())
     }
 
-    /// `FICLONE` `src` onto `dst`: shared extents, separate inode — writing
-    /// through the workspace copy can never alter the mirror's bytes.
     fn reflink_file(src: &Path, dst: &Path) -> std::io::Result<()> {
         let from = File::open(src)?;
         let mode = from.metadata()?.mode();
@@ -923,9 +720,6 @@ impl Mirrors {
     }
 }
 
-/// Whether a failed fetch is the server refusing one of the wants — an
-/// unadvertised SHA, or a ref that is gone — the only failures a narrower
-/// want can get past.
 fn want_refused(error: &Error) -> bool {
     let Error::Preparation(text) = error else {
         return false;
@@ -942,28 +736,16 @@ fn want_refused(error: &Error) -> bool {
     .any(|needle| text.contains(needle))
 }
 
-/// What one [`Mirrors::sweep`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MirrorSweep {
-    /// Mirrors seen.
     pub mirrors: u64,
-    /// Bytes the kept mirrors hold after the pass.
     pub bytes: u64,
-    /// Mirrors removed — idle past [`MIRROR_IDLE`] or over the budget.
     pub removed: u64,
-    /// Stale `tmp_*` files of killed fetches removed.
     pub tmp_removed: u64,
     pub bytes_freed: u64,
 }
 
 impl Mirrors {
-    /// Bound the mirrors' disk: stale `tmp_*` leftovers of killed
-    /// fetches go, a mirror no writer touched for [`MIRROR_IDLE`] goes, and
-    /// while the rest exceed `budget_bytes` the least recently written
-    /// mirrors go. Every removal happens under that mirror's writer lock
-    /// (taken without waiting — a busy mirror is skipped) and with no live
-    /// reader lease; the lock file itself stays, so a writer that opened it
-    /// can never lock a stale inode.
     pub fn sweep(&self, budget_bytes: u64) -> MirrorSweep {
         let mut out = MirrorSweep::default();
         let Ok(entries) = fs::read_dir(&self.root) else {
@@ -1016,8 +798,6 @@ impl Mirrors {
         out
     }
 
-    /// The mirror's writer lock without waiting; `None` when a writer holds
-    /// it or it cannot be opened.
     fn try_lock(&self, mirror: &Path) -> Option<File> {
         let file = OpenOptions::new()
             .read(true)
@@ -1032,7 +812,6 @@ impl Mirrors {
     }
 }
 
-/// Bytes of every regular file under `dir`, never following links.
 fn tree_bytes(dir: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
@@ -1053,7 +832,6 @@ fn tree_bytes(dir: &Path) -> u64 {
     total
 }
 
-/// Remove `tmp_*` files under an object store older than [`STALE_TMP`].
 fn remove_stale_tmp(objects: &Path, now: std::time::SystemTime) -> u64 {
     let mut removed = 0;
     let mut stack = vec![objects.to_path_buf()];
@@ -1083,8 +861,6 @@ fn remove_stale_tmp(objects: &Path, now: std::time::SystemTime) -> u64 {
     removed
 }
 
-/// `FICLONE` `from` onto `to`: shared extents, separate inode. Linux only;
-/// elsewhere reflink is unsupported and callers copy bytes.
 fn ficlone(to: &File, from: &File) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -1102,8 +878,6 @@ fn ficlone(to: &File, from: &File) -> std::io::Result<()> {
     }
 }
 
-/// Does `root`'s filesystem support `FICLONE`? One real clone of a probe
-/// pair — created, exercised and removed here — settles it for the process.
 fn reflink_supported(root: &Path) -> Result<bool> {
     let src = root.join(".reflink-probe-src");
     let dst = root.join(".reflink-probe-dst");
@@ -1117,8 +891,6 @@ fn reflink_supported(root: &Path) -> Result<bool> {
         }
     }
     let _clean = Clean(&src, &dst);
-    // `FICLONE` needs its source open for reading: a write-only source is
-    // `EBADF` on every filesystem.
     let mut from = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1137,9 +909,6 @@ fn reflink_supported(root: &Path) -> Result<bool> {
 mod tests {
     use super::*;
 
-    /// The probe answers what the filesystem does: it agrees with a clone
-    /// made the way materialization makes one (a read-only source).
-    /// Point `TMPDIR` at a reflink filesystem to see the `true` side; on ext4 or tmpfs both answers are `false`.
     #[test]
     fn the_reflink_probe_agrees_with_a_real_clone() {
         let dir = tempfile::tempdir().unwrap();
@@ -1149,8 +918,6 @@ mod tests {
         assert_eq!(reflink_supported(dir.path()).unwrap(), real);
     }
 
-    /// Only a server refusing a want earns the narrower retries;
-    /// an authentication, network or local failure is final.
     #[test]
     fn only_a_refused_want_is_retried_narrower() {
         for refused in [

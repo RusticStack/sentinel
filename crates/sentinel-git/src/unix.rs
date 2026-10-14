@@ -1,5 +1,3 @@
-//! The Unix implementation: process-group deadlines, owner-only credential
-//! files, and the two entry points.
 use std::{
     fs,
     io::{Read, Write},
@@ -23,30 +21,17 @@ use sentinel_protocol::source::{Access, Credential as SourceCredential};
 
 use crate::{Error, Merge, Result, destination};
 
-/// A whole checkout — every Git invocation together — must finish in this.
 pub const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-/// Longest path [`file_at`] accepts.
 pub const MAX_PATH_BYTES: usize = 1024;
-/// Bytes of diagnostics kept per stream (payload reads are explicitly capped).
 const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
-/// Longest a helper wait sleeps before looking at its cancel flag and
-/// output caps again. The child's own exit wakes it at once (a pidfd on
-/// Linux); only where that is unavailable is this a polling interval.
 const CHECK: Duration = Duration::from_millis(50);
-/// The fallback polling interval where no pidfd can be opened.
 const POLL: Duration = Duration::from_millis(20);
 
 thread_local! {
-    /// The cancel flag of the work this thread is doing, if any (see
-    /// [`cancel_scope`]).
     static CANCEL: std::cell::RefCell<Option<Arc<AtomicBool>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Run `f` with every Git helper it starts on this thread tied to `cancel`:
-/// once the flag is set, the running helper's whole process group is killed
-/// at its next check (at most [`CHECK`] later) and the call fails, instead
-/// of a fetch running on to its deadline after the work was cancelled.
 pub fn cancel_scope<T>(cancel: Arc<AtomicBool>, f: impl FnOnce() -> T) -> T {
     let previous = CANCEL.with(|slot| slot.borrow_mut().replace(cancel));
     let out = f();
@@ -62,9 +47,6 @@ fn canceled() -> bool {
     })
 }
 
-/// A handle that becomes readable when the child exits, so waiting costs
-/// no polling; `None` where the kernel has no pidfd (then [`wait_step`]
-/// polls).
 pub struct ExitWatch(#[cfg(target_os = "linux")] Option<std::os::fd::OwnedFd>);
 
 impl ExitWatch {
@@ -88,8 +70,6 @@ impl ExitWatch {
         }
     }
 
-    /// Whether the child's exit itself wakes a wait (a pidfd), rather than
-    /// the next [`POLL`] tick.
     pub fn wakes_on_exit(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -101,7 +81,6 @@ impl ExitWatch {
         }
     }
 
-    /// Block until the child may have exited or `wait` passed.
     fn park(&self, wait: Duration) {
         #[cfg(target_os = "linux")]
         if let Some(fd) = &self.0 {
@@ -123,9 +102,6 @@ impl ExitWatch {
     }
 }
 
-/// Wait for `child` until it exits or `until` passes, returning early —
-/// with `None` — at least every [`CHECK`] so the caller can look at its
-/// cancel flag and caps. The exit itself wakes the wait at once.
 pub fn wait_step(
     child: &mut Child,
     watch: &ExitWatch,
@@ -141,12 +117,10 @@ pub fn wait_step(
     child.try_wait()
 }
 
-/// Monotonic nanoseconds since `started`, saturated at `u64::MAX`.
 pub(crate) fn elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-/// What a helper produced. `code` is `None` when it died from a signal.
 #[derive(Debug)]
 pub struct Output {
     pub code: Option<i32>,
@@ -159,7 +133,6 @@ impl Output {
         self.code == Some(0)
     }
 
-    /// The last line of stderr, printable characters only, for an error.
     pub fn stderr_excerpt(&self) -> String {
         let text = String::from_utf8_lossy(&self.stderr);
         let line = text
@@ -175,39 +148,24 @@ impl Output {
     }
 }
 
-/// A short-lived, repository-scoped credential for the fetch.
 pub struct Credential {
     pub username: String,
     pub secret: String,
 }
 
-/// What was checked out: the verified revision, with the fetch and the
-/// worktree materialization measured separately (monotonic nanoseconds).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Checkout {
     pub sha: String,
-    /// Getting the objects: the remote fetch, or the mirror update.
     pub fetch_ns: u64,
-    /// Turning objects into the worktree: init, object copy, checkout and
-    /// the final `HEAD` verification.
     pub materialize_ns: u64,
 }
 
-/// One file read from one revision; `commit` is the peeled commit the file
-/// was read at (a tag object resolves to what it points to).
 #[derive(Debug, PartialEq, Eq)]
 pub struct FetchedFile {
     pub commit: String,
     pub bytes: Vec<u8>,
 }
 
-/// The `HOME` (and `XDG_CONFIG_HOME`) every Git helper sees: a directory
-/// that does not exist. Git then finds no `~/.gitconfig` or
-/// `~/.config/git/config` on *any* version, so nothing a repository
-/// committed (a `.gitconfig` at the workspace root, which a workspace-as-HOME
-/// would have exposed to every later Git command) and nothing from the host
-/// account can configure it. `GIT_CONFIG_GLOBAL=/dev/null` is only honored
-/// from Git 2.32; this holds without it.
 const NO_HOME: &str = "/nonexistent-sentinel-git-home";
 
 pub(crate) fn git(dir: &Path) -> Command {
@@ -224,8 +182,6 @@ pub(crate) fn git(dir: &Path) -> Command {
     cmd
 }
 
-/// How a stream is captured: a payload is kept whole up to a cap; diagnostics
-/// keep only a trailing window so a noisy helper cannot exhaust memory.
 enum Capture {
     Payload(Arc<Overflow>),
     Tail,
@@ -265,16 +221,6 @@ fn drain(mut stream: impl Read + Send + 'static, capture: Capture) -> thread::Jo
     })
 }
 
-/// Have the kernel `SIGKILL` the helper if the process that spawns it dies
-/// (Linux `PR_SET_PDEATHSIG`; a no-op elsewhere). A fetch holding a
-/// credential in its environment, or a pull, then cannot outlive a crashed
-/// or killed worker or controller until its own deadline.
-///
-/// The signal follows the *thread* that forked the helper, which is how
-/// every caller uses it: the helper is started and waited for on one
-/// thread. It reaches the helper itself, not processes the helper starts.
-/// If the parent is already gone when the helper starts, the spawn fails
-/// instead of running unowned.
 pub fn die_with_parent(command: &mut Command) {
     #[cfg(target_os = "linux")]
     {
@@ -295,8 +241,6 @@ pub fn die_with_parent(command: &mut Command) {
                 {
                     return Err(std::io::Error::last_os_error());
                 }
-                // The parent may have died between `fork` and `prctl`, when
-                // the signal would never come.
                 if libc::getppid() != parent {
                     return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
                 }
@@ -317,10 +261,6 @@ fn kill_group(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Run `command` as the leader of a new process group, with stdin closed, and
-/// wait until it exits or `deadline` passes — then the whole group is killed
-/// and `Timeout(what)` returned. Diagnostics are trimmed; a `None` cap keeps
-/// stdout whole.
 pub fn run(command: Command, deadline: Instant, what: &'static str) -> Result<Output> {
     run_capped(command, deadline, what, None)
 }
@@ -358,8 +298,6 @@ fn run_capped(
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(error) => {
-                // A wait that failed must not leave the helper running with
-                // its credentials in its environment, unobserved.
                 kill_group(&mut child);
                 let _ = stdout.join();
                 let _ = stderr.join();
@@ -405,8 +343,6 @@ pub(crate) fn step(
     if output.success() {
         Ok(output)
     } else {
-        // Git/SSH servers may reflect a credential in stderr. Take one bounded
-        // line and strip anything this fetch installed as a secret.
         let mut excerpt = output.stderr_excerpt();
         for secret in secrets {
             excerpt = excerpt.replace(secret, "[redacted]");
@@ -419,7 +355,6 @@ pub(crate) fn trim(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_owned()
 }
 
-/// A full object id: 40 (SHA-1) or 64 (SHA-256) lower-case hex digits.
 pub fn valid_sha(sha: &str) -> bool {
     (sha.len() == 40 || sha.len() == 64)
         && sha
@@ -427,8 +362,6 @@ pub fn valid_sha(sha: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// A safe `rev:path` path: relative, printable, bounded, and free of `:`,
-/// `\` and traversal segments. Hidden files (`.sentinel.yml`) are ordinary.
 pub fn valid_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= MAX_PATH_BYTES
@@ -451,8 +384,6 @@ pub(crate) fn init(work: &Path, deadline: Instant) -> Result<()> {
     Ok(())
 }
 
-/// Fetch `sha` itself (never a branch), depth one and without tags. The
-/// credential files are installed for this invocation only.
 fn fetch(
     work: &Path,
     remote: &str,
@@ -474,10 +405,6 @@ fn fetch(
     )
 }
 
-/// [`fetch`] with the given extra arguments before `--` (a depth, a
-/// partial-clone filter). `pin` is the `http.curloptResolve` value that
-/// restricts a manual remote's connection to the addresses already judged
-/// public ([`destination::pin`]).
 #[allow(clippy::too_many_arguments)]
 fn fetch_with(
     work: &Path,
@@ -494,8 +421,6 @@ fn fetch_with(
     }
     let mut fetch = git(work);
     let mut secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
-    // A manual credential a server echoes back is redacted like a bound
-    // one: no error excerpt may carry either.
     if let Some(credential) = credential
         && !credential.secret.is_empty()
     {
@@ -519,21 +444,10 @@ fn fetch_with(
             .env("SENTINEL_GIT_SECRET", &askpass.secret);
     }
     let fetched = step(fetch, deadline, "git fetch", &secrets);
-    // The credential files go as soon as the fetch returns; the caller owns
-    // the `Private` install for the checkout that follows.
     drop(askpass);
     fetched.map(|_| ())
 }
 
-/// The transport discipline for one fetch. An authorized fetch gets the
-/// binding's pinned trust ([`Private::configure`]). A fetch with no access —
-/// the manual mode, whose remote a client named — gets the same refusals
-/// minus the credential: no redirects, no credential helper from anywhere,
-/// and only `https` or a local path. `ssh` is refused outright there, since
-/// OpenSSH would present the worker account's own identity and
-/// configuration; `git://`, plain `http://` and remote helpers never run.
-/// Local paths stay possible here for worker-local mirrors and tests; the
-/// controller refuses them as a client-named manual source.
 pub(crate) fn transport(cmd: &mut Command, private: Option<&Private>) {
     match private {
         Some(private) => private.configure(cmd),
@@ -554,8 +468,6 @@ pub(crate) fn transport(cmd: &mut Command, private: Option<&Private>) {
     }
 }
 
-/// A full ref name under `refs/` — the merge ref a forge computes for a pull
-/// request. Anything else never reaches Git.
 pub(crate) fn valid_ref_name(name: &str) -> bool {
     name.starts_with("refs/")
         && name.len() <= 256
@@ -566,7 +478,6 @@ pub(crate) fn valid_ref_name(name: &str) -> bool {
         && !name.ends_with('/')
 }
 
-/// The commit `FETCH_HEAD` names after a fetch, peeled if it is a tag object.
 fn fetch_head(work: &Path, deadline: Instant, secrets: &[String]) -> Result<String> {
     let mut peel = git(work);
     peel.args(["rev-parse", "--verify", "FETCH_HEAD^{commit}"]);
@@ -580,8 +491,6 @@ fn fetch_head(work: &Path, deadline: Instant, secrets: &[String]) -> Result<Stri
     Ok(commit)
 }
 
-/// Read `path` at `commit` in `work`, probing the size first so an oversized
-/// file is refused without being read.
 fn read_path(
     work: &Path,
     commit: &str,
@@ -613,9 +522,6 @@ fn read_path(
     Ok(output.stdout)
 }
 
-/// Check out `source.sha` from `source.repo` into `workspace` (which must be
-/// empty), within `timeout`. `credential` is presented through the askpass
-/// helper for the fetch only.
 pub fn checkout(
     workspace: &Path,
     source: &PinnedSource,
@@ -625,8 +531,6 @@ pub fn checkout(
     checkout_inner(workspace, source, credential, None, timeout)
 }
 
-/// The same checkout under a source access: expiry, exact remote and allowed
-/// ref are rechecked here, never trusted from the run spec.
 pub fn checkout_authorized(
     workspace: &Path,
     source: &PinnedSource,
@@ -656,19 +560,13 @@ fn checkout_inner(
     if source.repo.starts_with('-') {
         return Err(Error::Preparation("repository looks like an option".into()));
     }
-    // Materialization is everything except the fetch itself: the init and
-    // credential install that precede it, and the detach plus verification
-    // that follow. The segments are timed separately, never subtracted.
     let pre_started = Instant::now();
     init(workspace, deadline)?;
     let private = access.map(|a| Private::install(workspace, a)).transpose()?;
     let pre_ns = elapsed_ns(pre_started);
 
     let fetch_started = Instant::now();
-    // An unbound remote — one a client named — is judged and pinned before
-    // Git connects (`destination`); its failures carry no Git diagnostic, so
-    // the worker's reach into its own network is not an oracle. A bound
-    // remote is the binding's, already approved against the allowlist.
+    // Judged before Git connects: a failure must not reveal the worker's own network to the client.
     let manual = access.is_none() && source.repo.starts_with("https://");
     let pin = if access.is_none() {
         destination::pin(&source.repo, deadline)?
@@ -713,10 +611,6 @@ fn checkout_inner(
     })
 }
 
-/// Fetch `sha` from `remote` into `work` (which must be empty), peel it to its
-/// commit (an annotated tag resolves to what it points to), and read `path`
-/// from that commit with a hard byte cap. `access`, when present, supplies the
-/// credential and trust and is revalidated here.
 pub fn file_at(
     work: &Path,
     remote: &str,
@@ -745,12 +639,6 @@ pub fn file_at(
     init(work, deadline)?;
     let private = access.map(|a| Private::install(work, a)).transpose()?;
     let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
-    // Fetch the commit and its trees only, then the one blob the pipeline
-    // is, instead of the whole tree. The work repository is a partial clone
-    // of `remote` (a promisor remote named `origin`: without one, a
-    // filtered fetch fails its connectivity check). A server that ignores
-    // the filter sends everything and the blob is simply present; any
-    // other failure on this path falls back to a whole depth-one fetch.
     let filtered = partial_origin(work, remote, deadline).is_ok()
         && fetch_with(
             work,
@@ -789,11 +677,8 @@ pub fn file_at(
     Ok(FetchedFile { commit, bytes })
 }
 
-/// The promisor remote a filtered pipeline read fetches through.
 const PARTIAL_REMOTE: &str = "origin";
 
-/// Make `work` a partial clone of `remote`: a promisor remote
-/// [`PARTIAL_REMOTE`] with a `blob:none` filter. Nothing is fetched here.
 fn partial_origin(work: &Path, remote: &str, deadline: Instant) -> Result<()> {
     if remote.starts_with('-') {
         return Err(Error::Preparation("repository looks like an option".into()));
@@ -812,9 +697,6 @@ fn partial_origin(work: &Path, remote: &str, deadline: Instant) -> Result<()> {
     Ok(())
 }
 
-/// The object id of the blob at `path` in `commit`, from its trees alone;
-/// `None` when the path is absent or not a regular file (the read that
-/// follows then says `Missing`).
 fn path_blob(
     work: &Path,
     commit: &str,
@@ -838,23 +720,14 @@ fn path_blob(
     })
 }
 
-/// Whether the object store holds `oid` locally, without a lazy fetch.
 fn object_present(work: &Path, oid: &str, deadline: Instant) -> bool {
     let mut exists = git(work);
-    // A partial clone would fetch a missing object to answer; the question
-    // is only whether it is here.
+    // GIT_NO_LAZY_FETCH: a partial clone would otherwise fetch the missing object just to answer.
     exists.env("GIT_NO_LAZY_FETCH", "1");
     exists.args(["cat-file", "-e", oid]);
     step(exists, deadline, "git cat-file", &[]).is_ok()
 }
 
-/// Fetch `merge_ref` — the tested-merge ref a forge computes for a pull
-/// request — from `remote` into `work` (which must be empty), require the
-/// commit it names to list `head` among its parents, and read `path` at it.
-/// A payload's claimed merge can be stale: only a merge commit that actually
-/// names the delivered head is truthful to test. `Error::Merge` means the ref
-/// is absent or still names a merge for another head — the forge may simply
-/// not have recomputed it yet.
 pub fn file_at_merge(
     work: &Path,
     remote: &str,
@@ -914,8 +787,7 @@ pub fn file_at_merge(
     drop(private);
     let commit = fetch_head(work, deadline, &secrets)?;
 
-    // The merge must name the delivered head among its parents; a merge
-    // computed for an earlier head would test the wrong change.
+    // A merge computed for an earlier head would test the wrong change.
     let mut object = git(work);
     object.args(["cat-file", "-p", &commit]);
     let output = run_capped(object, deadline, "git cat-file", Some(64 * 1024))?;
@@ -934,24 +806,11 @@ pub fn file_at_merge(
     Ok(FetchedFile { commit, bytes })
 }
 
-/// Whether a failed merge-ref fetch means the ref is absent — the forge has
-/// not computed the merge (yet), which is retryable. Every other failure is
-/// the remote itself: in particular a repository that is gone, renamed or
-/// inaccessible (`repository '…' not found`) is not a merge still pending.
 fn merge_ref_missing(excerpt: &str) -> bool {
     excerpt.contains("couldn't find remote ref")
 }
 
-/// Whether `ancestor` is in the history of `tip` on `remote`, looking at most
-/// `depth` generations back from `tip` — the intake resolver's test for "the
-/// repository already moved past this commit". Only commits are fetched
-/// (`--filter=tree:0`, where the server supports it; otherwise the depth
-/// alone bounds the transfer), into `work`, which must be empty; nothing is
-/// ever fetched lazily afterwards.
-///
-/// The answer is conservative: `false` means "not proven", including an
-/// ancestor older than the window and a `tip` the remote no longer has
-/// (force-pushed away). A remote that cannot be reached is an error.
+/// `false` means not proven, not absent: a vanished tip answers `false`, an unreachable remote errors.
 pub fn is_ancestor(
     work: &Path,
     remote: &str,
@@ -979,9 +838,6 @@ pub fn is_ancestor(
     init(work, deadline)?;
     let private = access.map(|a| Private::install(work, a)).transpose()?;
     let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
-    // A filtered fetch records its remote as a promisor, which needs a name:
-    // a bare URL or path is not one. The scratch repository gets `origin`
-    // (no refspec, so only the wanted commit is fetched).
     let mut name = git(work);
     name.args(["config", "--local", "remote.origin.url", remote]);
     step(name, deadline, "git config", &secrets)?;
@@ -1005,14 +861,11 @@ pub fn is_ancestor(
         for secret in &secrets {
             excerpt = excerpt.replace(secret, "[redacted]");
         }
-        // The remote no longer has the tip: nothing can be proven about it.
         if excerpt.contains("not our ref") || excerpt.contains("couldn't find remote ref") {
             return Ok(false);
         }
         return Err(Error::Preparation(format!("git fetch failed: {excerpt}")));
     }
-    // Walk only what was fetched: the shallow boundary ends the walk, and
-    // lazy fetching is disabled so a missing object is never requested.
     let limit = (depth as usize).saturating_mul(8).min(1 << 16);
     let mut walk = git(work);
     walk.env("GIT_NO_LAZY_FETCH", "1").args([
@@ -1031,12 +884,6 @@ pub fn is_ancestor(
         .any(|line| line == ancestor.as_bytes()))
 }
 
-/// Advertise `remote`'s heads and tags without fetching anything — the ref
-/// poller's whole view of a remote. `dir` is scratch only: credential
-/// helpers live next to it for the duration of the one command, and Git's
-/// own configuration is ignored as everywhere else. Output and the ref
-/// count are both capped; an annotated tag arrives as its object id with the
-/// peeled commit recorded on the same tip.
 pub fn ls_remote(
     dir: &Path,
     remote: &str,
@@ -1058,8 +905,6 @@ pub fn ls_remote(
     let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
     let mut cmd = git(dir);
     transport(&mut cmd, private.as_ref());
-    // `--heads --tags` keeps the advertisement to the refs a binding can
-    // name; `--` keeps the remote itself unambiguous as an argument.
     cmd.args(["ls-remote", "--heads", "--tags", "--", remote]);
     let cap = max_refs.min(65_536).saturating_mul(1_200);
     let output = run_capped(cmd, deadline, "git ls-remote", Some(cap))?;
@@ -1076,8 +921,6 @@ pub fn ls_remote(
     parse_tips(&output.stdout, max_refs)
 }
 
-/// `oid<TAB>ref` lines, with `<ref>^{}` lines folding onto their base ref.
-/// Anything that is not that shape is not an ls-remote answer.
 fn parse_tips(out: &[u8], max_refs: usize) -> Result<Vec<crate::RefTip>> {
     let mut tips: Vec<crate::RefTip> = Vec::new();
     let mut peeled: Vec<crate::RefTip> = Vec::new();
@@ -1127,8 +970,6 @@ fn parse_tips(out: &[u8], max_refs: usize) -> Result<Vec<crate::RefTip>> {
     Ok(tips)
 }
 
-/// An advertised ref name: under `refs/`, printable and bounded. Selection
-/// is the caller's; this only rejects lines that are not refs at all.
 fn advertised(name: &str) -> bool {
     name.starts_with("refs/")
         && name.len() <= 1024
@@ -1136,8 +977,6 @@ fn advertised(name: &str) -> bool {
         && !name.bytes().any(|b| !(0x21..=0x7e).contains(&b))
 }
 
-/// Fetch-only files are siblings of the work directory, never mounted in a
-/// job. Mode is set at creation, including on every partial-failure path.
 pub(crate) struct Private {
     dir: PathBuf,
     ssh: bool,
@@ -1232,9 +1071,6 @@ impl Drop for Private {
     }
 }
 
-/// The askpass helper: an owner-only script beside the workspace that
-/// answers Git's username/password prompts from its own environment and is
-/// removed as soon as the fetch has finished.
 pub(crate) struct Askpass {
     pub(crate) path: PathBuf,
     pub(crate) username: String,
@@ -1272,9 +1108,6 @@ impl Drop for Askpass {
 mod tests {
     use super::merge_ref_missing;
 
-    /// A `.gitconfig` a repository committed at its root never configures
-    /// Git, and Git's home is not the workspace: it names no directory that
-    /// exists, so no Git version can read a global config from it.
     #[test]
     fn a_committed_gitconfig_cannot_configure_git() {
         let work = tempfile::tempdir().unwrap();
@@ -1303,11 +1136,6 @@ mod tests {
         assert!(!String::from_utf8_lossy(&out.stdout).contains("planted"));
     }
 
-    /// A helper's exit wakes its wait at once, with no poll tick: parked
-    /// for a minute, the wait does not return while the child lives (a
-    /// polling wait would be back within one 20 ms tick) and returns once
-    /// it exits. Decided by the child's exit, not by timing, so machine
-    /// load cannot fail it.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_childs_exit_wakes_a_parked_wait() {
@@ -1347,12 +1175,9 @@ mod tests {
 
     #[test]
     fn only_a_missing_ref_is_a_pending_merge() {
-        // What Git prints when the forge has not computed the merge ref.
         assert!(merge_ref_missing(
             "fatal: couldn't find remote ref refs/pull/7/merge"
         ));
-        // A repository that is gone, renamed or inaccessible is the remote's
-        // answer, not a merge still pending.
         for excerpt in [
             "fatal: repository 'https://github.com/o/r.git/' not found",
             "remote: Repository not found.",

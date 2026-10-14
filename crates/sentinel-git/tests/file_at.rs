@@ -1,6 +1,3 @@
-//! Source resolution over a local repository: read one file at one
-//! revision, peel annotated tags to their commit, and refuse unsafe paths,
-//! oversized files and inconsistent access.
 #![cfg(unix)]
 
 use std::{
@@ -57,7 +54,6 @@ fn repository() -> Repo {
     fs::write(path.join(".sentinel.yml"), "schema: 1 # second\n").unwrap();
     git(&path, &["commit", "-qam", "two"]);
     let second = git(&path, &["rev-parse", "HEAD"]);
-    // A file far larger than any pipeline may be.
     fs::write(path.join("big.yml"), vec![b'x'; 2 * 1024 * 1024]).unwrap();
     git(&path, &["add", "big.yml"]);
     git(&path, &["commit", "-qm", "big"]);
@@ -84,7 +80,6 @@ fn a_file_is_read_at_the_exact_revision_and_tags_are_peeled() {
     let repo = repository();
     let remote = repo.path.to_str().unwrap();
 
-    // The revision asked for is the one read, not the branch head.
     let fetched = file_at(
         &work(&repo, "second"),
         remote,
@@ -112,7 +107,6 @@ fn a_file_is_read_at_the_exact_revision_and_tags_are_peeled() {
     assert_eq!(fetched.commit, repo.first);
     assert_eq!(fetched.bytes, b"schema: 1 # first\n");
 
-    // An annotated tag object resolves to the commit it points at.
     let fetched = file_at(
         &work(&repo, "tag"),
         remote,
@@ -133,7 +127,6 @@ fn missing_oversized_and_unsafe_inputs_are_refused_explicitly() {
     let remote = repo.path.to_str().unwrap();
     let timeout = Duration::from_secs(30);
 
-    // A path that is not in the revision.
     assert!(matches!(
         file_at(
             &work(&repo, "missing"),
@@ -146,7 +139,6 @@ fn missing_oversized_and_unsafe_inputs_are_refused_explicitly() {
         ),
         Err(Error::Missing)
     ));
-    // A file larger than the caller allows is refused without being read.
     assert!(matches!(
         file_at(
             &work(&repo, "big"),
@@ -159,7 +151,6 @@ fn missing_oversized_and_unsafe_inputs_are_refused_explicitly() {
         ),
         Err(Error::TooLarge(_))
     ));
-    // Unsafe paths never reach Git.
     for (index, path) in [
         "",
         "/etc/passwd",
@@ -188,8 +179,6 @@ fn missing_oversized_and_unsafe_inputs_are_refused_explicitly() {
             "{path:?}"
         );
     }
-    // A revision that is not a full object id, and a repository that looks
-    // like an option, are preparation failures.
     assert!(matches!(
         file_at(
             &work(&repo, "sha"),
@@ -221,7 +210,6 @@ fn a_merge_ref_is_read_only_when_it_names_the_delivered_head() {
     let repo = repository();
     let remote = repo.path.to_str().unwrap();
     let timeout = Duration::from_secs(30);
-    // A pull-request merge ref: a head commit on a branch merged into main.
     git(&repo.path, &["checkout", "-qb", "feature", &repo.second]);
     fs::write(repo.path.join("feature.txt"), "the head's change\n").unwrap();
     git(&repo.path, &["add", "feature.txt"]);
@@ -235,7 +223,6 @@ fn a_merge_ref_is_read_only_when_it_names_the_delivered_head() {
     let merge = git(&repo.path, &["rev-parse", "HEAD"]);
     git(&repo.path, &["update-ref", "refs/pull/7/merge", &merge]);
 
-    // The merge's own file contents are served, at the merge commit.
     let fetched = file_at_merge(
         &work(&repo, "merge"),
         remote,
@@ -252,8 +239,7 @@ fn a_merge_ref_is_read_only_when_it_names_the_delivered_head() {
     assert_eq!(fetched.commit, merge);
     assert_eq!(fetched.bytes, b"the head's change\n");
 
-    // A merge ref that does not name the delivered head is not trusted — it
-    // may still name a merge the forge computed for an older head.
+    // A merge ref must name the delivered head: it may still hold a merge computed for an older head.
     assert!(matches!(
         file_at_merge(
             &work(&repo, "stale"),
@@ -269,7 +255,6 @@ fn a_merge_ref_is_read_only_when_it_names_the_delivered_head() {
         ),
         Err(Error::Merge)
     ));
-    // A ref that does not exist at all is the same class: not computed yet.
     assert!(matches!(
         file_at_merge(
             &work(&repo, "absent"),
@@ -285,7 +270,6 @@ fn a_merge_ref_is_read_only_when_it_names_the_delivered_head() {
         ),
         Err(Error::Merge)
     ));
-    // Inputs that are not a ref under refs/ and a full head id never reach Git.
     for (index, (merge_ref, head_sha)) in [("pull/7/merge", &*head), ("refs/pull/7/merge", "main")]
         .into_iter()
         .enumerate()
@@ -335,7 +319,6 @@ fn a_source_access_must_match_the_remote_it_is_used_for() {
         ),
         Err(Error::Preparation(_))
     ));
-    // Even with a matching remote, an expired access is refused.
     access.binding.remote = remote.to_owned();
     access.expires_ms = sentinel_core::UnixMillis::now().0 - 1;
     assert!(matches!(
@@ -352,8 +335,6 @@ fn a_source_access_must_match_the_remote_it_is_used_for() {
     ));
 }
 
-/// A server that honours partial-clone filters sends the commit, its
-/// trees and the one blob the pipeline is — never the rest of the tree.
 #[test]
 fn a_filtering_server_sends_only_the_pipeline_blob() {
     let repo = repository();
