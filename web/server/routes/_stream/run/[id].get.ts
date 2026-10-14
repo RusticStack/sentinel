@@ -1,11 +1,4 @@
-// Live run updates for the browser as server-sent events. This process
-// holds the controller's long poll (`GET /runs/{id}/wait`) on the
-// browser's behalf and pushes a `run` event each time the run's version
-// changes; the browser keeps one idle stream open instead of polling.
-//
-// Events: `run` (the run document), `status` ({busy|reconnecting|live}),
-// `refused` (the controller's error: the session ended or access was
-// removed; the stream then ends), `finished` (every job is terminal).
+// Pushes a run event only when the version changes, so the browser keeps one idle stream instead of polling.
 export default defineEventHandler(async (event) => {
   const id = getRouterParam(event, "id") || "";
   if (!RUN_ID.test(id)) throw createError({ statusCode: 400, statusMessage: "malformed run id" });
