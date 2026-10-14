@@ -748,9 +748,12 @@ fn queued_work_reaches_a_connected_worker_on_the_wake_and_completion_queues_depe
     let tail = d.logs.tail(run, job, attempt, 0, 10, None).unwrap();
     assert_eq!(tail.frames.len(), 2);
     assert!(!tail.complete);
+    // The two frames may be acknowledged together or one by one, so count
+    // from what has been acknowledged, not from a fixed number.
+    let acked = recorder.log_acks.lock().unwrap().len();
     reporter.log(attempt, &text(2, "two\n")).unwrap();
     eventually("duplicate acked", || {
-        recorder.log_acks.lock().unwrap().len() == 3
+        recorder.log_acks.lock().unwrap().len() == acked + 1
     });
     assert_eq!(
         d.logs
