@@ -1,8 +1,3 @@
-//! Shared protocol contracts for the HTTP API, CLI/MCP clients and worker
-//! sessions: versioned structured errors, mutation idempotency, resumable
-//! event cursors, size limits, and worker capability negotiation. Pure
-//! types and functions; transports plug in above this crate.
-
 pub mod cache;
 pub mod cursor;
 pub mod diagnostics;

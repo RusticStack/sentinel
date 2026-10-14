@@ -1,14 +1,4 @@
-//! The optional external S3 blob adapter: a small, synchronous client
-//! for the S3 operations Sentinel's storage needs, signed with Signature V4
-//! over the same rustls/ring stack as the rest of the controller. No SDK,
-//! no async runtime, no MinIO dependency — any endpoint that speaks the S3
-//! API: AWS, Cloudflare R2, Backblaze B2, MinIO, Garage, SeaweedFS, Ceph.
-//!
-//! Bounded on every axis the remote controls: connect and per-read timeouts,
-//! response header size, response body size for everything but an object
-//! read (which is bounded by its own `Content-Length`), no redirects. A
-//! credential appears in one header per request and nowhere else — not in
-//! a URL, an error or `Debug` output.
+//! A credential appears in one header per request, never in a URL, error or Debug output.
 
 pub mod client;
 pub mod sigv4;
@@ -18,21 +8,12 @@ pub use client::{Client, Head, MultipartUpload, ObjectPage, Part};
 
 use std::{fmt, path::PathBuf, time::Duration};
 
-/// What went wrong, classified for the caller's retry decision.
 #[derive(Debug)]
 pub enum Error {
-    /// The configuration cannot work (bad endpoint, unreadable CA or
-    /// credentials file). Not retried.
     Config(String),
-    /// No such key, bucket or upload.
     NotFound(String),
-    /// The service refused the credentials or the request (4xx other than
-    /// not-found and throttling). Retrying the same request will not help.
     Refused { status: u16, code: String },
-    /// Worth retrying later: a transport failure, a timeout, a 5xx, a
-    /// `SlowDown`/throttling answer.
     Transient(String),
-    /// The service answered something this client cannot use.
     Protocol(String),
 }
 
@@ -51,7 +32,6 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Error {
-    /// Whether a later retry of the same request may succeed.
     pub fn is_transient(&self) -> bool {
         matches!(self, Error::Transient(_))
     }
@@ -59,8 +39,6 @@ impl Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The access key, secret and optional session token. The secret is wiped
-/// on drop and never printed.
 pub struct Credentials {
     pub access_key_id: String,
     secret: zeroize::Zeroizing<Vec<u8>>,
@@ -104,9 +82,7 @@ impl Credentials {
         })
     }
 
-    /// Read `access_key_id = …`, `secret_access_key = …` and optionally
-    /// `session_token = …` lines from an owner-only file of at most 8 KiB.
-    /// The contents are never echoed in an error.
+    // Contents are never echoed in an error.
     pub fn from_file(path: &std::path::Path) -> Result<Self> {
         let refuse = |why: &str| Error::Config(format!("{}: {why}", path.display()));
         let meta = std::fs::symlink_metadata(path).map_err(|_| refuse("cannot read"))?;
@@ -154,31 +130,20 @@ impl Credentials {
     }
 }
 
-/// Where the bucket is and how to reach it.
 #[derive(Debug)]
 pub struct Config {
-    /// `https://s3.eu-central-1.amazonaws.com`, `http://127.0.0.1:9000`, …
-    /// Scheme, host and optional port only.
     pub endpoint: String,
     pub region: String,
     pub bucket: String,
-    /// Every key starts with this (`sentinel/prod/`); empty for the bucket
-    /// root. Must end in `/` when set.
     pub prefix: String,
-    /// `https://endpoint/bucket/key` instead of `https://bucket.endpoint/key`
-    /// — what most self-hosted services want.
     pub path_style: bool,
-    /// PEM certificates to trust instead of the Mozilla roots, for an
-    /// endpoint with a private CA.
     pub ca_file: Option<PathBuf>,
     pub credentials: Credentials,
-    /// Connect and per-read timeouts.
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
 }
 
 impl Config {
-    /// Check the shape of every field; the endpoint is not contacted.
     pub fn validate(&self) -> Result<()> {
         let bad = |why: &str| Err(Error::Config(why.into()));
         let rest = self

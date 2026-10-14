@@ -1,67 +1,36 @@
-//! Protocol size limits. Every bound is enforced before parsing: a request
-//! that exceeds one is rejected with `payload_too_large` without reading
-//! the rest. Values are deliberately small; raise one only with a measured
-//! need and a note in `docs/protocol.md`.
-
-/// JSON API request body (dispatch, cancel, secrets, pipeline validation).
-pub const MAX_API_BODY_BYTES: usize = 1 << 20; // 1 MiB
-/// GitHub webhook body before signature verification.
-pub const MAX_WEBHOOK_BODY_BYTES: usize = 25 << 20; // GitHub's own cap is 25 MB
-/// A single `.sentinel.yml` file as read from the repository.
+pub const MAX_API_BODY_BYTES: usize = 1 << 20;
+pub const MAX_WEBHOOK_BODY_BYTES: usize = 25 << 20;
 pub const MAX_PIPELINE_FILE_BYTES: usize = 256 << 10;
-/// One worker-session control message (offers, acks, heartbeats, transitions).
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 << 10;
-/// One log frame payload; larger output is split, never dropped.
 pub const MAX_LOG_FRAME_BYTES: usize = 32 << 10;
-/// Log frames a worker may send before an acknowledgement.
 pub const MAX_UNACKED_LOG_FRAMES: usize = 256;
-/// How long a lease lasts from the renewal that granted it, in
-/// milliseconds. Part of the worker protocol: the controller renews to
-/// `now + LEASE_MS` on every heartbeat, and the worker measures its own
-/// deadline as this duration from the moment it sent that heartbeat — on
-/// its monotonic clock, so the two hosts' wall clocks never meet. Lowering
-/// it is a protocol change (an older worker would act too late).
+// The worker times its lease from its own heartbeat send, on a monotonic clock.
+// Lowering it breaks older workers, which would act too late.
 pub const LEASE_MS: i64 = 30_000;
-/// Items returned by any list endpoint; the default page is smaller.
 pub const MAX_PAGE_ITEMS: usize = 500;
 pub const DEFAULT_PAGE_ITEMS: usize = 100;
-/// `Idempotency-Key` header value.
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 64;
-/// Diagnostic text budget for agent-facing responses (default and hard ceiling).
 pub const DEFAULT_DIAGNOSTIC_TEXT_BYTES: usize = 8 << 10;
 pub const MAX_DIAGNOSTIC_TEXT_BYTES: usize = 64 << 10;
-/// Human-facing names (job, step, pipeline, repo) and free-text labels.
 pub const MAX_NAME_BYTES: usize = 128;
-/// Capability strings, worker labels and similar enumerations per message.
 pub const MAX_LIST_ITEMS: usize = 64;
-/// One `ArtifactData` frame payload on the worker link.
 pub const MAX_ARTIFACT_CHUNK_BYTES: usize = 48 << 10;
-/// Files one artifact may hold; bounds `ArtifactFile` messages per artifact.
 pub const MAX_ARTIFACT_ENTRIES: usize = 4096;
-/// One artifact's total published bytes.
 pub const MAX_ARTIFACT_BYTES: u64 = 4 << 30;
-/// All captured artifact bytes of one run, across jobs and attempts.
 pub const MAX_RUN_ARTIFACT_BYTES: u64 = 16 << 30;
-/// An `application/x-www-form-urlencoded` body at the OAuth token,
-/// revocation and device-authorization endpoints, and a consent form post.
 pub const MAX_OAUTH_FORM_BYTES: usize = 8 << 10;
-/// Artifact names are pipeline ids (`expect_id`), at most this long.
 pub const MAX_ARTIFACT_NAME_BYTES: usize = 64;
-/// One file path on the artifact wire; the store's entry-path bound agrees.
 pub const MAX_ARTIFACT_PATH_BYTES: usize = 1024;
 
-// Invariants between limits, checked at compile time.
 const _: () = {
     assert!(MAX_LOG_FRAME_BYTES < MAX_CONTROL_MESSAGE_BYTES);
-    // An artifact frame is a postcard-encoded ClientMessage: the payload
-    // plus id/sequence/envelope must fit the one control-message bound.
+    // The 64 bytes cover the postcard envelope (ids and sequence) of an artifact frame.
     assert!(MAX_ARTIFACT_CHUNK_BYTES + 64 <= MAX_CONTROL_MESSAGE_BYTES);
     assert!(MAX_PIPELINE_FILE_BYTES < MAX_API_BODY_BYTES);
     assert!(DEFAULT_DIAGNOSTIC_TEXT_BYTES < MAX_DIAGNOSTIC_TEXT_BYTES);
     assert!(DEFAULT_PAGE_ITEMS <= MAX_PAGE_ITEMS);
 };
 
-/// Clamp a requested page size to the allowed range; `None` means default.
 pub const fn page_size(requested: Option<usize>) -> usize {
     match requested {
         None | Some(0) => DEFAULT_PAGE_ITEMS,
@@ -70,7 +39,6 @@ pub const fn page_size(requested: Option<usize>) -> usize {
     }
 }
 
-/// Check a declared length against a limit before reading a body.
 pub const fn within(declared: usize, limit: usize) -> Result<(), usize> {
     if declared <= limit {
         Ok(())
