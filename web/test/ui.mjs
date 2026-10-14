@@ -531,7 +531,9 @@ await scenario("role changes during open sessions", async () => {
   const other = await browser.newPage({ width: 1280, height: 860 });
   current = other;
   await signIn(other, "dana");
-  await go(other, `/runs/${cfg.diamond}`, "document.querySelectorAll('main table tbody tr').length === 4");
+  // The jobs table is the first table; later tables (cache entries) load
+  // after hydration and add rows, so count the jobs table's rows only.
+  await go(other, `/runs/${cfg.diamond}`, "document.querySelector('main table').querySelectorAll('tbody tr').length === 4");
   check("dana (operator) sees no tenant admin link", !(await other.eval(`[...document.querySelectorAll('nav a')].some((a) => a.textContent.includes('Tenant admin'))`)));
   await root("PUT", "/api/v1/tenants/acme/members/dana", { role: "reader" });
   await other.eval(clickText("main table tbody tr button", "Cancel"));
