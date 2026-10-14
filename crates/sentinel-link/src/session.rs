@@ -2566,12 +2566,10 @@ fn serve_connection(
                     return Err(Error::Protocol("control message on bulk"));
                 }
                 let attempt = AttemptId::from_bytes(attempt).map_err(|_| Error::Protocol("id"))?;
-                if summary
-                    .as_ref()
-                    .is_some_and(|s| s.len() > MAX_SUMMARY_BYTES)
-                {
-                    return Err(Error::Protocol("summary size"));
-                }
+                // An oversized summary (the frame cap leaves room above it)
+                // is telemetry the controller will not keep, not a reason to
+                // drop the session and lose the verdict riding with it.
+                let summary = summary.filter(|s| s.len() <= MAX_SUMMARY_BYTES);
                 handler.reported(worker, attempt, Fence(fence), event.to_event()?, summary);
             }
             ClientMessage::NeedSpec { attempt } => {

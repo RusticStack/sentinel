@@ -458,6 +458,34 @@ fn a_canceled_report_without_a_request_is_not_recorded_as_a_cancel() {
     assert_eq!(row.failure_class, Some(FailureClass::Runtime));
 }
 
+/// A summary over the column's cap must not turn a passing report into a
+/// lease expiry: the verdict stands and the attempt simply records no summary.
+#[test]
+fn an_oversized_summary_is_dropped_and_the_pass_stands() {
+    let f = fixture();
+    let w = worker(&f);
+    run(&f, CHAIN);
+    let offer = place(&f, w, at(2_100));
+    ack(&f, w, &offer, at(2_200));
+    let (attempt, fence) = (offer.attempt, offer.fence);
+    // Inside the 64 KiB control frame, above the 32 KiB summary cap.
+    let big = vec![7u8; 48 * 1024];
+    let next = f
+        .store
+        .writer()
+        .write(move |tx| {
+            dispatch::report(tx, w, attempt, fence, Event::Passed, Some(&big), at(2_300), None)
+        })
+        .unwrap();
+    assert_eq!(next, JobState::Terminal(Outcome::Passed));
+    let tenant = f.tenant;
+    let stored = f
+        .store
+        .read(move |c| dispatch::attempt_summary(c, tenant, attempt))
+        .unwrap();
+    assert_eq!(stored, None);
+}
+
 /// P04-2: every hello renegotiates; an upgrade and a rollback are both
 /// recorded, a rollback below the profile protocol forgets profile-only
 /// placement facts, and a different architecture is not the same worker.

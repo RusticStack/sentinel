@@ -175,6 +175,23 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Error {
+    /// Whether the failure says nothing about the request itself: the writer
+    /// or a reader was unavailable, slow or busy, so the same call may succeed
+    /// later (a `WriteAmbiguous` one may even have committed, which a retry of
+    /// a fenced transition then finds as `NotFound`/`Conflict`). Everything
+    /// else is a verdict on the row — stale, refused or corrupt — and retrying
+    /// it changes nothing.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::WriterUnavailable | Self::WriteAmbiguous | Self::Overloaded => true,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(failure, _)) => matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ),
+            _ => false,
+        }
+    }
+
     /// The variant's name and nothing else: safe to log, because it carries
     /// no payload — no SQL text, no path, no value from a row.
     pub fn kind(&self) -> &'static str {

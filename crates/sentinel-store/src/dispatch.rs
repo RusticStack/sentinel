@@ -2405,7 +2405,8 @@ fn run_of(conn: &Connection, tenant: TenantId, job: JobId) -> Result<RunId> {
 
 /// A worker's report over the link: the attempt must be held by that worker
 /// under that fence, then [`finish`] applies the event as the worker. A
-/// terminal report may carry the attempt's summary, written once.
+/// terminal report may carry the attempt's summary, written once; a summary
+/// over `MAX_SUMMARY_BYTES` is dropped and the verdict stands.
 #[allow(clippy::too_many_arguments)]
 pub fn report(
     tx: &Transaction<'_>,
@@ -2444,13 +2445,17 @@ pub fn report(
         }
         event => event,
     };
+    // The size is judged before the transition, never after it: refusing an
+    // oversized summary once the verdict was applied would roll the whole
+    // report back and leave a passing job to be failed by lease expiry. The
+    // summary is telemetry; the verdict is evidence. Too big (the column
+    // refuses more than `MAX_SUMMARY_BYTES`) means the attempt records no
+    // summary at all — absent, never a truncated blob that would decode wrong.
+    let summary = summary.filter(|s| s.len() <= MAX_SUMMARY_BYTES);
     let next = finish(tx, attempt, Actor::Worker(fence), event, now, logs)?;
     if let Some(summary) = summary
         && next.is_terminal()
     {
-        if summary.len() > MAX_SUMMARY_BYTES {
-            return Err(Error::InvalidInput("attempt summary"));
-        }
         tx.prepare_cached("UPDATE attempts SET summary = ?2 WHERE id = ?1 AND summary IS NULL")?
             .execute(params![attempt.as_bytes(), summary])?;
     }
