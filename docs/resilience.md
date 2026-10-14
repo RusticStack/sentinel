@@ -1,6 +1,6 @@
-# Failure drills (R07)
+# Failure drills
 
-Each failure Part 13 promises to survive, what Sentinel does about it, and the test that shows it. All of them run with the regular suites on the verification VPS ([development](development.md#where-tests-run)).
+Each failure Sentinel is meant to survive, what Sentinel does about it, and the test that shows it. All of them run with the regular suites on the verification VPS ([development](development.md#where-tests-run)).
 
 | Failure | What happens | Shown by |
 |---|---|---|

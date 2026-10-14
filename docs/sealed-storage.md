@@ -1,8 +1,8 @@
-# Sealed storage (S01)
+# Sealed storage
 
-Sentinel uses RustCrypto XChaCha20-Poly1305 for recoverable values. Each seal uses a fresh 192-bit OS-random nonce. Ciphertext format 2 is `02 | key ID (u32 big endian) | nonce (24 bytes) | ciphertext and tag`; the version and key ID are included in authenticated associated data together with the row ownership context. Authentication failure, unknown key IDs, malformed blobs and unknown versions all fail closed without printing plaintext. The existing format 1 (`01 | nonce | ciphertext and tag`) remains readable with key ID 0 for legacy 32-byte key files. New writes use format 2.
+Sentinel uses RustCrypto XChaCha20-Poly1305 for recoverable values. Each seal uses a fresh 192-bit OS-random nonce. Ciphertext format 2 is `02 | key ID (u32 big endian) | nonce (24 bytes) | ciphertext and tag`; the version and key ID are included in authenticated associated data together with the row ownership context. Authentication failure, unknown key IDs, malformed blobs and unknown versions all fail closed without printing plaintext. Format 1 (`01 | nonce | ciphertext and tag`) remains readable with key ID 0 for legacy 32-byte key files; new writes use format 2.
 
-Existing second-factor seeds bind to their user ID; source credentials bind to tenant ID, repository ID and source version. `secret_context` provides a distinct, length-delimited tenant, optional repository, name and version context for S02's secret records. It prevents a ciphertext moved between owners, names or versions from opening. The database stores ciphertext only; no general plaintext read API exists.
+Second-factor seeds bind to their user ID; source credentials bind to tenant ID, repository ID and source version. `secret_context` provides a distinct, length-delimited tenant, optional repository, name and version context for secret records, so it prevents a ciphertext moved between owners, names or versions from opening. The database stores ciphertext only; no general plaintext read API exists.
 
 The key also keys the stored request fingerprints of secret writes: a BLAKE3 `derive_key` subkey of the active key MACs each retry record, so the database alone cannot confirm a guessed secret value. The subkey is derived once when the key loads.
 
