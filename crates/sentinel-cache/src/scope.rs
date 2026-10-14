@@ -14,9 +14,8 @@ use sentinel_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-/// The kernel half of the `os-arch` platform component. Linux is the only
-/// executor today; the enum exists so a second OS can never reuse a scope
-/// directory silently — it would render a different component.
+/// The kernel half of the `os-arch` platform component. A second OS would
+/// render a different component, so it can never reuse a scope directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
@@ -88,9 +87,8 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// The name must already satisfy the schema's `valid_id` rule; this
-    /// re-checks rather than trusts, so metadata built by hand gets the
-    /// same answer the parser would have given.
+    /// The name is re-checked against the schema's `valid_id` rule, not
+    /// trusted.
     pub fn new(
         tenant: TenantId,
         repo: RepoId,
@@ -190,16 +188,15 @@ pub fn gen_name(unix_ms: i64, rand: u32) -> String {
 
 /// The manifest file inside a generation directory.
 pub const MANIFEST_NAME: &str = "manifest";
-/// The file listing inside a generation directory (K02's materialization
-/// input): manifest carries only its count, bytes and digest so lookups
-/// never pay for it.
+/// The file listing inside a generation directory: the manifest carries only
+/// its count, bytes and digest so lookups never pay for it.
 pub const FILES_NAME: &str = "files";
 /// The entry's pointer to the live generation: a small file naming the
-/// `gen-*` directory, swapped atomically at publication (K03).
+/// `gen-*` directory, swapped atomically at publication.
 pub const CURRENT_NAME: &str = "current";
 /// Per-entry staging area for generations still being written.
 pub const WRITING_NAME: &str = "writing";
-/// Per-entry lease markers (K03).
+/// Per-entry lease markers.
 pub const LEASE_NAME: &str = "lease";
 
 #[cfg(test)]
@@ -242,13 +239,10 @@ mod tests {
             f(&mut other);
             other.rel_path()
         };
-        // A different repo is a different tenant's content: repo IDs are
-        // globally unique, and it is the leading component — so the two
-        // tenants can never produce the same scope directory.
+        // Repo IDs are globally unique and lead the path, so two tenants can
+        // never share a scope directory.
         assert_ne!(a.rel_path(), isolated(&|s| s.repo = RepoId::new()), "repo");
-        // The tenant is not a path component (the repo leads); it is still
-        // recorded in every manifest boundary, so a directory moved under
-        // another tenant's tree can never serve — see manifest tests.
+        // The tenant is only recorded in the manifest boundary, not the path.
         assert_eq!(
             a.rel_path(),
             isolated(&|s| s.tenant = TenantId::new()),
@@ -355,7 +349,6 @@ mod tests {
                 "{name}"
             );
         }
-        // Same key, same entry, deterministic across calls.
         assert_eq!(entry_name("cargo-9f8e7d6c"), entry_name("cargo-9f8e7d6c"));
         // Slug collisions are still distinct entries via the digest tail.
         assert_ne!(entry_name("a/b"), entry_name("a\\b"));
@@ -368,8 +361,7 @@ mod tests {
     fn generation_names_order_and_differ() {
         assert_eq!(gen_name(1_700_000_000_000, 1), "gen-1700000000000-00000001");
         assert_ne!(gen_name(1, 1), gen_name(1, 2));
-        // Unix-millisecond stamps are the same width for the foreseeable
-        // future, so directory listings sort oldest-first.
+        // Equal-width millisecond stamps sort oldest-first in listings.
         assert!(gen_name(1_700_000_000_000, 9) < gen_name(1_700_000_000_001, 0));
     }
 }

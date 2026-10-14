@@ -1,25 +1,14 @@
-//! K02 — the read path: resolve an entry's `current` generation, verify
+//! The read path: resolve an entry's `current` generation, verify
 //! its manifest against the request, pin it with a lease and clone it
 //! into the job's private view. Every failure is an `Outcome::Miss`.
 //!
-//! The flow per declared `cache:` entry (docs/cache.md):
-//!
-//! 1. The key is already rendered (the caller evaluated `hash_files`
-//!    against the fresh checkout); the scope and compat inputs are
-//!    derived through `attach`'s shared functions so publish (K03)
-//!    derives the same entry.
-//! 2. `entry/current` names the live generation — a bounded read whose
-//!    content is the `gen-*` directory name. An entry that has one is
-//!    pinned (`Lease::acquire`) and the pointer read again under the pin,
-//!    so GC can never take the generation between lookup and clone.
-//! 3. `manifest::lookup` answers hit or the explainable miss.
-//! 4. On a hit the `files` blob's digest is verified against the manifest
-//!    — the trust anchor for the whole payload — every `payload/<i>` tree
-//!    is checked against the listing, and only then is each cloned to its
-//!    target.
-//! 5. On a miss the declared paths still exist as empty writable
-//!    directories: a job always sees writable cache paths — a clone that
-//!    failed part-way empties them again.
+//! Per declared `cache:` entry (docs/cache.md): the caller has rendered the
+//! key against the fresh checkout; `entry/current` names the live
+//! generation, which is pinned and the pointer re-read under the pin;
+//! `manifest::lookup` answers hit or miss; on a hit the `files` blob's digest
+//! (the trust anchor for the payload) and every `payload/<i>` tree are
+//! verified before any is cloned. On a miss the declared paths still exist
+//! as empty writable directories.
 //!
 //! Nothing here fails an attempt: a filesystem or lease error is an
 //! explainable `Miss`, and target resolution never follows a symlink —
@@ -45,21 +34,17 @@ use crate::{
     scope::{self, Scope},
 };
 
-/// `current` is one `gen-<unix_ms>-<rand>` name: 4 + digits + 1 + 8 hex
-/// fits in 32 bytes; 128 is generous headroom, never unbounded.
+/// `current` is one `gen-<unix_ms>-<rand>` name, under 32 bytes.
 const MAX_CURRENT_BYTES: u64 = 128;
 
-/// The first-read sample size (K08): one small read of a representative
-/// file per target — enough to fault a cold extent, never enough to
-/// matter.
+/// The first-read sample size: enough to fault a cold extent.
 const FIRST_TOUCH_BYTES: usize = 4 * 1024;
 
 fn ns(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-/// The environment every restore in one attempt shares — built once by
-/// the caller, never re-derived per declaration.
+/// The environment every restore in one attempt shares.
 #[derive(Clone, Copy)]
 pub struct Context<'a> {
     /// The worker's cache root: `<data_dir>/cache`.
@@ -90,12 +75,11 @@ pub fn restore(
     restore_remote(env, decl, key, scope, owner, None)
 }
 
-/// [`restore`] with the remote path (Q08, [`crate::remote`]) available
-/// for a local miss. A local hit never consults `remote`: hydration is
-/// strictly a miss path. When a transfer was attempted and did not
-/// serve, the miss is the transfer's own — `unavailable` for a bounded
-/// transfer that failed or ran out of budget, or the reason the received
-/// bundle failed the same lookup the local store answers.
+/// [`restore`] with remote hydration ([`crate::remote`]) available for a
+/// local miss; a local hit never consults `remote`. When a transfer ran and
+/// did not serve, the miss is the transfer's own: `unavailable` if it failed
+/// or ran out of budget, else the reason the received bundle failed the
+/// local lookup.
 pub fn restore_remote(
     env: &Context<'_>,
     decl: &Cache,
@@ -118,9 +102,8 @@ pub fn restore_remote(
         stats: Stats::default(),
     };
 
-    // Targets first: whatever the lookup answers, the job needs its
-    // writable paths, and an unusable one decides the entry on its own —
-    // a store read for a path that cannot serve is wasted work.
+    // Targets first: the job needs its writable paths whatever the lookup
+    // answers, and an unusable one decides the entry without a store read.
     let mut usable = !attached.key.is_empty();
     for (index, declared) in decl.paths.iter().enumerate() {
         let (target, miss) = target(env, &decl.name, index, declared);
@@ -135,11 +118,10 @@ pub fn restore_remote(
     let entry_dir = attached
         .scope
         .entry_dir(env.cache_root, entry_key(decl.class, &attached.key));
-    // An entry with no `current` is the common miss and takes no pin. One
-    // that has one is pinned *before* its pointer is trusted (P07-8): the
-    // pointer is read again under the lease, so the generation it names
-    // cannot be reclaimed between the read and the clone — a sweep that
-    // raced the first read is an ordinary miss, never a `corrupt` one.
+    // An entry with no `current` takes no pin. Otherwise the pin comes
+    // before the pointer is trusted and the pointer is re-read under it, so
+    // GC cannot reclaim the generation between read and clone; a sweep that
+    // raced the first read is an ordinary miss, never `corrupt`.
     let started = Instant::now();
     let probe = current(&entry_dir);
     let mut lookup_ns = ns(started);
@@ -151,8 +133,6 @@ pub fn restore_remote(
             match pinned {
                 Ok(lease) => Some(lease),
                 Err(_) => {
-                    // The wait was measured either way; the lease is the
-                    // part that never happened.
                     attached.stats.lookup_ns = Some(lookup_ns);
                     attached.outcome = Outcome::Miss(Miss::Unavailable);
                     return attached;
@@ -177,8 +157,6 @@ pub fn restore_remote(
     lookup_ns += ns(started);
     attached.stats.lookup_ns = Some(lookup_ns);
     let (name, gen_dir, hit, lease) = match (found, lease) {
-        // A local hit never touches the network: the miss path below is
-        // the only place remote hydration is consulted (Q08).
         (Ok((name, dir, Outcome::Hit(hit))), Some(lease)) => (name, dir, hit, lease),
         // A hit is only ever read under a pin; without one it cannot serve.
         (Ok((_, _, Outcome::Hit(_))), None) => {
@@ -187,10 +165,8 @@ pub fn restore_remote(
         }
         (Ok((_, _, Outcome::Miss(miss))), _) | (Err(miss), _) => {
             attached.outcome = Outcome::Miss(miss);
-            // Targets were resolved usable above (an unusable one already
-            // returned `invalid`), so any miss here may hydrate: a local
-            // generation that is absent, broken or semantically invalid
-            // says nothing about what the controller holds.
+            // Any local miss may hydrate: a bad local generation says
+            // nothing about what the controller holds.
             if let Some(policy) = remote {
                 match crate::remote::hydrate(env, &mut attached, owner, policy) {
                     crate::remote::Hydro::Served(hydrated) => {
@@ -206,10 +182,8 @@ pub fn restore_remote(
         }
     };
 
-    // The pin taken above stays for the attempt's run (renewed while this
-    // process holds it — `lease`): the generation — and later this
-    // writer's staging — stays unreachable to GC while the job reads and
-    // rewrites its view.
+    // The pin stays for the attempt's run so GC cannot take the generation
+    // (or later this writer's staging) while the job uses its view.
     let started = Instant::now();
     attached.stats.reflink = env.backend == Backend::Reflink;
     match materialize(
@@ -221,18 +195,16 @@ pub fn restore_remote(
     ) {
         Ok(blob) => {
             attached.stats.clone_ns = Some(ns(started));
-            // K08: the first-touch sample is timed separately — cold-extent
-            // read cost is not the clone's wall time.
+            // Timed apart from `clone_ns`: cold-extent reads are not clone cost.
             attached.stats.first_touch_ns = first_touch(&blob, &attached.targets);
-            // The entry was used: reclamation evicts least recently used.
+            // Reclamation evicts least recently used.
             crate::gc::touch(&entry_dir);
             attached.generation = Some(name);
             attached.lease = Some(lease);
             attached.outcome = Outcome::Hit(hit);
         }
-        // The dropped `lease` releases the pin; the entry answers the miss.
-        // A generation that is gone although pinned was reclaimed before
-        // the pin landed — a transient `unavailable`, not tampering.
+        // Dropping `lease` releases the pin. A generation gone although
+        // pinned was reclaimed before the pin landed: transient, not tampering.
         Err(miss) => {
             let miss = if miss == Miss::Corrupt && !gen_dir.is_dir() {
                 Miss::Unavailable
@@ -246,8 +218,7 @@ pub fn restore_remote(
 }
 
 /// `entry/current` → the generation's `(name, dir)`. Absent is the common
-/// miss; an unreadable file is `Unavailable`, a malformed one `Corrupt` —
-/// and a name that is not `gen-*`-shaped can never name a directory here.
+/// miss; an unreadable file is `Unavailable`, a malformed one `Corrupt`.
 fn current(entry: &Path) -> Result<(String, PathBuf), Miss> {
     let file = fs::File::open(entry.join(scope::CURRENT_NAME)).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => Miss::Absent,
@@ -282,10 +253,9 @@ fn gen_name_shape(name: &str) -> bool {
         && rand.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// The `files` listing: bounded read, BLAKE3 digest verified against the
-/// manifest — the anchor that lets materialization skip per-file hashing
-/// — then decode. A manifest without its listing, an oversize one or a
-/// digest mismatch is a `Corrupt` generation.
+/// The `files` listing: bounded read, BLAKE3 digest checked against the
+/// manifest (the anchor that lets materialization skip per-file hashing),
+/// then decode. A missing, oversize or mismatching listing is `Corrupt`.
 pub(crate) fn files_blob(gen_dir: &Path, manifest: &manifest::Manifest) -> Result<FilesBlob, Miss> {
     let file = fs::File::open(gen_dir.join(scope::FILES_NAME)).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => Miss::Corrupt,
@@ -303,8 +273,7 @@ pub(crate) fn files_blob(gen_dir: &Path, manifest: &manifest::Manifest) -> Resul
     FilesBlob::decode(&raw)
 }
 
-/// `payload/<i>/<rel>` → `(i, rel)` — the listing's own shape, which
-/// materialization validated before this is ever asked.
+/// `payload/<i>/<rel>` → `(i, rel)`.
 fn payload_parts(path: &str) -> Option<(usize, &str)> {
     let rest = path.strip_prefix("payload/")?;
     let (index, rel) = rest.split_once('/')?;
@@ -314,19 +283,16 @@ fn payload_parts(path: &str) -> Option<(usize, &str)> {
     Some((index.parse().ok()?, rel))
 }
 
-/// Walk a generation's `payload/<i>` tree and require it to be exactly
-/// the sealed listing for that index: every non-directory entry a listed
-/// regular file at its listed size, and all of them present. A planted
-/// file, a symlink where a file was listed or a missing listed file is a
-/// generation that drifted from what its manifest pinned — `Corrupt`,
-/// never served. Bounded like the writer's own walk: deeper than
-/// [`MAX_WALK_DEPTH`] cannot be sealed content.
+/// Require a generation's `payload/<i>` tree to be exactly the sealed
+/// listing for that index: every non-directory entry a listed regular file
+/// at its listed size, all present. A planted file, a symlink or a missing
+/// file is `Corrupt`. Deeper than [`MAX_WALK_DEPTH`] cannot be sealed
+/// content.
 fn check_payload_tree(src: &Path, listed: &HashMap<&str, &FileEntry>) -> Result<(), Miss> {
     // `(dir, rel)` — `rel` is the listing's suffix form: `sub/dir/file`.
     let mut stack = vec![(src.to_path_buf(), String::new(), 0usize)];
     let mut seen = 0usize;
-    // One scratch name per walk: a file's listing key is built in place,
-    // never allocated per file.
+    // Scratch buffer: the listing key is built in place per file.
     let mut key = String::new();
     while let Some((dir, rel, depth)) = stack.pop() {
         if depth >= MAX_WALK_DEPTH {
@@ -375,18 +341,14 @@ fn check_payload_tree(src: &Path, listed: &HashMap<&str, &FileEntry>) -> Result<
 }
 
 /// Clone every `payload/<i>` to its target. The listing is re-validated
-/// here — `decode` already checked each path is relative, and a clone
-/// input is checked twice rather than trusted once — and the tree must
-/// match it exactly: the listing is the payload's whole authority, so a
-/// planted or missing file is `Corrupt`, never served (K09). Payload
-/// bytes are not re-hashed: that would defeat the reflink path
-/// (docs/cache.md). `Ok` carries the verified listing so the caller can
-/// run the bounded first-touch sample after it has stamped `clone_ns` —
-/// the sample's cost must not land inside the clone's wall time (K08).
+/// (paths relative, shaped `payload/<i>/<rel>`) and the tree must match it
+/// exactly, so a planted or missing file is `Corrupt`. Payload bytes are not
+/// re-hashed: that would defeat the reflink path (docs/cache.md). `Ok`
+/// carries the verified listing so the caller can take the first-touch
+/// sample after stamping `clone_ns`.
 ///
-/// `pub(crate)` for the remote path (Q08): a hydrated generation is
-/// materialized by this exact code, so a served clone and a hydrated one
-/// can never differ in their checks.
+/// Shared with the remote path so a hydrated generation faces the same
+/// checks as a local one.
 pub(crate) fn materialize(
     gen_dir: &Path,
     manifest: &manifest::Manifest,
@@ -404,15 +366,12 @@ pub(crate) fn materialize(
                 i < targets.len() && listed[i].insert(rel, entry).is_none()
             });
         if !ok {
-            // The verified listing names a file outside the payload
-            // layout — or the same payload path twice: the generation
-            // cannot serve.
+            // A file outside the payload layout, or listed twice.
             return Err(Miss::Invalid);
         }
     }
-    // Every payload tree is checked against its listing before any is
-    // cloned (P07-8): a generation broken at index 1 must not leave index
-    // 0's bytes in the job's view under a "miss".
+    // Check every tree before cloning any: a generation broken at index 1
+    // must not leave index 0's bytes in the job's view under a miss.
     let mut sources = Vec::with_capacity(targets.len());
     for (index, listed) in listed.iter().enumerate() {
         let src = gen_dir.join("payload").join(index.to_string());
@@ -423,8 +382,7 @@ pub(crate) fn materialize(
             }
             Ok(_) => return Err(Miss::Corrupt),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // No payload for this declared path: honest only when the
-                // listing agrees there was nothing to carry.
+                // Honest only when the listing carries nothing for it.
                 if !listed.is_empty() {
                     return Err(Miss::Corrupt);
                 }
@@ -444,16 +402,13 @@ pub(crate) fn materialize(
                 stats.copied_bytes += cloned.copied_bytes;
             }
             Err(e) => {
-                // A clone that stopped halfway — a full disk, an I/O error —
-                // leaves the miss contract intact: every target is an empty
-                // writable directory again, never a partial materialization
-                // an installer could mistake for a finished one.
+                // Restore the miss contract: no partial materialization an
+                // installer could mistake for a finished one.
                 for target in targets {
                     let _ = clone::empty(&target.dir);
                 }
                 return Err(match e.kind() {
-                    // A payload the listing names but the tree does not
-                    // hold is a broken generation, not a hiccup.
+                    // Listed but absent: a broken generation, not a hiccup.
                     io::ErrorKind::NotFound => Miss::Corrupt,
                     _ => Miss::Unavailable,
                 });
@@ -463,18 +418,14 @@ pub(crate) fn materialize(
     Ok(blob)
 }
 
-/// One bounded first-read sample per target after a hit's clone
-/// materialized: open the largest listed file and read its first
-/// [`FIRST_TOUCH_BYTES`]. A clone's cost is per file, but the first real
-/// read is what faults a cold extent — the K02 probe showed that cost is
-/// real, so it is measured separately rather than folded into `clone_ns`.
-/// `None` when the listing held no file to sample; a file that will not
-/// open is simply not measured, never a miss.
+/// Read the first [`FIRST_TOUCH_BYTES`] of the largest listed file per
+/// target after a hit's clone. The first real read faults a cold extent, so
+/// it is measured apart from `clone_ns`. `None` when nothing was sampled; a
+/// file that will not open is not measured, never a miss.
 pub(crate) fn first_touch(blob: &FilesBlob, targets: &[Target]) -> Option<u64> {
     if blob.entries.is_empty() {
         return None;
     }
-    // The largest listed file per target, in one pass over the listing.
     let mut largest: Vec<Option<(u64, &str)>> = vec![None; targets.len()];
     for entry in &blob.entries {
         let Some((index, rel)) = payload_parts(&entry.path) else {
@@ -497,25 +448,20 @@ pub(crate) fn first_touch(blob: &FilesBlob, targets: &[Target]) -> Option<u64> {
         let Ok(mut file) = fs::File::open(target.dir.join(rel)) else {
             continue;
         };
-        // One read; a short read still faulted the extent, which is the
-        // cost being measured.
+        // A short read still faulted the extent.
         sampled |= file.read(&mut [0u8; FIRST_TOUCH_BYTES]).is_ok();
     }
     if sampled { Some(ns(started)) } else { None }
 }
 
 /// Resolve one declared path to its `Target`, creating the writable
-/// directory. The `Miss` in the pair explains a refusal: the declared
-/// path was unusable (`Invalid`) or the workspace refused it
-/// (`Unavailable`). The `Target` is always produced so `targets[i]` keeps
-/// index alignment with `payload/<i>`.
+/// directory. The `Miss` explains a refusal (`Invalid`: unusable path;
+/// `Unavailable`: the workspace refused it). The `Target` is always
+/// produced so `targets[i]` stays aligned with `payload/<i>`.
 fn target(env: &Context<'_>, name: &str, index: usize, declared: &str) -> (Target, Option<Miss>) {
-    // Re-check the schema's rule rather than trust it: a path that is not
-    // a normalised relative or `/`-absolute path is refused, not guessed.
-    // An absolute path reaches the container as a bind-mount spec, where
-    // `:` separates fields and `,` options: such a path could only ever
-    // fail `podman create` — and so the attempt — so it is refused here as
-    // the explainable miss a cache-path error must be (P07-16).
+    // The schema's rule is re-checked, not trusted. An absolute path
+    // reaches the container as a bind-mount spec where `:` and `,` are
+    // separators: it would only fail `podman create`, and so the attempt.
     let unmountable = declared.starts_with('/') && declared.contains([':', ',']);
     if !valid_cache_path(declared) || unmountable {
         return (
@@ -531,9 +477,8 @@ fn target(env: &Context<'_>, name: &str, index: usize, declared: &str) -> (Targe
     }
     let (dir, container, mount, rel) = match declared.strip_prefix('/') {
         Some(rest) => {
-            // Absolute inside the container: the job writes outside the
-            // workspace, so a private view is bound in. One naming the
-            // workspace mount itself would shadow the checkout — refused.
+            // Absolute inside the container: bound in as a private view.
+            // One naming the workspace mount would shadow the checkout.
             let mount_rel = env.workspace_mount.trim_start_matches('/');
             let under_mount = rest == mount_rel || rest.starts_with(&format!("{mount_rel}/"));
             let rel = Path::new(attach::PRIVATE_DIR)
@@ -547,9 +492,8 @@ fn target(env: &Context<'_>, name: &str, index: usize, declared: &str) -> (Targe
             )
         }
         None => {
-            // Relative: inside the workspace, which already reaches the
-            // container at `workspace_mount` — no bind needed. The
-            // private directory's name is the machinery's, not a job's.
+            // Relative: already reachable at `workspace_mount`, no bind
+            // needed. The private directory's name is reserved.
             let reserved = declared.split('/').next() == Some(attach::PRIVATE_DIR);
             (
                 env.workspace.join(declared),
@@ -578,8 +522,7 @@ fn target(env: &Context<'_>, name: &str, index: usize, declared: &str) -> (Targe
     }
     match create_under(env.workspace, &rel) {
         Ok(()) => (target, None),
-        // A directory that could not be made is never bound into the
-        // container: a mount of a missing host path would fail the start.
+        // Never bound: a mount of a missing host path would fail the start.
         Err(miss) => (
             Target {
                 mount: false,
@@ -590,11 +533,10 @@ fn target(env: &Context<'_>, name: &str, index: usize, declared: &str) -> (Targe
     }
 }
 
-/// Create `root/rel` as a real directory, never resolving through
-/// symlinks: an existing component above the last that is a symlink (or
-/// anything but a directory) makes the path unusable — `Invalid` — while
-/// a symlink *at* the path is replaced with the real directory it hides.
-/// Missing components are created 0755-by-umask.
+/// Create `root/rel` as a real directory without resolving symlinks: a
+/// non-directory component above the last makes the path `Invalid`, while a
+/// symlink *at* the path is replaced with a real directory. Components are
+/// created with the default umask mode.
 fn create_under(root: &Path, rel: &Path) -> Result<(), Miss> {
     let mut cur = root.to_path_buf();
     let components: Vec<_> = rel.iter().collect();
@@ -605,8 +547,7 @@ fn create_under(root: &Path, rel: &Path) -> Result<(), Miss> {
             Ok(meta) if meta.is_dir() => {}
             Ok(meta) if meta.file_type().is_symlink() => {
                 if !last {
-                    // Resolving through it would write wherever the
-                    // checkout's link points — refused, never followed.
+                    // Following it would write wherever the checkout's link points.
                     return Err(Miss::Invalid);
                 }
                 fs::remove_file(&cur).map_err(|_| Miss::Unavailable)?;
@@ -673,11 +614,9 @@ mod tests {
         }
     }
 
-    /// What `seal` writes: `entry_of`/`entry_key` decide which entry dir
-    /// the generation sits under; `recorded`/`recorded_key` are what the
-    /// manifest claims — kept separate so a test can emulate a directory
-    /// found under the wrong scope, exactly the case the boundary fields
-    /// exist to catch.
+    /// `entry_of`/`entry_key` pick the entry dir the generation sits under;
+    /// `recorded`/`recorded_key` are what its manifest claims, so a test can
+    /// emulate a generation found under the wrong scope.
     struct Seal<'a> {
         entry_of: &'a Scope,
         entry_key: &'a str,
@@ -689,8 +628,7 @@ mod tests {
     }
 
     impl<'a> Seal<'a> {
-        /// The honest case: the generation sits where its manifest's own
-        /// scope and key put it, sealed, carrying `payloads`.
+        /// A sealed generation where its manifest's scope and key put it.
         fn at(
             recorded: &'a Scope,
             key: &'a str,
@@ -709,8 +647,7 @@ mod tests {
         }
     }
 
-    /// Write a generation and the `current` pointer for it; returns the
-    /// entry dir and the generation dir.
+    /// Returns the entry dir and the generation dir.
     fn seal(cache_root: &Path, s: &Seal<'_>) -> (PathBuf, PathBuf) {
         let entry_dir = s
             .entry_of
@@ -811,8 +748,6 @@ mod tests {
         let entry = s.entry_dir(&root, attach::entry_key(Class::Dependencies, KEY));
         let gen_dir = entry.join(a.generation.as_ref().unwrap());
         assert_eq!(fs::read(gen_dir.join("payload/0/b")).unwrap(), b"bb");
-        // Measured, all four phases — the clone ran, and the first-touch
-        // sample read the largest listed file's first bytes per target.
         assert!(a.stats.lookup_ns.is_some());
         assert!(a.stats.lock_wait_ns.is_some());
         assert!(a.stats.clone_ns.is_some());
@@ -852,8 +787,7 @@ mod tests {
         let (root, ws) = (temp.path().join("cache"), temp.path().join("ws"));
         fs::create_dir(&ws).unwrap();
         let s = scope();
-        // A declared path the generation never carried: the hit is real
-        // but the listing is empty, so there is nothing to sample.
+        // A real hit with an empty listing: nothing to sample.
         let d = decl(&["vendor"]);
         let compat = attach::declared_compat(&d, KEY, s.platform);
         seal(&root, &Seal::at(&s, KEY, &compat, &[&[]]));
@@ -961,8 +895,7 @@ mod tests {
         fs::create_dir(&ws).unwrap();
         let s = scope();
         let d = decl(&["v"]);
-        // The manifest was sealed for another trust class; the entry dir
-        // is the requester's — the moved-directory case the boundary is for.
+        // Sealed for another trust class but found under the requester's entry dir.
         let mut pr = s.clone();
         pr.trust = Trust::PullRequest;
         let compat = attach::declared_compat(&d, KEY, s.platform);
@@ -987,8 +920,7 @@ mod tests {
         );
         let a = restore_one(&root, &ws, &d, other_tool);
         assert_eq!(miss(&a), Miss::WrongToolchain);
-        // And an exact-class key that differs — the entry dir is the
-        // request's, the recorded key is not.
+        // A recorded key that differs from the request's.
         seal(
             &root,
             &Seal {
@@ -1014,8 +946,7 @@ mod tests {
         let t = &a.targets[0];
         assert!(t.mount);
         assert_eq!(t.container, "/opt/ccache");
-        // The host view is the machinery's private directory, never a
-        // path the job's own files could occupy.
+        // The host view is the private directory.
         assert!(t.dir.starts_with(ws.join(attach::PRIVATE_DIR)));
         assert_eq!(fs::read(t.dir.join("bin")).unwrap(), b"b");
     }
@@ -1026,8 +957,7 @@ mod tests {
         let (root, ws) = (temp.path().join("cache"), temp.path().join("ws"));
         fs::create_dir(&ws).unwrap();
         let s = scope();
-        // `..`, a shadowing of the workspace mount, and the private dir's
-        // name as a relative path are all refused with `Invalid`.
+        // `..`, shadowing the workspace mount and the private dir's name.
         for paths in [
             &["../up"][..],
             &["/workspace/evil"][..],
@@ -1067,9 +997,8 @@ mod tests {
         );
     }
 
-    /// P07-8: a generation broken at a later index is a miss that leaves
-    /// *every* target empty — index 0 is never cloned first — and the
-    /// pin is released with the miss.
+    /// A generation broken at a later index leaves every target empty and
+    /// releases the pin.
     #[test]
     fn a_failed_materialization_leaves_empty_targets() {
         let temp = tempfile::tempdir().unwrap();
@@ -1103,8 +1032,7 @@ mod tests {
         }
     }
 
-    /// P07-16: an absolute path the bind-mount spec cannot carry is an
-    /// explainable `invalid` miss, and it is never offered as a mount.
+    /// A path the bind-mount spec cannot carry is `invalid` and never a mount.
     #[test]
     fn an_unmountable_absolute_path_is_refused() {
         let temp = tempfile::tempdir().unwrap();
