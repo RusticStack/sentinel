@@ -747,7 +747,7 @@ impl Inner {
             (&self.stats.sweep_errors, &self.warned[1])
         };
         let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let now = UnixMillis::now().0;
+        let now = UnixMillis::steady().0;
         let last = slot.load(Ordering::Relaxed);
         if now.saturating_sub(last) >= WARN_INTERVAL_MS
             && slot
@@ -785,7 +785,7 @@ impl Inner {
     /// that moved first (renewed, acknowledged, released) is skipped; any
     /// other store failure is counted and logged (P08-15).
     fn dispatch_pass(&self) {
-        let now = UnixMillis::now();
+        let now = UnixMillis::steady();
         // Leases that ran out and attempts that outran their job's timeout
         // by the grace: infra-failed, capacity back, never replayed. One
         // write for the whole batch, each lease re-checked inside it; the
@@ -1016,7 +1016,7 @@ impl Inner {
                     )
                 })
                 .collect();
-            let now = UnixMillis::now();
+            let now = UnixMillis::steady();
             let placed: Vec<(usize, Option<dispatch::Offer>)> = {
                 let batch = round.clone();
                 match self.write_store(move |tx| {
@@ -1092,7 +1092,7 @@ impl Inner {
                     let busy = session::is_busy(&sent);
                     let attempt = offer.attempt;
                     match self
-                        .write_store(move |tx| dispatch::lapse(tx, attempt, UnixMillis::now()))
+                        .write_store(move |tx| dispatch::lapse(tx, attempt, UnixMillis::steady()))
                     {
                         Ok(()) => {}
                         Err(e) if Self::benign(&e) => {}
@@ -1552,7 +1552,7 @@ impl Inner {
     fn settle_canceled(&self, request: &SpecRequest, fence: Fence) {
         let (worker, attempt) = (request.worker, request.attempt);
         if self
-            .write(move |tx| dispatch::decline(tx, worker, attempt, fence, UnixMillis::now()))
+            .write(move |tx| dispatch::decline(tx, worker, attempt, fence, UnixMillis::steady()))
             .is_ok()
         {
             self.stats.handed_back.fetch_add(1, Ordering::Relaxed);
@@ -1570,7 +1570,7 @@ impl Inner {
     fn refuse_secrets(&self, request: &SpecRequest) {
         let (worker, attempt) = (request.worker, request.attempt);
         let settled = self.write(move |tx| {
-            let now = UnixMillis::now();
+            let now = UnixMillis::steady();
             let Some(refusal) = sentinel_store::secrets::refuse_delivery(tx, worker, attempt)?
             else {
                 return Ok(None);
@@ -1858,7 +1858,10 @@ impl SessionHandler for Inner {
         true
     }
     fn ping(&self, worker: WorkerId, held: &[AttemptId]) -> Result<Beat> {
-        let now = UnixMillis::now();
+        // The lease deadline is the controller's deadline clock; "last seen"
+        // is provenance an operator reads, so it stays on the wall clock.
+        let now = UnixMillis::steady();
+        let wall = UnixMillis::now();
         let peer = self
             .fleet
             .lock()
@@ -1867,7 +1870,7 @@ impl SessionHandler for Inner {
             .cloned();
         let record_seen = peer.as_ref().is_some_and(|p| {
             let last = p.seen_recorded_ms.load(Ordering::Relaxed);
-            now.0.saturating_sub(last) >= workers::SEEN_RECORD_INTERVAL_MS
+            wall.0.saturating_sub(last) >= workers::SEEN_RECORD_INTERVAL_MS
         });
         if held.is_empty() && !record_seen {
             // Nothing to renew and liveness recorded recently: no write.
@@ -1881,12 +1884,12 @@ impl SessionHandler for Inner {
         let wanted = held.clone();
         let (lease_until, stop) = self.write(move |tx| {
             if record_seen {
-                workers::seen(tx, worker, now)?;
+                workers::seen(tx, worker, wall)?;
             }
             dispatch::renew(tx, worker, &held, dispatch::DEFAULT_LEASE_MS, now)
         })?;
         if record_seen && let Some(peer) = peer {
-            peer.seen_recorded_ms.store(now.0, Ordering::Relaxed);
+            peer.seen_recorded_ms.store(wall.0, Ordering::Relaxed);
         }
         // Cancellation desired for anything still held: delivered with every
         // beat until the worker reports, so a missed pong changes nothing.
@@ -1906,7 +1909,7 @@ impl SessionHandler for Inner {
 
     fn acknowledged(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {
         let acked = self
-            .write(move |tx| dispatch::acknowledge(tx, worker, attempt, fence, UnixMillis::now()));
+            .write(move |tx| dispatch::acknowledge(tx, worker, attempt, fence, UnixMillis::steady()));
         if acked.is_ok() {
             self.stats.acknowledged.fetch_add(1, Ordering::Relaxed);
         }
@@ -1935,7 +1938,7 @@ impl SessionHandler for Inner {
                 fence,
                 event,
                 summary.as_deref(),
-                UnixMillis::now(),
+                UnixMillis::steady(),
                 None,
             )?;
             if ended && state.is_terminal() {
@@ -1963,7 +1966,7 @@ impl SessionHandler for Inner {
     fn abandoned(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {
         let ended = self.log_has_end(worker, attempt);
         let settled = self.write(move |tx| {
-            let state = dispatch::abandon(tx, worker, attempt, fence, UnixMillis::now(), None)?;
+            let state = dispatch::abandon(tx, worker, attempt, fence, UnixMillis::steady(), None)?;
             if ended && state.is_terminal() {
                 dispatch::log_ended(tx, attempt)?;
             }
@@ -2064,7 +2067,7 @@ impl SessionHandler for Inner {
     /// its terminal report (P07-7), so the same worker's attempt released
     /// within [`OFFER_WINDOW_MS`] still names its boundary.
     fn cache_offer(&self, worker: WorkerId, upload: &Upload) -> Option<std::path::PathBuf> {
-        let since = UnixMillis(UnixMillis::now().0 - OFFER_WINDOW_MS);
+        let since = UnixMillis(UnixMillis::steady().0 - OFFER_WINDOW_MS);
         self.cache_authorize(
             worker,
             upload.attempt,
@@ -2156,7 +2159,7 @@ impl SessionHandler for Inner {
     /// arrived (P04-4). Either goes back to the queue, or ends `canceled`.
     fn declined(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {
         if let Ok(state) =
-            self.write(move |tx| dispatch::decline(tx, worker, attempt, fence, UnixMillis::now()))
+            self.write(move |tx| dispatch::decline(tx, worker, attempt, fence, UnixMillis::steady()))
         {
             self.stats.lapsed.fetch_add(1, Ordering::Relaxed);
             self.stats.handed_back.fetch_add(1, Ordering::Relaxed);
@@ -2599,7 +2602,7 @@ fn resolve_spec(
                 if !destinations.iter().any(|d| d == authority) {
                     return Err(StoreError::Forbidden);
                 }
-                let now = UnixMillis::now();
+                let now = UnixMillis::steady();
                 let (tenant, repo) = sources::attempt_repo(&tx, worker, attempt, now)?;
                 if (tenant, repo) != (binding.tenant, binding.repo) {
                     return Err(StoreError::Forbidden);
@@ -2622,7 +2625,7 @@ fn resolve_spec(
         // And the lease that authorized this delivery must still be live.
         let (tenant, repo) = (binding.tenant, binding.repo);
         store.read(move |conn| {
-            if sources::attempt_repo(conn, worker, attempt, UnixMillis::now())? != (tenant, repo) {
+            if sources::attempt_repo(conn, worker, attempt, UnixMillis::steady())? != (tenant, repo) {
                 return Err(StoreError::Forbidden);
             }
             Ok(())
@@ -2856,7 +2859,7 @@ impl Controller {
         let reconciled = store
             .writer()
             .write(move |tx| {
-                dispatch::reconcile_startup(tx, UnixMillis::now(), Some(&reconcile_logs))
+                dispatch::reconcile_startup(tx, UnixMillis::steady(), Some(&reconcile_logs))
             })
             .map_err(|_| Error::Internal("startup reconciliation"))?;
         let listener = TcpListener::bind(listen)?;

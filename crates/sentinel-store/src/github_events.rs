@@ -212,6 +212,9 @@ fn rerequest(
         // A full immutable DAG rerun preserves attempts, fences and image pins.
         // Each reset is compare-and-set on the terminal state just read, so a
         // job that moved in between is never overwritten.
+        // The reset jobs queue on the deadline clock their queue timeout is
+        // decided against, not the caller's wall-clock `now`.
+        let queued = UnixMillis::steady();
         for ((job, seen), compiled) in jobs.iter().zip(&spec.pipeline.jobs) {
             let ready = compiled.needs.is_empty() && compiled.spec.condition.is_none();
             let state = if ready {
@@ -219,7 +222,7 @@ fn rerequest(
             } else {
                 JobState::Blocked
             };
-            let reset = tx.execute("UPDATE jobs SET state_code=?1,cancel_requested=0,failure_class=NULL,queued_ms=?2,leased_ms=NULL,preparing_ms=NULL,running_ms=NULL,finalizing_ms=NULL,terminal_ms=NULL WHERE id=?3 AND state_code=?4",params![crate::codec::encode_state(state),if ready{Some(now.0)}else{None},job.as_bytes(),crate::codec::encode_state(*seen)])?;
+            let reset = tx.execute("UPDATE jobs SET state_code=?1,cancel_requested=0,failure_class=NULL,queued_ms=?2,leased_ms=NULL,preparing_ms=NULL,running_ms=NULL,finalizing_ms=NULL,terminal_ms=NULL WHERE id=?3 AND state_code=?4",params![crate::codec::encode_state(state),if ready{Some(queued.0)}else{None},job.as_bytes(),crate::codec::encode_state(*seen)])?;
             if reset != 1 {
                 // The single writer read these states in this very
                 // transaction: a miss means the row is not what it was.

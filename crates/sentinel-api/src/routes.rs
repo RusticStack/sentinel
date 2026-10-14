@@ -572,7 +572,7 @@ pub(crate) fn route(
                 .writer()
                 .write(move |tx| {
                     let now = UnixMillis::now();
-                    let count = dispatch::cancel_run(tx, tenant, run, now)?;
+                    let count = dispatch::cancel_run(tx, tenant, run, UnixMillis::steady())?;
                     operations::record(
                         tx,
                         tenant,
@@ -597,7 +597,7 @@ pub(crate) fn route(
                 .writer()
                 .write(move |tx| {
                     let now = UnixMillis::now();
-                    let outcome = dispatch::cancel(tx, tenant, job, now)?;
+                    let outcome = dispatch::cancel(tx, tenant, job, UnixMillis::steady())?;
                     operations::record(
                         tx,
                         tenant,
@@ -622,7 +622,7 @@ pub(crate) fn route(
                 .writer()
                 .write(move |tx| {
                     let now = UnixMillis::now();
-                    let next = runs::rerun_job(tx, tenant, job, now)?;
+                    let next = runs::rerun_job(tx, tenant, job, UnixMillis::steady())?;
                     operations::record(
                         tx,
                         tenant,
@@ -1309,9 +1309,13 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
                 principal: &principal_text,
                 route: "runs.create",
             };
+            // Job and idempotency timestamps are deadline-clock values: the
+            // queue timeout and the key's TTL are decided against them. The
+            // provenance and check rows below stay wall-clock.
             let now = UnixMillis::now();
+            let steady = UnixMillis::steady();
             if let Some(key) = key {
-                match idempotency::begin(tx, scope, key, fingerprint, now)? {
+                match idempotency::begin(tx, scope, key, fingerprint, steady)? {
                     idempotency::Begin::Execute => {}
                     idempotency::Begin::Replay(run) => return Ok(Err(Some(run))),
                     idempotency::Begin::Mismatch => return Ok(Err(None)),
@@ -1319,7 +1323,7 @@ fn dispatch_run(state: &State, request: &mut Request, slug: &str, name: &str) ->
                 }
             }
             let run = RunId::new();
-            let jobs = authz::create_run(tx, principal, repo, run, &spec, now)?;
+            let jobs = authz::create_run(tx, principal, repo, run, &spec, steady)?;
             for (job, (digest, platform)) in jobs.iter().zip(&images) {
                 runs::resolve_image(tx, tenant, *job, digest, platform)?;
             }

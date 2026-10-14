@@ -1475,20 +1475,28 @@ type Purge =
 /// filled its batch, i.e. may have more to purge.
 #[cfg(feature = "server")]
 fn purge_expired(store: &sentinel_store::Store, batch: u32) -> bool {
-    let now = sentinel_core::UnixMillis::now();
-    let purges: [(&str, Purge); 6] = [
-        ("oauth", sentinel_store::oauth::purge_expired),
-        ("api_tokens", sentinel_store::tokens::purge_expired),
-        ("sessions", sentinel_store::local_auth::purge_expired),
-        ("sign_in", sentinel_store::sign_in::purge_expired),
-        ("idempotency", sentinel_store::idempotency::purge_expired),
+    let wall = sentinel_core::UnixMillis::now();
+    // Idempotency keys are stamped by the deadline clock (the API's run
+    // creation), so their TTL is judged on it; everything else is wall time.
+    let steady = sentinel_core::UnixMillis::steady();
+    let purges: [(&str, Purge, sentinel_core::UnixMillis); 6] = [
+        ("oauth", sentinel_store::oauth::purge_expired, wall),
+        ("api_tokens", sentinel_store::tokens::purge_expired, wall),
+        ("sessions", sentinel_store::local_auth::purge_expired, wall),
+        ("sign_in", sentinel_store::sign_in::purge_expired, wall),
+        (
+            "idempotency",
+            sentinel_store::idempotency::purge_expired,
+            steady,
+        ),
         (
             "secret_idempotency",
             sentinel_store::secrets::purge_idempotency,
+            wall,
         ),
     ];
     let mut backlog = false;
-    for (kind, purge) in purges {
+    for (kind, purge, now) in purges {
         match purge(store, now, batch) {
             Ok(0) => {}
             Ok(removed) => {
