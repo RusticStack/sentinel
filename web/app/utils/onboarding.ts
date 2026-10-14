@@ -126,10 +126,9 @@ export function baseUrlProblem(text: string): string | null {
 
 export type RegistrationChoice = "closed" | "invite-only" | "approval-required";
 export type TenantCreationChoice = "super-admin-only" | "approved-users";
-export type SmtpTls = "starttls" | "implicit" | "none";
 
 /** What the wizard keeps across a refresh: never the setup token, a
- *  password or the SMTP password, which live in the page's memory only. */
+ *  password, which live in the page's memory only. */
 export interface WizardDraft {
   step: number;
   email: string;
@@ -138,11 +137,6 @@ export interface WizardDraft {
   tenantCreation: TenantCreationChoice;
   instanceName: string;
   baseUrl: string;
-  smtpHost: string;
-  smtpPort: number;
-  smtpTls: SmtpTls;
-  smtpFrom: string;
-  smtpUsername: string;
   personalNamespace: string;
   organization: string;
 }
@@ -158,11 +152,6 @@ export function emptyDraft(): WizardDraft {
     tenantCreation: "super-admin-only",
     instanceName: "Sentinel",
     baseUrl: "",
-    smtpHost: "",
-    smtpPort: 587,
-    smtpTls: "starttls",
-    smtpFrom: "",
-    smtpUsername: "",
     personalNamespace: "",
     organization: "",
   };
@@ -170,7 +159,6 @@ export function emptyDraft(): WizardDraft {
 
 const REGISTRATIONS: readonly string[] = ["closed", "invite-only", "approval-required"];
 const CREATIONS: readonly string[] = ["super-admin-only", "approved-users"];
-const TLS: readonly string[] = ["starttls", "implicit", "none"];
 const str = (v: unknown, max: number) => (typeof v === "string" ? v.slice(0, max) : "");
 
 /// The draft as stored: only the allowlisted, non-secret fields, whatever
@@ -184,11 +172,6 @@ export function serializeDraft(draft: WizardDraft): string {
     tenantCreation: draft.tenantCreation,
     instanceName: draft.instanceName,
     baseUrl: draft.baseUrl,
-    smtpHost: draft.smtpHost,
-    smtpPort: draft.smtpPort,
-    smtpTls: draft.smtpTls,
-    smtpFrom: draft.smtpFrom,
-    smtpUsername: draft.smtpUsername,
     personalNamespace: draft.personalNamespace,
     organization: draft.organization,
   };
@@ -210,11 +193,6 @@ export function parseDraft(text: string | null, maxStep: number): WizardDraft {
   if (CREATIONS.includes(raw.tenantCreation)) out.tenantCreation = raw.tenantCreation;
   out.instanceName = str(raw.instanceName, 128) || out.instanceName;
   out.baseUrl = str(raw.baseUrl, 2048);
-  out.smtpHost = str(raw.smtpHost, 253);
-  if (Number.isInteger(raw.smtpPort) && raw.smtpPort > 0 && raw.smtpPort < 65536) out.smtpPort = raw.smtpPort;
-  if (TLS.includes(raw.smtpTls)) out.smtpTls = raw.smtpTls;
-  out.smtpFrom = str(raw.smtpFrom, 254);
-  out.smtpUsername = str(raw.smtpUsername, 256);
   out.personalNamespace = str(raw.personalNamespace, 63);
   out.organization = str(raw.organization, 63);
   return out;

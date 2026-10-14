@@ -77,19 +77,20 @@ test("a base URL is an absolute http(s) address without credentials, query or fr
 });
 
 test("the stored wizard draft never carries a secret, whatever the object holds", () => {
-  const draft = { ...emptyDraft(), email: "ada@example.com", token: HEX, password: "a secret password", smtpPassword: "relay secret", again: "a secret password" };
+  const draft = { ...emptyDraft(), email: "ada@example.com", token: HEX, password: "a secret password", resendKey: "re_not_a_real_key", again: "a secret password" };
   const text = serializeDraft(draft);
-  for (const secret of [HEX, "a secret password", "relay secret"]) assert.ok(!text.includes(secret), secret);
+  for (const secret of [HEX, "a secret password", "re_not_a_real_key"]) assert.ok(!text.includes(secret), secret);
   assert.deepEqual(Object.keys(JSON.parse(text)).sort(), Object.keys(emptyDraft()).sort());
 });
 
 test("a stored draft is read back field by field, and anything malformed falls back", () => {
-  const back = parseDraft(serializeDraft({ ...emptyDraft(), step: 4, email: "ada@example.com", registration: "closed", smtpPort: 465 }), 6);
+  const back = parseDraft(serializeDraft({ ...emptyDraft(), step: 4, email: "ada@example.com", registration: "closed", tenantCreation: "approved-users", instanceName: "Build farm" }), 6);
   assert.equal(back.step, 4);
   assert.equal(back.email, "ada@example.com");
   assert.equal(back.registration, "closed");
-  assert.equal(back.smtpPort, 465);
-  const bad = parseDraft(JSON.stringify({ step: 99, registration: "open", smtpPort: 70000, smtpTls: "ssl", email: 5 }), 6);
+  assert.equal(back.tenantCreation, "approved-users");
+  assert.equal(back.instanceName, "Build farm");
+  const bad = parseDraft(JSON.stringify({ step: 99, registration: "open", tenantCreation: "everyone", retired: "a field from an older draft", email: 5 }), 6);
   assert.deepEqual(bad, emptyDraft());
   assert.deepEqual(parseDraft("not json", 6), emptyDraft());
   assert.deepEqual(parseDraft(null, 6), emptyDraft());

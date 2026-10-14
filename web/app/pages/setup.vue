@@ -11,7 +11,7 @@
 // administrator, the policy, the instance settings and the optional
 // namespaces in one commit and signs the administrator in. An authenticator
 // is then offered (not forced), and a last screen says what to do next.
-import type { RegistrationChoice, SmtpTls, TenantCreationChoice, WizardDraft } from "~/utils/onboarding";
+import type { RegistrationChoice, TenantCreationChoice, WizardDraft } from "~/utils/onboarding";
 
 definePageMeta({ layout: "auth" });
 useHead({ title: "Set up Sentinel" });
@@ -33,8 +33,7 @@ const resumed = ref(false);
 const token = ref("");
 const password = ref("");
 const again = ref("");
-const smtpPassword = ref("");
-const smtpTo = ref("");
+const mailTo = ref("");
 const completed = ref<{ organization: string | null; personal: string | null } | null>(null);
 const heading = useTemplateRef<HTMLElement>("heading");
 
@@ -70,7 +69,6 @@ onBeforeUnmount(() => {
   token.value = "";
   password.value = "";
   again.value = "";
-  smtpPassword.value = "";
 });
 
 // --- Moving between steps ------------------------------------------------
@@ -143,59 +141,68 @@ const CREATIONS: { value: TenantCreationChoice; label: string; description: stri
   { value: "super-admin-only", label: "Only platform administrators", description: "You create organizations and add people to them." },
   { value: "approved-users", label: "Any approved account", description: "Every admitted person may create up to 10 organizations of their own and administer them." },
 ];
-const TLS_CHOICES: { value: SmtpTls; label: string }[] = [
-  { value: "starttls", label: "STARTTLS (usually port 587)" },
-  { value: "implicit", label: "TLS from the start (usually port 465)" },
-  { value: "none", label: "None (a relay on this host only)" },
-];
 const regLabel = computed(() => REGISTRATIONS.find((r) => r.value === draft.registration)?.label ?? draft.registration);
 const creationLabel = computed(() => CREATIONS.find((c) => c.value === draft.tenantCreation)?.label ?? draft.tenantCreation);
-watch(() => draft.smtpTls, (tls, old) => {
-  const defaults: Record<SmtpTls, number> = { starttls: 587, implicit: 465, none: 25 };
-  if (draft.smtpPort === defaults[old]) draft.smtpPort = defaults[tls];
+
+// --- Email ---------------------------------------------------------------
+
+// Whether the controller has a Resend key and sender (`GET /setup`); `null`
+// until known. Read again each time the step opens, so a controller set up
+// meanwhile is seen without a reload.
+const mailConfigured = ref<boolean | null>(null);
+async function readMailConfigured() {
+  try {
+    mailConfigured.value = (await api<{ open: boolean; mail_configured?: boolean }>("/api/v1/setup")).mail_configured === true;
+  } catch {
+    // Unknown: the test itself says whether mail is configured.
+  }
+}
+watch(step, (at) => {
+  if (at !== 4) return;
+  if (!mailTo.value) mailTo.value = draft.email;
+  readMailConfigured();
 });
 
-// --- SMTP test -------------------------------------------------------------
-
-type SmtpResult = { kind: "sent" } | { kind: "failed"; failure: string; reason: string } | { kind: "error"; message: string };
-const smtpResult = ref<SmtpResult | null>(null);
-const testing = ref(false);
-const smtpWait = useRetryWait();
-const smtpSnippet = computed(() => [
-  `SENTINEL_SMTP_HOST=${draft.smtpHost || "smtp.example.com"}`,
-  `SENTINEL_SMTP_PORT=${draft.smtpPort}`,
-  `SENTINEL_SMTP_TLS=${draft.smtpTls}`,
-  `SENTINEL_SMTP_FROM=${draft.smtpFrom || "ci@example.com"}`,
-  ...(draft.smtpUsername ? ["SENTINEL_SMTP_CREDENTIALS_FILE=/etc/sentinel/smtp-credentials  # owner-only: username = …, password = …"] : []),
-].join("\n"));
-
-async function testSmtp() {
-  if (testing.value || smtpWait.waiting.value) return;
-  smtpResult.value = null;
-  if (!draft.smtpHost.trim() || !looksLikeEmail(draft.smtpFrom) || !looksLikeEmail(smtpTo.value || draft.email)) {
-    smtpResult.value = { kind: "error", message: "Fill in the relay's host, the sender address and where the test should go." };
-    return;
+/** The controller's environment lines, each with its own copy button. */
+const MAIL_LINES = [
+  "SENTINEL_RESEND_API_KEY_FILE=/etc/sentinel/resend-key",
+  "SENTINEL_EMAIL_FROM=Sentinel <sentinel@example.com>",
+] as const;
+const lineName = (line: string) => line.slice(0, line.indexOf("="));
+const copyStatus = ref("");
+async function copyLine(line: string) {
+  try {
+    await navigator.clipboard.writeText(line);
+    copyStatus.value = `Copied the ${lineName(line)} line to the clipboard.`;
+  } catch {
+    copyStatus.value = "The browser refused the clipboard; select the line and copy it instead.";
   }
-  if (!!draft.smtpUsername !== !!smtpPassword.value) {
-    smtpResult.value = { kind: "error", message: "Give both the user name and the password, or neither." };
+}
+
+type MailResult = { kind: "sent" } | { kind: "failed"; failure: string; reason: string } | { kind: "error"; message: string };
+const mailResult = ref<MailResult | null>(null);
+const testing = ref(false);
+const mailWait = useRetryWait();
+
+async function testMail() {
+  if (testing.value || mailWait.waiting.value) return;
+  mailResult.value = null;
+  const to = (mailTo.value || draft.email).trim();
+  if (!looksLikeEmail(to)) {
+    mailResult.value = { kind: "error", message: "Enter the address the test message should go to, such as you@example.com." };
     return;
   }
   testing.value = true;
-  const body: Record<string, unknown> = {
-    token: token.value.trim(),
-    host: draft.smtpHost.trim(),
-    port: draft.smtpPort,
-    tls: draft.smtpTls,
-    from: draft.smtpFrom.trim(),
-    to: (smtpTo.value || draft.email).trim(),
-  };
-  if (draft.smtpUsername) {
-    body.username = draft.smtpUsername;
-    body.password = smtpPassword.value;
-  }
   try {
-    const done = await api<{ sent: boolean; failure?: string; reason?: string }>("/api/v1/setup/smtp-test", { method: "POST", body });
-    smtpResult.value = done.sent ? { kind: "sent" } : { kind: "failed", failure: done.failure ?? "transient", reason: done.reason ?? "" };
+    const done = await api<{ sent: boolean; failure?: string; reason?: string }>("/api/v1/setup/mail-test", { method: "POST", body: { token: token.value.trim(), to } });
+    if (done.sent) {
+      mailResult.value = { kind: "sent" };
+      mailConfigured.value = true;
+    } else {
+      const failure = done.failure ?? "transient";
+      if (failure === "not_configured") mailConfigured.value = false;
+      mailResult.value = { kind: "failed", failure, reason: done.reason ?? "" };
+    }
   } catch (e) {
     const err = e as ApiError;
     if (err.code === "forbidden" && err.message === "setup token refused") {
@@ -203,19 +210,26 @@ async function testSmtp() {
       return;
     }
     if (err.code === "not_found") return setupGone();
-    if (err.code === "rate_limited") smtpWait.start(err);
-    smtpResult.value = { kind: "error", message: err.code === "rate_limited" ? `Another test is running or too many were sent. Try again in ${retryAfter(err)}.` : err.code === "forbidden" ? ORIGIN_REFUSED : refusal(err) };
+    if (err.code === "rate_limited") mailWait.start(err);
+    mailResult.value = { kind: "error", message: err.code === "rate_limited" ? `Another test is running or too many were sent. Try again in ${retryAfter(err)}.` : err.code === "forbidden" ? ORIGIN_REFUSED : refusal(err) };
   } finally {
-    body.password = undefined;
     testing.value = false;
   }
 }
 
 const FAILURE_WORDS: Record<string, string> = {
-  invalid_settings: "The settings themselves are not usable",
-  transient: "The relay could not be reached or refused for now (address, port, TLS mode or credentials)",
-  permanent: "The relay refused the message",
+  not_configured: "The controller has no Resend key and sender yet, so nothing was sent",
+  invalid_settings: "That address cannot receive a test message; check it and try again",
+  transient: "Resend could not be reached or asked to wait; try again in a moment",
+  permanent: "Resend refused the message; check the key and that the sender's domain is verified in Resend",
 };
+
+const emailSummary = computed(() => {
+  if (mailResult.value?.kind === "sent") return "Configured; test message sent";
+  if (mailConfigured.value === false) return "Not configured; links are printed by sentinel admin";
+  if (mailConfigured.value) return "Configured; not tested";
+  return "Not tested (optional)";
+});
 
 // --- Finishing -------------------------------------------------------------
 
@@ -266,7 +280,6 @@ async function finish() {
     setCsrfToken(done.csrf);
     token.value = "";
     again.value = "";
-    smtpPassword.value = "";
     completed.value = { organization: done.organization ?? null, personal: done.personal_namespace ?? null };
     forget();
     setupStatus.markClosed();
@@ -385,49 +398,37 @@ const firstNamespace = computed(() => completed.value?.organization ?? completed
 
       <!-- 5. Email -->
       <template v-else-if="step === 4">
-        <p class="text-sm">Optional. Sentinel can email confirmation links and invitations through your mail relay. Without one, nobody is locked out: you hand links over yourself.</p>
-        <UAlert color="info" variant="subtle" icon="i-lucide-info" title="The wizard only tests these settings."
-          description="Nothing typed here is stored. To turn email on, put the settings in the controller's configuration ([mail], or the environment lines below) and restart it." />
-        <div class="grid gap-4 sm:grid-cols-[1fr_8rem]">
-          <UFormField label="Relay host" name="smtp-host">
-            <UInput id="smtp-host" v-model="draft.smtpHost" autocapitalize="off" spellcheck="false" placeholder="smtp.example.com" class="w-full" />
-          </UFormField>
-          <UFormField label="Port" name="smtp-port">
-            <UInput id="smtp-port" v-model.number="draft.smtpPort" type="number" min="1" max="65535" class="w-full" />
-          </UFormField>
-        </div>
-        <UFormField label="Encryption" name="smtp-tls">
-          <USelect id="smtp-tls" v-model="draft.smtpTls" :items="TLS_CHOICES" class="w-full" />
-        </UFormField>
-        <UFormField label="Sender address" name="smtp-from">
-          <UInput id="smtp-from" v-model="draft.smtpFrom" type="email" autocapitalize="off" spellcheck="false" placeholder="ci@example.com" class="w-full" />
-        </UFormField>
-        <div class="grid gap-4 sm:grid-cols-2">
-          <UFormField label="User name" name="smtp-user" hint="If the relay asks">
-            <UInput id="smtp-user" v-model="draft.smtpUsername" autocomplete="off" autocapitalize="off" spellcheck="false" class="w-full" />
-          </UFormField>
-          <UFormField label="Password" name="smtp-password" hint="Not kept">
-            <UInput id="smtp-password" v-model="smtpPassword" type="password" autocomplete="off" class="w-full" />
-          </UFormField>
-        </div>
-        <div class="flex flex-wrap items-end gap-3">
-          <UFormField label="Send the test to" name="smtp-to">
-            <UInput id="smtp-to" v-model="smtpTo" type="email" :placeholder="draft.email || 'you@example.com'" autocapitalize="off" spellcheck="false" class="w-64 max-w-full" />
-          </UFormField>
-          <UButton type="button" color="neutral" variant="outline" icon="i-lucide-send" :label="smtpWait.waiting.value ? `Wait ${smtpWait.waiting.value} s` : 'Send test message'" :loading="testing" :disabled="!!smtpWait.waiting.value" @click="testSmtp" />
-        </div>
+        <p class="text-sm">Optional. Sentinel can email confirmation links and invitations through Resend. Without it, nobody is locked out: you hand links over yourself.</p>
+        <template v-if="mailConfigured === false">
+          <UAlert color="info" variant="subtle" icon="i-lucide-mail-x" title="Email is not configured on the controller."
+            description="Nothing is sent until the controller has a Resend API key and a sender. Until then, verification and invitation links are printed by sentinel admin on the host." />
+          <p class="text-sm">To turn email on, put the Resend API key in the file <code>/etc/sentinel/resend-key</code>, readable only by the controller's service user (owner-only), add these two lines to the controller's environment and restart it. The key never goes in a variable or in this page.</p>
+          <ul class="space-y-2" aria-label="Environment lines for the controller">
+            <li v-for="line in MAIL_LINES" :key="line" class="flex items-center gap-2">
+              <code class="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded bg-muted px-2 py-1.5 text-xs">{{ line }}</code>
+              <UButton type="button" size="xs" color="neutral" variant="outline" icon="i-lucide-copy" :aria-label="`Copy the ${lineName(line)} line`" @click="copyLine(line)" />
+            </li>
+          </ul>
+          <p class="text-xs text-muted" role="status">{{ copyStatus }}</p>
+          <p class="text-xs text-muted">Use a sender on a domain verified in Resend. Restarting the controller makes a new setup token.</p>
+        </template>
+        <template v-else>
+          <p v-if="mailConfigured" class="text-sm">The controller has a Resend key and sender. Send a test message to check that they work.</p>
+          <div class="flex flex-wrap items-end gap-3">
+            <UFormField label="Send test to" name="mail-to">
+              <UInput id="mail-to" v-model="mailTo" type="email" :placeholder="draft.email || 'you@example.com'" autocapitalize="off" spellcheck="false" class="w-64 max-w-full" />
+            </UFormField>
+            <UButton type="button" color="neutral" variant="outline" icon="i-lucide-send" :label="mailWait.waiting.value ? `Wait ${mailWait.waiting.value} s` : 'Send test message'" :loading="testing" :disabled="!!mailWait.waiting.value" @click="testMail" />
+          </div>
+        </template>
         <div aria-live="polite">
-          <UAlert v-if="smtpResult?.kind === 'sent'" color="success" variant="subtle" icon="i-lucide-mail-check" title="Test message sent."
-            description="Check that it arrived (and not in spam). Then put these settings in the controller's configuration." />
-          <UAlert v-else-if="smtpResult?.kind === 'failed'" color="warning" variant="subtle" icon="i-lucide-mail-warning" :title="`${FAILURE_WORDS[smtpResult.failure] ?? 'The test failed'}.`"
-            :description="smtpResult.reason ? `The relay said: ${smtpResult.reason}` : undefined" />
-          <UAlert v-else-if="smtpResult?.kind === 'error'" color="error" variant="subtle" icon="i-lucide-circle-alert" :title="smtpResult.message" />
+          <UAlert v-if="mailResult?.kind === 'sent'" color="success" variant="subtle" icon="i-lucide-mail-check" title="Test message sent."
+            description="Check that it arrived (and not in spam)." />
+          <UAlert v-else-if="mailResult?.kind === 'failed'" color="warning" variant="subtle" icon="i-lucide-mail-warning" :title="`${FAILURE_WORDS[mailResult.failure] ?? 'The test failed'}.`"
+            :description="mailResult.reason ? `Resend said: ${mailResult.reason}` : undefined" />
+          <UAlert v-else-if="mailResult?.kind === 'error'" color="error" variant="subtle" icon="i-lucide-circle-alert" :title="mailResult.message" />
         </div>
-        <details class="rounded-md border border-default p-3 text-sm">
-          <summary class="cursor-pointer font-medium">Configuration lines for the controller</summary>
-          <pre class="mt-2 overflow-x-auto rounded bg-muted p-2 text-xs"><code>{{ smtpSnippet }}</code></pre>
-          <p class="mt-2 text-xs text-muted">The relay's password goes in the owner-only credentials file, never in the environment.</p>
-        </details>
+        <p class="text-xs text-muted">A failed test does not stop setup: you can finish now and configure email later.</p>
       </template>
 
       <!-- 6. Namespaces -->
@@ -450,7 +451,7 @@ const firstNamespace = computed(() => completed.value?.organization ?? completed
             { at: 2, label: 'Who can create an account', value: regLabel },
             { at: 2, label: 'Who can create organizations', value: creationLabel },
             { at: 3, label: 'Instance', value: draft.baseUrl ? `${draft.instanceName} — ${draft.baseUrl}` : draft.instanceName },
-            { at: 4, label: 'Email', value: smtpResult?.kind === 'sent' ? 'Tested; configure it on the controller' : 'Not tested (optional)' },
+            { at: 4, label: 'Email', value: emailSummary },
             { at: 5, label: 'Personal namespace', value: draft.personalNamespace || 'None' },
             { at: 5, label: 'First organization', value: draft.organization || 'None' },
           ]" :key="row.label" class="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
