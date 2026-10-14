@@ -1,4 +1,4 @@
-//! The bookkeeping of the optional external S3 copy (R02/R03): what still
+//! The bookkeeping of the optional external S3 copy: what still
 //! needs replicating, what may be evicted locally, multipart uploads to
 //! resume, and S3 copies to delete. The transfers themselves happen outside
 //! the store (the controller's replicator); every function here is a short

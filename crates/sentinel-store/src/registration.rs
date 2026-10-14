@@ -1,4 +1,4 @@
-//! Admission (A05): who may obtain an account, who approves it, who may create
+//! Admission: who may obtain an account, who approves it, who may create
 //! a namespace, and who may bind a forge installation to one.
 //!
 //! These are four separate decisions, and this module keeps them separate.
@@ -202,7 +202,7 @@ pub fn invite(
 /// the ceiling on using an organization's invitation right to send mail.
 const EMAIL_INVITES_PER_HOUR: i64 = 50;
 
-/// An invitation sent by email (A05 extension): `invite` plus the mailbox it
+/// An invitation sent by email: `invite` plus the mailbox it
 /// is addressed to. The organization must be app-created: a GitHub-backed
 /// one takes its members from GitHub, so an email invitation is refused for
 /// it (`InvalidInput`), whoever asks. The role is the invitation's term and
@@ -482,7 +482,7 @@ pub(crate) enum Select {
 
 /// The one statement deciding whether an invitation is redeemable now:
 /// unspent, unrevoked, unexpired, and its creator's authority intact (see
-/// the module notes). `$selector` binds `?1`; `?2` is the instant.
+/// [`usable_invitation`]). `$selector` binds `?1`; `?2` is the instant.
 macro_rules! usable_sql {
     ($selector:literal) => {
         concat!(
@@ -786,7 +786,7 @@ pub enum Applicant<'a> {
         email: &'a str,
         password: &'a [u8],
     },
-    /// An already-verified external identity (A04 established the proof).
+    /// An already-verified external identity.
     External {
         display_name: &'a str,
         provider: &'a str,
@@ -1224,7 +1224,7 @@ pub fn create_personal_namespace(
 
 /// Record that a forge installation exists, without trusting it.
 ///
-/// Trusted intake, called by webhook/App handling (G01–G02), not by a client. A
+/// Trusted intake, called by webhook/App handling, not by a client. A
 /// recorded installation is unbound and inactive: it grants nothing until an
 /// authorized binding exists. Idempotent, because deliveries repeat.
 pub fn record_installation(

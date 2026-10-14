@@ -1,4 +1,4 @@
-//! Opt-in bounded ref polling (G07): durable schedules and observation
+//! Opt-in bounded ref polling: durable schedules and observation
 //! cursors.
 //!
 //! A repository's poll configuration is tenant-owned and requires a live
@@ -444,8 +444,7 @@ struct Cursor(Option<[u8; 16]>, i64);
 /// same delivery, but a later, legitimate repeat of the same transition —
 /// `A→B`, force-reverted `B→A`, re-pushed `A→B` — moves a cursor that a
 /// different delivery set, so it is a new delivery rather than a suppressed
-/// duplicate. The cursor and the delivery commit together, so crash safety
-/// never needed the identity to ignore the cursor.
+/// duplicate.
 fn external_id(reference: &str, old: &str, new: &str, cursor: &Cursor) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(reference.as_bytes());
