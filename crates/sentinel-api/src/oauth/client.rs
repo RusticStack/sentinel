@@ -474,7 +474,6 @@ fn busy(message: &str) -> Reply {
     reply
 }
 
-/// The registrant digest of this request's client address.
 fn registrant(state: &State, request: &Request) -> [u8; 16] {
     grants::registrant_digest(super::client_of(state, request))
 }
@@ -898,7 +897,7 @@ mod tests {
         );
     }
 
-    /// P11-3 / P09S-5: RFC 7591 defaults and echoed advertised grants are
+    /// RFC 7591 defaults and echoed advertised grants are
     /// accepted; anything not a public code-flow client is still refused.
     #[test]
     fn registered_clients_must_declare_only_supported_grants_and_responses() {

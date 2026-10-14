@@ -47,9 +47,8 @@ pub struct Identity {
     pub grant: Option<GrantId>,
     /// When an OAuth access token stops working.
     pub expires: Option<UnixMillis>,
-    /// A browser session that proved presence within the step-up window
-    /// (A06). Never set for a bearer credential or an OAuth token, which
-    /// can never step up.
+    /// A browser session that proved presence within the step-up window.
+    /// Never set for a bearer credential or an OAuth token.
     ///
     /// This is what the interface shows; it is **not** what authorizes a
     /// change. A privileged mutation goes through [`Identity::authority`],

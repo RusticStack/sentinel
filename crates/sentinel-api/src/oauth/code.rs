@@ -1,4 +1,4 @@
-//! The authorization-code flow over HTTP (O01): `GET`/`POST
+//! The authorization-code flow over HTTP: `GET`/`POST
 //! /oauth/authorize` (sign-in, consent, approve or deny, `303` back to the
 //! client) and the `authorization_code` branch of the token endpoint.
 //!
@@ -109,7 +109,6 @@ fn show(state: &State, request: &Request, query: &str) -> Reply {
     consent::page(state, &params, &who, &token, None)
 }
 
-/// The sign-in page that returns to this authorization request.
 fn sign_in(state: &State, query: &str, client_name: Option<&str>) -> Reply {
     let mut message = String::with_capacity(64);
     match client_name {
@@ -240,7 +239,6 @@ fn approve(state: &State, form: &Form, params: &Params<'_>, who: &Identity) -> R
     }
 }
 
-/// The browser session behind this request and its CSRF digest.
 fn signed_in(
     state: &State,
     request: &Request,

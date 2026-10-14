@@ -1,4 +1,4 @@
-//! Scrapeable metrics (R06): `GET /metrics` in the Prometheus text
+//! Scrapeable metrics: `GET /metrics` in the Prometheus text
 //! exposition format, and the request counters the HTTP layer keeps.
 //!
 //! Everything here is either an atomic the hot paths already bump or an
@@ -23,8 +23,8 @@ const BUCKETS: [f64; 10] = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0
 pub(crate) struct Requests {
     /// By status class: 1xx … 5xx.
     by_class: [AtomicU64; 5],
-    /// Cumulative-by-construction later: each request lands in the first
-    /// bucket whose bound it is within, `+Inf` last.
+    /// Not cumulative: each request lands in the first bucket whose bound it
+    /// is within, `+Inf` last; `render` accumulates.
     buckets: [AtomicU64; BUCKETS.len() + 1],
     micros: AtomicU64,
     /// Refusals worth watching for: a wrong or missing credential, a
@@ -79,7 +79,7 @@ impl Requests {
     }
 }
 
-/// A metric family being written.
+/// The exposition text being written.
 struct Out(String);
 
 impl Out {
@@ -99,7 +99,6 @@ impl Out {
     }
 }
 
-/// Escape a label value.
 fn label(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -139,7 +138,6 @@ fn process(out: &mut Out) {
     }
 }
 
-/// Render every metric.
 pub(crate) fn render(state: &State) -> String {
     let mut out = Out(String::with_capacity(8 * 1024));
     let schema: i64 = state
@@ -167,7 +165,6 @@ pub(crate) fn render(state: &State) -> String {
     );
     process(&mut out);
 
-    // HTTP.
     let r = &state.requests;
     out.family(
         "sentinel_http_requests_total",
