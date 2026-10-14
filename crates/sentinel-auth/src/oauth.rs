@@ -1,4 +1,4 @@
-//! OAuth token text forms (O02), PKCE (RFC 7636), device user codes and the
+//! OAuth token text forms, PKCE (RFC 7636), device user codes and the
 //! loopback redirect rule. Pure: nothing here reads a clock, a database or a
 //! request, and no token material is formatted through `Debug`/`Display`.
 //!
@@ -68,7 +68,7 @@ pub fn parse(kind: Kind, text: &str) -> Option<Secret> {
 
 /// What an `Authorization: Bearer` header may carry.
 pub enum Bearer {
-    /// A `sntl_` API credential (A03).
+    /// A `sntl_` API credential.
     Credential(Secret),
     /// A `sntl_at_` OAuth access token.
     Access(Secret),

@@ -1,4 +1,4 @@
-//! O05 server additions over real HTTP on loopback: the run wait long poll
+//! Over real HTTP on loopback: the run wait long poll
 //! on the store's commit notifier and its subscriber cap (shared with
 //! `logs?wait=1`), the bounded literal log search, the per-attempt cache
 //! summary behind `cache:read`, and keyset pagination of a repository's
@@ -265,7 +265,7 @@ fn lease(d: &Deployment, job: JobId) -> (WorkerId, AttemptId, Fence) {
 
 /// A worker the store knows: its own dedicated pool of the tenant and a
 /// host-local enrollment. Acknowledgements and reports come only from a
-/// registered, unrevoked worker (P08-7).
+/// registered, unrevoked worker.
 fn enrolled_worker(
     tx: &sentinel_store::Transaction<'_>,
     tenant: TenantId,
@@ -519,7 +519,7 @@ fn a_parked_subscriber_past_the_cap_is_rate_limited_and_log_follows_share_it() {
     assert_eq!(status, 200);
 }
 
-/// P09-12: one user cannot hold every parked slot. Past its share its next
+/// One user cannot hold every parked slot. Past its share its next
 /// parking poll is refused at once, while another user's still parks; the
 /// share comes back when a poll ends.
 #[test]
@@ -968,7 +968,7 @@ fn failure_view_parses_attempt_logs_with_stable_evidence_and_a_hard_budget() {
         &d.auth,
     );
     assert_eq!(status, 200);
-    // P11D-2: between the rerun and the next lease the job is queued under
+    // Between the rerun and the next lease the job is queued under
     // the old fence; the failed attempt must not report that as its own.
     let (status, requeued) = get(&d, &path);
     assert_eq!(status, 200, "{requeued}");
@@ -1200,7 +1200,7 @@ fn diagnostics_for<'a>(view: &'a Value, name: &str) -> Vec<&'a Value> {
         .collect()
 }
 
-/// X08: exactly 100 MiB of noisy output (3,200 full frames) with one test
+/// Exactly 100 MiB of noisy output (3,200 full frames) with one test
 /// failure in the middle (frame 1,600) and one just before a final binary
 /// frame (frame 3,199); frame 1 is noise. A deterministic agent finds the
 /// newest failure from the first bounded response (the failed step's newest
@@ -1383,7 +1383,7 @@ fn mcp_agent_finds_failure_in_a_hundred_mib_log_and_explicitly_reruns() {
         .unwrap();
     assert_ne!(new_attempt, attempt);
 
-    // P11-6: the agent's control actions are traceable to the account, the
+    // The agent's control actions are traceable to the account, the
     // grant to revoke and the client that held it.
     mcp_tool(&d, &agent, "cancel", json!({"job": job.to_string()}));
     let grant: [u8; 16] = d
@@ -1521,8 +1521,8 @@ fn run_listing_pages_with_a_next_cursor() {
     assert_eq!(status, 404);
 }
 
-/// P11D-1, P11D-6 and P11D-10 through the route: a coloured Go location
-/// no longer voids the report, messages carry no raw control bytes, and an
+/// Through the route, a coloured Go location
+/// does not void the report, messages carry no raw control bytes, and an
 /// `if: always()` step writing more than a scan page after the failed step
 /// does not empty the failed step's excerpt.
 #[test]
@@ -1607,7 +1607,7 @@ fn failure_view_keeps_coloured_reports_and_the_failed_steps_own_tail() {
     assert_eq!(tail.last().unwrap()["sequence"], failed_last);
 }
 
-/// X02/X08: report files the attempt published as artifacts are collected
+/// Report files the attempt published as artifacts are collected
 /// as advisory evidence; truncated, malformed, mis-bound or verdict-claiming
 /// reports stay visible as incomplete data and never change the verdict or
 /// the job row. A credential without `artifacts:read` does not see them.

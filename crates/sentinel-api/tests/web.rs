@@ -1,5 +1,5 @@
-//! The routes behind the web interface (U02–U05) and how the interface
-//! itself is served (U01), over real HTTP against a seeded controller.
+//! The routes behind the web interface and how the interface
+//! itself is served, over real HTTP against a seeded controller.
 
 #[path = "support/web_fixture.rs"]
 mod fixture;
@@ -975,7 +975,7 @@ fn parked_polls_leave_every_handler_for_work() {
     drop(parked);
 }
 
-/// R01: storage policy over the API — the platform sets a tenant's, the
+/// Storage policy over the API — the platform sets a tenant's, the
 /// tenant's administration narrows a repository's and reads both with
 /// usage, the deployment reports its disk and limits, and a log retention
 /// removed says so instead of looking like a log still to come.
@@ -1083,7 +1083,7 @@ fn storage_policy_is_administered_per_level_and_an_expired_log_says_so() {
     assert_eq!((status, &body["expired_ms"]), (200, &json!(2)), "{body}");
 }
 
-/// R01 end to end: the controller's maintenance pass stamps a finished
+/// End to end: the controller's maintenance pass stamps a finished
 /// attempt's log (its bytes count toward the tenant's usage), and once its
 /// deadline passes records it expired, frees the usage and deletes the
 /// files — the database first, the files after.
@@ -1151,7 +1151,7 @@ fn the_maintenance_pass_stamps_expires_and_deletes_finished_logs() {
     assert_eq!(tenant_logs(), before - bytes as u64);
 }
 
-/// R03: while the external copy's backlog holds admission closed, nothing
+/// While the external copy's backlog holds admission closed, nothing
 /// is placed — the queue says the job waits on storage, not that it is
 /// ready — and `GET /admin/storage` reports the replicator's state.
 #[test]
@@ -1214,7 +1214,7 @@ fn a_full_external_copy_backlog_is_what_the_queue_and_the_storage_report_say() {
     assert_eq!(queue["placement_paused"], Value::Null);
 }
 
-/// R06: `/metrics` is platform administration and counts what it answered,
+/// `/metrics` is platform administration and counts what it answered,
 /// including refused credentials; `/ready` is public and says what is
 /// degraded; the diagnostic bundle counts without naming.
 #[test]
