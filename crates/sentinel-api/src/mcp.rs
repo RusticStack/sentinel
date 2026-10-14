@@ -361,7 +361,6 @@ pub(crate) fn post(state: &State, request: &mut Request) -> Route {
     }
 }
 
-/// A JSON-RPC result whose `result` is already serialized JSON.
 fn raw_result(id: &Value, result: &str) -> Route {
     let id = serde_json::to_string(id)
         .map_err(|_| ApiError::new(ErrorCode::Internal, "controller fault"))?;
