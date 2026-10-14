@@ -517,3 +517,69 @@ fn an_interrupted_backup_leaves_nothing_the_next_one_does_not_clean() {
     assert!(!stray.exists(), "no kept backup names the part file");
     assert!(backup::verify(&f.target(), &first.id).unwrap().ok());
 }
+
+/// A shared copy an earlier backup left is reused only while it still hashes
+/// to its digest: rot that keeps the length is replaced, not named by every
+/// later backup.
+#[test]
+fn a_rotted_shared_copy_is_replaced_not_reused() {
+    let f = fixture();
+    let digest = f.put(b"an object whose shared copy rots in place");
+    f.manifest(digest, 41);
+    f.backup();
+    let hex = digest.to_string();
+    let shared = f
+        .target()
+        .join("objects")
+        .join(f.tenant.to_string())
+        .join(&hex[..2])
+        .join(&hex);
+    let mut bytes = fs::read(&shared).unwrap();
+    bytes[0] ^= 1;
+    fs::write(&shared, &bytes).unwrap();
+    // Same length, wrong content: only a rehash notices.
+    std::thread::sleep(Duration::from_millis(1_100));
+    let second = f.backup();
+    assert_eq!(second.objects_recopied, 1, "{second:?}");
+    assert!(backup::verify(&f.target(), &second.id).unwrap().ok());
+    assert_eq!(
+        fs::read(&shared).unwrap(),
+        fs::read(
+            f.data
+                .join("objects")
+                .join(f.tenant.to_string())
+                .join(&hex[..2])
+                .join(&hex)
+        )
+        .unwrap()
+    );
+}
+
+/// `prune` waits for a create in another process: the shared files a running
+/// create has copied are named by no kept backup yet.
+#[test]
+fn pruning_waits_for_a_running_backup_instead_of_deleting_its_files() {
+    let f = fixture();
+    f.put(b"kept");
+    f.backup();
+    std::thread::sleep(Duration::from_millis(1_100));
+    f.backup();
+    // Another process's create holds the writer lock on the directory.
+    let holder = fs::OpenOptions::new()
+        .write(true)
+        .open(f.target().join(".lock"))
+        .unwrap();
+    holder.lock().unwrap();
+    let target = f.target();
+    let pruning = std::thread::spawn(move || backup::prune(&target, 1).unwrap());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        backup::list(&f.target()).unwrap().len(),
+        2,
+        "prune is still waiting for the lock"
+    );
+    holder.unlock().unwrap();
+    let pruned = pruning.join().unwrap();
+    assert_eq!(pruned.backups.len(), 1);
+    assert_eq!(backup::list(&f.target()).unwrap().len(), 1);
+}
