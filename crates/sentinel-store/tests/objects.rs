@@ -1,6 +1,3 @@
-//! Tenant-scoped immutable objects and versioned manifests: the
-//! stage/commit order, verified reads, manifest versioning and reference
-//! checks, and recovery's orphan/corrupt/missing reconciliation.
 use std::io::Write;
 
 use rusqlite::Connection;
@@ -105,7 +102,6 @@ fn staged_object_becomes_committed_and_reads_back_verified() {
         body.len() as u64
     );
     assert_eq!(out, body);
-    // The file lives under the tenant's own namespace.
     let path = fx
         .dir
         .path()
@@ -121,7 +117,6 @@ fn same_content_commits_once_and_is_scoped_per_tenant() {
     let mut fx = fixture();
     let body = b"shared bytes";
     let first = fx.put(fx.tenant, body);
-    // Second commit of identical content is a no-op for the same tenant…
     let staged = fx
         .objects
         .stage(fx.tenant, &body[..], u64::MAX, Expect::default())
@@ -129,7 +124,6 @@ fn same_content_commits_once_and_is_scoped_per_tenant() {
     let tx = fx.conn.transaction().unwrap();
     assert!(!fx.objects.commit(&tx, &staged).unwrap());
     tx.commit().unwrap();
-    // …and a fresh object for another tenant.
     let second = fx.put(fx.other, body);
     assert_eq!(first, second, "content-addressed digest is the same");
     let count: i64 = fx
@@ -137,7 +131,6 @@ fn same_content_commits_once_and_is_scoped_per_tenant() {
         .query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 2);
-    // The other tenant's lookup is its own row; an uncommitted digest is absent.
     let missing = Digest::from_bytes([9; 32]);
     assert!(matches!(
         fx.objects.meta(&fx.conn, fx.tenant, missing),
@@ -173,7 +166,6 @@ fn declared_length_or_digest_mismatch_stages_nothing() {
             .unwrap();
         assert_eq!(before, after);
     }
-    // Nothing lingers in tmp and nothing landed under objects/.
     assert_eq!(
         std::fs::read_dir(fx.dir.path().join("tmp"))
             .unwrap()
@@ -207,8 +199,7 @@ fn commit_for_an_unknown_tenant_is_refused_by_the_reference() {
         .stage(TenantId::new(), &b"x"[..], u64::MAX, Expect::default())
         .unwrap();
     let tx = fx.conn.transaction().unwrap();
-    // The tenant foreign key is the guard: staging may have run, but no row
-    // can be committed for a tenant that does not exist.
+    // The tenant foreign key refuses the commit; staging may already have run.
     assert!(matches!(
         fx.objects.commit(&tx, &staged),
         Err(Error::Sqlite(_))
@@ -221,7 +212,6 @@ fn manifest_versions_are_monotonic_and_reference_only_committed_objects() {
     let mut fx = fixture();
     let a = fx.put(fx.tenant, b"first");
     let b = fx.put(fx.tenant, b"second payload");
-    // Referencing an object the tenant has not committed is refused.
     let tx = fx.conn.transaction().unwrap();
     assert!(matches!(
         fx.objects.commit_manifest(
@@ -269,7 +259,6 @@ fn manifest_versions_are_monotonic_and_reference_only_committed_objects() {
         .manifest(&fx.conn, fx.tenant, Kind::Artifact, "dist", Some(1))
         .unwrap();
     assert_eq!(older.entries.len(), 1);
-    // Another tenant sees no such manifest.
     assert!(matches!(
         fx.objects
             .manifest(&fx.conn, fx.other, Kind::Artifact, "dist", None),
@@ -311,19 +300,15 @@ fn manifests_and_objects_are_immutable() {
         .commit_manifest(&tx, fx.tenant, Kind::Artifact, "m", &[entry("p", a, 6)])
         .unwrap();
     tx.commit().unwrap();
-    // Updates stay sealed: identity columns cannot be rewritten. Deletes are
-    // not blocked: reclamation removes rows through its own guarded path,
-    // never through an update.
+    // Updates stay sealed, but reclamation deletes through its own guarded path.
     for sql in [
         "UPDATE objects SET len = 0",
         "UPDATE manifests SET version = 9",
         "UPDATE manifests SET digest = X'00'",
-        // The one permitted manifest write is the one-way refs_indexed flip.
         "UPDATE manifests SET refs_indexed = 0",
     ] {
         assert!(fx.conn.execute_batch(sql).is_err(), "{sql} must fail");
     }
-    // `refs_indexed` flipping 0 -> 1 is the only update the trigger admits.
     fx.conn
         .execute_batch("UPDATE manifests SET refs_indexed = 1")
         .unwrap();
@@ -334,18 +319,15 @@ fn recovery_sweeps_staging_and_reports_orphans_corrupt_and_missing() {
     let mut fx = fixture();
     let keep = fx.put(fx.tenant, b"committed");
     let gone = fx.put(fx.tenant, b"will be deleted");
-    // A staged-but-never-committed file: the crash-between-rename-and-commit case.
     let orphan = fx
         .objects
         .stage(fx.tenant, &b"orphan"[..], u64::MAX, Expect::default())
         .unwrap();
-    // A torn staged write left behind in tmp/.
     let tmp = fx.dir.path().join("tmp").join("leftover.part");
     std::fs::File::create(&tmp)
         .unwrap()
         .write_all(b"partial")
         .unwrap();
-    // Corrupt one committed object on disk and delete another entirely.
     let hex = gone.to_string();
     let corrupt_path = fx
         .dir
@@ -382,7 +364,6 @@ fn recovery_sweeps_staging_and_reports_orphans_corrupt_and_missing() {
     );
     assert_eq!(report.corrupt, vec![corrupt_path]);
     assert_eq!(report.missing.len(), 1);
-    // The healthy object still verifies.
     let mut out = Vec::new();
     fx.objects
         .read(&fx.conn, fx.tenant, keep, &mut out)
@@ -402,15 +383,12 @@ fn verify_catches_content_rot_that_recovery_cannot_see() {
         .join(fx.tenant.to_string())
         .join(&hex[..2])
         .join(&hex);
-    // Same length, different bytes: recovery's length check passes, only the
-    // rehash sees it.
     std::fs::write(&path, b"original contenX").unwrap();
     let report = fx.objects.recover(&fx.conn).unwrap();
     assert!(report.corrupt.is_empty());
     let corrupt = fx.objects.verify(&fx.conn).unwrap();
     assert_eq!(corrupt.len(), 1);
     assert_eq!(corrupt[0].digest, digest);
-    // And a verified read refuses to serve it.
     let mut out = Vec::new();
     assert!(matches!(
         fx.objects.read(&fx.conn, fx.tenant, digest, &mut out),
@@ -437,7 +415,6 @@ fn corrupt_manifest_file_is_detected_on_read() {
         .commit_manifest(&tx, fx.tenant, Kind::Artifact, "m", &[entry("p", a, 5)])
         .unwrap();
     tx.commit().unwrap();
-    // Flip the file on disk: the committed digest no longer matches.
     let hash = blake3::hash(b"m").to_hex().to_string();
     let path = fx
         .dir
@@ -518,7 +495,6 @@ fn upload_chunks_seal_into_a_verified_object() {
     let body = b"resumable upload body".repeat(500);
     let declared = Digest::from_bytes(*blake3::hash(&body).as_bytes());
     let id = fx.begin(fx.tenant, body.len() as u64, Some(declared));
-    // Out-of-order chunks are fine; the ranges tile in the record.
     assert_eq!(
         fx.chunk(fx.tenant, id, 4000, &body[4000..]).unwrap(),
         body.len() as u64 - 4000
@@ -532,7 +508,6 @@ fn upload_chunks_seal_into_a_verified_object() {
     );
     let digest = fx.seal(fx.tenant, id).unwrap();
     assert_eq!(digest, declared);
-    // The staged file is gone and the committed object reads back.
     assert!(!fx.dir.path().join("incoming").join(id.to_string()).exists());
     let mut out = Vec::new();
     fx.objects
@@ -546,7 +521,6 @@ fn uploads_resume_after_the_store_reopens() {
     let mut fx = fixture();
     let id = fx.begin(fx.tenant, 8, None);
     assert_eq!(fx.chunk(fx.tenant, id, 0, b"abcd").unwrap(), 4);
-    // A new Objects over the same tree is the restart boundary.
     let objects = Objects::open(fx.dir.path()).unwrap();
     let status = objects.upload(&fx.conn, fx.tenant, id).unwrap();
     assert_eq!(status.state, objects::UploadState::Open);
@@ -570,13 +544,10 @@ fn resent_chunks_are_idempotent_and_ranges_merge() {
     let mut fx = fixture();
     let id = fx.begin(fx.tenant, 10, None);
     assert_eq!(fx.chunk(fx.tenant, id, 0, b"0123").unwrap(), 4);
-    // A retried identical chunk counts once.
     assert_eq!(fx.chunk(fx.tenant, id, 0, b"0123").unwrap(), 4);
-    // Overlapping retries merge; the status still reports real bytes.
     assert_eq!(fx.chunk(fx.tenant, id, 2, b"234567").unwrap(), 8);
     let status = fx.objects.upload(&fx.conn, fx.tenant, id).unwrap();
     assert_eq!(status.ranges, vec![(0, 8)]);
-    // An empty write is a protocol bug, not a chunk.
     assert!(matches!(
         fx.chunk(fx.tenant, id, 0, b""),
         Err(Error::InvalidInput(_))
@@ -608,8 +579,6 @@ fn seal_requires_tiled_ranges_and_the_declared_digest() {
         fx.seal(fx.tenant, id),
         Err(Error::InvalidInput("upload incomplete"))
     ));
-    // A wrong declared digest refuses the seal but keeps the staged bytes:
-    // the client rewrites the bad ranges and seals again.
     let wrong = fx.begin(
         fx.tenant,
         4,
@@ -640,7 +609,6 @@ fn sealing_twice_returns_the_same_digest_and_abort_is_final() {
         fx.chunk(fx.tenant, id, 0, b"data"),
         Err(Error::Conflict)
     ));
-    // Aborting an open upload drops the staged file and refuses everything after.
     let other = fx.begin(fx.tenant, 4, None);
     fx.chunk(fx.tenant, other, 0, b"zz").unwrap();
     let tx = fx.conn.transaction().unwrap();
@@ -654,7 +622,6 @@ fn sealing_twice_returns_the_same_digest_and_abort_is_final() {
             .exists()
     );
     assert!(matches!(fx.seal(fx.tenant, other), Err(Error::Conflict)));
-    // Aborting a committed upload is impossible — the object is reachable.
     let tx = fx.conn.transaction().unwrap();
     assert!(matches!(
         fx.objects.abort_upload(&tx, fx.tenant, id),
@@ -716,7 +683,6 @@ fn expired_uploads_are_swept_and_cannot_be_resumed() {
         Err(Error::Conflict)
     ));
     tx.rollback().unwrap();
-    // A live upload past its expiry is refused even without a sweep.
     let tx = fx.conn.transaction().unwrap();
     let stale = fx
         .objects
@@ -744,7 +710,6 @@ fn readers_are_counted_and_released_on_drop() {
     assert!(fx.objects.reader_active(fx.tenant, digest));
     drop(reader2);
     assert!(!fx.objects.reader_active(fx.tenant, digest));
-    // Uncommitted and foreign digests register nothing.
     assert!(matches!(
         fx.objects
             .open_read(&fx.conn, fx.tenant, Digest::from_bytes([7; 32])),
@@ -761,7 +726,6 @@ fn recovery_keeps_open_uploads_and_removes_dead_staging() {
     let mut fx = fixture();
     let id = fx.begin(fx.tenant, 8, None);
     fx.chunk(fx.tenant, id, 0, b"live").unwrap();
-    // A staging file with no row is dead; an aborted row's file is dead too.
     let orphan = fx.dir.path().join("incoming").join("upl_deadbeef");
     std::fs::write(&orphan, b"nobody").unwrap();
     let dead = fx.begin(fx.tenant, 4, None);
@@ -821,9 +785,7 @@ fn a_manifest_that_could_not_be_extracted_is_refused_at_commit() {
     let mut fx = fixture();
     let a = fx.put(fx.tenant, b"payload");
     for entries in [
-        // The same path twice.
         vec![entry("out/a", a, 7), entry("out/a", a, 7)],
-        // A file that is also the directory of another entry, either order.
         vec![entry("out", a, 7), entry("out/a", a, 7)],
         vec![entry("out/a", a, 7), entry("out", a, 7)],
     ] {
@@ -835,7 +797,6 @@ fn a_manifest_that_could_not_be_extracted_is_refused_at_commit() {
         ));
         drop(tx);
     }
-    // Siblings that merely share a prefix are fine.
     let tx = fx.conn.transaction().unwrap();
     fx.objects
         .commit_manifest(

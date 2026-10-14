@@ -1,7 +1,3 @@
-//! Durable polling: opt-in configuration under tenant authority, the
-//! baseline-then-diff admission protocol, deterministic delivery identities
-//! that make a retried observation a no-op, creation/move/deletion
-//! transitions, and lifecycle cleanup on rebind and revoke.
 use rusqlite::Connection;
 use sentinel_auth::sealed::Key;
 use sentinel_core::{
@@ -123,8 +119,6 @@ fn admit(f: &mut Fixture, tips: &[Tip]) -> sentinel_store::Result<Option<poll::A
     Ok(out)
 }
 
-/// (provider, external_id, ref, old, new), sorted by ref then old then new
-/// so assertions are independent of insertion order.
 fn deliveries(f: &Fixture) -> Vec<(String, String, String, String, String)> {
     let mut q = f
         .conn
@@ -150,21 +144,17 @@ fn deliveries(f: &Fixture) -> Vec<(String, String, String, String, String)> {
 fn polling_is_opt_in_tenant_owned_and_requires_a_binding() {
     let mut f = fixture();
     let (alice, bob) = (f.alice, f.bob);
-    // No binding: there is no remote or credential to poll with.
     assert!(matches!(
         configure(&mut f, Authority::credential(alice), &[MAIN]),
         Err(Error::NotFound)
     ));
     bind(&mut f);
-    // A different account cannot decide what this repository polls.
     assert!(configure(&mut f, Authority::credential(bob), &[MAIN]).is_err());
     configure(&mut f, Authority::credential(alice), &[MAIN]).unwrap();
     let config = poll::of_repo(&f.conn, f.repo).unwrap().unwrap();
     assert_eq!(config.tenant, f.tenant);
     assert_eq!(config.refs, vec![MAIN]);
     assert!(!config.baselined);
-    // Bad specs are refused: out-of-range intervals, empty or oversized
-    // selections, patterns that are not ref selectors.
     for bad in [
         Spec {
             interval_ms: poll::MIN_INTERVAL_MS - 1,
@@ -203,8 +193,6 @@ fn the_first_poll_records_a_baseline_and_admits_nothing() {
     assert_eq!(out.created + out.moved + out.deleted, 0);
     assert!(deliveries(&f).is_empty());
     assert!(poll::of_repo(&f.conn, f.repo).unwrap().unwrap().baselined);
-    // A tip outside the selection never becomes observable state — the
-    // store enforces the configured patterns itself.
     let out = admit(
         &mut f,
         &[tip(MAIN, &sha), tip("refs/heads/other", &"b".repeat(40))],
@@ -213,8 +201,6 @@ fn the_first_poll_records_a_baseline_and_admits_nothing() {
     .unwrap();
     assert_eq!(out, poll::Admitted::default());
     assert!(deliveries(&f).is_empty());
-    // A selected ref appearing for the first time is a creation — while
-    // refs that stay advertised stay unchanged.
     configure(&mut f, Authority::HostLocal, &["refs/heads/*"]).unwrap();
     admit(&mut f, &[tip(MAIN, &sha)]).unwrap();
     let out = admit(
@@ -238,15 +224,10 @@ fn moved_created_and_deleted_refs_become_ref_update_deliveries() {
     configure(&mut f, Authority::HostLocal, &["refs/heads/*"]).unwrap();
     let (a, b) = ("a".repeat(40), "b".repeat(40));
     admit(&mut f, &[tip(MAIN, &a)]).unwrap();
-    // A move is old -> new; a force-push is the same shape, ancestry is
-    // never inspected.
     let out = admit(&mut f, &[tip(MAIN, &b)]).unwrap().unwrap();
     assert_eq!(out.moved, 1);
-    // A return to an earlier id is still a distinct transition.
     let out = admit(&mut f, &[tip(MAIN, &a)]).unwrap().unwrap();
     assert_eq!(out.moved, 1);
-    // Deletion: absent from the advertisement, with the all-zero new id a
-    // hook would report.
     let out = admit(&mut f, &[]).unwrap().unwrap();
     assert_eq!(out.deleted, 1);
     let rows = deliveries(&f);
@@ -266,12 +247,10 @@ fn moved_created_and_deleted_refs_become_ref_update_deliveries() {
     ] {
         assert!(transitions.contains(&expected), "missing {expected:?}");
     }
-    // Every transition identity is distinct.
     let mut ids: Vec<&String> = rows.iter().map(|r| &r.1).collect();
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), 3);
-    // The deleted ref's cursor is gone: re-creating it is a creation, not a move.
     let out = admit(&mut f, &[tip(MAIN, &b)]).unwrap().unwrap();
     assert_eq!(out.created, 1);
     assert_eq!(rows_len(&f), 4);
@@ -291,8 +270,7 @@ fn a_replayed_advertisement_never_duplicates_a_delivery() {
     let (a, b) = ("a".repeat(40), "b".repeat(40));
     admit(&mut f, &[tip(MAIN, &a)]).unwrap();
     admit(&mut f, &[tip(MAIN, &b)]).unwrap();
-    // Crash between the remote call and the cursor write: the same
-    // advertisement replays. The cursor already names it, so nothing emits.
+    // A replayed advertisement emits nothing: the cursor already names it.
     let out = admit(&mut f, &[tip(MAIN, &b)]).unwrap().unwrap();
     assert_eq!(out, poll::Admitted::default());
     assert_eq!(rows_len(&f), 1);
@@ -317,8 +295,6 @@ fn annotated_tags_track_the_tag_object_and_record_the_peel() {
     assert_eq!(observed.len(), 1);
     assert_eq!(observed[0].oid, tag_obj);
     assert_eq!(observed[0].peeled.as_deref(), Some(commit.as_str()));
-    // Retagging (the tag object itself changed) is a move against the tag
-    // object id — the same shape a hook reports for `refs/tags/v1`.
     let out = admit(
         &mut f,
         &[Tip {
@@ -340,8 +316,7 @@ fn reconfigure_rebind_and_revoke_reset_or_remove_poll_state() {
     bind(&mut f);
     configure(&mut f, Authority::HostLocal, &[MAIN]).unwrap();
     admit(&mut f, &[tip(MAIN, &"a".repeat(40))]).unwrap();
-    // Changing the selection rebuilds the baseline: stale cursors for refs
-    // the new selection dropped could not fabricate deletions.
+    // Stale cursors for dropped refs would fabricate deletions, so the baseline is rebuilt.
     configure(&mut f, Authority::HostLocal, &["refs/heads/release-*"]).unwrap();
     assert!(poll::observations(&f.conn, f.repo).unwrap().is_empty());
     assert!(!poll::of_repo(&f.conn, f.repo).unwrap().unwrap().baselined);
@@ -350,7 +325,6 @@ fn reconfigure_rebind_and_revoke_reset_or_remove_poll_state() {
         .unwrap();
     assert_eq!(out.baseline, 1);
     assert!(deliveries(&f).is_empty());
-    // Rebinding (possibly another remote) resets the baseline the same way.
     let binding = Binding {
         remote: "https://git.example:8443/team/other.git".into(),
         allowed_refs: vec!["refs/heads/*".into()],
@@ -377,12 +351,10 @@ fn reconfigure_rebind_and_revoke_reset_or_remove_poll_state() {
     tx.commit().unwrap();
     assert!(poll::observations(&f.conn, f.repo).unwrap().is_empty());
     assert!(!poll::of_repo(&f.conn, f.repo).unwrap().unwrap().baselined);
-    // Revocation removes the configuration entirely.
     let tx = f.conn.transaction().unwrap();
     sources::revoke(&tx, Authority::HostLocal, None, f.repo, 2, NOW).unwrap();
     tx.commit().unwrap();
     assert!(poll::of_repo(&f.conn, f.repo).unwrap().is_none());
-    // And a revoked binding cannot be polled back to life.
     let tx = f.conn.transaction().unwrap();
     assert!(matches!(
         poll::configure(&tx, Authority::HostLocal, None, f.repo, &spec(&[MAIN]), NOW),
@@ -407,14 +379,12 @@ fn disabling_clears_schedule_and_cursor_and_reenabling_rebaselines() {
             .unwrap()
             .is_empty()
     );
-    // A mid-flight admission whose configuration vanished admits nothing.
     let tx = f.conn.transaction().unwrap();
     assert_eq!(
         poll::admit(&tx, f.repo, &[tip(MAIN, &"b".repeat(40))], NOW).unwrap(),
         None
     );
     tx.rollback().unwrap();
-    // Re-enabling starts a fresh baseline.
     configure(&mut f, Authority::HostLocal, &[MAIN]).unwrap();
     let out = admit(&mut f, &[tip(MAIN, &"b".repeat(40))])
         .unwrap()
@@ -429,7 +399,6 @@ fn a_full_delivery_queue_defers_without_advancing_the_cursor() {
     configure(&mut f, Authority::HostLocal, &[MAIN]).unwrap();
     let (a, b) = ("a".repeat(40), "b".repeat(40));
     admit(&mut f, &[tip(MAIN, &a)]).unwrap();
-    // Fill the per-repo pending bound so the next admission overloads.
     let tx = f.conn.transaction().unwrap();
     for i in 0..intake::MAX_PENDING_PER_REPO {
         let sha = format!("{:040x}", i + 1);
@@ -453,15 +422,10 @@ fn a_full_delivery_queue_defers_without_advancing_the_cursor() {
     let out = admit(&mut f, &[tip(MAIN, &b)]).unwrap().unwrap();
     assert_eq!(out.deferred, 1);
     assert_eq!(out.moved, 0);
-    // The cursor still names the old id: the transition is not lost.
     let observed = poll::observations(&f.conn, f.repo).unwrap();
     assert_eq!(observed[0].oid, a);
 }
 
-/// `A→B`, force-reverted `B→A`, re-pushed `A→B`: the third observation is
-/// the same transition as the first but a new event, so it becomes a new
-/// delivery rather than being suppressed as a duplicate of the first. The
-/// clock is fixed here on purpose — the identity must not rely on it.
 #[test]
 fn a_repeated_transition_after_a_revert_is_a_new_delivery() {
     let mut f = fixture();
@@ -481,8 +445,6 @@ fn a_repeated_transition_after_a_revert_is_a_new_delivery() {
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), 3);
-    // Replaying the last advertisement against the same cursor still emits
-    // nothing.
     let out = admit(&mut f, &[tip(MAIN, &b)]).unwrap().unwrap();
     assert_eq!(out, poll::Admitted::default());
 }

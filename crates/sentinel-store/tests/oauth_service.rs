@@ -1,10 +1,3 @@
-//! Service-account grants: only an administrator of the principal's
-//! tenant (or a platform administrator) issues them, within lifetime bounds,
-//! never with administrative scopes, confined to the tenant and its
-//! repositories; the refresh token is returned once and stored only as a
-//! digest; listing is metadata; revocation by owner, tenant administrator or
-//! platform administrator, NotFound for anyone else.
-
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
     GrantId, RepoId, SessionId, TenantId, UnixMillis, UserId,
@@ -40,9 +33,6 @@ struct Ids {
     other_repo: RepoId,
 }
 
-/// A super admin; `admin` administers `acme`; `dev` operates it; `outsider`
-/// administers only `other`; `bot` is a service principal of `acme` allowed
-/// read and run on `app`; `foreign_bot` belongs to `other`.
 fn fixture() -> (tempfile::TempDir, Store, Ids) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
@@ -81,7 +71,6 @@ fn fixture() -> (tempfile::TempDir, Store, Ids) {
             auth::set_membership(tx, root, i.other, i.outsider, Role::TenantAdmin)?;
             auth::create_repo(tx, root, i.tenant, i.repo, "app", NOW)?;
             auth::create_repo(tx, root, i.other, i.other_repo, "app", NOW)?;
-            // Each tenant's own administrator creates its service principal.
             auth::create_service_account(
                 tx,
                 stepped(person(i.admin, false)),
@@ -108,8 +97,6 @@ fn fixture() -> (tempfile::TempDir, Store, Ids) {
     (dir, store, i)
 }
 
-/// What a person holds through a session: every repository permission and
-/// tenant administration, platform administration for a super admin.
 fn person(user: UserId, super_admin: bool) -> Principal {
     let base = P::REPOSITORY.union(P::TENANT_ADMIN);
     let permissions = if super_admin {
@@ -120,7 +107,6 @@ fn person(user: UserId, super_admin: bool) -> Principal {
     Principal::new(user, permissions, None, None)
 }
 
-/// A caller that has just proven presence, as a stepped-up session would.
 fn stepped(principal: Principal) -> Authority {
     Authority::Credential {
         principal,
@@ -184,8 +170,6 @@ fn only_an_administrator_of_the_tenant_issues() {
             Err(Error::Forbidden)
         ));
     }
-    // A tenant-admin principal narrowed to another tenant, or to a
-    // repository, is not an administrator of this one.
     let narrowed = Principal::new(
         i.admin,
         P::REPOSITORY.union(P::TENANT_ADMIN),
@@ -196,7 +180,6 @@ fn only_an_administrator_of_the_tenant_issues() {
         issue(&store, Issue::by(i, narrowed)),
         Err(Error::Forbidden)
     ));
-    // The service principal cannot issue to itself.
     let own = Principal::new(i.bot, P::REPOSITORY, Some(i.tenant), None);
     assert!(matches!(
         issue(&store, Issue::by(i, own)),
@@ -205,8 +188,6 @@ fn only_an_administrator_of_the_tenant_issues() {
 
     let (grant, _, expires) = issue(&store, Issue::by(i, person(i.admin, false))).unwrap();
     assert_eq!(expires, at(SERVICE_DEFAULT_MS));
-    // A platform administrator who does not administer the tenant gives a
-    // reason, and the override is audited before the issue.
     let mut platform = Issue::by(i, person(i.root, true));
     platform.reason = Some("incident 42".to_owned());
     let platform = issue(&store, platform).unwrap();
@@ -225,8 +206,7 @@ fn only_an_administrator_of_the_tenant_issues() {
 fn issuing_needs_fresh_step_up_and_platform_reach_needs_a_reason() {
     let (_dir, store, i) = fixture();
     let admin = person(i.admin, false);
-    // A bearer credential or OAuth token never steps up; neither does a
-    // session without a stamp, nor host-local (no principal to attribute).
+    // Bearer and OAuth credentials and unstamped sessions never step up; host-local has no principal to attribute.
     assert!(matches!(
         issue(&store, Issue::with(i, Authority::credential(admin))),
         Err(Error::StepUpRequired)
@@ -235,8 +215,7 @@ fn issuing_needs_fresh_step_up_and_platform_reach_needs_a_reason() {
         issue(&store, Issue::with(i, Authority::HostLocal)),
         Err(Error::Forbidden)
     ));
-    // Without administration the answer is `Forbidden`, not a step-up
-    // prompt: a non-administrator learns nothing about proof.
+    // Forbidden rather than a step-up prompt, so a non-administrator learns nothing about proof.
     assert!(matches!(
         issue(
             &store,
@@ -244,7 +223,6 @@ fn issuing_needs_fresh_step_up_and_platform_reach_needs_a_reason() {
         ),
         Err(Error::Forbidden)
     ));
-    // Platform reach: proof first, then the reason; a reason is bounded.
     let root = person(i.root, true);
     assert!(matches!(
         issue(&store, Issue::with(i, Authority::credential(root))),
@@ -262,13 +240,10 @@ fn issuing_needs_fresh_step_up_and_platform_reach_needs_a_reason() {
             Err(Error::InvalidInput("reason"))
         ));
     }
-    // Nothing was written by any refusal.
     let audit = store.read(|c| local_auth::recent_audit(c, 1)).unwrap();
     assert_eq!(audit[0].event, Event::GrantChanged);
 }
 
-/// A live session row for `user`, optionally stamped, and the authority that
-/// names it by token digest, as the API builds it.
 fn session(store: &Store, user: UserId, stepped_ago_ms: Option<i64>) -> (Authority, Secret) {
     let secret = Secret::generate();
     let digest = secret.digest();
@@ -301,7 +276,6 @@ fn session(store: &Store, user: UserId, stepped_ago_ms: Option<i64>) -> (Authori
 fn a_sessions_step_up_is_read_again_where_the_change_is_made() {
     let (_dir, store, i) = fixture();
     let policy = local_auth::Policy::default();
-    // No stamp, and a stamp older than the window: asked for a proof.
     for stamp in [None, Some(policy.step_up_ms + 1_000)] {
         let (authority, _) = session(&store, i.admin, stamp);
         assert!(matches!(
@@ -309,13 +283,10 @@ fn a_sessions_step_up_is_read_again_where_the_change_is_made() {
             Err(Error::StepUpRequired)
         ));
     }
-    // A fresh stamp issues.
     let (authority, _) = session(&store, i.admin, Some(1_000));
     let mut fresh = Issue::with(i, authority);
     fresh.now = UnixMillis::now();
     issue(&store, fresh).unwrap();
-    // The authority was built while the stamp was fresh; the session is
-    // revoked before the change is made, and the change is refused.
     let (authority, secret) = session(&store, i.admin, Some(1_000));
     let digest = secret.digest();
     store
@@ -346,8 +317,6 @@ fn revoking_an_accounts_sessions_revokes_service_grants_it_minted_in_the_window(
         r.now = UnixMillis(now.0 - ago);
         issue(&store, r).unwrap().0
     };
-    // The session began 60 s ago (see `session`). One grant predates it, one
-    // came after it, and the platform administrator's is unrelated.
     let before = minted(120_000, i.admin);
     let during = minted(10_000, i.admin);
     let theirs = minted(10_000, i.root);
@@ -369,8 +338,6 @@ fn revoking_an_accounts_sessions_revokes_service_grants_it_minted_in_the_window(
     assert_eq!(audit[0].subject, Some(i.admin));
 }
 
-/// A named session of `user` created at `created_ms`, optionally already
-/// expired; returns its id.
 fn named_session(store: &Store, user: UserId, created_ms: i64, expired: bool) -> SessionId {
     let id = SessionId::new();
     let now = UnixMillis::now().0;
@@ -434,8 +401,6 @@ fn revoking_one_session_by_name_revokes_the_grants_minted_since_it_began() {
         .unwrap();
     assert!(grant_revoked(&store, i, during));
     assert!(!grant_revoked(&store, i, before));
-    // The other session is untouched; a second revoke of the same one is
-    // refused and revokes nothing further.
     let later = mint_at(&store, i, i.admin, now.0 - 1_000);
     let again = store.writer().write(move |tx| {
         local_auth::revoke_session(tx, Authority::HostLocal, i.admin, hijacked, now)
@@ -449,7 +414,6 @@ fn revoking_one_session_by_name_revokes_the_grants_minted_since_it_began() {
 fn logout_all_reaches_grants_minted_by_a_session_that_has_since_expired() {
     let (_dir, store, i) = fixture();
     let now = UnixMillis::now();
-    // The hijacked session went idle and expired but its row is not purged.
     let _ = named_session(&store, i.admin, now.0 - 120_000, true);
     let minted = mint_at(&store, i, i.admin, now.0 - 100_000);
     let _ = named_session(&store, i.admin, now.0 - 10_000, false);
@@ -485,7 +449,6 @@ fn terms_are_bounded_confined_and_never_administrative() {
             Err(Error::InvalidInput("scope"))
         ));
     }
-    // A repository of another tenant; a principal of another tenant; a person.
     assert!(matches!(
         with(&|r| r.repo = Some(i.other_repo)),
         Err(Error::NotFound)
@@ -495,7 +458,6 @@ fn terms_are_bounded_confined_and_never_administrative() {
         Err(Error::NotFound)
     ));
     assert!(matches!(with(&|r| r.account = i.dev), Err(Error::NotFound)));
-    // The bounds themselves are fine, and a repository of the tenant narrows.
     with(&|r| r.lifetime_ms = SERVICE_MIN_MS).unwrap();
     with(&|r| r.lifetime_ms = SERVICE_MAX_MS).unwrap();
     let (grant, refresh, _) = with(&|r| r.repo = Some(i.repo)).unwrap();
@@ -514,8 +476,6 @@ fn terms_are_bounded_confined_and_never_administrative() {
 fn the_refresh_token_is_returned_once_and_stored_only_as_a_digest() {
     let (dir, store, i) = fixture();
     let (grant, refresh, expires) = issue(&store, Issue::by(i, person(i.admin, false))).unwrap();
-    // The holder's first refresh works and keeps the service life: the
-    // refresh token lives exactly as long as the grant.
     let minted = oauth::refresh(&store, CLI_CLIENT_ID, &refresh, None, None, at(10)).unwrap();
     assert_eq!(minted.refresh_expires, expires);
     assert!(matches!(
@@ -528,8 +488,6 @@ fn the_refresh_token_is_returned_once_and_stored_only_as_a_digest() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, grant);
     drop(store);
-    // Neither the token (as text or raw bytes) is anywhere in the database
-    // files; its digest is what was stored.
     let mut hex = String::new();
     refresh.expose(&mut hex);
     let raw = refresh_bytes(&hex);
@@ -580,7 +538,6 @@ fn listing_is_metadata_for_administrators_only() {
     assert_eq!(record.scopes, Scopes::RUNS_READ);
     assert!(!record.revoked);
     assert!(listed.iter().any(|g| g.id == first));
-    // Platform administration also lists; members and other tenants do not.
     assert_eq!(
         store
             .read(|c| service::service_grants(c, person(i.root, true), i.tenant, i.bot))
@@ -594,7 +551,6 @@ fn listing_is_metadata_for_administrators_only() {
             Err(Error::Forbidden)
         ));
     }
-    // A person or another tenant's principal is not a service principal here.
     for account in [i.dev, i.foreign_bot] {
         assert!(matches!(
             store.read(|c| service::service_grants(c, admin, i.tenant, account)),
@@ -624,8 +580,6 @@ fn owner_tenant_admin_and_platform_admin_revoke_anyone_else_sees_nothing() {
         oauth::refresh(&store, CLI_CLIENT_ID, &refresh, None, None, at(6)),
         Err(RefreshError::Invalid)
     ));
-    // The owner (the service principal's own credential) and a platform
-    // administrator may too.
     let (owned, _, _) = issue(&store, Issue::by(i, admin)).unwrap();
     let own = Principal::new(i.bot, P::REPOSITORY, Some(i.tenant), None);
     revoke(Authority::credential(own), owned).unwrap();
@@ -687,8 +641,6 @@ fn repository_access_is_allowed_only_within_the_tenant() {
 fn creating_a_service_account_is_audited_and_needs_an_administrator() {
     let (_dir, store, i) = fixture();
     let audit = store.read(|c| local_auth::recent_audit(c, 3)).unwrap();
-    // Newest first: the repository grant, then the two creations, each by
-    // its own tenant's administrator.
     assert_eq!(audit[0].event, Event::GrantChanged);
     for (row, (account, actor)) in audit[1..]
         .iter()
@@ -711,7 +663,6 @@ fn creating_a_service_account_is_audited_and_needs_an_administrator() {
         )
     });
     assert!(matches!(refused, Err(Error::Forbidden)));
-    // Creating a principal that can hold credentials is a step-up change.
     let unstepped = store.writer().write(move |tx| {
         auth::create_service_account(
             tx,

@@ -1,7 +1,3 @@
-//! Registration policy, one-use expiring invitations,
-//! pending/approved/rejected accounts, and the separate decisions of creating a
-//! tenant and binding a forge installation to it.
-
 use sentinel_auth::secret::Secret;
 use sentinel_core::{
     InstallationId, TenantId, UnixMillis, UserId,
@@ -32,7 +28,6 @@ struct Fixture {
     tenant: TenantId,
 }
 
-/// A bootstrapped deployment with one organization the super admin administers.
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
@@ -63,8 +58,6 @@ fn fixture() -> Fixture {
 }
 
 impl Fixture {
-    /// Make the root an administrator of `acme` too, so another admin can be
-    /// removed or downgraded without leaving the tenant without one.
     fn second_admin(&self) {
         let (admin, tenant, root) = (self.admin, self.tenant, self.root);
         self.store
@@ -117,7 +110,6 @@ impl Fixture {
     }
 }
 
-/// A platform admin whose session proved a second factor just now.
 fn stepped(principal: Principal) -> Authority {
     Authority::Credential {
         principal,
@@ -164,18 +156,15 @@ fn an_invitation_admits_once_and_only_once() {
     let invitation = f.invite(Terms::default());
     let user = admitted(f.apply_local("member", Some(&invitation.secret)));
 
-    // The new account is active and can sign in immediately.
     assert!(matches!(
         local_auth::login(&f.store, "member", PASSWORD, Policy::default(), at(20)).unwrap(),
         Login::Accepted(_)
     ));
 
-    // The same invitation cannot admit a second person.
     assert!(matches!(
         f.apply_local("second", Some(&invitation.secret)),
         Admission::Refused(Refusal::InvitationUnusable)
     ));
-    // Nor can an unknown or revoked one.
     assert!(matches!(
         f.apply_local("third", Some(&Secret::generate())),
         Admission::Refused(Refusal::InvitationUnusable)
@@ -257,12 +246,10 @@ fn an_invitation_can_bind_a_tenant_role_and_a_verified_identity() {
         lifetime_ms: registration::DEFAULT_INVITATION_MS,
     });
 
-    // A local applicant cannot redeem an identity-bound invitation.
     assert!(matches!(
         f.apply_local("member", Some(&bound.secret)),
         Admission::Refused(Refusal::InvitationUnusable)
     ));
-    // Neither can a different GitHub account.
     let wrong = registration::register(
         &f.store,
         Applicant::External {
@@ -292,7 +279,6 @@ fn an_invitation_can_bind_a_tenant_role_and_a_verified_identity() {
         )
         .unwrap(),
     );
-    // The membership it promised exists, and no more than that.
     let role: i64 = f
         .store
         .read(move |conn| {
@@ -305,7 +291,6 @@ fn an_invitation_can_bind_a_tenant_role_and_a_verified_identity() {
         })
         .unwrap();
     assert_eq!(role, Role::Operator as i64);
-    // And that verified identity now signs in as this account.
     assert!(matches!(
         sign_in::complete(&f.store, "github", "4242", Policy::default(), at(12)).unwrap(),
         sign_in::Outcome::SignedIn(_)
@@ -321,12 +306,10 @@ fn approval_required_creates_a_pending_account_that_holds_nothing() {
         other => panic!("expected pending, got {other:?}"),
     };
 
-    // Pending is not admitted: the password is right and login still fails.
     assert!(matches!(
         local_auth::login(&f.store, "member", PASSWORD, Policy::default(), at(20)).unwrap(),
         Login::Rejected
     ));
-    // Nor can a session or credential be minted for it.
     let refused = f.store.writer().write(move |tx| {
         local_auth::issue_session(tx, user, Policy::default(), at(21)).map(|_| ())
     });
@@ -355,7 +338,6 @@ fn approval_required_creates_a_pending_account_that_holds_nothing() {
             .unwrap()
             .is_empty()
     );
-    // Approving twice is not a silent success.
     let again = f
         .store
         .writer()
@@ -386,7 +368,6 @@ fn rejection_ends_access_and_keeps_the_identity_claimed() {
         .writer()
         .write(move |tx| registration::reject(tx, stepped(admin), user, at(22)))
         .unwrap();
-    // The live session stops working, and the password no longer signs in.
     assert!(matches!(
         f.store
             .read(|conn| local_auth::authenticate(conn, &issued.session, at(23))),
@@ -396,12 +377,10 @@ fn rejection_ends_access_and_keeps_the_identity_claimed() {
         local_auth::login(&f.store, "member", PASSWORD, Policy::default(), at(24)).unwrap(),
         Login::Rejected
     ));
-    // The username stays claimed: a rejected applicant cannot simply reapply.
     assert!(matches!(
         f.apply_local("member", None),
         Admission::Refused(Refusal::AlreadyRegistered)
     ));
-    // A rejected account cannot be made active again by a raw update.
     let revive = f.store.writer().write(move |tx| {
         tx.execute(
             "UPDATE users SET active = 1 WHERE id = ?1",
@@ -419,7 +398,6 @@ fn closing_registration_refuses_everyone_new_and_locks_nobody_out() {
     let member = admitted(f.apply_local("member", Some(&invitation.secret)));
 
     f.set_registration(Registration::Closed);
-    // An outstanding invitation does not survive closing: closed means closed.
     let spare = f.invite(Terms::default());
     assert!(matches!(
         f.apply_local("second", Some(&spare.secret)),
@@ -430,7 +408,6 @@ fn closing_registration_refuses_everyone_new_and_locks_nobody_out() {
         Admission::Refused(Refusal::RegistrationClosed)
     ));
 
-    // Everybody already admitted keeps working: local login and GitHub alike.
     assert!(matches!(
         local_auth::login(&f.store, "member", PASSWORD, Policy::default(), at(30)).unwrap(),
         Login::Accepted(_)
@@ -504,7 +481,6 @@ fn only_a_platform_admin_sets_policy_approves_or_rejects() {
         Err(Error::Forbidden)
     ));
 
-    // Even the admin's own session loses it when the credential is narrowed.
     let narrowed = Principal::new(f.root, P::REPOSITORY, None, None);
     let refused = f.store.writer().write(move |tx| {
         registration::approve(tx, Authority::credential(narrowed), member, at(23))
@@ -523,7 +499,6 @@ fn a_tenant_admin_may_invite_only_into_the_tenant_they_administer() {
     let member = admitted(f.apply_local("member", Some(&invitation.secret)));
     let theirs = Principal::new(member, P::ALL, None, None);
 
-    // Their own tenant: allowed.
     let their_invite = f
         .store
         .writer()
@@ -545,8 +520,6 @@ fn a_tenant_admin_may_invite_only_into_the_tenant_they_administer() {
         Admission::Admitted(_)
     ));
 
-    // A deployment-wide invitation, or one into another tenant, is not theirs
-    // to make.
     let refused = f.store.writer().write(move |tx| {
         registration::invite(tx, Authority::credential(theirs), Terms::default(), at(21))
             .map(|_| ())
@@ -590,7 +563,6 @@ fn creating_a_namespace_is_a_separate_decision_from_being_admitted() {
     let member = admitted(f.apply_local("member", Some(&invitation.secret)));
     let theirs = Principal::new(member, P::ALL, None, None);
 
-    // Default policy: an admitted account still cannot create a namespace.
     let refused = f.store.writer().write(move |tx| {
         registration::create_personal_namespace(
             tx,
@@ -625,7 +597,6 @@ fn creating_a_namespace_is_a_separate_decision_from_being_admitted() {
             )
         })
         .unwrap();
-    // It is theirs: the owner membership was created with it.
     assert_eq!(
         f.store
             .read(move |conn| auth::get_namespace(
@@ -637,7 +608,6 @@ fn creating_a_namespace_is_a_separate_decision_from_being_admitted() {
             .id,
         personal
     );
-    // One each, and a tenant-scoped credential cannot create another.
     let second = f.store.writer().write(move |tx| {
         registration::create_personal_namespace(
             tx,
@@ -671,14 +641,12 @@ fn an_installation_is_known_but_inactive_until_an_authorized_binding_exists() {
         .write(move |tx| registration::record_installation(tx, "github", "12345", "acme", at(20)))
         .unwrap();
 
-    // Seeing it grants nothing: it resolves to no tenant.
     assert_eq!(
         f.store
             .read(|conn| registration::installation_tenant(conn, "github", "12345"))
             .unwrap(),
         None
     );
-    // Repeated deliveries do not duplicate or re-create it.
     let again = f
         .store
         .writer()
@@ -702,7 +670,6 @@ fn an_installation_is_known_but_inactive_until_an_authorized_binding_exists() {
         Some(f.tenant)
     );
 
-    // Rebinding elsewhere requires an explicit unbind first.
     let other = TenantId::new();
     f.store
         .writer()
@@ -762,13 +729,11 @@ fn binding_requires_administering_that_tenant_and_the_policy_to_allow_it() {
         .write(move |tx| registration::record_installation(tx, "github", "12345", "acme", at(20)))
         .unwrap();
 
-    // Not an admin of that tenant: refused, policy or no policy.
     let refused = f.store.writer().write(move |tx| {
         registration::bind_installation(tx, outsiders, installation, f.tenant, at(21))
     });
     assert!(matches!(refused, Err(Error::Forbidden)));
 
-    // The tenant's own admin may, under the default policy.
     f.store
         .writer()
         .write(move |tx| {
@@ -780,7 +745,6 @@ fn binding_requires_administering_that_tenant_and_the_policy_to_allow_it() {
         .write(move |tx| registration::unbind_installation(tx, theirs, installation, at(23)))
         .unwrap();
 
-    // Under the stricter policy, the same tenant admin may not.
     let policy = DeploymentPolicy {
         installation_binding: InstallationBinding::SuperAdminOnly,
         ..f.store.read(registration::policy).unwrap()
@@ -846,8 +810,6 @@ fn admission_decisions_are_audited_and_spent_invitations_are_purged() {
     ));
 }
 
-/// A tenant admin (not the root) who mints an admin invitation into `acme`,
-/// plus that invitation. Returns (admin user, their principal, invitation).
 fn delegated_invitation(f: &Fixture) -> (UserId, Principal, registration::Invitation) {
     let invitation = f.invite(Terms {
         tenant: Some(f.tenant),
@@ -907,8 +869,6 @@ fn an_invitation_dies_with_its_inviters_suspension() {
         .write(move |tx| local_auth::set_active(tx, stepped(admin), dev, false, at(12)))
         .unwrap();
     assert!(!redeems(&f, "mallory", &backdoor));
-    // Reactivated and still an admin: the invitation works again, because
-    // what it delegates is live authority, not a record of the past.
     f.store
         .writer()
         .write(move |tx| local_auth::set_active(tx, stepped(admin), dev, true, at(13)))
@@ -927,7 +887,6 @@ fn an_invitation_dies_with_its_inviters_downgrade_to_reader() {
         .write(move |tx| auth::set_membership(tx, admin, tenant, dev, Role::Reader))
         .unwrap();
     assert!(!redeems(&f, "mallory", &backdoor));
-    // An invitation the inviter could still make stays good.
     let still_admin = fixture();
     let (_, _, kept) = delegated_invitation(&still_admin);
     assert!(redeems(&still_admin, "friend", &kept));
@@ -936,8 +895,6 @@ fn an_invitation_dies_with_its_inviters_downgrade_to_reader() {
 #[test]
 fn a_tenantless_invitation_dies_with_super_admin_demotion() {
     let f = fixture();
-    // A second super admin mints a deployment-wide invitation, then loses
-    // platform administration.
     let invitation = f.invite(Terms::default());
     let other = admitted(f.apply_local("other-admin", Some(&invitation.secret)));
     f.store
@@ -959,7 +916,6 @@ fn a_tenantless_invitation_dies_with_super_admin_demotion() {
         })
         .unwrap();
     assert!(!redeems(&f, "mallory", &minted));
-    // A host-local invitation has no inviter to lose authority.
     let host = f
         .store
         .writer()
@@ -968,8 +924,7 @@ fn a_tenantless_invitation_dies_with_super_admin_demotion() {
     assert!(redeems(&f, "operator", &host));
 }
 
-/// Rejecting an approved account takes it away for good, so it needs the
-/// same step-up as suspending it; a pending application does not.
+/// Rejecting an approved account needs the same step-up as suspending it; a pending one does not.
 #[test]
 fn rejecting_an_approved_account_needs_step_up() {
     let f = fixture();
@@ -981,7 +936,6 @@ fn rejecting_an_approved_account_needs_step_up() {
         .writer()
         .write(move |tx| registration::reject(tx, Authority::credential(admin), member, at(20)));
     assert!(matches!(refused, Err(Error::StepUpRequired)), "{refused:?}");
-    // Still active and able to sign in.
     assert!(matches!(
         local_auth::login(&f.store, "member", PASSWORD, Policy::default(), at(21)).unwrap(),
         Login::Accepted(_)

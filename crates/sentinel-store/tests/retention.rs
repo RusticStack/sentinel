@@ -1,7 +1,3 @@
-//! Storage quotas and retention at deployment, tenant, repository and
-//! run level — policies that only narrow downwards, database-driven log
-//! expiry with usage accounting, retention changes applied to what is
-//! already stored, and the aborted-upload purge.
 use std::sync::Arc;
 
 use sentinel_auth::secret::Secret;
@@ -103,8 +99,6 @@ impl Fixture {
         retention::finish_reapply(&self.store, &d, tenant, repo, rest)
     }
 
-    /// A run with one job, placed on a fresh worker, whose attempt was then
-    /// released at `released` — the state a finished attempt's log is in.
     fn released_attempt(&self, released: UnixMillis) -> (RunId, JobId, AttemptId) {
         let (tenant, repo, run) = (self.tenant, self.repo, RunId::new());
         let spec = RunSpec::new(
@@ -162,7 +156,6 @@ impl Fixture {
         (run, job, attempt)
     }
 
-    /// Stamp every unstamped log with `bytes` under `d`.
     fn stamp(&self, d: Deployment, bytes: u64) -> u32 {
         let rows = self
             .store
@@ -198,7 +191,6 @@ fn a_tenant_policy_is_platform_administration_and_a_repository_only_narrows_it()
         log_retention_ms: Some(10 * DAY),
         artifact_retention_ms: Some(20 * DAY),
     };
-    // Neither a member nor the tenant's own administrator sets the tenant's.
     for user in [f.dev, f.admin] {
         assert!(matches!(
             f.set(credential(user), None, tenant_policy),
@@ -207,7 +199,6 @@ fn a_tenant_policy_is_platform_administration_and_a_repository_only_narrows_it()
     }
     f.set(credential(f.root), None, tenant_policy).unwrap();
 
-    // The tenant administrator narrows a repository; a member cannot.
     let narrow = Policy {
         quota_bytes: Some(400),
         log_retention_ms: Some(5 * DAY),
@@ -231,7 +222,6 @@ fn a_tenant_policy_is_platform_administration_and_a_repository_only_narrows_it()
         "inherited from the tenant"
     );
 
-    // Nothing past the tenant's own limits, and nothing out of range.
     for wider in [
         Policy {
             log_retention_ms: Some(11 * DAY),
@@ -256,7 +246,6 @@ fn a_tenant_policy_is_platform_administration_and_a_repository_only_narrows_it()
         ));
     }
 
-    // A tenant later narrowed below its repository's value still wins.
     f.set(
         Authority::HostLocal,
         None,
@@ -272,7 +261,6 @@ fn a_tenant_policy_is_platform_administration_and_a_repository_only_narrows_it()
         .unwrap();
     assert_eq!(e.log_retention_ms, 2 * DAY);
 
-    // An empty policy removes the row: the deployment's defaults apply.
     f.set(Authority::HostLocal, Some(f.repo), Policy::default())
         .unwrap();
     f.set(Authority::HostLocal, None, Policy::default())
@@ -307,7 +295,6 @@ fn released_logs_are_stamped_counted_and_expired_from_the_database() {
         .unwrap();
     assert_eq!((usage.log_bytes, repo.log_bytes), (500, 500));
 
-    // Not due a millisecond early; due at its deadline.
     let due = |at: i64| {
         f.store
             .read(|c| retention::expiring(c, UnixMillis(at), 256))
@@ -350,7 +337,6 @@ fn released_logs_are_stamped_counted_and_expired_from_the_database() {
         Ok(())
     });
     assert!(reopened.is_err());
-    // An attempt no row names is gone too.
     assert!(
         f.store
             .read(|c| retention::log_gone(c, AttemptId::new()))
@@ -368,8 +354,7 @@ fn lowered_retention_applies_to_logs_and_artifacts_already_stored() {
         .unwrap();
     let (run, job, attempt) = f.released_attempt(NOW);
     f.stamp(d, 100);
-    // A pipeline asking a year is capped at the deployment's 90 days on
-    // insert, whatever path writes the row.
+    // Capped at the deployment limit on insert, whatever path writes the row.
     let tenant = f.tenant;
     let artifact = f
         .store
@@ -404,7 +389,6 @@ fn lowered_retention_applies_to_logs_and_artifacts_already_stored() {
     };
     assert_eq!(retained(), NOW.0 + d.artifact_retention_ms);
 
-    // The tenant lowers both: the stored log and artifact follow at once.
     f.set(
         Authority::HostLocal,
         None,
@@ -418,8 +402,6 @@ fn lowered_retention_applies_to_logs_and_artifacts_already_stored() {
     assert_eq!(f.expires(attempt), Some(NOW.0 + DAY));
     assert_eq!(retained(), NOW.0 + 7 * DAY);
 
-    // The repository narrows further; then raising the tenant's retention
-    // extends the log (still in the store) but never an artifact's deadline.
     f.set(
         Authority::HostLocal,
         Some(f.repo),
@@ -440,9 +422,6 @@ fn lowered_retention_applies_to_logs_and_artifacts_already_stored() {
     assert_eq!(retained(), NOW.0 + DAY);
 }
 
-/// Re-applying a policy to what is stored runs a bounded number of rows per
-/// write and resumes from its cursor: a small batch leaves work for the next
-/// step, and the steps together reach exactly the unbatched result.
 #[test]
 fn reapplying_a_policy_is_bounded_per_write_and_resumes_to_the_same_result() {
     let f = fixture();
@@ -456,8 +435,6 @@ fn reapplying_a_policy_is_bounded_per_write_and_resumes_to_the_same_result() {
     for attempt in &attempts {
         assert_eq!(f.expires(*attempt), Some(NOW.0 + d.log_retention_ms));
     }
-    // The tenant's policy narrows (written as the policy row alone, as a
-    // crash between a set and its re-stamping would leave it).
     let tenant = f.tenant;
     f.store
         .writer()
@@ -500,7 +477,6 @@ fn reapplying_a_policy_is_bounded_per_write_and_resumes_to_the_same_result() {
         steps >= 3,
         "five rows in batches of two take several writes"
     );
-    // Idempotent: another pass from the start changes nothing.
     let mut again = retention::Reapply::default();
     while !again.done() {
         again = step(&f, again);
@@ -525,7 +501,6 @@ fn quotas_count_logs_and_hold_at_the_deployment_tenant_and_repository() {
             .write(move |tx| objects.commit(tx, &staged))
     };
 
-    // The tenant's quota counts its logs: 80 of 100 are already used.
     f.set(
         Authority::HostLocal,
         None,
@@ -536,8 +511,6 @@ fn quotas_count_logs_and_hold_at_the_deployment_tenant_and_repository() {
     )
     .unwrap();
     f.objects.set_deployment(Deployment::default());
-    // As in the server: a disk gate is installed (plenty free), so staged
-    // bytes are charged and their commit is checked against the quotas.
     let marks = sentinel_store::space::Watermarks {
         reserve: 1 << 30,
         low: 2 << 30,
@@ -556,7 +529,6 @@ fn quotas_count_logs_and_hold_at_the_deployment_tenant_and_repository() {
         .write(move |tx| objects.begin_upload(tx, tenant, 1, None, 60_000, UnixMillis::now()));
     assert!(matches!(upload, Err(Error::QuotaExceeded)));
 
-    // The deployment's cap holds whatever the tenant's says.
     f.set(Authority::HostLocal, None, Policy::default())
         .unwrap();
     f.objects.set_deployment(Deployment {
@@ -566,7 +538,6 @@ fn quotas_count_logs_and_hold_at_the_deployment_tenant_and_repository() {
     assert!(commit(&[3; 10]).unwrap());
     assert!(matches!(commit(&[4; 1]), Err(Error::QuotaExceeded)));
 
-    // A repository over its own quota refuses another artifact byte.
     let d = Deployment::default();
     let (repo, run) = (f.repo, RunId::new());
     f.set(
@@ -588,7 +559,6 @@ fn quotas_count_logs_and_hold_at_the_deployment_tenant_and_repository() {
         .read(move |c| Ok(retention::check_repo(c, &d, tenant, repo, 0)))
         .unwrap();
     assert!(fits.is_ok());
-    // A run the store does not know has no repository quota to consult.
     assert!(
         f.store
             .read(move |c| retention::check_run_repo(c, &d, tenant, run, 1_000))
@@ -669,7 +639,6 @@ fn the_log_sweep_removes_only_what_the_database_released() {
     assert!(logs.stored_bytes(kept_run, kept_job, kept) > 0);
     let d = Deployment::default();
     f.stamp(d, 10);
-    // Only `old` reaches its deadline.
     f.store
         .writer()
         .write(move |tx| {
@@ -687,8 +656,6 @@ fn the_log_sweep_removes_only_what_the_database_released() {
         .write(move |tx| retention::expire(tx, &due, NOW))
         .unwrap();
     assert_eq!(expired.len(), 1);
-    // A crash here would leave `old`'s files: the sweep still takes them,
-    // and the stray no row names, and keeps `kept`.
     let swept = logs
         .sweep_dirs(256, |attempt| {
             f.store.read(|c| retention::log_gone(c, attempt)).unwrap()
@@ -698,13 +665,9 @@ fn the_log_sweep_removes_only_what_the_database_released() {
     assert!(logs.attempt_dir(kept_run, kept_job, kept).exists());
     assert!(!logs.attempt_dir(old_run, old_job, old).exists());
     assert!(!logs.attempt_dir(stray_run, stray_job, stray).exists());
-    // `remove` of an already-removed log is not an error.
     logs.remove(old_run, old_job, old).unwrap();
 }
 
-/// A repository scope that matches none of the tenant's rows still walks the
-/// tenant's batches to the end and changes nothing, so a narrow scope costs
-/// reads, never writes outside it.
 #[test]
 fn reapplying_for_a_repository_with_no_rows_finishes_and_touches_nothing() {
     let f = fixture();
