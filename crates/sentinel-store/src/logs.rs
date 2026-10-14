@@ -772,13 +772,9 @@ impl LogStore {
             sync_dir(&w.dir)?;
         }
         let file = w.file.as_mut().expect("opened above");
-        let written = file.write_all(&w.scratch).and_then(|()| {
-            if durable {
-                file.sync_data()
-            } else {
-                Ok(())
-            }
-        });
+        let written = file
+            .write_all(&w.scratch)
+            .and_then(|()| if durable { file.sync_data() } else { Ok(()) });
         if let Err(e) = written {
             // Never acknowledged: truncate back so a later frame never lands behind a torn record.
             let _ = file.set_len(w.seg_len);
@@ -1855,7 +1851,7 @@ fn seg_decoder(dir: &Path, seg: u32, compressed: bool) -> Result<Decoder> {
     })
 }
 
-/// On Windows a plain segment still delete-pending refuses open with PermissionDenied; read its .z twin.
+/// Windows: a delete-pending plain segment fails open with PermissionDenied; read its .z twin instead.
 fn listed_seg_decoder(dir: &Path, seg: u32, compressed: bool) -> Result<Option<Decoder>> {
     use std::io::ErrorKind;
     const DELETE_PENDING: i32 = 303;
