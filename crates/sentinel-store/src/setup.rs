@@ -42,6 +42,9 @@ use crate::{
 /// standing credential. A controller start or `admin setup-token` issues a
 /// new one and voids the old.
 pub const TOKEN_TTL_MS: i64 = 60 * 60 * 1000;
+/// The owner-only file in the data directory the controller writes a freshly
+/// issued token to, and removes once it is no longer good.
+pub const TOKEN_FILE: &str = "setup-token";
 /// Wrong tokens, all clients together, before setup locks.
 pub const FAILURES_BEFORE_LOCK: i64 = 5;
 /// How long a locked setup refuses every attempt.
@@ -387,8 +390,9 @@ pub fn instance(conn: &Connection) -> Result<Option<(String, Option<String>)>> {
 }
 
 /// Remove an expired or stale token row once setup has closed or the token
-/// has expired, so the table never holds a dead credential. Maintenance.
-pub fn purge(store: &Store, now: UnixMillis) -> Result<usize> {
+/// has expired, so the table never holds a dead credential. Maintenance
+/// (`limit` is the tick's row budget; there is at most one row).
+pub fn purge(store: &Store, now: UnixMillis, _limit: u32) -> Result<usize> {
     store.writer().write(move |tx: &Transaction<'_>| {
         Ok(tx.execute(
             "DELETE FROM setup_token
@@ -396,4 +400,16 @@ pub fn purge(store: &Store, now: UnixMillis) -> Result<usize> {
             [now.0],
         )?)
     })
+}
+
+/// Whether a setup token is still good to present: setup is open and an
+/// unexpired token row exists. The host's token file is removed once this is
+/// false.
+pub fn token_live(conn: &Connection, now: UnixMillis) -> Result<bool> {
+    if !is_open(conn)? {
+        return Ok(false);
+    }
+    Ok(conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM setup_token WHERE expires_ms > ?1)")?
+        .query_row([now.0], |r| r.get(0))?)
 }
