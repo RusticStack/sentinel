@@ -1,20 +1,3 @@
-//! The controller's side of the link: listen, admit, keep the fleet, place
-//! work and push offers.
-//!
-//! Two threads own the loop. The acceptor takes connections and hands each
-//! to a session thread that authenticates it against the store, registers
-//! it in the fleet and serves it. The dispatcher sleeps on a condition
-//! variable and is woken the moment anything changes the answer to "is
-//! there work for a connected worker?": a worker arriving, an enqueue, a
-//! completion, a decline. A short reconciliation interval is the safety
-//! net for a missed wake, and the ack-timeout sweep rides on the same loop.
-//! Heartbeats never drive dispatch; they only renew leases.
-//!
-//! Every decision is one writer transaction on the store: placement takes the
-//! lease and reservation together, the ack marks the attempt, a lapse frees
-//! it. Nothing here is state the database does not also hold, so a restart
-//! reconstructs the queue and the reservations by reading them.
-
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
@@ -54,60 +37,29 @@ use crate::{
     tls,
 };
 
-/// How long the dispatcher sleeps without a wake before re-checking the
-/// queue and sweeping unacknowledged offers. A safety net, not the clock.
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
-/// The prefetch pass reads the queue at most this often: a hint is
-/// advisory, so a burst of wakes never becomes a burst of reads.
 pub const PREFETCH_INTERVAL: Duration = Duration::from_millis(500);
 const _: () = assert!(
     dispatch::MAX_PREFETCH_HINTS <= MAX_PREFETCH_IMAGES,
     "a hint must fit the wire bound"
 );
-/// Sessions accepted at once; beyond this a connection is closed unserved.
-/// Lower when the process's descriptor limit cannot carry this many (two
-/// descriptors each; see [`admission::session_cap`]).
 pub const MAX_SESSIONS: usize = 1024;
-/// Connections that have not finished their handshake and hello yet, a cap
-/// separate from [`MAX_SESSIONS`]; [`admission::Pending`] holds one source to
-/// a few slots and reserves the last quarter for sources that have
-/// authenticated a worker before. The decision is made before TLS, from the
-/// address alone, and the known set lives in memory: after a controller
-/// restart every source is a stranger until its worker has authenticated once.
 pub const MAX_PENDING: usize = 256;
-/// Spec resolutions running at once. Each may make GitHub round trips to
-/// mint a source token, so they run off the session threads, bounded.
 const SPEC_RESOLVERS: usize = 8;
-/// Spec requests waiting for a resolver, fleet-wide. Per worker the bound
-/// is what it may hold ([`dispatch::MAX_HELD_ATTEMPTS`]); a request past
-/// either bound is dropped unanswered and the worker asks again.
 const MAX_SPEC_QUEUE: usize = 4096;
-/// How long a resolver waits for an acknowledgement still in flight on the
-/// control connection before leaving the request unanswered.
 const SPEC_ACK_WAIT: Duration = Duration::from_millis(dispatch::OFFER_ACK_MS as u64);
-/// Tries per request against a transient fault (reader overload, a GitHub
-/// timeout) before the request is left for the worker to ask again.
 const SPEC_TRIES: u32 = 3;
 
-/// Rows one storage maintenance pass may touch.
 const STORAGE_BATCH: i64 = 256;
-/// Directory entries one orphan sweep pass examines at most.
 const ORPHAN_SCAN_BUDGET: u32 = 4096;
-/// Batches of released logs one pass stamps at most: a backlog after
-/// an upgrade or an outage catches up without one pass holding on.
 const LOG_STAMP_ROUNDS: u32 = 16;
-/// How often the maintenance thread checks whether a pass is due.
 const MAINTENANCE_TICK: Duration = Duration::from_millis(250);
 
-/// How the controller runs storage maintenance. Unset disables the
-/// pass entirely — no deletions, no quota bookkeeping side effects.
 #[derive(Clone, Copy, Debug)]
 pub struct StoragePolicy {
-    /// The pass runs at most this often, on the storage maintenance thread.
     pub interval_ms: i64,
 }
 
-/// Counters for diagnostics and tests. Monotonic, never reset.
 #[derive(Debug, Default)]
 pub struct Stats {
     pub admitted: AtomicU64,
@@ -123,57 +75,23 @@ pub struct Stats {
     pub expired: AtomicU64,
     pub queue_timeouts: AtomicU64,
     pub abandoned: AtomicU64,
-    /// Artifacts committed through the object store (protocol 4).
     pub artifacts: AtomicU64,
-    /// Protocol-7 bulk connections attached to a live control session.
     pub bulk_attached: AtomicU64,
-    /// Protocol-7 bulk connections refused: no live control session with
-    /// that certificate.
     pub bulk_refused: AtomicU64,
-    /// Remote-cache needs and offers refused `denied`: no remote store, an
-    /// attempt this worker does not own (or released too long ago), or a
-    /// boundary that is not the job's.
     pub cache_denied: AtomicU64,
-    /// Bytes the remote-cache store's reclamation removed, in total.
     pub remote_cache_freed: AtomicU64,
-    /// The remote-cache store's kept bytes after its last sweep.
     pub remote_cache_bytes: AtomicU64,
-    /// Connections closed unserved because the session or pre-admission
-    /// cap was full.
     pub shed: AtomicU64,
-    /// Enrollment-secret attempts by unknown certificates answered
-    /// `Unavailable` because the per-source or overall budget was spent.
     pub enrollment_limited: AtomicU64,
-    /// Spec requests handed back to the queue: offers declined and
-    /// acknowledged attempts whose spec never reached their worker.
     pub handed_back: AtomicU64,
-    /// Placement transactions (or the reads that precede them) the store
-    /// failed. Each failure is also logged, by error kind only, at most once
-    /// a minute: a fleet that stops placing leaves evidence.
     pub placement_errors: AtomicU64,
-    /// Expiry, queue-timeout, offer-lapse and revocation sweeps the store
-    /// failed, counted and logged the same way. A sweep that found its row
-    /// already moved (renewed, acknowledged, released) is not a failure. A
-    /// worker acknowledgement or report the store refused transiently counts
-    /// here too (stage `worker_message`), then waits for retry.
     pub sweep_errors: AtomicU64,
-    /// Prefetch hints sent (protocol 9): one per session whose wanted
-    /// set changed.
     pub prefetch_hints: AtomicU64,
-    /// Live sessions closed because their worker was revoked.
     pub revoked_sessions: AtomicU64,
-    /// Worker acknowledgements and reports whose store write failed for a
-    /// transient reason and were kept to be applied by a later pass instead
-    /// of being dropped as stale.
     pub deferred_worker_messages: AtomicU64,
-    /// Deferred worker messages given up on: older than
-    /// [`DEFERRED_MAX_AGE`] or past [`MAX_DEFERRED`]. The attempt's lease
-    /// then settles it, as for any report that never arrived.
     pub deferred_dropped: AtomicU64,
 }
 
-/// A worker message the store could not take yet. The summary is shared, so
-/// a retry never copies it.
 #[derive(Clone)]
 enum Deferred {
     Ack,
@@ -193,21 +111,16 @@ struct DeferredMessage {
     since: Instant,
 }
 
-/// The messages waiting for the store, oldest first. Pure bookkeeping: what
-/// to retry and what it protects is decided by [`Inner`].
 #[derive(Default)]
 struct DeferredQueue {
     items: VecDeque<DeferredMessage>,
 }
 
 impl DeferredQueue {
-    /// Whether a message of `attempt` is waiting: a newer one queues behind it.
     fn holds(&self, attempt: AttemptId) -> bool {
         self.items.iter().any(|m| m.attempt == attempt)
     }
 
-    /// Keep `message` behind the others; `false` when the queue is full and
-    /// the message was dropped.
     fn push(&mut self, message: DeferredMessage) -> bool {
         if self.items.len() >= MAX_DEFERRED {
             return false;
@@ -216,26 +129,22 @@ impl DeferredQueue {
         true
     }
 
-    /// The oldest message, left in place while it is applied.
     fn head(&self) -> Option<DeferredMessage> {
         self.items.front().cloned()
     }
 
-    /// The head is settled (applied, stale or given up on).
     fn settle(&mut self, id: u64) {
         if self.items.front().is_some_and(|m| m.id == id) {
             self.items.pop_front();
         }
     }
 
-    /// Whether a verdict of `attempt` is waiting.
     fn has_report(&self, attempt: AttemptId) -> bool {
         self.items
             .iter()
             .any(|m| m.attempt == attempt && matches!(m.what, Deferred::Report { .. }))
     }
 
-    /// Attempts with a verdict waiting.
     fn awaiting_reports(&self) -> HashSet<AttemptId> {
         self.items
             .iter()
@@ -245,36 +154,22 @@ impl DeferredQueue {
     }
 }
 
-/// Worker messages kept for retry at most; each holds at most one attempt
-/// summary, so the memory is bounded by this times `MAX_SUMMARY_BYTES`.
 const MAX_DEFERRED: usize = 256;
-/// How long a message is retried. Past this the store has been unusable far
-/// longer than a lease, and the lease expiry owns the attempt.
 const DEFERRED_MAX_AGE: Duration = Duration::from_secs(300);
 
-/// What became of a worker message offered to the deferral queue.
 enum Received {
-    /// The store took it.
     Applied,
-    /// A verdict already waiting for this attempt: a worker sends it again
-    /// until the controller counts the attempt as released, and a copy adds
-    /// nothing.
     Copy,
-    /// Another message of the attempt is waiting, so this one waits behind
-    /// it; `kept` is `false` when the full queue refused it.
-    Queued { kept: bool },
-    /// The store failed for a reason that says nothing about the message.
+    Queued {
+        kept: bool,
+    },
     Transient {
         error: sentinel_store::Error,
         kept: bool,
     },
-    /// The store refused it as stale: nothing changed.
     Stale,
 }
 
-/// Offer `message` to the queue: behind its attempt's earlier messages when
-/// there are any, else to `apply` at once, keeping it only when that fails
-/// transiently. `apply` runs without the queue locked.
 fn receive_with(
     queue: &Mutex<DeferredQueue>,
     message: &DeferredMessage,
@@ -304,19 +199,13 @@ fn receive_with(
     }
 }
 
-/// What a retry of the queue's head found.
 enum Retried {
     Applied,
-    /// Older than the retry window: given up on, the lease settles it.
     Aged,
     Stale,
     Transient(sentinel_store::Error),
 }
 
-/// Apply the queue's messages oldest first until it is empty or the store
-/// fails transiently again (the head then stays for the next pass). The head
-/// stays queued while `apply` runs, so a message of the same attempt that
-/// arrives meanwhile queues behind it. `each` sees every outcome.
 fn retry_with(
     queue: &Mutex<DeferredQueue>,
     max_age: Duration,
@@ -348,8 +237,6 @@ fn retry_with(
     }
 }
 
-/// Leave out of the expiry sweep the attempts whose verdict waits for the
-/// store: their worker finished and can no longer renew the lease.
 fn shield(due: &mut Vec<(AttemptId, RunId, JobId)>, waiting: &HashSet<AttemptId>) {
     if !waiting.is_empty() {
         due.retain(|(attempt, _, _)| !waiting.contains(attempt));
@@ -358,52 +245,24 @@ fn shield(due: &mut Vec<(AttemptId, RunId, JobId)>, waiting: &HashSet<AttemptId>
 
 struct Peer {
     sender: Sender,
-    /// The connection's remote end as accepted (canonical): what a hand-off
-    /// matches against the helper's connections, without a socket call.
     addr: SocketAddr,
-    /// The worker advertised `HANDOFF_ANSWER`: its silence after a hand-off
-    /// close means the close was not delivered.
     answers_handoff: bool,
     pool: PoolId,
     generation: u64,
-    /// The CPU and memory the hello reported: the sweep's order and what the
-    /// rest of the fleet can hold are read from here, never from the store.
     cpu_millis: i64,
     memory_bytes: i64,
-    /// The scratch disk its protocol-7 profile reported; 0 until then, and
-    /// 0 stays "none offered" for a profile-protocol worker. A worker older
-    /// than the profile protocol cannot report disk and has no constraint
-    /// ([`Peer::size`]).
     disk_bytes: AtomicI64,
-    /// The measured load its protocol-7 profile reported: CPU busy
-    /// nanoseconds over the worker's sampling window, across all cores; 0
-    /// when unmeasured. Read by the dispatch sweep's ranking.
     load_ns: AtomicI64,
-    /// Warm cache bytes its profile reported; 0 when unmeasured.
     cache_bytes: AtomicI64,
-    /// When liveness was last written, so a beat costs a write once a minute.
     seen_recorded_ms: AtomicI64,
-    /// The certificate this session presented; a bulk connection may only
-    /// attach to it from the same fingerprint.
     fingerprint: Digest,
-    /// The session's negotiated protocol: bulk traffic and the profile are
-    /// gated on it.
     protocol: u16,
-    /// The latest transport telemetry the worker reported.
     transport: Mutex<Option<TransportStats>>,
-    /// Attempts verified as held by this worker for log frames, mapped to
-    /// their (run, job) so the store path costs one read per attempt
-    /// rather than one per frame.
     logging: Mutex<HashMap<AttemptId, (RunId, JobId)>>,
-    /// The protocol-7 bulk connection attached to this session, closed with
-    /// it: a bulk connection lives exactly as long as its control session.
     bulk: Mutex<Option<Sender>>,
-    /// The prefetch hint (protocol 9) this session was last sent; `None`
-    /// until the first, so a new session always learns the current set.
     prefetch_sent: Mutex<Option<Vec<String>>>,
 }
 
-/// A file currently receiving `ArtifactData` chunks.
 struct OpenFile {
     path: String,
     mode: u32,
@@ -412,43 +271,27 @@ struct OpenFile {
     staging: objects::Staging,
 }
 
-/// An artifact publication in flight (protocol 4): granted by
-/// `artifact_begin`, settled by `artifact_end`/`artifact_absent` or a
-/// mid-flight failure. The session orders the messages; this owns the
-/// staging and the run-budget accounting.
 struct InFlight {
     tenant: TenantId,
     run: RunId,
     job: sentinel_core::JobId,
     name: String,
     retain_secs: u64,
-    /// Sealed-but-uncommitted files in wire order; committed at `end`.
     done: Vec<(String, u32, objects::Staged)>,
-    /// Bytes charged to the run budget: sealed files plus the open file's
-    /// declared length. Equals the artifact's total when `end` lands.
     accounted: u64,
-    /// The path most recently declared; wire order must be strictly
-    /// increasing so the manifest lands sorted.
     last_path: String,
     file: Option<OpenFile>,
-    /// Settled (ended, failed or abandoned) and out of the map: a caller
-    /// that found the entry before it left answers `Stale`.
     settled: bool,
 }
 
-/// One attempt's publication behind its own lock: file writes, fsyncs and
-/// renames happen under it, never under the process-wide map lock.
 type Publication = Arc<Mutex<InFlight>>;
 
 #[derive(Default)]
 struct ArtifactState {
     in_flight: HashMap<AttemptId, Publication>,
-    /// Accounted in-flight bytes per run: the per-run budget stays exact
-    /// while attempts on different workers publish concurrently.
     runs: HashMap<RunId, u64>,
 }
 
-/// One worker's request for an attempt's run spec, waiting for a resolver.
 struct SpecRequest {
     worker: WorkerId,
     attempt: AttemptId,
@@ -456,11 +299,6 @@ struct SpecRequest {
     protocol: u16,
 }
 
-/// The bounded spec queue: at most [`SPEC_RESOLVERS`] resolutions
-/// run at once, the rest wait here in arrival order instead of being
-/// refused. A request already waiting or running for the same attempt is
-/// not queued twice, and a worker can have no more waiting than it may
-/// hold. Resolver threads drain the queue and exit when it is empty.
 struct SpecDesk<T> {
     state: Mutex<DeskState<T>>,
 }
@@ -468,21 +306,15 @@ struct SpecDesk<T> {
 struct DeskState<T> {
     running: usize,
     queue: VecDeque<((WorkerId, AttemptId), T)>,
-    /// Queued or being resolved.
     pending: HashSet<(WorkerId, AttemptId)>,
     per_worker: HashMap<WorkerId, usize>,
 }
 
-/// What [`SpecDesk::submit`] did with a request.
 #[derive(Debug, PartialEq, Eq)]
 enum Submitted {
-    /// Queued; the caller must start one more resolver thread.
     Start,
-    /// Queued behind the running resolvers.
     Queued,
-    /// The same attempt is already waiting or being resolved.
     Duplicate,
-    /// Over the per-worker or fleet bound: dropped, the worker asks again.
     Full,
 }
 
@@ -522,9 +354,6 @@ impl<T> SpecDesk<T> {
         }
     }
 
-    /// The next request for a resolver thread, after settling the one it
-    /// finished (`done`). `None` means the queue is empty and the thread
-    /// has been counted out — it must exit.
     fn next(&self, done: Option<(WorkerId, AttemptId)>) -> Option<((WorkerId, AttemptId), T)> {
         let mut state = self.lock();
         if let Some(key) = done {
@@ -547,15 +376,12 @@ impl<T> SpecDesk<T> {
         }
     }
 
-    /// A resolver thread could not be started: count it out. Its request
-    /// stays queued for the next thread.
     fn not_started(&self) {
         self.lock().running -= 1;
     }
 }
 
 struct Inner {
-    /// This controller, for the threads it starts from a `&self` handler.
     me: std::sync::OnceLock<std::sync::Weak<Inner>>,
     source_destinations: Mutex<Arc<Vec<String>>>,
     source_app: Mutex<Option<Arc<sentinel_github::app::App>>>,
@@ -565,16 +391,10 @@ struct Inner {
     logs: Arc<LogStore>,
     objects: Arc<Objects>,
     artifacts: Mutex<ArtifactState>,
-    /// Storage maintenance policy and when it last ran.
     storage: Mutex<Option<StoragePolicy>>,
-    /// What the remote cache store is held to.
     remote_budget: AtomicU64,
     last_storage: AtomicI64,
-    /// Set (and notified) at shutdown so the maintenance thread stops
-    /// without waiting out its tick.
     maintenance: (Mutex<bool>, Condvar),
-    /// Where the controller keeps remote cache objects; `None` answers
-    /// every cache need as a miss.
     remote_cache: Mutex<Option<std::path::PathBuf>>,
     config: Arc<rustls::ServerConfig>,
     fleet: Mutex<HashMap<WorkerId, Arc<Peer>>>,
@@ -582,50 +402,23 @@ struct Inner {
     wake: (Mutex<bool>, Condvar),
     stop: AtomicBool,
     sessions: AtomicUsize,
-    /// Sessions the descriptor limit can carry, at most [`MAX_SESSIONS`].
     session_cap: usize,
-    /// Connections still in their handshake or hello, by source.
     pending: admission::Pending,
-    /// Enrollment-secret attempts by unknown certificates, rate limited.
     enrollments: admission::Enrollments,
-    /// Those of them from loopback, by the peer's (canonical) address: the
-    /// only ones a Tailcat helper can carry, so the only ones a hand-off may
-    /// have to close before they are sessions. A remote peer costs nothing
-    /// here.
     arrivals: Mutex<Vec<(SocketAddr, Arc<session::Arrival>)>>,
-    /// Loopback arrivals so far: a hand-off in progress reads the helper's
-    /// connections again when this moves.
     arrived: AtomicU64,
     max_pending: AtomicUsize,
     handshake_ms: AtomicU64,
     stats: Stats,
-    /// The revocation fingerprint (`dispatch::revocations`) the dispatcher
-    /// last acted on; `(-1, -1)` until the first pass, which always checks.
     revocations: Mutex<(i64, i64)>,
-    /// When a placement or sweep failure was last logged, for the
-    /// once-a-minute limit.
     warned: [AtomicI64; 2],
-    /// When the prefetch pass last read the queue: it runs at most once
-    /// per `PREFETCH_INTERVAL`, however often the dispatcher wakes.
     prefetch_at: Mutex<Option<Instant>>,
-    /// Acknowledgements and reports the store refused transiently, oldest
-    /// first, retried at the head of every dispatch pass (and protected from
-    /// lease expiry meanwhile). Per attempt the order is the arrival order,
-    /// so a report never overtakes the acknowledgement before it.
     deferred: Mutex<DeferredQueue>,
     next_deferred: AtomicU64,
 }
 
-/// Placement and sweep failures are logged at most this often per kind.
 const WARN_INTERVAL_MS: i64 = 60_000;
 
-/// What the dispatch sweep ranks a connected worker by, lowest first: the
-/// share of its reported CPU its held attempts already take (least committed
-/// first, so a burst spreads instead of filling whichever worker comes
-/// first), then its measured load per reported millicore (the host's own
-/// busy time — work that is not ours counts too), then more warm cache
-/// first, then the smaller worker (best fit: the large worker's room stays
-/// for the jobs only it can run), then its id for a total order.
 fn rank(size: Ranked, held_millis: i64) -> (i64, i64, i64, i64, i64) {
     let cpu = size.cpu_millis.max(1);
     (
@@ -637,7 +430,6 @@ fn rank(size: Ranked, held_millis: i64) -> (i64, i64, i64, i64, i64) {
     )
 }
 
-/// What [`rank`] reads of a worker.
 #[derive(Clone, Copy, Debug)]
 struct Ranked {
     cpu_millis: i64,
@@ -657,9 +449,6 @@ impl Peer {
     }
 }
 
-/// Per pool, the largest and second-largest of each resource among the
-/// connected workers of one sweep, so what "every other worker" can hold is
-/// O(1) per worker instead of a scan per worker.
 struct Reach {
     pools: Vec<PoolReach>,
 }
@@ -667,13 +456,11 @@ struct Reach {
 struct PoolReach {
     pool: PoolId,
     workers: usize,
-    /// `(largest, index of its holder, second largest)` per resource.
     cpu: (i64, usize, i64),
     memory: (i64, usize, i64),
     disk: (i64, usize, i64),
 }
 
-/// Fold one value into a `(largest, holder, second)` triple.
 fn top_two(top: &mut (i64, usize, i64), value: i64, index: usize) {
     if value > top.0 {
         *top = (value, index, top.0);
@@ -682,17 +469,11 @@ fn top_two(top: &mut (i64, usize, i64), value: i64, index: usize) {
     }
 }
 
-/// The most any worker but `index` holds: the second largest when `index`
-/// holds the largest, the largest otherwise.
 fn other_than(top: (i64, usize, i64), index: usize) -> i64 {
     if top.1 == index { top.2 } else { top.0 }
 }
 
 impl Peer {
-    /// What this worker holds, as the sweep compares it: a worker too old to
-    /// report disk has no disk constraint, while a profile-protocol worker's
-    /// zero is a limit of zero (the store's `disk_reported` rule), so it is
-    /// never the room a disk-hungry job could wait for.
     fn size(&self) -> dispatch::Capacity {
         dispatch::Capacity {
             cpu_millis: self.cpu_millis,
@@ -707,7 +488,6 @@ impl Peer {
 }
 
 impl Reach {
-    /// Fold the sweep's workers, in sweep order, as `(pool, size)`.
     fn of(sizes: impl IntoIterator<Item = (PoolId, dispatch::Capacity)>) -> Reach {
         let mut pools: Vec<PoolReach> = Vec::new();
         for (index, (pool, size)) in sizes.into_iter().enumerate() {
@@ -733,9 +513,6 @@ impl Reach {
         Reach { pools }
     }
 
-    /// What the rest of `pool` can hold beside the `index`th worker, per
-    /// resource; `None` when it is the pool's only connected worker (nothing
-    /// to prefer).
     fn elsewhere(&self, index: usize, pool: PoolId) -> Option<dispatch::Capacity> {
         let r = self.pools.iter().find(|r| r.pool == pool)?;
         (r.workers > 1).then(|| dispatch::Capacity {
@@ -769,15 +546,11 @@ impl Inner {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(worker, peer);
-        // A reconnecting worker replaces its previous session; the old socket
-        // is closed so its thread ends instead of lingering to its deadline.
         if let Some(old) = old {
             old.sender.close();
         }
     }
 
-    /// Its thread is done with an arrival (a session now, closed, or
-    /// failed): it leaves the list a hand-off reads.
     fn leave(&self, arrival: Option<&Arc<session::Arrival>>) {
         let Some(arrival) = arrival else {
             return;
@@ -822,13 +595,9 @@ impl Inner {
             ),
             None => session::accept_within(socket, Arc::clone(&self.config), &**self, deadline),
         };
-        // Handshake and hello are over, one way or the other: the slot of
-        // the pre-admission cap is free again.
         self.pending.leave(addr.ip());
         let mut session = match outcome {
             Ok(Accepted::Control(session)) => {
-                // Authenticated: this source may use the reserve of the
-                // pre-admission pool when it reconnects.
                 self.pending.vouch(addr.ip(), Instant::now());
                 session
             }
@@ -838,7 +607,6 @@ impl Inner {
                 self.serve_bulk(bulk);
                 return;
             }
-            // Closed by a hand-off before it was a session.
             Err(Error::Closed) if arrival.as_ref().is_some_and(|a| a.answered().is_some()) => {
                 self.leave(arrival.as_ref());
                 return;
@@ -863,7 +631,6 @@ impl Inner {
                 .contains(Capabilities::HANDOFF_ANSWER),
             pool,
             generation,
-            // Admission already refused a capacity that is not an i64.
             cpu_millis: i64::try_from(capacity.cpu_millis).unwrap_or(i64::MAX),
             memory_bytes: i64::try_from(capacity.memory_bytes).unwrap_or(i64::MAX),
             disk_bytes: AtomicI64::new(0),
@@ -878,27 +645,17 @@ impl Inner {
             prefetch_sent: Mutex::new(None),
         });
         self.register(worker, Arc::clone(&peer));
-        // Only now: a hand-off that found this connection being admitted
-        // waits for it to leave, then finds the session registered.
         self.leave(arrival.as_ref());
         self.wake();
         let _ = session.serve(&**self);
         self.unregister(worker, generation);
-        // The socket goes with the session, whatever ended it: a sender
-        // still holding it (a spec resolver, the dispatcher) fails at once
-        // instead of writing into a connection nobody reads.
         peer.sender.close();
         if let Some(bulk) = peer.bulk.lock().unwrap_or_else(|p| p.into_inner()).take() {
             bulk.close();
         }
         self.stats.sessions_ended.fetch_add(1, Ordering::Relaxed);
-        // Its unacknowledged offers lapse in the sweep; acknowledged leases
-        // run to expiry, so a brief reconnect keeps its work.
     }
 
-    /// Attach and serve a bulk connection: only the same certificate that
-    /// holds the live control session may open one, and it carries no
-    /// negotiation of its own — it serves the version that session agreed.
     fn serve_bulk(self: &Arc<Self>, mut bulk: BulkSession) {
         let Some(peer) = self.peer(bulk.worker) else {
             self.stats.bulk_refused.fetch_add(1, Ordering::Relaxed);
@@ -918,8 +675,6 @@ impl Inner {
         {
             previous.close();
         }
-        // Idle is fine for as long as the control session this connection
-        // belongs to is registered; its end closes this socket too.
         let worker = bulk.worker;
         let alive = || {
             self.peer(worker)
@@ -930,8 +685,6 @@ impl Inner {
         self.stats.sessions_ended.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A write whose store error the caller needs (to tell a benign "the row
-    /// already moved" from a failure).
     fn write_store<T: Send + 'static>(
         &self,
         f: impl FnOnce(&sentinel_store::Transaction<'_>) -> sentinel_store::Result<T> + Send + 'static,
@@ -939,9 +692,6 @@ impl Inner {
         self.store.writer().write(f)
     }
 
-    /// Count a failed placement or sweep and log its kind, at most once a
-    /// minute per class. The error's kind is the variant name only: no SQL,
-    /// path or row value reaches the log.
     fn failed(&self, placement: bool, what: &'static str, error: &sentinel_store::Error) {
         let (counter, slot) = if placement {
             (&self.stats.placement_errors, &self.warned[0])
@@ -970,8 +720,6 @@ impl Inner {
         }
     }
 
-    /// Whether a sweep's error only says the row moved first (renewed,
-    /// acknowledged, released): the sweep's work is already done or moot.
     fn benign(error: &sentinel_store::Error) -> bool {
         matches!(
             error,
@@ -979,24 +727,9 @@ impl Inner {
         )
     }
 
-    /// One dispatch pass: sweep expired leases, queue timeouts and lapsed
-    /// offers (one batched transaction each, every row re-checked inside it
-    /// under its own savepoint), apply revocations, then place work in
-    /// rounds ([`Inner::placement_pass`]). Storage maintenance runs on its
-    /// own thread ([`Inner::maintenance_loop`]), never here. A sweep row
-    /// that moved first (renewed, acknowledged, released) is skipped; any
-    /// other store failure is counted and logged.
     fn dispatch_pass(&self) {
-        // Verdicts and acknowledgements the store refused earlier go first,
-        // so a passed job is settled before its lease is looked at.
         self.retry_deferred();
         let now = UnixMillis::steady();
-        // Leases that ran out and attempts that outran their job's timeout
-        // by the grace: infra-failed, capacity back, never replayed. One
-        // write for the whole batch, each lease re-checked inside it; the
-        // log-end answer is read here, so the writer never waits on log I/O.
-        // An attempt whose verdict is still waiting for the store is left
-        // alone: its worker finished and can no longer renew the lease.
         match self
             .store
             .read(|c| dispatch::expired_scoped(c, now))
@@ -1047,13 +780,6 @@ impl Inner {
         self.prefetch_pass();
     }
 
-    /// Tell each idle or underused protocol-9 worker which images the
-    /// work still queued after placement needs and it does not hold
-    /// (`dispatch::prefetch_hints` decides eligibility, fan-out and
-    /// bounds). A session is sent a hint only when its wanted set changed
-    /// — an empty set included, which is how a stale prefetch is stopped.
-    /// One store read per pass, at most once per [`PREFETCH_INTERVAL`];
-    /// nothing is read when no connected session speaks protocol 9.
     fn prefetch_pass(&self) {
         let peers: Vec<(WorkerId, Arc<Peer>)> = self
             .fleet
@@ -1081,7 +807,6 @@ impl Inner {
             Ok(hints) => hints,
             Err(e) => return self.failed(true, "prefetch", &e),
         };
-        // `prefetch_hints` answers every worker, in the order asked.
         for ((_, images), (_, peer)) in hints.into_iter().zip(&peers) {
             let mut sent = peer.prefetch_sent.lock().unwrap_or_else(|p| p.into_inner());
             if sent.as_ref() == Some(&images) {
@@ -1094,8 +819,6 @@ impl Inner {
         }
     }
 
-    /// Count a batched sweep's failed rows: each is a sweep error, logged
-    /// (by its first error's kind) under the same once-a-minute limit.
     fn swept(&self, what: &'static str, swept: dispatch::Swept) {
         if let Some(error) = &swept.error {
             self.stats
@@ -1105,15 +828,6 @@ impl Inner {
         }
     }
 
-    /// A revocation is written by the host-local admin command, another
-    /// process that cannot signal this one. Each pass compares one indexed
-    /// fingerprint of the revoked set; when it moved, every connected
-    /// session of a revoked worker is closed and everything a revoked worker
-    /// holds is fenced — acknowledged attempts `Reconciled`, offers lapsed —
-    /// within one reconciliation interval of the revocation. The
-    /// store already refuses such a worker's acknowledgements, renewals,
-    /// reports, logs, publications and cache transfers from the moment the
-    /// row says revoked.
     fn revocation_pass(&self, now: UnixMillis) {
         let stamp = match self.store.read(dispatch::revocations) {
             Ok(stamp) => stamp,
@@ -1143,9 +857,6 @@ impl Inner {
             }
             Err(e) => return self.failed(false, "revocation", &e),
         }
-        // One sweep batch per transaction until nothing is left; bounded,
-        // and an unfinished sweep leaves the fingerprint unrecorded so the
-        // next pass continues it.
         for _ in 0..16 {
             let logs = Arc::clone(&self.logs);
             match self.write_store(move |tx| dispatch::reconcile_revoked(tx, now, Some(&logs))) {
@@ -1163,17 +874,8 @@ impl Inner {
         }
     }
 
-    /// Place work in rounds. A round ranks the connected workers (see
-    /// [`rank`]) and offers each one job, all in one writer transaction; a
-    /// worker with nothing to take leaves the pass, and rounds repeat until
-    /// none is left or each worker holds [`dispatch::MAX_HELD_ATTEMPTS`].
-    /// A burst therefore spreads over the fleet by commitment and measured
-    /// load instead of filling whichever worker comes first, and the
-    /// writer sees one round trip per round rather than one per worker.
-    /// Nothing is read or written when no job is ready at all.
     fn placement_pass(&self) {
-        // Below the low watermark, no new work is placed: a job that cannot
-        // store its output must not consume capacity discovering that.
+        // Below the low watermark no new work is placed: a job must not hold capacity it cannot store output for.
         if !self.objects.admission().is_none_or(|a| a.is_open()) {
             return;
         }
@@ -1184,10 +886,7 @@ impl Inner {
             .iter()
             .map(|(w, p)| (*w, Arc::clone(p)))
             .collect();
-        // The dispatcher is one thread: a peer whose connection another
-        // thread is mid-write on (a spec stream to a slow reader) is left
-        // for the next pass, never waited for, so one stuck peer cannot
-        // hold every other worker's offers.
+        // A peer mid-write on another thread is skipped, never waited for, so one stuck peer cannot block the others.
         peers.retain(|(_, p)| session::is_free(&p.sender));
         if peers.is_empty() {
             return;
@@ -1201,8 +900,6 @@ impl Inner {
             Ok(held) => held,
             Err(e) => return self.failed(true, "held", &e),
         };
-        // A stable index per worker for `Reach`; the order is the best
-        // fit (smallest first), which is also `rank`'s tie-break.
         peers.sort_unstable_by_key(|(worker, p)| (p.cpu_millis, p.memory_bytes, *worker));
         let reach = Reach::of(peers.iter().map(|(_, p)| (p.pool, p.size())));
         let mut active: Vec<usize> = (0..peers.len()).collect();
@@ -1248,9 +945,6 @@ impl Inner {
                 }) {
                     Ok(placed) => placed,
                     Err(e) => {
-                        // One worker's failure must not stall the fleet:
-                        // retry the round a worker per transaction, and a
-                        // worker that still fails leaves this pass.
                         self.failed(true, "round", &e);
                         round
                             .into_iter()
@@ -1297,10 +991,6 @@ impl Inner {
                     job_index: placed.job_index,
                 };
                 if let Err(sent) = session::offer(&peer.sender, &offer) {
-                    // The session is gone (or, when `busy`, was taken by
-                    // another writer between the check and the send): give
-                    // the attempt back at once rather than letting the ack
-                    // timeout find it.
                     let busy = session::is_busy(&sent);
                     let attempt = offer.attempt;
                     match self
@@ -1323,20 +1013,8 @@ impl Inner {
         }
     }
 
-    /// Storage maintenance: retire expired uploads and leases, expire
-    /// artifact rows past their declared retention (their manifest versions
-    /// retire with them, releasing object references), index un-indexed
-    /// manifests, reclaim unreferenced objects, then sweep orphan files,
-    /// idle log writers and out-of-retention logs. Every stage is bounded:
-    /// the row stages take at most `STORAGE_BATCH` rows through indexes,
-    /// the orphan and log sweeps look at a bounded number of directory
-    /// entries and resume where they stopped, and none of the file walks
-    /// runs on the writer. Every unlink runs on the writer through
-    /// [`Objects::unlink`], which re-checks ownership first.
     fn storage_pass(&self, now: UnixMillis) {
-        // A backup in progress holds this for its whole run: nothing
-        // it snapshotted may be deleted before it is copied. The pass
-        // simply waits for the next interval.
+        // A backup holds this for its whole run: nothing it snapshotted may be deleted before it is copied.
         let Some(_maintenance) = self.objects.try_maintenance() else {
             return;
         };
@@ -1350,8 +1028,6 @@ impl Inner {
             Ok(doomed)
         }) && !doomed.is_empty()
         {
-            // The rows are committed gone; a failure leaves orphans the
-            // file sweep collects.
             let objects = Arc::clone(&self.objects);
             let _ = self.write(move |tx| objects.unlink(tx, &doomed));
         }
@@ -1368,11 +1044,6 @@ impl Inner {
         self.log_retention(now);
     }
 
-    /// Log retention: stamp released attempts' logs with their stored
-    /// bytes and deadline, expire the ones past it and delete their files,
-    /// then sweep log directories the database no longer accounts for. The
-    /// sizes are read and the files deleted off the writer; the writer only
-    /// records.
     fn log_retention(&self, now: UnixMillis) {
         let deployment = self.objects.deployment();
         if let Some(admission) = self.objects.admission() {
@@ -1410,8 +1081,6 @@ impl Inner {
             && !due.is_empty()
             && let Ok(expired) = self.write(move |tx| retention::expire(tx, &due, now))
         {
-            // The rows say expired; a failed delete leaves files the
-            // directory sweep below collects on a later pass.
             for log in expired {
                 let _ = self.logs.remove(log.run, log.job, log.attempt);
             }
@@ -1426,10 +1095,6 @@ impl Inner {
             self.write(move |tx| retention::purge_aborted_uploads(tx, now, STORAGE_BATCH as u32));
     }
 
-    /// The storage maintenance thread: checks the policy every
-    /// `MAINTENANCE_TICK` and runs [`Inner::storage_pass`] when its interval
-    /// is due — off the dispatch thread, so placement never waits on a
-    /// sweep.
     fn maintenance_loop(&self) {
         let (flag, cv) = &self.maintenance;
         loop {
@@ -1474,20 +1139,11 @@ impl Inner {
     }
 }
 
-/// How often the controller's remote-cache store is reclaimed.
 pub const REMOTE_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
-/// How long after its release an attempt may still offer what it sealed: the
-/// worker's offer budget plus slack for publication and the terminal
-/// report's round trip.
 pub const OFFER_WINDOW_MS: i64 = 10 * 60 * 1000;
 
 impl Inner {
-    /// The shared remote-cache gate: `attempt` is owned
-    /// by `worker` (held, or released since `released_since` for an offer)
-    /// and the transfer names exactly the job's tenant and repository and a
-    /// trust class the job's admits. `Some(root)` to serve from; a refusal
-    /// is counted in `cache_denied`.
     fn cache_authorize(
         &self,
         worker: WorkerId,
@@ -1526,22 +1182,12 @@ impl Inner {
             .cloned()
     }
 
-    /// Whether `attempt` is still held by `worker`: the gate for artifact
-    /// publication, where a released attempt is stale. Logs use the wider
-    /// [`Self::log_scope`]: late retransmissions only complete the record.
     fn holds(&self, worker: WorkerId, attempt: AttemptId) -> bool {
         self.store
             .read(|c| dispatch::is_held(c, worker, attempt))
             .unwrap_or(false)
     }
 
-    /// The attempt's `(run, job)` when owned by `worker` — held or released:
-    /// resolved against the store once per attempt, then remembered on the
-    /// session. A released attempt still accepts log frames and its end;
-    /// the verdict is long decided and the bytes are evidence.
-    ///
-    /// `Ok(None)` is a definite "not this worker's" (or no live session);
-    /// `Err` is a store fault, which must never be answered as a refusal.
     fn log_scope(
         &self,
         worker: WorkerId,
@@ -1573,10 +1219,7 @@ impl Inner {
         Ok(Some(scope))
     }
 
-    /// Whether the attempt's log end is durable, asked before a terminal
-    /// write so the writer thread never waits on the log store's I/O.
-    /// Unknown (a store fault) answers `false`: the row then says
-    /// `incomplete`, which a later `LogEnd` upgrades.
+    /// Asked before a terminal write so the writer thread never waits on log I/O.
     fn log_has_end(&self, worker: WorkerId, attempt: AttemptId) -> bool {
         match self.log_scope(worker, attempt) {
             Ok(Some((run, job))) => self.logs.has_end(run, job, attempt),
@@ -1584,8 +1227,6 @@ impl Inner {
         }
     }
 
-    /// The attempt was released: its open log writer and cached scope go
-    /// with it, so neither grows with uptime.
     fn released(&self, worker: WorkerId, attempt: AttemptId) {
         self.logs.forget(attempt);
         if let Some(peer) = self.peer(worker) {
@@ -1596,15 +1237,7 @@ impl Inner {
         }
     }
 
-    /// A worker's acknowledgement or report. The store either takes it, or
-    /// says it is stale (fence, holder, terminal duplicate: nothing changes,
-    /// and a stale message is dropped), or fails for a reason that says
-    /// nothing about the message — writer unavailable, a write of unknown
-    /// outcome, overload. Only the last is kept: the worker sent its verdict
-    /// once and is done with the attempt, so dropping it would leave a passed
-    /// job to be failed by its lease. A message behind another one of the
-    /// same attempt waits its turn, so a report never overtakes the
-    /// acknowledgement before it.
+    /// Only a transient failure is kept: the worker sent its verdict once, so dropping it would lose the outcome.
     fn receive(&self, worker: WorkerId, attempt: AttemptId, fence: Fence, what: Deferred) {
         let message = DeferredMessage {
             id: self.next_deferred.fetch_add(1, Ordering::Relaxed),
@@ -1625,9 +1258,6 @@ impl Inner {
         }
     }
 
-    /// Commit one worker message. `Ok` once it took effect; the counters and
-    /// the capacity wake of a terminal report follow it here, wherever it is
-    /// applied from.
     fn apply(&self, m: &DeferredMessage) -> sentinel_store::Result<()> {
         let (worker, attempt, fence) = (m.worker, m.attempt, m.fence);
         match &m.what {
@@ -1640,9 +1270,6 @@ impl Inner {
             Deferred::Report { event, summary } => {
                 let event = *event;
                 let summary = summary.clone();
-                // Whether the log ended is asked here, before the writer is
-                // taken, so a terminal report never waits behind another
-                // attempt's log fsync on the single writer thread.
                 let ended = matches!(event, Event::Passed | Event::Failed(_))
                     && self.log_has_end(worker, attempt);
                 let state = self.write_store(move |tx| {
@@ -1664,7 +1291,6 @@ impl Inner {
                 self.stats.reports.fetch_add(1, Ordering::Relaxed);
                 if state.is_terminal() {
                     self.released(worker, attempt);
-                    // Capacity came back and dependents may be queued.
                     self.wake();
                 }
             }
@@ -1672,12 +1298,6 @@ impl Inner {
         Ok(())
     }
 
-    /// A message the store refused as stale: stale reports are counted, a
-    /// stale acknowledgement changes nothing. `retried` says the message had
-    /// failed transiently before: a write of unknown outcome may have
-    /// committed then, so its report owes the release and wake it would have
-    /// done (both idempotent). A first-try stale report owes nothing, and
-    /// must not touch the log state of an attempt it does not own.
     fn stale(&self, m: &DeferredMessage, retried: bool) {
         if matches!(m.what, Deferred::Report { .. }) {
             self.stats.stale_reports.fetch_add(1, Ordering::Relaxed);
@@ -1688,7 +1308,6 @@ impl Inner {
         }
     }
 
-    /// Count a message kept for retry, or one the full queue refused.
     fn counted(&self, kept: bool) {
         let counter = if kept {
             &self.stats.deferred_worker_messages
@@ -1698,12 +1317,6 @@ impl Inner {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Apply the deferred messages in arrival order, until the queue is empty
-    /// or the store fails transiently again (then the rest waits for the next
-    /// pass instead of hammering an unavailable writer). A message stays in
-    /// the queue while it is applied, so one that arrives for the same
-    /// attempt meanwhile queues behind it. Runs at the head of a dispatch
-    /// pass, before the expiry sweep reads the leases.
     fn retry_deferred(&self) {
         retry_with(
             &self.deferred,
@@ -1720,9 +1333,6 @@ impl Inner {
         );
     }
 
-    /// Attempts whose terminal verdict the controller holds but the store has
-    /// not taken yet: the expiry sweep must not fail them for a lease their
-    /// worker can no longer renew.
     fn awaiting_report(&self) -> HashSet<AttemptId> {
         self.deferred
             .lock()
@@ -1730,9 +1340,6 @@ impl Inner {
             .awaiting_reports()
     }
 
-    /// Record the settled outcome of a declared artifact: `state`, the
-    /// committed manifest version when captured, and the charged bytes.
-    /// A store fault changes nothing the verdict reports.
     fn record_artifact(
         &self,
         f: &InFlight,
@@ -1742,7 +1349,6 @@ impl Inner {
     ) {
         let (tenant, run, job) = (f.tenant, f.run, f.job);
         let name = f.name.clone();
-        // Sealed files only: a file that never completed reports nothing.
         let entries = f.done.len() as u64;
         let bytes = f.done.iter().map(|(_, _, s)| s.len()).sum::<u64>();
         let retain_until = UnixMillis(
@@ -1768,8 +1374,6 @@ impl Inner {
         });
     }
 
-    /// The attempt's publication, if one is in flight. The map lock is held
-    /// only for the lookup.
     fn publication(&self, attempt: AttemptId) -> Option<Publication> {
         self.artifacts
             .lock()
@@ -1779,8 +1383,6 @@ impl Inner {
             .cloned()
     }
 
-    /// Take the publication out of the map and release its run budget; the
-    /// caller holds its lock. Idempotent through `settled`.
     fn settle(&self, attempt: AttemptId, f: &mut InFlight) {
         if f.settled {
             return;
@@ -1793,11 +1395,6 @@ impl Inner {
         }
     }
 
-    /// Drop an in-flight publication: release the run budget, discard the
-    /// sealed-but-uncommitted files it created, and — for a declared
-    /// artifact that failed after opening — record `failed` so the run's
-    /// output stays explainable. `Stale` means nothing was granted. The
-    /// caller holds the publication's lock.
     fn artifact_fail(
         &self,
         f: &mut InFlight,
@@ -1811,16 +1408,11 @@ impl Inner {
         if code != ArtifactCode::Stale {
             self.record_artifact(f, attempt, artifacts::State::Failed, None);
         }
-        // The open file's temp copy goes with its `Staging`.
         f.file = None;
         self.discard(std::mem::take(&mut f.done));
         code
     }
 
-    /// Discard sealed-but-uncommitted files on the writer: a file another
-    /// stage or a committed row still owns stays ([`Objects::discard`]).
-    /// Should the writer refuse, the stages drop unpinned and the orphan
-    /// sweep decides later — never this thread.
     fn discard(&self, done: Vec<(String, u32, objects::Staged)>) {
         if done.is_empty() {
             return;
@@ -1835,9 +1427,6 @@ impl Inner {
     }
 }
 
-/// Back-off between tries against a transient fault: doubling from 100 ms,
-/// with ±25 % jitter from the attempt id so concurrent resolutions do not
-/// retry in step.
 fn spec_backoff(try_no: u32, attempt: AttemptId) -> Duration {
     let base = 100u64 << try_no.min(4);
     let quarter = base / 4;
@@ -1846,7 +1435,6 @@ fn spec_backoff(try_no: u32, attempt: AttemptId) -> Duration {
 }
 
 impl Inner {
-    /// A resolver thread: drain the spec desk, then exit.
     fn resolve_specs(&self) {
         let mut done = None;
         while let Some((key, request)) = self.specs.next(done.take()) {
@@ -1861,8 +1449,6 @@ impl Inner {
         });
     }
 
-    /// Where the attempt stands, with transient read faults retried. `None`
-    /// means the question stays open: leave the request unanswered.
     fn spec_gate(&self, request: &SpecRequest) -> Option<dispatch::SpecGate> {
         let (worker, attempt) = (request.worker, request.attempt);
         let started = Instant::now();
@@ -1870,9 +1456,6 @@ impl Inner {
         let mut faults = 0;
         loop {
             match self.store.read(|c| dispatch::spec_gate(c, worker, attempt)) {
-                // The acknowledgement is on its way on the control
-                // connection (the request may have come on bulk): wait for
-                // it, briefly. Nothing is served before it is durable.
                 Ok(dispatch::SpecGate::Unacknowledged) => {
                     if started.elapsed() >= SPEC_ACK_WAIT {
                         return None;
@@ -1892,9 +1475,6 @@ impl Inner {
         }
     }
 
-    /// Settle an acknowledged, unstarted attempt whose job has cancellation
-    /// desired: `canceled` now, dependents decided, and `NoSpec` so the
-    /// worker lets it go.
     fn settle_canceled(&self, request: &SpecRequest, fence: Fence) {
         let (worker, attempt) = (request.worker, request.attempt);
         if self
@@ -1907,12 +1487,6 @@ impl Inner {
         }
     }
 
-    /// A spec refused for good because a declared secret cannot be
-    /// delivered — revoked, deleted, unbound, ambiguous — is settled here
-    /// as the preparation failure it is, with a value-free detail naming
-    /// the secret and why; the refused use was audited once by the
-    /// `secrets::deliver` that refused it. The worker's own `Failed` report
-    /// after `NoSpec` is then stale and changes nothing. Any other refusal is left to that report.
     fn refuse_secrets(&self, request: &SpecRequest) {
         let (worker, attempt) = (request.worker, request.attempt);
         let settled = self.write(move |tx| {
@@ -1949,13 +1523,6 @@ impl Inner {
         }
     }
 
-    /// Serve one spec request. A definitive answer is sent — the spec, or
-    /// `NoSpec` for an attempt that is not this worker's, was settled
-    /// canceled, or whose source or spec is refused for good. A transient
-    /// fault is retried a few times and then left unanswered: the worker
-    /// asks again, and hands the attempt back if it never gets it, so a
-    /// fault never turns into an infrastructure failure of a job that did
-    /// not run.
     fn serve_spec(&self, request: &SpecRequest) {
         let (worker, attempt) = (request.worker, request.attempt);
         match self.spec_gate(request) {
@@ -1996,8 +1563,6 @@ impl Inner {
                     return;
                 }
                 Err(SpecFault::Refused) => {
-                    // A cancel that landed after the gate refuses a bound
-                    // source too: settle it as the cancel it is.
                     match self.spec_gate(request) {
                         Some(dispatch::SpecGate::Canceled(fence)) => {
                             self.settle_canceled(request, fence);
@@ -2045,10 +1610,6 @@ impl Admission for Inner {
         capacity: Capacity,
     ) -> std::result::Result<Admitted, Rejection> {
         let negotiated = sentinel_protocol::negotiate::negotiate(hello).map_err(Rejection::from)?;
-        // The disk half of the capacity only arrives with the protocol-7
-        // profile, after the welcome. Defer the capacity write entirely for
-        // such a session so placement never sees a disk of zero for a worker
-        // that is about to report one.
         let deferred = negotiated.protocol.0 >= PROFILE_MIN.0;
         let capacity = dispatch::Capacity {
             cpu_millis: i64::try_from(capacity.cpu_millis).map_err(|_| Rejection::Capacity)?,
@@ -2057,19 +1618,12 @@ impl Admission for Inner {
         };
         match self.store.read(|c| workers::authenticate(c, fingerprint)) {
             Ok(known) => {
-                // The architecture is part of what was enrolled; a machine
-                // presenting the key on another one is not that worker.
                 if known.negotiated.arch != negotiated.arch {
                     return Err(Rejection::Identity);
                 }
-                // Negotiated afresh on every hello and recorded: an upgraded
-                // worker is welcomed at the newer protocol (and so sends
-                // its profile), a rolled-back one at a version it speaks.
                 let id = known.id;
                 let renegotiated = (known.negotiated != negotiated).then_some(negotiated);
                 let immediate = (!deferred).then_some(capacity);
-                // What it runs, for skew reports: written only when
-                // it changed, so a reconnect costs no write.
                 let software = workers::software_label(&hello.software)
                     .filter(|s| known.software.as_deref() != Some(s.as_str()));
                 if renegotiated.is_some() || immediate.is_some() || software.is_some() {
@@ -2094,19 +1648,12 @@ impl Admission for Inner {
                 });
             }
             Err(sentinel_store::Error::NotFound) => {}
-            // A store fault is not an unknown fingerprint: answering the
-            // enrollment path would refuse a known worker with the wrong
-            // error — say it is the store, retryably.
             Err(_) => return Err(Rejection::Unavailable),
         }
         let Some(secret) = enrollment else {
             return Err(Rejection::NotEnrolled);
         };
-        // An unknown certificate presenting a secret reaches the single
-        // writer, where a refused secret commits an audit row. Budget those
-        // attempts per source and overall before they get there; the answer
-        // is the retryable `Unavailable`, so a real enrollment that hit the
-        // budget succeeds on the worker's next back-off.
+        // Unknown-certificate secret attempts are budgeted before the single writer; Unavailable lets them retry.
         if let Some(source) = source
             && !self.enrollments.allow(source, Instant::now())
         {
@@ -2130,7 +1677,6 @@ impl Admission for Inner {
         self.store
             .writer()
             .write(move |tx| {
-                // A refused secret commits its audit row: `Ok(None)`.
                 let Some(enrolled) = workers::redeem(
                     tx,
                     &secret,
@@ -2169,12 +1715,6 @@ impl Admission for Inner {
 }
 
 impl SessionHandler for Inner {
-    /// Queue the request on the bounded spec desk: at most
-    /// [`SPEC_RESOLVERS`] resolutions (each possibly a GitHub round trip)
-    /// run off the session threads, and the rest wait their turn instead of
-    /// being refused. A request over the bound is dropped unanswered — the
-    /// worker asks again — never answered `NoSpec`, which would end the
-    /// attempt.
     fn spec_requested(
         &self,
         worker: WorkerId,
@@ -2197,15 +1737,12 @@ impl SessionHandler for Inner {
                     .is_ok()
             });
             if !spawned {
-                // The request stays queued for the next resolver.
                 self.specs.not_started();
             }
         }
         true
     }
     fn ping(&self, worker: WorkerId, held: &[AttemptId]) -> Result<Beat> {
-        // The lease deadline is the controller's deadline clock; "last seen"
-        // is provenance an operator reads, so it stays on the wall clock.
         let now = UnixMillis::steady();
         let wall = UnixMillis::now();
         let peer = self
@@ -2219,7 +1756,6 @@ impl SessionHandler for Inner {
             wall.0.saturating_sub(last) >= workers::SEEN_RECORD_INTERVAL_MS
         });
         if held.is_empty() && !record_seen {
-            // Nothing to renew and liveness recorded recently: no write.
             return Ok(Beat {
                 lease_until: UnixMillis(now.0 + dispatch::DEFAULT_LEASE_MS),
                 stop: Vec::new(),
@@ -2237,8 +1773,6 @@ impl SessionHandler for Inner {
         if record_seen && let Some(peer) = peer {
             peer.seen_recorded_ms.store(wall.0, Ordering::Relaxed);
         }
-        // Cancellation desired for anything still held: delivered with every
-        // beat until the worker reports, so a missed pong changes nothing.
         let cancel = if wanted.is_empty() {
             Vec::new()
         } else {
@@ -2254,9 +1788,6 @@ impl SessionHandler for Inner {
     }
 
     fn acknowledged(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {
-        // A stale acknowledgement changes nothing; the worker learns the
-        // attempt is not its own from the stop list on its next beat. One the
-        // store could not take is kept and retried ([`Inner::receive`]).
         self.receive(worker, attempt, fence, Deferred::Ack);
     }
 
@@ -2297,24 +1828,10 @@ impl SessionHandler for Inner {
         }
     }
 
-    /// The synchronous fallback is never used by this controller: it resolves
-    /// specs on its own thread ([`Inner::spec_requested`]) so that GitHub
-    /// round trips and credential minting happen outside the session thread.
     fn spec(&self, _worker: WorkerId, _attempt: AttemptId) -> Option<(JobContext, Vec<u8>)> {
         None
     }
 
-    /// Protocol 7. Records the profile and, in the same transaction, the
-    /// capacity with the disk the profile carries — the hello's own capacity
-    /// write was deferred for exactly this one, so placement never sees a
-    /// disk of zero for a worker that reports one. The labels, the warm
-    /// images and the disk are the worker's whole statement for this
-    /// session and replace the stored ones: an empty label set or image list
-    /// is a fact (none), and a disk of zero is a platform that could not
-    /// measure, which no job declaring scratch disk is placed on. Only the
-    /// values that are a measurement of a moment (host, cache bytes, load)
-    /// are reported absent when zero on the wire, so a column keeps its
-    /// last known value instead of being overwritten with a zero claim.
     fn profiled(&self, worker: WorkerId, profile: &Profile, capacity: Capacity) -> Result<()> {
         let capacity = dispatch::Capacity {
             cpu_millis: i64::try_from(capacity.cpu_millis)
@@ -2353,26 +1870,16 @@ impl SessionHandler for Inner {
             )
         })
         .map_err(|_| Error::Internal("profile write"))?;
-        // A worker that just reported an image warm — often one it
-        // prefetched — may now take work a locality hold kept from it, so
-        // placement runs now rather than at the next reconciliation.
         self.wake();
         Ok(())
     }
 
-    /// Protocol 7. The worker's latest transport telemetry, kept on
-    /// its session for operators and diagnostics.
     fn transport(&self, worker: WorkerId, stats: &TransportStats) {
         if let Some(peer) = self.peer(worker) {
             *peer.transport.lock().unwrap_or_else(|p| p.into_inner()) = Some(stats.clone());
         }
     }
 
-    /// Protocol 7. Authorizes a download: the fenced attempt must be
-    /// held by the worker, and the need's tenant, repo and trust class must
-    /// equal the attempt's — the worker never names a boundary it does not
-    /// hold. The controller's remote-cache root is returned to serve from;
-    /// without one, every need is a miss.
     fn cache_need(&self, worker: WorkerId, need: &Need) -> Option<std::path::PathBuf> {
         self.cache_authorize(
             worker,
@@ -2382,11 +1889,6 @@ impl SessionHandler for Inner {
         )
     }
 
-    /// Protocol 7. Authorizes an upload under the same boundary rule
-    /// as a download before any bytes are staged — except that the attempt
-    /// may already be released: a worker offers what it sealed only after
-    /// its terminal report, so the same worker's attempt released
-    /// within [`OFFER_WINDOW_MS`] still names its boundary.
     fn cache_offer(&self, worker: WorkerId, upload: &Upload) -> Option<std::path::PathBuf> {
         let since = UnixMillis(UnixMillis::steady().0 - OFFER_WINDOW_MS);
         self.cache_authorize(
@@ -2397,11 +1899,6 @@ impl SessionHandler for Inner {
         )
     }
 
-    /// `Refused` only for a permanent cause — not this worker's attempt, a
-    /// log that already ended, the size cap, no disk reserve left for
-    /// evidence. A store read or log I/O fault is `Retry`: the connection
-    /// closes and the worker resends from its last acknowledgement, so a
-    /// passing job never loses its log (and its verdict) to a hiccup.
     fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict {
         let (run, job) = match self.log_scope(worker, attempt) {
             Ok(Some(scope)) => scope,
@@ -2411,8 +1908,6 @@ impl SessionHandler for Inner {
             }
             Err(()) => return LogVerdict::Retry,
         };
-        // Written now, made durable by `log_sync` before the session
-        // acknowledges: one `fsync` covers a burst of frames.
         match self.logs.append_deferred(run, job, attempt, &frame) {
             Ok(sentinel_store::logs::Appended::Stored { through }) => {
                 self.stats.log_frames.fetch_add(1, Ordering::Relaxed);
@@ -2455,10 +1950,6 @@ impl SessionHandler for Inner {
         };
         match self.logs.finish(run, job, attempt, last_seq, gaps) {
             Ok(()) => {
-                // The acknowledgement — and the spool it releases — waits for
-                // the row that says the end marker is durable. If the write
-                // fails the connection closes and the worker re-sends
-                // `LogEnd` from its rewind; `finish` is idempotent.
                 if self
                     .write(move |tx| dispatch::log_ended(tx, attempt))
                     .is_err()
@@ -2473,8 +1964,6 @@ impl SessionHandler for Inner {
                 }
                 LogVerdict::Acked(last_seq)
             }
-            // A different end than the one recorded, or an end before what
-            // is stored: the worker's claim cannot be accepted, ever.
             Err(sentinel_store::Error::Conflict | sentinel_store::Error::InvalidInput(_)) => {
                 self.stats.log_refused.fetch_add(1, Ordering::Relaxed);
                 LogVerdict::Refused
@@ -2483,20 +1972,12 @@ impl SessionHandler for Inner {
         }
     }
 
-    /// Fenced on the declining worker: only the holder of the
-    /// offer, under its fence, can give it back — an unacknowledged offer,
-    /// or an acknowledged attempt it never started because the spec never
-    /// arrived. Either goes back to the queue, or ends `canceled`.
     fn declined(&self, worker: WorkerId, attempt: AttemptId, fence: Fence) {
         if let Ok(state) = self
             .write(move |tx| dispatch::decline(tx, worker, attempt, fence, UnixMillis::steady()))
         {
             self.stats.lapsed.fetch_add(1, Ordering::Relaxed);
             self.stats.handed_back.fetch_add(1, Ordering::Relaxed);
-            // Deliberately no wake for a requeue: the next reconciliation
-            // places it, which bounds a worker that keeps refusing to one
-            // offer per interval instead of a tight loop. A cancel that
-            // ended the job did free capacity and decide dependents.
             if state.is_terminal() {
                 self.wake();
             }
@@ -2508,9 +1989,6 @@ impl SessionHandler for Inner {
         if !self.holds(worker, attempt) {
             return Verdict(ArtifactCode::Stale);
         }
-        // One read snapshot: the attempt's ownership scope, its encoded spec,
-        // whether the artifact already has a row, the run's budget base and
-        // whether its repository is still under its own quota.
         let deployment = self.objects.deployment();
         let scope = self.store.read(|c| {
             let tx = c.unchecked_transaction()?;
@@ -2541,8 +2019,6 @@ impl SessionHandler for Inner {
         };
         let mut state = self.artifacts.lock().unwrap_or_else(|p| p.into_inner());
         if state.in_flight.contains_key(&attempt) {
-            // The session already orders one publication per attempt; a
-            // second begin here means the worker raced its own stream.
             return Verdict(ArtifactCode::Invalid);
         }
         if committed.saturating_add(*state.runs.get(&run).unwrap_or(&0))
@@ -2593,17 +2069,15 @@ impl SessionHandler for Inner {
         {
             return Some(self.artifact_fail(f, attempt, ArtifactCode::Invalid));
         }
-        // The run budget is committed bytes plus what every in-flight
-        // artifact of the run already charges; the charge is taken under
-        // the map lock so two publications cannot both fit the last byte.
         let committed = self
             .store
             .read(|c| artifacts::run_bytes(c, f.tenant, f.run))
             .unwrap_or(u64::MAX);
         let fits = f.accounted.saturating_add(len) <= MAX_ARTIFACT_BYTES
-            // Disk admission closed: the stream would refuse its writes
-            // anyway, so the file is never opened.
-            && self.objects.admission().is_none_or(|a| a.check(len).is_ok())
+            && self
+                .objects
+                .admission()
+                .is_none_or(|a| a.check(len).is_ok())
             && {
                 let mut state = self.artifacts.lock().unwrap_or_else(|p| p.into_inner());
                 let charged = state.runs.entry(f.run).or_default();
@@ -2630,8 +2104,6 @@ impl SessionHandler for Inner {
             next_seq: 0,
             staging,
         };
-        // An empty file sends no data frames: seal it at once, or
-        // `artifact_end` would find it still open.
         if len == 0 {
             match self.objects.stage_seal(f.tenant, file.staging, 0) {
                 Ok(staged) => f.done.push((file.path, file.mode, staged)),
@@ -2719,10 +2191,7 @@ impl SessionHandler for Inner {
         let objects = Arc::clone(&self.objects);
         let bytes = entries.iter().map(|e| e.len).sum::<u64>();
         let count = entries.len() as u64;
-        // One transaction: object references, the manifest row and file,
-        // then the artifact row that names its version. A crash mid-commit
-        // can only leave adoptable orphans under `objects/`. The stages stay
-        // pinned until this closure ends on the writer, after their rows.
+        // One transaction: a crash mid-commit leaves only adoptable orphans; the stages stay pinned until it ends.
         self.write(move |tx| {
             for s in &staged {
                 objects.commit(tx, s)?;
@@ -2769,8 +2238,6 @@ impl SessionHandler for Inner {
         } else {
             artifacts::State::Failed
         };
-        // An in-flight publication of the same name is abandoned; its scope
-        // comes with the state and needs no lookup.
         if let Some(publication) = self.publication(attempt) {
             let mut guard = publication.lock().unwrap_or_else(|p| p.into_inner());
             let f = &mut *guard;
@@ -2844,13 +2311,9 @@ impl SessionHandler for Inner {
     }
 }
 
-/// Why a spec could not be resolved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpecFault {
-    /// For good: the attempt is gone, the source is not authorized or not
-    /// allowed, the stored spec does not decode.
     Refused,
-    /// Worth another try: reader overload, a busy writer, a GitHub timeout.
     Transient,
 }
 
@@ -2888,14 +2351,11 @@ fn resolve_spec(
     SpecFault,
 > {
     use sentinel_store::{Error as StoreError, secrets, sources};
-    // One read snapshot: the attempt's context and spec, the binding that
-    // authorizes it, and the destination policy.
     let (mut context, bytes, binding, requires_secret_delivery) = store.read(|conn| {
         let tx = conn.unchecked_transaction()?;
         let c = dispatch::job_context(&tx, worker, attempt)?;
         let bytes = dispatch::spec_bytes(&tx, worker, attempt)?;
         let context = JobContext {
-            // Access is minted below, outside this snapshot.
             source: None,
             run: c.run,
             repo: c.repo,
@@ -2944,15 +2404,12 @@ fn resolve_spec(
         Ok((context, bytes, binding, requires_secret_delivery))
     })?;
     if let Some(binding) = binding {
-        // The only network step; a revocation that lands while a token is
-        // being minted wins the race (rechecked inside `issue`).
         let access =
             sentinel_intake::source::issue(store, key.as_deref(), app, &binding, UnixMillis::now())
                 .map_err(|e| match e {
                     sentinel_intake::source::Error::Unavailable(_) => SpecFault::Transient,
                     sentinel_intake::source::Error::Refused(_) => SpecFault::Refused,
                 })?;
-        // And the lease that authorized this delivery must still be live.
         let (tenant, repo) = (binding.tenant, binding.repo);
         store.read(move |conn| {
             if sources::attempt_repo(conn, worker, attempt, UnixMillis::steady())? != (tenant, repo)
@@ -2970,8 +2427,6 @@ fn resolve_spec(
         let Some(key) = key else {
             return Err(SpecFault::Refused);
         };
-        // A policy refusal (missing binding, revoked version, ambiguity)
-        // commits its `denied`/`missing` audit row and fails the delivery.
         Some(
             secrets::deliver(store, key, worker, attempt, UnixMillis::now())
                 .map_err(SpecFault::from)?,
@@ -2993,8 +2448,6 @@ fn send_resolved(
     )>,
 ) -> Result<()> {
     use session::ServerMessage;
-    // Protocol 3 carries the event context and (from 2) the source access;
-    // anything older is served `NoSpec` rather than a message it cannot decode.
     let Some((context, bytes, delivery)) = spec.filter(|(_, b, delivery)| {
         protocol >= 3
             && b.len() <= session::MAX_SPEC_BYTES
@@ -3004,9 +2457,6 @@ fn send_resolved(
             attempt: *attempt.as_bytes(),
         });
     };
-    // `Context2` carries the tenant and cache trust class from protocol 6;
-    // earlier workers get the original shape and scope themselves to
-    // pull-request state.
     sender.send(&session::context_message(protocol, &context, attempt))?;
     if let Some(access) = context.source {
         sender.send(&ServerMessage::Source {
@@ -3063,7 +2513,6 @@ fn send_resolved(
     Ok(())
 }
 
-/// A running controller: listener, fleet and dispatcher.
 pub struct Controller {
     inner: Arc<Inner>,
     addr: SocketAddr,
@@ -3096,9 +2545,6 @@ impl Controller {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(key);
     }
-    /// Pre-admission limits: how many connections may be in their handshake
-    /// and hello at once, and how long each may take. Defaults are
-    /// [`MAX_PENDING`] and [`session::HANDSHAKE_DEADLINE`].
     pub fn set_admission_limits(&self, pending: usize, handshake: Duration) {
         self.inner
             .max_pending
@@ -3109,24 +2555,14 @@ impl Controller {
         );
     }
 
-    /// Enable storage maintenance. Unset keeps every byte forever.
     pub fn set_storage_policy(&self, policy: StoragePolicy) {
         *self.inner.storage.lock().unwrap_or_else(|p| p.into_inner()) = Some(policy);
     }
 
-    /// The byte budget the remote cache store is held to (default
-    /// `remote::STORE_BUDGET_BYTES`), from its next reclamation pass on.
     pub fn set_remote_cache_budget(&self, bytes: u64) {
         self.inner.remote_budget.store(bytes, Ordering::Relaxed);
     }
 
-    /// Where the controller keeps remote cache objects, normally
-    /// `<data_dir>/remote-cache`. Unset answers every cache need `denied`;
-    /// the directory itself is created lazily by the first upload. Setting
-    /// it starts the store's reclamation: one bounded
-    /// `remote::sweep_store` pass now and every [`REMOTE_SWEEP_INTERVAL`] —
-    /// one bundle per entry, abandoned uploads removed, and the store held
-    /// to `remote::STORE_BUDGET_BYTES`, least recently served first.
     pub fn set_remote_cache(&self, root: std::path::PathBuf) {
         let first = self
             .inner
@@ -3172,8 +2608,6 @@ impl Controller {
                 }
             });
     }
-    /// Bind `listen`, present `identity`, and start serving workers of
-    /// `store`. Returns once the socket is bound; workers may connect.
     pub fn start(
         store: Arc<Store>,
         logs: Arc<LogStore>,
@@ -3183,9 +2617,6 @@ impl Controller {
     ) -> Result<Controller> {
         let fingerprint = identity.fingerprint();
         let config = tls::server_config(identity)?;
-        // What the last controller left mid-flight is settled from the rows
-        // before any worker is admitted: expired leases, unanswered offers,
-        // attempts of workers revoked meanwhile.
         let reconcile_logs = Arc::clone(&logs);
         let reconciled = store
             .writer()
@@ -3260,13 +2691,10 @@ impl Controller {
         })
     }
 
-    /// What starting this controller settled from the previous one's rows.
     pub fn reconciled(&self) -> dispatch::Reconciled {
         self.reconciled
     }
 
-    /// A cheap handle for other subsystems (the API) to wake the dispatcher
-    /// and ask who is connected, without owning the controller.
     pub fn handle(&self) -> Handle {
         Handle(Arc::clone(&self.inner))
     }
@@ -3275,18 +2703,14 @@ impl Controller {
         self.addr
     }
 
-    /// What workers must pin.
     pub fn fingerprint(&self) -> Digest {
         self.fingerprint
     }
 
-    /// Something changed the queue (an enqueue, a completion, a cancel):
-    /// dispatch now rather than at the next reconciliation.
     pub fn wake(&self) {
         self.inner.wake();
     }
 
-    /// Workers with a live session, for placement reasons and operators.
     pub fn connected(&self) -> Vec<WorkerId> {
         self.inner
             .fleet
@@ -3301,14 +2725,9 @@ impl Controller {
         &self.inner.stats
     }
 
-    /// Stop accepting, close every session and stop dispatching. Returns
-    /// whether every session thread ended within `timeout`; the store is the
-    /// caller's to shut down afterwards, and nothing durable is lost either
-    /// way — leases and offers are rows, reconciled at the next start.
     pub fn shutdown(mut self, timeout: Duration) -> bool {
         self.inner.stop.store(true, Ordering::Release);
         self.inner.wake();
-        // Unblock the acceptor with one connection to itself.
         let _ = TcpStream::connect_timeout(&self.addr, Duration::from_secs(1));
         if let Some(handle) = self.acceptor.take() {
             let _ = handle.join();
@@ -3347,9 +2766,6 @@ impl Controller {
 }
 
 fn accept_loop(inner: &Arc<Inner>, listener: &TcpListener) {
-    // Accept errors in a row that are about the process, not one peer
-    // (descriptor or memory exhaustion): the acceptor sleeps between them
-    // instead of spinning on a listener that keeps failing at once.
     let mut failures = 0u32;
     loop {
         let accepted = listener.accept();
@@ -3370,11 +2786,6 @@ fn accept_loop(inner: &Arc<Inner>, listener: &TcpListener) {
             }
         };
         let ip = canonical(addr).ip();
-        // Two caps: every session, and — much smaller — connections that
-        // have not authenticated yet, each also bounded by the handshake
-        // deadline, per source, with a reserve for sources that have
-        // authenticated before. Peers that prove nothing can never hold the
-        // slots the enrolled fleet reconnects into.
         if inner.sessions.load(Ordering::Acquire) >= inner.session_cap
             || !inner.pending.enter(
                 ip,
@@ -3401,7 +2812,6 @@ fn accept_loop(inner: &Arc<Inner>, listener: &TcpListener) {
     }
 }
 
-/// See [`Controller::handle`].
 #[derive(Clone)]
 pub struct Handle(Arc<Inner>);
 
@@ -3410,7 +2820,6 @@ impl Handle {
         self.0.wake();
     }
 
-    /// The link's counters, as `/metrics` reports them.
     pub fn stats(&self) -> &Stats {
         &self.0.stats
     }
@@ -3425,9 +2834,6 @@ impl Handle {
             .collect()
     }
 
-    /// The latest transport telemetry the worker reported: direct or
-    /// relayed path, round-trip time, reconnects, helper version and byte
-    /// counters. `None` until a protocol-7 worker reports one.
     pub fn transport(&self, worker: WorkerId) -> Option<TransportStats> {
         let peer = self
             .0
@@ -3442,9 +2848,6 @@ impl Handle {
             .clone()
     }
 
-    /// Close a worker's session from the controller's side. Its leases stay
-    /// until they expire and it may reconnect at once; an operator's way to
-    /// force a fresh session, and the test's way to lose the network.
     pub fn disconnect(&self, worker: WorkerId) -> bool {
         let peer = self
             .0
@@ -3462,36 +2865,7 @@ impl Handle {
         }
     }
 
-    /// Replace the allow list of the Tailcat helper that carries this link
-    /// port, handing the tunnelled connections over instead of cutting them.
-    ///
-    /// Restarting the helper (its only way to take a new list) leaves every
-    /// connection it carried open at the worker's end: a killed helper
-    /// closes nothing through the tunnel, so the worker would notice only at
-    /// a deadline, about 20 s later. So, while the old helper still runs,
-    /// every connection that arrived through it — told apart from direct TLS
-    /// by the helper owning the socket's other end — is closed cleanly (a
-    /// TLS `close_notify` and a FIN), which the helper carries to the worker,
-    /// and only then is the helper replaced. That covers sessions and also
-    /// connections still in their TLS handshake or hello
-    /// ([`session::Arrival`]). Direct-TLS sessions are never touched. `None`
-    /// when the list is unchanged: no restart, no close.
-    ///
-    /// The helper is replaced as soon as every closed connection has ended
-    /// at the worker's side too (the close was delivered), plus
-    /// [`HANDOFF_SETTLE`], and after [`HANDOFF_BOUND`] at most. A close the
-    /// tunnel lost is resent only by the helper that took it, so when every
-    /// closed session's worker advertised `HANDOFF_ANSWER` (its silence then
-    /// means the close was not delivered, and it cannot be stranded by a
-    /// redial) the old helper is kept for up to [`HANDOFF_RESEND_BOUND`]
-    /// while a close is unanswered. A worker that redials into it meanwhile
-    /// is closed the same way: a new loopback arrival makes the helper's
-    /// connections be read again.
-    ///
-    /// The worker reads the close as [`crate::Error::Closed`], replaces its
-    /// own helper once its answer had time to leave, and redials on its
-    /// shortest back-off. Live, a change then costs about the restarted
-    /// helper's own start (3.2-4.3 s) where cutting cost 18.0-21.0 s.
+    /// Closes the carried sessions cleanly rather than cutting them: a killed helper leaves workers to notice after about 20 s.
     pub fn hand_off(&self, server: &Server, allow: &[NodeKey]) -> Option<Handoff> {
         let started = Instant::now();
         let mut handoff = Handoff::default();
@@ -3504,12 +2878,6 @@ impl Handle {
         })
     }
 
-    /// Close cleanly every session (and its bulk connection) and every
-    /// connection still in its handshake or hello that `carried` names, and
-    /// wait until each has ended or `within` passed; `patiently`, when every
-    /// closed connection is a session whose worker answers hand-offs.
-    /// `carried` is read again whenever a loopback connection arrives
-    /// meanwhile.
     fn drain(
         &self,
         carried: &dyn Fn() -> Vec<SocketAddr>,
@@ -3534,8 +2902,6 @@ impl Handle {
         self.claim(&from, &mut claimed, &mut admitting);
         self.close_carried(&from, &mut closed);
         loop {
-            // A connection that arrived meanwhile may be a worker redialling
-            // into the old helper: it would be cut with it.
             let arrived = self.0.arrived.load(Ordering::Acquire);
             if arrived != seen {
                 seen = arrived;
@@ -3577,10 +2943,6 @@ impl Handle {
                 }
                 return handoff;
             }
-            // Past the short bound only for workers that answer a delivered
-            // close: one that does not could be redialling into this helper.
-            // Decided once, at the short bound, so a redial closed later
-            // still gets its close through.
             let deadline = if now < short {
                 short
             } else if *patient.get_or_insert_with(|| {
@@ -3599,10 +2961,6 @@ impl Handle {
         }
     }
 
-    /// Claim the connections still in their handshake or hello whose remote
-    /// end is one of `from` (each then closes itself from its own thread),
-    /// and note those whose hello is being admitted: they become sessions,
-    /// closed once registered.
     fn claim(
         &self,
         from: &[SocketAddr],
@@ -3627,10 +2985,7 @@ impl Handle {
         }
     }
 
-    /// Close cleanly the registered sessions whose remote end is one of
-    /// `from` and that are not in `closed` yet, adding them there.
     fn close_carried(&self, from: &[SocketAddr], closed: &mut Vec<Closed>) {
-        // The fleet lock is not held across the socket calls below.
         let peers: Vec<(WorkerId, Arc<Peer>)> = self
             .0
             .fleet
@@ -3660,55 +3015,24 @@ impl Handle {
     }
 }
 
-/// A session a hand-off closed.
 struct Closed {
     worker: WorkerId,
     generation: u64,
-    /// Its worker advertised `HANDOFF_ANSWER`.
     answers: bool,
 }
 
-/// Longest [`Handle::hand_off`] waits for closed connections before it
-/// replaces the helper, whoever the workers are. Below the shortest
-/// reconnect back-off (1 s less its 25 % jitter) of a worker that saw the
-/// close, so it cannot redial into the old helper before it goes: a worker
-/// older than `HANDOFF_ANSWER` keeps a forward younger than 10 s, and one
-/// that redialled through it into the old helper was stuck for 21 s when
-/// the wait was longer.
+/// Kept below the shortest worker reconnect back-off, so no worker redials into the old helper first.
 pub const HANDOFF_BOUND: Duration = Duration::from_millis(600);
-/// Longest [`Handle::hand_off`] keeps the old helper for a close still
-/// unanswered when every closed session's worker advertised
-/// `HANDOFF_ANSWER`, so the silence means the close was not delivered. A
-/// close the tunnel dropped is resent only by the helper that took it, on
-/// its own retransmission clock: live, with exactly 800 ms of loss at the
-/// worker, closes arrived 1.40 s (direct) and 0.95-1.03 s (relayed) after
-/// they were sent, answered in 40 of 40 changes, and the direct ones were
-/// lost for good when the helper went at 600 ms. A loss held longer moves
-/// the resend to a later retransmission (about 2.9 s relayed after about
-/// 0.9 s of loss), which this bound does not wait for. Such a worker that
-/// redials into the old helper meanwhile is closed as well, and replaces
-/// its forward on that close too.
 pub const HANDOFF_RESEND_BOUND: Duration = Duration::from_millis(3_000);
-/// After the last closed connection ended: time for the old helper to send
-/// the close on through the tunnel before it is killed.
 pub const HANDOFF_SETTLE: Duration = Duration::from_millis(100);
-/// How often the hand-off looks for the closed connections' end.
 const HANDOFF_POLL: Duration = Duration::from_millis(5);
 
-/// What one [`Handle::hand_off`] did, for the operator's log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Handoff {
-    /// Connections the old helper carried into the link port.
     pub tunnelled: usize,
-    /// Sessions among them that were closed cleanly.
     pub closed: usize,
-    /// Connections among them still in their TLS handshake or hello, not
-    /// yet sessions, that were closed cleanly.
     pub arrivals: usize,
-    /// Of the closed sessions and connections, the ones whose worker closed
-    /// its end before the helper was replaced: the close was delivered.
     pub ended: usize,
-    /// From the call to the helper's replacement.
     pub waited: Duration,
 }
 
@@ -3742,13 +3066,9 @@ mod tests {
             (other, size(64_000, 64, 64)),
             (pool, size(7_000, 16, 256)),
         ]);
-        // The largest worker is compared with the next largest per resource,
-        // across workers: memory and disk need not come from one machine.
         assert_eq!(reach.elsewhere(3, pool), Some(size(5_000, 8, i64::MAX)));
         assert_eq!(reach.elsewhere(0, pool), Some(size(7_000, 16, i64::MAX)));
         assert_eq!(reach.elsewhere(1, pool), Some(size(7_000, 16, 256)));
-        // Another pool's worker is never "elsewhere", and a lone worker has
-        // nothing to prefer.
         assert_eq!(reach.elsewhere(2, other), None);
     }
 
@@ -3770,21 +3090,16 @@ mod tests {
         }
     }
 
-    /// A verdict the store refused is kept, in arrival order and behind the
-    /// acknowledgement before it; it protects its attempt from expiry until
-    /// it is settled, and a full queue refuses instead of growing.
     #[test]
     fn deferred_messages_keep_their_order_protect_their_attempt_and_are_bounded() {
         let (a, b) = (AttemptId::new(), AttemptId::new());
         let mut queue = DeferredQueue::default();
         assert!(queue.push(message(1, a, Deferred::Ack)));
-        // The ack alone does not stand in for a verdict.
         assert!(queue.holds(a) && !queue.holds(b));
         assert!(queue.awaiting_reports().is_empty());
         assert!(queue.push(message(2, a, report())));
         assert!(queue.push(message(3, b, report())));
         assert_eq!(queue.awaiting_reports(), HashSet::from([a, b]));
-        // Oldest first, and only the head settles.
         assert_eq!(queue.head().map(|m| m.id), Some(1));
         queue.settle(2);
         assert_eq!(queue.head().map(|m| m.id), Some(1));
@@ -3810,9 +3125,6 @@ mod tests {
         q.items.iter().map(|m| m.id).collect()
     }
 
-    /// Every transient store error keeps the verdict instead of dropping it
-    /// as stale, whatever the error; a stale refusal is dropped and counts as
-    /// the stale report it is.
     #[test]
     fn a_transient_store_error_keeps_the_message_and_a_stale_one_drops_it() {
         let errors: [fn() -> StoreError; 3] = [
@@ -3839,10 +3151,6 @@ mod tests {
         assert!(ids(&q).is_empty(), "a stale message is not kept");
     }
 
-    /// The whole path of a passed job whose report the store refused: kept,
-    /// its attempt shielded from lease expiry, a worker's repeat not queued
-    /// twice, applied once at the head of the next pass, and no longer
-    /// shielded after.
     #[test]
     fn a_refused_report_is_retried_once_and_shields_its_attempt_until_then() {
         let q = queue();
@@ -3863,14 +3171,11 @@ mod tests {
             vec![other],
             "only the attempt with a waiting verdict is shielded"
         );
-        // The worker's resend of the same verdict is a copy: nothing queued,
-        // and the store is not asked.
         let got = receive_with(&q, &message(2, a, report()), |_| {
             panic!("a copy must not reach the store")
         });
         assert!(matches!(got, Received::Copy));
         assert_eq!(ids(&q), vec![1]);
-        // The next pass applies it, once.
         let applied = std::cell::RefCell::new(Vec::new());
         let seen = std::cell::RefCell::new(0);
         retry_with(
@@ -3893,9 +3198,6 @@ mod tests {
         assert_eq!(sweep.len(), 1, "settled: the lease owns it again");
     }
 
-    /// A verdict never overtakes the acknowledgement before it, a store that
-    /// is still down ends the pass with the head in place, and the next pass
-    /// resumes in arrival order.
     #[test]
     fn retries_keep_arrival_order_and_stop_at_a_store_that_is_still_down() {
         let q = queue();
@@ -3904,13 +3206,11 @@ mod tests {
             Err(StoreError::WriteAmbiguous)
         });
         assert!(matches!(got, Received::Transient { kept: true, .. }));
-        // The report arrives while the ack waits: behind it, store untouched.
         let got = receive_with(&q, &message(2, a, report()), |_| {
             panic!("a report must wait for the acknowledgement before it")
         });
         assert!(matches!(got, Received::Queued { kept: true }));
         assert_eq!(ids(&q), vec![1, 2]);
-        // Still down: one attempt at the head, nothing behind it applied.
         let calls = std::cell::RefCell::new(Vec::new());
         let transient = std::cell::RefCell::new(0);
         retry_with(
@@ -3929,7 +3229,6 @@ mod tests {
         assert_eq!(*calls.borrow(), vec![1]);
         assert_eq!(*transient.borrow(), 1);
         assert_eq!(ids(&q), vec![1, 2]);
-        // Back up: the acknowledgement, then the report.
         retry_with(
             &q,
             DEFERRED_MAX_AGE,
@@ -3943,9 +3242,6 @@ mod tests {
         assert!(ids(&q).is_empty());
     }
 
-    /// A retried message the store now calls stale (its write of unknown
-    /// outcome had committed, or the lease moved on) is settled and reported
-    /// as stale to the controller, which owes the release and wake then.
     #[test]
     fn a_retried_message_that_turns_out_stale_is_settled_as_stale() {
         let q = queue();
@@ -3968,8 +3264,6 @@ mod tests {
         assert!(ids(&q).is_empty());
     }
 
-    /// Past the retry window the message is given up on without asking the
-    /// store, and settled so the queue cannot hold it forever.
     #[test]
     fn a_message_past_its_retry_window_is_dropped_unapplied() {
         let q = queue();
@@ -3991,8 +3285,6 @@ mod tests {
         assert!(ids(&q).is_empty());
     }
 
-    /// The queue is bounded: past `MAX_DEFERRED` a refused message is
-    /// reported as not kept, for the counter, rather than growing memory.
     #[test]
     fn a_full_queue_refuses_the_next_transient_message() {
         let q = queue();
@@ -4018,28 +3310,17 @@ mod tests {
         }
     }
 
-    /// The ranking, in its order of precedence: commitment, then measured
-    /// load per core, then warm cache, then the smaller worker.
     #[test]
     fn the_sweep_ranks_workers_by_commitment_then_load_then_cache_then_size() {
         let idle = ranked(8_000, 0, 0);
-        // A quarter committed ranks behind idle, whatever else it has.
         assert!(rank(idle, 0) < rank(ranked(8_000, 0, 1 << 40), 2_000));
-        // Commitment is a share of the worker: 2 cores of 16 beat 2 of 8.
         assert!(rank(ranked(16_000, 0, 0), 2_000) < rank(ranked(8_000, 0, 0), 2_000));
-        // Equal commitment: the host that measured less busy time per core.
         assert!(rank(ranked(8_000, 10_000_000, 0), 0) < rank(ranked(8_000, 400_000_000, 0), 0));
-        // Load is per core: the same busy time on twice the cores is lighter.
         assert!(rank(ranked(16_000, 200_000_000, 0), 0) < rank(ranked(8_000, 200_000_000, 0), 0));
-        // Equal load: more warm cache first.
         assert!(rank(ranked(8_000, 0, 1 << 30), 0) < rank(idle, 0));
-        // Everything equal: the smaller worker (best fit).
         assert!(rank(ranked(2_500, 0, 0), 0) < rank(idle, 0));
     }
 
-    /// A burst of spec requests past the resolver bound is queued and
-    /// every one is served, never refused; duplicates are not queued twice,
-    /// and a worker cannot queue more than it may hold.
     #[test]
     fn the_spec_desk_serves_a_burst_past_its_resolver_bound_in_order() {
         let desk = std::sync::Arc::new(SpecDesk::<usize>::new());
@@ -4056,8 +3337,6 @@ mod tests {
         }
         assert_eq!(starts, SPEC_RESOLVERS);
         assert_eq!(desk.submit(keys[3], 99), Submitted::Duplicate);
-        // Resolver threads drain the queue with at most SPEC_RESOLVERS
-        // running; every request is served exactly once, in arrival order.
         let running = std::sync::Arc::new(AtomicUsize::new(0));
         let peak = std::sync::Arc::new(AtomicUsize::new(0));
         let served = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -4089,9 +3368,7 @@ mod tests {
         served.sort_unstable();
         assert_eq!(served, (0..20).collect::<Vec<_>>());
         assert!(peak.load(Ordering::SeqCst) <= SPEC_RESOLVERS);
-        // Drained: the same attempt may ask again, and threads were counted out.
         assert_eq!(desk.submit(keys[3], 3), Submitted::Start);
-        // Per-worker bound: no more waiting than it may hold.
         let desk = SpecDesk::<()>::new();
         for _ in 0..dispatch::MAX_HELD_ATTEMPTS {
             assert_ne!(desk.submit((worker, AttemptId::new()), ()), Submitted::Full);
