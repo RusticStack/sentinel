@@ -86,6 +86,8 @@ fn teardown_removes_the_container_even_when_its_stop_fails() {
             cpu_millis: 1_000,
             memory_bytes: 1 << 30,
             pids: 64,
+            disk_bytes: 0,
+            lifetime_secs: 0,
         },
         workspace.path(),
         &[],

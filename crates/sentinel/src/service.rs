@@ -42,6 +42,10 @@ fn trusted_proxy_valid(_: &str) -> bool {
 /// Bounded drains at shutdown: sessions and dispatcher, then the store.
 const LINK_SHUTDOWN: Duration = Duration::from_secs(2);
 const STORE_SHUTDOWN: Duration = Duration::from_secs(5);
+/// How long a worker's shutdown waits for its attempts to be torn down
+/// (container removal is bounded at 10 s by the runtime helper).
+#[cfg(feature = "worker")]
+const WORKER_SHUTDOWN: Duration = Duration::from_secs(20);
 
 pub struct Error {
     pub code: u8,
@@ -1087,6 +1091,31 @@ fn bootstrap_work<T: Send + 'static>(
         .map_err(|error| Error::runtime(error.to_string()))
 }
 
+/// Create the data directory owner-only (`0700`, whatever the umask): it
+/// holds the sealing key, the TLS identity, spools and checkouts. A
+/// directory that already exists keeps its mode — an operator may have
+/// chosen it — but one open to group or others is reported once, without
+/// echoing anything from the configuration.
+fn create_data_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+            tracing::warn!(
+                event = "data_dir_permissive",
+                "the data directory is open to other accounts; restrict it to its owner (chmod 700)"
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(path)
+}
+
 /// The sealing key, always `<data_dir>/master.key` (the path `admin key`
 /// writes). Absent is fine only while the database holds no sealed value;
 /// otherwise, or when the key does not open this database's newest sealed
@@ -1139,21 +1168,23 @@ fn identity(data_dir: &Path, stem: &str) -> Result<sentinel_link::identity::Iden
         data_dir.join(format!("{stem}.crt")),
         data_dir.join(format!("{stem}.key")),
     );
-    if cert.exists() || key.exists() {
-        return sentinel_link::identity::Identity::load(&cert, &key)
-            .map_err(|error| Error::runtime(format!("cannot load {stem} identity: {error}")));
+    use sentinel_link::identity::Origin;
+    let (identity, origin) = sentinel_link::identity::Identity::load_or_generate(stem, &cert, &key)
+        .map_err(|error| Error::runtime(format!("cannot load {stem} identity: {error}")))?;
+    match origin {
+        Origin::Loaded => {}
+        Origin::Generated => tracing::info!(
+            event = "identity_generated",
+            stem,
+            "{stem} identity generated"
+        ),
+        Origin::Recovered => tracing::warn!(
+            event = "identity_recovered",
+            stem,
+            "a {stem} identity file was found without its pair, so a new identity was generated; enroll its new fingerprint"
+        ),
     }
-    let generated = sentinel_link::identity::Identity::generate(stem)
-        .map_err(|error| Error::runtime(format!("cannot generate {stem} identity: {error}")))?;
-    generated
-        .save(&cert, &key)
-        .map_err(|error| Error::runtime(format!("cannot save {stem} identity: {error}")))?;
-    tracing::info!(
-        event = "identity_generated",
-        stem,
-        "{stem} identity generated"
-    );
-    Ok(generated)
+    Ok(identity)
 }
 
 /// What the running role holds until shutdown, drained in order. Constructed
@@ -1196,6 +1227,8 @@ enum Running {
         /// Shared with the link thread, which replaces it when sessions over
         /// it keep failing.
         tailcat: Option<Arc<sentinel_link::tailcat::Forward>>,
+        /// Holds the running executor, so shutdown can end its attempts.
+        metrics: Arc<crate::worker_metrics::Metrics>,
     },
 }
 
@@ -2012,6 +2045,12 @@ mod worker_role {
                     sentinel_worker::executor::Notice::CostlyCacheHit { attempt, name, costly, stats } => {
                         tracing::warn!(event = "cache_costly_hit", attempt = %attempt, cache = %name, reason = costly.as_str(), copied_bytes = stats.copied_bytes, bytes = stats.bytes, lock_wait_ns = ?stats.lock_wait_ns, clone_ns = ?stats.clone_ns, "nominal hit paid rebuild-scale restore cost (docs/cache.md)");
                     }
+                    sentinel_worker::executor::Notice::OfferRefused { attempt, free_bytes, floor_bytes } => {
+                        tracing::warn!(event = "offer_refused_low_disk", attempt = %attempt, free_bytes, floor_bytes, "the data directory's disk is below the admission floor; offers are refused until it recovers");
+                    }
+                    sentinel_worker::executor::Notice::ShutDown { ended, left, handed_back } => {
+                        tracing::info!(event = "attempts_shut_down", ended, left, handed_back);
+                    }
                     sentinel_worker::executor::Notice::Availability(snapshot) => {
                         tracing::info!(event = "availability", images_held = snapshot.images_held.len(), images_in_flight = snapshot.images_in_flight, cache_entries = snapshot.cache_entries, cache_generations = snapshot.cache_generations, cache_bytes = snapshot.cache_bytes, truncated = snapshot.truncated);
                     }
@@ -2449,6 +2488,7 @@ mod worker_role {
             handle,
             thread,
             tailcat: forward,
+            metrics,
         })
     }
 }
@@ -2469,7 +2509,7 @@ fn initialize_and_wait(
         })
         .map_err(|error| Error::runtime(format!("cannot install shutdown handler: {error}")))?;
         let data_dir = config.data_dir.clone();
-        bootstrap_work(io, move || fs::create_dir_all(data_dir))?
+        bootstrap_work(io, move || create_data_dir(&data_dir))?
             .map_err(|error| Error::runtime(format!("cannot initialize data_dir: {error}")))?;
         match &config.role {
             #[cfg(feature = "server")]
@@ -2565,7 +2605,15 @@ fn initialize_and_wait(
             handle,
             thread,
             tailcat,
+            metrics,
         } => {
+            // Attempts first, while the session is still up: running ones
+            // are stopped and their containers removed (a container would
+            // otherwise run on after this process, while the controller
+            // reallocates its capacity), waiting ones are handed back.
+            if let Some(executor) = metrics.executor.get() {
+                executor.shutdown(WORKER_SHUTDOWN);
+            }
             handle.stop();
             let joined = thread.join().is_ok();
             if let Some(forward) = tailcat {

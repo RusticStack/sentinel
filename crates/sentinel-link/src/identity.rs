@@ -11,6 +11,17 @@ use sentinel_auth::secret::Digest;
 
 use crate::{Error, Result};
 
+/// Where [`Identity::load_or_generate`]'s identity came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Read from the files a previous start saved.
+    Loaded,
+    /// Generated: there were no files.
+    Generated,
+    /// Generated after removing one file left without the other.
+    Recovered,
+}
+
 pub struct Identity {
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
@@ -51,12 +62,51 @@ impl Identity {
 
     /// Persist as two PEM files beside each other. The key file is written
     /// owner-only where the platform supports it; it is the worker's secret.
+    ///
+    /// Each file is written whole to a sibling, synced and renamed into
+    /// place, so neither is ever seen half-written. The key goes first and
+    /// the certificate last: the certificate is the commit marker, and a
+    /// crash between the two leaves a key alone, which
+    /// [`Identity::load_or_generate`] recognizes as a save that never
+    /// finished and replaces.
     pub fn save(&self, cert_path: &Path, key_path: &Path) -> Result<()> {
         let cert_pem = pem_block("CERTIFICATE", self.cert.as_ref());
         let key_pem = pem_block("PRIVATE KEY", self.key.secret_der());
-        std::fs::write(cert_path, cert_pem)?;
-        write_private(key_path, key_pem.as_bytes())?;
+        write_atomic(key_path, key_pem.as_bytes(), true)?;
+        write_atomic(cert_path, cert_pem.as_bytes(), false)?;
         Ok(())
+    }
+
+    /// Load the identity saved at these paths, or generate and save one when
+    /// there is none. Exactly one of the two files present is a first save
+    /// that a crash cut short (or a file lost since): the identity was never
+    /// handed out whole, or cannot be used any more, so the orphan is
+    /// removed and a new identity generated — [`Origin::Recovered`] says so,
+    /// because a new fingerprint has to be enrolled afresh.
+    pub fn load_or_generate(
+        name: &str,
+        cert_path: &Path,
+        key_path: &Path,
+    ) -> Result<(Identity, Origin)> {
+        let (has_cert, has_key) = (cert_path.exists(), key_path.exists());
+        if has_cert && has_key {
+            return Ok((Identity::load(cert_path, key_path)?, Origin::Loaded));
+        }
+        let origin = if has_cert || has_key {
+            for orphan in [cert_path, key_path] {
+                match std::fs::remove_file(orphan) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Origin::Recovered
+        } else {
+            Origin::Generated
+        };
+        let generated = Identity::generate(name)?;
+        generated.save(cert_path, key_path)?;
+        Ok((generated, origin))
     }
 
     pub fn load(cert_path: &Path, key_path: &Path) -> Result<Identity> {
@@ -101,21 +151,54 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::{io::Write, os::unix::fs::OpenOptionsExt};
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
+/// Write `bytes` to `path` all at once: into a sibling file created
+/// exclusively (owner-only when `private`), synced, then renamed over
+/// `path`, and the directory synced so the rename itself survives a crash.
+fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    // A leftover of a crashed save is not ours to reuse: it may have been
+    // made readable by someone else.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let written = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return written;
+    }
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -137,6 +220,69 @@ mod tests {
             "two generations are two identities"
         );
         assert!(!format!("{identity:?}").contains("PRIVATE"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sentinel-link-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_save_leaves_no_temporary_file_and_replaces_an_earlier_one() {
+        let dir = scratch("save");
+        let (cert, key) = (dir.join("worker.crt"), dir.join("worker.key"));
+        Identity::generate("w").unwrap().save(&cert, &key).unwrap();
+        let second = Identity::generate("w").unwrap();
+        second.save(&cert, &key).unwrap();
+        assert_eq!(
+            Identity::load(&cert, &key).unwrap().fingerprint(),
+            second.fingerprint()
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 2, "only the two files remain: {names:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "the key is owner-only");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A first save that stopped after one file must not wedge every later
+    /// start: the orphan is replaced, and the caller is told.
+    #[test]
+    fn a_lone_file_from_an_interrupted_save_is_replaced() {
+        for lost in ["worker.crt", "worker.key"] {
+            let dir = scratch("torn");
+            let (cert, key) = (dir.join("worker.crt"), dir.join("worker.key"));
+            Identity::generate("w").unwrap().save(&cert, &key).unwrap();
+            std::fs::remove_file(dir.join(lost)).unwrap();
+            let (identity, origin) = Identity::load_or_generate("w", &cert, &key).unwrap();
+            assert_eq!(origin, Origin::Recovered);
+            assert_eq!(
+                Identity::load(&cert, &key).unwrap().fingerprint(),
+                identity.fingerprint()
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_intact_identity_is_loaded_and_a_missing_one_is_generated() {
+        let dir = scratch("load");
+        let (cert, key) = (dir.join("worker.crt"), dir.join("worker.key"));
+        let (made, origin) = Identity::load_or_generate("w", &cert, &key).unwrap();
+        assert_eq!(origin, Origin::Generated);
+        let (again, origin) = Identity::load_or_generate("w", &cert, &key).unwrap();
+        assert_eq!(origin, Origin::Loaded);
+        assert_eq!(again.fingerprint(), made.fingerprint());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
