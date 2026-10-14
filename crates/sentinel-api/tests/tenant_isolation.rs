@@ -1329,10 +1329,11 @@ fn an_invitation_link_presented_by_two_people_at_once_joins_exactly_one() {
 fn setup_and_registration_say_the_same_thing_to_everyone() {
     let d = deployment();
     // The deployment is past first-run setup: it is closed, and says so with
-    // nothing else about the instance.
+    // nothing else about the instance (`mail_configured` is false once closed,
+    // whatever the deployment has).
     let (status, body) = send(&d.base, "GET", "/api/v1/setup", &Body::None, None, &[]);
     assert_eq!(status, 200);
-    assert_eq!(body, json!({ "open": false }));
+    assert_eq!(body, json!({ "open": false, "mail_configured": false }));
     let mut well_formed_token = String::new();
     sentinel_auth::secret::Secret::generate().expose(&mut well_formed_token);
     let (status, _) = send(
