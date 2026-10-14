@@ -26,7 +26,29 @@ use std::borrow::Cow;
 
 use sentinel_protocol::logs::Stream;
 
-pub const MIN_SECRET_BYTES: usize = 1;
+/// The shortest value [`Redactor::register`] accepts. Redaction is an exact
+/// match on bytes, so it replaces every occurrence of the value wherever it
+/// appears: a one-, two- or three-byte value is a single character or a
+/// short digit run that turns up in nearly every line of ordinary output,
+/// so registering it blanks the log without hiding the secret (a reader
+/// still sees everything around the stars) and a value that small is
+/// guessable without any log. From four bytes a chance occurrence in
+/// output the job did not copy from the secret is rare enough for exact
+/// matching to stay precise. The rule is a length, not an entropy test: the
+/// secret's own policy (its minimum length at creation) is what keeps real
+/// credentials above it. Lines of a longer multi-line value are not held to
+/// the floor ([`carries_material`] decides those).
+pub const MIN_SECRET_BYTES: usize = 4;
+/// The longest value whose base64 and percent-encoded forms are registered
+/// beside it: a value of a few KiB (a key, a token, a certificate) costs a
+/// handful of extra patterns built once at registration, while a very large
+/// one would multiply its size in both automata. Past it only the value
+/// itself and its JSON escapings are matched.
+pub const MAX_ENCODED_SOURCE_BYTES: usize = 16 * 1024;
+/// The shortest base64 fragment registered for a value at a shifted
+/// alignment (see [`base64_fragments`]): a fragment of a handful of
+/// characters would match in unrelated base64 text by chance.
+const MIN_FRAGMENT_BYTES: usize = 8;
 pub const REPLACEMENT: &[u8] = b"***";
 /// Characters a diagnostic excerpt keeps: the verdict detail and the stored
 /// summary are bounded, whatever a step printed.
@@ -196,12 +218,34 @@ impl Redactor {
     /// each of its lines that [`carries_material`] is registered as well,
     /// raw and escaped, whatever its length. All of this is paid once here;
     /// the per-byte scan stays O(output).
+    ///
+    /// A value shorter than [`MIN_SECRET_BYTES`] is refused (`false`): see
+    /// that constant for the rule. A value of at most
+    /// [`MAX_ENCODED_SOURCE_BYTES`] is registered in its base64 and
+    /// percent-encoded forms too (see [`base64_fragments`] and
+    /// [`percent_encodings`] for what exactly is covered).
     pub fn register(&mut self, secret: &[u8]) -> bool {
-        if secret.is_empty() {
+        if secret.len() < MIN_SECRET_BYTES {
             return false;
         }
         if self.secrets.iter().any(|known| known.as_slice() == secret) {
             return true;
+        }
+        self.register_exact(secret);
+        if secret.len() <= MAX_ENCODED_SOURCE_BYTES {
+            base64_fragments(secret, |fragment| self.insert(fragment));
+            percent_encodings(secret, |encoded| self.insert(encoded));
+        }
+        true
+    }
+
+    /// The value as it is, its JSON escapings and (when it has several
+    /// lines) its lines — no floor, no derived encodings. What
+    /// [`Redactor::excerpt`] uses to rebuild a redactor from values that
+    /// were already expanded.
+    fn register_exact(&mut self, secret: &[u8]) {
+        if secret.is_empty() {
+            return;
         }
         self.insert(secret);
         json_escapings(secret, |escaped| self.insert(escaped));
@@ -218,7 +262,6 @@ impl Redactor {
             stale.reversed.wipe();
             stale.forward.wipe();
         }
-        true
     }
 
     /// Duplicates are removed (and wiped) when the matcher is next built,
@@ -314,10 +357,12 @@ impl Redactor {
             return excerpt(tail);
         }
         let mut lines = Redactor::new();
+        // `self.secrets` already holds every derived form; each is only
+        // split into lines here, never expanded again.
         for secret in &self.secrets {
-            lines.register(secret);
+            lines.register_exact(secret);
             for line in secret.split(|b| matches!(*b, b'\n' | b'\r')) {
-                lines.register(line);
+                lines.register_exact(line);
             }
         }
         let mut redacted = lines.redact_all(tail);
@@ -456,6 +501,103 @@ pub fn excerpt(bytes: &[u8]) -> String {
 fn carries_material(line: &[u8]) -> bool {
     line.iter()
         .any(|byte| !(byte.is_ascii_punctuation() || byte.is_ascii_whitespace()))
+}
+
+/// Call `each` with the base64 forms a tool is likely to print `value` in,
+/// in both the standard and the URL-safe alphabet, unpadded (a padded form
+/// then matches up to its `=`).
+///
+/// A value rarely appears as a base64 string of its own: HTTP Basic
+/// authorization encodes `user:secret`, a config file base64s a whole
+/// document. What base64 produces for the value depends on where it falls
+/// in the 3-byte groups, so the three alignments are each registered as the
+/// characters that depend on the value alone: the leading characters that
+/// mix in the unknown preceding byte(s) and the trailing character that
+/// mixes in the unknown following one are dropped. A fragment of fewer than
+/// [`MIN_FRAGMENT_BYTES`] characters is skipped. Everything is derived once
+/// at registration; the scan never encodes anything. Not covered: base64
+/// of a transformed value (hashed, compressed, re-encoded twice) or split
+/// across lines by a wrapping encoder, which no exact match can recognize.
+fn base64_fragments(value: &[u8], mut each: impl FnMut(&[u8])) {
+    const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut input = Vec::with_capacity(value.len() + 2);
+    let mut encoded = Vec::with_capacity((value.len() + 2).div_ceil(3) * 4);
+    for (url, table) in [(false, STD), (true, URL)] {
+        for shift in 0..3usize {
+            input.clear();
+            input.resize(shift, 0);
+            input.extend_from_slice(value);
+            encoded.clear();
+            for group in input.chunks(3) {
+                let n = group.iter().fold(0u32, |acc, b| (acc << 8) | u32::from(*b))
+                    << (8 * (3 - group.len()));
+                // A group of 1 or 2 bytes yields 2 or 3 characters.
+                for i in 0..=group.len() {
+                    encoded.push(table[((n >> (18 - 6 * i)) & 63) as usize]);
+                }
+            }
+            // Characters mixing in the filler before the value, and the
+            // last one of an incomplete group, which mixes in what follows.
+            let lead = [0, 2, 3][shift];
+            let complete = (shift + value.len()).is_multiple_of(3);
+            // The value as a string of its own (shift 0) keeps every
+            // character; the same, without its last, is what it looks like
+            // with more following it.
+            let trims: &[usize] = match (shift, complete) {
+                (0, false) => &[0, 1],
+                (0, true) | (_, true) => &[0],
+                (_, false) => &[1],
+            };
+            for &trim in trims {
+                let end = encoded.len() - trim;
+                let fragment = &encoded[lead.min(end)..end];
+                // The two alphabets differ only in two characters.
+                let distinct = !url || fragment.iter().any(|b| matches!(b, b'-' | b'_'));
+                // The whole value on its own is as long as the value
+                // warrants; any cut-down fragment must clear the floor.
+                let standalone = shift == 0 && trim == 0;
+                if distinct && (standalone || fragment.len() >= MIN_FRAGMENT_BYTES) {
+                    each(fragment);
+                }
+            }
+        }
+    }
+    input.fill(0);
+    encoded.fill(0);
+    core::hint::black_box((&mut input, &mut encoded));
+}
+
+/// Call `each` with the percent-encoded forms of `value` that differ from
+/// it: RFC 3986 (everything outside the unreserved set `A-Z a-z 0-9 - . _ ~`
+/// as `%XX`) with upper- and lower-case hex digits, and the
+/// `application/x-www-form-urlencoded` form (a space as `+`). What a URL,
+/// a query string or a form body carries a value as.
+fn percent_encodings(value: &[u8], mut each: impl FnMut(&[u8])) {
+    let unreserved = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
+    if value.iter().all(|b| unreserved(*b)) {
+        return;
+    }
+    for (hex, form) in [
+        (b"0123456789ABCDEF", false),
+        (b"0123456789abcdef", false),
+        (b"0123456789ABCDEF", true),
+    ] {
+        let mut out = Vec::with_capacity(value.len() * 3);
+        for &byte in value {
+            if unreserved(byte) {
+                out.push(byte);
+            } else if form && byte == b' ' {
+                out.push(b'+');
+            } else {
+                out.push(b'%');
+                out.push(hex[usize::from(byte >> 4)]);
+                out.push(hex[usize::from(byte & 15)]);
+            }
+        }
+        each(&out);
+        out.fill(0);
+    }
 }
 
 /// Call `each` with every distinct JSON string escaping of `value` that
@@ -899,5 +1041,93 @@ mod tests {
         // Nothing registered, nothing wrapped: the plain excerpt.
         assert_eq!(Redactor::new().excerpt(b"a\nlast\n\n", false), "last");
         assert_eq!(Redactor::new().excerpt(b"", false), "no diagnostic output");
+    }
+
+    /// A value too short to be told from ordinary output is refused, so a
+    /// one-byte secret cannot blank every occurrence of that byte.
+    #[test]
+    fn a_value_below_the_floor_is_refused_and_blanks_nothing() {
+        let mut r = Redactor::new();
+        assert!(!r.register(b""));
+        assert!(!r.register(b"a"));
+        assert!(!r.register(b"abc"));
+        assert!(r.is_empty());
+        assert_eq!(
+            run(&mut r, &[b"a b c abc abcd"]),
+            b"a b c abc abcd".to_vec()
+        );
+        assert!(r.register(b"abcd"));
+        assert_eq!(run(&mut r, &[b"a abc abcd"]), b"a abc ***".to_vec());
+    }
+
+    /// The value as base64 of its own, standard or URL-safe, padded or not.
+    #[test]
+    fn a_secret_printed_as_base64_is_redacted() {
+        let mut r = Redactor::new();
+        assert!(r.register(b"s3cr3t-value!"));
+        // Padded: only the padding stays.
+        assert_eq!(
+            run(&mut r, &[b"token=czNjcjN0LXZhbHVlIQ==\n"]),
+            b"token=***==\n".to_vec()
+        );
+        // Bytes whose encodings differ between the two alphabets.
+        let mut r = Redactor::new();
+        assert!(r.register(b"\xfb\xff\xfe\xfa\xfbxyz!"));
+        assert_eq!(run(&mut r, &[b"std +//++vt4eXoh."]), b"std ***.".to_vec());
+        assert_eq!(run(&mut r, &[b"url -__--vt4eXoh."]), b"url ***.".to_vec());
+    }
+
+    /// `user:secret` in a Basic header, a secret deep inside an encoded
+    /// document: whichever of the three alignments the value falls on, the
+    /// characters that depend on the value alone are caught; only the ones
+    /// that mix in its neighbours stay.
+    #[test]
+    fn a_secret_inside_a_larger_base64_string_is_redacted_at_every_alignment() {
+        let mut r = Redactor::new();
+        assert!(r.register(b"s3cr3t-value!"));
+        for (haystack, expected) in [
+            // "" + value + "-tail"
+            ("czNjcjN0LXZhbHVlIS10YWls", "***S10YWls"),
+            // "u" + value + "-tail"
+            ("dXMzY3IzdC12YWx1ZSEtdGFpbA==", "dX***EtdGFpbA=="),
+            // "us" + value + "-tail"
+            ("dXNzM2NyM3QtdmFsdWUhLXRhaWw=", "dXN***LXRhaWw="),
+            // "usr:" + value + "-tail"
+            ("dXNyOnMzY3IzdC12YWx1ZSEtdGFpbA==", "dXNyOn***EtdGFpbA=="),
+        ] {
+            assert_eq!(
+                run(&mut r, &[haystack.as_bytes()]),
+                expected.as_bytes(),
+                "{haystack}"
+            );
+        }
+    }
+
+    /// What a URL or a form body carries a value as.
+    #[test]
+    fn a_secret_printed_percent_encoded_is_redacted() {
+        let mut r = Redactor::new();
+        assert!(r.register(b"p@ss word/1+2"));
+        assert_eq!(
+            run(
+                &mut r,
+                &[b"q=p%40ss%20word%2F1%2B2&r=p%40ss+word%2F1%2B2&s=p%40ss%20word%2f1%2b2"]
+            ),
+            b"q=***&r=***&s=***".to_vec()
+        );
+    }
+
+    /// Encodings are derived for values up to the cap only: past it a
+    /// value's base64 would multiply its size in both automata.
+    #[test]
+    fn encodings_are_derived_up_to_the_cap_only() {
+        let encoded = |len: usize| -> Vec<u8> { b"YWFh".repeat(len / 3) };
+        let mut within = Redactor::new();
+        assert!(within.register(&vec![b'a'; 3000]));
+        assert_eq!(run(&mut within, &[&encoded(3000)]), REPLACEMENT);
+        let over = MAX_ENCODED_SOURCE_BYTES + 3;
+        let mut beyond = Redactor::new();
+        assert!(beyond.register(&vec![b'a'; over]));
+        assert_eq!(run(&mut beyond, &[&encoded(over)]), encoded(over));
     }
 }
