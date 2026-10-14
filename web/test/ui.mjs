@@ -363,12 +363,19 @@ await scenario("keyboard", async () => {
   await page.key("ArrowDown");
   check("log: arrow keys scroll by line", (await page.eval("document.querySelector('#log-view').scrollTop")) === 2 * lineH);
   await page.key("End");
-  // End may reveal the step's status row and grow the list by a row, and a
-  // niced, busy host renders the newly visible rows late: the key keeps
-  // working until the view rests at the bottom, for up to 3 s.
+  // End may reveal the step's status row and grow the list by a row, the
+  // list re-measures the rows it has just drawn, and a niced, busy host
+  // renders them late: the key keeps working until the view has rested at
+  // the bottom for three samples in a row (0.3 s), for up to 4 s. One
+  // sample is not enough: a re-measure can move the end just after it.
   const atEnd = "(() => { const v = document.querySelector('#log-view'); return v.scrollTop + v.clientHeight >= v.scrollHeight - 1; })()";
-  for (let i = 0; i < 30 && !(await page.eval(atEnd)); i++) { await sleep(100); await page.key("End"); }
-  check("log: End reaches the end", await page.eval(atEnd),
+  let rested = 0;
+  for (let i = 0; i < 40 && rested < 3; i++) {
+    if (await page.eval(atEnd)) rested++;
+    else { rested = 0; await page.key("End"); }
+    await sleep(100);
+  }
+  check("log: End reaches the end", rested >= 3,
     await page.eval("(() => { const v = document.querySelector('#log-view'); return { top: v.scrollTop, client: v.clientHeight, height: v.scrollHeight, rows: document.querySelectorAll('.log-row').length }; })()"));
   await page.key("Home");
   check("log: Home returns to the start", (await page.eval("document.querySelector('#log-view').scrollTop")) === 0);
