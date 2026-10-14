@@ -49,7 +49,7 @@ pub enum TenantCreation {
     /// Only a super admin, for organizations and personal namespaces alike.
     SuperAdminOnly = 0,
     /// An approved account may create its own personal namespace (one each,
-    /// enforced by the schema). Organizations remain a platform decision.
+    /// enforced by the schema) and its own organizations, within quotas.
     ApprovedUsers = 1,
 }
 

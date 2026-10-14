@@ -105,6 +105,15 @@ Both processes currently initialize their directories and wait for shutdown. The
 
 For file-based configuration, copy the appropriate [server](../examples/server.toml) or [worker](../examples/worker.toml) example into `.local/` and supply `--config .local/server.toml` or `--config .local/worker.toml`. Create `.local/` first and set an absolute writable `data_dir`, or override it on the command line. See [configuration](configuration.md) for precedence, size limits, and exit codes.
 
+### Operator first run
+
+A fresh controller has no administrator. Pick one way to create the first:
+
+1. **Web wizard (no shell for the person doing it).** Start the controller (`cargo dev-server --data-dir "$PWD/data/controller"`). Its console prints one `setup_required` line with a token, and the same token is in `data/controller/setup-token` (mode `0600`). Open the web interface, which shows the wizard while setup is open, paste the token, and choose the administrator's address and password, the registration policy (`invite-only` is the default; `approval-required` lets anyone apply; `closed` admits nobody new), whether approved users may create organizations, the instance name and base URL, optionally a first organization, and optionally test an SMTP relay (a failed test blocks nothing). The token lives an hour and a restart issues a new one; five wrong guesses lock setup for five minutes.
+2. **CLI.** `printf '%s' "$PASSWORD" | sentinel admin bootstrap --data-dir … --username root`. It closes the same latch and invalidates any open wizard token.
+
+Either way the administrator can then enroll a second factor from the account page, invite people by address, and (under `approved-users`) let approved accounts create their own organizations. [Admission](admission.md#first-run-setup) describes the guarantees; [configuration](configuration.md#first-run-setup-without-a-shell) the files and log line.
+
 ### Where tests run
 
 Every test — a single test binary, the full `test-*` suites, the web browser test and benchmarks — runs on the verification VPS, never on a workstation or in WSL (the owner's decision of 2026-09-27: local runs exhaust memory and wear the disk). The host, user and SSH key are in the git-ignored `.env` at the repository root; [`.env.example`](../.env.example) names the variables. Local work stops at `cargo fmt`, `cargo check`/`cargo lint` and `pnpm -C web typecheck`. The web interface's pure guard tests (`pnpm -C web test:unit`, Node's own runner, no browser) also run on the VPS only.
