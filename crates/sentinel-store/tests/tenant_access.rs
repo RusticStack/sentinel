@@ -1,9 +1,4 @@
-//! Changing who can reach a tenant's data from a client route: a platform
-//! administrator carries no ambient data access, so granting it to themselves
-//! (or anyone) without being an administrator of the tenant needs fresh
-//! step-up and an audited reason; naming a person resolves a sign-in name only
-//! among the tenant's members, so the route is no oracle for which accounts
-//! exist.
+//! A platform administrator has no ambient data access: granting it needs fresh step-up and an audited reason.
 
 use sentinel_core::{
     RepoId, TenantId, UnixMillis, UserId,
@@ -52,9 +47,6 @@ fn unstepped(user: UserId, platform: bool) -> Authority {
     Authority::credential(principal(user, platform))
 }
 
-/// `root` is a super admin who is not a member of `acme`; `admin` administers
-/// it; `dev` is a member; `stranger` has an account but no membership. Local
-/// sign-in names exist for `dev` and `stranger`.
 fn fixture() -> (tempfile::TempDir, Store, Ids) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap();
@@ -145,7 +137,6 @@ fn a_tenant_administrator_changes_membership_without_a_proof_or_a_reason() {
     )
     .unwrap();
     grant(&store, i, unstepped(i.admin, false), i.dev, None).unwrap();
-    // A member who does not administer the tenant is refused as before.
     assert!(matches!(
         set_member(
             &store,
@@ -162,7 +153,6 @@ fn a_tenant_administrator_changes_membership_without_a_proof_or_a_reason() {
 #[test]
 fn a_platform_administrator_cannot_grant_themselves_access_without_proof_and_reason() {
     let (_dir, store, i) = fixture();
-    // Not stepped up: asked for a proof, whatever the reason.
     for reason in [None, Some("incident 7")] {
         assert!(matches!(
             set_member(
@@ -180,7 +170,6 @@ fn a_platform_administrator_cannot_grant_themselves_access_without_proof_and_rea
             Err(Error::StepUpRequired)
         ));
     }
-    // Stepped up but no reason, or an empty or oversized one: refused.
     let long = "x".repeat(101);
     for reason in [None, Some(""), Some(long.as_str())] {
         assert!(matches!(
@@ -195,7 +184,6 @@ fn a_platform_administrator_cannot_grant_themselves_access_without_proof_and_rea
             Err(Error::InvalidInput("reason"))
         ));
     }
-    // Nothing changed.
     let member: bool = store
         .read(|c| {
             Ok(c.query_row(
@@ -228,9 +216,7 @@ fn an_accepted_override_is_audited_with_its_reason_and_fails_closed_for_host_loc
     assert_eq!(audit[2].event, Event::PlatformOverride);
     assert_eq!(audit[2].actor, Some(i.root));
     assert_eq!(audit[2].detail.as_deref(), Some("incident 7"));
-    // Now an administrator-member, root needs neither proof nor reason here.
     grant(&store, i, unstepped(i.root, true), i.root, None).unwrap();
-    // A host-local authority has no principal to attribute: refused.
     assert!(matches!(
         set_member(&store, i, Authority::HostLocal, i.dev, Role::Reader, None),
         Err(Error::Forbidden)
@@ -242,10 +228,8 @@ fn sign_in_names_resolve_only_among_the_tenants_members() {
     let (_dir, store, i) = fixture();
     let resolve = |text: &str| store.read(|c| auth::resolve_member(c, i.tenant, text));
     assert_eq!(resolve("dev").unwrap(), i.dev);
-    // A real account outside the tenant and a name nobody has are the same.
     assert!(matches!(resolve("stranger"), Err(Error::NotFound)));
     assert!(matches!(resolve("nobody"), Err(Error::NotFound)));
-    // An id is taken as given: adding a new member needs the person's id.
     assert_eq!(resolve(&i.stranger.to_string()).unwrap(), i.stranger);
     set_member(
         &store,
@@ -269,7 +253,6 @@ fn adding_a_non_member_is_audited_apart_from_changing_a_member() {
     assert_eq!(audit[1].event, Event::MemberAdded);
     assert_eq!(audit[1].actor, Some(i.admin));
     assert_eq!(audit[1].subject, Some(i.stranger));
-    // Changing the role of an existing member is not an addition.
     set_member(&store, i, admin, i.stranger, Role::Operator, None).unwrap();
     let audit = store.read(|c| local_auth::recent_audit(c, 2)).unwrap();
     assert_eq!(audit[0].event, Event::MembershipSet);

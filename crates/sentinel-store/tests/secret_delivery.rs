@@ -38,8 +38,6 @@ fn fixture() -> Fixture {
     fixture_at(10)
 }
 
-/// The fixture with its worker enrolled at `protocol`, still advertising
-/// the secret-delivery capability bit.
 fn fixture_at(protocol: u16) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("master.key");
@@ -106,8 +104,6 @@ fn fixture_at(protocol: u16) -> Fixture {
                     Capacity {
                         cpu_millis: 4_000,
                         memory_bytes: 8 << 30,
-                        // A profile-protocol worker states the scratch disk it
-                        // offers, and zero means none (docs/compatibility.md).
                         disk_bytes: 1 << 40,
                     },
                 )?;
@@ -168,13 +164,10 @@ fn fixture_at(protocol: u16) -> Fixture {
     }
 }
 
-/// A run as intake records it: a push whose pipeline came from the bound
-/// repository, the only provenance that may receive secrets.
 fn create_run(f: &Fixture, now: UnixMillis) -> (RunId, sentinel_core::JobId) {
     create_run_as(f, now, Some("push"))
 }
 
-/// A run with the given recorded trigger; `None` records no provenance.
 fn create_run_as(
     f: &Fixture,
     now: UnixMillis,
@@ -294,8 +287,7 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
     let first = next_offer(&f, UnixMillis(2_100));
     assert_eq!(first.job, job);
 
-    // A worker cannot fetch any secret until its lease acknowledgement is
-    // durable, even though the offer already names this worker and fence.
+    // A worker cannot fetch any secret until its lease acknowledgement is durable.
     assert!(matches!(
         f.store.writer().write({
             let key = f.key.clone();
@@ -317,9 +309,6 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
     assert_eq!(first_bundle.values[2].expose(), b"certificate-v1");
     finish(&f, &first);
 
-    // Reruns keep the immutable run spec but resolve each authorized name
-    // again. They use the current active version, not the earlier attempt's
-    // version; revoked current versions fail closed.
     let admin = Principal::new(f.root, Permissions::ALL, None, None);
     let (tenant, repo) = (f.tenant, f.repo);
     f.store
@@ -396,10 +385,6 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
         }),
         Err(Error::NotFound)
     ));
-    // Through `deliver`, the refusal itself is audited (one `use`
-    // row with result `missing`, the attempt, step and version), while the
-    // refused preparation's own `use` rows (OCI_AUTH resolved before TOKEN
-    // failed) are rolled back.
     assert!(matches!(
         secrets::deliver(
             &f.store,
@@ -452,7 +437,6 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
         })
         .unwrap();
     assert_eq!(ok_uses, 3, "a refused preparation leaves no use row");
-    // The audit is append-only.
     for sql in [
         "UPDATE secret_audit SET result='ok'",
         "DELETE FROM secret_audit",
@@ -513,9 +497,6 @@ fn preparation_is_acknowledgement_fenced_and_reruns_use_current_versions() {
     );
 }
 
-/// The capability bit alone does not make a worker able to receive
-/// secrets — a session that sets it on protocol 9 is never placed a job
-/// that needs them (it could only fail it).
 #[test]
 fn a_secret_job_is_never_placed_on_a_worker_below_protocol_10() {
     let f = fixture_at(9);
@@ -535,13 +516,11 @@ fn a_secret_job_is_never_placed_on_a_worker_below_protocol_10() {
         })
         .unwrap();
     assert!(offer.is_none(), "placed on a protocol-9 worker");
-    // The same job on a protocol-10 worker is placed.
     let f = fixture();
     create_run(&f, UnixMillis(2_000));
     next_offer(&f, UnixMillis(2_100));
 }
 
-/// The attempt's `use` audit results, in order.
 fn use_audit(f: &Fixture, attempt: sentinel_core::AttemptId) -> Vec<(String, String)> {
     f.store
         .read(|conn| {
@@ -557,8 +536,6 @@ fn use_audit(f: &Fixture, attempt: sentinel_core::AttemptId) -> Vec<(String, Str
         .unwrap()
 }
 
-/// The controller's refusal path: the delivery fails (and audits the
-/// refused use), then the refusal is explained for the failure detail.
 fn refuse(f: &Fixture, offer: &dispatch::Offer) -> Option<secrets::Refusal> {
     let (worker, attempt) = (f.worker, offer.attempt);
     let delivered = secrets::deliver(&f.store, f.key.clone(), worker, attempt, UnixMillis(2_135));
@@ -571,12 +548,8 @@ fn refuse(f: &Fixture, offer: &dispatch::Offer) -> Option<secrets::Refusal> {
     refusal
 }
 
-/// A declared secret that cannot be delivered is explained by
-/// name and reason — never by value — and the refused use is audited
-/// exactly once (by the delivery), not again by the explanation.
 #[test]
 fn a_refused_delivery_is_explained_and_audited() {
-    // Revoked current version.
     let f = fixture();
     let admin = Principal::new(f.root, Permissions::ALL, None, None);
     create_run(&f, UnixMillis(2_000));
@@ -597,7 +570,6 @@ fn a_refused_delivery_is_explained_and_audited() {
         [("TOKEN".to_owned(), "missing".to_owned())]
     );
 
-    // Unbound: the binding is gone; the refused use is recorded by name.
     let f = fixture();
     let admin = Principal::new(f.root, Permissions::ALL, None, None);
     create_run(&f, UnixMillis(2_000));
@@ -615,7 +587,6 @@ fn a_refused_delivery_is_explained_and_audited() {
         [("CERT".to_owned(), "missing".to_owned())]
     );
 
-    // Everything resolvable: nothing to explain, and only delivered uses.
     let f = fixture();
     create_run(&f, UnixMillis(2_000));
     let offer = next_offer(&f, UnixMillis(2_100));
@@ -626,10 +597,6 @@ fn a_refused_delivery_is_explained_and_audited() {
     assert!(audit.iter().all(|(_, result)| result == "ok"), "{audit:?}");
 }
 
-/// A caller-authored pipeline holds a `run` grant, not the right to read the
-/// repository's secrets: bindings match any job and step, so a manual run
-/// (or one with no recorded provenance) is refused every declared secret,
-/// the refusal is audited as `denied` and explained without a value.
 #[test]
 fn manual_and_unclassified_runs_never_receive_secrets() {
     for trigger in [Some("manual"), None] {
