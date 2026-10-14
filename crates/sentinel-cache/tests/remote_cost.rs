@@ -1,4 +1,4 @@
-//! Measurement, not a check (P08-C8): what the worker side of one remote
+//! Measurement, not a check: what the worker side of one remote
 //! cache transfer costs — wall time and the bytes it moves through
 //! `read`/`write` syscalls (`/proc/self/io` `rchar`/`wchar`) — for a
 //! hydration (fetch, install, materialize into the job's view) and for an

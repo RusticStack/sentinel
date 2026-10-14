@@ -1,7 +1,7 @@
-//! Publication behavior (K03): sealed generations, the atomic `current`
-//! swap, the single-writer bound, cancellation and the trust boundary —
-//! exercised through `commit` with synthetic `Attached` carriers, the
-//! same shape K02's restore fills.
+//! Publication behavior: sealed generations, the atomic `current` swap, the
+//! single-writer bound, cancellation and the trust boundary — exercised
+//! through `commit` with synthetic `Attached` carriers, the same shape
+//! restore fills.
 
 use std::{
     fs,
@@ -538,7 +538,7 @@ fn unsupported_entries_are_skipped_not_followed() {
     assert_eq!(files, 1, "only the regular file may be staged");
 }
 
-/// K07: an executable staged into the payload must keep its exec bit —
+/// An executable staged into the payload must keep its exec bit —
 /// restore re-applies the payload file's own mode, so a 0666&umask
 /// staging would degrade every cached tool binary to Permission denied.
 #[test]
@@ -580,8 +580,6 @@ fn sealed_payload_files_carry_the_recorded_mode() {
     );
 }
 
-// ——— P07-1 / P07-5 / P07-9: confined, bounded, refusal-aware publish ———
-
 /// A restore-shaped carrier over a real workspace: the targets are what
 /// `restore` resolved (anchored at the workspace), so publish sees exactly
 /// what finalization hands it.
@@ -615,7 +613,7 @@ fn listed(root: &Path, a: &Attached, generation: &str) -> Vec<String> {
     blob.entries.into_iter().map(|e| e.path).collect()
 }
 
-/// P07-1: a job that swaps an intermediate component of a declared path
+/// A job that swaps an intermediate component of a declared path
 /// for a symlink to a host directory must not seal that directory — for a
 /// relative declaration and for an absolute one (whose private view lives
 /// under `.sentinel-cache/` inside the workspace).
@@ -654,7 +652,7 @@ fn publish_refuses_a_symlinked_intermediate_component() {
     assert!(current_gen(&entry_of(&root, &a)).is_none());
 }
 
-/// P07-1/P07-9: a symlink the checkout itself carries above a declared
+/// A symlink the checkout itself carries above a declared
 /// path makes restore refuse the entry (`invalid`); publication of a
 /// refused entry is a `refused` skip — the path is never walked.
 #[cfg(unix)]
@@ -677,7 +675,7 @@ fn publish_skips_an_entry_restore_refused() {
     assert!(!entry_of(&root, &a).exists(), "nothing was created");
 }
 
-/// P07-9: an entry whose key never rendered (`""`) could never serve — it
+/// An entry whose key never rendered (`""`) could never serve — it
 /// publishes nothing instead of a permanent unservable `current`; neither
 /// does an entry restore answered `invalid`.
 #[test]
@@ -701,7 +699,7 @@ fn an_unrendered_key_publishes_nothing() {
     assert_eq!(SkipReason::Refused.as_str(), "refused");
 }
 
-/// P07-1: a file swapped for a symlink between the plan and the copy is
+/// A file swapped for a symlink between the plan and the copy is
 /// never opened — the stage reopens every file beneath its confined base
 /// with `O_NOFOLLOW`, so the swap stages nothing of the link's target.
 #[cfg(unix)]
@@ -751,7 +749,7 @@ fn publish_opens_files_nofollow() {
     assert_eq!(listed(&root, &a, &generation), ["payload/0/keep"]);
 }
 
-/// P07-5: a generation whose logical payload exceeds the per-generation
+/// A generation whose logical payload exceeds the per-generation
 /// cap is refused before a byte is staged — a sparse file claiming
 /// terabytes costs a stat, not a copy.
 #[cfg(target_os = "linux")]
@@ -785,7 +783,7 @@ fn publish_refuses_a_generation_over_the_byte_cap() {
     );
 }
 
-/// P07-5: a sparse file within the cap is staged hole-for-hole: the sealed
+/// A sparse file within the cap is staged hole-for-hole: the sealed
 /// copy allocates about what the source allocates, not its logical size,
 /// and its recorded digest is still of the full logical content.
 #[cfg(target_os = "linux")]
