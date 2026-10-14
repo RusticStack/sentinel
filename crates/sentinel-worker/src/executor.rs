@@ -210,6 +210,15 @@ fn valid_delivery(
     if !bundle.valid() {
         return false;
     }
+    // A value the redactor refuses (shorter than MIN_SECRET_BYTES) must not
+    // reach a job unredacted: the attempt fails as Preparation instead.
+    if bundle
+        .values
+        .iter()
+        .any(|value| value.expose().len() < crate::redact::MIN_SECRET_BYTES)
+    {
+        return false;
+    }
     let mut expected = HashSet::with_capacity(
         job.steps
             .iter()
@@ -331,6 +340,8 @@ mod secret_delivery_tests {
         let auth = br#"{"auths":{"ghcr.io":{"auth":"dG9rZW4="}}}"#;
         assert!(valid_delivery(&spec, 0, &bundle(b"token", auth, true)));
         assert!(!valid_delivery(&spec, 0, &bundle(b"token", auth, false)));
+        // A value the redactor would refuse is never delivered.
+        assert!(!valid_delivery(&spec, 0, &bundle(b"123", auth, true)));
         assert!(!valid_delivery(
             &spec,
             0,

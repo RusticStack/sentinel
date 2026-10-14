@@ -34,9 +34,10 @@ use sentinel_protocol::logs::Stream;
 /// still sees everything around the stars) and a value that small is
 /// guessable without any log. From four bytes a chance occurrence in
 /// output the job did not copy from the secret is rare enough for exact
-/// matching to stay precise. The rule is a length, not an entropy test: the
-/// secret's own policy (its minimum length at creation) is what keeps real
-/// credentials above it. Lines of a longer multi-line value are not held to
+/// matching to stay precise. The rule is a length, not an entropy test. The
+/// secret store accepts values from one byte, so the floor is enforced at
+/// delivery: a bound value below it fails the attempt as `Preparation`
+/// rather than reaching a job that could print it unredacted. Lines of a longer multi-line value are not held to
 /// the floor ([`carries_material`] decides those).
 pub const MIN_SECRET_BYTES: usize = 4;
 /// The longest value whose base64 and percent-encoded forms are registered
