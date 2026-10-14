@@ -1,6 +1,6 @@
-# Lockwell CI baseline (F06)
+# Lockwell CI baseline
 
-Measured 2026-09-13. This records what the current GitHub Actions setup actually does on the hardware Sentinel must beat. Numbers are from the raw records committed under [`bench/`](../bench/); nothing here is a Sentinel result.
+Measured 2026-09-13. This records what Lockwell's GitHub Actions setup does on the hardware Sentinel must beat. Numbers are from the raw records committed under [`bench/`](../bench/); nothing here is a Sentinel result.
 
 ## Physical topology behind the runner names
 
@@ -70,8 +70,8 @@ Two concurrent lanes cost little extra wall time, but throttling rose from 8 s t
 
 - The ~600 s median is not one slow thing. It is three ~250 s lanes whose length is set by a few wait-heavy packages, plus compile cache misses of 35–45 s, plus queue and contention tails.
 - Sentinel-side wins available without touching tests: persistent per-toolchain `GOCACHE` (removes 36–44 s per lane on a miss), pre-extracted images and toolchains (removes Setup Node/Go steps), immediate dispatch, and per-job CPU reservations so ten jobs do not oversubscribe ten cores.
-- Repository-side work is unavoidable for the last factor: `internal/web` under race (193 s) and `internal/consensus` (59 s) are single packages and cannot be parallelised by the CI engine. Sharding across packages already happens; these need shorter fixed waits or split test binaries. This is step 5 of the experiment sequence in [performance research](performance-research.md), and it is measured evidence now, not a guess.
-- Docker/Compose (221 s) and integration (223 s) lanes were not profiled internally here; that is the next F06-class measurement, along with a repeat of the probe while a real CI run is executing.
+- Repository-side work is unavoidable for the last factor: `internal/web` under race (193 s) and `internal/consensus` (59 s) are single packages and cannot be parallelised by the CI engine. Sharding across packages already happens; these need shorter fixed waits or split test binaries. This is step 5 of the experiment sequence in [performance research](performance-research.md).
+- The Docker/Compose (221 s) and integration (223 s) lanes were not profiled internally, and the probe was not repeated while a real CI run was executing.
 
 ## Reproducing
 
