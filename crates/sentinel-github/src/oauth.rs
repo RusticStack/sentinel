@@ -135,7 +135,7 @@ impl App {
     /// setting the matching cookie before this URL is followed.
     ///
     /// No scopes are requested: signing in needs identity, not repository
-    /// access. Repository permissions come from the App installation (Part 05).
+    /// access. Repository permissions come from the App installation.
     pub fn authorize_url(&self, endpoints: &Endpoints, state: &str) -> String {
         format!(
             "{}?client_id={}&redirect_uri={}&scope=&state={}&allow_signup=false",

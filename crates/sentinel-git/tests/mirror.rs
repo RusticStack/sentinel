@@ -1,4 +1,4 @@
-//! K04 worker-local Git mirrors over local `file://` repositories: the
+//! Worker-local Git mirrors over local `file://` repositories: the
 //! pinned commit is what lands in the workspace, fetches serialize and stay
 //! incremental, a reader lease holds GC off, a job cannot mutate shared
 //! objects, and a damaged mirror is rebuilt rather than served.
@@ -553,7 +553,7 @@ fn an_authorized_checkout_still_enforces_the_access() {
     assert!(matches!(error, Error::Preparation(_)));
 }
 
-/// P07-17: a mirror serves only the remote that filled it — the same
+/// A mirror serves only the remote that filled it — the same
 /// repository id checked out from another remote gets a rebuilt, empty
 /// store, never the first remote's objects.
 #[test]
@@ -597,7 +597,7 @@ fn a_mirror_serves_only_the_remote_that_filled_it() {
     );
 }
 
-/// P07-19: store damage a bare-repository check cannot see — the pinned
+/// Store damage a bare-repository check cannot see — the pinned
 /// commit's object gone from under a ref — is rebuilt and served, not a
 /// permanent preparation failure.
 #[test]
@@ -642,7 +642,7 @@ fn damage_under_a_ref_tip_is_rebuilt_not_a_permanent_failure() {
     assert_eq!(out.sha, repo.first);
 }
 
-/// P07-23: a crashed attempt's leftover lease temp file does not block the
+/// A crashed attempt's leftover lease temp file does not block the
 /// same attempt id's next lease.
 #[test]
 fn a_leftover_lease_temp_file_does_not_block_a_retry() {
@@ -665,7 +665,7 @@ fn a_leftover_lease_temp_file_does_not_block_a_retry() {
         .unwrap();
 }
 
-/// P07-20: a store too large to copy is materialized by a depth-1 fetch of
+/// A store too large to copy is materialized by a depth-1 fetch of
 /// the pinned commit alone. The job gets exactly that commit — here one the
 /// branch has moved past, so not an advertised tip — in its own pack: no
 /// history behind it, no `alternates`, sound with the mirror gone, and its

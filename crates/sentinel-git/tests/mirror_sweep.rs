@@ -1,4 +1,4 @@
-//! P07-22's mirror disk bound, in a process of its own: a sweep skips a
+//! The mirror disk bound, in a process of its own: a sweep skips a
 //! mirror whose lock is momentarily held, and git children that other tests
 //! fork in the same process can hold an inherited copy of a lock descriptor
 //! until they exec — which would make which mirror goes depend on timing.
@@ -12,7 +12,7 @@ use sentinel_git::mirror::Mirrors;
 mod support;
 use support::{repository, source, work};
 
-/// P07-22: the sweep bounds mirror disk — a killed fetch's stale `tmp_*`
+/// The sweep bounds mirror disk — a killed fetch's stale `tmp_*`
 /// goes, and over the budget the least recently written mirror goes; a
 /// mirror whose writer lock is held is never touched.
 #[test]

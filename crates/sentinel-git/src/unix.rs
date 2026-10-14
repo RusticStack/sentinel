@@ -495,7 +495,7 @@ fn fetch_with(
     let mut fetch = git(work);
     let mut secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
     // A manual credential a server echoes back is redacted like a bound
-    // one (P07-25): no error excerpt may carry either.
+    // one: no error excerpt may carry either.
     if let Some(credential) = credential
         && !credential.secret.is_empty()
     {
@@ -745,14 +745,12 @@ pub fn file_at(
     init(work, deadline)?;
     let private = access.map(|a| Private::install(work, a)).transpose()?;
     let secrets = private.as_ref().map(|p| p.secrets()).unwrap_or_default();
-    // B04: the commit and its trees only, then the one blob the pipeline
-    // is. A depth-one fetch of the whole tree cost 3.6 s and 75 MB on
-    // Lockwell for a 1.5 KB file; this costs about 0.3 s and 0.2 MB. The
-    // work repository is a partial clone of `remote` (a promisor remote
-    // named `origin`: without one, a filtered fetch fails its connectivity
-    // check). A server that ignores the filter sends everything and the
-    // blob is simply present; anything else that goes wrong on this path
-    // gets the whole depth-one fetch, as before.
+    // Fetch the commit and its trees only, then the one blob the pipeline
+    // is, instead of the whole tree. The work repository is a partial clone
+    // of `remote` (a promisor remote named `origin`: without one, a
+    // filtered fetch fails its connectivity check). A server that ignores
+    // the filter sends everything and the blob is simply present; any
+    // other failure on this path falls back to a whole depth-one fetch.
     let filtered = partial_origin(work, remote, deadline).is_ok()
         && fetch_with(
             work,
@@ -1234,7 +1232,7 @@ impl Drop for Private {
     }
 }
 
-/// The legacy askpass helper: an owner-only script beside the workspace that
+/// The askpass helper: an owner-only script beside the workspace that
 /// answers Git's username/password prompts from its own environment and is
 /// removed as soon as the fetch has finished.
 pub(crate) struct Askpass {
@@ -1309,8 +1307,7 @@ mod tests {
     /// for a minute, the wait does not return while the child lives (a
     /// polling wait would be back within one 20 ms tick) and returns once
     /// it exits. Decided by the child's exit, not by timing, so machine
-    /// load cannot fail it (the paired-timing test it replaces swung by
-    /// ±2.9 s under load).
+    /// load cannot fail it.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_childs_exit_wakes_a_parked_wait() {

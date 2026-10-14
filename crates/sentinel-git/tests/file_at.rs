@@ -1,4 +1,4 @@
-//! G03 source resolution over a local repository: read one file at one
+//! Source resolution over a local repository: read one file at one
 //! revision, peel annotated tags to their commit, and refuse unsafe paths,
 //! oversized files and inconsistent access.
 #![cfg(unix)]
@@ -352,7 +352,7 @@ fn a_source_access_must_match_the_remote_it_is_used_for() {
     ));
 }
 
-/// B04: a server that honours partial-clone filters sends the commit, its
+/// A server that honours partial-clone filters sends the commit, its
 /// trees and the one blob the pipeline is — never the rest of the tree.
 #[test]
 fn a_filtering_server_sends_only_the_pipeline_blob() {
