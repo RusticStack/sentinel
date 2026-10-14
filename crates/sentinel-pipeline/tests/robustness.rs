@@ -1,7 +1,7 @@
-//! C08 malformed-input verification: every truncation and single-byte
-//! mutation of every fixture must either compile or fail with a structured
-//! error, never panic, and must do so quickly. Plus targeted edge cases the
-//! mutation sweep cannot reach.
+//! Malformed-input verification: every truncation and single-byte mutation of
+//! every fixture must either compile or fail with a structured error, never
+//! panic, and must do so quickly. Plus targeted edge cases the mutation sweep
+//! cannot reach.
 use std::{fs, path::Path, time::Instant};
 
 use sentinel_pipeline::{compile_str, yaml};
@@ -145,10 +145,9 @@ fn hostile_documents_fail_fast_with_structured_errors() {
             .join(", ")
     );
     assert!(compile_str(&wide).is_err());
-    // Bounded work, asserted as work rather than wall-clock time (a timing
-    // bound here failed under machine load): the loader stops at the node
-    // budget, well before the end of the document, instead of building
-    // all 40,000 nodes and rejecting them afterwards.
+    // Bounded work, asserted as work rather than wall-clock time: the loader
+    // stops at the node budget, well before the end of the document, instead
+    // of building all 40,000 nodes and rejecting them afterwards.
     let e = yaml::load(&wide).unwrap_err();
     assert_eq!(
         e.kind,

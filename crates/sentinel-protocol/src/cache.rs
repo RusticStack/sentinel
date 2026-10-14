@@ -71,16 +71,14 @@ impl std::fmt::Display for Class {
 
 /// The trust boundary a job's cache scopes live behind.
 ///
-/// The derivation ([`Trust::derive`], docs/cache.md) keys trust to who could
-/// have produced the run's content, not merely to its event name: only a
-/// `push`/`tag` that arrived through verified intake for a ref the
-/// repository's binding names exactly is `Protected`; a `pull_request` run
-/// is `PullRequest`; everything else — manual API runs (caller-chosen
-/// source and pipeline), pushes to refs a wildcard admits, runs of an
-/// unbound repository, or no recorded provenance — is `Unprotected`. Each
-/// class reads and writes only its own scope, so neither untrusted class
-/// can plant state a protected build restores. The store computes this
-/// once and every consumer uses the same rule.
+/// [`Trust::derive`] (docs/cache.md) keys trust to who could have produced the
+/// run's content, not merely to its event name: only a `push`/`tag` from
+/// verified intake for a ref the repository's binding names exactly is
+/// `Protected`; a `pull_request` run is `PullRequest`; everything else
+/// (manual API runs, pushes to wildcard-admitted refs, unbound repositories,
+/// no recorded provenance) is `Unprotected`. Each class reads and writes only
+/// its own scope, so neither untrusted class can plant state a protected
+/// build restores.
 ///
 /// Wire form is one byte (`to_u8`); serde/JSON uses the snake_case name.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -207,9 +205,9 @@ mod tests {
         assert_eq!(Trust::default(), Trust::PullRequest);
     }
 
-    /// P07-2: protected state is written only by verified pushes/tags to a
-    /// ref the binding names exactly; manual runs, wildcard-admitted refs
-    /// and unknown events never are.
+    /// Protected state is written only by verified pushes/tags to a ref the
+    /// binding names exactly; manual runs, wildcard-admitted refs and unknown
+    /// events never are.
     #[test]
     fn only_verified_protected_refs_are_protected() {
         assert_eq!(Trust::derive("push", true, true), Trust::Protected);
