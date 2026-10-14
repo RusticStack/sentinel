@@ -165,16 +165,15 @@ pub enum SpecError {
 }
 
 /// Bump when the encoded layout changes; blobs older than
-/// [`SPEC_FORMAT_READ_MIN`] are rejected rather than misread. Format 2:
-/// `on` carries ref filters (`policy::Triggers`) instead of a trigger
-/// list. Format 3: artifacts carry `required`. Format 4: caches carry
-/// `class`. Format 5: steps carry secret targets. Format 6 adds tenant
-/// registry credentials to the job's image-pull authorization.
+/// [`SPEC_FORMAT_READ_MIN`] are rejected rather than misread. Layouts: 2 `on`
+/// carries ref filters (`policy::Triggers`); 3 artifacts carry `required`;
+/// 4 caches carry `class`; 5 steps carry secret targets; 6 jobs carry the
+/// tenant registry credential for image pulls.
 pub const SPEC_FORMAT: u8 = 6;
 
 /// The oldest format `decode` still accepts. Format 3 differs from 4 only
-/// in the absent `cache.class`; its blobs upgrade to `Dependencies` —
-/// exactly what a `class`-less schema 1 document compiles to.
+/// in the absent `cache.class`; its caches upgrade to `Dependencies`, what a
+/// `class`-less schema 1 document compiles to.
 pub const SPEC_FORMAT_READ_MIN: u8 = 3;
 
 impl RunSpec {
@@ -204,16 +203,12 @@ impl RunSpec {
             .map_err(|_| SpecError::Encode)
     }
 
-    /// The byte that heads a stored spec decides which layout follows.
-    /// Formats 3 through 5 decode through shadow types. Older steps receive
-    /// empty secret targets; old jobs have no registry credential. Format 3
-    /// also upgrades caches to `Dependencies`. Any
-    /// other format byte, a body its layout
-    /// cannot parse, or bytes left over after it is `Decode`. The format
-    /// byte alone chooses the type — a v3 body is never fed to the v4
-    /// layout hoping the extra field swallows leftover bytes — and the
-    /// chosen layout must consume the whole body, so a corrupted or
-    /// concatenated blob is refused rather than half-read.
+    /// The leading format byte alone chooses the layout. Formats 3 through 5
+    /// decode through shadow types: older steps get empty secret targets, old
+    /// jobs have no registry credential, and format 3 caches become
+    /// `Dependencies`. An unknown format byte, an unparsable body or bytes
+    /// left over after the body is `Decode`, so a corrupted or concatenated
+    /// blob is refused rather than half-read.
     pub fn decode(bytes: &[u8]) -> Result<Self, SpecError> {
         fn whole<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, SpecError> {
             match postcard::take_from_bytes(body) {
@@ -238,12 +233,10 @@ impl RunSpec {
     }
 }
 
-// --- Format 3 shadow layout ------------------------------------------------
-// postcard encodes fields positionally, so a readable old format needs the
-// old type graph, not a `serde(default)` field. These mirror the format-3
-// `Job`/`Cache` exactly — every other type they touch is unchanged —
-// and the conversion below lands every cache on `Dependencies`, the class
-// a `class`-less schema 1 document always compiled to.
+// Shadow layouts for formats 3 to 5. postcard encodes fields positionally, so
+// reading an old format needs the old type graph, not a `serde(default)`
+// field. Each mirrors the old `Job`/`Step`/`Cache` shape; every other type
+// they touch is unchanged.
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheV3 {
@@ -603,7 +596,7 @@ mod tests {
     }
 
     /// Encode `spec` in the format-3 layout: the shadow type graph, format
-    /// byte 3. This is what pre-class builds wrote into `run_specs`.
+    /// byte 3.
     fn encode_v3(spec: &RunSpec) -> Vec<u8> {
         let shadow = RunSpecV3 {
             source: spec.source.clone(),
@@ -855,7 +848,7 @@ mod tests {
 
     #[test]
     fn a_blob_with_trailing_bytes_is_not_a_spec() {
-        // P02-5: readers reject unknown bytes rather than guess
+        // Readers reject unknown bytes rather than guess
         // (docs/compatibility.md), in both readable layouts.
         let spec = full_spec();
         for blob in [spec.encode().unwrap(), encode_v3(&spec)] {
