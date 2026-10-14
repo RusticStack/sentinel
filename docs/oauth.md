@@ -313,9 +313,11 @@ Routes (JSON, `sentinel.error/1`; every one needs the `tenant:admin` scope and, 
 
 | Route | Body | Answer |
 |---|---|---|
-| `POST /api/v1/tenants/{slug}/service-accounts` | `{name, role?: "reader"\|"operator"}` (default operator) | `201 {user, name, role}` |
-| `PUT /api/v1/tenants/{slug}/service-accounts/{usr}/repos/{name}` | `{access: ["read", "run"]}` (`[]` withdraws) | `200 {user, repo, access}` |
-| `POST /api/v1/tenants/{slug}/service-accounts/{usr}/grants` | `{name, scope, repo?, expires_in_ms?}` | `201 {grant, refresh_token, expires_ms, scope}` |
+| `POST /api/v1/tenants/{slug}/service-accounts` | `{name, role?: "reader"\|"operator", reason?}` (default operator) | `201 {user, name, role}` |
+| `PUT /api/v1/tenants/{slug}/service-accounts/{usr}/repos/{name}` | `{access: ["read", "run"], reason?}` (`[]` withdraws) | `200 {user, repo, access}` |
+| `POST /api/v1/tenants/{slug}/service-accounts/{usr}/grants` | `{name, scope, repo?, expires_in_ms?, reason?}` | `201 {grant, refresh_token, expires_ms, scope}` |
+
+The three mutating routes need a **browser session that stepped up** within the policy window, re-checked in the writing transaction ([step-up](step-up.md#issuing-credentials)): a refresh token outlives the session that asked for it, so a stolen bearer or OAuth token — even one holding `tenant:admin` — answers `forbidden` with `details.step_up`. A platform administrator who does not administer the tenant also gives a `reason` (audited as `platform-override`). Grants a person minted are revoked when that person's sessions are revoked, whatever the cause ([step-up](step-up.md#service-credentials-minted-by-a-session)). `GET /grants` and `DELETE /grants/{grt}` need `tenant:admin` (or a browser session) except for the token's own grant ([API](api.md)).
 | `GET /api/v1/tenants/{slug}/service-accounts/{usr}/grants` | | `200 {grants: [...]}` |
 
 Issuance rules: `scope` is space-separated scope names, non-empty, never `tenant:admin` or `platform:admin` (`400`; the insert trigger refuses them too); the lifetime defaults to 30 days (`SERVICE_DEFAULT_MS`) within 1 hour..90 days (`SERVICE_MIN_MS`..`SERVICE_MAX_MS`, else `400`); `repo` must be a repository of the tenant; the account must be an active service principal of the tenant. One writer transaction writes the grant (`created_by` = the administrator, audited `ServiceGrantIssued` 55) and a single refresh token of generation 1 whose idle expiry is the grant's own — no access token is minted, since the holder refreshes first. The refresh token appears exactly once, in the `201`; only its digest is stored, and nothing lists or re-reveals it. A service grant's repository access remains the live `repo_grants` check: the grant is a ceiling, `PUT …/repos/{name}` is the authority.
