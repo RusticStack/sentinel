@@ -19,9 +19,12 @@ useHead({ title: "Sentinel" });
   <SPage id="home" title="Sentinel">
     <UEmpty
       icon="i-lucide-building-2"
-      title="No tenants yet"
-      description="Your account is not a member of any tenant yet. An administrator can add you."
-      :actions="session.me.value?.super_admin ? [{ label: 'Open platform administration', to: '/platform', icon: 'i-lucide-shield' }] : []"
+      title="No organizations yet"
+      description="Your account does not belong to any organization yet. Accept an invitation from your email, create an organization if this instance allows it, or link GitHub to join one whose membership GitHub manages."
+      :actions="[
+        { label: 'Organizations', to: '/organizations', icon: 'i-lucide-building' },
+        ...(session.me.value?.super_admin ? [{ label: 'Open platform administration', to: '/platform', icon: 'i-lucide-shield', color: 'neutral' as const, variant: 'outline' as const }] : []),
+      ]"
     />
   </SPage>
 </template>

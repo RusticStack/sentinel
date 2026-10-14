@@ -90,6 +90,60 @@ async function changePassword() {
   }
 }
 
+// --- Email address -----------------------------------------------------
+// A new address is a claim until its link is opened; the confirmed one stays
+// the account's until then. Every answer reads the same whether or not
+// another account holds the address.
+
+const newEmail = ref("");
+const emailNote = ref<"sent-email" | "sent-operator" | null>(null);
+const emailError = ref("");
+const savingEmail = ref(false);
+const resendingEmail = ref(false);
+const emailWait = useRetryWait();
+
+async function changeEmail() {
+  if (savingEmail.value || emailWait.waiting.value) return;
+  emailError.value = "";
+  emailNote.value = null;
+  if (!looksLikeEmail(newEmail.value)) {
+    emailError.value = "Enter an email address such as name@example.com.";
+    return;
+  }
+  savingEmail.value = true;
+  try {
+    const done = await withStepUp(() => api<{ verification: "email" | "operator" }>("/api/v1/me/email", { method: "POST", body: { email: newEmail.value.trim() } }));
+    emailNote.value = done.verification === "email" ? "sent-email" : "sent-operator";
+    newEmail.value = "";
+    await session.load(true);
+  } catch (e) {
+    if (e instanceof StepUpDeclined) return;
+    const err = e as ApiError;
+    if (err.code === "unauthenticated") return;
+    if (err.code === "rate_limited") emailWait.start(err);
+    emailError.value = err.code === "invalid_request" ? "Enter a plain email address, such as name@example.com." : refusal(err);
+  } finally {
+    savingEmail.value = false;
+  }
+}
+
+async function resendEmail() {
+  if (resendingEmail.value || emailWait.waiting.value) return;
+  resendingEmail.value = true;
+  emailError.value = "";
+  try {
+    const done = await api<{ verification: "email" | "operator" }>("/api/v1/me/email/resend", { method: "POST", body: {} });
+    emailNote.value = done.verification === "email" ? "sent-email" : "sent-operator";
+  } catch (e) {
+    const err = e as ApiError;
+    if (err.code === "unauthenticated") return;
+    if (err.code === "rate_limited") emailWait.start(err);
+    emailError.value = err.code === "conflict" ? "No address is waiting for confirmation." : err.code === "rate_limited" ? `You asked for several links already. Try again in ${retryAfter(err)}.` : refusal(err);
+  } finally {
+    resendingEmail.value = false;
+  }
+}
+
 // --- Linked identities -------------------------------------------------
 
 const linking = ref(false);
@@ -148,6 +202,38 @@ onBeforeUnmount(clearPasswords);
           <TotpEnroll v-else :has-password="security.password" :pending="security.mfa.pending" :username="session.me.value?.username" @done="refresh()" @cancel="refresh()" />
         </UCard>
 
+        <!-- Email address -->
+        <UCard as="section" aria-labelledby="email-h">
+          <template #header>
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <h2 id="email-h" class="text-base font-semibold flex items-center gap-2"><UIcon name="i-lucide-mail" />Email address</h2>
+              <UBadge v-if="session.me.value?.email && session.me.value.email_verified" color="success" variant="subtle" icon="i-lucide-badge-check" label="Confirmed" />
+              <UBadge v-else-if="session.me.value?.email" color="warning" variant="subtle" label="Not confirmed" />
+            </div>
+          </template>
+          <div class="space-y-4 text-sm">
+            <p v-if="session.me.value?.email" class="break-all"><span class="text-muted">Address:</span> {{ session.me.value.email }}</p>
+            <p v-else class="text-muted">No email address. Adding one lets you sign in with it and accept invitations sent to it.</p>
+            <div v-if="session.me.value?.email && !session.me.value.email_verified" class="flex flex-wrap items-center gap-3">
+              <span>Open the link sent to this address to confirm it; until then it cannot sign in.</span>
+              <UButton size="sm" color="neutral" variant="outline" icon="i-lucide-send" :label="emailWait.waiting.value ? `Wait ${emailWait.waiting.value} s` : 'Send the link again'" :loading="resendingEmail" :disabled="!!emailWait.waiting.value" @click="resendEmail" />
+            </div>
+            <form class="flex flex-wrap items-end gap-3" aria-label="Change your email address" novalidate @submit.prevent="changeEmail">
+              <UFormField :label="session.me.value?.email ? 'New address' : 'Address'" name="new-email">
+                <UInput id="new-email" v-model="newEmail" type="email" autocomplete="email" autocapitalize="off" spellcheck="false" class="w-72 max-w-full" />
+              </UFormField>
+              <UButton type="submit" :label="session.me.value?.email ? 'Change address' : 'Add address'" :loading="savingEmail" :disabled="!!emailWait.waiting.value" />
+            </form>
+            <p class="text-xs text-muted">A new address takes effect once you open the link sent to it; your current confirmed address keeps working until then.</p>
+            <div aria-live="polite">
+              <UAlert v-if="emailNote === 'sent-email'" color="success" variant="subtle" icon="i-lucide-mail-check" title="If that address can be used, a confirmation link is on its way." description="It works once, for 24 hours." />
+              <UAlert v-else-if="emailNote === 'sent-operator'" color="info" variant="subtle" icon="i-lucide-user-cog" title="This instance does not send email."
+                description="Ask your administrator for the confirmation link (sentinel admin account email-link)." />
+              <UAlert v-if="emailError" color="error" variant="subtle" icon="i-lucide-circle-alert" :title="emailError" role="alert" />
+            </div>
+          </div>
+        </UCard>
+
         <!-- Password -->
         <UCard as="section" aria-labelledby="password-h">
           <template #header>
@@ -185,7 +271,7 @@ onBeforeUnmount(clearPasswords);
             </ul>
             <p v-else class="text-sm text-muted">No external account is linked.</p>
             <div v-if="security.github_link && !github" class="space-y-2">
-              <p class="text-sm">Link your GitHub account to sign in with it. You confirm it's you first, then approve on GitHub and come back here.</p>
+              <p class="text-sm">Link your GitHub account to sign in with it and to join organizations whose membership GitHub manages. You confirm it's you first, then approve on GitHub and come back here.</p>
               <UButton icon="i-lucide-github" color="neutral" variant="outline" label="Link a GitHub account" :loading="linking" @click="linkGitHub" />
             </div>
           </div>
