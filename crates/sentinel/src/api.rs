@@ -1,4 +1,4 @@
-//! The legacy `sentinel api …` commands (W08), kept with their flags and
+//! The legacy `sentinel api …` commands, kept with their flags and
 //! output: `me`, `run`, `status`, `runs`, `cancel`, `rerun`, `logs`,
 //! `workers`, `queue`, `drain`, `undrain`. They run on the shared
 //! [`sentinel::client::Client`] with a static credential from `--token-file`,

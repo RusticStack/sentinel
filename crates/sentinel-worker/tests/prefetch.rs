@@ -1,4 +1,4 @@
-//! K05 bounded image prefetch with real rootless Podman. Runs only with
+//! Bounded image prefetch with real rootless Podman. Runs only with
 //! `SENTINEL_PODMAN_TESTS=1` as an account with rootless Podman (see
 //! docs/development.md); otherwise it reports that it was skipped, never a
 //! false pass. It needs the registry: the images are pulled from Docker
