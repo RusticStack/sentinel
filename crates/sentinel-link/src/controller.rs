@@ -1477,8 +1477,8 @@ impl Inner {
 /// How often the controller's remote-cache store is reclaimed.
 pub const REMOTE_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
-/// How long after its release an attempt may still offer what it sealed
-/// the worker's offer budget plus slack for publication and the terminal
+/// How long after its release an attempt may still offer what it sealed: the
+/// worker's offer budget plus slack for publication and the terminal
 /// report's round trip.
 pub const OFFER_WINDOW_MS: i64 = 10 * 60 * 1000;
 
