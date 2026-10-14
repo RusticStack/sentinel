@@ -1,9 +1,3 @@
-//! Resolution over a real repository served on loopback HTTPS: policy,
-//! exact provenance, duplicate/reordered events, the explicit outcomes, tag
-//! peeling, and the pull-request trust rules. The pull-request happy path
-//! uses an injected fetcher because a GitHub-App-bound remote is not
-//! reachable offline; the merge choice and provenance it exercises are the
-//! same code path a real App delivery takes.
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -89,7 +83,6 @@ fn run(command: &mut Command) {
     );
 }
 
-/// The loopback HTTPS server from the shared fixture.
 struct Server(std::process::Child);
 
 impl Drop for Server {
@@ -101,7 +94,6 @@ impl Drop for Server {
 
 struct Fixture {
     dir: tempfile::TempDir,
-    /// The deployment's approved authorities: the loopback remote and GitHub.
     destinations: Arc<[String]>,
     store: Arc<Store>,
     key: Arc<Key>,
@@ -110,7 +102,6 @@ struct Fixture {
     repo: RepoId,
     github_repo: RepoId,
     remote: String,
-    /// one, two (main), dev, unpinned, broken, no-pipeline
     commits: Vec<String>,
     tag_object: String,
     tag_commit: String,
@@ -134,8 +125,6 @@ fn prerequisites() -> bool {
     true
 }
 
-/// The binding's authority: transport, host and port, as the destination
-/// policy is written.
 fn authority(remote: &str) -> String {
     sentinel_protocol::source::remote(remote)
         .unwrap()
@@ -150,7 +139,6 @@ fn fixture() -> Fixture {
     let store =
         Arc::new(Store::open(dir.path().join("metadata.sqlite"), Durability::Normal).unwrap());
 
-    // The repository the fixture serves: one commit per interesting case.
     let git = dir.path().join("repo");
     fs::create_dir(&git).unwrap();
     let repo_git = Repo { git };
@@ -173,7 +161,6 @@ fn fixture() -> Fixture {
     let tag_object = repo_git.rev("refs/tags/v1");
     let tag_commit = repo_git.rev("refs/tags/v1^{commit}");
     let second = repo_git.commit("two", &[("src/lib.txt", "two\n")]);
-    // A branch the pipeline's push filter excludes.
     run(Command::new("git")
         .args(["checkout", "-qb", "dev"])
         .current_dir(&repo_git.git));
@@ -189,18 +176,14 @@ fn fixture() -> Fixture {
         )],
     );
     let broken = repo_git.commit("broken", &[(".sentinel.yml", "schema: 1\njobs: []\n")]);
-    // The bound pipeline path removed: the commit itself is valid, the source
-    // has nothing to compile.
     run(Command::new("git")
         .args(["rm", "-q", ".sentinel.yml"])
         .current_dir(&repo_git.git));
     let no_pipeline = repo_git.commit("no-pipeline", &[("src/other.txt", "other\n")]);
-    // Real servers need to be told to serve an arbitrary pinned revision.
     run(Command::new("git")
         .args(["config", "uploadpack.allowAnySHA1InWant", "true"])
         .current_dir(&repo_git.git));
 
-    // Serve it over loopback HTTPS with a generated CA.
     let cert = dir.path().join("ca.pem");
     let tls_key = dir.path().join("tls.key");
     let generated = Command::new("openssl")
@@ -234,8 +217,6 @@ fn fixture() -> Fixture {
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../fixtures/git_https.py"
             ))
-            // The project root is the directory *containing* the repository;
-            // the URL below names it.
             .arg(dir.path())
             .arg(&cert)
             .arg(&tls_key)
@@ -306,9 +287,6 @@ fn fixture() -> Fixture {
                     &sealing,
                     UnixMillis::now(),
                 )?;
-                // An App association for the trust rules; a happy PR path is
-                // exercised with an injected fetcher, since the App-bound
-                // remote is not reachable offline.
                 let installation = sources_forge::refresh(
                     tx,
                     sources_forge::Snapshot {
@@ -450,7 +428,6 @@ impl Fixture {
             .unwrap()
     }
 
-    /// Validate a delivery (lane phase one) and return its current row.
     fn validate(&self, id: DeliveryId) -> intake::Delivery {
         self.store
             .writer()
@@ -459,7 +436,6 @@ impl Fixture {
         self.store.read(move |c| intake::get(c, id)).unwrap()
     }
 
-    /// Resolve a delivery (lane phase two) and return its current row.
     fn resolve(&self, id: DeliveryId) -> (Outcome, intake::Delivery) {
         self.resolve_with(&self.resolver, id)
     }
@@ -501,14 +477,11 @@ fn a_push_resolves_through_the_policy_and_dispatches_with_exact_provenance() {
     };
     assert_eq!(delivery.state, State::Dispatched);
     assert_eq!(delivery.run, Some(run));
-    // The run stores the immutable spec at the pushed revision.
     let spec = f.spec_of(run);
     assert_eq!(spec.source.sha, head);
     assert_eq!(spec.source.repo, f.remote);
     assert_eq!(spec.source.ref_name.as_deref(), Some(REF));
     assert_eq!(spec.pipeline.jobs.len(), 1);
-    // Provenance is exactly the event: push, the ref transition, the
-    // pipeline revision.
     let recorded = f.provenance_of(run);
     assert_eq!(recorded.trigger, "push");
     assert_eq!(recorded.provider.as_deref(), Some("generic"));
@@ -519,15 +492,12 @@ fn a_push_resolves_through_the_policy_and_dispatches_with_exact_provenance() {
     assert_eq!(recorded.pipeline_sha, head);
     assert_eq!(recorded.pipeline_path.as_deref(), Some(".sentinel.yml"));
     assert!(recorded.head_sha.is_none() && recorded.pr_number.is_none());
-    // The status view names the trigger.
     let view = f
         .store
         .read(move |c| status::run(c, f.tenant, run))
         .unwrap();
     assert_eq!(view.trigger.as_deref(), Some("push"));
 
-    // A redelivery of the same transition under a new ID is a duplicate and
-    // creates no second run; a predecessor is superseded.
     let again = f.accept_push("push-2", REF, &f.commits[0], &head);
     let _ = f.validate(again);
     let (outcome, row) = f.resolve(again);
@@ -545,10 +515,6 @@ fn a_push_resolves_through_the_policy_and_dispatches_with_exact_provenance() {
     assert_eq!(runs, 1);
 }
 
-/// Pushes `A→B`, `B→C`, `C→D` arriving as `C→D`, `A→B`, `B→C` (a relay
-/// replaying its spool, or GitHub's out-of-order delivery): only the tip is
-/// built, and the stale pushes neither dispatch nor cancel the tip's run
-/// under `cancel_in_progress`.
 #[test]
 fn out_of_order_pushes_never_dispatch_behind_or_cancel_the_tip() {
     if !prerequisites() {
@@ -571,13 +537,11 @@ fn out_of_order_pushes_never_dispatch_behind_or_cancel_the_tip() {
     let Outcome::Dispatched { run: tip_run } = outcome else {
         panic!("the tip dispatches: {outcome:?}");
     };
-    // A→B is not adjacent to C→D: only history shows B is behind D.
     let stale = f.accept_push("push-b", REF, &a, &b);
     let _ = f.validate(stale);
     let (outcome, row) = f.resolve(stale);
     assert_eq!(outcome, Outcome::Ignored("superseded"));
     assert_eq!(row.reason.as_deref(), Some("superseded"));
-    // B→C ends where the tip began.
     let stale = f.accept_push("push-c", REF, &b, &c);
     let _ = f.validate(stale);
     let (outcome, _) = f.resolve(stale);
@@ -596,8 +560,6 @@ fn out_of_order_pushes_never_dispatch_behind_or_cancel_the_tip() {
     assert_eq!((runs, cancelled), (1, 0), "only the tip ran, uncancelled");
     assert_eq!(f.spec_of(tip_run).source.sha, d);
 
-    // The stream continues normally from the tip — and a rewind to an older
-    // commit is a new transition, not a stale one.
     let rewind = f.accept_push("push-rewind", REF, &d, &b);
     let _ = f.validate(rewind);
     let (outcome, _) = f.resolve(rewind);
@@ -607,12 +569,7 @@ fn out_of_order_pushes_never_dispatch_behind_or_cancel_the_tip() {
     );
 }
 
-/// A verified push is protected cache state only when the binding
-/// names its ref exactly. Admitted through the fixture's `refs/heads/*`
-/// wildcard, anyone with push rights to any branch could produce it, so it
-/// is `unprotected`; once the binding names `refs/heads/main` itself, the
-/// same run reads as `protected`. A run with no delivery (manual API
-/// dispatch) never is.
+/// A wildcard-admitted push is unprotected: anyone with push rights to any branch could produce it.
 #[test]
 fn a_push_is_protected_only_for_a_ref_the_binding_names_exactly() {
     use sentinel_protocol::cache::Trust;
@@ -651,7 +608,6 @@ fn a_push_is_protected_only_for_a_ref_the_binding_names_exactly() {
         })
         .unwrap();
     assert_eq!(trust(&f.store), Trust::Protected, "named exactly");
-    // A revoked binding protects nothing.
     f.store
         .writer()
         .write(move |tx| {
@@ -671,8 +627,6 @@ fn the_policy_refuses_branches_it_does_not_declare() {
         return;
     }
     let f = fixture();
-    // `dev` exists and the binding allows it, but the pipeline's push filter
-    // names main and release/* only.
     let accepted = f.accept_push("dev-1", "refs/heads/dev", &f.commits[1], &f.commits[2]);
     let _ = f.validate(accepted);
     let (outcome, row) = f.resolve(accepted);
@@ -692,7 +646,6 @@ fn tags_are_peeled_to_their_commit_for_checkout() {
     let Outcome::Dispatched { run } = outcome else {
         panic!("expected a tag dispatch, got {outcome:?}");
     };
-    // The tag object is not checked out: its commit is.
     let spec = f.spec_of(run);
     assert_eq!(spec.source.sha, f.tag_commit);
     assert_ne!(spec.source.sha, f.tag_object);
@@ -763,13 +716,9 @@ fn an_unreachable_remote_retries_within_the_attempt_budget() {
     assert!(attempts >= 3, "it retried rather than failing at once");
 }
 
-/// A fetcher that serves one pipeline at one verified merge, for the pull
-/// request path a GitHub-App-bound remote cannot reach offline.
 struct FakeFetch {
     pipeline: String,
-    /// The merge commit the live merge ref resolves to.
     merge: String,
-    /// The head the merge must name as a parent.
     head: String,
 }
 
@@ -801,8 +750,6 @@ impl Fetch for FakeFetch {
     }
 }
 
-/// A fetcher whose merge ref is absent or stale: every call fails as a merge
-/// that is not computed for this head.
 struct PendingMerge;
 
 impl Fetch for PendingMerge {
@@ -828,8 +775,6 @@ impl Fetch for PendingMerge {
     }
 }
 
-/// A stub GitHub API for the App token path: token minting and the
-/// repository check the App makes before any credential is issued.
 struct GithubStub {
     addr: std::net::SocketAddr,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -913,9 +858,6 @@ fn serve_github(mut stream: std::net::TcpStream) {
             Ok(n) => body.extend_from_slice(&chunk[..n]),
         }
     }
-    // App-authenticated requests carry a JWT; the token-authenticated
-    // repository check carries the minted installation token. Another
-    // credential shape is a contract violation.
     if request.contains("/app/installations") {
         assert!(bearer.starts_with("Bearer ey"), "{request} {bearer}");
     } else {
@@ -957,11 +899,7 @@ fn serve_github(mut stream: std::net::TcpStream) {
     );
 }
 
-/// A resolver backed by the stub App and an injected fetcher — the path a
-/// pull-request delivery takes against a forge-bound remote.
 fn app_resolver(f: &Fixture, name: &str, fetch: Arc<dyn Fetch>) -> (Resolver, GithubStub) {
-    // An App whose API is a loopback stub: the token path a real installation
-    // takes, without github.com.
     let key_file = f.dir.path().join(format!("{name}.pem"));
     run(Command::new("openssl")
         .args(["genrsa", "-out"])
@@ -1009,16 +947,12 @@ fn a_same_repository_pull_request_dispatches_at_the_tested_merge() {
             head: head.clone(),
         }),
     );
-    // The payload's merge claim is not consulted: an `opened` delivery that
-    // has none still resolves the live merge ref.
     let accepted = f.accept_pr("pr-1", GITHUB_REPO_ID, None);
     let _ = f.validate(accepted);
     let (outcome, _) = f.resolve_with(&resolver, accepted);
     let Outcome::Dispatched { run } = outcome else {
         panic!("expected a pull-request dispatch, got {outcome:?}");
     };
-    // The verified tested merge is what runs; the spec is accountable to the
-    // authorized base ref, and the head is provenance.
     let spec = f.spec_of(run);
     assert_eq!(spec.source.sha, merge);
     assert_eq!(spec.source.ref_name.as_deref(), Some("refs/heads/main"));
@@ -1045,15 +979,11 @@ fn a_fork_or_unmergeable_pull_request_is_refused_before_any_fetch() {
         return;
     }
     let f = fixture();
-    // A head that lives in another repository is refused: Git refs do not
-    // prove fork trust, and hostile fork execution is not a default.
     let accepted = f.accept_pr("pr-fork", 999, Some(&"e".repeat(40)));
     let _ = f.validate(accepted);
     let (outcome, row) = f.resolve(accepted);
     assert_eq!(outcome, Outcome::Ignored("fork_pr"));
     assert_eq!(row.reason.as_deref(), Some("fork_pr"));
-    // A merge ref the forge has not computed yet is retried, then settles
-    // merge_unavailable rather than testing a merge for another head.
     let (resolver, _stub) = app_resolver(&f, "pending", Arc::new(PendingMerge));
     let accepted = f.accept_pr("pr-unmergeable", GITHUB_REPO_ID, None);
     let _ = f.validate(accepted);
@@ -1095,9 +1025,6 @@ fn a_generic_binding_without_an_app_association_cannot_claim_a_pull_request() {
         return;
     }
     let f = fixture();
-    // A PR delivery for the *generic* repository: the adapter would never
-    // produce one, and the resolver refuses it explicitly rather than treating
-    // the base branch as a trusted pull-request target.
     let merge = "e".repeat(40);
     let head_sha = "c".repeat(40);
     let base_sha = "d".repeat(40);
@@ -1188,9 +1115,6 @@ fn a_revoked_binding_settles_with_a_reason() {
     assert_eq!(row.reason.as_deref(), Some("binding_revoked"));
 }
 
-/// Polling over the real remote: `git ls-remote` against the loopback server
-/// discovers the baseline, a pushed commit becomes a `poll` delivery, and it
-/// resolves through the same path a hook delivery takes.
 #[test]
 fn a_polled_ref_observation_becomes_a_real_dispatch() {
     if !prerequisites() {
@@ -1229,7 +1153,6 @@ fn a_polled_ref_observation_becomes_a_real_dispatch() {
         |_| {},
     )
     .unwrap();
-    // The first real ls-remote only establishes the baseline.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let baselined = loop {
         let done = f
@@ -1254,7 +1177,6 @@ fn a_polled_ref_observation_becomes_a_real_dispatch() {
     };
     assert!(deliveries(&f).is_empty(), "the baseline admits nothing");
 
-    // The remote moves; the next poll admits the transition as a delivery.
     let repo_git = Repo {
         git: f.dir.path().join("repo"),
     };
@@ -1276,8 +1198,6 @@ fn a_polled_ref_observation_becomes_a_real_dispatch() {
     assert_eq!(delivery.ref_name.as_deref(), Some(REF));
     assert_eq!(delivery.new_sha.as_deref(), Some(head.as_str()));
 
-    // Validate and resolve exactly as the intake lane would: the delivery
-    // produces a real run whose spec pins the polled revision.
     let delivery = f.validate(delivery.id);
     assert_eq!(delivery.state, State::Ready);
     let (outcome, delivery) = f.resolve(delivery.id);
@@ -1294,9 +1214,7 @@ fn a_polled_ref_observation_becomes_a_real_dispatch() {
     drop(poller);
 }
 
-/// The jobs a resolution creates are ready from the write that creates them.
-/// `now` is taken before the pipeline fetch; stamping the jobs with it would
-/// count the fetch as queue time.
+/// Jobs are stamped at creation, not with the resolution's start time, or the fetch counts as queue time.
 #[test]
 fn a_dispatched_job_is_ready_from_its_creation_not_from_resolution_start() {
     if !prerequisites() {
@@ -1306,8 +1224,6 @@ fn a_dispatched_job_is_ready_from_its_creation_not_from_resolution_start() {
     let accepted = f.accept_push("push-ready", REF, &f.commits[0], &f.commits[1]);
     let delivery = f.validate(accepted);
     let before = UnixMillis::now();
-    // Resolution that began seconds ago, as a slow fetch would make it
-    // (within the source access it mints, which a minute would outlive).
     let outcome = f
         .resolver
         .resolve(&delivery, UnixMillis(before.0 - 5_000))

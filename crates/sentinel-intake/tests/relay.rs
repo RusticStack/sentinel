@@ -1,7 +1,3 @@
-//! Relay example: a real `git push` runs `examples/hooks/post-receive`,
-//! which spools each ref update and submits it over loopback HTTP. The stub
-//! server records what arrived, including the Authorization header and the
-//! exact JSON body.
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -33,7 +29,6 @@ impl Request {
     }
 }
 
-/// A loopback intake stub that records requests and answers with a status.
 struct Stub {
     addr: SocketAddr,
     requests: Arc<Mutex<Vec<Request>>>,
@@ -180,8 +175,6 @@ struct Repo {
 }
 
 impl Repo {
-    /// A bare repository with the hook installed and an env file pointing at
-    /// `url`; a working clone with one commit.
     fn create(url: &str, spool_max: Option<u32>) -> Repo {
         let dir = tempfile::tempdir().unwrap();
         let (bare, work) = (dir.path().join("origin.git"), dir.path().join("work"));
@@ -256,8 +249,6 @@ impl Repo {
         String::from_utf8(sha.stdout).unwrap().trim().to_owned()
     }
 
-    /// Push the current branch; returns the push's stderr (where the hook's
-    /// messages surface).
     fn push(&self) -> String {
         let (ok, stderr) = run(Command::new("git")
             .args(["push", "origin", "main"])
@@ -270,8 +261,7 @@ impl Repo {
         run(Command::new("sh").arg(&self.hook).arg("--flush"))
     }
 
-    /// Push with `dir` first on the hook's `PATH` (the hook inherits the
-    /// pusher's environment through `receive-pack`).
+    /// The hook inherits the pusher's environment through receive-pack, so PATH reaches it.
     fn push_with_path_prefix(&self, dir: &Path) -> String {
         let path = format!(
             "{}:{}",
@@ -337,7 +327,6 @@ fn a_push_is_delivered_once_and_a_dead_controller_spools_it_for_flush() {
     let sha = repo.commit("two");
     repo.push();
 
-    // Exactly one delivery, with the scoped secret and the exact ref update.
     let requests = stub.wait(1, Duration::from_secs(10));
     assert_eq!(requests.len(), 1);
     assert_eq!(
@@ -354,8 +343,6 @@ fn a_push_is_delivered_once_and_a_dead_controller_spools_it_for_flush() {
         "an acknowledged event leaves no spool"
     );
 
-    // A dead controller: the event is spooled, the push still succeeds, and
-    // the same stable delivery ID is what a later flush submits.
     repo.write_env("http://127.0.0.1:9/api/v1/intake/rep_test", None);
     let sha = repo.commit("three");
     let stderr = repo.push();
@@ -391,7 +378,6 @@ fn a_permanent_refusal_moves_the_event_to_failed_with_its_response() {
     let stderr = repo.push();
     assert!(stderr.contains("spooled"), "{stderr}");
     assert_eq!(repo.spooled().len(), 1);
-    // The flush retries once, sees the 4xx and files the event as failed.
     let (ok, stderr) = repo.flush();
     assert!(!ok, "a permanent refusal is reported: {stderr}");
     assert!(stderr.contains("refused permanently"), "{stderr}");
@@ -411,8 +397,6 @@ fn a_rate_limited_event_stays_spooled_for_retry() {
     if !prerequisites() {
         return;
     }
-    // 429 is the controller asking for back-off (admission bound, a full
-    // writer queue, an ambiguous write): the event must survive it.
     let stub = Stub::start(429);
     let repo = Repo::create(&stub.url("rep_test"), None);
     repo.commit("two");
@@ -427,7 +411,6 @@ fn a_rate_limited_event_stays_spooled_for_retry() {
         repo.failed().is_empty(),
         "never filed as a permanent refusal"
     );
-    // 408 is the same kind of answer.
     let stub = Stub::start(408);
     repo.write_env(&stub.url("rep_test"), None);
     let (ok, _) = repo.flush();
@@ -441,8 +424,6 @@ fn spooled_pushes_are_delivered_oldest_first() {
     if !prerequisites() {
         return;
     }
-    // Three pushes while the controller is down; the IDs sort by time, so
-    // the flush replays them in push order rather than directory order.
     let repo = Repo::create("http://127.0.0.1:9/api/v1/intake/rep_test", None);
     let mut pushed = Vec::new();
     for name in ["two", "three", "four"] {
@@ -461,8 +442,6 @@ fn spooled_pushes_are_delivered_oldest_first() {
         .map(|r| r.json()["new_sha"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(delivered, pushed, "push order, not directory order");
-    // The spool file names are what order them: sorted names are the
-    // delivered IDs in the same order.
     let ids: Vec<String> = requests
         .iter()
         .map(|r| r.json()["delivery_id"].as_str().unwrap().to_owned())
@@ -482,8 +461,6 @@ fn a_live_push_is_delivered_after_the_events_already_spooled() {
     let older = repo.commit("two");
     repo.push();
     assert_eq!(repo.spooled().len(), 1);
-    // The controller is back; the next push must not overtake the event it
-    // missed.
     let stub = Stub::start(202);
     repo.write_env(&stub.url("rep_test"), None);
     let newer = repo.commit("three");
@@ -501,8 +478,6 @@ fn the_hook_secret_never_appears_in_curl_arguments() {
     }
     let stub = Stub::start(202);
     let repo = Repo::create(&stub.url("rep_test"), None);
-    // A `curl` shim first on PATH records its argv and standard input, then
-    // runs the real one with the same input.
     let real = Command::new("sh")
         .args(["-c", "command -v curl"])
         .output()
@@ -530,12 +505,10 @@ fn the_hook_secret_never_appears_in_curl_arguments() {
     repo.commit("two");
     repo.push_with_path_prefix(&shim_dir);
     let requests = stub.wait(1, Duration::from_secs(10));
-    // The controller still receives the bearer header…
     assert_eq!(
         requests[0].authorization.as_deref(),
         Some(format!("Bearer {SECRET}").as_str())
     );
-    // …but it travelled on curl's standard input, never its command line.
     let argv = fs::read_to_string(&argv_log).unwrap();
     assert!(!argv.is_empty(), "the shim ran");
     assert!(!argv.contains(SECRET), "secret in argv: {argv}");
@@ -548,7 +521,6 @@ fn a_full_spool_refuses_new_events_instead_of_growing() {
         return;
     }
     let repo = Repo::create("http://127.0.0.1:9/api/v1/intake/rep_test", Some(1));
-    // Pre-fill the spool so the next event crosses the bound.
     fs::create_dir_all(&repo.spool).unwrap();
     fs::write(repo.spool.join("seed.json"), "{}").unwrap();
     repo.commit("two");
@@ -572,7 +544,6 @@ fn an_unencodable_ref_is_refused_without_a_spool_write() {
     }
     let stub = Stub::start(202);
     let repo = Repo::create(&stub.url("rep_test"), None);
-    // A ref that cannot be encoded in the JSON contract is skipped loudly.
     let mut child = Command::new("sh")
         .arg(&repo.hook)
         .stdin(std::process::Stdio::piped())
