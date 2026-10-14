@@ -94,6 +94,21 @@ pub struct Setup<'a> {
     pub organization: Option<&'a str>,
 }
 
+/// Judge a presented token without using it, for the wizard's side steps (the
+/// SMTP test). A wrong token counts against the same lock as [`complete`];
+/// the refusals are the same.
+pub fn verify(store: &Store, token: &Secret, now: UnixMillis) -> Result<()> {
+    let presented = token.digest();
+    match store.read(move |c| judge(c, &presented, now))? {
+        Verdict::Good => Ok(()),
+        Verdict::Wrong => {
+            fail(store, now)?;
+            Err(Error::Forbidden)
+        }
+        Verdict::Refused | Verdict::Locked => Err(Error::Forbidden),
+    }
+}
+
 /// What setup created.
 pub struct Completed {
     pub user: UserId,

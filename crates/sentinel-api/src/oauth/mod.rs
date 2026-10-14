@@ -76,6 +76,13 @@ pub(crate) enum Budget {
     Signup,
     /// Email resend, verification and invitation links.
     Mail,
+    /// First-run setup attempts (`POST /api/v1/setup`, the SMTP test): a
+    /// token judgement, and for a right one a password hash. Tight, because
+    /// nothing legitimate asks more than a handful of times.
+    Setup,
+    /// `POST /api/v1/orgs`: the slug check inherently says whether a name is
+    /// taken, so a client gets a few and then a slow refill.
+    Organization,
 }
 
 /// Per client at the token endpoint: 10/s, burst 20.
@@ -106,6 +113,14 @@ const SIGNUP_CEILING: Rate = Rate::per_sec(2, 10);
 /// and invitation links): burst 8, then one per 15 s; all clients 5/s.
 const MAIL_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(15), 8);
 const MAIL_CEILING: Rate = Rate::per_sec(5, 20);
+/// First-run setup attempts per client: burst 5, then one per 10 s; all
+/// clients together one per second, burst 5.
+const SETUP_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(10), 5);
+const SETUP_CEILING: Rate = Rate::per_sec(1, 5);
+/// Organization creations and name checks per client: burst 5, then one per
+/// 10 s; all clients together 2/s.
+const ORGANIZATION_CLIENT: Rate = Rate::new(std::time::Duration::from_secs(10), 5);
+const ORGANIZATION_CEILING: Rate = Rate::per_sec(2, 10);
 
 /// The authorization server's per-process state.
 pub(crate) struct OAuthState {
@@ -146,6 +161,10 @@ pub(crate) struct OAuthState {
     pub signup_budget: Mutex<Limiter>,
     /// Email resend, verification and invitation-link admission.
     pub mail_budget: Mutex<Limiter>,
+    /// First-run setup admission.
+    pub setup_budget: Mutex<Limiter>,
+    /// Self-service organization creation admission.
+    pub organization_budget: Mutex<Limiter>,
     /// Bounded in-memory CIMD cache.
     pub client_metadata: client::MetadataCache,
     /// Device-code digest -> (last poll, current interval in ms), bounded by
@@ -193,6 +212,12 @@ impl OAuthState {
             login_budget: Mutex::new(Limiter::new(LOGIN_CLIENT, Some(LOGIN_CEILING), now)),
             signup_budget: Mutex::new(Limiter::new(SIGNUP_CLIENT, Some(SIGNUP_CEILING), now)),
             mail_budget: Mutex::new(Limiter::new(MAIL_CLIENT, Some(MAIL_CEILING), now)),
+            setup_budget: Mutex::new(Limiter::new(SETUP_CLIENT, Some(SETUP_CEILING), now)),
+            organization_budget: Mutex::new(Limiter::new(
+                ORGANIZATION_CLIENT,
+                Some(ORGANIZATION_CEILING),
+                now,
+            )),
             client_metadata: client::MetadataCache::default(),
             device_polls: Mutex::new(HashMap::new()),
             user_code_failures: Mutex::new(device::WrongCodes::new()),
@@ -398,6 +423,8 @@ pub(crate) fn admitted(state: &State, request: &Request, budget: Budget) -> bool
         Budget::Login => take(&oauth.login_budget),
         Budget::Signup => take(&oauth.signup_budget),
         Budget::Mail => take(&oauth.mail_budget),
+        Budget::Setup => take(&oauth.setup_budget),
+        Budget::Organization => take(&oauth.organization_budget),
     }
 }
 
