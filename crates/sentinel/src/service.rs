@@ -42,6 +42,10 @@ fn trusted_proxy_valid(_: &str) -> bool {
 /// Bounded drains at shutdown: sessions and dispatcher, then the store.
 const LINK_SHUTDOWN: Duration = Duration::from_secs(2);
 const STORE_SHUTDOWN: Duration = Duration::from_secs(5);
+/// How long a worker's shutdown waits for its attempts to be torn down
+/// (container removal is bounded at 10 s by the runtime helper).
+#[cfg(feature = "worker")]
+const WORKER_SHUTDOWN: Duration = Duration::from_secs(20);
 
 pub struct Error {
     pub code: u8,
@@ -1200,6 +1204,8 @@ enum Running {
         /// Shared with the link thread, which replaces it when sessions over
         /// it keep failing.
         tailcat: Option<Arc<sentinel_link::tailcat::Forward>>,
+        /// Holds the running executor, so shutdown can end its attempts.
+        metrics: Arc<crate::worker_metrics::Metrics>,
     },
 }
 
@@ -2016,6 +2022,12 @@ mod worker_role {
                     sentinel_worker::executor::Notice::CostlyCacheHit { attempt, name, costly, stats } => {
                         tracing::warn!(event = "cache_costly_hit", attempt = %attempt, cache = %name, reason = costly.as_str(), copied_bytes = stats.copied_bytes, bytes = stats.bytes, lock_wait_ns = ?stats.lock_wait_ns, clone_ns = ?stats.clone_ns, "nominal hit paid rebuild-scale restore cost (docs/cache.md)");
                     }
+                    sentinel_worker::executor::Notice::OfferRefused { attempt, free_bytes, floor_bytes } => {
+                        tracing::warn!(event = "offer_refused_low_disk", attempt = %attempt, free_bytes, floor_bytes, "the data directory's disk is below the admission floor; offers are refused until it recovers");
+                    }
+                    sentinel_worker::executor::Notice::ShutDown { ended, left, handed_back } => {
+                        tracing::info!(event = "attempts_shut_down", ended, left, handed_back);
+                    }
                     sentinel_worker::executor::Notice::Availability(snapshot) => {
                         tracing::info!(event = "availability", images_held = snapshot.images_held.len(), images_in_flight = snapshot.images_in_flight, cache_entries = snapshot.cache_entries, cache_generations = snapshot.cache_generations, cache_bytes = snapshot.cache_bytes, truncated = snapshot.truncated);
                     }
@@ -2448,6 +2460,7 @@ mod worker_role {
             handle,
             thread,
             tailcat: forward,
+            metrics,
         })
     }
 }
@@ -2564,7 +2577,15 @@ fn initialize_and_wait(
             handle,
             thread,
             tailcat,
+            metrics,
         } => {
+            // Attempts first, while the session is still up: running ones
+            // are stopped and their containers removed (a container would
+            // otherwise run on after this process, while the controller
+            // reallocates its capacity), waiting ones are handed back.
+            if let Some(executor) = metrics.executor.get() {
+                executor.shutdown(WORKER_SHUTDOWN);
+            }
             handle.stop();
             let joined = thread.join().is_ok();
             if let Some(forward) = tailcat {
