@@ -106,9 +106,12 @@ impl LogState {
 
 /// Resources as the scheduler counts them: CPU in thousandths of a core,
 /// bytes of memory and bytes of scratch disk. A zero capacity is a worker
-/// that takes no work. `disk_bytes = 0` on a worker additionally means it
-/// has never reported disk capacity (migration 28), and disk is then not
-/// part of its admission: unreported is not the same as zero.
+/// that takes no work. For disk, zero is "not reported", and what that
+/// means depends on the wire, never on the number alone:
+/// a worker that speaks the profile protocol (7 and later) states its disk
+/// every session, so zero from it is a measurement it could not make and
+/// no job that declares scratch disk ever places there; a worker older than
+/// that has no way to state it, and is admitted on CPU and memory alone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capacity {
     pub cpu_millis: i64,
@@ -118,8 +121,9 @@ pub struct Capacity {
 
 /// Record what a worker has, as it reported at its hello. Replaces the
 /// previous report: the measurement is the worker's, made each session.
-/// Protocol 6 workers report no disk, and `disk_bytes = 0` records that
-/// absence rather than claiming a zero-sized scratch area.
+/// The disk is replaced like CPU and memory: the figure of the latest hello or
+/// profile, zero when that session measured none. Protocol 6 and older workers
+/// report no disk and are not held to one (see [`Capacity`]).
 pub fn report_capacity(tx: &Transaction<'_>, worker: WorkerId, capacity: Capacity) -> Result<()> {
     if capacity.cpu_millis < 0 || capacity.memory_bytes < 0 || capacity.disk_bytes < 0 {
         return Err(Error::InvalidInput("capacity"));
@@ -160,6 +164,17 @@ const FREE_CAPACITY_SQL: &str = "SELECT w.cpu_millis - COALESCE((
                   AND ((w.host_id IS NOT NULL AND h.host_id = w.host_id)
                        OR (w.host_id IS NULL AND h.id = w.id))), 0) END
      FROM workers w WHERE w.id = ?1 AND w.revoked_ms IS NULL";
+
+/// Whether disk is part of a worker's admission: it speaks the profile
+/// protocol, whose every session states the disk it offers. The worker's
+/// `disk_bytes` is then the limit even when it is zero (a platform that could
+/// not measure offers nothing), while an older worker cannot report disk at
+/// all and keeps the admission it always had. Derived from the negotiated
+/// protocol and never from the figure, so "not reported" cannot read as
+/// "unlimited" on a worker that was able to report.
+fn disk_reported(protocol: i64) -> bool {
+    protocol >= i64::from(sentinel_protocol::negotiate::PROFILE_MIN.0)
+}
 
 /// What the worker has left: its reported capacity less every attempt still
 /// held that the host counts. Attempts of every worker sharing the same
@@ -374,8 +389,9 @@ struct WorkerFacts {
     arch: String,
     labels: Vec<u8>,
     draining: bool,
-    /// `false` when the worker has never reported disk (protocol 6): disk is
-    /// then not part of its admission, never read as a zero-sized scratch.
+    /// `false` for a worker too old to report disk (protocol 6 and older):
+    /// disk is then not part of its admission. `true` for every profile
+    /// protocol worker, whose zero is a limit of zero ([`disk_reported`]).
     disk_reported: bool,
     avail_images: Vec<u8>,
     cpu_millis: i64,
@@ -448,7 +464,7 @@ fn worker_facts(conn: &Connection, worker: WorkerId) -> Result<Option<(WorkerId,
             arch,
             labels,
             draining,
-            disk_reported: disk_bytes > 0,
+            disk_reported: disk_reported(protocol),
             avail_images,
             cpu_millis: cpu,
             memory_bytes: memory,
@@ -498,7 +514,7 @@ fn pool_workers(conn: &Connection, tenant: TenantId) -> Result<Vec<(WorkerId, Wo
                 arch,
                 labels,
                 draining,
-                disk_reported: disk > 0,
+                disk_reported: disk_reported(protocol),
                 avail_images: images,
                 cpu_millis: cpu,
                 memory_bytes: memory,
@@ -851,6 +867,8 @@ struct LocalityWorker {
     cpu_millis: i64,
     memory_bytes: i64,
     disk_bytes: i64,
+    /// [`disk_reported`] of the worker's protocol.
+    disk_reported: bool,
     avail_images: Vec<u8>,
     /// When the earliest attempt it holds must have ended: its offer plus
     /// its job's timeout. `None` when it holds nothing. This is an upper
@@ -865,7 +883,7 @@ struct LocalityWorker {
 fn locality_view(conn: &Connection, tenant: TenantId) -> Result<Vec<LocalityWorker>> {
     let mut stmt = conn.prepare_cached(
         "SELECT w.id, w.arch, w.labels, w.cpu_millis, w.memory_bytes, w.disk_bytes,
-                w.avail_images,
+                w.avail_images, w.protocol,
                 (SELECT MIN(a.offered_ms + j.timeout_ms) FROM attempts a
                  JOIN jobs j ON j.id = a.job_id
                  WHERE a.worker_id = w.id AND a.released_ms IS NULL)
@@ -887,13 +905,21 @@ fn locality_view(conn: &Connection, tenant: TenantId) -> Result<Vec<LocalityWork
                 r.get::<_, i64>(5)?,
             ),
             r.get::<_, Vec<u8>>(6)?,
-            r.get::<_, Option<i64>>(7)?,
+            r.get::<_, i64>(7)?,
+            r.get::<_, Option<i64>>(8)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, arch, labels, (cpu_millis, memory_bytes, disk_bytes), avail_images, frees_by) =
-            row?;
+        let (
+            id,
+            arch,
+            labels,
+            (cpu_millis, memory_bytes, disk_bytes),
+            avail_images,
+            protocol,
+            frees_by,
+        ) = row?;
         out.push(LocalityWorker {
             id: WorkerId::from_bytes(id).map_err(|_| Error::Corrupt("worker id"))?,
             arch,
@@ -901,6 +927,7 @@ fn locality_view(conn: &Connection, tenant: TenantId) -> Result<Vec<LocalityWork
             cpu_millis,
             memory_bytes,
             disk_bytes,
+            disk_reported: disk_reported(protocol),
             avail_images,
             frees_by,
         });
@@ -929,9 +956,7 @@ fn locality_hold(view: &[LocalityWorker], exclude: WorkerId, pick: &Pick, now: U
             && labels_subset(&pick.labels, &worker.labels)
             && worker.cpu_millis >= pick.cpu_millis
             && worker.memory_bytes >= pick.memory_bytes
-            && !(pick.disk_bytes > 0
-                && worker.disk_bytes > 0
-                && worker.disk_bytes < pick.disk_bytes)
+            && !(pick.disk_bytes > 0 && worker.disk_reported && worker.disk_bytes < pick.disk_bytes)
             && caches_image(&worker.avail_images, &key)
             && worker.frees_by.is_none_or(|until| until <= bound)
     })
@@ -2405,7 +2430,8 @@ fn run_of(conn: &Connection, tenant: TenantId, job: JobId) -> Result<RunId> {
 
 /// A worker's report over the link: the attempt must be held by that worker
 /// under that fence, then [`finish`] applies the event as the worker. A
-/// terminal report may carry the attempt's summary, written once.
+/// terminal report may carry the attempt's summary, written once; a summary
+/// over `MAX_SUMMARY_BYTES` is dropped and the verdict stands.
 #[allow(clippy::too_many_arguments)]
 pub fn report(
     tx: &Transaction<'_>,
@@ -2444,13 +2470,17 @@ pub fn report(
         }
         event => event,
     };
+    // The size is judged before the transition, never after it: refusing an
+    // oversized summary once the verdict was applied would roll the whole
+    // report back and leave a passing job to be failed by lease expiry. The
+    // summary is telemetry; the verdict is evidence. Too big (the column
+    // refuses more than `MAX_SUMMARY_BYTES`) means the attempt records no
+    // summary at all — absent, never a truncated blob that would decode wrong.
+    let summary = summary.filter(|s| s.len() <= MAX_SUMMARY_BYTES);
     let next = finish(tx, attempt, Actor::Worker(fence), event, now, logs)?;
     if let Some(summary) = summary
         && next.is_terminal()
     {
-        if summary.len() > MAX_SUMMARY_BYTES {
-            return Err(Error::InvalidInput("attempt summary"));
-        }
         tx.prepare_cached("UPDATE attempts SET summary = ?2 WHERE id = ?1 AND summary IS NULL")?
             .execute(params![attempt.as_bytes(), summary])?;
     }

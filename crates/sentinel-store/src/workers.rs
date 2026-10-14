@@ -227,15 +227,16 @@ pub fn redeem(
 /// the newer protocol and a rolled-back one the older, never a version it
 /// cannot speak. The architecture is part of the identity — a different one
 /// is `Conflict`. Dropping below the profile protocol clears the placement
-/// facts only a profile reports (labels, warm images), so a worker that can
-/// no longer report them is not matched on stale ones.
+/// facts only a profile reports (labels, warm images, disk), so a worker that
+/// can no longer report them is not matched on stale ones.
 pub fn renegotiate(tx: &Transaction<'_>, worker: WorkerId, negotiated: Negotiated) -> Result<()> {
     let profiled = negotiated.protocol.0 >= sentinel_protocol::negotiate::PROFILE_MIN.0;
     let changed = tx
         .prepare_cached(
             "UPDATE workers SET protocol = ?2, capabilities = ?3,
                     labels = CASE WHEN ?5 THEN labels ELSE X'' END,
-                    avail_images = CASE WHEN ?5 THEN avail_images ELSE X'' END
+                    avail_images = CASE WHEN ?5 THEN avail_images ELSE X'' END,
+                    disk_bytes = CASE WHEN ?5 THEN disk_bytes ELSE 0 END
              WHERE id = ?1 AND revoked_ms IS NULL AND arch = ?4",
         )?
         .execute(params![

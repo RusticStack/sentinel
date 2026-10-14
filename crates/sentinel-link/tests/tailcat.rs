@@ -1256,7 +1256,12 @@ fn a_hand_off_restarts_the_helper_only_on_a_change_and_spares_direct_tls() {
             cpu_millis: 1_000,
             memory_bytes: 1 << 30,
         },
-        profile: sentinel_protocol::negotiate::Profile::default(),
+        profile: sentinel_protocol::negotiate::Profile {
+            // A profile-protocol worker states its scratch disk; zero offers none,
+            // and every job declares some.
+            disk_bytes: 64 << 30,
+            ..sentinel_protocol::negotiate::Profile::default()
+        },
         transport: sentinel_link::session::TransportStats::default(),
         remote_cache: false,
     };

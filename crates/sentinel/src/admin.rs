@@ -593,7 +593,7 @@ fn tenant_storage(
         quota.is_some() || log_ms.is_some() || artifact_ms.is_some() || !inherit.is_empty();
     if changing {
         let inherit = inherit.to_vec();
-        store
+        let (d, rest) = store
             .writer()
             .write(move |tx| {
                 let d = retention::installed(tx)?;
@@ -609,7 +609,7 @@ fn tenant_storage(
                 policy.quota_bytes = quota.or(policy.quota_bytes);
                 policy.log_retention_ms = log_ms.or(policy.log_retention_ms);
                 policy.artifact_retention_ms = artifact_ms.or(policy.artifact_retention_ms);
-                retention::set(
+                let rest = retention::set(
                     tx,
                     &Authority::HostLocal,
                     &d,
@@ -617,9 +617,12 @@ fn tenant_storage(
                     repo,
                     policy,
                     UnixMillis::now(),
-                )
+                )?;
+                Ok((d, rest))
             })
             .map_err(|error| fail(format!("cannot set the storage policy: {error}")))?;
+        retention::finish_reapply(&store, &d, tenant, repo, rest)
+            .map_err(|error| fail(format!("cannot re-apply the storage policy: {error}")))?;
     }
     let report = store
         .read(move |conn| {

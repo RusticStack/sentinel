@@ -438,7 +438,7 @@ fn set_storage(state: &State, request: &mut Request, slug: &str, repo: Option<&s
     let principal = who.principal;
     let d = state.objects.deployment();
     let (slug, repo) = (slug.to_owned(), repo.map(str::to_owned));
-    let (own, effective) = state
+    let (own, effective, (tenant, repo, rest)) = state
         .store
         .writer()
         .write(move |tx| {
@@ -450,13 +450,17 @@ fn set_storage(state: &State, request: &mut Request, slug: &str, repo: Option<&s
                     (tenant, Some(lookup::repo_by_name(tx, tenant, &name)?))
                 }
             };
-            retention::set(tx, &authority, &d, tenant, repo, policy, UnixMillis::now())?;
+            let rest = retention::set(tx, &authority, &d, tenant, repo, policy, UnixMillis::now())?;
             Ok((
                 retention::policy(tx, tenant, repo)?,
                 retention::effective(tx, &d, tenant, repo)?,
+                (tenant, repo, rest),
             ))
         })
         .map_err(store_error)?;
+    // The rest of the re-stamping, a bounded write at a time: the writer
+    // serves other requests between batches.
+    retention::finish_reapply(&state.store, &d, tenant, repo, rest).map_err(store_error)?;
     ok(json!({ "policy": storage_policy_json(&own), "effective": effective_json(&effective) }))
 }
 
