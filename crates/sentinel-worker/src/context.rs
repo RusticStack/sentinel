@@ -1,13 +1,3 @@
-//! The worker-phase expression context: what a step's `if` and a cache key
-//! can see once the pinned checkout exists.
-//!
-//! Every value comes from the controller's `JobContext` or the run spec;
-//! `hash_files` reads the attempt's private workspace. The event facts
-//! (`event.name|ref|base_ref|key|pr_number`) come from the job's event. A
-//! field the event does not carry answers `null`, and a field the run does
-//! not hold answers `Unresolved` so the attempt fails preparation naming it
-//! rather than defaulting it.
-
 use std::path::{Path, PathBuf};
 
 use sentinel_link::session::JobContext;
@@ -37,6 +27,7 @@ impl Context for WorkerContext<'_> {
         Phase::Worker
     }
 
+    // Unknown fields are Unresolved, never defaulted: preparation fails naming the field.
     fn lookup(&self, path: &[String]) -> Lookup {
         let key: Vec<&str> = path.iter().map(String::as_str).collect();
         let event = &self.job.event;

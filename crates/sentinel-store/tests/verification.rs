@@ -1,6 +1,3 @@
-//! Verification: duplicate requests, transaction rollback, conflicting
-//! updates from concurrent callers, and a real process crash between
-//! acknowledged commits and reopen.
 use std::{
     process::Command,
     sync::{Arc, Barrier},
@@ -46,7 +43,6 @@ fn open(dir: &std::path::Path, durability: Durability) -> (Store, TenantId, Repo
     (store, tenant, repo)
 }
 
-/// Dispatch with an idempotency key: begin, create, complete in one transaction.
 fn dispatch(
     store: &Store,
     tenant: TenantId,
@@ -96,7 +92,6 @@ fn duplicate_requests_execute_once_and_replay_the_same_run() {
         .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))?))
         .unwrap();
     assert_eq!(count, 1);
-    // Same key, different body: rejected, nothing created.
     assert!(matches!(
         dispatch(&store, tenant, repo, "dispatch-1", b"{\"sha\":\"b\"}", 1002),
         Err(Error::Conflict)
@@ -105,7 +100,6 @@ fn duplicate_requests_execute_once_and_replay_the_same_run() {
         .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))?))
         .unwrap();
     assert_eq!(count, 1);
-    // Another tenant with the same key is an unrelated scope.
     let (store2, tenant2, repo2) = (store, TenantId::new(), RepoId::new());
     store2
         .writer()
@@ -125,7 +119,6 @@ fn duplicate_requests_execute_once_and_replay_the_same_run() {
     .unwrap();
     assert!(!replayed);
     assert_ne!(third, first);
-    // After the TTL the key is fresh again.
     let (fourth, replayed) = dispatch(
         &store2,
         tenant,
@@ -150,7 +143,6 @@ fn expired_idempotency_records_are_purged_in_bounded_batches() {
     for i in 0..2 {
         dispatch(&store, tenant, repo, &format!("live-{i}"), b"a", live_at).unwrap();
     }
-    // The old records are past the TTL at `now`; the live ones are not.
     let now = UnixMillis(2_000 + IDEMPOTENCY_TTL_MS);
     let keys = || -> i64 {
         store
@@ -162,7 +154,6 @@ fn expired_idempotency_records_are_purged_in_bounded_batches() {
     assert_eq!(idempotency::purge_expired(&store, now, 3).unwrap(), 2);
     assert_eq!(idempotency::purge_expired(&store, now, 3).unwrap(), 0);
     assert_eq!(keys(), 2);
-    // Live keys still replay their run, and the runs themselves are untouched.
     for i in 0..2 {
         let (_, replayed) =
             dispatch(&store, tenant, repo, &format!("live-{i}"), b"a", now.0).unwrap();
@@ -182,8 +173,6 @@ fn failed_transaction_leaves_no_partial_rows() {
     let run = RunId::new();
     let s = spec();
     let key = IdempotencyKey::parse("k").unwrap();
-    // The idempotency record is written first; the run then fails because the
-    // repo is not the tenant's. Both must roll back together.
     let result = store.writer().write(move |tx| {
         let scope = Scope {
             tenant,
@@ -262,8 +251,6 @@ fn concurrent_leases_of_one_job_succeed_exactly_once() {
     assert_eq!(attempts, 1);
 }
 
-/// Child mode: perform N acknowledged transitions with FULL durability, then
-/// abort without any cleanup. The parent then reopens and counts.
 #[test]
 fn crash_child() {
     let Ok(path) = std::env::var("SENTINEL_CRASH_DB") else {
@@ -299,7 +286,6 @@ fn crash_child() {
                 )
             })
             .unwrap();
-        // Report progress so the parent knows what was acknowledged.
         println!("ACKED {}", i + 1);
     }
     std::process::abort();
