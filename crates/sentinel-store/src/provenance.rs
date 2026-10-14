@@ -1,46 +1,25 @@
-//! Why a run exists: one immutable row per run, written in the same
-//! transaction as the run itself.
-//!
-//! A manual dispatch names its pipeline inline and has no delivery; an event
-//! names the delivery that produced it, the ref transition, and — for a pull
-//! request — the head, base and tested-merge revisions. `pipeline_sha` is the
-//! revision the pipeline file was read from, which is not necessarily the
-//! revision that will be checked out. Nothing here is inferred from a ref:
-//! the values are what the authorizing adapter supplied, and a generic Git
-//! event can never claim PR metadata.
+//! Values are what the authorizing adapter supplied, never inferred from a ref, so a generic Git event cannot claim PR metadata.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{DeliveryId, RepoId, RunId, TenantId, UnixMillis};
 
 use crate::{Error, Result};
 
-/// The terms of one run's provenance. Owned: the dispatch transaction moves
-/// them onto the writer thread.
 pub struct Provenance {
     pub tenant: TenantId,
     pub repo: RepoId,
-    /// `push`, `tag`, `pull_request` or `manual`.
     pub trigger: String,
-    /// The delivery that produced this run; `None` for manual dispatch.
     pub delivery: Option<DeliveryId>,
-    /// The provider that authenticated the event; `None` for manual dispatch.
     pub provider: Option<String>,
-    /// The full ref the event concerns (the base branch for a pull request).
     pub ref_name: Option<String>,
-    /// The observed ref transition, when the event was one.
     pub old_sha: Option<String>,
     pub new_sha: Option<String>,
-    /// Pull-request provenance: the head tip, the base tip and the tested
-    /// merge commit GitHub computed, when there was one.
     pub head_sha: Option<String>,
     pub base_sha: Option<String>,
     pub merge_sha: Option<String>,
     pub pipeline_sha: String,
-    /// The bound pipeline path; `None` when the pipeline was submitted inline.
     pub pipeline_path: Option<String>,
-    /// The compiled content digest.
     pub pipeline_digest: [u8; 16],
-    /// The pull request number, when the run came from one.
     pub pr_number: Option<u64>,
 }
 
@@ -78,7 +57,6 @@ impl Provenance {
     }
 }
 
-/// Insert one run's provenance. The store refuses a rewrite or a delete.
 pub fn insert(
     tx: &Transaction<'_>,
     provenance: &Provenance,
@@ -114,7 +92,6 @@ pub fn insert(
     Ok(())
 }
 
-/// A run's provenance as read back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunProvenance {
     pub run: RunId,
@@ -136,9 +113,6 @@ pub struct RunProvenance {
     pub created: UnixMillis,
 }
 
-/// The event facts expressions and the worker context see, derived from
-/// provenance. `event.key` is a short, stable key: the branch or tag name,
-/// `pr-<n>`, or `manual`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventFacts {
     pub name: String,
@@ -160,8 +134,6 @@ impl EventFacts {
                 let number = pr_number;
                 EventFacts {
                     name: trigger.to_owned(),
-                    // The merge ref is what was tested; keep the base ref in
-                    // `base_ref` where a pipeline can filter on it.
                     ref_name: number
                         .map(|n| format!("refs/pull/{n}/merge"))
                         .unwrap_or_else(|| "refs/pull/unknown/merge".to_owned()),
@@ -183,8 +155,6 @@ impl EventFacts {
     }
 }
 
-/// One run's event facts. A run without provenance (created by a raw store
-/// primitive) is the manual mode: the only path that did not record one.
 pub fn event_facts(conn: &Connection, run: RunId) -> Result<EventFacts> {
     let row: Option<(String, Option<String>, Option<i64>)> = conn
         .prepare_cached(
@@ -202,13 +172,6 @@ pub fn event_facts(conn: &Connection, run: RunId) -> Result<EventFacts> {
     })
 }
 
-/// The cache trust class of one run (docs/cache.md): `Protected`
-/// only for a `push`/`tag` that arrived through verified intake (a
-/// recorded delivery — never the API) for a ref the repository's live
-/// binding names *exactly*; `PullRequest` for pull-request runs;
-/// `Unprotected` for everything else — manual runs, whose source and
-/// pipeline the caller chose, refs admitted only by a wildcard, unbound or
-/// revoked repositories, and runs without provenance.
 pub fn cache_trust(
     conn: &Connection,
     run: RunId,
@@ -245,12 +208,8 @@ pub fn cache_trust(
     Ok(Trust::derive(&trigger, verified, exact))
 }
 
-/// Whether a run may be handed secret plaintext. Only a run with recorded
-/// non-manual provenance qualifies: intake builds its pipeline from the file
-/// at a bound revision of the repository, which the repository's writers
-/// control. A manual run's pipeline was authored by the caller of a `run`
-/// grant, so it never receives secrets; a run without provenance cannot be
-/// classified and fails closed the same way.
+/// Only non-manual runs with recorded provenance may receive secrets: a manual pipeline is authored by its caller,
+/// and a run without provenance fails closed.
 pub fn may_receive_secrets(conn: &Connection, run: RunId) -> Result<bool> {
     Ok(conn
         .prepare_cached(
@@ -262,8 +221,6 @@ pub fn may_receive_secrets(conn: &Connection, run: RunId) -> Result<bool> {
         .unwrap_or(false))
 }
 
-/// One run's provenance; `None` for a run created by a path that does not
-/// record it.
 pub fn of_run(conn: &Connection, run: RunId) -> Result<Option<RunProvenance>> {
     type Row = (
         [u8; 16],
@@ -361,8 +318,6 @@ pub fn of_run(conn: &Connection, run: RunId) -> Result<Option<RunProvenance>> {
     }))
 }
 
-/// The event kind of a run, for the status views. `None` means the run has no
-/// provenance row.
 pub fn trigger_of(conn: &Connection, run: RunId) -> Result<Option<String>> {
     Ok(conn
         .prepare_cached("SELECT trigger FROM run_provenance WHERE run_id = ?1")?

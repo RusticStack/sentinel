@@ -1,36 +1,5 @@
-//! Storage quotas and retention at deployment, tenant, repository and run
-//! level.
-//!
-//! The deployment's configuration sets the defaults ([`Deployment`]); a
-//! `storage_policies` row overrides them for one tenant (`repo_id = X''`) or
-//! one repository. A NULL column inherits. Retention only ever narrows going
-//! down: a repository's effective retention is the smaller of its own and its
-//! tenant's, so a tenant administrator can shorten a repository's retention
-//! but never keep its data longer than the platform allows the tenant.
-//! Quotas are separate caps at each level, all enforced:
-//!
-//! | Level | Counts | Enforced when |
-//! |---|---|---|
-//! | deployment | every tenant's objects, open uploads and logs | an object or upload would add bytes |
-//! | tenant | its objects, open uploads and logs | the same |
-//! | repository | its artifacts' logical bytes and its logs | an artifact begins |
-//! | run | its artifacts | an artifact begins and while it streams |
-//!
-//! Logs are counted but never refused for quota: a log is the evidence of
-//! what ran, and refusing it would hide a failure. They are bounded instead
-//! by the per-attempt cap and their retention.
-//!
-//! **Log expiry is database-driven.** Once an attempt is released, the
-//! maintenance pass stamps its log's stored bytes and its expiry deadline
-//! (release plus the effective log retention) — [`unstamped`] then
-//! [`stamp`]. [`expiring`] and [`expire`] then retire logs past their deadline:
-//! the row records `log_expired_ms` and drops its bytes from usage in one
-//! transaction, and the files go after that commits. A crash between the two
-//! leaves files whose row says expired; the log store's directory sweep
-//! removes those, and any directory no attempt row names. Changing a policy
-//! re-stamps the logs and re-clamps the artifacts it covers in the same
-//! transaction, so a lowered retention frees space on the next pass rather
-//! than for new data only.
+//! Logs are never refused for quota, since refusing one would hide a failure.
+//! Expiry deletes a log's files only after its row commits, so a crash leaves files the directory sweep reclaims.
 
 use std::collections::HashMap;
 
@@ -41,24 +10,15 @@ use crate::{Error, Result, auth::Authority};
 
 const DAY_MS: i64 = 24 * 3_600_000;
 
-/// Shortest and longest retention a policy may set.
 pub const MIN_RETENTION_MS: i64 = 3_600_000;
 pub const MAX_RETENTION_MS: i64 = 366 * DAY_MS;
 
-/// The deployment's own storage limits, from configuration. `0` quotas mean
-/// unlimited.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deployment {
-    /// Cap on everything every tenant stores together.
     pub quota_bytes: u64,
-    /// Quota for a tenant without its own.
     pub tenant_quota_bytes: u64,
-    /// Log retention for a tenant without its own.
     pub log_retention_ms: i64,
-    /// Longest artifact retention a pipeline may ask for, for a tenant
-    /// without its own limit; a longer `retain` is shortened to it.
     pub artifact_retention_ms: i64,
-    /// Artifact bytes one run may store.
     pub run_artifact_bytes: u64,
 }
 
@@ -74,7 +34,6 @@ impl Default for Deployment {
     }
 }
 
-/// One `storage_policies` row as set: `None` inherits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Policy {
     pub quota_bytes: Option<u64>,
@@ -102,12 +61,9 @@ impl Policy {
     }
 }
 
-/// The limits that apply to one tenant, or one repository of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Effective {
-    /// The tenant's quota; 0 unlimited.
     pub tenant_quota_bytes: u64,
-    /// The repository's own quota; 0 none (only the tenant's applies).
     pub repo_quota_bytes: u64,
     pub log_retention_ms: i64,
     pub artifact_retention_ms: i64,
@@ -117,8 +73,6 @@ fn blob_repo(repo: Option<RepoId>) -> Vec<u8> {
     repo.map_or_else(Vec::new, |r| r.as_bytes().to_vec())
 }
 
-/// The policy row of a tenant (`repo = None`) or repository; all `None`
-/// when there is none.
 pub fn policy(conn: &Connection, tenant: TenantId, repo: Option<RepoId>) -> Result<Policy> {
     Ok(conn
         .prepare_cached(
@@ -139,7 +93,6 @@ pub fn policy(conn: &Connection, tenant: TenantId, repo: Option<RepoId>) -> Resu
         .unwrap_or_default())
 }
 
-/// What applies to `tenant`, or to one repository of it.
 pub fn effective(
     conn: &Connection,
     d: &Deployment,
@@ -168,16 +121,6 @@ pub fn effective(
     Ok(out)
 }
 
-/// Set (or, when every field is `None`, remove) the policy of a tenant or
-/// one of its repositories, then start re-applying retention to what it
-/// covers: the policy row and the first [`REAPPLY_BATCH`] rows commit here,
-/// and the returned cursor is what [`finish_reapply`] continues from, one
-/// bounded write at a time, so no policy change occupies the writer for the
-/// size of the tenant.
-///
-/// A tenant's policy is platform administration. A repository's is its
-/// tenant's administration, and may only narrow: its retention cannot exceed
-/// the tenant's effective retention, nor its quota the tenant's quota.
 pub fn set(
     tx: &Transaction<'_>,
     authority: &Authority,
@@ -256,10 +199,6 @@ pub fn set(
     reapply_step(tx, d, tenant, repo, Reapply::default(), REAPPLY_BATCH)
 }
 
-/// The effective log and artifact retention of an attempt's or artifact's
-/// repository, as SQL over `storage_policies`: `?1` tenant, `?2` the
-/// deployment's value, `{col}` the policy column and `{repo}` the row's
-/// repository expression.
 fn effective_sql(col: &str, repo: &str) -> String {
     format!(
         "(SELECT MIN(COALESCE(rp.{col}, tp), tp) FROM
@@ -269,38 +208,21 @@ fn effective_sql(col: &str, repo: &str) -> String {
     )
 }
 
-/// Rows one re-application write touches at most, per kind. Each write is a
-/// short transaction, and the writer serves everything else between them.
 pub const REAPPLY_BATCH: i64 = 512;
 
-/// Where re-applying a policy stands: a position in the tenant's stamped
-/// logs, then in its artifacts, by row id. Opaque; hand it back to
-/// [`reapply_step`] or [`finish_reapply`]. A step is idempotent, so a cursor
-/// that is lost or repeated costs time, never correctness.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[must_use = "the rows past the first batch are re-applied by finish_reapply"]
 pub struct Reapply {
-    /// 0: logs, 1: artifacts, 2: done.
     phase: u8,
-    /// The last row id of the previous batch; rows after it are next.
     after: [u8; 16],
 }
 
 impl Reapply {
-    /// Nothing is left to re-apply.
     pub fn done(&self) -> bool {
         self.phase >= 2
     }
 }
 
-/// Re-stamp one batch of the stamped, unexpired logs, or re-clamp one batch
-/// of the artifacts, of a tenant (every repository without its own narrower
-/// value follows it) or of one repository, to the policy now in force. Rows
-/// are visited in row order from the cursor, at most `batch` of the tenant's
-/// stamped logs or artifacts per call ([`REAPPLY_BATCH`] in production, and
-/// read through a keyed index, so what other tenants hold costs nothing); a
-/// repository scope filters within that range, so a step may touch fewer rows
-/// than `batch`. A phase ends when fewer than `batch` candidates remain.
 pub fn reapply_step(
     tx: &Transaction<'_>,
     d: &Deployment,
@@ -322,12 +244,8 @@ pub fn reapply_step(
         (d.artifact_retention_ms, "artifact_retention_ms")
     };
     let t = tenant.as_bytes().as_slice();
-    // `?3` is the repository when the scope names one, and an unused NULL
-    // when it does not; every statement binds the same five values.
     let r: Option<[u8; 16]> = repo.map(|r| *r.as_bytes());
     let (bound_sql, update) = reapply_sql(logs_phase, repo.is_some(), expires, batch);
-    // The batch's last row: the `batch`-th of the tenant's candidate rows
-    // past the cursor, or none when the rest fits in this batch.
     let bound: Option<[u8; 16]> = tx
         .prepare_cached(&bound_sql)?
         .query_row(
@@ -361,14 +279,7 @@ pub fn reapply_step(
     })
 }
 
-/// The two statements of one re-application step: the bound (the batch's
-/// last row id, or none when the rest fits) and the write over the id range
-/// it closes. The range is cut over the tenant's rows in a keyed index,
-/// `INDEXED BY` so the plan cannot fall back to the primary key, which would
-/// walk every tenant's rows to find this one's. A step therefore reads at
-/// most `batch` of the tenant's candidate rows plus the final remainder
-/// (itself under `batch`), whatever else the table holds; a repository scope
-/// only filters inside that range.
+/// INDEXED BY pins the tenant's keyed index: without it the planner may walk every tenant's rows.
 fn reapply_sql(logs_phase: bool, scoped: bool, expires: &str, batch: i64) -> (String, String) {
     let (table, index, filter) = if logs_phase {
         (
@@ -411,10 +322,6 @@ fn reapply_sql(logs_phase: bool, scoped: bool, expires: &str, batch: i64) -> (St
     (bound, update)
 }
 
-/// Continue a re-application to its end, each batch in its own write so the
-/// writer is free between them. A failure leaves what was re-applied in
-/// place and the rest as it was; running [`set`] again (or this, with a
-/// fresh cursor) repeats the work, which is idempotent.
 pub fn finish_reapply(
     store: &crate::Store,
     d: &Deployment,
@@ -431,7 +338,6 @@ pub fn finish_reapply(
     Ok(())
 }
 
-/// A tenant's stored bytes: objects plus open uploads, and logs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
     pub object_bytes: u64,
@@ -457,7 +363,6 @@ pub fn tenant_usage(conn: &Connection, tenant: TenantId) -> Result<Usage> {
         .unwrap_or_default())
 }
 
-/// Everything every tenant stores.
 pub fn deployment_usage(conn: &Connection) -> Result<u64> {
     let total: i64 = conn
         .prepare_cached("SELECT COALESCE(SUM(bytes + log_bytes), 0) FROM tenant_usage")?
@@ -465,7 +370,6 @@ pub fn deployment_usage(conn: &Connection) -> Result<u64> {
     Ok(total.max(0) as u64)
 }
 
-/// A repository's stored bytes: its artifacts' logical bytes and its logs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RepoUsage {
     pub artifact_bytes: u64,
@@ -497,7 +401,6 @@ pub fn repo_usage(conn: &Connection, tenant: TenantId, repo: RepoId) -> Result<R
         .unwrap_or_default())
 }
 
-/// One repository's storage as its tenant sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoStorage {
     pub repo: RepoId,
@@ -506,7 +409,6 @@ pub struct RepoStorage {
     pub policy: Policy,
 }
 
-/// Every repository of a tenant with its usage and its own policy, by name.
 pub fn repos(conn: &Connection, tenant: TenantId) -> Result<Vec<RepoStorage>> {
     let mut stmt = conn.prepare_cached(
         "SELECT r.id, r.name, COALESCE(u.artifact_bytes, 0), COALESCE(u.log_bytes, 0),
@@ -547,9 +449,6 @@ pub fn repos(conn: &Connection, tenant: TenantId) -> Result<Vec<RepoStorage>> {
     Ok(out)
 }
 
-/// Refuse `extra` more bytes for `tenant` when that would pass its quota or
-/// the deployment's. `owed` is what the tenant already owes (its usage plus
-/// what the caller knows is in flight for it).
 pub fn check_tenant(
     conn: &Connection,
     d: &Deployment,
@@ -567,7 +466,6 @@ pub fn check_tenant(
     Ok(())
 }
 
-/// Refuse `extra` more artifact bytes for a repository over its own quota.
 pub fn check_repo(
     conn: &Connection,
     d: &Deployment,
@@ -587,8 +485,6 @@ pub fn check_repo(
     Ok(())
 }
 
-/// [`check_repo`] for the repository a run belongs to: refuse `extra`
-/// more artifact bytes when that repository is over its own quota.
 pub fn check_run_repo(
     conn: &Connection,
     d: &Deployment,
@@ -611,10 +507,6 @@ pub fn check_run_repo(
     }
 }
 
-/// Record the deployment's limits where the database's own triggers read
-/// them (the artifact retention cap) and host-local tools find them
-/// ([`installed`]). The controller calls it at every start, so a
-/// configuration change applies from then on.
 pub fn install(tx: &Transaction<'_>, d: &Deployment) -> Result<()> {
     let fits = |v: u64| i64::try_from(v).map_err(|_| Error::InvalidInput("storage limit"));
     if d.log_retention_ms <= 0 || d.artifact_retention_ms <= 0 || d.run_artifact_bytes == 0 {
@@ -642,8 +534,6 @@ pub fn install(tx: &Transaction<'_>, d: &Deployment) -> Result<()> {
     Ok(())
 }
 
-/// The limits the controller last started with, or the built-in defaults
-/// when it never has — what host-local administration validates against.
 pub fn installed(conn: &Connection) -> Result<Deployment> {
     Ok(conn
         .prepare_cached(
@@ -664,7 +554,6 @@ pub fn installed(conn: &Connection) -> Result<Deployment> {
         .unwrap_or_default())
 }
 
-/// A released attempt whose log has no stored size or deadline yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Unstamped {
     pub attempt: AttemptId,
@@ -683,8 +572,6 @@ fn id<T>(
     f(bytes).map_err(|_| Error::Corrupt(what))
 }
 
-/// Up to `limit` released attempts whose logs are not stamped yet, oldest
-/// release first (the `attempts_log_unstamped` index).
 pub fn unstamped(conn: &Connection, limit: u32) -> Result<Vec<Unstamped>> {
     let mut stmt = conn.prepare_cached(
         "SELECT a.id, j.run_id, a.job_id, a.tenant_id, a.repo_id, a.released_ms
@@ -720,8 +607,6 @@ pub fn unstamped(conn: &Connection, limit: u32) -> Result<Vec<Unstamped>> {
     Ok(out)
 }
 
-/// Stamp each log's stored bytes and its deadline (release plus the
-/// effective retention). Rows stamped meanwhile are left alone.
 pub fn stamp(tx: &Transaction<'_>, d: &Deployment, logs: &[(Unstamped, u64)]) -> Result<u32> {
     let mut retention: HashMap<(TenantId, Option<RepoId>), i64> = HashMap::new();
     let mut stamped = 0u32;
@@ -749,7 +634,6 @@ pub fn stamp(tx: &Transaction<'_>, d: &Deployment, logs: &[(Unstamped, u64)]) ->
     Ok(stamped)
 }
 
-/// A log past its deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Expiring {
     pub attempt: AttemptId,
@@ -757,7 +641,6 @@ pub struct Expiring {
     pub job: JobId,
 }
 
-/// Up to `limit` logs whose deadline has passed, earliest first.
 pub fn expiring(conn: &Connection, now: UnixMillis, limit: u32) -> Result<Vec<Expiring>> {
     let mut stmt = conn.prepare_cached(
         "SELECT a.id, j.run_id, a.job_id
@@ -786,9 +669,6 @@ pub fn expiring(conn: &Connection, now: UnixMillis, limit: u32) -> Result<Vec<Ex
     Ok(out)
 }
 
-/// Record the logs as expired and drop their bytes from usage; re-checks the
-/// deadline, so a log whose retention was raised meanwhile stays. Returns
-/// the attempts whose files the caller now removes, after this commits.
 pub fn expire(tx: &Transaction<'_>, logs: &[Expiring], now: UnixMillis) -> Result<Vec<Expiring>> {
     let mut out = Vec::with_capacity(logs.len());
     for log in logs {
@@ -806,8 +686,6 @@ pub fn expire(tx: &Transaction<'_>, logs: &[Expiring], now: UnixMillis) -> Resul
     Ok(out)
 }
 
-/// Whether an attempt's log files may be deleted by the directory sweep: no
-/// attempt row names it, or retention already expired it.
 pub fn log_gone(conn: &Connection, attempt: AttemptId) -> Result<bool> {
     let expired: Option<bool> = conn
         .prepare_cached("SELECT log_expired_ms IS NOT NULL FROM attempts WHERE id = ?1")?
@@ -816,7 +694,6 @@ pub fn log_gone(conn: &Connection, attempt: AttemptId) -> Result<bool> {
     Ok(expired.unwrap_or(true))
 }
 
-/// When retention removed an attempt's log, if it did.
 pub fn log_expired(conn: &Connection, attempt: AttemptId) -> Result<Option<UnixMillis>> {
     Ok(conn
         .prepare_cached("SELECT log_expired_ms FROM attempts WHERE id = ?1")?
@@ -828,12 +705,9 @@ pub fn log_expired(conn: &Connection, attempt: AttemptId) -> Result<Option<UnixM
         .map(UnixMillis))
 }
 
-/// How long aborted upload rows are kept for explanation before they go.
 pub const ABORTED_UPLOAD_KEEP_MS: i64 = 7 * DAY_MS;
 
-/// Delete up to `limit` aborted upload sessions whose expiry is older than
-/// [`ABORTED_UPLOAD_KEEP_MS`]. Committed sessions are kept: they authorize
-/// reads of the object they produced.
+/// Committed sessions stay: they authorize reads of the object they produced.
 pub fn purge_aborted_uploads(tx: &Transaction<'_>, now: UnixMillis, limit: u32) -> Result<u32> {
     let ids: Vec<Vec<u8>> = tx
         .prepare_cached(
@@ -868,9 +742,6 @@ mod tests {
             .collect()
     }
 
-    /// Each re-application statement walks the tenant's keyed index in row
-    /// order: never the primary key (every tenant's rows), never a sort, so
-    /// a step's reads are bounded by the batch whatever other tenants hold.
     #[test]
     fn reapply_statements_read_the_tenants_rows_by_key() {
         let mut conn = Connection::open_in_memory().unwrap();

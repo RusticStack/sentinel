@@ -1,12 +1,4 @@
-//! Opt-in bounded ref polling: durable schedules and observation
-//! cursors.
-//!
-//! A repository's poll configuration is tenant-owned and requires a live
-//! source binding; it records which ref patterns to watch and when the next
-//! poll is due. `admit` compares one remote advertisement to the durable
-//! cursor and inserts a normal intake delivery for every transition — the
-//! cursor advances only when the delivery it produced commits in the same
-//! transaction, so a crash can never skip a change or replay one twice.
+//! The cursor advances in the same transaction as its delivery, so a crash never skips or replays a change.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{DeliveryId, RepoId, TenantId, UnixMillis, UserId};
@@ -14,20 +6,16 @@ use sentinel_protocol::source::{self, ref_matches, valid_ref_pattern};
 
 use crate::{Error, Result, intake, registration::Authority, sources};
 
-/// Provider key a polled transition carries through the delivery table.
 pub const PROVIDER: &str = "poll";
 pub const MIN_INTERVAL_MS: i64 = 10_000;
 pub const MAX_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const MAX_REFS: usize = source::MAX_REFS;
 
-/// What one repository polls for: an interval and the ref patterns it
-/// watches. Patterns follow the binding's selector rules exactly.
 pub struct Spec {
     pub interval_ms: i64,
     pub refs: Vec<String>,
 }
 
-/// A repository's durable poll configuration and schedule.
 pub struct Config {
     pub repo: RepoId,
     pub tenant: TenantId,
@@ -36,20 +24,15 @@ pub struct Config {
     pub next_poll_ms: i64,
     pub failures: i64,
     pub last_error: Option<String>,
-    /// `true` once the first successful poll has recorded the baseline;
-    /// transitions are admitted only after it exists.
     pub baselined: bool,
 }
 
-/// One remote tip, as `git ls-remote` advertised it.
 pub struct Tip {
     pub name: String,
     pub oid: String,
-    /// Peeled commit id for an annotated tag.
     pub peeled: Option<String>,
 }
 
-/// The durable cursor for one watched ref.
 pub struct Observation {
     pub ref_name: String,
     pub oid: String,
@@ -58,24 +41,15 @@ pub struct Observation {
     pub observed_ms: UnixMillis,
 }
 
-/// What one `admit` call produced.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Admitted {
-    /// The first successful poll only establishes the baseline.
     pub baseline: usize,
     pub created: usize,
     pub moved: usize,
     pub deleted: usize,
-    /// Transitions deferred because the delivery queue was full; their
-    /// cursors were not advanced and the next poll retries them.
     pub deferred: usize,
 }
 
-/// Install or replace a repository's poll configuration. Requires a live
-/// source binding (there is no remote or credential to poll without one)
-/// and the same authority a binding change does. Replacing the spec rebuilds
-/// the baseline from scratch so a changed selection can never fabricate
-/// deletions against stale cursors.
 pub fn configure(
     tx: &Transaction,
     authority: Authority,
@@ -117,8 +91,6 @@ pub fn configure(
     Ok(())
 }
 
-/// Stop polling a repository: configuration and cursors go together so a
-/// later re-enable starts from a clean baseline rather than a stale one.
 pub fn disable(
     tx: &Transaction,
     authority: Authority,
@@ -149,8 +121,6 @@ pub fn disable(
     Ok(())
 }
 
-/// Drop a repo's poll state without authority: the binding the config
-/// depended on is gone, so the schedule can never succeed again.
 pub fn drop_config(tx: &Transaction, repo: RepoId) -> Result<()> {
     tx.execute(
         "DELETE FROM poll_configs WHERE repo_id=?1",
@@ -163,7 +133,6 @@ pub fn drop_config(tx: &Transaction, repo: RepoId) -> Result<()> {
     Ok(())
 }
 
-/// The repositories whose polls have come due, soonest first.
 pub fn due(conn: &Connection, now: UnixMillis, limit: u16) -> Result<Vec<Config>> {
     let mut q = conn.prepare_cached(
         "SELECT repo_id,tenant_id,interval_ms,refs,next_poll_ms,failures,last_error,baseline_ms FROM poll_configs WHERE next_poll_ms<=?1 ORDER BY next_poll_ms LIMIT ?2",
@@ -185,7 +154,6 @@ pub fn due(conn: &Connection, now: UnixMillis, limit: u16) -> Result<Vec<Config>
     rows.iter().map(config_row).collect()
 }
 
-/// One repository's poll configuration, for admin and inspection.
 pub fn of_repo(conn: &Connection, repo: RepoId) -> Result<Option<Config>> {
     let row: Option<ConfigRow> = conn
         .prepare_cached(
@@ -231,9 +199,6 @@ fn config_row(row: &ConfigRow) -> Result<Config> {
     })
 }
 
-/// Reschedule one repository's poll and record its failure state. A missing
-/// row means the configuration was disabled mid-flight; that is not an
-/// error for the lane.
 pub fn schedule(
     tx: &Transaction,
     repo: RepoId,
@@ -249,7 +214,6 @@ pub fn schedule(
     Ok(())
 }
 
-/// The durable observation cursor for one repository.
 pub fn observations(conn: &Connection, repo: RepoId) -> Result<Vec<Observation>> {
     let mut q = conn.prepare_cached(
         "SELECT ref_name,oid,peeled,delivery_id,observed_ms FROM poll_observations WHERE repo_id=?1 ORDER BY ref_name",
@@ -271,15 +235,6 @@ pub fn observations(conn: &Connection, repo: RepoId) -> Result<Vec<Observation>>
     .map_err(Into::into)
 }
 
-/// Admit one remote advertisement against the durable cursor. Only tips the
-/// repository's selected patterns cover become observable state — the
-/// selection is enforced here, not just by the caller. Returns `None` when
-/// the configuration vanished between the poll and this transaction.
-///
-/// Every transition becomes an ordinary `poll`-provider `ref_update`
-/// delivery through `intake::accept`, and the cursor update commits in the
-/// same transaction: a crash mid-flight loses both or neither, and a replay
-/// against the same cursor state maps to the same delivery id.
 pub fn admit(
     tx: &Transaction,
     repo: RepoId,
@@ -302,8 +257,6 @@ pub fn admit(
     let tenant = TenantId::from_bytes(tenant).map_err(|_| Error::Corrupt("poll tenant"))?;
     let selection: Vec<String> =
         serde_json::from_str(&refs).map_err(|_| Error::Corrupt("poll refs"))?;
-    // The selection is enforced here too, not just by the lane: nothing the
-    // caller passed can become observable state outside it.
     let tips: Vec<&Tip> = tips
         .iter()
         .filter(|t| selection.iter().any(|p| ref_matches(p, &t.name)))
@@ -311,8 +264,7 @@ pub fn admit(
     let mut out = Admitted::default();
 
     if baseline.is_none() {
-        // Initial discovery: record what the remote looks like and admit
-        // nothing, so enabling polling never replays history.
+        // Initial discovery admits nothing, so enabling polling never replays history.
         for &tip in &tips {
             if !valid_tip(tip) {
                 continue;
@@ -327,8 +279,7 @@ pub fn admit(
         return Ok(Some(out));
     }
 
-    // `present` is every advertised name, valid or not: a ref the remote
-    // still advertises — however badly — is not a deletion.
+    // A ref still advertised, however badly, is never a deletion.
     let mut present = std::collections::HashSet::with_capacity(tips.len());
     let mut processed = std::collections::HashSet::with_capacity(tips.len());
     for &tip in &tips {
@@ -378,8 +329,6 @@ pub fn admit(
         }
     }
 
-    // A watched ref the remote no longer advertises is a deletion. The
-    // cursor is dropped only once the deletion delivery lands.
     let mut q = tx.prepare_cached(
         "SELECT ref_name,oid,delivery_id,observed_ms FROM poll_observations WHERE repo_id=?1",
     )?;
@@ -422,8 +371,6 @@ pub fn admit(
     Ok(Some(out))
 }
 
-/// A tip must be shape-valid to ever become a delivery; a remote answering
-/// outside the ref contract is skipped rather than wedging the schedule.
 fn valid_tip(tip: &Tip) -> bool {
     sentinel_protocol::intake::valid_ref(&tip.name)
         && sentinel_protocol::intake::valid_sha(&tip.oid)
@@ -434,17 +381,8 @@ fn valid_tip(tip: &Tip) -> bool {
             .is_none_or(sentinel_protocol::intake::valid_sha)
 }
 
-/// The cursor state a transition moves: the delivery that last moved it
-/// (none for a baseline) and when. A ref with no cursor uses the admission
-/// time.
 struct Cursor(Option<[u8; 16]>, i64);
 
-/// `poll:` plus the digest of the transition *and the cursor state it
-/// moves*. Replaying one advertisement against one cursor state maps to the
-/// same delivery, but a later, legitimate repeat of the same transition —
-/// `A→B`, force-reverted `B→A`, re-pushed `A→B` — moves a cursor that a
-/// different delivery set, so it is a new delivery rather than a suppressed
-/// duplicate.
 fn external_id(reference: &str, old: &str, new: &str, cursor: &Cursor) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(reference.as_bytes());
@@ -515,8 +453,6 @@ fn tenant_admin_of(tx: &Transaction, authority: Authority, repo: RepoId) -> Resu
     }
 }
 
-/// Unused by the lane's own writes but part of the shared filter surface:
-/// does this configuration's selection cover `reference`?
 pub fn selected(config: &Config, reference: &str) -> bool {
     config.refs.iter().any(|p| ref_matches(p, reference))
 }
