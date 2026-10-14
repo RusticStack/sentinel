@@ -255,7 +255,7 @@ onBeforeUnmount(() => {
               </svg>
               <div class="space-y-2 min-w-0">
                 <p class="text-sm text-muted">Key (time-based, 6 digits, 30 seconds)</p>
-                <p class="font-mono text-sm break-all select-all rounded-md border border-default bg-muted px-3 py-2">{{ secret ?? "—" }}</p>
+                <p id="totp-key" class="font-mono text-sm break-all select-all rounded-md border border-default bg-muted px-3 py-2">{{ secret ?? "—" }}</p>
                 <UButton :to="uri" external size="sm" color="neutral" variant="link" icon="i-lucide-external-link" label="Open in an authenticator app on this device" class="px-0" />
               </div>
             </div>
