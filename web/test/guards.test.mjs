@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { classifyProxyPath, clientAddress } from "../server/utils/guard.ts";
-import { sameOriginPath } from "../app/utils/redirect.ts";
+import { RETURN_SECONDS, returnCookie, sameOriginPath } from "../app/utils/redirect.ts";
 
 test("controller paths proxy and others pass", () => {
   assert.equal(classifyProxyPath("/api/v1/runs?x=1", "GET").kind, "proxy");
@@ -48,4 +48,18 @@ test("next must be a same-origin path", () => {
   assert.equal(sameOriginPath("/t/acme/runs?a=1"), "/t/acme/runs?a=1");
   for (const bad of ["//evil.com", "/\\evil.com", "https://evil.com", "evil", "/a\nb", undefined, ["/x"], "/" + "a".repeat(3000)])
     assert.equal(sameOriginPath(bad), "/", String(bad).slice(0, 20));
+});
+
+test("a pending return is a short-lived same-origin path cookie the server can read", () => {
+  const set = returnCookie("/invitations/accept", true);
+  assert.match(set, /^sentinel-return=%2Finvitations%2Faccept; /);
+  assert.ok(set.includes("; Path=/;") && set.includes(`; Max-Age=${RETURN_SECONDS};`) && set.includes("; SameSite=Lax") && set.endsWith("; Secure"), set);
+  assert.equal(RETURN_SECONDS, 600);
+  assert.ok(!returnCookie("/account", false).includes("Secure"));
+  // Another origin is never recorded; characters that would break the
+  // cookie are encoded.
+  assert.match(returnCookie("//evil.com", true), /^sentinel-return=%2F; /);
+  assert.match(returnCookie("/a;b=c d", false), /^sentinel-return=%2Fa%3Bb%3Dc%20d; /);
+  // Clearing expires it at once.
+  assert.match(returnCookie(null, false), /^sentinel-return=; Path=\/; Max-Age=0; /);
 });

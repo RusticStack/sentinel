@@ -5,8 +5,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  baseUrlProblem, emptyDraft, fragmentToken, githubStanding, isSetupToken, parseDraft,
-  passwordAdvice, serializeDraft, slugProblem,
+  baseUrlProblem, emptyDraft, fragmentToken, githubStanding, INVITATION_STASH_MS, isSetupToken, parseDraft,
+  passwordAdvice, serializeDraft, slugProblem, stashInvitation, unstashInvitation,
 } from "../app/utils/onboarding.ts";
 
 const HEX = "0123456789abcdef".repeat(4);
@@ -22,6 +22,22 @@ test("a link's secret is taken from the fragment only when it is exactly one wel
   assert.equal(fragmentToken(`?token=${HEX}`, "verification"), null);
   assert.equal(fragmentToken("", "verification"), null);
   assert.equal(fragmentToken(`#token=${HEX}${"x".repeat(600)}`, "verification"), null);
+});
+
+test("an invitation parked for GitHub sign-in comes back only within its ten minutes", () => {
+  const token = `sntl_${HEX}`;
+  const now = 1_700_000_000_000;
+  const parked = stashInvitation(token, now);
+  assert.equal(unstashInvitation(parked, now + 1), token);
+  assert.equal(unstashInvitation(parked, now + INVITATION_STASH_MS - 1), token);
+  // Expired, absent, malformed, the wrong kind of secret, or dated further
+  // ahead than a stash can be (a forged or clock-skewed entry).
+  assert.equal(unstashInvitation(parked, now + INVITATION_STASH_MS), null);
+  assert.equal(unstashInvitation(null, now), null);
+  assert.equal(unstashInvitation("{not json", now), null);
+  assert.equal(unstashInvitation(stashInvitation(HEX, now), now), null);
+  assert.equal(unstashInvitation(JSON.stringify({ token, until: now + 10 * INVITATION_STASH_MS }), now), null);
+  assert.equal(unstashInvitation(JSON.stringify({ token }), now), null);
 });
 
 test("a setup token is 64 hex digits, surrounding spaces forgiven", () => {

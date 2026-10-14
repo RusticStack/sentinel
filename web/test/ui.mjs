@@ -636,6 +636,30 @@ await scenario("organizations and invitations", async () => {
   await page.clickText("button", "Accept invitation");
   await page.waitFor("[...document.querySelectorAll('[role=alert]')].some((a) => a.textContent.includes('could not accept'))", 8000, "unusable invitation");
   check("an unusable invitation is said without naming an organization", !(await page.eval("document.querySelector('main').textContent.includes('acme')")));
+
+  // The end of a GitHub sign-in started from an invitation: the controller
+  // lands the browser on `/` with a full load. A signed-in person who
+  // already has tenants still goes back to the invitation, the parked
+  // secret is spent from storage and the return marker is gone.
+  await page.eval(`(() => {
+    document.cookie = "sentinel-return=%2Finvitations%2Faccept; Path=/; Max-Age=600; SameSite=Lax";
+    sessionStorage.setItem("sentinel-invitation", JSON.stringify({ token: "sntl_${"cd".repeat(32)}", until: Date.now() + 600000 }));
+    return true;
+  })()`);
+  await go(page, "/", "location.pathname.startsWith('/t/') || [...document.querySelectorAll('button')].some((b) => b.textContent.includes('Accept invitation'))");
+  check("a GitHub sign-in started from an invitation comes back to the invitation, not the first tenant",
+    await page.eval("location.pathname === '/invitations/accept' && [...document.querySelectorAll('button')].some((b) => b.textContent.includes('Accept invitation'))"),
+    await page.eval("location.pathname"));
+  check("the parked invitation secret leaves session storage once read", (await page.eval("sessionStorage.getItem('sentinel-invitation')")) === null);
+  check("the return marker is cleared once it has served", !(await page.eval("document.cookie.includes('sentinel-return=')")));
+  await go(page, "/", "location.pathname.startsWith('/t/')");
+  check("without a pending return `/` opens a tenant again", true);
+
+  // A parked secret past its ten minutes is dropped on the next page load,
+  // wherever the tab is.
+  await page.eval(`(() => { sessionStorage.setItem("sentinel-invitation", JSON.stringify({ token: "sntl_${"cd".repeat(32)}", until: Date.now() - 1 })); return true; })()`);
+  await go(page, "/organizations", "!!document.querySelector('#org-slug')");
+  check("an expired parked invitation secret is removed on the next load", (await page.eval("sessionStorage.getItem('sentinel-invitation')")) === null);
 });
 
 // Last: it enrolls a second factor for rui and changes rui's password,
