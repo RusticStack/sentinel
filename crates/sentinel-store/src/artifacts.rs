@@ -1,19 +1,4 @@
-//! Artifact records: one row per declared artifact per attempt,
-//! written by the controller when the worker's publication settles.
-//!
-//! A `captured` row names the manifest version committed earlier in the same
-//! transaction; the manifest's entries name the committed objects, so an
-//! artifact is never half-published. `absent` records a declaration that
-//! matched no files, `failed` one whose capture or transfer broke — both
-//! keep the run's outcome explainable instead of silently missing.
-//! Retention is the declared `retain` rendered as a deadline;
-//! [`sweep_expired`] retires rows past it, deleting the artifact row and
-//! its manifest version in one transaction.
-//!
-//! Recording is fenced through the attempt: the caller proves the attempt
-//! is still held before the row is written, and the ownership trigger in
-//! migration 25 joins attempt → job → run → tenant rather than trusting the
-//! caller's identifiers.
+//! A captured row commits with its manifest version, so an artifact is never half-published.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sentinel_core::{ArtifactId, AttemptId, JobId, RunId, TenantId, UnixMillis};
@@ -23,15 +8,11 @@ use crate::{
     objects::{self, Objects},
 };
 
-/// Terminal artifact state; stored as `state_code`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum State {
-    /// Files were published: `manifest_version` names the entry list.
     Captured = 0,
-    /// The declaration resolved to no files.
     Absent = 1,
-    /// Capture or transfer broke before the artifact could be sealed.
     Failed = 2,
 }
 
@@ -56,7 +37,6 @@ impl State {
     }
 }
 
-/// One artifact record for the API.
 #[derive(Clone, Debug)]
 pub struct Row {
     pub id: ArtifactId,
@@ -65,7 +45,6 @@ pub struct Row {
     pub attempt: AttemptId,
     pub name: String,
     pub state: State,
-    /// The manifest version holding the captured file list.
     pub manifest_version: Option<u64>,
     pub entries: u64,
     pub bytes: u64,
@@ -73,14 +52,11 @@ pub struct Row {
     pub created_ms: UnixMillis,
 }
 
-/// The manifest name for an artifact: unique per job, versioned per attempt.
 pub fn manifest_name(job: JobId, name: &str) -> String {
     format!("{job}/{name}")
 }
 
-/// Insert the record. Called inside the transaction that committed the
-/// manifest (captured) or alone (absent/failed); `UNIQUE(attempt_id, name)`
-/// makes a redelivery a conflict rather than a duplicate.
+// UNIQUE(attempt_id, name) turns a redelivered insert into a conflict, not a duplicate.
 #[allow(clippy::too_many_arguments)]
 pub fn record(
     tx: &Transaction<'_>,
@@ -125,8 +101,6 @@ pub fn record(
     Ok(id)
 }
 
-/// Whether the attempt already has an artifact record under `name` — the
-/// duplicate check a publisher runs before granting a stream.
 pub fn exists(conn: &Connection, attempt: AttemptId, name: &str) -> Result<bool> {
     Ok(conn
         .prepare_cached(
@@ -137,8 +111,6 @@ pub fn exists(conn: &Connection, attempt: AttemptId, name: &str) -> Result<bool>
         })?)
 }
 
-/// Every `(name, state)` row of one attempt — the terminal coverage check
-/// reads the set once instead of probing per declaration.
 pub fn for_attempt(conn: &Connection, attempt: AttemptId) -> Result<Vec<(String, State)>> {
     let rows = conn
         .prepare_cached("SELECT name, state_code FROM artifacts WHERE attempt_id = ?1")?
@@ -151,9 +123,6 @@ pub fn for_attempt(conn: &Connection, attempt: AttemptId) -> Result<Vec<(String,
         .collect()
 }
 
-/// The captured artifacts of one attempt of the tenant, by name, at
-/// most `limit`: `(name, manifest version)` for the failure view's report
-/// collection. One indexed read on `(attempt_id, name)`.
 pub fn captured_for_attempt(
     conn: &Connection,
     tenant: TenantId,
@@ -183,8 +152,6 @@ pub fn captured_for_attempt(
         .collect()
 }
 
-/// Total captured bytes of a run, across every job and attempt: the durable
-/// half of the per-run artifact budget.
 pub fn run_bytes(conn: &Connection, tenant: TenantId, run: RunId) -> Result<u64> {
     Ok(conn
         .prepare_cached(
@@ -197,8 +164,6 @@ pub fn run_bytes(conn: &Connection, tenant: TenantId, run: RunId) -> Result<u64>
         )? as u64)
 }
 
-/// Every artifact row of a run, newest attempt last within a job. Foreign
-/// runs answer `NotFound` before this is ever called.
 pub fn for_run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<Row>> {
     let mut stmt = conn.prepare_cached(
         "SELECT a.id, a.job_id, j.name, a.attempt_id, a.name, a.state_code,
@@ -256,9 +221,7 @@ pub fn for_run(conn: &Connection, tenant: TenantId, run: RunId) -> Result<Vec<Ro
     Ok(out)
 }
 
-/// One artifact row of a run by id, in any state. A foreign or absent id
-/// answers `NotFound`, so a caller can never tell another tenant's records
-/// apart from ones that do not exist.
+/// A foreign or absent id answers NotFound, so a tenant cannot probe for another tenant's records.
 pub fn get(conn: &Connection, tenant: TenantId, run: RunId, id: ArtifactId) -> Result<Row> {
     let row = conn
         .prepare_cached(
@@ -312,8 +275,6 @@ pub fn get(conn: &Connection, tenant: TenantId, run: RunId, id: ArtifactId) -> R
     })
 }
 
-/// The newest captured row of one (job, name) in a run; other attempts of
-/// the job and non-captured rows fall behind it.
 pub fn captured(
     conn: &Connection,
     tenant: TenantId,
@@ -379,19 +340,12 @@ pub fn captured(
         created_ms: UnixMillis(created),
     })
 }
-/// Retire artifact rows whose retention deadline passed: a captured row's
-/// manifest version is deleted with it (cascading its `manifest_refs`
-/// edges, which is what later lets the objects be reclaimed), and the row
-/// itself goes. Returns the manifest files the caller hands to
-/// [`Objects::unlink`] once the transaction commits; at most `limit` rows
-/// per pass.
 pub fn sweep_expired(
     tx: &Transaction<'_>,
     objects: &Objects,
     now: UnixMillis,
     limit: i64,
 ) -> Result<Vec<objects::Doomed>> {
-    // (id, tenant_id, job_id, name, manifest_version)
     type Due = (Vec<u8>, Vec<u8>, Vec<u8>, String, Option<i64>);
     let due: Vec<Due> = tx
         .prepare(

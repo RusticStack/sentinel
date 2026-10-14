@@ -1,34 +1,4 @@
-//! Operator-configured email-domain auto-join (`SENTINEL_AUTO_JOIN_DOMAINS`).
-//!
-//! The operator maps mail domains to app-created organizations. A person whose
-//! **verified** address is in a listed domain joins that organization as its
-//! lowest role (a reader), the first such person to an organization that does
-//! not exist yet creates it and administers it, and the join is audited. The
-//! setting is trusted because the operator set it: there is no DNS proof, and
-//! nothing here is reachable from a request.
-//!
-//! Safety rules, each enforced in exactly one place:
-//!
-//! - Only a verified address counts; a claim never does (the join statement
-//!   reads `email_verified_ms`).
-//! - A domain matches exactly: both sides are in the one canonical form of
-//!   [`crate::email::normalize_domain`] (lower case, punycode), and the match is
-//!   a key equality, never a suffix or a subdomain test.
-//! - An organization whose membership GitHub confirms (a bound GitHub App
-//!   installation, or `membership_source = 1`) is never joined, and neither is
-//!   a personal namespace or a suspended tenant. Checked when the rules are
-//!   recorded at start (the entry is dropped and reported by index) and again
-//!   in the joining transaction, because a tenant can be converted later.
-//! - Only an admitted, active account joins; a domain match never bypasses
-//!   the deployment's registration approval.
-//! - Removing a domain stops new joins and removes nobody.
-//!
-//! The parsed rules are written to `auto_join_domains` at every controller
-//! start, like the mail settings, so the transactions that verify an address
-//! or open a session (including the host-local CLI's) read them with one key
-//! probe and no configuration plumbing. Joining is one idempotent statement
-//! sequence inside the caller's transaction on the single writer: two accounts
-//! verifying at once are serialized, so an organization is created once.
+//! Trusted because the operator set it (no DNS proof); joins run on the single writer, so an organization is created once.
 
 use rusqlite::{OptionalExtension, Transaction, params};
 use sentinel_core::{
@@ -43,34 +13,19 @@ use crate::{
     local_auth::{Event, audit},
 };
 
-/// Entries read from the setting; past this the rest are ignored (one entry
-/// is reported). Bounds the table and the startup work.
 pub const MAX_ENTRIES: usize = 1_024;
 
-/// Why an entry produces no rule. Never carries the entry's text: a
-/// configuration value may hold something secret-like.
+/// Never carries the entry's text: a configuration value may hold something secret-like.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
-    /// Not `domain` or `domain=slug`.
     Shape,
-    /// The domain is not a registrable domain after IDN normalization.
     Domain,
-    /// The organization name is not a valid slug (lower case letters, digits
-    /// and hyphens, at most 63, no hyphen at either end), or the name derived
-    /// from a bare domain is not one.
     Slug,
-    /// The domain already appeared in an earlier entry.
     Duplicate,
-    /// A derived name collides with another entry's: two different domains
-    /// would silently share one organization.
     SlugCollision,
-    /// Past [`MAX_ENTRIES`].
     TooMany,
-    /// The organization is GitHub-backed: its members come from GitHub only.
     GithubBacked,
-    /// The name belongs to a personal namespace.
     PersonalNamespace,
-    /// The organization is suspended.
     Suspended,
 }
 
@@ -90,26 +45,19 @@ impl Reason {
     }
 }
 
-/// An entry that produced no rule: its 1-based position among the setting's
-/// entries and why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ignored {
     pub index: usize,
     pub reason: Reason,
 }
 
-/// One validated rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
-    /// 1-based position in the setting, for diagnostics.
     pub index: usize,
-    /// Canonical (punycode, lower case) mail domain.
     pub domain: String,
-    /// The organization its members join.
     pub slug: String,
 }
 
-/// The validated, immutable rule set: at most one rule per domain.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rules {
     rules: Vec<Rule>,
@@ -128,7 +76,6 @@ impl Rules {
         self.rules.is_empty()
     }
 
-    /// The organization a canonical `domain` joins.
     pub fn slug_for(&self, domain: &str) -> Option<&str> {
         self.rules
             .iter()
@@ -137,22 +84,14 @@ impl Rules {
     }
 }
 
-/// The result of reading the setting: the rules that stand and the entries
-/// that were dropped.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Parsed {
     pub rules: Rules,
     pub ignored: Vec<Ignored>,
 }
 
-/// Parse `SENTINEL_AUTO_JOIN_DOMAINS`: entries separated by commas or white
-/// space, each `domain=organization` or a bare `domain`, which names an
-/// organization after the domain with every dot a hyphen (`example.com` is
-/// `example-com`). Every defect drops that entry alone and is reported by
-/// position; the controller still starts, and no value is echoed.
 pub fn parse(text: &str) -> Parsed {
     let mut parsed = Parsed::default();
-    // slug -> whether the first entry to take it derived it from a bare domain.
     let mut taken: Vec<(String, bool)> = Vec::new();
     let entries = text
         .split(|c: char| c == ',' || c.is_ascii_whitespace())
@@ -204,9 +143,7 @@ fn entry_rule(
     if so_far.rules.iter().any(|rule| rule.domain == domain) {
         return Err(Reason::Duplicate);
     }
-    // Two explicit entries may share an organization on purpose (several
-    // domains of one company); a name *derived* from a domain may not be
-    // shared with a different domain, or `a.b.com` and `a-b.com` would merge.
+    // A derived name may not be shared with another domain, or a.b.com and a-b.com would merge.
     if taken
         .iter()
         .any(|(other, other_bare)| *other == slug && (bare || *other_bare))
@@ -223,11 +160,8 @@ fn entry_rule(
     ))
 }
 
-/// What a name resolves to, for deciding whether it may be joined.
 enum Target {
-    /// No such tenant: the first match creates it.
     Absent,
-    /// An active, app-created organization.
     Open(TenantId),
     Refused(Reason),
 }
@@ -258,12 +192,6 @@ fn target(tx: &Transaction<'_>, slug: &str) -> Result<Target> {
     })
 }
 
-/// Record the rules that stand for this run, replacing the previous run's.
-/// Called by the controller at start. A rule whose organization is already
-/// GitHub-backed, personal or suspended is not recorded and is returned for
-/// the caller to warn about by index; everything else is recorded, including
-/// organizations that do not exist yet. Idempotent: a restart changes nothing
-/// for anyone who already joined.
 pub fn set_rules(store: &Store, rules: &Rules) -> Result<Vec<Ignored>> {
     let rules = rules.clone();
     store.writer().write(move |tx| {
@@ -286,22 +214,13 @@ pub fn set_rules(store: &Store, rules: &Rules) -> Result<Vec<Ignored>> {
     })
 }
 
-/// The lowest role: what a domain match grants.
 const JOINED_ROLE: Role = Role::Reader;
 
-/// Join `user` to the organization their verified address's domain maps to,
-/// if any, inside the caller's transaction. `None` when nothing applies:
-/// no rules, an unverified address, an account that is not admitted and
-/// active, a domain with no rule, or an organization that may not be joined.
-/// Idempotent: an existing membership keeps its role and is not audited
-/// again. Never fails a caller's transaction for a policy refusal.
 pub(crate) fn apply(
     tx: &Transaction<'_>,
     user: UserId,
     now: UnixMillis,
 ) -> Result<Option<TenantId>> {
-    // One key probe on the (usually empty) rule table; the address is
-    // already canonical, so the domain is whatever follows the one `@`.
     let slug: Option<String> = tx
         .prepare_cached(
             "SELECT j.slug FROM users u
@@ -431,7 +350,6 @@ mod tests {
 
     #[test]
     fn derived_names_never_merge_two_domains() {
-        // `a.b.example` and `a-b.example` would both become `a-b-example`.
         let parsed = parse("a.b.example, a-b.example, one.example=shared, two.example=shared");
         assert_eq!(
             parsed.ignored,
@@ -440,9 +358,7 @@ mod tests {
                 reason: Reason::SlugCollision
             }]
         );
-        // Two explicit entries may name one organization on purpose.
         assert_eq!(parsed.rules.len(), 3);
-        // An explicit name equal to an earlier derived one is refused too.
         let parsed = parse("acme.example, other.example=acme-example");
         assert_eq!(parsed.ignored[0].reason, Reason::SlugCollision);
     }
