@@ -15,8 +15,8 @@ use std::{
 
 /// Connections one unknown source may have in their handshake at once. A
 /// handshake takes milliseconds; eight is a worker (it holds two at most)
-/// behind a retrying proxy, and a fifth of the default pool at most one
-/// attacker address.
+/// behind a retrying proxy, and an attacker address takes at most a
+/// thirty-second of the default pool.
 pub const PENDING_PER_SOURCE: usize = 8;
 /// The same for a source that has authenticated a worker before: a site
 /// whose whole fleet reconnects through one NAT address after a restart.
