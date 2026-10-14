@@ -1,4 +1,13 @@
 //! Objects and manifests are immutable and the maintenance lock is held until the last copy, so no named file can be reclaimed mid-backup.
+//!
+//! ```text
+//! <target>/objects/…              committed objects, content-addressed (shared)
+//! <target>/manifests/…            manifest versions, immutable (shared)
+//! <target>/logs/…                 attempt logs, mirrored incrementally (shared)
+//! <target>/<id>/metadata.sqlite   the database at one instant
+//! <target>/<id>/config/…          the controller's own files (never the key)
+//! <target>/<id>/backup.json       what it holds, with checksums
+//! ```
 
 use std::{
     collections::{BTreeSet, HashSet},
