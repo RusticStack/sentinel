@@ -1,4 +1,4 @@
-//! GitHub sign-in for humans (A04).
+//! GitHub sign-in for humans.
 //!
 //! Three things are kept apart here, deliberately:
 //!
@@ -7,8 +7,8 @@
 //! 2. **A Sentinel session or credential** — issued by `sentinel-store` only
 //!    after admission policy has been applied. Authenticating at GitHub does
 //!    not admit anybody.
-//! 3. **A GitHub App installation token** — repository access for running jobs
-//!    (Part 05). A user login token is never used as one, never persisted and
+//! 3. **A GitHub App installation token** — repository access for running jobs.
+//!    A user login token is never used as one, never persisted and
 //!    never handed to a workload; it is read once and dropped.
 //!
 //! The only durable fact this crate produces is the immutable numeric GitHub

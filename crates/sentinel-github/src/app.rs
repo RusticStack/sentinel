@@ -238,7 +238,7 @@ impl App {
         parse_installation(&value, self.id, id)
     }
 
-    /// The same read for the reconcile lane (G05): `Ok(None)` is a verified
+    /// The same read for the reconcile lane: `Ok(None)` is a verified
     /// 404 — the installation is gone for good — while any other non-200 is a
     /// transport-class failure the caller retries.
     pub fn installation_status(&self, id: u64, now_ms: i64) -> Result<Option<Installation>> {
@@ -531,7 +531,7 @@ impl App {
         )
     }
 
-    /// A token for publishing Checks (G04): `checks: write` and nothing else,
+    /// A token for publishing Checks: `checks: write` and nothing else,
     /// for the same one immutable repository and with the same verification.
     /// A different permission set is a different token, never a wider one.
     pub fn checks_token(

@@ -1,4 +1,4 @@
-//! Measurement, not a check (P07-20): what one mirrored checkout costs on
+//! Measurement, not a check: what one mirrored checkout costs on
 //! the worker's filesystem — wall time of the materialization phase and
 //! the bytes it leaves in the job's `.git` — for a repository with a long
 //! history. Ignored by default; run it in release on the filesystem under
