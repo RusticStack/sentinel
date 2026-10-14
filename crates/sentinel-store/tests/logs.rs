@@ -634,6 +634,36 @@ fn deferred_frames_are_readable_and_a_window_syncs_once_before_it_is_acknowledge
 }
 
 #[test]
+fn a_deferred_hole_fill_is_on_disk_before_the_hole_is_recorded_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let attempt = AttemptId::new();
+    {
+        let logs = LogStore::open(temp.path().join("logs")).unwrap();
+        for (seq, text, through) in [(1, "a\n", 1), (3, "c\n", 3), (2, "b\n", 3)] {
+            assert_eq!(
+                logs.append_deferred(run(), job(), attempt, &frame(seq, text))
+                    .unwrap(),
+                Appended::Stored { through }
+            );
+        }
+        // No `sync`: persisting the closed hole had to make the fill
+        // durable itself, so after a reopen its resend is a duplicate of
+        // bytes that are actually there.
+    }
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let tail = logs.tail(run(), job(), attempt, 0, 10, None).unwrap();
+    assert_eq!(
+        tail.frames.iter().map(|f| f.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        logs.append_deferred(run(), job(), attempt, &frame(2, "b\n"))
+            .unwrap(),
+        Appended::Duplicate { through: 3 }
+    );
+}
+
+#[test]
 fn a_resent_deferred_frame_is_a_duplicate_and_a_reopen_keeps_what_was_written() {
     let temp = tempfile::tempdir().unwrap();
     let attempt = AttemptId::new();

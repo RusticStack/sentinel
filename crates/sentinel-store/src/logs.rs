@@ -1924,9 +1924,6 @@ fn write_end_marker(dir: &Path, last_seq: u64, gaps: &[(u64, u64)]) -> Result<()
     sync_dir(dir)
 }
 
-/// Land the hole list if it changed: tmp, fsync, rename, directory
-/// fsync — complete or absent, like the end marker. Rare: only jumps and
-/// fills change it.
 /// `fsync` the active segment when deferred frames are waiting on it.
 fn sync_dirty(w: &mut Open) -> Result<()> {
     if w.dirty {
@@ -1938,10 +1935,16 @@ fn sync_dirty(w: &mut Open) -> Result<()> {
     Ok(())
 }
 
+/// Land the hole list if it changed: tmp, fsync, rename, directory
+/// fsync — complete or absent, like the end marker. Rare: only jumps and
+/// fills change it. Deferred frames are made durable first: a fill is
+/// recorded as closed only once its frame is on disk, or a power loss
+/// would leave a closed hole whose resend is answered as a duplicate.
 fn persist_holes(w: &mut Open) -> Result<()> {
     if !w.holes_dirty {
         return Ok(());
     }
+    sync_dirty(w)?;
     let mut bytes = Vec::with_capacity(10 + w.holes.len() * 16);
     bytes.extend_from_slice(HOLES_MAGIC);
     bytes.extend_from_slice(&HOLES_FORMAT.to_le_bytes());
