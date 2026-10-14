@@ -701,3 +701,44 @@ fn the_log_sweep_removes_only_what_the_database_released() {
     // `remove` of an already-removed log is not an error.
     logs.remove(old_run, old_job, old).unwrap();
 }
+
+/// A repository scope that matches none of the tenant's rows still walks the
+/// tenant's batches to the end and changes nothing, so a narrow scope costs
+/// reads, never writes outside it.
+#[test]
+fn reapplying_for_a_repository_with_no_rows_finishes_and_touches_nothing() {
+    let f = fixture();
+    let d = Deployment::default();
+    f.store
+        .writer()
+        .write(move |tx| retention::install(tx, &d))
+        .unwrap();
+    let attempts: Vec<AttemptId> = (0..3).map(|_| f.released_attempt(NOW).2).collect();
+    f.stamp(d, 10);
+    let (tenant, other) = (f.tenant, RepoId::new());
+    f.store
+        .writer()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO storage_policies(tenant_id, repo_id, log_retention_ms, updated_ms)
+                 VALUES (?1, X'', ?2, ?3)",
+                rusqlite::params![tenant.as_bytes().as_slice(), DAY, NOW.0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let mut at = retention::Reapply::default();
+    let mut steps = 0;
+    while !at.done() {
+        at = f
+            .store
+            .writer()
+            .write(move |tx| retention::reapply_step(tx, &d, tenant, Some(other), at, 1))
+            .unwrap();
+        steps += 1;
+        assert!(steps < 20, "the cursor must advance");
+    }
+    for a in attempts {
+        assert_eq!(f.expires(a), Some(NOW.0 + d.log_retention_ms));
+    }
+}
