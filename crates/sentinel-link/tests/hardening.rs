@@ -74,6 +74,9 @@ fn eventually(what: &str, within: Duration, mut predicate: impl FnMut() -> bool)
 struct Scripted {
     verdicts: Mutex<Vec<LogVerdict>>,
     logs: AtomicU64,
+    /// `log_sync` calls, and whether they report a fault.
+    syncs: AtomicU64,
+    sync_fails: AtomicBool,
 }
 
 impl SessionHandler for Scripted {
@@ -98,6 +101,10 @@ impl SessionHandler for Scripted {
         } else {
             script.remove(0)
         }
+    }
+    fn log_sync(&self, _: WorkerId, _: AttemptId) -> bool {
+        self.syncs.fetch_add(1, Ordering::SeqCst);
+        !self.sync_fails.load(Ordering::SeqCst)
     }
     fn abandoned(&self, _: WorkerId, _: AttemptId, _: Fence) {}
 }
@@ -143,6 +150,8 @@ impl Admission for ScriptedAdmission {
 struct Quiet {
     reporter: Mutex<Option<Reporter>>,
     refused: AtomicU64,
+    /// The highest sequence the controller acknowledged.
+    acked: AtomicU64,
 }
 
 impl Executor for Quiet {
@@ -163,7 +172,9 @@ impl Executor for Quiet {
     }
     fn spec(&self, _: AttemptId, _: JobContext, _: Vec<u8>) {}
     fn no_spec(&self, _: AttemptId) {}
-    fn log_acked(&self, _: AttemptId, _: u64) {}
+    fn log_acked(&self, _: AttemptId, through: u64) {
+        self.acked.fetch_max(through, Ordering::SeqCst);
+    }
     fn log_refused(&self, _: AttemptId) {
         self.refused.fetch_add(1, Ordering::SeqCst);
     }
@@ -349,7 +360,7 @@ fn a_welcome_outside_the_hellos_range_is_refused() {
 fn a_transient_log_fault_closes_the_connection_instead_of_refusing() {
     let handler = Arc::new(Scripted {
         verdicts: Mutex::new(vec![LogVerdict::Retry]),
-        logs: AtomicU64::new(0),
+        ..Scripted::default()
     });
     let (addr, fingerprint, _) = stand_in(
         Arc::new(ScriptedAdmission {
@@ -666,4 +677,125 @@ fn enrollment_guessing_is_rate_limited_and_never_touches_enrolled_workers() {
     );
     // The enrolled worker reconnects regardless.
     assert!(d.connect(load(), worker, None, 6).is_ok());
+}
+
+/// Frames written ahead of their `fsync` are acknowledged only after the
+/// handler made them durable: a burst is answered at its highest sequence
+/// with at most one sync per frame, never an acknowledgement without one.
+#[test]
+fn deferred_log_frames_are_acknowledged_only_after_a_sync() {
+    let handler = Arc::new(Scripted {
+        verdicts: Mutex::new((1..=8).map(LogVerdict::Stored).collect()),
+        ..Scripted::default()
+    });
+    let (addr, fingerprint, _) = stand_in(
+        Arc::new(ScriptedAdmission {
+            answers: Mutex::new(Vec::new()),
+            asked: AtomicUsize::new(0),
+        }),
+        Arc::clone(&handler),
+        Arc::new(AtomicBool::new(true)),
+    );
+    let client = tls::client_config(Identity::generate("w").unwrap(), fingerprint).unwrap();
+    let mut link = session::connect(
+        addr,
+        client,
+        WorkerId::new(),
+        "w",
+        hello(6),
+        None,
+        capacity(),
+    )
+    .unwrap();
+    let executor = Quiet::default();
+    let attempt = AttemptId::new();
+    thread::scope(|scope| {
+        let stop = AtomicBool::new(false);
+        let running = scope.spawn(|| link.run(&executor, || stop.load(Ordering::SeqCst)));
+        eventually("the session's reporter", Duration::from_secs(5), || {
+            executor.reporter.lock().unwrap().is_some()
+        });
+        let reporter = executor.reporter.lock().unwrap().clone().unwrap();
+        for seq in 1..=8 {
+            reporter
+                .log(
+                    attempt,
+                    &Frame {
+                        seq,
+                        step: 0,
+                        stream: Stream::Stdout,
+                        bytes: b"line
+"
+                        .to_vec(),
+                    },
+                )
+                .unwrap();
+        }
+        eventually(
+            "the last frame's acknowledgement",
+            Duration::from_secs(5),
+            || executor.acked.load(Ordering::SeqCst) == 8,
+        );
+        stop.store(true, Ordering::SeqCst);
+        let _ = running.join().unwrap();
+    });
+    let syncs = handler.syncs.load(Ordering::SeqCst);
+    assert!((1..=8).contains(&syncs), "{syncs} syncs for 8 frames");
+}
+
+/// A sync that fails acknowledges nothing and closes the connection, so the
+/// worker resends from its last acknowledgement instead of dropping frames
+/// that were never durable.
+#[test]
+fn a_failed_log_sync_closes_the_connection_without_an_acknowledgement() {
+    let handler = Arc::new(Scripted {
+        verdicts: Mutex::new(vec![LogVerdict::Stored(1)]),
+        sync_fails: AtomicBool::new(true),
+        ..Scripted::default()
+    });
+    let (addr, fingerprint, _) = stand_in(
+        Arc::new(ScriptedAdmission {
+            answers: Mutex::new(Vec::new()),
+            asked: AtomicUsize::new(0),
+        }),
+        Arc::clone(&handler),
+        Arc::new(AtomicBool::new(true)),
+    );
+    let client = tls::client_config(Identity::generate("w").unwrap(), fingerprint).unwrap();
+    let mut link = session::connect(
+        addr,
+        client,
+        WorkerId::new(),
+        "w",
+        hello(6),
+        None,
+        capacity(),
+    )
+    .unwrap();
+    let executor = Quiet::default();
+    let attempt = AttemptId::new();
+    let outcome = thread::scope(|scope| {
+        let running = scope.spawn(|| link.run(&executor, || false));
+        eventually("the session's reporter", Duration::from_secs(5), || {
+            executor.reporter.lock().unwrap().is_some()
+        });
+        let reporter = executor.reporter.lock().unwrap().clone().unwrap();
+        reporter
+            .log(
+                attempt,
+                &Frame {
+                    seq: 1,
+                    step: 0,
+                    stream: Stream::Stdout,
+                    bytes: b"hello
+"
+                    .to_vec(),
+                },
+            )
+            .unwrap();
+        running.join().unwrap()
+    });
+    assert!(outcome.is_err(), "the connection must close");
+    assert_eq!(executor.acked.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.refused.load(Ordering::SeqCst), 0);
 }

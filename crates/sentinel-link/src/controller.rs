@@ -2415,9 +2415,14 @@ impl SessionHandler for Inner {
             }
             Err(()) => return LogVerdict::Retry,
         };
-        match self.logs.append(run, job, attempt, &frame) {
-            Ok(sentinel_store::logs::Appended::Stored { through })
-            | Ok(sentinel_store::logs::Appended::Duplicate { through }) => {
+        // Written now, made durable by `log_sync` before the session
+        // acknowledges: one `fsync` covers a burst of frames.
+        match self.logs.append_deferred(run, job, attempt, &frame) {
+            Ok(sentinel_store::logs::Appended::Stored { through }) => {
+                self.stats.log_frames.fetch_add(1, Ordering::Relaxed);
+                LogVerdict::Stored(through)
+            }
+            Ok(sentinel_store::logs::Appended::Duplicate { through }) => {
                 self.stats.log_frames.fetch_add(1, Ordering::Relaxed);
                 LogVerdict::Acked(through)
             }
@@ -2431,6 +2436,10 @@ impl SessionHandler for Inner {
             }
             Err(_) => LogVerdict::Retry,
         }
+    }
+
+    fn log_sync(&self, _worker: WorkerId, attempt: AttemptId) -> bool {
+        self.logs.sync(attempt).is_ok()
     }
 
     fn log_end(

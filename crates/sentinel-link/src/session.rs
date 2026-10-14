@@ -561,6 +561,10 @@ impl SensitiveFrame for ServerMessage {
 pub enum LogVerdict {
     /// Stored and synced through this sequence.
     Acked(u64),
+    /// Written through this sequence but not yet durable: the session must
+    /// call [`SessionHandler::log_sync`] before it acknowledges, which lets
+    /// one `fsync` cover a whole burst of frames. Only `log` answers it.
+    Stored(u64),
     /// Permanently refused: the attempt is not this worker's, its log has
     /// already ended, or the size cap is reached. `LogRefused` goes out
     /// and the worker stops sending.
@@ -1099,6 +1103,13 @@ pub trait SessionHandler: Send + Sync {
     /// A log frame of an attempt this worker holds. Acknowledged only once
     /// durable; a frame out of sequence or past the size cap is refused.
     fn log(&self, worker: WorkerId, attempt: AttemptId, frame: Frame) -> LogVerdict;
+    /// Make the frames `log` answered [`LogVerdict::Stored`] for durable.
+    /// `false` is a transient fault: the session closes the connection and
+    /// acknowledges nothing, so the worker resends. The default has nothing
+    /// deferred.
+    fn log_sync(&self, _worker: WorkerId, _attempt: AttemptId) -> bool {
+        true
+    }
     /// The attempt's log is complete through `last_seq`. `Acked` means the
     /// end marker is durable; the session answers `LogEndAck` when the
     /// negotiated protocol carries it. The default refuses: nothing was
@@ -2477,6 +2488,34 @@ impl WorkerSession {
     }
 }
 
+/// The most log frames written ahead of one `fsync`: well inside the
+/// worker's `MAX_UNACKED_LOG_FRAMES` window, so a full window is never
+/// waiting on an acknowledgement the batch has not earned yet.
+const LOG_SYNC_FRAMES: usize = 64;
+
+/// Make the deferred frames durable, then acknowledge each attempt once, at
+/// the highest sequence it holds. A sync that fails acknowledges nothing and
+/// closes the connection; the worker resends from its last acknowledgement.
+fn flush_log_acks(
+    handler: &dyn SessionHandler,
+    worker: WorkerId,
+    tx: &Sender,
+    unsynced: &mut Vec<(AttemptId, u64)>,
+    frames: &mut usize,
+) -> Result<()> {
+    *frames = 0;
+    for (attempt, through) in unsynced.drain(..) {
+        if !handler.log_sync(worker, attempt) {
+            return Err(Error::Internal("log store"));
+        }
+        tx.send(&ServerMessage::LogAck {
+            attempt: *attempt.as_bytes(),
+            through,
+        })?;
+    }
+    Ok(())
+}
+
 /// Serve one connection's inbound messages until `Bye`, a protocol violation
 /// or loss. `bulk` is `None` on the control connection: it carries
 /// heartbeats, offer answers and reports, accepts bulk-class messages as the
@@ -2513,8 +2552,26 @@ fn serve_connection(
     let transfers = Arc::new(AtomicUsize::new(0));
     // The cancel flag of each download in flight (protocol 8, P08-C2).
     let serving: Arc<Mutex<HashMap<AttemptId, Arc<AtomicBool>>>> = Arc::default();
+    // Log frames written but not yet acknowledged: one `fsync` per attempt
+    // covers the whole burst the receiver already holds, so the durability
+    // cost is paid per window of frames, never per frame. Nothing here is
+    // acknowledged before `log_sync` says it is durable.
+    let mut unsynced: Vec<(AttemptId, u64)> = Vec::new();
+    let mut unsynced_frames = 0usize;
     loop {
-        let received = rx.recv_timeout::<ClientMessage>(HEARTBEAT_DEADLINE)?;
+        let received = if unsynced.is_empty() {
+            rx.recv_timeout::<ClientMessage>(HEARTBEAT_DEADLINE)?
+        } else {
+            // Only what the receiver already holds: a zero wait never
+            // reads the socket, so an idle link acknowledges at once.
+            match rx.recv_timeout::<ClientMessage>(Duration::ZERO)? {
+                Some(message) => Some(message),
+                None => {
+                    flush_log_acks(handler, worker, tx, &mut unsynced, &mut unsynced_frames)?;
+                    rx.recv_timeout::<ClientMessage>(HEARTBEAT_DEADLINE)?
+                }
+            }
+        };
         if !uploads.is_empty() {
             let now = Instant::now();
             uploads.retain(|_, (_, moved)| now.duration_since(*moved) < UPLOAD_IDLE);
@@ -2525,6 +2582,9 @@ fn serve_connection(
             }
             return Err(Error::Lost);
         };
+        if !unsynced.is_empty() && !matches!(message, ClientMessage::Log { .. }) {
+            flush_log_acks(handler, worker, tx, &mut unsynced, &mut unsynced_frames)?;
+        }
         match message {
             ClientMessage::Ping { seq, held } => {
                 if !control {
@@ -2643,10 +2703,28 @@ fn serve_connection(
                     bytes,
                 };
                 match handler.log(worker, id, frame) {
+                    LogVerdict::Stored(through) => {
+                        match unsynced.iter_mut().find(|(a, _)| *a == id) {
+                            Some((_, last)) => *last = through,
+                            None => unsynced.push((id, through)),
+                        }
+                        unsynced_frames += 1;
+                        if unsynced_frames >= LOG_SYNC_FRAMES {
+                            flush_log_acks(
+                                handler,
+                                worker,
+                                tx,
+                                &mut unsynced,
+                                &mut unsynced_frames,
+                            )?;
+                        }
+                    }
                     LogVerdict::Acked(through) => {
+                        flush_log_acks(handler, worker, tx, &mut unsynced, &mut unsynced_frames)?;
                         tx.send(&ServerMessage::LogAck { attempt, through })?;
                     }
                     LogVerdict::Refused => {
+                        flush_log_acks(handler, worker, tx, &mut unsynced, &mut unsynced_frames)?;
                         tx.send(&ServerMessage::LogRefused { attempt })?;
                     }
                     LogVerdict::Retry => return Err(Error::Internal("log store")),
@@ -2671,7 +2749,9 @@ fn serve_connection(
                     LogVerdict::Refused => {
                         tx.send(&ServerMessage::LogRefused { attempt })?;
                     }
-                    LogVerdict::Retry => return Err(Error::Internal("log store")),
+                    LogVerdict::Retry | LogVerdict::Stored(_) => {
+                        return Err(Error::Internal("log store"));
+                    }
                 }
             }
             ClientMessage::Abandon { attempt, fence } => {

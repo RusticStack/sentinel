@@ -599,3 +599,107 @@ fn the_newest_page_holds_at_most_its_byte_bound_of_the_newest_frames() {
     );
     assert!(tail.complete && tail.next_after.is_none());
 }
+
+#[test]
+fn deferred_frames_are_readable_and_a_window_syncs_once_before_it_is_acknowledged() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    let attempt = AttemptId::new();
+    // Nothing is open yet: there is nothing a sync could vouch for.
+    assert!(matches!(logs.sync(attempt), Err(Error::Conflict)));
+    for seq in 1..=5 {
+        assert_eq!(
+            logs.append_deferred(
+                run(),
+                job(),
+                attempt,
+                &frame(
+                    seq, "x
+"
+                )
+            )
+            .unwrap(),
+            Appended::Stored { through: seq }
+        );
+    }
+    // Written frames are visible to readers before the window is synced.
+    let tail = logs.tail(run(), job(), attempt, 0, 10, None).unwrap();
+    assert_eq!(tail.frames.len(), 5);
+    logs.sync(attempt).unwrap();
+    // A second sync with nothing dirty is a no-op, not an error.
+    logs.sync(attempt).unwrap();
+    logs.finish(run(), job(), attempt, 5, &[]).unwrap();
+    let dir = logs.attempt_dir(run(), job(), attempt);
+    assert_eq!(read_dir(&dir, 0, 10, None).unwrap().frames.len(), 5);
+}
+
+#[test]
+fn a_resent_deferred_frame_is_a_duplicate_and_a_reopen_keeps_what_was_written() {
+    let temp = tempfile::tempdir().unwrap();
+    let attempt = AttemptId::new();
+    {
+        let logs = LogStore::open(temp.path().join("logs")).unwrap();
+        logs.append_deferred(
+            run(),
+            job(),
+            attempt,
+            &frame(
+                1, "a
+",
+            ),
+        )
+        .unwrap();
+        logs.append_deferred(
+            run(),
+            job(),
+            attempt,
+            &frame(
+                2, "b
+",
+            ),
+        )
+        .unwrap();
+        // The connection died before the window was acknowledged; the worker
+        // resends from its last acknowledgement.
+        assert_eq!(
+            logs.append_deferred(
+                run(),
+                job(),
+                attempt,
+                &frame(
+                    1, "a
+"
+                )
+            )
+            .unwrap(),
+            Appended::Duplicate { through: 2 }
+        );
+    }
+    let logs = LogStore::open(temp.path().join("logs")).unwrap();
+    assert_eq!(
+        logs.append(
+            run(),
+            job(),
+            attempt,
+            &frame(
+                2, "b
+"
+            )
+        )
+        .unwrap(),
+        Appended::Duplicate { through: 2 }
+    );
+    assert_eq!(
+        logs.append_deferred(
+            run(),
+            job(),
+            attempt,
+            &frame(
+                3, "c
+"
+            )
+        )
+        .unwrap(),
+        Appended::Stored { through: 3 }
+    );
+}
